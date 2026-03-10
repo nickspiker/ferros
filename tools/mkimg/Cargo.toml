@@ -1,0 +1,10 @@
+[package]
+name = "ferros-mkimg"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Build flashable images from the ferros kernel ELF"
+
+[[bin]]
+name = "ferros-mkimg"
+path = "src/main.rs"

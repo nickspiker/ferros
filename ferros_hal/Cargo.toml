@@ -1,0 +1,13 @@
+[package]
+name = "ferros_hal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer, storage"
+
+[dependencies]
+ferros_ledger = { path = "../ferros_ledger", default-features = false }
+
+[features]
+default = ["std"]
+std = ["ferros_ledger/std"]
