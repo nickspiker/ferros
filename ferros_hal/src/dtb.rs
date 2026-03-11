@@ -109,6 +109,30 @@ impl<'a> Dtb<'a> {
         Some(Self { data, struct_offset, strings_offset })
     }
 
+    /// Create a DTB from a raw pointer (e.g. from bootloader handoff in x0).
+    ///
+    /// # Safety
+    /// `ptr` must point to readable memory containing a valid FDT blob.
+    /// The memory must remain valid for the lifetime of the returned Dtb.
+    pub unsafe fn from_ptr(ptr: *const u8) -> Option<Self> {
+        // Read just the header first to get totalsize
+        let header = unsafe { core::slice::from_raw_parts(ptr, 40) };
+        if be_u32(header, 0) != FDT_MAGIC {
+            return None;
+        }
+        let totalsize = be_u32(header, 4) as usize;
+        if totalsize < 40 || totalsize > 16 * 1024 * 1024 {
+            return None; // sanity: reject > 16MB
+        }
+        let data = unsafe { core::slice::from_raw_parts(ptr, totalsize) };
+        Self::from_bytes(data)
+    }
+
+    /// Total size of the DTB blob in bytes.
+    pub fn total_size(&self) -> usize {
+        self.data.len()
+    }
+
     /// Look up a string in the strings block.
     fn string_at(&self, offset: usize) -> &'a [u8] {
         let start = self.strings_offset + offset;
@@ -179,6 +203,178 @@ impl<'a> Dtb<'a> {
         }
 
         None
+    }
+
+    /// Find all properties of a node, calling `cb` for each.
+    /// Returns true if the node was found.
+    pub fn for_each_prop<F>(&self, node_name: &[u8], mut cb: F) -> bool
+    where
+        F: FnMut(DtbProp<'a>),
+    {
+        let mut pos = self.struct_offset;
+        let mut in_target = false;
+        let mut depth: i32 = 0;
+        let mut target_depth: i32 = 0;
+        let mut found = false;
+
+        while pos + 4 <= self.data.len() {
+            let token = be_u32(self.data, pos);
+            pos += 4;
+
+            match token {
+                FDT_BEGIN_NODE => {
+                    depth += 1;
+                    let name_start = pos;
+                    let name_end = self.data[pos..].iter().position(|&b| b == 0)
+                        .map(|p| pos + p)
+                        .unwrap_or(self.data.len());
+                    let name = &self.data[name_start..name_end];
+
+                    if name.len() >= node_name.len() && &name[..node_name.len()] == node_name {
+                        in_target = true;
+                        target_depth = depth;
+                        found = true;
+                    }
+                    pos = align4(name_end + 1);
+                }
+                FDT_END_NODE => {
+                    if in_target && depth == target_depth {
+                        in_target = false;
+                    }
+                    depth -= 1;
+                }
+                FDT_PROP => {
+                    if pos + 8 > self.data.len() { return found; }
+                    let len = be_u32(self.data, pos) as usize;
+                    let nameoff = be_u32(self.data, pos + 4) as usize;
+                    pos += 8;
+                    if pos + len > self.data.len() { return found; }
+                    let data = &self.data[pos..pos + len];
+                    let name = self.string_at(nameoff);
+
+                    if in_target && depth == target_depth {
+                        cb(DtbProp { name, data });
+                    }
+                    pos = align4(pos + len);
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
+        found
+    }
+
+    /// Iterate over all top-level node names, calling `cb(name)` for each.
+    pub fn for_each_node<F>(&self, mut cb: F)
+    where
+        F: FnMut(&'a [u8], i32), // (node_name, depth)
+    {
+        let mut pos = self.struct_offset;
+        let mut depth: i32 = 0;
+
+        while pos + 4 <= self.data.len() {
+            let token = be_u32(self.data, pos);
+            pos += 4;
+
+            match token {
+                FDT_BEGIN_NODE => {
+                    depth += 1;
+                    let name_start = pos;
+                    let name_end = self.data[pos..].iter().position(|&b| b == 0)
+                        .map(|p| pos + p)
+                        .unwrap_or(self.data.len());
+                    let name = &self.data[name_start..name_end];
+                    cb(name, depth);
+                    pos = align4(name_end + 1);
+                }
+                FDT_END_NODE => { depth -= 1; }
+                FDT_PROP => {
+                    if pos + 8 > self.data.len() { return; }
+                    let len = be_u32(self.data, pos) as usize;
+                    pos += 8;
+                    if pos + len > self.data.len() { return; }
+                    pos = align4(pos + len);
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
+    }
+
+    /// Iterate direct children of `parent_name`, calling `cb(child_name, reg_data)`
+    /// for each child that has a "reg" property. Used to scan reserved-memory, etc.
+    pub fn for_each_child_reg<F>(&self, parent_name: &[u8], mut cb: F)
+    where
+        F: FnMut(&'a [u8], &'a [u8]), // (child_node_name, reg_data)
+    {
+        let mut pos = self.struct_offset;
+        let mut depth: i32 = 0;
+        let mut in_parent = false;
+        let mut parent_depth: i32 = 0;
+        let mut in_child = false;
+        let mut child_depth: i32 = 0;
+        let mut child_name: &[u8] = b"";
+
+        while pos + 4 <= self.data.len() {
+            let token = be_u32(self.data, pos);
+            pos += 4;
+
+            match token {
+                FDT_BEGIN_NODE => {
+                    depth += 1;
+                    let name_start = pos;
+                    let name_end = self.data[pos..].iter().position(|&b| b == 0)
+                        .map(|p| pos + p)
+                        .unwrap_or(self.data.len());
+                    let name = &self.data[name_start..name_end];
+
+                    if !in_parent && name.len() >= parent_name.len()
+                        && &name[..parent_name.len()] == parent_name
+                    {
+                        in_parent = true;
+                        parent_depth = depth;
+                    } else if in_parent && depth == parent_depth + 1 {
+                        in_child = true;
+                        child_depth = depth;
+                        child_name = name;
+                    }
+
+                    pos = align4(name_end + 1);
+                }
+                FDT_END_NODE => {
+                    if in_child && depth == child_depth {
+                        in_child = false;
+                    }
+                    if in_parent && depth == parent_depth {
+                        in_parent = false;
+                        return; // done with parent
+                    }
+                    depth -= 1;
+                }
+                FDT_PROP => {
+                    if pos + 8 > self.data.len() { return; }
+                    let len = be_u32(self.data, pos) as usize;
+                    let nameoff = be_u32(self.data, pos + 4) as usize;
+                    pos += 8;
+                    if pos + len > self.data.len() { return; }
+                    let data = &self.data[pos..pos + len];
+
+                    if in_child && depth == child_depth {
+                        let pname = self.string_at(nameoff);
+                        if pname == b"reg" {
+                            cb(child_name, data);
+                        }
+                    }
+
+                    pos = align4(pos + len);
+                }
+                FDT_NOP => {}
+                FDT_END => break,
+                _ => break,
+            }
+        }
     }
 
     /// Parse the `simple-framebuffer` node into an FbConfig.

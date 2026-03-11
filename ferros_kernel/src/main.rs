@@ -1,15 +1,6 @@
-//! Ferros kernel — display test build.
+//! Ferros kernel — framebuffer console build.
 //!
-//! Code execution confirmed (PSCI reboot + red flash seen).
-//! Now focusing on persistent display output via DPU trigger.
-//!
-//! Sequence:
-//!   1. Fill framebuffer red (DRAM, in assembly — immediate)
-//!   2. Set up exception handler + stack → enter Rust
-//!   3. Fill entire FB with color pattern
-//!   4. Try DPU splash handoff (flush all CTLs)
-//!   5. Try full DPU pipeline setup
-//!   6. Stay alive (WFE loop, no reboot)
+//! Boots on FP5, fills framebuffer, renders text diagnostic console.
 
 #![no_std]
 #![no_main]
@@ -19,7 +10,12 @@ extern crate alloc;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
+use ferros_hal::console::Console;
 use ferros_hal::dpu;
+use ferros_hal::dtb::Dtb;
+use ferros_hal::pstore::{Ramoops, RamoopsConfig};
+use ferros_hal::spmi;
+use ferros_hal::uart::{Uart, UartBackend};
 
 // ---------------------------------------------------------------------------
 // Global allocator
@@ -317,6 +313,8 @@ const FP5_SPLASH_ADDR: u64 = 0xE100_0000;
 
 /// PS_HOLD register — writing 0 kills power (Qualcomm TCSR).
 const PS_HOLD: usize = 0x0C26_4000;
+/// GENI SE UART base (QUPv3 SE3, from stock cmdline console=ttyMSM0).
+const FP5_UART_BASE: usize = 0x0099_4000;
 
 // ---------------------------------------------------------------------------
 // Statics
@@ -336,90 +334,275 @@ fn boot_el() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel entry — display test
+// Log tee — writes to console + ramoops simultaneously
 // ---------------------------------------------------------------------------
 
+struct Log {
+    con: Console,
+    ram: Option<Ramoops>,
+}
+
+impl Log {
+    fn putc(&mut self, b: u8) {
+        self.con.putc(b);
+        if let Some(ref mut r) = self.ram { r.putc(b); }
+    }
+    fn puts(&mut self, s: &str) {
+        self.con.puts(s);
+        if let Some(ref mut r) = self.ram { r.puts(s); }
+    }
+    fn put_hex(&mut self, val: u64) {
+        self.con.put_hex(val);
+        if let Some(ref mut r) = self.ram { r.put_hex(val); }
+    }
+    fn put_hex32(&mut self, val: u32) {
+        self.con.put_hex32(val);
+        if let Some(ref mut r) = self.ram { r.put_hex32(val); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel entry — framebuffer console + ramoops log
+// ---------------------------------------------------------------------------
+
+/// Parse ramoops zone config from DTB.
+fn parse_ramoops_config(dtb: &Dtb) -> Option<RamoopsConfig> {
+    // Find ramoops reg (base + size)
+    let reg = dtb.find_node_prop(b"ramoops", b"reg")?;
+    if reg.data.len() < 16 { return None; }
+    let base = u64::from_be_bytes([
+        reg.data[0], reg.data[1], reg.data[2], reg.data[3],
+        reg.data[4], reg.data[5], reg.data[6], reg.data[7],
+    ]);
+    let size = u64::from_be_bytes([
+        reg.data[8], reg.data[9], reg.data[10], reg.data[11],
+        reg.data[12], reg.data[13], reg.data[14], reg.data[15],
+    ]) as usize;
+
+    let record_size = dtb.find_node_prop(b"ramoops", b"record-size")
+        .and_then(|p| p.as_u32()).unwrap_or(0x40000) as usize;
+    let console_size = dtb.find_node_prop(b"ramoops", b"console-size")
+        .and_then(|p| p.as_u32()).unwrap_or(0x40000) as usize;
+    let ftrace_size = dtb.find_node_prop(b"ramoops", b"ftrace-size")
+        .and_then(|p| p.as_u32()).unwrap_or(0x40000) as usize;
+    let pmsg_size = dtb.find_node_prop(b"ramoops", b"pmsg-size")
+        .and_then(|p| p.as_u32()).unwrap_or(0x40000) as usize;
+
+    Some(RamoopsConfig { base, size, record_size, console_size, ftrace_size, pmsg_size })
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main(_dtb_addr: u64) -> ! {
-    let exc_before = exception_count();
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    let exc_start = exception_count();
 
-    // ---- Phase 1: Read MDSS HW_VERSION to check if DPU MMIO is accessible ----
+    // ---- Set up framebuffer console ----
+    let con = unsafe {
+        Console::new(
+            FP5_SPLASH_ADDR as *mut u32,
+            FP5_FB_WIDTH as usize,
+            FP5_FB_HEIGHT as usize,
+            FP5_FB_WIDTH as usize,
+            0xFFFF_FFFF,           // white text
+            0xFF00_0000,           // black background
+            (120, 48, 80, 48),     // margins: top (notch), right, bottom, left
+        )
+    };
+
+    // ---- Parse DTB early to find ramoops (fallback to known FP5 address) ----
+    let ramoops = if dtb_addr != 0 {
+        unsafe { Dtb::from_ptr(dtb_addr as *const u8) }
+            .and_then(|dtb| parse_ramoops_config(&dtb))
+            .map(|cfg| unsafe { Ramoops::from_config(&cfg) })
+    } else {
+        None
+    };
+    // Fallback: if DTB lookup failed, use known FP5 ramoops region directly.
+    // ramoops@0xBA800000, 2MB, default zone sizes (256KB each).
+    let ramoops = ramoops.or_else(|| {
+        let cfg = RamoopsConfig {
+            base: 0xBA80_0000,
+            size: 0x20_0000,
+            record_size: 0x40000,
+            console_size: 0x40000,
+            ftrace_size: 0x40000,
+            pmsg_size: 0x40000,
+        };
+        Some(unsafe { Ramoops::from_config(&cfg) })
+    });
+
+    let mut log = Log { con, ram: ramoops };
+    log.con.clear();
+
+    // ---- Banner ----
+    log.puts("ferros v0.0 on Fairphone 5 (QCM6490)\n");
+    log.puts("=====================================\n\n");
+
+    // ---- Boot diagnostics ----
+    log.puts("Boot EL:       "); log.put_hex32(boot_el() as u32); log.puts("\n");
+    log.puts("DTB addr:      "); log.put_hex(dtb_addr); log.puts("\n");
+    log.puts("Exceptions:    "); log.put_hex(exception_count() - exc_start); log.puts("\n");
+    log.puts("pstore:        ");
+    if log.ram.is_some() { log.puts("OK (ramoops)\n"); } else { log.puts("not found\n"); }
+
+    // ---- DPU MMIO probe ----
+    let exc_pre = exception_count();
     let hw_ver = dpu::hw_version();
-    let exc_after_hwver = exception_count();
-    let dpu_accessible = exc_after_hwver == exc_before;
+    let exc_post = exception_count();
+    let dpu_ok = exc_post == exc_pre;
 
-    // ---- Phase 2: Fill entire FB bright red (assembly already did this, ----
-    // ---- but redo from Rust to be sure — full 1224x2700)              ----
-    let fb_base = FP5_SPLASH_ADDR as *mut u32;
-    let w = FP5_FB_WIDTH as usize;
-    let h = FP5_FB_HEIGHT as usize;
-    let stride_words = FP5_FB_STRIDE as usize / 4;
-    let red: u32 = 0xFFFF_0000;
+    log.puts("\n-- DPU --\n");
+    log.puts("MDSS HW_VER:   "); log.put_hex32(hw_ver);
+    log.puts(if dpu_ok { " (OK)\n" } else { " (FAULT)\n" });
 
-    for y in 0..h {
-        for x in 0..w {
-            unsafe { fb_base.add(y * stride_words + x).write_volatile(red) };
-        }
-    }
-    unsafe { core::arch::asm!("dsb sy") };
+    if dpu_ok {
+        log.puts("CTL0_TOP:      "); log.put_hex32(dpu::read_reg(dpu::MDP_BASE + 0x15014)); log.puts("\n");
+        log.puts("CTL0_FLUSH:    "); log.put_hex32(dpu::read_reg(dpu::MDP_BASE + 0x15018)); log.puts("\n");
+        log.puts("INTF1_EN:      "); log.put_hex32(dpu::read_reg(dpu::MDP_BASE + 0x35000)); log.puts("\n");
+        log.puts("VIG0 SRC_FMT:  "); log.put_hex32(dpu::read_reg(dpu::SSPP_VIG0 + 0x30)); log.puts("\n");
+        log.puts("VIG0 SRC_ADDR: "); log.put_hex32(dpu::read_reg(dpu::SSPP_VIG0 + 0x14)); log.puts("\n");
+        log.puts("VIG0 STRIDE:   "); log.put_hex32(dpu::read_reg(dpu::SSPP_VIG0 + 0x24)); log.puts("\n");
+        log.puts("VIG0 SRC_SIZE: "); log.put_hex32(dpu::read_reg(dpu::SSPP_VIG0 + 0x00)); log.puts("\n");
 
-    // ---- Phase 3: Try DPU splash handoff (flush + start all CTLs) ----
-    // This is the simplest approach: ABL left the DPU pipeline configured,
-    // we just tell it to push a new frame.
-    if dpu_accessible {
-        dpu::try_splash_handoff();
-        unsafe { core::arch::asm!("dsb sy") };
-
-        // Wait a bit for the frame to be sent
-        spin_ms(100);
-
-        // Try again (command mode may need repeated triggers)
-        dpu::try_splash_handoff();
-        unsafe { core::arch::asm!("dsb sy") };
-
-        spin_ms(100);
-
-        // ---- Phase 4: Try full pipeline setup (VIG0 path) ----
-        dpu::setup_pipeline(
-            FP5_SPLASH_ADDR as u32,
-            FP5_FB_WIDTH,
-            FP5_FB_HEIGHT,
-            FP5_FB_STRIDE,
-        );
-        unsafe { core::arch::asm!("dsb sy") };
-
-        spin_ms(200);
-
-        // ---- Phase 5: Try DMA0 path instead ----
-        dpu::setup_pipeline_dma0(
-            FP5_SPLASH_ADDR as u32,
-            FP5_FB_WIDTH,
-            FP5_FB_HEIGHT,
-            FP5_FB_STRIDE,
-        );
-        unsafe { core::arch::asm!("dsb sy") };
-
-        // ---- Phase 6: Repeated flush loop — keep triggering DPU ----
-        // Some command-mode panels need periodic triggers.
-        // Also try re-triggering every 100ms for 30 seconds.
-        for _ in 0..300 {
-            dpu::try_splash_handoff();
-            spin_ms(100);
-        }
+        log.puts("DMA0 SRC_ADDR: "); log.put_hex32(dpu::read_reg(dpu::SSPP_DMA0 + 0x14)); log.puts("\n");
+        log.puts("DMA0 STRIDE:   "); log.put_hex32(dpu::read_reg(dpu::SSPP_DMA0 + 0x24)); log.puts("\n");
+        log.puts("DMA0 SRC_SIZE: "); log.put_hex32(dpu::read_reg(dpu::SSPP_DMA0 + 0x00)); log.puts("\n");
     }
 
-    // ---- Write diagnostics to DRAM ----
-    let exc_end = exception_count();
-    let diag_addr = 0x8008_5000u64 as *mut u64;
+    // ---- UART ----
+    log.puts("\n-- UART --\n");
+    let uart = Uart::new(UartBackend::GeniSe { base: FP5_UART_BASE });
+    let exc_pre = exception_count();
+    if uart.probe() && exception_count() == exc_pre {
+        uart.init();
+        log.puts("UART:          OK\n");
+        uart.puts("ferros v0.0 UART alive\r\n");
+    } else {
+        log.puts("UART:          FAIL\n");
+    }
+
+    // ---- DTB parse ----
+    log.puts("\n-- DTB --\n");
+    if dtb_addr != 0 {
+        let dtb = unsafe { Dtb::from_ptr(dtb_addr as *const u8) };
+        match dtb {
+            Some(dtb) => {
+                log.puts("DTB valid:     "); log.put_hex32(dtb.total_size() as u32); log.puts(" bytes\n");
+
+                if let Some(bootargs) = dtb.find_node_prop(b"chosen", b"bootargs") {
+                    log.puts("bootargs:\n");
+                    if let Some(s) = bootargs.as_str() {
+                        let bytes = s.as_bytes();
+                        let mut i = 0;
+                        while i < bytes.len() {
+                            let end = if i + 100 < bytes.len() { i + 100 } else { bytes.len() };
+                            log.puts("  ");
+                            log.puts(&s[i..end]);
+                            log.puts("\n");
+                            i = end;
+                        }
+                    }
+                }
+
+                match dtb.parse_simplefb() {
+                    Some(fb) => {
+                        log.puts("simplefb addr: "); log.put_hex(fb.phys_base); log.puts("\n");
+                        log.puts("simplefb size: "); log.put_hex32(fb.width); log.puts("x"); log.put_hex32(fb.height); log.puts("\n");
+                        log.puts("simplefb strd: "); log.put_hex32(fb.stride); log.puts("\n");
+                    }
+                    None => log.puts("simplefb:      not found\n"),
+                }
+
+                if let Some(reg) = dtb.find_node_prop(b"memory", b"reg") {
+                    log.puts("memory reg:    ");
+                    let mut off = 0;
+                    while off + 16 <= reg.data.len() {
+                        let addr = u64::from_be_bytes([
+                            reg.data[off], reg.data[off+1], reg.data[off+2], reg.data[off+3],
+                            reg.data[off+4], reg.data[off+5], reg.data[off+6], reg.data[off+7],
+                        ]);
+                        let size = u64::from_be_bytes([
+                            reg.data[off+8], reg.data[off+9], reg.data[off+10], reg.data[off+11],
+                            reg.data[off+12], reg.data[off+13], reg.data[off+14], reg.data[off+15],
+                        ]);
+                        if off > 0 { log.puts("               "); }
+                        log.put_hex(addr); log.puts(" +"); log.put_hex(size); log.puts("\n");
+                        off += 16;
+                    }
+                }
+
+                log.puts("\n-- reserved-memory --\n");
+                let mut rmem_count = 0u32;
+                dtb.for_each_child_reg(b"reserved-memory", |name, reg| {
+                    log.puts("  ");
+                    for &b in name {
+                        if b == b'@' { break; }
+                        log.putc(b);
+                    }
+                    log.puts(": ");
+                    if reg.len() >= 16 {
+                        let addr = u64::from_be_bytes([
+                            reg[0], reg[1], reg[2], reg[3],
+                            reg[4], reg[5], reg[6], reg[7],
+                        ]);
+                        let size = u64::from_be_bytes([
+                            reg[8], reg[9], reg[10], reg[11],
+                            reg[12], reg[13], reg[14], reg[15],
+                        ]);
+                        log.put_hex(addr); log.puts(" +"); log.put_hex(size);
+                    } else if reg.len() >= 8 {
+                        let addr = u32::from_be_bytes([reg[0], reg[1], reg[2], reg[3]]);
+                        let size = u32::from_be_bytes([reg[4], reg[5], reg[6], reg[7]]);
+                        log.put_hex32(addr); log.puts(" +"); log.put_hex32(size);
+                    }
+                    log.puts("\n");
+                    rmem_count += 1;
+                });
+                if rmem_count == 0 { log.puts("  (none found)\n"); }
+
+                log.puts("\nnodes:         ");
+                let mut count = 0u32;
+                dtb.for_each_node(|name, depth| {
+                    if depth == 2 && !name.is_empty() {
+                        if count > 0 { log.puts(" "); }
+                        if count < 16 {
+                            for &b in name {
+                                if b == b'@' { break; }
+                                log.putc(b);
+                            }
+                        }
+                        count += 1;
+                    }
+                });
+                if count >= 16 { log.puts(" ..."); }
+                log.puts(" ("); log.put_hex32(count); log.puts(" total)\n");
+            }
+            None => {
+                log.puts("DTB invalid at "); log.put_hex(dtb_addr); log.puts("\n");
+            }
+        }
+    } else {
+        log.puts("DTB addr:      NULL\n");
+    }
+
+    // ---- Final ----
+    log.puts("\nTotal exc:     "); log.put_hex(exception_count()); log.puts("\n");
+    if let Some(ref r) = log.ram {
+        log.con.puts("pstore bytes:  "); log.con.put_hex32(r.written() as u32); log.con.puts("\n");
+    }
+
+    // ---- PSCI reboot (warm — preserves ramoops DRAM) ----
+    log.puts("\n-- rebooting --\n");
     unsafe {
-        diag_addr.write_volatile(0xFE00_D150_0000_0000u64 | boot_el());
-        diag_addr.add(1).write_volatile(hw_ver as u64);
-        diag_addr.add(2).write_volatile(if dpu_accessible { 1 } else { 0 });
-        diag_addr.add(3).write_volatile(exc_end);
-    }
-
-    loop {
-        unsafe { core::arch::asm!("wfe") };
+        core::arch::asm!("dsb sy");
+        core::arch::asm!(
+            "mov w0, #0x9",
+            "movk w0, #0x8400, lsl #16",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "smc #0",
+            options(noreturn)
+        );
     }
 }
 

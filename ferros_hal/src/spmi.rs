@@ -160,6 +160,46 @@ pub fn read_byte(apid: u16, reg_offset: u8) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// PON (Power-On) button status
+// ---------------------------------------------------------------------------
+
+/// PM7325 SID (primary PMIC on QCM6490)
+pub const SID_PM7325: u8 = 0;
+
+/// PON peripheral ID
+pub const PID_PON: u8 = 0x08;
+
+/// PON RT_STS register offset — real-time button state.
+const PON_RT_STS: u8 = 0x10;
+
+/// Bit masks in PON RT_STS (active low — 0 = pressed)
+const KPDPWR_N: u8 = 1 << 0; // power button
+const RESIN_N: u8 = 1 << 1;  // volume down ("reset in")
+
+/// Read PON real-time status. Returns None if SPMI fails.
+pub fn pon_rt_sts() -> Option<u8> {
+    let pon_ppid = ppid(SID_PM7325, PID_PON);
+    let apid = find_apid(pon_ppid)?;
+    read_byte(apid, PON_RT_STS)
+}
+
+/// Check if volume-down is currently pressed.
+pub fn vol_down_pressed() -> bool {
+    match pon_rt_sts() {
+        Some(sts) => (sts & RESIN_N) == 0, // active low
+        None => false,
+    }
+}
+
+/// Check if power button is currently pressed.
+pub fn power_pressed() -> bool {
+    match pon_rt_sts() {
+        Some(sts) => (sts & KPDPWR_N) == 0, // active low
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Flash LED convenience functions
 // ---------------------------------------------------------------------------
 

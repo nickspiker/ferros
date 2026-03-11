@@ -20,5 +20,7 @@ pub mod uart;
 pub mod fb;
 pub mod dtb;
 pub mod sdmmc;
+pub mod console;
 pub mod dpu;
+pub mod pstore;
 pub mod spmi;
