@@ -1,18 +1,15 @@
-//! Ferros kernel — bare metal entry point for aarch64.
+//! Ferros kernel — display test build.
 //!
-//! ## Boot flow
+//! Code execution confirmed (PSCI reboot + red flash seen).
+//! Now focusing on persistent display output via DPU trigger.
 //!
-//! ```text
-//! ABL loads boot.img → _start (asm) → kernel_main (Rust)
-//!   → UART init (serial debug)
-//!   → DTB parse (find framebuffer)
-//!   → SimpleFB init (proof of life: colored rectangles)
-//!   → SD/MMC init (probe microSD)
-//!   → Anchor ring scan (find latest committed state)
-//!   → Ledger mount (ready for operations)
-//! ```
-//!
-//! ABL passes the DTB physical address in x0 (standard arm64 boot protocol).
+//! Sequence:
+//!   1. Fill framebuffer red (DRAM, in assembly — immediate)
+//!   2. Set up exception handler + stack → enter Rust
+//!   3. Fill entire FB with color pattern
+//!   4. Try DPU splash handoff (flush all CTLs)
+//!   5. Try full DPU pipeline setup
+//!   6. Stay alive (WFE loop, no reboot)
 
 #![no_std]
 #![no_main]
@@ -22,25 +19,20 @@ extern crate alloc;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-use ferros_hal::uart::{Uart, UartBackend};
-use ferros_hal::fb::Framebuffer;
-use ferros_hal::dtb::Dtb;
+use ferros_hal::dpu;
 
 // ---------------------------------------------------------------------------
-// Global allocator — simple bump allocator for early boot
+// Global allocator
 // ---------------------------------------------------------------------------
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// 256KB heap — plenty for boot. Will be replaced by the ring allocator.
 const HEAP_SIZE: usize = 256 * 1024;
 
 #[repr(align(4096))]
 struct HeapMem(UnsafeCell<[u8; HEAP_SIZE]>);
-
-// SAFETY: We use atomic operations to synchronize access to the heap.
 unsafe impl Sync for HeapMem {}
 
 static HEAP: HeapMem = HeapMem(UnsafeCell::new([0; HEAP_SIZE]));
@@ -63,47 +55,177 @@ unsafe impl GlobalAlloc for BumpAlloc {
             }
         }
     }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator never frees. This is fine for boot.
-    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
 
 #[global_allocator]
 static ALLOC: BumpAlloc = BumpAlloc;
 
 // ---------------------------------------------------------------------------
-// Boot stub — aarch64 assembly
+// Boot stub — minimal, no MMU
 // ---------------------------------------------------------------------------
 
 global_asm!(r#"
 .section .text.boot, "ax"
 .global _start
 
-_start:
-    // x0 = DTB physical address (from ABL)
-    // Save it before we clobber registers.
-    mov     x19, x0
+// ========================================================================
+// ARM64 Image header with PE/COFF stub
+//
+// Qualcomm ABL (UEFI-based) requires PE/COFF format to find entry point.
+// Stock FP5 kernel starts with "MZ" (PE/COFF). We replicate this.
+//
+// Layout:
+//   0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew)
+//   0x040: PE header (PE\0\0 + COFF + Optional + Section table)
+//   0x1000: _entry (page-aligned .text section start)
+// ========================================================================
 
-    // Disable interrupts
+_start:
+    // Offset 0x00: "MZ" magic — must be valid ARM64: `add x13, x18, #0x16`
+    // Bytes: 4D 5A 00 91. Stock kernel uses this exact encoding.
+    .long   0x91005A4D
+    // Offset 0x04: branch to _entry (past all headers)
+    b       _entry
+
+    // Offset 0x08: text_offset (ARM64 Image header)
+    .quad   0x80000                 // text_offset = 0x80000 (matches stock FP5 kernel)
+    // Offset 0x10: image_size
+    .quad   __kernel_size
+    // Offset 0x18: flags — LE, 4K pages, can be placed anywhere
+    .quad   0x0A
+    // Offset 0x20: res2
+    .quad   0
+    // Offset 0x28: res3
+    .quad   0
+    // Offset 0x30: res4
+    .quad   0
+    // Offset 0x38: ARM64 magic
+    .ascii  "ARM\x64"
+    // Offset 0x3C: PE header offset (e_lfanew for PE/COFF)
+    .long   .Lpe_header - _start
+
+// ---------- PE/COFF Header (at offset 0x40) ----------
+.balign 4
+.Lpe_header:
+    .ascii  "PE\0\0"               // PE magic
+
+    // COFF header (20 bytes)
+    .short  0xAA64                  // Machine: ARM64
+    .short  1                       // NumberOfSections
+    .long   0                       // TimeDateStamp
+    .long   0                       // PointerToSymbolTable
+    .long   0                       // NumberOfSymbols
+    .short  .Lsection_table - .Loptional_header   // SizeOfOptionalHeader
+    .short  0x206                   // Characteristics: EXEC | NO_LINE | NO_DEBUG
+
+.Loptional_header:
+    // PE32+ Optional Header
+    .short  0x20B                   // Magic: PE32+
+    .byte   0                       // MajorLinkerVersion
+    .byte   0                       // MinorLinkerVersion
+    .long   __kernel_size - 0x1000   // SizeOfCode (section data, excl headers)
+    .long   0                       // SizeOfInitializedData
+    .long   0                       // SizeOfUninitializedData
+    .long   0x1000                  // AddressOfEntryPoint (RVA = page 1)
+    .long   0x1000                  // BaseOfCode
+
+    // PE32+ fields
+    .quad   0                       // ImageBase (relocatable)
+    .long   0x1000                  // SectionAlignment (4K)
+    .long   0x200                   // FileAlignment (512 — matches stock)
+    .short  0                       // MajorOperatingSystemVersion
+    .short  0                       // MinorOperatingSystemVersion
+    .short  0                       // MajorImageVersion
+    .short  0                       // MinorImageVersion
+    .short  0                       // MajorSubsystemVersion
+    .short  0                       // MinorSubsystemVersion
+    .long   0                       // Win32VersionValue
+    .long   __kernel_size           // SizeOfImage
+    .long   0x1000                  // SizeOfHeaders (one page)
+    .long   0                       // CheckSum
+    .short  10                      // Subsystem: EFI Application
+    .short  0                       // DllCharacteristics
+    .quad   0                       // SizeOfStackReserve
+    .quad   0                       // SizeOfStackCommit
+    .quad   0                       // SizeOfHeapReserve
+    .quad   0                       // SizeOfHeapCommit
+    .long   0                       // LoaderFlags
+    .long   6                       // NumberOfRvaAndSizes (6, matches stock)
+
+    // Data directories (6 entries, all empty — matches stock)
+    .quad   0                       // Export Table
+    .quad   0                       // Import Table
+    .quad   0                       // Resource Table
+    .quad   0                       // Exception Table
+    .quad   0                       // Certificate Table
+    .quad   0                       // Base Relocation Table
+
+.Lsection_table:
+    // Section header: ".text"
+    .ascii  ".text\0\0\0"           // Name (8 bytes)
+    .long   __kernel_size - 0x1000  // VirtualSize (section virtual extent, incl BSS)
+    .long   0x1000                  // VirtualAddress (RVA, page-aligned)
+    .long   __bss_start - _start - 0x1000  // SizeOfRawData (file-backed only, excl BSS)
+    .long   0x1000                  // PointerToRawData (file offset)
+    .long   0                       // PointerToRelocations
+    .long   0                       // PointerToLinenumbers
+    .short  0                       // NumberOfRelocations
+    .short  0                       // NumberOfLinenumbers
+    .long   0xE0000020              // Characteristics: CODE | EXECUTE | READ | WRITE
+
+// ---------- Actual kernel entry (page-aligned at RVA 0x1000) ----------
+.balign 0x1000
+_entry:
+    // Save DTB pointer, mask interrupts
+    mov     x19, x0
     msr     daifset, #0xF
 
-    // Check CPU ID — only core 0 boots, others park
-    mrs     x1, mpidr_el1
-    and     x1, x1, #0xFF
-    cbz     x1, .Lprimary
-.Lpark:
-    wfe
-    b       .Lpark
+    // ================================================================
+    // IMMEDIATE PROOF OF LIFE — before ANY other setup.
+    // No stack, no BSS, no exception handler, no Rust.
+    // ================================================================
 
-.Lprimary:
-    // Set up stack
-    ldr     x1, =__stack_top
+    // -- Write red pixels to splash FB (DRAM, no MMIO needed) --
+    // If DPU is still scanning from ABL, screen turns red.
+    movz    x8, #0x0000
+    movk    x8, #0xE100, lsl #16   // x8 = 0xE1000000 (splash FB base)
+    movz    w9, #0x0000
+    movk    w9, #0xFFFF, lsl #16   // w9 = 0xFFFF0000 (XRGB red)
+
+    // Fill ALL scanlines (1224 * 2700 = 3304800 = 0x326BE0 pixels)
+    movz    x10, #0x6BE0
+    movk    x10, #0x32, lsl #16    // x10 = 0x326BE0
+.Lfill_red:
+    str     w9, [x8], #4
+    subs    x10, x10, #1
+    b.ne    .Lfill_red
+    dsb     sy
+
+    // Fall through to normal boot (set up exception handler, stack, Rust)
+
+    mrs     x20, CurrentEL
+    lsr     x20, x20, #2
+
+    adr     x2, .Lvectors
+    cmp     x20, #2
+    b.ne    .Lvbar_el1
+    msr     vbar_el2, x2
+    b       .Lvbar_done
+.Lvbar_el1:
+    msr     vbar_el1, x2
+.Lvbar_done:
+    isb
+
+    msr     spsel, #1
+    adrp    x1, __stack_top
+    add     x1, x1, :lo12:__stack_top
     mov     sp, x1
 
-    // Zero BSS
-    ldr     x1, =__bss_start
-    ldr     x2, =__bss_end
+    adrp    x1, __bss_start
+    add     x1, x1, :lo12:__bss_start
+    adrp    x2, __bss_end
+    add     x2, x2, :lo12:__bss_end
 .Lbss_loop:
     cmp     x1, x2
     b.ge    .Lbss_done
@@ -111,136 +233,207 @@ _start:
     b       .Lbss_loop
 .Lbss_done:
 
-    // Jump to Rust — x19 = DTB address
+    adrp    x1, __boot_el
+    add     x1, x1, :lo12:__boot_el
+    str     x20, [x1]
+
     mov     x0, x19
     bl      kernel_main
 
-    // If kernel_main returns, halt
 .Lhalt:
     wfe
     b       .Lhalt
+
+.balign 0x800
+.Lvectors:
+    b       .Lexc_recover
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+
+    .balign 0x80
+    b       .Lexc_recover
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+
+    .balign 0x80
+    b       .Lexc_recover
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+
+.balign 16
+.Lexc_recover:
+    stp     x0, x1, [sp, #-16]!
+    adrp    x0, __exception_count
+    add     x0, x0, :lo12:__exception_count
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.eq    .Lexc_el2
+    mrs     x0, elr_el1
+    add     x0, x0, #4
+    msr     elr_el1, x0
+    b       .Lexc_ret
+.Lexc_el2:
+    mrs     x0, elr_el2
+    add     x0, x0, #4
+    msr     elr_el2, x0
+.Lexc_ret:
+    ldp     x0, x1, [sp], #16
+    eret
 "#);
 
 // ---------------------------------------------------------------------------
-// Kernel entry point (Rust)
+// Constants
 // ---------------------------------------------------------------------------
 
-/// Main kernel entry — called from assembly with DTB address.
+const FP5_FB_WIDTH: u32 = 1224;
+const FP5_FB_HEIGHT: u32 = 2700;
+const FP5_FB_STRIDE: u32 = FP5_FB_WIDTH * 4;
+const FP5_SPLASH_ADDR: u64 = 0xE100_0000;
+
+/// PS_HOLD register — writing 0 kills power (Qualcomm TCSR).
+const PS_HOLD: usize = 0x0C26_4000;
+
+// ---------------------------------------------------------------------------
+// Statics
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
-    // -- Stage 1: UART --
-    // QEMU virt PL011 at 0x0900_0000.
-    // On real FP5, this would be the GENI SE UART base.
-    let uart = Uart::new(UartBackend::Pl011 { base: 0x0900_0000 });
-    uart.puts("\n\n");
-    uart.puts("========================================\n");
-    uart.puts("  ferros kernel alive\n");
-    uart.puts("========================================\n");
-    uart.puts("DTB at: ");
-    uart.put_hex(dtb_addr);
-    uart.puts("\n");
+static mut __exception_count: u64 = 0;
+#[unsafe(no_mangle)]
+static mut __boot_el: u64 = 0;
 
-    // -- Stage 2: Parse DTB --
-    let dtb_slice = unsafe {
-        // ABL guarantees DTB is valid at this address.
-        // Read totalsize from header to know how big it is.
-        let header = dtb_addr as *const u8;
-        let size_bytes = [
-            *header.add(4), *header.add(5), *header.add(6), *header.add(7),
-        ];
-        let total_size = u32::from_be_bytes(size_bytes) as usize;
-        core::slice::from_raw_parts(header, total_size)
-    };
+fn exception_count() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __exception_count) }
+}
 
-    if let Some(dtb) = Dtb::from_bytes(dtb_slice) {
-        uart.puts("[dtb] parsed OK\n");
+fn boot_el() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __boot_el) }
+}
 
-        // -- Stage 3: SimpleFB --
-        if let Some(fb_config) = dtb.parse_simplefb() {
-            uart.puts("[fb] found simplefb: ");
-            uart.put_hex(fb_config.phys_base);
-            uart.puts(" ");
-            uart.put_hex(fb_config.width as u64);
-            uart.puts("x");
-            uart.put_hex(fb_config.height as u64);
-            uart.puts("\n");
+// ---------------------------------------------------------------------------
+// Kernel entry — display test
+// ---------------------------------------------------------------------------
 
-            // Identity-mapped: phys == virt on bare metal
-            let fb_ptr = fb_config.phys_base as *mut u8;
-            let mut fb = unsafe {
-                Framebuffer::new(fb_config, fb_ptr)
-            };
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(_dtb_addr: u64) -> ! {
+    let exc_before = exception_count();
 
-            // Proof of life: fill screen dark blue, draw ferros logo placeholder
-            fb.clear(0x10, 0x10, 0x30);  // dark blue-gray
+    // ---- Phase 1: Read MDSS HW_VERSION to check if DPU MMIO is accessible ----
+    let hw_ver = dpu::hw_version();
+    let exc_after_hwver = exception_count();
+    let dpu_accessible = exc_after_hwver == exc_before;
 
-            // Draw a white rectangle in the center
-            let cx = fb.config.width / 2;
-            let cy = fb.config.height / 2;
-            fb.fill_rect(cx - 100, cy - 40, 200, 80, 0xFF, 0xFF, 0xFF);
+    // ---- Phase 2: Fill entire FB bright red (assembly already did this, ----
+    // ---- but redo from Rust to be sure — full 1224x2700)              ----
+    let fb_base = FP5_SPLASH_ADDR as *mut u32;
+    let w = FP5_FB_WIDTH as usize;
+    let h = FP5_FB_HEIGHT as usize;
+    let stride_words = FP5_FB_STRIDE as usize / 4;
+    let red: u32 = 0xFFFF_0000;
 
-            // Draw ferros orange accent bar
-            fb.fill_rect(cx - 100, cy + 50, 200, 8, 0xFF, 0x80, 0x00);
-
-            uart.puts("[fb] proof of life displayed\n");
-        } else {
-            uart.puts("[fb] no simplefb node in DTB\n");
+    for y in 0..h {
+        for x in 0..w {
+            unsafe { fb_base.add(y * stride_words + x).write_volatile(red) };
         }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
 
-        // -- Stage 4: SD/MMC (placeholder) --
-        uart.puts("[sdmmc] TODO: probe microSD controller\n");
+    // ---- Phase 3: Try DPU splash handoff (flush + start all CTLs) ----
+    // This is the simplest approach: ABL left the DPU pipeline configured,
+    // we just tell it to push a new frame.
+    if dpu_accessible {
+        dpu::try_splash_handoff();
+        unsafe { core::arch::asm!("dsb sy") };
 
-        // -- Stage 5: Anchor ring (placeholder) --
-        uart.puts("[anchor] TODO: scan anchor ring on microSD\n");
+        // Wait a bit for the frame to be sent
+        spin_ms(100);
 
-        // -- Stage 6: Ledger mount (placeholder) --
-        uart.puts("[ledger] TODO: mesh consensus and mount\n");
-    } else {
-        uart.puts("[dtb] FAILED to parse DTB!\n");
+        // Try again (command mode may need repeated triggers)
+        dpu::try_splash_handoff();
+        unsafe { core::arch::asm!("dsb sy") };
+
+        spin_ms(100);
+
+        // ---- Phase 4: Try full pipeline setup (VIG0 path) ----
+        dpu::setup_pipeline(
+            FP5_SPLASH_ADDR as u32,
+            FP5_FB_WIDTH,
+            FP5_FB_HEIGHT,
+            FP5_FB_STRIDE,
+        );
+        unsafe { core::arch::asm!("dsb sy") };
+
+        spin_ms(200);
+
+        // ---- Phase 5: Try DMA0 path instead ----
+        dpu::setup_pipeline_dma0(
+            FP5_SPLASH_ADDR as u32,
+            FP5_FB_WIDTH,
+            FP5_FB_HEIGHT,
+            FP5_FB_STRIDE,
+        );
+        unsafe { core::arch::asm!("dsb sy") };
+
+        // ---- Phase 6: Repeated flush loop — keep triggering DPU ----
+        // Some command-mode panels need periodic triggers.
+        // Also try re-triggering every 100ms for 30 seconds.
+        for _ in 0..300 {
+            dpu::try_splash_handoff();
+            spin_ms(100);
+        }
     }
 
-    uart.puts("\n");
-    uart.puts("ferros: boot complete, entering idle loop\n");
+    // ---- Write diagnostics to DRAM ----
+    let exc_end = exception_count();
+    let diag_addr = 0x8008_5000u64 as *mut u64;
+    unsafe {
+        diag_addr.write_volatile(0xFE00_D150_0000_0000u64 | boot_el());
+        diag_addr.add(1).write_volatile(hw_ver as u64);
+        diag_addr.add(2).write_volatile(if dpu_accessible { 1 } else { 0 });
+        diag_addr.add(3).write_volatile(exc_end);
+    }
 
     loop {
-        // WFE = Wait For Event — low power idle
         unsafe { core::arch::asm!("wfe") };
     }
 }
 
-// ---------------------------------------------------------------------------
-// Panic handler
-// ---------------------------------------------------------------------------
+/// Spin delay — approximately `ms` milliseconds on a ~1GHz core.
+fn spin_ms(ms: u32) {
+    // ~4 instructions per inner loop iteration, ~1GHz → ~250K iterations/ms
+    for _ in 0..ms {
+        for _ in 0..250_000u32 {
+            unsafe { core::arch::asm!("nop") };
+        }
+    }
+}
 
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // Try to print panic message via UART
-    let uart = Uart::new(UartBackend::Pl011 { base: 0x0900_0000 });
-    uart.puts("\n!!! KERNEL PANIC !!!\n");
-    if let Some(location) = info.location() {
-        uart.puts(location.file());
-        uart.puts(":");
-        // Print line number as decimal
-        let mut line = location.line();
-        let mut buf = [0u8; 10];
-        let mut i = 0;
-        if line == 0 {
-            uart.putc(b'0');
-        } else {
-            while line > 0 {
-                buf[i] = b'0' + (line % 10) as u8;
-                line /= 10;
-                i += 1;
-            }
-            while i > 0 {
-                i -= 1;
-                uart.putc(buf[i]);
-            }
-        }
-        uart.puts("\n");
-    }
-
-    loop {
-        unsafe { core::arch::asm!("wfe") };
-    }
+fn panic(_info: &PanicInfo) -> ! {
+    loop { unsafe { core::arch::asm!("wfe") }; }
 }

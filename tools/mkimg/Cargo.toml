@@ -8,3 +8,6 @@ description = "Build flashable images from the ferros kernel ELF"
 [[bin]]
 name = "ferros-mkimg"
 path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.1.9"

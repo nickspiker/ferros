@@ -16,34 +16,35 @@
 //! ferros-mkimg boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
 //! ```
 //!
-//! ## Android Boot Image Format (v0/v1)
+//! ## Android Boot Image Format
+//!
+//! Supports v4 (Android 13 GKI — required for FP5/QCM6490):
 //!
 //! ```text
-//! Offset  Size    Field
+//! boot_img_hdr_v4:
 //! 0x000   8       Magic: "ANDROID!"
 //! 0x008   4       kernel_size
-//! 0x00C   4       kernel_addr  (load address)
-//! 0x010   4       ramdisk_size (0 for us)
-//! 0x014   4       ramdisk_addr
-//! 0x018   4       second_size  (0)
-//! 0x01C   4       second_addr
-//! 0x020   4       tags_addr    (DTB address hint)
-//! 0x024   4       page_size    (2048 or 4096)
-//! 0x028   4       header_version (0)
-//! 0x02C   4       os_version
-//! 0x030   16      name
-//! 0x040   512     cmdline
-//! 0x240   32      id (SHA1 of kernel + ramdisk)
-//! 0x260   1024    extra_cmdline
+//! 0x00C   4       ramdisk_size (0)
+//! 0x010   4       os_version (0)
+//! 0x014   4       header_size (1584)
+//! 0x018   16      reserved (zeros)
+//! 0x028   4       header_version (4)
+//! 0x02C   1536    cmdline
+//! 0x62C   4       signature_size (0)
 //! ```
 //!
-//! After the header (padded to page_size), the kernel binary follows
-//! (also padded to page_size).
+//! Page size is always 4096 for v3/v4. No kernel_addr field —
+//! ABL uses the ARM64 Image header's text_offset instead.
+//!
+//! Also supports legacy v0 via `boot-v0` command.
 
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process;
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -250,62 +251,90 @@ fn cmd_anchor_key(args: &[String]) {
 // Android boot image construction
 // ---------------------------------------------------------------------------
 
-/// Build an Android boot image (v0 format) wrapping a flat kernel binary.
+/// Build an Android boot image (v2 format) wrapping a gzip-compressed kernel.
 ///
-/// This produces an image that `fastboot boot` can load directly.
+/// This matches the format confirmed working on FP5 (QCM6490) per U-Boot docs:
+///   mkbootimg --pagesize 4096 --header_version 2 --kernel_offset 0x00008000
+///
+/// ABL detects gzip magic (0x1f8b) and decompresses before loading.
+/// After decompression, it reads the ARM64 Image header's text_offset.
+///
+/// boot_img_hdr_v0/v1/v2 layout:
+///   0x000  8     magic "ANDROID!"
+///   0x008  4     kernel_size
+///   0x00C  4     kernel_addr (base + kernel_offset)
+///   0x010  4     ramdisk_size (0)
+///   0x014  4     ramdisk_addr
+///   0x018  4     second_size (0)
+///   0x01C  4     second_addr
+///   0x020  4     tags_addr
+///   0x024  4     page_size (4096)
+///   0x028  4     header_version (2)
+///   0x02C  4     os_version (0)
+///   0x030  16    name
+///   0x040  512   cmdline
+///   0x240  32    id
+///   0x260  1024  extra_cmdline
+///   -- v1 fields --
+///   0x660  4     recovery_dtbo_size (0)
+///   0x664  8     recovery_dtbo_offset (0)
+///   0x66C  4     header_size
+///   -- v2 fields --
+///   0x670  4     dtb_size (0)
+///   0x674  8     dtb_addr (0)
 fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
-    let page_size: u32 = 2048;
-    let kernel_addr: u32 = 0x0008_0000; // standard arm64 load address
-    let tags_addr: u32 = 0x0000_0100;   // DTB hint (ABL may override)
+    // FP5 uses boot image header v3 (GKI format).
+    // Stock kernel is UNCOMPRESSED PE/COFF — ABL may not support gzip.
+    // v3 removed kernel_addr, ramdisk_addr, tags_addr, second_*, page_size fields.
+    // Page size is always 4096 (implicit). ABL uses ARM64 Image header text_offset.
+    //
+    // boot_img_hdr_v3 layout:
+    //   0x000  8     magic "ANDROID!"
+    //   0x008  4     kernel_size
+    //   0x00C  4     ramdisk_size (0)
+    //   0x010  4     os_version (0)
+    //   0x014  4     header_size (1580)
+    //   0x018  16    reserved (zeros)
+    //   0x028  4     header_version (3)
+    //   0x02C  1536  cmdline (zeros)
+    //   Total header: 1580 bytes, padded to 4096
+    const PAGE_SIZE: usize = 4096;
+    const HEADER_VERSION: u32 = 3;
+    const HEADER_SIZE: u32 = 1580;
 
-    // Build the 1-page header
-    let mut header = vec![0u8; page_size as usize];
+    // NO gzip compression — FP5 ABL expects uncompressed ARM64 Image
+    eprintln!("  Kernel: {} bytes (uncompressed)", kernel.len());
 
-    // Magic
+    // Build the header (padded to page_size)
+    let mut header = vec![0u8; PAGE_SIZE];
+
     header[0..8].copy_from_slice(b"ANDROID!");
-
-    // kernel_size
-    write_le32(&mut header, 8, kernel.len() as u32);
-    // kernel_addr
-    write_le32(&mut header, 12, kernel_addr);
-    // ramdisk_size = 0
-    write_le32(&mut header, 16, 0);
-    // ramdisk_addr
-    write_le32(&mut header, 20, 0);
-    // second_size = 0
-    write_le32(&mut header, 24, 0);
-    // second_addr
-    write_le32(&mut header, 28, 0);
-    // tags_addr
-    write_le32(&mut header, 32, tags_addr);
-    // page_size
-    write_le32(&mut header, 36, page_size);
-    // header_version = 0
-    write_le32(&mut header, 40, 0);
-    // os_version = 0
-    write_le32(&mut header, 44, 0);
-
-    // name: "ferros"
-    header[48..54].copy_from_slice(b"ferros");
-
-    // cmdline (empty — we don't use Linux cmdline)
-    // id field: simple hash of kernel for identification
-    let id_hash = simple_hash(kernel);
-    header[576..608].copy_from_slice(&id_hash);
+    write_le32(&mut header, 0x008, kernel.len() as u32);      // kernel_size
+    write_le32(&mut header, 0x00C, 0);                        // ramdisk_size
+    write_le32(&mut header, 0x010, 0);                        // os_version
+    write_le32(&mut header, 0x014, HEADER_SIZE);               // header_size
+    // 0x018..0x028: reserved (zeros)
+    write_le32(&mut header, 0x028, HEADER_VERSION);            // header_version = 3
+    // 0x02C..0x62C: cmdline (zeros)
 
     // Pad kernel to page boundary
-    let kernel_pages = (kernel.len() + page_size as usize - 1) / page_size as usize;
-    let mut kernel_padded = vec![0u8; kernel_pages * page_size as usize];
+    let kernel_pages = (kernel.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut kernel_padded = vec![0u8; kernel_pages * PAGE_SIZE];
     kernel_padded[..kernel.len()].copy_from_slice(kernel);
 
-    // Concatenate header + kernel
     let mut img = header;
     img.extend_from_slice(&kernel_padded);
 
-    eprintln!("  Boot image: {} header + {} kernel = {} total",
-        page_size, kernel_padded.len(), img.len());
+    eprintln!("  Boot image v3: {} header + {} kernel = {} total",
+        PAGE_SIZE, kernel_padded.len(), img.len());
 
     img
+}
+
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
 fn write_le32(buf: &mut [u8], offset: usize, val: u32) {

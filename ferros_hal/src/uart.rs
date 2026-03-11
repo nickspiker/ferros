@@ -13,6 +13,8 @@ use crate::mmio;
 /// UART backend selector.
 #[derive(Clone, Copy)]
 pub enum UartBackend {
+    /// No UART — discard all output. Safe on any hardware.
+    Null,
     /// ARM PL011 UART (QEMU virt machine).
     Pl011 { base: usize },
     /// Qualcomm GENI SE UART (QCM6490).
@@ -32,6 +34,7 @@ impl Uart {
     /// Write a single byte, blocking until the TX FIFO has space.
     pub fn putc(&self, byte: u8) {
         match self.backend {
+            UartBackend::Null => {}
             UartBackend::Pl011 { base } => self.pl011_putc(base, byte),
             UartBackend::GeniSe { base } => self.geni_putc(base, byte),
         }

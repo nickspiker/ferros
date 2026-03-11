@@ -39,7 +39,13 @@ SECTIONS
     }
 
     . = ALIGN(4096);
+
+    /* Page tables for identity mapping (2 × 4KB: L0 + L1) */
+    __pagetable = .;
+    . = . + 0x2000;
+
     __kernel_end = .;
+    __kernel_size = __kernel_end - _start;
 
     /* Stack: 64KB, placed after kernel image */
     . = . + 0x10000;

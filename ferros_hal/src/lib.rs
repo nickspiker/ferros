@@ -20,3 +20,5 @@ pub mod uart;
 pub mod fb;
 pub mod dtb;
 pub mod sdmmc;
+pub mod dpu;
+pub mod spmi;
