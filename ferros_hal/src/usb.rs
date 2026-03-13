@@ -239,6 +239,9 @@ const DEPEVT_XFERINPROGRESS: u32 = 2;
 /// EP event: transfer not ready.
 const DEPEVT_XFERNOTREADY: u32 = 3;
 
+/// SETEPCONFIG action field [31:30] in DEPCFGPAR1.
+const DEPCFGPAR1_ACTION_MODIFY: u32 = 2 << 30;
+
 // ---------------------------------------------------------------------------
 // USB Standard Requests
 // ---------------------------------------------------------------------------
@@ -317,14 +320,16 @@ const QSCRATCH_SS_LANE0_PWR_PRESENT: u32 = 1 << 24;
 // Static buffers — placed in BSS, guaranteed DRAM
 // ---------------------------------------------------------------------------
 
-/// Event buffer — 256 entries * 4 bytes = 1024 bytes. Must be 16-byte aligned.
-#[repr(C, align(16))]
+/// Event buffer — 256 entries * 4 bytes = 1024 bytes.
+/// Cache-line aligned (64B) to isolate from other DMA buffers.
+#[repr(C, align(64))]
 struct EventBuffer {
     buf: [u32; 256],
 }
 
 /// EP0 TRB ring — small, just 4 TRBs for setup/data/status.
-#[repr(C, align(16))]
+/// Cache-line aligned (64B) to isolate from other DMA buffers.
+#[repr(C, align(64))]
 struct Ep0Trbs {
     setup: Trb,   // Setup stage TRB
     data: Trb,    // Data stage TRB
@@ -356,15 +361,17 @@ static mut EP0_TRBS: Ep0Trbs = Ep0Trbs {
     _pad: Trb::zero(),
 };
 
-/// EP0 setup packet buffer (8 bytes, but we need it aligned).
-#[repr(C, align(16))]
+/// EP0 setup packet buffer (8 bytes, but cache-line aligned to prevent
+/// DMA bleed-over from SETUP DMA writes into adjacent buffers).
+#[repr(C, align(64))]
 struct SetupPacket {
     data: [u8; 8],
 }
 static mut EP0_SETUP_BUF: SetupPacket = SetupPacket { data: [0; 8] };
 
-/// EP0 data buffer (64 bytes max for control transfers).
-#[repr(C, align(16))]
+/// EP0 data buffer for control transfers.
+/// Cache-line aligned (64B) to isolate from other DMA buffers.
+#[repr(C, align(64))]
 struct Ep0DataBuf {
     data: [u8; 512],
 }
@@ -727,6 +734,26 @@ pub struct Dwc3Dev {
     pub last_cmd_type: u32,     // Command type of last CMDSTATUS failure
     ep0_resource_idx: u8,       // Transfer resource index for EP0 (0 = no active xfer)
     ep1_resource_idx: u8,       // Transfer resource index for EP1 (0 = no active xfer)
+    pub ep1_start_ok: u32,      // STARTTRANSFER successes on EP1
+    pub ep1_start_fail: u32,    // STARTTRANSFER failures on EP1 (first attempt)
+    pub ep1_retry_ok: u32,      // STARTTRANSFER retry successes on EP1
+    pub ep1_retry_fail: u32,    // STARTTRANSFER retry failures on EP1
+    pending_ep1_len: u16,       // Pending data length for XferNotReady retry
+    pending_ep1_trbctl: u32,    // Pending TRB type for XferNotReady retry
+    pub setup_count: u32,       // Total SETUP packets received
+    pub ep0_setup_arm_ok: u32,  // ep0_start_setup STARTTRANSFER successes
+    pub ep0_setup_arm_fail: u32,// ep0_start_setup STARTTRANSFER failures (both attempts)
+    pub last_setup_brequest: u8,// bRequest of last SETUP received
+    pub last_setup_wvalue: u16, // wValue of last SETUP received
+    pub ep0_status_out_arm_fail: u32, // ep0_status_out STARTTRANSFER failures (both)
+    pub last_evt_raw: u32,      // Last raw event word (for debug)
+    // Diagnostics: readback of data buffer after copy, before DMA
+    pub last_send_preview: u32, // First 4 bytes of EP0_DATA_BUF after volatile copy
+    pub last_send_len: u16,     // Length passed to ep0_send
+    pub last_send_buf_addr: u32, // Low 32 bits of EP0_DATA_BUF physical address
+    pub last_send_trb_addr: u32, // Low 32 bits of data TRB physical address
+    pub last_send_src_addr: u32, // Low 32 bits of source data slice address
+    pub last_send_src_preview: u32, // First 4 bytes of source data (volatile read)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -850,6 +877,25 @@ impl Dwc3Dev {
             last_cmd_type: 0,
             ep0_resource_idx: 0,
             ep1_resource_idx: 0,
+            ep1_start_ok: 0,
+            ep1_start_fail: 0,
+            ep1_retry_ok: 0,
+            ep1_retry_fail: 0,
+            pending_ep1_len: 0,
+            pending_ep1_trbctl: 0,
+            setup_count: 0,
+            ep0_setup_arm_ok: 0,
+            ep0_setup_arm_fail: 0,
+            last_setup_brequest: 0,
+            last_setup_wvalue: 0,
+            ep0_status_out_arm_fail: 0,
+            last_evt_raw: 0,
+            last_send_preview: 0,
+            last_send_len: 0,
+            last_send_buf_addr: 0,
+            last_send_trb_addr: 0,
+            last_send_src_addr: 0,
+            last_send_src_preview: 0,
         };
 
         // Start EP0 configuration
@@ -933,6 +979,7 @@ impl Dwc3Dev {
     }
 
     /// Prepare EP0 to receive a SETUP packet.
+    /// If STARTTRANSFER fails, force ENDTRANSFER and retry.
     pub fn ep0_start_setup(&mut self) {
         let setup_addr = &raw const EP0_SETUP_BUF as usize;
 
@@ -962,26 +1009,105 @@ impl Dwc3Dev {
 
         // Start transfer on EP0 OUT
         if self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
-            self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+            self.ep0_setup_arm_ok += 1;
+        } else {
+            self.force_end_transfer_unconditional(0);
+            unsafe {
+                let trb = &raw mut EP0_TRBS.setup;
+                (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                    | (TRBCTL_SETUP << TRB_CTRL_TRBCTL_SHIFT);
+                cache_clean(trb_addr, 16);
+            }
+            if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+                self.ep0_setup_arm_fail += 1;
+            } else {
+                self.ep0_setup_arm_ok += 1;
+            }
         }
+        let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
+        self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         self.ep0_state = Ep0State::Setup;
     }
 
     /// Send data on EP0 IN (physical EP 1) with proactive STARTTRANSFER.
     /// If the transfer resource is occupied, force ENDTRANSFER and retry.
+    /// If both attempts fail, data stays in EP0_DATA_BUF for XferNotReady retry.
     fn ep0_send(&mut self, data: &[u8], trbctl: u32) {
         let len = data.len().min(512);
 
-        // Copy data to DMA buffer
-        unsafe {
-            for i in 0..len {
-                EP0_DATA_BUF.data[i] = data[i];
+        // Capture source address and data BEFORE copy (diagnose 0x40 bug)
+        let src_ptr = data.as_ptr();
+        self.last_send_src_addr = src_ptr as u32;
+        if len >= 4 {
+            unsafe {
+                // Volatile read of source to bypass any caching
+                let mut src_preview = 0u32;
+                for i in 0..4 {
+                    let b = core::ptr::read_volatile(src_ptr.add(i));
+                    src_preview |= (b as u32) << (i * 8);
+                }
+                self.last_send_src_preview = src_preview;
             }
+        } else if len > 0 {
+            let mut src_preview = 0u32;
+            for i in 0..len {
+                unsafe {
+                    let b = core::ptr::read_volatile(src_ptr.add(i));
+                    src_preview |= (b as u32) << (i * 8);
+                }
+            }
+            self.last_send_src_preview = src_preview;
+        } else {
+            self.last_send_src_preview = 0;
         }
 
+        // Copy data to DMA buffer using volatile writes to prevent
+        // compiler from optimizing away or reordering stores.
+        unsafe {
+            let dst = &raw mut EP0_DATA_BUF.data as *mut u8;
+            for i in 0..len {
+                core::ptr::write_volatile(dst.add(i), data[i]);
+            }
+            // Explicit barrier: ensure all volatile stores are visible
+            // to DMA masters before we set up the TRB.
+            core::arch::asm!("dsb sy");
+        }
+
+        // Capture diagnostic readback (volatile read of what we just wrote)
+        let buf_addr = &raw const EP0_DATA_BUF as usize;
+        self.last_send_buf_addr = buf_addr as u32;
+        self.last_send_len = len as u16;
+        if len >= 4 {
+            unsafe {
+                let p = buf_addr as *const u32;
+                self.last_send_preview = core::ptr::read_volatile(p);
+            }
+        } else if len > 0 {
+            let mut preview = 0u32;
+            for i in 0..len {
+                unsafe {
+                    let b = core::ptr::read_volatile((buf_addr as *const u8).add(i));
+                    preview |= (b as u32) << (i * 8);
+                }
+            }
+            self.last_send_preview = preview;
+        } else {
+            self.last_send_preview = 0;
+        }
+
+        // Store pending info for XferNotReady fallback
+        self.pending_ep1_len = len as u16;
+        self.pending_ep1_trbctl = trbctl;
+
+        self.ep1_start_transfer(len, trbctl);
+    }
+
+    /// Actually issue STARTTRANSFER on EP1 with data already in EP0_DATA_BUF.
+    /// Used by both ep0_send (proactive) and XferNotReady handler (reactive).
+    fn ep1_start_transfer(&mut self, len: usize, trbctl: u32) {
         let buf_addr = &raw const EP0_DATA_BUF as usize;
         let trb_addr = unsafe { &raw mut EP0_TRBS.data } as usize;
+        self.last_send_trb_addr = trb_addr as u32;
 
         unsafe {
             let trb = &raw mut EP0_TRBS.data;
@@ -1002,7 +1128,10 @@ impl Dwc3Dev {
 
         // Issue STARTTRANSFER on EP1. If it fails (resource occupied),
         // force ENDTRANSFER and retry once.
-        if !self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+        if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+            self.ep1_start_ok += 1;
+        } else {
+            self.ep1_start_fail += 1;
             self.force_end_transfer_unconditional(1);
             // Re-set HWO since ENDTRANSFER may have cleared it
             unsafe {
@@ -1011,11 +1140,20 @@ impl Dwc3Dev {
                     | (trbctl << TRB_CTRL_TRBCTL_SHIFT);
                 cache_clean(trb_addr, 16);
             }
-            self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32);
+            if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+                self.ep1_retry_ok += 1;
+            } else {
+                self.ep1_retry_fail += 1;
+                // Both failed — XferNotReady handler will retry later
+                return;
+            }
         }
         // Save resource index from successful STARTTRANSFER
         let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 16 + 0x0C) };
         self.ep1_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+        // Clear pending — transfer is armed, don't retry from XferNotReady
+        self.pending_ep1_len = 0;
+        self.pending_ep1_trbctl = 0;
     }
 
     /// Send zero-length status IN (for SET_ADDRESS, SET_CONFIGURATION).
@@ -1026,6 +1164,7 @@ impl Dwc3Dev {
     }
 
     /// Receive zero-length status OUT after sending data.
+    /// If STARTTRANSFER fails, force ENDTRANSFER and retry (like ep0_send).
     fn ep0_status_out(&mut self) {
         self.status_out_count += 1;
         let buf_addr = &raw const EP0_DATA_BUF as usize;
@@ -1044,10 +1183,21 @@ impl Dwc3Dev {
         unsafe { cache_clean(trb_addr, 16); }
 
         // Start transfer on EP0 OUT (physical EP 0)
-        if self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
-            self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+        if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+            // Retry: force ENDTRANSFER then re-arm
+            self.force_end_transfer_unconditional(0);
+            unsafe {
+                let trb = &raw mut EP0_TRBS.status;
+                (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                    | (TRBCTL_STATUS3 << TRB_CTRL_TRBCTL_SHIFT);
+                cache_clean(trb_addr, 16);
+            }
+            if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+                self.ep0_status_out_arm_fail += 1;
+            }
         }
+        let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
+        self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         self.ep0_state = Ep0State::Status;
     }
 
@@ -1076,6 +1226,8 @@ impl Dwc3Dev {
 
         // Acknowledge this event
         unsafe { mmio::write32(DWC3_BASE + GEVNTCOUNT, 4) };
+
+        self.last_evt_raw = evt;
 
         // Parse event
         if evt & EVT_NON_EP != 0 {
@@ -1111,12 +1263,18 @@ impl Dwc3Dev {
                                 req[i] = core::ptr::read_volatile(&EP0_SETUP_BUF.data[i]);
                             }
                         }
+                        self.setup_count += 1;
+                        self.last_setup_brequest = req[1];
+                        self.last_setup_wvalue = (req[3] as u16) << 8 | req[2] as u16;
                         return UsbEvent::Ep0Setup { request: req };
                     }
-                    // EP0 IN data stage complete → arm status OUT (host sends ZLP)
+                    // EP0 IN data stage complete → transition to Status and
+                    // wait for XferNotReady before arming status OUT.
+                    // (Reactive model — matches Linux DWC3 driver. Proactive
+                    // status arming can race with DWC3's internal state machine.)
                     if ep_phys == 1 && self.ep0_state == Ep0State::DataIn {
                         self.ep1_xfer_complete += 1;
-                        self.ep0_status_out();
+                        self.ep0_state = Ep0State::Status;
                         return UsbEvent::None;
                     }
                     // EP0 IN status stage complete (SET_ADDRESS, SET_CONFIG) → re-arm SETUP
@@ -1140,6 +1298,17 @@ impl Dwc3Dev {
                     // host is waiting for a stage we should have already armed.
                     // These are fallback handlers.
 
+                    // EP1 XferNotReady in DataIn → proactive STARTTRANSFER
+                    // failed, retry now that DWC3 is ready
+                    if ep_phys == 1 && self.ep0_state == Ep0State::DataIn {
+                        self.ep1_data_notready += 1;
+                        if self.pending_ep1_trbctl != 0 {
+                            let len = self.pending_ep1_len as usize;
+                            let trbctl = self.pending_ep1_trbctl;
+                            self.ep1_start_transfer(len, trbctl);
+                        }
+                        return UsbEvent::None;
+                    }
                     // EP0 XferNotReady in DataIn → host wants status OUT
                     if ep_phys == 0 && self.ep0_state == Ep0State::DataIn {
                         self.ep0_status_out();
@@ -1150,8 +1319,23 @@ impl Dwc3Dev {
                         self.ep0_status_out();
                         return UsbEvent::None;
                     }
+                    // EP1 XferNotReady in Status → retry status IN
+                    if ep_phys == 1 && self.ep0_state == Ep0State::Status {
+                        if self.pending_ep1_trbctl != 0 {
+                            let len = self.pending_ep1_len as usize;
+                            let trbctl = self.pending_ep1_trbctl;
+                            self.ep1_start_transfer(len, trbctl);
+                        }
+                        return UsbEvent::None;
+                    }
                     if ep_phys == 1 && self.ep0_state == Ep0State::DataOut {
                         self.ep0_status_in();
+                        return UsbEvent::None;
+                    }
+                    // EP0 XferNotReady in Setup → SETUP TRB wasn't armed
+                    // (ep0_start_setup failed), re-arm now
+                    if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
+                        self.ep0_start_setup();
                         return UsbEvent::None;
                     }
                     UsbEvent::TransferNotReady { ep: ep_phys }
@@ -1212,10 +1396,17 @@ impl Dwc3Dev {
         self.address = 0;
         self.configured = false;
         self.ep0_state = Ep0State::Setup;
+        self.pending_ep1_len = 0;
+        self.pending_ep1_trbctl = 0;
 
         // End any in-flight transfers so their resources are freed.
-        self.force_end_transfer(0);
-        self.force_end_transfer(1);
+        // Only issue ENDTRANSFER if we have an active transfer (software tracking).
+        if self.ep0_resource_idx != 0 {
+            self.end_transfer_raw(0, self.ep0_resource_idx as u32);
+        }
+        if self.ep1_resource_idx != 0 {
+            self.end_transfer_raw(1, self.ep1_resource_idx as u32);
+        }
 
         // Clear any stall condition
         self.ep_cmd(0, DEPCMD_CLEARSTALL, 0, 0, 0);
@@ -1228,12 +1419,14 @@ impl Dwc3Dev {
         }
     }
 
-    /// Handle ConnectDone — read speed, update EP0 MPS if needed.
-    /// Only issues SETEPCONFIG (modify) — does NOT re-issue DEPSTARTCFG
-    /// or SETTRANSFRESOURCE.  Those are set once in init() and must not
-    /// be touched on reset, as re-issuing SETTRANSFRESOURCE corrupts the
-    /// resource allocation and causes CMDSTATUS=1 on STARTTRANSFER.
-    /// This matches Linux's dwc3_gadget_conndone_interrupt().
+    /// Handle ConnectDone — read speed, full EP0 re-init.
+    ///
+    /// SETEPCONFIG Modify doesn't work after USB bus reset on DWC3 3.30a
+    /// (QCM6490) — the second enumeration always times out. So we do full
+    /// DEPSTARTCFG + SETEPCONFIG(Init) + SETTRANSFRESOURCE here.
+    ///
+    /// The previous config descriptor timeout was caused by a separate
+    /// XferNotReady ZLP bug, not by SETTRANSFRESOURCE corruption.
     pub fn handle_connect_done(&mut self) {
         let dsts = unsafe { mmio::read32(DWC3_BASE + DSTS) };
         self.connected_speed = dsts & DSTS_CONNECTSPD_MASK;
@@ -1243,7 +1436,7 @@ impl Dwc3Dev {
             _ => 64,
         };
 
-        // Full reconfiguration after USB bus reset.
+        // Full re-init after USB bus reset
         self.ep_start_config(0);
 
         // EP0 OUT
@@ -1326,13 +1519,27 @@ impl Dwc3Dev {
             USB_DT_DEVICE => &DEVICE_DESC,
             USB_DT_CONFIGURATION => &CONFIG_DESC,
             USB_DT_STRING => {
-                match desc_idx {
-                    0 => &STRING_DESC_0,
-                    1 => &STRING_DESC_1,
-                    2 => &STRING_DESC_2,
-                    3 => &STRING_DESC_3,
+                // String descriptors are packed into a single static to avoid
+                // the compiler generating a lookup table of absolute pointers.
+                // ABL loads the kernel at a different address than the linker
+                // assumes, so absolute pointers in .rodata tables are wrong.
+                // Using a single base (resolved via PC-relative `adr`) plus
+                // integer offsets is position-independent.
+                let base = &raw const ALL_STRING_DESCS as *const u8;
+                let (off, slen) = match desc_idx {
+                    0 => (0usize, 4usize),
+                    1 => (4, 16),
+                    2 => (20, 22),
+                    3 => (42, 4),
                     _ => return false,
-                }
+                };
+                let desc = unsafe {
+                    core::slice::from_raw_parts(base.add(off), slen)
+                };
+                let len = desc.len().min(max_len as usize);
+                self.ep0_send(&desc[..len], TRBCTL_CONTROL_DATA);
+                self.ep0_state = Ep0State::DataIn;
+                return true;
             }
             USB_DT_DEVICE_QUALIFIER => &DEVICE_QUALIFIER_DESC,
             USB_DT_BOS => &BOS_DESC,
@@ -1437,27 +1644,24 @@ static BOS_DESC: [u8; 22] = [
     0x20, 0x00,         // wU2DevExitLat = 32us
 ];
 
-/// String descriptor 0 (language ID — English US).
-static STRING_DESC_0: [u8; 4] = [4, USB_DT_STRING, 0x09, 0x04];
-
-/// Helper to make a UTF-16LE string descriptor at compile time.
-/// We use short fixed arrays since we can't do const generic string conversion easily.
-
-/// "ferros" as UTF-16LE string descriptor.
-static STRING_DESC_1: [u8; 16] = [
+/// All string descriptors packed contiguously.
+/// Using a single static avoids the compiler generating a lookup table
+/// of absolute pointers (which break when ABL loads the kernel at a
+/// different address than the linker assumed).
+///
+/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (16B)] [STRING_DESC_2 (22B)] [STRING_DESC_3 (4B)]
+/// Offsets: 0, 4, 20, 42  Total: 46 bytes
+static ALL_STRING_DESCS: [u8; 46] = [
+    // String 0: Language ID (English US) — offset 0, length 4
+    4, USB_DT_STRING, 0x09, 0x04,
+    // String 1: "ferros" — offset 4, length 16
     16, USB_DT_STRING,
     b'f', 0, b'e', 0, b'r', 0, b'r', 0, b'o', 0, b's', 0, 0, 0,
-];
-
-/// "Ferros USB" as UTF-16LE string descriptor.
-static STRING_DESC_2: [u8; 22] = [
+    // String 2: "Ferros USB" — offset 20, length 22
     22, USB_DT_STRING,
     b'F', 0, b'e', 0, b'r', 0, b'r', 0, b'o', 0, b's', 0, b' ', 0,
     b'U', 0, b'S', 0, b'B', 0,
-];
-
-/// "000001" as UTF-16LE string descriptor.
-static STRING_DESC_3: [u8; 14] = [
-    14, USB_DT_STRING,
-    b'0', 0, b'0', 0, b'0', 0, b'0', 0, b'0', 0, b'1', 0,
+    // String 3: "0" — offset 42, length 4
+    4, USB_DT_STRING,
+    b'0', 0,
 ];

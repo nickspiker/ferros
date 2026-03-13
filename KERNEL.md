@@ -590,7 +590,7 @@ Attacker cannot:
 
 ---
 
-## Module 7: Kill Switch
+## Module 7: Killswitch
 
 ### Hardware Path
 
@@ -965,7 +965,7 @@ Week 1-2:  Read seL4 abstract spec (l4v/spec/abstract/)
            Understand proof methodology before writing code
 
 Week 3-4:  Write ferros abstract spec in Verus
-           Theorem 3 (kill switch) first — most novel, cleanest to state
+           Theorem 3 (killswitch) first — most novel, cleanest to state
            If you can state it formally, you understand the problem
 
 Week 5-6:  Write Theorem 2 (ring memory) in Verus

@@ -759,13 +759,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     log.puts("Run/Stop:      CLEARED!\n");
                 }
 
-                log.puts("Waiting for host...\n");
+                log.puts("Waiting for host (reboot in ~60s)...\n");
 
-                // Poll for USB events indefinitely
+                // Poll for USB events with timer-based reboot timeout.
+                // Use ARM generic timer (CNTPCT_EL0 / CNTFRQ_EL0) for accurate timing.
+                let timer_freq: u64 = read_cntfrq();
+                let timer_start: u64 = read_cntpct();
+                let reboot_ticks: u64 = timer_freq * 60; // 60 seconds
                 let mut evt_count = 0u32;
                 let mut poll_count = 0u32;
 
                 loop {
+                    if read_cntpct().wrapping_sub(timer_start) >= reboot_ticks {
+                        log.puts("\n-- reboot to fastboot (USB timeout) --\n");
+                        psci_reboot_fastboot();
+                    }
                     match usb.poll_event() {
                         ferros_hal::usb::UsbEvent::None => {}
                         ferros_hal::usb::UsbEvent::Reset => {
@@ -799,6 +807,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             if !usb.handle_setup(&request) {
                                 log.puts("  (stall)\n");
                                 usb.ep0_stall();
+                            } else {
+                                // Log diagnostic readback for data transfers
+                                if usb.last_send_len > 0 {
+                                    log.puts("  -> len=");
+                                    log.put_hex32(usb.last_send_len as u32);
+                                    log.puts(" src@");
+                                    log.put_hex32(usb.last_send_src_addr);
+                                    log.puts("=");
+                                    log.put_hex32(usb.last_send_src_preview);
+                                    log.puts(" dst@");
+                                    log.put_hex32(usb.last_send_buf_addr);
+                                    log.puts("=");
+                                    log.put_hex32(usb.last_send_preview);
+                                    log.puts("\n");
+                                }
                             }
                             evt_count += 1;
                         }
@@ -815,11 +838,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     poll_count = poll_count.wrapping_add(1);
                     // Print status every ~10M polls
                     if poll_count & 0x00FF_FFFF == 0 {
-                        log.puts("  X1 "); log.put_hex32(usb.ep1_xfer_complete);
-                        log.puts(" CS "); log.put_hex32(usb.cmd_status_fail);
-                        log.puts(" D1 "); log.put_hex32(usb.ep1_data_notready);
+                        log.puts("  SU "); log.put_hex32(usb.setup_count);
+                        log.puts(" bR "); log.put_hex32(usb.last_setup_brequest as u32);
+                        log.puts(" wV "); log.put_hex32(usb.last_setup_wvalue as u32);
+                        log.puts(" X1 "); log.put_hex32(usb.ep1_xfer_complete);
+                        log.puts(" OK "); log.put_hex32(usb.ep1_start_ok);
+                        log.puts(" F "); log.put_hex32(usb.ep1_start_fail);
+                        log.puts("\n  SA "); log.put_hex32(usb.ep0_setup_arm_ok);
+                        log.puts("/"); log.put_hex32(usb.ep0_setup_arm_fail);
+                        log.puts(" SO "); log.put_hex32(usb.ep0_status_out_arm_fail);
+                        log.puts(" NR "); log.put_hex32(usb.ep0_xfer_notready);
+                        log.puts(" EV "); log.put_hex32(usb.last_evt_raw);
                         if usb.cmd_status_fail > 0 {
-                            log.puts("\n  CMD="); log.put_hex32(usb.last_cmd_status);
+                            log.puts("\n  CS "); log.put_hex32(usb.cmd_status_fail);
+                            log.puts(" CMD="); log.put_hex32(usb.last_cmd_status);
                             log.puts(" ep="); log.put_hex32(usb.last_cmd_ep as u32);
                             log.puts(" ty="); log.put_hex32(usb.last_cmd_type);
                         }
@@ -843,10 +875,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.con.puts("pstore bytes:  "); log.con.put_hex32(r.written() as u32); log.con.puts("\n");
     }
 
-    // ---- Halt (WFE loop) — do NOT reboot to avoid boot loops ----
-    log.puts("\n-- halted (hold power to reboot) --\n");
-    unsafe { core::arch::asm!("dsb sy"); }
-    loop { unsafe { core::arch::asm!("wfe"); } }
+    // ---- Reboot to fastboot via PSCI so we don't need battery pulls ----
+    log.puts("\n-- rebooting to fastboot in 5s --\n");
+    spin_ms(5000);
+    psci_reboot_fastboot();
 }
 
 /// Spin delay — approximately `ms` milliseconds on a ~1GHz core.
@@ -856,6 +888,45 @@ fn spin_ms(ms: u32) {
         for _ in 0..250_000u32 {
             unsafe { core::arch::asm!("nop") };
         }
+    }
+}
+
+/// Read ARM generic timer frequency (CNTFRQ_EL0).
+fn read_cntfrq() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) val) };
+    val
+}
+
+/// Read ARM generic timer counter (CNTPCT_EL0).
+fn read_cntpct() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val) };
+    val
+}
+
+/// Write Qualcomm IMEM restart reason and reboot into fastboot.
+/// QCM6490 IMEM base = 0x146BF000, restart reason offset = 0x65C.
+/// Magic 0x77665500 = "boot to bootloader" (fastboot mode).
+fn psci_reboot_fastboot() -> ! {
+    const IMEM_RESTART_REASON: usize = 0x146B_F000 + 0x65C;
+    unsafe { ferros_hal::mmio::write32(IMEM_RESTART_REASON, 0x7766_5500); }
+    psci_reboot();
+}
+
+/// PSCI SYSTEM_RESET via SMC — warm reboot that preserves DRAM.
+/// Reboots back into ABL → fastboot (if set_active points to our slot).
+fn psci_reboot() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "movz x0, #0x0009",
+            "movk x0, #0x8400, lsl #16",  // x0 = 0x84000009 (SYSTEM_RESET)
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "smc #0",
+            options(noreturn)
+        );
     }
 }
 
