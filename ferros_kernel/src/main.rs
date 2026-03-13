@@ -686,7 +686,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("GSNPSID:       "); log.put_hex32(usb_info.snpsid); log.puts("\n");
         log.puts("revision:      "); log.put_hex32(usb_info.revision() as u32); log.puts("\n");
         log.puts("GCTL:          "); log.put_hex32(usb_info.gctl); log.puts("\n");
-        log.puts("mode:          "); log.puts(usb_info.port_cap()); log.puts("\n");
+        log.puts("mode:          "); log.put_hex32((usb_info.gctl >> 12) & 0x3); log.puts("\n");
         log.puts("endpoints:     "); log.put_hex32(usb_info.num_eps()); log.puts("\n");
         log.puts("DSTS:          "); log.put_hex32(usb_info.dsts); log.puts("\n");
 
@@ -783,7 +783,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         }
                         ferros_hal::usb::UsbEvent::ConnectDone { speed } => {
                             log.puts("  connected: ");
-                            log.puts(ferros_hal::usb::speed_string(speed));
+                            log.put_hex32(speed);
                             log.puts(" DSTS=");
                             log.put_hex32(unsafe { ferros_hal::mmio::read32(0x0A60C70C) });
                             log.puts(" PHY=");
@@ -826,8 +826,25 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::TransferComplete { ep } => {
-                            // EP0 status stage is handled internally by the driver.
-                            // This arm now only fires for non-EP0 endpoints.
+                            if ep == 2 {
+                                // Bulk OUT complete — copy, echo back
+                                let mut tmp = [0u8; 512];
+                                let mut n = 0usize;
+                                if let Some(data) = usb.bulk_out_read() {
+                                    n = data.len().min(512);
+                                    tmp[..n].copy_from_slice(&data[..n]);
+                                }
+                                if n > 0 {
+                                    usb.bulk_in_send(&tmp[..n]);
+                                    log.puts("  BULK RX ");
+                                    log.put_hex32(n as u32);
+                                    log.puts("B\n");
+                                }
+                                usb.bulk_out_arm();
+                            }
+                            if ep == 3 {
+                                // Bulk IN complete
+                            }
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::TransferNotReady { .. } => {

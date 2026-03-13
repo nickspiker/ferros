@@ -5,6 +5,7 @@ members = [
     "ferros_hal",
     "ferros_ledger",
     "tools/mkimg",
+    "tools/ferros-bridge",
 ]
 
 [workspace.package]

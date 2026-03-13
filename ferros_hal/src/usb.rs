@@ -377,6 +377,25 @@ struct Ep0DataBuf {
 }
 static mut EP0_DATA_BUF: Ep0DataBuf = Ep0DataBuf { data: [0; 512] };
 
+/// Bulk endpoint TRBs — one per direction, cache-line aligned.
+#[repr(C, align(64))]
+struct BulkOutTrb { trb: Trb, _pad: [Trb; 3] }
+#[repr(C, align(64))]
+struct BulkInTrb { trb: Trb, _pad: [Trb; 3] }
+
+static mut BULK_OUT_TRB: BulkOutTrb = BulkOutTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
+static mut BULK_IN_TRB: BulkInTrb = BulkInTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
+
+/// Bulk OUT data buffer (host→device). 512B for HS bulk MPS.
+#[repr(C, align(64))]
+struct BulkOutBuf { data: [u8; 512] }
+/// Bulk IN data buffer (device→host). 4KB for batching log output.
+#[repr(C, align(64))]
+struct BulkInBuf { data: [u8; 4096] }
+
+static mut BULK_OUT_BUF: BulkOutBuf = BulkOutBuf { data: [0; 512] };
+static mut BULK_IN_BUF: BulkInBuf = BulkInBuf { data: [0; 4096] };
+
 // ---------------------------------------------------------------------------
 // Probe (read-only diagnostics)
 // ---------------------------------------------------------------------------
@@ -406,13 +425,6 @@ impl Dwc3Info {
         (self.hwparams3 >> 12) & 0x3F
     }
 
-    pub fn port_cap(&self) -> &'static str {
-        match (self.gctl >> 12) & 0x3 {
-            1 => "host",
-            2 => "device",
-            _ => "unknown",
-        }
-    }
 }
 
 pub fn probe() -> Dwc3Info {
@@ -526,15 +538,6 @@ pub fn dump_diag(exc_fn: fn() -> u64) -> Dwc3Diag {
     }
 }
 
-pub fn speed_string(dsts: u32) -> &'static str {
-    match dsts & DSTS_CONNECTSPD_MASK {
-        0 => "HS",
-        1 => "FS",
-        4 => "SS",
-        5 => "SS+",
-        _ => "??",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // PHY + QSCRATCH initialization
@@ -754,6 +757,17 @@ pub struct Dwc3Dev {
     pub last_send_trb_addr: u32, // Low 32 bits of data TRB physical address
     pub last_send_src_addr: u32, // Low 32 bits of source data slice address
     pub last_send_src_preview: u32, // First 4 bytes of source data (volatile read)
+    // Bulk endpoint state
+    bulk_out_resource_idx: u8,  // Transfer resource index for bulk OUT (phys EP 2)
+    bulk_in_resource_idx: u8,   // Transfer resource index for bulk IN (phys EP 3)
+    /// Bytes received in last bulk OUT transfer
+    pub bulk_out_len: u16,
+    /// New bulk OUT data available for kernel to consume
+    pub bulk_out_ready: bool,
+    /// Bulk IN transfer idle (buffer available for next send)
+    pub bulk_in_idle: bool,
+    pub bulk_out_xfer_complete: u32,
+    pub bulk_in_xfer_complete: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -896,11 +910,19 @@ impl Dwc3Dev {
             last_send_trb_addr: 0,
             last_send_src_addr: 0,
             last_send_src_preview: 0,
+            bulk_out_resource_idx: 0,
+            bulk_in_resource_idx: 0,
+            bulk_out_len: 0,
+            bulk_out_ready: false,
+            bulk_in_idle: true,
+            bulk_out_xfer_complete: 0,
+            bulk_in_xfer_complete: 0,
         };
 
-        // Start EP0 configuration
+        // Configure all endpoints
         dev.ep_start_config(0);
         dev.ep0_configure();
+        dev.bulk_configure();
 
         // Set Run/Stop to connect
         unsafe {
@@ -943,6 +965,140 @@ impl Dwc3Dev {
         unsafe {
             let ena = mmio::read32(DWC3_BASE + DALEPENA);
             mmio::write32(DWC3_BASE + DALEPENA, ena | 0x3); // bits 0+1 = EP0 OUT+IN
+        }
+    }
+
+    /// Configure bulk endpoints: EP1 OUT (phys 2) and EP1 IN (phys 3).
+    /// Must be called after ep0_configure() and again in handle_connect_done().
+    fn bulk_configure(&mut self) {
+        // DEPSTARTCFG with XferRscIdx=2 to preserve EP0 config.
+        // XferRscIdx goes in DEPCMD[22:16], issued on EP0.
+        self.ep_cmd(0, DEPCMD_DEPSTARTCFG | (2 << 16), 0, 0, 0);
+
+        // EP1 OUT (physical EP 2) — Bulk, 512B MPS
+        let par0 = (EP_TYPE_BULK << DEPCFGPAR0_EPTYPE_SHIFT)
+            | (512 << DEPCFGPAR0_MPS_SHIFT);
+        let par1 = (2 << DEPCFGPAR1_EPNUM_SHIFT)
+            | DEPCFGPAR1_XFER_CMPL_EN
+            | DEPCFGPAR1_XFER_NRDY_EN;
+        self.ep_cmd(2, DEPCMD_SETEPCONFIG, par0, par1, 0);
+        self.ep_cmd(2, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
+
+        // EP1 IN (physical EP 3) — Bulk, 512B MPS, FIFO 1
+        let par0 = (EP_TYPE_BULK << DEPCFGPAR0_EPTYPE_SHIFT)
+            | (512 << DEPCFGPAR0_MPS_SHIFT)
+            | (1 << DEPCFGPAR0_FIFONUM_SHIFT); // FIFO 1 (FIFO 0 = EP0 IN)
+        let par1 = (3 << DEPCFGPAR1_EPNUM_SHIFT)
+            | DEPCFGPAR1_XFER_CMPL_EN
+            | DEPCFGPAR1_XFER_NRDY_EN;
+        self.ep_cmd(3, DEPCMD_SETEPCONFIG, par0, par1, 0);
+        self.ep_cmd(3, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
+
+        // Enable all 4 EPs in DALEPENA (bits 0-3)
+        unsafe {
+            let ena = mmio::read32(DWC3_BASE + DALEPENA);
+            mmio::write32(DWC3_BASE + DALEPENA, ena | 0xF);
+        }
+    }
+
+    /// Arm bulk OUT (phys EP 2) to receive up to 512 bytes from host.
+    pub fn bulk_out_arm(&mut self) {
+        let buf_addr = &raw const BULK_OUT_BUF as usize;
+        let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
+
+        unsafe {
+            let trb = &raw mut BULK_OUT_TRB.trb;
+            (*trb).bpl = buf_addr as u32;
+            (*trb).bph = (buf_addr >> 32) as u32;
+            (*trb).size = 512;
+            (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                | TRB_CTRL_ISP_IMI // complete on short packet too
+                | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+            cache_clean(trb_addr, 16);
+            cache_clean(buf_addr, 512);
+        }
+
+        if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
+            self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+        } else {
+            self.force_end_transfer_unconditional(2);
+            unsafe {
+                let trb = &raw mut BULK_OUT_TRB.trb;
+                (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                    | TRB_CTRL_ISP_IMI
+                    | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+                cache_clean(trb_addr, 16);
+            }
+            if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+                let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
+                self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+            }
+        }
+    }
+
+    /// Queue data for bulk IN (phys EP 3, device→host).
+    /// Copies data to DMA buffer and starts transfer.
+    /// Returns false if a transfer is already in progress.
+    pub fn bulk_in_send(&mut self, data: &[u8]) -> bool {
+        if !self.bulk_in_idle { return false; }
+        let len = data.len().min(4096);
+        if len == 0 { return false; }
+
+        let buf_addr = &raw const BULK_IN_BUF as usize;
+        let trb_addr = unsafe { &raw mut BULK_IN_TRB.trb } as usize;
+
+        unsafe {
+            let dst = &raw mut BULK_IN_BUF.data as *mut u8;
+            for i in 0..len {
+                core::ptr::write_volatile(dst.add(i), data[i]);
+            }
+            core::arch::asm!("dsb sy");
+
+            let trb = &raw mut BULK_IN_TRB.trb;
+            (*trb).bpl = buf_addr as u32;
+            (*trb).bph = (buf_addr >> 32) as u32;
+            (*trb).size = len as u32;
+            (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+            cache_clean(buf_addr, len);
+            cache_clean(trb_addr, 16);
+        }
+
+        self.bulk_in_idle = false;
+
+        if self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 3 * 16 + 0x0C) };
+            self.bulk_in_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+        } else {
+            self.force_end_transfer_unconditional(3);
+            unsafe {
+                let trb = &raw mut BULK_IN_TRB.trb;
+                (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                    | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+                cache_clean(trb_addr, 16);
+            }
+            if !self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
+                self.bulk_in_idle = true;
+                return false;
+            }
+            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 3 * 16 + 0x0C) };
+            self.bulk_in_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+        }
+        true
+    }
+
+    /// Read received bulk OUT data. Returns slice of received bytes,
+    /// or None if no data available. Caller must call bulk_out_arm() after.
+    pub fn bulk_out_read(&mut self) -> Option<&[u8]> {
+        if !self.bulk_out_ready { return None; }
+        self.bulk_out_ready = false;
+        let len = self.bulk_out_len as usize;
+        if len == 0 { return None; }
+        unsafe {
+            cache_invalidate(&raw const BULK_OUT_BUF as usize, len);
+            Some(core::slice::from_raw_parts(
+                &raw const BULK_OUT_BUF as *const u8, len))
         }
     }
 
@@ -1252,6 +1408,27 @@ impl Dwc3Dev {
                     // Clear resource index — transfer is done
                     if ep_phys == 0 { self.ep0_resource_idx = 0; }
                     if ep_phys == 1 { self.ep1_resource_idx = 0; }
+                    if ep_phys == 2 { self.bulk_out_resource_idx = 0; }
+                    if ep_phys == 3 { self.bulk_in_resource_idx = 0; }
+
+                    // Bulk OUT complete — read actual length from TRB
+                    if ep_phys == 2 {
+                        self.bulk_out_xfer_complete += 1;
+                        unsafe {
+                            cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
+                            let remaining = BULK_OUT_TRB.trb.size & 0x00FF_FFFF;
+                            self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
+                        }
+                        self.bulk_out_ready = true;
+                        return UsbEvent::TransferComplete { ep: ep_phys };
+                    }
+
+                    // Bulk IN complete — mark idle
+                    if ep_phys == 3 {
+                        self.bulk_in_xfer_complete += 1;
+                        self.bulk_in_idle = true;
+                        return UsbEvent::TransferComplete { ep: ep_phys };
+                    }
 
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
                         // SETUP packet received — invalidate cache to see DMA data
@@ -1294,9 +1471,16 @@ impl Dwc3Dev {
                 }
                 DEPEVT_XFERNOTREADY => {
                     self.ep0_xfer_notready += 1;
-                    // With proactive STARTTRANSFER, XferNotReady means the
-                    // host is waiting for a stage we should have already armed.
-                    // These are fallback handlers.
+
+                    // Bulk OUT XferNotReady — arm receive if configured
+                    if ep_phys == 2 && self.configured {
+                        self.bulk_out_arm();
+                        return UsbEvent::None;
+                    }
+                    // Bulk IN XferNotReady — host polling, NAK until we send
+                    if ep_phys == 3 {
+                        return UsbEvent::None;
+                    }
 
                     // EP1 XferNotReady in DataIn → proactive STARTTRANSFER
                     // failed, retry now that DWC3 is ready
@@ -1383,8 +1567,13 @@ impl Dwc3Dev {
         self.last_cmd_status = saved.1;
         self.last_cmd_ep = saved.2;
         self.last_cmd_type = saved.3;
-        if ep_phys == 0 { self.ep0_resource_idx = 0; }
-        else { self.ep1_resource_idx = 0; }
+        match ep_phys {
+            0 => self.ep0_resource_idx = 0,
+            1 => self.ep1_resource_idx = 0,
+            2 => self.bulk_out_resource_idx = 0,
+            3 => self.bulk_in_resource_idx = 0,
+            _ => {}
+        }
     }
 
     /// Handle a USB bus reset event.
@@ -1400,17 +1589,26 @@ impl Dwc3Dev {
         self.pending_ep1_trbctl = 0;
 
         // End any in-flight transfers so their resources are freed.
-        // Only issue ENDTRANSFER if we have an active transfer (software tracking).
         if self.ep0_resource_idx != 0 {
             self.end_transfer_raw(0, self.ep0_resource_idx as u32);
         }
         if self.ep1_resource_idx != 0 {
             self.end_transfer_raw(1, self.ep1_resource_idx as u32);
         }
+        if self.bulk_out_resource_idx != 0 {
+            self.end_transfer_raw(2, self.bulk_out_resource_idx as u32);
+        }
+        if self.bulk_in_resource_idx != 0 {
+            self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
+        }
+        self.bulk_out_ready = false;
+        self.bulk_in_idle = true;
 
         // Clear any stall condition
         self.ep_cmd(0, DEPCMD_CLEARSTALL, 0, 0, 0);
         self.ep_cmd(1, DEPCMD_CLEARSTALL, 0, 0, 0);
+        self.ep_cmd(2, DEPCMD_CLEARSTALL, 0, 0, 0);
+        self.ep_cmd(3, DEPCMD_CLEARSTALL, 0, 0, 0);
 
         // Clear device address
         unsafe {
@@ -1458,11 +1656,8 @@ impl Dwc3Dev {
         self.ep_cmd(1, DEPCMD_SETEPCONFIG, par0, par1, 0);
         self.ep_cmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
 
-        // Ensure EP0 OUT+IN are enabled
-        unsafe {
-            let ena = mmio::read32(DWC3_BASE + DALEPENA);
-            mmio::write32(DWC3_BASE + DALEPENA, ena | 0x3);
-        }
+        // Re-configure bulk endpoints after reset
+        self.bulk_configure();
     }
 
     /// Handle EP0 SETUP packet. Returns true if handled.
@@ -1500,6 +1695,10 @@ impl Dwc3Dev {
             }
             USB_REQ_SET_CONFIGURATION => {
                 self.configured = w_value != 0;
+                if self.configured {
+                    self.bulk_out_arm();
+                    self.bulk_in_idle = true;
+                }
                 self.ep0_status_in();
                 true
             }
@@ -1584,12 +1783,12 @@ static DEVICE_DESC: [u8; 18] = [
     1,                  // bNumConfigurations
 ];
 
-/// Configuration descriptor (9 + 9 = 18 bytes total with interface, no endpoints yet).
-static CONFIG_DESC: [u8; 18] = [
+/// Configuration descriptor (9 config + 9 interface + 7 EP OUT + 7 EP IN = 32 bytes).
+static CONFIG_DESC: [u8; 32] = [
     // Configuration descriptor
     9,                  // bLength
     USB_DT_CONFIGURATION, // bDescriptorType
-    18, 0,              // wTotalLength
+    32, 0,              // wTotalLength
     1,                  // bNumInterfaces
     1,                  // bConfigurationValue
     0,                  // iConfiguration
@@ -1601,11 +1800,27 @@ static CONFIG_DESC: [u8; 18] = [
     USB_DT_INTERFACE,   // bDescriptorType
     0,                  // bInterfaceNumber
     0,                  // bAlternateSetting
-    0,                  // bNumEndpoints (0 for now — add bulk later)
+    2,                  // bNumEndpoints
     0xFF,               // bInterfaceClass = Vendor Specific
     0x01,               // bInterfaceSubClass
-    0x01,               // bInterfaceProtocol
+    0x02,               // bInterfaceProtocol
     2,                  // iInterface (string index 2)
+
+    // EP1 OUT (host→device) — Bulk, 512B MPS
+    7,                  // bLength
+    USB_DT_ENDPOINT,    // bDescriptorType
+    0x01,               // bEndpointAddress = EP1 OUT
+    0x02,               // bmAttributes = Bulk
+    0x00, 0x02,         // wMaxPacketSize = 512
+    0x00,               // bInterval
+
+    // EP1 IN (device→host) — Bulk, 512B MPS
+    7,                  // bLength
+    USB_DT_ENDPOINT,    // bDescriptorType
+    0x81,               // bEndpointAddress = EP1 IN
+    0x02,               // bmAttributes = Bulk
+    0x00, 0x02,         // wMaxPacketSize = 512
+    0x00,               // bInterval
 ];
 
 /// Device qualifier descriptor (for HS hosts asking about other speeds).
