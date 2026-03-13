@@ -203,6 +203,81 @@ _entry:
     mrs     x20, CurrentEL
     lsr     x20, x20, #2
 
+    // ================================================================
+    // Save SCTLR and disable MMU + caches.
+    // ABL (UEFI) may leave caches enabled. With write-back caches,
+    // DMA masters (DWC3 USB) read stale DRAM, not the CPU cache.
+    // We must clean+disable caches before any DMA.
+    // ================================================================
+    cmp     x20, #2
+    b.ne    .Lsctlr_el1
+
+    // EL2 path
+    mrs     x21, sctlr_el2     // x21 = original SCTLR (saved for diagnostics)
+    // Clean + invalidate data caches before disabling
+    // (otherwise dirty lines are lost)
+    mrs     x0, ctr_el0
+    ubfx    x0, x0, #16, #4    // DminLine (log2 words)
+    mov     x1, #4
+    lsl     x1, x1, x0         // x1 = cache line size in bytes
+    sub     x3, x1, #1          // line mask
+
+    // Clean entire BSS + data region conservatively (0 to 8MB from load addr)
+    adrp    x4, _start
+    mov     x5, #0x800000       // 8MB
+    add     x5, x5, x4
+.Lclean_el2:
+    dc      civac, x4
+    add     x4, x4, x1
+    cmp     x4, x5
+    b.lo    .Lclean_el2
+    dsb     sy
+    isb
+
+    bic     x0, x21, #(1 << 0)  // Clear M (MMU)
+    bic     x0, x0, #(1 << 2)   // Clear C (data cache)
+    bic     x0, x0, #(1 << 12)  // Clear I (instruction cache)
+    msr     sctlr_el2, x0
+    isb
+    // Invalidate TLBs + I-cache after disabling
+    tlbi    alle2
+    ic      iallu
+    dsb     sy
+    isb
+    b       .Lsctlr_done
+
+.Lsctlr_el1:
+    // EL1 path
+    mrs     x21, sctlr_el1
+    mrs     x0, ctr_el0
+    ubfx    x0, x0, #16, #4
+    mov     x1, #4
+    lsl     x1, x1, x0
+    sub     x3, x1, #1
+
+    adrp    x4, _start
+    mov     x5, #0x800000
+    add     x5, x5, x4
+.Lclean_el1:
+    dc      civac, x4
+    add     x4, x4, x1
+    cmp     x4, x5
+    b.lo    .Lclean_el1
+    dsb     sy
+    isb
+
+    bic     x0, x21, #(1 << 0)
+    bic     x0, x0, #(1 << 2)
+    bic     x0, x0, #(1 << 12)
+    msr     sctlr_el1, x0
+    isb
+    tlbi    vmalle1
+    ic      iallu
+    dsb     sy
+    isb
+
+.Lsctlr_done:
+
     adr     x2, .Lvectors
     cmp     x20, #2
     b.ne    .Lvbar_el1
@@ -232,6 +307,10 @@ _entry:
     adrp    x1, __boot_el
     add     x1, x1, :lo12:__boot_el
     str     x20, [x1]
+
+    adrp    x1, __boot_sctlr
+    add     x1, x1, :lo12:__boot_sctlr
+    str     x21, [x1]
 
     mov     x0, x19
     bl      kernel_main
@@ -324,6 +403,8 @@ const FP5_UART_BASE: usize = 0x0099_4000;
 static mut __exception_count: u64 = 0;
 #[unsafe(no_mangle)]
 static mut __boot_el: u64 = 0;
+#[unsafe(no_mangle)]
+static mut __boot_sctlr: u64 = 0;
 
 fn exception_count() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const __exception_count) }
@@ -331,6 +412,10 @@ fn exception_count() -> u64 {
 
 fn boot_el() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const __boot_el) }
+}
+
+fn boot_sctlr() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __boot_sctlr) }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +524,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // ---- Boot diagnostics ----
     log.puts("Boot EL:       "); log.put_hex32(boot_el() as u32); log.puts("\n");
+    let sctlr = boot_sctlr();
+    log.puts("SCTLR (orig):  "); log.put_hex32(sctlr as u32); log.puts("\n");
+    log.puts("  MMU="); log.put_hex32((sctlr & 1) as u32);
+    log.puts(" D$="); log.put_hex32(((sctlr >> 2) & 1) as u32);
+    log.puts(" I$="); log.put_hex32(((sctlr >> 12) & 1) as u32);
+    log.puts("\n");
     log.puts("DTB addr:      "); log.put_hex(dtb_addr); log.puts("\n");
     log.puts("Exceptions:    "); log.put_hex(exception_count() - exc_start); log.puts("\n");
     log.puts("pstore:        ");
@@ -584,26 +675,178 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("DTB addr:      NULL\n");
     }
 
+    // ---- USB DWC3 probe ----
+    log.puts("\n-- USB DWC3 --\n");
+    let exc_pre = exception_count();
+    let usb_info = ferros_hal::usb::probe();
+    let exc_post = exception_count();
+    let usb_ok = exc_post == exc_pre;
+
+    if usb_ok && usb_info.is_valid() {
+        log.puts("GSNPSID:       "); log.put_hex32(usb_info.snpsid); log.puts("\n");
+        log.puts("revision:      "); log.put_hex32(usb_info.revision() as u32); log.puts("\n");
+        log.puts("GCTL:          "); log.put_hex32(usb_info.gctl); log.puts("\n");
+        log.puts("mode:          "); log.puts(usb_info.port_cap()); log.puts("\n");
+        log.puts("endpoints:     "); log.put_hex32(usb_info.num_eps()); log.puts("\n");
+        log.puts("DSTS:          "); log.put_hex32(usb_info.dsts); log.puts("\n");
+
+        // Dump pre-init state
+        log.puts("Pre-init DCTL: "); log.put_hex32(unsafe { ferros_hal::mmio::read32(0x0A60C704) }); log.puts("\n");
+        log.puts("Pre-init GEVNTCOUNT: "); log.put_hex32(unsafe { ferros_hal::mmio::read32(0x0A60C40C) }); log.puts("\n");
+
+        // Bypass SMMU so DWC3 DMA uses physical addresses directly
+        ferros_hal::usb::smmu_bypass();
+        log.puts("SMMU:          bypass\n");
+
+        // Initialize USB PHY (SNPS Femto v2 — ABL tears it down at handoff)
+        log.puts("PHY init:      ");
+        if ferros_hal::usb::phy_init() {
+            log.puts("OK\n");
+        } else {
+            log.puts("FAIL\n");
+        }
+
+        // Initialize USB device mode
+        log.puts("USB init:      ");
+        match ferros_hal::usb::Dwc3Dev::init() {
+            Some(mut usb) => {
+                log.puts("OK\n");
+
+                // Halt diagnostics
+                log.puts("halt_ok:       ");
+                if usb.halt_ok { log.puts("YES\n"); } else { log.puts("NO\n"); }
+                log.puts("DSTS@halt:     "); log.put_hex32(usb.dsts_at_halt); log.puts("\n");
+
+                // Print computed DMA buffer addresses vs what DWC3 has
+                let (evt_a, trb_a, setup_a, data_a) = ferros_hal::usb::dma_buffer_addrs();
+                log.puts("EVT_BUF @:     "); log.put_hex(evt_a); log.puts("\n");
+                log.puts("EP0_TRBS @:    "); log.put_hex(trb_a); log.puts("\n");
+                log.puts("SETUP_BUF @:   "); log.put_hex(setup_a); log.puts("\n");
+                log.puts("DATA_BUF @:    "); log.put_hex(data_a); log.puts("\n");
+
+                // Dump post-init register state
+                let diag = ferros_hal::usb::dump_diag(exception_count);
+                log.puts("DCTL:          "); log.put_hex32(diag.dctl); log.puts("\n");
+                log.puts("DSTS:          "); log.put_hex32(diag.dsts); log.puts("\n");
+                log.puts("DCFG:          "); log.put_hex32(diag.dcfg); log.puts("\n");
+                log.puts("DEVTEN:        "); log.put_hex32(diag.devten); log.puts("\n");
+                log.puts("GCTL:          "); log.put_hex32(diag.gctl); log.puts("\n");
+                log.puts("GSTS:          "); log.put_hex32(diag.gsts); log.puts("\n");
+                log.puts("EVT_ADRLO:     "); log.put_hex32(diag.gevntadrlo); log.puts("\n");
+                log.puts("EVT_ADRHI:     "); log.put_hex32(diag.gevntadrhi); log.puts("\n");
+                log.puts("EVT_SIZ:       "); log.put_hex32(diag.gevntsiz); log.puts("\n");
+                log.puts("EVT_COUNT:     "); log.put_hex32(diag.gevntcount); log.puts("\n");
+                log.puts("QCOM_GEN_CFG:  "); log.put_hex32(diag.qcom_general_cfg); log.puts("\n");
+                log.puts("QCOM_HS_PHY:   "); log.put_hex32(diag.qcom_hs_phy_ctrl); log.puts("\n");
+                log.puts("QCOM_SS_PHY:   "); log.put_hex32(diag.qcom_ss_phy_ctrl); log.puts("\n");
+                log.puts("QUSB2_PWR:     "); log.put_hex32(diag.qusb2_pwr_ctrl); log.puts("\n");
+                log.puts("QMP_PWR:       "); log.put_hex32(diag.qmp_pwr_ctrl); log.puts("\n");
+                log.puts("USB2_UTMI:     "); log.put_hex32(diag.usb2_phy_utmi_ctrl); log.puts("\n");
+                log.puts("PHY exc:       "); log.put_hex32(diag.exc_during_phy); log.puts("\n");
+                log.puts("GUSB2PHYCFG:   "); log.put_hex32(diag.gusb2phycfg); log.puts("\n");
+                log.puts("GUSB3PIPECTL:  "); log.put_hex32(diag.gusb3pipectl); log.puts("\n");
+                log.puts("DALEPENA:      "); log.put_hex32(diag.dalepena); log.puts("\n");
+                log.puts("EVT_RAW[0-3]:  ");
+                log.put_hex32(diag.evt_buf_raw[0]); log.puts(" ");
+                log.put_hex32(diag.evt_buf_raw[1]); log.puts(" ");
+                log.put_hex32(diag.evt_buf_raw[2]); log.puts(" ");
+                log.put_hex32(diag.evt_buf_raw[3]); log.puts("\n");
+
+                // Check if Run/Stop is actually set
+                if diag.dctl & (1 << 31) != 0 {
+                    log.puts("Run/Stop:      SET\n");
+                } else {
+                    log.puts("Run/Stop:      CLEARED!\n");
+                }
+
+                log.puts("Waiting for host...\n");
+
+                // Poll for USB events indefinitely
+                let mut evt_count = 0u32;
+                let mut poll_count = 0u32;
+
+                loop {
+                    match usb.poll_event() {
+                        ferros_hal::usb::UsbEvent::None => {}
+                        ferros_hal::usb::UsbEvent::Reset => {
+                            log.puts("  USB reset\n");
+                            usb.handle_reset();
+                            evt_count += 1;
+                        }
+                        ferros_hal::usb::UsbEvent::ConnectDone { speed } => {
+                            log.puts("  connected: ");
+                            log.puts(ferros_hal::usb::speed_string(speed));
+                            log.puts(" DSTS=");
+                            log.put_hex32(unsafe { ferros_hal::mmio::read32(0x0A60C70C) });
+                            log.puts(" PHY=");
+                            log.put_hex32(unsafe { ferros_hal::mmio::read32(0x0A60C200) });
+                            log.puts("\n");
+                            usb.handle_connect_done();
+                            usb.ep0_start_setup();
+                            evt_count += 1;
+                        }
+                        ferros_hal::usb::UsbEvent::Disconnect => {
+                            log.puts("  disconnected\n");
+                            evt_count += 1;
+                        }
+                        ferros_hal::usb::UsbEvent::Ep0Setup { request } => {
+                            log.puts("  SETUP: ");
+                            for i in 0..8 {
+                                log.put_hex32(request[i] as u32);
+                                log.puts(" ");
+                            }
+                            log.puts("\n");
+                            if !usb.handle_setup(&request) {
+                                log.puts("  (stall)\n");
+                                usb.ep0_stall();
+                            }
+                            evt_count += 1;
+                        }
+                        ferros_hal::usb::UsbEvent::TransferComplete { ep } => {
+                            // EP0 status stage is handled internally by the driver.
+                            // This arm now only fires for non-EP0 endpoints.
+                            evt_count += 1;
+                        }
+                        ferros_hal::usb::UsbEvent::TransferNotReady { .. } => {
+                            evt_count += 1;
+                        }
+                    }
+
+                    poll_count = poll_count.wrapping_add(1);
+                    // Print status every ~10M polls
+                    if poll_count & 0x00FF_FFFF == 0 {
+                        log.puts("  X1 "); log.put_hex32(usb.ep1_xfer_complete);
+                        log.puts(" CS "); log.put_hex32(usb.cmd_status_fail);
+                        log.puts(" D1 "); log.put_hex32(usb.ep1_data_notready);
+                        if usb.cmd_status_fail > 0 {
+                            log.puts("\n  CMD="); log.put_hex32(usb.last_cmd_status);
+                            log.puts(" ep="); log.put_hex32(usb.last_cmd_ep as u32);
+                            log.puts(" ty="); log.put_hex32(usb.last_cmd_type);
+                        }
+                        log.puts("\n");
+                    }
+                }
+            }
+            None => {
+                log.puts("FAIL (reset timeout)\n");
+            }
+        }
+    } else if usb_ok {
+        log.puts("DWC3:          bad SNPSID "); log.put_hex32(usb_info.snpsid); log.puts("\n");
+    } else {
+        log.puts("DWC3:          FAULT (clocks gated?)\n");
+    }
+
     // ---- Final ----
     log.puts("\nTotal exc:     "); log.put_hex(exception_count()); log.puts("\n");
     if let Some(ref r) = log.ram {
         log.con.puts("pstore bytes:  "); log.con.put_hex32(r.written() as u32); log.con.puts("\n");
     }
 
-    // ---- PSCI reboot (warm — preserves ramoops DRAM) ----
-    log.puts("\n-- rebooting --\n");
-    unsafe {
-        core::arch::asm!("dsb sy");
-        core::arch::asm!(
-            "mov w0, #0x9",
-            "movk w0, #0x8400, lsl #16",
-            "mov x1, xzr",
-            "mov x2, xzr",
-            "mov x3, xzr",
-            "smc #0",
-            options(noreturn)
-        );
-    }
+    // ---- Halt (WFE loop) — do NOT reboot to avoid boot loops ----
+    log.puts("\n-- halted (hold power to reboot) --\n");
+    unsafe { core::arch::asm!("dsb sy"); }
+    loop { unsafe { core::arch::asm!("wfe"); } }
 }
 
 /// Spin delay — approximately `ms` milliseconds on a ~1GHz core.

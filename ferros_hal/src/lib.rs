@@ -24,3 +24,4 @@ pub mod console;
 pub mod dpu;
 pub mod pstore;
 pub mod spmi;
+pub mod usb;
