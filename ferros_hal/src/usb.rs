@@ -162,6 +162,8 @@ const DEPCMD_CLEARSTALL: u32 = 0x05;
 const DEPCMD_CMDACT: u32 = 1 << 10;
 /// Command Interrupt on Complete.
 const DEPCMD_CMDIOC: u32 = 1 << 8;
+/// High Priority / Force Remove — required for forced ENDTRANSFER.
+const DEPCMD_HIPRI_FORCERM: u32 = 1 << 9;
 
 // ---------------------------------------------------------------------------
 // DEPCMD SETEPCONFIG parameter bits (PAR0)
@@ -1177,18 +1179,22 @@ impl Dwc3Dev {
         self.end_transfer_raw(ep_phys, 1);
     }
 
-    /// Issue raw ENDTRANSFER command. Silently ignores CMDSTATUS errors.
+    /// Issue raw ENDTRANSFER command with HIPRI_FORCERM (force remove).
+    /// No CMDIOC — forced end doesn't generate completion events.
+    /// Silently ignores CMDSTATUS errors.
     fn end_transfer_raw(&mut self, ep_phys: u8, rsc_idx: u32) {
         let base = DWC3_BASE + 0xC800 + (ep_phys as usize) * 16;
         let saved = (self.cmd_status_fail, self.last_cmd_status, self.last_cmd_ep, self.last_cmd_type);
         unsafe {
             mmio::write32(base + 0x0C,
-                DEPCMD_ENDTRANSFER | DEPCMD_CMDIOC | DEPCMD_CMDACT
+                DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | DEPCMD_CMDACT
                 | (rsc_idx << 16));
             for _ in 0..100_000u32 {
                 if mmio::read32(base + 0x0C) & DEPCMD_CMDACT == 0 { break; }
             }
         }
+        // DWC3 databook: wait ~100µs after ENDTRANSFER before new STARTTRANSFER
+        phy_delay(50_000);
         self.cmd_status_fail = saved.0;
         self.last_cmd_status = saved.1;
         self.last_cmd_ep = saved.2;
@@ -1237,8 +1243,7 @@ impl Dwc3Dev {
             _ => 64,
         };
 
-        // Re-init endpoint config sequencer (needed after USB bus reset).
-        // No SETTRANSFRESOURCE — preserve allocation from init().
+        // Full reconfiguration after USB bus reset.
         self.ep_start_config(0);
 
         // EP0 OUT
@@ -1248,6 +1253,7 @@ impl Dwc3Dev {
             | DEPCFGPAR1_XFER_CMPL_EN
             | DEPCFGPAR1_XFER_NRDY_EN;
         self.ep_cmd(0, DEPCMD_SETEPCONFIG, par0, par1, 0);
+        self.ep_cmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
 
         // EP0 IN
         let par0 = (EP_TYPE_CONTROL << DEPCFGPAR0_EPTYPE_SHIFT)
@@ -1257,6 +1263,7 @@ impl Dwc3Dev {
             | DEPCFGPAR1_XFER_CMPL_EN
             | DEPCFGPAR1_XFER_NRDY_EN;
         self.ep_cmd(1, DEPCMD_SETEPCONFIG, par0, par1, 0);
+        self.ep_cmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
 
         // Ensure EP0 OUT+IN are enabled
         unsafe {

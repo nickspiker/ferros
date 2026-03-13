@@ -272,5 +272,5 @@ Additional inspiration from:
 ## Contact
 
 **Website:** https://holdmyoscilloscope.com/
-**Author:** Nick Spiker  
+**Author:** Nick Spiker
 **Email:** fractaldecoder@proton.me
