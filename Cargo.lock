@@ -137,7 +137,7 @@ dependencies = [
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
- "ferros_ledger",
+ "ferros_vault",
 ]
 
 [[package]]
@@ -146,10 +146,18 @@ version = "0.1.0"
 dependencies = [
  "ferros_hal",
  "ferros_ledger",
+ "ferros_vault",
 ]
 
 [[package]]
 name = "ferros_ledger"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
+name = "ferros_vault"
 version = "0.1.0"
 dependencies = [
  "blake3",

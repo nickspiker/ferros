@@ -3,14 +3,10 @@ name = "ferros_ledger"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "The persistent object store that ferros boots from and operates on"
+description = "Append-only event chain — BLAKE3-chained VSF entries, capability-gated"
 
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 
 [features]
-default = ["std"]
-std = ["blake3/std"]
-alloc = []  # enables Vec/String via extern crate alloc
-
-[dev-dependencies]
+default = []

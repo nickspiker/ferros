@@ -64,7 +64,7 @@
 //!   Mesh = 2 devices (microSD + internal UFS GPT partition)
 //!   Shrink userdata, add two GPT partitions:
 //!     ferros_anchor (4KB, type 66657272-6f73-416e-...)
-//!     ferros_ledger (50GB, type 66657272-6f73-4c65-...)
+//!     ferros_vault (50GB, type 66657272-6f73-4c65-...)
 //!   Real mesh: dual device, dual vendor
 //!   Anchor key = ferros_anchor partition on internal UFS
 //!
@@ -125,7 +125,7 @@ pub const GPT_TYPE_FERROS_ANCHOR: [u8; 16] = [
 ];
 
 /// Recommended GPT partition names (UTF-16LE in GPT, but we store as bytes).
-pub const GPT_NAME_LEDGER: &str = "ferros_ledger";
+pub const GPT_NAME_LEDGER: &str = "ferros_vault";
 pub const GPT_NAME_ANCHOR: &str = "ferros_anchor";
 
 /// Minimum sizes for GPT partitions.
@@ -222,7 +222,7 @@ pub fn fp5_dev_config() -> PlatformConfig {
 /// # From Android recovery or fastboot:
 /// # 1. Shrink userdata by ~50GB
 /// # 2. Add ferros_anchor partition (4KB, type GPT_TYPE_FERROS_ANCHOR)
-/// # 3. Add ferros_ledger partition (50GB, type GPT_TYPE_FERROS_LEDGER)
+/// # 3. Add ferros_vault partition (50GB, type GPT_TYPE_FERROS_LEDGER)
 /// ```
 pub fn fp5_dual_mesh_config() -> PlatformConfig {
     PlatformConfig {
@@ -239,8 +239,8 @@ pub fn fp5_dual_mesh_config() -> PlatformConfig {
                 capacity: 0,
             },
             PlatformDevice {
-                description: "Internal UFS ferros_ledger partition (mesh member 1)",
-                access: DeviceAccess::BlockDevice { path: "/dev/disk/by-partlabel/ferros_ledger" },
+                description: "Internal UFS ferros_vault partition (mesh member 1)",
+                access: DeviceAccess::BlockDevice { path: "/dev/disk/by-partlabel/ferros_vault" },
                 vendor: "unknown",
                 capacity: 0,
             },

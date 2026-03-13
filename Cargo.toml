@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "ferros_kernel",
     "ferros_hal",
+    "ferros_vault",
     "ferros_ledger",
     "tools/mkimg",
     "tools/ferros-bridge",

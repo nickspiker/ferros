@@ -31,7 +31,7 @@
 
 use alloc::vec::Vec;
 
-use ferros_ledger::device::{Device, DeviceError, DeviceId, DeviceInfo, DeviceIoKind};
+use ferros_vault::device::{Device, DeviceError, DeviceId, DeviceInfo, DeviceIoKind};
 
 /// Standard SDHCI register offsets (from SD Host Controller Spec v3.00).
 #[allow(dead_code)]

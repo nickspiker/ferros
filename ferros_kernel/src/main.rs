@@ -16,6 +16,8 @@ use ferros_hal::dtb::Dtb;
 use ferros_hal::pstore::{Ramoops, RamoopsConfig};
 use ferros_hal::spmi;
 use ferros_hal::uart::{Uart, UartBackend};
+use ferros_ledger::event::Event;
+use ferros_ledger::chain::Chain;
 
 // ---------------------------------------------------------------------------
 // Global allocator
@@ -518,11 +520,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut log = Log { con, ram: ramoops };
     log.con.clear();
 
+    // ---- Ledger init ----
+    let mut ledger = Chain::new();
+    ledger.init();
+
     // ---- Banner ----
     log.puts("ferros v0.0 on Fairphone 5 (QCM6490)\n");
     log.puts("=====================================\n\n");
 
     // ---- Boot diagnostics ----
+    ledger.post(&Event::BootStarted {
+        el: boot_el() as u32,
+        sctlr: boot_sctlr() as u32,
+        dtb_addr,
+    });
     log.puts("Boot EL:       "); log.put_hex32(boot_el() as u32); log.puts("\n");
     let sctlr = boot_sctlr();
     log.puts("SCTLR (orig):  "); log.put_hex32(sctlr as u32); log.puts("\n");
@@ -533,7 +544,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     log.puts("DTB addr:      "); log.put_hex(dtb_addr); log.puts("\n");
     log.puts("Exceptions:    "); log.put_hex(exception_count() - exc_start); log.puts("\n");
     log.puts("pstore:        ");
-    if log.ram.is_some() { log.puts("OK (ramoops)\n"); } else { log.puts("not found\n"); }
+    if log.ram.is_some() {
+        log.puts("OK (ramoops)\n");
+        // TODO: get actual base/size from ramoops config
+        ledger.post(&Event::BootPstoreFound { base: 0, size: 0 });
+    } else {
+        log.puts("not found\n");
+    }
 
     // ---- DPU MMIO probe ----
     let exc_pre = exception_count();
@@ -544,6 +561,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     log.puts("\n-- DPU --\n");
     log.puts("MDSS HW_VER:   "); log.put_hex32(hw_ver);
     log.puts(if dpu_ok { " (OK)\n" } else { " (FAULT)\n" });
+    ledger.post(&Event::BootDpuProbed { hw_ver, ok: dpu_ok });
 
     if dpu_ok {
         log.puts("CTL0_TOP:      "); log.put_hex32(dpu::read_reg(dpu::MDP_BASE + 0x15014)); log.puts("\n");
@@ -563,13 +581,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     log.puts("\n-- UART --\n");
     let uart = Uart::new(UartBackend::GeniSe { base: FP5_UART_BASE });
     let exc_pre = exception_count();
-    if uart.probe() && exception_count() == exc_pre {
+    let uart_ok = uart.probe() && exception_count() == exc_pre;
+    if uart_ok {
         uart.init();
         log.puts("UART:          OK\n");
         uart.puts("ferros v0.0 UART alive\r\n");
     } else {
         log.puts("UART:          FAIL\n");
     }
+    ledger.post(&Event::BootUartProbed { ok: uart_ok });
 
     // ---- DTB parse ----
     log.puts("\n-- DTB --\n");
@@ -578,6 +598,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         match dtb {
             Some(dtb) => {
                 log.puts("DTB valid:     "); log.put_hex32(dtb.total_size() as u32); log.puts(" bytes\n");
+                ledger.post(&Event::BootDtbParsed { total_size: dtb.total_size() as u32 });
 
                 if let Some(bootargs) = dtb.find_node_prop(b"chosen", b"bootargs") {
                     log.puts("bootargs:\n");
@@ -708,9 +729,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         // Initialize USB device mode
         log.puts("USB init:      ");
+        ledger.post(&Event::BootUsbInitStarted);
         match ferros_hal::usb::Dwc3Dev::init() {
             Some(mut usb) => {
                 log.puts("OK\n");
+                ledger.post(&Event::BootUsbInitDone { ok: true });
 
                 // Halt diagnostics
                 log.puts("halt_ok:       ");
@@ -770,6 +793,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         ferros_hal::usb::UsbEvent::Reset => {
                             log.puts("  USB reset\n");
                             usb.handle_reset();
+                            ledger.post(&Event::UsbReset);
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::ConnectDone { speed } => {
@@ -782,10 +806,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             log.puts("\n");
                             usb.handle_connect_done();
                             usb.ep0_start_setup();
+                            ledger.post(&Event::UsbConnectDone { speed });
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::Disconnect => {
                             log.puts("  disconnected\n");
+                            ledger.post(&Event::UsbDisconnect);
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::Ep0Setup { request } => {
@@ -795,9 +821,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                 log.puts(" ");
                             }
                             log.puts("\n");
+                            ledger.post(&Event::UsbSetupPacket {
+                                bm_request_type: request[0],
+                                b_request: request[1],
+                                w_value: (request[3] as u16) << 8 | request[2] as u16,
+                                w_index: (request[5] as u16) << 8 | request[4] as u16,
+                                w_length: (request[7] as u16) << 8 | request[6] as u16,
+                            });
                             if !usb.handle_setup(&request) {
                                 log.puts("  (stall)\n");
                                 usb.ep0_stall();
+                                ledger.post(&Event::UsbSetupStall);
                             } else {
                                 // Log diagnostic readback for data transfers
                                 if usb.last_send_len > 0 {
@@ -830,11 +864,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     log.puts("  BULK RX ");
                                     log.put_hex32(n as u32);
                                     log.puts("B\n");
+                                    ledger.post(&Event::UsbBulkRx { len: n as u32 });
                                 }
                                 usb.bulk_out_arm();
                             }
                             if ep == 3 {
-                                // Bulk IN complete
+                                ledger.post(&Event::UsbBulkTxComplete);
                             }
                             evt_count += 1;
                         }
@@ -869,6 +904,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
             None => {
                 log.puts("FAIL (reset timeout)\n");
+                ledger.post(&Event::BootUsbInitDone { ok: false });
             }
         }
     } else if usb_ok {
@@ -878,7 +914,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
 
     // ---- Final ----
+    ledger.post(&Event::BootHalted);
     log.puts("\nTotal exc:     "); log.put_hex(exception_count()); log.puts("\n");
+    log.puts("Ledger:        "); log.put_hex32(ledger.total_entries() as u32);
+    log.puts(" entries, seq "); log.put_hex32(ledger.global_seq() as u32); log.puts("\n");
     if let Some(ref r) = log.ram {
         log.con.puts("pstore bytes:  "); log.con.put_hex32(r.written() as u32); log.con.puts("\n");
     }

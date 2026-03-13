@@ -6,8 +6,8 @@ license.workspace = true
 description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer, storage"
 
 [dependencies]
-ferros_ledger = { path = "../ferros_ledger", default-features = false }
+ferros_vault = { path = "../ferros_vault", default-features = false }
 
 [features]
 default = ["std"]
-std = ["ferros_ledger/std"]
+std = ["ferros_vault/std"]
