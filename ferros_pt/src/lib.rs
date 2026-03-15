@@ -8,13 +8,16 @@
 
 #![no_std]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub mod command;
 pub mod packet;
 pub mod transfer;
 
 pub use command::{Command, Op};
 pub use packet::{PacketKind, StreamId};
-pub use transfer::{InboundTransfer, OutboundTransfer, TransferState};
+pub use transfer::{BitmapWord, InboundTransfer, OutboundTransfer, TransferState};
 
 /// Maximum chunk payload size (USB HS bulk MPS).
 pub const CHUNK_SIZE: usize = 512;

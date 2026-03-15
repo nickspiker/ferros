@@ -36,10 +36,14 @@ pub enum TransferState {
 // Bitmap — tracks received/verified chunks, caller-provided storage
 // ---------------------------------------------------------------------------
 
-/// Set a bit in a u32 bitmap slice. Returns true if it was previously unset.
-fn bitmap_set(bmap: &mut [u32], idx: usize) -> bool {
-    let word = idx / 32;
-    let bit = idx % 32;
+/// Bitmap word type — u64 for native 64-bit register ops, 64 chunks per word.
+pub type BitmapWord = u64;
+const BITS_PER_WORD: usize = 64;
+
+/// Set a bit in a bitmap slice. Returns true if it was previously unset.
+fn bitmap_set(bmap: &mut [BitmapWord], idx: usize) -> bool {
+    let word = idx / BITS_PER_WORD;
+    let bit = idx % BITS_PER_WORD;
     if word >= bmap.len() {
         return false;
     }
@@ -48,10 +52,10 @@ fn bitmap_set(bmap: &mut [u32], idx: usize) -> bool {
     was_unset
 }
 
-/// Test a bit in a u32 bitmap slice.
-fn bitmap_test(bmap: &[u32], idx: usize) -> bool {
-    let word = idx / 32;
-    let bit = idx % 32;
+/// Test a bit in a bitmap slice.
+fn bitmap_test(bmap: &[BitmapWord], idx: usize) -> bool {
+    let word = idx / BITS_PER_WORD;
+    let bit = idx % BITS_PER_WORD;
     if word >= bmap.len() {
         return false;
     }
@@ -59,15 +63,33 @@ fn bitmap_test(bmap: &[u32], idx: usize) -> bool {
 }
 
 /// Clear all bits in a bitmap slice.
-fn bitmap_clear(bmap: &mut [u32]) {
+fn bitmap_clear(bmap: &mut [BitmapWord]) {
     for w in bmap.iter_mut() {
         *w = 0;
     }
 }
 
-/// Number of u32 words needed for `count` bits.
+/// Number of words needed for `count` bits.
 pub fn bitmap_words(count: u64) -> usize {
-    ((count as usize) + 31) / 32
+    ((count as usize) + BITS_PER_WORD - 1) / BITS_PER_WORD
+}
+
+/// Calculate the exact bitmap words needed for an outbound transfer of `data_len` bytes.
+/// Use this to pre-allocate the bitmap buffer before calling `OutboundTransfer::start()`.
+pub fn outbound_bitmap_words(data_len: usize) -> usize {
+    if data_len == 0 {
+        return bitmap_words(1);
+    }
+    // Compute psize iteratively (same logic as OutboundTransfer::start)
+    let rough_psize = CHUNK_SIZE - 1 - 1 - CHUNK_HASH_SIZE;
+    let rough_count = (data_len + rough_psize - 1) / rough_psize;
+    let sw = ewe::seq_width(rough_count as u64);
+    let psize = CHUNK_SIZE - 1 - sw - CHUNK_HASH_SIZE;
+    let count = (data_len + psize - 1) / psize;
+    let final_sw = ewe::seq_width(count as u64);
+    let final_psize = CHUNK_SIZE - 1 - final_sw - CHUNK_HASH_SIZE;
+    let final_count = (data_len + final_psize - 1) / final_psize;
+    bitmap_words(final_count as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +105,7 @@ pub struct InboundTransfer<'a> {
     /// Reassembly buffer (caller-provided, length = spec.total).
     pub data: &'a mut [u8],
     /// Bitmap of received chunks (caller-provided).
-    received: &'a mut [u32],
+    received: &'a mut [BitmapWord],
     /// How many bytes are valid in `data`.
     pub data_len: usize,
     /// Expected total bytes from SPEC.
@@ -113,7 +135,7 @@ impl<'a> InboundTransfer<'a> {
     /// `bitmap_buf` must be at least `bitmap_words(spec.count)` u32s.
     ///
     /// Returns None if buffers are too small (caller should NAK).
-    pub fn new(spec: &Spec, data_buf: &'a mut [u8], bitmap_buf: &'a mut [u32]) -> Option<Self> {
+    pub fn new(spec: &Spec, data_buf: &'a mut [u8], bitmap_buf: &'a mut [BitmapWord]) -> Option<Self> {
         let needed_data = spec.total as usize;
         let needed_bitmap = bitmap_words(spec.count);
 
@@ -263,7 +285,7 @@ impl<'a> InboundTransfer<'a> {
 /// Outbound transfer state. Source data is borrowed from the caller.
 pub struct OutboundTransfer<'a> {
     /// Bitmap for tracking retransmit requests (caller-provided).
-    retransmit: &'a mut [u32],
+    retransmit: &'a mut [BitmapWord],
     /// Stream ID.
     pub sid: StreamId,
     /// Total data bytes.
@@ -290,7 +312,7 @@ impl<'a> OutboundTransfer<'a> {
     pub fn start(
         sid: StreamId,
         data: &[u8],
-        bitmap_buf: &'a mut [u32],
+        bitmap_buf: &'a mut [BitmapWord],
         spec_buf: &mut [u8],
     ) -> Option<(Self, usize)> {
         // Compute seq_width and psize iteratively.
@@ -348,6 +370,24 @@ impl<'a> OutboundTransfer<'a> {
         };
 
         Some((xfer, spec_len))
+    }
+
+    /// Begin a new outbound transfer with automatic bitmap allocation.
+    /// The Vec is resized to exactly the needed capacity.
+    #[cfg(feature = "alloc")]
+    pub fn start_vec(
+        sid: StreamId,
+        data: &[u8],
+        bitmap_vec: &'a mut alloc::vec::Vec<BitmapWord>,
+        spec_buf: &mut [u8],
+    ) -> Option<(Self, usize)> {
+        let needed = outbound_bitmap_words(data.len());
+        bitmap_vec.clear();
+        bitmap_vec.resize(needed, 0);
+        let bmap = unsafe {
+            core::slice::from_raw_parts_mut(bitmap_vec.as_mut_ptr(), bitmap_vec.len())
+        };
+        Self::start(sid, data, bmap, spec_buf)
     }
 
     /// Encode the next DATA packet from source data (initial blast).

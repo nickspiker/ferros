@@ -92,8 +92,7 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     let sid = StreamId::FIRST;
 
     let mut spec_buf = [0u8; 512];
-    let rough_chunks = (data.len() / 450) + 2; // ~477 bytes payload per chunk now
-    let mut bitmap_buf = vec![0u32; (rough_chunks + 31) / 32 + 1];
+    let mut bitmap_buf = vec![0u64; ferros_pt::transfer::outbound_bitmap_words(data.len())];
 
     let (mut xfer, spec_len) = OutboundTransfer::start(sid, data, &mut bitmap_buf, &mut spec_buf)
         .ok_or_else(|| "Failed to build SPEC".to_string())?;
@@ -237,22 +236,14 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
 
     // Allocate buffers
     let mut data_buf = vec![0u8; spec.total as usize];
-    let mut bitmap_buf = vec![0u32; bitmap_words(spec.count)];
+    let mut bitmap_buf = vec![0u64; bitmap_words(spec.count)];
 
     let mut xfer = InboundTransfer::new(&spec, &mut data_buf, &mut bitmap_buf)
         .ok_or_else(|| "Failed to create InboundTransfer".to_string())?;
 
-    // Send SPEC ACK
-    let mut ack_buf = [0u8; 64];
-    let spec_ack = Ack {
-        sid: spec.sid,
-        seq: u64::MAX,
-    };
-    let ack_len = spec_ack.encode(&mut ack_buf);
-    link.send(&ack_buf[..ack_len])
-        .await
-        .map_err(|e| format!("SPEC ACK send failed: {e}"))?;
-    eprintln!("  SPEC ACK sent");
+    // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump.
+    // Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
+    eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
 
     // Receive DATA blast — silent, no ACKs
     let mut received = 0u64;
@@ -264,42 +255,37 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("DATA recv failed: {e}"))?;
 
         if resp.is_empty() {
+            eprintln!("  recv: empty");
             continue;
         }
+
+        eprintln!("  recv: {} bytes first=0x{:02x}", resp.len(), resp[0]);
 
         if ferros_pt::is_data_packet(resp[0]) {
             if let Some((_sid, seq, chunk_hash, payload)) =
                 packet::decode_data(&resp, xfer.seq_width)
             {
-                xfer.handle_data(seq, &chunk_hash, payload);
-                received += 1;
+                let ok = xfer.handle_data(seq, &chunk_hash, payload);
+                if ok { received += 1; }
+                eprintln!("  DATA seq={} ok={} rcv={}/{}", seq, ok, xfer.chunks_received, xfer.expected_count);
+            } else {
+                eprintln!("  DATA decode failed");
             }
 
-            // All chunks received? Respond immediately (don't wait for FIN)
+            // All chunks received? Verify and return (no COMPLETE send needed for response direction)
             if xfer.all_received() {
                 let mut resp_buf = [0u8; 128];
-                let n = xfer.finish(&mut resp_buf);
-                if n > 0 {
-                    link.send(&resp_buf[..n])
-                        .await
-                        .map_err(|e| format!("COMPLETE send failed: {e}"))?;
-                }
+                xfer.finish(&mut resp_buf); // verify hash
                 break;
             }
         } else if resp[0] == b'F' {
             // FIN — sender says blast is done. Check what we have.
             let mut resp_buf = [0u8; 128];
-            let n = xfer.finish(&mut resp_buf);
-            if n > 0 {
-                link.send(&resp_buf[..n])
-                    .await
-                    .map_err(|e| format!("response send failed: {e}"))?;
-                // If COMPLETE was sent (success or fail), we're done
-                if xfer.state == ferros_pt::TransferState::Done {
-                    break;
-                }
-                // If NAK was sent, keep receiving retransmits
+            xfer.finish(&mut resp_buf);
+            if xfer.state == ferros_pt::TransferState::Done {
+                break;
             }
+            // If missing chunks, keep receiving (can't NAK without OUT send)
         } else {
             eprintln!("  (unexpected packet during recv: {:02x})", resp[0]);
         }

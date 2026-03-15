@@ -992,7 +992,7 @@ impl Dwc3Dev {
             | DEPCFGPAR1_XFER_CMPL_EN
             | DEPCFGPAR1_XFER_NRDY_EN;
         self.ep_cmd(3, DEPCMD_SETEPCONFIG, par0, par1, 0);
-        self.ep_cmd(3, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
+        self.ep_cmd(3, DEPCMD_SETTRANSFRESOURCE, 2, 0, 0); // 2 resources — avoids leak when STARTTRANSFER from within TransferComplete
 
         // Enable all 4 EPs in DALEPENA (bits 0-3)
         unsafe {
@@ -1064,6 +1064,7 @@ impl Dwc3Dev {
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
             cache_clean(buf_addr, len);
             cache_clean(trb_addr, 16);
+            core::arch::asm!("dsb sy"); // ensure DMA-visible before STARTTRANSFER
         }
 
         self.bulk_in_idle = false;
@@ -1544,7 +1545,19 @@ impl Dwc3Dev {
     /// Unconditionally issue ENDTRANSFER with rsc_idx=1.
     /// Used when STARTTRANSFER fails with CMDSTATUS=1 (resource occupied)
     /// but the register may not reflect the actual resource index.
-    fn force_end_transfer_unconditional(&mut self, ep_phys: u8) {
+    /// Cancel a pending bulk IN transfer and fully reset the endpoint.
+    /// Used when the host disconnects/times out mid-transfer.
+    pub fn cancel_bulk_in(&mut self) {
+        if self.bulk_in_resource_idx != 0 {
+            self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
+        } else {
+            self.force_end_transfer_unconditional(3);
+        }
+        self.ep_cmd(3, DEPCMD_CLEARSTALL, 0, 0, 0);
+        self.bulk_in_idle = true;
+    }
+
+    pub fn force_end_transfer_unconditional(&mut self, ep_phys: u8) {
         self.end_transfer_raw(ep_phys, 1);
     }
 

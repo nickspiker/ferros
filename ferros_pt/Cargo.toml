@@ -12,3 +12,4 @@ ferros_ledger = { path = "../ferros_ledger" }
 [features]
 default = []
 std = []
+alloc = []

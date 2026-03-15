@@ -1231,7 +1231,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 let mut poll_count = 0u32;
                 // PT inbound state — allocated on SPEC arrival, freed on COMPLETE
                 let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                let mut pt_bitmap_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                let mut pt_bitmap_buf: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
                 let mut pt_inbound: Option<InboundTransfer<'_>> = None;
                 // Current seq_width for DATA parsing (0 = no active transfer)
                 let mut pt_seq_width: usize = 0;
@@ -1240,7 +1240,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 let mut pt_complete_len: usize = 0;
                 // PT outbound state — device→host response transfer
                 let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                let mut pt_out_bitmap: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                let mut pt_out_bitmap: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
                 let mut pt_outbound: Option<OutboundTransfer<'_>> = None;
                 // Outbound SPEC queued after inbound COMPLETE (sent on second ep3)
                 let mut pt_out_spec_pending = [0u8; 512];
@@ -1253,6 +1253,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 // Staging area for hot-reload kernel image
                 const RELOAD_STAGE: usize = 0xA000_0000;
                 let mut reload_size: usize = 0;
+                // Flag: outbound DATA pump needs to send next packet
+                let mut pt_out_pump = false;
 
                 loop {
                     match usb.poll_event() {
@@ -1466,24 +1468,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                 }
                                                             }
                                                             // Start outbound PT if we have response data
+                                                            pt_outbound = None; // release borrow on pt_out_bitmap
                                                             if !pt_out_data.is_empty() {
                                                                 let sid = ferros_pt::StreamId(xfer.sid.0);
-                                                                let bw = bitmap_words(
-                                                                    ((pt_out_data.len() + 508) / 509) as u64 + 1
-                                                                );
-                                                                pt_out_bitmap = alloc::vec![0u32; bw];
-                                                                let out_bmap = unsafe {
-                                                                    core::slice::from_raw_parts_mut(
-                                                                        pt_out_bitmap.as_mut_ptr(),
-                                                                        pt_out_bitmap.len(),
-                                                                    )
-                                                                };
                                                                 let mut spec_buf = [0u8; 128];
                                                                 if let Some((out_xfer, spec_len)) =
-                                                                    OutboundTransfer::start(
+                                                                    OutboundTransfer::start_vec(
                                                                         sid,
                                                                         &pt_out_data,
-                                                                        out_bmap,
+                                                                        &mut pt_out_bitmap,
                                                                         &mut spec_buf,
                                                                     )
                                                                 {
@@ -1509,6 +1502,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                         // Control packet — single-byte tag dispatch
                                         if let Some(spec) = Spec::decode(&tmp[..n]) {
                                             // SPEC — new inbound transfer (clears stale state)
+                                            // New session — cancel any stale bulk IN from previous session
+                                            if !usb.bulk_in_idle {
+                                                usb.cancel_bulk_in();
+                                            }
                                             pt_outbound = None;
                                             pt_out_data.clear();
                                             pt_out_bitmap.clear();
@@ -1522,7 +1519,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                             log.puts("\n");
 
                                             pt_data_buf = alloc::vec![0u8; spec.total as usize];
-                                            pt_bitmap_buf = alloc::vec![0u32; bitmap_words(spec.count)];
+                                            pt_bitmap_buf = alloc::vec![0u64; bitmap_words(spec.count)];
 
                                             let data_slice = unsafe {
                                                 core::slice::from_raw_parts_mut(
@@ -1557,20 +1554,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     log.puts("  PT NAK: alloc failed\n");
                                                 }
                                             }
-                                        } else if let Some(ack) = Ack::decode(&tmp[..n]) {
-                                            // ACK from bridge — SPEC ACK triggers blast
-                                            if let Some(ref mut out) = pt_outbound {
-                                                if ack.seq == u64::MAX {
-                                                    // SPEC ACK — start outbound blast.
-                                                    // DWC3 can only queue one bulk IN at a time.
-                                                    // Send first packet here, ep3 handler sends the rest.
-                                                    let mut pkt = [0u8; 512];
-                                                    let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);
-                                                    if pkt_len > 0 {
-                                                        usb.bulk_in_send(&pkt[..pkt_len]);
-                                                    }
-                                                }
-                                            }
+                                        } else if let Some(_ack) = Ack::decode(&tmp[..n]) {
+                                            // ACK — currently unused (outbound blast is auto)
                                         } else if let Some(fin_sid) = packet::decode_fin(&tmp[..n]) {
                                             // FIN from bridge — blast is done, check what we have
                                             if let Some(ref mut xfer) = pt_inbound {
@@ -1600,6 +1585,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             }
                             if ep == 3 {
                                 // Bulk IN complete — chain next pending send
+                                log.screen = true;
+                                log.puts("E3 c="); log.put_hex32(pt_complete_len as u32);
+                                log.puts(" s="); log.put_hex32(pt_out_spec_len as u32);
+                                log.puts(" o="); log.put_hex32(pt_outbound.is_some() as u32);
+                                log.puts("\n");
+                                log.screen = false;
                                 if pt_complete_len > 0 {
                                     // Inbound COMPLETE
                                     usb.bulk_in_send(&pt_complete_pending[..pt_complete_len]);
@@ -1609,31 +1600,44 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     // Outbound SPEC
                                     usb.bulk_in_send(&pt_out_spec_pending[..pt_out_spec_len]);
                                     pt_out_spec_len = 0;
-                                } else if let Some(ref mut out) = pt_outbound {
-                                    // Outbound DATA blast — one packet per ep3 event
-                                    if !out.all_sent() {
-                                        let mut pkt = [0u8; 512];
-                                        let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);
-                                        if pkt_len > 0 {
-                                            usb.bulk_in_send(&pkt[..pkt_len]);
-                                        }
-                                    } else {
-                                        // All sent — send FIN
-                                        let mut pkt = [0u8; 512];
-                                        let fin_len = out.encode_fin(&mut pkt);
-                                        if fin_len > 0 {
-                                            usb.bulk_in_send(&pkt[..512]);
-                                        }
-                                        // Clear outbound — FIN sent, wait for COMPLETE from bridge
-                                        pt_outbound = None;
-                                    }
                                 }
+                                // Outbound DATA is handled by the main loop idle check
                                 ledger.post(&Event::UsbBulkTxComplete);
                             }
                             evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::TransferNotReady { .. } => {
                             evt_count += 1;
+                        }
+                    }
+
+                    // Outbound DATA pump — poll bulk_in_idle directly.
+                    if usb.bulk_in_idle {
+                        if let Some(ref mut out) = pt_outbound {
+                            if !out.all_sent() {
+                                let mut pkt = [0u8; 512];
+                                let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);
+                                if pkt_len > 0 {
+                                    let ok = usb.bulk_in_send(&pkt[..pkt_len]);
+                                    // Debug first few sends
+                                    if out.next_seq <= 3 || !ok {
+                                        log.screen = true;
+                                        log.puts("D"); log.put_hex32(out.next_seq as u32);
+                                        if ok { log.puts("ok "); } else { log.puts("FAIL "); }
+                                        log.screen = false;
+                                    }
+                                }
+                            } else {
+                                log.screen = true;
+                                log.puts("FIN ");
+                                log.screen = false;
+                                let mut pkt = [0u8; 16];
+                                let fin_len = out.encode_fin(&mut pkt);
+                                if fin_len > 0 {
+                                    usb.bulk_in_send(&pkt[..fin_len]);
+                                }
+                                pt_outbound = None;
+                            }
                         }
                     }
 
