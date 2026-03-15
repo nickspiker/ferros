@@ -18,15 +18,20 @@ impl UsbLink {
         let device = nusb::list_devices()
             .map_err(|e| format!("USB enumeration failed: {e}"))?
             .find(|d| d.vendor_id() == FERROS_VID && d.product_id() == FERROS_PID)
-            .ok_or_else(|| format!("No device found with VID={FERROS_VID:04x} PID={FERROS_PID:04x}"))?;
+            .ok_or_else(|| {
+                format!("No device found with VID={FERROS_VID:04x} PID={FERROS_PID:04x}")
+            })?;
 
-        let device = device.open().map_err(|e| format!("Failed to open device: {e}"))?;
+        let device = device
+            .open()
+            .map_err(|e| format!("Failed to open device: {e}"))?;
         let interface = device
             .claim_interface(INTERFACE)
             .map_err(|e| format!("Failed to claim interface {INTERFACE}: {e}"))?;
 
         // Find bulk endpoints from the active config
-        let config = device.active_configuration()
+        let config = device
+            .active_configuration()
             .map_err(|e| format!("Failed to read config: {e}"))?;
 
         let mut ep_out = None;
@@ -54,9 +59,15 @@ impl UsbLink {
         let ep_out = ep_out.ok_or("No bulk OUT endpoint found")?;
         let ep_in = ep_in.ok_or("No bulk IN endpoint found")?;
 
-        eprintln!("Connected: VID={FERROS_VID:04x} PID={FERROS_PID:04x} EP_OUT=0x{ep_out:02x} EP_IN=0x{ep_in:02x}");
+        eprintln!(
+            "Connected: VID={FERROS_VID:04x} PID={FERROS_PID:04x} EP_OUT=0x{ep_out:02x} EP_IN=0x{ep_in:02x}"
+        );
 
-        Ok(UsbLink { interface, ep_out, ep_in })
+        Ok(UsbLink {
+            interface,
+            ep_out,
+            ep_in,
+        })
     }
 
     /// Send data via bulk OUT.
@@ -67,12 +78,31 @@ impl UsbLink {
 
     /// Receive data via bulk IN (up to 512 bytes).
     pub async fn recv(&self) -> Result<Vec<u8>, TransferError> {
-        let completion = self.interface
+        let completion = self
+            .interface
             .bulk_in(self.ep_in, RequestBuffer::new(512))
             .await;
         completion.status.map(|_| completion.data)
     }
 
-    pub fn ep_out(&self) -> u8 { self.ep_out }
-    pub fn ep_in(&self) -> u8 { self.ep_in }
+    /// Receive data via bulk IN with a timeout.
+    pub async fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>, String> {
+        tokio::select! {
+            completion = self.interface.bulk_in(self.ep_in, RequestBuffer::new(512)) => {
+                completion.status
+                    .map(|_| completion.data)
+                    .map_err(|e| format!("USB read error: {e}"))
+            }
+            _ = tokio::time::sleep(timeout) => {
+                Err("timeout".to_string())
+            }
+        }
+    }
+
+    pub fn ep_out(&self) -> u8 {
+        self.ep_out
+    }
+    pub fn ep_in(&self) -> u8 {
+        self.ep_in
+    }
 }

@@ -156,7 +156,9 @@ impl Chain {
     ///
     /// Returns the entry's provenance hash, or None if encoding failed.
     pub fn post(&mut self, event: &Event) -> Option<Hash> {
-        if !self.initialized { return None; }
+        if !self.initialized {
+            return None;
+        }
 
         let cat = event.category();
         let idx = Self::category_index(cat);
@@ -165,12 +167,7 @@ impl Chain {
         let cap_hash = [0u8; 32];
         let sig = [0u8; 32];
 
-        let entry = self.chains[idx].append(
-            self.global_seq,
-            event,
-            &cap_hash,
-            &sig,
-        )?;
+        let entry = self.chains[idx].append(self.global_seq, event, &cap_hash, &sig)?;
 
         self.global_seq += 1;
         self.total_entries += 1;

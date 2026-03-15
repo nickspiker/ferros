@@ -18,6 +18,8 @@ use ferros_hal::spmi;
 use ferros_hal::uart::{Uart, UartBackend};
 use ferros_ledger::event::Event;
 use ferros_ledger::chain::Chain;
+use ferros_pt::packet::{self, Spec, Ack, Complete};
+use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
 
 // ---------------------------------------------------------------------------
 // Global allocator
@@ -389,13 +391,13 @@ _entry:
 
 const FP5_FB_WIDTH: u32 = 1224;
 const FP5_FB_HEIGHT: u32 = 2700;
-const FP5_FB_STRIDE: u32 = FP5_FB_WIDTH * 4;
 const FP5_SPLASH_ADDR: u64 = 0xE100_0000;
 
 /// PS_HOLD register — writing 0 kills power (Qualcomm TCSR).
 const PS_HOLD: usize = 0x0C26_4000;
 /// GENI SE UART base (QUPv3 SE3, from stock cmdline console=ttyMSM0).
 const FP5_UART_BASE: usize = 0x0099_4000;
+const FP5_SDC2_BASE: usize = 0x0880_4000; // QCM6490 SDHCI for microSD
 
 // ---------------------------------------------------------------------------
 // Statics
@@ -427,25 +429,68 @@ fn boot_sctlr() -> u64 {
 struct Log {
     con: Console,
     ram: Option<Ramoops>,
+    /// Boot log buffer — captured for USB retrieval.
+    buf: alloc::vec::Vec<u8>,
+    /// When false, puts/put_hex skip console output (buf + ramoops only).
+    screen: bool,
 }
 
 impl Log {
     fn putc(&mut self, b: u8) {
-        self.con.putc(b);
+        if self.screen { self.con.putc(b); }
         if let Some(ref mut r) = self.ram { r.putc(b); }
+        self.buf.push(b);
     }
     fn puts(&mut self, s: &str) {
-        self.con.puts(s);
+        if self.screen { self.con.puts(s); }
         if let Some(ref mut r) = self.ram { r.puts(s); }
+        self.buf.extend_from_slice(s.as_bytes());
     }
     fn put_hex(&mut self, val: u64) {
-        self.con.put_hex(val);
+        if self.screen { self.con.put_hex(val); }
         if let Some(ref mut r) = self.ram { r.put_hex(val); }
+        let mut tmp = [0u8; 18];
+        let n = fmt_hex64(val, &mut tmp);
+        self.buf.extend_from_slice(&tmp[..n]);
     }
     fn put_hex32(&mut self, val: u32) {
-        self.con.put_hex32(val);
+        if self.screen { self.con.put_hex32(val); }
         if let Some(ref mut r) = self.ram { r.put_hex32(val); }
+        let mut tmp = [0u8; 10];
+        let n = fmt_hex32(val, &mut tmp);
+        self.buf.extend_from_slice(&tmp[..n]);
     }
+    /// Write to log buffer only (no console, no ramoops).
+    fn buf_only(&mut self, s: &str) {
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+    fn buf_put_hex32(&mut self, val: u32) {
+        let mut tmp = [0u8; 10];
+        let n = fmt_hex32(val, &mut tmp);
+        self.buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Format u32 as hex into buffer, return length written.
+fn fmt_hex32(val: u32, buf: &mut [u8; 10]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..8 {
+        buf[2 + i] = HEX[((val >> (28 - i * 4)) & 0xF) as usize];
+    }
+    10
+}
+
+/// Format u64 as hex into buffer, return length written.
+fn fmt_hex64(val: u64, buf: &mut [u8; 18]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = HEX[((val >> (60 - i * 4)) & 0xF) as usize];
+    }
+    18
 }
 
 // ---------------------------------------------------------------------------
@@ -517,8 +562,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         Some(unsafe { Ramoops::from_config(&cfg) })
     });
 
-    let mut log = Log { con, ram: ramoops };
+    let mut log = Log { con, ram: ramoops, buf: alloc::vec::Vec::with_capacity(8192), screen: false };
     log.con.clear();
+    // Banner only — everything else goes to buf + ramoops
+    log.screen = true;
+    log.puts("ferros v0.0\n");
+    log.screen = false;
 
     // ---- Ledger init ----
     let mut ledger = Chain::new();
@@ -696,6 +745,400 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("DTB addr:      NULL\n");
     }
 
+    // ---- GCC SDC2 clock init ----
+    log.puts("\n-- GCC SDC2 clocks --\n");
+    {
+        // Pre-enable diagnostics
+        log.puts("BCR pre:       "); log.put_hex32(ferros_hal::gcc::sdc2_bcr_raw()); log.puts("\n");
+        let (ahb_raw, apps_raw) = ferros_hal::gcc::sdc2_cbcr_raw();
+        log.puts("AHB_CBCR pre:  "); log.put_hex32(ahb_raw); log.puts("\n");
+        log.puts("APPS_CBCR pre: "); log.put_hex32(apps_raw); log.puts("\n");
+        log.puts("CMD_RCGR pre:  "); log.put_hex32(ferros_hal::gcc::sdc2_cmd_rcgr()); log.puts("\n");
+        log.puts("CFG_RCGR pre:  "); log.put_hex32(ferros_hal::gcc::sdc2_cfg_rcgr()); log.puts("\n");
+
+        // Full init: deassert reset, configure 400KHz, enable branches
+        let (ahb_ok, apps_ok) = ferros_hal::gcc::sdc2_clock_init();
+        log.puts("init 400KHz:   AHB="); log.put_hex32(ahb_ok as u32);
+        log.puts(" APPS="); log.put_hex32(apps_ok as u32); log.puts("\n");
+
+        // Post-enable diagnostics
+        log.puts("BCR post:      "); log.put_hex32(ferros_hal::gcc::sdc2_bcr_raw()); log.puts("\n");
+        let (ahb_raw, apps_raw) = ferros_hal::gcc::sdc2_cbcr_raw();
+        log.puts("AHB_CBCR post: "); log.put_hex32(ahb_raw); log.puts("\n");
+        log.puts("APPS_CBCR post:"); log.put_hex32(apps_raw); log.puts("\n");
+        log.puts("CMD_RCGR post: "); log.put_hex32(ferros_hal::gcc::sdc2_cmd_rcgr()); log.puts("\n");
+        log.puts("CFG_RCGR post: "); log.put_hex32(ferros_hal::gcc::sdc2_cfg_rcgr()); log.puts("\n");
+    }
+
+    // ---- SD card power via RPMh mailbox ----
+    // SPMI arbiter blocks direct LDO access (EE ownership). Use RPMh TCS
+    // to request LDO enable through the proper power management channel.
+    log.puts("\n-- RPMh cmd-db --\n");
+    {
+        use ferros_hal::rpmh;
+
+        // Look up LDO addresses in cmd-db
+        let ldoc9_addr = rpmh::cmd_db_lookup(b"ldoc9");
+        log.puts("ldoc9: ");
+        match ldoc9_addr {
+            Some(a) => { log.put_hex32(a); log.puts("\n"); }
+            None => log.puts("NOT FOUND\n"),
+        }
+
+        let ldoc6_addr = rpmh::cmd_db_lookup(b"ldoc6");
+        log.puts("ldoc6: ");
+        match ldoc6_addr {
+            Some(a) => { log.put_hex32(a); log.puts("\n"); }
+            None => log.puts("NOT FOUND\n"),
+        }
+
+        // TCS pre-state diagnostics
+        log.buf_only("TCS0 ctrl=");
+        log.buf_put_hex32(rpmh::tcs0_control());
+        log.buf_only(" irq=");
+        log.buf_put_hex32(rpmh::tcs0_irq_status());
+        log.buf_only(" cmd0_sts=");
+        log.buf_put_hex32(rpmh::tcs0_cmd0_status());
+        log.buf_only("\n");
+
+        // If either found, enable via TCS
+        if ldoc9_addr.is_some() || ldoc6_addr.is_some() {
+            log.puts("RPMh TCS enable...\n");
+
+            if let Some(addr) = ldoc9_addr {
+                // vmmc — SD card power 2.95V
+                let v_ok = rpmh::vrm_set_voltage(addr, 2950);
+                log.buf_only("ldoc9 volt=");
+                log.buf_put_hex32(v_ok as u32);
+                let e_ok = rpmh::vrm_enable(addr);
+                log.buf_only(" en=");
+                log.buf_put_hex32(e_ok as u32);
+                log.buf_only(" cmd0_sts=");
+                log.buf_put_hex32(rpmh::tcs0_cmd0_status());
+                log.buf_only("\n");
+                if v_ok && e_ok {
+                    log.puts("ldoc9 (vmmc): OK\n");
+                } else {
+                    log.puts("ldoc9 (vmmc): FAIL\n");
+                }
+            }
+
+            if let Some(addr) = ldoc6_addr {
+                // vqmmc — SD I/O voltage 1.8V
+                let v_ok = rpmh::vrm_set_voltage(addr, 1800);
+                log.buf_only("ldoc6 volt=");
+                log.buf_put_hex32(v_ok as u32);
+                let e_ok = rpmh::vrm_enable(addr);
+                log.buf_only(" en=");
+                log.buf_put_hex32(e_ok as u32);
+                log.buf_only(" cmd0_sts=");
+                log.buf_put_hex32(rpmh::tcs0_cmd0_status());
+                log.buf_only("\n");
+                if v_ok && e_ok {
+                    log.puts("ldoc6 (vqmmc): OK\n");
+                } else {
+                    log.puts("ldoc6 (vqmmc): FAIL\n");
+                }
+            }
+
+            // Delay for power rail stabilization
+            for _ in 0..1_000_000u32 { unsafe { core::arch::asm!("nop") }; }
+        }
+    }
+
+    // ---- SDHCI (microSD) card probe ----
+    log.puts("\n-- SDHCI SDC2 --\n");
+    {
+        let tlmm = 0x0F10_0000usize;
+
+        // 1. Configure TLMM SDC2 pads BEFORE probing
+        //    All three pads share one register at TLMM + 0xB4000 (SC7280 pinctrl)
+        //    Bit layout: DATA drv [2:0], CMD drv [5:3], CLK drv [8:6],
+        //                DATA pull [10:9], CMD pull [12:11], CLK pull [15:14]
+        //    Drive: (mA/2)-1. Pull: 0=none, 1=down, 2=keeper, 3=up
+        let pack_pre = unsafe { ferros_hal::mmio::read32(tlmm + 0xB4000) };
+        log.puts("TLMM pre:  "); log.put_hex32(pack_pre); log.puts("\n");
+
+        let sdc2_cfg: u32 = (4 << 0)   // DATA drv = 10mA
+                          | (4 << 3)    // CMD drv = 10mA
+                          | (7 << 6)    // CLK drv = 16mA
+                          | (3 << 9)    // DATA pull-up
+                          | (3 << 11)   // CMD pull-up
+                          | (0 << 13);  // CLK no-pull
+        unsafe { ferros_hal::mmio::write32(tlmm + 0xB4000, sdc2_cfg) };
+        let pack_post = unsafe { ferros_hal::mmio::read32(tlmm + 0xB4000) };
+        log.puts("TLMM post: "); log.put_hex32(pack_post); log.puts("\n");
+
+        // 2. Card detect — GPIO 91, active-low
+        //    TLMM GPIO regs: base + gpio*0x1000, +0x00=CFG, +0x04=IN_OUT
+        //    CFG: [3:2]=func(0=gpio), [1:0]=pull(3=up), [8:6]=drv
+        let gpio91_cfg_addr = tlmm + 91 * 0x1000;
+        let gpio91_cfg_pre = unsafe { ferros_hal::mmio::read32(gpio91_cfg_addr) };
+        log.buf_only("GPIO91 CFG pre: "); log.buf_put_hex32(gpio91_cfg_pre); log.buf_only("\n");
+        // Configure as GPIO input with pull-up: func=0, pull=3(up), drv=2mA(0)
+        unsafe { ferros_hal::mmio::write32(gpio91_cfg_addr, 0x03) }; // pull-up, func=gpio
+        // Read IN_OUT register bit 0 = input value
+        let gpio91_val = unsafe { ferros_hal::mmio::read32(gpio91_cfg_addr + 0x04) };
+        let card_detect = gpio91_val & 1 == 0; // active-low
+        log.puts("CD GPIO91: "); log.put_hex32(gpio91_val);
+        log.puts(if card_detect { " (CARD)\n" } else { " (EMPTY)\n" });
+
+        // 3. Delay for pad config to stabilize
+        for _ in 0..200_000u32 { unsafe { core::arch::asm!("nop") }; }
+
+        // 4. Now probe with pads configured
+        let sdc = ferros_hal::sdmmc::SdmmcController::new(FP5_SDC2_BASE);
+        let probe = sdc.probe_card();
+
+        log.puts("reset:  "); log.puts(if probe.reset_ok { "OK\n" } else { "FAIL\n" });
+        log.puts("PWRCTL: pre="); log.put_hex32(probe.pwrctl_status_pre);
+        log.puts(" post="); log.put_hex32(probe.pwrctl_status_post);
+        log.puts(if probe.pwrctl_ack_ok { " ACK\n" } else { " NONE\n" });
+        log.puts("PRESENT:"); log.put_hex32(probe.present_state); log.puts("\n");
+        log.puts("CLK_CTL:"); log.put_hex32(probe.clock_ctrl as u32); log.puts("\n");
+        log.puts("CAPS:   "); log.put_hex32(probe.caps); log.puts("\n");
+
+        // Raw SDHCI register dump (buf-only for diag)
+        log.buf_only("\nSDHCI raw regs (base=0x08804000):\n");
+        {
+            let sdc_base = FP5_SDC2_BASE;
+            let std_offsets: [(usize, &str); 16] = [
+                (0x00, "SDMA_ADDR   "),
+                (0x04, "BLOCK_SZ/CNT"),
+                (0x08, "ARGUMENT    "),
+                (0x0C, "XFER/CMD    "),
+                (0x10, "RESP0       "),
+                (0x14, "RESP1       "),
+                (0x18, "RESP2       "),
+                (0x1C, "RESP3       "),
+                (0x20, "BUF_DATA    "),
+                (0x24, "PRESENT_ST  "),
+                (0x28, "HOST_CTRL   "),
+                (0x2C, "CLK/TIMEOUT "),
+                (0x30, "INT_STATUS  "),
+                (0x34, "INT_STAT_EN "),
+                (0x38, "INT_SIG_EN  "),
+                (0x3C, "AUTO_CMD_ERR"),
+            ];
+            for &(off, name) in std_offsets.iter() {
+                let exc_pre = exception_count();
+                let val = unsafe { ferros_hal::mmio::read32(sdc_base + off) };
+                let exc_post = exception_count();
+                log.buf_only("  "); log.buf_only(name); log.buf_only(" [");
+                log.buf_put_hex32(off as u32); log.buf_only("]: ");
+                if exc_post > exc_pre {
+                    log.buf_only("FAULT\n");
+                } else {
+                    log.buf_put_hex32(val); log.buf_only("\n");
+                }
+            }
+            for off in [0x40usize, 0x44, 0x48, 0x4C] {
+                let exc_pre = exception_count();
+                let val = unsafe { ferros_hal::mmio::read32(sdc_base + off) };
+                let exc_post = exception_count();
+                log.buf_only("  CAPS        [");
+                log.buf_put_hex32(off as u32); log.buf_only("]: ");
+                if exc_post > exc_pre {
+                    log.buf_only("FAULT\n");
+                } else {
+                    log.buf_put_hex32(val); log.buf_only("\n");
+                }
+            }
+            log.buf_only("  -- QC vendor --\n");
+            for off_idx in 0..13u32 {
+                let off = 0x200 + (off_idx as usize) * 4;
+                let exc_pre = exception_count();
+                let val = unsafe { ferros_hal::mmio::read32(sdc_base + off) };
+                let exc_post = exception_count();
+                log.buf_only("  VENDOR      [");
+                log.buf_put_hex32(off as u32); log.buf_only("]: ");
+                if exc_post > exc_pre {
+                    log.buf_only("FAULT\n");
+                } else {
+                    log.buf_put_hex32(val); log.buf_only("\n");
+                }
+            }
+        }
+
+        log.puts("CMD0:   "); log.puts(if probe.cmd0_ok { "OK\n" } else { "FAIL\n" });
+        log.puts("CMD8:   ");
+        if probe.cmd8_ok {
+            log.puts("OK resp="); log.put_hex32(probe.cmd8_resp); log.puts("\n");
+        } else {
+            log.puts("FAIL err="); log.put_hex32(probe.cmd8_err as u32); log.puts("\n");
+        }
+        log.puts("ACMD41: ");
+        if probe.acmd41_ok {
+            log.puts("OK tries="); log.put_hex32(probe.acmd41_tries);
+            log.puts(" OCR="); log.put_hex32(probe.ocr); log.puts("\n");
+        } else {
+            log.puts("FAIL tries="); log.put_hex32(probe.acmd41_tries);
+            log.puts(" OCR="); log.put_hex32(probe.ocr); log.puts("\n");
+        }
+        log.buf_only("pre-CMD2: PRESENT=");
+        log.buf_put_hex32(probe.pre_cmd2_present);
+        log.buf_only(" INT=");
+        log.buf_put_hex32(probe.pre_cmd2_int as u32);
+        log.buf_only(" PWRCTL=");
+        log.buf_put_hex32(probe.pre_cmd2_pwrctl);
+        log.buf_only("\n");
+        log.puts("CMD2:   ");
+        if probe.cmd2_ok {
+            log.puts("OK\n");
+            log.puts("CID:    ");
+            log.put_hex32(probe.cid[3]); log.puts(" ");
+            log.put_hex32(probe.cid[2]); log.puts(" ");
+            log.put_hex32(probe.cid[1]); log.puts(" ");
+            log.put_hex32(probe.cid[0]); log.puts("\n");
+            let mid = ((probe.cid[3] >> 24) & 0xFF) as u8;
+            log.puts("MFR:    "); log.put_hex32(mid as u32); log.puts("\n");
+            let pn: [u8; 5] = [
+                (probe.cid[3] & 0xFF) as u8,
+                ((probe.cid[2] >> 24) & 0xFF) as u8,
+                ((probe.cid[2] >> 16) & 0xFF) as u8,
+                ((probe.cid[2] >> 8) & 0xFF) as u8,
+                (probe.cid[2] & 0xFF) as u8,
+            ];
+            log.puts("NAME:   ");
+            for &b in pn.iter() {
+                if b >= 0x20 && b <= 0x7E {
+                    log.putc(b);
+                } else {
+                    log.puts("?");
+                }
+            }
+            log.puts("\n");
+        } else {
+            log.puts("FAIL err="); log.put_hex32(probe.cmd2_err as u32); log.puts("\n");
+        }
+        log.puts("CMD3:   ");
+        if probe.cmd3_ok {
+            log.puts("OK RCA="); log.put_hex32(probe.cmd3_resp >> 16); log.puts("\n");
+        } else {
+            log.puts("FAIL err="); log.put_hex32(probe.cmd3_err as u32); log.puts("\n");
+        }
+        // CSD register (speed, voltage, capacity)
+        if probe.cmd9_ok {
+            log.puts("CSD:    ");
+            log.put_hex32(probe.csd[3]); log.puts(" ");
+            log.put_hex32(probe.csd[2]); log.puts(" ");
+            log.put_hex32(probe.csd[1]); log.puts(" ");
+            log.put_hex32(probe.csd[0]); log.puts("\n");
+            // SDHCI shifts R2 left 8 bits; CSD[3] bits [31:30] = CSD_STRUCTURE
+            let csd_ver = (probe.csd[3] >> 30) & 0x3;
+            // TRAN_SPEED is CSD byte 3 (bits [103:96])
+            // After SDHCI 8-bit shift: in csd[3] bits [7:0] or csd[2] bits [31:24]
+            let tran_speed = ((probe.csd[2] >> 24) & 0xFF) as u8;
+            log.puts("  ver="); log.put_hex32(csd_ver);
+            log.puts(" TRAN_SPEED="); log.put_hex32(tran_speed as u32);
+            // Decode TRAN_SPEED: [2:0]=time_unit, [6:3]=time_value
+            let unit = match tran_speed & 0x7 {
+                0 => "100Kbit/s",
+                1 => "1Mbit/s",
+                2 => "10Mbit/s",
+                3 => "100Mbit/s",
+                _ => "?",
+            };
+            let mult = match (tran_speed >> 3) & 0xF {
+                1 => "1.0",  6 => "2.5",
+                2 => "1.2",  7 => "3.0",
+                3 => "1.3",  8 => "3.5",
+                4 => "1.5",  9 => "4.0",
+                5 => "2.0", 10 => "4.5",
+                11 => "5.0", 12 => "5.5",
+                13 => "6.0", 14 => "7.0",
+                15 => "8.0", _ => "?",
+            };
+            log.puts(" ("); log.puts(mult); log.puts("x"); log.puts(unit); log.puts(")\n");
+            // CSD v2: C_SIZE is bits [69:48] = 22 bits
+            if csd_ver >= 1 {
+                // After 8-bit shift: C_SIZE spans csd[1] bits [29:8] and csd[0]
+                let c_size = ((probe.csd[1] & 0x3FFFFF00) >> 8)
+                           | ((probe.csd[0] >> 24) & 0xFF);
+                // Capacity = (C_SIZE + 1) * 512KB
+                let cap_mb = ((c_size as u64) + 1) / 2; // in MB
+                log.puts("  C_SIZE="); log.put_hex32(c_size);
+                log.puts(" cap="); log.put_hex32(cap_mb as u32); log.puts("MB\n");
+            }
+        }
+
+        log.puts("CMD7:   ");
+        if probe.cmd7_ok {
+            log.puts("OK (selected)\n");
+        } else {
+            log.puts("FAIL err="); log.put_hex32(probe.cmd7_err as u32); log.puts("\n");
+        }
+        if probe.cmd7_ok {
+            log.puts("CMD16:  "); log.puts(if probe.cmd16_ok { "OK\n" } else { "FAIL\n" });
+            log.puts("BUS4:   "); log.puts(if probe.bus4_ok { "OK (4-bit)\n" } else { "FAIL (1-bit)\n" });
+            log.puts("CLK25:  "); log.puts(if probe.clk25_ok { "OK (25MHz)\n" } else { "FAIL\n" });
+            log.puts("READ0:  ");
+            if probe.read_ok {
+                log.puts("OK sig=");
+                log.put_hex32(probe.block0_sig[0] as u32); log.puts(" ");
+                log.put_hex32(probe.block0_sig[1] as u32); log.puts("\n");
+                log.puts("BLK0:   ");
+                for i in 0..16 {
+                    log.put_hex32(probe.block0_head[i] as u32);
+                    if i < 15 { log.puts(" "); }
+                }
+                log.puts("\n");
+            } else {
+                log.puts("FAIL err="); log.put_hex32(probe.read_err as u32); log.puts("\n");
+            }
+            log.puts("WRITE1: ");
+            if probe.write_ok {
+                log.puts("OK\n");
+                log.puts("VERIFY: ");
+                if probe.verify_ok {
+                    log.puts("OK (FERROS pattern)\n");
+                } else {
+                    log.puts("MISMATCH err="); log.put_hex32(probe.verify_err as u32); log.puts("\n");
+                }
+            } else {
+                log.puts("FAIL err="); log.put_hex32(probe.write_err as u32); log.puts("\n");
+            }
+        }
+    }
+
+    // ---- SPMI full APID map dump (find ALL peripherals) ----
+    log.buf_only("\n-- SPMI ALL APIDs --\n");
+    {
+        let apid_map = 0x0C44_0000usize + 0x2000;
+        for n in 0..1024u32 {
+            let exc_pre = exception_count();
+            let entry = unsafe { ferros_hal::mmio::read32(apid_map + 4 * n as usize) };
+            let exc_post = exception_count();
+            if exc_post > exc_pre { break; }
+            if entry == 0 { continue; }
+            let ppid = ((entry >> 8) & 0xFFF) as u16;
+            let sid = (ppid >> 8) as u8;
+            let pid = (ppid & 0xFF) as u8;
+            log.buf_only("  A"); log.buf_put_hex32(n);
+            log.buf_only(" S"); log.buf_put_hex32(sid as u32);
+            log.buf_only(" P"); log.buf_put_hex32(pid as u32);
+            log.buf_only(" "); log.buf_put_hex32(entry);
+            log.buf_only("\n");
+        }
+    }
+
+    // ---- IMEM probe (reboot reason) ----
+    log.buf_only("\n-- IMEM 0x146AA000 --\n");
+    {
+        let imem_base = 0x146A_A000usize;
+        for &off in [0x0usize, 0x4, 0x65C, 0x660, 0x664].iter() {
+            let exc_pre = exception_count();
+            let val = unsafe { ferros_hal::mmio::read32(imem_base + off) };
+            let exc_post = exception_count();
+            log.buf_only("  ["); log.buf_put_hex32(off as u32); log.buf_only("]: ");
+            if exc_post > exc_pre {
+                log.buf_only("FAULT\n");
+            } else {
+                log.buf_put_hex32(val); log.buf_only("\n");
+            }
+        }
+    }
+
     // ---- USB DWC3 probe ----
     log.puts("\n-- USB DWC3 --\n");
     let exc_pre = exception_count();
@@ -786,6 +1229,30 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
                 let mut evt_count = 0u32;
                 let mut poll_count = 0u32;
+                // PT inbound state — allocated on SPEC arrival, freed on COMPLETE
+                let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                let mut pt_bitmap_buf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                let mut pt_inbound: Option<InboundTransfer<'_>> = None;
+                // Current seq_width for DATA parsing (0 = no active transfer)
+                let mut pt_seq_width: usize = 0;
+                // Pending COMPLETE packet to send after last ACK flushes
+                let mut pt_complete_pending = [0u8; 128];
+                let mut pt_complete_len: usize = 0;
+                // PT outbound state — device→host response transfer
+                let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                let mut pt_out_bitmap: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+                let mut pt_outbound: Option<OutboundTransfer<'_>> = None;
+                // Outbound SPEC queued after inbound COMPLETE (sent on second ep3)
+                let mut pt_out_spec_pending = [0u8; 512];
+                let mut pt_out_spec_len: usize = 0;
+                // Precomputed dev cap hashes
+                let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
+                let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
+                let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
+                let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
+                // Staging area for hot-reload kernel image
+                const RELOAD_STAGE: usize = 0xA000_0000;
+                let mut reload_size: usize = 0;
 
                 loop {
                     match usb.poll_event() {
@@ -793,6 +1260,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         ferros_hal::usb::UsbEvent::Reset => {
                             log.puts("  USB reset\n");
                             usb.handle_reset();
+                            // Clear all PT state on USB reset
+                            pt_inbound = None;
+                            pt_outbound = None;
+                            pt_seq_width = 0;
+                            pt_complete_len = 0;
+                            pt_out_spec_len = 0;
+                            pt_out_data.clear();
+                            pt_out_bitmap.clear();
                             ledger.post(&Event::UsbReset);
                             evt_count += 1;
                         }
@@ -852,7 +1327,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         }
                         ferros_hal::usb::UsbEvent::TransferComplete { ep } => {
                             if ep == 2 {
-                                // Bulk OUT complete — copy, echo back
+                                // Bulk OUT complete — PT packet handler
                                 let mut tmp = [0u8; 512];
                                 let mut n = 0usize;
                                 if let Some(data) = usb.bulk_out_read() {
@@ -860,15 +1335,299 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     tmp[..n].copy_from_slice(&data[..n]);
                                 }
                                 if n > 0 {
-                                    usb.bulk_in_send(&tmp[..n]);
-                                    log.puts("  BULK RX ");
-                                    log.put_hex32(n as u32);
-                                    log.puts("B\n");
                                     ledger.post(&Event::UsbBulkRx { len: n as u32 });
+                                    let mut resp = [0u8; 512];
+
+                                    // Debug: force to screen
+                                    log.screen = true;
+                                    log.puts("RX[");
+                                    log.put_hex32(tmp[0] as u32);
+                                    log.puts("] n=");
+                                    log.put_hex32(n as u32);
+                                    log.puts(" ctrl=");
+                                    log.put_hex32(ferros_pt::is_control_packet(tmp[0]) as u32);
+                                    log.puts("\n");
+                                    log.screen = false;
+
+                                    if ferros_pt::is_data_packet(tmp[0]) {
+                                        // DATA packet — silent receive, no ACK
+                                        if let Some(ref mut xfer) = pt_inbound {
+                                            if let Some((_sid, seq, chunk_hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
+                                                xfer.handle_data(seq, &chunk_hash, payload);
+                                                ledger.post(&Event::PtDataRx {
+                                                    sid: xfer.sid.0,
+                                                    seq,
+                                                    len: payload.len() as u16,
+                                                });
+                                                // All chunks received? Send COMPLETE/NAK immediately
+                                                log.screen = true;
+                                                log.puts("rcv="); log.put_hex32(xfer.chunks_received as u32);
+                                                log.puts("/"); log.put_hex32(xfer.expected_count as u32);
+                                                log.puts(" ar="); log.put_hex32(xfer.all_received() as u32);
+                                                log.puts(" bad="); log.put_hex32(xfer.bad_chunks as u32);
+                                                log.puts("\n");
+                                                log.screen = false;
+                                                if xfer.all_received() {
+                                                    let mut complete_buf = [0u8; 512];
+                                                    let clen = xfer.finish(&mut complete_buf);
+                                                    if clen > 0 {
+                                                        let ok = usb.bulk_in_send(&complete_buf[..clen]);
+                                                        log.puts("  PT COMPLETE sid=");
+                                                        log.put_hex32(xfer.sid.0 as u32);
+                                                        log.puts(" total=");
+                                                        log.put_hex32(xfer.data_len as u32);
+                                                        log.puts("\n");
+                                                        ledger.post(&Event::PtComplete {
+                                                            sid: xfer.sid.0,
+                                                            success: true,
+                                                            total: xfer.data_len as u64,
+                                                        });
+                                                        // Command dispatch on completed payload
+                                                        let payload = xfer.payload();
+                                                        if let Some(cmd) = ferros_pt::command::parse(payload) {
+                                                            if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                                                                // DIAG Read: send boot log back via PT
+                                                                pt_out_data = log.buf.clone();
+                                                            } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read {
+                                                                // MEM Read: params = [addr:8][len:4]
+                                                                if cmd.params.len() >= 12 {
+                                                                    let addr = u64::from_be_bytes([
+                                                                        cmd.params[0], cmd.params[1],
+                                                                        cmd.params[2], cmd.params[3],
+                                                                        cmd.params[4], cmd.params[5],
+                                                                        cmd.params[6], cmd.params[7],
+                                                                    ]);
+                                                                    let len = u32::from_be_bytes([
+                                                                        cmd.params[8], cmd.params[9],
+                                                                        cmd.params[10], cmd.params[11],
+                                                                    ]) as usize;
+                                                                    let len = len.min(4096);
+                                                                    // Round to 4-byte aligned reads (MMIO requires word access)
+                                                                    let aligned_addr = (addr as usize) & !3;
+                                                                    let skip = (addr as usize) - aligned_addr;
+                                                                    let word_count = (skip + len + 3) / 4;
+                                                                    pt_out_data = alloc::vec![0u8; len];
+                                                                    for w in 0..word_count {
+                                                                        let val = unsafe {
+                                                                            core::ptr::read_volatile((aligned_addr + w * 4) as *const u32)
+                                                                        };
+                                                                        let bytes = val.to_le_bytes();
+                                                                        for b in 0..4 {
+                                                                            let src_off = w * 4 + b;
+                                                                            if src_off >= skip && src_off < skip + len {
+                                                                                pt_out_data[src_off - skip] = bytes[b];
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
+                                                                // RELOAD Write: payload is the new kernel binary
+                                                                // Copy into staging DRAM
+                                                                let data = cmd.params;
+                                                                let dst = unsafe {
+                                                                    core::slice::from_raw_parts_mut(
+                                                                        (RELOAD_STAGE + reload_size) as *mut u8,
+                                                                        data.len(),
+                                                                    )
+                                                                };
+                                                                dst.copy_from_slice(data);
+                                                                reload_size += data.len();
+                                                                log.buf_only("RELOAD chunk ");
+                                                                log.buf_put_hex32(data.len() as u32);
+                                                                log.buf_only(" total=");
+                                                                log.buf_put_hex32(reload_size as u32);
+                                                                log.buf_only("\n");
+                                                                // Response: current total size
+                                                                pt_out_data.clear();
+                                                                pt_out_data.extend_from_slice(&(reload_size as u32).to_le_bytes());
+                                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                                                                // RELOAD Exec: jump to staged kernel
+                                                                log.buf_only("RELOAD exec size=");
+                                                                log.buf_put_hex32(reload_size as u32);
+                                                                log.buf_only("\n");
+                                                                if reload_size > 0x1000 {
+                                                                    // Validate: check for ARM64 magic or MZ header
+                                                                    let magic = unsafe { *(RELOAD_STAGE as *const u32) };
+                                                                    if magic == 0x91005A4D { // MZ header
+                                                                        hot_reload(RELOAD_STAGE, dtb_addr);
+                                                                    }
+                                                                }
+                                                            } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
+                                                                // REBOOT Exec: param[0] selects mode
+                                                                // 0x00 = normal reboot, 0x01 = fastboot
+                                                                let mode = cmd.params.first().copied().unwrap_or(0);
+                                                                log.buf_only("REBOOT mode=");
+                                                                log.buf_put_hex32(mode as u32);
+                                                                log.buf_only("\n");
+                                                                if mode == 0x01 {
+                                                                    psci_reboot_fastboot();
+                                                                } else {
+                                                                    psci_reboot();
+                                                                }
+                                                            }
+                                                            // Start outbound PT if we have response data
+                                                            if !pt_out_data.is_empty() {
+                                                                let sid = ferros_pt::StreamId(xfer.sid.0);
+                                                                let bw = bitmap_words(
+                                                                    ((pt_out_data.len() + 508) / 509) as u64 + 1
+                                                                );
+                                                                pt_out_bitmap = alloc::vec![0u32; bw];
+                                                                let out_bmap = unsafe {
+                                                                    core::slice::from_raw_parts_mut(
+                                                                        pt_out_bitmap.as_mut_ptr(),
+                                                                        pt_out_bitmap.len(),
+                                                                    )
+                                                                };
+                                                                let mut spec_buf = [0u8; 128];
+                                                                if let Some((out_xfer, spec_len)) =
+                                                                    OutboundTransfer::start(
+                                                                        sid,
+                                                                        &pt_out_data,
+                                                                        out_bmap,
+                                                                        &mut spec_buf,
+                                                                    )
+                                                                {
+                                                                    log.puts("  PT OUT SPEC count=");
+                                                                    log.put_hex32(out_xfer.count as u32);
+                                                                    log.puts(" total=");
+                                                                    log.put_hex32(out_xfer.total as u32);
+                                                                    log.puts("\n");
+                                                                    pt_outbound = Some(out_xfer);
+                                                                    // Queue outbound SPEC — sent after COMPLETE
+                                                                    pt_out_spec_pending[..spec_len]
+                                                                        .copy_from_slice(&spec_buf[..spec_len]);
+                                                                    pt_out_spec_len = spec_len;
+                                                                }
+                                                            }
+                                                        }
+                                                        pt_seq_width = 0;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if ferros_pt::is_control_packet(tmp[0]) {
+                                        // Control packet — single-byte tag dispatch
+                                        if let Some(spec) = Spec::decode(&tmp[..n]) {
+                                            // SPEC — new inbound transfer (clears stale state)
+                                            pt_outbound = None;
+                                            pt_out_data.clear();
+                                            pt_out_bitmap.clear();
+                                            pt_out_spec_len = 0;
+                                            log.puts("  PT SPEC sid=");
+                                            log.put_hex32(spec.sid.0 as u32);
+                                            log.puts(" count=");
+                                            log.put_hex32(spec.count as u32);
+                                            log.puts(" total=");
+                                            log.put_hex32(spec.total as u32);
+                                            log.puts("\n");
+
+                                            pt_data_buf = alloc::vec![0u8; spec.total as usize];
+                                            pt_bitmap_buf = alloc::vec![0u32; bitmap_words(spec.count)];
+
+                                            let data_slice = unsafe {
+                                                core::slice::from_raw_parts_mut(
+                                                    pt_data_buf.as_mut_ptr(),
+                                                    pt_data_buf.len(),
+                                                )
+                                            };
+                                            let bitmap_slice = unsafe {
+                                                core::slice::from_raw_parts_mut(
+                                                    pt_bitmap_buf.as_mut_ptr(),
+                                                    pt_bitmap_buf.len(),
+                                                )
+                                            };
+
+                                            match InboundTransfer::new(&spec, data_slice, bitmap_slice) {
+                                                Some(xfer) => {
+                                                    pt_seq_width = xfer.seq_width;
+                                                    ledger.post(&Event::PtSpecRx {
+                                                        sid: spec.sid.0,
+                                                        count: spec.count,
+                                                        total: spec.total,
+                                                    });
+                                                    pt_inbound = Some(xfer);
+                                                    let ack = Ack {
+                                                        sid: spec.sid,
+                                                        seq: u64::MAX,
+                                                    };
+                                                    let ack_len = ack.encode(&mut resp);
+                                                    usb.bulk_in_send(&resp[..ack_len]);
+                                                }
+                                                None => {
+                                                    log.puts("  PT NAK: alloc failed\n");
+                                                }
+                                            }
+                                        } else if let Some(ack) = Ack::decode(&tmp[..n]) {
+                                            // ACK from bridge — SPEC ACK triggers blast
+                                            if let Some(ref mut out) = pt_outbound {
+                                                if ack.seq == u64::MAX {
+                                                    // SPEC ACK — start outbound blast.
+                                                    // DWC3 can only queue one bulk IN at a time.
+                                                    // Send first packet here, ep3 handler sends the rest.
+                                                    let mut pkt = [0u8; 512];
+                                                    let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);
+                                                    if pkt_len > 0 {
+                                                        usb.bulk_in_send(&pkt[..pkt_len]);
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(fin_sid) = packet::decode_fin(&tmp[..n]) {
+                                            // FIN from bridge — blast is done, check what we have
+                                            if let Some(ref mut xfer) = pt_inbound {
+                                                if xfer.sid == fin_sid {
+                                                    let mut complete_buf = [0u8; 128];
+                                                    let clen = xfer.finish(&mut complete_buf);
+                                                    if clen > 0 {
+                                                        usb.bulk_in_send(&complete_buf[..clen]);
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(complete) = Complete::decode(&tmp[..n]) {
+                                            // COMPLETE from bridge — outbound transfer done
+                                            if let Some(ref mut out) = pt_outbound {
+                                                let ok = out.handle_complete(&complete);
+                                                log.puts("  PT OUT DONE ok=");
+                                                log.put_hex32(ok as u32);
+                                                log.puts("\n");
+                                                pt_outbound = None;
+                                                pt_out_data.clear();
+                                                pt_out_bitmap.clear();
+                                            }
+                                        }
+                                    }
                                 }
                                 usb.bulk_out_arm();
                             }
                             if ep == 3 {
+                                // Bulk IN complete — chain next pending send
+                                if pt_complete_len > 0 {
+                                    // Inbound COMPLETE
+                                    usb.bulk_in_send(&pt_complete_pending[..pt_complete_len]);
+                                    pt_complete_len = 0;
+                                    pt_inbound = None;
+                                } else if pt_out_spec_len > 0 {
+                                    // Outbound SPEC
+                                    usb.bulk_in_send(&pt_out_spec_pending[..pt_out_spec_len]);
+                                    pt_out_spec_len = 0;
+                                } else if let Some(ref mut out) = pt_outbound {
+                                    // Outbound DATA blast — one packet per ep3 event
+                                    if !out.all_sent() {
+                                        let mut pkt = [0u8; 512];
+                                        let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);
+                                        if pkt_len > 0 {
+                                            usb.bulk_in_send(&pkt[..pkt_len]);
+                                        }
+                                    } else {
+                                        // All sent — send FIN
+                                        let mut pkt = [0u8; 512];
+                                        let fin_len = out.encode_fin(&mut pkt);
+                                        if fin_len > 0 {
+                                            usb.bulk_in_send(&pkt[..512]);
+                                        }
+                                        // Clear outbound — FIN sent, wait for COMPLETE from bridge
+                                        pt_outbound = None;
+                                    }
+                                }
                                 ledger.post(&Event::UsbBulkTxComplete);
                             }
                             evt_count += 1;
@@ -926,6 +1685,44 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     loop { unsafe { core::arch::asm!("wfe") }; }
 }
 
+/// Hot-reload: jump to a new kernel image at the given DRAM address.
+///
+/// The new image is position-independent (uses adrp). We disable caches,
+/// flush the staging area, then branch to _start with x0 = DTB.
+fn hot_reload(stage_addr: usize, dtb: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            // Disable interrupts
+            "msr daifset, #0xF",
+            // Clean + invalidate D-cache for staging area (1MB should cover it)
+            "mov x2, {stage}",
+            "mov x3, #0x100000",
+            "add x3, x3, x2",
+            "2:",
+            "dc civac, x2",
+            "add x2, x2, #64",
+            "cmp x2, x3",
+            "b.lo 2b",
+            "dsb sy",
+            "isb",
+            // Invalidate I-cache
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            // Set up args: x0 = DTB pointer (what ABL passes)
+            "mov x0, {dtb}",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            // Jump to new image entry point
+            "br {stage}",
+            stage = in(reg) stage_addr as u64,
+            dtb = in(reg) dtb,
+            options(noreturn),
+        );
+    }
+}
+
 /// PSCI SYSTEM_RESET via SMC — warm reboot that preserves DRAM.
 fn psci_reboot() -> ! {
     unsafe {
@@ -937,6 +1734,68 @@ fn psci_reboot() -> ! {
             "mov x3, xzr",
             "smc #0",
             options(noreturn)
+        );
+    }
+}
+
+/// Reboot into fastboot via PMK8350 SDAM_2 restart reason register.
+///
+/// SDAM_2 is at SPMI SID 8 (not 0!), PID 0x71 → PPID 0x0871, APID 0x122.
+/// Direct SPMI write returns success but value doesn't stick — try SCM IO
+/// write to the SPMI arbiter channel registers instead (TZ privilege).
+fn psci_reboot_fastboot() -> ! {
+    // APID 0x122 write channel: CHNLS_BASE + 0x122 * 0x1000 = 0x0C722000
+    const SDAM2_CH: usize = 0x0C60_0000 + 0x122 * 0x1000;
+
+    // Method 1: SCM IO write through SPMI arbiter channel (TZ privilege)
+    // Write WDATA0 = 0x04 (FASTBOOT_MODE=0x02 << 1)
+    scm_io_write(SDAM2_CH + 0x10, 0x04);
+    // Write CMD: EXT_WRITEL opcode=0, reg_offset=0x48, 1 byte
+    scm_io_write(SDAM2_CH + 0x00, (0x48u32 << 4) | 0);
+    // Small delay for SPMI transaction
+    for _ in 0..100_000u32 { unsafe { core::arch::asm!("nop") }; }
+
+    // Method 2: Direct SPMI write with SEC_ACCESS unlock
+    use ferros_hal::spmi;
+    let sdam2_ppid = spmi::ppid(8, 0x71);
+    if let Some(apid) = spmi::find_apid(sdam2_ppid) {
+        // Unlock protected registers: write 0xA5 to SEC_ACCESS (0xD0)
+        spmi::write_byte(apid, 0xD0, 0xA5);
+        // Write fastboot reason
+        spmi::write_byte(apid, 0x48, 0x04);
+        // Also try unshifted value
+        spmi::write_byte(apid, 0xD0, 0xA5);
+        spmi::write_byte(apid, 0x48, 0x02);
+    }
+
+    // Method 3: IMEM (probably won't help but costs nothing)
+    unsafe {
+        let imem = 0x146A_A65C as *mut u32;
+        core::ptr::write_volatile(imem, 0x7766_5500u32);
+        core::arch::asm!("dsb sy");
+    }
+
+    psci_reboot();
+}
+
+/// SCM IO write: TrustZone-privileged write to a physical address.
+/// SMC64 fast call: SVC_IO(5), CMD_WRITE(2).
+fn scm_io_write(addr: usize, val: u32) {
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {func}",
+            "mov x1, #2",
+            "mov x2, {addr}",
+            "mov x3, {val}",
+            "smc #0",
+            func = in(reg) 0xC200_0502u64,
+            addr = in(reg) addr as u64,
+            val = in(reg) val as u64,
+            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _,
         );
     }
 }

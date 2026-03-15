@@ -9,11 +9,11 @@
 
 #![no_std]
 
-pub mod ewe;
 pub mod category;
-pub mod entry;
 pub mod chain;
+pub mod entry;
 pub mod event;
+pub mod ewe;
 pub mod preboot;
 
 pub use category::Category;

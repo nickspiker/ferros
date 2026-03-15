@@ -60,6 +60,38 @@ pub enum Event {
         config: u8,
     },
     UsbSetupStall,
+
+    // ---- USB::PT ----
+    /// SPEC received — new inbound transfer.
+    PtSpecRx {
+        sid: u8,
+        count: u64,
+        total: u64,
+    },
+    /// SPEC sent — new outbound transfer.
+    PtSpecTx {
+        sid: u8,
+        count: u64,
+        total: u64,
+    },
+    /// DATA chunk received.
+    PtDataRx {
+        sid: u8,
+        seq: u64,
+        len: u16,
+    },
+    /// DATA chunk sent.
+    PtDataTx {
+        sid: u8,
+        seq: u64,
+        len: u16,
+    },
+    /// Transfer completed (inbound or outbound).
+    PtComplete {
+        sid: u8,
+        success: bool,
+        total: u64,
+    },
 }
 
 impl Event {
@@ -84,6 +116,12 @@ impl Event {
             Self::UsbSetupPacket { .. }
             | Self::UsbSetConfiguration { .. }
             | Self::UsbSetupStall => Category::UsbEnumeration,
+
+            Self::PtSpecRx { .. }
+            | Self::PtSpecTx { .. }
+            | Self::PtDataRx { .. }
+            | Self::PtDataTx { .. }
+            | Self::PtComplete { .. } => Category::UsbPt,
         }
     }
 
@@ -95,73 +133,151 @@ impl Event {
         let mut pos = 0;
 
         match self {
-            Self::BootStarted { el, sctlr, dtb_addr } => {
-                buf[pos] = 0x01; pos += 1;
+            Self::BootStarted {
+                el,
+                sctlr,
+                dtb_addr,
+            } => {
+                buf[pos] = 0x01;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *el as u64);
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *sctlr as u64);
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *dtb_addr);
             }
             Self::BootDtbParsed { total_size } => {
-                buf[pos] = 0x02; pos += 1;
+                buf[pos] = 0x02;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *total_size as u64);
             }
             Self::BootUartProbed { ok } => {
-                buf[pos] = 0x03; pos += 1;
-                buf[pos] = if *ok { 1 } else { 0 }; pos += 1;
+                buf[pos] = 0x03;
+                pos += 1;
+                buf[pos] = if *ok { 1 } else { 0 };
+                pos += 1;
             }
             Self::BootPstoreFound { base, size } => {
-                buf[pos] = 0x04; pos += 1;
+                buf[pos] = 0x04;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *base);
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *size as u64);
             }
             Self::BootDpuProbed { hw_ver, ok } => {
-                buf[pos] = 0x05; pos += 1;
+                buf[pos] = 0x05;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *hw_ver as u64);
-                buf[pos] = if *ok { 1 } else { 0 }; pos += 1;
+                buf[pos] = if *ok { 1 } else { 0 };
+                pos += 1;
             }
             Self::BootUsbInitStarted => {
-                buf[pos] = 0x06; pos += 1;
+                buf[pos] = 0x06;
+                pos += 1;
             }
             Self::BootUsbInitDone { ok } => {
-                buf[pos] = 0x07; pos += 1;
-                buf[pos] = if *ok { 1 } else { 0 }; pos += 1;
+                buf[pos] = 0x07;
+                pos += 1;
+                buf[pos] = if *ok { 1 } else { 0 };
+                pos += 1;
             }
             Self::BootHalted => {
-                buf[pos] = 0x08; pos += 1;
+                buf[pos] = 0x08;
+                pos += 1;
             }
 
             Self::UsbReset => {
-                buf[pos] = 0x20; pos += 1;
+                buf[pos] = 0x20;
+                pos += 1;
             }
             Self::UsbConnectDone { speed } => {
-                buf[pos] = 0x21; pos += 1;
+                buf[pos] = 0x21;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *speed as u64);
             }
             Self::UsbDisconnect => {
-                buf[pos] = 0x22; pos += 1;
+                buf[pos] = 0x22;
+                pos += 1;
             }
             Self::UsbBulkRx { len } => {
-                buf[pos] = 0x23; pos += 1;
+                buf[pos] = 0x23;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *len as u64);
             }
             Self::UsbBulkTxComplete => {
-                buf[pos] = 0x24; pos += 1;
+                buf[pos] = 0x24;
+                pos += 1;
             }
 
-            Self::UsbSetupPacket { bm_request_type, b_request, w_value, w_index, w_length } => {
-                buf[pos] = 0x30; pos += 1;
-                buf[pos] = *bm_request_type; pos += 1;
-                buf[pos] = *b_request; pos += 1;
+            Self::UsbSetupPacket {
+                bm_request_type,
+                b_request,
+                w_value,
+                w_index,
+                w_length,
+            } => {
+                buf[pos] = 0x30;
+                pos += 1;
+                buf[pos] = *bm_request_type;
+                pos += 1;
+                buf[pos] = *b_request;
+                pos += 1;
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *w_value as u64);
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *w_index as u64);
                 pos += crate::ewe::encode_u64(&mut buf[pos..], *w_length as u64);
             }
             Self::UsbSetConfiguration { config } => {
-                buf[pos] = 0x31; pos += 1;
-                buf[pos] = *config; pos += 1;
+                buf[pos] = 0x31;
+                pos += 1;
+                buf[pos] = *config;
+                pos += 1;
             }
             Self::UsbSetupStall => {
-                buf[pos] = 0x32; pos += 1;
+                buf[pos] = 0x32;
+                pos += 1;
+            }
+
+            Self::PtSpecRx { sid, count, total } => {
+                buf[pos] = 0x40;
+                pos += 1;
+                buf[pos] = *sid;
+                pos += 1;
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *count);
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *total);
+            }
+            Self::PtSpecTx { sid, count, total } => {
+                buf[pos] = 0x41;
+                pos += 1;
+                buf[pos] = *sid;
+                pos += 1;
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *count);
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *total);
+            }
+            Self::PtDataRx { sid, seq, len } => {
+                buf[pos] = 0x42;
+                pos += 1;
+                buf[pos] = *sid;
+                pos += 1;
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *seq);
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *len as u64);
+            }
+            Self::PtDataTx { sid, seq, len } => {
+                buf[pos] = 0x43;
+                pos += 1;
+                buf[pos] = *sid;
+                pos += 1;
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *seq);
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *len as u64);
+            }
+            Self::PtComplete {
+                sid,
+                success,
+                total,
+            } => {
+                buf[pos] = 0x44;
+                pos += 1;
+                buf[pos] = *sid;
+                pos += 1;
+                buf[pos] = if *success { 1 } else { 0 };
+                pos += 1;
+                pos += crate::ewe::encode_u64(&mut buf[pos..], *total);
             }
         }
 

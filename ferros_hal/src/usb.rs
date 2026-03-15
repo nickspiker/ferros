@@ -1060,6 +1060,7 @@ impl Dwc3Dev {
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = len as u32;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+                | TRB_CTRL_ISP_IMI  // complete on short packet (< 512 bytes)
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
             cache_clean(buf_addr, len);
             cache_clean(trb_addr, 16);
@@ -1727,9 +1728,9 @@ impl Dwc3Dev {
                 let base = &raw const ALL_STRING_DESCS as *const u8;
                 let (off, slen) = match desc_idx {
                     0 => (0usize, 4usize),
-                    1 => (4, 16),
-                    2 => (20, 22),
-                    3 => (42, 4),
+                    1 => (4, 20),
+                    2 => (24, 4),
+                    3 => (28, 4),
                     _ => return false,
                 };
                 let desc = unsafe {
@@ -1793,7 +1794,7 @@ static CONFIG_DESC: [u8; 32] = [
     1,                  // bConfigurationValue
     0,                  // iConfiguration
     0xC0,               // bmAttributes = Self-powered
-    0x32,               // bMaxPower = 100mA
+    0x00,               // bMaxPower = 0 (self-powered, no bus draw)
 
     // Interface descriptor
     9,                  // bLength
@@ -1804,7 +1805,7 @@ static CONFIG_DESC: [u8; 32] = [
     0xFF,               // bInterfaceClass = Vendor Specific
     0x01,               // bInterfaceSubClass
     0x02,               // bInterfaceProtocol
-    2,                  // iInterface (string index 2)
+    0,                  // iInterface (no string)
 
     // EP1 OUT (host→device) — Bulk, 512B MPS
     7,                  // bLength
@@ -1864,19 +1865,18 @@ static BOS_DESC: [u8; 22] = [
 /// of absolute pointers (which break when ABL loads the kernel at a
 /// different address than the linker assumed).
 ///
-/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (16B)] [STRING_DESC_2 (22B)] [STRING_DESC_3 (4B)]
-/// Offsets: 0, 4, 20, 42  Total: 46 bytes
-static ALL_STRING_DESCS: [u8; 46] = [
+/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (20B)] [STRING_DESC_2 (4B)] [STRING_DESC_3 (4B)]
+/// Offsets: 0, 4, 24, 28  Total: 32 bytes
+static ALL_STRING_DESCS: [u8; 32] = [
     // String 0: Language ID (English US) — offset 0, length 4
     4, USB_DT_STRING, 0x09, 0x04,
-    // String 1: "ferros" — offset 4, length 16
-    16, USB_DT_STRING,
-    b'f', 0, b'e', 0, b'r', 0, b'r', 0, b'o', 0, b's', 0, 0, 0,
-    // String 2: "Ferros USB" — offset 20, length 22
-    22, USB_DT_STRING,
-    b'F', 0, b'e', 0, b'r', 0, b'r', 0, b'o', 0, b's', 0, b' ', 0,
-    b'U', 0, b'S', 0, b'B', 0,
-    // String 3: "0" — offset 42, length 4
+    // String 1: "Fairphone" — offset 4, length 20
+    20, USB_DT_STRING,
+    b'F', 0, b'a', 0, b'i', 0, b'r', 0, b'p', 0, b'h', 0, b'o', 0, b'n', 0, b'e', 0,
+    // String 2: "5" — offset 24, length 4
+    4, USB_DT_STRING,
+    b'5', 0,
+    // String 3: "0" — offset 28, length 4
     4, USB_DT_STRING,
     b'0', 0,
 ];

@@ -97,6 +97,11 @@ pub fn find_apid(target_ppid: u16) -> Option<u16> {
 ///
 /// Returns `true` on success, `false` on timeout or error.
 pub fn write_byte(apid: u16, reg_offset: u8, value: u8) -> bool {
+    write_byte_status(apid, reg_offset, value).0
+}
+
+/// Write a byte and return (success, raw_status) for diagnostics.
+pub fn write_byte_status(apid: u16, reg_offset: u8, value: u8) -> (bool, u32) {
     let ch = CHNLS_BASE + (apid as usize) * 0x1000;
 
     unsafe {
@@ -114,12 +119,12 @@ pub fn write_byte(apid: u16, reg_offset: u8, value: u8) -> bool {
         for _ in 0..POLL_MAX {
             let status = mmio::read32(ch + PMIC_ARB_STATUS);
             if status & STATUS_DONE != 0 {
-                // Check for errors
-                return (status & (STATUS_FAILURE | STATUS_DENIED | STATUS_DROPPED)) == 0;
+                let ok = (status & (STATUS_FAILURE | STATUS_DENIED | STATUS_DROPPED)) == 0;
+                return (ok, status);
             }
         }
     }
-    false // Timeout
+    (false, 0xDEAD) // Timeout
 }
 
 /// Read a single byte from a PMIC register via SPMI (observer channel).
@@ -129,7 +134,8 @@ pub fn write_byte(apid: u16, reg_offset: u8, value: u8) -> bool {
 ///
 /// Returns `Some(value)` on success, `None` on error.
 pub fn read_byte(apid: u16, reg_offset: u8) -> Option<u8> {
-    let ch = OBSRVR_BASE + (apid as usize) * 0x1000;
+    // v5 observer offset: 0x10000 * ee + 0x80 * apid (EE=0 for HLOS)
+    let ch = OBSRVR_BASE + 0x80 * (apid as usize);
 
     // Observer channel register offsets (same layout as write channel)
     const OBS_CMD: usize = 0x00;
@@ -197,6 +203,57 @@ pub fn power_pressed() -> bool {
         Some(sts) => (sts & KPDPWR_N) == 0, // active low
         None => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PMIC LDO regulator control
+// ---------------------------------------------------------------------------
+
+/// LDO control register offsets (within each LDO peripheral)
+const LDO_EN_CTL: u8 = 0x46;     // bit 7 = VREG_EN
+const LDO_VSET_LB: u8 = 0x40;    // voltage set low byte (some PMICs use 0x44)
+const LDO_STATUS1: u8 = 0x08;    // regulator status
+
+/// Enable an LDO regulator via SPMI.
+/// `sid`: PMIC slave ID, `ldo_pid`: peripheral ID of the LDO.
+/// Returns true on success.
+pub fn ldo_enable(sid: u8, ldo_pid: u8) -> bool {
+    let ldo_ppid = ppid(sid, ldo_pid);
+    let apid = match find_apid(ldo_ppid) {
+        Some(a) => a,
+        None => return false,
+    };
+    // Read current EN_CTL, set bit 7 (VREG_EN)
+    let cur = read_byte(apid, LDO_EN_CTL).unwrap_or(0);
+    write_byte(apid, LDO_EN_CTL, cur | 0x80)
+}
+
+/// Read LDO STATUS1 register for diagnostics.
+pub fn ldo_status(sid: u8, ldo_pid: u8) -> Option<u8> {
+    let ldo_ppid = ppid(sid, ldo_pid);
+    let apid = find_apid(ldo_ppid)?;
+    read_byte(apid, LDO_STATUS1)
+}
+
+/// Read LDO EN_CTL register (bit 7 = enabled).
+pub fn ldo_en_ctl(sid: u8, ldo_pid: u8) -> Option<u8> {
+    let ldo_ppid = ppid(sid, ldo_pid);
+    let apid = find_apid(ldo_ppid)?;
+    read_byte(apid, LDO_EN_CTL)
+}
+
+// PM8350C LDO peripheral IDs (LDO1=0x9B, step 3 per LDO)
+/// PM8350C LDO6 PID (vqmmc — SD I/O voltage)
+pub const PID_LDO6_PM8350C: u8 = 0xAA;
+/// PM8350C LDO9 PID (vmmc — SD card power 2.95V)
+pub const PID_LDO9_PM8350C: u8 = 0xB3;
+
+/// Enable SD card power rails (vmmc + vqmmc) on Fairphone 5.
+/// Returns (vqmmc_ok, vmmc_ok).
+pub fn sd_power_enable() -> (bool, bool) {
+    let vqmmc = ldo_enable(SID_PM8350C, PID_LDO6_PM8350C);
+    let vmmc = ldo_enable(SID_PM8350C, PID_LDO9_PM8350C);
+    (vqmmc, vmmc)
 }
 
 // ---------------------------------------------------------------------------

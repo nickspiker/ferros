@@ -122,6 +122,8 @@ dependencies = [
 name = "ferros-bridge"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "ferros_pt",
  "nusb",
  "tokio",
 ]
@@ -146,6 +148,7 @@ version = "0.1.0"
 dependencies = [
  "ferros_hal",
  "ferros_ledger",
+ "ferros_pt",
  "ferros_vault",
 ]
 
@@ -154,6 +157,14 @@ name = "ferros_ledger"
 version = "0.1.0"
 dependencies = [
  "blake3",
+]
+
+[[package]]
+name = "ferros_pt"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_ledger",
 ]
 
 [[package]]

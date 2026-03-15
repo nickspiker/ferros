@@ -9,3 +9,4 @@ description = "Ferros bare-metal kernel — boots on aarch64, mounts the ledger"
 ferros_hal = { path = "../ferros_hal", default-features = false }
 ferros_vault = { path = "../ferros_vault", default-features = false }
 ferros_ledger = { path = "../ferros_ledger" }
+ferros_pt = { path = "../ferros_pt" }

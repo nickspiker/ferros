@@ -9,8 +9,8 @@
 //! which the next entry references as prev_hash.
 
 use crate::category::Category;
-use crate::ewe;
 use crate::event::Event;
+use crate::ewe;
 
 /// Maximum serialized entry size. Entries that exceed this are rejected.
 /// 512 bytes is generous for current event types.
@@ -60,56 +60,82 @@ pub fn build_entry(
     // ---- Schema identifier ----
     // 'l' tag + length + "ferros.ledger"
     let schema = b"ferros.ledger";
-    if pos + 2 + schema.len() > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'l'; pos += 1;
-    buf[pos] = schema.len() as u8; pos += 1;
+    if pos + 2 + schema.len() > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'l';
+    pos += 1;
+    buf[pos] = schema.len() as u8;
+    pos += 1;
     buf[pos..pos + schema.len()].copy_from_slice(schema);
     pos += schema.len();
 
     // ---- Identity section ----
     // Category path
     let cat_bytes = category.as_bytes();
-    if pos + 2 + cat_bytes.len() > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'c'; pos += 1; // 'c' = category tag
-    buf[pos] = cat_bytes.len() as u8; pos += 1;
+    if pos + 2 + cat_bytes.len() > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'c';
+    pos += 1; // 'c' = category tag
+    buf[pos] = cat_bytes.len() as u8;
+    pos += 1;
     buf[pos..pos + cat_bytes.len()].copy_from_slice(cat_bytes);
     pos += cat_bytes.len();
 
     // Writer cap hash (32 bytes)
-    if pos + 1 + 32 > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'k'; pos += 1; // 'k' = cap hash tag
+    if pos + 1 + 32 > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'k';
+    pos += 1; // 'k' = cap hash tag
     buf[pos..pos + 32].copy_from_slice(cap_hash);
     pos += 32;
 
     // Writer signature (32 bytes)
-    if pos + 1 + 32 > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'g'; pos += 1; // 'g' = signature tag
+    if pos + 1 + 32 > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'g';
+    pos += 1; // 'g' = signature tag
     buf[pos..pos + 32].copy_from_slice(sig);
     pos += 32;
 
     // ---- Order section ----
     // Global sequence (EWE)
-    if pos + 10 > MAX_ENTRY_SIZE { return None; }
+    if pos + 10 > MAX_ENTRY_SIZE {
+        return None;
+    }
     pos += ewe::encode_u64(&mut buf[pos..], global_seq);
 
     // Category sequence (EWE)
-    if pos + 10 > MAX_ENTRY_SIZE { return None; }
+    if pos + 10 > MAX_ENTRY_SIZE {
+        return None;
+    }
     pos += ewe::encode_u64(&mut buf[pos..], cat_seq);
 
     // Eagle time — TODO: placeholder 0 until physics-bounded clock
-    if pos + 10 > MAX_ENTRY_SIZE { return None; }
+    if pos + 10 > MAX_ENTRY_SIZE {
+        return None;
+    }
     pos += ewe::encode_u64(&mut buf[pos..], 0);
 
     // Prev hash (32 bytes)
-    if pos + 1 + 32 > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'p'; pos += 1; // 'p' = prev hash tag
+    if pos + 1 + 32 > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'p';
+    pos += 1; // 'p' = prev hash tag
     buf[pos..pos + 32].copy_from_slice(prev_hash);
     pos += 32;
 
     // ---- Payload section ----
     // Event payload
-    if pos + 1 > MAX_ENTRY_SIZE { return None; }
-    buf[pos] = b'e'; pos += 1; // 'e' = event tag
+    if pos + 1 > MAX_ENTRY_SIZE {
+        return None;
+    }
+    buf[pos] = b'e';
+    pos += 1; // 'e' = event tag
     let event_len = event.encode(&mut buf[pos..]);
     pos += event_len;
 

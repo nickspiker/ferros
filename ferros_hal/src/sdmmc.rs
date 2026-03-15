@@ -52,18 +52,77 @@ mod regs {
     pub const SW_RESET: usize = 0x2F;
     pub const NORMAL_INT_STATUS: usize = 0x30;
     pub const ERROR_INT_STATUS: usize = 0x32;
+    pub const NORMAL_INT_STATUS_EN: usize = 0x34;
+    pub const ERROR_INT_STATUS_EN: usize = 0x36;
     pub const CAPABILITIES: usize = 0x40;
+    pub const CAPABILITIES_HI: usize = 0x44;
 
     // Present State bits
     pub const CMD_INHIBIT: u32 = 1 << 0;
     pub const DAT_INHIBIT: u32 = 1 << 1;
     pub const CARD_INSERTED: u32 = 1 << 16;
 
+    // HOST_CTRL1 bits
+    pub const HOST_4BIT: u8 = 1 << 1;  // 4-bit data transfer width
+
+    // Qualcomm vendor-specific registers (sdhci-msm v5)
+    pub const VENDOR_SPEC: usize = 0x20C;
+    pub const VENDOR_SPEC_CAPABILITIES0: usize = 0x21C;
+    pub const PWRCTL_STATUS: usize = 0x240;
+    pub const PWRCTL_MASK: usize = 0x244;
+    pub const PWRCTL_CLEAR: usize = 0x248;
+    pub const PWRCTL_CTL: usize = 0x24C;
+
+    // VENDOR_SPEC POR (power-on-reset) value from sdhci-msm driver
+    pub const VENDOR_SPEC_POR_VAL: u32 = 0x0A0C;
+
+    // PWRCTL_CTL success bits
+    pub const PWRCTL_BUS_SUCCESS: u32 = 1 << 0;
+    pub const PWRCTL_IO_SUCCESS: u32 = 1 << 2;
+
     // Normal interrupt status bits
     pub const CMD_COMPLETE: u16 = 1 << 0;
     pub const XFER_COMPLETE: u16 = 1 << 1;
-    pub const BUF_READ_READY: u16 = 1 << 5;
     pub const BUF_WRITE_READY: u16 = 1 << 4;
+    pub const BUF_READ_READY: u16 = 1 << 5;
+    pub const ERR_INTERRUPT: u16 = 1 << 15;
+
+    // SDHCI command register response type encoding (bits [1:0])
+    pub const RESP_NONE: u16 = 0x00;    // no response
+    pub const RESP_136: u16 = 0x01;     // R2 (136-bit)
+    pub const RESP_48: u16 = 0x02;      // R1, R3, R6, R7 (48-bit)
+    pub const RESP_48_BUSY: u16 = 0x03; // R1b (48-bit + busy)
+
+    // Command register flag bits
+    pub const CMD_CRC_CHECK: u16 = 1 << 3;
+    pub const CMD_INDEX_CHECK: u16 = 1 << 4;
+    pub const CMD_DATA_PRESENT: u16 = 1 << 5;
+}
+
+/// SDHCI command response types.
+#[derive(Clone, Copy)]
+enum RespType {
+    None,    // CMD0
+    R1,      // most commands
+    R1b,     // CMD7, CMD12
+    R2,      // CMD2, CMD9 (136-bit CID/CSD)
+    R3,      // ACMD41 (no CRC)
+    R6,      // CMD3 (RCA)
+    R7,      // CMD8 (interface condition)
+}
+
+impl RespType {
+    fn to_cmd_flags(self) -> u16 {
+        match self {
+            RespType::None => regs::RESP_NONE,
+            RespType::R1 => regs::RESP_48 | regs::CMD_CRC_CHECK | regs::CMD_INDEX_CHECK,
+            RespType::R1b => regs::RESP_48_BUSY | regs::CMD_CRC_CHECK | regs::CMD_INDEX_CHECK,
+            RespType::R2 => regs::RESP_136 | regs::CMD_CRC_CHECK,
+            RespType::R3 => regs::RESP_48, // no CRC/index check for OCR
+            RespType::R6 => regs::RESP_48 | regs::CMD_CRC_CHECK | regs::CMD_INDEX_CHECK,
+            RespType::R7 => regs::RESP_48 | regs::CMD_CRC_CHECK | regs::CMD_INDEX_CHECK,
+        }
+    }
 }
 
 /// SD/MMC command indices.
@@ -74,11 +133,56 @@ mod cmd {
     pub const SEND_RELATIVE_ADDR: u16 = 3;
     pub const SELECT_CARD: u16 = 7;
     pub const SEND_IF_COND: u16 = 8;
+    pub const SEND_CSD: u16 = 9;
     pub const SET_BLOCKLEN: u16 = 16;
     pub const READ_SINGLE_BLOCK: u16 = 17;
     pub const WRITE_SINGLE_BLOCK: u16 = 24;
     pub const APP_CMD: u16 = 55;
     pub const SD_SEND_OP_COND: u16 = 41; // ACMD41
+    pub const SET_BUS_WIDTH: u16 = 6;    // ACMD6
+}
+
+/// Diagnostic probe results — each step logged individually.
+#[derive(Default)]
+pub struct ProbeResult {
+    pub reset_ok: bool,
+    pub present_state: u32,
+    pub clock_ctrl: u16,
+    pub caps: u32,
+    pub cmd0_ok: bool,
+    pub cmd8_ok: bool,
+    pub cmd8_resp: u32,
+    pub cmd8_err: u16,  // ERROR_INT_STATUS when CMD8 fails
+    pub acmd41_ok: bool,
+    pub acmd41_tries: u32,
+    pub ocr: u32,
+    pub cmd2_ok: bool,
+    pub cmd2_err: u16,
+    pub cid: [u32; 4],
+    pub cmd3_ok: bool,
+    pub cmd3_resp: u32,
+    pub cmd3_err: u16,
+    pub cmd7_ok: bool,
+    pub cmd7_err: u16,
+    pub cmd9_ok: bool,
+    pub csd: [u32; 4],
+    pub cmd16_ok: bool,
+    pub bus4_ok: bool,
+    pub clk25_ok: bool,
+    pub read_ok: bool,
+    pub read_err: u16,
+    pub block0_head: [u8; 16],  // first 16 bytes of block 0
+    pub block0_sig: [u8; 2],   // bytes 510-511 (MBR signature)
+    pub write_ok: bool,
+    pub write_err: u16,
+    pub verify_ok: bool,
+    pub verify_err: u16,
+    pub pre_cmd2_present: u32,
+    pub pre_cmd2_int: u16,
+    pub pre_cmd2_pwrctl: u32,
+    pub pwrctl_status_pre: u32,
+    pub pwrctl_status_post: u32,
+    pub pwrctl_ack_ok: bool,
 }
 
 /// Card identity from CID register (CMD2 response).
@@ -134,65 +238,477 @@ impl SdmmcController {
     ///
     /// Returns Ok(true) if a card is found, Ok(false) if slot is empty.
     pub fn init(&mut self) -> Result<bool, DeviceError> {
-        // Step 1: Check card presence
-        let state = unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) };
-        if state & regs::CARD_INSERTED == 0 {
-            return Ok(false);
-        }
-
-        // Step 2: Software reset
-        unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) }; // reset all
+        // Step 1: Software reset
+        unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) };
         self.wait_reset()?;
 
-        // Step 3: Set clock to 400KHz for identification
-        self.set_clock(400_000)?;
-
-        // Step 4: Power on (3.3V)
-        unsafe { crate::mmio::write8(self.base + regs::POWER_CTRL, 0x0F) }; // SD bus power on, 3.3V
-
-        // Step 5: Card identification sequence
-        self.send_cmd(cmd::GO_IDLE, 0)?;
-        self.send_cmd(cmd::SEND_IF_COND, 0x000001AA)?; // voltage 2.7-3.6V, check pattern
-
-        // Step 6: ACMD41 loop — wait for card to be ready
-        for _ in 0..1000 {
-            self.send_cmd(cmd::APP_CMD, 0)?;
-            self.send_cmd(cmd::SD_SEND_OP_COND, 0x40FF8000)?; // HCS=1, voltage window
-            let resp = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
-            if resp & (1 << 31) != 0 {
-                // Card is ready
-                break;
-            }
+        // Step 2: Enable all interrupt status signals
+        unsafe {
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS_EN, 0x7FFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS_EN, 0xFFFF);
         }
 
-        // Step 7: Get CID
-        self.send_cmd(cmd::ALL_SEND_CID, 0)?;
+        // Step 3: Set timeout to max
+        unsafe { crate::mmio::write8(self.base + regs::TIMEOUT_CTRL, 0x0E) };
+
+        // Step 4: Power on (3.3V)
+        unsafe { crate::mmio::write8(self.base + regs::POWER_CTRL, 0x0F) };
+
+        // Step 5: Set clock to 400KHz for identification
+        self.set_clock(400)?;
+
+        // Small delay for power + clock stabilization
+        Self::delay(100_000);
+
+        // Step 6: Card identification sequence
+        self.send_cmd_with(cmd::GO_IDLE, 0, RespType::None)?;
+
+        // CMD8: voltage check
+        let cmd8_ok = self.send_cmd_with(cmd::SEND_IF_COND, 0x000001AA, RespType::R7);
+        let _sdhc = cmd8_ok.is_ok(); // SD v2+ if CMD8 succeeds
+
+        // Step 7: ACMD41 loop — wait for card to be ready (up to 1s)
+        let mut ocr = 0u32;
+        for _ in 0..1000 {
+            // CMD55 (APP_CMD) with RCA=0 during init
+            self.send_cmd_with(cmd::APP_CMD, 0, RespType::R1)?;
+            // ACMD41: HCS=1 (bit 30), voltage window 2.7-3.6V
+            self.send_cmd_with(cmd::SD_SEND_OP_COND, 0x40FF8000, RespType::R3)?;
+            ocr = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+            if ocr & (1 << 31) != 0 {
+                break;
+            }
+            Self::delay(500_000);
+        }
+        if ocr & (1 << 31) == 0 {
+            return Ok(false); // Card never became ready
+        }
+
+        // Step 8: Get CID
+        self.send_cmd_with(cmd::ALL_SEND_CID, 0, RespType::R2)?;
         self.parse_cid();
 
-        // Step 8: Get RCA
-        self.send_cmd(cmd::SEND_RELATIVE_ADDR, 0)?;
+        // Step 9: Get RCA
+        self.send_cmd_with(cmd::SEND_RELATIVE_ADDR, 0, RespType::R6)?;
         self.rca = (unsafe { crate::mmio::read32(self.base + regs::RESPONSE) } >> 16) as u16;
 
-        // Step 9: Select card
-        self.send_cmd(cmd::SELECT_CARD, (self.rca as u32) << 16)?;
+        // Step 10: Select card
+        self.send_cmd_with(cmd::SELECT_CARD, (self.rca as u32) << 16, RespType::R1b)?;
 
-        // Step 10: Set block length to 512
-        self.send_cmd(cmd::SET_BLOCKLEN, 512)?;
+        // Step 11: Set block length to 512
+        self.send_cmd_with(cmd::SET_BLOCKLEN, 512, RespType::R1)?;
 
-        // Step 11: Switch to 25MHz for data transfer
-        self.set_clock(25_000_000)?;
+        // Step 12: Switch to 25MHz for data transfer
+        self.set_clock(25_000)?;
 
         self.device_info = Some(DeviceInfo {
             id: self.device_id,
             capacity: self.capacity,
-            vendor: Vec::new(), // TODO: extract from CID
-            model: Vec::new(),  // TODO: extract from CID
+            vendor: Vec::new(),
+            model: Vec::new(),
             atomic_write_size: Some(512),
             has_volatile_cache: false,
         });
 
         self.initialized = true;
         Ok(true)
+    }
+
+    /// Diagnostic probe: try to talk to the card, returning step-by-step
+    /// results as (step_name, ok, extra_data).
+    ///
+    /// This doesn't modify `self` state — it's a read-only probe for
+    /// logging to the boot console.
+    pub fn probe_card(&self) -> ProbeResult {
+        let mut r = ProbeResult::default();
+
+        // Software reset
+        unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) };
+        for _ in 0..10_000u32 {
+            if unsafe { crate::mmio::read8(self.base + regs::SW_RESET) } & 0x01 == 0 {
+                r.reset_ok = true;
+                break;
+            }
+        }
+        if !r.reset_ok { return r; }
+
+        // Qualcomm vendor init: write POR value to VENDOR_SPEC
+        unsafe { crate::mmio::write32(self.base + regs::VENDOR_SPEC, regs::VENDOR_SPEC_POR_VAL) };
+
+        // Clear any pending power control IRQ from reset
+        r.pwrctl_status_pre = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
+        self.pwrctl_clear_pending();
+
+        // Enable power control IRQ mask (all bits)
+        unsafe { crate::mmio::write32(self.base + regs::PWRCTL_MASK, 0x0F) };
+
+        // Enable status signals
+        unsafe {
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS_EN, 0x7FFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS_EN, 0xFFFF);
+            crate::mmio::write8(self.base + regs::TIMEOUT_CTRL, 0x0E);
+        }
+
+        // Power on 3.3V — this triggers a Qualcomm power control IRQ
+        unsafe { crate::mmio::write8(self.base + regs::POWER_CTRL, 0x0F) };
+
+        // ACK the power control IRQ
+        Self::delay(1_000);
+        r.pwrctl_status_post = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
+        r.pwrctl_ack_ok = self.pwrctl_clear_pending();
+
+        // Clock 400KHz
+        self.set_clock_raw(400);
+
+        Self::delay(100_000);
+
+        r.present_state = unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) };
+        r.clock_ctrl = unsafe { crate::mmio::read16(self.base + regs::CLOCK_CTRL) };
+        r.caps = unsafe { crate::mmio::read32(self.base + regs::CAPABILITIES) };
+
+        // CMD0 — GO_IDLE (no response expected)
+        r.cmd0_ok = self.send_cmd_raw(cmd::GO_IDLE, 0, RespType::None).is_ok();
+        if !r.cmd0_ok { return r; }
+
+        // CMD8 — SEND_IF_COND
+        match self.send_cmd_raw(cmd::SEND_IF_COND, 0x1AA, RespType::R7) {
+            Ok(resp) => {
+                r.cmd8_ok = true;
+                r.cmd8_resp = resp;
+            }
+            Err(_) => {
+                r.cmd8_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+            }
+        }
+
+        // ACMD41 loop — card can take up to 1s to power up.
+        // SD spec requires >= 1ms between retries.
+        for i in 0..1000u32 {
+            let c55 = self.send_cmd_raw(cmd::APP_CMD, 0, RespType::R1);
+            if c55.is_err() { break; }
+            // HCS (bit 30) = SDHC/SDXC support
+            // Voltage window 2.7-3.6V (bits 20:15)
+            let c41 = self.send_cmd_raw(cmd::SD_SEND_OP_COND, 0x40FF8000, RespType::R3);
+            if c41.is_err() { break; }
+            r.ocr = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+            r.acmd41_tries = i + 1;
+            if r.ocr & (1 << 31) != 0 {
+                r.acmd41_ok = true;
+                break;
+            }
+            // ~1ms delay (conservative — 500K nops at ~1GHz ≈ 0.5ms)
+            Self::delay(500_000);
+        }
+        if !r.acmd41_ok { return r; }
+
+        // Check for pending power IRQ after voltage negotiation
+        self.pwrctl_clear_pending();
+
+        // CMD-line reset to clear command engine state after ACMD41 loop.
+        // This only resets the command state machine, not the card.
+        unsafe {
+            crate::mmio::write8(self.base + regs::SW_RESET, 0x02);
+            for _ in 0..10_000u32 {
+                if crate::mmio::read8(self.base + regs::SW_RESET) & 0x02 == 0 { break; }
+            }
+            // Re-enable interrupt status after CMD reset
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS_EN, 0x7FFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS_EN, 0xFFFF);
+        }
+
+        // Capture state before CMD2
+        r.pre_cmd2_present = unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) };
+        r.pre_cmd2_int = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+        r.pre_cmd2_pwrctl = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
+
+        // CMD2 — ALL_SEND_CID
+        match self.send_cmd_raw(cmd::ALL_SEND_CID, 0, RespType::R2) {
+            Ok(_) => {
+                r.cid[0] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+                r.cid[1] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 4) };
+                r.cid[2] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 8) };
+                r.cid[3] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 12) };
+                r.cmd2_ok = true;
+            }
+            Err(_) => {
+                r.cmd2_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+            }
+        }
+
+        // CMD3 — SEND_RELATIVE_ADDR
+        match self.send_cmd_raw(cmd::SEND_RELATIVE_ADDR, 0, RespType::R6) {
+            Ok(_) => {
+                r.cmd3_resp = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+                r.cmd3_ok = true;
+            }
+            Err(_) => {
+                r.cmd3_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                return r;
+            }
+        }
+
+        let rca = r.cmd3_resp & 0xFFFF0000; // RCA in upper 16 bits
+
+        // CMD9 — SEND_CSD (card speed/voltage/capacity data, R2 response)
+        // Must be sent while card is in standby state (before CMD7), OR
+        // can be sent to addressed card. We send with RCA.
+        match self.send_cmd_raw(cmd::SEND_CSD, rca, RespType::R2) {
+            Ok(_) => {
+                r.cmd9_ok = true;
+                r.csd[0] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+                r.csd[1] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 4) };
+                r.csd[2] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 8) };
+                r.csd[3] = unsafe { crate::mmio::read32(self.base + regs::RESPONSE + 12) };
+            }
+            Err(_) => {}
+        }
+
+        // CMD7 — SELECT_CARD (transitions card to transfer state)
+        match self.send_cmd_raw(cmd::SELECT_CARD, rca, RespType::R1b) {
+            Ok(_) => r.cmd7_ok = true,
+            Err(_) => {
+                r.cmd7_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                return r;
+            }
+        }
+
+        // CMD16 — SET_BLOCKLEN to 512 (required for standard capacity, good practice)
+        r.cmd16_ok = self.send_cmd_raw(cmd::SET_BLOCKLEN, 512, RespType::R1).is_ok();
+
+        // Switch to 4-bit bus width: ACMD6 (SET_BUS_WIDTH) arg=2
+        if self.send_cmd_raw(cmd::APP_CMD, rca, RespType::R1).is_ok() {
+            if self.send_cmd_raw(cmd::SET_BUS_WIDTH, 2, RespType::R1).is_ok() {
+                // Tell the host controller to use 4-bit mode
+                unsafe {
+                    let hc = crate::mmio::read8(self.base + regs::HOST_CTRL1);
+                    crate::mmio::write8(self.base + regs::HOST_CTRL1, hc | regs::HOST_4BIT);
+                }
+                r.bus4_ok = true;
+            }
+        }
+
+        // Stay at 400KHz for now — 25MHz needs DLL tuning investigation
+        // Just test 4-bit bus width at the current clock rate
+        r.clk25_ok = false; // not switching yet
+
+        // Read block 0 — MBR/GPT signature area
+        // For SDHC/SDXC (CCS=1), block address is in 512-byte units
+        self.pwrctl_clear_pending();
+        match self.read_block_raw(0) {
+            Ok(buf) => {
+                r.read_ok = true;
+                r.block0_head[..16].copy_from_slice(&buf[..16]);
+                r.block0_sig = [buf[510], buf[511]];
+            }
+            Err(_) => {
+                r.read_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+            }
+        }
+
+        // Write-read-verify test on block 1 (avoid block 0 MBR)
+        // Write a recognizable pattern, read it back, verify
+        if r.read_ok {
+            match self.write_block_raw(1, &Self::test_pattern()) {
+                Ok(()) => {
+                    r.write_ok = true;
+                    // Read it back
+                    match self.read_block_raw(1) {
+                        Ok(buf) => {
+                            let pattern = Self::test_pattern();
+                            r.verify_ok = buf[..] == pattern[..];
+                            if !r.verify_ok {
+                                r.verify_err = 0xFFFF; // mismatch marker
+                            }
+                        }
+                        Err(_) => {
+                            r.verify_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                        }
+                    }
+                }
+                Err(_) => {
+                    r.write_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                }
+            }
+        }
+
+        r
+    }
+
+    /// Raw block read for probe — doesn't require `self.initialized`.
+    fn read_block_raw(&self, block_addr: u32) -> Result<[u8; 512], DeviceError> {
+        // Wait for DAT line free
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
+
+        unsafe {
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+
+            // Block size=512, count=1
+            crate::mmio::write32(self.base + regs::BLOCK_SIZE, 512 | (1 << 16));
+
+            crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+
+            // CMD17 (READ_SINGLE_BLOCK) with DATA_PRESENT, R1 response
+            // Transfer mode: read (bit 4), single block
+            let xfer_mode: u16 = 1 << 4; // data direction = read
+            let cmd_reg: u16 = (cmd::READ_SINGLE_BLOCK << 8)
+                | regs::CMD_DATA_PRESENT
+                | RespType::R1.to_cmd_flags();
+            // Combined 32-bit write: transfer_mode | (command << 16)
+            crate::mmio::write32(
+                self.base + regs::TRANSFER_MODE,
+                (cmd_reg as u32) << 16 | xfer_mode as u32,
+            );
+        }
+
+        // Wait for command complete
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::ERR_INTERRUPT != 0 {
+                return Err(DeviceError::IoError(DeviceIoKind::HardwareFailure));
+            }
+            if status & regs::CMD_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::CMD_COMPLETE) };
+                break;
+            }
+        }
+
+        // Wait for buffer read ready
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::ERR_INTERRUPT != 0 {
+                return Err(DeviceError::IoError(DeviceIoKind::HardwareFailure));
+            }
+            if status & regs::BUF_READ_READY != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_READ_READY) };
+                break;
+            }
+        }
+
+        // Read 512 bytes from buffer data port
+        let mut buf = [0u8; 512];
+        for i in 0..128 {
+            let word = unsafe { crate::mmio::read32(self.base + regs::BUFFER_DATA) };
+            let off = i * 4;
+            buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        // Wait for transfer complete
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::XFER_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
+                return Ok(buf);
+            }
+        }
+        Err(DeviceError::IoError(DeviceIoKind::Timeout))
+    }
+
+    /// Raw block write for probe — doesn't require `self.initialized`.
+    fn write_block_raw(&self, block_addr: u32, data: &[u8; 512]) -> Result<(), DeviceError> {
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
+
+        unsafe {
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+
+            crate::mmio::write32(self.base + regs::BLOCK_SIZE, 512 | (1 << 16));
+            crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+
+            // CMD24 (WRITE_SINGLE_BLOCK) with DATA_PRESENT, R1 response
+            // Transfer mode: write (bit 4 = 0), single block
+            let xfer_mode: u16 = 0; // data direction = write
+            let cmd_reg: u16 = (cmd::WRITE_SINGLE_BLOCK << 8)
+                | regs::CMD_DATA_PRESENT
+                | RespType::R1.to_cmd_flags();
+            crate::mmio::write32(
+                self.base + regs::TRANSFER_MODE,
+                (cmd_reg as u32) << 16 | xfer_mode as u32,
+            );
+        }
+
+        // Wait for command complete
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::ERR_INTERRUPT != 0 {
+                return Err(DeviceError::IoError(DeviceIoKind::HardwareFailure));
+            }
+            if status & regs::CMD_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::CMD_COMPLETE) };
+                break;
+            }
+        }
+
+        // Wait for buffer write ready
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::ERR_INTERRUPT != 0 {
+                return Err(DeviceError::IoError(DeviceIoKind::HardwareFailure));
+            }
+            if status & regs::BUF_WRITE_READY != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_WRITE_READY) };
+                break;
+            }
+        }
+
+        // Write 512 bytes
+        for i in 0..128 {
+            let off = i * 4;
+            let word = u32::from_le_bytes([
+                data[off], data[off + 1], data[off + 2], data[off + 3],
+            ]);
+            unsafe { crate::mmio::write32(self.base + regs::BUFFER_DATA, word) };
+        }
+
+        // Wait for transfer complete
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::XFER_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
+                return Ok(());
+            }
+        }
+        Err(DeviceError::IoError(DeviceIoKind::Timeout))
+    }
+
+    /// Generate a recognizable 512-byte test pattern.
+    fn test_pattern() -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        // "FERROS" magic + incrementing bytes
+        buf[0..6].copy_from_slice(b"FERROS");
+        for i in 6..512 {
+            buf[i] = (i & 0xFF) as u8;
+        }
+        buf
+    }
+
+    /// Clear pending Qualcomm power control IRQ and ACK success.
+    /// Returns true if there was a pending IRQ that was cleared.
+    fn pwrctl_clear_pending(&self) -> bool {
+        let status = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
+        if status == 0 {
+            return false;
+        }
+        // Clear the pending bits
+        unsafe { crate::mmio::write32(self.base + regs::PWRCTL_CLEAR, status) };
+        // Poll until cleared
+        for _ in 0..10_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) } == 0 {
+                break;
+            }
+        }
+        // ACK success (BUS_SUCCESS | IO_SUCCESS)
+        unsafe {
+            crate::mmio::write32(
+                self.base + regs::PWRCTL_CTL,
+                regs::PWRCTL_BUS_SUCCESS | regs::PWRCTL_IO_SUCCESS,
+            );
+        }
+        true
     }
 
     fn wait_reset(&self) -> Result<(), DeviceError> {
@@ -205,36 +721,97 @@ impl SdmmcController {
         Err(DeviceError::IoError(DeviceIoKind::Timeout))
     }
 
-    fn set_clock(&self, _hz: u32) -> Result<(), DeviceError> {
-        // TODO: Calculate divisor from base clock capability register.
-        // For now, just enable internal clock and SD clock.
-        unsafe {
-            crate::mmio::write32(self.base + regs::CLOCK_CTRL,
-                (1 << 0) |  // internal clock enable
-                (1 << 2)     // SD clock enable
-            );
+    fn delay(iters: u32) {
+        for _ in 0..iters {
+            unsafe { core::arch::asm!("nop") };
         }
+    }
+
+    /// Set SD clock. `khz` is target frequency in KHz.
+    fn set_clock(&self, khz: u32) -> Result<(), DeviceError> {
+        self.set_clock_raw(khz);
         Ok(())
     }
 
-    fn send_cmd(&self, cmd_idx: u16, arg: u32) -> Result<(), DeviceError> {
-        // Wait for CMD line to be free
-        while unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::CMD_INHIBIT != 0 {}
-
+    /// Enable SDHCI clock output — Qualcomm bypass mode (no internal divider).
+    ///
+    /// On sdhci-msm, the clock frequency is set entirely by the GCC RCG.
+    /// The SDHCI clock divider is unused — we just enable INT_EN + CARD_EN
+    /// with divider=0 so the GCC clock passes straight through.
+    fn set_clock_raw(&self, _khz: u32) {
         unsafe {
-            crate::mmio::write32(self.base + regs::ARGUMENT, arg);
-            // Command register: index in bits [13:8], response type in [1:0]
-            let cmd_reg = (cmd_idx << 8) | 0x1A; // R1 response, CRC check, index check
-            crate::mmio::write32(self.base + regs::COMMAND, cmd_reg as u32);
+            // 1. Disable everything
+            crate::mmio::write16(self.base + regs::CLOCK_CTRL, 0);
+
+            // 2. Enable internal clock (bit 0), divider=0
+            crate::mmio::write16(self.base + regs::CLOCK_CTRL, 1 << 0);
+
+            // 3. Wait for internal clock stable (bit 1)
+            for _ in 0..500_000u32 {
+                if crate::mmio::read16(self.base + regs::CLOCK_CTRL) & (1 << 1) != 0 {
+                    break;
+                }
+            }
+
+            // 4. Enable SD clock output (bit 2)
+            let clk = crate::mmio::read16(self.base + regs::CLOCK_CTRL);
+            crate::mmio::write16(self.base + regs::CLOCK_CTRL, clk | (1 << 2));
+        }
+    }
+
+    fn send_cmd_with(&self, cmd_idx: u16, arg: u32, resp: RespType) -> Result<u32, DeviceError> {
+        self.send_cmd_raw(cmd_idx, arg, resp)
+    }
+
+    fn send_cmd_raw(&self, cmd_idx: u16, arg: u32, resp: RespType) -> Result<u32, DeviceError> {
+        // Wait for CMD line to be free
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::CMD_INHIBIT == 0 {
+                break;
+            }
         }
 
-        // Wait for command complete
-        for _ in 0..100_000 {
-            let status = unsafe { crate::mmio::read32(self.base + regs::NORMAL_INT_STATUS) };
-            if status as u16 & regs::CMD_COMPLETE != 0 {
-                // Clear the flag
-                unsafe { crate::mmio::write32(self.base + regs::NORMAL_INT_STATUS, regs::CMD_COMPLETE as u32) };
-                return Ok(());
+        unsafe {
+            // Clear any pending interrupt status
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+
+            // Set argument
+            crate::mmio::write32(self.base + regs::ARGUMENT, arg);
+
+            // Build command register value
+            // [13:8] = command index, [5:0] = flags (response type, CRC, index check)
+            let cmd_reg: u16 = (cmd_idx << 8) | resp.to_cmd_flags();
+
+            // Linux sdhci.c always writes COMMAND + TRANSFER_MODE as a combined
+            // 32-bit write to offset 0x0C. Some controllers require this.
+            // Low 16 bits = TRANSFER_MODE (0 for non-data), high 16 bits = COMMAND.
+            crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16);
+        }
+
+        // Wait for command complete or error.
+        // At 400KHz, a 136-bit R2 response takes ~0.5ms. With CPU loop
+        // overhead (~3-5 cycles/iter at 1GHz), we need a generous timeout.
+        for _ in 0..5_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::ERR_INTERRUPT != 0 {
+                let err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                // Clear errors
+                unsafe {
+                    crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+                    crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+                    // CMD line reset
+                    crate::mmio::write8(self.base + regs::SW_RESET, 0x02);
+                }
+                for _ in 0..10_000u32 {
+                    if unsafe { crate::mmio::read8(self.base + regs::SW_RESET) } & 0x02 == 0 { break; }
+                }
+                return Err(DeviceError::IoError(DeviceIoKind::HardwareFailure));
+            }
+            if status & regs::CMD_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::CMD_COMPLETE) };
+                let resp0 = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
+                return Ok(resp0);
             }
         }
         Err(DeviceError::IoError(DeviceIoKind::Timeout))
@@ -278,22 +855,25 @@ impl SdmmcController {
         }
 
         // Wait for DAT line free
-        while unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT != 0 {}
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
 
-        // Set up for single block read
         unsafe {
-            crate::mmio::write32(self.base + regs::BLOCK_SIZE, 512);
-            crate::mmio::write32(self.base + regs::BLOCK_COUNT, 1);
+            crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
+            crate::mmio::write16(self.base + regs::BLOCK_COUNT, 1);
+            // Transfer mode: single block, read, no DMA
+            crate::mmio::write16(self.base + regs::TRANSFER_MODE, 1 << 4); // data direction = read
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
-            let cmd_reg = (cmd::READ_SINGLE_BLOCK << 8) | 0x3A; // R1, data read
-            crate::mmio::write32(self.base + regs::COMMAND, cmd_reg as u32);
+            let cmd_reg: u16 = (cmd::READ_SINGLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
+            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
         }
 
         // Wait for buffer read ready
-        for _ in 0..1_000_000 {
-            let status = unsafe { crate::mmio::read32(self.base + regs::NORMAL_INT_STATUS) } as u16;
+        for _ in 0..1_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::BUF_READ_READY != 0 {
-                unsafe { crate::mmio::write32(self.base + regs::NORMAL_INT_STATUS, regs::BUF_READ_READY as u32) };
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_READ_READY) };
                 break;
             }
         }
@@ -306,10 +886,10 @@ impl SdmmcController {
         }
 
         // Wait for transfer complete
-        for _ in 0..100_000 {
-            let status = unsafe { crate::mmio::read32(self.base + regs::NORMAL_INT_STATUS) } as u16;
+        for _ in 0..100_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::XFER_COMPLETE != 0 {
-                unsafe { crate::mmio::write32(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE as u32) };
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
                 return Ok(());
             }
         }
@@ -322,21 +902,25 @@ impl SdmmcController {
             return Err(DeviceError::NotReady);
         }
 
-        while unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT != 0 {}
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
 
         unsafe {
-            crate::mmio::write32(self.base + regs::BLOCK_SIZE, 512);
-            crate::mmio::write32(self.base + regs::BLOCK_COUNT, 1);
+            crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
+            crate::mmio::write16(self.base + regs::BLOCK_COUNT, 1);
+            // Transfer mode: single block, write, no DMA
+            crate::mmio::write16(self.base + regs::TRANSFER_MODE, 0); // data direction = write
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
-            let cmd_reg = (cmd::WRITE_SINGLE_BLOCK << 8) | 0x3A; // R1, data write
-            crate::mmio::write32(self.base + regs::COMMAND, cmd_reg as u32);
+            let cmd_reg: u16 = (cmd::WRITE_SINGLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
+            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
         }
 
         // Wait for buffer write ready
-        for _ in 0..1_000_000 {
-            let status = unsafe { crate::mmio::read32(self.base + regs::NORMAL_INT_STATUS) } as u16;
+        for _ in 0..1_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::BUF_WRITE_READY != 0 {
-                unsafe { crate::mmio::write32(self.base + regs::NORMAL_INT_STATUS, regs::BUF_WRITE_READY as u32) };
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_WRITE_READY) };
                 break;
             }
         }
@@ -351,10 +935,10 @@ impl SdmmcController {
         }
 
         // Wait for transfer complete
-        for _ in 0..100_000 {
-            let status = unsafe { crate::mmio::read32(self.base + regs::NORMAL_INT_STATUS) } as u16;
+        for _ in 0..100_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::XFER_COMPLETE != 0 {
-                unsafe { crate::mmio::write32(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE as u32) };
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
                 return Ok(());
             }
         }

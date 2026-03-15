@@ -5,6 +5,7 @@ members = [
     "ferros_hal",
     "ferros_vault",
     "ferros_ledger",
+    "ferros_pt",
     "tools/mkimg",
     "tools/ferros-bridge",
 ]

@@ -25,3 +25,5 @@ pub mod dpu;
 pub mod pstore;
 pub mod spmi;
 pub mod usb;
+pub mod gcc;
+pub mod rpmh;

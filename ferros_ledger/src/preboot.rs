@@ -29,13 +29,10 @@ impl PrebootBuffer {
         // Can't use [None; N] for non-Copy Option<Event>, so we do this:
         Self {
             events: [
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                 None, None, None, None, None, None, None, None,
             ],
             write_pos: 0,
@@ -79,7 +76,9 @@ impl PrebootBuffer {
     ///
     /// After drain, the buffer is empty.
     pub fn drain(&mut self, mut f: impl FnMut(Event)) {
-        if self.count == 0 { return; }
+        if self.count == 0 {
+            return;
+        }
 
         // Start position: if ring wrapped, start at write_pos (oldest surviving).
         // If not wrapped, start at 0.

@@ -1,6 +1,9 @@
 mod usb;
 
-use std::io::{self, Read, Write};
+use ferros_pt::StreamId;
+use ferros_pt::packet::{self, Ack, Complete, Spec};
+use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
+use std::io::{self, Write};
 
 fn usage() {
     eprintln!("ferros-bridge — USB bridge for ferros kernel");
@@ -8,11 +11,15 @@ fn usage() {
     eprintln!("Usage: ferros-bridge <command>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  log        Stream bulk IN data from device to stdout");
-    eprintln!("  send <hex> Send hex bytes to device via bulk OUT");
-    eprintln!("  terminal   Bidirectional: stdin → device, device → stdout");
-    eprintln!("  echo       Send test pattern, verify echo");
-    eprintln!("  status     Check if device is connected");
+    eprintln!("  status       Check if device is connected");
+    eprintln!("  diag         Retrieve boot diagnostics from device");
+    eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
+    eprintln!("  echo         PT echo test — send pattern, verify round-trip");
+    eprintln!("  send <hex>   Send hex bytes via PT transfer");
+    eprintln!("  log          Stream bulk IN data from device to stdout");
+    eprintln!("  reboot [fastboot]  Reboot device (default: normal, 'fastboot' for bootloader)");
+    eprintln!("  reload <kernel>   Hot-reload kernel binary (ELF path, runs mkimg internally)");
+    eprintln!("  terminal     Bidirectional PT session");
 }
 
 #[tokio::main]
@@ -25,16 +32,38 @@ async fn main() {
 
     match args[1].as_str() {
         "status" => cmd_status(),
-        "log" => cmd_log().await,
+        "diag" => cmd_diag().await,
+        "read" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge read <hex-addr> [len]");
+                std::process::exit(1);
+            }
+            let len = args
+                .get(3)
+                .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(4);
+            cmd_read(&args[2], len).await;
+        }
+        "echo" => cmd_echo().await,
         "send" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge send <hex-bytes>");
-                eprintln!("Example: ferros-bridge send 48656c6c6f");
                 std::process::exit(1);
             }
             cmd_send(&args[2]).await;
         }
-        "echo" => cmd_echo().await,
+        "log" => cmd_log().await,
+        "reboot" => {
+            let mode = args.get(2).map(|s| s.as_str()).unwrap_or("normal");
+            cmd_reboot(mode).await;
+        }
+        "reload" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge reload <kernel-binary>");
+                std::process::exit(1);
+            }
+            cmd_reload(&args[2]).await;
+        }
         "terminal" => cmd_terminal().await,
         _ => {
             eprintln!("Unknown command: {}", args[1]);
@@ -46,9 +75,7 @@ async fn main() {
 
 fn cmd_status() {
     match usb::UsbLink::open() {
-        Ok(_link) => {
-            println!("Device connected and ready");
-        }
+        Ok(_link) => println!("Device connected and ready"),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
@@ -56,25 +83,378 @@ fn cmd_status() {
     }
 }
 
-async fn cmd_log() {
-    let link = match usb::UsbLink::open() {
-        Ok(l) => l,
-        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
-    };
+// ---------------------------------------------------------------------------
+// PT send (host→device) — unchanged from before
+// ---------------------------------------------------------------------------
 
-    eprintln!("Streaming bulk IN... (Ctrl-C to stop)");
+/// Send data to the device via PT and wait for COMPLETE.
+async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
+    let sid = StreamId::FIRST;
+
+    let mut spec_buf = [0u8; 512];
+    let rough_chunks = (data.len() / 450) + 2; // ~477 bytes payload per chunk now
+    let mut bitmap_buf = vec![0u32; (rough_chunks + 31) / 32 + 1];
+
+    let (mut xfer, spec_len) = OutboundTransfer::start(sid, data, &mut bitmap_buf, &mut spec_buf)
+        .ok_or_else(|| "Failed to build SPEC".to_string())?;
+
+    eprintln!(
+        "  SPEC: sid={} count={} psize={} total={}",
+        sid.0 as char, xfer.count, xfer.psize, xfer.total
+    );
+
+    link.send(&spec_buf[..spec_len])
+        .await
+        .map_err(|e| format!("SPEC send failed: {e}"))?;
+
+    // Wait for SPEC ACK
+    let resp = link
+        .recv()
+        .await
+        .map_err(|e| format!("SPEC ACK recv failed: {e}"))?;
+    if let Some(ack) = Ack::decode(&resp) {
+        if ack.seq != u64::MAX {
+            return Err(format!("Expected SPEC ACK (seq=MAX), got seq={}", ack.seq));
+        }
+        eprintln!("  SPEC ACK received");
+    } else {
+        return Err(format!(
+            "Expected SPEC ACK, got {} bytes: {:02x?}",
+            resp.len(),
+            &resp[..resp.len().min(8)]
+        ));
+    }
+
+    // Blast all DATA packets — no ACK wait, USB guarantees delivery
+    let mut pkt_buf = [0u8; 512];
+    let mut sent = 0u64;
+
+    while !xfer.all_sent() {
+        let pkt_len = xfer.next_data_packet(data, &mut pkt_buf);
+        if pkt_len == 0 {
+            break;
+        }
+
+        link.send(&pkt_buf[..pkt_len])
+            .await
+            .map_err(|e| format!("DATA send failed: {e}"))?;
+        sent += 1;
+    }
+
+    eprintln!("  {} DATA packets blasted", sent);
+
+    // Send FIN, then wait for COMPLETE or NAK with binary backoff
+    let mut fin_buf = [0u8; 8];
+    let fin_len = xfer.encode_fin(&mut fin_buf);
+
+    // Binary backoff: 1/256s (~4ms), doubling, cap at 4s.
+    // Never give up — large transfers may take time to hash.
+    // Cap backoff at 4s and retry indefinitely until COMPLETE/NAK/abort.
+    let mut backoff_ms = 4u64; // ~1/256s
+    let mut attempt = 0u32;
+
     loop {
-        match link.recv().await {
-            Ok(data) if !data.is_empty() => {
-                // Print as raw bytes (kernel log stream)
-                let _ = io::stdout().write_all(&data);
-                let _ = io::stdout().flush();
+        link.send(&fin_buf[..fin_len])
+            .await
+            .map_err(|e| format!("FIN send failed: {e}"))?;
+
+        // Wait for response with timeout
+        match tokio::time::timeout(std::time::Duration::from_millis(backoff_ms), link.recv()).await
+        {
+            Ok(Ok(resp)) => {
+                eprintln!("  FIN resp: {} bytes, first={:02x?}", resp.len(), &resp[..resp.len().min(8)]);
+                if resp.is_empty() {
+                    continue;
+                }
+
+                // COMPLETE?
+                if let Some(complete) = Complete::decode(&resp) {
+                    xfer.handle_complete(&complete);
+                    eprintln!("  COMPLETE received (attempt {})", attempt + 1);
+                    return Ok(complete);
+                }
+
+                // NAK? Retransmit requested chunks
+                if let Some(nak) = ferros_pt::packet::Nak::decode(&resp) {
+                    eprintln!("  NAK: {} chunks to retransmit", nak.count);
+                    let seqs: Vec<u64> = nak.seqs[..nak.count].to_vec();
+                    for &seq in &seqs {
+                        let pkt_len = xfer.retransmit_packet(seq, data, &mut pkt_buf);
+                        if pkt_len > 0 {
+                            link.send(&pkt_buf[..pkt_len])
+                                .await
+                                .map_err(|e| format!("Retransmit failed: {e}"))?;
+                        }
+                    }
+                    // Reset backoff for next FIN cycle
+                    backoff_ms = 4;
+                    continue;
+                }
+
+                // Unknown response
+                eprintln!("  Unknown response: {:02x?}", &resp[..resp.len().min(8)]);
             }
-            Ok(_) => {} // empty, keep polling
-            Err(e) => {
-                eprintln!("\nUSB read error: {e}");
+            Ok(Err(e)) => {
+                return Err(format!("recv error: {e}"));
+            }
+            Err(_) => {
+                // Timeout — double backoff and retry FIN
+                eprintln!("  FIN timeout ({}ms), retrying...", backoff_ms);
+            }
+        }
+
+        backoff_ms = (backoff_ms * 2).min(4000); // cap at 4s
+        attempt += 1;
+    } // loop
+} // pt_send
+
+// ---------------------------------------------------------------------------
+// PT recv (device→host) — bridge acts as InboundTransfer receiver
+// ---------------------------------------------------------------------------
+
+/// Receive a PT transfer from the device (blast mode).
+/// Device sends SPEC + DATA blast + FIN. Bridge sends SPEC ACK, then
+/// responds with COMPLETE or NAK after all data received.
+async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
+    // Read SPEC from device
+    let resp = link
+        .recv()
+        .await
+        .map_err(|e| format!("SPEC recv failed: {e}"))?;
+
+    let spec = Spec::decode(&resp).ok_or_else(|| {
+        format!(
+            "Expected SPEC, got {} bytes: {:02x?}",
+            resp.len(),
+            &resp[..resp.len().min(8)]
+        )
+    })?;
+
+    eprintln!(
+        "  RECV SPEC: sid={} count={} psize={} total={}",
+        spec.sid.0 as char, spec.count, spec.psize, spec.total
+    );
+
+    // Allocate buffers
+    let mut data_buf = vec![0u8; spec.total as usize];
+    let mut bitmap_buf = vec![0u32; bitmap_words(spec.count)];
+
+    let mut xfer = InboundTransfer::new(&spec, &mut data_buf, &mut bitmap_buf)
+        .ok_or_else(|| "Failed to create InboundTransfer".to_string())?;
+
+    // Send SPEC ACK
+    let mut ack_buf = [0u8; 64];
+    let spec_ack = Ack {
+        sid: spec.sid,
+        seq: u64::MAX,
+    };
+    let ack_len = spec_ack.encode(&mut ack_buf);
+    link.send(&ack_buf[..ack_len])
+        .await
+        .map_err(|e| format!("SPEC ACK send failed: {e}"))?;
+    eprintln!("  SPEC ACK sent");
+
+    // Receive DATA blast — silent, no ACKs
+    let mut received = 0u64;
+
+    loop {
+        let resp = link
+            .recv()
+            .await
+            .map_err(|e| format!("DATA recv failed: {e}"))?;
+
+        if resp.is_empty() {
+            continue;
+        }
+
+        if ferros_pt::is_data_packet(resp[0]) {
+            if let Some((_sid, seq, chunk_hash, payload)) =
+                packet::decode_data(&resp, xfer.seq_width)
+            {
+                xfer.handle_data(seq, &chunk_hash, payload);
+                received += 1;
+            }
+
+            // All chunks received? Respond immediately (don't wait for FIN)
+            if xfer.all_received() {
+                let mut resp_buf = [0u8; 128];
+                let n = xfer.finish(&mut resp_buf);
+                if n > 0 {
+                    link.send(&resp_buf[..n])
+                        .await
+                        .map_err(|e| format!("COMPLETE send failed: {e}"))?;
+                }
                 break;
             }
+        } else if resp[0] == b'F' {
+            // FIN — sender says blast is done. Check what we have.
+            let mut resp_buf = [0u8; 128];
+            let n = xfer.finish(&mut resp_buf);
+            if n > 0 {
+                link.send(&resp_buf[..n])
+                    .await
+                    .map_err(|e| format!("response send failed: {e}"))?;
+                // If COMPLETE was sent (success or fail), we're done
+                if xfer.state == ferros_pt::TransferState::Done {
+                    break;
+                }
+                // If NAK was sent, keep receiving retransmits
+            }
+        } else {
+            eprintln!("  (unexpected packet during recv: {:02x})", resp[0]);
+        }
+    }
+
+    eprintln!("  {} DATA packets received", received);
+
+    let result = data_buf[..spec.total as usize].to_vec();
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Command helpers — build cap-addressed payloads
+// ---------------------------------------------------------------------------
+
+fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
+    let cap = ferros_pt::command::dev_cap(cap_name);
+    let mut buf = vec![0u8; 33 + params.len()];
+    ferros_pt::command::encode(&mut buf, &cap, op, params);
+    buf
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_diag() {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Send DIAG Read command
+    let cmd = build_cmd(ferros_pt::command::caps::DIAG, ferros_pt::Op::Read, &[]);
+    eprintln!("Sending DIAG Read ({} bytes)", cmd.len());
+
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device reported command failure");
+                std::process::exit(1);
+            }
+            eprintln!("Command accepted, receiving response...");
+        }
+        Err(e) => {
+            eprintln!("Command send failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Receive response via PT
+    match pt_recv(&link).await {
+        Ok(data) => {
+            eprintln!("Received {} bytes", data.len());
+            let _ = io::stdout().write_all(&data);
+            let _ = io::stdout().flush();
+        }
+        Err(e) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_read(addr_str: &str, len: usize) {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let addr = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+        eprintln!("Invalid hex address: {addr_str}");
+        std::process::exit(1);
+    });
+
+    // Build MEM Read command: params = [addr:8][len:4]
+    let mut params = [0u8; 12];
+    params[0..8].copy_from_slice(&addr.to_be_bytes());
+    params[8..12].copy_from_slice(&(len as u32).to_be_bytes());
+
+    let cmd = build_cmd(ferros_pt::command::caps::MEM, ferros_pt::Op::Read, &params);
+    eprintln!("Reading {} bytes from 0x{:X}", len, addr);
+
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device reported command failure");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Command send failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    match pt_recv(&link).await {
+        Ok(data) => {
+            // Hex dump
+            for (i, chunk) in data.chunks(16).enumerate() {
+                print!("{:08X}  ", addr as usize + i * 16);
+                for b in chunk {
+                    print!("{:02X} ", b);
+                }
+                println!();
+            }
+        }
+        Err(e) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_echo() {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let test_data: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
+    let data_hash = blake3::hash(&test_data);
+
+    eprintln!(
+        "PT echo: {} bytes, BLAKE3={}",
+        test_data.len(),
+        data_hash.to_hex()
+    );
+
+    match pt_send(&link, &test_data).await {
+        Ok(complete) => {
+            if complete.data_hash == *data_hash.as_bytes() {
+                println!("Layer 2 OK: transfer BLAKE3 matches");
+            } else {
+                eprintln!("Layer 2 FAIL: hash mismatch");
+            }
+
+            if complete.success {
+                println!("COMPLETE: success");
+            } else {
+                eprintln!("COMPLETE: device reported failure");
+            }
+        }
+        Err(e) => {
+            eprintln!("PT transfer failed: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -90,87 +470,228 @@ async fn cmd_send(hex: &str) {
 
     let link = match usb::UsbLink::open() {
         Ok(l) => l,
-        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
 
-    match link.send(&data).await {
-        Ok(()) => println!("Sent {} bytes", data.len()),
-        Err(e) => eprintln!("Send failed: {e}"),
+    match pt_send(&link, &data).await {
+        Ok(complete) => {
+            if complete.success {
+                println!("Sent {} bytes via PT — COMPLETE OK", data.len());
+            } else {
+                eprintln!("Sent {} bytes but device reported failure", data.len());
+            }
+        }
+        Err(e) => eprintln!("PT send failed: {e}"),
     }
 }
 
-async fn cmd_echo() {
+async fn cmd_log() {
     let link = match usb::UsbLink::open() {
         Ok(l) => l,
-        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
 
-    let test_data: Vec<u8> = (0..64).collect();
-    eprintln!("Sending {} byte test pattern...", test_data.len());
-
-    if let Err(e) = link.send(&test_data).await {
-        eprintln!("Send failed: {e}");
-        return;
-    }
-
-    match link.recv().await {
-        Ok(data) => {
-            if data == test_data {
-                println!("Echo OK: {} bytes match", data.len());
-            } else {
-                eprintln!("Echo MISMATCH: sent {} bytes, got {} bytes", test_data.len(), data.len());
-                eprintln!("Sent: {:02x?}", &test_data[..test_data.len().min(32)]);
-                eprintln!("Recv: {:02x?}", &data[..data.len().min(32)]);
+    eprintln!("Streaming bulk IN... (Ctrl-C to stop)");
+    loop {
+        match link.recv().await {
+            Ok(data) if !data.is_empty() => {
+                let _ = io::stdout().write_all(&data);
+                let _ = io::stdout().flush();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("\nUSB read error: {e}");
+                break;
             }
         }
-        Err(e) => eprintln!("Recv failed: {e}"),
+    }
+}
+
+async fn cmd_reload(path: &str) {
+    // Convert ELF to flat binary via objcopy, or read raw binary directly
+    let bin_data = if path.ends_with(".bin") || path.ends_with(".img") {
+        // Raw binary file
+        std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("Failed to read {path}: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        // Assume ELF — run objcopy to get flat binary via temp file
+        eprintln!("Converting ELF to flat binary...");
+        let tmp = format!("/tmp/ferros_reload_{}.bin", std::process::id());
+        let result = std::process::Command::new("llvm-objcopy")
+            .args(["-O", "binary", path, &tmp])
+            .status()
+            .or_else(|_| {
+                std::process::Command::new("rust-objcopy")
+                    .args(["-O", "binary", path, &tmp])
+                    .status()
+            });
+        match result {
+            Ok(s) if s.success() => {
+                let data = std::fs::read(&tmp).unwrap_or_else(|e| {
+                    eprintln!("Failed to read {tmp}: {e}");
+                    std::process::exit(1);
+                });
+                let _ = std::fs::remove_file(&tmp);
+                data
+            }
+            _ => {
+                eprintln!("objcopy failed. Install llvm-objcopy, or pass a raw .bin file");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // Validate: check for MZ magic (0x91005A4D)
+    if bin_data.len() < 0x1000 {
+        eprintln!("Binary too small: {} bytes", bin_data.len());
+        std::process::exit(1);
+    }
+    let magic = u32::from_le_bytes([bin_data[0], bin_data[1], bin_data[2], bin_data[3]]);
+    if magic != 0x91005A4D {
+        eprintln!("Bad magic: 0x{magic:08X} (expected 0x91005A4D MZ header)");
+        std::process::exit(1);
+    }
+
+    eprintln!("Kernel binary: {} bytes", bin_data.len());
+
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Step 1: Send binary as RELOAD Write
+    let mut cmd = build_cmd(
+        ferros_pt::command::caps::RELOAD,
+        ferros_pt::Op::Write,
+        &bin_data,
+    );
+    eprintln!("Sending kernel ({} bytes)...", bin_data.len());
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device rejected kernel write");
+                std::process::exit(1);
+            }
+            eprintln!("Write accepted, receiving ack...");
+        }
+        Err(e) => {
+            eprintln!("Transfer failed: {e}");
+            std::process::exit(1);
+        }
+    }
+    match pt_recv(&link).await {
+        Ok(resp) => {
+            if resp.len() >= 4 {
+                let total = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+                eprintln!("Device staged {} bytes", total);
+            }
+        }
+        Err(e) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Step 2: Send RELOAD Exec to trigger jump
+    cmd = build_cmd(ferros_pt::command::caps::RELOAD, ferros_pt::Op::Exec, &[]);
+    eprintln!("Executing reload...");
+    match pt_send(&link, &cmd).await {
+        Ok(_) => println!("Reload triggered — new kernel booting"),
+        Err(e) => {
+            if e.contains("recv") || e.contains("transfer") {
+                println!("Device is reloading");
+            } else {
+                eprintln!("Exec failed: {e}");
+            }
+        }
+    }
+}
+
+async fn cmd_reboot(mode: &str) {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mode_byte: u8 = match mode {
+        "fastboot" | "bootloader" => 0x01,
+        "normal" => 0x00,
+        other => {
+            eprintln!("Unknown reboot mode: {other} (use 'normal' or 'fastboot')");
+            std::process::exit(1);
+        }
+    };
+
+    let cmd = build_cmd(
+        ferros_pt::command::caps::REBOOT,
+        ferros_pt::Op::Exec,
+        &[mode_byte],
+    );
+
+    eprintln!("Rebooting device (mode={mode})...");
+
+    // Send command — device will reboot immediately, so we won't get COMPLETE
+    match pt_send(&link, &cmd).await {
+        Ok(_) => println!("Reboot command sent"),
+        Err(e) => {
+            // USB disconnect during reboot is expected
+            if e.contains("recv") || e.contains("transfer") {
+                println!("Device is rebooting");
+            } else {
+                eprintln!("Send failed: {e}");
+            }
+        }
     }
 }
 
 async fn cmd_terminal() {
     let link = match usb::UsbLink::open() {
         Ok(l) => l,
-        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
 
-    eprintln!("Terminal mode: stdin → device, device → stdout (Ctrl-C to exit)");
+    eprintln!("Terminal mode (PT): type input, Enter to send (Ctrl-C to exit)");
 
-    // Spawn reader task (device → stdout)
-    let link_ref = &link;
-    let reader = tokio::spawn(async move {
-        // We can't move link into spawn, so we use a different approach
-        // For now, just a placeholder — proper implementation needs Arc
-    });
-
-    // For MVP: simple alternating send/recv
-    // Full terminal mode with concurrent stdin/stdout needs Arc<UsbLink>
-    // or splitting into separate IN/OUT handles
     let mut line = String::new();
     loop {
         line.clear();
         eprint!("> ");
         let _ = io::stderr().flush();
         match io::stdin().read_line(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
-
-                if let Err(e) = link.send(trimmed.as_bytes()).await {
-                    eprintln!("Send failed: {e}");
-                    break;
+                if trimmed.is_empty() {
+                    continue;
                 }
 
-                // Try to read response
-                match link.recv().await {
-                    Ok(data) if !data.is_empty() => {
-                        let _ = io::stdout().write_all(&data);
-                        let _ = io::stdout().flush();
-                        println!();
+                match pt_send(&link, trimmed.as_bytes()).await {
+                    Ok(complete) => {
+                        if complete.success {
+                            println!("OK ({} bytes)", trimmed.len());
+                        } else {
+                            eprintln!("Device reported failure");
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
-                        eprintln!("Recv failed: {e}");
+                        eprintln!("PT send failed: {e}");
                         break;
                     }
                 }
@@ -181,13 +702,13 @@ async fn cmd_terminal() {
             }
         }
     }
-
-    reader.abort();
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 { return None; }
+    if s.len() % 2 != 0 {
+        return None;
+    }
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())

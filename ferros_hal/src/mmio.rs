@@ -44,6 +44,24 @@ pub unsafe fn write64(addr: usize, val: u64) {
     unsafe { ptr::write_volatile(addr as *mut u64, val) }
 }
 
+/// Read a 16-bit MMIO register.
+///
+/// # Safety
+/// `addr` must be a valid, mapped MMIO register address (2-byte aligned).
+#[inline(always)]
+pub unsafe fn read16(addr: usize) -> u16 {
+    unsafe { ptr::read_volatile(addr as *const u16) }
+}
+
+/// Write a 16-bit MMIO register.
+///
+/// # Safety
+/// `addr` must be a valid, mapped MMIO register address (2-byte aligned).
+#[inline(always)]
+pub unsafe fn write16(addr: usize, val: u16) {
+    unsafe { ptr::write_volatile(addr as *mut u16, val) }
+}
+
 /// Read a byte from an MMIO address.
 ///
 /// # Safety
