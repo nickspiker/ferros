@@ -36,12 +36,10 @@ use ferros_vault::device::{Device, DeviceError, DeviceId, DeviceInfo, DeviceIoKi
 /// Standard SDHCI register offsets (from SD Host Controller Spec v3.00).
 #[allow(dead_code)]
 mod regs {
-    pub const SDMA_ADDR: usize = 0x00;
     pub const BLOCK_SIZE: usize = 0x04;
     pub const BLOCK_COUNT: usize = 0x06;
     pub const ARGUMENT: usize = 0x08;
     pub const TRANSFER_MODE: usize = 0x0C;
-    pub const COMMAND: usize = 0x0E;
     pub const RESPONSE: usize = 0x10; // 0x10-0x1F (128 bits)
     pub const BUFFER_DATA: usize = 0x20;
     pub const PRESENT_STATE: usize = 0x24;
@@ -55,19 +53,16 @@ mod regs {
     pub const NORMAL_INT_STATUS_EN: usize = 0x34;
     pub const ERROR_INT_STATUS_EN: usize = 0x36;
     pub const CAPABILITIES: usize = 0x40;
-    pub const CAPABILITIES_HI: usize = 0x44;
 
     // Present State bits
     pub const CMD_INHIBIT: u32 = 1 << 0;
     pub const DAT_INHIBIT: u32 = 1 << 1;
-    pub const CARD_INSERTED: u32 = 1 << 16;
 
     // HOST_CTRL1 bits
     pub const HOST_4BIT: u8 = 1 << 1;  // 4-bit data transfer width
 
     // Qualcomm vendor-specific registers (sdhci-msm v5)
     pub const VENDOR_SPEC: usize = 0x20C;
-    pub const VENDOR_SPEC_CAPABILITIES0: usize = 0x21C;
     pub const PWRCTL_STATUS: usize = 0x240;
     pub const PWRCTL_MASK: usize = 0x244;
     pub const PWRCTL_CLEAR: usize = 0x248;
@@ -131,11 +126,9 @@ mod cmd {
     pub const GO_IDLE: u16 = 0;
     pub const ALL_SEND_CID: u16 = 2;
     pub const SEND_RELATIVE_ADDR: u16 = 3;
-    pub const SWITCH_FUNC: u16 = 6;       // CMD6 — switch function (HS mode)
     pub const SELECT_CARD: u16 = 7;
     pub const SEND_IF_COND: u16 = 8;
     pub const SEND_CSD: u16 = 9;
-    pub const STOP_TRANSMISSION: u16 = 12; // CMD12 — stop multi-block
     pub const SET_BLOCKLEN: u16 = 16;
     pub const READ_SINGLE_BLOCK: u16 = 17;
     pub const READ_MULTIPLE_BLOCK: u16 = 18;
@@ -145,7 +138,6 @@ mod cmd {
     pub const APP_CMD: u16 = 55;
     pub const SD_SEND_OP_COND: u16 = 41;  // ACMD41
     pub const SET_BUS_WIDTH: u16 = 6;     // ACMD6
-    pub const SEND_SCR: u16 = 51;         // ACMD51 — SD Configuration Register
 }
 
 /// Decoded CSD register (Card-Specific Data).
@@ -388,25 +380,25 @@ impl SdmmcController {
         unsafe { crate::mmio::write8(self.base + regs::POWER_CTRL, 0x0F) };
 
         // Step 5: Set clock to 400KHz for identification
-        self.set_clock(400)?;
+        self.set_clock_raw(400);
 
         // Small delay for power + clock stabilization
         Self::delay(100_000);
 
         // Step 6: Card identification sequence
-        self.send_cmd_with(cmd::GO_IDLE, 0, RespType::None)?;
+        self.send_cmd_raw(cmd::GO_IDLE, 0, RespType::None)?;
 
         // CMD8: voltage check
-        let cmd8_ok = self.send_cmd_with(cmd::SEND_IF_COND, 0x000001AA, RespType::R7);
+        let cmd8_ok = self.send_cmd_raw(cmd::SEND_IF_COND, 0x000001AA, RespType::R7);
         let _sdhc = cmd8_ok.is_ok(); // SD v2+ if CMD8 succeeds
 
         // Step 7: ACMD41 loop — wait for card to be ready (up to 1s)
         let mut ocr = 0u32;
         for _ in 0..1000 {
             // CMD55 (APP_CMD) with RCA=0 during init
-            self.send_cmd_with(cmd::APP_CMD, 0, RespType::R1)?;
+            self.send_cmd_raw(cmd::APP_CMD, 0, RespType::R1)?;
             // ACMD41: HCS=1 (bit 30), voltage window 2.7-3.6V
-            self.send_cmd_with(cmd::SD_SEND_OP_COND, 0x40FF8000, RespType::R3)?;
+            self.send_cmd_raw(cmd::SD_SEND_OP_COND, 0x40FF8000, RespType::R3)?;
             ocr = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
             if ocr & (1 << 31) != 0 {
                 break;
@@ -418,21 +410,21 @@ impl SdmmcController {
         }
 
         // Step 8: Get CID
-        self.send_cmd_with(cmd::ALL_SEND_CID, 0, RespType::R2)?;
+        self.send_cmd_raw(cmd::ALL_SEND_CID, 0, RespType::R2)?;
         self.parse_cid();
 
         // Step 9: Get RCA
-        self.send_cmd_with(cmd::SEND_RELATIVE_ADDR, 0, RespType::R6)?;
+        self.send_cmd_raw(cmd::SEND_RELATIVE_ADDR, 0, RespType::R6)?;
         self.rca = (unsafe { crate::mmio::read32(self.base + regs::RESPONSE) } >> 16) as u16;
 
         // Step 10: Select card
-        self.send_cmd_with(cmd::SELECT_CARD, (self.rca as u32) << 16, RespType::R1b)?;
+        self.send_cmd_raw(cmd::SELECT_CARD, (self.rca as u32) << 16, RespType::R1b)?;
 
         // Step 11: Set block length to 512
-        self.send_cmd_with(cmd::SET_BLOCKLEN, 512, RespType::R1)?;
+        self.send_cmd_raw(cmd::SET_BLOCKLEN, 512, RespType::R1)?;
 
         // Step 12: Switch to 25MHz for data transfer
-        self.set_clock(25_000)?;
+        self.set_clock_raw(25_000);
 
         self.device_info = Some(DeviceInfo {
             id: self.device_id,
@@ -849,26 +841,10 @@ impl SdmmcController {
         true
     }
 
-    fn wait_reset(&self) -> Result<(), DeviceError> {
-        for _ in 0..10_000 {
-            let val = unsafe { crate::mmio::read8(self.base + regs::SW_RESET) };
-            if val & 0x01 == 0 {
-                return Ok(());
-            }
-        }
-        Err(DeviceError::IoError(DeviceIoKind::Timeout))
-    }
-
     fn delay(iters: u32) {
         for _ in 0..iters {
             unsafe { core::arch::asm!("nop") };
         }
-    }
-
-    /// Set SD clock. `khz` is target frequency in KHz.
-    fn set_clock(&self, khz: u32) -> Result<(), DeviceError> {
-        self.set_clock_raw(khz);
-        Ok(())
     }
 
     /// Enable SDHCI clock output — Qualcomm bypass mode (no internal divider).
@@ -895,10 +871,6 @@ impl SdmmcController {
             let clk = crate::mmio::read16(self.base + regs::CLOCK_CTRL);
             crate::mmio::write16(self.base + regs::CLOCK_CTRL, clk | (1 << 2));
         }
-    }
-
-    fn send_cmd_with(&self, cmd_idx: u16, arg: u32, resp: RespType) -> Result<u32, DeviceError> {
-        self.send_cmd_raw(cmd_idx, arg, resp)
     }
 
     fn send_cmd_raw(&self, cmd_idx: u16, arg: u32, resp: RespType) -> Result<u32, DeviceError> {
@@ -933,7 +905,7 @@ impl SdmmcController {
         for _ in 0..5_000_000u32 {
             let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::ERR_INTERRUPT != 0 {
-                let err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
+                let _err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
                 // Clear errors
                 unsafe {
                     crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);

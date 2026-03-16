@@ -83,11 +83,7 @@ const DEPCMD: usize = 0xC80C;
 // ---------------------------------------------------------------------------
 
 const GCTL_PRTCAPDIR_MASK: u32 = 0x3 << 12;
-const GCTL_PRTCAPDIR_HOST: u32 = 0x1 << 12;
 const GCTL_PRTCAPDIR_DEVICE: u32 = 0x2 << 12;
-const GCTL_CORESOFTRESET: u32 = 1 << 11;
-const GCTL_DISSCRAMBLE: u32 = 1 << 3;
-const GCTL_SCALEDOWN_MASK: u32 = 0x3 << 4;
 
 // ---------------------------------------------------------------------------
 // DCTL bits
@@ -95,8 +91,7 @@ const GCTL_SCALEDOWN_MASK: u32 = 0x3 << 4;
 
 const DCTL_RUN_STOP: u32 = 1 << 31;
 const DCTL_CSFTRST: u32 = 1 << 30;
-/// Link state change request field [8:5].
-const DCTL_ULSTCHNGREQ_SHIFT: u32 = 5;
+
 
 // ---------------------------------------------------------------------------
 // DCFG bits
@@ -117,7 +112,6 @@ const DCFG_DEVADDR_MASK: u32 = 0x7F << 3;
 const DEVTEN_DISCONNEVTEN: u32 = 1 << 0;
 const DEVTEN_USBRSTEN: u32 = 1 << 1;
 const DEVTEN_CONNECTDONEEN: u32 = 1 << 2;
-const DEVTEN_ULSTCHNG: u32 = 1 << 3;
 const DEVTEN_CMDCMPLEN: u32 = 1 << 14;
 
 // ---------------------------------------------------------------------------
@@ -189,8 +183,6 @@ const EP_TYPE_INTERRUPT: u32 = 3;
 const DEPCFGPAR1_EPNUM_SHIFT: u32 = 25;
 /// Transfer event enable.
 const DEPCFGPAR1_XFER_CMPL_EN: u32 = 1 << 8;
-/// Xfer in progress enable.
-const DEPCFGPAR1_XFER_IN_PROG_EN: u32 = 1 << 9;
 /// Xfer not ready enable.
 const DEPCFGPAR1_XFER_NRDY_EN: u32 = 1 << 10;
 
@@ -201,8 +193,6 @@ const DEPCFGPAR1_XFER_NRDY_EN: u32 = 1 << 10;
 /// TRB Control bits.
 const TRB_CTRL_HWO: u32 = 1 << 0;   // Hardware Owns
 const TRB_CTRL_LST: u32 = 1 << 1;   // Last TRB
-const TRB_CTRL_CHN: u32 = 1 << 2;   // Chain
-const TRB_CTRL_CSP: u32 = 1 << 3;   // Continue on Short Packet
 const TRB_CTRL_ISP_IMI: u32 = 1 << 10; // Interrupt on Short/Miss
 const TRB_CTRL_IOC: u32 = 1 << 11;     // Interrupt on Complete
 /// TRB type field [9:4] (6 bits).
@@ -214,7 +204,6 @@ const TRBCTL_SETUP: u32 = 2;         // Control-Setup (EP0 OUT)
 const TRBCTL_STATUS2: u32 = 3;       // Control-Status 2 (no-data)
 const TRBCTL_STATUS3: u32 = 4;       // Control-Status 3 (with data)
 const TRBCTL_CONTROL_DATA: u32 = 5;  // Control-Data
-const TRBCTL_LINK: u32 = 6;          // Link TRB
 
 // ---------------------------------------------------------------------------
 // Event types (from event buffer entries)
@@ -228,27 +217,18 @@ const DEVT_DISCONN: u32 = 0;
 const DEVT_USBRST: u32 = 1;
 const DEVT_CONNECTDONE: u32 = 2;
 const DEVT_ULSTCHNG: u32 = 3;
-const DEVT_WKUP: u32 = 4;
-const DEVT_SOF: u32 = 7;
 const DEVT_CMDCMPLT: u32 = 10;
 
 /// EP event: transfer complete.
 const DEPEVT_XFERCOMPLETE: u32 = 1;
-/// EP event: transfer in progress.
-const DEPEVT_XFERINPROGRESS: u32 = 2;
 /// EP event: transfer not ready.
 const DEPEVT_XFERNOTREADY: u32 = 3;
-
-/// SETEPCONFIG action field [31:30] in DEPCFGPAR1.
-const DEPCFGPAR1_ACTION_MODIFY: u32 = 2 << 30;
 
 // ---------------------------------------------------------------------------
 // USB Standard Requests
 // ---------------------------------------------------------------------------
 
 const USB_REQ_GET_STATUS: u8 = 0;
-const USB_REQ_CLEAR_FEATURE: u8 = 1;
-const USB_REQ_SET_FEATURE: u8 = 3;
 const USB_REQ_SET_ADDRESS: u8 = 5;
 const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_REQ_SET_CONFIGURATION: u8 = 9;
@@ -440,10 +420,6 @@ pub fn probe() -> Dwc3Info {
             dcfg: mmio::read32(DWC3_BASE + DCFG),
         }
     }
-}
-
-pub fn qcom_wrapper_read() -> u32 {
-    unsafe { mmio::read32(QCOM_WRAPPER + QCOM_GENERAL_CFG) }
 }
 
 /// Diagnostic register dump after init.
@@ -1547,17 +1523,6 @@ impl Dwc3Dev {
                 _ => UsbEvent::None,
             }
         }
-    }
-
-    /// Force-end any active transfer on a physical endpoint.
-    /// Reads the resource index from hardware (DEPCMD[22:16]).
-    /// If no transfer is active (rsc_idx=0), does nothing.
-    fn force_end_transfer(&mut self, ep_phys: u8) {
-        let base = DWC3_BASE + 0xC800 + (ep_phys as usize) * 16;
-        let cmd_reg = unsafe { mmio::read32(base + 0x0C) };
-        let rsc_idx = (cmd_reg >> 16) & 0x7F;
-        if rsc_idx == 0 { return; }
-        self.end_transfer_raw(ep_phys, rsc_idx);
     }
 
     /// Unconditionally issue ENDTRANSFER with rsc_idx=1.
