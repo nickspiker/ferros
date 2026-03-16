@@ -340,9 +340,43 @@ impl SdmmcController {
     ///
     /// Returns Ok(true) if a card is found, Ok(false) if slot is empty.
     pub fn init(&mut self) -> Result<bool, DeviceError> {
+        // Step 0: GCC block reset + clock re-init for hot-reload recovery.
+        crate::gcc::sdc2_block_reset();
+        crate::gcc::sdc2_set_400khz();
+        Self::delay(50_000);
+
+        // Step 0.5: Clear any pending Qualcomm PWRCTL interrupts — SDHCI
+        // SW_RESET may not complete while PWRCTL is pending.
+        unsafe {
+            let status = crate::mmio::read32(self.base + regs::PWRCTL_STATUS);
+            if status != 0 {
+                crate::mmio::write32(self.base + regs::PWRCTL_CLEAR, status);
+                Self::delay(1000);
+                crate::mmio::write32(self.base + regs::PWRCTL_CTL,
+                    regs::PWRCTL_BUS_SUCCESS | regs::PWRCTL_IO_SUCCESS);
+                Self::delay(1000);
+            }
+        }
+
         // Step 1: Software reset
         unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) };
-        self.wait_reset()?;
+        // Wait for reset with PWRCTL polling — the Qualcomm wrapper generates
+        // PWRCTL interrupts during reset that must be acknowledged.
+        for _ in 0..100_000u32 {
+            let val = unsafe { crate::mmio::read8(self.base + regs::SW_RESET) };
+            if val & 0x01 == 0 {
+                break;
+            }
+            // Check for PWRCTL during reset
+            let pwr = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
+            if pwr != 0 {
+                unsafe {
+                    crate::mmio::write32(self.base + regs::PWRCTL_CLEAR, pwr);
+                    crate::mmio::write32(self.base + regs::PWRCTL_CTL,
+                        regs::PWRCTL_BUS_SUCCESS | regs::PWRCTL_IO_SUCCESS);
+                }
+            }
+        }
 
         // Step 2: Enable all interrupt status signals
         unsafe {

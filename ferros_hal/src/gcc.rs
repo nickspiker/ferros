@@ -140,6 +140,19 @@ fn sdc2_deassert_reset() {
     }
 }
 
+/// Full GCC block reset: assert BCR, wait, deassert, wait.
+/// This resets the entire SDHCI controller hardware — clears all stale state.
+pub fn sdc2_block_reset() {
+    unsafe {
+        // Assert reset (set bit 0)
+        crate::mmio::write32(GCC_SDCC2_BCR, 1);
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+        // Deassert reset (clear bit 0)
+        crate::mmio::write32(GCC_SDCC2_BCR, 0);
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+    }
+}
+
 /// Read the BCR register value (for diagnostics).
 pub fn sdc2_bcr_raw() -> u32 {
     unsafe { crate::mmio::read32(GCC_SDCC2_BCR) }
