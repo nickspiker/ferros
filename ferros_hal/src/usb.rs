@@ -377,23 +377,36 @@ struct Ep0DataBuf {
 }
 static mut EP0_DATA_BUF: Ep0DataBuf = Ep0DataBuf { data: [0; 512] };
 
-/// Bulk endpoint TRBs — one per direction, cache-line aligned.
+/// Bulk OUT TRB ring — 32 Normal TRBs + 1 Link TRB = circular ring.
+/// DWC3 walks the ring automatically via CHN bits. Link TRB wraps to start.
+/// One STARTTRANSFER at init, UPDATETRANSFER to recycle consumed TRBs.
+const BULK_OUT_RING_SIZE: usize = 32;
+
 #[repr(C, align(64))]
-struct BulkOutTrb { trb: Trb, _pad: [Trb; 3] }
+struct BulkOutRing {
+    trbs: [Trb; BULK_OUT_RING_SIZE + 1], // 32 Normal + 1 Link
+}
+
+/// 32 × 512-byte data buffers for the bulk OUT ring.
+#[repr(C, align(64))]
+struct BulkOutBufs {
+    bufs: [[u8; 512]; BULK_OUT_RING_SIZE],
+}
+
+static mut BULK_OUT_RING: BulkOutRing = BulkOutRing {
+    trbs: [Trb::zero(); BULK_OUT_RING_SIZE + 1],
+};
+static mut BULK_OUT_BUFS: BulkOutBufs = BulkOutBufs {
+    bufs: [[0u8; 512]; BULK_OUT_RING_SIZE],
+};
+
+/// Bulk IN TRB + buffer (single, unchanged for now).
 #[repr(C, align(64))]
 struct BulkInTrb { trb: Trb, _pad: [Trb; 3] }
-
-static mut BULK_OUT_TRB: BulkOutTrb = BulkOutTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
 static mut BULK_IN_TRB: BulkInTrb = BulkInTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
 
-/// Bulk OUT data buffer (host→device). 512B for HS bulk MPS.
-#[repr(C, align(64))]
-struct BulkOutBuf { data: [u8; 512] }
-/// Bulk IN data buffer (device→host). 4KB for batching log output.
 #[repr(C, align(64))]
 struct BulkInBuf { data: [u8; 4096] }
-
-static mut BULK_OUT_BUF: BulkOutBuf = BulkOutBuf { data: [0; 512] };
 static mut BULK_IN_BUF: BulkInBuf = BulkInBuf { data: [0; 4096] };
 
 // ---------------------------------------------------------------------------
@@ -760,6 +773,12 @@ pub struct Dwc3Dev {
     // Bulk endpoint state
     bulk_out_resource_idx: u8,  // Transfer resource index for bulk OUT (phys EP 2)
     bulk_in_resource_idx: u8,   // Transfer resource index for bulk IN (phys EP 3)
+    /// Ring consumer index — next TRB to read from
+    bulk_out_consumer: usize,
+    /// Ring producer index — next TRB to recycle (set HWO)
+    bulk_out_producer: usize,
+    /// Whether the ring has been started (STARTTRANSFER issued)
+    bulk_out_ring_started: bool,
     /// Bytes received in last bulk OUT transfer
     pub bulk_out_len: u16,
     /// New bulk OUT data available for kernel to consume
@@ -913,6 +932,9 @@ impl Dwc3Dev {
             last_send_src_preview: 0,
             bulk_out_resource_idx: 0,
             bulk_in_resource_idx: 0,
+            bulk_out_consumer: 0,
+            bulk_out_producer: 0,
+            bulk_out_ring_started: false,
             bulk_out_len: 0,
             bulk_out_ready: false,
             bulk_out_armed: false,
@@ -1003,45 +1025,103 @@ impl Dwc3Dev {
         }
     }
 
-    /// Arm bulk OUT (phys EP 2) to receive up to 512 bytes from host.
-    /// Whether bulk OUT has been armed (pending STARTTRANSFER).
-    pub fn bulk_out_needs_arm(&self) -> bool {
-        !self.bulk_out_ready && !self.bulk_out_armed
+    /// Initialize and start the bulk OUT TRB ring. Called once at ConnectDone.
+    /// Sets up 32 chained TRBs + Link TRB. DWC3 walks the ring automatically.
+    /// IOC on every TRB for per-packet processing. No ISP_IMI — short packets
+    /// don't break the chain.
+    pub fn bulk_out_arm_ring(&mut self) {
+        unsafe {
+            let ring = &raw mut BULK_OUT_RING;
+
+            // Set up 32 Normal TRBs, all chained, all with IOC
+            for i in 0..BULK_OUT_RING_SIZE {
+                let buf_addr = &raw const BULK_OUT_BUFS.bufs[i] as usize;
+                (*ring).trbs[i].bpl = buf_addr as u32;
+                (*ring).trbs[i].bph = (buf_addr >> 32) as u32;
+                (*ring).trbs[i].size = 512;
+                (*ring).trbs[i].ctrl = TRB_CTRL_HWO
+                    | TRB_CTRL_CHN  // chain to next TRB
+                    | TRB_CTRL_IOC  // interrupt on each completion
+                    | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+            }
+
+            // Link TRB at position 32 — wraps back to TRB[0]
+            let ring_start = &raw const (*ring).trbs[0] as usize;
+            (*ring).trbs[BULK_OUT_RING_SIZE].bpl = ring_start as u32;
+            (*ring).trbs[BULK_OUT_RING_SIZE].bph = (ring_start >> 32) as u32;
+            (*ring).trbs[BULK_OUT_RING_SIZE].size = 0;
+            (*ring).trbs[BULK_OUT_RING_SIZE].ctrl = TRB_CTRL_HWO
+                | TRB_CTRL_CHN
+                | (TRBCTL_LINK << TRB_CTRL_TRBCTL_SHIFT);
+
+            // Flush all TRBs + buffers to DRAM
+            let trb_addr = &raw const (*ring).trbs[0] as usize;
+            let trb_total = (BULK_OUT_RING_SIZE + 1) * 16;
+            cache_clean(trb_addr, trb_total);
+            let bufs_addr = &raw const BULK_OUT_BUFS as usize;
+            cache_clean(bufs_addr, BULK_OUT_RING_SIZE * 512);
+            core::arch::asm!("dsb sy");
+
+            self.bulk_out_consumer = 0;
+            self.bulk_out_armed = true;
+
+            // STARTTRANSFER with first TRB
+            if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0,
+                           trb_addr as u32, (trb_addr >> 32) as u32) {
+                let cmd_reg = mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C);
+                self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+                self.bulk_out_ring_started = true;
+            }
+        }
     }
 
-    pub fn bulk_out_arm(&mut self) {
-        self.bulk_out_armed = true;
-        let buf_addr = &raw const BULK_OUT_BUF as usize;
-        let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
-
+    /// Recycle a consumed TRB — reset HWO so DWC3 can reuse it on wrap.
+    /// Called after reading data from each TRB.
+    fn bulk_out_recycle_one(&mut self, idx: usize) {
         unsafe {
-            let trb = &raw mut BULK_OUT_TRB.trb;
-            (*trb).bpl = buf_addr as u32;
-            (*trb).bph = (buf_addr >> 32) as u32;
-            (*trb).size = 512;
-            (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
+            let ring = &raw mut BULK_OUT_RING;
+            let buf_addr = &raw const BULK_OUT_BUFS.bufs[idx] as usize;
+            (*ring).trbs[idx].bpl = buf_addr as u32;
+            (*ring).trbs[idx].bph = (buf_addr >> 32) as u32;
+            (*ring).trbs[idx].size = 512;
+            (*ring).trbs[idx].ctrl = TRB_CTRL_HWO
+                | TRB_CTRL_CHN
+                | TRB_CTRL_IOC
+                | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
+            let trb_addr = &raw const (*ring).trbs[idx] as usize;
+            cache_clean(trb_addr, 16);
+        }
+    }
+
+    /// Recycle consumed TRBs — reset HWO so DWC3 can reuse them.
+    /// Call after reading data from bulk_out_read().
+    fn bulk_out_recycle(&mut self) {
+        unsafe {
+            let ring = &raw mut BULK_OUT_RING;
+            let idx = self.bulk_out_producer;
+            let buf_addr = &raw const BULK_OUT_BUFS.bufs[idx] as usize;
+
+            (*ring).trbs[idx].bpl = buf_addr as u32;
+            (*ring).trbs[idx].bph = (buf_addr >> 32) as u32;
+            (*ring).trbs[idx].size = 512;
+            // Write HWO last (memory barrier)
+            (*ring).trbs[idx].ctrl = TRB_CTRL_HWO
+                | TRB_CTRL_CHN
+                | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-            cache_clean(trb_addr, 16);
-            cache_clean(buf_addr, 512);
-            core::arch::asm!("dsb sy");
-        }
 
-        if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
-            self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
-        } else {
-            self.force_end_transfer_unconditional(2);
-            unsafe {
-                let trb = &raw mut BULK_OUT_TRB.trb;
-                (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
-                    | TRB_CTRL_ISP_IMI
-                    | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
-            }
-            if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-                let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
-                self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
+            let trb_addr = &raw const (*ring).trbs[idx] as usize;
+            cache_clean(trb_addr, 16);
+            core::arch::asm!("dsb sy");
+
+            self.bulk_out_producer = (idx + 1) % BULK_OUT_RING_SIZE;
+
+            // UPDATETRANSFER to tell DWC3 about the recycled TRB
+            if self.bulk_out_ring_started && self.bulk_out_resource_idx != 0 {
+                self.ep_cmd(2,
+                    DEPCMD_UPDATETRANSFER | ((self.bulk_out_resource_idx as u32) << 16),
+                    0, 0, 0);
             }
         }
     }
@@ -1101,15 +1181,25 @@ impl Dwc3Dev {
 
     /// Read received bulk OUT data. Returns slice of received bytes,
     /// or None if no data available. Caller must call bulk_out_arm() after.
+    /// Advance the ring consumer and re-arm for the next packet.
+    /// Uses rotating buffer slots so we never overwrite unread data.
+    pub fn bulk_out_consume(&mut self) {
+        // Recycle this TRB so DWC3 can reuse it on the next ring pass
+        self.bulk_out_recycle_one(self.bulk_out_consumer);
+        self.bulk_out_consumer = (self.bulk_out_consumer + 1) % BULK_OUT_RING_SIZE;
+    }
+
     pub fn bulk_out_read(&mut self) -> Option<&[u8]> {
         if !self.bulk_out_ready { return None; }
         self.bulk_out_ready = false;
         let len = self.bulk_out_len as usize;
         if len == 0 { return None; }
+        let idx = self.bulk_out_consumer;
         unsafe {
-            cache_invalidate(&raw const BULK_OUT_BUF as usize, len);
-            Some(core::slice::from_raw_parts(
-                &raw const BULK_OUT_BUF as *const u8, len))
+            let buf_addr = &raw const BULK_OUT_BUFS.bufs[idx] as usize;
+            cache_invalidate(buf_addr, len);
+            let data = core::slice::from_raw_parts(buf_addr as *const u8, len);
+            Some(data)
         }
     }
 
@@ -1422,16 +1512,21 @@ impl Dwc3Dev {
                     if ep_phys == 2 { self.bulk_out_resource_idx = 0; }
                     if ep_phys == 3 { self.bulk_in_resource_idx = 0; }
 
-                    // Bulk OUT complete — read actual length from TRB
+                    // Bulk OUT complete — read from ring at consumer index
                     if ep_phys == 2 {
-                        self.bulk_out_armed = false;
                         self.bulk_out_xfer_complete += 1;
+                        let idx = self.bulk_out_consumer;
                         unsafe {
-                            cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
-                            let remaining = BULK_OUT_TRB.trb.size & 0x00FF_FFFF;
-                            self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
+                            let trb_addr = &raw const BULK_OUT_RING.trbs[idx] as usize;
+                            cache_invalidate(trb_addr, 16);
+                            let ctrl = BULK_OUT_RING.trbs[idx].ctrl;
+                            // Only process if HWO=0 (DWC3 completed this TRB)
+                            if ctrl & TRB_CTRL_HWO == 0 {
+                                let remaining = BULK_OUT_RING.trbs[idx].size & 0x00FF_FFFF;
+                                self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
+                                self.bulk_out_ready = true;
+                            }
                         }
-                        self.bulk_out_ready = true;
                         return UsbEvent::TransferComplete { ep: ep_phys };
                     }
 
@@ -1487,9 +1582,9 @@ impl Dwc3Dev {
                 DEPEVT_XFERNOTREADY => {
                     self.ep0_xfer_notready += 1;
 
-                    // Bulk OUT XferNotReady — arm receive if configured
-                    if ep_phys == 2 && self.configured {
-                        self.bulk_out_arm();
+                    // Bulk OUT XferNotReady — arm ring if not started
+                    if ep_phys == 2 && self.configured && !self.bulk_out_ring_started {
+                        self.bulk_out_arm_ring();
                         return UsbEvent::None;
                     }
                     // Bulk IN XferNotReady — host polling, NAK until we send
@@ -1630,6 +1725,9 @@ impl Dwc3Dev {
         }
         self.bulk_out_ready = false;
         self.bulk_out_armed = false;
+        self.bulk_out_ring_started = false;
+        self.bulk_out_consumer = 0;
+        self.bulk_out_producer = 0;
         self.bulk_in_idle = true;
 
         // Clear any stall condition
@@ -1724,7 +1822,7 @@ impl Dwc3Dev {
             USB_REQ_SET_CONFIGURATION => {
                 self.configured = w_value != 0;
                 if self.configured {
-                    self.bulk_out_arm();
+                    self.bulk_out_arm_ring();
                     self.bulk_in_idle = true;
                 }
                 self.ep0_status_in();

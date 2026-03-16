@@ -70,9 +70,13 @@ impl UsbLink {
         })
     }
 
-    /// Send data via bulk OUT.
+    /// Send data via bulk OUT. Always pads to 512 bytes (USB HS bulk MPS)
+    /// so DWC3's TRB ring never sees short packets that break the chain.
     pub async fn send(&self, data: &[u8]) -> Result<(), TransferError> {
-        let completion = self.interface.bulk_out(self.ep_out, data.to_vec()).await;
+        let mut padded = vec![0u8; 512];
+        let len = data.len().min(512);
+        padded[..len].copy_from_slice(&data[..len]);
+        let completion = self.interface.bulk_out(self.ep_out, padded).await;
         completion.status
     }
 

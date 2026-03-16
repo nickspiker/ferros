@@ -471,26 +471,45 @@ impl Log {
     }
 }
 
-/// Format u32 as hex into buffer, return length written.
+/// Format u32 as hex into buffer, no leading zeros. Returns length written.
 fn fmt_hex32(val: u32, buf: &mut [u8; 10]) -> usize {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..8 {
-        buf[2 + i] = HEX[((val >> (28 - i * 4)) & 0xF) as usize];
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
     }
-    10
+    // Find first non-zero nibble
+    let mut started = false;
+    let mut pos = 0;
+    for i in 0..8 {
+        let nibble = ((val >> (28 - i * 4)) & 0xF) as usize;
+        if nibble != 0 || started {
+            buf[pos] = HEX[nibble];
+            pos += 1;
+            started = true;
+        }
+    }
+    pos
 }
 
-/// Format u64 as hex into buffer, return length written.
+/// Format u64 as hex into buffer, no leading zeros. Returns length written.
 fn fmt_hex64(val: u64, buf: &mut [u8; 18]) -> usize {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..16 {
-        buf[2 + i] = HEX[((val >> (60 - i * 4)) & 0xF) as usize];
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
     }
-    18
+    let mut started = false;
+    let mut pos = 0;
+    for i in 0..16 {
+        let nibble = ((val >> (60 - i * 4)) & 0xF) as usize;
+        if nibble != 0 || started {
+            buf[pos] = HEX[nibble];
+            pos += 1;
+            started = true;
+        }
+    }
+    pos
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +918,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("CAPS:   "); log.put_hex32(probe.caps); log.puts("\n");
 
         // Raw SDHCI register dump (buf-only for diag)
-        log.buf_only("\nSDHCI raw regs (base=0x08804000):\n");
+        log.buf_only("\nSDHCI raw regs (base=G#08804000):\n");
         {
             let sdc_base = FP5_SDC2_BASE;
             let std_offsets: [(usize, &str); 16] = [
@@ -1123,7 +1142,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
 
     // ---- IMEM probe (reboot reason) ----
-    log.buf_only("\n-- IMEM 0x146AA000 --\n");
+    log.buf_only("\n-- IMEM G#146AA000 --\n");
     {
         let imem_base = 0x146A_A000usize;
         for &off in [0x0usize, 0x4, 0x65C, 0x660, 0x664].iter() {
@@ -1283,6 +1302,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             log.puts("\n");
                             usb.handle_connect_done();
                             usb.ep0_start_setup();
+                            usb.bulk_out_arm_ring(); // Initialize TRB ring
                             ledger.post(&Event::UsbConnectDone { speed });
                             evt_count += 1;
                         }
@@ -1351,6 +1371,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     log.puts("\n");
                                     log.screen = false;
 
+                                    // Debug: show first byte + length for first few packets
+                                    static mut PKT_DBG: u32 = 0;
+                                    unsafe { PKT_DBG += 1; }
+                                    if unsafe { PKT_DBG } <= 5 {
+                                        log.screen = true;
+                                        log.puts("["); log.put_hex32(tmp[0] as u32);
+                                        log.puts(" n="); log.put_hex32(n as u32);
+                                        log.puts("]");
+                                        log.screen = false;
+                                    }
+
                                     if ferros_pt::is_data_packet(tmp[0]) {
                                         // DATA packet — silent receive, no ACK
                                         if let Some(ref mut xfer) = pt_inbound {
@@ -1361,14 +1392,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     seq,
                                                     len: payload.len() as u16,
                                                 });
-                                                // All chunks received? Send COMPLETE/NAK immediately
-                                                log.screen = false; // was true
-                                                log.puts("rcv="); log.put_hex32(xfer.chunks_received as u32);
-                                                log.puts("/"); log.put_hex32(xfer.expected_count as u32);
-                                                log.puts(" ar="); log.put_hex32(xfer.all_received() as u32);
-                                                log.puts(" bad="); log.put_hex32(xfer.bad_chunks as u32);
-                                                log.puts("\n");
-                                                log.screen = false;
+                                                // Log first packet + near completion + bad chunks
+                                                if xfer.chunks_received <= 1 || xfer.bad_chunks > 0 || xfer.chunks_received >= xfer.expected_count.saturating_sub(1) {
+                                                    log.screen = true;
+                                                    log.puts("R"); log.put_hex32(xfer.chunks_received as u32);
+                                                    log.puts("/"); log.put_hex32(xfer.expected_count as u32);
+                                                    log.puts("B"); log.put_hex32(xfer.bad_chunks as u32);
+                                                    log.puts("\n");
+                                                    log.screen = false;
+                                                }
                                                 if xfer.all_received() {
                                                     let mut complete_buf = [0u8; 512];
                                                     let clen = xfer.finish(&mut complete_buf);
@@ -1587,9 +1619,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 pt_out_bitmap.clear();
                                             }
                                         }
+                                    } else {
+                                        // Raw echo — bounce back for testing
+                                        if usb.bulk_in_idle {
+                                            usb.bulk_in_send(&tmp[..n]);
+                                        }
                                     }
                                 }
-                                usb.bulk_out_arm();
+                                // Only advance ring consumer if we actually got data
+                                if n > 0 {
+                                    usb.bulk_out_consume();
+                                }
                             }
                             if ep == 3 {
                                 // Bulk IN complete — chain next pending send

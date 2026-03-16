@@ -249,8 +249,8 @@ impl Console {
             y_off: top,
             col: 0,
             row: 0,
-            cols: text_w / GLYPH_W,
-            rows: text_h / GLYPH_H,
+            cols: text_w / (GLYPH_W * Self::SCALE),
+            rows: text_h / (GLYPH_H * Self::SCALE),
             fg,
             bg,
         }
@@ -270,34 +270,32 @@ impl Console {
     }
 
     /// Draw a single character at text position (col, row) within the margin area.
+    /// Scale factor 2 = double size.
+    const SCALE: usize = 2;
+
     fn draw_char(&self, ch: u8, col: usize, row: usize) {
         let glyph = if ch >= FONT_FIRST && ch <= FONT_LAST {
             &FONT[(ch - FONT_FIRST) as usize]
         } else {
-            &FONT[0] // space for unprintable
+            &FONT[0]
         };
 
-        let px = self.x_off + col * GLYPH_W;
-        let py = self.y_off + row * GLYPH_H;
+        let s = Self::SCALE;
+        let px = self.x_off + col * GLYPH_W * s;
+        let py = self.y_off + row * GLYPH_H * s;
 
         for gy in 0..GLYPH_H {
             let bits = glyph[gy];
-            let y = py + gy;
-            if y >= self.height {
-                return;
-            }
-            for gx in 0..GLYPH_W {
-                let x = px + gx;
-                if x >= self.width {
-                    break;
-                }
-                let color = if bits & (0x80 >> gx) != 0 {
-                    self.fg
-                } else {
-                    self.bg
-                };
-                unsafe {
-                    self.fb.add(y * self.stride + x).write_volatile(color);
+            for sy in 0..s {
+                let y = py + gy * s + sy;
+                if y >= self.height { return; }
+                for gx in 0..GLYPH_W {
+                    let pixel = if (bits >> (7 - gx)) & 1 != 0 { self.fg } else { self.bg };
+                    for sx in 0..s {
+                        let x = px + gx * s + sx;
+                        if x >= self.width { break; }
+                        unsafe { self.fb.add(y * self.stride + x).write_volatile(pixel); }
+                    }
                 }
             }
         }
@@ -305,9 +303,9 @@ impl Console {
 
     /// Scroll the text area up by one text row (within margins).
     fn scroll_up(&mut self) {
-        let line_h = GLYPH_H;
-        let text_h = self.rows * GLYPH_H;
-        let x_end = self.x_off + self.cols * GLYPH_W;
+        let line_h = GLYPH_H * Self::SCALE;
+        let text_h = self.rows * GLYPH_H * Self::SCALE;
+        let x_end = self.x_off + self.cols * GLYPH_W * Self::SCALE;
         // Move rows 1..rows up to 0..rows-1
         for y in 0..(text_h - line_h) {
             let src_y = self.y_off + y + line_h;
@@ -370,21 +368,29 @@ impl Console {
 
     /// Write a u64 as hex.
     pub fn put_hex(&mut self, val: u64) {
-        self.puts("0x");
+        if val == 0 { self.putc(b'0'); return; }
+        let mut started = false;
         for i in (0..16).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
-            let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            self.putc(c);
+            if nibble != 0 || started {
+                let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+                self.putc(c);
+                started = true;
+            }
         }
     }
 
-    /// Write a u32 as hex (8 digits).
+    /// Write a u32 as hex, no leading zeros.
     pub fn put_hex32(&mut self, val: u32) {
-        self.puts("0x");
+        if val == 0 { self.putc(b'0'); return; }
+        let mut started = false;
         for i in (0..8).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
-            let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            self.putc(c);
+            if nibble != 0 || started {
+                let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+                self.putc(c);
+                started = true;
+            }
         }
     }
 }

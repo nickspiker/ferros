@@ -184,8 +184,18 @@ impl<'a> InboundTransfer<'a> {
             return true; // already have it
         }
 
-        // Verify per-chunk BLAKE3 hash
-        let computed = blake3::hash(payload);
+        // Determine actual payload length (last chunk may be shorter than psize).
+        // USB transport pads to 512 bytes, so payload may have trailing zeros.
+        let offset = seq_idx * self.psize as usize;
+        let actual_len = if offset + self.psize as usize > self.expected_total as usize {
+            self.expected_total as usize - offset
+        } else {
+            self.psize as usize
+        };
+        let real_payload = &payload[..actual_len.min(payload.len())];
+
+        // Verify per-chunk BLAKE3 hash (over real bytes, not padding)
+        let computed = blake3::hash(real_payload);
         if computed.as_bytes() != chunk_hash {
             self.bad_chunks += 1;
             // Don't store bad data, don't mark in bitmap — will be NAK'd
@@ -193,10 +203,9 @@ impl<'a> InboundTransfer<'a> {
         }
 
         // Place chunk data at correct offset
-        let offset = seq_idx * self.psize as usize;
-        let end = (offset + payload.len()).min(self.data.len());
+        let end = (offset + real_payload.len()).min(self.data.len());
         let copy_len = end - offset;
-        self.data[offset..end].copy_from_slice(&payload[..copy_len]);
+        self.data[offset..end].copy_from_slice(&real_payload[..copy_len]);
 
         bitmap_set(self.received, seq_idx);
         self.chunks_received += 1;

@@ -19,6 +19,7 @@ fn usage() {
     eprintln!("  log          Stream bulk IN data from device to stdout");
     eprintln!("  reboot [fastboot]  Reboot device (default: normal, 'fastboot' for bootloader)");
     eprintln!("  reload <kernel>   Hot-reload kernel binary (ELF path, runs mkimg internally)");
+    eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 200)");
     eprintln!("  terminal     Bidirectional PT session");
 }
 
@@ -126,6 +127,9 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
         ));
     }
 
+    // Small delay after SPEC ACK — let kernel finish arming ep2
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
     // Blast all DATA packets — no ACK wait, USB guarantees delivery
     let mut pkt_buf = [0u8; 512];
     let mut sent = 0u64;
@@ -140,16 +144,13 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
             .await
             .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
         sent += 1;
-        if sent % 50 == 0 || sent == xfer.count {
-            eprintln!("  sent {}/{}", sent, xfer.count);
-        }
     }
 
     eprintln!("  {} DATA packets blasted", sent);
 
     // Wait for COMPLETE. Kernel responds when all_received().
     // Timeout proportional to transfer size: ~1ms per packet + 2s base.
-    let wait_ms = 2000 + (sent as u64) * 2;
+    let wait_ms = (1u64 << 15) + (sent << 6); // 32768ms base + 64ms per packet
 
     match tokio::time::timeout(
         std::time::Duration::from_millis(wait_ms),
@@ -220,7 +221,7 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
             continue;
         }
 
-        eprintln!("  recv: {} bytes first=0x{:02x}", resp.len(), resp[0]);
+        eprintln!("  recv: {} bytes first=G#{:02x}", resp.len(), resp[0]);
 
         if ferros_pt::is_data_packet(resp[0]) {
             if let Some((_sid, seq, chunk_hash, payload)) =
@@ -334,7 +335,7 @@ async fn cmd_read(addr_str: &str, len: usize) {
     params[8..12].copy_from_slice(&(len as u32).to_be_bytes());
 
     let cmd = build_cmd(ferros_pt::command::caps::MEM, ferros_pt::Op::Read, &params);
-    eprintln!("Reading {} bytes from 0x{:X}", len, addr);
+    eprintln!("Reading {} bytes from G#{:X}", len, addr);
 
     match pt_send(&link, &cmd).await {
         Ok(complete) => {
@@ -503,7 +504,7 @@ async fn cmd_reload(path: &str) {
     }
     let magic = u32::from_le_bytes([bin_data[0], bin_data[1], bin_data[2], bin_data[3]]);
     if magic != 0x91005A4D {
-        eprintln!("Bad magic: 0x{magic:08X} (expected 0x91005A4D MZ header)");
+        eprintln!("Bad magic: G#{magic:08X} (expected G#91005A4D MZ header)");
         std::process::exit(1);
     }
 
