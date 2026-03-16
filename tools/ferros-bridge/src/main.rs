@@ -138,75 +138,34 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
 
         link.send(&pkt_buf[..pkt_len])
             .await
-            .map_err(|e| format!("DATA send failed: {e}"))?;
+            .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
         sent += 1;
+        if sent % 50 == 0 || sent == xfer.count {
+            eprintln!("  sent {}/{}", sent, xfer.count);
+        }
     }
 
     eprintln!("  {} DATA packets blasted", sent);
 
-    // Send FIN, then wait for COMPLETE or NAK with binary backoff
-    let mut fin_buf = [0u8; 8];
-    let fin_len = xfer.encode_fin(&mut fin_buf);
+    // Wait for COMPLETE. Kernel responds when all_received().
+    // Timeout proportional to transfer size: ~1ms per packet + 2s base.
+    let wait_ms = 2000 + (sent as u64) * 2;
 
-    // Binary backoff: 1/256s (~4ms), doubling, cap at 4s.
-    // Never give up — large transfers may take time to hash.
-    // Cap backoff at 4s and retry indefinitely until COMPLETE/NAK/abort.
-    let mut backoff_ms = 4u64; // ~1/256s
-    let mut attempt = 0u32;
-
-    loop {
-        link.send(&fin_buf[..fin_len])
-            .await
-            .map_err(|e| format!("FIN send failed: {e}"))?;
-
-        // Wait for response with timeout
-        match tokio::time::timeout(std::time::Duration::from_millis(backoff_ms), link.recv()).await
-        {
-            Ok(Ok(resp)) => {
-                eprintln!("  FIN resp: {} bytes, first={:02x?}", resp.len(), &resp[..resp.len().min(8)]);
-                if resp.is_empty() {
-                    continue;
-                }
-
-                // COMPLETE?
-                if let Some(complete) = Complete::decode(&resp) {
-                    xfer.handle_complete(&complete);
-                    eprintln!("  COMPLETE received (attempt {})", attempt + 1);
-                    return Ok(complete);
-                }
-
-                // NAK? Retransmit requested chunks
-                if let Some(nak) = ferros_pt::packet::Nak::decode(&resp) {
-                    eprintln!("  NAK: {} chunks to retransmit", nak.count);
-                    let seqs: Vec<u64> = nak.seqs[..nak.count].to_vec();
-                    for &seq in &seqs {
-                        let pkt_len = xfer.retransmit_packet(seq, data, &mut pkt_buf);
-                        if pkt_len > 0 {
-                            link.send(&pkt_buf[..pkt_len])
-                                .await
-                                .map_err(|e| format!("Retransmit failed: {e}"))?;
-                        }
-                    }
-                    // Reset backoff for next FIN cycle
-                    backoff_ms = 4;
-                    continue;
-                }
-
-                // Unknown response
-                eprintln!("  Unknown response: {:02x?}", &resp[..resp.len().min(8)]);
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(wait_ms),
+        link.recv(),
+    ).await {
+        Ok(Ok(resp)) => {
+            if let Some(complete) = Complete::decode(&resp) {
+                xfer.handle_complete(&complete);
+                eprintln!("  COMPLETE received");
+                return Ok(complete);
             }
-            Ok(Err(e)) => {
-                return Err(format!("recv error: {e}"));
-            }
-            Err(_) => {
-                // Timeout — double backoff and retry FIN
-                eprintln!("  FIN timeout ({}ms), retrying...", backoff_ms);
-            }
+            Err(format!("Expected COMPLETE, got {} bytes: {:02x?}", resp.len(), &resp[..resp.len().min(8)]))
         }
-
-        backoff_ms = (backoff_ms * 2).min(4000); // cap at 4s
-        attempt += 1;
-    } // loop
+        Ok(Err(e)) => Err(format!("recv error: {e}")),
+        Err(_) => Err(format!("Timeout waiting for COMPLETE after {}ms ({} packets)", wait_ms, sent)),
+    }
 } // pt_send
 
 // ---------------------------------------------------------------------------
