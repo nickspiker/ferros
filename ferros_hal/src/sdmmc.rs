@@ -173,33 +173,30 @@ impl CsdInfo {
     /// Decode CSD from the 4 response words (as read from SDHCI RESPONSE regs).
     /// SDHCI shifts R2 responses right by 8 bits — the MSB of CSD is in resp[3] bits [23:0].
     pub fn from_response(resp: &[u32; 4]) -> Self {
-        // Reconstruct the 128-bit CSD (SDHCI drops the MSB byte and shifts right 8).
-        // resp[3] has CSD[127:96] shifted → actually CSD[119:88]
-        // resp[2] has CSD[95:64] shifted → actually CSD[87:56]
-        // resp[1] has CSD[63:32] shifted → actually CSD[55:24]
-        // resp[0] has CSD[31:0] shifted → actually CSD[23:0] (low 8 bits lost)
+        // SDHCI shifts R2 responses right by 8 bits. Reconstruct as u128.
+        // CSD spec bit X → u128 bit (X - 8).
+        let csd: u128 = (resp[3] as u128) << 96
+            | (resp[2] as u128) << 64
+            | (resp[1] as u128) << 32
+            | (resp[0] as u128);
 
-        let csd_ver = ((resp[3] >> 22) & 0x3) as u8;
-        let tran_speed = ((resp[2] >> 24) & 0xFF) as u8;
-        let ccc = ((resp[2] >> 12) & 0xFFF) as u16;
-        let read_bl_len = ((resp[2] >> 8) & 0xF) as u8;
+        let csd_ver = ((csd >> 118) & 0x3) as u8;       // [127:126]
+        let tran_speed = ((csd >> 88) & 0xFF) as u8;     // [103:96]
+        let ccc = ((csd >> 76) & 0xFFF) as u16;          // [95:84]
+        let read_bl_len = ((csd >> 72) & 0xF) as u8;     // [83:80]
 
         let (capacity_blocks, capacity_bytes) = if csd_ver == 1 {
-            // CSD v2 (SDHC/SDXC): C_SIZE is bits [69:48] of original CSD
-            // After SDHCI shift: spans resp[1] and resp[2]
-            let c_size = (((resp[1] >> 8) & 0x3FFFFF) as u64)
-                | ((resp[2] as u64 & 0xFF) << 22);
-            // Capacity = (C_SIZE + 1) * 512KB
-            let blocks = (c_size + 1) * 1024; // in 512-byte blocks
+            // CSD v2 (SDHC/SDXC): C_SIZE is 22 bits at [69:48]
+            let c_size = ((csd >> 40) & 0x3FFFFF) as u64;
+            let blocks = (c_size + 1) * 1024; // in 512-byte sectors
             let bytes = blocks * 512;
             (blocks, bytes)
         } else {
-            // CSD v1 — older cards, different formula
             (0u64, 0u64)
         };
 
-        let erase_blk_en = ((resp[1] >> 6) & 1) == 1;
-        let sector_size = ((resp[1] >> 7) & 0x7F) as u8;
+        let erase_blk_en = ((csd >> 38) & 1) == 1;       // [46]
+        let sector_size = ((csd >> 31) & 0x7F) as u8;     // [45:39]
 
         Self {
             csd_ver,
@@ -455,7 +452,7 @@ impl SdmmcController {
     ///
     /// This doesn't modify `self` state — it's a read-only probe for
     /// logging to the boot console.
-    pub fn probe_card(&self) -> ProbeResult {
+    pub fn probe_card(&mut self) -> ProbeResult {
         let mut r = ProbeResult::default();
 
         // Software reset
@@ -665,6 +662,11 @@ impl SdmmcController {
                     r.write_err = unsafe { crate::mmio::read16(self.base + regs::ERROR_INT_STATUS) };
                 }
             }
+        }
+
+        // Mark as initialized if card was successfully selected
+        if r.cmd7_ok {
+            self.initialized = true;
         }
 
         r
@@ -985,24 +987,28 @@ impl SdmmcController {
     }
 
     /// Read a 512-byte block from the card.
-    fn read_block(&self, block_addr: u32, buf: &mut [u8; 512]) -> Result<(), DeviceError> {
+    pub fn read_block(&self, block_addr: u32, buf: &mut [u8; 512]) -> Result<(), DeviceError> {
         if !self.initialized {
             return Err(DeviceError::NotReady);
         }
 
-        // Wait for DAT line free
+        // Wait for both CMD and DAT lines free
         for _ in 0..100_000u32 {
-            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+            let ps = unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) };
+            if ps & (regs::CMD_INHIBIT | regs::DAT_INHIBIT) == 0 { break; }
         }
 
         unsafe {
+            // Clear stale interrupt status
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+
             crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
             crate::mmio::write16(self.base + regs::BLOCK_COUNT, 1);
-            // Transfer mode: single block, read, no DMA
-            crate::mmio::write16(self.base + regs::TRANSFER_MODE, 1 << 4); // data direction = read
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            let xfer_mode: u16 = 1 << 4; // read direction
             let cmd_reg: u16 = (cmd::READ_SINGLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
-            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+            crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16 | xfer_mode as u32);
         }
 
         // Wait for buffer read ready
@@ -1033,23 +1039,28 @@ impl SdmmcController {
     }
 
     /// Write a 512-byte block to the card.
-    fn write_block(&mut self, block_addr: u32, data: &[u8; 512]) -> Result<(), DeviceError> {
+    pub fn write_block(&mut self, block_addr: u32, data: &[u8; 512]) -> Result<(), DeviceError> {
         if !self.initialized {
             return Err(DeviceError::NotReady);
         }
 
+        // Wait for both CMD and DAT lines free
         for _ in 0..100_000u32 {
-            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+            let ps = unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) };
+            if ps & (regs::CMD_INHIBIT | regs::DAT_INHIBIT) == 0 { break; }
         }
 
         unsafe {
+            // Clear stale interrupt status
+            crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, 0xFFFF);
+            crate::mmio::write16(self.base + regs::ERROR_INT_STATUS, 0xFFFF);
+
             crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
             crate::mmio::write16(self.base + regs::BLOCK_COUNT, 1);
-            // Transfer mode: single block, write, no DMA
-            crate::mmio::write16(self.base + regs::TRANSFER_MODE, 0); // data direction = write
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            let xfer_mode: u16 = 0; // write direction
             let cmd_reg: u16 = (cmd::WRITE_SINGLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
-            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+            crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16 | xfer_mode as u32);
         }
 
         // Wait for buffer write ready
@@ -1087,8 +1098,8 @@ impl SdmmcController {
         if !self.initialized { return Err(DeviceError::NotReady); }
         if buf.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
 
-        // CMD23: SET_BLOCK_COUNT
-        self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1)?;
+        // CMD23: SET_BLOCK_COUNT (optional, skip if unsupported)
+        let _ = self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1);
 
         // Wait for DAT line free
         for _ in 0..100_000u32 {
@@ -1098,15 +1109,11 @@ impl SdmmcController {
         unsafe {
             crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
             crate::mmio::write16(self.base + regs::BLOCK_COUNT, count);
-            // Transfer mode: multi-block, read, block count enable, auto CMD23
-            crate::mmio::write16(self.base + regs::TRANSFER_MODE,
-                (1 << 5) | // multi-block
-                (1 << 4) | // read direction
-                (1 << 1)   // block count enable
-            );
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            // Combined 32-bit write: TRANSFER_MODE (low 16) + COMMAND (high 16)
+            let xfer_mode: u16 = (1 << 5) | (1 << 4) | (1 << 1); // multi, read, blk_cnt_en
             let cmd_reg: u16 = (cmd::READ_MULTIPLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
-            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+            crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16 | xfer_mode as u32);
         }
 
         // Read blocks one at a time from the buffer data port
@@ -1148,8 +1155,8 @@ impl SdmmcController {
         if !self.initialized { return Err(DeviceError::NotReady); }
         if data.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
 
-        // CMD23: SET_BLOCK_COUNT
-        self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1)?;
+        // CMD23: SET_BLOCK_COUNT (optional, skip if unsupported)
+        let _ = self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1);
 
         for _ in 0..100_000u32 {
             if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
@@ -1158,14 +1165,11 @@ impl SdmmcController {
         unsafe {
             crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
             crate::mmio::write16(self.base + regs::BLOCK_COUNT, count);
-            // Transfer mode: multi-block, write, block count enable
-            crate::mmio::write16(self.base + regs::TRANSFER_MODE,
-                (1 << 5) | // multi-block
-                (1 << 1)   // block count enable
-            );
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            // Combined 32-bit write: TRANSFER_MODE (low 16) + COMMAND (high 16)
+            let xfer_mode: u16 = (1 << 5) | (1 << 1); // multi, write, blk_cnt_en
             let cmd_reg: u16 = (cmd::WRITE_MULTIPLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
-            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+            crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16 | xfer_mode as u32);
         }
 
         // Write blocks one at a time

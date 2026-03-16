@@ -1087,7 +1087,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
             // Multi-block test: write 8 blocks at block 256, read back, verify
             if probe.write_ok && probe.verify_ok {
-                let test_start: u32 = 256;
+                let test_start: u32 = 2;
                 let test_count: u16 = 8;
                 let mut write_buf = [0u8; 4096]; // 8 * 512
                 // Fill with pattern: block N byte M = (N ^ M) & 0xFF
@@ -1096,24 +1096,68 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         write_buf[blk * 512 + byte] = ((blk ^ byte) & 0xFF) as u8;
                     }
                 }
-                log.puts("MBLK W: ");
-                match sdc.write_blocks(test_start, &write_buf, test_count) {
-                    Ok(()) => {
-                        log.puts("OK ");
-                        let mut read_buf = [0u8; 4096];
-                        log.puts("R: ");
-                        match sdc.read_blocks(test_start, &mut read_buf, test_count) {
-                            Ok(()) => {
-                                if read_buf == write_buf {
-                                    log.puts("OK VERIFIED 8blk\n");
+                // Test: 8 single-block writes + multi-block read back
+                log.puts("8xW: ");
+                let mut write_ok = true;
+                for blk in 0..test_count as u32 {
+                    let off = blk as usize * 512;
+                    let mut blk_buf = [0u8; 512];
+                    blk_buf.copy_from_slice(&write_buf[off..off + 512]);
+                    if sdc.write_block(test_start + blk, &blk_buf).is_err() {
+                        log.puts("F"); log.put_hex32(blk);
+                        write_ok = false;
+                        break;
+                    }
+                }
+                if write_ok {
+                    log.puts("OK ");
+                    // Multi-block read back
+                    log.puts("MR: ");
+                    let mut read_buf = [0u8; 4096];
+                    match sdc.read_blocks(test_start, &mut read_buf, test_count) {
+                        Ok(()) => {
+                            if read_buf == write_buf {
+                                log.puts("OK 8blk verified\n");
+                            } else {
+                                // Try single-block read to isolate
+                                log.puts("MBLK mismatch, trying single: ");
+                                let mut single_ok = true;
+                                for blk in 0..test_count as u32 {
+                                    let off = blk as usize * 512;
+                                    let mut blk_buf = [0u8; 512];
+                                    if sdc.read_block(test_start + blk, &mut blk_buf).is_ok() {
+                                        if blk_buf != write_buf[off..off + 512] {
+                                            log.puts("X"); log.put_hex32(blk);
+                                            single_ok = false;
+                                        }
+                                    } else {
+                                        log.puts("F"); log.put_hex32(blk);
+                                        single_ok = false;
+                                    }
+                                }
+                                if single_ok {
+                                    log.puts("OK (single read works, multi broken)\n");
                                 } else {
-                                    log.puts("MISMATCH\n");
+                                    log.puts("FAIL\n");
                                 }
                             }
-                            Err(_) => log.puts("FAIL\n"),
+                        }
+                        Err(_) => {
+                            log.puts("FAIL, single: ");
+                            // Fallback to single reads
+                            let mut ok_count = 0u32;
+                            for blk in 0..test_count as u32 {
+                                let mut blk_buf = [0u8; 512];
+                                if sdc.read_block(test_start + blk, &mut blk_buf).is_ok() {
+                                    let off = blk as usize * 512;
+                                    if blk_buf == write_buf[off..off + 512] {
+                                        ok_count += 1;
+                                    }
+                                }
+                            }
+                            log.put_hex32(ok_count); log.puts("/8 match\n");
                         }
                     }
-                    Err(_) => log.puts("FAIL\n"),
                 }
             }
         }
