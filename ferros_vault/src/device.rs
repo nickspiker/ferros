@@ -41,8 +41,11 @@ pub enum DeviceError {
 pub enum DeviceIoKind {
     ReadFailed,
     WriteFailed,
+    ReadError,
+    WriteError,
     FlushFailed,
     Timeout,
+    InvalidParam,
     PermissionDenied,
     HardwareFailure,
 }

@@ -906,7 +906,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         for _ in 0..200_000u32 { unsafe { core::arch::asm!("nop") }; }
 
         // 4. Now probe with pads configured
-        let sdc = ferros_hal::sdmmc::SdmmcController::new(FP5_SDC2_BASE);
+        let mut sdc = ferros_hal::sdmmc::SdmmcController::new(FP5_SDC2_BASE);
         let probe = sdc.probe_card();
 
         log.puts("reset:  "); log.puts(if probe.reset_ok { "OK\n" } else { "FAIL\n" });
@@ -1038,47 +1038,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
         // CSD register (speed, voltage, capacity)
         if probe.cmd9_ok {
-            log.puts("CSD:    ");
-            log.put_hex32(probe.csd[3]); log.puts(" ");
-            log.put_hex32(probe.csd[2]); log.puts(" ");
-            log.put_hex32(probe.csd[1]); log.puts(" ");
-            log.put_hex32(probe.csd[0]); log.puts("\n");
-            // SDHCI shifts R2 left 8 bits; CSD[3] bits [31:30] = CSD_STRUCTURE
-            let csd_ver = (probe.csd[3] >> 30) & 0x3;
-            // TRAN_SPEED is CSD byte 3 (bits [103:96])
-            // After SDHCI 8-bit shift: in csd[3] bits [7:0] or csd[2] bits [31:24]
-            let tran_speed = ((probe.csd[2] >> 24) & 0xFF) as u8;
-            log.puts("  ver="); log.put_hex32(csd_ver);
-            log.puts(" TRAN_SPEED="); log.put_hex32(tran_speed as u32);
-            // Decode TRAN_SPEED: [2:0]=time_unit, [6:3]=time_value
-            let unit = match tran_speed & 0x7 {
-                0 => "100Kbit/s",
-                1 => "1Mbit/s",
-                2 => "10Mbit/s",
-                3 => "100Mbit/s",
-                _ => "?",
-            };
-            let mult = match (tran_speed >> 3) & 0xF {
-                1 => "1.0",  6 => "2.5",
-                2 => "1.2",  7 => "3.0",
-                3 => "1.3",  8 => "3.5",
-                4 => "1.5",  9 => "4.0",
-                5 => "2.0", 10 => "4.5",
-                11 => "5.0", 12 => "5.5",
-                13 => "6.0", 14 => "7.0",
-                15 => "8.0", _ => "?",
-            };
-            log.puts(" ("); log.puts(mult); log.puts("x"); log.puts(unit); log.puts(")\n");
-            // CSD v2: C_SIZE is bits [69:48] = 22 bits
-            if csd_ver >= 1 {
-                // After 8-bit shift: C_SIZE spans csd[1] bits [29:8] and csd[0]
-                let c_size = ((probe.csd[1] & 0x3FFFFF00) >> 8)
-                           | ((probe.csd[0] >> 24) & 0xFF);
-                // Capacity = (C_SIZE + 1) * 512KB
-                let cap_mb = ((c_size as u64) + 1) / 2; // in MB
-                log.puts("  C_SIZE="); log.put_hex32(c_size);
-                log.puts(" cap="); log.put_hex32(cap_mb as u32); log.puts("MB\n");
-            }
+            let csd = ferros_hal::sdmmc::CsdInfo::from_response(&probe.csd);
+            log.puts("CSD v"); log.put_hex32(csd.csd_ver as u32);
+            log.puts(" max="); log.put_hex32(csd.max_freq_mhz()); log.puts("MHz");
+            log.puts(" cap="); log.put_hex32((csd.capacity_bytes >> 30) as u32); log.puts("GB");
+            log.puts(" blk="); log.put_hex32(1u32 << csd.read_bl_len);
+            log.puts(" erase="); log.put_hex32(if csd.erase_blk_en { 512 } else { (csd.sector_size as u32 + 1) * 512 });
+            log.puts(" ccc="); log.put_hex32(csd.ccc as u32);
+            log.puts("\n");
         }
 
         log.puts("CMD7:   ");
@@ -1116,6 +1083,38 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 }
             } else {
                 log.puts("FAIL err="); log.put_hex32(probe.write_err as u32); log.puts("\n");
+            }
+
+            // Multi-block test: write 8 blocks at block 256, read back, verify
+            if probe.write_ok && probe.verify_ok {
+                let test_start: u32 = 256;
+                let test_count: u16 = 8;
+                let mut write_buf = [0u8; 4096]; // 8 * 512
+                // Fill with pattern: block N byte M = (N ^ M) & 0xFF
+                for blk in 0..test_count as usize {
+                    for byte in 0..512 {
+                        write_buf[blk * 512 + byte] = ((blk ^ byte) & 0xFF) as u8;
+                    }
+                }
+                log.puts("MBLK W: ");
+                match sdc.write_blocks(test_start, &write_buf, test_count) {
+                    Ok(()) => {
+                        log.puts("OK ");
+                        let mut read_buf = [0u8; 4096];
+                        log.puts("R: ");
+                        match sdc.read_blocks(test_start, &mut read_buf, test_count) {
+                            Ok(()) => {
+                                if read_buf == write_buf {
+                                    log.puts("OK VERIFIED 8blk\n");
+                                } else {
+                                    log.puts("MISMATCH\n");
+                                }
+                            }
+                            Err(_) => log.puts("FAIL\n"),
+                        }
+                    }
+                    Err(_) => log.puts("FAIL\n"),
+                }
             }
         }
     }

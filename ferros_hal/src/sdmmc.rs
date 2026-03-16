@@ -131,15 +131,117 @@ mod cmd {
     pub const GO_IDLE: u16 = 0;
     pub const ALL_SEND_CID: u16 = 2;
     pub const SEND_RELATIVE_ADDR: u16 = 3;
+    pub const SWITCH_FUNC: u16 = 6;       // CMD6 — switch function (HS mode)
     pub const SELECT_CARD: u16 = 7;
     pub const SEND_IF_COND: u16 = 8;
     pub const SEND_CSD: u16 = 9;
+    pub const STOP_TRANSMISSION: u16 = 12; // CMD12 — stop multi-block
     pub const SET_BLOCKLEN: u16 = 16;
     pub const READ_SINGLE_BLOCK: u16 = 17;
+    pub const READ_MULTIPLE_BLOCK: u16 = 18;
+    pub const SET_BLOCK_COUNT: u16 = 23;   // CMD23 — pre-defined multi-block count
     pub const WRITE_SINGLE_BLOCK: u16 = 24;
+    pub const WRITE_MULTIPLE_BLOCK: u16 = 25;
     pub const APP_CMD: u16 = 55;
-    pub const SD_SEND_OP_COND: u16 = 41; // ACMD41
-    pub const SET_BUS_WIDTH: u16 = 6;    // ACMD6
+    pub const SD_SEND_OP_COND: u16 = 41;  // ACMD41
+    pub const SET_BUS_WIDTH: u16 = 6;     // ACMD6
+    pub const SEND_SCR: u16 = 51;         // ACMD51 — SD Configuration Register
+}
+
+/// Decoded CSD register (Card-Specific Data).
+#[derive(Default, Clone)]
+pub struct CsdInfo {
+    /// CSD structure version (0=v1, 1=v2 for SDHC/SDXC)
+    pub csd_ver: u8,
+    /// Max transfer speed (TRAN_SPEED raw byte)
+    pub tran_speed: u8,
+    /// Card capacity in 512-byte blocks
+    pub capacity_blocks: u64,
+    /// Card capacity in bytes
+    pub capacity_bytes: u64,
+    /// Max read block length (READ_BL_LEN, log2)
+    pub read_bl_len: u8,
+    /// Erase block enabled (1 = erase in units of 512 bytes)
+    pub erase_blk_en: bool,
+    /// Erase sector size (in write blocks)
+    pub sector_size: u8,
+    /// Command classes supported
+    pub ccc: u16,
+}
+
+impl CsdInfo {
+    /// Decode CSD from the 4 response words (as read from SDHCI RESPONSE regs).
+    /// SDHCI shifts R2 responses right by 8 bits — the MSB of CSD is in resp[3] bits [23:0].
+    pub fn from_response(resp: &[u32; 4]) -> Self {
+        // Reconstruct the 128-bit CSD (SDHCI drops the MSB byte and shifts right 8).
+        // resp[3] has CSD[127:96] shifted → actually CSD[119:88]
+        // resp[2] has CSD[95:64] shifted → actually CSD[87:56]
+        // resp[1] has CSD[63:32] shifted → actually CSD[55:24]
+        // resp[0] has CSD[31:0] shifted → actually CSD[23:0] (low 8 bits lost)
+
+        let csd_ver = ((resp[3] >> 22) & 0x3) as u8;
+        let tran_speed = ((resp[2] >> 24) & 0xFF) as u8;
+        let ccc = ((resp[2] >> 12) & 0xFFF) as u16;
+        let read_bl_len = ((resp[2] >> 8) & 0xF) as u8;
+
+        let (capacity_blocks, capacity_bytes) = if csd_ver == 1 {
+            // CSD v2 (SDHC/SDXC): C_SIZE is bits [69:48] of original CSD
+            // After SDHCI shift: spans resp[1] and resp[2]
+            let c_size = (((resp[1] >> 8) & 0x3FFFFF) as u64)
+                | ((resp[2] as u64 & 0xFF) << 22);
+            // Capacity = (C_SIZE + 1) * 512KB
+            let blocks = (c_size + 1) * 1024; // in 512-byte blocks
+            let bytes = blocks * 512;
+            (blocks, bytes)
+        } else {
+            // CSD v1 — older cards, different formula
+            (0u64, 0u64)
+        };
+
+        let erase_blk_en = ((resp[1] >> 6) & 1) == 1;
+        let sector_size = ((resp[1] >> 7) & 0x7F) as u8;
+
+        Self {
+            csd_ver,
+            tran_speed,
+            capacity_blocks,
+            capacity_bytes,
+            read_bl_len,
+            erase_blk_en,
+            sector_size,
+            ccc,
+        }
+    }
+
+    /// Decode TRAN_SPEED into MHz.
+    pub fn max_freq_mhz(&self) -> u32 {
+        let unit = match self.tran_speed & 0x7 {
+            0 => 100,   // 100 KHz
+            1 => 1000,  // 1 MHz
+            2 => 10000, // 10 MHz
+            3 => 100000,// 100 MHz
+            _ => 0,
+        };
+        let mult = match (self.tran_speed >> 3) & 0xF {
+            1 => 10,
+            2 => 12,
+            3 => 13,
+            4 => 15,
+            5 => 20,
+            6 => 25, // 0x32 = unit=10MHz, mult=2.5 → 25MHz
+            7 => 30,
+            8 => 35,
+            9 => 40,
+            10 => 45,
+            11 => 50,
+            12 => 55,
+            13 => 60,
+            14 => 70,
+            15 => 80,
+            _ => 0,
+        };
+        (unit * mult) / 10000 // result in MHz
+    }
 }
 
 /// Diagnostic probe results — each step logged individually.
@@ -943,6 +1045,130 @@ impl SdmmcController {
             }
         }
         Err(DeviceError::IoError(DeviceIoKind::Timeout))
+    }
+
+    /// Read multiple 512-byte blocks using CMD23 + CMD18.
+    /// `buf` must be exactly `count * 512` bytes.
+    pub fn read_blocks(&self, block_addr: u32, buf: &mut [u8], count: u16) -> Result<(), DeviceError> {
+        if !self.initialized { return Err(DeviceError::NotReady); }
+        if buf.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
+
+        // CMD23: SET_BLOCK_COUNT
+        self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1)?;
+
+        // Wait for DAT line free
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
+
+        unsafe {
+            crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
+            crate::mmio::write16(self.base + regs::BLOCK_COUNT, count);
+            // Transfer mode: multi-block, read, block count enable, auto CMD23
+            crate::mmio::write16(self.base + regs::TRANSFER_MODE,
+                (1 << 5) | // multi-block
+                (1 << 4) | // read direction
+                (1 << 1)   // block count enable
+            );
+            crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            let cmd_reg: u16 = (cmd::READ_MULTIPLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
+            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+        }
+
+        // Read blocks one at a time from the buffer data port
+        for blk in 0..count as usize {
+            // Wait for buffer read ready
+            for _ in 0..1_000_000u32 {
+                let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+                if status & regs::ERR_INTERRUPT != 0 {
+                    return Err(DeviceError::IoError(DeviceIoKind::ReadError));
+                }
+                if status & regs::BUF_READ_READY != 0 {
+                    unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_READ_READY) };
+                    break;
+                }
+            }
+            // Read 512 bytes
+            let base_off = blk * 512;
+            for i in 0..128 {
+                let word = unsafe { crate::mmio::read32(self.base + regs::BUFFER_DATA) };
+                let off = base_off + i * 4;
+                buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        // Wait for transfer complete
+        for _ in 0..1_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::XFER_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
+                return Ok(());
+            }
+        }
+        Err(DeviceError::IoError(DeviceIoKind::Timeout))
+    }
+
+    /// Write multiple 512-byte blocks using CMD23 + CMD25.
+    /// `data` must be exactly `count * 512` bytes.
+    pub fn write_blocks(&mut self, block_addr: u32, data: &[u8], count: u16) -> Result<(), DeviceError> {
+        if !self.initialized { return Err(DeviceError::NotReady); }
+        if data.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
+
+        // CMD23: SET_BLOCK_COUNT
+        self.send_cmd_raw(cmd::SET_BLOCK_COUNT, count as u32, RespType::R1)?;
+
+        for _ in 0..100_000u32 {
+            if unsafe { crate::mmio::read32(self.base + regs::PRESENT_STATE) } & regs::DAT_INHIBIT == 0 { break; }
+        }
+
+        unsafe {
+            crate::mmio::write16(self.base + regs::BLOCK_SIZE, 512);
+            crate::mmio::write16(self.base + regs::BLOCK_COUNT, count);
+            // Transfer mode: multi-block, write, block count enable
+            crate::mmio::write16(self.base + regs::TRANSFER_MODE,
+                (1 << 5) | // multi-block
+                (1 << 1)   // block count enable
+            );
+            crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
+            let cmd_reg: u16 = (cmd::WRITE_MULTIPLE_BLOCK << 8) | regs::CMD_DATA_PRESENT | RespType::R1.to_cmd_flags();
+            crate::mmio::write16(self.base + regs::COMMAND, cmd_reg);
+        }
+
+        // Write blocks one at a time
+        for blk in 0..count as usize {
+            for _ in 0..1_000_000u32 {
+                let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+                if status & regs::ERR_INTERRUPT != 0 {
+                    return Err(DeviceError::IoError(DeviceIoKind::WriteError));
+                }
+                if status & regs::BUF_WRITE_READY != 0 {
+                    unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::BUF_WRITE_READY) };
+                    break;
+                }
+            }
+            let base_off = blk * 512;
+            for i in 0..128 {
+                let off = base_off + i * 4;
+                let word = u32::from_le_bytes([
+                    data[off], data[off + 1], data[off + 2], data[off + 3],
+                ]);
+                unsafe { crate::mmio::write32(self.base + regs::BUFFER_DATA, word) };
+            }
+        }
+
+        for _ in 0..1_000_000u32 {
+            let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
+            if status & regs::XFER_COMPLETE != 0 {
+                unsafe { crate::mmio::write16(self.base + regs::NORMAL_INT_STATUS, regs::XFER_COMPLETE) };
+                return Ok(());
+            }
+        }
+        Err(DeviceError::IoError(DeviceIoKind::Timeout))
+    }
+
+    /// Decode the CSD register from the probe's raw response.
+    pub fn decode_csd(&self, csd_raw: &[u32; 4]) -> CsdInfo {
+        CsdInfo::from_response(csd_raw)
     }
 }
 
