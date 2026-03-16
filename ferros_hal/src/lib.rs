@@ -27,3 +27,4 @@ pub mod spmi;
 pub mod usb;
 pub mod gcc;
 pub mod rpmh;
+pub mod ufs;

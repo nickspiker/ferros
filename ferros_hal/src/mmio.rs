@@ -119,3 +119,37 @@ impl Reg32 {
         self.write(self.read() & !mask);
     }
 }
+
+/// Clean data cache lines covering [start, start+len) to PoC.
+/// Ensures CPU writes are visible to DMA devices.
+pub unsafe fn cache_clean(start: usize, len: usize) {
+    if len == 0 { return; }
+    let ctr: u64;
+    core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+    let line_shift = ((ctr >> 16) & 0xF) + 2;
+    let line_size = 1usize << line_shift;
+    let mut addr = start & !(line_size - 1);
+    let end = start + len;
+    while addr < end {
+        core::arch::asm!("dc cvac, {}", in(reg) addr);
+        addr += line_size;
+    }
+    core::arch::asm!("dsb sy");
+}
+
+/// Invalidate data cache lines covering [start, start+len) to PoC.
+/// Ensures DMA writes are visible to CPU (discard stale cache lines).
+pub unsafe fn cache_invalidate(start: usize, len: usize) {
+    if len == 0 { return; }
+    let ctr: u64;
+    core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+    let line_shift = ((ctr >> 16) & 0xF) + 2;
+    let line_size = 1usize << line_shift;
+    let mut addr = start & !(line_size - 1);
+    let end = start + len;
+    while addr < end {
+        core::arch::asm!("dc civac, {}", in(reg) addr);
+        addr += line_size;
+    }
+    core::arch::asm!("dsb sy");
+}

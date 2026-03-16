@@ -532,40 +532,7 @@ unsafe fn phy_rmw(addr: usize, clear: u32, set: u32) {
     unsafe { mmio::write32(addr, (val & !clear) | set); }
 }
 
-/// Clean data cache lines covering [start, start+len) to Point of Coherency.
-/// Ensures CPU writes are visible to DMA masters (DWC3).
-/// Safe to call even if caches are off (DC CVAC is a NOP in that case).
-unsafe fn cache_clean(start: usize, len: usize) {
-    if len == 0 { return; }
-    let ctr: u64;
-    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
-    let line_shift = ((ctr >> 16) & 0xF) + 2; // log2(bytes)
-    let line_size = 1usize << line_shift;
-    let mut addr = start & !(line_size - 1);
-    let end = start + len;
-    while addr < end {
-        unsafe { core::arch::asm!("dc cvac, {}", in(reg) addr); }
-        addr += line_size;
-    }
-    unsafe { core::arch::asm!("dsb sy"); }
-}
-
-/// Invalidate data cache lines covering [start, start+len) to PoC.
-/// Ensures DMA writes are visible to CPU (discard stale cache lines).
-unsafe fn cache_invalidate(start: usize, len: usize) {
-    if len == 0 { return; }
-    let ctr: u64;
-    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr); }
-    let line_shift = ((ctr >> 16) & 0xF) + 2;
-    let line_size = 1usize << line_shift;
-    let mut addr = start & !(line_size - 1);
-    let end = start + len;
-    while addr < end {
-        unsafe { core::arch::asm!("dc civac, {}", in(reg) addr); }
-        addr += line_size;
-    }
-    unsafe { core::arch::asm!("dsb sy"); }
-}
+// Cache ops moved to crate::mmio::cache_clean / cache_invalidate
 
 /// Initialize the SNPS Femto v2 USB2 HS PHY.
 ///
@@ -1003,8 +970,8 @@ impl Dwc3Dev {
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-            cache_clean(trb_addr, 16);
-            cache_clean(buf_addr, 512);
+            crate::mmio::cache_clean(trb_addr, 16);
+            crate::mmio::cache_clean(buf_addr, 512);
             core::arch::asm!("dsb sy");
         }
 
@@ -1018,7 +985,7 @@ impl Dwc3Dev {
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | TRB_CTRL_ISP_IMI
                     | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
+                crate::mmio::cache_clean(trb_addr, 16);
             }
             if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
@@ -1052,8 +1019,8 @@ impl Dwc3Dev {
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI  // complete on short packet (< 512 bytes)
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-            cache_clean(buf_addr, len);
-            cache_clean(trb_addr, 16);
+            crate::mmio::cache_clean(buf_addr, len);
+            crate::mmio::cache_clean(trb_addr, 16);
             core::arch::asm!("dsb sy"); // ensure DMA-visible before STARTTRANSFER
         }
 
@@ -1068,7 +1035,7 @@ impl Dwc3Dev {
                 let trb = &raw mut BULK_IN_TRB.trb;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
+                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.bulk_in_idle = true;
@@ -1088,7 +1055,7 @@ impl Dwc3Dev {
         let len = self.bulk_out_len as usize;
         if len == 0 { return None; }
         unsafe {
-            cache_invalidate(&raw const BULK_OUT_BUF as usize, len);
+            crate::mmio::cache_invalidate(&raw const BULK_OUT_BUF as usize, len);
             Some(core::slice::from_raw_parts(
                 &raw const BULK_OUT_BUF as *const u8, len))
         }
@@ -1151,8 +1118,8 @@ impl Dwc3Dev {
 
         // Clean cache lines so DWC3 DMA sees the TRB and setup buffer
         unsafe {
-            cache_clean(setup_addr, 8);
-            cache_clean(trb_addr, 16);
+            crate::mmio::cache_clean(setup_addr, 8);
+            crate::mmio::cache_clean(trb_addr, 16);
         }
 
         // Start transfer on EP0 OUT
@@ -1164,7 +1131,7 @@ impl Dwc3Dev {
                 let trb = &raw mut EP0_TRBS.setup;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_SETUP << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
+                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep0_setup_arm_fail += 1;
@@ -1269,9 +1236,9 @@ impl Dwc3Dev {
         // Clean data buffer + TRB so DWC3 DMA sees them
         unsafe {
             if len > 0 {
-                cache_clean(buf_addr, len);
+                crate::mmio::cache_clean(buf_addr, len);
             }
-            cache_clean(trb_addr, 16);
+            crate::mmio::cache_clean(trb_addr, 16);
         }
 
         // Issue STARTTRANSFER on EP1. If it fails (resource occupied),
@@ -1286,7 +1253,7 @@ impl Dwc3Dev {
                 let trb = &raw mut EP0_TRBS.data;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (trbctl << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
+                crate::mmio::cache_clean(trb_addr, 16);
             }
             if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep1_retry_ok += 1;
@@ -1328,7 +1295,7 @@ impl Dwc3Dev {
         }
 
         // Clean TRB so DWC3 DMA sees it
-        unsafe { cache_clean(trb_addr, 16); }
+        unsafe { crate::mmio::cache_clean(trb_addr, 16); }
 
         // Start transfer on EP0 OUT (physical EP 0)
         if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
@@ -1338,7 +1305,7 @@ impl Dwc3Dev {
                 let trb = &raw mut EP0_TRBS.status;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_STATUS3 << TRB_CTRL_TRBCTL_SHIFT);
-                cache_clean(trb_addr, 16);
+                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep0_status_out_arm_fail += 1;
@@ -1366,7 +1333,7 @@ impl Dwc3Dev {
 
         // Invalidate event buffer cache line so we see DWC3's DMA writes
         let evt_base = &raw const EVT_BUF as usize;
-        unsafe { cache_invalidate(evt_base + self.evt_read_idx, 4); }
+        unsafe { crate::mmio::cache_invalidate(evt_base + self.evt_read_idx, 4); }
 
         // Read one event (4 bytes)
         let evt = unsafe { core::ptr::read_volatile(&EVT_BUF.buf[self.evt_read_idx / 4]) };
@@ -1408,7 +1375,7 @@ impl Dwc3Dev {
                         self.bulk_out_armed = false;
                         self.bulk_out_xfer_complete += 1;
                         unsafe {
-                            cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
+                            crate::mmio::cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
                             let remaining = BULK_OUT_TRB.trb.size & 0x00FF_FFFF;
                             self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
                         }
@@ -1429,7 +1396,7 @@ impl Dwc3Dev {
                         self.bulk_out_armed = false;
                         // SETUP packet received — invalidate cache to see DMA data
                         let setup_addr = &raw const EP0_SETUP_BUF as usize;
-                        unsafe { cache_invalidate(setup_addr, 8); }
+                        unsafe { crate::mmio::cache_invalidate(setup_addr, 8); }
                         let mut req = [0u8; 8];
                         unsafe {
                             for i in 0..8 {

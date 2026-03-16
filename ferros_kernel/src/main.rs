@@ -1257,6 +1257,45 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
+    // ---- UFS probe ----
+    log.puts("\n-- UFS --\n");
+    {
+        let ufs = ferros_hal::ufs::UfsController::new(0x1D8_4000);
+        let p = ufs.probe();
+        log.puts("HCE="); log.put_hex32(p.hce);
+        log.puts(" HCS="); log.put_hex32(p.hcs);
+        log.puts(" VER="); log.put_hex32(p.ver);
+        log.puts(" link="); log.puts(if p.link_up { "UP" } else { "DOWN" });
+        log.puts("\n");
+        if p.nop_ok {
+            log.puts("NOP:    OK\n");
+        } else {
+            log.puts("NOP:    FAIL ocs="); log.put_hex32(p.nop_ocs as u32);
+            log.puts(" rsp="); log.put_hex32(p.nop_rsp as u32);
+            log.puts(" raw=[");
+            for i in 0..4 { log.put_hex32(p.nop_rsp_raw[i] as u32); if i < 3 { log.puts(" "); } }
+            log.puts("]\n");
+        }
+        if p.geo_ok {
+            let cap_gb = (p.total_raw_capacity_sectors * 512) >> 30;
+            let blk = 512u32 << p.min_block_size_exp;
+            log.puts("GEO:    cap="); log.put_hex32(cap_gb as u32); log.puts("GB");
+            log.puts(" seg="); log.put_hex32(p.segment_size);
+            log.puts(" blk="); log.put_hex32(blk);
+            log.puts(" LUNs="); log.put_hex32(p.num_lun as u32);
+            log.puts("\n");
+        }
+        if p.unit0_ok {
+            let blk = 512u32 << p.unit0_block_size_exp;
+            let cap_gb = (p.unit0_block_count * blk as u64) >> 30;
+            log.puts("LUN0:   cap="); log.put_hex32(cap_gb as u32); log.puts("GB");
+            log.puts(" blk="); log.put_hex32(blk);
+            log.puts(" blocks="); log.put_hex32(p.unit0_block_count as u32);
+            log.puts(" erase="); log.put_hex32(p.unit0_erase_block_size);
+            log.puts("\n");
+        }
+    }
+
     // ---- SPMI full APID map dump (find ALL peripherals) ----
     log.buf_only("\n-- SPMI ALL APIDs --\n");
     {
