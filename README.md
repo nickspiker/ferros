@@ -126,19 +126,27 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 
 ## Project Status
 
-**Current Phase:** Architecture design, early implementation
+**Current Phase:** Bare-metal bring-up on Fairphone 5 (QCM6490)
 
-### Completed
-- ✅ Ring memory architecture designed and documented
-- ✅ Killswitch semantics proven mathematically
-- ✅ TOKEN protocol specified
-- ✅ Prior art established (this document)
+### Working on Hardware
+- Bare-metal aarch64 kernel boots on FP5 (PE/COFF via ABL)
+- Framebuffer console (8x16 VGA font, 2x scaling, 1224x2700 AMOLED)
+- GENI UART TX (QUP1 SE5)
+- Pstore/ramoops log pipeline (warm reboot preserves DRAM)
+- SPMI PMIC access (PM8350C flash LED, observer channel reads)
+- DPU register reads (splash framebuffer at 0xE1000000)
+- USB device enumeration (DWC3, VID 0x1838 PID 0xFE01)
+- Bidirectional Photon Transport over USB (blast mode, per-chunk BLAKE3)
+- Hot-reload over USB (72KB kernel binary in ~15s, no fastboot needed)
+- SD card read/write (1TB SanDisk SDXC, 4-bit bus, 400KHz, multi-block)
+- GCC clock controller, RPMh TCS power enable via cmd-db
+- DTB parsing for reserved-memory, bootargs, ramoops address
 
-### In Progress (Next 3 Months)
-- 🔄 Ring memory kernel implementation
-- 🔄 RedoxFS → ring filesystem conversion  
-- 🔄 Basic TOKEN integration
-- 🔄 Hardware prototype (FPGA)
+### In Progress
+- Ledger: append-only VSF event chain (spec complete, implementation started)
+- SD card 25MHz/50MHz high-speed mode (needs DLL calibration)
+- UFS internal flash identification (host controller at 0x1D84000)
+- USB driver cleanup (TRB ring for throughput, proper endpoint state machine)
 
 ### Planned (Next 6 Months)
 - 📋 VSF compositor alpha
@@ -181,34 +189,36 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 ## Building ferros
 
 **Requirements:**
-- Rust nightly (for inline assembly, custom CSR access)
-- RISC-V toolchain (for hardware target)
-- QEMU or FPGA (for testing)
+- Rust nightly (for inline assembly, no_std kernel)
+- aarch64-unknown-none target (`rustup target add aarch64-unknown-none`)
+- Android fastboot (for flashing to Fairphone 5)
+- nusb (Rust USB library, pulled by cargo)
 
-**Build:**
+**Build kernel:**
 ```bash
-git clone https://github.com/ferros-org/ferros
-cd ferros
-cargo build --target riscv64gc-unknown-none-elf --release
+cargo build -p ferros_kernel --target aarch64-unknown-none --release
 ```
 
-**Run in QEMU:**
+**Create boot image:**
 ```bash
-qemu-system-riscv64 \
-  -machine virt \
-  -cpu rv64 \
-  -m 2G \
-  -kernel target/riscv64gc-unknown-none-elf/release/ferros \
-  -nographic
+cargo run -p ferros-mkimg -- boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
 ```
 
-**Flash to hardware:**
+**Flash to Fairphone 5:**
 ```bash
-# For FPGA prototype
-make flash-fpga
+fastboot flash boot_a ferros.img
+fastboot set_active a
+fastboot reboot
+```
 
-# For ASIC prototype (when available)
-make flash-device
+**Hot-reload (no reboot needed):**
+```bash
+cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_kernel
+```
+
+**Pull boot log:**
+```bash
+cargo run -p ferros-bridge -- diag
 ```
 
 ## Contributing

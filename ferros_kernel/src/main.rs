@@ -1,6 +1,100 @@
-//! Ferros kernel — framebuffer console build.
-//!
-//! Boots on FP5, fills framebuffer, renders text diagnostic console.
+// FERROS SOURCE MAP — keep updated when pub items or files change
+//
+// ferros_kernel/
+// └── main.rs ── kernel entry, boot sequence, USB event loop, SD probe
+//       _start (asm), kernel_main()
+//       Boot: EL check, DTB parse, FB console, UART, pstore, DPU, SPMI
+//       GCC clocks, RPMh power, SDHCI probe, USB DWC3 init
+//       USB event loop: PT command dispatch, hot-reload handler
+//       SD probe: CMD0-CMD8-ACMD41-CMD2-CMD3-CMD9-CMD7-CMD16, R/W verify
+//
+// ferros_hal/ ── hardware abstraction (no_std, QCM6490/FP5)
+// ├── lib.rs ── module re-exports
+// ├── mmio.rs ── raw MMIO read/write (8/16/32-bit), cache ops
+// ├── console.rs ── framebuffer text console, 8x16 VGA font, 2x scaling
+// │   struct Console { fb_base, stride, x_off, y_off, col, row }
+// │     ::new(), put_char(), scroll(), clear()
+// ├── fb.rs ── raw framebuffer pixel ops
+// ├── dtb.rs ── FDT/DTB parser (find nodes, read properties)
+// ├── dpu.rs ── display processing unit register reads
+// ├── uart.rs ── GENI UART TX (QUP1 SE5 at 0x994000)
+// ├── pstore.rs ── ramoops/persistent_ram_buffer writer
+// ├── spmi.rs ── SPMI arbiter v5 (observer reads, channel writes)
+// │   find_apid(), read_byte(), write_byte(), ppid()
+// ├── gcc.rs ── GCC clock controller (SDC2 branches + RCG)
+// │   sdc2_set_400khz(), sdc2_set_25mhz(), sdc2_block_reset()
+// ├── rpmh.rs ── RPMh TCS for LDO power enable via cmd-db
+// │   enable_ldo(), cmd_db_lookup()
+// ├── sdmmc.rs ── SD/MMC controller (SDHCI + Qualcomm vendor regs)
+// │   struct SdmmcController { base, initialized, card_id, capacity, rca }
+// │     ::new(), init(), probe_card() → ProbeResult
+// │     ::read_block(), write_block(), read_blocks(), write_blocks()
+// │   struct CsdInfo ::from_response(), max_freq_mhz()
+// │   impl Device for SdmmcController (byte-range read_at/write_at)
+// └── usb.rs ── DWC3 USB device controller (1879 lines)
+//     struct Dwc3Dev { evt_read_idx, ep0_state, bulk_out/in state }
+//       ::new() → init, CSFTRST, PHY, endpoint config, Run/Stop
+//       ::poll_event() → UsbEvent (Reset, ConnectDone, TransferComplete)
+//       ::bulk_out_arm(), bulk_out_read() → &[u8]
+//       ::bulk_in_send(data) → bool (ISP_IMI for short packets)
+//       ::ep0_send(), ep0_status_in/out(), handle_setup()
+//     pub fn probe() → Dwc3Info, dump_diag() → Dwc3Diag
+//     pub fn phy_init(), smmu_bypass()
+//
+// ferros_pt/ ── Photon Transport (no_std, optional alloc)
+// ├── lib.rs ── is_data_packet(), is_control_packet(), re-exports
+// ├── packet.rs ── packet encode/decode
+// │   TAG_SPEC='S', TAG_ACK='A', TAG_NAK='N', TAG_DONE='D', TAG_FIN='F'
+// │   struct Spec, Ack, Nak, Complete { sid, fields... }
+// │   encode_data(), decode_data() — per-chunk BLAKE3 hash
+// ├── transfer.rs ── transfer state machines
+// │   struct InboundTransfer { data, received bitmap, expected_count }
+// │     ::new(), handle_data(), all_received(), finish() → COMPLETE/NAK
+// │   struct OutboundTransfer { data, next_seq, count, psize }
+// │     ::start(), start_vec(), next_data_packet(), encode_fin()
+// │   BitmapWord = u64, outbound_bitmap_words()
+// └── command.rs ── cap-addressed command protocol
+//     [cap:32][op:1][params...], dev caps via BLAKE3
+//     caps: DIAG, MEM, RELOAD
+//     enum Op { Read, Write, Exec }
+//
+// ferros_ledger/ ── append-only event chain (no_std)
+// ├── lib.rs ── re-exports
+// ├── ewe.rs ── EWE variable-width integer encoding
+// │   encode_u64(), decode_u64(), encode_lean(), decode_lean()
+// │   encode_seq(), decode_seq(), seq_width()
+// ├── chain.rs ── BLAKE3 hash chain
+// ├── entry.rs ── ledger entry (VSF document structure)
+// ├── event.rs ── typed boot/USB/SD events
+// ├── category.rs ── log category tree
+// └── preboot.rs ── pre-ledger ring buffer
+//
+// ferros_vault/ ── persistent object store (no_std)
+// ├── lib.rs ── re-exports
+// ├── device.rs ── Device trait, DeviceError, DeviceIoKind
+// ├── hash.rs ── BLAKE3 hashing utilities
+// ├── anchor.rs ── root anchor / superblock
+// ├── boot.rs ── boot sequence validation
+// ├── capability.rs ── capability tokens
+// ├── commit.rs ── atomic commit protocol
+// ├── failure.rs ── failure modes and recovery
+// ├── mesh.rs ── object mesh topology
+// ├── object.rs ── stored objects
+// ├── platform.rs ── platform abstraction
+// └── store.rs ── key-value store
+//
+// tools/
+// ├── ferros-bridge/ ── host-side USB tool (tokio + nusb)
+// │   ├── main.rs ── CLI: diag, read, reload, reboot, status
+// │   │   cmd_diag(), cmd_read(), cmd_reload()
+// │   │   pt_send() — blast mode, 512-byte padded OUT, COMPLETE wait
+// │   │   pt_recv() — receive outbound response, no SPEC ACK
+// │   └── usb.rs ── UsbLink { interface, ep_out, ep_in }
+// │       ::open(), send() (512-byte pad), recv()
+// └── mkimg/ ── ELF → flat binary → boot.img v3
+//     main.rs ── PE/COFF header, boot.img v3 packing
+//
+//! Ferros kernel — bare-metal aarch64 on Fairphone 5 (QCM6490).
 
 #![no_std]
 #![no_main]
