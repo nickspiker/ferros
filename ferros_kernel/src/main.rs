@@ -1302,7 +1302,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             log.puts("\n");
                             usb.handle_connect_done();
                             usb.ep0_start_setup();
-                            usb.bulk_out_arm_ring(); // Initialize TRB ring
+                            usb.bulk_out_arm(); // Initialize TRB ring
                             ledger.post(&Event::UsbConnectDone { speed });
                             evt_count += 1;
                         }
@@ -1628,7 +1628,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                 }
                                 // Only advance ring consumer if we actually got data
                                 if n > 0 {
-                                    usb.bulk_out_consume();
+                                    usb.bulk_out_arm();
                                 }
                             }
                             if ep == 3 {

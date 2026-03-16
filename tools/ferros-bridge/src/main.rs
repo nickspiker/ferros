@@ -144,6 +144,8 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
             .await
             .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
         sent += 1;
+        // Pace sends — kernel needs time to process + re-arm ep2
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
     eprintln!("  {} DATA packets blasted", sent);
@@ -152,21 +154,32 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     // Timeout proportional to transfer size: ~1ms per packet + 2s base.
     let wait_ms = (1u64 << 15) + (sent << 6); // 32768ms base + 64ms per packet
 
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(wait_ms),
-        link.recv(),
-    ).await {
-        Ok(Ok(resp)) => {
-            if let Some(complete) = Complete::decode(&resp) {
-                xfer.handle_complete(&complete);
-                eprintln!("  COMPLETE received");
-                return Ok(complete);
+    // Try multiple recv() calls — COMPLETE might not be the first thing back
+    for attempt in 0..16u32 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(if attempt == 0 { wait_ms } else { 4096 }),
+            link.recv(),
+        ).await {
+            Ok(Ok(resp)) => {
+                eprintln!("  recv[{attempt}]: {} bytes first=0x{:02x}", resp.len(), resp.get(0).copied().unwrap_or(0));
+                if let Some(complete) = Complete::decode(&resp) {
+                    xfer.handle_complete(&complete);
+                    eprintln!("  COMPLETE received!");
+                    return Ok(complete);
+                }
+                continue; // try next recv
             }
-            Err(format!("Expected COMPLETE, got {} bytes: {:02x?}", resp.len(), &resp[..resp.len().min(8)]))
+            Ok(Err(e)) => return Err(format!("recv error: {e}")),
+            Err(_) => {
+                eprintln!("  timeout on attempt {attempt}");
+                if attempt == 0 {
+                    continue; // long timeout expired, try short ones
+                }
+                return Err(format!("Timeout waiting for COMPLETE after {}ms ({} packets)", wait_ms, sent));
+            }
         }
-        Ok(Err(e)) => Err(format!("recv error: {e}")),
-        Err(_) => Err(format!("Timeout waiting for COMPLETE after {}ms ({} packets)", wait_ms, sent)),
     }
+    Err(format!("No COMPLETE after 16 recv attempts ({sent} packets)"))
 } // pt_send
 
 // ---------------------------------------------------------------------------
