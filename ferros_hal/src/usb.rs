@@ -1011,11 +1011,6 @@ impl Dwc3Dev {
 
     pub fn bulk_out_arm(&mut self) {
         self.bulk_out_armed = true;
-
-        // Always ENDTRANSFER first to clear any stale/invalidated transfer.
-        // The host may have silently reset the endpoint on reconnect.
-        self.force_end_transfer_unconditional(2);
-
         let buf_addr = &raw const BULK_OUT_BUF as usize;
         let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
 

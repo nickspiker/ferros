@@ -1619,11 +1619,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         }
                     }
 
-                    // Periodic ep2 re-arm: ENDTRANSFER + STARTTRANSFER every ~100ms.
-                    // Handles silent endpoint invalidation from host reconnect.
-                    if poll_count & 0x7FFFFF == 0 && !usb.bulk_out_ready {
-                        usb.bulk_out_arm();
-                    }
+                    // (periodic re-arm removed — interferes with active transfers)
 
                     // Outbound DATA pump — poll bulk_in_idle directly.
                     if usb.bulk_in_idle {
