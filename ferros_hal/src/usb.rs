@@ -764,6 +764,7 @@ pub struct Dwc3Dev {
     pub bulk_out_len: u16,
     /// New bulk OUT data available for kernel to consume
     pub bulk_out_ready: bool,
+    pub bulk_out_armed: bool,
     /// Bulk IN transfer idle (buffer available for next send)
     pub bulk_in_idle: bool,
     pub bulk_out_xfer_complete: u32,
@@ -914,6 +915,7 @@ impl Dwc3Dev {
             bulk_in_resource_idx: 0,
             bulk_out_len: 0,
             bulk_out_ready: false,
+            bulk_out_armed: false,
             bulk_in_idle: true,
             bulk_out_xfer_complete: 0,
             bulk_in_xfer_complete: 0,
@@ -1002,7 +1004,18 @@ impl Dwc3Dev {
     }
 
     /// Arm bulk OUT (phys EP 2) to receive up to 512 bytes from host.
+    /// Whether bulk OUT has been armed (pending STARTTRANSFER).
+    pub fn bulk_out_needs_arm(&self) -> bool {
+        !self.bulk_out_ready && !self.bulk_out_armed
+    }
+
     pub fn bulk_out_arm(&mut self) {
+        self.bulk_out_armed = true;
+
+        // Always ENDTRANSFER first to clear any stale/invalidated transfer.
+        // The host may have silently reset the endpoint on reconnect.
+        self.force_end_transfer_unconditional(2);
+
         let buf_addr = &raw const BULK_OUT_BUF as usize;
         let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
 
@@ -1012,10 +1025,11 @@ impl Dwc3Dev {
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = 512;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
-                | TRB_CTRL_ISP_IMI // complete on short packet too
+                | TRB_CTRL_ISP_IMI
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
             cache_clean(trb_addr, 16);
             cache_clean(buf_addr, 512);
+            core::arch::asm!("dsb sy");
         }
 
         if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
@@ -1415,6 +1429,7 @@ impl Dwc3Dev {
 
                     // Bulk OUT complete — read actual length from TRB
                     if ep_phys == 2 {
+                        self.bulk_out_armed = false;
                         self.bulk_out_xfer_complete += 1;
                         unsafe {
                             cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
@@ -1433,6 +1448,9 @@ impl Dwc3Dev {
                     }
 
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
+                        // SETUP packet = host is (re)configuring — clear armed flags
+                        // so bulk endpoints get re-armed by the main loop
+                        self.bulk_out_armed = false;
                         // SETUP packet received — invalidate cache to see DMA data
                         let setup_addr = &raw const EP0_SETUP_BUF as usize;
                         unsafe { cache_invalidate(setup_addr, 8); }
@@ -1616,6 +1634,7 @@ impl Dwc3Dev {
             self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
         }
         self.bulk_out_ready = false;
+        self.bulk_out_armed = false;
         self.bulk_in_idle = true;
 
         // Clear any stall condition

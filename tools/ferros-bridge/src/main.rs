@@ -102,9 +102,11 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
         sid.0 as char, xfer.count, xfer.psize, xfer.total
     );
 
+    eprintln!("  SPEC sending...");
     link.send(&spec_buf[..spec_len])
         .await
         .map_err(|e| format!("SPEC send failed: {e}"))?;
+    eprintln!("  SPEC sent OK");
 
     // Wait for SPEC ACK
     let resp = link

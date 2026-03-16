@@ -1341,7 +1341,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     let mut resp = [0u8; 512];
 
                                     // Debug: force to screen
-                                    log.screen = true;
+                                    log.screen = false; // was true
                                     log.puts("RX[");
                                     log.put_hex32(tmp[0] as u32);
                                     log.puts("] n=");
@@ -1362,7 +1362,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     len: payload.len() as u16,
                                                 });
                                                 // All chunks received? Send COMPLETE/NAK immediately
-                                                log.screen = true;
+                                                log.screen = false; // was true
                                                 log.puts("rcv="); log.put_hex32(xfer.chunks_received as u32);
                                                 log.puts("/"); log.put_hex32(xfer.expected_count as u32);
                                                 log.puts(" ar="); log.put_hex32(xfer.all_received() as u32);
@@ -1389,7 +1389,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                         if let Some(cmd) = ferros_pt::command::parse(payload) {
                                                             if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                                                 // DIAG Read: send boot log back via PT
-                                                                pt_out_data = log.buf.clone();
+                                                                // Copy log into pt_out_data, then clear log
+                                                                // to prevent unbounded heap growth
+                                                                pt_out_data.clear();
+                                                                pt_out_data.extend_from_slice(&log.buf);
+                                                                log.buf.clear();
                                                             } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read {
                                                                 // MEM Read: params = [addr:8][len:4]
                                                                 if cmd.params.len() >= 12 {
@@ -1502,7 +1506,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                         // Control packet — single-byte tag dispatch
                                         if let Some(spec) = Spec::decode(&tmp[..n]) {
                                             // SPEC — new inbound transfer (clears stale state)
-                                            // New session — cancel any stale bulk IN from previous session
+                                            // New session — log + cancel stale state
+                                            log.screen = false; // was true
+                                            log.puts("NEW idle="); log.put_hex32(usb.bulk_in_idle as u32);
+                                            log.puts("\n");
+                                            log.screen = false;
                                             if !usb.bulk_in_idle {
                                                 usb.cancel_bulk_in();
                                             }
@@ -1585,7 +1593,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             }
                             if ep == 3 {
                                 // Bulk IN complete — chain next pending send
-                                log.screen = true;
+                                log.screen = false; // was true
                                 log.puts("E3 c="); log.put_hex32(pt_complete_len as u32);
                                 log.puts(" s="); log.put_hex32(pt_out_spec_len as u32);
                                 log.puts(" o="); log.put_hex32(pt_outbound.is_some() as u32);
@@ -1611,6 +1619,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         }
                     }
 
+                    // Periodic ep2 re-arm: ENDTRANSFER + STARTTRANSFER every ~100ms.
+                    // Handles silent endpoint invalidation from host reconnect.
+                    if poll_count & 0x7FFFFF == 0 && !usb.bulk_out_ready {
+                        usb.bulk_out_arm();
+                    }
+
                     // Outbound DATA pump — poll bulk_in_idle directly.
                     if usb.bulk_in_idle {
                         if let Some(ref mut out) = pt_outbound {
@@ -1621,21 +1635,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     let ok = usb.bulk_in_send(&pkt[..pkt_len]);
                                     // Debug first few sends
                                     if out.next_seq <= 3 || !ok {
-                                        log.screen = true;
+                                        log.screen = false; // was true
                                         log.puts("D"); log.put_hex32(out.next_seq as u32);
                                         if ok { log.puts("ok "); } else { log.puts("FAIL "); }
                                         log.screen = false;
                                     }
                                 }
                             } else {
-                                log.screen = true;
-                                log.puts("FIN ");
-                                log.screen = false;
-                                let mut pkt = [0u8; 16];
-                                let fin_len = out.encode_fin(&mut pkt);
-                                if fin_len > 0 {
-                                    usb.bulk_in_send(&pkt[..fin_len]);
-                                }
+                                // All DATA sent — no FIN for outbound response.
+                                // Bridge knows chunk count from SPEC. Sending FIN
+                                // would leave a stale IN transfer if bridge already
+                                // returned after all_received().
                                 pt_outbound = None;
                             }
                         }
