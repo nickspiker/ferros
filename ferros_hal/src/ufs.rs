@@ -155,6 +155,11 @@ pub struct UfsProbe {
     pub nop_ocs: u8,
     pub nop_rsp: u8,
     pub nop_rsp_raw: [u8; 4], // first 4 bytes of response UPIU
+    /// Raw descriptor bytes for debugging
+    pub geo_raw: [u8; 32],
+    pub unit0_raw: [u8; 32],
+    pub geo_len: usize,
+    pub unit0_len: usize,
     /// Geometry descriptor fields
     pub geo_ok: bool,
     pub total_raw_capacity_sectors: u64,  // in 512-byte units
@@ -374,6 +379,8 @@ impl UfsController {
 
         // Read Geometry Descriptor (IDN 0x07)
         let (geo, geo_len, geo_ocs) = self.query_read_descriptor(upiu::DESC_GEOMETRY, 0);
+        p.geo_len = geo_len;
+        p.geo_raw[..32.min(geo_len)].copy_from_slice(&geo[..32.min(geo_len)]);
         if geo_ocs == ocs::SUCCESS && geo_len >= 0x20 {
             p.geo_ok = true;
             // qTotalRawDeviceCapacity at offset 0x04, 8 bytes big-endian
@@ -392,6 +399,8 @@ impl UfsController {
 
         // Read Unit Descriptor for LUN 0 (IDN 0x02, index 0)
         let (unit, unit_len, unit_ocs) = self.query_read_descriptor(upiu::DESC_UNIT, 0);
+        p.unit0_len = unit_len;
+        p.unit0_raw[..32.min(unit_len)].copy_from_slice(&unit[..32.min(unit_len)]);
         if unit_ocs == ocs::SUCCESS && unit_len >= 0x20 {
             p.unit0_ok = true;
             p.unit0_block_size_exp = unit[0x0A];

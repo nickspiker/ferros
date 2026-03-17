@@ -1276,6 +1276,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             for i in 0..4 { log.put_hex32(p.nop_rsp_raw[i] as u32); if i < 3 { log.puts(" "); } }
             log.puts("]\n");
         }
+        // Raw descriptor dumps
+        log.buf_only("GEO raw: ");
+        for i in 0..p.geo_len.min(32) {
+            log.buf_put_hex32(p.geo_raw[i] as u32); log.buf_only(" ");
+        }
+        log.buf_only("\n");
+        log.buf_only("LUN0 raw: ");
+        for i in 0..p.unit0_len.min(32) {
+            log.buf_put_hex32(p.unit0_raw[i] as u32); log.buf_only(" ");
+        }
+        log.buf_only("\n");
+
         if p.geo_ok {
             let cap_gb = (p.total_raw_capacity_sectors * 512) >> 30;
             let blk = 512u32 << p.min_block_size_exp;
