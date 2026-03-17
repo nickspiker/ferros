@@ -102,4 +102,5 @@ pub mod usb;
 pub mod gcc;
 pub mod rpmh;
 pub mod ufs;
+pub mod vsf_mini;
 pub mod ring;

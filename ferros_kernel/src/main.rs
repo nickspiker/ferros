@@ -1397,19 +1397,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 }
             } else {
                 // Found existing ring — write next generation
-                let next_gen = scan.generation + 1;
-                let prev_hash = scan.entry.as_ref().map(|e| e.entry_hash).unwrap_or([0u8; 32]);
-                let entry = ferros_hal::ring::RingEntry {
-                    generation: next_gen,
-                    prev_hash,
-                    hamt_root: [0u8; 32],
-                    cap_hash: [0u8; 32],
-                    proc_hash: [0u8; 32],
-                    ledger_head: [0u8; 32],
-                    entry_hash: [0u8; 32],
-                };
-                log.puts("write gen="); log.put_hex32(next_gen as u32);
-                log.puts(" pos="); log.put_hex32(ferros_hal::ring::gen_to_pos(next_gen));
+                let entry = scan.entry.as_ref().unwrap().next();
+                log.puts("write gen="); log.put_hex32(entry.generation as u32);
+                log.puts(" pos="); log.put_hex32(ferros_hal::ring::gen_to_pos(entry.generation));
                 if ferros_hal::ring::write_entry(&ufs, &entry) {
                     log.puts(" OK\n");
                     // Verify: rescan
