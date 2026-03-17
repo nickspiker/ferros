@@ -62,31 +62,43 @@ Both rings are mirrors. Higher valid generation wins on boot.
 
 Every vault root entry is a complete VSF document, serialized per
 the VSF specification. All integers use EWE encoding. All hashes
-are VsfType::h (BLAKE3, 32 bytes).
+use the precise VSF type codes from vsf_type.rs.
 
 ```
 VSF document (fits in one 4KB block):
 
 Header:
-  VsfType::h(BLAKE3, entry_hash)          mandatory, auto-computed
+  VsfType::hp(entry_hash)                 mandatory provenance hash (BLAKE3)
   VsfType::l("ferros.vault_root")         schema identifier
 
 Ordering section ("vault_root.order"):
   VsfType::l("generation")    → VsfType::u(n)              EWE, monotonic
-  VsfType::l("prev_hash")    → VsfType::h(BLAKE3, hash)   previous entry
-                                genesis: VsfType::h(BLAKE3, [0u8;32])
+  VsfType::l("prev_hash")    → VsfType::hp(hash)           previous entry provenance
+                                genesis: VsfType::hp([0u8;32])
 
 State section ("vault_root.state"):
-  VsfType::l("hamt_root")    → VsfType::h(BLAKE3, hash)   HAMT root node
-  VsfType::l("cap_snapshot") → VsfType::h(BLAKE3, hash)   capability table
-  VsfType::l("proc_snapshot")→ VsfType::h(BLAKE3, hash)   running processes
-  VsfType::l("ledger_head")  → VsfType::h(BLAKE3, hash)   ledger chain head
+  VsfType::l("hamt_root")    → VsfType::hp(hash)           HAMT root node provenance
+  VsfType::l("cap_snapshot") → VsfType::hp(hash)           capability table provenance
+  VsfType::l("proc_snapshot")→ VsfType::hp(hash)           running processes provenance
+  VsfType::l("ledger_head")  → VsfType::hp(hash)           ledger chain head provenance
 
 Integrity section ("vault_root.integrity"):
-  VsfType::l("kernel_hash")  → VsfType::h(BLAKE3, hash)   kernel that wrote this
-  VsfType::l("eagle_time")   → EtType::ei(t)              physics-bounded timestamp
+  VsfType::l("kernel_hash")  → VsfType::hb(hash)           kernel rolling hash (BLAKE3)
+  VsfType::l("kernel_sig")   → VsfType::ge(sig)            kernel Ed25519 signature
+  VsfType::l("eagle_time")   → EtType::ei(t)               physics-bounded timestamp
 
 Remainder of 4KB block: zeroed (reserved for future fields)
+```
+
+**VSF type reference (from vsf_type.rs):**
+```
+hp  BLAKE3 provenance hash — immutable content identity, 32 bytes
+hb  BLAKE3 rolling hash — current state hash, 32 bytes
+ge  Ed25519 signature — 64 bytes
+ke  Ed25519 public key — 32 bytes
+u   EWE unsigned integer — variable width, no ceiling
+l   ASCII label — field names, schema identifiers
+e   Eagle Time — physics-bounded timestamp
 ```
 
 **Why VSF for every entry:**

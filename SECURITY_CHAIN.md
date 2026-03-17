@@ -191,13 +191,13 @@ Signing flow (both seed and kernel use the same mechanism):
 
   Seed binary contains:
     seed_code
-    developer_pubkey (baked in)
-    seed_signature (Ed25519 of BLAKE3(seed_code))
+    VsfType::ke(developer_pubkey)        ← Ed25519 pubkey, baked in
+    VsfType::ge(seed_signature)          ← Ed25519 sig of BLAKE3(seed_code)
 
   Kernel binary contains:
     kernel_code
-    kernel_signature (Ed25519 of BLAKE3(kernel_code))
-    developer_pubkey_hash (BLAKE3 of pubkey, for cross-reference)
+    VsfType::ge(kernel_signature)        ← Ed25519 sig of BLAKE3(kernel_code)
+    VsfType::hp(developer_pubkey_hash)   ← BLAKE3 of pubkey, cross-reference
 
 Verification flow (seed):
   Read kernel_hash, kernel_signature from known offsets

@@ -1,5 +1,5 @@
 # VAULT — ferros Persistent Object Store
-**Version:** 0
+**Version:** Zil (0)
 **Author:** Nick Spiker
 **Principle:** Everything that persists lives in the vault. VSF is the format. The vault root is the only way in.
 
@@ -71,18 +71,19 @@ Every vault object is a VSF document. No exceptions.
 
 ```
 Native VSF object:
-  VsfType::hp(BLAKE3, content_hash)   ← mandatory provenance hash
+  VsfType::hp(content_hash)          ← BLAKE3 provenance hash (immutable identity)
   content: VSF fields                ← the actual object
 
 Non-VSF wrapped object:
-  VsfType::hb(BLAKE3, plaintext_hash) ← integrity before encryption
-  VsfType::hb(BLAKE3, cipher_hash)    ← integrity of encrypted form
-  VsfType::v(encrypted_bytes)        ← the content, ChaCha20 encrypted
+  VsfType::hp(plaintext_hash)        ← provenance of plaintext content
+  VsfType::hb(cipher_hash)           ← rolling hash of encrypted form
+  VsfType::ge(signature)             ← Ed25519 signature (proves origin)
+  VsfType::v(b'e', encrypted_bytes)  ← ChaCha20 encrypted content
 
-  Two hashes prove:
-    encryption was applied to correct plaintext
-    ciphertext has not been tampered with
-    both properties, independently verifiable
+  Three checks prove:
+    hp: content identity matches expected provenance
+    hb: ciphertext has not been tampered with
+    ge: object was written by a key holder (not forged)
 ```
 
 Object address = BLAKE3 hash of content (provenance hash). Content-addressed storage.
