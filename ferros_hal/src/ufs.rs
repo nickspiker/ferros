@@ -418,4 +418,157 @@ impl UfsController {
 
         p
     }
+
+    /// Common UTRD setup, doorbell, poll, return OCS.
+    /// Caller must have already filled ucd.cmd_upiu and prdt.
+    fn send_command(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
+        unsafe {
+            let buf = &raw mut UFS_BUF;
+            let ucd_addr = &raw const (*buf).ucd as usize as u64;
+
+            // Build UTRD
+            (*buf).utrd.dw[0] = (1 << 24)          // interrupt
+                | (direction << 25)                  // data direction
+                | (cmd_type << 28);                  // command type
+            (*buf).utrd.dw[1] = 0;
+            (*buf).utrd.dw[2] = 0x0000_000F;        // OCS = INVALID
+            (*buf).utrd.dw[3] = 0;
+            (*buf).utrd.dw[4] = ucd_addr as u32;
+            (*buf).utrd.dw[5] = (ucd_addr >> 32) as u32;
+            (*buf).utrd.dw[6] = (0x0080 << 16) | 0x0080; // response: offset=0x80 DW, len=0x80 DW
+            (*buf).utrd.dw[7] = (0x0100 << 16) | (prdt_count as u32); // prdt: offset=0x100 DW
+
+            // Cache clean UTRD + UCD + data buffer
+            let utrd_phys = &raw const (*buf).utrd as usize;
+            let ucd_phys = &raw const (*buf).ucd as usize;
+            let data_phys = &raw const (*buf).data as usize;
+            crate::mmio::cache_clean(utrd_phys, 32);
+            crate::mmio::cache_clean(ucd_phys, 1040); // 1024 + 16 for PRDT
+            crate::mmio::cache_clean(data_phys, 4096);
+            core::arch::asm!("dsb sy");
+
+            // Ring doorbell
+            self.write_reg(regs::UTRLDBR, 1);
+
+            // Poll for completion
+            for _ in 0..10_000_000u32 {
+                let is = self.read_reg(regs::IS);
+                if is & regs::IS_UTRCS != 0 {
+                    self.write_reg(regs::IS, regs::IS_UTRCS);
+                    break;
+                }
+            }
+
+            // Invalidate caches to see DMA results
+            crate::mmio::cache_invalidate(utrd_phys, 32);
+            crate::mmio::cache_invalidate(ucd_phys, 1040);
+            crate::mmio::cache_invalidate(data_phys, 4096);
+
+            ((*buf).utrd.dw[2] & 0xFF) as u8
+        }
+    }
+
+    /// Build a SCSI Command UPIU in the UCD.
+    fn build_scsi_upiu(&self, lun: u8, tag: u8, flags: u8, xfer_len: u32, cdb: &[u8]) {
+        unsafe {
+            let buf = &raw mut UFS_BUF;
+            // Zero command UPIU
+            core::ptr::write_bytes((&raw mut (*buf).ucd.cmd_upiu) as *mut u8, 0, 512);
+
+            (*buf).ucd.cmd_upiu[0] = upiu::COMMAND;   // transaction code
+            (*buf).ucd.cmd_upiu[1] = flags;            // R/W flags
+            (*buf).ucd.cmd_upiu[2] = lun;              // LUN
+            (*buf).ucd.cmd_upiu[3] = tag;              // task tag
+            (*buf).ucd.cmd_upiu[4] = 0;                // command set type = SCSI
+
+            // Expected data transfer length (big-endian u32, bytes 12-15)
+            (*buf).ucd.cmd_upiu[12] = (xfer_len >> 24) as u8;
+            (*buf).ucd.cmd_upiu[13] = (xfer_len >> 16) as u8;
+            (*buf).ucd.cmd_upiu[14] = (xfer_len >> 8) as u8;
+            (*buf).ucd.cmd_upiu[15] = xfer_len as u8;
+
+            // CDB at bytes 16-31 (zero-padded)
+            let copy_len = cdb.len().min(16);
+            for i in 0..copy_len {
+                (*buf).ucd.cmd_upiu[16 + i] = cdb[i];
+            }
+
+            // Zero response UPIU
+            core::ptr::write_bytes((&raw mut (*buf).ucd.rsp_upiu) as *mut u8, 0, 512);
+        }
+    }
+
+    /// Set up PRDT entry 0 pointing to the data buffer.
+    fn setup_prdt(&self, byte_count: u32) {
+        unsafe {
+            let buf = &raw mut UFS_BUF;
+            let data_addr = &raw const (*buf).data as usize as u64;
+            (*buf).ucd.prdt[0].base_addr_lo = data_addr as u32;
+            (*buf).ucd.prdt[0].base_addr_hi = (data_addr >> 32) as u32;
+            (*buf).ucd.prdt[0].reserved = 0;
+            (*buf).ucd.prdt[0].size = byte_count - 1; // byte count minus 1
+        }
+    }
+
+    /// Read one 4KB block from UFS LUN 0.
+    /// Returns OCS (0 = success). Data is in the internal buffer.
+    pub fn read_block(&self, lba: u32) -> u8 {
+        // SCSI READ(10) CDB: opcode=0x28, LBA (big-endian), transfer length=1 block
+        let cdb = [
+            scsi::READ_10,
+            0x00,                        // flags
+            (lba >> 24) as u8,           // LBA [31:24]
+            (lba >> 16) as u8,           // LBA [23:16]
+            (lba >> 8) as u8,            // LBA [15:8]
+            lba as u8,                   // LBA [7:0]
+            0x00,                        // group
+            0x00, 0x01,                  // transfer length = 1 block
+            0x00,                        // control
+        ];
+
+        self.build_scsi_upiu(0, 1, upiu::FLAG_READ, 4096, &cdb);
+        self.setup_prdt(4096);
+
+        // direction=2 (device→host), cmd_type=0 (SCSI), 1 PRDT entry
+        self.send_command(0, 2, 1)
+    }
+
+    /// Write one 4KB block to UFS LUN 0.
+    /// Caller must fill data buffer first via `data_buffer_mut()`.
+    /// Returns OCS (0 = success).
+    pub fn write_block(&self, lba: u32) -> u8 {
+        // SCSI WRITE(10) CDB
+        let cdb = [
+            scsi::WRITE_10,
+            0x00,                        // flags
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0x00,
+            0x00, 0x01,                  // transfer length = 1 block
+            0x00,
+        ];
+
+        self.build_scsi_upiu(0, 1, upiu::FLAG_WRITE, 4096, &cdb);
+        self.setup_prdt(4096);
+
+        // direction=1 (host→device), cmd_type=0 (SCSI), 1 PRDT entry
+        self.send_command(0, 1, 1)
+    }
+
+    /// Get a reference to the data buffer (for reading results after read_block).
+    pub fn data_buffer(&self) -> &[u8; 4096] {
+        unsafe { &(*(&raw const UFS_BUF)).data }
+    }
+
+    /// Get a mutable reference to the data buffer (for filling before write_block).
+    pub fn data_buffer_mut(&self) -> &mut [u8; 4096] {
+        unsafe { &mut (*(&raw mut UFS_BUF)).data }
+    }
+
+    /// Get the SCSI response status from the last command.
+    pub fn last_response_status(&self) -> u8 {
+        unsafe { (*(&raw const UFS_BUF)).ucd.rsp_upiu[7] }
+    }
 }

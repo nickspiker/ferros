@@ -1305,6 +1305,24 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts(" blocks="); log.put_hex32(p.unit0_block_count as u32);
             log.puts(" erase="); log.put_hex32(p.unit0_erase_block_size);
             log.puts("\n");
+
+            // Test SCSI READ(10) — read block 0 from LUN 0
+            if p.nop_ok {
+                let read_ocs = ufs.read_block(0);
+                log.puts("READ0:  ocs="); log.put_hex32(read_ocs as u32);
+                log.puts(" sts="); log.put_hex32(ufs.last_response_status() as u32);
+                if read_ocs == 0 {
+                    // Show first 16 bytes of block 0
+                    let data = ufs.data_buffer();
+                    log.puts(" [");
+                    for i in 0..16 {
+                        log.put_hex32(data[i] as u32);
+                        if i < 15 { log.puts(" "); }
+                    }
+                    log.puts("]");
+                }
+                log.puts("\n");
+            }
         }
     }
 

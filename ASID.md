@@ -1,29 +1,6 @@
-# ARCHITECTURE — ferros Design Principles
-**Version:** Zil (0)
-**Author:** Nick Spiker
-**Principle:** Security is the architecture, not a layer on top.
+Things Linux has to deal with that ferros structurally eliminates:
 
----
-
-## Why ferros Exists
-
-Linux accumulated complexity solving problems that ferros eliminates
-at the architectural level. Not because Linux engineers were bad —
-because they were constrained by backward compatibility and a 1970s
-foundation.
-
-ferros has no such constraint.
-
----
-
-## Structural Elimination
-
-Every section below shows a Linux complexity that ferros does not
-mitigate, patch, or work around — it structurally eliminates. The
-problem does not exist in the architecture.
-
-### Page Tables
-
+**Page table complexity:**
 ```
 Linux:   demand paging, swapping, copy-on-write fork,
          huge pages, transparent huge pages,
@@ -38,8 +15,7 @@ ferros:  process gets a ring, hardware gets a grant
          no OOM killer (ring bounded at spawn)
 ```
 
-### Fork
-
+**Fork:**
 ```
 Linux:   fork() copies entire process address space
          COW fork: complex, racy, source of countless bugs
@@ -51,8 +27,7 @@ ferros:  no fork()
          no fork-related vulnerability class
 ```
 
-### Signals
-
+**Signal handling:**
 ```
 Linux:   signals are asynchronous, delivered at arbitrary points
          signal handlers: reentrant nightmares
@@ -65,8 +40,7 @@ ferros:  no signals
          entire signal complexity: does not exist
 ```
 
-### Device Drivers
-
+**Device drivers in kernel:**
 ```
 Linux:   ~70% of kernel code is drivers
          driver bug: kernel panic
@@ -77,11 +51,10 @@ ferros:  all drivers userspace
          driver bug: process crash, restart
          driver CVE: capability bounded
          no binary blobs: pure Rust
-         kernel stays small, stays proven
+         kernel stays 10K lines, stays proven
 ```
 
-### Filesystem
-
+**The VFS layer:**
 ```
 Linux:   Virtual Filesystem Switch
          dozens of filesystem implementations
@@ -89,15 +62,13 @@ Linux:   Virtual Filesystem Switch
          ext4, btrfs, xfs, nfs, fuse...
          all in kernel, all kernel privilege
 
-ferros:  one storage model: vault root ring + HAMT + vault objects
-         entirely userspace (after boot)
+ferros:  one filesystem: Ring FS + HAMT + Vault
+         entirely userspace
          kernel knows nothing about filesystems
          VSF is the format, period
-         see VAULT.md, VAULT_ROOT.md, HAMT.md
 ```
 
-### Privilege Escalation
-
+**Privilege escalation surface:**
 ```
 Linux:   setuid binaries
          capability sets (confusingly named, different from ferros caps)
@@ -107,13 +78,12 @@ Linux:   setuid binaries
 
 ferros:  no setuid
          no privilege escalation path
-         capabilities are cryptographic tokens (BLAKE3)
+         capabilities are cryptographic tokens
          you have what you were granted, nothing more
          escalation requires forging a BLAKE3 hash: 2^-256
 ```
 
-### Scheduler
-
+**The scheduler:**
 ```
 Linux:   CFS, real-time scheduling classes,
          cgroups, namespaces, control groups,
@@ -126,8 +96,7 @@ ferros:  simple scheduler
          threads get time, that's it
 ```
 
-### Syscall Surface
-
+**Syscall surface:**
 ```
 Linux:   ~350 syscalls
          each one: kernel attack surface
@@ -140,40 +109,20 @@ ferros:  five kernel responsibilities
          no syscall you weren't granted a cap for
 ```
 
-### Boot
-
+**Boot:**
 ```
 Linux:   initrd, initramfs, pivot_root,
          udev, systemd, dozens of race conditions,
          fsck, journal replay, recovery mode
 
-ferros:  seed verifies kernel → jump
-         kernel scans vault root ring → binary search → restore snapshot
-         no fsck (BLAKE3 + HAMT + vault ring)
+ferros:  scan vault root → find generation → restore snapshot
+         no fsck (BLAKE3 + ring FS + HAMT)
          no recovery mode (always valid state)
-         no initrd (vault always bootable)
-         deterministic, proven
-         see SECURITY_CHAIN.md, VAULT_ROOT.md
+         no initrd (ring always bootable)
+         300ms, deterministic, proven
 ```
 
-### Trust Model
-
-```
-Linux:   Secure Boot → shim → GRUB → kernel → systemd → SELinux
-         each link: different maintainer, different threat model
-         locked bootloaders protect vendor, not owner
-         owner cannot sign their own kernel without penalty
-
-ferros:  developer key → seed → kernel → vault root → userspace
-         one chain, one key model, one verification mechanism
-         owner CAN replace developer key (full sovereignty)
-         no features disabled for using your own key
-         see SECURITY_CHAIN.md
-```
-
----
-
-## The Meta-Point
+**The meta-point:**
 
 ```
 Linux missteps fall into two categories:
@@ -181,7 +130,7 @@ Linux missteps fall into two categories:
 1. Complexity added to solve real problems
    that ferros's architecture makes not-problems:
    fork, signals, VFS, page table management
-
+   
 2. Retrofitted security on top of insecure foundations:
    seccomp, namespaces, capabilities, SELinux, AppArmor
    all bolted on after the fact
@@ -193,39 +142,6 @@ ferros:  security is the architecture
          these problems structurally do not exist
 ```
 
----
+The common thread: Linux accumulated complexity solving problems that ferros eliminates at the architectural level. Not because Linux engineers were bad — because they were constrained by backward compatibility and a 1970s foundation.
 
-## Five Kernel Responsibilities
-
-The ferros kernel does exactly five things:
-
-```
-1. Memory:     ring allocation, grants, bounds enforcement
-2. Scheduling: time slicing, IPC dispatch
-3. IPC:        capability-gated message passing
-4. Boot:       seed verification, vault root scan, state restore
-5. Hardware:   interrupt routing to userspace drivers
-
-Everything else is userspace:
-  drivers, filesystems, networking, display, audio,
-  authentication, encryption, logging, applications
-  all capability-gated, all restartable, all isolated
-```
-
----
-
-## Document Map
-
-```
-ARCHITECTURE.md     this document — why these decisions
-SECURITY_CHAIN.md   boot trust model, signature chain, owner sovereignty
-VAULT_ROOT.md       boot state ring, binary search, mirror protocol
-VAULT.md            persistent object store, HAMT index, storage layout
-HAMT.md             hash array mapped trie, COW versioning
-LEDGER.md           append-only event chain, VSF format
-```
-
----
-
-*ARCHITECTURE 0 — Security is the architecture, not a layer on top.*
-*Author: Nick Spiker*
+ferros has no such constraint.

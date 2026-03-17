@@ -1,13 +1,13 @@
 # LEDGER — ferros Logging Specification
-**Version:** 0.0  
-**Author:** Nick Spiker  
+**Version:** Zil (0)
+**Author:** Nick Spiker
 **Principle:** Facts are immutable. VSF is the format. The chain does not lie.
 
 ---
 
 ## Philosophy
 
-A log is not a debugging convenience. It is a **formal record of system events** — capability-gated, cryptographically ordered, append-only, and killswitch-safe by construction.
+A log is not a debugging convenience. It is a **formal record of system events** — capability-gated, cryptographically ordered, append-only, and killswitch-ready by construction.
 
 VSF is not a serialization layer bolted onto the Ledger. VSF **is** the Ledger. Every entry is a VSF document. Native VSF on disk stays native. Non-VSF data gets wrapped. The filesystem is eventually VSF topology — the Ledger is its first expression.
 
@@ -49,7 +49,7 @@ Cap-gated:          Cap<Write, Ledger::Category> to append
                     Cap<Read, Ledger::Category> to query
                     categories are capability-scoped, not ACL-scoped
 
-Kill-safe:          Ring FS backed, atomic writes, generation-numbered
+Killswitch ready:          Ring FS backed, atomic writes, generation-numbered
                     partial write → VSF mandatory hash fails → discard
                     last committed entry always recoverable
 
@@ -81,6 +81,8 @@ Non-VSF:       wrapped in VSF envelope
 Result:        no block on disk lacks integrity proof (hb or g)
                no block lacks a VSF type
                the FS IS the VSF document tree
+
+Fragmenting and updates: Content is split into disk friendly chunks (4KB on Fairphone 5 and SanDisk SD) by Photon Transport type chunking. VSF also allows many empty sections to simplify fragmentation management.
 ```
 
 The Ledger is the first part of that tree to exist. Boot the Ledger, you have the seed of the FS.
@@ -221,14 +223,14 @@ Mint rules: same as all ferros caps
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                  LEDGER SERVER                       │
-│           (userspace — capability-gated)             │
-│                                                      │
-│  ┌──────────────┐ ┌─────────────┐ ┌───────────────┐ │
+│                  LEDGER SERVER                      │
+│           (userspace — capability-gated)            │
+│                                                     │
+│  ┌──────────────┐ ┌─────────────┐ ┌───────────────┐  │
 │  │  Category    │ │   Chain     │ │   Ring FS     │ │
 │  │  Registry    │ │  Validator  │ │   Backend     │ │
 │  │  (cap tree)  │ │ (VSF hash)  │ │ (VSF on disk) │ │
-│  └──────────────┘ └─────────────┘ └───────────────┘ │
+│  └──────────────┘ └─────────────┘ └───────────────┘  │
 └─────────────────────────┬────────────────────────────┘
                           │ Cap-gated IPC only
          ┌────────────────┼────────────────┐
