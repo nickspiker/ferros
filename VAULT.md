@@ -28,7 +28,7 @@ This:       VsfType::h(BLAKE3, object_hash) → vault object
 
 ```
 Boot snapshots:     HAMT root, cap table, process entry points
-                    indexed via vault root ring (see VAULT_ROOT.md)
+                    indexed via vault root ring (see RING.md)
                     restored on boot by kernel first stage
 
 Ledger backing:     ferros_ledger's chain storage
@@ -163,7 +163,7 @@ Physical storage (each device — UFS and SD mirror):
 │  (see SECURITY_CHAIN.md)     │  ← Ed25519 signed, BLAKE3 verified
 ├──────────────────────────────┤
 │  Vault Root Ring             │  ← 4MB (1024 × 4KB entries)
-│  (see VAULT_ROOT.md)         │  ← generation-ordered, binary search
+│  (see RING.md)         │  ← generation-ordered, binary search
 │  VSF documents, BLAKE3       │  ← write-verify-then-mirror
 ├──────────────────────────────┤
 │  Ledger Ring                 │  ← 1GB (spec only, future)
@@ -183,7 +183,7 @@ Mirror protocol:
   Write to UFS → read back → BLAKE3 verify
   Then write to SD → read back → BLAKE3 verify
   Both verified → committed
-  See VAULT_ROOT.md for full mirror protocol
+  See RING.md for full mirror protocol
 
 Hardware:
   UFS: 232GB, 4KB blocks, 4MB erase blocks, full wear leveling
@@ -248,7 +248,7 @@ SECURITY_CHAIN.md:
   Vault root is the FIRST thing the bootloader reads
   Protected regions: no cap for seed or vault root ring
 
-VAULT_ROOT.md:
+RING.md:
   The ring of boot state snapshots
   Each entry points to an HAMT root + cap snapshot + ledger head
   Binary search finds highest valid generation

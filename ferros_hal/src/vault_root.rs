@@ -4,7 +4,7 @@
 //! (not full VSF yet — that comes when the VSF serializer is ready).
 //! Binary search finds the highest valid generation in O(log2 N) reads.
 //!
-//! See VAULT_ROOT.md for the full specification.
+//! See RING.md for the full specification.
 
 use crate::ufs::UfsController;
 
@@ -24,7 +24,7 @@ const ENTRY_MAGIC: [u8; 8] = *b"FERROSV0";
 ///
 /// This is a simplified binary format for bootstrap. Once the VSF
 /// serializer is available, entries will be proper VSF documents
-/// per VAULT_ROOT.md spec.
+/// per RING.md spec.
 ///
 /// Layout (all fields little-endian):
 /// ```text
@@ -194,7 +194,7 @@ pub fn write_entry(ufs: &UfsController, entry: &VaultRootEntry) -> bool {
     let write_ocs = ufs.write_block(lba);
     if write_ocs != 0 { return false; }
 
-    // Read back and verify (write-verify protocol per VAULT_ROOT.md)
+    // Read back and verify (write-verify protocol per RING.md)
     let read_ocs = ufs.read_block(lba);
     if read_ocs != 0 { return false; }
 

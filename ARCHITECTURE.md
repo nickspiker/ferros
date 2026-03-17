@@ -93,7 +93,7 @@ ferros:  one storage model: vault root ring + HAMT + vault objects
          entirely userspace (after boot)
          kernel knows nothing about filesystems
          VSF is the format, period
-         see VAULT.md, VAULT_ROOT.md, HAMT.md
+         see VAULT.md, RING.md, HAMT.md
 ```
 
 ### Privilege Escalation
@@ -153,7 +153,7 @@ ferros:  seed verifies kernel → jump
          no recovery mode (always valid state)
          no initrd (vault always bootable)
          deterministic, proven
-         see SECURITY_CHAIN.md, VAULT_ROOT.md
+         see SECURITY_CHAIN.md, RING.md
 ```
 
 ### Trust Model
@@ -219,7 +219,7 @@ Everything else is userspace:
 ```
 ARCHITECTURE.md     this document — why these decisions
 SECURITY_CHAIN.md   boot trust model, signature chain, owner sovereignty
-VAULT_ROOT.md       boot state ring, binary search, mirror protocol
+RING.md       boot state ring, binary search, mirror protocol
 VAULT.md            persistent object store, HAMT index, storage layout
 HAMT.md             hash array mapped trie, COW versioning
 LEDGER.md           append-only event chain, VSF format

@@ -193,7 +193,7 @@ Process snapshot corrupt:
 
 ```
 SEED.md:        Seed verifies kernel, jumps to Stage 0
-VAULT_ROOT.md:  Ring format, generation numbering, entry layout
+RING.md:  Ring format, generation numbering, entry layout
 VAULT.md:       HAMT storage for process snapshots, capability tree
 LEDGER.md:      Pre-boot buffer format, ledger server bootstrap
 KERNEL.md:      Running kernel responsibilities (post-boot)

@@ -1,4 +1,4 @@
-# VAULT_ROOT — ferros Vault Root Specification
+# RING — ferros Boot State Ring Specification
 **Version:** Zil (0)
 **Author:** Nick Spiker
 **Principle:** The ring is the index. Binary search finds the head. VSF is the format.
@@ -84,7 +84,7 @@ Block range             Size     Purpose
 0x2000 - 0x11FFF        256MB    Vault root ring (65536 × 4KB entries)
 0x40000 - 0x7FFFF       1GB      State ring (running procs, caps, display)
 0x80000 - 0xBFFFF       1GB      Ledger ring (categorized events)
-0xC0000+                ~230GB   HAMT region (objects, snapshots, data)
+0xC0000+                ~128GB   HAMT region (objects, snapshots, data)
 
 SD card: identical layout, identical block numbers.
 Kernel copies C and D at blocks 0xC00 and 0x1400.
@@ -421,5 +421,5 @@ Theorem VaultRoot_ReproducibleVerification:
 
 ---
 
-*VAULT_ROOT Zil — The ring is the index. Binary search finds the head. VSF is the format.*
+*RING Zil — The ring is the index. Binary search finds the head. VSF is the format.*
 *Author: Nick Spiker*
