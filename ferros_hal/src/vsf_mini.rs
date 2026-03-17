@@ -116,7 +116,36 @@ impl<'a> VsfWriter<'a> {
         self.put_byte(VSF_CLOSE)
     }
 
-    // ----- Typed fields -----
+    // ----- Sections and fields -----
+
+    /// Open a section: [d("name")
+    pub fn section_open(&mut self, name: &str) -> bool {
+        self.put_byte(b'[') && self.dict_key(name)
+    }
+
+    /// Close a section: ]
+    pub fn section_close(&mut self) -> bool {
+        self.put_byte(b']')
+    }
+
+    /// Open a field: (d("name"):
+    pub fn field_open(&mut self, name: &str) -> bool {
+        self.put_byte(b'(') && self.dict_key(name) && self.put_byte(b':')
+    }
+
+    /// Close a field: )
+    pub fn field_close(&mut self) -> bool {
+        self.put_byte(b')')
+    }
+
+    /// Write internal dictionary key: d(string)
+    pub fn dict_key(&mut self, s: &str) -> bool {
+        self.put_byte(b'd')
+            && self.put_ewe_uint(s.len() as u64)
+            && self.put(s.as_bytes())
+    }
+
+    // ----- Typed values -----
 
     /// Write unsigned integer: u(val)
     pub fn uint(&mut self, val: u64) -> bool {
@@ -193,12 +222,17 @@ impl<'a> VsfReader<'a> {
         self.buf.len().saturating_sub(self.pos)
     }
 
-    /// Read one byte.
-    fn read_byte(&mut self) -> Option<u8> {
+    /// Read one byte (public for section/field delimiter parsing).
+    pub fn read_byte_raw(&mut self) -> Option<u8> {
         if self.pos >= self.buf.len() { return None; }
         let b = self.buf[self.pos];
         self.pos += 1;
         Some(b)
+    }
+
+    /// Read one byte (internal alias).
+    fn read_byte(&mut self) -> Option<u8> {
+        self.read_byte_raw()
     }
 
     /// Read N bytes.
@@ -276,6 +310,16 @@ impl<'a> VsfReader<'a> {
     /// Read and verify close byte: >
     pub fn close(&mut self) -> bool {
         self.read_byte() == Some(VSF_CLOSE)
+    }
+
+    // ----- Section/field parsing -----
+
+    /// Read internal dictionary key: d(string) → &str
+    pub fn dict_key_str(&mut self) -> Option<&'a str> {
+        if self.read_byte()? != b'd' { return None; }
+        let len = self.read_ewe_uint()? as usize;
+        let bytes = self.read_bytes(len)?;
+        core::str::from_utf8(bytes).ok()
     }
 
     // ----- Typed fields -----

@@ -40,81 +40,80 @@ impl RingEntry {
     ///
     /// Format:
     /// ```text
-    /// RÅ<                          magic (4 bytes)
-    /// z(0)                         version: Zil
-    /// y(0)                         backward compat: Zil
-    /// b(header_len)                header byte length
-    /// e(u(qtimer_ticks))           Eagle Time (QTIMER for now)
-    /// hp(document_hash)            provenance hash (placeholder, filled after)
-    /// n(3)                         3 body fields
-    /// >                            header close
-    /// u(generation)                ordering: binary search key
-    /// hp(prev_entry_hash)          ordering: chain link to previous
-    /// hp(resume_state_hash)        pointer: HAMT root for state restore
+    /// RÅ< z(7) y(7) b(header_len) e(u(qtimer)) hp(zeros→patched) n(1) >
+    /// [d("ring")
+    ///   (d("generation"):u(N))
+    ///   (d("prev_hash"):hp(...))
+    ///   (d("resume_state"):hp(...))
+    /// ]
     /// [zero padding to 4096]
+    ///
+    /// hp = BLAKE3 of entire document with hp field zeroed to 32×0x00
     /// ```
     pub fn to_block(&self) -> [u8; 4096] {
         let mut blk = [0u8; 4096];
         let mut w = VsfWriter::new(&mut blk);
 
-        // VSF header
+        // --- VSF header ---
         w.magic();
-        w.version(0);           // Zil
-        w.backward_version(0);  // Zil
+        w.version(7);           // Luna
+        w.backward_version(7);  // Luna
 
-        // Header length placeholder — we'll compute this after writing the header.
-        // For simplicity, write a fixed estimate. The header is small and predictable.
-        // We know: e(u(8bytes)) + hp(32bytes) + n(1byte) = ~50 bytes header body.
-        // Actual header_length = bytes from after b() to '>'.
+        // Header length placeholder (b field)
         let header_len_pos = w.pos();
-        w.header_length(0); // placeholder, overwritten below
+        w.header_length(0); // placeholder, patched below
 
         let header_body_start = w.pos();
 
-        // Eagle Time (QTIMER ticks — monotonic, not wall clock)
+        // Eagle Time (QTIMER ticks — monotonic, not wall clock yet)
         w.eagle_time_qtimer(self.eagle_time);
 
-        // Provenance hash placeholder — filled after body is written
+        // Provenance hash placeholder — 32 zero bytes, patched after full document is written
         let hp_pos = match w.hash_p_placeholder() {
             Some(pos) => pos,
             None => return blk,
         };
 
-        // Field count: 3 body fields (generation, prev_hash, resume_state)
-        w.field_count(3);
+        // n(1) — one section in the body
+        w.field_count(1);
 
         // Header close
         w.close();
 
         let header_body_end = w.pos();
 
-        // --- Body fields ---
-        let body_start = w.pos();
+        // --- Body: one section "ring" with 3 fields ---
+        w.section_open("ring");
 
-        // 1. Generation (ordering key for binary search)
+        // Field 1: generation (ordering key for binary search)
+        w.field_open("generation");
         w.uint(self.generation);
+        w.field_close();
 
-        // 2. Previous entry provenance hash (chain link)
+        // Field 2: prev_hash (chain link to previous entry)
+        w.field_open("prev_hash");
         w.hash_p(&self.prev_hash);
+        w.field_close();
 
-        // 3. Resume state HAMT root (single pointer to everything)
+        // Field 3: resume_state (HAMT root pointer)
+        w.field_open("resume_state");
         w.hash_p(&self.resume_state);
+        w.field_close();
 
-        let body_end = w.pos();
+        w.section_close();
+
+        // Patch header_length
         let header_body_len = header_body_end - header_body_start - 1; // -1 for '>'
-
-        // Drop writer to release mutable borrow on blk
         drop(w);
 
-        // Compute provenance hash over body
-        let body_hash = blake3::hash(&blk[body_start..body_end]);
-        blk[hp_pos..hp_pos + 32].copy_from_slice(body_hash.as_bytes());
-
-        // Fill in header_length: b(0) was written as 'b' '3' 0x00.
-        // Overwrite the value byte (pos+2) with actual length.
         if header_body_len <= 255 {
             blk[header_len_pos + 2] = header_body_len as u8;
         }
+
+        // Compute provenance hash: BLAKE3 of entire document with hp zeroed
+        // hp is already zeros (placeholder), so just hash the whole block
+        let doc_hash = blake3::hash(&blk);
+        blk[hp_pos..hp_pos + 32].copy_from_slice(doc_hash.as_bytes());
 
         blk
     }
@@ -123,52 +122,66 @@ impl RingEntry {
     pub fn from_block(blk: &[u8; 4096]) -> Option<Self> {
         let mut r = VsfReader::new(blk);
 
-        // Verify magic
+        // --- Header ---
         if !r.magic() { return None; }
-
-        // Version
         let _ver = r.version()?;
         let _bver = r.backward_version()?;
         let _hlen = r.header_length()?;
-
-        // Eagle Time
         let eagle_time = r.eagle_time_qtimer()?;
 
-        // Provenance hash
+        // Record hp position for verification
+        let hp_pos_in_buf = r.pos;
         let hp_hash_ref = r.hash_p()?;
         let mut hp_hash = [0u8; 32];
         hp_hash.copy_from_slice(hp_hash_ref);
 
-        // Field count
         let _count = r.field_count()?;
-
-        // Header close
         if !r.close() { return None; }
 
-        // --- Body ---
-        let body_start = r.pos;
-
-        // 1. Generation
-        let generation = r.uint()?;
-        if generation == 0 { return None; } // 0 = invalid/empty
-
-        // 2. Previous hash
-        let prev_ref = r.hash_p()?;
-        let mut prev_hash = [0u8; 32];
-        prev_hash.copy_from_slice(prev_ref);
-
-        // 3. Resume state
-        let resume_ref = r.hash_p()?;
-        let mut resume_state = [0u8; 32];
-        resume_state.copy_from_slice(resume_ref);
-
-        let body_end = r.pos;
-
-        // Verify provenance hash covers the body
-        let computed = blake3::hash(&blk[body_start..body_end]);
+        // --- Verify provenance hash ---
+        // BLAKE3 of entire block with hp field zeroed
+        let mut temp = *blk;
+        for i in 0..32 { temp[hp_pos_in_buf + 4 + i] = 0; } // +4 = 'h' 'p' '3' 31
+        let computed = blake3::hash(&temp);
         if computed.as_bytes() != &hp_hash {
             return None;
         }
+
+        // --- Body: parse section [d("ring") ...fields... ] ---
+        // Expect '[' d("ring")
+        if r.read_byte_raw()? != b'[' { return None; }
+        let section_name = r.dict_key_str()?;
+        if section_name != "ring" { return None; }
+
+        // Parse fields: (d("name"):value)
+        let mut generation: u64 = 0;
+        let mut prev_hash = [0u8; 32];
+        let mut resume_state = [0u8; 32];
+
+        while r.peek_tag() == Some(b'(') {
+            r.read_byte_raw(); // consume '('
+            let fname = r.dict_key_str()?;
+            if r.read_byte_raw()? != b':' { return None; } // field separator
+
+            match fname {
+                "generation" => { generation = r.uint()?; }
+                "prev_hash" => {
+                    let h = r.hash_p()?;
+                    prev_hash.copy_from_slice(h);
+                }
+                "resume_state" => {
+                    let h = r.hash_p()?;
+                    resume_state.copy_from_slice(h);
+                }
+                _ => { r.skip_field(); } // unknown field — skip
+            }
+
+            if r.read_byte_raw()? != b')' { return None; } // field close
+        }
+
+        if r.read_byte_raw()? != b']' { return None; } // section close
+
+        if generation == 0 { return None; } // 0 = invalid/empty
 
         Some(Self {
             generation,
@@ -273,6 +286,7 @@ pub fn write_entry(ufs: &UfsController, entry: &RingEntry) -> bool {
 
 /// Read just the generation from a VSF ring entry at a position.
 /// Returns 0 if empty, corrupt, or unreadable.
+/// Parses header + section structure to find the generation field.
 fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u64 {
     let lba = RING_BASE_BLOCK + pos;
     result.reads += 1;
@@ -282,8 +296,7 @@ fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u6
 
     let data = ufs.data_buffer();
 
-    // Quick parse: just read enough to extract generation.
-    // Full validation happens in read_entry.
+    // Quick parse: skip header to reach body
     let mut r = VsfReader::new(data);
     if !r.magic() { return 0; }
     if r.version().is_none() { return 0; }
@@ -294,7 +307,12 @@ fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u6
     if r.field_count().is_none() { return 0; }
     if !r.close() { return 0; }
 
-    // First body field should be u(generation)
+    // Body: [d("ring")(d("generation"):u(N))...]
+    if r.read_byte_raw() != Some(b'[') { return 0; }
+    if r.dict_key_str().is_none() { return 0; } // skip section name
+    if r.read_byte_raw() != Some(b'(') { return 0; } // field open
+    if r.dict_key_str().is_none() { return 0; } // skip field name "generation"
+    if r.read_byte_raw() != Some(b':') { return 0; } // separator
     r.uint().unwrap_or(0)
 }
 

@@ -1386,9 +1386,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 // Genesis: write first entry
                 log.puts("genesis: writing entry 1...");
                 let entry = ferros_hal::ring::RingEntry::genesis();
+                // Debug: dump first 60 bytes of the block
+                let blk = entry.to_block();
+                log.puts("\nblk: ");
+                for i in 0..60 { log.put_hex32(blk[i] as u32); log.puts(" "); }
+                log.puts("\n");
+                // Try parsing it back before writing
+                let parsed = ferros_hal::ring::RingEntry::from_block(&blk);
+                log.puts("self-parse: ");
+                match parsed {
+                    Some(e) => { log.puts("gen="); log.put_hex32(e.generation as u32); }
+                    None => log.puts("FAIL"),
+                }
+                log.puts("\n");
                 if ferros_hal::ring::write_entry(&ufs, &entry) {
-                    log.puts(" OK\n");
-                    // Verify: scan again
+                    log.puts("write OK\n");
                     let scan2 = ferros_hal::ring::scan_ring(&ufs);
                     log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
                     log.puts("\n");
