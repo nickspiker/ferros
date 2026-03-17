@@ -1514,7 +1514,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
                 loop {
                     match usb.poll_event() {
-                        ferros_hal::usb::UsbEvent::None => {}
+                        ferros_hal::usb::UsbEvent::None => {
+                            // Yield CPU briefly when no USB events pending.
+                            // Not WFI (no GIC/IRQ setup yet) but reduces power.
+                            // 64 yields ≈ ~64ns delay ≈ ~15MHz effective poll rate.
+                            // Lower values break USB timing. Proper fix: GIC + WFI.
+                            for _ in 0..64u32 { core::hint::spin_loop(); }
+                        }
                         ferros_hal::usb::UsbEvent::Reset => {
                             log.puts("  USB reset\n");
                             usb.handle_reset();
