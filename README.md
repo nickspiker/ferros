@@ -137,13 +137,13 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 - DPU register reads (splash framebuffer at 0xE1000000)
 - USB device enumeration (DWC3, VID 0x1838 PID 0xFE01)
 - Bidirectional Photon Transport over USB (blast mode, per-chunk BLAKE3)
-- Hot-reload over USB (72KB kernel binary in ~15s, no fastboot needed)
-- SD card read/write (1TB SanDisk SDXC, 4-bit bus, 400KHz, multi-block)
+- Hot-reload over USB (72KB kernel binary in <1s, no fastboot needed)
+- SD card read/write (1TB SanDisk SDXC, 4-bit bus, 400KHz, multi-block, sometimes needs a hard restart)
 - GCC clock controller, RPMh TCS power enable via cmd-db
 - DTB parsing for reserved-memory, bootargs, ramoops address
 
 ### In Progress
-- Ledger: append-only VSF event chain (spec complete, implementation started)
+- Ledger: append-only VSF event ring (spec complete, implementation started)
 - SD card 25MHz/50MHz high-speed mode (needs DLL calibration)
 - UFS internal flash identification (host controller at 0x1D84000)
 - USB driver cleanup (TRB ring for throughput, proper endpoint state machine)

@@ -211,7 +211,7 @@ pub fn power_pressed() -> bool {
 
 /// LDO control register offsets (within each LDO peripheral)
 const LDO_EN_CTL: u8 = 0x46;     // bit 7 = VREG_EN
-const LDO_VSET_LB: u8 = 0x40;    // voltage set low byte (some PMICs use 0x44)
+#[allow(dead_code)] const LDO_VSET_LB: u8 = 0x40;    // voltage set low byte (some PMICs use 0x44)
 const LDO_STATUS1: u8 = 0x08;    // regulator status
 
 /// Enable an LDO regulator via SPMI.

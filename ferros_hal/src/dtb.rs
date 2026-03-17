@@ -348,7 +348,6 @@ impl<'a> Dtb<'a> {
                         in_child = false;
                     }
                     if in_parent && depth == parent_depth {
-                        in_parent = false;
                         return; // done with parent
                     }
                     depth -= 1;

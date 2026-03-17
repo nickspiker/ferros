@@ -16,7 +16,7 @@
 //! binary backoff starting at 1/256s (~4ms), doubling each attempt.
 
 use crate::CHUNK_SIZE;
-use crate::packet::{self, Ack, CHUNK_HASH_SIZE, Complete, NAK_MAX_SEQS, Nak, Spec, StreamId};
+use crate::packet::{self, CHUNK_HASH_SIZE, Complete, NAK_MAX_SEQS, Nak, Spec, StreamId};
 use ferros_ledger::ewe;
 
 /// Transfer state.
@@ -294,7 +294,7 @@ impl<'a> InboundTransfer<'a> {
 /// Outbound transfer state. Source data is borrowed from the caller.
 pub struct OutboundTransfer<'a> {
     /// Bitmap for tracking retransmit requests (caller-provided).
-    retransmit: &'a mut [BitmapWord],
+    _retransmit: &'a mut [BitmapWord],
     /// Stream ID.
     pub sid: StreamId,
     /// Total data bytes.
@@ -367,7 +367,7 @@ impl<'a> OutboundTransfer<'a> {
         let spec_len = spec.encode(spec_buf);
 
         let xfer = Self {
-            retransmit: bitmap_buf,
+            _retransmit: bitmap_buf,
             sid,
             total: data.len() as u64,
             count: final_count as u64,

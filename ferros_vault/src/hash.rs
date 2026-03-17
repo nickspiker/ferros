@@ -44,7 +44,7 @@ impl core::fmt::Debug for ObjectHash {
 }
 
 fn hex_prefix(bytes: &[u8]) -> String {
-    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    format!("G#{}", bytes.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// Domain separator for permission levels.

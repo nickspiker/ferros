@@ -108,7 +108,7 @@ use ferros_hal::console::Console;
 use ferros_hal::dpu;
 use ferros_hal::dtb::Dtb;
 use ferros_hal::pstore::{Ramoops, RamoopsConfig};
-use ferros_hal::spmi;
+#[allow(unused_imports)] use ferros_hal::spmi;
 use ferros_hal::uart::{Uart, UartBackend};
 use ferros_ledger::event::Event;
 use ferros_ledger::chain::Chain;
@@ -488,7 +488,7 @@ const FP5_FB_HEIGHT: u32 = 2700;
 const FP5_SPLASH_ADDR: u64 = 0xE100_0000;
 
 /// PS_HOLD register — writing 0 kills power (Qualcomm TCSR).
-const PS_HOLD: usize = 0x0C26_4000;
+#[allow(dead_code)] const PS_HOLD: usize = 0x0C26_4000;
 /// GENI SE UART base (QUPv3 SE3, from stock cmdline console=ttyMSM0).
 const FP5_UART_BASE: usize = 0x0099_4000;
 const FP5_SDC2_BASE: usize = 0x0880_4000; // QCM6490 SDHCI for microSD
@@ -1540,16 +1540,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
                 log.puts("Waiting for host...\n");
 
-                let mut evt_count = 0u32;
+                let mut _evt_count = 0u32;
                 let mut poll_count = 0u32;
                 // PT inbound state — allocated on SPEC arrival, freed on COMPLETE
-                let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                let mut pt_bitmap_buf: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
+                #[allow(unused_assignments)] let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                #[allow(unused_assignments)] let mut pt_bitmap_buf: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
                 let mut pt_inbound: Option<InboundTransfer<'_>> = None;
                 // Current seq_width for DATA parsing (0 = no active transfer)
                 let mut pt_seq_width: usize = 0;
                 // Pending COMPLETE packet to send after last ACK flushes
-                let mut pt_complete_pending = [0u8; 128];
+                let pt_complete_pending = [0u8; 128];
                 let mut pt_complete_len: usize = 0;
                 // PT outbound state — device→host response transfer
                 let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -1567,7 +1567,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 const RELOAD_STAGE: usize = 0xA000_0000;
                 let mut reload_size: usize = 0;
                 // Flag: outbound DATA pump needs to send next packet
-                let mut pt_out_pump = false;
+                let mut _pt_out_pump = false;
 
                 loop {
                     match usb.poll_event() {
@@ -1590,7 +1590,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             pt_out_data.clear();
                             pt_out_bitmap.clear();
                             ledger.post(&Event::UsbReset);
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::ConnectDone { speed } => {
                             log.puts("  connected: ");
@@ -1604,12 +1604,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             usb.ep0_start_setup();
                             usb.bulk_out_arm(); // Initialize TRB ring
                             ledger.post(&Event::UsbConnectDone { speed });
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::Disconnect => {
                             log.puts("  disconnected\n");
                             ledger.post(&Event::UsbDisconnect);
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::Ep0Setup { request } => {
                             log.puts("  SETUP: ");
@@ -1645,7 +1645,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     log.puts("\n");
                                 }
                             }
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::TransferComplete { ep } => {
                             if ep == 2 {
@@ -1705,7 +1705,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     let mut complete_buf = [0u8; 512];
                                                     let clen = xfer.finish(&mut complete_buf);
                                                     if clen > 0 {
-                                                        let ok = usb.bulk_in_send(&complete_buf[..clen]);
+                                                        let _ok = usb.bulk_in_send(&complete_buf[..clen]);
                                                         log.puts("  PT COMPLETE sid=");
                                                         log.put_hex32(xfer.sid.0 as u32);
                                                         log.puts(" total=");
@@ -1952,10 +1952,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                 // Outbound DATA is handled by the main loop idle check
                                 ledger.post(&Event::UsbBulkTxComplete);
                             }
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                         ferros_hal::usb::UsbEvent::TransferNotReady { .. } => {
-                            evt_count += 1;
+                            _evt_count += 1;
                         }
                     }
 

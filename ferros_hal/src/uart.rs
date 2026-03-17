@@ -105,7 +105,7 @@ impl Uart {
 
     /// Write a hex u64 (for debugging addresses/values).
     pub fn put_hex(&self, val: u64) {
-        self.puts("0x");
+        self.puts("G#");
         for i in (0..16).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
             let c = if nibble < 10 {
@@ -142,15 +142,15 @@ impl Uart {
     const SE_GENI_M_IRQ_CLEAR: usize = 0x618;
     #[allow(non_upper_case_globals)]
     const SE_GENI_TX_FIFOn: usize = 0x700;
-    const SE_GENI_TX_FIFO_STATUS: usize = 0x800;
+    #[allow(dead_code)] const SE_GENI_TX_FIFO_STATUS: usize = 0x800;
 
     // UART-specific registers (within SE address space)
     const SE_UART_TX_TRANS_LEN: usize = 0x270;
 
     // M_IRQ bits
     const M_CMD_DONE: u32 = 1 << 0;
-    const M_CMD_ABORT: u32 = 1 << 5;
-    const M_TX_FIFO_WATERMARK: u32 = 1 << 30;
+    #[allow(dead_code)] const M_CMD_ABORT: u32 = 1 << 5;
+    #[allow(dead_code)] const M_TX_FIFO_WATERMARK: u32 = 1 << 30;
 
     fn geni_putc(&self, base: usize, byte: u8) {
         // Wait for any active command to finish

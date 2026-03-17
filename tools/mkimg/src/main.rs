@@ -164,7 +164,7 @@ fn elf_to_flat(elf_data: &[u8]) -> Vec<u8> {
         }
 
         eprintln!(
-            "  LOAD: vaddr=0x{:08x} filesz={} memsz={} -> offset 0x{:x}",
+            "  LOAD: vaddr=G#{:08x} filesz={} memsz={} -> offset G#{:x}",
             seg.vaddr, seg.file_size, seg.mem_size, dest_offset
         );
     }

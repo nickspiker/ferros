@@ -72,7 +72,7 @@ mod upiu {
 mod scsi {
     pub const READ_10: u8 = 0x28;
     pub const WRITE_10: u8 = 0x2A;
-    pub const TEST_UNIT_READY: u8 = 0x00;
+#[allow(dead_code)] pub const TEST_UNIT_READY: u8 = 0x00;
 }
 
 /// Overall Command Status values (UTRD DW2)

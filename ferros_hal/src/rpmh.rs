@@ -148,18 +148,18 @@ const RSC_BASE: usize = 0x1822_0000;
 const TCS_DRV_OFFSET: usize = 0xD00;
 
 /// TCS register stride — v2.7: 0x2A0 per TCS block.
-const TCS_STRIDE: usize = 0x2A0;
+#[allow(dead_code)] const TCS_STRIDE: usize = 0x2A0;
 
 /// Command register stride within a TCS — v2.7: 0x14 per command.
-const CMD_STRIDE: usize = 0x14;
+#[allow(dead_code)] const CMD_STRIDE: usize = 0x14;
 
 // TCS-level register offsets (relative to tcs_base + tcs_id * TCS_STRIDE)
-const TCS_IRQ_ENABLE: usize = 0x00;
+#[allow(dead_code)] const TCS_IRQ_ENABLE: usize = 0x00;
 const TCS_IRQ_STATUS: usize = 0x04;
 const TCS_IRQ_CLEAR: usize = 0x08;
 const TCS_CMD_WAIT_FOR_CMPL: usize = 0x10;
 const TCS_CONTROL: usize = 0x14;
-const TCS_STATUS: usize = 0x18;
+#[allow(dead_code)] const TCS_STATUS: usize = 0x18;
 const TCS_CMD_ENABLE: usize = 0x1C;
 
 // Per-command register offsets (+ cmd_id * CMD_STRIDE)
@@ -178,7 +178,7 @@ const CMD_MSGID_RESP_REQ: u32 = 1 << 8; // request completion response
 const CMD_MSGID_WRITE: u32 = 1 << 16;  // write request (bit 16)
 
 // CMD_STATUS bits
-const CMD_STATUS_COMPL: u32 = 1 << 16;
+#[allow(dead_code)] const CMD_STATUS_COMPL: u32 = 1 << 16;
 
 /// VRM register offsets within a resource address.
 pub const VRM_VOLTAGE: u32 = 0x0;   // voltage in mV

@@ -1,10 +1,8 @@
-use nusb::transfer::{Queue, RequestBuffer, TransferError};
-use std::time::Duration;
+use nusb::transfer::{RequestBuffer, TransferError};
 
 const FERROS_VID: u16 = 0x1838;
 const FERROS_PID: u16 = 0xFE01;
 const INTERFACE: u8 = 0;
-const TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct UsbLink {
     interface: nusb::Interface,
@@ -90,7 +88,8 @@ impl UsbLink {
     }
 
     /// Receive data via bulk IN with a timeout.
-    pub async fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>, String> {
+    #[allow(dead_code)]
+    pub async fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
         tokio::select! {
             completion = self.interface.bulk_in(self.ep_in, RequestBuffer::new(512)) => {
                 completion.status
@@ -103,10 +102,8 @@ impl UsbLink {
         }
     }
 
-    pub fn ep_out(&self) -> u8 {
-        self.ep_out
-    }
-    pub fn ep_in(&self) -> u8 {
-        self.ep_in
-    }
+    #[allow(dead_code)]
+    pub fn ep_out(&self) -> u8 { self.ep_out }
+    #[allow(dead_code)]
+    pub fn ep_in(&self) -> u8 { self.ep_in }
 }

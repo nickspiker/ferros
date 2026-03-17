@@ -55,7 +55,7 @@ const CTL_LAYER_EXT2_LM0: usize = 0x070;
 /// CTL_LAYER_EXT3(LM_0)
 const CTL_LAYER_EXT3_LM0: usize = 0x0A0;
 
-const CTL_TOP: usize = 0x014;
+#[allow(dead_code)] const CTL_TOP: usize = 0x014;
 const CTL_FLUSH: usize = 0x018;
 const CTL_START: usize = 0x01C;
 const CTL_INTF_ACTIVE: usize = 0x0F4;
@@ -101,7 +101,7 @@ const LM_BLEND0_CONST_ALPHA: usize = 0x24;
 // INTF register offsets
 // ---------------------------------------------------------------------------
 
-const INTF_TIMING_ENGINE_EN: usize = 0x000;
+#[allow(dead_code)] const INTF_TIMING_ENGINE_EN: usize = 0x000;
 
 // ---------------------------------------------------------------------------
 // XRGB8888 format constants (from Linux mdp_format.c)

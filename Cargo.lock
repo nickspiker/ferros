@@ -139,6 +139,7 @@ dependencies = [
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ferros_vault",
 ]
 

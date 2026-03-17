@@ -117,9 +117,9 @@ impl Ramoops {
         }
     }
 
-    /// Write a u64 as 0x-prefixed hex.
+    /// Write a u64 as G#-prefixed hex.
     pub fn put_hex(&mut self, val: u64) {
-        self.puts("0x");
+        self.puts("G#");
         for i in (0..16).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
             let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
@@ -127,9 +127,9 @@ impl Ramoops {
         }
     }
 
-    /// Write a u32 as 0x-prefixed hex (8 digits).
+    /// Write a u32 as G#-prefixed hex (8 digits).
     pub fn put_hex32(&mut self, val: u32) {
-        self.puts("0x");
+        self.puts("G#");
         for i in (0..8).rev() {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
             let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };

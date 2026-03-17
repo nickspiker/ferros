@@ -228,8 +228,7 @@ impl Ack {
         }
 
         let sid = StreamId::new(buf[1])?;
-        let mut pos = 2;
-        let (seq, _n) = ewe::decode_lean(&buf[pos..])?;
+        let (seq, _n) = ewe::decode_lean(&buf[2..])?;
 
         Some(Ack { sid, seq })
     }

@@ -31,25 +31,26 @@ pub const QCOM_WRAPPER: usize = 0x0A6F_8800;
 
 // ---------------------------------------------------------------------------
 // DWC3 Global register offsets (from DWC3_BASE)
+// Hardware register map — not all used yet, defined for completeness.
 // ---------------------------------------------------------------------------
 
-const GSBUSCFG0: usize = 0xC100;
-const GSBUSCFG1: usize = 0xC104;
+#[allow(dead_code)] const GSBUSCFG0: usize = 0xC100;
+#[allow(dead_code)] const GSBUSCFG1: usize = 0xC104;
 const GCTL: usize = 0xC110;
 const GSTS: usize = 0xC118;
 const GSNPSID: usize = 0xC120;
-const GGPIO: usize = 0xC124;
-const GUID: usize = 0xC128;
-const GUCTL: usize = 0xC12C;
+#[allow(dead_code)] const GGPIO: usize = 0xC124;
+#[allow(dead_code)] const GUID: usize = 0xC128;
+#[allow(dead_code)] const GUCTL: usize = 0xC12C;
 const GHWPARAMS0: usize = 0xC140;
 const GHWPARAMS1: usize = 0xC144;
-const GHWPARAMS2: usize = 0xC148;
+#[allow(dead_code)] const GHWPARAMS2: usize = 0xC148;
 const GHWPARAMS3: usize = 0xC14C;
-const GHWPARAMS4: usize = 0xC150;
-const GHWPARAMS5: usize = 0xC154;
-const GHWPARAMS6: usize = 0xC158;
-const GHWPARAMS7: usize = 0xC15C;
-const GHWPARAMS8: usize = 0xC160;
+#[allow(dead_code)] const GHWPARAMS4: usize = 0xC150;
+#[allow(dead_code)] const GHWPARAMS5: usize = 0xC154;
+#[allow(dead_code)] const GHWPARAMS6: usize = 0xC158;
+#[allow(dead_code)] const GHWPARAMS7: usize = 0xC15C;
+#[allow(dead_code)] const GHWPARAMS8: usize = 0xC160;
 
 // PHY interface config (important: PHYSOFTRST must be cleared after block reset)
 const GUSB2PHYCFG: usize = 0xC200;
@@ -73,10 +74,10 @@ const DSTS: usize = 0xC70C;
 const DALEPENA: usize = 0xC720;
 
 // Per-endpoint registers: base + 0xC800 + 16*ep_phys
-const DEPCMDPAR2: usize = 0xC800; // + 16*n
-const DEPCMDPAR1: usize = 0xC804;
-const DEPCMDPAR0: usize = 0xC808;
-const DEPCMD: usize = 0xC80C;
+#[allow(dead_code)] const DEPCMDPAR2: usize = 0xC800; // + 16*n
+#[allow(dead_code)] const DEPCMDPAR1: usize = 0xC804;
+#[allow(dead_code)] const DEPCMDPAR0: usize = 0xC808;
+#[allow(dead_code)] const DEPCMD: usize = 0xC80C;
 
 // ---------------------------------------------------------------------------
 // GCTL bits
@@ -99,7 +100,7 @@ const DCTL_CSFTRST: u32 = 1 << 30;
 
 /// Device speed [2:0].
 const DCFG_SPEED_MASK: u32 = 0x7;
-const DCFG_SPEED_SS: u32 = 4;
+#[allow(dead_code)] const DCFG_SPEED_SS: u32 = 4;
 const DCFG_SPEED_HS: u32 = 0;
 /// Device address [10:3].
 const DCFG_DEVADDR_SHIFT: u32 = 3;
@@ -119,10 +120,10 @@ const DEVTEN_CMDCMPLEN: u32 = 1 << 14;
 // ---------------------------------------------------------------------------
 
 const DSTS_CONNECTSPD_MASK: u32 = 0x7;
-const DSTS_SPEED_HIGH: u32 = 0;
-const DSTS_SPEED_FULL: u32 = 1;
-const DSTS_SPEED_SUPER: u32 = 4;
-const DSTS_SPEED_SUPER_PLUS: u32 = 5;
+#[allow(dead_code)] const DSTS_SPEED_HIGH: u32 = 0;
+#[allow(dead_code)] const DSTS_SPEED_FULL: u32 = 1;
+#[allow(dead_code)] const DSTS_SPEED_SUPER: u32 = 4;
+#[allow(dead_code)] const DSTS_SPEED_SUPER_PLUS: u32 = 5;
 
 // GSNPSID
 const GSNPSID_DWC3_PREFIX: u32 = 0x5533_0000;
@@ -146,7 +147,7 @@ const DEPCMD_STARTTRANSFER: u32 = 0x06;
 /// End transfer.
 const DEPCMD_ENDTRANSFER: u32 = 0x08;
 /// Update transfer (add TRBs to active transfer).
-const DEPCMD_UPDATETRANSFER: u32 = 0x07;
+#[allow(dead_code)] const DEPCMD_UPDATETRANSFER: u32 = 0x07;
 /// Set EP stall.
 const DEPCMD_SETSTALL: u32 = 0x04;
 /// Clear EP stall.
@@ -155,7 +156,7 @@ const DEPCMD_CLEARSTALL: u32 = 0x05;
 /// Command Active bit — set when issuing, cleared by HW on completion.
 const DEPCMD_CMDACT: u32 = 1 << 10;
 /// Command Interrupt on Complete.
-const DEPCMD_CMDIOC: u32 = 1 << 8;
+#[allow(dead_code)] const DEPCMD_CMDIOC: u32 = 1 << 8;
 /// High Priority / Force Remove — required for forced ENDTRANSFER.
 const DEPCMD_HIPRI_FORCERM: u32 = 1 << 9;
 
@@ -170,13 +171,13 @@ const DEPCFGPAR0_MPS_SHIFT: u32 = 3;
 /// FIFO number [21:17] in DEPCMDPAR0.
 const DEPCFGPAR0_FIFONUM_SHIFT: u32 = 17;
 /// Burst size [25:22] in DEPCMDPAR0.
-const DEPCFGPAR0_BRSTSIZ_SHIFT: u32 = 22;
+#[allow(dead_code)] const DEPCFGPAR0_BRSTSIZ_SHIFT: u32 = 22;
 
 /// EP type values.
 const EP_TYPE_CONTROL: u32 = 0;
-const EP_TYPE_ISOC: u32 = 1;
+#[allow(dead_code)] const EP_TYPE_ISOC: u32 = 1;
 const EP_TYPE_BULK: u32 = 2;
-const EP_TYPE_INTERRUPT: u32 = 3;
+#[allow(dead_code)] const EP_TYPE_INTERRUPT: u32 = 3;
 
 // DEPCMDPAR1 bits
 /// USB endpoint number [29:25].
@@ -216,8 +217,8 @@ const EVT_NON_EP: u32 = 1 << 0;
 const DEVT_DISCONN: u32 = 0;
 const DEVT_USBRST: u32 = 1;
 const DEVT_CONNECTDONE: u32 = 2;
-const DEVT_ULSTCHNG: u32 = 3;
-const DEVT_CMDCMPLT: u32 = 10;
+#[allow(dead_code)] const DEVT_ULSTCHNG: u32 = 3;
+#[allow(dead_code)] const DEVT_CMDCMPLT: u32 = 10;
 
 /// EP event: transfer complete.
 const DEPEVT_XFERCOMPLETE: u32 = 1;
@@ -248,7 +249,7 @@ const USB_DT_BOS: u8 = 15;
 const QCOM_GENERAL_CFG: usize = 0x08;
 const QCOM_HS_PHY_CTRL: usize = 0x10;
 const QCOM_SS_PHY_CTRL: usize = 0x30;
-const QCOM_PWR_EVNT_IRQ_STAT: usize = 0x58;
+#[allow(dead_code)] const QCOM_PWR_EVNT_IRQ_STAT: usize = 0x58;
 
 // ---------------------------------------------------------------------------
 // GCC (Global Clock Controller) reset registers
@@ -256,8 +257,8 @@ const QCOM_PWR_EVNT_IRQ_STAT: usize = 0x58;
 
 const GCC_BASE: usize = 0x0010_0000;
 const GCC_QUSB2PHY_PRIM_BCR: usize = GCC_BASE + 0x12000;
-const GCC_USB30_PRIM_BCR: usize = GCC_BASE + 0x0F000;
-const GCC_USB30_PRIM_GDSCR: usize = GCC_BASE + 0x0F004;
+#[allow(dead_code)] const GCC_USB30_PRIM_BCR: usize = GCC_BASE + 0x0F000;
+#[allow(dead_code)] const GCC_USB30_PRIM_GDSCR: usize = GCC_BASE + 0x0F004;
 
 // ---------------------------------------------------------------------------
 // SNPS Femto v2 HS PHY registers (offsets from QUSB2_PHY_BASE = 0x088E3000)
@@ -1630,10 +1631,10 @@ impl Dwc3Dev {
         let bm_request_type = req[0];
         let b_request = req[1];
         let w_value = (req[3] as u16) << 8 | req[2] as u16;
-        let w_index = (req[5] as u16) << 8 | req[4] as u16;
+        let _w_index = (req[5] as u16) << 8 | req[4] as u16;
         let w_length = (req[7] as u16) << 8 | req[6] as u16;
 
-        let dir_in = bm_request_type & 0x80 != 0;
+        let _dir_in = bm_request_type & 0x80 != 0;
 
         match b_request {
             USB_REQ_SET_ADDRESS => {
