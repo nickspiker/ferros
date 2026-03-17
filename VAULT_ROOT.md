@@ -1,6 +1,6 @@
 # VAULT_ROOT — ferros Vault Root Specification
 **Version:** Zil (0)
-**Author:** Nick Spiker 
+**Author:** Nick Spiker
 **Principle:** The ring is the index. Binary search finds the head. VSF is the format.
 
 ---
@@ -22,8 +22,8 @@ capabilities, manage namespaces, or know what a boot snapshot
 contains. It finds the most recent valid one. That is all.
 
 The bootloader (kernel first stage) scans the vault root ring
-after bootstrap verifies the kernel and jumps. See SECURITY_CHAIN.md
-for the full trust model.
+after the seed verifies the kernel and jumps. See SEED.md and
+BOOT.md for the full trust model.
 
 ---
 
@@ -35,25 +35,67 @@ for both UFS (4KB logical block) and SD card (4KB aligned for FTL
 efficiency).
 
 ```
-Ring layout (N = 1024 = 4MB total):
+Ring layout (N = 65536 = 256MB total):
 
-┌────┬────┬────┬────┬────┬ ─ ─ ─ ┬────┬────┐
-│  0 │  1 │  2 │  3 │  4 │       │1022│1023│
-└────┴────┴────┴────┴────┴ ─ ─ ─ ┴────┴────┘
- 4KB  4KB  4KB  4KB  4KB          4KB  4KB
+┌────┬────┬────┬────┬────┬ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┬─────┬─────┐
+│  0 │  1 │  2 │  3 │  4 │                     │65534│65535│
+└────┴────┴────┴────┴────┴ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┴─────┴─────┘
+ 4KB  4KB  4KB  4KB  4KB                         4KB   4KB
 
 Each entry: one 4KB block, one VSF document
 Write position: generation % N
 Wraps: after N writes, overwrites oldest entry
+Binary search: 16 reads to find newest (log2 65536 = 16)
 ```
 
-The ring lives at a fixed offset on each storage device:
+---
+
+## Unified Block Addressing
+
+Both UFS and SD are addressed with the same block numbers. One
+block = 4KB on both media. The SD card's 512-byte sector size is
+abstracted away — each 4KB block write translates to 8 consecutive
+SD sectors. Same block number, same offset, zero translation math.
 
 ```
-UFS:  blocks 0-1023 of a dedicated 4MB region (LBA aligned)
-SD:   blocks 0-1023 of a dedicated 4MB region (LBA aligned)
+Block = 4KB on both media
 
-Both rings are mirrors. Higher valid generation wins on boot.
+UFS: block N = LBA N (4KB logical blocks, native)
+SD:  block N = sector N×8 through N×8+7 (8 × 512-byte sectors)
+
+Same block numbers, same layout, same code path.
+```
+
+---
+
+## Partition Layout
+
+All offsets are in 4KB blocks. All boundaries are power-of-two
+aligned. All copies are >256 blocks (1MB) apart.
+
+```
+Block range             Size     Purpose
+────────────────────────────────────────────────────────
+0x000 - 0x3FF           4MB      Reserved (ABL, GPT, boot partitions)
+0x400 - 0x403           16KB     Seed copy A
+0x800 - 0x803           16KB     Seed copy B (4MB from A)
+0xC00 - 0xC7F           512KB    Kernel copy A
+0x1400 - 0x147F         512KB    Kernel copy B (4MB from A)
+0x2000 - 0x11FFF        256MB    Vault root ring (65536 × 4KB entries)
+0x40000 - 0x7FFFF       1GB      State ring (running procs, caps, display)
+0x80000 - 0xBFFFF       1GB      Ledger ring (categorized events)
+0xC0000+                ~230GB   HAMT region (objects, snapshots, data)
+
+SD card: identical layout, identical block numbers.
+Kernel copies C and D at blocks 0xC00 and 0x1400.
+No seed copies on SD (seed is in ABL boot partition).
+```
+
+Each kernel/seed copy includes its VSF signature document:
+```
+[binary: N bytes, 4KB-aligned]
+[VSF signature: hp + ge + ke + u (see SEED.md)]
+[padding to 4KB alignment]
 ```
 
 ---
@@ -61,8 +103,9 @@ Both rings are mirrors. Higher valid generation wins on boot.
 ## Entry Format (VSF Document)
 
 Every vault root entry is a complete VSF document, serialized per
-the VSF specification. All integers use EWE encoding. All hashes
-use the precise VSF type codes from vsf_type.rs.
+the VSF specification. All integers use EWE encoding — from the
+kernel, from day zero. All hashes use the precise VSF type codes
+from vsf_type.rs.
 
 ```
 VSF document (fits in one 4KB block):
@@ -80,6 +123,7 @@ State section ("vault_root.state"):
   VsfType::l("hamt_root")    → VsfType::hp(hash)           HAMT root node provenance
   VsfType::l("cap_snapshot") → VsfType::hp(hash)           capability table provenance
   VsfType::l("proc_snapshot")→ VsfType::hp(hash)           running processes provenance
+  VsfType::l("disp_state")   → VsfType::hp(hash)           display compositor state
   VsfType::l("ledger_head")  → VsfType::hp(hash)           ledger chain head provenance
 
 Integrity section ("vault_root.integrity"):
@@ -88,6 +132,24 @@ Integrity section ("vault_root.integrity"):
   VsfType::l("eagle_time")   → EtType::ei(t)               physics-bounded timestamp
 
 Remainder of 4KB block: zeroed (reserved for future fields)
+```
+
+**EWE in the kernel:**
+
+```
+The kernel includes a minimal EWE encoder/decoder (~80 lines, no_std).
+Same code as VSF, same wire format, same type tags.
+No fixed-width integers anywhere on disk.
+No ceilings. No migrations. No "we'll do it properly later."
+
+Generation counter example:
+  Generation 0-255:        u3 [1 byte]   = 2 bytes total
+  Generation 256-65535:    u4 [2 bytes]  = 3 bytes total
+  Generation 2^32+:        u5 [4 bytes]  = 5 bytes total
+  Generation never:        hits a ceiling
+
+Cost: 1 byte overhead per field for the size marker.
+      20 fields × 1 byte = 20 bytes per 4KB entry = 0.5% overhead.
 ```
 
 **VSF type reference (from vsf_type.rs):**
@@ -101,18 +163,6 @@ l   ASCII label — field names, schema identifiers
 e   Eagle Time — physics-bounded timestamp
 ```
 
-**Why VSF for every entry:**
-
-```
-Traditional ring:   fixed struct, hope the fields are enough,
-                    migration when you need more fields
-
-VSF ring:           self-describing, skip unknown fields,
-                    add fields without breaking old readers,
-                    mandatory BLAKE3 catches any corruption,
-                    encryption at rest via VSF ChaCha20 envelope
-```
-
 ---
 
 ## Binary Search
@@ -124,9 +174,10 @@ O(log2 N) reads.
 ```
 Finding the most recent valid entry:
 
-  The ring has N = 2^k entries. Generations increase monotonically
-  and wrap: the ring always contains entries spanning a range of
-  N consecutive generations (or fewer if < N writes have occurred).
+  The ring has N = 2^k entries (k=16 for N=65536).
+  Generations increase monotonically and wrap: the ring always
+  contains entries spanning a range of N consecutive generations
+  (or fewer if < N writes have occurred).
 
   The "seam" is where the newest entry is adjacent to the oldest
   (the wrap point). Binary search locates this seam.
@@ -139,11 +190,12 @@ Algorithm:
   4. Subdivide that half, repeat
   5. After log2(N) reads: found the newest entry
 
-  N = 1024 → 10 reads to find newest entry
+  N = 65536 → 16 reads to find newest entry
   Each read: one 4KB block from UFS or SD
+  Total boot I/O for vault scan: 16 × 4KB = 64KB
 
 Validation at each read:
-  VsfType::h(BLAKE3, entry_hash) valid?
+  VsfType::hp(BLAKE3, entry_hash) valid?
     Yes → entry is usable, compare generation
     No  → entry is corrupt, treat as empty
 
@@ -170,37 +222,36 @@ internally. We never erase directly. But DISCARD (TRIM) tells the
 FTL "this region is no longer in use, you can reclaim it."
 
 ```
-UFS erase block: 4MB (1 allocation unit = 1 segment = 1024 × 4KB blocks)
-SD erase:        FTL handles it (ERASE_BLK_EN=1, 512-byte granularity)
+UFS erase block: 4MB (1 allocation unit = 1 segment)
+SD erase:        FTL handles it (ERASE_BLK_EN=1)
+
+Vault root ring: 256MB = 64 × 4MB erase blocks
 
 DISCARD pattern:
-  The ring is 4MB total (1024 × 4KB entries)
-  This equals exactly one UFS erase block
-
-  For a ring that wraps every 1024 writes:
-    No DISCARD needed — the ring is one erase block
-    FTL sees sequential overwrites within one erase unit
-    This is optimal for flash — sequential writes, single region
-
-  For larger rings (future, userspace):
-    DISCARD in 4MB chunks as the ring wraps past each segment
+  As the ring wraps past each 4MB-aligned boundary:
+    DISCARD the 4MB region that was just fully overwritten
+    FTL reclaims the underlying NAND pages
     Always 4MB-aligned to match UFS erase blocks
+
+  No DISCARD during normal writes — only on wrap boundaries
+  Sequential overwrites within each 4MB segment are FTL-optimal
 ```
 
 ---
 
 ## Mirror Protocol
 
-Both UFS and SD carry identical vault root rings. Mirroring provides
-redundancy: either device alone contains the complete boot state.
+Both UFS and SD carry identical vault root rings at identical
+block addresses. Mirroring provides redundancy: either device
+alone contains the complete boot state.
 
 ```
 Write protocol (write-verify-then-mirror):
   1. Construct new VSF entry (generation N+1)
-  2. Write to UFS at position (generation % ring_size)
+  2. Write to UFS at block (ring_base + generation % ring_size)
   3. Read back from UFS, BLAKE3 verify
   4. If verify fails → retry or mark UFS position bad, do not proceed
-  5. UFS verified → write to SD at same logical position
+  5. UFS verified → write to SD at same block address
   6. Read back from SD, BLAKE3 verify
   7. If SD verify fails → UFS still has it, SD marked degraded
   8. Both verified → generation N+1 committed on both media
@@ -218,10 +269,12 @@ Read protocol (boot):
 Resync protocol (after boot):
   If UFS and SD generations differ:
     Copy entries from higher to lower until equal
+    Write-verify each copied entry
     Normal operation resumes
   If one device is missing (SD removed):
     Boot from UFS only
     When SD inserted: full ring copy from UFS to SD
+    Write-verify every copied entry
 
 Device replacement:
   Remove SD → system runs on UFS only
@@ -241,13 +294,15 @@ Slot A: current production state
 Slot B: update staging area
 
 Kernel update flow:
-  1. Write new kernel to slot B's partition
-  2. Write new vault root entry pointing to slot B state
-  3. Verify: read back, BLAKE3 check
-  4. Mark slot B as active
-  5. Reboot → bootstrap loads slot B kernel
-  6. If boot succeeds: slot B becomes new production
-  7. If boot fails: fall back to slot A (previous state)
+  1. Write new kernel to slot B's block range
+  2. Write-verify on UFS
+  3. Write-verify on SD
+  4. Write new vault root entry pointing to slot B state
+  5. Write-verify vault root on both media
+  6. Mark slot B as active
+  7. Reboot → seed loads slot B kernel
+  8. If boot succeeds: slot B becomes new production
+  9. If boot fails: fall back to slot A (previous state)
 
 Slot metadata in vault root entry:
   VsfType::l("active_slot")  → VsfType::u(0 or 1)    A or B
@@ -255,13 +310,46 @@ Slot metadata in vault root entry:
 
 ---
 
+## Wear Distribution
+
+```
+Ring of 65536 entries, power of two
+Write rotation: strict generation order, (generation % N)
+Each position: written exactly once per N writes
+Wear: perfectly uniform across the ring
+
+At 1 write per second (aggressive):
+  65536 seconds = ~18 hours per full rotation
+  UFS rated 3000+ P/E cycles
+  3000 × 18 hours = 54,000 hours = ~6 years
+  SD rated 500+ P/E cycles
+  500 × 18 hours = 9,000 hours = ~1 year
+
+At 1 write per boot (typical):
+  65536 boots per full rotation
+  UFS: 3000 × 65536 = 196M boots — effectively unlimited
+  SD: 500 × 65536 = 32M boots — effectively unlimited
+
+65536 entries vs 1024:
+  64× more wear leveling
+  256MB vs 4MB (negligible on 232GB UFS)
+  16 reads vs 10 reads for binary search (negligible at 4KB/read)
+  Clear win for durability
+```
+
+---
+
 ## Relationship to Other Specs
 
 ```
-SECURITY_CHAIN.md:
-  Bootstrap verifies kernel → jumps
+SEED.md:
+  Seed verifies kernel → jumps
   Kernel (bootloader stage) scans vault root ring
   Vault root is the FIRST thing the bootloader reads
+
+BOOT.md:
+  Stage 2 of kernel boot = vault root scan
+  Genesis boot creates the initial ring
 
 HAMT.md:
   Vault root entry.hamt_root → HAMT root node hash
@@ -276,27 +364,11 @@ VAULT.md:
   Vault root is the entry point into the vault
   Everything in the vault is reachable from the vault root
   HAMT root → objects → everything
-```
 
----
-
-## Wear Distribution
-
-```
-Ring of N entries, power of two
-Write rotation: strict generation order, (generation % N)
-Each position: written exactly once per N writes
-Wear: perfectly uniform across the ring
-
-N = 1024, kernel writes ~1 entry per boot snapshot:
-  1024 boots per full rotation
-  UFS rated 3000+ P/E cycles
-  Ring lasts: 3,000,000+ boots — effectively unlimited
-
-Even at 100 writes/day (aggressive):
-  1024 / 100 = 10.24 days per rotation
-  3000 rotations × 10.24 days = 84 years
-  Wear is not a concern for the kernel ring
+SECURITY_CHAIN.md:
+  Seed → kernel → vault root: the trust chain
+  Vault root entries contain kernel hash + signature
+  Each generation proves the kernel that wrote it was authentic
 ```
 
 ---
@@ -309,11 +381,12 @@ Theorem VaultRoot_FindNewest:
     binary_search(ring) → entry with highest valid generation
     in exactly k reads (one per binary search level)
     O(log2 N) deterministic
+    k=16 for N=65536: 16 reads, 64KB I/O
 
 Theorem VaultRoot_KillSafety:
   ∀ kill instant t:
     at most one entry is partially written
-    partial entry: VsfType::h(BLAKE3) fails → entry invalid
+    partial entry: VsfType::hp(BLAKE3) fails → entry invalid
     previous entry: always valid (was committed before this write)
     binary search skips invalid entries
     system always boots from last committed state
@@ -323,6 +396,7 @@ Theorem VaultRoot_MirrorRedundancy:
     other device has complete vault root ring
     boot proceeds from surviving device
     resync restores mirror after replacement
+    write-verify protocol ensures no silent corruption propagation
 
 Theorem VaultRoot_WearUniformity:
   ∀ positions p1, p2 in ring:
@@ -333,40 +407,19 @@ Theorem VaultRoot_WearUniformity:
 Theorem VaultRoot_GenerationIntegrity:
   ∀ entry e:
     e.generation embedded in VSF document
-    VsfType::h(BLAKE3) covers generation field
+    VsfType::hp(BLAKE3) covers generation field
     cannot forge generation without breaking BLAKE3
     binary search trusts generation only after BLAKE3 passes
+
+Theorem VaultRoot_ReproducibleVerification:
+  ∀ vault root entry e with kernel_hash field:
+    anyone can: build kernel from tagged source
+    compute: BLAKE3(built_binary)
+    compare: e.kernel_hash == BLAKE3(built_binary)
+    match proves: entry was written by kernel built from that source
 ```
 
 ---
 
-## Open Questions
-
-```
-1. Ring size (N)
-   Current candidate: 1024 (4MB, 10 reads to find newest)
-   Could be: 256 (1MB, 8 reads) or 4096 (16MB, 12 reads)
-   Decision: 1024 is fine — 10 reads × 4KB = 40KB total I/O at boot
-
-2. Ring base address on UFS
-   Needs: fixed LBA range that doesn't conflict with Android partitions
-   Option: use a dedicated UFS LUN (if available)
-   Option: allocate at end of LUN0
-   Decision: pending partition table analysis
-
-3. Ring base address on SD
-   Needs: fixed LBA range outside the GPT partition table
-   Option: dedicated partition
-   Option: raw blocks after GPT
-   Decision: pending
-
-4. ABL signing for nag elimination
-   Requires: understanding vbmeta key format
-   See SECURITY_CHAIN.md for current status
-   Decision: accept nag for now, research later
-```
-
----
-
-*VAULT_ROOT 0.1 — The ring is the index. Binary search finds the head. VSF is the format.*
+*VAULT_ROOT Zil — The ring is the index. Binary search finds the head. VSF is the format.*
 *Author: Nick Spiker*

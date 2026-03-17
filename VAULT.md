@@ -129,14 +129,14 @@ Not access denied. Does not exist. Same rule as everywhere in ferros.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                  VAULT SERVER                        │
-│              (userspace, cap-gated IPC)              │
-│                                                      │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │  Namespace  │  │  Object      │  │  Storage   │  │
-│  │  Registry   │  │  Store       │  │  Backend   │  │
-│  │  (cap tree) │  │  (HAMT)      │  │  (mirrored)│  │
-│  └─────────────┘  └──────────────┘  └────────────┘  │
+│                  VAULT SERVER                       │
+│              (userspace, cap-gated IPC)             │
+│                                                     │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐   │
+│  │  Namespace  │  │  Object      │  │  Storage   │   │
+│  │  Registry   │  │  Store       │  │  Backend   │   │
+│  │  (cap tree) │  │  (HAMT)      │  │  (mirrored)│   │
+│  └─────────────┘  └──────────────┘  └────────────┘   │
 └──────────────────────────────────────────────────────┘
                       │ cap-gated IPC only
        ┌──────────────┼──────────────┐
@@ -166,11 +166,12 @@ Physical storage (each device — UFS and SD mirror):
 │  (see VAULT_ROOT.md)         │  ← generation-ordered, binary search
 │  VSF documents, BLAKE3       │  ← write-verify-then-mirror
 ├──────────────────────────────┤
-│  Userspace Ledger Ring       │  ← 1GB (spec only, future)
-│  (see LEDGER.md)             │  ← structured events, 4KB writes
+│  Ledger Ring                 │  ← 1GB (spec only, future)
+│  (see LEDGER.md)             │  ← categorized events w/ origins, caps, timestamps
 ├──────────────────────────────┤
-│  Userspace Log Ring          │  ← 1GB (spec only, future)
-│                              │  ← verbose events, batched
+│  State Ring                  │  ← 1GB (spec only, future)
+│                              │  ← users, running procs, cap table, display state
+│                              │  ← display prioritized (compositor restores first)
 ├──────────────────────────────┤
 │  Vault Object Store          │  ← remainder of device
 │  HAMT-indexed (see HAMT.md)  │  ← content-addressed, CoW

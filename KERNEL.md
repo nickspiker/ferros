@@ -1,4 +1,4 @@
-# ferros 0.0 — Kernel Blueprint
+# ferros Zil (v0) — Kernel Blueprint
 **Author:** Nick Spiker  
 **Status:** Pre-implementation architectural specification  
 **Principle:** In mathematics we trust.
@@ -74,7 +74,7 @@ Layer 4: Hardware
 | Verus | Rust-native formal verification |
 | Isabelle/HOL | Reference: seL4 proof methodology |
 | SAIL | Formal RISC-V ISA model |
-| Iris | Concurrent separation logic (kill-switch proof) |
+| Iris | Concurrent separation logic (killswitch proof) |
 | Ferrocene | Safety-qualified Rust compiler |
 | RustBelt | Semantic foundation of Rust type system |
 
@@ -93,18 +93,18 @@ Theorem 1: RingMemoryIsolation
     holds under wraparound by two's complement construction
 
 Theorem 2: CapabilityConfinement
-  Rights flow downward through derivation tree only
+  Rights flow downward thru derivation tree only
   No process acquires rights not granted from root
   Proof: type system enforces at compile time
 
-Theorem 3: KillSwitch_Safety
+Theorem 3: Killswitch_Safety
   ∀ system state S at kill instant t:
     ∀ t' > t:
       kernel_instructions_executed(t, t') = 0
       observable(secret_data, t') = false
       observable(partial_state, t') = false
 
-Theorem 4: KillSwitch_Recovery
+Theorem 4: Killswitch_Recovery
   ∀ boot instant t_boot after kill:
     system_state(t_boot) = known_clean_initial_state
     derives_from(state(t_boot), pre_kill_state) = false
@@ -444,7 +444,7 @@ Theorem 2: RingMemoryIsolation — PROVABLE
 
 ### Principle
 
-Communication happens through capability-addressed endpoints. PIDs do not exist in the IPC model. You cannot address a thread. You can only address an endpoint you hold a Send right to.
+Communication happens thru capability-addressed endpoints. PIDs do not exist in the IPC model. You cannot address a thread. You can only address an endpoint you hold a Send right to.
 
 ### Endpoint Model
 
@@ -614,13 +614,13 @@ Latency:         0ms by construction
 ### What Is Provable
 
 ```
-Theorem 4: KillSwitch_Safety
+Theorem 4: Killswitch_Safety
   Kernel not in path: proven by relay hardware spec
   Key erasure: proven by CSR hardware spec (read-disabled)
   Power cut: proven by relay physics
   Partial state: cannot exist (no software state written post-kill)
 
-Theorem 5: KillSwitch_Recovery
+Theorem 5: Killswitch_Recovery
   Ring FS header ring: 10^6 valid headers
   BLAKE3 per header: corrupt header detected, skipped
   Mirror device: different manufacturer, independent failure
@@ -655,7 +655,7 @@ Partial mitigation:
   Kill latency: bounded microseconds (not zero)
   
 Honest theorem on dev target:
-  KillSwitch_Safety: kill latency provably bounded at N μs
+  Killswitch_Safety: kill latency provably bounded at N μs
                      NOT: provably zero
   Gap: explicitly stated in proof, not hidden
 ```
@@ -778,48 +778,15 @@ mod hardware {
 
 ## Boot Sequence
 
+See **SEED.md** (trust anchor) and **BOOT.md** (kernel boot) for full specifications.
+
 ```
-0.  Hardware init
-      CSRs initialized
-      Crypto coprocessor online
-      Kill circuit armed (hardware takes over from this point)
-      
-1.  Boot key derivation
-      boot_key = ChaCha20(device_key_csr, BLAKE3(entropy || eagle_time))
-      Never written to RAM
-      
-2.  Header ring scan
-      DMA: storage → coprocessor
-      BLAKE3 whilst copying
-      Collect valid headers
-      
-3.  State restoration
-      Select max valid generation
-      Restore ring regions
-      Restore CSpaces
-      Restore entry points
-      
-4.  Root capability minted
-      One. Everything derives from it.
-      Root cap: the only capability created ex nihilo
-      
-5.  Initial userspace server launched
-      Gets derived caps from root
-      
-6.  Servers negotiate caps via kernel IPC
-      No PID communication
-      No shared memory by default
-      Pure capability-gated IPC
-      
-7.  Kernel steps back
-      Enforces rules
-      Does not participate
-      Does not trust
-      Does not decide
-      
-Total boot time: ~300-400ms (dominated by NVMe read of 1GB header ring)
-Of which: ~285ms physics of reading storage
-          ~15ms everything else (coprocessor handles hash in parallel)
+ABL → Seed (verify self, verify kernel, jump)     <1s
+  → Kernel Boot Stage 0-8 (see BOOT.md)           <500ms
+    → Running system with restored state
+
+Total: <1.5s from power-on to userspace
+       (excludes ABL nag screen — eliminated when locked)
 ```
 
 ---
@@ -833,30 +800,59 @@ Of which: ~285ms physics of reading storage
 | AddressSpaceConfinement | ✓ Proven | ✓ Proven |
 | RingMemoryIsolation | ✓ Proven | ✓ Proven |
 | CapabilityConfinement | ✓ Proven | ✓ Proven |
-| KillSwitch_Safety (0ms) | ✓ Proven | ✗ — no relay |
-| KillSwitch_Safety (bounded) | N/A | ✓ Battery pull |
-| KillSwitch_Recovery | ✓ Proven | ✓ Proven |
+| Killswitch_Safety (0ms) | ✓ Proven | ✗ — no relay |
+| Killswitch_Safety (bounded) | N/A | ✓ Battery pull |
+| Killswitch_Recovery | ✓ Proven | ✓ Proven |
 | StorageTotalRecovery | ✓ Proven | ✓ Proven |
 | GlitchResistance | ✓ Proven | ✓ Proven |
 | EpochSoundness | ✓ Proven | ✓ Proven |
 | IPCIntegrity | ✓ Proven | ✓ Proven |
 | DataIntegrity (topology) | ✓ Proven | ✓ (TZ assumption) |
-| Key isolation | ✓ Proven | ✓ (TZ assumption) |
+| Key isolation | ✓ Proven | ✓ PAC registers + RPMB |
 | Open silicon audit | ✓ | ✗ ARM closed |
 | Side channels (EM/power) | ✓ PISPE | ✗ Not addressed |
 
-### TrustZone as Proof Asset
+### Key Storage on Dev Target (Fairphone 5 / QCM6490)
+
+```
+PAC Key Registers (ARM Pointer Authentication):
+  5 × 128-bit registers = 640 bits total
+  APIAKey_EL1, APIBKey_EL1, APDAKey_EL1, APDBKey_EL1, APGAKey_EL1
+  Writable at EL1, never touch RAM or cache
+  ferros repurposes for runtime crypto key storage
+  PAC itself unnecessary — ring memory eliminates its use case
+
+  Allocation:
+    APIAKey + APIBKey = 256-bit ChaCha20 session key
+    APDAKey           = 128-bit nonce/counter
+    APDBKey + APGAKey = 256-bit derived key / temp material
+
+RPMB (Replay Protected Memory Block):
+  UFS hardware feature — write-authenticated with SHA256-HMAC
+  Key provisioned once, cannot be read back
+  Used for persistent secrets (device identity, key material)
+  Production: RPMB
+  Glyph target: BLAKE3 silicon oracle with optical link
+
+TrustZone:
+  QCM6490 TZ is Qualcomm-locked (QSEE/QHEE)
+  Cannot load custom Trusted Applications without Qualcomm SDK
+  Not usable for ferros key isolation on FP5
+  Glyph target: own the secure world, formally verified
+```
+
+### TrustZone as Proof Asset (Glyph Target)
 
 ```
 Android TrustZone: black box (OEM TEE)
                    unauditable, unprovable
 
-ferros TrustZone:  you own the secure world
+ferros TrustZone:  you own the secure world (Glyph only)
                    no OEM TEE loaded
                    Rust code, formally verified
                    SMC interface formally specified
                    Key isolation: provable under ARM AArch64 spec
-                   
+
 ARM Architecture Reference Manual:
   Extremely detailed, precise
   Not open silicon but formally documented
@@ -1002,7 +998,7 @@ ferros is not seL4 in Rust. The novel formal results are:
    — execution paths do not exist without the key
    — not a property seL4 proves or claims
 
-2. Kill-switch formal proof
+2. Killswitch formal proof
    — seL4 proof assumes hardware runs
    — ferros proves properties when hardware stops
    — concurrent separation logic, SAIL hardware model
@@ -1023,7 +1019,7 @@ ferros is not seL4 in Rust. The novel formal results are:
 6. Unified elimination model
    — every security property expressed as non-existence
    — not protection, not hardening, removal
-   — consistent architectural philosophy throughout
+   — consistent architectural philosophy thruout
 ```
 
 ---
