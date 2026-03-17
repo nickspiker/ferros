@@ -198,7 +198,7 @@ impl UfsController {
     }
 
     /// Set up our own transfer request list and start it.
-    fn init_transfer_list(&self) {
+    pub fn init_transfer_list(&self) {
         unsafe {
             let utrd_addr = &raw const UFS_BUF.utrd as usize as u64;
             self.write_reg(regs::UTRLBA, utrd_addr as u32);
