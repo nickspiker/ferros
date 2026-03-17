@@ -82,8 +82,10 @@ impl RingEntry {
 
         let header_body_end = w.pos();
 
-        // --- Body: one section "ring" with 3 fields ---
-        w.section_open("ring");
+        // --- Body: one section with 3 fields ---
+        // Section name omitted from body (< 1MB from header per VSF spec).
+        // Name "ring" lives in header TOC only.
+        w.section_open_anonymous();
 
         // Field 1: generation (ordering key for binary search)
         w.field_open("generation");
@@ -147,11 +149,9 @@ impl RingEntry {
             return None;
         }
 
-        // --- Body: parse section [d("ring") ...fields... ] ---
-        // Expect '[' d("ring")
+        // --- Body: parse section [ ...fields... ] ---
+        // Anonymous section (< 1MB from header, name in TOC only)
         if r.read_byte_raw()? != b'[' { return None; }
-        let section_name = r.dict_key_str()?;
-        if section_name != "ring" { return None; }
 
         // Parse fields: (d("name"):value)
         let mut generation: u64 = 0;
@@ -307,9 +307,8 @@ fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u6
     if r.field_count().is_none() { return 0; }
     if !r.close() { return 0; }
 
-    // Body: [d("ring")(d("generation"):u(N))...]
+    // Body: [(d("generation"):u(N))...]  (anonymous section, no d("ring"))
     if r.read_byte_raw() != Some(b'[') { return 0; }
-    if r.dict_key_str().is_none() { return 0; } // skip section name
     if r.read_byte_raw() != Some(b'(') { return 0; } // field open
     if r.dict_key_str().is_none() { return 0; } // skip field name "generation"
     if r.read_byte_raw() != Some(b':') { return 0; } // separator

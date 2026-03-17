@@ -118,9 +118,15 @@ impl<'a> VsfWriter<'a> {
 
     // ----- Sections and fields -----
 
-    /// Open a section: [d("name")
+    /// Open a named section: [d("name")
     pub fn section_open(&mut self, name: &str) -> bool {
         self.put_byte(b'[') && self.dict_key(name)
+    }
+
+    /// Open an anonymous section: [
+    /// Used when section is < 1MB from header (name in TOC only per VSF spec).
+    pub fn section_open_anonymous(&mut self) -> bool {
+        self.put_byte(b'[')
     }
 
     /// Close a section: ]
