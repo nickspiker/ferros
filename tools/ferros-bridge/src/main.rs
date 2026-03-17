@@ -1,3 +1,23 @@
+// FERROS-BRIDGE SOURCE MAP — keep updated when commands change
+//
+// main.rs ── CLI entry point, PT send/recv, command dispatch
+//   Commands:
+//     status   — check device connected (USB VID/PID probe)
+//     diag     — retrieve boot log via PT DIAG cap
+//     read     — read MMIO register via PT MEM cap
+//     reboot   — reboot device (normal or fastboot) via PT REBOOT cap
+//     reload   — hot-reload kernel binary via PT RELOAD cap
+//
+//   pt_send(link, sid, data) — blast DATA packets with 1ms pacing
+//   pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
+//
+// usb.rs ── nusb USB link (VID G#1838, PID G#FE01)
+//   struct UsbLink { interface, ep_out, ep_in }
+//     ::open() → Result<Self>
+//     ::send(data) — pads to 512 bytes (DWC3 short packet workaround)
+//     ::recv() → Vec<u8>
+//     ::recv_timeout(duration) → Result<Vec<u8>>
+
 mod usb;
 
 use ferros_pt::StreamId;
