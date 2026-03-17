@@ -1,5 +1,22 @@
 //! Synopsys DWC3 USB controller driver (device mode).
 //!
+//! # WARNING — Development Quality
+//!
+//! This driver works for the current dev loop (diag, hot-reload) but is NOT
+//! production quality. Known issues:
+//!
+//! - **1ms send pacing**: bridge sleeps 1ms between OUT sends because single-TRB
+//!   re-arm can't keep up with back-to-back host transfers. Proper fix: TRB ring
+//!   or UPDATETRANSFER.
+//! - **ENDTRANSFER per inbound packet**: wasteful, generates spurious events.
+//!   Proper fix: TRB ring with pre-armed slots.
+//! - **No error recovery**: stalled transfer = dead session, needs power cycle.
+//! - **No kernel-side timeout**: bridge disconnect mid-transfer hangs forever.
+//! - **28 debug counters**: pub fields in Dwc3Dev, most never read. Clean up.
+//! - **bulk_out_armed tracking**: fragile flag, should be replaced by proper
+//!   endpoint state machine.
+//! - **No GIC/interrupt support**: polling only, burns CPU. Needs GIC setup + WFI.
+//!
 //! QCM6490 USB layout (from Linux DTS):
 //!   Qualcomm wrapper: 0x0A6F_8800 (0x400 bytes)
 //!   DWC3 core:        0x0A60_0000 (0xE000 bytes)

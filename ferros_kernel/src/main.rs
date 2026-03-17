@@ -1367,12 +1367,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts("scan: gen="); log.put_hex32(scan.generation as u32);
             log.puts(" pos="); log.put_hex32(scan.position);
             log.puts(" reads="); log.put_hex32(scan.reads);
-            log.puts(" valid="); log.put_hex32(scan.valid_count);
             log.puts("\n");
 
             // Debug: read position 1 directly
             {
-                let ocs = ufs.read_block(ferros_hal::ring::RING_BASE_LBA + 1);
+                let ocs = ufs.read_block(ferros_hal::ring::RING_BASE_BLOCK + 1);
                 log.puts("pos1: ocs="); log.put_hex32(ocs as u32);
                 if ocs == 0 {
                     let d = ufs.data_buffer();
@@ -1386,28 +1385,42 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             if scan.generation == 0 {
                 // Genesis: write first entry
                 log.puts("genesis: writing entry 1...");
-                let entry = ferros_hal::ring::VaultRootEntry {
-                    generation: 1,
-                    prev_hash: [0u8; 32],
-                    hamt_root: [0u8; 32],
-                    cap_hash: [0u8; 32],
-                    ledger_head: [0u8; 32],
-                    entry_hash: [0u8; 32], // computed by to_block()
-                };
+                let entry = ferros_hal::ring::RingEntry::genesis();
                 if ferros_hal::ring::write_entry(&ufs, &entry) {
                     log.puts(" OK\n");
                     // Verify: scan again
                     let scan2 = ferros_hal::ring::scan_ring(&ufs);
                     log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
-                    log.puts(" valid="); log.put_hex32(scan2.valid_count);
                     log.puts("\n");
                 } else {
                     log.puts(" FAIL\n");
                 }
             } else {
-                log.puts("found gen "); log.put_hex32(scan.generation as u32);
-                log.puts(" at pos "); log.put_hex32(scan.position);
-                log.puts("\n");
+                // Found existing ring — write next generation
+                let next_gen = scan.generation + 1;
+                let prev_hash = scan.entry.as_ref().map(|e| e.entry_hash).unwrap_or([0u8; 32]);
+                let entry = ferros_hal::ring::RingEntry {
+                    generation: next_gen,
+                    prev_hash,
+                    hamt_root: [0u8; 32],
+                    cap_hash: [0u8; 32],
+                    proc_hash: [0u8; 32],
+                    ledger_head: [0u8; 32],
+                    entry_hash: [0u8; 32],
+                };
+                log.puts("write gen="); log.put_hex32(next_gen as u32);
+                log.puts(" pos="); log.put_hex32(ferros_hal::ring::gen_to_pos(next_gen));
+                if ferros_hal::ring::write_entry(&ufs, &entry) {
+                    log.puts(" OK\n");
+                    // Verify: rescan
+                    let scan2 = ferros_hal::ring::scan_ring(&ufs);
+                    log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
+                    log.puts(" pos="); log.put_hex32(scan2.position);
+                    log.puts(" reads="); log.put_hex32(scan2.reads);
+                    log.puts("\n");
+                } else {
+                    log.puts(" FAIL\n");
+                }
             }
         } else {
             log.puts("UFS link down\n");
