@@ -331,6 +331,7 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     img
 }
 
+#[allow(dead_code)]
 fn gzip_compress(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(data).unwrap();
@@ -343,6 +344,7 @@ fn write_le32(buf: &mut [u8], offset: usize, val: u32) {
 
 /// Simple hash for the boot image ID field. Not cryptographic —
 /// just for identification in fastboot output.
+#[allow(dead_code)]
 fn simple_hash(data: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     for (i, &byte) in data.iter().enumerate() {
