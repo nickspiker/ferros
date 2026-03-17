@@ -1363,7 +1363,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let ufs = ferros_hal::ufs::UfsController::new(0x1D8_4000);
         if ufs.link_is_up() {
             ufs.init_transfer_list();
-            let scan = ferros_hal::vault_root::scan_ring(&ufs);
+            let scan = ferros_hal::ring::scan_ring(&ufs);
             log.puts("scan: gen="); log.put_hex32(scan.generation as u32);
             log.puts(" pos="); log.put_hex32(scan.position);
             log.puts(" reads="); log.put_hex32(scan.reads);
@@ -1372,7 +1372,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
             // Debug: read position 1 directly
             {
-                let ocs = ufs.read_block(ferros_hal::vault_root::RING_BASE_LBA + 1);
+                let ocs = ufs.read_block(ferros_hal::ring::RING_BASE_LBA + 1);
                 log.puts("pos1: ocs="); log.put_hex32(ocs as u32);
                 if ocs == 0 {
                     let d = ufs.data_buffer();
@@ -1386,7 +1386,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             if scan.generation == 0 {
                 // Genesis: write first entry
                 log.puts("genesis: writing entry 1...");
-                let entry = ferros_hal::vault_root::VaultRootEntry {
+                let entry = ferros_hal::ring::VaultRootEntry {
                     generation: 1,
                     prev_hash: [0u8; 32],
                     hamt_root: [0u8; 32],
@@ -1394,10 +1394,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     ledger_head: [0u8; 32],
                     entry_hash: [0u8; 32], // computed by to_block()
                 };
-                if ferros_hal::vault_root::write_entry(&ufs, &entry) {
+                if ferros_hal::ring::write_entry(&ufs, &entry) {
                     log.puts(" OK\n");
                     // Verify: scan again
-                    let scan2 = ferros_hal::vault_root::scan_ring(&ufs);
+                    let scan2 = ferros_hal::ring::scan_ring(&ufs);
                     log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
                     log.puts(" valid="); log.put_hex32(scan2.valid_count);
                     log.puts("\n");

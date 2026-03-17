@@ -78,7 +78,7 @@
 //     ::query_descriptor(idn, index, buf) → Option<usize>
 //   4KB blocks, 232GB LUN0, ABL leaves controller enabled
 //
-// vault_root.rs ── vault root ring on UFS/SD (spec in RING.md)
+// ring.rs ── vault root ring on UFS/SD (spec in RING.md)
 //   (implementation pending)
 
 //! Ferros Hardware Abstraction Layer
@@ -102,4 +102,4 @@ pub mod usb;
 pub mod gcc;
 pub mod rpmh;
 pub mod ufs;
-pub mod vault_root;
+pub mod ring;
