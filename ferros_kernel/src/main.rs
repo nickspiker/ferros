@@ -1308,18 +1308,49 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
             // Test SCSI READ(10) — read block 0 from LUN 0
             if p.nop_ok {
+                // Read block 0
                 let read_ocs = ufs.read_block(0);
                 log.puts("READ0:  ocs="); log.put_hex32(read_ocs as u32);
                 log.puts(" sts="); log.put_hex32(ufs.last_response_status() as u32);
                 if read_ocs == 0 {
-                    // Show first 16 bytes of block 0
                     let data = ufs.data_buffer();
                     log.puts(" [");
-                    for i in 0..16 {
-                        log.put_hex32(data[i] as u32);
-                        if i < 15 { log.puts(" "); }
+                    for i in 0..4 { log.put_hex32(data[i] as u32); log.puts(" "); }
+                    log.puts("...]");
+                }
+                log.puts("\n");
+
+                // Write-verify test: write a pattern to a safe block, read back
+                // Use block 1048576 (4GB into the disk — well past Android partitions)
+                let test_lba: u32 = 1 << 20;
+                {
+                    let buf = ufs.data_buffer_mut();
+                    for i in 0..4096 {
+                        buf[i] = ((i * 37 + 13) & 0xFF) as u8; // deterministic pattern
                     }
-                    log.puts("]");
+                }
+                let write_ocs = ufs.write_block(test_lba);
+                log.puts("WRITE:  ocs="); log.put_hex32(write_ocs as u32);
+                log.puts(" sts="); log.put_hex32(ufs.last_response_status() as u32);
+                log.puts(" lba="); log.put_hex32(test_lba);
+
+                if write_ocs == 0 {
+                    // Read back and verify
+                    let verify_ocs = ufs.read_block(test_lba);
+                    log.puts(" R:"); log.put_hex32(verify_ocs as u32);
+                    if verify_ocs == 0 {
+                        let data = ufs.data_buffer();
+                        let mut ok = true;
+                        for i in 0..4096 {
+                            let expected = ((i * 37 + 13) & 0xFF) as u8;
+                            if data[i] != expected {
+                                log.puts(" MISMATCH@"); log.put_hex32(i as u32);
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok { log.puts(" VERIFIED"); }
+                    }
                 }
                 log.puts("\n");
             }

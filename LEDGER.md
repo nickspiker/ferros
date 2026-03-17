@@ -331,7 +331,10 @@ VSF handles this. Not the Ledger server. Not a separate layer.
 VSF on disk:
   BLAKE3 hash: always present, auto-computed
   ChaCha20 encryption: document encrypted with boot_key
-  boot_key: in CSR, never RAM, per-boot fresh (talk to me when we get to this part)
+  boot_key: derived from hardware key, never RAM, per-boot fresh
+            FP5: UFS RPMB (SHA256-HMAC, write-once, can't read back)
+            Glyph: BLAKE3 silicon oracle (private domain separator, optical link)
+            See SECURITY_CHAIN.md key storage section
 
   Encrypted VSF document is still a VSF document
   Type markers intact (O(1) skip still works)
