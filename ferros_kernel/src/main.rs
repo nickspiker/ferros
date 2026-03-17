@@ -1369,57 +1369,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts(" reads="); log.put_hex32(scan.reads);
             log.puts("\n");
 
-            // Debug: read position 1 directly
-            {
-                let ocs = ufs.read_block(ferros_hal::ring::RING_BASE_BLOCK + 1);
-                log.puts("pos1: ocs="); log.put_hex32(ocs as u32);
-                if ocs == 0 {
-                    let d = ufs.data_buffer();
-                    log.puts(" magic=[");
-                    for i in 0..8 { log.put_hex32(d[i] as u32); log.puts(" "); }
-                    log.puts("]");
-                }
-                log.puts("\n");
-            }
-
             if scan.generation == 0 {
                 // Genesis: write first entry
-                log.puts("genesis: writing entry 1...");
                 let entry = ferros_hal::ring::RingEntry::genesis();
-                // Debug: dump first 60 bytes of the block
-                let blk = entry.to_block();
-                log.puts("\nblk: ");
-                for i in 0..60 { log.put_hex32(blk[i] as u32); log.puts(" "); }
-                log.puts("\n");
-                // Try parsing it back before writing
-                let parsed = ferros_hal::ring::RingEntry::from_block(&blk);
-                log.puts("self-parse: ");
-                match parsed {
-                    Some(e) => { log.puts("gen="); log.put_hex32(e.generation as u32); }
-                    None => log.puts("FAIL"),
-                }
-                log.puts("\n");
+                log.puts("genesis ");
                 if ferros_hal::ring::write_entry(&ufs, &entry) {
-                    log.puts("write OK\n");
-                    let scan2 = ferros_hal::ring::scan_ring(&ufs);
-                    log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
-                    log.puts("\n");
+                    log.puts("OK gen=1\n");
                 } else {
-                    log.puts(" FAIL\n");
+                    log.puts("FAIL\n");
                 }
             } else {
                 // Found existing ring — write next generation
                 let entry = scan.entry.as_ref().unwrap().next();
-                log.puts("write gen="); log.put_hex32(entry.generation as u32);
-                log.puts(" pos="); log.put_hex32(ferros_hal::ring::gen_to_pos(entry.generation));
+                log.puts("ring gen="); log.put_hex32(entry.generation as u32);
                 if ferros_hal::ring::write_entry(&ufs, &entry) {
                     log.puts(" OK\n");
-                    // Verify: rescan
-                    let scan2 = ferros_hal::ring::scan_ring(&ufs);
-                    log.puts("rescan: gen="); log.put_hex32(scan2.generation as u32);
-                    log.puts(" pos="); log.put_hex32(scan2.position);
-                    log.puts(" reads="); log.put_hex32(scan2.reads);
-                    log.puts("\n");
                 } else {
                     log.puts(" FAIL\n");
                 }
@@ -1588,9 +1552,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     match usb.poll_event() {
                         ferros_hal::usb::UsbEvent::None => {
                             // Yield CPU briefly when no USB events pending.
-                            // Not WFI (no GIC/IRQ setup yet) but reduces power.
-                            // 64 yields ≈ ~64ns delay ≈ ~15MHz effective poll rate.
-                            // Lower values break USB timing. Proper fix: GIC + WFI.
+                            // GIC + WFI attempted but GICD access may be TZ-protected.
+                            // TODO: probe GIC safely, fall back to spin if protected.
                             for _ in 0..64u32 { core::hint::spin_loop(); }
                         }
                         ferros_hal::usb::UsbEvent::Reset => {
