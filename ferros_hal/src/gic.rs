@@ -40,50 +40,56 @@ pub const SPI_DWC3: u32 = 133;
 #[allow(dead_code)]
 pub const PPI_NS_PHYS_TIMER: u32 = 14;
 
-/// Initialize GIC for WFI wakeup. Returns true if successful.
-///
-/// After this call, WFI will wake on any enabled SPI/PPI.
-/// PSTATE.I stays masked — no exception handler needed.
+/// Full GIC init including GICD/GICR MMIO. Returns true if successful.
+/// WARNING: GICD is TZ-protected on QCM6490 — causes exception. Do not use.
+#[allow(dead_code)]
 pub fn init() -> bool {
     unsafe {
-        // 1. Verify system register interface is enabled (TF-A should have done this)
         let sre: u64;
         core::arch::asm!("mrs {}, ICC_SRE_EL1", out(reg) sre);
-        if sre & 1 == 0 {
-            return false; // SRE not enabled, can't use system registers
-        }
+        if sre & 1 == 0 { return false; }
 
-        // 2. Wake GICR for CPU 0 (ABL likely already did this)
         let waker = crate::mmio::read32(GICR_BASE + GICR_WAKER);
         if waker & GICR_WAKER_PROCESSOR_SLEEP != 0 {
-            crate::mmio::write32(
-                GICR_BASE + GICR_WAKER,
-                waker & !GICR_WAKER_PROCESSOR_SLEEP,
-            );
-            // Poll until ChildrenAsleep clears
+            crate::mmio::write32(GICR_BASE + GICR_WAKER, waker & !GICR_WAKER_PROCESSOR_SLEEP);
             for _ in 0..1_000_000u32 {
-                if crate::mmio::read32(GICR_BASE + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP == 0 {
-                    break;
-                }
+                if crate::mmio::read32(GICR_BASE + GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP == 0 { break; }
             }
         }
 
-        // 3. Enable Group 1 NS in distributor (may already be enabled)
         let ctlr = crate::mmio::read32(GICD_BASE + GICD_CTLR);
         if ctlr & GICD_CTLR_ENABLE_GRP1_NS == 0 {
             crate::mmio::write32(GICD_BASE + GICD_CTLR, ctlr | GICD_CTLR_ENABLE_GRP1_NS);
         }
 
-        // 4. Set priority mask to allow all priorities
         core::arch::asm!("msr ICC_PMR_EL1, {}", in(reg) 0xFFu64);
-
-        // 5. Enable Group 1 interrupts at CPU interface
         core::arch::asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1u64);
-
-        // ISB to ensure all config takes effect before WFI
         core::arch::asm!("isb");
     }
+    true
+}
 
+/// Lightweight GIC init — EL1 system registers only, no MMIO.
+///
+/// ABL/QHEE already configured GICD and enabled the DWC3 SPI.
+/// We just open the CPU interface so WFI wakes on pending interrupts.
+/// No GICD/GICR MMIO access — safe on TZ-locked QCM6490.
+pub fn init_el1_only() -> bool {
+    unsafe {
+        // Verify ICC system register interface is available
+        let sre: u64;
+        core::arch::asm!("mrs {}, ICC_SRE_EL1", out(reg) sre);
+        if sre & 1 == 0 { return false; }
+
+        // Open priority mask — allow all interrupt priorities
+        core::arch::asm!("msr ICC_PMR_EL1, {}", in(reg) 0xFFu64);
+
+        // Enable Group 1 NS interrupts at CPU interface
+        core::arch::asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1u64);
+
+        // Barrier: ensure config takes effect before WFI
+        core::arch::asm!("isb");
+    }
     true
 }
 

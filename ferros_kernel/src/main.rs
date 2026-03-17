@@ -1357,6 +1357,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
+    // ---- Hypervisor probe ----
+    log.puts("\n-- HYP --\n");
+    {
+        let hp = ferros_hal::hyp::probe(exception_count);
+        log.puts("present="); log.put_hex32(hp.present as u32);
+        log.puts(" gunyah="); log.put_hex32(hp.gunyah as u32);
+        log.puts(" exc="); log.put_hex32(hp.exceptions as u32);
+        log.puts("\nGH x0="); log.put_hex32(hp.gh_identify_x0 as u32);
+        log.puts(" x1="); log.put_hex32(hp.gh_identify_x1 as u32);
+        log.puts("\nQCOM x0="); log.put_hex32(hp.qcom_x0 as u32);
+        log.puts("\n");
+    }
+
     // ---- Vault Root Ring scan ----
     log.puts("\n-- VAULT ROOT --\n");
     {
