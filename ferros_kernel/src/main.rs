@@ -1290,7 +1290,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         if p.geo_ok {
             let cap_gb = (p.total_raw_capacity_sectors * 512) >> 30;
-            let blk = 512u32 << p.min_block_size_exp;
+            let blk = 1u32 << p.min_block_size_exp; // 2^exp bytes (NOT 512 * 2^exp)
             log.puts("GEO:    cap="); log.put_hex32(cap_gb as u32); log.puts("GB");
             log.puts(" seg="); log.put_hex32(p.segment_size);
             log.puts(" blk="); log.put_hex32(blk);
@@ -1298,7 +1298,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts("\n");
         }
         if p.unit0_ok {
-            let blk = 512u32 << p.unit0_block_size_exp;
+            let blk = 1u32 << p.unit0_block_size_exp; // 2^exp bytes
             let cap_gb = (p.unit0_block_count * blk as u64) >> 30;
             log.puts("LUN0:   cap="); log.put_hex32(cap_gb as u32); log.puts("GB");
             log.puts(" blk="); log.put_hex32(blk);
