@@ -21,7 +21,7 @@ Ledger:               VSF from entry zero
                       BLAKE3 chain — VsfType::h, first-class
                       encryption at rest — VSF handles it
                       capability-gated — possession is authorization
-                      kill-safe — Ring FS backs it, BLAKE3 proves it
+                      killswitch ready — Ring FS backs it, BLAKE3 proves it
 ```
 
 No artificial limits. No retrofitted integrity. No format migration. VSF was designed for exactly this.
@@ -193,6 +193,12 @@ Ledger (root)
 ├── Ledger::TOKEN
 │   ├── Ledger::TOKEN::Attestation
 │   └── Ledger::TOKEN::Auth
+├── Ledger::Vault
+│   ├── Ledger::Vault::Create      object created (hp, type)
+│   ├── Ledger::Vault::Delete      object deleted (hp)
+│   ├── Ledger::Vault::Update      object updated (hp, old_hb, new_hb)
+│   ├── Ledger::Vault::Commit      spine entry written (gen)
+│   └── Ledger::Vault::Plow        plow relocation events
 ├── Ledger::RingFS
 │   ├── Ledger::RingFS::Boot
 │   ├── Ledger::RingFS::Write
@@ -463,5 +469,3 @@ Theorem Ledger_UnboundedOrdering:
 ```
 
 ---
-
-*Author: Nick Spiker*

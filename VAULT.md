@@ -1,7 +1,7 @@
 # VAULT — ferros Persistent Object Store
-**Version:** Zil (0)
+**Version:** Zila (1)
 **Author:** Nick Spiker
-**Principle:** Everything that persists lives in the vault. VSF is the format. The vault root is the only way in.
+**Principle:** Everything that persists lives in the vault. VSF is the format. The spine is the only way in.
 
 ---
 
@@ -16,9 +16,9 @@ a HAMT that makes them findable.
 Not this:   /home/user/documents/file.txt
             path string → inode → blocks
 
-This:       VsfType::h(BLAKE3, object_hash) → vault object
+This:       hp(BLAKE3, object_hash) → vault object
             possession of the hash = the address
-            HAMT root in vault root entry = how you find current state
+            HAMT root in spine entry = how you find current state
             the object's BLAKE3 hash = its identity and integrity proof
 ```
 
@@ -28,7 +28,7 @@ This:       VsfType::h(BLAKE3, object_hash) → vault object
 
 ```
 Boot snapshots:     HAMT root, cap table, process entry points
-                    indexed via vault root ring (see RING.md)
+                    indexed via spine (see RING.md)
                     restored on boot by kernel first stage
 
 Ledger backing:     ferros_ledger's chain storage
@@ -57,7 +57,7 @@ VSF objects:        anything else that needs to persist
 ```
 Keys in plaintext:  never. CSR only. Always.
 Seed binary:        protected partition, no cap issued for R/W
-Kernel code:        separate signed partition, not a vault concern
+Kernel code:        stem (kernel ring), not a vault concern
 Ephemeral IPC:      in-memory, dies on kill, not persisted
 Display buffers:    VSF compositor manages its own memory
 Logs as files:      ferros_ledger is the log, not vault objects
@@ -65,30 +65,373 @@ Logs as files:      ferros_ledger is the log, not vault objects
 
 ---
 
-## Object Model
+## Object Identity
 
-Every vault object is a VSF document. No exceptions.
+Every vault object is a VSF document. Identity, integrity, and
+authorship are distinguished by three hash fields:
 
 ```
-Native VSF object:
-  VsfType::hp(content_hash)          ← BLAKE3 provenance hash (immutable identity)
-  content: VSF fields                ← the actual object
+hp  provenance hash     born at creation, never changes
+                        permanent identity across all edits
+                        BLAKE3 of content at birth
 
-Non-VSF wrapped object:
-  VsfType::hp(plaintext_hash)        ← provenance of plaintext content
-  VsfType::hb(cipher_hash)           ← rolling hash of encrypted form
-  VsfType::ge(signature)             ← Ed25519 signature (proves origin)
-  VsfType::v(b'e', encrypted_bytes)  ← ChaCha20 encrypted content
+hb  body hash           current content integrity
+                        changes when content changes
+                        BLAKE3 of content as-is
 
-  Three checks prove:
-    hp: content identity matches expected provenance
-    hb: ciphertext has not been tampered with
-    ge: object was written by a key holder (not forged)
+ge  signature           Ed25519, proves authorship
+                        changes if re-signed
+
+Rules:
+  hp alone       →  identity AND integrity (immutable objects)
+  hp + hb        →  hp = identity, hb = integrity
+  hp + hb + ge   →  identity + integrity + authorship
 ```
 
-Object address = BLAKE3 hash of content (provenance hash). Content-addressed storage.
-The address IS the integrity proof. You cannot have the address
-of a corrupt object — the hash would not match.
+Object address = provenance hash. Content-addressed storage.
+The address IS the integrity proof for immutable objects.
+You cannot hold the address of a corrupt object — the hash
+would not match.
+
+---
+
+## Storage Architecture
+
+The vault's physical storage is organized into two layers:
+the **tract** and the **HAMT**.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                         TRACT                                │
+│        the physical ring where all blocks live                │
+│                                                              │
+│  ← plow advances this way ←                                 │
+│                                                              │
+│  [live][dead][dead][live][live][dead][new][new][new]→plow    │
+│                                                              │
+│  plow = write head, advances and wraps                       │
+│  live blocks = relocate to plow as it approaches             │
+│  dead blocks = trample, free                                 │
+│  no block allocator, no free list, no fragmentation          │
+│  free space = [plow, plow-1 wrapped], always contiguous      │
+├──────────────────────────────────────────────────────────────┤
+│                         HAMT                                 │
+│        the logical index, lives INSIDE the tract             │
+│                                                              │
+│  hp(provenance) → (hash, lba) for any object                │
+│  32-way branching, 5 bits per hash level                     │
+│  COW: every edit → new root, old intact                      │
+│  4-6 reads for any realistic dataset                         │
+│  See HAMT.md for full specification                          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The **tract** is a log-structured ring covering the entire HAMT region
+(block G#C0000 onward — approximately 230GB on UFS). It has a single
+write head called the **plow**. The plow advances forward with every
+write, wraps around at the end, and handles garbage collection
+implicitly: live blocks are relocated to the plow position, dead blocks
+are trampled.
+
+The **HAMT** (Hash Array Mapped Trie) is the object index. It maps
+provenance hashes to physical block locations. HAMT nodes are themselves
+blocks in the tract — they are subject to the plow just like data
+objects. The index indexes itself.
+
+The **spine** (vault root ring, 65536 entries at block G#2000) records
+commit points. Each spine entry stores the current HAMT root, plow
+position, and ledger head. The spine is the boot entry point —
+binary search finds the latest committed generation.
+
+---
+
+### The Plow
+
+The plow is the sole write mechanism for the tract.
+
+```
+New object write:
+  Write to tract at plow → read back → BLAKE3 verify on UFS
+  Write same bytes to SD  → read back → BLAKE3 verify on SD
+  Both verified → advance plow
+
+Plow reaches a live block:
+  Always relocate: copy to current plow position, update HAMT
+  Exception: plow is flush against live block → leave in place
+             (it's already where it would be written)
+
+Plow reaches a dead block (not in HAMT):
+  Trample. Advance plow.
+
+Plow reaches a zeroed block (deleted):
+  Check both disks — both must be zero
+  If HAMT entry still points here → remove from HAMT
+  Advance plow
+```
+
+Write amplification is bounded: each object relocation writes
+one data block plus ~4 HAMT node updates (COW path). Relocations
+are batched into spine commits (see Batch Commits below).
+
+Wear leveling is a free side effect — the plow rotates writes
+across the entire tract uniformly.
+
+---
+
+### Tract Capacity
+
+```
+UFS total:            60.8M blocks × 4KB = 232GB
+Fixed regions:        786,432 blocks (seeds, stem, spine, state, ledger)
+Tract:                ~60M blocks ≈ 230GB
+
+Per live object (small):
+  object block:       1 block
+  HAMT path:          ~4 blocks (COW: leaf + 3 internal nodes)
+  total:              ~5 blocks
+
+Live capacity:        ~12M small objects in 230GB
+                      fewer large objects, proportional to size
+                      HAMT overhead constant regardless of object size
+```
+
+---
+
+## Object Storage Modes
+
+Three modes, determined by object size. Each mode is a different
+HAMT leaf format. See HAMT.md for node encoding details.
+
+### Lone (inline, < ~3.9KB)
+
+Object content lives directly in the HAMT leaf node. One disk read
+returns both the index entry and the object.
+
+```
+RÅ<hp(provenance) hb(content_hash)>
+  [l("vault.lone")]
+  [v(content)]
+```
+
+Fresh writes are always lone when possible — best read performance.
+During plow rotation, lone objects may be promoted to direct
+(de-inlined) to allow batch commits without HAMT churn.
+
+### Direct (furrow LBAs in leaf, < ~4MB)
+
+Object is stored as furrows (extent data blocks) in the tract. The
+HAMT leaf holds a compact LBA list for all furrows.
+
+```
+RÅ<hp(provenance) hb(content_hash)>
+  [l("vault.direct")]
+  [size(u{total_bytes})]
+  [v_u(furrow_lbas[])]
+```
+
+At ~4 bytes per LBA (EWE, 26-bit addresses), approximately 1000
+LBAs fit in a leaf after overhead ≈ ~4MB max object size.
+
+### Chained (extent chain, > ~4MB)
+
+Object exceeds what one leaf can index. The leaf points to the first
+extent node. Each extent node lists up to ~1000 furrow LBAs and
+optionally points to the next extent node.
+
+```
+Leaf:
+RÅ<hp(provenance) hb(content_hash)>
+  [l("vault.chained")]
+  [size(u{total_bytes})]
+  [head(h{hash} u{lba})]
+
+Extent node (lives in tract):
+RÅ<hp(node_hash)>
+  [l("vault.extent")]
+  [v_u(furrow_lbas[])]
+  [next(h{hash} u{lba})]          ← absent if last node
+```
+
+A 10MB photo: leaf + 3 extent nodes + ~2500 furrows.
+4 reads for the full LBA list, then sequential furrow reads.
+
+### Furrows (extent data blocks)
+
+Each furrow is a minimal VSF document — not full-spec VSF with
+named fields and sections, just enough for identity, integrity,
+and position. VSF magic bytes are present so the plow's liveness
+scanner has one code path for all blocks.
+
+```
+RÅ<hp(provenance) hb(block_hash)>
+  [m(block_index)]
+  [v(payload)]
+```
+
+~45 bytes overhead, ~4050 bytes payload per 4KB block.
+Every furrow carries its own hb — corruption of any single block
+in a large object is detected independently.
+
+---
+
+## The Spine (Commit Log)
+
+The spine is the vault root ring (65536 entries × 4KB at block
+G#2000). It records committed vault state. Each entry is a VSF
+document. See RING.md for binary search mechanics, mirror protocol,
+and wear analysis.
+
+### Spine Entry Format
+
+```
+RÅ<hp(entry_hash)>
+  [gen(u{generation})]
+  [prev_hash(hp{hash})]
+  [hamt_root(h{hash} u{lba})]
+  [plow(u{lba})]
+  [ledger_head(hp{hash})]
+  [kernel_hash(hb{hash})]
+  [kernel_sig(ge{sig})]
+  [eagle_time(ei{t})]
+```
+
+The spine entry is the **transaction commit point**. Everything
+written to the tract between spine entries is provisional — power
+loss before a spine commit means those writes are orphaned. The
+plow will trample them on the next pass.
+
+### Batch Commits
+
+Multiple vault writes coalesce into one spine entry. The HAMT root
+in that entry reflects all writes in the batch.
+
+```
+Commit triggers (whichever fires first):
+  RAM buffer full    → commit immediately, timing irrelevant
+  1s timer fires     → commit whatever is pending
+
+Low activity:   timer drives. One spine entry per second.
+High activity:  capacity drives. Commit as fast as buffer fills.
+```
+
+Buffer size is the tuning knob — it sets maximum latency between
+a write and its commit under load. Power of 2 (64 or 128 pending
+HAMT paths, depending on available kernel RAM).
+
+### Spine Capacity
+
+```
+65536 entries, wraps.
+At 1 commit/second:                  ~18 hours of history
+At 1 commit/second, batched per 5s:  ~91 days of history
+```
+
+The spine never blocks — it wraps and tramples old entries.
+Current state is the latest entry. History is the ledger's job.
+
+---
+
+## Deletion
+
+Delete = zero the VSF magic bytes on both disks.
+
+```
+Protocol:
+  1. Zero block on UFS → read back → confirm zeros
+  2. Zero block on SD  → read back → confirm zeros
+  3. Both confirmed zero → deletion committed
+
+Lookup after deletion:
+  HAMT → lba → read block → no VSF magic → return None
+
+Cleanup:
+  Plow encounters zeroed block during rotation
+  Check both disks — both must be zero
+  If HAMT entry still points here → remove from HAMT
+  Advance plow
+
+Recovery:
+  Zeroed blocks invisible to recovery scan
+  Deleted objects never reappear
+  No tombstones needed
+```
+
+Flash erases to zero. Writing zeros is writing "natural" state.
+No HAMT COW path on delete — O(1) write to both disks.
+HAMT cleanup happens naturally during plow rotation.
+
+---
+
+## Write Path
+
+```
+1. Construct object as VSF document
+2. Write to UFS at plow → read back → BLAKE3 verify
+3. Write same bytes to SD → read back → BLAKE3 verify
+4. Both verified → advance plow
+5. Update in-memory HAMT (COW: new leaf, new path to root)
+6. Accumulate in batch buffer
+
+When batch commits (buffer full or 1s timer):
+7. Write dirty HAMT nodes to tract → verify on both disks
+8. Write spine entry (new hamt_root, new plow, new gen)
+   → verify on both disks
+9. COMMITTED
+```
+
+SD mirrors exact UFS procedure and bit representation immediately
+after UFS is in a known good committed state and verified.
+
+---
+
+## Recovery
+
+```
+Normal boot:
+  Spine binary search → highest valid gen → hamt_root + plow
+  HAMT traversal for any object. Fast. Deterministic.
+
+Spine intact, HAMT damaged:
+  Spine gives hamt_root → partial HAMT traversal
+  Corrupt HAMT node → BLAKE3 fails → fall back to previous gen
+  Previous spine entry has previous HAMT root → older but valid
+
+Full recovery (spine + HAMT both damaged):
+  Linear scan: read every 4KB block in tract
+  Identify by VSF magic + hp field
+  Reconstruct HAMT from all valid objects
+  Zeroed blocks skipped → deleted objects absent by construction
+  Replay ledger to re-apply any deletions
+  Write reconstructed HAMT + new spine entry
+
+Mirror recovery (one device failed):
+  Boot from surviving device
+  Full copy to replacement device
+  Resume mirroring
+```
+
+---
+
+## Kill Safety
+
+```
+Power fails during object write (step 2-4):
+  Block partially written → BLAKE3 fails → discarded
+  Plow unchanged → orphaned block trampled on next pass
+
+Power fails during HAMT update (step 7):
+  Dirty HAMT nodes partially written → BLAKE3 fails
+  Previous spine entry still valid → previous HAMT root intact
+
+Power fails during spine write (step 8):
+  Partial spine entry → BLAKE3 fails → skipped by binary search
+  Previous spine entry is current → previous state intact
+
+Result:
+  Every committed write is fully durable on both disks
+  Every in-flight write is fully absent
+  No partial state ever visible
+```
 
 ---
 
@@ -115,7 +458,7 @@ App namespace:
 
 Protected regions (NO cap ever issued):
   Seed partition: kernel denies all read/write caps
-  Vault root ring: kernel-only, no userspace cap
+  Spine: kernel-only, no userspace cap
   Only the flash tool (ferros-mkimg via fastboot) can write the seed
   See SECURITY_CHAIN.md for trust model
 ```
@@ -125,30 +468,25 @@ Not access denied. Does not exist. Same rule as everywhere in ferros.
 
 ---
 
-## Architecture
+## Encryption
+
+VSF handles encryption. The vault does not implement crypto.
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  VAULT SERVER                       │
-│              (userspace, cap-gated IPC)             │
-│                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐   │
-│  │  Namespace  │  │  Object      │  │  Storage   │   │
-│  │  Registry   │  │  Store       │  │  Backend   │   │
-│  │  (cap tree) │  │  (HAMT)      │  │  (mirrored)│   │
-│  └─────────────┘  └──────────────┘  └────────────┘   │
-└──────────────────────────────────────────────────────┘
-                      │ cap-gated IPC only
-       ┌──────────────┼──────────────┐
-       ▼              ▼              ▼
-  Kernel (boot)   Ledger server   App processes
-  Cap<Write,      Cap<Write,      Cap<Write,
-  Vault::Boot>    Vault::Ledger>  Vault::App::<hash>>
-```
+At rest: all vault objects encrypted with boot_key
+  boot_key: ChaCha20(device_key_in_CSR, boot_nonce)
+  per-boot fresh, never written to RAM
 
-Kernel first stage (bootloader) reads the vault root directly
-during boot — before the vault server exists. After boot, the
-vault server owns all vault access via cap-gated IPC.
+VSF encrypted object:
+  content encrypted: ChaCha20(boot_key, object_nonce)
+  pre-encryption hash: hp(BLAKE3, plaintext_hash)
+  post-encryption hash: hb(BLAKE3, ciphertext_hash)
+  nonce: u(n) EWE, per-object, never reused
+
+Nothing hits storage without encryption.
+Nothing hits storage without a BLAKE3 hash.
+Both properties: structural, not policy.
+```
 
 ---
 
@@ -157,33 +495,25 @@ vault server owns all vault access via cap-gated IPC.
 ```
 Physical storage (each device — UFS and SD mirror):
 
-┌──────────────────────────────┐
-│  Seed copies A + B           │  ← 2 copies, >= 1MB apart
-│  Kernel copies A + B         │  ← 2 copies, >= 1MB apart
-│  (see SECURITY_CHAIN.md)     │  ← Ed25519 signed, BLAKE3 verified
-├──────────────────────────────┤
-│  Vault Root Ring             │  ← 4MB (1024 × 4KB entries)
-│  (see RING.md)         │  ← generation-ordered, binary search
-│  VSF documents, BLAKE3       │  ← write-verify-then-mirror
-├──────────────────────────────┤
-│  Ledger Ring                 │  ← 1GB (spec only, future)
-│  (see LEDGER.md)             │  ← categorized events w/ origins, caps, timestamps
-├──────────────────────────────┤
-│  State Ring                  │  ← 1GB (spec only, future)
-│                              │  ← users, running procs, cap table, display state
-│                              │  ← display prioritized (compositor restores first)
-├──────────────────────────────┤
-│  Vault Object Store          │  ← remainder of device
-│  HAMT-indexed (see HAMT.md)  │  ← content-addressed, CoW
-│  Every block: VSF document   │  ← BLAKE3 integrity by construction
-│  Every block: encrypted      │  ← ChaCha20 at rest
-└──────────────────────────────┘
+Block range             Size     Purpose
+────────────────────────────────────────────────────────
+G#000 - G#3FF           4MB      Reserved (ABL, GPT)
+G#400 - G#403           16KB     Seed copy A
+G#800 - G#803           16KB     Seed copy B (4MB from A)
+G#C00 - G#CFF           1MB      Stem (kernel ring, 256 entries)
+G#2000 - G#11FFF        256MB    Spine (vault root ring, 65536 entries)
+G#40000 - G#7FFFF       1GB      State ring
+G#80000 - G#BFFFF       1GB      Ledger ring
+G#C0000+                ~230GB   Tract (vault objects, plow-managed)
+
+SD card: identical layout, identical block numbers.
 
 Mirror protocol:
   Write to UFS → read back → BLAKE3 verify
   Then write to SD → read back → BLAKE3 verify
   Both verified → committed
-  See RING.md for full mirror protocol
+  SD mirrors exact UFS procedure and bit representation
+  immediately after UFS is in a known good committed state
 
 Hardware:
   UFS: 232GB, 4KB blocks, 4MB erase blocks, full wear leveling
@@ -193,115 +523,23 @@ Hardware:
 
 ---
 
-## Object Indexing (HAMT)
-
-The vault uses a Hash Array Mapped Trie for object lookup.
-See HAMT.md for the full specification.
-
-```
-Vault root entry → hamt_root hash → HAMT root node
-HAMT lookup: provenance_hash → current block hash
-  O(log32 N): 4-6 node reads for any realistic dataset
-  COW by construction: edit produces new root, old intact
-
-HAMT nodes are themselves vault objects:
-  VSF documents, BLAKE3 content-addressed
-  Stored in the vault object store
-  The index indexes itself
-
-No separate index partition. No special block region.
-```
-
----
-
-## Kill Safety
-
-```
-Write path:
-  Object constructed as VSF document
-  BLAKE3 computed (mandatory, automatic)
-  Write to UFS → verify → write to SD → verify
-  HAMT path updated (COW: new nodes, old nodes untouched)
-  New HAMT root hash written to vault root ring entry
-  Generation counter incremented
-
-Kill fires mid-write:
-  Partial VSF document: mandatory hash fails → discarded
-  Partial HAMT update: old HAMT root still valid (COW)
-  Partial vault root entry: BLAKE3 fails → previous entry valid
-  Partial mirror write: at least one device has the previous state
-
-Recovery:
-  Boot → vault root binary search → highest valid generation
-  HAMT root → all objects committed before kill: intact
-  In-flight object: absent, not partial
-  Ledger chain: valid through last committed entry
-```
-
----
-
-## Relationship to Other Specs
-
-```
-SECURITY_CHAIN.md:
-  Seed verifies kernel → kernel scans vault root
-  Vault root is the FIRST thing the bootloader reads
-  Protected regions: no cap for seed or vault root ring
-
-RING.md:
-  The ring of boot state snapshots
-  Each entry points to an HAMT root + cap snapshot + ledger head
-  Binary search finds highest valid generation
-
-HAMT.md:
-  The object index
-  Provenance hash → current block location
-  COW: every edit produces new root, old versions intact
-
-LEDGER.md:
-  The event log
-  Tenant of the vault (chain entries are vault objects)
-  ledger_head in vault root entry → chain restoration on boot
-
-ARCHITECTURE.md:
-  Why this design instead of Linux/Unix patterns
-  Structural elimination of vulnerability classes
-```
-
----
-
-## Encryption
-
-VSF handles encryption. The vault server does not implement crypto.
-
-```
-At rest: all vault objects encrypted with boot_key
-  boot_key: ChaCha20(device_key_in_CSR, boot_nonce)
-  per-boot fresh, never written to RAM
-
-VSF encrypted object:
-  content encrypted: ChaCha20(boot_key, object_nonce)
-  pre-encryption hash: VsfType::h(BLAKE3, plaintext_hash)
-  post-encryption hash: VsfType::h(BLAKE3, ciphertext_hash)
-  nonce: VsfType::u(n) EWE, per-object, never reused
-
-Nothing hits storage without encryption.
-Nothing hits storage without a BLAKE3 hash.
-Both properties: structural, not policy.
-```
-
----
-
 ## Formal Properties
 
 ```
 Theorem Vault_ObjectIntegrity:
   ∀ vault object o:
-    address(o) = BLAKE3(content(o))
-    corrupt(o) → address(o) ≠ BLAKE3(corrupted_content)
+    hp(o) = BLAKE3(content_at_birth(o))
+    corrupt(o) → hb(o) ≠ BLAKE3(corrupted_content)
     → object excluded from store
 
   Corollary: you cannot hold the address of a corrupt object
+
+Theorem Vault_PlowLiveness:
+  ∀ block b at plow horizon:
+    b has VSF magic ∧ HAMT[hp(b)].lba == lba(b) → live, relocate
+    b has VSF magic ∧ HAMT[hp(b)].lba ≠ lba(b) → dead, trample
+    b has no VSF magic (zeroed)                   → deleted, trample
+    cleanup of stale HAMT entries: automatic during rotation
 
 Theorem Vault_CapabilityConfinement:
   ∀ process p without Cap<_, Vault::Namespace::N>:
@@ -311,7 +549,7 @@ Theorem Vault_CapabilityConfinement:
 Theorem Vault_KillSafety:
   ∀ kill instant t:
     ∀ object o where o.committed_at < t:
-      o recoverable via vault root binary search ∧
+      o recoverable via spine binary search ∧
       BLAKE3(o) valid
     ∀ in-flight object f at t:
       f either fully committed or fully absent
@@ -329,6 +567,41 @@ Theorem Vault_MirrorRedundancy:
     other device has complete vault state
     boot proceeds from surviving device
     resync restores mirror after replacement
+
+Theorem Vault_WearUniformity:
+  ∀ positions p1, p2 in tract:
+    E[writes(p1)] = E[writes(p2)]
+    plow rotation: mathematically uniform
+```
+
+---
+
+## Relationship to Other Specs
+
+```
+SECURITY_CHAIN.md:
+  Seed verifies kernel → kernel scans spine
+  Spine is the FIRST thing the bootloader reads
+  Protected regions: no cap for seed or spine
+
+RING.md:
+  Ring mechanics: generation numbering, binary search, mirror protocol
+  Spine = vault root ring instance
+  Stem = kernel ring instance
+
+HAMT.md:
+  Object index: provenance hash → block location
+  COW: every edit → new root, old intact
+  Three leaf formats: lone, direct, chained
+  Branching, collision handling, vector encoding
+
+LEDGER.md:
+  Event log: ledger_head in spine entry → chain restoration on boot
+  Records vault operations: create, delete, update
+
+ARCHITECTURE.md:
+  Why this design instead of Linux/Unix patterns
+  Structural elimination of vulnerability classes
 ```
 
 ---
@@ -336,43 +609,31 @@ Theorem Vault_MirrorRedundancy:
 ## Implementation Status
 
 ```
-ferros_vault crate: exists (persistent object store skeleton)
-ferros_hal::ufs:   UFS probe working (geometry, NOP, descriptors)
-ferros_hal::sdmmc: SD card R/W working (4-bit, 400KHz, multi-block)
+ferros_vault crate:   exists (persistent object store skeleton)
+ferros_hal::ufs:      UFS R/W working (SCSI READ/WRITE, 232GB LUN0)
+ferros_hal::sdmmc:    SD card R/W working (4-bit, 400KHz, multi-block)
+ferros_hal::ring:     Ring binary search working (kernel ring, vault root)
 
 Working now:
-  UFS controller probe (UFSHCI v3.0, link up, NOP verified)
-  SD card identification + block R/W + CSD decode
+  UFS block I/O (read, write, verify)
+  SD card block I/O (read, write, verify)
+  Ring binary search + write-verify
   Hot-reload over USB (development iteration)
 
 Next:
-  UFS SCSI READ(10)/WRITE(10) block I/O
-  Vault root ring implementation (binary search)
-  Seed signature verification (Ed25519 + BLAKE3)
-  HAMT implementation
+  HAMT implementation (v_u0 bitmap, v_h/v_u vectors, COW)
+  Tract with plow (log-structured gravity ring)
+  Spine entry with plow field
+  Lone/direct/chained leaf formats
+  Deletion (zero-header, both disks)
+  Batch commit logic
 
 Future:
   Vault server (userspace, cap-gated IPC)
   Full namespace registry
-  Garbage collection of old HAMT nodes
-  Userspace ledger ring (1GB)
+  Extent chains (chained objects > 4MB)
+  Encryption at rest (ChaCha20, boot_key)
   Cross-device vault sync (post-networking)
 ```
 
 ---
-
-## What Can Wait
-
-```
-- Vault server in userspace (kernel-direct access fine for bootstrap)
-- Full namespace admin
-- Garbage collection of old object versions
-- Userspace ledger ring (spec only for now)
-- Cross-device vault sync (post-networking)
-- App namespace provisioning (post-cap system)
-```
-
----
-
-*VAULT 0 — Everything that persists. Nothing that shouldn't.*
-*Author: Nick Spiker*

@@ -89,7 +89,8 @@ Linux:   Virtual Filesystem Switch
          ext4, btrfs, xfs, nfs, fuse...
          all in kernel, all kernel privilege
 
-ferros:  one storage model: vault root ring + HAMT + vault objects
+ferros:  one storage model: spine + HAMT + tract
+         plow-managed log-structured ring, no block allocator
          entirely userspace (after boot)
          kernel knows nothing about filesystems
          VSF is the format, period
@@ -148,8 +149,8 @@ Linux:   initrd, initramfs, pivot_root,
          fsck, journal replay, recovery mode
 
 ferros:  seed verifies kernel → jump
-         kernel scans vault root ring → binary search → restore snapshot
-         no fsck (BLAKE3 + HAMT + vault ring)
+         kernel scans spine → binary search → restore snapshot
+         no fsck (BLAKE3 + HAMT + plow)
          no recovery mode (always valid state)
          no initrd (vault always bootable)
          deterministic, proven
@@ -219,13 +220,10 @@ Everything else is userspace:
 ```
 ARCHITECTURE.md     this document — why these decisions
 SECURITY_CHAIN.md   boot trust model, signature chain, owner sovereignty
-RING.md       boot state ring, binary search, mirror protocol
-VAULT.md            persistent object store, HAMT index, storage layout
-HAMT.md             hash array mapped trie, COW versioning
+RING.md             ring mechanics, binary search, mirror protocol
+VAULT.md            persistent object store: tract, plow, HAMT, spine
+HAMT.md             hash array mapped trie, COW versioning, object formats
 LEDGER.md           append-only event chain, VSF format
 ```
 
 ---
-
-*ARCHITECTURE 0 — Security is the architecture, not a layer on top.*
-*Author: Nick Spiker*

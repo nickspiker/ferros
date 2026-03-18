@@ -125,15 +125,15 @@ Kernel first stage does:
      UFS controller probe (UFSHCI, already enabled by ABL)
      SD card probe (SDHCI, GCC clocks, RPMh power)
 
-  3. Vault root scan
-     Read vault root ring from UFS (binary search for highest generation)
-     Mirror check: compare UFS and SD vault root generations
+  3. Spine scan
+     Read spine (vault root ring) from UFS (binary search for highest gen)
+     Mirror check: compare UFS and SD spine generations
      Higher valid generation wins
 
   4. State restoration
-     Load HAMT root from vault root entry
-     Restore capability table
-     Restore process snapshots
+     Load HAMT root from spine entry (hash + lba)
+     Restore capability table via HAMT lookup
+     Restore process snapshots via HAMT lookup
 
   5. Userspace handoff
      Start Ledger server (receives pre-boot log buffer)
@@ -155,7 +155,7 @@ Every userspace process:
 
 Critical partition protection:
   Seed partition: NO cap issued for read or write
-  Vault root ring: kernel-only, no userspace cap exists
+  Spine: kernel-only, no userspace cap exists
   UFS raw blocks: kernel mediates all I/O, no direct access
   Even kernel privilege denies raw read/write to seed/bootloader regions
   Only the flash tool (ferros-mkimg via fastboot) can write the seed
@@ -278,10 +278,10 @@ Link 1 failure (Kernel verification):
     Boot succeeds from good copy
     Repair bad copy from good copy on next write opportunity
 
-Link 2 failure (Vault root scan):
+Link 2 failure (Spine scan):
   No valid entries found:
     Cause: first boot, or all entries corrupt
-    Action: genesis — create first vault root entry
+    Action: genesis — create first spine entry
     System boots into fresh state
 
   Corrupt entry (BLAKE3 mismatch):
@@ -437,6 +437,3 @@ Theorem SecurityChain_PhysicalAccessBound:
 ```
 
 ---
-
-*SECURITY_CHAIN 0.0 — Every link verifies the next. The owner holds the root.*
-*Author: Nick Spiker*

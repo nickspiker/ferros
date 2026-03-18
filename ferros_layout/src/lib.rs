@@ -32,30 +32,40 @@ pub const SEED_A_BLOCK: u32 = 0x400;
 pub const SEED_B_BLOCK: u32 = 0x800;
 
 // ---------------------------------------------------------------------------
-// Kernel ring — scanned by the seed to find the current kernel
+// Stem (kernel ring) — scanned by the seed to find the current kernel
 // ---------------------------------------------------------------------------
 
-/// Base block for the kernel ring (UFS and SD, same address).
-pub const KERNEL_RING_BASE: u32 = 0xC00;
+/// Base block for the stem / kernel ring (UFS and SD, same address).
+pub const STEM_BASE: u32 = 0xC00;
 
-/// Number of entries in the kernel ring. Must be a power of 2.
-pub const KERNEL_RING_SIZE: u32 = 256;
+/// Number of entries in the stem. Must be a power of 2.
+pub const STEM_SIZE: u32 = 256;
 
-/// Binary search depth for the kernel ring (log2(KERNEL_RING_SIZE)).
-pub const KERNEL_RING_DEPTH: u32 = 8;
+/// Binary search depth for the stem (log2(STEM_SIZE)).
+pub const STEM_DEPTH: u32 = 8;
+
+// Backwards compatibility aliases
+pub const KERNEL_RING_BASE: u32 = STEM_BASE;
+pub const KERNEL_RING_SIZE: u32 = STEM_SIZE;
+pub const KERNEL_RING_DEPTH: u32 = STEM_DEPTH;
 
 // ---------------------------------------------------------------------------
-// Vault root ring — scanned by the kernel to find system state
+// Spine (vault root ring) — scanned by the kernel to find system state
 // ---------------------------------------------------------------------------
 
-/// Base block for the vault root ring.
-pub const VAULT_ROOT_RING_BASE: u32 = 0x2000;
+/// Base block for the spine / vault root ring.
+pub const SPINE_BASE: u32 = 0x2000;
 
-/// Number of entries in the vault root ring. Must be a power of 2.
-pub const VAULT_ROOT_RING_SIZE: u32 = 1 << 16; // 65536
+/// Number of entries in the spine. Must be a power of 2.
+pub const SPINE_SIZE: u32 = 1 << 16; // 65536
 
-/// Binary search depth for the vault root ring.
-pub const VAULT_ROOT_RING_DEPTH: u32 = 16;
+/// Binary search depth for the spine (log2(SPINE_SIZE)).
+pub const SPINE_DEPTH: u32 = 16;
+
+// Backwards compatibility aliases
+pub const VAULT_ROOT_RING_BASE: u32 = SPINE_BASE;
+pub const VAULT_ROOT_RING_SIZE: u32 = SPINE_SIZE;
+pub const VAULT_ROOT_RING_DEPTH: u32 = SPINE_DEPTH;
 
 // ---------------------------------------------------------------------------
 // State ring — process state, capabilities, display state
@@ -78,11 +88,14 @@ pub const LEDGER_RING_BASE: u32 = 0x8_0000;
 pub const LEDGER_RING_SIZE: u32 = 1 << 18; // 262144 = 1GB
 
 // ---------------------------------------------------------------------------
-// HAMT region — kernel binaries, vault objects, everything else
+// Tract — vault object store, plow-managed log-structured ring
 // ---------------------------------------------------------------------------
 
-/// First block of the HAMT region. Everything before this is ring/reserved.
-pub const HAMT_BASE: u32 = 0xC_0000;
+/// First block of the tract. Everything before this is ring/reserved.
+pub const TRACT_BASE: u32 = 0xC_0000;
+
+// Backwards compatibility alias
+pub const HAMT_BASE: u32 = TRACT_BASE;
 
 // ---------------------------------------------------------------------------
 // DRAM addresses

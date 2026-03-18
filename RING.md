@@ -1,29 +1,43 @@
-# RING — ferros Boot State Ring Specification
-**Version:** Zil (0)
+# RING — ferros Ring Specification
+**Version:** Zila (1)
 **Author:** Nick Spiker
 **Principle:** The ring is the index. Binary search finds the head. VSF is the format.
 
 ---
 
-## What Vault Root Is
+## What The Ring Is
 
-A ring of boot state snapshots. That is its entire purpose.
+A ring is a fixed-size array of generation-numbered entries on persistent
+storage. Binary search finds the most recent valid entry in O(log2 N)
+reads. Rings are the foundation of all ferros persistent state.
+
+```
+Instances:
+  Stem      kernel ring       256 entries    1MB      block G#C00
+  Spine     vault root ring   65536 entries  256MB    block G#2000
+  State     state ring        262144 entries 1GB      block G#40000
+  Ledger    ledger ring       262144 entries 1GB      block G#80000
+```
+
+The spine is the primary example. It stores committed vault state.
 
 ```
 Given:    a ring of N entries on persistent storage
-Find:     the most recent valid boot state (highest generation)
+Find:     the most recent valid entry (highest generation)
 Method:   binary search on generation numbers — O(log2 N) reads
 Fallback: previous entry always findable via prev_hash chain
-Point to: current HAMT root, cap table, process snapshots
+
+Spine points to: current HAMT root, plow position, ledger head
+Stem points to:  current kernel binary location, hash, signature
 ```
 
-Nothing else. Vault root does not store objects, enforce
-capabilities, manage namespaces, or know what a boot snapshot
-contains. It finds the most recent valid one. That is all.
+The ring does not store objects, enforce capabilities, manage
+namespaces, or know what its entries mean. It finds the most
+recent valid one. That is all.
 
-The bootloader (kernel first stage) scans the vault root ring
-after the seed verifies the kernel and jumps. See SEED.md and
-BOOT.md for the full trust model.
+The seed scans the stem after self-verification.
+The kernel scans the spine after the seed jumps.
+See SEED.md and BOOT.md for the full trust model.
 
 ---
 
@@ -76,18 +90,16 @@ aligned. All copies are >256 blocks (1MB) apart.
 ```
 Block range             Size     Purpose
 ────────────────────────────────────────────────────────
-0x000 - 0x3FF           4MB      Reserved (ABL, GPT, boot partitions)
-0x400 - 0x403           16KB     Seed copy A
-0x800 - 0x803           16KB     Seed copy B (4MB from A)
-0xC00 - 0xC7F           512KB    Kernel copy A
-0x1400 - 0x147F         512KB    Kernel copy B (4MB from A)
-0x2000 - 0x11FFF        256MB    Vault root ring (65536 × 4KB entries)
-0x40000 - 0x7FFFF       1GB      State ring (running procs, caps, display)
-0x80000 - 0xBFFFF       1GB      Ledger ring (categorized events)
-0xC0000+                ~128GB   HAMT region (objects, snapshots, data)
+G#000 - G#3FF           4MB      Reserved (ABL, GPT)
+G#400 - G#403           16KB     Seed copy A
+G#800 - G#803           16KB     Seed copy B (4MB from A)
+G#C00 - G#CFF           1MB      Stem (kernel ring, 256 entries)
+G#2000 - G#11FFF        256MB    Spine (vault root ring, 65536 entries)
+G#40000 - G#7FFFF       1GB      State ring (running procs, caps, display)
+G#80000 - G#BFFFF       1GB      Ledger ring (categorized events)
+G#C0000+                ~230GB   Tract (vault objects, plow-managed)
 
 SD card: identical layout, identical block numbers.
-Kernel copies C and D at blocks 0xC00 and 0x1400.
 No seed copies on SD (seed is in ABL boot partition).
 ```
 
@@ -100,39 +112,30 @@ Each kernel/seed copy includes its VSF signature document:
 
 ---
 
-## Entry Format (VSF Document)
+## Spine Entry Format (VSF Document)
 
-Every vault root entry is a complete VSF document, serialized per
+Every spine entry is a complete VSF document, serialized per
 the VSF specification. All integers use EWE encoding — from the
 kernel, from day zero. All hashes use the precise VSF type codes
 from vsf_type.rs.
 
 ```
-VSF document (fits in one 4KB block):
-
-Header:
-  VsfType::hp(entry_hash)                 mandatory provenance hash (BLAKE3)
-  VsfType::l("ferros.vault_root")         schema identifier
-
-Ordering section ("vault_root.order"):
-  VsfType::l("generation")    → VsfType::u(n)              EWE, monotonic
-  VsfType::l("prev_hash")    → VsfType::hp(hash)           previous entry provenance
-                                genesis: VsfType::hp([0u8;32])
-
-State section ("vault_root.state"):
-  VsfType::l("hamt_root")    → VsfType::hp(hash)           HAMT root node provenance
-  VsfType::l("cap_snapshot") → VsfType::hp(hash)           capability table provenance
-  VsfType::l("proc_snapshot")→ VsfType::hp(hash)           running processes provenance
-  VsfType::l("disp_state")   → VsfType::hp(hash)           display compositor state
-  VsfType::l("ledger_head")  → VsfType::hp(hash)           ledger chain head provenance
-
-Integrity section ("vault_root.integrity"):
-  VsfType::l("kernel_hash")  → VsfType::hb(hash)           kernel rolling hash (BLAKE3)
-  VsfType::l("kernel_sig")   → VsfType::ge(sig)            kernel Ed25519 signature
-  VsfType::l("eagle_time")   → EtType::ei(t)               physics-bounded timestamp
+RÅ<hp(entry_hash)>
+  [gen(u{generation})]               EWE, monotonic
+  [prev_hash(hp{hash})]              previous entry provenance
+                                     genesis: hp([0u8;32])
+  [hamt_root(h{hash} u{lba})]       HAMT root node (hash + physical location)
+  [plow(u{lba})]                     tract write head position
+  [ledger_head(hp{hash})]            ledger chain head provenance
+  [kernel_hash(hb{hash})]            kernel rolling hash (BLAKE3)
+  [kernel_sig(ge{sig})]              kernel Ed25519 signature
+  [eagle_time(ei{t})]                physics-bounded timestamp
 
 Remainder of 4KB block: zeroed (reserved for future fields)
 ```
+
+Cap table, process snapshots, and display state are vault objects
+reachable through the HAMT root — not separate spine fields.
 
 **EWE in the kernel:**
 
@@ -329,12 +332,6 @@ At 1 write per boot (typical):
   65536 boots per full rotation
   UFS: 3000 × 65536 = 196M boots — effectively unlimited
   SD: 500 × 65536 = 32M boots — effectively unlimited
-
-65536 entries vs 1024:
-  64× more wear leveling
-  256MB vs 4MB (negligible on 232GB UFS)
-  16 reads vs 10 reads for binary search (negligible at 4KB/read)
-  Clear win for durability
 ```
 
 ---
@@ -344,30 +341,31 @@ At 1 write per boot (typical):
 ```
 SEED.md:
   Seed verifies kernel → jumps
-  Kernel (bootloader stage) scans vault root ring
-  Vault root is the FIRST thing the bootloader reads
+  Kernel scans spine on boot
+  Spine is the FIRST thing the bootloader reads
 
 BOOT.md:
-  Stage 2 of kernel boot = vault root scan
+  Stage 2 of kernel boot = spine scan
   Genesis boot creates the initial ring
 
 HAMT.md:
-  Vault root entry.hamt_root → HAMT root node hash
+  Spine entry.hamt_root → HAMT root node (hash, lba)
   HAMT provides O(log32 N) object lookup
-  Vault root provides the HAMT root for each generation
-
-LEDGER.md:
-  Vault root entry.ledger_head → ledger chain head hash
-  Ledger chain is restored from this pointer on boot
+  Spine provides the HAMT root for each generation
 
 VAULT.md:
-  Vault root is the entry point into the vault
-  Everything in the vault is reachable from the vault root
-  HAMT root → objects → everything
+  Spine is the entry point into the vault
+  Spine entry holds HAMT root + plow position + ledger head
+  Tract is the physical storage, plow-managed
+  Everything in the vault is reachable from the spine
+
+LEDGER.md:
+  Spine entry.ledger_head → ledger chain head hash
+  Ledger chain is restored from this pointer on boot
 
 SECURITY_CHAIN.md:
-  Seed → kernel → vault root: the trust chain
-  Vault root entries contain kernel hash + signature
+  Seed → kernel → spine: the trust chain
+  Spine entries contain kernel hash + signature
   Each generation proves the kernel that wrote it was authentic
 ```
 
@@ -420,6 +418,3 @@ Theorem VaultRoot_ReproducibleVerification:
 ```
 
 ---
-
-*RING Zil — The ring is the index. Binary search finds the head. VSF is the format.*
-*Author: Nick Spiker*

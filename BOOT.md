@@ -33,12 +33,12 @@ Stage 1: Storage Init
   - UFS: set up UTRD list, send NOP OUT ping
   - Both storage backends online
   ↓
-Stage 2: Vault Root Scan
-  - Read vault root ring from UFS (primary)
-  - Find highest valid generation (BLAKE3 chain intact)
-  - If UFS ring corrupt → fall back to SD mirror
+Stage 2: Spine Scan
+  - Read spine (vault root ring) from UFS (primary)
+  - Binary search for highest valid generation (BLAKE3 verified)
+  - If UFS spine corrupt → fall back to SD mirror
   - If both corrupt → genesis boot (first boot ever)
-  - Extract: kernel state, capability table seed, HAMT root pointer
+  - Extract: HAMT root (hash, lba), plow position, ledger head
   ↓
 Stage 3: PAC Key Init
   - Generate per-boot session key via TRNG (ARM RNDR instruction)
@@ -83,14 +83,14 @@ Stage 8: Userspace Launch
 ## Genesis Boot (First Boot Ever)
 
 ```
-No vault root ring exists on either medium:
-  1. Format vault root ring on UFS (write ring header + generation 0)
+No spine exists on either medium:
+  1. Format spine on UFS (write ring header + generation 0)
   2. Mirror to SD card
   3. Generate root capability (BLAKE3 of TRNG seed)
-  4. Write genesis vault root entry:
+  4. Write genesis spine entry:
      - generation: 0
-     - state: empty capability table
      - HAMT root: nil
+     - plow: G#C0000 (tract start)
      - prev_hash: hp(BLAKE3, [0; 32])
   5. Derive initial kernel caps from root cap
   6. Continue to Stage 5 (USB init)
@@ -128,7 +128,7 @@ Hot reload (ferros-bridge reload):
   Copies to staging DRAM
   Jumps to new kernel entry point
   Stage 0-1 re-run (hardware re-init)
-  Stage 2 skipped (vault root not needed, state was live)
+  Stage 2 skipped (spine not needed, state was live)
   Stage 3-8 re-run
 
   Key difference: hot reload does NOT scan vault root
@@ -162,12 +162,12 @@ Total target: <500ms from seed jump to userspace running
 ## Failure Recovery
 
 ```
-Vault root ring corrupt on UFS:
+Spine corrupt on UFS:
   → Fall back to SD mirror
-  → If SD valid, restore from SD, repair UFS ring
+  → If SD valid, restore from SD, repair UFS spine
   → If SD also corrupt, genesis boot
 
-Vault root generation mismatch (UFS ≠ SD):
+Spine generation mismatch (UFS ≠ SD):
   → Use higher generation (more recent)
   → Repair the stale copy from the fresh one
 
@@ -193,13 +193,11 @@ Process snapshot corrupt:
 
 ```
 SEED.md:        Seed verifies kernel, jumps to Stage 0
-RING.md:  Ring format, generation numbering, entry layout
-VAULT.md:       HAMT storage for process snapshots, capability tree
+RING.md:        Ring format, generation numbering, spine/stem entries
+VAULT.md:       Persistent object store: tract, plow, HAMT, spine
 LEDGER.md:      Pre-boot buffer format, ledger server bootstrap
 KERNEL.md:      Running kernel responsibilities (post-boot)
 SECURITY_CHAIN.md: Trust model, key management, signature verification
 ```
 
 ---
-
-*Boot is not initialization. Boot is restoration — finding the most recent valid state and resuming from it. The only "first time" is genesis. Every other boot is a continuation.*
