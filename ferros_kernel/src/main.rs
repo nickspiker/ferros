@@ -655,53 +655,86 @@ fn parse_ramoops_config(dtb: &Dtb) -> Option<RamoopsConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// TractIO — BlockIO adapter for HAMT over UFS with bump-pointer plow
+// MirrorIO — BlockIO adapter: UFS + SD mirrored, write-verify both
 // ---------------------------------------------------------------------------
 
-/// Minimal plow: bump-pointer allocator into the tract region.
-/// Wraps UFS read/write into the BlockIO trait that HAMT expects.
-struct TractIO<'a> {
+use ferros_hal::hamt::BlockIO;
+
+/// Mirrored plow: writes to UFS and SD, verifies both, one source of truth.
+/// Reads from UFS primary, falls back to SD on failure.
+/// Both devices use the same block numbering (4KB blocks from TRACT_BASE).
+/// SD translates to 8×512-byte sectors per 4KB block.
+struct MirrorIO<'a> {
     ufs: &'a ferros_hal::ufs::UfsController,
+    sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
     plow: u32,
 }
 
-impl<'a> TractIO<'a> {
-    fn new(ufs: &'a ferros_hal::ufs::UfsController) -> Self {
-        TractIO {
+impl<'a> MirrorIO<'a> {
+    fn new(
+        ufs: &'a ferros_hal::ufs::UfsController,
+        sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
+    ) -> Self {
+        MirrorIO {
             ufs,
+            sdc,
             plow: ferros_layout::TRACT_BASE,
         }
     }
 
-    /// Write a block and return the LBA it was written to.
-    /// Uses write-verify protocol.
-    fn write_hamt_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
-        let lba = self.plow;
-        // Copy data into UFS buffer
+    /// Convert a 4KB block LBA to an SD sector address (8 sectors per block).
+    fn block_to_sector(lba: u32) -> u32 {
+        lba * 8
+    }
+
+    /// Write to UFS, verify. Returns false on failure.
+    fn ufs_write_verify(&self, lba: u32, data: &[u8; 4096]) -> bool {
         self.ufs.data_buffer_mut().copy_from_slice(data);
-        let ocs = self.ufs.write_block(lba);
-        if ocs != 0 { return None; }
-        // Verify: read back and compare
-        let ocs = self.ufs.read_block(lba);
-        if ocs != 0 { return None; }
-        let readback = self.ufs.data_buffer();
-        if readback[..] != data[..] { return None; }
-        self.plow += 1;
-        Some(lba)
+        if self.ufs.write_block(lba) != 0 { return false; }
+        if self.ufs.read_block(lba) != 0 { return false; }
+        self.ufs.data_buffer()[..] == data[..]
+    }
+
+    /// Write to SD, verify. Returns false on failure.
+    fn sd_write_verify(sdc: &mut ferros_hal::sdmmc::SdmmcController, lba: u32, data: &[u8; 4096]) -> bool {
+        let sector = Self::block_to_sector(lba);
+        if sdc.write_blocks(sector, data, 8).is_err() { return false; }
+        let mut readback = [0u8; 4096];
+        if sdc.read_blocks(sector, &mut readback, 8).is_err() { return false; }
+        readback == *data
     }
 }
 
-impl ferros_hal::hamt::BlockIO for TractIO<'_> {
+impl ferros_hal::hamt::BlockIO for MirrorIO<'_> {
     fn read_block(&self, lba: u32) -> Option<[u8; 4096]> {
+        // Primary: UFS
         let ocs = self.ufs.read_block(lba);
-        if ocs != 0 { return None; }
-        let mut blk = [0u8; 4096];
-        blk.copy_from_slice(self.ufs.data_buffer());
-        Some(blk)
+        if ocs == 0 {
+            let mut blk = [0u8; 4096];
+            blk.copy_from_slice(self.ufs.data_buffer());
+            return Some(blk);
+        }
+        // Fallback: SD
+        if let Some(ref sdc) = self.sdc {
+            let sector = MirrorIO::block_to_sector(lba);
+            let mut blk = [0u8; 4096];
+            if sdc.read_blocks(sector, &mut blk, 8).is_ok() {
+                return Some(blk);
+            }
+        }
+        None
     }
 
     fn write_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
-        self.write_hamt_block(data)
+        let lba = self.plow;
+        // Write + verify UFS
+        if !self.ufs_write_verify(lba, data) { return None; }
+        // Write + verify SD (if present)
+        if let Some(ref mut sdc) = self.sdc {
+            if !MirrorIO::sd_write_verify(sdc, lba, data) { return None; }
+        }
+        self.plow += 1;
+        Some(lba)
     }
 }
 
@@ -1046,6 +1079,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // ---- SDHCI (microSD) card probe ----
     log.puts("\n-- SDHCI SDC2 --\n");
+    let mut sdc = ferros_hal::sdmmc::SdmmcController::new(FP5_SDC2_BASE);
+    let mut sd_ready = false;
     {
         let tlmm = 0x0F10_0000usize;
 
@@ -1085,7 +1120,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         for _ in 0..200_000u32 { unsafe { core::arch::asm!("nop") }; }
 
         // 4. Now probe with pads configured
-        let mut sdc = ferros_hal::sdmmc::SdmmcController::new(FP5_SDC2_BASE);
         let probe = sdc.probe_card();
 
         log.puts("reset:  "); log.puts(if probe.reset_ok { "OK\n" } else { "FAIL\n" });
@@ -1340,6 +1374,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 }
             }
         }
+        sd_ready = probe.cmd7_ok && probe.bus4_ok;
     }
 
     // ---- UFS probe ----
@@ -1523,17 +1558,23 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
-    // ---- HAMT genesis test ----
+    // ---- HAMT mirror test (UFS + SD) ----
     log.screen = true;
     log.puts("\n-- HAMT --\n");
     {
         let ufs = ferros_hal::ufs::UfsController::resume();
         if ufs.link_is_up() {
-            let mut tio = TractIO::new(&ufs);
-            // Create empty root node
+            log.puts(if sd_ready { "UFS+SD\n" } else { "UFS only\n" });
+
+            let mut tio = if sd_ready {
+                MirrorIO::new(&ufs, Some(&mut sdc))
+            } else {
+                MirrorIO::new(&ufs, None)
+            };
+
             let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
             let root_hash = hamt_block_hash(&root_blk);
-            match tio.write_hamt_block(&root_blk) {
+            match tio.write_block(&root_blk) {
                 Some(root_lba) => {
                     let root = ferros_hal::hamt::BlockRef {
                         hash: root_hash,
@@ -1549,12 +1590,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     for &k in test_keys.iter() {
                         let mut prov = [0u8; 32];
                         prov[0] = k;
-                        let content = [k; 64]; // 64-byte payload
+                        let content = [k; 64];
                         if let Some(leaf_blk) =
                             ferros_hal::hamt::lone_leaf_to_block(&prov, &content)
                         {
                             let leaf_hash = hamt_block_hash(&leaf_blk);
-                            if let Some(leaf_lba) = tio.write_hamt_block(&leaf_blk) {
+                            if let Some(leaf_lba) = tio.write_block(&leaf_blk) {
                                 let leaf_ref = ferros_hal::hamt::BlockRef {
                                     hash: leaf_hash,
                                     lba: leaf_lba,
@@ -1573,7 +1614,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     None => {
                                         log.puts("  +G#");
                                         log.put_hex32(k as u32);
-                                        log.puts(" INSERT FAIL\n");
+                                        log.puts(" FAIL\n");
                                     }
                                 }
                             }
@@ -1595,11 +1636,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     log.puts("/");
                     log.put_hex32(test_keys.len() as u32);
 
-                    // Lookup a key that doesn't exist
                     let mut missing = [0u8; 32];
                     missing[0] = 0xFF;
-                    let miss = ferros_hal::hamt::lookup(&tio, &cur_root, &missing);
-                    if miss.is_none() {
+                    if ferros_hal::hamt::lookup(&tio, &cur_root, &missing).is_none() {
                         log.puts(" miss=OK");
                     } else {
                         log.puts(" miss=BAD");
