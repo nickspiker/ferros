@@ -37,7 +37,12 @@ pub fn gen_to_pos(generation: u64) -> u32 {
 pub struct RingEntry {
     pub generation: u64,
     pub prev_hash: [u8; 32],
-    pub resume_state: [u8; 32],
+    /// HAMT root block BLAKE3 hash (zero if no HAMT yet).
+    pub hamt_root_hash: [u8; 32],
+    /// HAMT root block LBA in the tract (0 if no HAMT yet).
+    pub hamt_root_lba: u32,
+    /// Plow position: next free block in the tract.
+    pub plow_position: u32,
     pub eagle_time: u64,
     pub hp_hash: [u8; 32],
 }
@@ -104,9 +109,19 @@ impl RingEntry {
         w.hash_p(&self.prev_hash);
         w.field_close();
 
-        // Field 3: resume_state (HAMT root pointer)
-        w.field_open("resume_state");
-        w.hash_p(&self.resume_state);
+        // Field 3: hamt_root_hash
+        w.field_open("hamt_root_hash");
+        w.hash_p(&self.hamt_root_hash);
+        w.field_close();
+
+        // Field 4: hamt_root_lba
+        w.field_open("hamt_root_lba");
+        w.uint(self.hamt_root_lba as u64);
+        w.field_close();
+
+        // Field 5: plow_position
+        w.field_open("plow_position");
+        w.uint(self.plow_position as u64);
         w.field_close();
 
         w.section_close();
@@ -163,7 +178,9 @@ impl RingEntry {
         // Parse fields: (d("name"):value)
         let mut generation: u64 = 0;
         let mut prev_hash = [0u8; 32];
-        let mut resume_state = [0u8; 32];
+        let mut hamt_root_hash = [0u8; 32];
+        let mut hamt_root_lba: u32 = 0;
+        let mut plow_position: u32 = 0;
 
         while r.peek_tag() == Some(b'(') {
             r.read_byte_raw(); // consume '('
@@ -176,9 +193,16 @@ impl RingEntry {
                     let h = r.hash_p()?;
                     prev_hash.copy_from_slice(h);
                 }
+                "hamt_root_hash" => {
+                    let h = r.hash_p()?;
+                    hamt_root_hash.copy_from_slice(h);
+                }
+                "hamt_root_lba" => { hamt_root_lba = r.uint()? as u32; }
+                "plow_position" => { plow_position = r.uint()? as u32; }
+                // Backwards compat: old entries had resume_state
                 "resume_state" => {
                     let h = r.hash_p()?;
-                    resume_state.copy_from_slice(h);
+                    hamt_root_hash.copy_from_slice(h);
                 }
                 _ => { r.skip_field(); } // unknown field — skip
             }
@@ -193,7 +217,9 @@ impl RingEntry {
         Some(Self {
             generation,
             prev_hash,
-            resume_state,
+            hamt_root_hash,
+            hamt_root_lba,
+            plow_position,
             eagle_time,
             hp_hash,
         })
@@ -204,18 +230,24 @@ impl RingEntry {
         Self {
             generation: 1,
             prev_hash: [0u8; 32],
-            resume_state: [0u8; 32],
+            hamt_root_hash: [0u8; 32],
+            hamt_root_lba: 0,
+            plow_position: ferros_layout::TRACT_BASE,
             eagle_time: read_qtimer(),
             hp_hash: [0u8; 32], // computed in to_block()
         }
     }
 
     /// Create next entry in the chain from this entry.
+    /// Caller should set hamt_root_hash, hamt_root_lba, plow_position
+    /// before writing.
     pub fn next(&self) -> Self {
         Self {
             generation: self.generation + 1,
             prev_hash: self.hp_hash,
-            resume_state: [0u8; 32], // caller fills this in
+            hamt_root_hash: self.hamt_root_hash,
+            hamt_root_lba: self.hamt_root_lba,
+            plow_position: self.plow_position,
             eagle_time: read_qtimer(),
             hp_hash: [0u8; 32], // computed in to_block()
         }

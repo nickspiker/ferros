@@ -94,6 +94,14 @@ pub const LEDGER_RING_SIZE: u32 = 1 << 18; // 262144 = 1GB
 /// First block of the tract. Everything before this is ring/reserved.
 pub const TRACT_BASE: u32 = 0xC_0000;
 
+/// Last block (exclusive) of the tract. UFS LUN0 = 60.8M blocks (G#3A10800),
+/// but we round down to a power-of-2 boundary for clean wrapping.
+/// G#3A0_0000 = 60,817,408 blocks ≈ 232GB usable tract.
+pub const TRACT_END: u32 = 0x3A0_0000;
+
+/// Number of blocks in the tract. Power of 2 not required — plow wraps with %.
+pub const TRACT_SIZE: u32 = TRACT_END - TRACT_BASE;
+
 // Backwards compatibility alias
 pub const HAMT_BASE: u32 = TRACT_BASE;
 

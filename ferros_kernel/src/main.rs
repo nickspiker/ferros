@@ -703,11 +703,18 @@ impl MirrorMode {
 /// Degrades gracefully — if one disk fails, continues on the other with a
 /// persistent warning. Mode never recovers at runtime (requires physical
 /// intervention + reflash).
+/// Bounded mirrored block I/O. Owns a slice of the disk — writes and reads
+/// outside `[region_base, region_end)` are rejected. Same principle as Rust
+/// slices: the handle IS the capability.
 struct MirrorIO<'a> {
     ufs: &'a ferros_hal::ufs::UfsController,
     sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
     plow: u32,
     mode: MirrorMode,
+    /// Owned region: first valid block (inclusive).
+    region_base: u32,
+    /// Owned region: last valid block (exclusive).
+    region_end: u32,
     /// Count of failed operations since degradation.
     fail_count: u32,
 }
@@ -723,8 +730,15 @@ impl<'a> MirrorIO<'a> {
             sdc,
             plow: ferros_layout::TRACT_BASE,
             mode,
+            region_base: ferros_layout::TRACT_BASE,
+            region_end: ferros_layout::TRACT_END,
             fail_count: 0,
         }
+    }
+
+    /// True if `lba` falls within this handle's owned region.
+    fn in_bounds(&self, lba: u32) -> bool {
+        lba >= self.region_base && lba < self.region_end
     }
 
     /// Convert a 4KB block LBA to an SD sector address (8 sectors per block).
@@ -790,6 +804,10 @@ impl<'a> MirrorIO<'a> {
 
 impl ferros_hal::hamt::BlockIO for MirrorIO<'_> {
     fn read_block(&self, lba: u32) -> Option<[u8; 4096]> {
+        // Bounds check — reject reads outside our owned region
+        if !self.in_bounds(lba) {
+            return None;
+        }
         match self.mode {
             MirrorMode::Both | MirrorMode::UfsOnly => {
                 // Primary: UFS
@@ -815,11 +833,14 @@ impl ferros_hal::hamt::BlockIO for MirrorIO<'_> {
     fn write_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
         let lba = self.plow;
 
-        match self.mode {
+        // Bounds check — plow must be within our owned region
+        if !self.in_bounds(lba) {
+            return None;
+        }
+
+        let result = match self.mode {
             MirrorMode::Both => {
-                // Write + verify UFS
                 let ufs_ok = self.ufs_write_verify(lba, data);
-                // Write + verify SD
                 let sd_ok = if let Some(ref mut sdc) = self.sdc {
                     MirrorIO::sd_write_verify(sdc, lba, data)
                 } else {
@@ -827,49 +848,45 @@ impl ferros_hal::hamt::BlockIO for MirrorIO<'_> {
                 };
 
                 match (ufs_ok, sd_ok) {
-                    (true, true) => {
-                        self.plow += 1;
-                        Some(lba)
-                    }
+                    (true, true) => Some(lba),
                     (true, false) => {
-                        // SD failed — degrade, but write succeeded on UFS
                         self.degrade_sd();
-                        self.plow += 1;
                         Some(lba)
                     }
                     (false, true) => {
-                        // UFS failed — degrade, but write succeeded on SD
                         self.degrade_ufs();
-                        self.plow += 1;
                         Some(lba)
                     }
-                    (false, false) => {
-                        // Both failed — cannot write anywhere
-                        None
-                    }
+                    (false, false) => None,
                 }
             }
             MirrorMode::UfsOnly => {
                 if self.ufs_write_verify(lba, data) {
-                    self.plow += 1;
                     Some(lba)
                 } else {
-                    None // UFS was our last disk and it failed
+                    None
                 }
             }
             MirrorMode::SdOnly => {
                 if let Some(ref mut sdc) = self.sdc {
                     if MirrorIO::sd_write_verify(sdc, lba, data) {
-                        self.plow += 1;
                         Some(lba)
                     } else {
-                        None // SD was our last disk and it failed
+                        None
                     }
                 } else {
                     None
                 }
             }
+        };
+
+        // Advance plow on success, wrapping at region boundary
+        if result.is_some() {
+            self.plow = self.region_base
+                + ((lba - self.region_base + 1) % (self.region_end - self.region_base));
         }
+
+        result
     }
 }
 
@@ -1625,54 +1642,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("\n");
     }
 
-    // ---- Vault Root Ring scan ----
-    log.puts("\n-- VAULT ROOT --\n");
+    // ---- Kernel Ring scan ----
+    log.puts("\n-- KERNEL RING --\n");
     {
         let ufs = ferros_hal::ufs::UfsController::new(0x1D8_4000);
         if ufs.link_is_up() {
             ufs.init_transfer_list();
-            let scan = ferros_hal::ring::scan_ring(&ufs);
-            log.puts("scan: gen="); log.put_hex32(scan.generation as u32);
-            log.puts(" pos="); log.put_hex32(scan.position);
-            log.puts(" reads="); log.put_hex32(scan.reads);
-            log.puts("\n");
-
-            if scan.generation == 0 {
-                // Genesis: write first entry
-                let entry = ferros_hal::ring::RingEntry::genesis();
-                log.puts("genesis ");
-                if ferros_hal::ring::write_entry(&ufs, &entry) {
-                    log.puts("OK gen=1\n");
-                } else {
-                    log.puts("FAIL\n");
-                }
-            } else {
-                // Found existing ring — write next generation
-                let entry = scan.entry.as_ref().unwrap().next();
-                log.puts("ring gen="); log.put_hex32(entry.generation as u32);
-                if ferros_hal::ring::write_entry(&ufs, &entry) {
-                    log.puts(" OK\n");
-                } else {
-                    log.puts(" FAIL\n");
-                }
-            }
-        } else {
-            log.puts("UFS link down\n");
-        }
-    }
-
-    // ---- Kernel Ring scan ----
-    log.puts("\n-- KERNEL RING --\n");
-    {
-        let ufs = ferros_hal::ufs::UfsController::resume();
-        if ufs.link_is_up() {
             let scan = ferros_hal::ring::scan_kernel_ring(&ufs);
             log.puts("kring: gen="); log.put_hex32(scan.generation as u32);
             log.puts(" pos="); log.put_hex32(scan.position);
             log.puts(" reads="); log.put_hex32(scan.reads);
             log.puts("\n");
             if scan.generation > 0 {
-                // Read full entry to show details
                 let lba = ferros_layout::KERNEL_RING_BASE + scan.position;
                 let ocs = ufs.read_block(lba);
                 if ocs == 0 {
@@ -1693,114 +1674,234 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
-    // ---- HAMT mirror test (UFS + SD) ----
+    // ---- Vault: spine scan → HAMT → spine commit ----
     log.screen = true;
-    log.puts("\n-- HAMT --\n");
+    log.puts("\n-- VAULT --\n");
     let mirror_mode;
     {
         let ufs = ferros_hal::ufs::UfsController::resume();
         if ufs.link_is_up() {
+            // 1. Scan spine for current state
+            let scan = ferros_hal::ring::scan_ring(&ufs);
+            let spine_entry = if scan.generation == 0 {
+                log.puts("spine: genesis\n");
+                ferros_hal::ring::RingEntry::genesis()
+            } else {
+                let e = scan.entry.as_ref().unwrap();
+                log.puts("spine: gen=");
+                log.put_hex32(e.generation as u32);
+                log.puts(" plow=G#");
+                log.put_hex32(e.plow_position);
+                log.puts(" root=G#");
+                log.put_hex32(e.hamt_root_lba);
+                log.puts("\n");
+                e.next()
+            };
+
+            // 2. Set up MirrorIO with plow resumed from spine
             let mut tio = if sd_ready {
                 MirrorIO::new(&ufs, Some(&mut sdc))
             } else {
                 MirrorIO::new(&ufs, None)
             };
+            // Resume plow from spine. Clamp to region bounds (old entries may have 0).
+            tio.plow = if tio.in_bounds(spine_entry.plow_position) {
+                spine_entry.plow_position
+            } else {
+                tio.region_base
+            };
             log.puts(tio.mode.label());
+            log.puts(" plow=G#");
+            log.put_hex32(tio.plow);
             log.puts("\n");
 
-            let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
-            let root_hash = hamt_block_hash(&root_blk);
-            match tio.write_block(&root_blk) {
-                Some(root_lba) => {
-                    let root = ferros_hal::hamt::BlockRef {
-                        hash: root_hash,
-                        lba: root_lba,
-                    };
-                    log.puts("root lba=G#");
-                    log.put_hex32(root_lba);
-                    log.puts("\n");
+            // 3. Resume or create HAMT root
+            let has_root = spine_entry.hamt_root_lba != 0
+                && spine_entry.hamt_root_hash != [0u8; 32];
 
-                    // Insert 4 test objects
-                    let mut cur_root = root;
-                    let test_keys: [u8; 4] = [0x42, 0x99, 0xDE, 0x07];
-                    for &k in test_keys.iter() {
-                        let mut prov = [0u8; 32];
-                        prov[0] = k;
-                        let content = [k; 64];
-                        if let Some(leaf_blk) =
-                            ferros_hal::hamt::lone_leaf_to_block(&prov, &content)
-                        {
-                            let leaf_hash = hamt_block_hash(&leaf_blk);
-                            if let Some(leaf_lba) = tio.write_block(&leaf_blk) {
-                                let leaf_ref = ferros_hal::hamt::BlockRef {
-                                    hash: leaf_hash,
-                                    lba: leaf_lba,
-                                };
-                                match ferros_hal::hamt::insert(
-                                    &mut tio, &cur_root, leaf_ref, &prov,
-                                ) {
-                                    Some(new_root) => {
-                                        cur_root = new_root;
+            let cur_root = if has_root {
+                let r = ferros_hal::hamt::BlockRef {
+                    hash: spine_entry.hamt_root_hash,
+                    lba: spine_entry.hamt_root_lba,
+                };
+                // Validate: read root block and verify BLAKE3
+                if let Some(blk) = tio.read_block(r.lba) {
+                    let computed = hamt_block_hash(&blk);
+                    if computed == r.hash {
+                        log.puts("hamt: resume root=G#");
+                        log.put_hex32(r.lba);
+                        log.puts("\n");
+                        Some(r)
+                    } else {
+                        log.puts("hamt: root corrupt, fresh genesis\n");
+                        None
+                    }
+                } else {
+                    log.puts("hamt: root unreadable, fresh genesis\n");
+                    None
+                }
+            } else {
+                let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
+                let root_hash = hamt_block_hash(&root_blk);
+                match tio.write_block(&root_blk) {
+                    Some(root_lba) => {
+                        log.puts("hamt: new root=G#");
+                        log.put_hex32(root_lba);
+                        log.puts("\n");
+                        Some(ferros_hal::hamt::BlockRef {
+                            hash: root_hash,
+                            lba: root_lba,
+                        })
+                    }
+                    None => {
+                        log.puts("hamt: root write FAIL\n");
+                        None
+                    }
+                }
+            };
+
+            // 4. Insert test objects (skip if no root)
+            if let Some(cur_root) = cur_root {
+                let mut live_root = cur_root;
+                let test_keys: [u8; 4] = [0x42, 0x99, 0xDE, 0x07];
+                let mut any_fail = false;
+                for &k in test_keys.iter() {
+                    let mut prov = [0u8; 32];
+                    prov[0] = k;
+                    // Only insert if not already present
+                    if ferros_hal::hamt::lookup(&tio, &live_root, &prov).is_some() {
+                        log.puts("  =G#");
+                        log.put_hex32(k as u32);
+                        log.puts("\n");
+                        continue;
+                    }
+                    let content = [k; 64];
+                    if let Some(leaf_blk) =
+                        ferros_hal::hamt::lone_leaf_to_block(&prov, &content)
+                    {
+                        let leaf_hash = hamt_block_hash(&leaf_blk);
+                        if let Some(leaf_lba) = tio.write_block(&leaf_blk) {
+                            let leaf_ref = ferros_hal::hamt::BlockRef {
+                                hash: leaf_hash,
+                                lba: leaf_lba,
+                            };
+                            match ferros_hal::hamt::insert(
+                                &mut tio, &live_root, leaf_ref, &prov,
+                            ) {
+                                Some(new_root) => {
+                                    live_root = new_root;
+                                    log.puts("  +G#");
+                                    log.put_hex32(k as u32);
+                                    log.puts(" root=G#");
+                                    log.put_hex32(new_root.lba);
+                                    log.puts("\n");
+                                }
+                                None => {
+                                    log.puts("  +G#");
+                                    log.put_hex32(k as u32);
+                                    log.puts(" FAIL\n");
+                                    any_fail = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If any insert failed, the resumed tree is corrupt.
+                // Discard it, create a fresh root, re-insert everything.
+                if any_fail {
+                    log.puts("hamt: corrupt tree, rebuild\n");
+                    let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
+                    let root_hash = hamt_block_hash(&root_blk);
+                    if let Some(root_lba) = tio.write_block(&root_blk) {
+                        live_root = ferros_hal::hamt::BlockRef {
+                            hash: root_hash,
+                            lba: root_lba,
+                        };
+                        for &k in test_keys.iter() {
+                            let mut prov = [0u8; 32];
+                            prov[0] = k;
+                            let content = [k; 64];
+                            if let Some(leaf_blk) =
+                                ferros_hal::hamt::lone_leaf_to_block(&prov, &content)
+                            {
+                                let leaf_hash = hamt_block_hash(&leaf_blk);
+                                if let Some(leaf_lba) = tio.write_block(&leaf_blk) {
+                                    let leaf_ref = ferros_hal::hamt::BlockRef {
+                                        hash: leaf_hash,
+                                        lba: leaf_lba,
+                                    };
+                                    if let Some(new_root) = ferros_hal::hamt::insert(
+                                        &mut tio, &live_root, leaf_ref, &prov,
+                                    ) {
+                                        live_root = new_root;
                                         log.puts("  +G#");
                                         log.put_hex32(k as u32);
                                         log.puts(" root=G#");
                                         log.put_hex32(new_root.lba);
                                         log.puts("\n");
                                     }
-                                    None => {
-                                        log.puts("  +G#");
-                                        log.put_hex32(k as u32);
-                                        log.puts(" FAIL\n");
-                                    }
                                 }
                             }
                         }
                     }
+                }
 
-                    // Lookup each key
-                    let mut found = 0u32;
-                    for &k in test_keys.iter() {
-                        let mut prov = [0u8; 32];
-                        prov[0] = k;
-                        if ferros_hal::hamt::lookup(&tio, &cur_root, &prov).is_some()
-                        {
-                            found += 1;
-                        }
-                    }
-                    log.puts("lookup ");
-                    log.put_hex32(found);
-                    log.puts("/");
-                    log.put_hex32(test_keys.len() as u32);
-
-                    let mut missing = [0u8; 32];
-                    missing[0] = 0xFF;
-                    if ferros_hal::hamt::lookup(&tio, &cur_root, &missing).is_none() {
-                        log.puts(" miss=OK");
-                    } else {
-                        log.puts(" miss=BAD");
-                    }
-
-                    log.puts(" plow=G#");
-                    log.put_hex32(tio.plow);
-                    log.puts("\n");
-
-                    // Report degradation if it happened during test
-                    if tio.mode != MirrorMode::Both {
-                        log.puts("DEGRADED: ");
-                        log.puts(tio.mode.label());
-                        log.puts(" fails=");
-                        log.put_hex32(tio.fail_count);
-                        log.puts("\n");
+                // 5. Verify lookups
+                let mut found = 0u32;
+                for &k in test_keys.iter() {
+                    let mut prov = [0u8; 32];
+                    prov[0] = k;
+                    if ferros_hal::hamt::lookup(&tio, &live_root, &prov).is_some() {
+                        found += 1;
                     }
                 }
-                None => {
-                    log.puts("root write FAIL\n");
+                log.puts("lookup ");
+                log.put_hex32(found);
+                log.puts("/");
+                log.put_hex32(test_keys.len() as u32);
+
+                let mut missing = [0u8; 32];
+                missing[0] = 0xFF;
+                if ferros_hal::hamt::lookup(&tio, &live_root, &missing).is_none() {
+                    log.puts(" miss=OK");
+                } else {
+                    log.puts(" miss=BAD");
+                }
+                log.puts("\n");
+
+                // 6. Commit spine entry with new HAMT root + plow position
+                let mut commit = spine_entry;
+                commit.hamt_root_hash = live_root.hash;
+                commit.hamt_root_lba = live_root.lba;
+                commit.plow_position = tio.plow;
+
+                if ferros_hal::ring::write_entry(&ufs, &commit) {
+                    log.puts("spine: gen=");
+                    log.put_hex32(commit.generation as u32);
+                    log.puts(" plow=G#");
+                    log.put_hex32(commit.plow_position);
+                    log.puts(" root=G#");
+                    log.put_hex32(commit.hamt_root_lba);
+                    log.puts(" OK\n");
+                } else {
+                    log.puts("spine: COMMIT FAIL\n");
                 }
             }
+
+            // Report degradation
+            if tio.mode != MirrorMode::Both {
+                log.puts("DEGRADED: ");
+                log.puts(tio.mode.label());
+                log.puts(" fails=");
+                log.put_hex32(tio.fail_count);
+                log.puts("\n");
+            }
+
             mirror_mode = tio.mode;
         } else {
             log.puts("UFS link down\n");
-            mirror_mode = MirrorMode::UfsOnly; // will show warning
+            mirror_mode = MirrorMode::UfsOnly;
         }
     }
 
