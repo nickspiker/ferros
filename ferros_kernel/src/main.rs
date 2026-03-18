@@ -660,14 +660,56 @@ fn parse_ramoops_config(dtb: &Dtb) -> Option<RamoopsConfig> {
 
 use ferros_hal::hamt::BlockIO;
 
+// ---------------------------------------------------------------------------
+// Mirror mode — tracks disk health, degrades instead of halting
+// ---------------------------------------------------------------------------
+
+/// Mirror health state. Degrades on verify failure, never recovers at runtime.
+/// Recovery requires physical intervention: replace disk, rebuild, reflash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorMode {
+    /// Both disks healthy. Normal operation.
+    Both,
+    /// SD failed or absent. UFS only. Data at risk — no redundancy.
+    UfsOnly,
+    /// UFS failed. SD only. Reads from SD, writes to SD. Data at risk.
+    SdOnly,
+}
+
+impl MirrorMode {
+    fn has_ufs(self) -> bool { matches!(self, MirrorMode::Both | MirrorMode::UfsOnly) }
+    fn has_sd(self) -> bool { matches!(self, MirrorMode::Both | MirrorMode::SdOnly) }
+
+    /// Status string for display.
+    fn label(self) -> &'static str {
+        match self {
+            MirrorMode::Both => "UFS+SD",
+            MirrorMode::UfsOnly => "UFS ONLY — SD FAILED",
+            MirrorMode::SdOnly => "SD ONLY — UFS FAILED",
+        }
+    }
+
+    /// Warning banner for persistent on-screen display. None if healthy.
+    fn warning(self) -> Option<&'static str> {
+        match self {
+            MirrorMode::Both => None,
+            MirrorMode::UfsOnly => Some("WARNING: SD MIRROR FAILED — DATA NOT REDUNDANT"),
+            MirrorMode::SdOnly => Some("WARNING: UFS PRIMARY FAILED — RUNNING FROM SD"),
+        }
+    }
+}
+
 /// Mirrored plow: writes to UFS and SD, verifies both, one source of truth.
-/// Reads from UFS primary, falls back to SD on failure.
-/// Both devices use the same block numbering (4KB blocks from TRACT_BASE).
-/// SD translates to 8×512-byte sectors per 4KB block.
+/// Degrades gracefully — if one disk fails, continues on the other with a
+/// persistent warning. Mode never recovers at runtime (requires physical
+/// intervention + reflash).
 struct MirrorIO<'a> {
     ufs: &'a ferros_hal::ufs::UfsController,
     sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
     plow: u32,
+    mode: MirrorMode,
+    /// Count of failed operations since degradation.
+    fail_count: u32,
 }
 
 impl<'a> MirrorIO<'a> {
@@ -675,10 +717,13 @@ impl<'a> MirrorIO<'a> {
         ufs: &'a ferros_hal::ufs::UfsController,
         sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
     ) -> Self {
+        let mode = if sdc.is_some() { MirrorMode::Both } else { MirrorMode::UfsOnly };
         MirrorIO {
             ufs,
             sdc,
             plow: ferros_layout::TRACT_BASE,
+            mode,
+            fail_count: 0,
         }
     }
 
@@ -695,6 +740,14 @@ impl<'a> MirrorIO<'a> {
         self.ufs.data_buffer()[..] == data[..]
     }
 
+    /// Read from UFS. Returns None on failure.
+    fn ufs_read(&self, lba: u32) -> Option<[u8; 4096]> {
+        if self.ufs.read_block(lba) != 0 { return None; }
+        let mut blk = [0u8; 4096];
+        blk.copy_from_slice(self.ufs.data_buffer());
+        Some(blk)
+    }
+
     /// Write to SD, verify. Returns false on failure.
     fn sd_write_verify(sdc: &mut ferros_hal::sdmmc::SdmmcController, lba: u32, data: &[u8; 4096]) -> bool {
         let sector = Self::block_to_sector(lba);
@@ -703,38 +756,120 @@ impl<'a> MirrorIO<'a> {
         if sdc.read_blocks(sector, &mut readback, 8).is_err() { return false; }
         readback == *data
     }
+
+    /// Read from SD. Returns None on failure.
+    fn sd_read(sdc: &ferros_hal::sdmmc::SdmmcController, lba: u32) -> Option<[u8; 4096]> {
+        let sector = Self::block_to_sector(lba);
+        let mut blk = [0u8; 4096];
+        if sdc.read_blocks(sector, &mut blk, 8).is_ok() {
+            Some(blk)
+        } else {
+            None
+        }
+    }
+
+    /// Degrade from Both to single-disk mode. Returns the new mode.
+    fn degrade_ufs(&mut self) {
+        if self.mode == MirrorMode::Both {
+            self.mode = MirrorMode::SdOnly;
+            self.fail_count = 1;
+        } else {
+            self.fail_count += 1;
+        }
+    }
+
+    fn degrade_sd(&mut self) {
+        if self.mode == MirrorMode::Both {
+            self.mode = MirrorMode::UfsOnly;
+            self.fail_count = 1;
+        } else {
+            self.fail_count += 1;
+        }
+    }
 }
 
 impl ferros_hal::hamt::BlockIO for MirrorIO<'_> {
     fn read_block(&self, lba: u32) -> Option<[u8; 4096]> {
-        // Primary: UFS
-        let ocs = self.ufs.read_block(lba);
-        if ocs == 0 {
-            let mut blk = [0u8; 4096];
-            blk.copy_from_slice(self.ufs.data_buffer());
-            return Some(blk);
-        }
-        // Fallback: SD
-        if let Some(ref sdc) = self.sdc {
-            let sector = MirrorIO::block_to_sector(lba);
-            let mut blk = [0u8; 4096];
-            if sdc.read_blocks(sector, &mut blk, 8).is_ok() {
-                return Some(blk);
+        match self.mode {
+            MirrorMode::Both | MirrorMode::UfsOnly => {
+                // Primary: UFS
+                if let Some(blk) = self.ufs_read(lba) {
+                    return Some(blk);
+                }
+                // Fallback: SD (if available)
+                if let Some(ref sdc) = self.sdc {
+                    return MirrorIO::sd_read(sdc, lba);
+                }
+                None
+            }
+            MirrorMode::SdOnly => {
+                if let Some(ref sdc) = self.sdc {
+                    MirrorIO::sd_read(sdc, lba)
+                } else {
+                    None
+                }
             }
         }
-        None
     }
 
     fn write_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
         let lba = self.plow;
-        // Write + verify UFS
-        if !self.ufs_write_verify(lba, data) { return None; }
-        // Write + verify SD (if present)
-        if let Some(ref mut sdc) = self.sdc {
-            if !MirrorIO::sd_write_verify(sdc, lba, data) { return None; }
+
+        match self.mode {
+            MirrorMode::Both => {
+                // Write + verify UFS
+                let ufs_ok = self.ufs_write_verify(lba, data);
+                // Write + verify SD
+                let sd_ok = if let Some(ref mut sdc) = self.sdc {
+                    MirrorIO::sd_write_verify(sdc, lba, data)
+                } else {
+                    false
+                };
+
+                match (ufs_ok, sd_ok) {
+                    (true, true) => {
+                        self.plow += 1;
+                        Some(lba)
+                    }
+                    (true, false) => {
+                        // SD failed — degrade, but write succeeded on UFS
+                        self.degrade_sd();
+                        self.plow += 1;
+                        Some(lba)
+                    }
+                    (false, true) => {
+                        // UFS failed — degrade, but write succeeded on SD
+                        self.degrade_ufs();
+                        self.plow += 1;
+                        Some(lba)
+                    }
+                    (false, false) => {
+                        // Both failed — cannot write anywhere
+                        None
+                    }
+                }
+            }
+            MirrorMode::UfsOnly => {
+                if self.ufs_write_verify(lba, data) {
+                    self.plow += 1;
+                    Some(lba)
+                } else {
+                    None // UFS was our last disk and it failed
+                }
+            }
+            MirrorMode::SdOnly => {
+                if let Some(ref mut sdc) = self.sdc {
+                    if MirrorIO::sd_write_verify(sdc, lba, data) {
+                        self.plow += 1;
+                        Some(lba)
+                    } else {
+                        None // SD was our last disk and it failed
+                    }
+                } else {
+                    None
+                }
+            }
         }
-        self.plow += 1;
-        Some(lba)
     }
 }
 
@@ -1561,16 +1696,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // ---- HAMT mirror test (UFS + SD) ----
     log.screen = true;
     log.puts("\n-- HAMT --\n");
+    let mirror_mode;
     {
         let ufs = ferros_hal::ufs::UfsController::resume();
         if ufs.link_is_up() {
-            log.puts(if sd_ready { "UFS+SD\n" } else { "UFS only\n" });
-
             let mut tio = if sd_ready {
                 MirrorIO::new(&ufs, Some(&mut sdc))
             } else {
                 MirrorIO::new(&ufs, None)
             };
+            log.puts(tio.mode.label());
+            log.puts("\n");
 
             let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
             let root_hash = hamt_block_hash(&root_blk);
@@ -1647,14 +1783,32 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     log.puts(" plow=G#");
                     log.put_hex32(tio.plow);
                     log.puts("\n");
+
+                    // Report degradation if it happened during test
+                    if tio.mode != MirrorMode::Both {
+                        log.puts("DEGRADED: ");
+                        log.puts(tio.mode.label());
+                        log.puts(" fails=");
+                        log.put_hex32(tio.fail_count);
+                        log.puts("\n");
+                    }
                 }
                 None => {
                     log.puts("root write FAIL\n");
                 }
             }
+            mirror_mode = tio.mode;
         } else {
             log.puts("UFS link down\n");
+            mirror_mode = MirrorMode::UfsOnly; // will show warning
         }
+    }
+
+    // Persistent degradation warning — stays on screen forever
+    if let Some(warning) = mirror_mode.warning() {
+        log.puts("\n");
+        log.puts(warning);
+        log.puts("\n");
     }
     log.screen = false;
 
@@ -2214,9 +2368,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                         if let Some(cmd) = ferros_pt::command::parse(payload) {
                                                             if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                                                 // DIAG Read: send boot log back via PT
-                                                                // Copy log into pt_out_data, then clear log
-                                                                // to prevent unbounded heap growth
                                                                 pt_out_data.clear();
+                                                                // Prepend degradation warning if applicable
+                                                                if let Some(w) = mirror_mode.warning() {
+                                                                    pt_out_data.extend_from_slice(w.as_bytes());
+                                                                    pt_out_data.extend_from_slice(b"\n\n");
+                                                                }
                                                                 pt_out_data.extend_from_slice(&log.buf);
                                                                 log.buf.clear();
                                                             } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read {
