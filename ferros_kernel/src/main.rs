@@ -654,6 +654,73 @@ fn parse_ramoops_config(dtb: &Dtb) -> Option<RamoopsConfig> {
     Some(RamoopsConfig { base, size, record_size, console_size, ftrace_size, pmsg_size })
 }
 
+// ---------------------------------------------------------------------------
+// TractIO — BlockIO adapter for HAMT over UFS with bump-pointer plow
+// ---------------------------------------------------------------------------
+
+/// Minimal plow: bump-pointer allocator into the tract region.
+/// Wraps UFS read/write into the BlockIO trait that HAMT expects.
+struct TractIO<'a> {
+    ufs: &'a ferros_hal::ufs::UfsController,
+    plow: u32,
+}
+
+impl<'a> TractIO<'a> {
+    fn new(ufs: &'a ferros_hal::ufs::UfsController) -> Self {
+        TractIO {
+            ufs,
+            plow: ferros_layout::TRACT_BASE,
+        }
+    }
+
+    /// Write a block and return the LBA it was written to.
+    /// Uses write-verify protocol.
+    fn write_hamt_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
+        let lba = self.plow;
+        // Copy data into UFS buffer
+        self.ufs.data_buffer_mut().copy_from_slice(data);
+        let ocs = self.ufs.write_block(lba);
+        if ocs != 0 { return None; }
+        // Verify: read back and compare
+        let ocs = self.ufs.read_block(lba);
+        if ocs != 0 { return None; }
+        let readback = self.ufs.data_buffer();
+        if readback[..] != data[..] { return None; }
+        self.plow += 1;
+        Some(lba)
+    }
+}
+
+impl ferros_hal::hamt::BlockIO for TractIO<'_> {
+    fn read_block(&self, lba: u32) -> Option<[u8; 4096]> {
+        let ocs = self.ufs.read_block(lba);
+        if ocs != 0 { return None; }
+        let mut blk = [0u8; 4096];
+        blk.copy_from_slice(self.ufs.data_buffer());
+        Some(blk)
+    }
+
+    fn write_block(&mut self, data: &[u8; 4096]) -> Option<u32> {
+        self.write_hamt_block(data)
+    }
+}
+
+/// Compute BLAKE3 hash of a serialized HAMT block (with hp field zeroed).
+fn hamt_block_hash(blk: &[u8; 4096]) -> [u8; 32] {
+    // Find hp position and zero it for hashing
+    let mut tmp = *blk;
+    // hp format: 'h' 'p' '3' 0x1F [32 bytes]
+    for i in 4..tmp.len().saturating_sub(36) {
+        if tmp[i] == b'h' && tmp[i + 1] == b'p'
+            && tmp[i + 2] == b'3' && tmp[i + 3] == 0x1F
+        {
+            tmp[i + 4..i + 36].fill(0);
+            break;
+        }
+    }
+    *blake3::hash(&tmp).as_bytes()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let exc_start = exception_count();
@@ -1455,6 +1522,102 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
         }
     }
+
+    // ---- HAMT genesis test ----
+    log.screen = true;
+    log.puts("\n-- HAMT --\n");
+    {
+        let ufs = ferros_hal::ufs::UfsController::resume();
+        if ufs.link_is_up() {
+            let mut tio = TractIO::new(&ufs);
+            // Create empty root node
+            let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
+            let root_hash = hamt_block_hash(&root_blk);
+            match tio.write_hamt_block(&root_blk) {
+                Some(root_lba) => {
+                    let root = ferros_hal::hamt::BlockRef {
+                        hash: root_hash,
+                        lba: root_lba,
+                    };
+                    log.puts("root lba=G#");
+                    log.put_hex32(root_lba);
+                    log.puts("\n");
+
+                    // Insert 4 test objects
+                    let mut cur_root = root;
+                    let test_keys: [u8; 4] = [0x42, 0x99, 0xDE, 0x07];
+                    for &k in test_keys.iter() {
+                        let mut prov = [0u8; 32];
+                        prov[0] = k;
+                        let content = [k; 64]; // 64-byte payload
+                        if let Some(leaf_blk) =
+                            ferros_hal::hamt::lone_leaf_to_block(&prov, &content)
+                        {
+                            let leaf_hash = hamt_block_hash(&leaf_blk);
+                            if let Some(leaf_lba) = tio.write_hamt_block(&leaf_blk) {
+                                let leaf_ref = ferros_hal::hamt::BlockRef {
+                                    hash: leaf_hash,
+                                    lba: leaf_lba,
+                                };
+                                match ferros_hal::hamt::insert(
+                                    &mut tio, &cur_root, leaf_ref, &prov,
+                                ) {
+                                    Some(new_root) => {
+                                        cur_root = new_root;
+                                        log.puts("  +G#");
+                                        log.put_hex32(k as u32);
+                                        log.puts(" root=G#");
+                                        log.put_hex32(new_root.lba);
+                                        log.puts("\n");
+                                    }
+                                    None => {
+                                        log.puts("  +G#");
+                                        log.put_hex32(k as u32);
+                                        log.puts(" INSERT FAIL\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Lookup each key
+                    let mut found = 0u32;
+                    for &k in test_keys.iter() {
+                        let mut prov = [0u8; 32];
+                        prov[0] = k;
+                        if ferros_hal::hamt::lookup(&tio, &cur_root, &prov).is_some()
+                        {
+                            found += 1;
+                        }
+                    }
+                    log.puts("lookup ");
+                    log.put_hex32(found);
+                    log.puts("/");
+                    log.put_hex32(test_keys.len() as u32);
+
+                    // Lookup a key that doesn't exist
+                    let mut missing = [0u8; 32];
+                    missing[0] = 0xFF;
+                    let miss = ferros_hal::hamt::lookup(&tio, &cur_root, &missing);
+                    if miss.is_none() {
+                        log.puts(" miss=OK");
+                    } else {
+                        log.puts(" miss=BAD");
+                    }
+
+                    log.puts(" plow=G#");
+                    log.put_hex32(tio.plow);
+                    log.puts("\n");
+                }
+                None => {
+                    log.puts("root write FAIL\n");
+                }
+            }
+        } else {
+            log.puts("UFS link down\n");
+        }
+    }
+    log.screen = false;
 
     // ---- SPMI full APID map dump (find ALL peripherals) ----
     log.buf_only("\n-- SPMI ALL APIDs --\n");
