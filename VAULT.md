@@ -412,18 +412,18 @@ Mirror recovery (one device failed):
 
 ---
 
-## Kill Safety
+## Killswitch Ready
 
 ```
-Power fails during object write (step 2-4):
+Power disappears during object write (step 2-4):
   Block partially written → BLAKE3 fails → discarded
   Plow unchanged → orphaned block trampled on next pass
 
-Power fails during HAMT update (step 7):
+Power disappears during HAMT update (step 7):
   Dirty HAMT nodes partially written → BLAKE3 fails
   Previous spine entry still valid → previous HAMT root intact
 
-Power fails during spine write (step 8):
+Power disappears during spine write (step 8):
   Partial spine entry → BLAKE3 fails → skipped by binary search
   Previous spine entry is current → previous state intact
 
@@ -546,7 +546,7 @@ Theorem Vault_CapabilityConfinement:
     objects in N do not exist from p's perspective
     not access denied — not addressable
 
-Theorem Vault_KillSafety:
+Theorem Vault_KillswitchReady:
   ∀ kill instant t:
     ∀ object o where o.committed_at < t:
       o recoverable via spine binary search ∧

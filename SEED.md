@@ -239,5 +239,3 @@ Future (locked bootloader):
 ```
 
 ---
-
-*The seed exists to answer one question: "Is this kernel what I think it is?" If yes, jump. If no, stop. That's the entire specification.*

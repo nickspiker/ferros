@@ -381,7 +381,7 @@ Theorem VaultRoot_FindNewest:
     O(log2 N) deterministic
     k=16 for N=65536: 16 reads, 64KB I/O
 
-Theorem VaultRoot_KillSafety:
+Theorem VaultRoot_KillswitchReady:
   ∀ kill instant t:
     at most one entry is partially written
     partial entry: VsfType::hp(BLAKE3) fails → entry invalid

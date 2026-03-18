@@ -1046,6 +1046,3 @@ In mathematics we trust.
 ```
 
 ---
-
-*ferros 0.0 — Built by engineers who believe sovereignty is a choice, not a privilege.*  
-*First published: 2025 — Author: Nick Spiker*

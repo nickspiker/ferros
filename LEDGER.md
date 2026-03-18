@@ -303,7 +303,7 @@ Userspace Ledger:
 
 ---
 
-## Kill Safety
+## Killswitch Ready
 
 ```
 Write path:
@@ -398,7 +398,7 @@ Theorem Ledger_WriterAuthenticity:
 
   Corollary: cannot forge entry for category without held cap
 
-Theorem Ledger_KillSafety:
+Theorem Ledger_KillswitchReady:
   ∀ kill instant t:
     ∀ entry e where e.committed_at < t:
       e recoverable from Ring FS ∧
