@@ -31,6 +31,11 @@
 // │     ::read_block(), write_block(), read_blocks(), write_blocks()
 // │   struct CsdInfo ::from_response(), max_freq_mhz()
 // │   impl Device for SdmmcController (byte-range read_at/write_at)
+// ├── pmic_glink.rs ── SMEM/GLINK transport to ADSP charger_pd
+// │   probe_smem() → SmemProbe, probe_rtc() → Option<u32>
+// │   struct PmicGlink — init(), open_channel(), bat_status(), property_get(), set_charge_limit()
+// │   struct BatStatus — voltage_mv, capacity_pct, rate_ma, source, temp_tenths_k
+// │   PROP_VOLT_NOW, PROP_CURR_NOW, PROP_CAPACITY, PROP_TEMP, PROP_CHG_CTRL
 // └── usb.rs ── DWC3 USB device controller (1879 lines)
 //     struct Dwc3Dev { evt_read_idx, ep0_state, bulk_out/in state }
 //       ::new() → init, CSFTRST, PHY, endpoint config, Run/Stop
@@ -419,31 +424,31 @@ _entry:
 
 .balign 0x800
 .Lvectors:
-    b       .Lexc_recover
+    b       .Lexc_recover          // EL1t sync
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // EL1t IRQ
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // EL1t FIQ
     .balign 0x80
-    b .Lhalt
+    b       .Lexc_serror           // EL1t SError
 
     .balign 0x80
-    b       .Lexc_recover
+    b       .Lexc_recover          // EL1h sync
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // EL1h IRQ
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // EL1h FIQ
     .balign 0x80
-    b .Lhalt
+    b       .Lexc_serror           // EL1h SError
 
     .balign 0x80
-    b       .Lexc_recover
+    b       .Lexc_recover          // Lower AArch64 sync
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // Lower AArch64 IRQ
     .balign 0x80
-    b .Lhalt
+    b .Lhalt                       // Lower AArch64 FIQ
     .balign 0x80
-    b .Lhalt
+    b       .Lexc_serror           // Lower AArch64 SError
 
     .balign 0x80
     b .Lhalt
@@ -455,6 +460,7 @@ _entry:
     b .Lhalt
 
 .balign 16
+// Synchronous abort: increment count, advance ELR past faulting instruction, eret.
 .Lexc_recover:
     stp     x0, x1, [sp, #-16]!
     adrp    x0, __exception_count
@@ -475,6 +481,18 @@ _entry:
     add     x0, x0, #4
     msr     elr_el2, x0
 .Lexc_ret:
+    ldp     x0, x1, [sp], #16
+    eret
+
+// SError (asynchronous): increment count, do NOT advance ELR (fault is async),
+// just eret — the exception entry consumed the pending SError.
+.Lexc_serror:
+    stp     x0, x1, [sp, #-16]!
+    adrp    x0, __exception_count
+    add     x0, x0, :lo12:__exception_count
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
     ldp     x0, x1, [sp], #16
     eret
 "#);
@@ -1406,6 +1424,38 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
+    // ---- Kernel Ring scan ----
+    log.puts("\n-- KERNEL RING --\n");
+    {
+        let ufs = ferros_hal::ufs::UfsController::resume();
+        if ufs.link_is_up() {
+            let scan = ferros_hal::ring::scan_kernel_ring(&ufs);
+            log.puts("kring: gen="); log.put_hex32(scan.generation as u32);
+            log.puts(" pos="); log.put_hex32(scan.position);
+            log.puts(" reads="); log.put_hex32(scan.reads);
+            log.puts("\n");
+            if scan.generation > 0 {
+                // Read full entry to show details
+                let lba = ferros_layout::KERNEL_RING_BASE + scan.position;
+                let ocs = ufs.read_block(lba);
+                if ocs == 0 {
+                    let data = ufs.data_buffer();
+                    let mut blk = [0u8; 4096];
+                    blk.copy_from_slice(&data[..4096]);
+                    if let Some(ke) = ferros_hal::ring::KernelRingEntry::from_block(&blk) {
+                        log.puts("  lba="); log.put_hex32(ke.kernel_lba);
+                        log.puts(" size="); log.put_hex32(ke.kernel_size);
+                        log.puts(" hash=");
+                        for i in 0..4 { log.put_hex32(ke.kernel_hash[i] as u32); }
+                        log.puts("...\n");
+                    }
+                }
+            } else {
+                log.puts("  (empty)\n");
+            }
+        }
+    }
+
     // ---- SPMI full APID map dump (find ALL peripherals) ----
     log.buf_only("\n-- SPMI ALL APIDs --\n");
     {
@@ -1441,6 +1491,255 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             } else {
                 log.buf_put_hex32(val); log.buf_only("\n");
             }
+        }
+    }
+
+    // ---- pmic-glink (ADSP charger service) probe ----
+    log.puts("\n-- pmic-glink --\n");
+    {
+        use ferros_hal::pmic_glink;
+
+        // SMEM state — read-only, safe even before GLINK handshake.
+        let smem = pmic_glink::probe_smem();
+        log.puts("SMEM init:     "); log.put_hex32(smem.initialized);    log.puts("\n");
+        log.puts("version[7]:    "); log.put_hex32(smem.version7);      log.puts("\n");
+        log.puts("ptable magic:  "); log.put_hex32(smem.ptable_magic);  log.puts("\n");
+        log.puts("ptable entries:"); log.put_hex32(smem.ptable_entries); log.puts("\n");
+        log.puts("adsp part off: "); log.put_hex32(smem.adsp_part_off); log.puts("\n");
+        log.puts("adsp part size:"); log.put_hex32(smem.adsp_part_size); log.puts("\n");
+        log.puts("part magic:    "); log.put_hex32(smem.part_magic);    log.puts("\n");
+        log.puts("part free unc: "); log.put_hex32(smem.part_free_off); log.puts("\n");
+        log.puts("part free cac: "); log.put_hex32(smem.part_free_cac); log.puts("\n");
+        log.puts("priv items:    desc="); log.put_hex32(smem.priv_desc_found as u32);
+        log.puts(" tx=");             log.put_hex32(smem.priv_tx_found as u32);
+        log.puts(" rx=");             log.put_hex32(smem.priv_rx_found as u32); log.puts("\n");
+        log.puts("desc alloc:    "); log.put_hex32(smem.desc_alloc);    log.puts(" (global heap)\n");
+        log.puts("tx tail/head:  "); log.put_hex32(smem.tx_tail);
+        log.puts(" / ");              log.put_hex32(smem.tx_head);      log.puts("\n");
+        log.puts("rx tail/head:  "); log.put_hex32(smem.rx_tail);
+        log.puts(" / ");              log.put_hex32(smem.rx_head);      log.puts("\n");
+
+        // Dump partition header + first two entry headers (each as u32 LE words).
+        // 32-byte partition header + 16-byte entry header × 2 = 64 bytes = 16 u32s
+        {
+            let mut buf = [0u8; 64];
+            let n = pmic_glink::dump_adsp_partition(0, &mut buf);
+            if n >= 32 {
+                log.buf_only("part u32s [0..40]:\n");
+                let words = n / 4;
+                for i in 0..words.min(16) {
+                    let off = i * 4;
+                    let w = (buf[off] as u32)
+                        | ((buf[off+1] as u32) << 8)
+                        | ((buf[off+2] as u32) << 16)
+                        | ((buf[off+3] as u32) << 24);
+                    log.buf_only("  ["); log.buf_put_hex32((off as u32));
+                    log.buf_only("] "); log.buf_put_hex32(w); log.buf_only("\n");
+                }
+            }
+        }
+
+        // GLINK handshake + BATTMGR query.
+        // init() will auto-allocate item 480 (APPS TX FIFO) if missing.
+        // We only need SMEM initialized + items 478/479 present (ADSP side).
+        let adsp_ready = smem.initialized == 1
+            && (smem.priv_desc_found || smem.desc_alloc == 1)
+            && (smem.priv_tx_found   || smem.tx_alloc   == 1);
+
+        // Dump all ptable entries to see if there's a non-ADSP partition we're missing.
+        {
+            let mut entries = [(0u16, 0u16, 0u32, 0u32); 16];
+            let n = pmic_glink::dump_ptable_entries(&mut entries);
+            log.puts("ptable hosts:  ");
+            for i in 0..n {
+                let (h0, h1, _, _) = entries[i];
+                log.buf_put_hex32(h0 as u32); log.buf_only(":"); log.buf_put_hex32(h1 as u32);
+                log.buf_only(" ");
+            }
+            log.puts("\n");
+        }
+        // Pre-init ADSP raw state — read BEFORE init() modifies anything.
+        // If th>0, ADSP already wrote a VERSION frame to item 479.
+        {
+            let (desc_a, th_a, rx_a, rx_b) = pmic_glink::probe_adsp_raw();
+            log.buf_only("adsp raw:      desc="); log.buf_put_hex32(desc_a);
+            log.buf_only(" th="); log.buf_put_hex32(th_a);
+            log.buf_only(" rx="); log.buf_put_hex32(rx_a);
+            log.buf_only(" rx[0..16]=[");
+            for b in &rx_b { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+            log.buf_only("]\n");
+        }
+        // Scan all items in APPS↔ADSP private partition.
+        {
+            let mut items = [(0u16, 0u32); 16];
+            let n = pmic_glink::scan_adsp_items(&mut items);
+            log.puts("adsp items:    ");
+            for i in 0..n {
+                let (id, sz) = items[i];
+                log.buf_put_hex32(id as u32); log.buf_only("(");
+                log.buf_put_hex32(sz); log.buf_only(") ");
+            }
+            log.puts("\n");
+        }
+        // Scan all items in APPS↔CDSP private partition (host 5).
+        {
+            let mut items = [(0u16, 0u32); 16];
+            let n = pmic_glink::scan_cdsp_items(&mut items);
+            log.puts("cdsp items:    ");
+            for i in 0..n {
+                let (id, sz) = items[i];
+                log.buf_put_hex32(id as u32); log.buf_only("(");
+                log.buf_put_hex32(sz); log.buf_only(") ");
+            }
+            log.puts("\n");
+        }
+
+        if adsp_ready {
+            match pmic_glink::PmicGlink::init() {
+                None => log.puts("glink init:    FAIL (alloc/items)\n"),
+                Some(mut glink) => {
+                    log.puts("glink init:    OK\n");
+                    {
+                        let (desc, tx, rx) = glink.addresses();
+                        log.buf_only("  desc="); log.buf_put_hex32(desc as u32);
+                        log.buf_only(" tx=");   log.buf_put_hex32(tx as u32);
+                        log.buf_only(" rx=");   log.buf_put_hex32(rx as u32);
+                        log.buf_only("\n");
+                        let (tt, th, rt, rh) = glink.desc_snapshot();
+                        log.buf_only("  desc: tt="); log.buf_put_hex32(tt);
+                        log.buf_only(" th="); log.buf_put_hex32(th);
+                        log.buf_only(" rt="); log.buf_put_hex32(rt);
+                        log.buf_only(" rh="); log.buf_put_hex32(rh);
+                        log.buf_only("\n");
+                        // Dump first 32 bytes of tx_fifo (item 479) — ADSP may have written VERSION here
+                        let mut fv = [0u8; 32];
+                        glink.dump_tx(&mut fv);
+                        log.buf_only("  tx[0..32]: ");
+                        for b in &fv { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+                        log.buf_only("\n");
+                        // Dump first 32 bytes of rx_fifo (item 480, just allocated)
+                        glink.dump_rx(&mut fv);
+                        log.buf_only("  rx[0..32]: ");
+                        for b in &fv { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+                        log.buf_only("\n");
+                    }
+                    if glink.open_channel() {
+                        log.puts("channel:       open (rcid=");
+                        log.put_hex32(glink.rcid() as u32);
+                        log.puts(")\n");
+
+                        // Full battery snapshot.
+                        match glink.bat_status() {
+                            None => log.puts("bat status:    timeout\n"),
+                            Some(bst) => {
+                                log.puts("voltage:       "); log.put_hex32(bst.voltage_mv);  log.puts(" mV\n");
+                                log.puts("capacity:      "); log.put_hex32(bst.capacity_pct); log.puts("%\n");
+                                log.puts("rate:          "); log.put_hex32(bst.rate_ma);     log.puts(" mA\n");
+                                log.puts("source:        "); log.put_hex32(bst.source);      log.puts("\n");
+                                let tc = bst.temp_tenths_c();
+                                log.puts("temperature:   ");
+                                if tc < 0 {
+                                    log.puts("-");
+                                    log.put_hex32((-tc) as u32);
+                                } else {
+                                    log.put_hex32(tc as u32);
+                                }
+                                log.puts(" (tenths C)\n");
+                                log.puts("charging:      ");
+                                log.puts(if bst.is_charging() { "yes\n" } else { "no\n" });
+                            }
+                        }
+
+                        // Individual properties for cross-check.
+                        if let Some(v) = glink.property_get(pmic_glink::PROP_VOLT_NOW) {
+                            log.puts("volt_now:      "); log.put_hex32(v); log.puts(" uV\n");
+                        }
+                        if let Some(v) = glink.property_get(pmic_glink::PROP_CURR_NOW) {
+                            log.puts("curr_now:      "); log.put_hex32(v); log.puts(" uA\n");
+                        }
+                    } else {
+                        log.puts("channel:       OPEN timeout\n");
+                        // Dump post-timeout state to diagnose which FIFO ADSP used
+                        let (tt, th, rt, rh) = glink.desc_snapshot();
+                        log.buf_only("  post-to desc: tt="); log.buf_put_hex32(tt);
+                        log.buf_only(" th="); log.buf_put_hex32(th);
+                        log.buf_only(" rt="); log.buf_put_hex32(rt);
+                        log.buf_only(" rh="); log.buf_put_hex32(rh);
+                        log.buf_only("\n");
+                        let mut fv = [0u8; 32];
+                        glink.dump_tx(&mut fv);
+                        log.buf_only("  post-to tx[0..32]: ");
+                        for b in &fv { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+                        log.buf_only("\n");
+                        glink.dump_rx(&mut fv);
+                        log.buf_only("  post-to rx[0..32]: ");
+                        for b in &fv { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+                        log.buf_only("\n");
+                        // Dump all IPCC registers (incl. tentative per-source banks).
+                        {
+                            let mut ipcc = [(0u32, 0u32); 32];
+                            let n = pmic_glink::PmicGlink::dump_ipcc(&mut ipcc);
+                            log.buf_only("  IPCC regs: ");
+                            for i in 0..n {
+                                let (off, val) = ipcc[i];
+                                if val != 0 {
+                                    log.buf_only("["); log.buf_put_hex32(off);
+                                    log.buf_only("]="); log.buf_put_hex32(val);
+                                    log.buf_only(" ");
+                                }
+                            }
+                            log.buf_only("(nz only)\n");
+                        }
+                    }
+                }
+            }
+        } else {
+            log.puts("glink:         SKIP (ADSP not ready)\n");
+        }
+
+        // SID 8 SPMI probe — PM7250B BMS/charger peripherals on FP5.
+        // Reads PERPH_TYPE (0x40), PERPH_SUBTYPE (0x41), INT_LATCHED_STS (0x08).
+        {
+            let mut sid8 = [(0u8, 0u8, 0u8, 0u8); 16];
+            let n = pmic_glink::probe_sid8_spmi(&mut sid8);
+            log.puts("sid8 perph:    ");
+            for i in 0..n {
+                let (pid, ptype, psub, s0) = sid8[i];
+                log.buf_put_hex32(pid as u32); log.buf_only(":");
+                log.buf_put_hex32(ptype as u32); log.buf_only("/");
+                log.buf_put_hex32(psub as u32);
+                if s0 != 0xFF { log.buf_only("="); log.buf_put_hex32(s0 as u32); }
+                log.buf_only(" ");
+            }
+            if n == 0 { log.buf_only("none"); }
+            log.puts("\n");
+        }
+        // Deep register dumps from key SID 8 PIDs.
+        // C8 = type 0x51/0x3F (FG or charger main — target for SOC/voltage)
+        // CB = type 0x0B/0x01 (BAT_IF — offset 7 = 0x21 = 33, possible SOC%)
+        // CA = type 0x0A/0x01 (VADC/ADC — target for voltage/temp measurements)
+        // Read 32 bytes at 0x00 and 16 bytes at 0x10 for each.
+        for pid_u8 in [0xC8u8, 0xCBu8, 0xCAu8] {
+            let mut regs = [0xFFu8; 32];
+            let n = pmic_glink::read_sid8_regs(pid_u8, 0x00, &mut regs);
+            log.buf_only("  C"); log.buf_put_hex32(pid_u8 as u32 & 0xF);
+            log.buf_only("[00]: ");
+            for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
+            log.buf_only("\n");
+            // Also read 0x10-0x1F region (STATUS/control/data on many charger peripherals).
+            let mut regs2 = [0xFFu8; 16];
+            let n2 = pmic_glink::read_sid8_regs(pid_u8, 0x10, &mut regs2);
+            log.buf_only("  C"); log.buf_put_hex32(pid_u8 as u32 & 0xF);
+            log.buf_only("[10]: ");
+            for i in 0..n2 { log.buf_put_hex32(regs2[i] as u32); log.buf_only(" "); }
+            log.buf_only("\n");
+        }
+
+        // RTC — direct SPMI probe, independent of GLINK.
+        log.puts("RTC probe:     ");
+        match pmic_glink::probe_rtc() {
+            Some(t) => { log.put_hex32(t); log.puts(" (Unix seconds)\n"); }
+            None    => log.puts("DENIED (SPMI arbiter)\n"),
         }
     }
 
@@ -1555,6 +1854,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
                 let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
                 let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
+                let cap_beam = ferros_pt::command::dev_cap(ferros_pt::command::caps::BEAM);
                 // Staging area for hot-reload kernel image
                 const RELOAD_STAGE: usize = 0xA000_0000;
                 let mut reload_size: usize = 0;
@@ -1770,14 +2070,72 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                 pt_out_data.clear();
                                                                 pt_out_data.extend_from_slice(&(reload_size as u32).to_le_bytes());
                                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
-                                                                // RELOAD Exec: jump to staged kernel
+                                                                // RELOAD Exec: persist to UFS, update kernel ring, jump
                                                                 log.buf_only("RELOAD exec size=");
                                                                 log.buf_put_hex32(reload_size as u32);
                                                                 log.buf_only("\n");
                                                                 if reload_size > 0x1000 {
-                                                                    // Validate: check for ARM64 magic or MZ header
                                                                     let magic = unsafe { *(RELOAD_STAGE as *const u32) };
                                                                     if magic == 0x91005A4D { // MZ header
+                                                                        // Persist kernel to UFS + update kernel ring
+                                                                        let ufs = ferros_hal::ufs::UfsController::resume();
+                                                                        if ufs.link_is_up() {
+                                                                            let kernel_slice = unsafe {
+                                                                                core::slice::from_raw_parts(
+                                                                                    RELOAD_STAGE as *const u8,
+                                                                                    reload_size,
+                                                                                )
+                                                                            };
+
+                                                                            // Write kernel binary to HAMT region
+                                                                            let kernel_lba = ferros_layout::HAMT_BASE;
+                                                                            let blocks = (reload_size + 4095) / 4096;
+                                                                            let mut write_ok = true;
+                                                                            for i in 0..blocks {
+                                                                                let buf = ufs.data_buffer_mut();
+                                                                                let offset = i * 4096;
+                                                                                let copy_len = core::cmp::min(4096, reload_size - offset);
+                                                                                buf[..copy_len].copy_from_slice(&kernel_slice[offset..offset + copy_len]);
+                                                                                // Zero padding
+                                                                                for b in copy_len..4096 { buf[b] = 0; }
+                                                                                if ufs.write_block(kernel_lba + i as u32) != 0 {
+                                                                                    write_ok = false;
+                                                                                    break;
+                                                                                }
+                                                                            }
+
+                                                                            if write_ok {
+                                                                                // Compute BLAKE3 of kernel
+                                                                                let kernel_hash = blake3::hash(kernel_slice);
+
+                                                                                // Scan kernel ring for current generation
+                                                                                let scan = ferros_hal::ring::scan_kernel_ring(&ufs);
+                                                                                let new_gen = scan.generation + 1;
+
+                                                                                let entry = ferros_hal::ring::KernelRingEntry {
+                                                                                    generation: new_gen,
+                                                                                    kernel_lba,
+                                                                                    kernel_size: reload_size as u32,
+                                                                                    kernel_hash: *kernel_hash.as_bytes(),
+                                                                                    kernel_sig: [0u8; 64], // unsigned dev build
+                                                                                    eagle_time: ferros_hal::vsf_mini::read_qtimer(),
+                                                                                    hp_hash: [0u8; 32], // computed in to_block()
+                                                                                };
+
+                                                                                if ferros_hal::ring::write_kernel_entry(&ufs, &entry) {
+                                                                                    log.buf_only("KRING gen=");
+                                                                                    log.buf_put_hex32(new_gen as u32);
+                                                                                    log.buf_only(" lba=");
+                                                                                    log.buf_put_hex32(kernel_lba);
+                                                                                    log.buf_only(" OK\n");
+                                                                                } else {
+                                                                                    log.buf_only("KRING WRITE FAIL\n");
+                                                                                }
+                                                                            } else {
+                                                                                log.buf_only("KERNEL UFS WRITE FAIL\n");
+                                                                            }
+                                                                        }
+
                                                                         hot_reload(RELOAD_STAGE, dtb_addr);
                                                                     }
                                                                 }
@@ -1792,6 +2150,86 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                     psci_reboot_fastboot();
                                                                 } else {
                                                                     psci_reboot();
+                                                                }
+                                                            } else if cmd.cap == cap_beam && cmd.op == ferros_pt::Op::Read {
+                                                                // BEAM Read: read ring entries
+                                                                // Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
+                                                                if cmd.params.len() >= 10 {
+                                                                    let ring_id = cmd.params[0];
+                                                                    let mode = cmd.params[1];
+                                                                    let offset = u32::from_be_bytes([
+                                                                        cmd.params[2], cmd.params[3],
+                                                                        cmd.params[4], cmd.params[5],
+                                                                    ]);
+                                                                    let count = u32::from_be_bytes([
+                                                                        cmd.params[6], cmd.params[7],
+                                                                        cmd.params[8], cmd.params[9],
+                                                                    ]).max(1).min(256); // clamp 1..256
+
+                                                                    let ufs = ferros_hal::ufs::UfsController::resume();
+                                                                    if ufs.link_is_up() {
+                                                                        // Determine ring base, size, and resolve latest
+                                                                        let (base, ring_size) = match ring_id {
+                                                                            0 => (ferros_layout::KERNEL_RING_BASE, ferros_layout::KERNEL_RING_SIZE),
+                                                                            1 => (ferros_layout::VAULT_ROOT_RING_BASE, ferros_layout::VAULT_ROOT_RING_SIZE),
+                                                                            2 => (ferros_layout::LEDGER_RING_BASE, ferros_layout::LEDGER_RING_SIZE),
+                                                                            3 => (ferros_layout::STATE_RING_BASE, ferros_layout::STATE_RING_SIZE),
+                                                                            _ => (0, 0),
+                                                                        };
+
+                                                                        if ring_size > 0 {
+                                                                            // Find latest generation via scan
+                                                                            let scan = match ring_id {
+                                                                                0 => ferros_hal::ring::scan_kernel_ring(&ufs),
+                                                                                _ => ferros_hal::ring::scan_ring(&ufs),
+                                                                            };
+
+                                                                            let start_pos = match mode {
+                                                                                0 => {
+                                                                                    // Latest minus offset
+                                                                                    if scan.generation == 0 { 0 }
+                                                                                    else {
+                                                                                        let target_gen = scan.generation.saturating_sub(offset as u64);
+                                                                                        if target_gen == 0 { 0 }
+                                                                                        else { ((target_gen - 1) % ring_size as u64) as u32 }
+                                                                                    }
+                                                                                }
+                                                                                1 => {
+                                                                                    // Absolute generation
+                                                                                    if offset == 0 { 0 }
+                                                                                    else { ((offset as u64 - 1) % ring_size as u64) as u32 }
+                                                                                }
+                                                                                _ => 0,
+                                                                            };
+
+                                                                            // Read blocks into response
+                                                                            pt_out_data.clear();
+                                                                            for i in 0..count {
+                                                                                let pos = (start_pos + ring_size - i) % ring_size;
+                                                                                let lba = base + pos;
+                                                                                let ocs = ufs.read_block(lba);
+                                                                                if ocs == 0 {
+                                                                                    let data = ufs.data_buffer();
+                                                                                    pt_out_data.extend_from_slice(&data[..4096]);
+                                                                                } else {
+                                                                                    // Pad with zeros for failed reads
+                                                                                    pt_out_data.resize(pt_out_data.len() + 4096, 0);
+                                                                                }
+                                                                            }
+
+                                                                            log.buf_only("BEAM ring=");
+                                                                            log.buf_put_hex32(ring_id as u32);
+                                                                            log.buf_only(" gen=");
+                                                                            log.buf_put_hex32(scan.generation as u32);
+                                                                            log.buf_only(" pos=");
+                                                                            log.buf_put_hex32(start_pos);
+                                                                            log.buf_only(" n=");
+                                                                            log.buf_put_hex32(count);
+                                                                            log.buf_only(" bytes=");
+                                                                            log.buf_put_hex32(pt_out_data.len() as u32);
+                                                                            log.buf_only("\n");
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                             // Start outbound PT if we have response data
@@ -1936,9 +2374,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     pt_complete_len = 0;
                                     pt_inbound = None;
                                 } else if pt_out_spec_len > 0 {
-                                    // Outbound SPEC
-                                    usb.bulk_in_send(&pt_out_spec_pending[..pt_out_spec_len]);
-                                    pt_out_spec_len = 0;
+                                    // Outbound SPEC — only clear if send succeeds
+                                    if usb.bulk_in_send(&pt_out_spec_pending[..pt_out_spec_len]) {
+                                        pt_out_spec_len = 0;
+                                    }
+                                    // else: keep pt_out_spec_len set, idle pump retries
                                 }
                                 // Outbound DATA is handled by the main loop idle check
                                 ledger.post(&Event::UsbBulkTxComplete);
@@ -1952,9 +2392,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
                     // (periodic re-arm removed — interferes with active transfers)
 
-                    // Outbound DATA pump — poll bulk_in_idle directly.
+                    // Outbound pump — SPEC first (retry if E3 send failed), then DATA.
                     if usb.bulk_in_idle {
-                        if let Some(ref mut out) = pt_outbound {
+                        if pt_out_spec_len > 0 {
+                            // SPEC retry — E3 handler may have failed due to dirty endpoint
+                            if usb.bulk_in_send(&pt_out_spec_pending[..pt_out_spec_len]) {
+                                pt_out_spec_len = 0;
+                            }
+                        } else if let Some(ref mut out) = pt_outbound {
                             if !out.all_sent() {
                                 let mut pkt = [0u8; 512];
                                 let pkt_len = out.next_data_packet(&pt_out_data, &mut pkt);

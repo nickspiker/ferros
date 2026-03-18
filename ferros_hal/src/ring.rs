@@ -10,12 +10,19 @@
 
 use crate::ufs::UfsController;
 use crate::vsf_mini::{VsfWriter, VsfReader, read_qtimer};
+use ferros_layout::{
+    VAULT_ROOT_RING_BASE, VAULT_ROOT_RING_SIZE,
+    KERNEL_RING_BASE, KERNEL_RING_SIZE, KERNEL_RING_DEPTH,
+    BLOCK_SIZE,
+};
 
 /// Ring size: 65536 entries × 4KB = 256MB total.
-pub const RING_SIZE: u32 = 1 << 16;
+/// (Legacy alias — use ferros_layout::VAULT_ROOT_RING_SIZE for new code)
+pub const RING_SIZE: u32 = VAULT_ROOT_RING_SIZE;
 
 /// Base block for the ring on UFS LUN 0 (4KB blocks).
-pub const RING_BASE_BLOCK: u32 = 0x2000;
+/// (Legacy alias — use ferros_layout::VAULT_ROOT_RING_BASE for new code)
+pub const RING_BASE_BLOCK: u32 = VAULT_ROOT_RING_BASE;
 
 /// Convert generation number to ring position.
 /// Generation 1 → position 0, generation 2 → position 1, etc.
@@ -325,4 +332,246 @@ fn read_entry(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> Option<
 
     let data = ufs.data_buffer();
     RingEntry::from_block(data)
+}
+
+// ===========================================================================
+// Kernel Ring — 256 entries, scanned by the seed to find the current kernel
+// ===========================================================================
+
+/// Kernel ring entry — points the seed to the current kernel binary.
+#[derive(Clone)]
+pub struct KernelRingEntry {
+    pub generation: u64,
+    pub kernel_lba: u32,
+    pub kernel_size: u32,
+    pub kernel_hash: [u8; 32],
+    pub kernel_sig: [u8; 64],
+    pub eagle_time: u64,
+    pub hp_hash: [u8; 32],
+}
+
+impl KernelRingEntry {
+    /// Serialize to a 4KB VSF document.
+    pub fn to_block(&self) -> [u8; BLOCK_SIZE] {
+        let mut blk = [0u8; BLOCK_SIZE];
+        let mut w = VsfWriter::new(&mut blk);
+
+        // VSF header
+        w.magic();
+        w.version(7);
+        w.backward_version(7);
+
+        let header_len_pos = w.pos();
+        w.header_length(0); // placeholder
+        let header_body_start = w.pos();
+
+        w.eagle_time_qtimer(self.eagle_time);
+
+        let hp_pos = match w.hash_p_placeholder() {
+            Some(pos) => pos,
+            None => return blk,
+        };
+
+        w.field_count(1); // one section
+        w.close();
+
+        let header_body_end = w.pos();
+
+        // Body: anonymous section with kernel fields
+        w.section_open_anonymous();
+
+        w.field_open("generation");
+        w.uint(self.generation);
+        w.field_close();
+
+        w.field_open("kernel_lba");
+        w.uint(self.kernel_lba as u64);
+        w.field_close();
+
+        w.field_open("kernel_size");
+        w.uint(self.kernel_size as u64);
+        w.field_close();
+
+        w.field_open("kernel_hash");
+        w.hash_p(&self.kernel_hash);
+        w.field_close();
+
+        // Ed25519 signature: ge(64 bytes)
+        w.field_open("kernel_sig");
+        w.signature(&self.kernel_sig);
+        w.field_close();
+
+        w.section_close();
+
+        // Patch header_length
+        let header_body_len = header_body_end - header_body_start - 1;
+        drop(w);
+        if header_body_len <= 255 {
+            blk[header_len_pos + 2] = header_body_len as u8;
+        }
+
+        // Compute provenance hash
+        let doc_hash = blake3::hash(&blk);
+        blk[hp_pos..hp_pos + 32].copy_from_slice(doc_hash.as_bytes());
+
+        blk
+    }
+
+    /// Deserialize from a 4KB block. Returns None if not valid.
+    pub fn from_block(blk: &[u8]) -> Option<Self> {
+        if blk.len() < BLOCK_SIZE { return None; }
+
+        let mut r = VsfReader::new(blk);
+
+        if !r.magic() { return None; }
+        let _ver = r.version()?;
+        let _bver = r.backward_version()?;
+        let _hlen = r.header_length()?;
+        let eagle_time = r.eagle_time_qtimer()?;
+
+        let hp_pos = r.pos;
+        let hp_hash_ref = r.hash_p()?;
+        let mut hp_hash = [0u8; 32];
+        hp_hash.copy_from_slice(hp_hash_ref);
+
+        let _count = r.field_count()?;
+        if !r.close() { return None; }
+
+        // Verify provenance hash
+        let mut temp = [0u8; BLOCK_SIZE];
+        temp.copy_from_slice(&blk[..BLOCK_SIZE]);
+        for i in 0..32 { temp[hp_pos + 4 + i] = 0; }
+        let computed = blake3::hash(&temp);
+        if computed.as_bytes() != &hp_hash {
+            return None;
+        }
+
+        // Parse body
+        if r.read_byte_raw()? != b'[' { return None; }
+
+        let mut entry = KernelRingEntry {
+            generation: 0,
+            kernel_lba: 0,
+            kernel_size: 0,
+            kernel_hash: [0u8; 32],
+            kernel_sig: [0u8; 64],
+            eagle_time,
+            hp_hash,
+        };
+
+        while r.peek_tag() == Some(b'(') {
+            r.read_byte_raw();
+            let fname = r.dict_key_str()?;
+            if r.read_byte_raw()? != b':' { return None; }
+
+            match fname {
+                "generation" => { entry.generation = r.uint()?; }
+                "kernel_lba" => { entry.kernel_lba = r.uint()? as u32; }
+                "kernel_size" => { entry.kernel_size = r.uint()? as u32; }
+                "kernel_hash" => {
+                    let h = r.hash_p()?;
+                    entry.kernel_hash.copy_from_slice(h);
+                }
+                "kernel_sig" => {
+                    let sig = r.signature()?;
+                    entry.kernel_sig.copy_from_slice(sig);
+                }
+                _ => { r.skip_field(); }
+            }
+
+            if r.read_byte_raw()? != b')' { return None; }
+        }
+
+        if entry.generation == 0 { return None; }
+        Some(entry)
+    }
+}
+
+/// Scan the kernel ring for the newest valid generation.
+pub fn scan_kernel_ring(ufs: &UfsController) -> ScanResult {
+    let mut result = ScanResult {
+        generation: 0,
+        position: 0,
+        entry: None,
+        reads: 0,
+    };
+
+    let mut lo: u32 = 0;
+    let mut size: u32 = KERNEL_RING_SIZE;
+
+    for _ in 0..KERNEL_RING_DEPTH {
+        let half = size >> 1;
+        let mid = (lo + half) % KERNEL_RING_SIZE;
+        let gen_lo = read_kernel_generation(ufs, lo, &mut result);
+        let gen_mid = read_kernel_generation(ufs, mid, &mut result);
+
+        if gen_mid > gen_lo {
+            lo = mid;
+        }
+        size = half;
+    }
+
+    // Read full entry at converged position
+    let lba = KERNEL_RING_BASE + lo;
+    result.reads += 1;
+    let ocs = ufs.read_block(lba);
+    if ocs == 0 {
+        let data = ufs.data_buffer();
+        let mut blk = [0u8; BLOCK_SIZE];
+        blk.copy_from_slice(&data[..BLOCK_SIZE]);
+        if let Some(ke) = KernelRingEntry::from_block(&blk) {
+            result.generation = ke.generation;
+            result.position = lo;
+            // Convert to RingEntry-compatible result (entry field unused for kernel ring)
+            result.entry = None;
+        }
+    }
+
+    result
+}
+
+/// Write a kernel ring entry. Returns true if write + verify passed.
+pub fn write_kernel_entry(ufs: &UfsController, entry: &KernelRingEntry) -> bool {
+    let pos = ((entry.generation - 1) % KERNEL_RING_SIZE as u64) as u32;
+    let lba = KERNEL_RING_BASE + pos;
+    let blk = entry.to_block();
+
+    let buf = ufs.data_buffer_mut();
+    buf.copy_from_slice(&blk);
+    let write_ocs = ufs.write_block(lba);
+    if write_ocs != 0 { return false; }
+
+    // Read back and verify
+    let read_ocs = ufs.read_block(lba);
+    if read_ocs != 0 { return false; }
+
+    let readback = ufs.data_buffer();
+    readback == &blk
+}
+
+/// Read just the generation from a kernel ring position.
+fn read_kernel_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u64 {
+    let lba = KERNEL_RING_BASE + pos;
+    result.reads += 1;
+
+    let ocs = ufs.read_block(lba);
+    if ocs != 0 { return 0; }
+
+    let data = ufs.data_buffer();
+
+    let mut r = VsfReader::new(data);
+    if !r.magic() { return 0; }
+    if r.version().is_none() { return 0; }
+    if r.backward_version().is_none() { return 0; }
+    if r.header_length().is_none() { return 0; }
+    if r.eagle_time_qtimer().is_none() { return 0; }
+    if r.hash_p().is_none() { return 0; }
+    if r.field_count().is_none() { return 0; }
+    if !r.close() { return 0; }
+
+    if r.read_byte_raw() != Some(b'[') { return 0; }
+    if r.read_byte_raw() != Some(b'(') { return 0; }
+    if r.dict_key_str().is_none() { return 0; }
+    if r.read_byte_raw() != Some(b':') { return 0; }
+    r.uint().unwrap_or(0)
 }

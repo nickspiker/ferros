@@ -86,6 +86,17 @@ async fn main() {
             cmd_reload(&args[2]).await;
         }
         "terminal" => cmd_terminal().await,
+        "beam" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge beam <ring> [~N] [count]");
+                eprintln!("  ring: kernel-ring, vault-root, ledger, state");
+                eprintln!("  ~N:   offset from latest (default: latest)");
+                eprintln!("  count: number of entries (default: 1)");
+                eprintln!("  gen:N  absolute generation number");
+                std::process::exit(1);
+            }
+            cmd_beam(&args[2..]).await;
+        }
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             usage();
@@ -571,15 +582,22 @@ async fn cmd_reload(path: &str) {
             std::process::exit(1);
         }
     }
-    match pt_recv(&link).await {
-        Ok(resp) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        pt_recv(&link),
+    ).await {
+        Ok(Ok(resp)) => {
             if resp.len() >= 4 {
                 let total = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
                 eprintln!("Device staged {} bytes", total);
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("Timed out after 15s — kernel didn't send staged-size. Power cycle required.");
             std::process::exit(1);
         }
     }
@@ -635,6 +653,89 @@ async fn cmd_reboot(mode: &str) {
             } else {
                 eprintln!("Send failed: {e}");
             }
+        }
+    }
+}
+
+async fn cmd_beam(args: &[String]) {
+    use ferros_pt::command::{ring_id, beam_mode};
+
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Parse ring name
+    let rid = match args[0].as_str() {
+        "kernel-ring" | "kernel" => ring_id::KERNEL,
+        "vault-root" | "vault" => ring_id::VAULT_ROOT,
+        "ledger" => ring_id::LEDGER,
+        "state" => ring_id::STATE,
+        other => {
+            eprintln!("Unknown ring: {other}");
+            std::process::exit(1);
+        }
+    };
+
+    // Parse optional offset and count
+    let mut mode = beam_mode::LATEST;
+    let mut offset: u32 = 0;
+    let mut count: u32 = 1;
+
+    for arg in &args[1..] {
+        if arg.starts_with('~') {
+            // ~N = latest minus N
+            mode = beam_mode::LATEST;
+            offset = arg[1..].parse().unwrap_or(0);
+        } else if arg.starts_with("gen:") {
+            // gen:N = absolute generation
+            mode = beam_mode::ABSOLUTE;
+            offset = arg[4..].parse().unwrap_or(1);
+        } else if arg == "all" {
+            mode = beam_mode::ALL;
+        } else if let Ok(n) = arg.parse::<u32>() {
+            // bare number = count
+            count = n;
+        }
+    }
+
+    // Build params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
+    let mut params = [0u8; 10];
+    params[0] = rid;
+    params[1] = mode;
+    params[2..6].copy_from_slice(&offset.to_be_bytes());
+    params[6..10].copy_from_slice(&count.to_be_bytes());
+
+    let cmd = build_cmd(ferros_pt::command::caps::BEAM, ferros_pt::Op::Read, &params);
+    eprintln!("Beam: ring={} mode={} offset={} count={}", args[0], mode, offset, count);
+
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device rejected beam command");
+                std::process::exit(1);
+            }
+            eprintln!("Command accepted, receiving data...");
+        }
+        Err(e) => {
+            eprintln!("Command send failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Receive ring data
+    match pt_recv(&link).await {
+        Ok(data) => {
+            eprintln!("Received {} bytes ({} blocks)", data.len(), data.len() / 4096);
+            let _ = io::stdout().write_all(&data);
+            let _ = io::stdout().flush();
+        }
+        Err(e) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
         }
     }
 }

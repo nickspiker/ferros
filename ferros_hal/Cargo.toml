@@ -6,9 +6,11 @@ license.workspace = true
 description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer, storage"
 
 [dependencies]
-ferros_vault = { path = "../ferros_vault", default-features = false }
+ferros_layout = { path = "../ferros_layout" }
+ferros_vault = { path = "../ferros_vault", default-features = false, optional = true }
 blake3 = { version = "1", default-features = false }
 
 [features]
-default = ["std"]
-std = ["ferros_vault/std"]
+default = ["alloc"]
+alloc = ["ferros_vault"]
+std = ["alloc", "ferros_vault/std"]

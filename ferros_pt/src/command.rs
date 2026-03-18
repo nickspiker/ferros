@@ -101,4 +101,27 @@ pub mod caps {
     pub const REBOOT: &[u8] = b"ferros.dev.reboot";
     /// Reload — write sends new kernel binary, exec jumps to it.
     pub const RELOAD: &[u8] = b"ferros.dev.reload";
+    /// Beam — read ring entries by generation offset.
+    /// Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
+    /// ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state
+    /// mode: 0=latest (~N offset), 1=absolute generation, 2=all
+    pub const BEAM: &[u8] = b"ferros.dev.beam";
+}
+
+/// Ring identifiers for the beam command.
+pub mod ring_id {
+    pub const KERNEL: u8 = 0;
+    pub const VAULT_ROOT: u8 = 1;
+    pub const LEDGER: u8 = 2;
+    pub const STATE: u8 = 3;
+}
+
+/// Beam mode: how to interpret the offset parameter.
+pub mod beam_mode {
+    /// Latest minus offset (~N). offset=0 = newest entry.
+    pub const LATEST: u8 = 0;
+    /// Absolute generation number.
+    pub const ABSOLUTE: u8 = 1;
+    /// Dump all entries (dev mode only).
+    pub const ALL: u8 = 2;
 }

@@ -196,6 +196,15 @@ impl<'a> VsfWriter<'a> {
             && self.put(hash)
     }
 
+    /// Write Ed25519 signature: ge(sig_bytes)
+    /// 'g' 'e' [EWE len-1] [64 bytes]
+    pub fn signature(&mut self, sig: &[u8; 64]) -> bool {
+        self.put_byte(b'g')
+            && self.put_byte(b'e')
+            && self.put_ewe_uint(63) // len-1 = 63
+            && self.put(sig)
+    }
+
     /// Write Eagle Time as a u64 QTIMER value.
     /// Uses the 'e' tag with 'u' sub-encoding (eu6 format).
     /// When real Eagle Time is available, this becomes proper EtType.
@@ -366,6 +375,17 @@ impl<'a> VsfReader<'a> {
         let hash = self.read_bytes(len_minus_1 + 1)?;
         if hash.len() != 32 { return None; }
         Some(hash.try_into().ok()?)
+    }
+
+    /// Read Ed25519 signature: ge(64 bytes)
+    /// Returns a reference to the 64-byte signature.
+    pub fn signature(&mut self) -> Option<&'a [u8]> {
+        if self.read_byte()? != b'g' { return None; }
+        if self.read_byte()? != b'e' { return None; }
+        let len_minus_1 = self.read_ewe_uint()? as usize;
+        let sig = self.read_bytes(len_minus_1 + 1)?;
+        if sig.len() != 64 { return None; }
+        Some(sig)
     }
 
     /// Read Eagle Time (QTIMER u64): e(u(ticks))

@@ -182,6 +182,14 @@ impl UfsController {
         Self { base }
     }
 
+    /// Resume from ABL's initialized state at the default QCM6490 base.
+    /// ABL leaves HCE=1 and link up. We just set up our transfer list.
+    pub fn resume() -> Self {
+        let ctrl = Self::new(ferros_layout::UFS_BASE);
+        ctrl.init_transfer_list();
+        ctrl
+    }
+
     fn read_reg(&self, offset: usize) -> u32 {
         unsafe { crate::mmio::read32(self.base + offset) }
     }

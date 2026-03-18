@@ -1,8 +1,4 @@
-# Cross-compilation config for the kernel.
-# Use: cargo build -p ferros_kernel --target aarch64-unknown-none
+# Cross-compilation config for bare-metal aarch64 targets.
+# Linker scripts are passed per-crate via build.rs, not here.
 
 [target.aarch64-unknown-none]
-rustflags = [
-    "-C", "link-arg=-T",
-    "-C", "link-arg=ferros_kernel/aarch64.ld",
-]

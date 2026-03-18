@@ -109,6 +109,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-compact"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ce99a9e19c84beb4cc35ece85374335ccc398240712114c85038319ed709bd"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -140,6 +146,7 @@ name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ferros_layout",
  "ferros_vault",
 ]
 
@@ -147,11 +154,17 @@ dependencies = [
 name = "ferros_kernel"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ferros_hal",
+ "ferros_layout",
  "ferros_ledger",
  "ferros_pt",
  "ferros_vault",
 ]
+
+[[package]]
+name = "ferros_layout"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_ledger"
@@ -166,6 +179,16 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_ledger",
+]
+
+[[package]]
+name = "ferros_seed"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-compact",
+ "ferros_hal",
+ "ferros_layout",
 ]
 
 [[package]]

@@ -80,28 +80,52 @@
 //
 // ring.rs ── vault root ring on UFS/SD (spec in RING.md)
 //   (implementation pending)
+//
+// pmic_glink.rs ── SMEM/GLINK transport to ADSP charger_pd (BATTMGR)
+//   probe_smem() → SmemProbe — read-only SMEM/GLINK state for diagnostics
+//   probe_rtc() → Option<u32> — PMK8350 RTC via SPMI SID=0 PID=G#61 offset=G#48
+//   struct PmicGlink { desc, tx_fifo, rx_fifo, rcid }
+//     ::init() → Option<Self> — locate SMEM items 478/479/480
+//     ::open_channel() → bool — GLINK VERSION + OPEN handshake
+//     ::bat_status() → Option<BatStatus> — voltage/SOC/current/temp
+//     ::property_get(prop) → Option<u32> — single battery property
+//     ::set_charge_limit(target_soc, delta) → bool — cap charging at target%
+//   struct BatStatus — state, capacity_pct, rate_ma, voltage_mv, source, temp_tenths_k
+//   PROP_VOLT_NOW(7), PROP_CURR_NOW(9), PROP_CAPACITY(4), PROP_TEMP(12)
 
 //! Ferros Hardware Abstraction Layer
 //!
 //! `#![no_std]` — runs bare metal or with alloc provided by the kernel.
+//!
+//! The `alloc` feature (default) enables modules that require heap allocation
+//! (sdmmc, usb, console, pmic_glink). Disable for the seed which has no allocator.
 
 #![no_std]
 
+#[cfg(feature = "alloc")]
 extern crate alloc;
 
 pub mod mmio;
 pub mod uart;
 pub mod fb;
 pub mod dtb;
-pub mod sdmmc;
-pub mod console;
+pub mod ufs;
+pub mod gcc;
+pub mod rpmh;
+pub mod vsf_mini;
+pub mod ring;
+pub mod gic;
+pub mod hyp;
 pub mod dpu;
 pub mod pstore;
 pub mod spmi;
+
+// Modules requiring alloc
+#[cfg(feature = "alloc")]
+pub mod sdmmc;
+#[cfg(feature = "alloc")]
+pub mod console;
+#[cfg(feature = "alloc")]
 pub mod usb;
-pub mod gcc;
-pub mod rpmh;
-pub mod ufs;
-pub mod gic;
-pub mod vsf_mini;
-pub mod ring;
+#[cfg(feature = "alloc")]
+pub mod pmic_glink;
