@@ -129,3 +129,5 @@ pub mod console;
 pub mod usb;
 #[cfg(feature = "alloc")]
 pub mod pmic_glink;
+#[cfg(feature = "alloc")]
+pub mod hamt;

@@ -346,6 +346,11 @@ VSF on disk:
   Type markers intact (O(1) skip still works)
   Content: ciphertext
   Hash: over ciphertext (integrity of encrypted form)
+
+Ledger uses boot_key encryption (system namespace).
+  No per-reader key wrapping — kernel is the only writer/reader.
+  User-facing vault objects use per-namespace content keys
+  with X25519-wrapped reader access (see VAULT.md Access Control).
 ```
 
 Nothing hits disk without a VSF wrapper. Nothing in a VSF wrapper lacks integrity proof. This is not policy — it is structural.

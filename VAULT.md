@@ -435,9 +435,15 @@ Result:
 
 ---
 
-## Capability Gating
+## Access Control
 
-Every vault operation requires a capability:
+Two independent enforcement layers. Both must pass. Neither alone
+is sufficient.
+
+### Layer 1: Kernel Capabilities (fast path)
+
+Every vault operation requires a capability. The kernel enforces
+this in memory — no IPC, no crypto, just a register check.
 
 ```
 Cap<Read,  Vault::Object::<hash>>   read a specific object
@@ -466,22 +472,168 @@ Protected regions (NO cap ever issued):
 No capability = object does not exist from your perspective.
 Not access denied. Does not exist. Same rule as everywhere in ferros.
 
+Capabilities are the fast path. They prevent software from reaching
+objects it should not touch. They do not survive physical disk access.
+
+### Layer 2: Cryptographic Access Control (hard path)
+
+Every vault object can carry an `access()` section — a first-class
+VSF section that controls who can read or write the object using
+cryptographic keys. This layer survives physical access: pulling the
+UFS chip and reading it yields only ciphertext without the right
+private key.
+
+```
+access() section format (inside the object's VSF document):
+
+RÅ<hp(provenance) hb(content_hash)>
+  [l("vault.lone")]
+  [access()
+    [admin(ke{admin_pubkey})]
+    [writers()
+      ke{writer_A_pubkey}
+      ke{writer_B_pubkey}
+    ]
+    [readers()
+      [wrap()
+        ke{reader_pubkey}
+        kx{ephemeral_pubkey}
+        v{encrypted_content_key}     ← ChaCha20-Poly1305, 48 bytes
+      ]
+      [wrap()
+        ke{reader_pubkey}
+        kx{ephemeral_pubkey}
+        v{encrypted_content_key}
+      ]
+    ]
+  ]
+  [v(content)]
+```
+
+**Read access:**
+```
+Each namespace has a symmetric content key (ChaCha20).
+Key is wrapped per-reader:
+  X25519(reader_pubkey, ephemeral_secret) → shared secret
+  ChaCha20-Poly1305(shared, content_key)  → encrypted_content_key
+
+Each wrap: ke(32B) + kx(32B) + v(48B) = ~116 bytes per reader
+  ke  = reader's Ed25519 public key (identity)
+  kx  = X25519 ephemeral public key (key exchange)
+  v   = content key encrypted + Poly1305 tag
+
+Adding a reader: wrap content key with new pubkey, append to
+access section. Content blocks untouched.
+```
+
+**Write access:**
+```
+Writers list = public keys whose ge signatures the vault accepts.
+Writing an object:
+  Writer signs with Ed25519 → ge in the object
+  Vault checks ge against access() writers list
+  No matching ke? Write rejected.
+```
+
+**Admin:**
+```
+Single admin ke in access(). Only admin can modify the
+access section itself — add/remove readers, writers.
+Admin signs the updated access section with ge.
+```
+
+**Namespace inheritance:**
+```
+Namespace root object carries the access() section for the namespace.
+Objects without their own access() inherit the namespace ACD.
+Per-object override: object has its own access() → trumps namespace.
+```
+
+**Inline vs spill:**
+```
+access() inline:    fits in the object's 4KB block
+                    ~20 readers before lone content shrinks too much
+
+access() spills:    too many readers for one block
+                    object gets acl(h{hash} u{lba}) pointer field
+                    ACD lives in its own tract block(s)
+                    same pattern as lone → direct promotion
+```
+
+**New VSF type: kx (X25519 public key)**
+```
+kx  X25519 public key — 32 bytes, key exchange
+    same k family as ke (Ed25519, signing)
+    distinct tags prevent using signing keys for exchange
+    wire format: 'k' 'x' EWE(31) [32 bytes]
+```
+
+---
+
+### Revocation
+
+```
+Soft revoke (default):
+  Remove reader wrap from access() section
+  Kernel caps enforce the gap immediately
+  Plow re-encrypts blocks naturally during rotation
+  Old content key useless once all blocks re-encrypted
+
+Hard revoke (immediate):
+  Generate new content key
+  Re-wrap for all remaining readers
+  Plow writes re-encrypted blocks now → verify → zero old on both disks
+  Same mechanics as normal plow relocation, just triggered immediately
+
+Writer revoke:
+  Remove ke from writers list
+  Existing signed objects remain valid (immutable, already committed)
+  Future writes from that key rejected immediately
+```
+
+Soft and hard are the same operation at different speeds. The kernel
+cap layer covers the gap between removing the wrap and re-encrypting
+the content.
+
 ---
 
 ## Encryption
 
-VSF handles encryption. The vault does not implement crypto.
+### Key Hierarchy
 
 ```
-At rest: all vault objects encrypted with boot_key
-  boot_key: ChaCha20(device_key_in_CSR, boot_nonce)
-  per-boot fresh, never written to RAM
+device_key       CSR (PAC registers), never RAM, never disk
+                 5 × 128-bit: APIAKey, APIBKey, APDAKey, APDBKey, APGAKey
+                 640 bits total
 
+boot_key         ChaCha20(device_key, boot_nonce)
+                 per-boot fresh, derived on startup, never persisted
+
+namespace_key    BLAKE3(boot_key || namespace_hash)
+                 per-namespace, deterministic from boot_key
+                 system namespaces (Boot, Ledger, Stem) use boot_key directly
+
+content_key      random, per-namespace (or per-object for isolation)
+                 wrapped in access() section per-reader
+                 X25519 DH + ChaCha20-Poly1305
+```
+
+### At Rest
+
+```
 VSF encrypted object:
-  content encrypted: ChaCha20(boot_key, object_nonce)
-  pre-encryption hash: hp(BLAKE3, plaintext_hash)
-  post-encryption hash: hb(BLAKE3, ciphertext_hash)
-  nonce: u(n) EWE, per-object, never reused
+  content:     ChaCha20(content_key, object_nonce) — ciphertext
+  hp:          BLAKE3(plaintext at birth) — provenance, never changes
+  hb:          BLAKE3(ciphertext) — integrity of encrypted form
+  nonce:       u(n) EWE, per-object, never reused
+
+System namespaces (no per-reader keys):
+  Boot, Ledger, Stem → encrypted with boot_key
+  Only the kernel reads these, no multi-party access
+
+User namespaces (per-reader keys):
+  App, shared → encrypted with content_key
+  content_key wrapped per-reader in access() section
 
 Nothing hits storage without encryption.
 Nothing hits storage without a BLAKE3 hash.
@@ -555,10 +707,26 @@ Theorem Vault_KillswitchReady:
       f either fully committed or fully absent
       partial f: VSF mandatory hash fails → discarded
 
+Theorem Vault_CryptoAccessControl:
+  ∀ object o with access() section:
+    read(o) requires possession of private key k where
+      ke(public(k)) ∈ o.access.readers
+    physical disk access without k → ciphertext only
+    X25519 DH: 2^-128 key recovery
+    ChaCha20-Poly1305: 2^-128 forgery
+
+Theorem Vault_DualLayerEnforcement:
+  ∀ vault access attempt:
+    Cap check fails  → object does not exist (kernel enforced)
+    Crypto check fails → object is ciphertext (math enforced)
+    both must pass for plaintext access
+    neither alone is sufficient
+
 Theorem Vault_TenantIsolation:
   ∀ namespaces N1 ≠ N2:
     compromise(N1) → objects in N2 unaffected
     Cap<Write, N1> grants nothing in N2
+    content_key(N1) reveals nothing about content_key(N2)
     ferros_ledger compromise → vault boot snapshots unaffected
     app compromise → other app objects unaffected
 
@@ -592,7 +760,7 @@ RING.md:
 HAMT.md:
   Object index: provenance hash → block location
   COW: every edit → new root, old intact
-  Three leaf formats: lone, direct, chained
+  Three leaf formats: lone, direct, chained (with optional access() section)
   Branching, collision handling, vector encoding
 
 LEDGER.md:
@@ -632,7 +800,10 @@ Future:
   Vault server (userspace, cap-gated IPC)
   Full namespace registry
   Extent chains (chained objects > 4MB)
-  Encryption at rest (ChaCha20, boot_key)
+  Encryption at rest (ChaCha20, key hierarchy)
+  Per-namespace content keys, X25519 key wrapping
+  access() section format, hard/soft revocation
+  kx (X25519 pubkey) encoder/decoder in vsf_mini
   Cross-device vault sync (post-networking)
 ```
 

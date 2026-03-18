@@ -381,6 +381,11 @@ ferros:   capability is Cap<Rights, Epoch>
            
 Delta: type system ate a portion of the kernel proof obligation
        proof is smaller because Rust enforces it structurally
+
+Vault objects additionally carry cryptographic access control:
+  Capabilities gate the fast path (kernel enforced, in-memory)
+  Crypto enforces the hard path (math enforced, survives physical access)
+  See VAULT.md Access Control for the full dual-layer model
 ```
 
 ---

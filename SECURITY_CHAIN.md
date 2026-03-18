@@ -168,6 +168,11 @@ Ledger server:
 App processes:
   Cap<Write, Vault::App::<hash>>
   Cannot touch other apps or system objects
+
+Cryptographic access control (survives physical disk access):
+  Per-namespace content key, wrapped per-reader via X25519 + ChaCha20-Poly1305
+  Physical disk read without private key → ciphertext only
+  See VAULT.md Access Control for full model
 ```
 
 ---
@@ -330,6 +335,12 @@ Attack: MITM the flash process
   Prevention: ferros-mkimg signs locally on developer machine
   Signature travels with the image, verified on device
   Tampered image → signature mismatch → rejected
+
+Attack: physical disk read to extract user data
+  Prevention: per-namespace content key, X25519-wrapped per reader
+  Disk read without matching private key → ciphertext
+  Content key never on disk in plaintext — only wrapped copies
+  Device key in CSR (PAC registers) — not readable from disk
 
 Attack: supply chain (malicious developer key)
   Prevention: owner can audit source, build, sign with own key

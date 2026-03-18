@@ -218,6 +218,16 @@ impl<'a> VsfWriter<'a> {
     pub fn fill_hash(&mut self, pos: usize, hash: &[u8; 32]) {
         self.buf[pos..pos + 32].copy_from_slice(hash);
     }
+
+    /// Write raw bytes (public for HAMT vector encoding).
+    pub fn put_raw(&mut self, data: &[u8]) -> bool {
+        self.put(data)
+    }
+
+    /// Write EWE-encoded unsigned integer (public for HAMT vector encoding).
+    pub fn put_ewe_uint_pub(&mut self, val: u64) -> bool {
+        self.put_ewe_uint(val)
+    }
 }
 
 /// Reader that parses VSF fields from a buffer.
@@ -393,6 +403,11 @@ impl<'a> VsfReader<'a> {
         if self.read_byte()? != b'e' { return None; }
         if self.read_byte()? != b'u' { return None; }
         self.read_ewe_uint()
+    }
+
+    /// Read N raw bytes (public for HAMT vector decoding).
+    pub fn read_bytes_raw(&mut self, n: usize) -> Option<&'a [u8]> {
+        self.read_bytes(n)
     }
 
     /// Skip an unknown field (reads type tag + payload).

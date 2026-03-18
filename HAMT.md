@@ -98,8 +98,17 @@ Object content directly in the leaf. One disk read.
 ```
 RÅ<hp(provenance) hb(content_hash)>
   [l("vault.lone")]
+  [access()                           ← optional, per-object override
+    [admin(ke{pubkey})]
+    [writers() ke{...} ...]
+    [readers() [wrap() ke{} kx{} v{}] ...]
+  ]
   [v(content)]
 ```
+
+Objects without `access()` inherit their namespace's ACD.
+With access section inline, content budget shrinks (~116B per reader
+wrap). If content + access > 4KB → promote to direct.
 
 ### Leaf Node — Direct (furrow LBAs in leaf, < ~4MB)
 
@@ -108,6 +117,8 @@ RÅ<hp(provenance) hb(content_hash)>
   [l("vault.direct")]
   [size(u{total_bytes})]
   [v_u(furrow_lbas[])]          ← up to ~1000 LBAs
+  [access() ...]                ← optional, inline if fits
+  [acl(h{hash} u{lba})]        ← optional, spill pointer if access too large
 ```
 
 Each furrow carries its own hb for per-block integrity.
@@ -120,6 +131,8 @@ RÅ<hp(provenance) hb(content_hash)>
   [l("vault.chained")]
   [size(u{total_bytes})]
   [head(h{hash} u{lba})]       ← first extent node
+  [access() ...]                ← optional
+  [acl(h{hash} u{lba})]        ← optional
 ```
 
 ### Extent Node (chain link)
