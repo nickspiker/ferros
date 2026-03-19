@@ -50,6 +50,19 @@ pub const KERNEL_RING_SIZE: u32 = STEM_SIZE;
 pub const KERNEL_RING_DEPTH: u32 = STEM_DEPTH;
 
 // ---------------------------------------------------------------------------
+// Kernel binary storage — between stem and spine
+// ---------------------------------------------------------------------------
+
+/// Kernel copy A base block (right after stem).
+pub const KERNEL_A_BASE: u32 = 0xD00;
+
+/// Kernel copy B base block (>1MB from A, for redundancy).
+pub const KERNEL_B_BASE: u32 = 0x1500;
+
+/// Maximum kernel size in blocks (8MB = 2048 × 4KB).
+pub const KERNEL_MAX_BLOCKS: u32 = 2048;
+
+// ---------------------------------------------------------------------------
 // Spine (vault root ring) — scanned by the kernel to find system state
 // ---------------------------------------------------------------------------
 

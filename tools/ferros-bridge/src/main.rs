@@ -7,6 +7,7 @@
 //     read     — read MMIO register via PT MEM cap
 //     reboot   — reboot device (normal or fastboot) via PT REBOOT cap
 //     reload   — hot-reload kernel binary via PT RELOAD cap
+//     install  — install signed kernel to UFS + stem entry via PT INSTALL cap
 //
 //   pt_send(link, sid, data) — blast DATA packets with 1ms pacing
 //   pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
@@ -39,6 +40,7 @@ fn usage() {
     eprintln!("  log          Stream bulk IN data from device to stdout");
     eprintln!("  reboot [fastboot]  Reboot device (default: normal, 'fastboot' for bootloader)");
     eprintln!("  reload <kernel>   Hot-reload kernel binary (ELF path, runs mkimg internally)");
+    eprintln!("  install <kernel.signed>  Install signed kernel to UFS + stem entry");
     eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 200)");
     eprintln!("  terminal     Bidirectional PT session");
 }
@@ -84,6 +86,13 @@ async fn main() {
                 std::process::exit(1);
             }
             cmd_reload(&args[2]).await;
+        }
+        "install" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge install <kernel.signed>");
+                std::process::exit(1);
+            }
+            cmd_install(&args[2]).await;
         }
         "terminal" => cmd_terminal().await,
         "beam" => {
@@ -613,6 +622,149 @@ async fn cmd_reload(path: &str) {
             } else {
                 eprintln!("Exec failed: {e}");
             }
+        }
+    }
+}
+
+async fn cmd_install(path: &str) {
+    // Read .signed file and parse trailer: [binary][size:4 LE][hash:32][sig:64]["FERROSIG"]
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {path}: {e}");
+        std::process::exit(1);
+    });
+
+    const TRAILER: usize = 108; // 4 + 32 + 64 + 8
+    if data.len() < TRAILER + 0x1000 {
+        eprintln!("File too small for signed kernel: {} bytes", data.len());
+        std::process::exit(1);
+    }
+
+    // Verify FERROSIG magic at end
+    let magic_start = data.len() - 8;
+    if &data[magic_start..] != b"FERROSIG" {
+        eprintln!("Missing FERROSIG trailer magic");
+        std::process::exit(1);
+    }
+
+    // Extract fields
+    let meta_start = data.len() - TRAILER;
+    let kernel_size = u32::from_le_bytes([
+        data[meta_start], data[meta_start + 1],
+        data[meta_start + 2], data[meta_start + 3],
+    ]);
+    let kernel_data = &data[..kernel_size as usize];
+
+    let mut kernel_hash = [0u8; 32];
+    kernel_hash.copy_from_slice(&data[meta_start + 4..meta_start + 36]);
+
+    let mut kernel_sig = [0u8; 64];
+    kernel_sig.copy_from_slice(&data[meta_start + 36..meta_start + 100]);
+
+    // Verify hash locally
+    let computed = blake3::hash(kernel_data);
+    if computed.as_bytes() != &kernel_hash {
+        eprintln!("Local BLAKE3 mismatch — .signed file corrupt");
+        std::process::exit(1);
+    }
+
+    eprintln!("Kernel: {} bytes, BLAKE3 {}...verified",
+        kernel_size, &computed.to_hex()[..16]);
+
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Step 1: Stage kernel binary via RELOAD Write (reuses proven staging path)
+    let cmd = build_cmd(
+        ferros_pt::command::caps::RELOAD,
+        ferros_pt::Op::Write,
+        kernel_data,
+    );
+    eprintln!("Staging kernel ({} bytes) via RELOAD Write...", kernel_data.len());
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device rejected kernel write");
+                std::process::exit(1);
+            }
+            eprintln!("Write accepted, receiving staged size...");
+        }
+        Err(e) => {
+            eprintln!("Transfer failed: {e}");
+            std::process::exit(1);
+        }
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        pt_recv(&link),
+    ).await {
+        Ok(Ok(resp)) => {
+            if resp.len() >= 4 {
+                let staged = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+                eprintln!("Device staged {} bytes", staged);
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("Timed out waiting for staged-size");
+            std::process::exit(1);
+        }
+    }
+
+    // Step 2: Send INSTALL Exec with params [size:4 LE][hash:32][sig:64] = 100 bytes
+    let mut params = [0u8; 100];
+    params[0..4].copy_from_slice(&kernel_size.to_le_bytes());
+    params[4..36].copy_from_slice(&kernel_hash);
+    params[36..100].copy_from_slice(&kernel_sig);
+
+    let cmd = build_cmd(
+        ferros_pt::command::caps::INSTALL,
+        ferros_pt::Op::Exec,
+        &params,
+    );
+    eprintln!("Executing install (write to UFS + stem entry)...");
+    match pt_send(&link, &cmd).await {
+        Ok(complete) => {
+            if !complete.success {
+                eprintln!("Device rejected install exec");
+                std::process::exit(1);
+            }
+            eprintln!("Exec accepted, receiving result...");
+        }
+        Err(e) => {
+            eprintln!("Exec failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Read response — "OK" or "ERR:..."
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        pt_recv(&link),
+    ).await {
+        Ok(Ok(resp)) => {
+            let msg = String::from_utf8_lossy(&resp);
+            if msg.starts_with("OK") {
+                println!("Install complete — kernel persisted to UFS + signed stem entry");
+            } else {
+                eprintln!("Install failed: {msg}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("Response receive failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("Timed out waiting for install result (30s)");
+            std::process::exit(1);
         }
     }
 }

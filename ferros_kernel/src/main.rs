@@ -125,23 +125,24 @@ use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
 // ---------------------------------------------------------------------------
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 256 * 1024;
+/// DRAM-based bump allocator. Base address set at startup from __stack_top
+/// linker symbol (right after kernel image + 64KB stack). Keeps binary small
+/// — no BSS heap array — so PT transfers don't grow circularly.
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
-#[repr(align(4096))]
-struct HeapMem(UnsafeCell<[u8; HEAP_SIZE]>);
-unsafe impl Sync for HeapMem {}
-
-static HEAP: HeapMem = HeapMem(UnsafeCell::new([0; HEAP_SIZE]));
+static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 
 struct BumpAlloc;
 
 unsafe impl GlobalAlloc for BumpAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let base = HEAP.0.get() as *mut u8;
+        let base = HEAP_BASE.load(Ordering::Relaxed) as *mut u8;
+        if base.is_null() {
+            return core::ptr::null_mut();
+        }
         loop {
             let pos = HEAP_POS.load(Ordering::Relaxed);
             let aligned = (pos + layout.align() - 1) & !(layout.align() - 1);
@@ -908,6 +909,14 @@ fn hamt_block_hash(blk: &[u8; 4096]) -> [u8; 32] {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Init DRAM heap — must happen before any allocation.
+    // __stack_top is right after kernel image + 64KB stack.
+    // Align to 4KB page boundary for clean start.
+    unsafe extern "C" { static __stack_top: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF; // page-align up
+    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+
     let exc_start = exception_count();
 
     // ---- Set up framebuffer console ----
@@ -2312,7 +2321,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
                 let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
                 let cap_beam = ferros_pt::command::dev_cap(ferros_pt::command::caps::BEAM);
-                // Staging area for hot-reload kernel image
+                let cap_install = ferros_pt::command::dev_cap(ferros_pt::command::caps::INSTALL);
+                // Staging area for hot-reload / install kernel image
                 const RELOAD_STAGE: usize = 0xA000_0000;
                 let mut reload_size: usize = 0;
                 // Flag: outbound DATA pump needs to send next packet
@@ -2547,8 +2557,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                                 )
                                                                             };
 
-                                                                            // Write kernel binary to HAMT region
-                                                                            let kernel_lba = ferros_layout::HAMT_BASE;
+                                                                            // Write kernel binary to kernel storage region
+                                                                            let kernel_lba = ferros_layout::KERNEL_A_BASE;
                                                                             let blocks = (reload_size + 4095) / 4096;
                                                                             let mut write_ok = true;
                                                                             for i in 0..blocks {
@@ -2598,6 +2608,138 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
                                                                         hot_reload(RELOAD_STAGE, dtb_addr);
                                                                     }
+                                                                }
+                                                            } else if cmd.cap == cap_install && cmd.op == ferros_pt::Op::Write {
+                                                                // INSTALL Write: same staging as RELOAD
+                                                                let chunk = cmd.params;
+                                                                if !chunk.is_empty() {
+                                                                    unsafe {
+                                                                        core::ptr::copy_nonoverlapping(
+                                                                            chunk.as_ptr(),
+                                                                            (RELOAD_STAGE + reload_size) as *mut u8,
+                                                                            chunk.len(),
+                                                                        );
+                                                                    }
+                                                                    reload_size += chunk.len();
+                                                                }
+                                                                pt_out_data.clear();
+                                                                pt_out_data.extend_from_slice(&(reload_size as u32).to_le_bytes());
+                                                            } else if cmd.cap == cap_install && cmd.op == ferros_pt::Op::Exec {
+                                                                // INSTALL Exec: persist to UFS + signed stem entry (no jump)
+                                                                // Params: [size:4 LE][hash:32][sig:64] = 100 bytes
+                                                                log.buf_only("INSTALL exec size=");
+                                                                log.buf_put_hex32(reload_size as u32);
+                                                                log.buf_only("\n");
+                                                                if cmd.params.len() >= 100 && reload_size > 0x1000 {
+                                                                    let inst_size = u32::from_le_bytes(
+                                                                        cmd.params[0..4].try_into().unwrap()
+                                                                    ) as usize;
+                                                                    let mut inst_hash = [0u8; 32];
+                                                                    inst_hash.copy_from_slice(&cmd.params[4..36]);
+                                                                    let mut inst_sig = [0u8; 64];
+                                                                    inst_sig.copy_from_slice(&cmd.params[36..100]);
+
+                                                                    // Verify staged size matches
+                                                                    if inst_size != reload_size {
+                                                                        log.buf_only("INSTALL size mismatch\n");
+                                                                        pt_out_data.clear();
+                                                                        pt_out_data.extend_from_slice(b"ERR:SIZE");
+                                                                    } else {
+                                                                        let kernel_slice = unsafe {
+                                                                            core::slice::from_raw_parts(
+                                                                                RELOAD_STAGE as *const u8,
+                                                                                reload_size,
+                                                                            )
+                                                                        };
+
+                                                                        // Verify BLAKE3
+                                                                        let computed = blake3::hash(kernel_slice);
+                                                                        if computed.as_bytes() != &inst_hash {
+                                                                            log.buf_only("INSTALL hash mismatch\n");
+                                                                            pt_out_data.clear();
+                                                                            pt_out_data.extend_from_slice(b"ERR:HASH");
+                                                                        } else {
+                                                                            // Write to UFS at KERNEL_A_BASE
+                                                                            let ufs = ferros_hal::ufs::UfsController::resume();
+                                                                            let kernel_lba = ferros_layout::KERNEL_A_BASE;
+                                                                            let blocks = (reload_size + 4095) / 4096;
+                                                                            let mut write_ok = blocks <= ferros_layout::KERNEL_MAX_BLOCKS as usize;
+
+                                                                            if write_ok {
+                                                                                for i in 0..blocks {
+                                                                                    let buf = ufs.data_buffer_mut();
+                                                                                    let offset = i * 4096;
+                                                                                    let copy_len = core::cmp::min(4096, reload_size - offset);
+                                                                                    buf[..copy_len].copy_from_slice(&kernel_slice[offset..offset + copy_len]);
+                                                                                    for b in copy_len..4096 { buf[b] = 0; }
+                                                                                    if ufs.write_block(kernel_lba + i as u32) != 0 {
+                                                                                        write_ok = false;
+                                                                                        break;
+                                                                                    }
+                                                                                }
+                                                                            }
+
+                                                                            if write_ok {
+                                                                                // Read back and verify
+                                                                                let mut verify_ok = true;
+                                                                                let mut verify_hasher = blake3::Hasher::new();
+                                                                                for i in 0..blocks {
+                                                                                    if ufs.read_block(kernel_lba + i as u32) != 0 {
+                                                                                        verify_ok = false;
+                                                                                        break;
+                                                                                    }
+                                                                                    let buf = ufs.data_buffer();
+                                                                                    let offset = i * 4096;
+                                                                                    let copy_len = core::cmp::min(4096, reload_size - offset);
+                                                                                    verify_hasher.update(&buf[..copy_len]);
+                                                                                }
+                                                                                let verify_hash = verify_hasher.finalize();
+                                                                                if verify_hash.as_bytes() != &inst_hash {
+                                                                                    verify_ok = false;
+                                                                                }
+
+                                                                                if verify_ok {
+                                                                                    // Write signed stem entry
+                                                                                    let scan = ferros_hal::ring::scan_kernel_ring(&ufs);
+                                                                                    let new_gen = scan.generation + 1;
+                                                                                    let entry = ferros_hal::ring::KernelRingEntry {
+                                                                                        generation: new_gen,
+                                                                                        kernel_lba,
+                                                                                        kernel_size: reload_size as u32,
+                                                                                        kernel_hash: inst_hash,
+                                                                                        kernel_sig: inst_sig,
+                                                                                        eagle_time: ferros_hal::vsf_mini::read_qtimer(),
+                                                                                        hp_hash: [0u8; 32],
+                                                                                    };
+                                                                                    if ferros_hal::ring::write_kernel_entry(&ufs, &entry) {
+                                                                                        log.buf_only("INSTALL gen=");
+                                                                                        log.buf_put_hex32(new_gen as u32);
+                                                                                        log.buf_only(" lba=G#");
+                                                                                        log.buf_put_hex32(kernel_lba);
+                                                                                        log.buf_only(" OK\n");
+                                                                                        pt_out_data.clear();
+                                                                                        pt_out_data.extend_from_slice(b"OK");
+                                                                                    } else {
+                                                                                        log.buf_only("INSTALL stem FAIL\n");
+                                                                                        pt_out_data.clear();
+                                                                                        pt_out_data.extend_from_slice(b"ERR:STEM");
+                                                                                    }
+                                                                                } else {
+                                                                                    log.buf_only("INSTALL verify FAIL\n");
+                                                                                    pt_out_data.clear();
+                                                                                    pt_out_data.extend_from_slice(b"ERR:VERIFY");
+                                                                                }
+                                                                            } else {
+                                                                                log.buf_only("INSTALL write FAIL\n");
+                                                                                pt_out_data.clear();
+                                                                                pt_out_data.extend_from_slice(b"ERR:WRITE");
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    reload_size = 0;
+                                                                } else {
+                                                                    pt_out_data.clear();
+                                                                    pt_out_data.extend_from_slice(b"ERR:PARAMS");
                                                                 }
                                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                                                                 // REBOOT Exec: param[0] selects mode

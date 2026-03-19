@@ -46,7 +46,6 @@ SECTIONS
         __bss_end = .;
     }
 
-    . = ALIGN(4096);
     __seed_end = .;
     __seed_size = __seed_end - _start;
 

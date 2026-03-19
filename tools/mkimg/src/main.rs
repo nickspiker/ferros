@@ -1,4 +1,4 @@
-//! ferros-mkimg — build flashable images from the ferros kernel.
+//! ferros-mkimg — build flashable images and manage the trust chain.
 //!
 //! ## Usage
 //!
@@ -9,11 +9,17 @@
 //! # Build Android boot.img for fastboot:
 //! ferros-mkimg boot kernel.elf -o ferros.img
 //!
+//! # Generate Ed25519 keypair:
+//! ferros-mkimg keygen -o keys/
+//!
+//! # Sign a kernel binary:
+//! ferros-mkimg sign-kernel kernel.elf --key keys/ferros.secret -o kernel.signed
+//!
+//! # Build signed seed boot.img:
+//! ferros-mkimg seed seed.elf --key keys/ferros.secret -o seed.img
+//!
 //! # Generate a random anchor key image:
 //! ferros-mkimg anchor-key -o anchor.img
-//!
-//! # All-in-one: build + wrap
-//! ferros-mkimg boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
 //! ```
 //!
 //! ## Android Boot Image Format
@@ -57,6 +63,9 @@ fn main() {
     match args[1].as_str() {
         "flat" => cmd_flat(&args[2..]),
         "boot" => cmd_boot(&args[2..]),
+        "keygen" => cmd_keygen(&args[2..]),
+        "sign-kernel" => cmd_sign_kernel(&args[2..]),
+        "seed" => cmd_seed(&args[2..]),
         "anchor-key" => cmd_anchor_key(&args[2..]),
         "help" | "--help" | "-h" => usage(),
         _ => {
@@ -68,11 +77,14 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("ferros-mkimg — build flashable images");
+    eprintln!("ferros-mkimg — build flashable images + trust chain");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  ferros-mkimg flat <kernel.elf> -o <output.bin>");
     eprintln!("  ferros-mkimg boot <kernel.elf> -o <output.img>");
+    eprintln!("  ferros-mkimg keygen -o <dir/>");
+    eprintln!("  ferros-mkimg sign-kernel <kernel.elf> --key <secret> -o <kernel.signed>");
+    eprintln!("  ferros-mkimg seed <seed.elf> --key <secret> -o <seed.img>");
     eprintln!("  ferros-mkimg anchor-key -o <anchor.img>");
 }
 
@@ -387,4 +399,315 @@ fn write_output(path: &str, data: &[u8]) {
             process::exit(1);
         });
     }
+}
+
+/// Find a named argument value: --key <val> or -k <val>.
+fn find_arg<'a>(args: &'a [String], long: &str, short: &str) -> Option<&'a str> {
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == long || args[i] == short {
+            return Some(&args[i + 1]);
+        }
+    }
+    None
+}
+
+/// Load Ed25519 secret key from file (64 bytes).
+fn load_secret_key(path: &str) -> ed25519_compact::SecretKey {
+    let data = fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Error reading key {}: {}", path, e);
+        process::exit(1);
+    });
+    if data.len() != 64 {
+        eprintln!("Error: secret key must be 64 bytes, got {}", data.len());
+        process::exit(1);
+    }
+    ed25519_compact::SecretKey::from_slice(&data).unwrap_or_else(|e| {
+        eprintln!("Error: invalid Ed25519 secret key: {}", e);
+        process::exit(1);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ELF symbol table parsing
+// ---------------------------------------------------------------------------
+
+const SHT_SYMTAB: u32 = 2;
+
+/// Find a symbol's virtual address in an ELF file by name.
+fn elf_find_symbol(elf_data: &[u8], name: &str) -> Option<u64> {
+    if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC { return None; }
+
+    let e_shoff = u64::from_le_bytes(elf_data[40..48].try_into().ok()?) as usize;
+    let e_shentsize = u16::from_le_bytes(elf_data[58..60].try_into().ok()?) as usize;
+    let e_shnum = u16::from_le_bytes(elf_data[60..62].try_into().ok()?) as usize;
+
+    // Find SHT_SYMTAB and its string table
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if sh + e_shentsize > elf_data.len() { break; }
+
+        let sh_type = u32::from_le_bytes(elf_data[sh + 4..sh + 8].try_into().ok()?);
+        if sh_type != SHT_SYMTAB { continue; }
+
+        let sh_offset = u64::from_le_bytes(elf_data[sh + 24..sh + 32].try_into().ok()?) as usize;
+        let sh_size = u64::from_le_bytes(elf_data[sh + 32..sh + 40].try_into().ok()?) as usize;
+        let sh_entsize = u64::from_le_bytes(elf_data[sh + 56..sh + 64].try_into().ok()?) as usize;
+        let sh_link = u32::from_le_bytes(elf_data[sh + 40..sh + 44].try_into().ok()?) as usize;
+
+        if sh_entsize == 0 { continue; }
+
+        // Get string table for this symtab
+        let strtab_sh = e_shoff + sh_link * e_shentsize;
+        let strtab_off = u64::from_le_bytes(
+            elf_data[strtab_sh + 24..strtab_sh + 32].try_into().ok()?
+        ) as usize;
+
+        // Iterate symbols
+        let num_syms = sh_size / sh_entsize;
+        for j in 0..num_syms {
+            let sym = sh_offset + j * sh_entsize;
+            if sym + sh_entsize > elf_data.len() { break; }
+
+            let st_name = u32::from_le_bytes(
+                elf_data[sym..sym + 4].try_into().ok()?
+            ) as usize;
+            let st_value = u64::from_le_bytes(
+                elf_data[sym + 8..sym + 16].try_into().ok()?
+            );
+
+            // Read null-terminated name from strtab
+            let name_start = strtab_off + st_name;
+            if name_start >= elf_data.len() { continue; }
+            let name_end = elf_data[name_start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| name_start + p)
+                .unwrap_or(elf_data.len());
+            let sym_name = std::str::from_utf8(&elf_data[name_start..name_end]).ok()?;
+
+            if sym_name == name {
+                return Some(st_value);
+            }
+        }
+    }
+    None
+}
+
+/// Find a symbol whose name ends with the given suffix (for Rust-mangled names).
+/// E.g. suffix "PUBKEY" matches "_ZN11ferros_seed6PUBKEY17h...E".
+fn elf_find_symbol_suffix(elf_data: &[u8], suffix: &str) -> Option<u64> {
+    if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC { return None; }
+
+    let e_shoff = u64::from_le_bytes(elf_data[40..48].try_into().ok()?) as usize;
+    let e_shentsize = u16::from_le_bytes(elf_data[58..60].try_into().ok()?) as usize;
+    let e_shnum = u16::from_le_bytes(elf_data[60..62].try_into().ok()?) as usize;
+
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if sh + e_shentsize > elf_data.len() { break; }
+
+        let sh_type = u32::from_le_bytes(elf_data[sh + 4..sh + 8].try_into().ok()?);
+        if sh_type != SHT_SYMTAB { continue; }
+
+        let sh_offset = u64::from_le_bytes(elf_data[sh + 24..sh + 32].try_into().ok()?) as usize;
+        let sh_size = u64::from_le_bytes(elf_data[sh + 32..sh + 40].try_into().ok()?) as usize;
+        let sh_entsize = u64::from_le_bytes(elf_data[sh + 56..sh + 64].try_into().ok()?) as usize;
+        let sh_link = u32::from_le_bytes(elf_data[sh + 40..sh + 44].try_into().ok()?) as usize;
+
+        if sh_entsize == 0 { continue; }
+
+        let strtab_sh = e_shoff + sh_link * e_shentsize;
+        let strtab_off = u64::from_le_bytes(
+            elf_data[strtab_sh + 24..strtab_sh + 32].try_into().ok()?
+        ) as usize;
+
+        let num_syms = sh_size / sh_entsize;
+        for j in 0..num_syms {
+            let sym = sh_offset + j * sh_entsize;
+            if sym + sh_entsize > elf_data.len() { break; }
+
+            let st_name = u32::from_le_bytes(
+                elf_data[sym..sym + 4].try_into().ok()?
+            ) as usize;
+            let st_value = u64::from_le_bytes(
+                elf_data[sym + 8..sym + 16].try_into().ok()?
+            );
+
+            let name_start = strtab_off + st_name;
+            if name_start >= elf_data.len() { continue; }
+            let name_end = elf_data[name_start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| name_start + p)
+                .unwrap_or(elf_data.len());
+            let sym_name = std::str::from_utf8(&elf_data[name_start..name_end]).ok()?;
+
+            // Rust mangling: look for the suffix between length prefix and hash suffix
+            // e.g. _ZN11ferros_seed6PUBKEY17h...E contains "PUBKEY"
+            if sym_name.contains(suffix) && st_value != 0 {
+                return Some(st_value);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Synthesizer commands
+// ---------------------------------------------------------------------------
+
+const SIGNED_TRAILER_MAGIC: &[u8; 8] = b"FERROSIG";
+
+/// Generate Ed25519 keypair.
+fn cmd_keygen(args: &[String]) {
+    let dir = if args.len() >= 2 && args[0] == "-o" {
+        args[1].clone()
+    } else {
+        "keys".to_string()
+    };
+
+    fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        eprintln!("Error creating {}: {}", dir, e);
+        process::exit(1);
+    });
+
+    let kp = ed25519_compact::KeyPair::generate();
+
+    let secret_path = format!("{}/ferros.secret", dir);
+    let pub_path = format!("{}/ferros.pub", dir);
+
+    fs::write(&secret_path, kp.sk.as_ref()).unwrap();
+    fs::write(&pub_path, kp.pk.as_ref()).unwrap();
+
+    // Restrict secret key permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).ok();
+    }
+
+    let fingerprint = blake3::hash(kp.pk.as_ref());
+    eprintln!("Generated Ed25519 keypair");
+    eprintln!("  Secret: {}", secret_path);
+    eprintln!("  Public: {}", pub_path);
+    eprintln!("  Fingerprint: {}", &fingerprint.to_hex()[..16]);
+}
+
+/// Sign a kernel binary: ELF → flat → BLAKE3 → Ed25519 → .signed package.
+fn cmd_sign_kernel(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: ferros-mkimg sign-kernel <kernel.elf> --key <secret> -o <output>");
+        process::exit(1);
+    }
+
+    let input = &args[0];
+    let output = find_arg(args, "-o", "-o").unwrap_or("kernel.signed");
+    let key_path = find_arg(args, "--key", "-k");
+
+    let elf_data = fs::read(input).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {}", input, e);
+        process::exit(1);
+    });
+
+    eprintln!("Signing kernel: {}", input);
+    let flat = elf_to_flat(&elf_data);
+
+    let hash = blake3::hash(&flat);
+    eprintln!("  BLAKE3: {}", &hash.to_hex()[..16]);
+
+    let mut sig = [0u8; 64];
+    if let Some(kp) = key_path {
+        let sk = load_secret_key(kp);
+        let signature = sk.sign(hash.as_bytes(), None);
+        sig.copy_from_slice(signature.as_ref());
+        eprintln!("  Ed25519: signed");
+    } else {
+        eprintln!("  Ed25519: unsigned (dev build)");
+    }
+
+    // Build .signed package: [flat][size:u32 LE][hash:32][sig:64][FERROSIG]
+    let mut signed = flat.clone();
+    signed.extend_from_slice(&(flat.len() as u32).to_le_bytes());
+    signed.extend_from_slice(hash.as_bytes());
+    signed.extend_from_slice(&sig);
+    signed.extend_from_slice(SIGNED_TRAILER_MAGIC);
+
+    write_output(output, &signed);
+    eprintln!("Wrote {} ({} bytes, kernel {} bytes)",
+        output, signed.len(), flat.len());
+}
+
+/// Build signed seed boot.img: ELF → patch pubkey+sig → boot.img.
+fn cmd_seed(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: ferros-mkimg seed <seed.elf> --key <secret> -o <output>");
+        process::exit(1);
+    }
+
+    let input = &args[0];
+    let output = find_arg(args, "-o", "-o").unwrap_or("seed.img");
+    let key_path = find_arg(args, "--key", "-k");
+
+    let elf_data = fs::read(input).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {}", input, e);
+        process::exit(1);
+    });
+
+    eprintln!("Building signed seed: {}", input);
+
+    // Find PUBKEY and SEED_SIG statics in the ELF symbol table.
+    // Rust mangles these, so search by suffix.
+    let pubkey_addr = elf_find_symbol_suffix(&elf_data, "PUBKEY").unwrap_or_else(|| {
+        eprintln!("Error: PUBKEY symbol not found in ELF");
+        process::exit(1);
+    });
+    let sig_addr = elf_find_symbol_suffix(&elf_data, "SEED_SIG").unwrap_or_else(|| {
+        eprintln!("Error: SEED_SIG symbol not found in ELF");
+        process::exit(1);
+    });
+
+    let mut flat = elf_to_flat(&elf_data);
+
+    // Convert symbol addresses to flat binary offsets
+    let segments = parse_elf_segments(&elf_data);
+    let base_addr = segments[0].vaddr;
+    let pubkey_off = (pubkey_addr - base_addr) as usize;
+    let sig_off = (sig_addr - base_addr) as usize;
+
+    eprintln!("  PUBKEY offset: G#{:X} (vaddr G#{:X})", pubkey_off, pubkey_addr);
+    eprintln!("  SEED_SIG offset: G#{:X} (vaddr G#{:X})", sig_off, sig_addr);
+
+    // Bounds check
+    if pubkey_off + 32 > flat.len() || sig_off + 64 > flat.len() {
+        eprintln!("Error: symbol offsets exceed binary size");
+        process::exit(1);
+    }
+
+    if let Some(kp) = key_path {
+        let sk = load_secret_key(kp);
+        let pk = sk.public_key();
+
+        // Patch public key
+        flat[pubkey_off..pubkey_off + 32].copy_from_slice(pk.as_ref());
+        eprintln!("  Patched pubkey at G#{:X}", pubkey_off);
+
+        // Signature region is already zero (matches self_verify's zeroing logic)
+        // Hash the binary with sig region zeroed
+        let hash = blake3::hash(&flat);
+        eprintln!("  BLAKE3: {}", &hash.to_hex()[..16]);
+
+        // Sign
+        let signature = sk.sign(hash.as_bytes(), None);
+
+        // Patch signature
+        flat[sig_off..sig_off + 64].copy_from_slice(signature.as_ref());
+        eprintln!("  Patched signature at G#{:X}", sig_off);
+    } else {
+        eprintln!("  Unsigned dev build (pubkey and sig zeroed)");
+    }
+
+    // Wrap as boot.img
+    let boot_img = make_boot_img(&flat);
+    write_output(output, &boot_img);
+    eprintln!("Wrote seed.img -> {} ({} bytes)", output, boot_img.len());
 }

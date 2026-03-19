@@ -106,6 +106,9 @@ pub mod caps {
     /// ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state
     /// mode: 0=latest (~N offset), 1=absolute generation, 2=all
     pub const BEAM: &[u8] = b"ferros.dev.beam";
+    /// Install — write sends signed kernel binary, exec persists to UFS + stem entry.
+    /// Exec params: [size:4 LE][hash:32][sig:64] = 100 bytes
+    pub const INSTALL: &[u8] = b"ferros.dev.install";
 }
 
 /// Ring identifiers for the beam command.
