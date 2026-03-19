@@ -1510,9 +1510,6 @@ impl Dwc3Dev {
         }
     }
 
-    /// Unconditionally issue ENDTRANSFER with rsc_idx=1.
-    /// Used when STARTTRANSFER fails with CMDSTATUS=1 (resource occupied)
-    /// but the register may not reflect the actual resource index.
     /// Cancel a pending bulk IN transfer and fully reset the endpoint.
     /// Used when the host disconnects/times out mid-transfer.
     pub fn cancel_bulk_in(&mut self) {
@@ -1523,6 +1520,41 @@ impl Dwc3Dev {
         }
         self.ep_cmd(3, DEPCMD_CLEARSTALL, 0, 0, 0);
         self.bulk_in_idle = true;
+    }
+
+    /// Recover a stale endpoint: ENDTRANSFER + CLEARSTALL + re-arm.
+    /// Call this when bulk_in_send() or bulk_out_arm() fails persistently.
+    pub fn recover_endpoint(&mut self, ep_phys: u8) {
+        self.force_end_transfer_unconditional(ep_phys);
+        self.ep_cmd(ep_phys as u8, DEPCMD_CLEARSTALL, 0, 0, 0);
+        match ep_phys {
+            2 => {
+                self.bulk_out_armed = false;
+                self.bulk_out_ready = false;
+                self.bulk_out_arm();
+            }
+            3 => {
+                self.bulk_in_idle = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Clean up all in-flight transfers on disconnect. Call from the
+    /// kernel's Disconnect event handler so endpoints are in a known
+    /// state when the host reconnects.
+    pub fn handle_disconnect(&mut self) {
+        // End any in-flight bulk transfers
+        if self.bulk_out_resource_idx != 0 {
+            self.end_transfer_raw(2, self.bulk_out_resource_idx as u32);
+        }
+        if self.bulk_in_resource_idx != 0 {
+            self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
+        }
+        self.bulk_out_armed = false;
+        self.bulk_out_ready = false;
+        self.bulk_in_idle = true;
+        self.configured = false;
     }
 
     pub fn force_end_transfer_unconditional(&mut self, ep_phys: u8) {
@@ -1616,6 +1648,13 @@ impl Dwc3Dev {
             4 | 5 => 512,
             _ => 64,
         };
+
+        // Clear stalls on bulk endpoints before re-init.
+        // handle_reset() does this, but if a transfer was in-flight when
+        // the host disconnected, the endpoint hardware may have stalled
+        // between reset and connect-done.
+        self.ep_cmd(2, DEPCMD_CLEARSTALL, 0, 0, 0);
+        self.ep_cmd(3, DEPCMD_CLEARSTALL, 0, 0, 0);
 
         // Full re-init after USB bus reset
         self.ep_start_config(0);

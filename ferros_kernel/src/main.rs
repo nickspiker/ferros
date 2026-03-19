@@ -2366,6 +2366,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         }
                         ferros_hal::usb::UsbEvent::Disconnect => {
                             log.puts("  disconnected\n");
+                            usb.handle_disconnect();
+                            // Clear PT state — session is dead
+                            pt_inbound = None;
+                            pt_outbound = None;
+                            pt_seq_width = 0;
+                            pt_complete_len = 0;
+                            pt_out_spec_len = 0;
+                            pt_out_data.clear();
+                            pt_out_bitmap.clear();
                             ledger.post(&Event::UsbDisconnect);
                             _evt_count += 1;
                         }
