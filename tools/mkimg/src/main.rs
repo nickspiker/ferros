@@ -655,14 +655,18 @@ fn cmd_seed(args: &[String]) {
 
     eprintln!("Building signed seed: {}", input);
 
-    // Find PUBKEY and SEED_SIG statics in the ELF symbol table.
-    // Rust mangles these, so search by suffix.
+    // Find PUBKEY, SEED_SIG, and __bss_start in the ELF symbol table.
+    // Rust mangles statics, so search by suffix.
     let pubkey_addr = elf_find_symbol_suffix(&elf_data, "PUBKEY").unwrap_or_else(|| {
         eprintln!("Error: PUBKEY symbol not found in ELF");
         process::exit(1);
     });
     let sig_addr = elf_find_symbol_suffix(&elf_data, "SEED_SIG").unwrap_or_else(|| {
         eprintln!("Error: SEED_SIG symbol not found in ELF");
+        process::exit(1);
+    });
+    let bss_start_addr = elf_find_symbol(&elf_data, "__bss_start").unwrap_or_else(|| {
+        eprintln!("Error: __bss_start symbol not found in ELF");
         process::exit(1);
     });
 
@@ -673,13 +677,19 @@ fn cmd_seed(args: &[String]) {
     let base_addr = segments[0].vaddr;
     let pubkey_off = (pubkey_addr - base_addr) as usize;
     let sig_off = (sig_addr - base_addr) as usize;
+    let bss_off = (bss_start_addr - base_addr) as usize;
 
     eprintln!("  PUBKEY offset: G#{:X} (vaddr G#{:X})", pubkey_off, pubkey_addr);
     eprintln!("  SEED_SIG offset: G#{:X} (vaddr G#{:X})", sig_off, sig_addr);
+    eprintln!("  __bss_start offset: G#{:X} (vaddr G#{:X})", bss_off, bss_start_addr);
 
     // Bounds check
     if pubkey_off + 32 > flat.len() || sig_off + 64 > flat.len() {
         eprintln!("Error: symbol offsets exceed binary size");
+        process::exit(1);
+    }
+    if bss_off > flat.len() || sig_off + 64 > bss_off {
+        eprintln!("Error: __bss_start must be after SEED_SIG");
         process::exit(1);
     }
 
@@ -691,10 +701,11 @@ fn cmd_seed(args: &[String]) {
         flat[pubkey_off..pubkey_off + 32].copy_from_slice(pk.as_ref());
         eprintln!("  Patched pubkey at G#{:X}", pubkey_off);
 
-        // Signature region is already zero (matches self_verify's zeroing logic)
-        // Hash the binary with sig region zeroed
-        let hash = blake3::hash(&flat);
-        eprintln!("  BLAKE3: {}", &hash.to_hex()[..16]);
+        // Hash only _start..__bss_start (file-backed data, excludes BSS/stack).
+        // Matches seed's self_verify() which hashes the same range.
+        // Signature region is still zero (matches self_verify's zeroing logic).
+        let hash = blake3::hash(&flat[..bss_off]);
+        eprintln!("  BLAKE3 (..bss): {}", &hash.to_hex()[..16]);
 
         // Sign
         let signature = sk.sign(hash.as_bytes(), None);

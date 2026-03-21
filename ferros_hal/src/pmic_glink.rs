@@ -35,13 +35,13 @@ use crate::mmio;
 const IPCC_BASE: usize = 0x0040_8000;
 const IPCC_SEND_ID: usize = IPCC_BASE + 0x0C; // write to ring remote doorbell
 
-/// Doorbell to signal ADSP GLINK: client=LPASS/ADSP(2)<<16 | signal=GLINK_TXN(0).
-/// IPCC client IDs (SM7325/QCM6490): APSS=0, MPSS=1, LPASS/ADSP=2, SLPI=3, CDSP=6.
-/// ADSP is confirmed running (SMEM version[7]=0xC0000 written by ADSP).
-/// Try signal 0 first; also try signal 1 and 2 during handshake (signal ID unknown).
-const ADSP_DOORBELL: u32 = 2 << 16 | 0;  // LPASS/ADSP client, signal 0
-const ADSP_DOORBELL_S1: u32 = 2 << 16 | 1; // LPASS/ADSP client, signal 1 (alt)
-const ADSP_DOORBELL_S2: u32 = 2 << 16 | 2; // LPASS/ADSP client, signal 2 (alt)
+/// Doorbell to signal ADSP GLINK: client=LPASS(3)<<16 | signal=GLINK_QMP(0).
+/// IPCC client IDs (SC7280/QCM6490 from Linux qcom-ipcc.h):
+///   AOP=0, TZ=1, MPSS=2, LPASS=3, SLPI=4, CDSP=5, NPU=6, APSS=7.
+/// Signal 0 = IPCC_MPROC_SIGNAL_GLINK_QMP (standard GLINK doorbell).
+const ADSP_DOORBELL: u32 = 3 << 16 | 0;  // LPASS client, GLINK_QMP signal
+/// SMP2P doorbell: same LPASS client, signal 2 = IPCC_MPROC_SIGNAL_SMP2P.
+const ADSP_SMP2P_DOORBELL: u32 = 3 << 16 | 2;
 
 // ---------------------------------------------------------------------------
 // SMEM — Shared Memory (G#80900000, 2MB)
@@ -112,6 +112,41 @@ const SMEM_PRIVATE_CANARY: u16 = 0xa5a5;
 const SMEM_ITEM_DESC:    usize = 478; // 32-byte GLINK descriptor (head/tail pointers)
 const SMEM_ITEM_ADSP_TX: usize = 479; // ADSP TX FIFO (ADSP writes → APPS reads)
 const SMEM_ITEM_APPS_TX: usize = 480; // APPS TX FIFO (APPS writes → ADSP reads), APPS allocates
+
+// ---------------------------------------------------------------------------
+// SMP2P — Shared Memory Point-to-Point (readiness signaling)
+// ---------------------------------------------------------------------------
+//
+// ADSP waits for APPS to clear the "stop" bit in SMP2P before starting
+// GLINK transport. Without this signal, ADSP's charger_pd stays dormant.
+//
+// SMEM items:
+//   443 = APPS→ADSP (outbound, APPS writes)
+//   429 = ADSP→APPS (inbound, ADSP writes)
+//
+// smp2p_smem_item layout (G#154 = 340 bytes):
+//   [0x00] magic          u32 = G#504D5324 ("$SMP")
+//   [0x04] version        u8  = 1
+//   [0x05] features       u24 (3 bytes)
+//   [0x08] local_pid      u16 (writer's processor ID)
+//   [0x0A] remote_pid     u16 (reader's processor ID)
+//   [0x0C] total_entries  u16 (max 16)
+//   [0x0E] valid_entries  u16 (currently valid)
+//   [0x10] flags          u32 (SSR flags)
+//   [0x14] entries[16]    each: name[16] + value[4] = 20 bytes
+//
+// Processor IDs: APPS=0, Modem=1, ADSP/LPASS=2, WCNSS=3, SLPI=4, CDSP=5
+//
+// Entry "master-kernel": bit 0 of value = stop signal.
+//   Set = APPS requesting ADSP to stop.
+//   Clear = APPS ready, ADSP may proceed.
+
+const SMP2P_APPS_TO_ADSP: usize = 443; // SMEM item: APPS→ADSP SMP2P
+const SMP2P_ADSP_TO_APPS: usize = 429; // SMEM item: ADSP→APPS SMP2P
+const SMP2P_MAGIC: u32 = 0x504D_5324;  // "$SMP" in LE
+const SMP2P_MAX_ENTRY: usize = 16;
+const SMP2P_ENTRY_SIZE: usize = 20;    // name[16] + value[4]
+const SMP2P_HEADER_SIZE: usize = 0x14; // 20 bytes before entries[]
 
 const FIFO_SIZE: usize = 0x4000; // 16 KiB — must be a power of 2
 const FIFO_MASK: usize = FIFO_SIZE - 1;
@@ -366,6 +401,50 @@ pub fn scan_cdsp_items(out: &mut [(u16, u32)]) -> usize {
     scan_partition_items(5, out)
 }
 
+/// Scan all items in any partition identified by host pair.
+pub fn scan_host_items(host_a: u16, host_b: u16, out: &mut [(u16, u32)]) -> usize {
+    let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
+    let ptable_magic   = unsafe { mmio::read32(ptable_base) };
+    if ptable_magic != SMEM_PTABLE_MAGIC { return 0; }
+    let ptable_entries = unsafe { mmio::read32(ptable_base + 8) } as usize;
+    let (part_off, part_size, part_magic, free_unc, free_cac) =
+        find_host_partition(ptable_base, ptable_entries, host_a, host_b);
+    if part_off == 0xFFFF_FFFF || part_magic != SMEM_PARTITION_MAGIC { return 0; }
+    let part_base = SMEM_BASE + part_off as usize;
+    let mut n = 0;
+    let unc_start = part_base + 32;
+    let unc_end   = part_base + free_unc as usize;
+    let mut cur = unc_start;
+    while cur + 16 <= unc_end && n < out.len() {
+        let canary = unsafe { mmio::read16(cur + 0) };
+        if canary != SMEM_PRIVATE_CANARY { break; }
+        let item_id     = unsafe { mmio::read16(cur + 2) };
+        let data_size   = unsafe { mmio::read32(cur + 4) };
+        let padding_hdr = unsafe { mmio::read16(cur + 10) } as usize;
+        out[n] = (item_id, data_size);
+        n += 1;
+        let step = 16 + padding_hdr + data_size as usize;
+        if step == 0 { break; }
+        cur += step;
+    }
+    let cac_start = part_base + free_cac as usize;
+    let cac_end   = part_base + part_size as usize;
+    cur = cac_start;
+    while cur + 16 <= cac_end && n < out.len() {
+        let canary = unsafe { mmio::read16(cur + 0) };
+        if canary != SMEM_PRIVATE_CANARY { break; }
+        let item_id     = unsafe { mmio::read16(cur + 2) };
+        let data_size   = unsafe { mmio::read32(cur + 4) };
+        let padding_hdr = unsafe { mmio::read16(cur + 10) } as usize;
+        out[n] = (item_id, data_size);
+        n += 1;
+        let step = 16 + padding_hdr + data_size as usize;
+        if step == 0 { break; }
+        cur += step;
+    }
+    n
+}
+
 fn scan_partition_items(remote_host: u16, out: &mut [(u16, u32)]) -> usize {
     let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
@@ -472,6 +551,76 @@ pub fn probe_adsp_raw() -> (u32, u32, u32, [u8; 16]) {
     (desc_addr as u32, th, rx_addr as u32, rx_bytes)
 }
 
+/// Battery state from QG (fuel gauge) + SDAM direct SPMI reads.
+///
+/// Bypasses GLINK entirely — reads raw hardware registers.
+/// QG at SID 8 PID G#C8, SDAM at SID 8 PID G#70.
+#[derive(Copy, Clone, Default)]
+pub struct QgBatteryState {
+    /// Raw QG VBAT ADC code from C8[G#50-G#51] (u16 LE).
+    pub vbat_raw: u16,
+    /// Estimated battery voltage in mV (vbat_raw × G#9C / G#28, ~2.44 mV/code).
+    pub vbat_mv: u32,
+    /// SDAM 70[G#40] validity byte (non-zero = QG data valid).
+    pub sdam_valid: u8,
+    /// SDAM 70 data region (10 bytes at G#40-G#49).
+    pub sdam_data: [u8; 10],
+    /// SCHG_USB C9 status: reg[G#09] = USB charger real-time status.
+    pub usb_rt_sts: u8,
+    /// SCHG_CHGR C7 status: reg[G#09] (real-time charge status).
+    pub chgr_rt_sts: u8,
+    /// SCHG_MISC CB: reg[G#07] = MISC status.
+    pub misc_sts: u8,
+}
+
+/// Read battery state directly from QG/SDAM/SCHG registers via SPMI.
+///
+/// Works without GLINK — uses SPMI arbiter-granted read access to SID 8.
+pub fn probe_battery_qg() -> QgBatteryState {
+    use crate::spmi;
+    let mut st = QgBatteryState::default();
+
+    // QG at SID 8, PID 0xC8: read VBAT raw at registers 0x50-0x51.
+    let c8_ppid = spmi::ppid(8, 0xC8);
+    if let Some(apid) = spmi::find_apid(c8_ppid) {
+        let lo = spmi::read_byte(apid, 0x50).unwrap_or(0) as u16;
+        let hi = spmi::read_byte(apid, 0x51).unwrap_or(0) as u16;
+        st.vbat_raw = lo | (hi << 8);
+        // Conversion: ~2.441 mV per code (5000 mV / 2048 codes, 11-bit effective).
+        // Use integer math: raw * 5000 / 2048 = raw * 625 / 256.
+        st.vbat_mv = (st.vbat_raw as u32 * 625) / 256;
+    }
+
+    // SDAM at SID 8, PID 0x70: QG calibration/state data at 0x40.
+    let sdam_ppid = spmi::ppid(8, 0x70);
+    if let Some(apid) = spmi::find_apid(sdam_ppid) {
+        st.sdam_valid = spmi::read_byte(apid, 0x40).unwrap_or(0);
+        for i in 0..10 {
+            st.sdam_data[i] = spmi::read_byte(apid, 0x40 + i as u8).unwrap_or(0);
+        }
+    }
+
+    // SCHG_USB at SID 8, PID 0xC9: USB charger RT status.
+    let c9_ppid = spmi::ppid(8, 0xC9);
+    if let Some(apid) = spmi::find_apid(c9_ppid) {
+        st.usb_rt_sts = spmi::read_byte(apid, 0x09).unwrap_or(0);
+    }
+
+    // SCHG_CHGR at SID 8, PID 0xC7: charger RT status.
+    let c7_ppid = spmi::ppid(8, 0xC7);
+    if let Some(apid) = spmi::find_apid(c7_ppid) {
+        st.chgr_rt_sts = spmi::read_byte(apid, 0x09).unwrap_or(0);
+    }
+
+    // SCHG_MISC at SID 8, PID 0xCB: misc status.
+    let cb_ppid = spmi::ppid(8, 0xCB);
+    if let Some(apid) = spmi::find_apid(cb_ppid) {
+        st.misc_sts = spmi::read_byte(apid, 0x07).unwrap_or(0);
+    }
+
+    st
+}
+
 /// Probe SID 8 peripherals via SPMI — PM7250B BMS/charger on Fairphone 5.
 ///
 /// Returns (pid, perph_type, perph_subtype, status0) where:
@@ -526,6 +675,264 @@ pub fn probe_rtc() -> Option<u32> {
     Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
 }
 
+/// SMP2P probe result — read-only snapshot of both directions.
+pub struct Smp2pProbe {
+    /// APPS→ADSP item found (SMEM 443).
+    pub outbound_found: bool,
+    /// APPS→ADSP magic (G#504D5324 if valid).
+    pub outbound_magic: u32,
+    /// APPS→ADSP valid_entries count.
+    pub outbound_valid: u16,
+    /// APPS→ADSP flags (SSR bits).
+    pub outbound_flags: u32,
+    /// Index of "master-kernel" entry in outbound item, G#FF if not found.
+    pub master_kernel_idx: u8,
+    /// Current value of "master-kernel" entry (bit 0 = stop).
+    pub master_kernel_val: u32,
+    /// ADSP→APPS item found (SMEM 429).
+    pub inbound_found: bool,
+    /// ADSP→APPS magic.
+    pub inbound_magic: u32,
+    /// ADSP→APPS valid_entries count.
+    pub inbound_valid: u16,
+    /// Index of "slave-kernel" entry in inbound item, G#FF if not found.
+    pub slave_kernel_idx: u8,
+    /// Current value of "slave-kernel" entry (bit 1 = ready).
+    pub slave_kernel_val: u32,
+}
+
+/// Read SMP2P state from both APPS→ADSP (item 443) and ADSP→APPS (item 429).
+///
+/// Safe to call at any time — purely read-only.
+pub fn probe_smp2p() -> Smp2pProbe {
+    let mut p = Smp2pProbe {
+        outbound_found: false, outbound_magic: 0, outbound_valid: 0,
+        outbound_flags: 0, master_kernel_idx: 0xFF, master_kernel_val: 0,
+        inbound_found: false, inbound_magic: 0, inbound_valid: 0,
+        slave_kernel_idx: 0xFF, slave_kernel_val: 0,
+    };
+
+    // APPS→ADSP (item 443)
+    if let Some(addr) = smem_item_ptr(SMP2P_APPS_TO_ADSP) {
+        p.outbound_found = true;
+        p.outbound_magic = unsafe { mmio::read32(addr) };
+        if p.outbound_magic == SMP2P_MAGIC {
+            p.outbound_valid = unsafe { mmio::read16(addr + 0x0E) };
+            p.outbound_flags = unsafe { mmio::read32(addr + 0x10) };
+            if let Some((idx, val)) = smp2p_find_entry(addr, p.outbound_valid, b"master-kernel\0\0\0") {
+                p.master_kernel_idx = idx;
+                p.master_kernel_val = val;
+            }
+        }
+    }
+
+    // ADSP→APPS (item 429)
+    if let Some(addr) = smem_item_ptr(SMP2P_ADSP_TO_APPS) {
+        p.inbound_found = true;
+        p.inbound_magic = unsafe { mmio::read32(addr) };
+        if p.inbound_magic == SMP2P_MAGIC {
+            p.inbound_valid = unsafe { mmio::read16(addr + 0x0E) };
+            if let Some((idx, val)) = smp2p_find_entry(addr, p.inbound_valid, b"slave-kernel\0\0\0\0") {
+                p.slave_kernel_idx = idx;
+                p.slave_kernel_val = val;
+            }
+        }
+    }
+
+    p
+}
+
+/// Clear the "stop" bit in SMP2P APPS→ADSP to signal readiness.
+///
+/// If item 443 doesn't exist yet, allocates it in the APPS↔ADSP partition
+/// and creates a "master-kernel" entry with value 0 (stop cleared).
+///
+/// If the item exists but has no "master-kernel" entry, appends one.
+///
+/// Rings the SMP2P doorbell (IPCC signal 2) after updating.
+///
+/// Returns `true` if the stop bit was successfully cleared (or was already clear).
+pub fn smp2p_clear_stop() -> bool {
+    // Try to find existing item 443.
+    if let Some(addr) = smem_item_ptr(SMP2P_APPS_TO_ADSP) {
+        let magic = unsafe { mmio::read32(addr) };
+        if magic != SMP2P_MAGIC {
+            return false;
+        }
+        let valid = unsafe { mmio::read16(addr + 0x0E) };
+        if let Some((_, val)) = smp2p_find_entry(addr, valid, b"master-kernel\0\0\0") {
+            // Entry exists — clear bit 0 (stop).
+            if val & 1 != 0 {
+                let entry_val_addr = smp2p_entry_value_addr(addr, valid, b"master-kernel\0\0\0").unwrap();
+                let new_val = val & !1;
+                unsafe { mmio::write32(entry_val_addr, new_val) };
+                dsb();
+            }
+            // Ring SMP2P doorbell.
+            unsafe { mmio::write32(IPCC_SEND_ID, ADSP_SMP2P_DOORBELL) };
+            return true;
+        }
+        // Entry not found — create "master-kernel" with value 0.
+        if (valid as usize) < SMP2P_MAX_ENTRY {
+            let entry_base = addr + SMP2P_HEADER_SIZE + (valid as usize) * SMP2P_ENTRY_SIZE;
+            // Write 16-byte name.
+            let name = b"master-kernel\0\0\0";
+            for i in 0..16 {
+                unsafe { mmio::write8(entry_base + i, name[i]) };
+            }
+            // Write value = 0 (stop cleared).
+            unsafe { mmio::write32(entry_base + 16, 0) };
+            dsb();
+            // Increment valid_entries.
+            unsafe { mmio::write16(addr + 0x0E, valid + 1) };
+            dsb();
+            // Ring SMP2P doorbell.
+            unsafe { mmio::write32(IPCC_SEND_ID, ADSP_SMP2P_DOORBELL) };
+            return true;
+        }
+        return false; // full
+    }
+
+    // Item 443 not found — allocate in both (0,2) and (7,2) partitions.
+    // ADSP might look in either APPS(0) or APSS(7) partition for SMP2P.
+    let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
+    let ptable_magic   = unsafe { mmio::read32(ptable_base) };
+    if ptable_magic != SMEM_PTABLE_MAGIC { return false; }
+    let ptable_entries = unsafe { mmio::read32(ptable_base + 8) } as usize;
+    let smp2p_size = SMP2P_HEADER_SIZE + SMP2P_MAX_ENTRY * SMP2P_ENTRY_SIZE;
+
+    let mut allocated = false;
+    for &(host_a, local_pid) in &[(0u16, 0u16), (7, 7)] {
+        let (part_off, part_size, part_magic, _, _) =
+            find_host_partition(ptable_base, ptable_entries, host_a, 2);
+        if part_off == 0xFFFF_FFFF || part_magic != SMEM_PARTITION_MAGIC { continue; }
+        let part_base = SMEM_BASE + part_off as usize;
+        let free_unc = unsafe { mmio::read32(part_base + 12) } as usize;
+
+        let addr = match smem_alloc_private_item(part_base, part_size as usize,
+                                                  free_unc, SMP2P_APPS_TO_ADSP, smp2p_size) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Initialize SMP2P header.
+        unsafe {
+            mmio::write32(addr + 0x00, SMP2P_MAGIC);
+            mmio::write8(addr + 0x04, 1);             // version
+            mmio::write8(addr + 0x05, 1);             // features = SSR_ACK
+            mmio::write8(addr + 0x06, 0);
+            mmio::write8(addr + 0x07, 0);
+            mmio::write16(addr + 0x08, local_pid);    // local_pid = host_a
+            mmio::write16(addr + 0x0A, 2);            // remote_pid = ADSP(2)
+            mmio::write16(addr + 0x0C, SMP2P_MAX_ENTRY as u16);
+            mmio::write16(addr + 0x0E, 1);            // valid_entries = 1
+            mmio::write32(addr + 0x10, 0);            // flags = 0
+        }
+
+        // Write "master-kernel" entry with value 0 (stop cleared).
+        let entry_base = addr + SMP2P_HEADER_SIZE;
+        let name = b"master-kernel\0\0\0";
+        for i in 0..16 {
+            unsafe { mmio::write8(entry_base + i, name[i]) };
+        }
+        unsafe { mmio::write32(entry_base + 16, 0) };
+        dsb();
+        allocated = true;
+    }
+
+    if allocated {
+        // Ring SMP2P doorbell.
+        unsafe { mmio::write32(IPCC_SEND_ID, ADSP_SMP2P_DOORBELL) };
+    }
+    allocated
+}
+
+/// Find a named entry in an SMP2P item. Returns (index, value) if found.
+fn smp2p_find_entry(item_addr: usize, valid_entries: u16, name: &[u8; 16]) -> Option<(u8, u32)> {
+    let count = (valid_entries as usize).min(SMP2P_MAX_ENTRY);
+    for i in 0..count {
+        let entry = item_addr + SMP2P_HEADER_SIZE + i * SMP2P_ENTRY_SIZE;
+        let mut matched = true;
+        for j in 0..16 {
+            if unsafe { mmio::read8(entry + j) } != name[j] {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let val = unsafe { mmio::read32(entry + 16) };
+            return Some((i as u8, val));
+        }
+    }
+    None
+}
+
+/// Return the address of a named entry's value field in an SMP2P item.
+fn smp2p_entry_value_addr(item_addr: usize, valid_entries: u16, name: &[u8; 16]) -> Option<usize> {
+    let count = (valid_entries as usize).min(SMP2P_MAX_ENTRY);
+    for i in 0..count {
+        let entry = item_addr + SMP2P_HEADER_SIZE + i * SMP2P_ENTRY_SIZE;
+        let mut matched = true;
+        for j in 0..16 {
+            if unsafe { mmio::read8(entry + j) } != name[j] {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Some(entry + 16);
+        }
+    }
+    None
+}
+
+/// Probe IPCC state for diagnostics.
+/// Returns: (recv_id, pending signals read from RECV_ID register).
+/// Also reads all safe IPCC registers into `regs` (offset, value) pairs.
+/// `regs` should have at least 16 entries.
+pub fn probe_ipcc(regs: &mut [(u32, u32)]) -> (u32, usize) {
+    // Only offsets confirmed safe from prior testing
+    const OFFSETS: &[u32] = &[0x00, 0x04];
+    let mut n = 0;
+    for &off in OFFSETS {
+        if n >= regs.len() { break; }
+        let val = unsafe { mmio::read32(IPCC_BASE + off as usize) };
+        regs[n] = (off, val);
+        n += 1;
+    }
+    // RECV_ID at 0x10 might fault — skip if base read already failed
+    let recv_id = if n > 0 && regs[0].1 != 0 {
+        unsafe { mmio::read32(IPCC_BASE + 0x10) }
+    } else {
+        0xDEAD_DEAD
+    };
+    (recv_id, n)
+}
+
+/// Enable IPCC receive signal for ADSP→APPS GLINK.
+/// This ensures the IPCC hardware knows APPS is listening for ADSP doorbells.
+/// Returns (recv_enable_ok, clear_ok) — false if MMIO access faulted.
+pub fn ipcc_enable_recv() -> (bool, bool) {
+    // These registers (0x14, 0x1C) may fault on some platforms.
+    // Read IPCC_REV first as a canary — if 0x00 faults, skip everything.
+    let rev = unsafe { mmio::read32(IPCC_BASE) };
+    if rev == 0 { return (false, false); }
+
+    // Try writing — no way to detect fault from bare-metal without exception count.
+    // Just write and hope. If it faults, the exception handler will resume.
+    let adsp_glink: u32 = (3 << 16) | 0;
+    unsafe {
+        mmio::write32(IPCC_BASE + 0x1C, adsp_glink); // clear pending
+        mmio::write32(IPCC_BASE + 0x14, adsp_glink); // enable recv
+    }
+    (true, true)
+}
+
+/// Send doorbell to a specific IPCC client/signal for testing.
+pub fn ipcc_send(client: u32, signal: u32) {
+    unsafe { mmio::write32(IPCC_SEND_ID, (client << 16) | signal) };
+}
+
 // ---------------------------------------------------------------------------
 // PmicGlink — GLINK-over-SMEM driver
 // ---------------------------------------------------------------------------
@@ -555,16 +962,22 @@ impl PmicGlink {
             return None;
         }
 
+        // SMP2P readiness: clear the "stop" bit in APPS→ADSP SMP2P (SMEM 443).
+        // ADSP waits for this signal before starting GLINK transport.
+        // Must happen before any GLINK activity.
+        smp2p_clear_stop();
+        // Give ADSP time to process SMP2P signal and start GLINK transport.
+        for _ in 0..1_000_000u32 {
+            unsafe { core::arch::asm!("nop") };
+        }
+
         // Signal APPS SMEM readiness: write SMEM_PROTOCOL_VERSION to versions[0].
         // ADSP's charger_pd checks this before starting the GLINK handshake.
         // versions[7] is set by ABL; versions[0] = APPS (us) signaling we're up.
         unsafe { mmio::write32(SMEM_BASE + SMEM_VERSION_OFF, 0x000C_0000) };
         // Ring ADSP doorbell immediately after version write so charger_pd wakes up.
-        // Try signals 0, 1, 2 — GLINK_TXN signal ID on SM7325/QCM6490 unknown.
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S1);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S2);
         }
 
         // All three items must come from the same private partition.
@@ -611,8 +1024,7 @@ impl PmicGlink {
         let _ = tx_fifo_was_new; // suppress unused warning
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S1);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S2);
+            // Signal 0 only — GLINK_QMP is the standard doorbell.
         }
         for _ in 0..200_000u32 {
             unsafe { core::arch::asm!("nop") };
@@ -650,6 +1062,9 @@ impl PmicGlink {
     pub fn addresses(&self) -> (usize, usize, usize) {
         (self.desc, self.tx_fifo, self.rx_fifo)
     }
+
+    /// Return descriptor base address for raw memory reads.
+    pub fn desc_addr(&self) -> usize { self.desc }
 
     /// Read descriptor head/tail words: (tx_tail, tx_head, rx_tail, rx_head).
     pub fn desc_snapshot(&self) -> (u32, u32, u32, u32) {
@@ -1015,8 +1430,7 @@ impl PmicGlink {
         // IPCC write is write-only; hardware clears immediately so rapid succession is fine.
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S1);
-            mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL_S2);
+            // Signal 0 only — GLINK_QMP is the standard doorbell.
         }
     }
 
@@ -1130,10 +1544,12 @@ fn smem_item_ptr(item: usize) -> Option<usize> {
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
     if ptable_magic != SMEM_PTABLE_MAGIC { return None; }
     let ptable_entries = unsafe { mmio::read32(ptable_base + 8) } as usize;
-    // Private partition — try CDSP (host 5) first, then ADSP (host 2).
-    for &remote in &[5u16, 2u16] {
+    // Private partitions — check all relevant host pairs.
+    // Host 0 = APPS (legacy), Host 7 = APSS (newer SoCs like QCM6490).
+    // SMP2P items may be in (7,2) APSS↔ADSP rather than (0,2) APPS↔ADSP.
+    for &(host_a, host_b) in &[(0u16, 5u16), (0, 2), (7, 2), (7, 5)] {
         let (part_off, part_size, part_magic, free_unc, free_cac) =
-            find_host_partition(ptable_base, ptable_entries, 0, remote);
+            find_host_partition(ptable_base, ptable_entries, host_a, host_b);
         if part_off == 0xFFFF_FFFF || part_magic != SMEM_PARTITION_MAGIC { continue; }
         let part_base = SMEM_BASE + part_off as usize;
         if let Some(p) = find_private_item(part_base, free_unc as usize,

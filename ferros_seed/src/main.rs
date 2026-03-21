@@ -256,14 +256,15 @@ const KERNEL_STAGE: usize = 0x8200_0000;
 
 #[unsafe(no_mangle)]
 extern "C" fn seed_main(dtb_addr: usize) -> ! {
-    progress(0xFF_00FF00); // green = entered seed_main
-
-    // ---- Step 1: Self-verify ----
+    // Self-verify FIRST — before any memory modifications.
+    // progress() modifies PROGRESS_X (.data), which is in the hashed range.
+    // Stack frames are excluded by hashing only _start..__bss_start.
     if !self_verify() {
         error("SEED INTEGRITY FAILURE");
         halt();
     }
-    progress(0xFF_FFFF00); // yellow = self-verify passed
+    progress(0xFF_00FF00); // green = self-verify passed
+    progress(0xFF_FFFF00); // yellow = proceeding
 
     // ---- Step 2: Init UFS (resume from ABL state) ----
     let ufs = ferros_hal::ufs::UfsController::resume();
@@ -319,8 +320,9 @@ extern "C" fn seed_main(dtb_addr: usize) -> ! {
                 halt();
             }
 
-            if PUBKEY != [0u8; 32] {
-                if !ed25519_verify(&entry.kernel_sig, hash.as_bytes()) {
+            let pubkey = read_pubkey();
+            if pubkey != [0u8; 32] {
+                if !ed25519_verify_key(&entry.kernel_sig, hash.as_bytes(), &pubkey) {
                     error("KERNEL SIGNATURE INVALID");
                     halt();
                 }
@@ -370,11 +372,21 @@ extern "C" fn seed_main(dtb_addr: usize) -> ! {
 // Self-verification
 // ---------------------------------------------------------------------------
 
+/// Read PUBKEY from memory via volatile — prevents the compiler from
+/// constant-folding the [0u8; 32] initializer (mkimg patches the bytes).
+fn read_pubkey() -> [u8; 32] {
+    unsafe { core::ptr::read_volatile(&raw const PUBKEY as *const [u8; 32]) }
+}
+
 /// Verify seed's own integrity: BLAKE3 hash with signature zeroed,
 /// then Ed25519 verify against embedded public key.
+///
+/// Hashes _start..__bss_start (file-backed data only). This excludes
+/// BSS and stack, which are modified at runtime before this runs.
+/// MUST be called before any .data modifications (e.g. progress()).
 fn self_verify() -> bool {
     let start = &raw const _start as usize;
-    let end = &raw const __seed_end as usize;
+    let end = &raw const __bss_start as usize;
     let sig_off = SEED_SIG.as_ptr() as usize - start;
     let size = end - start;
 
@@ -391,22 +403,24 @@ fn self_verify() -> bool {
     hasher.update(&binary[sig_off + 64..]);
     let hash = hasher.finalize();
 
+    // Read sig and pubkey from memory (not the static — compiler may fold it)
     let sig_bytes = &binary[sig_off..sig_off + 64];
+    let pubkey = read_pubkey();
 
     // Dev build: all-zero signature + pubkey = skip verification
-    if sig_bytes == &[0u8; 64] && PUBKEY == [0u8; 32] {
+    if sig_bytes == &[0u8; 64] && pubkey == [0u8; 32] {
         return true;
     }
 
-    ed25519_verify(sig_bytes, hash.as_bytes())
+    ed25519_verify_key(sig_bytes, hash.as_bytes(), &pubkey)
 }
 
 // ---------------------------------------------------------------------------
 // Ed25519 verification
 // ---------------------------------------------------------------------------
 
-fn ed25519_verify(sig_bytes: &[u8], message: &[u8]) -> bool {
-    let pk = match ed25519_compact::PublicKey::from_slice(&PUBKEY) {
+fn ed25519_verify_key(sig_bytes: &[u8], message: &[u8], pubkey: &[u8; 32]) -> bool {
+    let pk = match ed25519_compact::PublicKey::from_slice(pubkey) {
         Ok(pk) => pk,
         Err(_) => return false,
     };

@@ -2005,6 +2005,53 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
         }
 
+        // SMP2P readiness signaling probe (before GLINK init)
+        {
+            let smp = pmic_glink::probe_smp2p();
+            log.puts("smp2p out 443: ");
+            if smp.outbound_found {
+                log.puts("found magic="); log.put_hex32(smp.outbound_magic);
+                log.puts(" valid="); log.put_hex32(smp.outbound_valid as u32);
+                log.puts(" flags="); log.put_hex32(smp.outbound_flags);
+                log.puts("\n");
+                if smp.master_kernel_idx != 0xFF {
+                    log.puts("  master-kernel: idx="); log.put_hex32(smp.master_kernel_idx as u32);
+                    log.puts(" val="); log.put_hex32(smp.master_kernel_val);
+                    log.puts(if smp.master_kernel_val & 1 != 0 { " STOP SET\n" } else { " stop clear\n" });
+                } else {
+                    log.puts("  master-kernel: NOT FOUND\n");
+                }
+            } else {
+                log.puts("NOT FOUND\n");
+            }
+
+            log.puts("smp2p in  429: ");
+            if smp.inbound_found {
+                log.puts("found magic="); log.put_hex32(smp.inbound_magic);
+                log.puts(" valid="); log.put_hex32(smp.inbound_valid as u32);
+                log.puts("\n");
+                if smp.slave_kernel_idx != 0xFF {
+                    log.puts("  slave-kernel:  idx="); log.put_hex32(smp.slave_kernel_idx as u32);
+                    log.puts(" val="); log.put_hex32(smp.slave_kernel_val);
+                    let ready = smp.slave_kernel_val & 2 != 0;
+                    log.puts(if ready { " READY\n" } else { " not ready\n" });
+                } else {
+                    log.puts("  slave-kernel:  NOT FOUND\n");
+                }
+            } else {
+                log.puts("NOT FOUND\n");
+            }
+        }
+
+        // IPCC rev + config (safe offsets only — 0x10+ are TZ-protected)
+        {
+            let rev = unsafe { ferros_hal::mmio::read32(0x0040_8000) };
+            let cfg = unsafe { ferros_hal::mmio::read32(0x0040_8004) };
+            log.buf_only("IPCC:          rev="); log.buf_put_hex32(rev);
+            log.buf_only(" cfg="); log.buf_put_hex32(cfg);
+            log.buf_only("\n");
+        }
+
         // GLINK handshake + BATTMGR query.
         // init() will auto-allocate item 480 (APPS TX FIFO) if missing.
         // We only need SMEM initialized + items 478/479 present (ADSP side).
@@ -2056,6 +2103,32 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 let (id, sz) = items[i];
                 log.buf_put_hex32(id as u32); log.buf_only("(");
                 log.buf_put_hex32(sz); log.buf_only(") ");
+            }
+            log.puts("\n");
+        }
+        // Scan APSS(7)↔ADSP(2) partition — SMP2P items may live here.
+        {
+            let mut items = [(0u16, 0u32); 16];
+            let n = pmic_glink::scan_host_items(7, 2, &mut items);
+            log.puts("apss↔adsp(7:2):");
+            if n == 0 { log.puts(" (empty)"); }
+            for i in 0..n {
+                let (id, sz) = items[i];
+                log.buf_only(" "); log.buf_put_hex32(id as u32);
+                log.buf_only("("); log.buf_put_hex32(sz); log.buf_only(")");
+            }
+            log.puts("\n");
+        }
+        // Also scan APSS(7)↔Modem(1) for reference.
+        {
+            let mut items = [(0u16, 0u32); 16];
+            let n = pmic_glink::scan_host_items(7, 1, &mut items);
+            log.puts("apss↔mdm (7:1):");
+            if n == 0 { log.puts(" (empty)"); }
+            for i in 0..n {
+                let (id, sz) = items[i];
+                log.buf_only(" "); log.buf_put_hex32(id as u32);
+                log.buf_only("("); log.buf_put_hex32(sz); log.buf_only(")");
             }
             log.puts("\n");
         }
@@ -2141,21 +2214,29 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         log.buf_only("  post-to rx[0..32]: ");
                         for b in &fv { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
                         log.buf_only("\n");
-                        // Dump all IPCC registers (incl. tentative per-source banks).
+                        // Dump raw descriptor (32 bytes) after timeout
                         {
-                            let mut ipcc = [(0u32, 0u32); 32];
-                            let n = pmic_glink::PmicGlink::dump_ipcc(&mut ipcc);
-                            log.buf_only("  IPCC regs: ");
-                            for i in 0..n {
-                                let (off, val) = ipcc[i];
-                                if val != 0 {
-                                    log.buf_only("["); log.buf_put_hex32(off);
-                                    log.buf_only("]="); log.buf_put_hex32(val);
-                                    log.buf_only(" ");
-                                }
+                            log.buf_only("  desc raw: ");
+                            for off in (0..32).step_by(4) {
+                                let v = unsafe { ferros_hal::mmio::read32(glink.desc_addr() + off) };
+                                log.buf_put_hex32(v); log.buf_only(" ");
                             }
-                            log.buf_only("(nz only)\n");
+                            log.buf_only("\n");
                         }
+                        // Post-GLINK SMP2P re-probe — did our allocation work?
+                        let smp = pmic_glink::probe_smp2p();
+                        log.puts("  smp2p post:  out=");
+                        log.put_hex32(smp.outbound_found as u32);
+                        if smp.outbound_found {
+                            log.puts(" magic="); log.put_hex32(smp.outbound_magic);
+                            log.puts(" mk="); log.put_hex32(smp.master_kernel_val);
+                        }
+                        log.puts(" in="); log.put_hex32(smp.inbound_found as u32);
+                        if smp.inbound_found {
+                            log.puts(" magic="); log.put_hex32(smp.inbound_magic);
+                            log.puts(" sk="); log.put_hex32(smp.slave_kernel_val);
+                        }
+                        log.puts("\n");
                     }
                 }
             }
@@ -2163,8 +2244,22 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts("glink:         SKIP (ADSP not ready)\n");
         }
 
+        // Battery state from QG fuel gauge + SCHG charger (direct SPMI).
+        {
+            let bat = pmic_glink::probe_battery_qg();
+            log.puts("battery:       ");
+            log.put_hex32(bat.vbat_mv); log.puts(" mV (raw=");
+            log.put_hex32(bat.vbat_raw as u32); log.puts(")\n");
+            log.puts("  sdam valid:  "); log.put_hex32(bat.sdam_valid as u32); log.puts("\n");
+            log.buf_only("  sdam[40-49]: ");
+            for b in &bat.sdam_data { log.buf_put_hex32(*b as u32); log.buf_only(" "); }
+            log.buf_only("\n");
+            log.puts("  usb_rt_sts:  "); log.put_hex32(bat.usb_rt_sts as u32);
+            log.puts("  chgr_rt_sts: "); log.put_hex32(bat.chgr_rt_sts as u32);
+            log.puts("  misc_sts:    "); log.put_hex32(bat.misc_sts as u32); log.puts("\n");
+        }
+
         // SID 8 SPMI probe — PM7250B BMS/charger peripherals on FP5.
-        // Reads PERPH_TYPE (0x40), PERPH_SUBTYPE (0x41), INT_LATCHED_STS (0x08).
         {
             let mut sid8 = [(0u8, 0u8, 0u8, 0u8); 16];
             let n = pmic_glink::probe_sid8_spmi(&mut sid8);
@@ -2181,10 +2276,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.puts("\n");
         }
         // Deep register dumps from key SID 8 PIDs.
-        // C8 = type 0x51/0x3F (FG or charger main — target for SOC/voltage)
-        // CB = type 0x0B/0x01 (BAT_IF — offset 7 = 0x21 = 33, possible SOC%)
-        // CA = type 0x0A/0x01 (VADC/ADC — target for voltage/temp measurements)
-        // Read 32 bytes at 0x00 and 16 bytes at 0x10 for each.
+        // C8 = type 0x51/0x3F (QG/BMS — fuel gauge, battery voltage/SOC)
+        // CB = type 0x0B/0x01 (BAT_IF)
+        // CA = type 0x0A/0x01 (MBG/ADC)
         for pid_u8 in [0xC8u8, 0xCBu8, 0xCAu8] {
             let mut regs = [0xFFu8; 32];
             let n = pmic_glink::read_sid8_regs(pid_u8, 0x00, &mut regs);
@@ -2192,13 +2286,58 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.buf_only("[00]: ");
             for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
             log.buf_only("\n");
-            // Also read 0x10-0x1F region (STATUS/control/data on many charger peripherals).
             let mut regs2 = [0xFFu8; 16];
             let n2 = pmic_glink::read_sid8_regs(pid_u8, 0x10, &mut regs2);
             log.buf_only("  C"); log.buf_put_hex32(pid_u8 as u32 & 0xF);
             log.buf_only("[10]: ");
             for i in 0..n2 { log.buf_put_hex32(regs2[i] as u32); log.buf_only(" "); }
             log.buf_only("\n");
+        }
+        // Extended QG/BMS (PID C8) register dump — fuel gauge data regions.
+        // 0x40-0x5F: config/data, 0x60-0x7F: FIFO data, 0x80-0x9F: more data,
+        // 0xA0-0xBF: SDAM/scratch, 0xC0-0xDF: SOC/capacity, 0xE0-0xFF: cal data.
+        {
+            log.puts("  QG C8 ext:\n");
+            for base in [0x40u8, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
+                let mut regs = [0xFFu8; 16];
+                let n = pmic_glink::read_sid8_regs(0xC8, base, &mut regs);
+                log.buf_only("    ["); log.buf_put_hex32(base as u32); log.buf_only("]: ");
+                for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
+                log.buf_only("\n");
+            }
+        }
+        // Extended reads from C9 (type 0x0B/0x02) — might be charger/SCHG peripheral.
+        {
+            log.puts("  C9 ext:\n");
+            for base in [0x40u8, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
+                let mut regs = [0xFFu8; 16];
+                let n = pmic_glink::read_sid8_regs(0xC9, base, &mut regs);
+                log.buf_only("    ["); log.buf_put_hex32(base as u32); log.buf_only("]: ");
+                for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
+                log.buf_only("\n");
+            }
+        }
+
+        // SDAM (Shared Direct Access Memory) — PID G#70, G#71 on SID 8.
+        // QG firmware writes battery state (SOC, OCV, ESR) here for HLOS.
+        // SDAM data registers start at offset 0x40 (SDAM_MEM_0).
+        {
+            log.puts("  SDAM 70:\n");
+            for base in [0x00u8, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
+                let mut regs = [0xFFu8; 16];
+                let n = pmic_glink::read_sid8_regs(0x70, base, &mut regs);
+                log.buf_only("    ["); log.buf_put_hex32(base as u32); log.buf_only("]: ");
+                for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
+                log.buf_only("\n");
+            }
+            log.puts("  SDAM 71:\n");
+            for base in [0x00u8, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
+                let mut regs = [0xFFu8; 16];
+                let n = pmic_glink::read_sid8_regs(0x71, base, &mut regs);
+                log.buf_only("    ["); log.buf_put_hex32(base as u32); log.buf_only("]: ");
+                for i in 0..n { log.buf_put_hex32(regs[i] as u32); log.buf_only(" "); }
+                log.buf_only("\n");
+            }
         }
 
         // RTC — direct SPMI probe, independent of GLINK.
@@ -2615,6 +2754,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                             }
                                                                         }
 
+                                                                        // Shut down peripherals before jump
+                                                                        usb.shutdown();
+                                                                        ferros_hal::gcc::sdc2_block_reset();
                                                                         hot_reload(RELOAD_STAGE, dtb_addr);
                                                                     }
                                                                 }
