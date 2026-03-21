@@ -254,8 +254,30 @@ core::arch::global_asm!(
 /// addressing (adrp) so it runs correctly from any DRAM address.
 const KERNEL_STAGE: usize = 0x8200_0000;
 
+/// Seed timing record — written to DRAM for the kernel to read.
+/// Located just below KERNEL_STAGE so the kernel read doesn't clobber it.
+const SEED_TIMING_ADDR: usize = 0x81FF_FFE0;
+
+fn qtimer() -> u64 {
+    let val: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) val) };
+    val
+}
+
+fn write_seed_timing(start: u64, end: u64) {
+    unsafe {
+        let p = SEED_TIMING_ADDR as *mut u64;
+        core::ptr::write_volatile(p, start);
+        core::ptr::write_volatile(p.add(1), end);
+        // Magic: "SEEDTIME"
+        core::ptr::write_volatile(p.add(2), 0x454D_4954_4445_4553);
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn seed_main(dtb_addr: usize) -> ! {
+    let t_start = qtimer();
+
     // Self-verify FIRST — before any memory modifications.
     // progress() modifies PROGRESS_X (.data), which is in the hashed range.
     // Stack frames are excluded by hashing only _start..__bss_start.
@@ -351,6 +373,9 @@ extern "C" fn seed_main(dtb_addr: usize) -> ! {
             }
 
             progress(0xFF_FFFFFF); // white = jumping to kernel
+
+            let t_end = qtimer();
+            write_seed_timing(t_start, t_end);
 
             unsafe {
                 core::arch::asm!(

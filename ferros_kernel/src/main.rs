@@ -969,6 +969,58 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     log.puts("ferros v0.0 on Fairphone 5 (QCM6490)\n");
     log.puts("=====================================\n\n");
 
+    // ---- Seed timing (if seed left a timing record) ----
+    {
+        const SEED_TIMING_ADDR: usize = 0x81FF_FFE0;
+        let p = SEED_TIMING_ADDR as *const u64;
+        let magic = unsafe { core::ptr::read_volatile(p.add(2)) };
+        if magic == 0x454D_4954_4445_4553 { // "SEEDTIME"
+            let t_start = unsafe { core::ptr::read_volatile(p) };
+            let t_end = unsafe { core::ptr::read_volatile(p.add(1)) };
+            let ticks = t_end.saturating_sub(t_start);
+            // QCM6490 QTimer = 19.2 MHz → 1 tick = 52.08ns
+            // microseconds = ticks * 1000 / 19200
+            let us = ticks * 1000 / 19200;
+            let ms = us / 1000;
+            let us_frac = us % 1000;
+            log.screen = true;
+            log.puts("seed: ");
+            // Decimal ms output
+            let mut dec = [b'0'; 8];
+            let mut v = us;
+            let mut i = 7;
+            loop {
+                dec[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 || i == 0 { break; }
+                i -= 1;
+            }
+            // Insert decimal point: output digits with . before last 3
+            let digits = &dec[i..8];
+            if digits.len() <= 3 {
+                log.puts("0.");
+                for _ in 0..(3 - digits.len()) { log.putc(b'0'); }
+                for &d in digits { log.putc(d); }
+            } else {
+                let split = digits.len() - 3;
+                for &d in &digits[..split] { log.putc(d); }
+                log.puts(".");
+                for &d in &digits[split..] { log.putc(d); }
+            }
+            log.puts(" ms\n");
+            log.screen = false;
+            log.puts("seed timing: start=");
+            log.put_hex(t_start);
+            log.puts(" end=");
+            log.put_hex(t_end);
+            log.puts(" ticks=");
+            log.put_hex(ticks);
+            log.puts(" = ");
+            log.put_hex(us);
+            log.puts(" us\n");
+        }
+    }
+
     // ---- Boot diagnostics ----
     ledger.post(&Event::BootStarted {
         el: boot_el() as u32,
