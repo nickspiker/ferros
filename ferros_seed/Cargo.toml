@@ -14,3 +14,4 @@ ferros_layout = { path = "../ferros_layout" }
 ferros_hal = { path = "../ferros_hal", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-compact = { version = "2", default-features = false }
+ihi = { version = "0.0.2", default-features = false }
