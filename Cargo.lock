@@ -664,9 +664,9 @@ dependencies = [
 
 [[package]]
 name = "ihi"
-version = "0.0.2"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8e1896a3d72733d2fdfddbb25f546dbaaaa9dd10efa3fc98723e327a79e21e"
+checksum = "c78a8e5fe4e5a7e668507a78f0879d8d736ac4e984164d0eddfc71594feda2d7"
 dependencies = [
  "blake3",
  "i256",
@@ -812,15 +812,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-complex"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
-dependencies = [
  "num-traits",
 ]
 
@@ -1159,12 +1150,11 @@ dependencies = [
 
 [[package]]
 name = "spirix"
-version = "0.0.10"
+version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8989215c575eb0769671d3dd53745dca2a06191f68e7c79643001929855b2019"
+checksum = "3bd4885b4680357e1b9806ba231e91a32efd934406092c8db1307969505be99d"
 dependencies = [
  "i256",
- "num-complex",
  "num-integer",
  "num-traits",
 ]
