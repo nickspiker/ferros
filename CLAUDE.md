@@ -107,8 +107,62 @@ M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
   and G#00000000 (black), not standard 8-bit ARGB.
 
 ## Phase 4: Apple USB for PT Transport (CURRENT)
-Now that booting is confirmed, implement Apple USB controller in `ferros_hal_m1/src/usb.rs`.
-Then ferros-bridge on Fedora can connect to running ferros kernel for hot-reload, diag, etc.
+Implement DWC3 device-mode USB on M1 for PT transport. Then bridge connects for hot-reload, diag, beam.
+
+### Key discovery: M1 uses Synopsys DWC3 — same IP as the FP5 driver
+The DWC3 core protocol (TRBs, events, endpoint commands, bulk I/O) is identical.
+Only platform init differs: ATCPHY + PipeHandler + DART instead of QUSB2/SMMU.
+
+### M1 USB register map (from m1n1 reverse engineering)
+- **DWC3 core**: reg[0] of `/arm-io/usb-drd0` (need ADT read for actual address)
+- **PipeHandler**: reg[3] of `/arm-io/usb-drd0` (MUX, AON_GEN, reset control)
+- **ATCPHY**: reg[0] of `/arm-io/atc-phy0` (Apple Type-C PHY)
+- **DART USB0**: 0x382f80000 (confirmed from boot log, T8020 variant)
+
+### ATCPHY init sequence (from m1n1/src/usb.c)
+```
+write32(atc + 0x08, 0x01c1000f)
+write32(atc + 0x04, 0x00000003)
+write32(atc + 0x04, 0x00000000)
+write32(atc + 0x1c, 0x008c0813)
+write32(atc + 0x00, 0x00000002)
+```
+
+### PipeHandler init (from m1n1/src/usb.c)
+```
+write32(pipe + 0x0c, 0x22)    // MUX: dummy mode
+write32(pipe + 0x1c, 0x01)    // AON_GEN: DWC3_RESET_N
+write32(pipe + 0x20, 0x9332)  // NONSELECTED_OVERRIDE
+```
+
+### DART (IOMMU) setup — T8020 variant
+- TTBR at offset 0x200, TCR at offset 0x100
+- 2-level page table: L1 (16KB pages) → L2 (16KB pages)
+- Must map: event buffer, TRB rings, bulk I/O buffers to IOVAs
+- Stream command invalidate at 0x20, stream select at 0x34
+
+### DWC3 core init (same as any DWC3, from m1n1/src/usb_dwc3.c)
+1. Device soft reset (DCTL.CSFTRST)
+2. Core + PHY soft reset (GCTL.CORESOFTRESET + GUSB2PHYCFG/GUSB3PIPECTL PHYSOFTRST)
+3. Force HS mode (DCFG.SPEED = 0)
+4. Event buffer setup (GEVNTADR/SIZ/COUNT)
+5. Endpoint config (DEPSTARTCFG, SETEPCONFIG, SETTRANSFRESOURCE)
+6. Enable EP0 (DALEPENA), start controller (DCTL.RUN_STOP)
+
+### Implementation plan
+1. `ferros_hal_m1/src/dart.rs` — minimal T8020 DART for USB DMA mapping
+2. `ferros_hal_m1/src/usb.rs` — fresh clean DWC3 driver implementing `UsbBulk` trait
+3. Wire up USB event loop in M1 `kernel_main` (port from FP5 kernel)
+4. `ferros-bridge` connects via PT — all commands light up
+
+### Next boot: read ADT addresses
+Use m1n1 proxy to dump the actual register base addresses:
+```python
+# In m1n1 proxy shell:
+u.adt["/arm-io/usb-drd0"].get_reg(0)   # DWC3 core base
+u.adt["/arm-io/usb-drd0"].get_reg(3)   # PipeHandler base
+u.adt["/arm-io/atc-phy0"].get_reg(0)   # ATCPHY base
+```
 
 ## Phase 5: Persistent ferros Boot Entry (LATER)
 - Only after ferros boots stably
