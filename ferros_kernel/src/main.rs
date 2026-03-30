@@ -940,10 +940,208 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     con.clear();
     con.puts("ferros on M1\n");
     con.puts("============\n\n");
-    con.puts("USB: not yet implemented\n");
-    con.puts("Connect via m1n1 proxy for interaction.\n");
+
+    // --- USB init ---
+    // TODO: read actual addresses from ADT. These are placeholders.
+    // Boot into m1n1 proxy and run m1n1-boot.py to dump real values.
+    con.puts("USB init:      ");
+    let usb_addrs = ferros_hal_m1::usb::M1UsbAddrs {
+        dwc3:      0x3_8228_0000,  // reg[0] of /arm-io/usb-drd0 (TBD from ADT)
+        pipe:      0x3_8228_0000,  // reg[3] of /arm-io/usb-drd0 (TBD from ADT)
+        atcphy:    0x3_8208_0000,  // reg[0] of /arm-io/atc-phy0 (TBD from ADT)
+        dart_base: 0x3_82F8_0000,  // confirmed from boot log
+        dart_sid:  0,
+    };
+    match ferros_hal_m1::usb::M1Usb::init(&usb_addrs) {
+        Some(mut usb) => {
+            con.puts("OK\n");
+            con.puts("Waiting for host...\n");
+            m1_usb_event_loop(&mut usb, &mut con);
+        }
+        None => {
+            con.puts("FAIL\n");
+            con.puts("USB init failed. Halted.\n");
+        }
+    }
 
     loop { core::hint::spin_loop(); }
+}
+
+/// M1 USB event loop with PT command dispatch.
+#[cfg(feature = "m1")]
+fn m1_usb_event_loop(
+    usb: &mut ferros_hal_m1::usb::M1Usb,
+    con: &mut ferros_hal::console::Console,
+) {
+    use ferros_hal::{UsbBulk, UsbEvent};
+    use ferros_pt::{packet, transfer::InboundTransfer};
+
+    // PT state
+    let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut pt_bitmap_buf: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
+    let mut pt_inbound: Option<InboundTransfer<'_>> = None;
+    let mut pt_seq_width: usize = 0;
+    let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // Cap hashes
+    let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
+    let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
+    let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
+
+    // Staging area for hot-reload (use high DRAM, well above kernel)
+    const RELOAD_STAGE: usize = 0x8_2000_0000;
+    let mut reload_size: usize = 0;
+
+    // Boot log buffer for DIAG command
+    let mut boot_log: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    boot_log.extend_from_slice(b"ferros on M1\nUSB: connected\n");
+
+    loop {
+        match usb.poll_event() {
+            UsbEvent::None => {
+                // Pump outbound data if pending
+                if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                    let len = pt_out_data.len().min(512);
+                    let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
+                    usb.bulk_in_send(&chunk);
+                }
+                for _ in 0..64u32 { core::hint::spin_loop(); }
+            }
+            UsbEvent::Reset => {
+                con.puts("  USB reset\n");
+                usb.handle_reset();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::ConnectDone { speed } => {
+                con.puts("  connected spd=");
+                con.put_hex32(speed);
+                con.puts("\n");
+                usb.handle_connect_done();
+                usb.ep0_start_setup();
+                usb.bulk_out_arm();
+            }
+            UsbEvent::Disconnect => {
+                con.puts("  disconnected\n");
+                usb.handle_disconnect();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::Ep0Setup { request } => {
+                if !usb.handle_setup(&request) {
+                    usb.ep0_stall();
+                }
+            }
+            UsbEvent::TransferComplete { ep } => {
+                if ep == 2 {
+                    // Bulk OUT — PT packet
+                    let mut tmp = [0u8; 512];
+                    let mut n = 0usize;
+                    if let Some(data) = usb.bulk_out_read() {
+                        n = data.len().min(512);
+                        tmp[..n].copy_from_slice(&data[..n]);
+                    }
+                    if n > 0 {
+                        if ferros_pt::is_data_packet(tmp[0]) {
+                            // DATA packet
+                            if let Some(ref mut xfer) = pt_inbound {
+                                if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
+                                    xfer.handle_data(seq, &hash, payload);
+                                    if xfer.all_received() {
+                                        let mut complete_buf = [0u8; 512];
+                                        let clen = xfer.finish(&mut complete_buf);
+                                        if clen > 0 {
+                                            usb.bulk_in_send(&complete_buf[..clen]);
+                                        }
+                                        // Command dispatch
+                                        let payload = xfer.payload();
+                                        if let Some(cmd) = ferros_pt::command::parse(payload) {
+                                            if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                                                con.puts("  CMD: DIAG\n");
+                                                pt_out_data.clear();
+                                                pt_out_data.extend_from_slice(&boot_log);
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
+                                                let data = cmd.params;
+                                                unsafe {
+                                                    core::ptr::copy_nonoverlapping(
+                                                        data.as_ptr(),
+                                                        (RELOAD_STAGE + reload_size) as *mut u8,
+                                                        data.len(),
+                                                    );
+                                                }
+                                                reload_size += data.len();
+                                                con.puts("  RELOAD +");
+                                                con.put_hex32(data.len() as u32);
+                                                con.puts(" total=");
+                                                con.put_hex32(reload_size as u32);
+                                                con.puts("\n");
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                                                con.puts("  RELOAD EXEC ");
+                                                con.put_hex32(reload_size as u32);
+                                                con.puts(" bytes\n");
+                                                // TODO: verify + jump
+                                                // For now, just acknowledge
+                                            } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
+                                                con.puts("  REBOOT\n");
+                                                // PSCI SYSTEM_RESET
+                                                unsafe {
+                                                    core::arch::asm!(
+                                                        "mov x0, #0x84000000",
+                                                        "movk x0, #0x0009, lsl #16",
+                                                        "hvc #0",
+                                                        options(noreturn)
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        pt_inbound = None;
+                                        pt_seq_width = 0;
+                                    }
+                                }
+                            }
+                        } else if ferros_pt::is_control_packet(tmp[0]) {
+                            // SPEC packet — start new inbound transfer
+                            if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
+                                pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
+                                let bitmap_words = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+                                pt_data_buf = alloc::vec![0u8; spec.total as usize];
+                                pt_bitmap_buf = alloc::vec![0u64; bitmap_words];
+                                // SAFETY: pt_data_buf and pt_bitmap_buf live as long as pt_inbound
+                                let xfer = unsafe {
+                                    InboundTransfer::new(
+                                        &spec,
+                                        core::slice::from_raw_parts_mut(pt_data_buf.as_mut_ptr(), pt_data_buf.len()),
+                                        core::slice::from_raw_parts_mut(pt_bitmap_buf.as_mut_ptr(), pt_bitmap_buf.len()),
+                                    )
+                                };
+                                if let Some(xfer) = xfer {
+                                    // Send SPEC ACK (seq=MAX means "ready")
+                                    let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
+                                    let mut ack_buf = [0u8; 64];
+                                    let ack_len = ack.encode(&mut ack_buf);
+                                    if ack_len > 0 {
+                                        usb.bulk_in_send(&ack_buf[..ack_len]);
+                                    }
+                                    pt_inbound = Some(xfer);
+                                    con.puts("  SPEC sid=");
+                                    con.put_hex32(spec.sid.0 as u32);
+                                    con.puts(" cnt=");
+                                    con.put_hex32(spec.count as u32);
+                                    con.puts("\n");
+                                }
+                            }
+                        }
+                    }
+                    usb.bulk_out_arm();
+                } else if ep == 3 {
+                    // Bulk IN complete — nothing to do, bulk_in_idle set by poll_event
+                }
+            }
+            UsbEvent::TransferNotReady { .. } => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,18 +1161,83 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let exc_start = exception_count();
 
-    // ---- Set up framebuffer console ----
-    let con = unsafe {
-        Console::new(
-            FP5_SPLASH_ADDR as *mut u32,
-            FP5_FB_WIDTH as usize,
-            FP5_FB_HEIGHT as usize,
-            FP5_FB_WIDTH as usize,
-            0xFFFF_FFFF,           // white text
-            0xFF00_0000,           // black background
-            (120, 48, 80, 48),     // margins: top (notch), right, bottom, left
-        )
-    };
+    // ---- Probe DECON0 display controller for ABL's scanout buffer ----
+    // Tensor G3 (Exynos) DECON0 at G#19470000. ABL leaves it scanning
+    // the splash framebuffer. We read the base address register to find it.
+    //
+    // DECON register map (Samsung Exynos):
+    //   +G#0000: DECON_ID
+    //   +G#0020: WINCON (window control)
+    //   +G#0080: VIDW_BUF_START (scanout buffer base address)
+    //   +G#0084: VIDW_BUF_END
+    //   +G#00A0: VIDW_BUF_SIZE (stride)
+    //   +G#0100: VIDOSD_A (window position)
+    //   +G#0104: VIDOSD_B (window size)
+    const DECON0_BASE: usize = 0x1947_0000;
+
+    // Read DECON0 ID and scanout addresses — probe multiple likely offsets
+    // since the exact register layout varies between Exynos generations.
+    let decon_id = unsafe { core::ptr::read_volatile((DECON0_BASE) as *const u32) };
+
+    // Probe DPP (Display Post Processor) which holds the actual buffer address.
+    // DPP0 at G#19900000, IDMA base address registers at various offsets.
+    const DPP0_BASE: usize = 0x1990_0000;
+    // Common IDMA_IN_BASE_ADDR offsets for Exynos: G#0074, G#0078, G#008C
+    let dpp_base_74 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x0074) as *const u32) };
+    let dpp_base_78 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x0078) as *const u32) };
+    let dpp_base_8c = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x008C) as *const u32) };
+
+    // Also check RDMA (Read DMA) which is separate on newer Exynos
+    // RDMA0 often at DPP_BASE + G#1000
+    let rdma_base_74 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x1074) as *const u32) };
+    let rdma_base_78 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x1078) as *const u32) };
+
+    // Write probe results to a known DRAM location (G#90060000 — in reserved area,
+    // survives warm reboot). We'll read it back from GrapheneOS.
+    const PROBE_ADDR: usize = 0x9006_0000;
+    unsafe {
+        let p = PROBE_ADDR as *mut u32;
+        core::ptr::write_volatile(p.add(0), 0xFE00_0001_u32);  // magic
+        core::ptr::write_volatile(p.add(1), dtb_addr as u32);
+        core::ptr::write_volatile(p.add(2), (dtb_addr >> 32) as u32);
+        core::ptr::write_volatile(p.add(3), decon_id);
+        core::ptr::write_volatile(p.add(4), dpp_base_74);
+        core::ptr::write_volatile(p.add(5), dpp_base_78);
+        core::ptr::write_volatile(p.add(6), dpp_base_8c);
+        core::ptr::write_volatile(p.add(7), rdma_base_74);
+        core::ptr::write_volatile(p.add(8), rdma_base_78);
+    }
+
+    // Now try to find a framebuffer: if any probed address looks like a valid
+    // DRAM address (G#80000000+), try writing green pixels there.
+    let candidates = [dpp_base_74, dpp_base_78, dpp_base_8c, rdma_base_74, rdma_base_78];
+    let mut fb_addr: u64 = 0;
+    for &addr in &candidates {
+        // Tensor G3 DRAM starts around G#80000000
+        if addr >= 0x8000_0000 && addr < 0xF000_0000 {
+            fb_addr = addr as u64;
+            break;
+        }
+    }
+
+    // If we found a plausible FB address, paint green pixels
+    if fb_addr != 0 {
+        unsafe {
+            let fb = fb_addr as *mut u32;
+            // Paint 256x256 green block — 1080 pixel stride (4 bytes each)
+            for y in 0..256_usize {
+                for x in 0..256_usize {
+                    let offset = y * 1080 + x;
+                    core::ptr::write_volatile(fb.add(offset), 0xFF00FF00);
+                }
+            }
+        }
+    }
+
+    // Spin forever — we're just probing for now.
+    loop { core::hint::spin_loop(); }
+
+    /*  DISABLED: original FP5 boot sequence — unreachable during DECON probe.
 
     // ---- Parse DTB early to find ramoops (fallback to known FP5 address) ----
     let ramoops = if dtb_addr != 0 {
@@ -3318,6 +3581,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     log.puts("\n-- halted --\n");
     loop { unsafe { core::arch::asm!("wfe") }; }
+    */  // END DISABLED FP5 boot sequence
 }
 
 /// Hot-reload: jump to a new kernel image at the given DRAM address.

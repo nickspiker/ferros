@@ -1,9 +1,9 @@
 //! ferros HAL — Apple M1 / m1n1 EL2
 //!
-//! Stub implementations. Apple's USB controller (XHCI variant) is not yet
-//! implemented. On M1, m1n1 proxy mode handles USB at the bootloader level —
-//! ferros communicates via the framebuffer console until native USB is ready.
+//! Platform-specific drivers for the Apple M1 MacBook Air (T8103).
+//! DWC3 USB device mode with DART IOMMU, ATCPHY, PipeHandler init.
 
 #![no_std]
 
+pub mod dart;
 pub mod usb;

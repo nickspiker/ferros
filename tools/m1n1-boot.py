@@ -23,6 +23,36 @@ fb_stride = ba.video.stride
 fb_depth = ba.video.depth
 print(f"Framebuffer: {fb_base:#x} {fb_width}x{fb_height} stride={fb_stride:#x} depth={fb_depth}")
 
+# Dump USB register addresses from ADT (needed for DWC3 driver)
+print("\n=== USB ADT Addresses ===")
+try:
+    usb_drd = u.adt["/arm-io/usb-drd0"]
+    for i in range(4):
+        try:
+            addr, size = usb_drd.get_reg(i)
+            print(f"  usb-drd0 reg[{i}]: {addr:#x} (size {size:#x})")
+        except:
+            pass
+
+    atc_phy = u.adt["/arm-io/atc-phy0"]
+    for i in range(4):
+        try:
+            addr, size = atc_phy.get_reg(i)
+            print(f"  atc-phy0 reg[{i}]: {addr:#x} (size {size:#x})")
+        except:
+            pass
+
+    dart_usb = u.adt["/arm-io/dart-usb0"]
+    for i in range(4):
+        try:
+            addr, size = dart_usb.get_reg(i)
+            print(f"  dart-usb0 reg[{i}]: {addr:#x} (size {size:#x})")
+        except:
+            pass
+    print("=========================\n")
+except Exception as e:
+    print(f"  ADT read failed: {e}\n")
+
 # Build a minimal FDT with a simple-framebuffer node
 # Our DTB parser looks for compatible = "simple-framebuffer" and reads reg, width, height, stride
 def build_simplefb_dtb(fb_base, fb_width, fb_height, fb_stride):
