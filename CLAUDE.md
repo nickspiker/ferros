@@ -50,26 +50,18 @@ Comms first: Photon Transport + ferros-bridge over USB. Then HAL trait split (`f
 
 These are instructions for setting up the M1 MacBook Air as a ferros development target. Run these when working on the macbook directly.
 
-## Phase 1: Clean macOS Install (CURRENT)
-macOS was just restored via DFU (Apple Configurator 2). Device is at Hello screen.
+## Phase 1: Clean macOS Install (DONE — 2026-03-30)
+macOS 26.4 installed via DFU (Apple Configurator 2). Tools installed:
+- Xcode CLT, Homebrew 5.1.2, Rust 1.94.1, aarch64-unknown-none target, git, gh, iTerm2, VS Code
+- Bloatware: macOS 26 fresh install has none in /Applications — system apps live in /System/Applications (SIP-protected, not worth removing)
+- Note: Photon Messenger was installed to ~/Applications during setup (ferros comms tool)
+- Disk: 245 GB total, ~26 GB used by macOS, ~219 GB free for Asahi + ferros
 
+For future reinstalls:
 1. Complete macOS setup (minimal — skip Apple ID if possible, or use throwaway)
-2. Run `diskutil list` and save the partition layout
-3. Remove bloatware apps where possible:
-   - `sudo rm -rf /Applications/FaceTime.app`
-   - `sudo rm -rf /Applications/TV.app`
-   - `sudo rm -rf "/Applications/Apple TV.app"`
-   - `sudo rm -rf /Applications/News.app`
-   - `sudo rm -rf /Applications/Stocks.app`
-   - `sudo rm -rf /Applications/Chess.app`
-   - `sudo rm -rf /Applications/Maps.app`
-   - Note: SIP may block some of these. `csrutil disable` from recoveryOS if needed, then re-enable after.
-4. Install essential tools:
-   - Xcode Command Line Tools: `xcode-select --install`
-   - Homebrew: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-   - Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-   - `rustup target add aarch64-unknown-none`
-   - `brew install git`
+2. Add brew to PATH: `echo 'eval "$(/opt/homebrew/bin/brew shellenv zsh)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv zsh)"`
+3. Install tools: `brew install --cask iterm2 && brew install gh git && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+4. Add Rust target: `rustup target add aarch64-unknown-none`
 
 ## Phase 2: Asahi Linux
 1. Install Asahi Linux: `curl https://alx.sh | sh`
@@ -93,7 +85,9 @@ macOS was just restored via DFU (Apple Configurator 2). Device is at Hello scree
 - iBoot requires a stub macOS APFS container per boot entry
 - Model after how Asahi creates its boot entry
 - ferros entry chainloads: iBoot -> m1n1 -> ferros
-- NEVER set ferros as default boot (this is how we bricked it last time)
+- **NEVER set ferros as default boot — this is how we bricked it last time**
+- **NEVER overwrite or share the macOS recovery partition** — each macOS install has its own recovery; touching it = no recovery path
+- macOS must always remain the default boot. Use boot picker (hold power) to select ferros/Asahi
 
 ## Important M1 Notes
 - SecureROM (EL3) is not flashable, ever — silicon ROM
