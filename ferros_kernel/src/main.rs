@@ -286,6 +286,16 @@ _entry:
     mrs     x20, CurrentEL
     lsr     x20, x20, #2
 
+// ---------- M1 entry: skip cache/MMU ops (m1n1 already handled them) ----------
+.global _m1_entry
+_m1_entry:
+    mov     x19, x0
+    msr     daifset, #0xF
+    mrs     x20, CurrentEL
+    lsr     x20, x20, #2
+    mov     x21, #0             // no saved SCTLR
+    b       .Lsctlr_done
+
     // ================================================================
     // Save SCTLR and disable MMU + caches.
     // ABL (UEFI) may leave caches enabled. With write-back caches,
@@ -908,6 +918,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
 
     // Set up framebuffer console from DTB simplefb, or spin if not found.
+    // M1 DCP uses 10:10:10:2 pixel format (R10:G10:B10:X2, little-endian u32).
+    // White = G#FFFFFFFC, Black = G#00000000.
     let mut con = if let Some(cfg) = fb_cfg {
         unsafe {
             ferros_hal::console::Console::new(
@@ -915,8 +927,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 cfg.width as usize,
                 cfg.height as usize,
                 (cfg.stride / 4) as usize, // stride in pixels
-                0xFFFF_FFFF,               // white text
-                0xFF00_0000,               // black background
+                0xFFFF_FFFC,               // white text (10:10:10:2)
+                0x0000_0000,               // black background
                 (32, 32, 32, 32),          // margins
             )
         }

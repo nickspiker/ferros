@@ -69,59 +69,45 @@ Ran `curl https://alx.sh | sh`, selected "UEFI environment only (m1n1 + U-Boot +
 Named the entry "ferros". macOS is default boot. 120 GB allocated to ferros partition.
 Boot picker: hold power button → select "ferros" entry.
 
-## Phase 3: First Boot via m1n1 Proxy (CURRENT)
-The Fedora x86 box (leviathan) is the dev host. MacBook is the target.
-m1n1 is cloned at `/mnt/Octopus/Code/m1n1` on the Fedora box. pyserial is installed.
+## Phase 3: First Boot via m1n1 Proxy (DONE — 2026-03-30)
+ferros boots on the M1 MacBook Air via m1n1 proxy. Framebuffer console output confirmed.
 
-### Problem: Asahi m1n1 has U-Boot embedded
-The Asahi installer concatenated U-Boot into m1n1.bin as a payload. When m1n1 finds a payload,
-it chainloads immediately instead of waiting for proxy. We need a proxy-only m1n1 (no payload).
+### Setup (already done)
+- **MacBook:** Asahi m1n1 replaced with proxy-only build (no U-Boot payload) on the ESP.
+- **Fedora:** m1n1 cloned at `/mnt/Octopus/Code/m1n1`, pyserial + construct installed.
+- **udev rule:** `/etc/udev/rules.d/99-m1n1.rules` auto-loads `cdc_acm` and sets `dialout` group.
 
-### MacBook Claude: Install proxy-only m1n1 (DO THIS FIRST)
-The Asahi-installed m1n1 chainloads U-Boot. Replace it with a proxy-only build.
-
+### Boot procedure (each dev iteration)
 ```bash
-# 1. Clone and build m1n1 (native aarch64 — no cross-compile needed)
-git clone https://github.com/AsahiLinux/m1n1 ~/m1n1
-cd ~/m1n1
-git submodule update --init --recursive
-rustup target add aarch64-unknown-none-softfloat
-make   # native build, produces build/m1n1.bin (~1.1MB, proxy-only)
-
-# 2. Find the Asahi EFI System Partition
-diskutil list   # look for the Asahi/ferros EFI partition (likely ~500MB, type "EFI")
-# It will NOT be the macOS EFI — look for the one Asahi created
-
-# 3. Mount the ESP and find the current m1n1
-# The path is typically: /Volumes/<ESP>/m1n1/boot.bin
-# Asahi uses a custom boot.bin path, not the standard EFI boot path
-sudo diskutil mount <partition-id>   # e.g. disk0s4 or similar
-find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
-ls -la /Volumes/*/m1n1/   # find the current m1n1 boot binary
-
-# 4. Replace with proxy-only build
-sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
-```
-
-**CRITICAL:** Do NOT touch the macOS EFI partition. Only modify the Asahi/ferros ESP.
-After replacing, `sudo shutdown -h now`. User holds power → boot picker → "ferros" → m1n1 proxy mode.
-
-### Fedora side (DONE)
-```bash
-# m1n1 cloned + built at /mnt/Octopus/Code/m1n1
-# ferros M1 kernel built:
+# 1. Build kernel + flat binary
 cargo build -p ferros_kernel --target aarch64-unknown-none --release --no-default-features --features m1
+aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel \
+    target/aarch64-unknown-none/release/ferros_kernel.bin
+
+# 2. MacBook: shut down → hold power → boot picker → "ferros"
+#    m1n1 loads, drops to proxy mode, MacBook appears as /dev/ttyACM0
+
+# 3. Fedora: push kernel via proxy
+M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
 ```
 
-### To boot ferros (after proxy-only m1n1 is installed)
-1. On MacBook: shut down → hold power button → boot picker → select **"ferros"**
-   - m1n1 loads, finds no payload, drops to proxy mode
-   - MacBook appears as `/dev/ttyACM0` on Fedora (USB-C cable must be connected)
-2. On Fedora: `M1N1DEVICE=/dev/ttyACM0 python3 /mnt/Octopus/Code/m1n1/proxyclient/tools/run_guest.py /mnt/Octopus/Code/ferros/target/aarch64-unknown-none/release/ferros_kernel`
-3. ferros boots at EL2 → framebuffer console shows "ferros on M1" on MacBook screen
+### Key learnings
+- **ELF vs flat binary:** m1n1 proxy loads raw bytes — must use `objcopy -O binary`, not the ELF directly.
+  File offsets in ELF don't match VMA offsets (`.text` starts at file offset G#10000, not G#0).
+- **_m1_entry:** M1 needs a separate entry point that skips the Pixel 8's cache/MMU/SCTLR teardown.
+  m1n1's `mmu_shutdown()` already handles this before jumping. The standard `_entry` code's
+  cache clean + MMU disable sequence crashes on M1 (likely interacts badly with Apple SPRR/GXF).
+- **p.reload() not p.call():** `p.call()` runs under SPRR which blocks execute on heap memory.
+  `p.reload()` (P_VECTOR) goes through m1n1's full shutdown path, disabling SPRR before jumping.
+- **run_guest.py is wrong tool:** It runs a hypervisor (EL1 guest). We need direct EL2 boot.
+  Custom `m1n1-boot.py` uploads kernel + minimal DTB and uses `p.reload()`.
+- **DTB:** m1n1's `kboot_boot()` doesn't auto-generate a DTB — need to build a minimal one with
+  a `simple-framebuffer` node containing reg, width, height, stride, format from boot_args.
+- **30bpp display:** M1 DCP uses 10:10:10:2 pixel format. Console colors use G#FFFFFFFC (white)
+  and G#00000000 (black), not standard 8-bit ARGB.
 
-## Phase 4: Apple USB for PT Transport (NEXT AFTER PHASE 3)
-Once booting confirmed, implement Apple USB controller in `ferros_hal_m1/src/usb.rs`.
+## Phase 4: Apple USB for PT Transport (CURRENT)
+Now that booting is confirmed, implement Apple USB controller in `ferros_hal_m1/src/usb.rs`.
 Then ferros-bridge on Fedora can connect to running ferros kernel for hot-reload, diag, etc.
 
 ## Phase 5: Persistent ferros Boot Entry (LATER)
