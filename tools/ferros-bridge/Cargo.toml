@@ -14,3 +14,4 @@ nusb = "0.1"
 ferros_pt = { path = "../../ferros_pt", features = ["std"] }
 blake3 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "macros", "fs", "time"] }
+nunc-time = "0.0.0"

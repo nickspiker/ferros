@@ -1540,6 +1540,33 @@ impl Dwc3Dev {
         }
     }
 
+    /// Full shutdown: end all transfers, clear Run/Stop, soft reset.
+    /// Call before hot-reload to leave DWC3 in a clean state for the
+    /// next kernel's init().
+    pub fn shutdown(&mut self) {
+        // End any in-flight transfers on all endpoints
+        self.handle_disconnect();
+        // Clear Run/Stop (disconnect from bus)
+        unsafe {
+            let dctl = mmio::read32(DWC3_BASE + DCTL);
+            mmio::write32(DWC3_BASE + DCTL, dctl & !DCTL_RUN_STOP);
+        }
+        phy_delay(10_000);
+        // Device controller soft reset
+        unsafe {
+            let dctl = mmio::read32(DWC3_BASE + DCTL);
+            mmio::write32(DWC3_BASE + DCTL, dctl | DCTL_CSFTRST);
+            for _ in 0..100_000u32 {
+                if mmio::read32(DWC3_BASE + DCTL) & DCTL_CSFTRST == 0 { break; }
+            }
+        }
+        // Mask events so DWC3 doesn't write to stale event buffer
+        unsafe {
+            let evt_size = core::mem::size_of::<EventBuffer>() as u32;
+            mmio::write32(DWC3_BASE + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
+        }
+    }
+
     /// Clean up all in-flight transfers on disconnect. Call from the
     /// kernel's Disconnect event handler so endpoints are in a known
     /// state when the host reconnects.

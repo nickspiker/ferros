@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="logo.svg" width="220" alt="ferros" />
+</div>
+
 # ferros - Killswitch Ready Mobile Operating System
 
 ## Overview
@@ -39,11 +43,9 @@ ferros is a mobile operating system built from first principles in Rust, designe
 - **NFID optional** - Near Field Identity for paranoia-appropriate security
 
 ### 🎨 VSF Compositor
-- **Spectral color** - RGB 462nm/523nm/703nm, biologically-derived wavelengths
-- **Ring-based rendering** - Damage tracking uses same ring semantics as memory
-- **Occlusion-aware** - Widgets know when they're visible, don't render when occluded
-- **No HTML/CSS/JS** - VSF (Versatile Storage Format) replaces entire web stack
-- **Compositor = filesystem** - Same ring topology thruout
+- **AGB spectral colour** - Primaries at 703nm/523nm/462nm from geometric mean cone ratios (L/(L+M), M/(L+S), S/(S+M))
+- **Versatile Storage Format** - The format is defined; the compositor architecture is an open design space
+- **No HTML/CSS/JS** - VSF replaces the web rendering stack; how it does so is being worked out
 
 ### 💾 Ring Filesystem
 - **Random superblock** - Location stored encrypted in UEFI, not at block 0
@@ -104,13 +106,18 @@ Half of MITRE's vulnerability database becomes **irrelevant**, not mitigated.
 
 ## Hardware Platform: Glyph
 
-ferros runs on Glyph, purpose-built hardware designed for this OS.
+ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly out of scope — Intel ME and AMD PSP are architectural backdoors, not bugs. RISC-V is the long-term target for fully auditable hardware.
 
-### RISC-V Silicon
+### Development Targets
+- **Pixel 8 (Tensor G3)** - Primary dev target. ARMv9, `fastboot oem pkvm disable` gives EL2 ownership, full hardware access without fighting TrustZone
+- **Apple M1 / Asahi** - Secondary dev target. m1n1 proxy gives live hardware exploration at EL2 without reflashing
+- **Any ARM device** - HAL trait abstraction means drivers are portable across supported hardware
+
+### Glyph (Production Target)
+- **RISC-V Silicon** - Custom ISA extensions for key storage, no Intel ME / AMD PSP
 - **Custom CSRs** - Key storage, read-disabled, hardware enforced
 - **Crypto coprocessor** - ChaCha20/Poly1305 in dedicated silicon
 - **Killswitch circuit** - Hardware power cutoff, zeroes CSRs simultaneously
-- **Open ISA** - No Intel ME / AMD PSP backdoors, auditable design
 
 ### Connectivity
 - **Physical SIM slot** - No carrier lock-in, user choice
@@ -126,27 +133,27 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 
 ## Project Status
 
-**Current Phase:** Bare-metal bring-up on Fairphone 5 (QCM6490)
+**Current Phase:** ARM bring-up — Pixel 8 (Tensor G3) primary target
 
-### Working on Hardware
-- Bare-metal aarch64 kernel boots on FP5 (PE/COFF via ABL)
+### Established on ARM (QCM6490 / Qualcomm)
+- Bare-metal aarch64 kernel boots (PE/COFF via ABL)
 - Framebuffer console (8x16 VGA font, 2x scaling, 1224x2700 AMOLED)
-- GENI UART TX (QUP1 SE5)
+- GENI UART TX
 - Pstore/ramoops log pipeline (warm reboot preserves DRAM)
-- SPMI PMIC access (PM8350C flash LED, observer channel reads)
-- DPU register reads (splash framebuffer at 0xE1000000)
+- SPMI PMIC access (flash LED, observer channel reads)
+- DPU register reads (splash framebuffer)
 - USB device enumeration (DWC3, VID 0x1838 PID 0xFE01)
 - Bidirectional Photon Transport over USB (blast mode, per-chunk BLAKE3)
 - Hot-reload over USB (72KB kernel binary in <1s, no fastboot needed)
-- SD card read/write (1TB SanDisk SDXC, 4-bit bus, 400KHz, multi-block, sometimes needs a hard restart)
+- SD card read/write (4-bit bus, 400KHz, multi-block)
 - GCC clock controller, RPMh TCS power enable via cmd-db
 - DTB parsing for reserved-memory, bootargs, ramoops address
 
-### In Progress
+### In Progress (Pixel 8 / Tensor G3)
+- Comms bring-up: PT transport + ferros-bridge over USB
+- HAL trait split: `ferros_hal` traits, `ferros_hal_pixel8` implementation
 - Ledger: append-only VSF event ring (spec complete, implementation started)
-- SD card 25MHz/50MHz high-speed mode (needs DLL calibration)
-- UFS internal flash identification (host controller at 0x1D84000)
-- USB driver cleanup (TRB ring for throughput, proper endpoint state machine)
+- USB driver: TRB ring for throughput, proper endpoint state machine
 
 ### Planned (Next 6 Months)
 - 📋 VSF compositor alpha
@@ -166,7 +173,7 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 - Ring memory working on FPGA
 - Basic filesystem with power-loss tolerance
 - TOKEN identity creation and attestation
-- Single-device prototype (Fairphone 5)
+- Single-device prototype (Pixel 8 / Tensor G3)
 
 ### Phase 2: Alpha System (Months 4-6)
 - Multi-process ring memory with rotation
@@ -191,7 +198,7 @@ ferros runs on Glyph, purpose-built hardware designed for this OS.
 **Requirements:**
 - Rust nightly (for inline assembly, no_std kernel)
 - aarch64-unknown-none target (`rustup target add aarch64-unknown-none`)
-- Android fastboot (for flashing to Fairphone 5)
+- Android fastboot (for initial flash to ARM device)
 - nusb (Rust USB library, pulled by cargo)
 
 **Build kernel:**
@@ -204,7 +211,7 @@ cargo build -p ferros_kernel --target aarch64-unknown-none --release
 cargo run -p ferros-mkimg -- boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
 ```
 
-**Flash to Fairphone 5:**
+**Flash to device (Pixel 8 example):**
 ```bash
 fastboot flash boot_a ferros.img
 fastboot set_active a
@@ -255,7 +262,7 @@ This publication establishes prior art for:
 4. **Hardware key storage integration** - CSRs/TrustZone for encryption keys
 5. **Ring filesystem** - Circular topology with stochastic allocation
 6. **Passless authentication via device fingerprints** - TOKEN protocol
-7. **Spectral color in OS compositor** - VSF rendering with biological wavelengths
+7. **Spectral colour in OS compositor** - VSF rendering with biological wavelengths
 
 **First Published:** January 1, 2025  
 **Author:** Nick Spiker  

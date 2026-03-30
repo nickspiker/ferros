@@ -1,9 +1,11 @@
 target/
 *.img
 *.bin
+*.signed
 
 # Keys — never push secrets
 keys/*.secret
+keys/
 
 # Editor / IDE
 .vscode/
@@ -15,5 +17,10 @@ Intellectual Property/
 # Signed binaries
 kernel.signed
 
-# Temp files
+# Temp / generated
 *.tmp.*
+compact.txt
+
+# Local memory — not for repo
+memory/
+CLAUDE MEMORY.md

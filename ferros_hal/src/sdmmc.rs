@@ -447,6 +447,14 @@ impl SdmmcController {
     pub fn probe_card(&mut self) -> ProbeResult {
         let mut r = ProbeResult::default();
 
+        // GCC block reset — clears all SDHCI controller state.
+        // Essential for hot-reload recovery where the previous kernel
+        // left the controller mid-transfer or with clocks at 25MHz.
+        crate::gcc::sdc2_block_reset();
+        crate::gcc::sdc2_set_400khz();
+        crate::gcc::sdc2_clock_enable();
+        Self::delay(50_000);
+
         // Software reset
         unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) };
         for _ in 0..10_000u32 {

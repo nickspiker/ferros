@@ -26,6 +26,30 @@ use ferros_pt::packet::{self, Ack, Complete, Spec};
 use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
 use std::io::{self, Write};
 
+/// Session clock — calibrated once at startup via nunc, advanced locally via Instant.
+struct SessionClock {
+    base_et:      i64,
+    base_instant: std::time::Instant,
+}
+
+impl SessionClock {
+    async fn calibrate() -> Self {
+        match nunc::query(nunc::Mode::Fast).await {
+            Ok(t) => Self { base_et: t.timestamp_et, base_instant: std::time::Instant::now() },
+            Err(e) => {
+                eprintln!("nunc: clock calibration failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Current eagle_time — base + elapsed oscillations since calibration.
+    fn now(&self) -> i64 {
+        let elapsed_ns = self.base_instant.elapsed().as_nanos() as i64;
+        self.base_et + elapsed_ns * nunc::OPS / 1_000_000_000
+    }
+}
+
 fn usage() {
     eprintln!("ferros-bridge — USB bridge for ferros kernel");
     eprintln!();
@@ -52,6 +76,8 @@ async fn main() {
         usage();
         std::process::exit(1);
     }
+
+    let clock = SessionClock::calibrate().await;
 
     match args[1].as_str() {
         "status" => cmd_status(),
