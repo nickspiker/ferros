@@ -14,7 +14,12 @@ ferros is a mobile OS built from first principles in Rust on the Redox OS microk
 
 ## Build
 ```bash
+# Pixel 8 (default)
 cargo build -p ferros_kernel --target aarch64-unknown-none --release
+
+# M1 MacBook Air
+cargo build -p ferros_kernel --target aarch64-unknown-none --release --no-default-features --features m1
+
 cargo run -p ferros-mkimg -- boot target/aarch64-unknown-none/release/ferros_kernel -o ferros.img
 cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_kernel
 ```

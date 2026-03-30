@@ -105,6 +105,9 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod usb_trait;
+pub use usb_trait::{UsbBulk, UsbEvent};
+
 pub mod mmio;
 pub mod uart;
 pub mod fb;

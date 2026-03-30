@@ -281,28 +281,7 @@ _entry:
     mov     x19, x0
     msr     daifset, #0xF
 
-    // ================================================================
-    // IMMEDIATE PROOF OF LIFE — before ANY other setup.
-    // No stack, no BSS, no exception handler, no Rust.
-    // ================================================================
-
-    // -- Write red pixels to splash FB (DRAM, no MMIO needed) --
-    // If DPU is still scanning from ABL, screen turns red.
-    movz    x8, #0x0000
-    movk    x8, #0xE100, lsl #16   // x8 = 0xE1000000 (splash FB base)
-    movz    w9, #0x0000
-    movk    w9, #0xFFFF, lsl #16   // w9 = 0xFFFF0000 (XRGB red)
-
-    // Fill ALL scanlines (1224 * 2700 = 3304800 = 0x326BE0 pixels)
-    movz    x10, #0x6BE0
-    movk    x10, #0x32, lsl #16    // x10 = 0x326BE0
-.Lfill_red:
-    str     w9, [x8], #4
-    subs    x10, x10, #1
-    b.ne    .Lfill_red
-    dsb     sy
-
-    // Fall through to normal boot (set up exception handler, stack, Rust)
+    // Fall through to boot (exception handler, stack, Rust)
 
     mrs     x20, CurrentEL
     lsr     x20, x20, #2
@@ -907,6 +886,59 @@ fn hamt_block_hash(blk: &[u8; 4096]) -> [u8; 32] {
     *blake3::hash(&tmp).as_bytes()
 }
 
+// ---------------------------------------------------------------------------
+// M1 kernel entry
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "m1")]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Init DRAM heap.
+    unsafe extern "C" { static __stack_top: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF;
+    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+
+    // Parse DTB for simplefb — m1n1 always provides one.
+    let fb_cfg = if dtb_addr != 0 {
+        unsafe { ferros_hal::dtb::Dtb::from_ptr(dtb_addr as *const u8) }
+            .and_then(|dtb| dtb.parse_simplefb())
+    } else {
+        None
+    };
+
+    // Set up framebuffer console from DTB simplefb, or spin if not found.
+    let mut con = if let Some(cfg) = fb_cfg {
+        unsafe {
+            ferros_hal::console::Console::new(
+                cfg.phys_base as *mut u32,
+                cfg.width as usize,
+                cfg.height as usize,
+                (cfg.stride / 4) as usize, // stride in pixels
+                0xFFFF_FFFF,               // white text
+                0xFF00_0000,               // black background
+                (32, 32, 32, 32),          // margins
+            )
+        }
+    } else {
+        // No framebuffer — spin. Connect serial via m1n1 proxy to debug.
+        loop { core::hint::spin_loop(); }
+    };
+
+    con.clear();
+    con.puts("ferros on M1\n");
+    con.puts("============\n\n");
+    con.puts("USB: not yet implemented\n");
+    con.puts("Connect via m1n1 proxy for interaction.\n");
+
+    loop { core::hint::spin_loop(); }
+}
+
+// ---------------------------------------------------------------------------
+// Pixel 8 / QCM6490 kernel entry
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pixel8")]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Init DRAM heap — must happen before any allocation.

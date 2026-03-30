@@ -432,11 +432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_hal_m1"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
 name = "ferros_kernel"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_hal",
+ "ferros_hal_m1",
  "ferros_layout",
  "ferros_ledger",
  "ferros_pt",

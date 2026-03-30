@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Ferros bare-metal kernel — boots on aarch64, mounts the ledger"
 
+[features]
+default = ["pixel8"]
+pixel8 = []
+m1 = ["dep:ferros_hal_m1"]
+
 [dependencies]
 ferros_hal = { path = "../ferros_hal", default-features = false, features = ["alloc"] }
+ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }
 ferros_layout = { path = "../ferros_layout" }
 blake3 = { version = "1", default-features = false }
 ferros_vault = { path = "../ferros_vault", default-features = false }
