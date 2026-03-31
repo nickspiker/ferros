@@ -104,12 +104,12 @@ rustup target add aarch64-unknown-none-softfloat
 #     //display_shutdown(DCP_SLEEP_IF_EXTERNAL);
 #     //fb_shutdown(next_stage.restore_logo);
 #     mmu_shutdown();
-# Add usb_phy_bringup(0) AFTER mmu_shutdown() — the very last thing before the jump.
+# Add usb_phy_bringup(0) BEFORE mmu_shutdown() (needs MMU for PMGR register access).
 # Everything else stays stock. This is the ONLY change to src/main.c.
 python3 -c "
 with open('src/main.c') as f: s = f.read()
-s = s.replace('    mmu_shutdown();\n#endif',
-    '    mmu_shutdown();\n    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }\n#endif')
+s = s.replace('    mmu_shutdown();',
+    '    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }\n    mmu_shutdown();')
 with open('src/main.c','w') as f: f.write(s)
 "
 
@@ -123,9 +123,9 @@ find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What this changes:** Adds ONE line after `mmu_shutdown()`: `usb_phy_bringup(0)`.
-All other shutdown steps (USB, display, fb, MMU) run normally — identical to Phase 3.
-The PHY is re-powered right before the jump so ferros can init DWC3.
+**What this changes:** Adds ONE line before `mmu_shutdown()`: `usb_phy_bringup(0)`.
+Must be before MMU shutdown because PMGR register access needs device memory mappings.
+All other shutdown steps run normally — identical to Phase 3.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 
