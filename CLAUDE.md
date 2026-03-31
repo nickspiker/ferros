@@ -104,15 +104,12 @@ rustup target add aarch64-unknown-none-softfloat
 #     //display_shutdown(DCP_SLEEP_IF_EXTERNAL);
 #     //fb_shutdown(next_stage.restore_logo);
 #     mmu_shutdown();
+# Add usb_phy_bringup(0) AFTER mmu_shutdown() — the very last thing before the jump.
+# Everything else stays stock. This is the ONLY change to src/main.c.
 python3 -c "
-import re
 with open('src/main.c') as f: s = f.read()
-s = s.replace('    usb_iodev_shutdown();',
-    '    usb_iodev_shutdown();\n    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }')
-s = s.replace('    display_shutdown(DCP_SLEEP_IF_EXTERNAL);',
-    '    //display_shutdown(DCP_SLEEP_IF_EXTERNAL);')
-s = s.replace('    fb_shutdown(next_stage.restore_logo);',
-    '    //fb_shutdown(next_stage.restore_logo);')
+s = s.replace('    mmu_shutdown();\n#endif',
+    '    mmu_shutdown();\n    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }\n#endif')
 with open('src/main.c','w') as f: f.write(s)
 "
 
@@ -126,10 +123,9 @@ find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What this changes:**
-- After USB shutdown, re-powers ATCPHY + PipeHandler via `usb_phy_bringup(0)`
-- Skips display_shutdown and fb_shutdown (keeps framebuffer visible for ferros console)
-- mmu_shutdown still runs (required for clean kernel entry)
+**What this changes:** Adds ONE line after `mmu_shutdown()`: `usb_phy_bringup(0)`.
+All other shutdown steps (USB, display, fb, MMU) run normally — identical to Phase 3.
+The PHY is re-powered right before the jump so ferros can init DWC3.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 
