@@ -184,15 +184,17 @@ iface.writemem(dtb_addr, dtb)
 entry = kernel_addr + 0x1000
 print(f"Entry: {entry:#x}")
 
-# Use _m1_entry (offset 0x1010) — skips cache/MMU ops that crash on M1.
-m1_entry = kernel_addr + 0x1010
-print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset 0x1010)")
+# Find _m1_entry offset dynamically from nm output, or use known offset.
+# _m1_entry is at VMA 0x81038, _start is at 0x80000, so offset = 0x1038.
+m1_entry_offset = 0x1038
+m1_entry = kernel_addr + m1_entry_offset
+print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset {m1_entry_offset:#x})")
 
 # Pre-map kernel BSS pages in the USB DART before jumping.
 # The kernel's static DMA buffers live in BSS (after the loaded image).
 # We need the DART to translate their physical addresses for DWC3 DMA.
 # Use identity mapping: IOVA = physical address.
-DART_MAP_ENABLED = False  # Kernel handles DART setup now
+DART_MAP_ENABLED = True  # Map kernel BSS to low IOVAs via m1n1 proxy
 
 # Dump USB PHY state and test re-powering
 print("\n=== USB PHY State ===")
@@ -215,19 +217,29 @@ except Exception as e:
 if DART_MAP_ENABLED:
     print("Setting up USB DART mappings for kernel DMA buffers...")
     try:
-        # Get the USB DART handle from m1n1
-        dart_handle = p.dart_init(0x382f80000, 0)  # dart-usb0 reg[1], sid=0
+        # Get the USB DART handle from m1n1 (use reg[0] for init, m1n1 programs both)
+        dart_handle = p.dart_init(0x382f80000, 0)  # dart-usb0, sid=0
         print(f"  DART handle: {dart_handle:#x}")
 
         # BSS starts after the kernel image, page-aligned.
-        # The linker puts BSS at offset 0x4000 from _start.
-        # kernel_addr is the load address. BSS physical addr = kernel_addr + 0x4000.
-        # We need to map enough pages to cover all static DMA buffers (~32KB of BSS).
-        # Map 256KB to be safe (16 × 16KB DART pages).
-        bss_start = (kernel_addr + len(kernel) + 0x3FFF) & ~0x3FFF  # page-align after image
-        map_size = 256 * 1024  # 256KB should cover all static buffers
-        print(f"  Mapping BSS region: {bss_start:#x} .. {bss_start + map_size:#x} (identity)")
-        p.dart_map(dart_handle, bss_start, bss_start, map_size)
+        bss_start = (kernel_addr + len(kernel) + 0x3FFF) & ~0x3FFF
+        map_size = 256 * 1024  # 256KB covers all static DMA buffers
+
+        # Map BSS at LOW IOVAs (< 4GB) so DWC3 TRB buffer pointers work.
+        # Use IOVA base 0xF0000000 — well below 4GB, avoids m1n1's IOVAs.
+        iova_base = 0xF0000000
+        print(f"  BSS phys: {bss_start:#x}, IOVA: {iova_base:#x}, size: {map_size:#x}")
+        p.dart_map(dart_handle, iova_base, bss_start, map_size)
+
+        # Calculate dma_offset: iova = phys + offset → offset = iova - phys
+        dma_offset = iova_base - bss_start
+        print(f"  dma_offset: {dma_offset:#x} (0x{dma_offset & 0xFFFFFFFFFFFFFFFF:016x})")
+
+        # Write dma_offset to a known DRAM location so the kernel can read it.
+        # Use the 8 bytes right before the kernel image (we control that memory).
+        dma_offset_addr = kernel_addr - 8
+        p.write64(dma_offset_addr, dma_offset & 0xFFFFFFFFFFFFFFFF)
+        print(f"  dma_offset written to {dma_offset_addr:#x}")
         print("  DART mappings OK")
     except Exception as e:
         print(f"  DART setup failed: {e} — USB may not work")

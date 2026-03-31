@@ -773,6 +773,135 @@ impl Dwc3Dev {
     /// Takes over from ABL without soft reset (preserves PHY state).
     /// Stops the controller, reconfigures event buffer and EP0, then restarts.
     /// Returns None if initialization fails.
+    /// Warm takeover: skip CSFTRST, halt controller, reprogram buffers + EPs, restart.
+    /// For use when ABL already initialized the DWC3 (Tensor G3, M1 via m1n1).
+    pub fn warm_init() -> Option<Self> {
+        // Check DWC3 is alive
+        let snpsid = unsafe { mmio::read32(dwc3_base() + GSNPSID) };
+        if snpsid == 0 || snpsid == 0xFFFF_FFFF {
+            return None; // Clock gated, no DWC3
+        }
+
+        // Set device mode
+        unsafe {
+            let gctl = mmio::read32(dwc3_base() + GCTL);
+            mmio::write32(dwc3_base() + GCTL,
+                (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_DEVICE);
+        }
+
+        // Halt controller (clear RUN_STOP, wait for DEVCTRLHLT)
+        unsafe {
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, dctl & !DCTL_RUN_STOP);
+            for _ in 0..100_000u32 {
+                if mmio::read32(dwc3_base() + DSTS) & (1 << 22) != 0 { break; } // DEVCTRLHLT
+            }
+        }
+
+        // Mask events
+        unsafe {
+            let evt_size = core::mem::size_of::<EventBuffer>() as u32;
+            mmio::write32(dwc3_base() + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
+        }
+
+        // Drain pending events
+        unsafe {
+            let pending = mmio::read32(dwc3_base() + GEVNTCOUNT);
+            if pending > 0 {
+                mmio::write32(dwc3_base() + GEVNTCOUNT, pending);
+            }
+        }
+
+        // Set up our event buffer
+        unsafe {
+            let evt_addr = &raw const EVT_BUF as usize;
+            let evt_size = core::mem::size_of::<EventBuffer>() as u32;
+            for i in 0..256 { EVT_BUF.buf[i] = 0; }
+            mmio::write32(dwc3_base() + GEVNTADRLO, evt_addr as u32);
+            mmio::write32(dwc3_base() + GEVNTADRHI, (evt_addr >> 32) as u32);
+            mmio::write32(dwc3_base() + GEVNTSIZ, evt_size & !GEVNTSIZ_INTMASK);
+            mmio::write32(dwc3_base() + GEVNTCOUNT, 0);
+        }
+
+        // Enable device events
+        unsafe {
+            mmio::write32(dwc3_base() + DEVTEN,
+                DEVTEN_USBRSTEN | DEVTEN_CONNECTDONEEN |
+                DEVTEN_DISCONNEVTEN | DEVTEN_CMDCMPLEN);
+        }
+
+        // Set speed to High-Speed
+        unsafe {
+            let dcfg = mmio::read32(dwc3_base() + DCFG);
+            mmio::write32(dwc3_base() + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
+        }
+
+        let dsts_now = unsafe { mmio::read32(dwc3_base() + DSTS) };
+        let mut dev = Dwc3Dev {
+            evt_read_idx: 0,
+            ep0_state: Ep0State::Setup,
+            address: 0,
+            configured: false,
+            connected_speed: 0,
+            halt_ok: true,
+            dsts_at_halt: dsts_now,
+            last_ep_cmd_ok: true,
+            ep_cmd_fail_count: 0,
+            ep1_xfer_complete: 0,
+            ep0_xfer_notready: 0,
+            status_out_count: 0,
+            status_in_count: 0,
+            ep1_data_notready: 0,
+            cmd_status_fail: 0,
+            last_cmd_status: 0,
+            last_cmd_ep: 0,
+            last_cmd_type: 0,
+            ep0_resource_idx: 0,
+            ep1_resource_idx: 0,
+            ep1_start_ok: 0,
+            ep1_start_fail: 0,
+            ep1_retry_ok: 0,
+            ep1_retry_fail: 0,
+            pending_ep1_len: 0,
+            pending_ep1_trbctl: 0,
+            setup_count: 0,
+            ep0_setup_arm_ok: 0,
+            ep0_setup_arm_fail: 0,
+            last_setup_brequest: 0,
+            last_setup_wvalue: 0,
+            ep0_status_out_arm_fail: 0,
+            last_evt_raw: 0,
+            last_send_preview: 0,
+            last_send_len: 0,
+            last_send_buf_addr: 0,
+            last_send_trb_addr: 0,
+            last_send_src_addr: 0,
+            last_send_src_preview: 0,
+            bulk_out_resource_idx: 0,
+            bulk_in_resource_idx: 0,
+            bulk_out_len: 0,
+            bulk_out_ready: false,
+            bulk_out_armed: false,
+            bulk_in_idle: true,
+            bulk_out_xfer_complete: 0,
+            bulk_in_xfer_complete: 0,
+        };
+
+        // Configure endpoints
+        dev.ep_start_config(0);
+        dev.ep0_configure();
+        dev.bulk_configure();
+
+        // Start controller
+        unsafe {
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, dctl | DCTL_RUN_STOP);
+        }
+
+        Some(dev)
+    }
+
+    /// Full cold init with CSFTRST. Use on QCM6490 where ABL leaves caches hot.
     pub fn init() -> Option<Self> {
         // Ensure device mode
         unsafe {

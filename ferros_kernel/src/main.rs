@@ -1005,9 +1005,96 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 con.puts("DART ERR:      ");
                 con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x40));
                 con.puts("\n");
+                // DART TCR for SID 0 on both banks
+                con.puts("DART TCR0[0]:  ");
+                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x100));
+                con.puts("\n");
+                con.puts("DART TCR0[1]:  ");
+                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base1 + 0x100));
+                con.puts("\n");
+                // Event buffer address — this is what DWC3 uses for DMA
+                con.puts("GEVNTADR:      ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC404));
+                con.puts("_");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC400));
+                con.puts("\n");
+            }
+            con.puts("ep_cmd ok=");
+            con.put_hex32(usb.ep_cmd_ok);
+            con.puts(" fail=");
+            con.put_hex32(usb.ep_cmd_fail);
+            con.puts("\n");
+            if usb.ep_cmd_fail > 0 {
+                con.puts("last_cmd:      ");
+                con.put_hex32(usb.last_cmd_status);
+                con.puts("\n");
             }
             con.puts("Waiting for host...\n");
-            m1_usb_event_loop(&mut usb, &mut con);
+
+            // Run event loop with diagnostics
+            use ferros_hal::UsbBulk;
+            let mut loop_count = 0u32;
+            loop {
+                match usb.poll_event() {
+                    ferros_hal::UsbEvent::None => {
+                        loop_count += 1;
+                        if loop_count == 10_000_000 {
+                            con.puts("\n--- 10M polls ---\n");
+                            con.puts("evt_count:     ");
+                            con.put_hex32(usb.evt_count);
+                            con.puts("\n");
+                            con.puts("setup_count:   ");
+                            con.put_hex32(usb.setup_count);
+                            con.puts("\n");
+                            con.puts("GEVNTCOUNT:    ");
+                            con.put_hex32(usb.read_reg(0xC40C));
+                            con.puts("\n");
+                            con.puts("DSTS:          ");
+                            con.put_hex32(usb.read_reg(0xC70C));
+                            con.puts("\n");
+                            con.puts("DCTL:          ");
+                            con.put_hex32(usb.read_reg(0xC704));
+                            con.puts("\n");
+                        }
+                        for _ in 0..64u32 { core::hint::spin_loop(); }
+                    }
+                    ferros_hal::UsbEvent::Reset => {
+                        con.puts("  USB reset\n");
+                        usb.handle_reset();
+                    }
+                    ferros_hal::UsbEvent::ConnectDone { speed } => {
+                        con.puts("  connected spd=");
+                        con.put_hex32(speed);
+                        con.puts("\n");
+                        usb.handle_connect_done();
+                    }
+                    ferros_hal::UsbEvent::Disconnect => {
+                        con.puts("  disconnected\n");
+                        usb.handle_disconnect();
+                    }
+                    ferros_hal::UsbEvent::Ep0Setup { request } => {
+                        con.puts("  SETUP: ");
+                        for b in &request {
+                            con.put_hex32(*b as u32);
+                            con.puts(" ");
+                        }
+                        con.puts("\n");
+                        if !usb.handle_setup(&request) {
+                            usb.ep0_stall();
+                        }
+                    }
+                    ferros_hal::UsbEvent::TransferComplete { ep } => {
+                        con.puts("  XferDone ep=");
+                        con.put_hex32(ep as u32);
+                        con.puts("\n");
+                    }
+                    ferros_hal::UsbEvent::TransferNotReady { ep } => {
+                        con.puts("  XferNRdy ep=");
+                        con.put_hex32(ep as u32);
+                        con.puts("\n");
+                    }
+                }
+            }
         }
         None => {
             con.puts("FAIL\n");
@@ -1220,14 +1307,44 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     const VOL_DOWN_BIT: u32 = 1 << 1;
     const VOL_UP_BIT: u32 = 1 << 2;
 
-    // ---- DWC3 USB init ----
-    // Tensor G3 DWC3 at G#11210000. ABL already did PHY init.
-    // Set the base address and let the existing driver take over.
+    // ---- Display: deferred ----
+    // Display SYSMMU is write-protected (S2MPU). Writing to G#19840000 locks the CPU.
+    // Display output requires either: walking SYSMMU page tables (read-only) to find
+    // the FB physical address, or USB transport for all I/O. Prioritizing USB.
+
+    // ---- DWC3 USB: warm takeover ----
+    // Tensor G3 DWC3 at G#11210000. USB SYSMMU at G#11040000.
+    // ABL initialized PHY + controller. We take over without soft reset.
     ferros_hal::usb::set_dwc3_base(0x1121_0000);
 
-    // Skip PHY init and SMMU bypass — ABL handled both.
-    // Go straight to DWC3 device mode init.
-    let mut usb = ferros_hal::usb::Dwc3Dev::init();
+    // NOTE: USB SYSMMU at G#11040000 — do NOT write to it (S2MPU may protect it).
+    // DMA mapping will need to use the existing SYSMMU page tables or add entries.
+
+    // Probe DWC3 before init — check if it's clocked
+    let snpsid = unsafe { core::ptr::read_volatile((0x1121_0000_usize + 0xC120) as *const u32) };
+    // If SNPSID is 0 or G#FFFFFFFF, USB clock is gated. Use killswitch behavior as diagnostic:
+    // Valid SNPSID → killswitch = SYSTEM_OFF (power dead)
+    // Invalid SNPSID → killswitch = SYSTEM_RESET (reboot to fastboot)
+    // This way we can tell from the phone's behavior whether DWC3 is clocked.
+    let usb_clocked = snpsid != 0 && snpsid != 0xFFFF_FFFF;
+
+    // Ultra-minimal: just ensure device mode + RUN_STOP, no reprogram.
+    // See if ABL's existing config is enough for the host to detect us.
+    let mut usb: Option<ferros_hal::usb::Dwc3Dev> = None;
+    if usb_clocked {
+        unsafe {
+            let base = 0x1121_0000_usize;
+            // Ensure device mode
+            let gctl = core::ptr::read_volatile((base + 0xC110) as *const u32);
+            core::ptr::write_volatile((base + 0xC110) as *mut u32,
+                (gctl & !0x3000) | 0x2000); // PRTCAPDIR = device
+
+            // Just set RUN_STOP — don't touch anything else
+            let dctl = core::ptr::read_volatile((base + 0xC704) as *const u32);
+            core::ptr::write_volatile((base + 0xC704) as *mut u32,
+                dctl | (1 << 31)); // RUN_STOP
+        }
+    }
 
     // Killswitch + USB event loop.
     loop {
@@ -1235,12 +1352,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
         if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
-            unsafe {
-                core::arch::asm!(
-                    "ldr x0, =0x84000008",
-                    "smc #0",
-                    options(noreturn)
-                );
+            // Both buttons: always SYSTEM_OFF (killswitch)
+            unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
+        }
+        // Vol down only: diagnostic — dead = USB init OK, reboot = USB init failed
+        if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) != 0 {
+            if usb.is_some() {
+                unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
+            } else {
+                unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }
             }
         }
 

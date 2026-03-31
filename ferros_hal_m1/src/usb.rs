@@ -255,6 +255,19 @@ pub struct M1Usb {
     pub bulk_out_ready: bool,
     pub bulk_out_armed: bool,
     pub bulk_in_idle: bool,
+    // Diagnostics
+    pub ep_cmd_ok: u32,
+    pub ep_cmd_fail: u32,
+    pub last_cmd_status: u32,
+    pub evt_count: u32,
+    pub setup_count: u32,
+}
+
+impl M1Usb {
+    /// Read a DWC3 register (for diagnostics from kernel_main).
+    pub fn read_reg(&self, offset: usize) -> u32 {
+        unsafe { mmio::read32(self.base + offset) }
+    }
 }
 
 /// Delay loop (~us at ~GHz clock).
@@ -325,10 +338,19 @@ impl M1Usb {
             for _ in 0..100_000u32 {
                 let val = mmio::read32(reg_base + 0x0C);
                 if val & DEPCMD_CMDACT == 0 {
-                    return (val >> 12) & 0xF == 0;
+                    let status = (val >> 12) & 0xF;
+                    if status == 0 {
+                        self.ep_cmd_ok += 1;
+                        return true;
+                    } else {
+                        self.ep_cmd_fail += 1;
+                        self.last_cmd_status = val;
+                        return false;
+                    }
                 }
             }
         }
+        self.ep_cmd_fail += 1;
         false
     }
 
@@ -362,83 +384,41 @@ impl M1Usb {
             return None;
         }
 
-        // Phase 1: DART setup — m1n1 shut down the DART during usb_iodev_shutdown.
-        // We need to re-initialize it and map our DMA buffers.
-        // Use identity mapping (iova = phys) for simplicity.
-        let dart = Dart::init(addrs.dart_base0, addrs.dart_base1, addrs.dart_sid);
-
-        // Identity-map all buffer pages
-        let buf_addrs: [usize; 9] = [
-            &raw const EVT_BUF as usize,
-            &raw const SCRATCHPAD as usize,
-            &raw const EP0_TRBS as usize,
-            &raw const EP0_SETUP_BUF as usize,
-            &raw const EP0_DATA_BUF as usize,
-            &raw const BULK_OUT_TRB as usize,
-            &raw const BULK_IN_TRB as usize,
-            &raw const BULK_OUT_BUF as usize,
-            &raw const BULK_IN_BUF as usize,
-        ];
-        let mut mapped: [usize; 16] = [0; 16];
-        let mut n_mapped = 0usize;
-        for &addr in &buf_addrs {
-            let page = addr & !0x3FFF;
-            let mut found = false;
-            for i in 0..n_mapped {
-                if mapped[i] == page { found = true; break; }
-            }
-            if !found && n_mapped < 16 {
-                dart.map(page, page, 0x4000);
-                mapped[n_mapped] = page;
-                n_mapped += 1;
+        // Phase 1: DART bypass — physical addresses pass through.
+        // All M1 DRAM is >4GB (starts at G#800000000). T8020 DART bypass
+        // supports full address width (tested: event buffer DMA works).
+        unsafe {
+            for base in [addrs.dart_base0, addrs.dart_base1] {
+                let bypass = (1u32 << 8) | (1u32 << 12); // BYPASS_DART | BYPASS_DAPF
+                for sid in 0..16u32 {
+                    mmio::write32(base + 0x100 + (sid as usize) * 4, bypass);
+                }
+                // Invalidate TLB
+                mmio::write32(base + 0x34, 0xFFFF);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                mmio::write32(base + 0x20, 1 << 20);
+                for _ in 0..100_000u32 {
+                    if mmio::read32(base + 0x20) & (1 << 2) == 0 { break; }
+                }
             }
         }
 
-        // dma_offset = 0 (identity mapping)
+        // dma_offset = 0 (bypass: DMA addr = physical addr)
         let dma_offset: i64 = 0;
 
-        // Phase 2: Full DWC3 core + PHY soft reset.
-        // m1n1's usb_phy_bringup() re-powered the ATCPHY and PipeHandler.
-        // The DART is freshly initialized. Now do the standard DWC3 bringup.
+        // Phase 2: Device-mode reconfigure only. No PHY/core reset.
+        // m1n1 left PHY powered (PMGR domains stay active after usb_iodev_shutdown).
+        // Just CSFTRST to reset the device state machine, then reconfigure.
         unsafe {
-            // Assert core + PHY soft resets
+            // Ensure device mode
             let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, gctl | GCTL_CORESOFTRESET);
-            let phycfg = mmio::read32(base + GUSB2PHYCFG);
-            mmio::write32(base + GUSB2PHYCFG, phycfg | (1 << 31));
-            let pipectl = mmio::read32(base + GUSB3PIPECTL);
-            mmio::write32(base + GUSB3PIPECTL, pipectl | (1 << 31));
-        }
-        delay(100_000);
+            mmio::write32(base + GCTL, (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_DEVICE);
 
-        unsafe {
-            // Deassert PHY soft resets
-            let phycfg = mmio::read32(base + GUSB2PHYCFG);
-            mmio::write32(base + GUSB2PHYCFG, phycfg & !(1 << 31));
-            let pipectl = mmio::read32(base + GUSB3PIPECTL);
-            mmio::write32(base + GUSB3PIPECTL, pipectl & !(1 << 31));
-        }
-        delay(100_000);
-
-        unsafe {
-            // Deassert core soft reset
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, gctl & !GCTL_CORESOFTRESET);
-        }
-        delay(100_000);
-
-        // Device mode + HS speed
-        unsafe {
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL,
-                (gctl & !(GCTL_PRTCAPDIR_MASK | GCTL_SCALEDOWN_MASK | GCTL_DISSCRAMBLE))
-                | GCTL_PRTCAPDIR_DEVICE);
+            // HS speed
             let dcfg = mmio::read32(base + DCFG);
             mmio::write32(base + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
-        }
 
-        // Device controller soft reset
-        unsafe {
+            // Device controller soft reset
             let dctl = mmio::read32(base + DCTL);
             mmio::write32(base + DCTL, (dctl & !DCTL_RUN_STOP) | DCTL_CSFTRST);
             for _ in 0..100_000u32 {
@@ -464,6 +444,11 @@ impl M1Usb {
             bulk_out_ready: false,
             bulk_out_armed: false,
             bulk_in_idle: true,
+            ep_cmd_ok: 0,
+            ep_cmd_fail: 0,
+            last_cmd_status: 0,
+            evt_count: 0,
+            setup_count: 0,
         };
 
         // Scratchpad setup
@@ -655,6 +640,7 @@ impl UsbBulk for M1Usb {
             core::ptr::read_volatile(buf.add(self.evt_read_idx))
         };
         self.evt_read_idx = (self.evt_read_idx + 1) % 256;
+        self.evt_count += 1;
         unsafe { mmio::write32(self.base + GEVNTCOUNT, 4); }
 
         if evt & EVT_NON_EP != 0 {
@@ -677,6 +663,7 @@ impl UsbBulk for M1Usb {
                 DEPEVT_XFERCOMPLETE => {
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
                         // EP0 OUT SETUP complete — read the 8-byte setup packet
+                        self.setup_count += 1;
                         unsafe {
                             let buf_phys = &raw const EP0_SETUP_BUF as usize;
                             mmio::cache_invalidate(buf_phys, 8);
