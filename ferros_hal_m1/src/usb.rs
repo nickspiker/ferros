@@ -272,6 +272,9 @@ pub struct M1Usb {
     pub l1_readback: u64,
     pub setup_buf_dma: u64,
     pub setup_trb_dma: u64,
+    /// Last 8 raw event words seen (ring buffer for debugging)
+    pub raw_evts: [u32; 8],
+    pub raw_evt_idx: usize,
 }
 
 impl M1Usb {
@@ -486,6 +489,8 @@ impl M1Usb {
             l1_readback: 0,
             setup_buf_dma: 0,
             setup_trb_dma: 0,
+            raw_evts: [0; 8],
+            raw_evt_idx: 0,
         };
 
         // Scratchpad setup
@@ -691,6 +696,8 @@ impl UsbBulk for M1Usb {
         };
         self.evt_read_idx = (self.evt_read_idx + 1) % 256;
         self.evt_count += 1;
+        self.raw_evts[self.raw_evt_idx % 8] = evt;
+        self.raw_evt_idx += 1;
         unsafe { mmio::write32(self.base + GEVNTCOUNT, 4); }
 
         if evt & EVT_NON_EP != 0 {

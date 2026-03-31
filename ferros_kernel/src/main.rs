@@ -1165,6 +1165,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             con.puts("DCTL:          ");
                             con.put_hex32(usb.read_reg(0xC704));
                             con.puts("\n");
+                            // Dump raw events
+                            con.puts("raw evts:      ");
+                            for i in 0..8 {
+                                con.put_hex32(usb.raw_evts[i]);
+                                con.puts(" ");
+                            }
+                            con.puts("\n");
+                            // Read DART error addr
+                            con.puts("DART ERR_ADDR: ");
+                            unsafe {
+                                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x54));
+                                con.puts("_");
+                                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x50));
+                            }
+                            con.puts("\n");
                         }
                         for _ in 0..64u32 { core::hint::spin_loop(); }
                     }
