@@ -70,6 +70,16 @@ struct L1Table {
     entries: [u64; L1_ENTRIES],
 }
 
+/// Get physical address of L1 table (for diagnostics).
+pub fn l1_phys_addr() -> usize {
+    &raw const L1 as usize
+}
+
+/// Get L2_NEXT counter (for diagnostics).
+pub fn l2_next_val() -> usize {
+    unsafe { L2_NEXT }
+}
+
 /// L2 page table — allocated on demand for IOVA ranges we map.
 /// We pre-allocate 4 L2 tables, enough for 4 × 2048 × 16KB = 128MB of IOVA space.
 #[repr(C, align(16384))]
@@ -195,10 +205,9 @@ impl Dart {
         let sid_bit = 1u32 << (sid & 0x1F);
 
         unsafe {
-            // Enable this stream on both banks
+            // Enable ALL streams on both banks (we don't know which SID the DWC3 uses)
             for i in 0..2 {
-                let enabled = mmio::read32(dart.bases[i] + ENABLED_STREAMS);
-                mmio::write32(dart.bases[i] + ENABLED_STREAMS, enabled | sid_bit);
+                mmio::write32(dart.bases[i] + ENABLED_STREAMS, 0xFFFF);
             }
 
             // Check if DART is locked (firmware set it up, we reuse L1)
@@ -212,19 +221,26 @@ impl Dart {
                     core::ptr::write_volatile(l1_ptr.add(i), 0);
                 }
 
-                // Program TTBR0 with L1 physical address on BOTH banks
+                // Program TTBR0 for ALL streams on BOTH banks
                 let l1_phys = &raw const L1 as usize;
                 let ttbr_val = TTBR_VALID | ((l1_phys >> TTBR_SHIFT) as u32 & TTBR_ADDR_MASK);
                 for b in 0..2 {
-                    let ttbr_base = dart.bases[b] + TTBR_OFF + (sid as usize) * 16;
-                    mmio::write32(ttbr_base, ttbr_val);
-                    for i in 1..TTBR_COUNT {
-                        mmio::write32(ttbr_base + i * 4, 0);
+                    for s in 0..16u32 {
+                        let ttbr_base = dart.bases[b] + TTBR_OFF + (s as usize) * 16;
+                        mmio::write32(ttbr_base, ttbr_val);
+                        for i in 1..TTBR_COUNT {
+                            mmio::write32(ttbr_base + i * 4, 0);
+                        }
                     }
                 }
 
-                // Enable translation on BOTH banks
-                dart.write_all(TCR_OFF + (sid as usize) * 4, TCR_TRANSLATE_ENABLE);
+                // Ensure all table writes are visible to DART before enabling translation
+                core::arch::asm!("dsb sy");
+
+                // Enable translation for ALL streams on BOTH banks
+                for s in 0..16u32 {
+                    dart.write_all(TCR_OFF + (s as usize) * 4, TCR_TRANSLATE_ENABLE);
+                }
             }
 
             // Invalidate TLB

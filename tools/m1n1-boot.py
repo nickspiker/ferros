@@ -194,7 +194,7 @@ print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset {m1_entry_offset:#x})")
 # The kernel's static DMA buffers live in BSS (after the loaded image).
 # We need the DART to translate their physical addresses for DWC3 DMA.
 # Use identity mapping: IOVA = physical address.
-DART_MAP_ENABLED = True  # Map kernel BSS to low IOVAs via m1n1 proxy
+DART_MAP_ENABLED = False  # Kernel handles DART setup (boot script mapping gets destroyed by m1n1 shutdown)
 
 # Dump USB PHY state and test re-powering
 print("\n=== USB PHY State ===")
@@ -221,12 +221,13 @@ if DART_MAP_ENABLED:
         dart_handle = p.dart_init(0x382f80000, 0)  # dart-usb0, sid=0
         print(f"  DART handle: {dart_handle:#x}")
 
-        # BSS starts after the kernel image, page-aligned.
-        bss_start = (kernel_addr + len(kernel) + 0x3FFF) & ~0x3FFF
-        map_size = 256 * 1024  # 256KB covers all static DMA buffers
+        # BSS is at linker offset 0x7000 from _start (0x87000 - 0x80000).
+        # Align down to DART page size (16KB = 0x4000).
+        bss_start = (kernel_addr + 0x7000) & ~0x3FFF
+        # Map 512KB from BSS start to cover all static buffers + stack + heap start
+        map_size = 512 * 1024
 
-        # Map BSS at LOW IOVAs (< 4GB) so DWC3 TRB buffer pointers work.
-        # Use IOVA base 0xF0000000 — well below 4GB, avoids m1n1's IOVAs.
+        # Map at LOW IOVAs (< 4GB) so DWC3 TRB buffer pointers work.
         iova_base = 0xF0000000
         print(f"  BSS phys: {bss_start:#x}, IOVA: {iova_base:#x}, size: {map_size:#x}")
         p.dart_map(dart_handle, iova_base, bss_start, map_size)

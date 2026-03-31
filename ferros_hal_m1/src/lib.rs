@@ -5,5 +5,7 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod dart;
 pub mod usb;

@@ -261,6 +261,17 @@ pub struct M1Usb {
     pub last_cmd_status: u32,
     pub evt_count: u32,
     pub setup_count: u32,
+    pub dart_config: u32,
+    pub dart_tcr_before: u32,
+    pub dart_ttbr_before: u32,
+    pub dart_tcr_after: u32,
+    pub dart_ttbr_after: u32,
+    pub dma_offset_val: i64,
+    pub l1_phys: u64,
+    pub min_buf_page: u64,
+    pub l1_readback: u64,
+    pub setup_buf_dma: u64,
+    pub setup_trb_dma: u64,
 }
 
 impl M1Usb {
@@ -268,6 +279,27 @@ impl M1Usb {
     pub fn read_reg(&self, offset: usize) -> u32 {
         unsafe { mmio::read32(self.base + offset) }
     }
+}
+
+/// Get the lowest 16KB-aligned page address among all DMA buffers.
+pub fn dma_buffer_min_page() -> usize {
+    let addrs: [usize; 9] = [
+        &raw const EVT_BUF as usize,
+        &raw const SCRATCHPAD as usize,
+        &raw const EP0_TRBS as usize,
+        &raw const EP0_SETUP_BUF as usize,
+        &raw const EP0_DATA_BUF as usize,
+        &raw const BULK_OUT_TRB as usize,
+        &raw const BULK_IN_TRB as usize,
+        &raw const BULK_OUT_BUF as usize,
+        &raw const BULK_IN_BUF as usize,
+    ];
+    let mut min = usize::MAX;
+    for &a in &addrs {
+        let p = a & !0x3FFF;
+        if p < min { min = p; }
+    }
+    min
 }
 
 /// Delay loop (~us at ~GHz clock).
@@ -372,9 +404,9 @@ impl M1Usb {
     ///
     /// Full bringup: ATCPHY, PipeHandler, core+PHY reset, DART, endpoints.
     /// PMGR power domains are still active from m1n1.
-    pub fn init(addrs: &M1UsbAddrs) -> Option<Self> {
-        // Skip ATCPHY/PipeHandler init — m1n1 left them configured.
-        // Warm takeover: just reconfigure the DWC3 device-mode state.
+    /// Initialize with a pre-computed DMA offset.
+    /// Call `setup_dart()` first to configure the DART and get the offset.
+    pub fn init(addrs: &M1UsbAddrs, dma_offset: i64) -> Option<Self> {
         let base = addrs.dwc3;
 
         // Verify DWC3 core presence
@@ -384,27 +416,21 @@ impl M1Usb {
             return None;
         }
 
-        // Phase 1: DART bypass — physical addresses pass through.
-        // All M1 DRAM is >4GB (starts at G#800000000). T8020 DART bypass
-        // supports full address width (tested: event buffer DMA works).
-        unsafe {
-            for base in [addrs.dart_base0, addrs.dart_base1] {
-                let bypass = (1u32 << 8) | (1u32 << 12); // BYPASS_DART | BYPASS_DAPF
-                for sid in 0..16u32 {
-                    mmio::write32(base + 0x100 + (sid as usize) * 4, bypass);
-                }
-                // Invalidate TLB
-                mmio::write32(base + 0x34, 0xFFFF);
-                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-                mmio::write32(base + 0x20, 1 << 20);
-                for _ in 0..100_000u32 {
-                    if mmio::read32(base + 0x20) & (1 << 2) == 0 { break; }
-                }
-            }
-        }
+        // Phase 1: DART setup from kernel.
+        // m1n1's usb_iodev_shutdown calls dart_shutdown which zeroes TTBRs.
+        // We must set up the DART fresh.
+        //
+        // First check: is the DART locked? If so, we can't program TTBRs.
+        // Read DART state before we touch it (dart_base0 is the primary bank)
+        let dart_config = unsafe { mmio::read32(addrs.dart_base0 + 0x60) };
+        let dart_tcr0 = unsafe { mmio::read32(addrs.dart_base0 + 0x100) };
+        let dart_ttbr0 = unsafe { mmio::read32(addrs.dart_base0 + 0x200) };
+        // Store for kernel diagnostic printing
+        // (we'll expose these via the M1Usb struct)
 
-        // dma_offset = 0 (bypass: DMA addr = physical addr)
-        let dma_offset: i64 = 0;
+        // DART is set up by kernel_main before calling init().
+        // dma_offset converts physical addresses to < 4GB IOVAs.
+        let l1_readback: u64 = 0;
 
         // Phase 2: Device-mode reconfigure only. No PHY/core reset.
         // m1n1 left PHY powered (PMGR domains stay active after usb_iodev_shutdown).
@@ -449,6 +475,17 @@ impl M1Usb {
             last_cmd_status: 0,
             evt_count: 0,
             setup_count: 0,
+            dart_config,
+            dart_tcr_before: dart_tcr0,
+            dart_ttbr_before: dart_ttbr0,
+            dart_tcr_after: 0,  // filled in after init
+            dart_ttbr_after: 0,
+            dma_offset_val: dma_offset,
+            l1_phys: 0,
+            min_buf_page: 0,
+            l1_readback: 0,
+            setup_buf_dma: 0,
+            setup_trb_dma: 0,
         };
 
         // Scratchpad setup
@@ -490,6 +527,19 @@ impl M1Usb {
             let dctl = mmio::read32(base + DCTL);
             mmio::write32(base + DCTL, dctl | DCTL_RUN_STOP);
         }
+
+        // Read back DART state for diagnostics
+        dev.dart_tcr_after = unsafe { mmio::read32(addrs.dart_base0 + 0x100) };
+        dev.dart_ttbr_after = unsafe { mmio::read32(addrs.dart_base0 + 0x200) };
+        dev.dma_offset_val = dma_offset;
+        dev.l1_phys = 0;
+        dev.min_buf_page = 0;
+        dev.l1_readback = l1_readback;
+        // Record what DMA addresses we'll use for EP0 SETUP
+        let setup_phys = &raw const EP0_SETUP_BUF as usize;
+        let trb_phys = &raw const EP0_TRBS as usize;
+        dev.setup_buf_dma = dev.dma(setup_phys) as u64;
+        dev.setup_trb_dma = dev.dma(trb_phys) as u64;
 
         Some(dev)
     }

@@ -973,16 +973,77 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     con.put_hex32(dsts);
     con.puts("\n");
 
-    con.puts("USB init:      ");
     let usb_addrs = ferros_hal_m1::usb::M1UsbAddrs {
-        dwc3:      0x3_8228_0000,  // reg[0] of /arm-io/usb-drd0
-        pipe:      0x3_82A8_4000,  // reg[3] of /arm-io/usb-drd0
-        atcphy:    0x3_82A9_0000,  // reg[0] of /arm-io/atc-phy0
-        dart_base0: 0x3_82F0_0000, // reg[0] of /arm-io/dart-usb0
-        dart_base1: 0x3_82F8_0000, // reg[1] of /arm-io/dart-usb0 (T8020 dual bank)
+        dwc3:      0x3_8228_0000,
+        pipe:      0x3_82A8_4000,
+        atcphy:    0x3_82A9_0000,
+        dart_base0: 0x3_82F8_0000,
+        dart_base1: 0x3_82F0_0000,
         dart_sid:  0,
     };
-    match ferros_hal_m1::usb::M1Usb::init(&usb_addrs) {
+
+    // DART setup with progress prints
+    con.puts("DART alloc:    ");
+    let l1_alloc = alloc::vec![0u8; 16384 + 16384];
+    let l1_base = (l1_alloc.as_ptr() as usize + 0x3FFF) & !0x3FFF;
+    let l2_alloc = alloc::vec![0u8; 16384 + 16384];
+    let l2_base = (l2_alloc.as_ptr() as usize + 0x3FFF) & !0x3FFF;
+    core::mem::forget(l1_alloc);
+    core::mem::forget(l2_alloc);
+    con.puts("OK\n");
+
+    con.puts("DART tables:   ");
+    let min_page = ferros_hal_m1::usb::dma_buffer_min_page();
+    let iova_base: usize = 0xF000_0000;
+    let l1_idx = (iova_base >> 25) & 0x1FFF;
+    unsafe {
+        // Zero tables
+        let l1 = l1_base as *mut u64;
+        let l2 = l2_base as *mut u64;
+        for i in 0..2048 { core::ptr::write_volatile(l1.add(i), 0); }
+        for i in 0..2048 { core::ptr::write_volatile(l2.add(i), 0); }
+        // L1 entry → L2
+        let l1_entry = ((l2_base as u64) >> 14) << 14 | (0xFFF_u64 << 40) | (1 << 1) | 1;
+        core::ptr::write_volatile(l1.add(l1_idx), l1_entry);
+        // L2 entries → buffer pages
+        for i in 0..32usize {
+            let phys = min_page + i * 16384;
+            let iova = iova_base + i * 16384;
+            let l2_idx = (iova >> 14) & 0x7FF;
+            let pte = ((phys as u64) >> 14) << 14 | (0xFFF_u64 << 40) | (1 << 1) | 1;
+            core::ptr::write_volatile(l2.add(l2_idx), pte);
+        }
+        core::arch::asm!("dsb sy");
+    }
+    con.puts("OK\n");
+
+    con.puts("DART hw:       ");
+    let ttbr_val = (1u32 << 31) | ((l1_base >> 12) as u32 & 0x7FFF_FFFF);
+    unsafe {
+        for dart_base in [usb_addrs.dart_base0, usb_addrs.dart_base1] {
+            ferros_hal::mmio::write32(dart_base + 0xFC, 0xFFFF); // enable streams
+            for s in 0..16u32 {
+                let off = 0x200 + (s as usize) * 16;
+                ferros_hal::mmio::write32(dart_base + off, ttbr_val);
+                for t in 1..4u32 { ferros_hal::mmio::write32(dart_base + off + (t as usize) * 4, 0); }
+            }
+            for s in 0..16u32 {
+                ferros_hal::mmio::write32(dart_base + 0x100 + (s as usize) * 4, 0x80);
+            }
+            // TLB invalidate
+            ferros_hal::mmio::write32(dart_base + 0x34, 0xFFFF);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            ferros_hal::mmio::write32(dart_base + 0x20, 1 << 20);
+            for _ in 0..100_000u32 {
+                if ferros_hal::mmio::read32(dart_base + 0x20) & (1 << 2) == 0 { break; }
+            }
+        }
+    }
+    let dma_offset: i64 = iova_base as i64 - min_page as i64;
+    con.puts("OK\n");
+
+    con.puts("USB init:      ");
+    match ferros_hal_m1::usb::M1Usb::init(&usb_addrs, dma_offset) {
         Some(mut usb) => {
             con.puts("OK\n");
             // Post-init register dump
@@ -1005,20 +1066,68 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 con.puts("DART ERR:      ");
                 con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x40));
                 con.puts("\n");
-                // DART TCR for SID 0 on both banks
-                con.puts("DART TCR0[0]:  ");
-                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x100));
-                con.puts("\n");
-                con.puts("DART TCR0[1]:  ");
-                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base1 + 0x100));
-                con.puts("\n");
-                // Event buffer address — this is what DWC3 uses for DMA
+                // Event buffer DMA address
                 con.puts("GEVNTADR:      ");
                 con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC404));
                 con.puts("_");
                 con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC400));
                 con.puts("\n");
             }
+            con.puts("DART cfg:      ");
+            con.put_hex32(usb.dart_config);
+            con.puts("\n");
+            con.puts("DART TCR b/a:  ");
+            con.put_hex32(usb.dart_tcr_before);
+            con.puts(" -> ");
+            con.put_hex32(usb.dart_tcr_after);
+            con.puts("\n");
+            con.puts("DART TTBR b/a: ");
+            con.put_hex32(usb.dart_ttbr_before);
+            con.puts(" -> ");
+            con.put_hex32(usb.dart_ttbr_after);
+            con.puts("\n");
+            con.puts("dma_offset:    ");
+            con.put_hex32((usb.dma_offset_val >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.dma_offset_val as u32);
+            con.puts("\n");
+            // Read back L1 entry for IOVA 0xF0000000
+            // L1 index = (0xF0000000 >> 25) & 0x1FFF = 0x780
+            // TTBR after has L1 phys = (ttbr & 0x7FFFFFFF) << 12
+            let l1_phys = ((usb.dart_ttbr_after & 0x7FFF_FFFF) as usize) << 12;
+            con.puts("\nL1 phys:       ");
+            con.put_hex32((usb.l1_phys >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.l1_phys as u32);
+            con.puts("\nmin_buf_page:  ");
+            con.put_hex32((usb.min_buf_page >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.min_buf_page as u32);
+            // L1 readback immediately after dart.map() (inside USB init)
+            con.puts("\nL1 immed:      ");
+            con.put_hex32((usb.l1_readback >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.l1_readback as u32);
+            // Read back L1 entry now (from kernel_main)
+            let l1_addr = usb.l1_phys as usize;
+            if l1_addr != 0 {
+                let l1_entry_addr = l1_addr + 0x780 * 8;
+                let l1_lo = unsafe { core::ptr::read_volatile(l1_entry_addr as *const u32) };
+                let l1_hi = unsafe { core::ptr::read_volatile((l1_entry_addr + 4) as *const u32) };
+                con.puts("\nL1 now:        ");
+                con.put_hex32(l1_hi);
+                con.puts("_");
+                con.put_hex32(l1_lo);
+            }
+            con.puts("\nSETUP buf DMA: ");
+            con.put_hex32((usb.setup_buf_dma >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.setup_buf_dma as u32);
+            con.puts("\nSETUP trb DMA: ");
+            con.put_hex32((usb.setup_trb_dma >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.setup_trb_dma as u32);
+            con.puts("\n");
             con.puts("ep_cmd ok=");
             con.put_hex32(usb.ep_cmd_ok);
             con.puts(" fail=");
@@ -1312,59 +1421,130 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Display output requires either: walking SYSMMU page tables (read-only) to find
     // the FB physical address, or USB transport for all I/O. Prioritizing USB.
 
-    // ---- DWC3 USB: warm takeover ----
-    // Tensor G3 DWC3 at G#11210000. USB SYSMMU at G#11040000.
-    // ABL initialized PHY + controller. We take over without soft reset.
-    ferros_hal::usb::set_dwc3_base(0x1121_0000);
-
-    // NOTE: USB SYSMMU at G#11040000 — do NOT write to it (S2MPU may protect it).
-    // DMA mapping will need to use the existing SYSMMU page tables or add entries.
-
-    // Probe DWC3 before init — check if it's clocked
-    let snpsid = unsafe { core::ptr::read_volatile((0x1121_0000_usize + 0xC120) as *const u32) };
-    // If SNPSID is 0 or G#FFFFFFFF, USB clock is gated. Use killswitch behavior as diagnostic:
-    // Valid SNPSID → killswitch = SYSTEM_OFF (power dead)
-    // Invalid SNPSID → killswitch = SYSTEM_RESET (reboot to fastboot)
-    // This way we can tell from the phone's behavior whether DWC3 is clocked.
-    let usb_clocked = snpsid != 0 && snpsid != 0xFFFF_FFFF;
-
-    // Ultra-minimal: just ensure device mode + RUN_STOP, no reprogram.
-    // See if ABL's existing config is enough for the host to detect us.
-    let mut usb: Option<ferros_hal::usb::Dwc3Dev> = None;
-    if usb_clocked {
+    // ---- S2MPU bypass (from pkvm_s2mpu.c:187) ----
+    // Bypass ALL relevant S2MPUs so we can access USB PHY, UFS, and display.
+    // Each S2MPU: write G#FF to +G#54 (clear VID protection), 0 to +G#00 (disable)
+    const S2MPUS: [usize; 2] = [
+        0x1107_0000, // HSI0 — USB PHY + DWC3 DMA
+        0x131F_0000, // HSI2 — UFS
+    ];
+    for &base in &S2MPUS {
         unsafe {
-            let base = 0x1121_0000_usize;
-            // Ensure device mode
-            let gctl = core::ptr::read_volatile((base + 0xC110) as *const u32);
-            core::ptr::write_volatile((base + 0xC110) as *mut u32,
-                (gctl & !0x3000) | 0x2000); // PRTCAPDIR = device
-
-            // Just set RUN_STOP — don't touch anything else
-            let dctl = core::ptr::read_volatile((base + 0xC704) as *const u32);
-            core::ptr::write_volatile((base + 0xC704) as *mut u32,
-                dctl | (1 << 31)); // RUN_STOP
+            core::ptr::write_volatile((base + 0x54) as *mut u32, 0xFF);
+            core::ptr::write_volatile((base + 0x00) as *mut u32, 0x00);
         }
     }
 
+    // ---- eUSB PHY init (now possible with S2MPU bypassed) ----
+    // Ported from phy-exynos-usbdrd-eusb.c + exynos-usb-blkcon.c
+    const USBCON: usize = 0x1110_0000;
+    const EUSB_PHY: usize = 0x1111_0000;
+
+    unsafe {
+        // 1. Assert PHY reset
+        let mut reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+        reg |= (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+        core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+        // 2. PLL config for 19.2 MHz
+        reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+        reg |= 1 << 1;    // rptr_mode
+        reg &= !(7 << 4); // ref_freq_sel = 0 (19.2 MHz)
+        core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+        reg = core::ptr::read_volatile((EUSB_PHY + 0x0008) as *const u32);
+        reg = (reg & !0xFFF) | 368; // pll_fb_div
+        core::ptr::write_volatile((EUSB_PHY + 0x0008) as *mut u32, reg);
+
+        reg = core::ptr::read_volatile((EUSB_PHY + 0x000C) as *const u32);
+        reg &= !0xF; // pll_ref_div = 0
+        core::ptr::write_volatile((EUSB_PHY + 0x000C) as *mut u32, reg);
+
+        // 3. Link controller init
+        reg = core::ptr::read_volatile((USBCON + 0x0004) as *const u32);
+        reg |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7); // dis_*_qact
+        reg &= !(1 << 8);
+        core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+        for _ in 0..50_000u32 { core::hint::spin_loop(); }
+        reg |= 1 << 8;    // force_qact
+        reg |= 0xF << 12; // bus_filter_bypass
+        core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+
+        // Link reset
+        reg = core::ptr::read_volatile((USBCON + 0x000C) as *const u32);
+        reg |= 1 << 0;
+        core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+        for _ in 0..10_000u32 { core::hint::spin_loop(); }
+        reg &= !(1 << 0);
+        core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+
+        // Force VBUS valid (device mode)
+        reg = core::ptr::read_volatile((USBCON + 0x0010) as *const u32);
+        reg |= (1 << 1) | (1 << 2);
+        core::ptr::write_volatile((USBCON + 0x0010) as *mut u32, reg);
+
+        // 4. Release PHY reset
+        reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+        reg &= !((1 << 0) | (1 << 2));
+        core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+        // 5. Wait for PLL lock
+        for _ in 0..1_000_000u32 { core::hint::spin_loop(); }
+    }
+
+    // If we survived, S2MPU is bypassed and PHY is initialized. Now try UFS + USB.
+    const DWC3: usize = 0x1121_0000;
+    const UFS_BASE: usize = 0x1320_0000;
+    const FERROS_PART_LBA: u32 = 21758972;
+
+    fn hex_to_buf(buf: &mut [u8], off: &mut usize, label: &[u8], val: u32) {
+        for &b in label { buf[*off] = b; *off += 1; }
+        let hex = b"0123456789ABCDEF";
+        for i in (0..8).rev() {
+            buf[*off] = hex[((val >> (i * 4)) & 0xF) as usize]; *off += 1;
+        }
+        buf[*off] = b'\n'; *off += 1;
+    }
+
+    let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
+    let ufs_up = ufs.link_is_up();
+
+    if ufs_up {
+        ufs.init_transfer_list();
+
+        let buf = ufs.data_buffer_mut();
+        buf.fill(0);
+        let mut off = 0_usize;
+
+        for &b in b"FERROS v3 S2MPU_BYPASS=OK\n" { buf[off] = b; off += 1; }
+
+        unsafe {
+            hex_to_buf(buf, &mut off, b"SNPSID=", core::ptr::read_volatile((DWC3 + 0xC120) as *const u32));
+            hex_to_buf(buf, &mut off, b"GCTL=", core::ptr::read_volatile((DWC3 + 0xC110) as *const u32));
+            hex_to_buf(buf, &mut off, b"DSTS=", core::ptr::read_volatile((DWC3 + 0xC70C) as *const u32));
+            hex_to_buf(buf, &mut off, b"USB2PHY=", core::ptr::read_volatile((DWC3 + 0xC200) as *const u32));
+        }
+
+        for &b in b"END\n" { buf[off] = b; off += 1; }
+        ufs.write_block(FERROS_PART_LBA);
+    }
+
+    // ---- DWC3 USB init ----
+    ferros_hal::usb::set_dwc3_base(DWC3);
+    let mut usb = ferros_hal::usb::Dwc3Dev::init();
+
     // Killswitch + USB event loop.
+    // NOTE: GPA6 (vol up) reads 0 when not pressed — vol-down-only diagnostic
+    // was broken (always fired "both buttons"). Removed the diagnostic.
+    // Both buttons = SYSTEM_OFF (killswitch). That's all we need.
     loop {
-        // ---- Killswitch check ----
         let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
         if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
-            // Both buttons: always SYSTEM_OFF (killswitch)
             unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
         }
-        // Vol down only: diagnostic — dead = USB init OK, reboot = USB init failed
-        if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) != 0 {
-            if usb.is_some() {
-                unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
-            } else {
-                unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }
-            }
-        }
 
-        // ---- USB event poll ----
+        // USB event poll
         if let Some(ref mut u) = usb {
             match u.poll_event() {
                 ferros_hal::usb::UsbEvent::Reset => {
