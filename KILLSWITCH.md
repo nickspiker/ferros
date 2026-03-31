@@ -83,3 +83,48 @@ discharge (1-4 seconds at room temperature).
 ## Hardware Confirmed On
 - Google Pixel 8 (Tensor G3 / Zuma), EL2, PSCI via Samsung TF-A
 - Kill confirmed: phone powers off immediately, requires manual power-on to restart
+
+## M1 MacBook Air — Killswitch Plan
+
+### Trigger: Power Button (single press)
+The M1 has no volume buttons. The power button is the killswitch trigger.
+Unlike the Pixel 8 (GPIO poll), the M1 power button event comes through the **SMC**
+(System Management Controller) — an RTKit coprocessor at `/arm-io/smc` in the ADT.
+
+### SMC Architecture
+- RTKit firmware running on a dedicated coprocessor (not the AP)
+- Communicates via mailbox protocol (Apple ASC mailbox at ADT-specified address)
+- Power button generates an SMC event readable via the mailbox
+- Asahi Linux has a working driver (`macsmc` in the Linux kernel)
+
+### Kill Mechanism
+Same as Pixel 8: PSCI SYSTEM_OFF (ARM SMC G#84000008).
+m1n1 runs at EL2 and PSCI calls trap to Apple's SecureROM (EL3 equivalent).
+SecureROM commands the PMU to cut power rails.
+
+### Key Differences from Pixel 8
+| Aspect | Pixel 8 | M1 MacBook |
+|--------|---------|------------|
+| Trigger | Vol Up + Vol Down (GPIO) | Power button (SMC) |
+| Detection | GPIO register poll (~1μs) | SMC mailbox read (~10μs) |
+| PAC registers | ARMv9 PAC (same) | ARMv8.3 PAC (same API, same registers) |
+| PSCI | Samsung TF-A | Apple SecureROM |
+| Power cut | S2MPG PMIC via SPMI | Apple PMU via SMC |
+| Touch ID | N/A | SEP-owned, never accessible from AP |
+
+### Implementation Steps (after USB/PT transport works)
+1. Read SMC base address from ADT (`/arm-io/smc`)
+2. Init RTKit mailbox (same protocol as DCP, simpler — no display state)
+3. Register for power button events
+4. On event: PSCI SYSTEM_OFF (identical to Pixel 8 kill path)
+
+### Key Storage on M1
+Identical to Pixel 8. M1's Icestorm/Firestorm cores implement ARMv8.3-PAuth.
+PAC key registers (APIAKey, APIBKey, APDAKey, APDBKey, APGAKey) are EL2-only,
+flip-flop-based, destroyed on power loss. Same security properties apply.
+
+### Estimated Timing (M1)
+- SMC event detection: ~10μs (mailbox read vs GPIO poll)
+- SMC trap to EL3: ~100ns (same ARM mechanism)
+- PMU power cut: ~1-10ms
+- **Total button-to-dead: < 15ms** (same as Pixel 8)
