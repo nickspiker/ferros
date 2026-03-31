@@ -37,13 +37,28 @@
 use crate::mmio;
 
 // ---------------------------------------------------------------------------
-// Base addresses (QCM6490)
+// Base addresses
 // ---------------------------------------------------------------------------
 
-/// DWC3 core base address.
+/// DWC3 core base address — set by platform init before calling Dwc3Dev::init().
+/// Default: QCM6490 (G#A600000). Tensor G3: G#11210000.
+static DWC3_BASE_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0x0A60_0000);
+
+/// Get the current DWC3 base address.
+#[inline(always)]
+pub fn dwc3_base() -> usize {
+    DWC3_BASE_ADDR.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the DWC3 base address. Must be called before Dwc3Dev::init().
+pub fn set_dwc3_base(base: usize) {
+    DWC3_BASE_ADDR.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Legacy constant for backward compatibility.
 pub const DWC3_BASE: usize = 0x0A60_0000;
 
-/// Qualcomm USB wrapper base.
+/// Qualcomm USB wrapper base (QCM6490 only).
 pub const QCOM_WRAPPER: usize = 0x0A6F_8800;
 
 // ---------------------------------------------------------------------------
@@ -428,14 +443,14 @@ impl Dwc3Info {
 pub fn probe() -> Dwc3Info {
     unsafe {
         Dwc3Info {
-            snpsid: mmio::read32(DWC3_BASE + GSNPSID),
-            gctl: mmio::read32(DWC3_BASE + GCTL),
-            gsts: mmio::read32(DWC3_BASE + GSTS),
-            hwparams0: mmio::read32(DWC3_BASE + GHWPARAMS0),
-            hwparams1: mmio::read32(DWC3_BASE + GHWPARAMS1),
-            hwparams3: mmio::read32(DWC3_BASE + GHWPARAMS3),
-            dsts: mmio::read32(DWC3_BASE + DSTS),
-            dcfg: mmio::read32(DWC3_BASE + DCFG),
+            snpsid: mmio::read32(dwc3_base() + GSNPSID),
+            gctl: mmio::read32(dwc3_base() + GCTL),
+            gsts: mmio::read32(dwc3_base() + GSTS),
+            hwparams0: mmio::read32(dwc3_base() + GHWPARAMS0),
+            hwparams1: mmio::read32(dwc3_base() + GHWPARAMS1),
+            hwparams3: mmio::read32(dwc3_base() + GHWPARAMS3),
+            dsts: mmio::read32(dwc3_base() + DSTS),
+            dcfg: mmio::read32(dwc3_base() + DCFG),
         }
     }
 }
@@ -507,16 +522,16 @@ pub fn dump_diag(exc_fn: fn() -> u64) -> Dwc3Diag {
 
     unsafe {
         Dwc3Diag {
-            dctl: mmio::read32(DWC3_BASE + DCTL),
-            dsts: mmio::read32(DWC3_BASE + DSTS),
-            dcfg: mmio::read32(DWC3_BASE + DCFG),
-            devten: mmio::read32(DWC3_BASE + DEVTEN),
-            gctl: mmio::read32(DWC3_BASE + GCTL),
-            gsts: mmio::read32(DWC3_BASE + GSTS),
-            gevntadrlo: mmio::read32(DWC3_BASE + GEVNTADRLO),
-            gevntadrhi: mmio::read32(DWC3_BASE + GEVNTADRHI),
-            gevntsiz: mmio::read32(DWC3_BASE + GEVNTSIZ),
-            gevntcount: mmio::read32(DWC3_BASE + GEVNTCOUNT),
+            dctl: mmio::read32(dwc3_base() + DCTL),
+            dsts: mmio::read32(dwc3_base() + DSTS),
+            dcfg: mmio::read32(dwc3_base() + DCFG),
+            devten: mmio::read32(dwc3_base() + DEVTEN),
+            gctl: mmio::read32(dwc3_base() + GCTL),
+            gsts: mmio::read32(dwc3_base() + GSTS),
+            gevntadrlo: mmio::read32(dwc3_base() + GEVNTADRLO),
+            gevntadrhi: mmio::read32(dwc3_base() + GEVNTADRHI),
+            gevntsiz: mmio::read32(dwc3_base() + GEVNTSIZ),
+            gevntcount: mmio::read32(dwc3_base() + GEVNTCOUNT),
             qcom_general_cfg: mmio::read32(QCOM_WRAPPER + QCOM_GENERAL_CFG),
             qcom_hs_phy_ctrl: mmio::read32(QCOM_WRAPPER + QCOM_HS_PHY_CTRL),
             qcom_ss_phy_ctrl: mmio::read32(QCOM_WRAPPER + QCOM_SS_PHY_CTRL),
@@ -524,9 +539,9 @@ pub fn dump_diag(exc_fn: fn() -> u64) -> Dwc3Diag {
             qmp_pwr_ctrl: qmp_pwr,
             usb2_phy_utmi_ctrl: usb2_utmi,
             exc_during_phy: (exc_after - exc_before) as u32,
-            gusb2phycfg: mmio::read32(DWC3_BASE + GUSB2PHYCFG),
-            gusb3pipectl: mmio::read32(DWC3_BASE + GUSB3PIPECTL),
-            dalepena: mmio::read32(DWC3_BASE + DALEPENA),
+            gusb2phycfg: mmio::read32(dwc3_base() + GUSB2PHYCFG),
+            gusb3pipectl: mmio::read32(dwc3_base() + GUSB3PIPECTL),
+            dalepena: mmio::read32(dwc3_base() + DALEPENA),
             evt_buf_raw: evt_raw,
         }
     }
@@ -578,10 +593,10 @@ pub fn phy_init() -> bool {
         // The DWC3↔PHY interface must be disconnected while we reset and
         // re-init the PHY, otherwise the DWC3 loses sync with the PHY and
         // falls back to FS (PHY TX corrupted → host sees no valid packets).
-        let phycfg = mmio::read32(DWC3_BASE + GUSB2PHYCFG);
-        mmio::write32(DWC3_BASE + GUSB2PHYCFG, phycfg | (1 << 31));  // Assert PHYSOFTRST
-        let pipectl = mmio::read32(DWC3_BASE + GUSB3PIPECTL);
-        mmio::write32(DWC3_BASE + GUSB3PIPECTL, pipectl | (1 << 31)); // Assert USB3 PHYSOFTRST
+        let phycfg = mmio::read32(dwc3_base() + GUSB2PHYCFG);
+        mmio::write32(dwc3_base() + GUSB2PHYCFG, phycfg | (1 << 31));  // Assert PHYSOFTRST
+        let pipectl = mmio::read32(dwc3_base() + GUSB3PIPECTL);
+        mmio::write32(dwc3_base() + GUSB3PIPECTL, pipectl | (1 << 31)); // Assert USB3 PHYSOFTRST
         phy_delay(10_000);
 
         // Phase 1: GCC reset cycle for the USB2 PHY
@@ -661,10 +676,10 @@ pub fn phy_init() -> bool {
 
         // Phase 3: Deassert PHYSOFTRST — reconnect DWC3 to the freshly
         // initialized PHY. Clock mux and VBUS are already configured.
-        let phycfg = mmio::read32(DWC3_BASE + GUSB2PHYCFG);
-        mmio::write32(DWC3_BASE + GUSB2PHYCFG, phycfg & !(1 << 31));
-        let pipectl = mmio::read32(DWC3_BASE + GUSB3PIPECTL);
-        mmio::write32(DWC3_BASE + GUSB3PIPECTL,
+        let phycfg = mmio::read32(dwc3_base() + GUSB2PHYCFG);
+        mmio::write32(dwc3_base() + GUSB2PHYCFG, phycfg & !(1 << 31));
+        let pipectl = mmio::read32(dwc3_base() + GUSB3PIPECTL);
+        mmio::write32(dwc3_base() + GUSB3PIPECTL,
             (pipectl & !(1 << 31)) | (1 << 28)); // Clear PHYSOFTRST + DISRXDETINP3
         phy_delay(100_000); // Wait for DWC3↔PHY handshake
     }
@@ -761,8 +776,8 @@ impl Dwc3Dev {
     pub fn init() -> Option<Self> {
         // Ensure device mode
         unsafe {
-            let gctl = mmio::read32(DWC3_BASE + GCTL);
-            mmio::write32(DWC3_BASE + GCTL,
+            let gctl = mmio::read32(dwc3_base() + GCTL);
+            mmio::write32(dwc3_base() + GCTL,
                 (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_DEVICE);
         }
 
@@ -771,13 +786,13 @@ impl Dwc3Dev {
         // This ensures clean state after PHY re-init.
         let halt_ok;
         unsafe {
-            let dctl = mmio::read32(DWC3_BASE + DCTL);
-            mmio::write32(DWC3_BASE + DCTL, (dctl & !DCTL_RUN_STOP) | DCTL_CSFTRST);
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, (dctl & !DCTL_RUN_STOP) | DCTL_CSFTRST);
             // Wait for CSFTRST to self-clear
             halt_ok = {
                 let mut ok = false;
                 for _ in 0..100_000u32 {
-                    if mmio::read32(DWC3_BASE + DCTL) & DCTL_CSFTRST == 0 {
+                    if mmio::read32(dwc3_base() + DCTL) & DCTL_CSFTRST == 0 {
                         ok = true;
                         break;
                     }
@@ -790,14 +805,14 @@ impl Dwc3Dev {
         // Mask events before reprogramming the event buffer
         unsafe {
             let evt_size = core::mem::size_of::<EventBuffer>() as u32;
-            mmio::write32(DWC3_BASE + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
+            mmio::write32(dwc3_base() + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
         }
 
         // Acknowledge any pending events from ABL
         unsafe {
-            let pending = mmio::read32(DWC3_BASE + GEVNTCOUNT);
+            let pending = mmio::read32(dwc3_base() + GEVNTCOUNT);
             if pending > 0 {
-                mmio::write32(DWC3_BASE + GEVNTCOUNT, pending);
+                mmio::write32(dwc3_base() + GEVNTCOUNT, pending);
             }
         }
 
@@ -811,27 +826,27 @@ impl Dwc3Dev {
                 EVT_BUF.buf[i] = 0;
             }
 
-            mmio::write32(DWC3_BASE + GEVNTADRLO, evt_addr as u32);
-            mmio::write32(DWC3_BASE + GEVNTADRHI, (evt_addr >> 32) as u32);
+            mmio::write32(dwc3_base() + GEVNTADRLO, evt_addr as u32);
+            mmio::write32(dwc3_base() + GEVNTADRHI, (evt_addr >> 32) as u32);
             // Unmask events now that address is set
-            mmio::write32(DWC3_BASE + GEVNTSIZ, evt_size & !GEVNTSIZ_INTMASK);
-            mmio::write32(DWC3_BASE + GEVNTCOUNT, 0);
+            mmio::write32(dwc3_base() + GEVNTSIZ, evt_size & !GEVNTSIZ_INTMASK);
+            mmio::write32(dwc3_base() + GEVNTCOUNT, 0);
         }
 
         // Enable device events
         unsafe {
-            mmio::write32(DWC3_BASE + DEVTEN,
+            mmio::write32(dwc3_base() + DEVTEN,
                 DEVTEN_USBRSTEN | DEVTEN_CONNECTDONEEN |
                 DEVTEN_DISCONNEVTEN | DEVTEN_CMDCMPLEN);
         }
 
         // Set device speed to High-Speed (USB2) — SS PHY may be torn down by ABL
         unsafe {
-            let dcfg = mmio::read32(DWC3_BASE + DCFG);
-            mmio::write32(DWC3_BASE + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
+            let dcfg = mmio::read32(dwc3_base() + DCFG);
+            mmio::write32(dwc3_base() + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
         }
 
-        let dsts_now = unsafe { mmio::read32(DWC3_BASE + DSTS) };
+        let dsts_now = unsafe { mmio::read32(dwc3_base() + DSTS) };
         let mut dev = Dwc3Dev {
             evt_read_idx: 0,
             ep0_state: Ep0State::Setup,
@@ -889,8 +904,8 @@ impl Dwc3Dev {
 
         // Set Run/Stop to connect
         unsafe {
-            let dctl = mmio::read32(DWC3_BASE + DCTL);
-            mmio::write32(DWC3_BASE + DCTL, dctl | DCTL_RUN_STOP);
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, dctl | DCTL_RUN_STOP);
         }
 
         Some(dev)
@@ -926,8 +941,8 @@ impl Dwc3Dev {
         // Without this, the endpoint data path is disabled — DMA completes
         // but the FIFO never drains to the PHY, so no packets reach the wire.
         unsafe {
-            let ena = mmio::read32(DWC3_BASE + DALEPENA);
-            mmio::write32(DWC3_BASE + DALEPENA, ena | 0x3); // bits 0+1 = EP0 OUT+IN
+            let ena = mmio::read32(dwc3_base() + DALEPENA);
+            mmio::write32(dwc3_base() + DALEPENA, ena | 0x3); // bits 0+1 = EP0 OUT+IN
         }
     }
 
@@ -959,8 +974,8 @@ impl Dwc3Dev {
 
         // Enable all 4 EPs in DALEPENA (bits 0-3)
         unsafe {
-            let ena = mmio::read32(DWC3_BASE + DALEPENA);
-            mmio::write32(DWC3_BASE + DALEPENA, ena | 0xF);
+            let ena = mmio::read32(dwc3_base() + DALEPENA);
+            mmio::write32(dwc3_base() + DALEPENA, ena | 0xF);
         }
     }
 
@@ -994,7 +1009,7 @@ impl Dwc3Dev {
         }
 
         if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
+            let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 2 * 16 + 0x0C) };
             self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         } else {
             self.force_end_transfer_unconditional(2);
@@ -1006,7 +1021,7 @@ impl Dwc3Dev {
                 crate::mmio::cache_clean(trb_addr, 16);
             }
             if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-                let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 2 * 16 + 0x0C) };
+                let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 2 * 16 + 0x0C) };
                 self.bulk_out_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
             }
         }
@@ -1045,7 +1060,7 @@ impl Dwc3Dev {
         self.bulk_in_idle = false;
 
         if self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 3 * 16 + 0x0C) };
+            let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 3 * 16 + 0x0C) };
             self.bulk_in_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         } else {
             self.force_end_transfer_unconditional(3);
@@ -1059,7 +1074,7 @@ impl Dwc3Dev {
                 self.bulk_in_idle = true;
                 return false;
             }
-            let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 3 * 16 + 0x0C) };
+            let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 3 * 16 + 0x0C) };
             self.bulk_in_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         }
         true
@@ -1081,7 +1096,7 @@ impl Dwc3Dev {
 
     /// Issue a DEPCMD to a physical endpoint. Blocks until command completes.
     fn ep_cmd(&mut self, ep_phys: u8, cmd: u32, par0: u32, par1: u32, par2: u32) -> bool {
-        let base = DWC3_BASE + 0xC800 + (ep_phys as usize) * 16;
+        let base = dwc3_base() + 0xC800 + (ep_phys as usize) * 16;
         unsafe {
             mmio::write32(base + 0x00, par2);  // DEPCMDPAR2
             mmio::write32(base + 0x04, par1);  // DEPCMDPAR1
@@ -1157,7 +1172,7 @@ impl Dwc3Dev {
                 self.ep0_setup_arm_ok += 1;
             }
         }
-        let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
+        let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 0x0C) };
         self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         self.ep0_state = Ep0State::Setup;
     }
@@ -1282,7 +1297,7 @@ impl Dwc3Dev {
             }
         }
         // Save resource index from successful STARTTRANSFER
-        let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 16 + 0x0C) };
+        let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 16 + 0x0C) };
         self.ep1_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         // Clear pending — transfer is armed, don't retry from XferNotReady
         self.pending_ep1_len = 0;
@@ -1329,7 +1344,7 @@ impl Dwc3Dev {
                 self.ep0_status_out_arm_fail += 1;
             }
         }
-        let cmd_reg = unsafe { mmio::read32(DWC3_BASE + 0xC800 + 0x0C) };
+        let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 0x0C) };
         self.ep0_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         self.ep0_state = Ep0State::Status;
     }
@@ -1344,7 +1359,7 @@ impl Dwc3Dev {
 
     /// Poll for events. Returns the next event, or None.
     pub fn poll_event(&mut self) -> UsbEvent {
-        let count = unsafe { mmio::read32(DWC3_BASE + GEVNTCOUNT) } & 0xFFFC;
+        let count = unsafe { mmio::read32(dwc3_base() + GEVNTCOUNT) } & 0xFFFC;
         if count == 0 {
             return UsbEvent::None;
         }
@@ -1358,7 +1373,7 @@ impl Dwc3Dev {
         self.evt_read_idx = (self.evt_read_idx + 4) % core::mem::size_of::<EventBuffer>();
 
         // Acknowledge this event
-        unsafe { mmio::write32(DWC3_BASE + GEVNTCOUNT, 4) };
+        unsafe { mmio::write32(dwc3_base() + GEVNTCOUNT, 4) };
 
         self.last_evt_raw = evt;
 
@@ -1369,7 +1384,7 @@ impl Dwc3Dev {
             match evt_type {
                 DEVT_USBRST => UsbEvent::Reset,
                 DEVT_CONNECTDONE => {
-                    let dsts = unsafe { mmio::read32(DWC3_BASE + DSTS) };
+                    let dsts = unsafe { mmio::read32(dwc3_base() + DSTS) };
                     self.connected_speed = dsts & DSTS_CONNECTSPD_MASK;
                     UsbEvent::ConnectDone { speed: self.connected_speed }
                 }
@@ -1548,22 +1563,22 @@ impl Dwc3Dev {
         self.handle_disconnect();
         // Clear Run/Stop (disconnect from bus)
         unsafe {
-            let dctl = mmio::read32(DWC3_BASE + DCTL);
-            mmio::write32(DWC3_BASE + DCTL, dctl & !DCTL_RUN_STOP);
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, dctl & !DCTL_RUN_STOP);
         }
         phy_delay(10_000);
         // Device controller soft reset
         unsafe {
-            let dctl = mmio::read32(DWC3_BASE + DCTL);
-            mmio::write32(DWC3_BASE + DCTL, dctl | DCTL_CSFTRST);
+            let dctl = mmio::read32(dwc3_base() + DCTL);
+            mmio::write32(dwc3_base() + DCTL, dctl | DCTL_CSFTRST);
             for _ in 0..100_000u32 {
-                if mmio::read32(DWC3_BASE + DCTL) & DCTL_CSFTRST == 0 { break; }
+                if mmio::read32(dwc3_base() + DCTL) & DCTL_CSFTRST == 0 { break; }
             }
         }
         // Mask events so DWC3 doesn't write to stale event buffer
         unsafe {
             let evt_size = core::mem::size_of::<EventBuffer>() as u32;
-            mmio::write32(DWC3_BASE + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
+            mmio::write32(dwc3_base() + GEVNTSIZ, evt_size | GEVNTSIZ_INTMASK);
         }
     }
 
@@ -1592,7 +1607,7 @@ impl Dwc3Dev {
     /// No CMDIOC — forced end doesn't generate completion events.
     /// Silently ignores CMDSTATUS errors.
     fn end_transfer_raw(&mut self, ep_phys: u8, rsc_idx: u32) {
-        let base = DWC3_BASE + 0xC800 + (ep_phys as usize) * 16;
+        let base = dwc3_base() + 0xC800 + (ep_phys as usize) * 16;
         let saved = (self.cmd_status_fail, self.last_cmd_status, self.last_cmd_ep, self.last_cmd_type);
         unsafe {
             mmio::write32(base + 0x0C,
@@ -1654,8 +1669,8 @@ impl Dwc3Dev {
 
         // Clear device address
         unsafe {
-            let dcfg = mmio::read32(DWC3_BASE + DCFG);
-            mmio::write32(DWC3_BASE + DCFG, dcfg & !DCFG_DEVADDR_MASK);
+            let dcfg = mmio::read32(dwc3_base() + DCFG);
+            mmio::write32(dwc3_base() + DCFG, dcfg & !DCFG_DEVADDR_MASK);
         }
     }
 
@@ -1668,7 +1683,7 @@ impl Dwc3Dev {
     /// The previous config descriptor timeout was caused by a separate
     /// XferNotReady ZLP bug, not by SETTRANSFRESOURCE corruption.
     pub fn handle_connect_done(&mut self) {
-        let dsts = unsafe { mmio::read32(DWC3_BASE + DSTS) };
+        let dsts = unsafe { mmio::read32(dwc3_base() + DSTS) };
         self.connected_speed = dsts & DSTS_CONNECTSPD_MASK;
 
         let mps: u32 = match self.connected_speed {
@@ -1729,8 +1744,8 @@ impl Dwc3Dev {
                 // the next SETUP to the new address before DCFG is updated.
                 self.address = w_value as u8;
                 unsafe {
-                    let dcfg = mmio::read32(DWC3_BASE + DCFG);
-                    mmio::write32(DWC3_BASE + DCFG,
+                    let dcfg = mmio::read32(dwc3_base() + DCFG);
+                    mmio::write32(dwc3_base() + DCFG,
                         (dcfg & !DCFG_DEVADDR_MASK)
                         | ((self.address as u32) << DCFG_DEVADDR_SHIFT));
                 }

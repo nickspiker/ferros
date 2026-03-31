@@ -1220,56 +1220,54 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     const VOL_DOWN_BIT: u32 = 1 << 1;
     const VOL_UP_BIT: u32 = 1 << 2;
 
-    // DWC3 USB controller at G#11210000 (from DTB: usb@11210000/dwc3)
-    // ABL already initialized it — we just need to take over.
-    const T_DWC3: usize = 0x1121_0000;
-    const GSNPSID: usize = 0xC120;
-    const GCTL: usize = 0xC110;
-    const DSTS: usize = 0xC70C;
-    const DCTL: usize = 0xC704;
-    const GEVNTCOUNT: usize = 0xC40C;
+    // ---- DWC3 USB init ----
+    // Tensor G3 DWC3 at G#11210000. ABL already did PHY init.
+    // Set the base address and let the existing driver take over.
+    ferros_hal::usb::set_dwc3_base(0x1121_0000);
 
-    // Probe DWC3 — read SNPSID to confirm it's alive
-    let snpsid = unsafe { core::ptr::read_volatile((T_DWC3 + GSNPSID) as *const u32) };
-    let gctl = unsafe { core::ptr::read_volatile((T_DWC3 + GCTL) as *const u32) };
-    let dsts = unsafe { core::ptr::read_volatile((T_DWC3 + DSTS) as *const u32) };
-    let dctl = unsafe { core::ptr::read_volatile((T_DWC3 + DCTL) as *const u32) };
-    let evtcnt = unsafe { core::ptr::read_volatile((T_DWC3 + GEVNTCOUNT) as *const u32) };
+    // Skip PHY init and SMMU bypass — ABL handled both.
+    // Go straight to DWC3 device mode init.
+    let mut usb = ferros_hal::usb::Dwc3Dev::init();
 
-    // Write probe results to DTB area (survives if we can read from GrapheneOS)
-    if dtb_addr != 0 {
-        unsafe {
-            let p = dtb_addr as *mut u32;
-            core::ptr::write_volatile(p.add(0), 0xFE00_D3C3_u32); // magic
-            core::ptr::write_volatile(p.add(1), snpsid);
-            core::ptr::write_volatile(p.add(2), gctl);
-            core::ptr::write_volatile(p.add(3), dsts);
-            core::ptr::write_volatile(p.add(4), dctl);
-            core::ptr::write_volatile(p.add(5), evtcnt);
-        }
-    }
-
-    // Killswitch loop: poll vol up + vol down, PSCI reboot if both pressed.
-    // Also: if vol_down only → PSCI reboot (quick exit for dev iteration).
+    // Killswitch + USB event loop.
     loop {
+        // ---- Killswitch check ----
         let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
-
-        let vol_down = (gpa4 & VOL_DOWN_BIT) == 0;
-        let vol_up = (gpa6 & VOL_UP_BIT) == 0;
-
-        if vol_down && vol_up {
-            // KILLSWITCH: both volume buttons → immediate reboot
+        if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
             unsafe {
                 core::arch::asm!(
-                    "ldr x0, =0x84000009",
+                    "ldr x0, =0x84000008",
                     "smc #0",
                     options(noreturn)
                 );
             }
         }
 
-        for _ in 0..256_u32 {
+        // ---- USB event poll ----
+        if let Some(ref mut u) = usb {
+            match u.poll_event() {
+                ferros_hal::usb::UsbEvent::Reset => {
+                    u.handle_reset();
+                }
+                ferros_hal::usb::UsbEvent::ConnectDone { .. } => {
+                    u.handle_connect_done();
+                    u.ep0_start_setup();
+                    u.bulk_out_arm();
+                }
+                ferros_hal::usb::UsbEvent::Disconnect => {
+                    u.handle_disconnect();
+                }
+                ferros_hal::usb::UsbEvent::Ep0Setup { request } => {
+                    if !u.handle_setup(&request) {
+                        u.ep0_stall();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for _ in 0..64_u32 {
             core::hint::spin_loop();
         }
     }
