@@ -944,17 +944,56 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // --- USB init ---
     // TODO: read actual addresses from ADT. These are placeholders.
     // Boot into m1n1 proxy and run m1n1-boot.py to dump real values.
+    // Probe DWC3 before full init — check if controller is powered
+    let dwc3_base: usize = 0x3_8228_0000;
+    con.puts("DWC3 probe:    ");
+    let snpsid = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC120) };
+    con.put_hex32(snpsid);
+    con.puts("\n");
+
+    con.puts("GCTL:          ");
+    let gctl = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC110) };
+    con.put_hex32(gctl);
+    con.puts("\n");
+
+    con.puts("DSTS:          ");
+    let dsts = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC70C) };
+    con.put_hex32(dsts);
+    con.puts("\n");
+
     con.puts("USB init:      ");
     let usb_addrs = ferros_hal_m1::usb::M1UsbAddrs {
-        dwc3:      0x3_8228_0000,  // reg[0] of /arm-io/usb-drd0 (TBD from ADT)
-        pipe:      0x3_8228_0000,  // reg[3] of /arm-io/usb-drd0 (TBD from ADT)
-        atcphy:    0x3_8208_0000,  // reg[0] of /arm-io/atc-phy0 (TBD from ADT)
-        dart_base: 0x3_82F8_0000,  // confirmed from boot log
+        dwc3:      0x3_8228_0000,  // reg[0] of /arm-io/usb-drd0
+        pipe:      0x3_82A8_4000,  // reg[3] of /arm-io/usb-drd0
+        atcphy:    0x3_82A9_0000,  // reg[0] of /arm-io/atc-phy0
+        dart_base0: 0x3_82F0_0000, // reg[0] of /arm-io/dart-usb0
+        dart_base1: 0x3_82F8_0000, // reg[1] of /arm-io/dart-usb0 (T8020 dual bank)
         dart_sid:  0,
     };
     match ferros_hal_m1::usb::M1Usb::init(&usb_addrs) {
         Some(mut usb) => {
             con.puts("OK\n");
+            // Post-init register dump
+            unsafe {
+                con.puts("DCTL:          ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC704));
+                con.puts("\n");
+                con.puts("DALEPENA:      ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC720));
+                con.puts("\n");
+                con.puts("GUSB2PHYCFG:   ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC200));
+                con.puts("\n");
+                con.puts("GUSB3PIPECTL:  ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC2C0));
+                con.puts("\n");
+                con.puts("GEVNTCOUNT:    ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC40C));
+                con.puts("\n");
+                con.puts("DART ERR:      ");
+                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x40));
+                con.puts("\n");
+            }
             con.puts("Waiting for host...\n");
             m1_usb_event_loop(&mut usb, &mut con);
         }
@@ -1174,67 +1213,53 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     //   +G#0100: VIDOSD_A (window position)
     //   +G#0104: VIDOSD_B (window size)
     const DECON0_BASE: usize = 0x1947_0000;
-
-    // Read DECON0 ID and scanout addresses — probe multiple likely offsets
-    // since the exact register layout varies between Exynos generations.
-    let decon_id = unsafe { core::ptr::read_volatile((DECON0_BASE) as *const u32) };
-
-    // Probe DPP (Display Post Processor) which holds the actual buffer address.
-    // DPP0 at G#19900000, IDMA base address registers at various offsets.
     const DPP0_BASE: usize = 0x1990_0000;
-    // Common IDMA_IN_BASE_ADDR offsets for Exynos: G#0074, G#0078, G#008C
-    let dpp_base_74 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x0074) as *const u32) };
-    let dpp_base_78 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x0078) as *const u32) };
-    let dpp_base_8c = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x008C) as *const u32) };
 
-    // Also check RDMA (Read DMA) which is separate on newer Exynos
-    // RDMA0 often at DPP_BASE + G#1000
-    let rdma_base_74 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x1074) as *const u32) };
-    let rdma_base_78 = unsafe { core::ptr::read_volatile((DPP0_BASE + 0x1078) as *const u32) };
-
-    // Write probe results to a known DRAM location (G#90060000 — in reserved area,
-    // survives warm reboot). We'll read it back from GrapheneOS.
-    const PROBE_ADDR: usize = 0x9006_0000;
+    // Write probe data to reserved DRAM at G#90200000.
+    // After watchdog reboots to GrapheneOS, read it back via:
+    //   adb shell su -c "dd if=/dev/mem bs=4 count=64 skip=$((0x90200000/4)) | xxd"
+    // If we see the magic, our kernel_main executed.
+    const PROBE: usize = 0x9020_0000;
     unsafe {
-        let p = PROBE_ADDR as *mut u32;
-        core::ptr::write_volatile(p.add(0), 0xFE00_0001_u32);  // magic
-        core::ptr::write_volatile(p.add(1), dtb_addr as u32);
-        core::ptr::write_volatile(p.add(2), (dtb_addr >> 32) as u32);
-        core::ptr::write_volatile(p.add(3), decon_id);
-        core::ptr::write_volatile(p.add(4), dpp_base_74);
-        core::ptr::write_volatile(p.add(5), dpp_base_78);
-        core::ptr::write_volatile(p.add(6), dpp_base_8c);
-        core::ptr::write_volatile(p.add(7), rdma_base_74);
-        core::ptr::write_volatile(p.add(8), rdma_base_78);
-    }
+        let p = PROBE as *mut u32;
+        core::ptr::write_volatile(p, 0xFE12_0001);           // [0] magic
+        core::ptr::write_volatile(p.add(1), dtb_addr as u32); // [1] dtb low
+        core::ptr::write_volatile(p.add(2), (dtb_addr >> 32) as u32); // [2] dtb high
 
-    // Now try to find a framebuffer: if any probed address looks like a valid
-    // DRAM address (G#80000000+), try writing green pixels there.
-    let candidates = [dpp_base_74, dpp_base_78, dpp_base_8c, rdma_base_74, rdma_base_78];
-    let mut fb_addr: u64 = 0;
-    for &addr in &candidates {
-        // Tensor G3 DRAM starts around G#80000000
-        if addr >= 0x8000_0000 && addr < 0xF000_0000 {
-            fb_addr = addr as u64;
-            break;
+        // [3] CurrentEL
+        let el: u64;
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) el);
+        core::ptr::write_volatile(p.add(3), el as u32);
+
+        // [4..20] DECON0 register dump (G#19470000 + offsets)
+        let decon_off: [usize; 16] = [
+            0x0000, 0x0004, 0x0008, 0x000C,
+            0x0020, 0x0024, 0x0080, 0x0084,
+            0x00A0, 0x00A4, 0x0100, 0x0104,
+            0x0200, 0x0204, 0x0400, 0x0404,
+        ];
+        for (i, &off) in decon_off.iter().enumerate() {
+            let val = core::ptr::read_volatile((DECON0_BASE + off) as *const u32);
+            core::ptr::write_volatile(p.add(4 + i), val);
         }
-    }
 
-    // If we found a plausible FB address, paint green pixels
-    if fb_addr != 0 {
-        unsafe {
-            let fb = fb_addr as *mut u32;
-            // Paint 256x256 green block — 1080 pixel stride (4 bytes each)
-            for y in 0..256_usize {
-                for x in 0..256_usize {
-                    let offset = y * 1080 + x;
-                    core::ptr::write_volatile(fb.add(offset), 0xFF00FF00);
-                }
-            }
+        // [20..36] DPP0/RDMA0 register dump (G#19900000 + offsets)
+        let dpp_off: [usize; 16] = [
+            0x0000, 0x0004, 0x0074, 0x0078,
+            0x008C, 0x0090, 0x0094, 0x0098,
+            0x1000, 0x1004, 0x1074, 0x1078,
+            0x108C, 0x1090, 0x1094, 0x1098,
+        ];
+        for (i, &off) in dpp_off.iter().enumerate() {
+            let val = core::ptr::read_volatile((DPP0_BASE + off) as *const u32);
+            core::ptr::write_volatile(p.add(20 + i), val);
         }
+
+        // [36] end marker
+        core::ptr::write_volatile(p.add(36), 0xFE12_DEAD);
     }
 
-    // Spin forever — we're just probing for now.
+    // Spin — watchdog reboots in ~30s, then read probe data from GrapheneOS
     loop { core::hint::spin_loop(); }
 
     /*  DISABLED: original FP5 boot sequence — unreachable during DECON probe.

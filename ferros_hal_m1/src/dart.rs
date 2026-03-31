@@ -92,24 +92,44 @@ static mut L2_NEXT: usize = 0;
 // ---------------------------------------------------------------------------
 
 pub struct Dart {
-    base: usize,
+    /// T8020 DART has two register banks that must be programmed identically.
+    bases: [usize; 2],
+    num_bases: usize,
     sid: u8,
 }
 
 impl Dart {
+    /// Write a register to ALL DART register banks (T8020 requires both).
+    unsafe fn write_all(&self, offset: usize, val: u32) {
+        for i in 0..self.num_bases {
+            mmio::write32(self.bases[i] + offset, val);
+        }
+    }
+
+    /// Read a register from the first bank.
+    unsafe fn read(&self, offset: usize) -> u32 {
+        mmio::read32(self.bases[0] + offset)
+    }
+
     /// Initialize the DART for a single stream ID.
-    /// Clears any existing translation, sets up L1, enables translation.
-    pub fn init(base: usize, sid: u8) -> Self {
-        let dart = Dart { base, sid };
+    /// `base0` and `base1` are reg[0] and reg[1] from the ADT.
+    pub fn init(base0: usize, base1: usize, sid: u8) -> Self {
+        let dart = Dart {
+            bases: [base0, base1],
+            num_bases: 2,
+            sid,
+        };
         let sid_bit = 1u32 << (sid & 0x1F);
 
         unsafe {
-            // Enable this stream
-            let enabled = mmio::read32(base + ENABLED_STREAMS);
-            mmio::write32(base + ENABLED_STREAMS, enabled | sid_bit);
+            // Enable this stream on both banks
+            for i in 0..2 {
+                let enabled = mmio::read32(dart.bases[i] + ENABLED_STREAMS);
+                mmio::write32(dart.bases[i] + ENABLED_STREAMS, enabled | sid_bit);
+            }
 
             // Check if DART is locked (firmware set it up, we reuse L1)
-            let config = mmio::read32(base + CONFIG);
+            let config = dart.read(CONFIG);
             let locked = config & CONFIG_LOCK != 0;
 
             if !locked {
@@ -119,19 +139,19 @@ impl Dart {
                     core::ptr::write_volatile(l1_ptr.add(i), 0);
                 }
 
-                // Program TTBR0 with L1 physical address
+                // Program TTBR0 with L1 physical address on BOTH banks
                 let l1_phys = &raw const L1 as usize;
                 let ttbr_val = TTBR_VALID | ((l1_phys >> TTBR_SHIFT) as u32 & TTBR_ADDR_MASK);
-                let ttbr_base = base + TTBR_OFF + (sid as usize) * 16;
-                mmio::write32(ttbr_base, ttbr_val);
-                // Clear remaining TTBRs
-                for i in 1..TTBR_COUNT {
-                    mmio::write32(ttbr_base + i * 4, 0);
+                for b in 0..2 {
+                    let ttbr_base = dart.bases[b] + TTBR_OFF + (sid as usize) * 16;
+                    mmio::write32(ttbr_base, ttbr_val);
+                    for i in 1..TTBR_COUNT {
+                        mmio::write32(ttbr_base + i * 4, 0);
+                    }
                 }
 
-                // Enable translation
-                let tcr_addr = base + TCR_OFF + (sid as usize) * 4;
-                mmio::write32(tcr_addr, TCR_TRANSLATE_ENABLE);
+                // Enable translation on BOTH banks
+                dart.write_all(TCR_OFF + (sid as usize) * 4, TCR_TRANSLATE_ENABLE);
             }
 
             // Invalidate TLB
@@ -213,25 +233,25 @@ impl Dart {
         true
     }
 
-    /// Invalidate TLB for this stream.
+    /// Invalidate TLB for this stream on ALL register banks.
     fn invalidate_tlb(&self) {
         unsafe {
-            mmio::write32(self.base + STREAM_SELECT, 1u32 << (self.sid & 0x1F));
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            mmio::write32(self.base + STREAM_COMMAND, STREAM_COMMAND_INVALIDATE);
-
-            // Wait for invalidation to complete
-            for _ in 0..100_000u32 {
-                if mmio::read32(self.base + STREAM_COMMAND) & STREAM_COMMAND_BUSY == 0 {
-                    return;
+            let sid_bit = 1u32 << (self.sid & 0x1F);
+            for b in 0..self.num_bases {
+                mmio::write32(self.bases[b] + STREAM_SELECT, sid_bit);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                mmio::write32(self.bases[b] + STREAM_COMMAND, STREAM_COMMAND_INVALIDATE);
+                for _ in 0..100_000u32 {
+                    if mmio::read32(self.bases[b] + STREAM_COMMAND) & STREAM_COMMAND_BUSY == 0 {
+                        break;
+                    }
                 }
             }
-            // Timeout — continue anyway (best effort)
         }
     }
 
     /// Read error status (for diagnostics).
     pub fn error_status(&self) -> u32 {
-        unsafe { mmio::read32(self.base + ERROR) }
+        unsafe { mmio::read32(self.bases[0] + ERROR) }
     }
 }

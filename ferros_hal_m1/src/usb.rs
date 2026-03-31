@@ -57,9 +57,9 @@ const DEVTEN_CONNECTDONEEN: u32 = 1 << 2;
 // GEVNTSIZ bits
 const GEVNTSIZ_INTMASK: u32 = 1 << 31;
 
-// GSNPSID
+// GSNPSID — DWC3 = 0x5533xxxx, DWC_usb31 = 0x3331xxxx (M1 uses DWC31)
 const GSNPSID_DWC3_MASK: u32 = 0xFFFF_0000;
-const GSNPSID_DWC3_PREFIX: u32 = 0x5533_0000;
+const GSNPSID_DWC31_PREFIX: u32 = 0x3331_0000;
 
 // DEPCMD command codes
 const DEPCMD_DEPSTARTCFG: u32 = 0x09;
@@ -266,11 +266,12 @@ fn delay(iters: u32) {
 
 /// M1 platform addresses (from ADT, filled in at init).
 pub struct M1UsbAddrs {
-    pub dwc3: usize,       // DWC3 core base (reg[0] of usb-drd0)
-    pub pipe: usize,       // PipeHandler base (reg[3] of usb-drd0)
-    pub atcphy: usize,     // ATCPHY base (reg[0] of atc-phy0)
-    pub dart_base: usize,  // DART USB0 base (0x382f80000)
-    pub dart_sid: u8,      // DART stream ID (typically 0)
+    pub dwc3: usize,        // DWC3 core base (reg[0] of usb-drd0)
+    pub pipe: usize,        // PipeHandler base (reg[3] of usb-drd0)
+    pub atcphy: usize,      // ATCPHY base (reg[0] of atc-phy0)
+    pub dart_base0: usize,  // DART USB0 reg[0] (0x382f00000)
+    pub dart_base1: usize,  // DART USB0 reg[1] (0x382f80000) — T8020 dual bank
+    pub dart_sid: u8,       // DART stream ID (typically 0)
 }
 
 impl M1Usb {
@@ -347,11 +348,10 @@ impl M1Usb {
 
     /// Initialize the M1 DWC3 USB controller.
     ///
-    /// Performs ATCPHY init, PipeHandler init, DART mapping, DWC3 core reset,
-    /// endpoint configuration, and starts the controller.
+    /// Full bringup: ATCPHY, PipeHandler, core+PHY reset, DART, endpoints.
+    /// PMGR power domains are still active from m1n1.
     pub fn init(addrs: &M1UsbAddrs) -> Option<Self> {
-        // Phase 1: Platform init (ATCPHY + PipeHandler)
-        // Note: m1n1 may have already done this. We redo it to ensure clean state.
+        // Platform init: re-initialize ATCPHY and PipeHandler
         Self::atcphy_init(addrs.atcphy);
         Self::pipe_handler_init(addrs.pipe);
         delay(10_000);
@@ -360,62 +360,45 @@ impl M1Usb {
 
         // Verify DWC3 core presence
         let snpsid = unsafe { mmio::read32(base + GSNPSID) };
-        if snpsid & GSNPSID_DWC3_MASK != GSNPSID_DWC3_PREFIX {
-            return None; // Not a DWC3 controller
+        let prefix = snpsid & GSNPSID_DWC3_MASK;
+        if prefix != GSNPSID_DWC31_PREFIX && prefix != 0x5533_0000 {
+            return None;
         }
 
-        // Phase 2: DART setup — map all DMA buffers to IOVAs
-        let dart = Dart::init(addrs.dart_base, addrs.dart_sid);
-
-        // Compute DMA offset: we'll map buffers at fixed IOVAs matching m1n1's scheme
-        let evt_phys = &raw const EVT_BUF as usize;
-        let evt_iova: usize = 0xdead_0000;
-        let dma_offset = evt_iova as i64 - evt_phys as i64;
-
-        // Map each buffer (16KB aligned pages)
-        // Event buffer
-        let evt_page = evt_phys & !0x3FFF;
-        dart.map(evt_iova & !0x3FFF, evt_page, 0x4000);
-        // Scratchpad
-        let scratch_phys = &raw const SCRATCHPAD as usize;
-        dart.map(0xbeef_0000, scratch_phys, 0x4000);
-        // EP0 TRBs + buffers (may share a page)
-        let trb_phys = &raw const EP0_TRBS as usize;
-        let trb_page = trb_phys & !0x3FFF;
-        dart.map(0xf00d_0000, trb_page, 0x4000);
-        // Bulk TRBs + buffers
-        let bout_trb_phys = &raw const BULK_OUT_TRB as usize;
-        let bout_page = bout_trb_phys & !0x3FFF;
-        dart.map(0xf00d_4000, bout_page, 0x4000);
-        let bin_trb_phys = &raw const BULK_IN_TRB as usize;
-        let bin_page = bin_trb_phys & !0x3FFF;
-        if bin_page != bout_page {
-            dart.map(0xf00d_8000, bin_page, 0x4000);
-        }
-        // Bulk data buffers
-        let bout_buf_phys = &raw const BULK_OUT_BUF as usize;
-        dart.map(0xbabe_0000, bout_buf_phys & !0x3FFF, 0x4000);
-        let bin_buf_phys = &raw const BULK_IN_BUF as usize;
-        dart.map(0xbabe_4000, bin_buf_phys & !0x3FFF, 0x4000);
-        // EP0 setup + data buffers
-        let setup_phys = &raw const EP0_SETUP_BUF as usize;
-        let setup_page = setup_phys & !0x3FFF;
-        dart.map(0xbabe_8000, setup_page, 0x4000);
-        let ep0data_phys = &raw const EP0_DATA_BUF as usize;
-        let ep0data_page = ep0data_phys & !0x3FFF;
-        if ep0data_page != setup_page {
-            dart.map(0xbabe_C000, ep0data_page, 0x4000);
+        // Phase 1: DART bypass — pass physical addresses through unchanged.
+        // No page table setup needed. DMA uses physical addresses directly.
+        unsafe {
+            // Set DART to bypass mode on BOTH register banks
+            // TCR_BYPASS_DART (bit 8) | TCR_BYPASS_DAPF (bit 12)
+            let bypass = (1u32 << 8) | (1u32 << 12);
+            for sid in 0..2u8 {
+                let tcr_off = 0x100 + (sid as usize) * 4;
+                mmio::write32(addrs.dart_base0 + tcr_off, bypass);
+                mmio::write32(addrs.dart_base1 + tcr_off, bypass);
+            }
+            // Invalidate TLB on both banks
+            for base in [addrs.dart_base0, addrs.dart_base1] {
+                mmio::write32(base + 0x34, 0x3); // STREAM_SELECT: SID 0+1
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                mmio::write32(base + 0x20, 1 << 20); // STREAM_COMMAND: INVALIDATE
+                for _ in 0..100_000u32 {
+                    if mmio::read32(base + 0x20) & (1 << 2) == 0 { break; }
+                }
+            }
         }
 
-        // Phase 3: DWC3 core + PHY soft reset
+        // With DART bypass, dma_offset = 0 (physical address = DMA address)
+        let dma_offset: i64 = 0;
+
+        // Phase 2: Full DWC3 core + PHY soft reset (same sequence as m1n1)
         unsafe {
             // Assert core + PHY soft resets
             let gctl = mmio::read32(base + GCTL);
             mmio::write32(base + GCTL, gctl | GCTL_CORESOFTRESET);
             let phycfg = mmio::read32(base + GUSB2PHYCFG);
-            mmio::write32(base + GUSB2PHYCFG, phycfg | (1 << 31));
+            mmio::write32(base + GUSB2PHYCFG, phycfg | (1 << 31)); // PHYSOFTRST
             let pipectl = mmio::read32(base + GUSB3PIPECTL);
-            mmio::write32(base + GUSB3PIPECTL, pipectl | (1 << 31));
+            mmio::write32(base + GUSB3PIPECTL, pipectl | (1 << 31)); // PHYSOFTRST
         }
         delay(100_000); // 100ms
 
@@ -435,17 +418,13 @@ impl M1Usb {
         }
         delay(100_000);
 
-        // Phase 4: DWC3 device mode configuration
+        // Phase 3: Device mode configuration
         unsafe {
-            // Disable scramble/scaledown
             let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, gctl & !(GCTL_SCALEDOWN_MASK | GCTL_DISSCRAMBLE));
+            mmio::write32(base + GCTL,
+                (gctl & !(GCTL_PRTCAPDIR_MASK | GCTL_SCALEDOWN_MASK | GCTL_DISSCRAMBLE))
+                | GCTL_PRTCAPDIR_DEVICE);
 
-            // Device mode
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_DEVICE);
-
-            // HS speed
             let dcfg = mmio::read32(base + DCFG);
             mmio::write32(base + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
         }
@@ -495,7 +474,7 @@ impl M1Usb {
             let buf_ptr = &raw mut EVT_BUF as *mut u32;
             for i in 0..256 { core::ptr::write_volatile(buf_ptr.add(i), 0); }
 
-            let evt_dma = dev.dma(evt_phys);
+            let evt_dma = dev.dma(&raw const EVT_BUF as usize);
             mmio::write32(base + GEVNTADRLO, evt_dma as u32);
             mmio::write32(base + GEVNTADRHI, (evt_dma >> 32) as u32);
             mmio::write32(base + GEVNTSIZ, evt_size & !GEVNTSIZ_INTMASK);
