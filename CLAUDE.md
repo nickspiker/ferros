@@ -94,11 +94,27 @@ rustup target add aarch64-unknown-none-softfloat
 # Change: usb_iodev_shutdown();
 # To:     //usb_iodev_shutdown();
 # (This is the ONLY change. Everything else stays normal.)
-# Add usb_phy_bringup(0) call AFTER usb_iodev_shutdown() to re-power PHY.
-# Find the line "usb_iodev_shutdown();" in src/main.c and add after it:
+# Apply ALL patches to src/main.c in the #ifndef BRINGUP block before mmu_shutdown():
+# 1. After usb_iodev_shutdown() add: { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }
+# 2. Comment out display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+# 3. Comment out fb_shutdown(next_stage.restore_logo);
+# The result should be:
+#     usb_iodev_shutdown();
 #     { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }
-sed -i '' 's|    usb_iodev_shutdown();|    usb_iodev_shutdown();\
-    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }|' src/main.c
+#     //display_shutdown(DCP_SLEEP_IF_EXTERNAL);
+#     //fb_shutdown(next_stage.restore_logo);
+#     mmu_shutdown();
+python3 -c "
+import re
+with open('src/main.c') as f: s = f.read()
+s = s.replace('    usb_iodev_shutdown();',
+    '    usb_iodev_shutdown();\n    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }')
+s = s.replace('    display_shutdown(DCP_SLEEP_IF_EXTERNAL);',
+    '    //display_shutdown(DCP_SLEEP_IF_EXTERNAL);')
+s = s.replace('    fb_shutdown(next_stage.restore_logo);',
+    '    //fb_shutdown(next_stage.restore_logo);')
+with open('src/main.c','w') as f: f.write(s)
+"
 
 make clean && make
 # Produces build/m1n1.bin (~1.1MB)
@@ -110,9 +126,10 @@ find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What this changes:** After normal USB shutdown (which powers down DWC3 + DART),
-re-runs `usb_phy_bringup(0)` to power the ATCPHY + PipeHandler back up.
-The PHY is live when ferros starts; ferros inits DART + DWC3 fresh on top.
+**What this changes:**
+- After USB shutdown, re-powers ATCPHY + PipeHandler via `usb_phy_bringup(0)`
+- Skips display_shutdown and fb_shutdown (keeps framebuffer visible for ferros console)
+- mmu_shutdown still runs (required for clean kernel entry)
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 
