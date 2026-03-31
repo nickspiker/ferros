@@ -982,14 +982,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         dart_sid:  0,
     };
 
-    // DART setup with progress prints
+    // DART page tables: use fixed addresses after the heap base.
+    // __stack_top is at ~kernel+0x23000. Heap starts there.
+    // We reserve the first 64KB of heap for DART page tables.
+    // L1 at heap+0, L2 at heap+16KB. Then bump HEAP_POS past them.
     con.puts("DART alloc:    ");
-    let l1_alloc = alloc::vec![0u8; 16384 + 16384];
-    let l1_base = (l1_alloc.as_ptr() as usize + 0x3FFF) & !0x3FFF;
-    let l2_alloc = alloc::vec![0u8; 16384 + 16384];
-    let l2_base = (l2_alloc.as_ptr() as usize + 0x3FFF) & !0x3FFF;
-    core::mem::forget(l1_alloc);
-    core::mem::forget(l2_alloc);
+    let l1_base = (heap_base + 0x3FFF) & !0x3FFF; // 16KB align
+    let l2_base = l1_base + 16384;
+    // Bump heap position past the page tables
+    HEAP_POS.store(l2_base + 16384 - heap_base, Ordering::SeqCst);
     con.puts("OK\n");
 
     con.puts("DART tables:   ");
@@ -1433,6 +1434,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             core::ptr::write_volatile((base + 0x54) as *mut u32, 0xFF);
             core::ptr::write_volatile((base + 0x00) as *mut u32, 0x00);
         }
+    }
+
+    // ---- USB SYSMMU bypass (now accessible with S2MPU disabled) ----
+    // SYSMMU at G#11040000 translates DWC3 DMA addresses. Without bypass,
+    // DWC3 can't read TRBs or write events to our DRAM buffers.
+    // Samsung SYSMMU v9: write 0 to CTRL (offset 0) to disable translation.
+    const USB_SYSMMU: usize = 0x1104_0000;
+    unsafe {
+        core::ptr::write_volatile((USB_SYSMMU + 0x00) as *mut u32, 0); // disable SYSMMU
     }
 
     // ---- eUSB PHY init (now possible with S2MPU bypassed) ----
