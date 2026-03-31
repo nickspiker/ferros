@@ -129,6 +129,15 @@ All other shutdown steps run normally — identical to Phase 3.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 
+### MacBook Claude: Restore stock m1n1 (DO THIS IF PATCHED)
+If the m1n1 on the ESP has any ferros patches, restore it to stock:
+```bash
+cd ~/m1n1
+git checkout src/main.c
+make clean && make
+# Then mount ESP and copy as above
+```
+
 ### Boot procedure (each dev iteration)
 ```bash
 # 1. Build kernel + flat binary
