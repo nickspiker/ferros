@@ -295,26 +295,24 @@ fn cmd_anchor_key(args: &[String]) {
 ///   0x670  4     dtb_size (0)
 ///   0x674  8     dtb_addr (0)
 fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
-    // FP5 uses boot image header v3 (GKI format).
-    // Stock kernel is UNCOMPRESSED PE/COFF — ABL may not support gzip.
-    // v3 removed kernel_addr, ramdisk_addr, tags_addr, second_*, page_size fields.
-    // Page size is always 4096 (implicit). ABL uses ARM64 Image header text_offset.
+    // Pixel 8 ABL requires boot image header v4 (GKI 2.0 format).
+    // v4 extends v3 with a signature_size field at the end.
     //
-    // boot_img_hdr_v3 layout:
+    // boot_img_hdr_v4 layout:
     //   0x000  8     magic "ANDROID!"
     //   0x008  4     kernel_size
     //   0x00C  4     ramdisk_size (0)
-    //   0x010  4     os_version (0)
-    //   0x014  4     header_size (1580)
+    //   0x010  4     os_version
+    //   0x014  4     header_size (1584)
     //   0x018  16    reserved (zeros)
-    //   0x028  4     header_version (3)
+    //   0x028  4     header_version (4)
     //   0x02C  1536  cmdline (zeros)
-    //   Total header: 1580 bytes, padded to 4096
+    //   0x62C  4     signature_size (0 — v4 addition)
+    //   Total header: 1584 bytes, padded to 4096
     const PAGE_SIZE: usize = 4096;
-    const HEADER_VERSION: u32 = 3;
-    const HEADER_SIZE: u32 = 1580;
+    const HEADER_VERSION: u32 = 4;
+    const HEADER_SIZE: u32 = 1584;
 
-    // NO gzip compression — FP5 ABL expects uncompressed ARM64 Image
     eprintln!("  Kernel: {} bytes (uncompressed)", kernel.len());
 
     // Build the header (padded to page_size)
@@ -323,11 +321,12 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     header[0..8].copy_from_slice(b"ANDROID!");
     write_le32(&mut header, 0x008, kernel.len() as u32);      // kernel_size
     write_le32(&mut header, 0x00C, 0);                        // ramdisk_size
-    write_le32(&mut header, 0x010, 0);                        // os_version
+    write_le32(&mut header, 0x010, 0x200001A3);                // os_version (match GrapheneOS)
     write_le32(&mut header, 0x014, HEADER_SIZE);               // header_size
     // 0x018..0x028: reserved (zeros)
-    write_le32(&mut header, 0x028, HEADER_VERSION);            // header_version = 3
+    write_le32(&mut header, 0x028, HEADER_VERSION);            // header_version = 4
     // 0x02C..0x62C: cmdline (zeros)
+    write_le32(&mut header, 0x62C, 0);                        // signature_size = 0
 
     // Pad kernel to page boundary
     let kernel_pages = (kernel.len() + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -337,7 +336,7 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     let mut img = header;
     img.extend_from_slice(&kernel_padded);
 
-    eprintln!("  Boot image v3: {} header + {} kernel = {} total",
+    eprintln!("  Boot image v4: {} header + {} kernel = {} total",
         PAGE_SIZE, kernel_padded.len(), img.len());
 
     img

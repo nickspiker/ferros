@@ -953,6 +953,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     con.clear();
     con.puts("ferros on M1\n");
     con.puts("============\n\n");
+    con.puts("m1n1 USB skip test\n");
+    con.puts("If you see this, kernel boots fine with usb_iodev_shutdown skipped.\n\n");
 
     // --- USB init ---
     // TODO: read actual addresses from ADT. These are placeholders.
@@ -1213,22 +1215,41 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let exc_start = exception_count();
 
-    // ---- Pixel 8 / Tensor G3: no framebuffer yet ----
-    // Samsung DECON scans through SYSMMU — we can't find the FB address easily.
-    // For now, skip display and just confirm kernel_main runs.
-    // TODO: init DWC3 USB for PT transport as primary I/O channel.
+    // ---- Pixel 8 / Tensor G3: killswitch + vibration feedback ----
+    // GPIO registers for volume buttons (from DTB: pinctrl@G#154D0000)
+    // GPA4 DAT = G#154D0084, bit 1 = vol down (active low)
+    // GPA6 DAT = G#154D00A4, bit 2 = vol up (active low)
+    const GPA4_DAT: usize = 0x154D_0084;
+    const GPA6_DAT: usize = 0x154D_00A4;
+    const VOL_DOWN_BIT: u32 = 1 << 1;
+    const VOL_UP_BIT: u32 = 1 << 2;
 
-    // Write a magic value to the DTB area (which is in DRAM, mapped by ABL)
-    // so we can confirm kernel_main executed by checking if the DTB is overwritten.
-    if dtb_addr != 0 {
-        unsafe {
-            let p = dtb_addr as *mut u32;
-            core::ptr::write_volatile(p, 0xFE00_0ACE);  // "ferros ACE" magic
+    // Poll volume buttons. When both pressed simultaneously → PSCI reboot.
+    // This is the killswitch prototype — proves GPIO read + hardware control.
+    // PSCI SYSTEM_RESET = SMC #0 with x0 = G#84000009
+    loop {
+        let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
+        let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
+
+        let vol_down = (gpa4 & VOL_DOWN_BIT) == 0;  // active low
+        let vol_up = (gpa6 & VOL_UP_BIT) == 0;      // active low
+
+        if vol_down && vol_up {
+            // KILLSWITCH: both volume buttons pressed — immediate reboot via PSCI
+            unsafe {
+                core::arch::asm!(
+                    "ldr x0, =0x84000009",  // PSCI SYSTEM_RESET
+                    "smc #0",
+                    options(noreturn)
+                );
+            }
+        }
+
+        // Brief spin between polls
+        for _ in 0..256_u32 {
+            core::hint::spin_loop();
         }
     }
-
-    // Spin forever — watchdog reboot, then check DTB area from GrapheneOS.
-    loop { core::hint::spin_loop(); }
 
     /* DISABLED: original FP5 boot sequence — needs Pixel 8 display + USB rework.
 
