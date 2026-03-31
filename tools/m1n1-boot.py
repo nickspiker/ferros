@@ -193,6 +193,25 @@ print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset 0x1010)")
 # We need the DART to translate their physical addresses for DWC3 DMA.
 # Use identity mapping: IOVA = physical address.
 DART_MAP_ENABLED = False  # Kernel handles DART setup now
+
+# Dump USB PHY state and test re-powering
+print("\n=== USB PHY State ===")
+try:
+    dwc3_base = 0x382280000
+    snpsid_before = p.read32(dwc3_base + 0xC120)
+    print(f"  SNPSID before: {snpsid_before:#010x}")
+
+    # Read PMGR clock-gates for USB devices from ADT
+    for path in ["/arm-io/atc-phy0", "/arm-io/dart-usb0", "/arm-io/usb-drd0"]:
+        try:
+            node = u.adt[path]
+            cg = node.clock_gates
+            print(f"  {path} clock-gates: {[f'{x:#x}' for x in cg]}")
+        except Exception as e:
+            print(f"  {path}: {e}")
+    print("=====================\n")
+except Exception as e:
+    print(f"  USB PHY dump failed: {e}\n")
 if DART_MAP_ENABLED:
     print("Setting up USB DART mappings for kernel DMA buffers...")
     try:
