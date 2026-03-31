@@ -94,8 +94,11 @@ rustup target add aarch64-unknown-none-softfloat
 # Change: usb_iodev_shutdown();
 # To:     //usb_iodev_shutdown();
 # (This is the ONLY change. Everything else stays normal.)
-# ONLY comment out usb_iodev_shutdown. Leave mmu_shutdown ENABLED.
-sed -i '' 's|    usb_iodev_shutdown();|    //usb_iodev_shutdown();  // ferros: keep PHY alive|' src/main.c
+# Add usb_phy_bringup(0) call AFTER usb_iodev_shutdown() to re-power PHY.
+# Find the line "usb_iodev_shutdown();" in src/main.c and add after it:
+#     { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }
+sed -i '' 's|    usb_iodev_shutdown();|    usb_iodev_shutdown();\
+    { extern int usb_phy_bringup(u32 idx); usb_phy_bringup(0); }|' src/main.c
 
 make clean && make
 # Produces build/m1n1.bin (~1.1MB)
@@ -107,10 +110,9 @@ find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What this changes:** Skips ONLY `usb_iodev_shutdown()` before jumping.
-MMU shutdown, display shutdown, everything else runs normally.
-USB PHY stays powered so ferros can take over the DWC3 controller.
-DART mappings for kernel DMA buffers are set up by m1n1-boot.py before the jump.
+**What this changes:** After normal USB shutdown (which powers down DWC3 + DART),
+re-runs `usb_phy_bringup(0)` to power the ATCPHY + PipeHandler back up.
+The PHY is live when ferros starts; ferros inits DART + DWC3 fresh on top.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 

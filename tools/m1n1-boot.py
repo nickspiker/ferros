@@ -192,7 +192,7 @@ print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset 0x1010)")
 # The kernel's static DMA buffers live in BSS (after the loaded image).
 # We need the DART to translate their physical addresses for DWC3 DMA.
 # Use identity mapping: IOVA = physical address.
-DART_MAP_ENABLED = False  # Set to False to test boot without DART mapping
+DART_MAP_ENABLED = False  # Kernel handles DART setup now
 if DART_MAP_ENABLED:
     print("Setting up USB DART mappings for kernel DMA buffers...")
     try:

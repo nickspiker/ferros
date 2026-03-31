@@ -953,9 +953,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     con.clear();
     con.puts("ferros on M1\n");
     con.puts("============\n\n");
-    con.puts("m1n1 USB skip test\n");
-    con.puts("If you see this, kernel boots fine with usb_iodev_shutdown skipped.\n\n");
-
     // --- USB init ---
     // TODO: read actual addresses from ADT. These are placeholders.
     // Boot into m1n1 proxy and run m1n1-boot.py to dump real values.
@@ -1215,37 +1212,63 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let exc_start = exception_count();
 
-    // ---- Pixel 8 / Tensor G3: killswitch + vibration feedback ----
+    // ---- Pixel 8 / Tensor G3 ----
+
     // GPIO registers for volume buttons (from DTB: pinctrl@G#154D0000)
-    // GPA4 DAT = G#154D0084, bit 1 = vol down (active low)
-    // GPA6 DAT = G#154D00A4, bit 2 = vol up (active low)
     const GPA4_DAT: usize = 0x154D_0084;
     const GPA6_DAT: usize = 0x154D_00A4;
     const VOL_DOWN_BIT: u32 = 1 << 1;
     const VOL_UP_BIT: u32 = 1 << 2;
 
-    // Poll volume buttons. When both pressed simultaneously → PSCI reboot.
-    // This is the killswitch prototype — proves GPIO read + hardware control.
-    // PSCI SYSTEM_RESET = SMC #0 with x0 = G#84000009
+    // DWC3 USB controller at G#11210000 (from DTB: usb@11210000/dwc3)
+    // ABL already initialized it — we just need to take over.
+    const T_DWC3: usize = 0x1121_0000;
+    const GSNPSID: usize = 0xC120;
+    const GCTL: usize = 0xC110;
+    const DSTS: usize = 0xC70C;
+    const DCTL: usize = 0xC704;
+    const GEVNTCOUNT: usize = 0xC40C;
+
+    // Probe DWC3 — read SNPSID to confirm it's alive
+    let snpsid = unsafe { core::ptr::read_volatile((T_DWC3 + GSNPSID) as *const u32) };
+    let gctl = unsafe { core::ptr::read_volatile((T_DWC3 + GCTL) as *const u32) };
+    let dsts = unsafe { core::ptr::read_volatile((T_DWC3 + DSTS) as *const u32) };
+    let dctl = unsafe { core::ptr::read_volatile((T_DWC3 + DCTL) as *const u32) };
+    let evtcnt = unsafe { core::ptr::read_volatile((T_DWC3 + GEVNTCOUNT) as *const u32) };
+
+    // Write probe results to DTB area (survives if we can read from GrapheneOS)
+    if dtb_addr != 0 {
+        unsafe {
+            let p = dtb_addr as *mut u32;
+            core::ptr::write_volatile(p.add(0), 0xFE00_D3C3_u32); // magic
+            core::ptr::write_volatile(p.add(1), snpsid);
+            core::ptr::write_volatile(p.add(2), gctl);
+            core::ptr::write_volatile(p.add(3), dsts);
+            core::ptr::write_volatile(p.add(4), dctl);
+            core::ptr::write_volatile(p.add(5), evtcnt);
+        }
+    }
+
+    // Killswitch loop: poll vol up + vol down, PSCI reboot if both pressed.
+    // Also: if vol_down only → PSCI reboot (quick exit for dev iteration).
     loop {
         let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
 
-        let vol_down = (gpa4 & VOL_DOWN_BIT) == 0;  // active low
-        let vol_up = (gpa6 & VOL_UP_BIT) == 0;      // active low
+        let vol_down = (gpa4 & VOL_DOWN_BIT) == 0;
+        let vol_up = (gpa6 & VOL_UP_BIT) == 0;
 
         if vol_down && vol_up {
-            // KILLSWITCH: both volume buttons pressed — immediate reboot via PSCI
+            // KILLSWITCH: both volume buttons → immediate reboot
             unsafe {
                 core::arch::asm!(
-                    "ldr x0, =0x84000009",  // PSCI SYSTEM_RESET
+                    "ldr x0, =0x84000009",
                     "smc #0",
                     options(noreturn)
                 );
             }
         }
 
-        // Brief spin between polls
         for _ in 0..256_u32 {
             core::hint::spin_loop();
         }
