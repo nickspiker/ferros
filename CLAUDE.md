@@ -77,34 +77,38 @@ ferros boots on the M1 MacBook Air via m1n1 proxy. Framebuffer console output co
 - **Fedora:** m1n1 cloned at `/mnt/Octopus/Code/m1n1`, pyserial + construct installed.
 - **udev rule:** `/etc/udev/rules.d/99-m1n1.rules` auto-loads `cdc_acm` and sets `dialout` group.
 
-### MacBook Claude: Install BRINGUP m1n1 (DONE — 2026-03-30)
-The current proxy-only m1n1 shuts down USB PHY power before jumping to ferros.
-ferros can't re-enable it without a PMGR driver. The BRINGUP build skips USB shutdown,
-keeping the PHY alive so ferros can take over the DWC3 controller.
+### MacBook Claude: Install patched m1n1 (DO THIS — replaces broken BRINGUP build)
+The BRINGUP build was wrong — it disables ALL peripherals (no display, no USB, no MMU).
+We need a normal m1n1 build with ONLY `usb_iodev_shutdown()` commented out.
+
+**DO NOT use `make EXTRA_CFLAGS="-DBRINGUP"`.** That breaks everything.
 
 ```bash
-# 1. Build m1n1 with BRINGUP flag (native aarch64, no cross-compile)
+# 1. Build patched m1n1 (normal build, USB shutdown commented out)
 cd ~/m1n1
-git pull   # or use existing clone
+git pull
 git submodule update --init --recursive
 rustup target add aarch64-unknown-none-softfloat
-make clean && make EXTRA_CFLAGS="-DBRINGUP"
-# Produces build/m1n1.bin (~1.1MB) with BRINGUP defined
 
-# 2. Find and replace m1n1 on the Asahi ESP (same as before)
+# Apply the patch: comment out usb_iodev_shutdown() in src/main.c line 195
+# Change: usb_iodev_shutdown();
+# To:     //usb_iodev_shutdown();
+# (This is the ONLY change. Everything else stays normal.)
+sed -i '' 's|    usb_iodev_shutdown();|    //usb_iodev_shutdown();  // ferros: keep PHY alive|' src/main.c
+
+make clean && make
+# Produces build/m1n1.bin (~1.1MB)
+
+# 2. Find and replace m1n1 on the Asahi ESP
 diskutil list   # find the Asahi/ferros EFI partition
 sudo diskutil mount <partition-id>
-# Find current m1n1 boot binary:
 find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
-# Replace it:
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What BRINGUP changes:** m1n1 skips `usb_iodev_shutdown()`, `display_shutdown()`,
-`fb_shutdown()`, and `mmu_shutdown()` before jumping to next stage. This means:
-- USB PHY stays powered → ferros can init DWC3 device mode
-- Display stays active → framebuffer writes are immediately visible
-- MMU stays on → ferros entry code handles this (m1n1 uses identity mapping)
+**What this changes:** ONLY skips `usb_iodev_shutdown()` before jumping to ferros.
+Display, MMU, PMGR, everything else works normally. USB PHY stays powered so ferros
+can take over the DWC3 controller for PT transport.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 
