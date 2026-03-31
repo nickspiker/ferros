@@ -185,9 +185,31 @@ entry = kernel_addr + 0x1000
 print(f"Entry: {entry:#x}")
 
 # Use _m1_entry (offset 0x1010) — skips cache/MMU ops that crash on M1.
-# m1n1 already handled MMU shutdown before jumping.
 m1_entry = kernel_addr + 0x1010
 print(f"M1 entry: {m1_entry:#x} (_m1_entry at offset 0x1010)")
+
+# Pre-map kernel BSS pages in the USB DART before jumping.
+# The kernel's static DMA buffers live in BSS (after the loaded image).
+# We need the DART to translate their physical addresses for DWC3 DMA.
+# Use identity mapping: IOVA = physical address.
+print("Setting up USB DART mappings for kernel DMA buffers...")
+try:
+    # Get the USB DART handle from m1n1
+    dart_handle = p.dart_init(0x382f80000, 0)  # dart-usb0 reg[1], sid=0
+    print(f"  DART handle: {dart_handle:#x}")
+
+    # BSS starts after the kernel image, page-aligned.
+    # The linker puts BSS at offset 0x4000 from _start.
+    # kernel_addr is the load address. BSS physical addr = kernel_addr + 0x4000.
+    # We need to map enough pages to cover all static DMA buffers (~32KB of BSS).
+    # Map 256KB to be safe (16 × 16KB DART pages).
+    bss_start = (kernel_addr + len(kernel) + 0x3FFF) & ~0x3FFF  # page-align after image
+    map_size = 256 * 1024  # 256KB should cover all static buffers
+    print(f"  Mapping BSS region: {bss_start:#x} .. {bss_start + map_size:#x} (identity)")
+    p.dart_map(dart_handle, bss_start, bss_start, map_size)
+    print("  DART mappings OK")
+except Exception as e:
+    print(f"  DART setup failed: {e} — USB may not work")
 
 print(f"Jumping to ferros via reload (entry={m1_entry:#x}, dtb={dtb_addr:#x})...")
 try:

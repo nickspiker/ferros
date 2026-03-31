@@ -111,6 +111,79 @@ impl Dart {
         mmio::read32(self.bases[0] + offset)
     }
 
+    /// Attach to an existing DART setup (e.g. from m1n1) without overwriting page tables.
+    /// Reads the existing TTBR to find m1n1's L1 table and adds new mappings to it.
+    pub fn attach(base0: usize, base1: usize, sid: u8) -> Self {
+        Dart {
+            bases: [base0, base1],
+            num_bases: 2,
+            sid,
+        }
+    }
+
+    /// Add an identity mapping (iova=phys) to the EXISTING DART page tables.
+    /// Reads the current TTBR to find m1n1's L1, allocates L2 from our pool if needed.
+    pub fn map_existing(&self, iova: usize, phys: usize, len: usize) -> bool {
+        let pages = len / PAGE_SIZE;
+        for i in 0..pages {
+            if !self.map_page_existing(iova + i * PAGE_SIZE, phys + i * PAGE_SIZE) {
+                return false;
+            }
+        }
+        self.invalidate_tlb();
+        true
+    }
+
+    /// Map a single page using the EXISTING L1 table from TTBR.
+    fn map_page_existing(&self, iova: usize, phys: usize) -> bool {
+        let l1_idx = (iova >> 25) & 0x1FFF;
+        let l2_idx = (iova >> PAGE_SHIFT) & 0x7FF;
+
+        // Read the existing TTBR0 to find m1n1's L1 table
+        let ttbr_addr = self.bases[0] + TTBR_OFF + (self.sid as usize) * 16;
+        let ttbr = unsafe { mmio::read32(ttbr_addr) };
+        if ttbr & TTBR_VALID == 0 {
+            return false; // No L1 table configured
+        }
+        let l1_phys = ((ttbr & TTBR_ADDR_MASK) as usize) << TTBR_SHIFT;
+        let l1_ptr = l1_phys as *mut u64;
+
+        unsafe {
+            let l1_entry = core::ptr::read_volatile(l1_ptr.add(l1_idx));
+
+            let l2_phys = if l1_entry & PTE_VALID != 0 {
+                // L2 already exists — use it
+                ((l1_entry >> PTE_OFFSET_SHIFT) << PTE_OFFSET_SHIFT) as usize
+            } else {
+                // Allocate new L2 from our pool
+                let idx = L2_NEXT;
+                if idx >= 4 { return false; }
+                L2_NEXT += 1;
+
+                let l2_addr = (&raw mut L2_POOL as *mut L2Table).add(idx) as usize;
+                let l2_ptr = l2_addr as *mut u64;
+                for j in 0..L2_ENTRIES {
+                    core::ptr::write_volatile(l2_ptr.add(j), 0);
+                }
+
+                // Write L1 entry pointing to new L2
+                let l1_val = ((l2_addr as u64) >> PTE_OFFSET_SHIFT) << PTE_OFFSET_SHIFT
+                    | PTE_SP_END | PTE_DISABLE_SP | PTE_VALID;
+                core::ptr::write_volatile(l1_ptr.add(l1_idx), l1_val);
+                mmio::cache_clean(l1_ptr.add(l1_idx) as usize, 8);
+
+                l2_addr
+            };
+
+            // Write L2 PTE
+            let l2_ptr = l2_phys as *mut u64;
+            let pte = ((phys as u64) >> PTE_OFFSET_SHIFT) << PTE_OFFSET_SHIFT | PTE_FLAGS;
+            core::ptr::write_volatile(l2_ptr.add(l2_idx), pte);
+            mmio::cache_clean(l2_ptr.add(l2_idx) as usize, 8);
+        }
+        true
+    }
+
     /// Initialize the DART for a single stream ID.
     /// `base0` and `base1` are reg[0] and reg[1] from the ADT.
     pub fn init(base0: usize, base1: usize, sid: u8) -> Self {

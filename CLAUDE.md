@@ -94,8 +94,8 @@ rustup target add aarch64-unknown-none-softfloat
 # Change: usb_iodev_shutdown();
 # To:     //usb_iodev_shutdown();
 # (This is the ONLY change. Everything else stays normal.)
+# ONLY comment out usb_iodev_shutdown. Leave mmu_shutdown ENABLED.
 sed -i '' 's|    usb_iodev_shutdown();|    //usb_iodev_shutdown();  // ferros: keep PHY alive|' src/main.c
-sed -i '' 's|    mmu_shutdown();|    //mmu_shutdown();  // ferros: keep DMA coherent|' src/main.c
 
 make clean && make
 # Produces build/m1n1.bin (~1.1MB)
@@ -107,10 +107,10 @@ find /Volumes -name "*.bin" -path "*/m1n1/*" 2>/dev/null
 sudo cp ~/m1n1/build/m1n1.bin <path-to-current-m1n1-boot.bin>
 ```
 
-**What this changes:** Skips `usb_iodev_shutdown()` and `mmu_shutdown()` before jumping.
-Display, PMGR, everything else works normally. USB PHY stays powered and DMA stays
-coherent so ferros can take over the DWC3 controller for PT transport.
-m1n1's MMU uses identity mapping (phys=virt) so ferros code works unchanged.
+**What this changes:** Skips ONLY `usb_iodev_shutdown()` before jumping.
+MMU shutdown, display shutdown, everything else runs normally.
+USB PHY stays powered so ferros can take over the DWC3 controller.
+DART mappings for kernel DMA buffers are set up by m1n1-boot.py before the jump.
 
 After replacing, `sudo shutdown -h now`. Then hold power → boot picker → "ferros".
 

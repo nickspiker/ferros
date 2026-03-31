@@ -281,12 +281,30 @@ _entry:
     mov     x19, x0
     msr     daifset, #0xF
 
-    // Fall through to boot (exception handler, stack, Rust)
-
     mrs     x20, CurrentEL
     lsr     x20, x20, #2
 
-// ---------- M1 entry: skip cache/MMU ops (m1n1 already handled them) ----------
+    // ================================================================
+    // Check if MMU is already off. If so, skip the teardown entirely.
+    // ABL (Tensor G3, m1n1) disables MMU + caches before jumping.
+    // FP5/QCM6490 ABL leaves them enabled.
+    // Attempting cache clean + MMU disable when already off faults on
+    // Tensor G3 (Apple SPRR, Samsung SCTLR behavior).
+    // ================================================================
+    cmp     x20, #2
+    b.ne    .Lcheck_el1_mmu
+    mrs     x21, sctlr_el2
+    tst     x21, #1             // test M bit (MMU enable)
+    b.eq    .Lsctlr_done        // MMU already off — skip teardown
+    b       .Ldo_cache_clean_el2
+
+.Lcheck_el1_mmu:
+    mrs     x21, sctlr_el1
+    tst     x21, #1
+    b.eq    .Lsctlr_done        // MMU already off — skip teardown
+    b       .Ldo_cache_clean_el1
+
+// ---------- M1 entry: explicit skip (kept for m1n1-boot.py compatibility) ----------
 .global _m1_entry
 _m1_entry:
     mov     x19, x0
@@ -297,14 +315,9 @@ _m1_entry:
     b       .Lsctlr_done
 
     // ================================================================
-    // Save SCTLR and disable MMU + caches.
-    // ABL (UEFI) may leave caches enabled. With write-back caches,
-    // DMA masters (DWC3 USB) read stale DRAM, not the CPU cache.
-    // We must clean+disable caches before any DMA.
+    // Cache clean + MMU disable — only reached if MMU was on.
     // ================================================================
-    cmp     x20, #2
-    b.ne    .Lsctlr_el1
-
+.Ldo_cache_clean_el2:
     // EL2 path
     mrs     x21, sctlr_el2     // x21 = original SCTLR (saved for diagnostics)
     // Clean + invalidate data caches before disabling
@@ -339,7 +352,7 @@ _m1_entry:
     isb
     b       .Lsctlr_done
 
-.Lsctlr_el1:
+.Ldo_cache_clean_el1:
     // EL1 path
     mrs     x21, sctlr_el1
     mrs     x0, ctr_el0
@@ -1200,69 +1213,24 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let exc_start = exception_count();
 
-    // ---- Probe DECON0 display controller for ABL's scanout buffer ----
-    // Tensor G3 (Exynos) DECON0 at G#19470000. ABL leaves it scanning
-    // the splash framebuffer. We read the base address register to find it.
-    //
-    // DECON register map (Samsung Exynos):
-    //   +G#0000: DECON_ID
-    //   +G#0020: WINCON (window control)
-    //   +G#0080: VIDW_BUF_START (scanout buffer base address)
-    //   +G#0084: VIDW_BUF_END
-    //   +G#00A0: VIDW_BUF_SIZE (stride)
-    //   +G#0100: VIDOSD_A (window position)
-    //   +G#0104: VIDOSD_B (window size)
-    const DECON0_BASE: usize = 0x1947_0000;
-    const DPP0_BASE: usize = 0x1990_0000;
+    // ---- Pixel 8 / Tensor G3: no framebuffer yet ----
+    // Samsung DECON scans through SYSMMU — we can't find the FB address easily.
+    // For now, skip display and just confirm kernel_main runs.
+    // TODO: init DWC3 USB for PT transport as primary I/O channel.
 
-    // Write probe data to reserved DRAM at G#90200000.
-    // After watchdog reboots to GrapheneOS, read it back via:
-    //   adb shell su -c "dd if=/dev/mem bs=4 count=64 skip=$((0x90200000/4)) | xxd"
-    // If we see the magic, our kernel_main executed.
-    const PROBE: usize = 0x9020_0000;
-    unsafe {
-        let p = PROBE as *mut u32;
-        core::ptr::write_volatile(p, 0xFE12_0001);           // [0] magic
-        core::ptr::write_volatile(p.add(1), dtb_addr as u32); // [1] dtb low
-        core::ptr::write_volatile(p.add(2), (dtb_addr >> 32) as u32); // [2] dtb high
-
-        // [3] CurrentEL
-        let el: u64;
-        core::arch::asm!("mrs {}, CurrentEL", out(reg) el);
-        core::ptr::write_volatile(p.add(3), el as u32);
-
-        // [4..20] DECON0 register dump (G#19470000 + offsets)
-        let decon_off: [usize; 16] = [
-            0x0000, 0x0004, 0x0008, 0x000C,
-            0x0020, 0x0024, 0x0080, 0x0084,
-            0x00A0, 0x00A4, 0x0100, 0x0104,
-            0x0200, 0x0204, 0x0400, 0x0404,
-        ];
-        for (i, &off) in decon_off.iter().enumerate() {
-            let val = core::ptr::read_volatile((DECON0_BASE + off) as *const u32);
-            core::ptr::write_volatile(p.add(4 + i), val);
+    // Write a magic value to the DTB area (which is in DRAM, mapped by ABL)
+    // so we can confirm kernel_main executed by checking if the DTB is overwritten.
+    if dtb_addr != 0 {
+        unsafe {
+            let p = dtb_addr as *mut u32;
+            core::ptr::write_volatile(p, 0xFE00_0ACE);  // "ferros ACE" magic
         }
-
-        // [20..36] DPP0/RDMA0 register dump (G#19900000 + offsets)
-        let dpp_off: [usize; 16] = [
-            0x0000, 0x0004, 0x0074, 0x0078,
-            0x008C, 0x0090, 0x0094, 0x0098,
-            0x1000, 0x1004, 0x1074, 0x1078,
-            0x108C, 0x1090, 0x1094, 0x1098,
-        ];
-        for (i, &off) in dpp_off.iter().enumerate() {
-            let val = core::ptr::read_volatile((DPP0_BASE + off) as *const u32);
-            core::ptr::write_volatile(p.add(20 + i), val);
-        }
-
-        // [36] end marker
-        core::ptr::write_volatile(p.add(36), 0xFE12_DEAD);
     }
 
-    // Spin — watchdog reboots in ~30s, then read probe data from GrapheneOS
+    // Spin forever — watchdog reboot, then check DTB area from GrapheneOS.
     loop { core::hint::spin_loop(); }
 
-    /*  DISABLED: original FP5 boot sequence — unreachable during DECON probe.
+    /* DISABLED: original FP5 boot sequence — needs Pixel 8 display + USB rework.
 
     // ---- Parse DTB early to find ramoops (fallback to known FP5 address) ----
     let ramoops = if dtb_addr != 0 {

@@ -351,11 +351,8 @@ impl M1Usb {
     /// Full bringup: ATCPHY, PipeHandler, core+PHY reset, DART, endpoints.
     /// PMGR power domains are still active from m1n1.
     pub fn init(addrs: &M1UsbAddrs) -> Option<Self> {
-        // Platform init: re-initialize ATCPHY and PipeHandler
-        Self::atcphy_init(addrs.atcphy);
-        Self::pipe_handler_init(addrs.pipe);
-        delay(10_000);
-
+        // Skip ATCPHY/PipeHandler init — m1n1 left them configured.
+        // Warm takeover: just reconfigure the DWC3 device-mode state.
         let base = addrs.dwc3;
 
         // Verify DWC3 core presence
@@ -365,82 +362,31 @@ impl M1Usb {
             return None;
         }
 
-        // Phase 1: DART bypass — pass physical addresses through unchanged.
-        // No page table setup needed. DMA uses physical addresses directly.
-        unsafe {
-            // Set DART to bypass mode on BOTH register banks
-            // TCR_BYPASS_DART (bit 8) | TCR_BYPASS_DAPF (bit 12)
-            let bypass = (1u32 << 8) | (1u32 << 12);
-            for sid in 0..2u8 {
-                let tcr_off = 0x100 + (sid as usize) * 4;
-                mmio::write32(addrs.dart_base0 + tcr_off, bypass);
-                mmio::write32(addrs.dart_base1 + tcr_off, bypass);
-            }
-            // Invalidate TLB on both banks
-            for base in [addrs.dart_base0, addrs.dart_base1] {
-                mmio::write32(base + 0x34, 0x3); // STREAM_SELECT: SID 0+1
-                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-                mmio::write32(base + 0x20, 1 << 20); // STREAM_COMMAND: INVALIDATE
-                for _ in 0..100_000u32 {
-                    if mmio::read32(base + 0x20) & (1 << 2) == 0 { break; }
-                }
-            }
-        }
-
-        // With DART bypass, dma_offset = 0 (physical address = DMA address)
+        // Phase 1: DART — handled by m1n1-boot.py before jumping.
+        // The boot script uses m1n1's dart_map() to identity-map our BSS pages
+        // in the USB DART. We don't touch the DART from the kernel at all.
+        // dma_offset = 0 (identity mapping: iova = phys)
         let dma_offset: i64 = 0;
 
-        // Phase 2: Full DWC3 core + PHY soft reset (same sequence as m1n1)
+        // Phase 2: Warm takeover — m1n1 left DWC3 running with USB connected.
+        // Skip core/PHY reset to preserve the USB connection.
+        // Just stop the controller, reconfigure, and restart.
         unsafe {
-            // Assert core + PHY soft resets
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, gctl | GCTL_CORESOFTRESET);
-            let phycfg = mmio::read32(base + GUSB2PHYCFG);
-            mmio::write32(base + GUSB2PHYCFG, phycfg | (1 << 31)); // PHYSOFTRST
-            let pipectl = mmio::read32(base + GUSB3PIPECTL);
-            mmio::write32(base + GUSB3PIPECTL, pipectl | (1 << 31)); // PHYSOFTRST
-        }
-        delay(100_000); // 100ms
-
-        unsafe {
-            // Deassert PHY soft resets
-            let phycfg = mmio::read32(base + GUSB2PHYCFG);
-            mmio::write32(base + GUSB2PHYCFG, phycfg & !(1 << 31));
-            let pipectl = mmio::read32(base + GUSB3PIPECTL);
-            mmio::write32(base + GUSB3PIPECTL, pipectl & !(1 << 31));
-        }
-        delay(100_000);
-
-        unsafe {
-            // Deassert core soft reset
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL, gctl & !GCTL_CORESOFTRESET);
-        }
-        delay(100_000);
-
-        // Phase 3: Device mode configuration
-        unsafe {
-            let gctl = mmio::read32(base + GCTL);
-            mmio::write32(base + GCTL,
-                (gctl & !(GCTL_PRTCAPDIR_MASK | GCTL_SCALEDOWN_MASK | GCTL_DISSCRAMBLE))
-                | GCTL_PRTCAPDIR_DEVICE);
-
-            let dcfg = mmio::read32(base + DCFG);
-            mmio::write32(base + DCFG, (dcfg & !DCFG_SPEED_MASK) | DCFG_SPEED_HS);
-        }
-
-        // Device controller soft reset
-        unsafe {
+            // Stop controller (clears Run/Stop, host sees disconnect)
             let dctl = mmio::read32(base + DCTL);
-            mmio::write32(base + DCTL, (dctl & !DCTL_RUN_STOP) | DCTL_CSFTRST);
-            for _ in 0..100_000u32 {
-                if mmio::read32(base + DCTL) & DCTL_CSFTRST == 0 { break; }
-            }
+            mmio::write32(base + DCTL, dctl & !DCTL_RUN_STOP);
         }
         delay(10_000);
 
-        // Scratchpad setup (M1-specific, FP5 doesn't need this)
-        let scratch_iova = 0xbeef_0000u32;
+        // Clear any pending events from m1n1's session
+        unsafe {
+            let pending = mmio::read32(base + GEVNTCOUNT);
+            if pending > 0 {
+                mmio::write32(base + GEVNTCOUNT, pending);
+            }
+        }
+
+        // Skip scratchpad setup — m1n1 already configured it.
         let mut dev = M1Usb {
             base,
             dma_offset: dma_offset,
@@ -458,9 +404,6 @@ impl M1Usb {
             bulk_out_armed: false,
             bulk_in_idle: true,
         };
-
-        dev.global_cmd(DGCMD_SET_SCRATCHPAD_LO, scratch_iova);
-        dev.global_cmd(DGCMD_SET_SCRATCHPAD_HI, 0);
 
         // Event buffer setup
         unsafe {
@@ -571,7 +514,7 @@ impl M1Usb {
         }
         self.ep0_state = Ep0State::DataIn;
         let trb_dma = self.dma(unsafe { &raw mut EP0_TRBS.data as *mut Trb as usize });
-        if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32) {
+        if self.ep_cmd(1, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0) {
             self.ep1_resource_idx = self.read_resource_idx(1);
         }
     }
@@ -591,7 +534,7 @@ impl M1Usb {
         }
         self.ep0_state = Ep0State::Status;
         let trb_dma = self.dma(unsafe { &raw mut EP0_TRBS.status as *mut Trb as usize });
-        self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32);
+        self.ep_cmd(1, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0);
     }
 
     fn ep0_status_out(&mut self) {
@@ -609,7 +552,7 @@ impl M1Usb {
         }
         self.ep0_state = Ep0State::Status;
         let trb_dma = self.dma(unsafe { &raw mut EP0_TRBS.status as *mut Trb as usize });
-        self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32);
+        self.ep_cmd(0, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0);
     }
 
     fn handle_get_descriptor(&mut self, dt: u8, idx: u8, max_len: u16) -> bool {
@@ -666,7 +609,29 @@ impl UsbBulk for M1Usb {
             let evt_type = (evt >> 12) & 0xF;
             match evt_type {
                 DEPEVT_XFERCOMPLETE => {
-                    if ep_phys == 2 {
+                    if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
+                        // EP0 OUT SETUP complete — read the 8-byte setup packet
+                        unsafe {
+                            let buf_phys = &raw const EP0_SETUP_BUF as usize;
+                            mmio::cache_invalidate(buf_phys, 8);
+                            let mut request = [0u8; 8];
+                            let src = buf_phys as *const u8;
+                            for i in 0..8 {
+                                request[i] = core::ptr::read_volatile(src.add(i));
+                            }
+                            return UsbEvent::Ep0Setup { request };
+                        }
+                    } else if ep_phys == 0 || ep_phys == 1 {
+                        // EP0 data/status stage complete
+                        if self.ep0_state == Ep0State::DataIn {
+                            // Data sent, now do status OUT
+                            self.ep0_status_out();
+                        } else if self.ep0_state == Ep0State::Status {
+                            // Status complete, re-arm for next SETUP
+                            self.ep0_start_setup();
+                        }
+                        UsbEvent::TransferComplete { ep: ep_phys as u8 }
+                    } else if ep_phys == 2 {
                         // Bulk OUT complete — read actual transfer size from TRB
                         unsafe {
                             let trb_phys = &raw const BULK_OUT_TRB as usize;
@@ -677,10 +642,13 @@ impl UsbBulk for M1Usb {
                             self.bulk_out_ready = true;
                             self.bulk_out_armed = false;
                         }
+                        UsbEvent::TransferComplete { ep: ep_phys as u8 }
                     } else if ep_phys == 3 {
                         self.bulk_in_idle = true;
+                        UsbEvent::TransferComplete { ep: ep_phys as u8 }
+                    } else {
+                        UsbEvent::TransferComplete { ep: ep_phys as u8 }
                     }
-                    UsbEvent::TransferComplete { ep: ep_phys as u8 }
                 }
                 DEPEVT_XFERNOTREADY => {
                     if ep_phys == 2 && !self.bulk_out_armed {
@@ -718,7 +686,7 @@ impl UsbBulk for M1Usb {
         }
 
         let trb_dma = self.dma(trb_phys);
-        if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32) {
+        if self.ep_cmd(2, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0) {
             self.bulk_out_resource_idx = self.read_resource_idx(2);
         }
     }
@@ -761,7 +729,7 @@ impl UsbBulk for M1Usb {
 
         self.bulk_in_idle = false;
         let trb_dma = self.dma(trb_phys);
-        if self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32) {
+        if self.ep_cmd(3, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0) {
             self.bulk_in_resource_idx = self.read_resource_idx(3);
             true
         } else {
@@ -862,7 +830,7 @@ impl UsbBulk for M1Usb {
             core::arch::asm!("dsb sy");
         }
         let trb_dma = self.dma(unsafe { &raw mut EP0_TRBS.setup as *mut Trb as usize });
-        if self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_dma as u32, (trb_dma >> 32) as u32) {
+        if self.ep_cmd(0, DEPCMD_STARTTRANSFER, (trb_dma >> 32) as u32, trb_dma as u32, 0) {
             self.ep0_resource_idx = self.read_resource_idx(0);
         }
     }
