@@ -77,7 +77,7 @@ ferros boots on the M1 MacBook Air via m1n1 proxy. Framebuffer console output co
 - **Fedora:** m1n1 cloned at `/mnt/Octopus/Code/m1n1`, pyserial + construct installed.
 - **udev rule:** `/etc/udev/rules.d/99-m1n1.rules` auto-loads `cdc_acm` and sets `dialout` group.
 
-### MacBook Claude: Install BRINGUP m1n1 (DO THIS NOW)
+### MacBook Claude: Install BRINGUP m1n1 (DONE — 2026-03-30)
 The current proxy-only m1n1 shuts down USB PHY power before jumping to ferros.
 ferros can't re-enable it without a PMGR driver. The BRINGUP build skips USB shutdown,
 keeping the PHY alive so ferros can take over the DWC3 controller.
