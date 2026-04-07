@@ -82,6 +82,29 @@ Same block numbers, same layout, same code path.
 
 ---
 
+## GPT Partition Type
+
+ferros partitions use a deterministic GPT type GUID derived from
+the name itself: BLAKE3("ferros") truncated to 128 bits.
+
+```
+BLAKE3("ferros") → a0b51225-61c5-0f5a-ffe7-1b644f9ca954
+
+Derivation:
+  echo -n "ferros" | b3sum | head -c 32
+  → a0b5122561c50f5affe71b644f9ca954
+  → a0b51225-61c5-0f5a-ffe7-1b644f9ca954 (standard GUID formatting)
+
+Anyone can verify:  the type GUID is not random, not assigned by
+any registry. It is the BLAKE3 hash of the ASCII string "ferros".
+```
+
+Each ferros partition instance also carries a unique GUID (the
+per-partition identity). These are random 128-bit values generated
+at partition creation time — standard GPT behavior.
+
+---
+
 ## Partition Layout
 
 All offsets are in 4KB blocks. All boundaries are power-of-two
