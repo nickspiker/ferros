@@ -33,15 +33,16 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 - `ferros_seed` — trust anchor (self-verify, kernel ring scan, jump)
 - `ferros_kernel` — bare-metal aarch64 kernel (no_std); feature flags: `pixel8` (default), `m1`
 - `ferros_hal` — HAL trait definitions (`UsbBulk`, `UsbEvent`) + shared utils
-- `ferros_hal_m1` — M1 HAL stub (USB not yet implemented; framebuffer via DTB simplefb)
+- `ferros_hal_m1` — M1 HAL: DART IOMMU (T8020), DWC3 device-mode USB (full UsbBulk impl), framebuffer via DTB simplefb
 - `ferros_pt` — Photon Transport (blast mode, per-chunk BLAKE3)
 - `ferros_vault` — persistent object store (tract, plow, HAMT, spine)
 - `ferros_ledger` — categorized event chain, VSF from entry zero
 - `tools/ferros-bridge` — host-side USB bridge (diag, reload, reboot)
 - `tools/ferros-mkimg` — ELF to boot.img
+- `tools/ferros-install` — partition tool (resize, create, format, genesis, kernel, seed)
 
 ## Current Priority
-Get ferros booting on M1 via m1n1 proxy. Fedora box is the proxy host (USB-C). First goal: framebuffer console output on MacBook screen. Then: Apple USB controller for PT transport.
+Validate M1 DWC3 USB end-to-end: boot kernel via m1n1 proxy, verify USB enumeration, test PT transport with ferros-bridge. Then hot-reload.
 
 ## Do NOT
 - Commit anything from `Intellectual Property/` — contains patent filings
@@ -54,20 +55,39 @@ Get ferros booting on M1 via m1n1 proxy. Fedora box is the proxy host (USB-C). F
 
 # Macbook Air (M1) Setup
 
-## Phase 1: macOS Setup (DONE — 2026-03-30)
-macOS 26.4 installed via DFU. Tools: Xcode CLT, Homebrew 5.1.2, Rust 1.94.1, aarch64-unknown-none, git, gh, iTerm2, VS Code.
-Disk: 125 GB macOS, 120 GB free for ferros.
+## Phase 1: macOS Setup (DONE — reinstalled 2026-04-07)
+macOS 26.4 reinstalled. SIP disabled. Authenticated root disabled.
+Tri-boot: macOS (83.6 GB) | Asahi (82 GB) | ferros partition (79.5 GB, GUID stamped) | Recovery.
+Tools: Homebrew 5.1.5, Rust 1.94.1, aarch64-unknown-none + x86_64-unknown-none + riscv64gc-unknown-none-elf,
+git, gh, llvm, cmake, ninja, nasm, qemu, just, blake3, gptfdisk, tree.
+VS Code + DaVinci Resolve. No Apple account. Dvorak keyboard.
+~90 launchd bloat services disabled (Siri, iCloud, analytics, iMessage, iOS bridging, etc).
+Bloat apps removed from system volume (Music, TV, Maps, Mail, Siri, Photos, etc).
+TCC nags killed for VSCode + Terminal + Resolve. Gatekeeper quarantine disabled.
 
 For future reinstalls:
 1. Complete macOS setup minimal
 2. `echo 'eval "$(/opt/homebrew/bin/brew shellenv zsh)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv zsh)"`
-3. `brew install --cask iterm2 && brew install gh git && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-4. `rustup target add aarch64-unknown-none`
+3. `brew install gh git llvm cmake ninja nasm qemu just blake3 gptfdisk tree`
+4. `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+5. `rustup target add aarch64-unknown-none x86_64-unknown-none riscv64gc-unknown-none-elf`
+6. `gh auth login && gh repo clone nickspiker/ferros ~/code/ferros`
+7. Run `~/disable-apple-bloat.sh` to kill launchd services
+8. Recovery: `csrutil disable` + `csrutil authenticated-root disable`
+9. Run `sudo ferros-install install` or `sudo ferros-install all` if partition exists
 
-## Phase 2: m1n1 UEFI Boot Entry (DONE — 2026-03-30)
+## Phase 2: m1n1 UEFI Boot Entry (DONE — reinstalled 2026-04-07)
 Ran `curl https://alx.sh | sh`, selected "UEFI environment only (m1n1 + U-Boot + ESP)".
-Named the entry "ferros". macOS is default boot. 120 GB allocated to ferros partition.
+Named the entry "ferros". macOS is default boot. 82 GB allocated to Asahi/m1n1.
+ferros data partition: 79.5 GB, GPT type GUID a0b51225-61c5-0f5a-ffe7-1b644f9ca954 (BLAKE3("ferros")).
+Partition formatted with ring layout + genesis spine entry via `ferros-install all`.
 Boot picker: hold power button → select "ferros" entry.
+
+Disk layout (disk0):
+```
+| ISC (524MB) | macOS (83.6GB) | Asahi stub+EFI+Linux (82GB) | ferros (79.5GB) | Recovery (5.4GB) |
+| disk0s1     | disk0s2        | disk0s3-s6                  | disk0s9         | disk0s7          |
+```
 
 ## Phase 3: First Boot via m1n1 Proxy (DONE — 2026-03-30)
 ferros boots on the M1 MacBook Air via m1n1 proxy. Framebuffer console output confirmed.
@@ -167,63 +187,51 @@ M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
 - **30bpp display:** M1 DCP uses 10:10:10:2 pixel format. Console colors use G#FFFFFFFC (white)
   and G#00000000 (black), not standard 8-bit ARGB.
 
-## Phase 4: Apple USB for PT Transport (CURRENT)
-Implement DWC3 device-mode USB on M1 for PT transport. Then bridge connects for hot-reload, diag, beam.
+## Phase 4: Apple USB for PT Transport (CURRENT — code complete, needs hardware test)
 
-### Key discovery: M1 uses Synopsys DWC3 — same IP as the FP5 driver
-The DWC3 core protocol (TRBs, events, endpoint commands, bulk I/O) is identical.
-Only platform init differs: ATCPHY + PipeHandler + DART instead of QUSB2/SMMU.
+### Implementation status
+All code written, never run on hardware. Next step is boot + validate.
 
-### M1 USB register map (from m1n1 reverse engineering)
-- **DWC3 core**: reg[0] of `/arm-io/usb-drd0` (need ADT read for actual address)
-- **PipeHandler**: reg[3] of `/arm-io/usb-drd0` (MUX, AON_GEN, reset control)
-- **ATCPHY**: reg[0] of `/arm-io/atc-phy0` (Apple Type-C PHY)
-- **DART USB0**: 0x382f80000 (confirmed from boot log, T8020 variant)
+- `ferros_hal_m1/src/dart.rs` (346 LOC) — DONE. T8020 DART, dual register banks, L1/L2 16KB pages, 128MB IOVA.
+- `ferros_hal_m1/src/usb.rs` (966 LOC) — DONE. Full DWC3 device-mode, all 13 UsbBulk trait methods.
+  EP0 control (SET_ADDRESS, GET_DESCRIPTOR, SET_CONFIG), EP1 bulk IN/OUT, TRB-based I/O.
+  USB descriptors: VID=G#1838, PID=G#FE01, "ferros M1". 28 diagnostic fields.
+- `ferros_kernel/src/main.rs` M1 path — DONE. DART setup, DWC3 init, USB event loop, PT dispatch stub.
 
-### ATCPHY init sequence (from m1n1/src/usb.c)
+### Hardcoded M1 register addresses (from m1n1 ADT dump)
+- DWC3 core:    G#3_8228_0000
+- PipeHandler:  G#3_82A8_4000
+- ATCPHY:       G#3_82A9_0000
+- DART USB0 bank 0: G#3_82F8_0000
+- DART USB0 bank 1: G#3_82F0_0000
+
+### Test plan (Phase 4a: validate boot-to-USB)
+```bash
+# Fedora box:
+cd /mnt/Octopus/Code/ferros
+git pull
+cargo build -p ferros_kernel --target aarch64-unknown-none --release --no-default-features --features m1
+aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel \
+    target/aarch64-unknown-none/release/ferros_kernel.bin
+
+# MacBook: shut down → hold power → boot picker → "ferros" → m1n1 proxy mode
+# Fedora:
+M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
+
+# Watch MacBook framebuffer for DWC3 probe + DART init output
+# Then from Fedora:
+cargo run -p ferros-bridge -- status    # should see VID=G#1838 PID=G#FE01
+cargo run -p ferros-bridge -- diag      # PT DIAG command
 ```
-write32(atc + 0x08, 0x01c1000f)
-write32(atc + 0x04, 0x00000003)
-write32(atc + 0x04, 0x00000000)
-write32(atc + 0x1c, 0x008c0813)
-write32(atc + 0x00, 0x00000002)
-```
 
-### PipeHandler init (from m1n1/src/usb.c)
-```
-write32(pipe + 0x0c, 0x22)    // MUX: dummy mode
-write32(pipe + 0x1c, 0x01)    // AON_GEN: DWC3_RESET_N
-write32(pipe + 0x20, 0x9332)  // NONSELECTED_OVERRIDE
-```
-
-### DART (IOMMU) setup — T8020 variant
-- TTBR at offset 0x200, TCR at offset 0x100
-- 2-level page table: L1 (16KB pages) → L2 (16KB pages)
-- Must map: event buffer, TRB rings, bulk I/O buffers to IOVAs
-- Stream command invalidate at 0x20, stream select at 0x34
-
-### DWC3 core init (same as any DWC3, from m1n1/src/usb_dwc3.c)
-1. Device soft reset (DCTL.CSFTRST)
-2. Core + PHY soft reset (GCTL.CORESOFTRESET + GUSB2PHYCFG/GUSB3PIPECTL PHYSOFTRST)
-3. Force HS mode (DCFG.SPEED = 0)
-4. Event buffer setup (GEVNTADR/SIZ/COUNT)
-5. Endpoint config (DEPSTARTCFG, SETEPCONFIG, SETTRANSFRESOURCE)
-6. Enable EP0 (DALEPENA), start controller (DCTL.RUN_STOP)
-
-### Implementation plan
-1. `ferros_hal_m1/src/dart.rs` — minimal T8020 DART for USB DMA mapping
-2. `ferros_hal_m1/src/usb.rs` — fresh clean DWC3 driver implementing `UsbBulk` trait
-3. Wire up USB event loop in M1 `kernel_main` (port from FP5 kernel)
-4. `ferros-bridge` connects via PT — all commands light up
-
-### Next boot: read ADT addresses
-Use m1n1 proxy to dump the actual register base addresses:
-```python
-# In m1n1 proxy shell:
-u.adt["/arm-io/usb-drd0"].get_reg(0)   # DWC3 core base
-u.adt["/arm-io/usb-drd0"].get_reg(3)   # PipeHandler base
-u.adt["/arm-io/atc-phy0"].get_reg(0)   # ATCPHY base
-```
+### Known limitations (OK for Phase 4, fix later)
+- Hardcoded register addresses (should read ADT)
+- Polling only, no GIC interrupts
+- Single-TRB model (no TRB rings, no UPDATETRANSFER)
+- No error recovery from stalled transfers
+- ATCPHY/PipeHandler init not called (m1n1 pre-inits them)
+- DART limited to 128MB IOVA (4 pre-allocated L2 tables)
+- Cache coherence requires explicit clean/invalidate around DMA
 
 ## Phase 5: Persistent ferros Boot Entry (LATER)
 - Only after ferros boots stably
