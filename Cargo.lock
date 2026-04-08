@@ -414,6 +414,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-install"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ferros_layout",
+]
+
+[[package]]
 name = "ferros-mkimg"
 version = "0.1.0"
 dependencies = [

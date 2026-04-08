@@ -11,6 +11,7 @@ members = [
     "ferros_seed",
     "tools/mkimg",
     "tools/ferros-bridge",
+    "tools/install",
 ]
 
 [workspace.package]
