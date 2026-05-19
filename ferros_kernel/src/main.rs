@@ -3455,7 +3455,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                                     kernel_size: reload_size as u32,
                                                                                     kernel_hash: *kernel_hash.as_bytes(),
                                                                                     kernel_sig: [0u8; 64], // unsigned dev build
-                                                                                    eagle_time: ferros_hal::vsf_mini::read_qtimer(),
+                                                                                    eagle_time: ferros_hal::qtimer::read_qtimer(),
                                                                                     hp_hash: [0u8; 32], // computed in to_block()
                                                                                 };
 
@@ -3578,7 +3578,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                                         kernel_size: reload_size as u32,
                                                                                         kernel_hash: inst_hash,
                                                                                         kernel_sig: inst_sig,
-                                                                                        eagle_time: ferros_hal::vsf_mini::read_qtimer(),
+                                                                                        eagle_time: ferros_hal::qtimer::read_qtimer(),
                                                                                         hp_hash: [0u8; 32],
                                                                                     };
                                                                                     if ferros_hal::ring::write_kernel_entry(&ufs, &entry) {

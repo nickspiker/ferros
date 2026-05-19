@@ -9,7 +9,8 @@
 //! See RING.md for the full specification.
 
 use crate::ufs::UfsController;
-use crate::vsf_mini::{VsfWriter, VsfReader, read_qtimer};
+use crate::qtimer::read_qtimer;
+use crate::vsf_mini::{VsfReader, VsfWriter};
 use ferros_layout::{
     VAULT_ROOT_RING_BASE, VAULT_ROOT_RING_SIZE,
     KERNEL_RING_BASE, KERNEL_RING_SIZE, KERNEL_RING_DEPTH,

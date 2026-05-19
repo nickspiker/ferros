@@ -152,7 +152,7 @@ impl InternalNode {
         let header_body_start = w.pos();
 
         // Eagle time (QTIMER)
-        w.eagle_time_qtimer(crate::vsf_mini::read_qtimer());
+        w.eagle_time_qtimer(crate::qtimer::read_qtimer());
 
         // Provenance hash placeholder
         let hp_pos = w.hash_p_placeholder().unwrap();
@@ -375,7 +375,7 @@ pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8]) -> Option<[u8; 
     w.header_length(0);
     let header_body_start = w.pos();
 
-    w.eagle_time_qtimer(crate::vsf_mini::read_qtimer());
+    w.eagle_time_qtimer(crate::qtimer::read_qtimer());
     w.hash_p(provenance);
 
     // Body hash = BLAKE3 of content
