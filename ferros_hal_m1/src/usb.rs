@@ -179,7 +179,8 @@ static mut SCRATCHPAD: Scratchpad = Scratchpad { data: [0; 16384] };
 // USB Descriptors — ferros M1 device
 // ---------------------------------------------------------------------------
 
-// VID/PID: 0x1838/0xFE01 (matches ferros-bridge expectations)
+// VID/PID: 0x1209/0x4665 (pid.codes, ferros — assigned via pid.codes PR #1208 on 2026-05-13).
+// Same PID used by every ferros-shipped USB device. The VSF document's "PIPE message" section disambiguates protocol/role; PID-level multiplexing isn't needed.
 static DEVICE_DESC: [u8; 18] = [
     18, 1,       // bLength, bDescriptorType (DEVICE)
     0x00, 0x02,  // bcdUSB (2.00)
@@ -187,8 +188,8 @@ static DEVICE_DESC: [u8; 18] = [
     0x00,        // bDeviceSubClass
     0x00,        // bDeviceProtocol
     64,          // bMaxPacketSize0
-    0x38, 0x18,  // idVendor (0x1838) LE
-    0x01, 0xFE,  // idProduct (0xFE01) LE
+    0x09, 0x12,  // idVendor (0x1209) LE
+    0x65, 0x46,  // idProduct (0x4665) LE
     0x00, 0x01,  // bcdDevice (1.00)
     1, 2, 0,     // iManufacturer, iProduct, iSerialNumber
     1,           // bNumConfigurations
