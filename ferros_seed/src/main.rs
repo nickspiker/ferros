@@ -24,10 +24,53 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use ferros_layout::{
-    KERNEL_RING_BASE, KERNEL_RING_SIZE, KERNEL_RING_DEPTH,
-    SPLASH_FB_BASE, BLOCK_SIZE,
+    BLOCK_SIZE, KERNEL_RING_BASE, KERNEL_RING_DEPTH, KERNEL_RING_SIZE, SPLASH_FB_BASE,
 };
+
+// ---------------------------------------------------------------------------
+// Bump allocator — pinned to a .bss buffer at startup.
+//
+// The seed needs alloc to use the unified vsf crate (header parsing returns
+// Vec<HeaderField>, section parsing returns Vec<VsfField>, etc).
+// 64 KB is plenty — kernel ring entries are <1 KB each and the seed parses
+// at most a few of them per boot. Static .bss, zero runtime init beyond
+// publishing the base pointer.
+// ---------------------------------------------------------------------------
+
+const HEAP_SIZE: usize = 64 * 1024;
+static mut HEAP_MEM: [u8; HEAP_SIZE] = [0u8; HEAP_SIZE];
+static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
+
+struct BumpAlloc;
+
+unsafe impl GlobalAlloc for BumpAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let base = &raw mut HEAP_MEM as *mut u8;
+        loop {
+            let pos = HEAP_POS.load(Ordering::Relaxed);
+            let aligned = (pos + layout.align() - 1) & !(layout.align() - 1);
+            let new_pos = aligned + layout.size();
+            if new_pos > HEAP_SIZE {
+                return core::ptr::null_mut();
+            }
+            if HEAP_POS
+                .compare_exchange_weak(pos, new_pos, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return unsafe { base.add(aligned) };
+            }
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOC: BumpAlloc = BumpAlloc;
 
 // ---------------------------------------------------------------------------
 // Linker symbols
@@ -460,101 +503,18 @@ fn ed25519_verify_key(sig_bytes: &[u8], message: &[u8], pubkey: &[u8; 32]) -> bo
 // Kernel ring entry
 // ---------------------------------------------------------------------------
 
-struct KernelRingEntry {
-    generation: u64,
-    kernel_lba: u32,
-    kernel_size: u32,
-    kernel_hash: [u8; 32],
-    kernel_sig: [u8; 64],
-}
+// Kernel ring entries are decoded via `ferros_hal::ring::KernelRingEntry`.
+// The same VSF document format is shared between writer (ferros_kernel) and reader (this seed),
+// and the actual decode/hp-verify logic lives in ferros_hal so there's exactly one impl.
+use ferros_hal::ring::KernelRingEntry;
 
-/// Parse a kernel ring entry from a 4KB block.
-fn parse_kernel_entry(blk: &[u8]) -> Option<KernelRingEntry> {
-    use ferros_hal::vsf_mini::VsfReader;
-
-    let mut r = VsfReader::new(blk);
-
-    if !r.magic() { return None; }
-    let _ver = r.version()?;
-    let _bver = r.backward_version()?;
-    let _hlen = r.header_length()?;
-    let _eagle_time = r.eagle_time_qtimer()?;
-
-    let hp_pos = r.pos;
-    let _hp = r.hash_p()?;
-    let _count = r.field_count()?;
-    if !r.close() { return None; }
-
-    // Verify provenance hash
-    let mut temp = [0u8; BLOCK_SIZE];
-    temp.copy_from_slice(&blk[..BLOCK_SIZE]);
-    for i in 0..32 { temp[hp_pos + 4 + i] = 0; }
-    let computed = blake3::hash(&temp);
-    if computed.as_bytes() != &blk[hp_pos + 4..hp_pos + 36] {
-        return None;
-    }
-
-    if r.read_byte_raw()? != b'[' { return None; }
-
-    let mut entry = KernelRingEntry {
-        generation: 0,
-        kernel_lba: 0,
-        kernel_size: 0,
-        kernel_hash: [0u8; 32],
-        kernel_sig: [0u8; 64],
-    };
-
-    while r.peek_tag() == Some(b'(') {
-        r.read_byte_raw();
-        let fname = r.dict_key_str()?;
-        if r.read_byte_raw()? != b':' { return None; }
-
-        match fname {
-            "generation" => { entry.generation = r.uint()?; }
-            "kernel_lba" => { entry.kernel_lba = r.uint()? as u32; }
-            "kernel_size" => { entry.kernel_size = r.uint()? as u32; }
-            "kernel_hash" => {
-                let h = r.hash_p()?;
-                entry.kernel_hash.copy_from_slice(h);
-            }
-            "kernel_sig" => {
-                let sig = r.signature()?;
-                entry.kernel_sig.copy_from_slice(sig);
-            }
-            _ => { r.skip_field(); }
-        }
-
-        if r.read_byte_raw()? != b')' { return None; }
-    }
-
-    if entry.generation == 0 { return None; }
-    Some(entry)
-}
-
-/// Read the generation number from a kernel ring position.
+/// Read just the generation field at a kernel ring position. Returns 0 on any error.
 fn read_generation(ufs: &ferros_hal::ufs::UfsController, pos: u32) -> u64 {
     let lba = KERNEL_RING_BASE + pos;
-    let ocs = ufs.read_block(lba);
-    if ocs != 0 { return 0; }
-
-    let data = ufs.data_buffer();
-
-    use ferros_hal::vsf_mini::VsfReader;
-    let mut r = VsfReader::new(data);
-    if !r.magic() { return 0; }
-    if r.version().is_none() { return 0; }
-    if r.backward_version().is_none() { return 0; }
-    if r.header_length().is_none() { return 0; }
-    if r.eagle_time_qtimer().is_none() { return 0; }
-    if r.hash_p().is_none() { return 0; }
-    if r.field_count().is_none() { return 0; }
-    if !r.close() { return 0; }
-
-    if r.read_byte_raw() != Some(b'[') { return 0; }
-    if r.read_byte_raw() != Some(b'(') { return 0; }
-    if r.dict_key_str().is_none() { return 0; }
-    if r.read_byte_raw() != Some(b':') { return 0; }
-    r.uint().unwrap_or(0)
+    if ufs.read_block(lba) != 0 {
+        return 0;
+    }
+    KernelRingEntry::from_block(ufs.data_buffer()).map(|e| e.generation).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,14 +543,10 @@ fn scan_kernel_ring(ufs: &ferros_hal::ufs::UfsController) -> Option<KernelRingEn
     }
 
     let lba = KERNEL_RING_BASE + lo;
-    let ocs = ufs.read_block(lba);
-    if ocs != 0 { return None; }
-
-    let data = ufs.data_buffer();
-    let mut blk = [0u8; BLOCK_SIZE];
-    blk.copy_from_slice(&data[..BLOCK_SIZE]);
-
-    parse_kernel_entry(&blk)
+    if ufs.read_block(lba) != 0 {
+        return None;
+    }
+    KernelRingEntry::from_block(ufs.data_buffer())
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use crate::vsf_mini::{VsfWriter, VsfReader, VSF_MAGIC};
+use vsf::file_format::{VsfHeader, VsfSection};
+use vsf::types::VsfType;
+use vsf::vsf_builder::VsfBuilder;
+
+/// VSF magic bytes (`RÅ<` in UTF-8 = 0x52 0xC3 0x85 0x3C).
+pub const VSF_MAGIC: [u8; 4] = [0x52, 0xC3, 0x85, 0x3C];
 
 /// Bits consumed per trie level.
 const BITS_PER_LEVEL: u32 = 5;
@@ -58,13 +63,68 @@ fn sparse_index(bitmap: u32, bit: u32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// VSF helpers (shared between internal nodes and leaves)
+// ---------------------------------------------------------------------------
+
+/// Build a complete VSF document into a fixed-size block.
+/// Returns `None` if the encoded doc exceeds `BLK` bytes.
+fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> {
+    let doc = builder.build().ok()?;
+    if doc.len() > BLK {
+        return None;
+    }
+    let mut blk = [0u8; BLK];
+    blk[..doc.len()].copy_from_slice(&doc);
+    Some(blk)
+}
+
+/// Open a 4KB block as a VSF doc and return its parsed header.
+/// Returns `None` if the magic is missing or the header doesn't parse.
+fn open_header(blk: &[u8]) -> Option<VsfHeader> {
+    let (header, _) = VsfHeader::decode(blk).ok()?;
+    Some(header)
+}
+
+/// Locate a named section in a parsed header and parse its body.
+fn parse_named_section(blk: &[u8], header: &VsfHeader, name: &str) -> Option<VsfSection> {
+    let field = header.fields.iter().find(|f| f.name == name)?;
+    let off = field.offset_bytes;
+    let size = field.size_bytes;
+    if off.checked_add(size)? > blk.len() {
+        return None;
+    }
+    let mut ptr = off;
+    VsfSection::parse(&blk[..off + size], &mut ptr).ok()
+}
+
+/// Find the position of the hp hash bytes in a VSF document.
+/// Scans for `'h' 'p' '3' 0x1F` (hp + EWE-encoded length 31) after the magic.
+/// Both the old vsf_mini encoder and the new vsf crate emit hp as len-1 in EWE form,
+/// so this byte pattern remains stable.
+pub fn find_hp_position(blk: &[u8]) -> Option<usize> {
+    for i in 4..blk.len().saturating_sub(36) {
+        if blk[i] == b'h' && blk[i + 1] == b'p'
+            && blk[i + 2] == b'3' && blk[i + 3] == 0x1F
+        {
+            return Some(i + 4);
+        }
+    }
+    None
+}
+
+/// Check if a block has VSF magic (first 4 bytes = RÅ<).
+pub fn has_vsf_magic(blk: &[u8]) -> bool {
+    blk.len() >= 4 && blk[..4] == VSF_MAGIC
+}
+
+// ---------------------------------------------------------------------------
 // Block I/O trait — the kernel implements this with UFS + plow
 // ---------------------------------------------------------------------------
 
 /// Trait for reading and writing 4KB blocks.
 ///
-/// The kernel provides this using UFS (+ SD mirror). The HAMT logic
-/// is pure — it doesn't know about UFS, SD, or the plow.
+/// The kernel provides this using UFS (+ SD mirror).
+/// The HAMT logic is pure — it doesn't know about UFS, SD, or the plow.
 pub trait BlockIO {
     /// Read a 4KB block at `lba`. Returns None on I/O error.
     fn read_block(&self, lba: u32) -> Option<[u8; BLOCK_SIZE]>;
@@ -128,86 +188,44 @@ impl InternalNode {
 
     /// Serialize to a 4KB VSF document.
     ///
-    /// Format:
-    /// ```text
-    /// RÅ< z(7) y(7) b(N) e(qtimer) hp(zeros→patched) n(1) >
-    /// [ l("hamt.node")
-    ///   v_u0(bitmap[32])       ← 32-element bit-packed bool vector
-    ///   v_h(child_hashes[])    ← BLAKE3 hashes, popcount entries
-    ///   v_u(child_lbas[])      ← LBAs, parallel array
-    /// ]
-    /// ```
+    /// Section `hamt.node` with three fields:
+    /// - `bitmap`: single u (32-bit presence mask)
+    /// - `child_hashes`: multi-valued, popcount(bitmap) × hp(32 bytes)
+    /// - `child_lbas`: multi-valued, popcount(bitmap) × u
     pub fn to_block(&self) -> [u8; BLOCK_SIZE] {
-        let mut blk = [0u8; BLOCK_SIZE];
-        let mut w = VsfWriter::new(&mut blk);
+        let qtimer = crate::qtimer::read_qtimer();
 
-        // VSF header
-        w.magic();
-        w.version(7);
-        w.backward_version(7);
+        let mut section = VsfSection::new("hamt.node");
+        section.add_field("bitmap", VsfType::u(self.bitmap as usize, false));
 
-        // Header length placeholder: b(0) = 'b' '3' 0x00
-        let header_len_pos = w.pos();
-        w.header_length(0);
-        let header_body_start = w.pos();
+        let hashes: Vec<VsfType> = self
+            .child_hashes
+            .iter()
+            .map(|h| VsfType::hp(h.to_vec()))
+            .collect();
+        section.add_field_multi("child_hashes", hashes);
 
-        // Eagle time (QTIMER)
-        w.eagle_time_qtimer(crate::qtimer::read_qtimer());
+        let lbas: Vec<VsfType> = self
+            .child_lbas
+            .iter()
+            .map(|lba| VsfType::u(*lba as usize, false))
+            .collect();
+        section.add_field_multi("child_lbas", lbas);
 
-        // Provenance hash placeholder
-        let hp_pos = w.hash_p_placeholder().unwrap();
+        let builder = VsfBuilder::new()
+            .version(7, 7)
+            .creation_time_oscillations(qtimer as i64)
+            .provenance_only()
+            .add_section_direct(section);
 
-        // Field count: 1 section
-        w.field_count(1);
-
-        // Close header
-        w.close();
-
-        let header_body_end = w.pos();
-
-        // Body: single anonymous section
-        w.section_open_anonymous();
-
-        // Label
-        w.label("hamt.node");
-
-        // v_u0: bit-packed bool vector (32 elements = 4 bytes)
-        w.put_raw(b"v_u0");
-        w.put_raw(&self.bitmap.to_le_bytes());
-
-        // v_h: child hashes array
-        w.put_raw(b"v_h");
-        w.put_ewe_uint_pub(self.child_count() as u64);
-        for h in &self.child_hashes {
-            w.put_raw(h);
-        }
-
-        // v_u: child LBAs array
-        w.put_raw(b"v_u");
-        w.put_ewe_uint_pub(self.child_count() as u64);
-        for &lba in &self.child_lbas {
-            w.put_ewe_uint_pub(lba as u64);
-        }
-
-        w.section_close();
-
-        // Patch header_length (same pattern as ring.rs)
-        let header_body_len = header_body_end - header_body_start - 1; // -1 for '>'
-        drop(w);
-        if header_body_len <= 255 {
-            blk[header_len_pos + 2] = header_body_len as u8;
-        }
-
-        // Compute BLAKE3 with hp field zeroed (it's already zeros)
-        let hash = blake3::hash(&blk);
-        blk[hp_pos..hp_pos + 32].copy_from_slice(hash.as_bytes());
-
-        blk
+        build_into_block::<BLOCK_SIZE>(builder).unwrap_or([0u8; BLOCK_SIZE])
     }
 
     /// Parse from a 4KB block. Returns None if not a valid HAMT node.
+    /// `expected_hash` is the kernel-side block hash (BLAKE3 of full 4KB with hp zeroed);
+    /// it is verified before parsing.
     pub fn from_block(blk: &[u8; BLOCK_SIZE], expected_hash: &[u8; 32]) -> Option<Self> {
-        // Verify BLAKE3: zero out hp field, hash, compare
+        // Verify kernel block hash: zero hp in a copy, hash full 4KB, compare.
         let mut verify_buf = *blk;
         let hp_pos = find_hp_position(&verify_buf)?;
         verify_buf[hp_pos..hp_pos + 32].fill(0);
@@ -216,75 +234,52 @@ impl InternalNode {
             return None;
         }
 
-        let mut r = VsfReader::new(blk);
+        let header = open_header(blk)?;
+        let section = parse_named_section(blk, &header, "hamt.node")?;
 
-        // Skip VSF header
-        if !r.magic() { return None; }
-        r.version()?;
-        r.backward_version()?;
-        r.header_length()?;
+        let mut bitmap: u32 = 0;
+        let mut child_hashes: Vec<[u8; 32]> = Vec::new();
+        let mut child_lbas: Vec<u32> = Vec::new();
 
-        // Skip eagle time
-        r.eagle_time_qtimer();
-
-        // Read provenance hash (skip it, we already verified)
-        r.hash_p()?;
-
-        // Field count
-        r.field_count()?;
-
-        // Close header
-        if !r.close() { return None; }
-
-        // Body: section open
-        if r.read_byte_raw()? != b'[' { return None; }
-
-        // Label: "hamt.node"
-        let label = r.label()?;
-        if label != b"hamt.node" { return None; }
-
-        // v_u0: bitmap
-        if r.read_byte_raw()? != b'v' { return None; }
-        if r.read_byte_raw()? != b'_' { return None; }
-        if r.read_byte_raw()? != b'u' { return None; }
-        if r.read_byte_raw()? != b'0' { return None; }
-        let bitmap_bytes = r.read_bytes_raw(4)?;
-        let bitmap = u32::from_le_bytes([
-            bitmap_bytes[0], bitmap_bytes[1],
-            bitmap_bytes[2], bitmap_bytes[3],
-        ]);
-
-        let count = bitmap.count_ones() as usize;
-
-        // v_h: child hashes
-        if r.read_byte_raw()? != b'v' { return None; }
-        if r.read_byte_raw()? != b'_' { return None; }
-        if r.read_byte_raw()? != b'h' { return None; }
-        let h_count = r.read_ewe_uint()? as usize;
-        if h_count != count { return None; }
-
-        let mut child_hashes = Vec::with_capacity(count);
-        for _ in 0..count {
-            let h = r.read_bytes_raw(32)?;
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(h);
-            child_hashes.push(arr);
+        for f in &section.fields {
+            match f.name.as_str() {
+                "bitmap" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        bitmap = *v as u32;
+                    }
+                }
+                "child_hashes" => {
+                    for v in &f.values {
+                        if let VsfType::hp(bytes) = v {
+                            if bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(bytes);
+                                child_hashes.push(arr);
+                            }
+                        }
+                    }
+                }
+                "child_lbas" => {
+                    for v in &f.values {
+                        if let VsfType::u(n, _) = v {
+                            child_lbas.push(*n as u32);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
 
-        // v_u: child LBAs
-        if r.read_byte_raw()? != b'v' { return None; }
-        if r.read_byte_raw()? != b'_' { return None; }
-        if r.read_byte_raw()? != b'u' { return None; }
-        let u_count = r.read_ewe_uint()? as usize;
-        if u_count != count { return None; }
-
-        let mut child_lbas = Vec::with_capacity(count);
-        for _ in 0..count {
-            let lba = r.read_ewe_uint()? as u32;
-            child_lbas.push(lba);
+        let expected = bitmap.count_ones() as usize;
+        if child_hashes.len() != expected || child_lbas.len() != expected {
+            return None;
         }
 
-        Some(InternalNode { bitmap, child_hashes, child_lbas })
+        Some(InternalNode {
+            bitmap,
+            child_hashes,
+            child_lbas,
+        })
     }
 
     /// Create an empty node (no children).
@@ -353,125 +348,111 @@ impl InternalNode {
 
 /// Serialize a lone leaf (inline object) to a 4KB block.
 ///
-/// Format:
-/// ```text
-/// RÅ< z(7) y(7) b(N) e(qtimer) hp(provenance) hb(body_hash) n(1) >
-/// [ l("vault.lone") v(content) ]
-/// ```
+/// Section `vault.lone` with three fields:
+/// - `provenance_key`: hp (the trie key — content-derived BLAKE3 of the original object)
+/// - `body_hash`: hp (BLAKE3 of the inline content)
+/// - `content`: v(b'b', bytes) — raw inline bytes
+///
+/// The vsf header's own hp field is the file integrity hash (auto-computed by the builder);
+/// it is separate from the `provenance_key` which is the HAMT lookup key.
 pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8]) -> Option<[u8; BLOCK_SIZE]> {
-    if content.len() > BLOCK_SIZE - 128 {
-        // Too large for inline — rough check, exact budget ~3950 bytes
+    if content.len() > BLOCK_SIZE - 256 {
+        // Conservative budget — header + field framing eats ~200B; leave headroom.
         return None;
     }
 
-    let mut blk = [0u8; BLOCK_SIZE];
-    let mut w = VsfWriter::new(&mut blk);
-
-    w.magic();
-    w.version(7);
-    w.backward_version(7);
-
-    let header_len_pos = w.pos();
-    w.header_length(0);
-    let header_body_start = w.pos();
-
-    w.eagle_time_qtimer(crate::qtimer::read_qtimer());
-    w.hash_p(provenance);
-
-    // Body hash = BLAKE3 of content
+    let qtimer = crate::qtimer::read_qtimer();
     let body_hash = blake3::hash(content);
-    w.hash_b(body_hash.as_bytes());
 
-    w.field_count(1);
+    let mut section = VsfSection::new("vault.lone");
+    section.add_field("provenance_key", VsfType::hp(provenance.to_vec()));
+    section.add_field("body_hash", VsfType::hp(body_hash.as_bytes().to_vec()));
+    section.add_field("content", VsfType::v(b'b', content.to_vec()));
 
-    // Close header
-    w.close();
+    let builder = VsfBuilder::new()
+        .version(7, 7)
+        .creation_time_oscillations(qtimer as i64)
+        .provenance_only()
+        .add_section_direct(section);
 
-    let header_body_end = w.pos();
-
-    // Body
-    w.section_open_anonymous();
-    w.label("vault.lone");
-
-    // v(content): 'v' + EWE(len) + bytes
-    w.put_raw(b"v");
-    w.put_ewe_uint_pub(content.len() as u64);
-    w.put_raw(content);
-
-    w.section_close();
-
-    // Patch header_length
-    let header_body_len = header_body_end - header_body_start - 1;
-    drop(w);
-    if header_body_len <= 255 {
-        blk[header_len_pos + 2] = header_body_len as u8;
-    }
-
-    Some(blk)
+    build_into_block::<BLOCK_SIZE>(builder)
 }
 
-/// Check if a block is a lone leaf (has "vault.lone" label).
-/// Returns (provenance_hash, body_hash, content_slice) if valid.
-pub fn parse_lone_leaf(blk: &[u8; BLOCK_SIZE]) -> Option<([u8; 32], [u8; 32], &[u8])> {
-    let mut r = VsfReader::new(blk);
+/// Helper: extract the 32-byte provenance key from a parsed leaf section.
+fn section_provenance_key(section: &VsfSection) -> Option<[u8; 32]> {
+    let field = section.fields.iter().find(|f| f.name == "provenance_key")?;
+    match field.values.first()? {
+        VsfType::hp(bytes) if bytes.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(bytes);
+            Some(out)
+        }
+        _ => None,
+    }
+}
 
-    if !r.magic() { return None; }
-    r.version()?;
-    r.backward_version()?;
-    r.header_length()?;
+/// Parse a lone leaf. Returns (provenance_key, body_hash, content_slice) if valid
+/// and the embedded body hash matches BLAKE3(content).
+pub fn parse_lone_leaf(blk: &[u8; BLOCK_SIZE]) -> Option<([u8; 32], [u8; 32], Vec<u8>)> {
+    let header = open_header(blk)?;
+    let section = parse_named_section(blk, &header, "vault.lone")?;
 
-    // Eagle time (skip)
-    r.eagle_time_qtimer();
+    let mut provenance = [0u8; 32];
+    let mut body_hash = [0u8; 32];
+    let mut content: Option<Vec<u8>> = None;
 
-    let provenance = *r.hash_p()?;
-    let body_hash = *r.hash_b()?;
+    for f in &section.fields {
+        match f.name.as_str() {
+            "provenance_key" => {
+                if let Some(VsfType::hp(v)) = f.values.first() {
+                    if v.len() == 32 {
+                        provenance.copy_from_slice(v);
+                    }
+                }
+            }
+            "body_hash" => {
+                if let Some(VsfType::hp(v)) = f.values.first() {
+                    if v.len() == 32 {
+                        body_hash.copy_from_slice(v);
+                    }
+                }
+            }
+            "content" => {
+                if let Some(VsfType::v(_, bytes)) = f.values.first() {
+                    content = Some(bytes.clone());
+                }
+            }
+            _ => {}
+        }
+    }
 
-    r.field_count()?;
-    if !r.close() { return None; }
-
-    // Section open
-    if r.read_byte_raw()? != b'[' { return None; }
-
-    let label = r.label()?;
-    if label != b"vault.lone" { return None; }
-
-    // v(content)
-    if r.read_byte_raw()? != b'v' { return None; }
-    let len = r.read_ewe_uint()? as usize;
-    let content = r.read_bytes_raw(len)?;
-
-    // Verify body hash
-    let computed = blake3::hash(content);
+    let content = content?;
+    let computed = blake3::hash(&content);
     if computed.as_bytes() != &body_hash {
         return None;
     }
-
     Some((provenance, body_hash, content))
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+/// Read the provenance key from a leaf block without verifying content.
+/// Used by `lookup` / `insert` / `remove` to compare against a query key.
+fn leaf_provenance(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
+    let header = open_header(blk)?;
 
-/// Find the position of the hp hash bytes in a VSF document.
-/// Scans for 'h' 'p' EWE(31) pattern after the magic.
-fn find_hp_position(blk: &[u8]) -> Option<usize> {
-    // hp is: 'h' 'p' '3' 0x1F [32 bytes]
-    // The EWE encoding of 31 is: '3' 0x1F
-    for i in 4..blk.len().saturating_sub(36) {
-        if blk[i] == b'h' && blk[i + 1] == b'p'
-            && blk[i + 2] == b'3' && blk[i + 3] == 0x1F
-        {
-            return Some(i + 4);
+    // Try each known leaf section type. Only one will match.
+    for name in ["vault.lone", "vault.direct", "vault.chained"].iter() {
+        if let Some(section) = parse_named_section(blk, &header, name) {
+            if let Some(key) = section_provenance_key(&section) {
+                return Some(key);
+            }
         }
     }
     None
 }
 
-/// Check if a block has VSF magic (first 4 bytes = RÅ<).
-pub fn has_vsf_magic(blk: &[u8]) -> bool {
-    blk.len() >= 4 && blk[..4] == VSF_MAGIC
-}
+// ---------------------------------------------------------------------------
+// Block kind identification
+// ---------------------------------------------------------------------------
 
 /// Identify what kind of node a block contains.
 pub enum NodeKind {
@@ -483,28 +464,24 @@ pub enum NodeKind {
     Unknown,
 }
 
-/// Peek at a block's label to determine its kind.
+/// Peek at a block's first section name to determine its kind.
 pub fn identify_block(blk: &[u8; BLOCK_SIZE]) -> NodeKind {
-    // Quick scan for label after section open
-    // Label format: 'l' EWE(len) bytes
-    // We look for known labels
-    for i in 0..blk.len().saturating_sub(16) {
-        if blk[i] == b'l' {
-            // Try to read the label
-            let mut r = VsfReader::new(&blk[i..]);
-            if let Some(label) = r.label() {
-                return match label {
-                    b"hamt.node" => NodeKind::Internal,
-                    b"vault.lone" => NodeKind::Lone,
-                    b"vault.direct" => NodeKind::Direct,
-                    b"vault.chained" => NodeKind::Chained,
-                    b"vault.extent" => NodeKind::Extent,
-                    _ => NodeKind::Unknown,
-                };
-            }
-        }
+    let header = match open_header(blk) {
+        Some(h) => h,
+        None => return NodeKind::Unknown,
+    };
+    let first = match header.fields.first() {
+        Some(f) => f.name.as_str(),
+        None => return NodeKind::Unknown,
+    };
+    match first {
+        "hamt.node" => NodeKind::Internal,
+        "vault.lone" => NodeKind::Lone,
+        "vault.direct" => NodeKind::Direct,
+        "vault.chained" => NodeKind::Chained,
+        "vault.extent" => NodeKind::Extent,
+        _ => NodeKind::Unknown,
     }
-    NodeKind::Unknown
 }
 
 // ---------------------------------------------------------------------------
@@ -512,18 +489,18 @@ pub fn identify_block(blk: &[u8; BLOCK_SIZE]) -> NodeKind {
 // ---------------------------------------------------------------------------
 
 /// Serialize a node, write it via BlockIO, return its BlockRef.
+/// The hash is the kernel block hash (full 4KB BLAKE3 with hp zeroed).
 fn write_node(io: &mut impl BlockIO, node: &InternalNode) -> Option<BlockRef> {
     let blk = node.to_block();
-    // Hash is already embedded in the block by to_block()
-    let hp_pos = find_hp_position(&blk)?;
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&blk[hp_pos..hp_pos + 32]);
+    let hash = block_hash(&blk)?;
     let lba = io.write_block(&blk)?;
     Some(BlockRef { hash, lba })
 }
 
-/// Compute the BLAKE3 hash for an already-serialized block (hp zeroed, then hash).
-fn block_hash(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
+/// Compute the kernel block hash (BLAKE3 of full 4KB block with hp zeroed).
+/// This is the hash stored in BlockRef — distinct from the vsf-internal hp field,
+/// which only covers the file_length bytes.
+pub fn block_hash(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
     let hp_pos = find_hp_position(blk)?;
     let mut tmp = *blk;
     tmp[hp_pos..hp_pos + 32].fill(0);
@@ -549,12 +526,9 @@ pub fn lookup(
     for level in 0..MAX_DEPTH {
         let blk = io.read_block(current.lba)?;
 
-        // Verify BLAKE3
-        let mut verify_buf = blk;
-        let hp_pos = find_hp_position(&verify_buf)?;
-        verify_buf[hp_pos..hp_pos + 32].fill(0);
-        let computed = blake3::hash(&verify_buf);
-        if computed.as_bytes() != &current.hash {
+        // Verify kernel block hash before trusting the node body.
+        let computed = block_hash(&blk)?;
+        if &computed != &current.hash {
             return None; // Corrupt
         }
 
@@ -566,14 +540,8 @@ pub fn lookup(
             }
             NodeKind::Lone | NodeKind::Direct | NodeKind::Chained => {
                 // Leaf — check if provenance matches
-                let mut r = VsfReader::new(&blk);
-                if !r.magic() { return None; }
-                r.version()?;
-                r.backward_version()?;
-                r.header_length()?;
-                r.eagle_time_qtimer();
-                let prov = r.hash_p()?;
-                if prov == key {
+                let prov = leaf_provenance(&blk)?;
+                if &prov == key {
                     return Some(current);
                 } else {
                     return None; // Different key at this path
@@ -594,8 +562,8 @@ struct PathEntry {
 
 /// Insert or update an object in the HAMT. Returns new root reference.
 ///
-/// `leaf_block` is the already-serialized 4KB leaf (lone, direct, or chained).
-/// `leaf_provenance` is the key (provenance hash from the leaf header).
+/// `leaf_ref` is the BlockRef of an already-written leaf (lone, direct, or chained).
+/// `leaf_provenance` is the key (provenance hash from the leaf body).
 ///
 /// The caller is responsible for writing the leaf block to storage first.
 /// This function writes new internal nodes via `io.write_block()` and
@@ -614,11 +582,8 @@ pub fn insert(
         let blk = io.read_block(current.lba)?;
 
         // Verify
-        let mut verify_buf = blk;
-        let hp_pos = find_hp_position(&verify_buf)?;
-        verify_buf[hp_pos..hp_pos + 32].fill(0);
-        let computed = blake3::hash(&verify_buf);
-        if computed.as_bytes() != &current.hash {
+        let computed = block_hash(&blk)?;
+        if &computed != &current.hash {
             return None;
         }
 
@@ -639,13 +604,7 @@ pub fn insert(
             }
             NodeKind::Lone | NodeKind::Direct | NodeKind::Chained => {
                 // Existing leaf at this position
-                let mut r = VsfReader::new(&blk);
-                if !r.magic() { return None; }
-                r.version()?;
-                r.backward_version()?;
-                r.header_length()?;
-                r.eagle_time_qtimer();
-                let existing_prov = *r.hash_p()?;
+                let existing_prov = leaf_provenance_or_zero(&blk);
 
                 if &existing_prov == leaf_provenance {
                     // Update: replace this leaf. Path already collected,
@@ -701,6 +660,12 @@ pub fn insert(
     Some(child_ref)
 }
 
+/// Read the provenance key from a leaf block; returns zeros if parsing fails.
+/// Used in collision paths where we've already identified the block as a leaf.
+fn leaf_provenance_or_zero(blk: &[u8; BLOCK_SIZE]) -> [u8; 32] {
+    leaf_provenance(blk).unwrap_or([0u8; 32])
+}
+
 /// Remove a key from the HAMT. Returns new root reference.
 ///
 /// Uses COW: rebuilds the path without the leaf.
@@ -718,11 +683,8 @@ pub fn remove(
     for level in 0..MAX_DEPTH {
         let blk = io.read_block(current.lba)?;
 
-        let mut verify_buf = blk;
-        let hp_pos = find_hp_position(&verify_buf)?;
-        verify_buf[hp_pos..hp_pos + 32].fill(0);
-        let computed = blake3::hash(&verify_buf);
-        if computed.as_bytes() != &current.hash {
+        let computed = block_hash(&blk)?;
+        if &computed != &current.hash {
             return None;
         }
 
@@ -738,14 +700,8 @@ pub fn remove(
                 }
             }
             NodeKind::Lone | NodeKind::Direct | NodeKind::Chained => {
-                let mut r = VsfReader::new(&blk);
-                if !r.magic() { return None; }
-                r.version()?;
-                r.backward_version()?;
-                r.header_length()?;
-                r.eagle_time_qtimer();
-                let prov = r.hash_p()?;
-                if prov == key {
+                let prov = leaf_provenance(&blk)?;
+                if &prov == key {
                     found = true;
                     break;
                 } else {
@@ -760,12 +716,12 @@ pub fn remove(
         return None;
     }
 
-    // Rebuild bottom-up, removing the leaf from the last node
+    // Rebuild bottom-up, removing the leaf from the last node.
     let last = path.len() - 1;
 
-    // If node has exactly one child left, we could collapse it,
-    // but for simplicity we keep single-child nodes. The plow
-    // cleanup can optimize this during rotation.
+    // If a node ends up with exactly one child, we could collapse it,
+    // but for simplicity we keep single-child nodes.
+    // The plow cleanup can optimize this during rotation.
 
     let mut child_ref = write_node(io, &path[last].node.without_child(path[last].bit))?;
 

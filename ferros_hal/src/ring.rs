@@ -1,28 +1,34 @@
 //! Boot State Ring — generation-ordered ring of VSF documents on UFS/SD.
 //!
-//! Each ring entry is a proper VSF document (starts with RÅ<, EWE-encoded
-//! fields, provenance hash). Any standard VSF reader can parse them.
+//! Each ring entry is a complete VSF document (RÅ< magic, EWE-encoded fields, provenance hash).
+//! Any standard VSF reader (`vsfinfo`, the `vsf` crate, anything that follows the spec) can parse them.
 //!
-//! Binary search finds the highest valid generation in exactly 16 reads
-//! (log2(65536)). Generation starts at 1 (0 = empty slot).
+//! Binary search finds the highest valid generation in 2×log2(RING_SIZE) generation reads plus one full entry read.
+//! Generation starts at 1 (0 = empty slot).
 //!
 //! See RING.md for the full specification.
 
-use crate::ufs::UfsController;
+extern crate alloc;
+
 use crate::qtimer::read_qtimer;
-use crate::vsf_mini::{VsfReader, VsfWriter};
+use crate::ufs::UfsController;
+use alloc::string::ToString;
+use alloc::vec;
 use ferros_layout::{
-    VAULT_ROOT_RING_BASE, VAULT_ROOT_RING_SIZE,
-    KERNEL_RING_BASE, KERNEL_RING_SIZE, KERNEL_RING_DEPTH,
-    BLOCK_SIZE,
+    BLOCK_SIZE, KERNEL_RING_BASE, KERNEL_RING_DEPTH, KERNEL_RING_SIZE, VAULT_ROOT_RING_BASE,
+    VAULT_ROOT_RING_SIZE,
 };
+use vsf::file_format::{VsfHeader, VsfSection};
+use vsf::types::{EtType, VsfType};
+use vsf::verification::is_original;
+use vsf::vsf_builder::VsfBuilder;
 
 /// Ring size: 65536 entries × 4KB = 256MB total.
-/// (Legacy alias — use ferros_layout::VAULT_ROOT_RING_SIZE for new code)
+/// (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_SIZE` for new code.)
 pub const RING_SIZE: u32 = VAULT_ROOT_RING_SIZE;
 
 /// Base block for the ring on UFS LUN 0 (4KB blocks).
-/// (Legacy alias — use ferros_layout::VAULT_ROOT_RING_BASE for new code)
+/// (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_BASE` for new code.)
 pub const RING_BASE_BLOCK: u32 = VAULT_ROOT_RING_BASE;
 
 /// Convert generation number to ring position.
@@ -48,172 +54,149 @@ pub struct RingEntry {
     pub hp_hash: [u8; 32],
 }
 
-impl RingEntry {
-    /// Serialize to a 4KB VSF document.
-    ///
-    /// Format:
-    /// ```text
-    /// RÅ< z(7) y(7) b(header_len) e(u(qtimer)) hp(zeros→patched) n(1) >
-    /// [d("ring")
-    ///   (d("generation"):u(N))
-    ///   (d("prev_hash"):hp(...))
-    ///   (d("resume_state"):hp(...))
-    /// ]
-    /// [zero padding to 4096]
-    ///
-    /// hp = BLAKE3 of entire document with hp field zeroed to 32×0x00
-    /// ```
-    pub fn to_block(&self) -> [u8; 4096] {
-        let mut blk = [0u8; 4096];
-        let mut w = VsfWriter::new(&mut blk);
+/// Build a complete VSF document into a fixed-size block.
+/// Returns `None` if the encoded doc exceeds `BLK` bytes.
+fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> {
+    let doc = builder.build().ok()?;
+    if doc.len() > BLK {
+        return None;
+    }
+    let mut blk = [0u8; BLK];
+    blk[..doc.len()].copy_from_slice(&doc);
+    Some(blk)
+}
 
-        // --- VSF header ---
-        w.magic();
-        w.version(7);           // Luna
-        w.backward_version(7);  // Luna
+/// Extract eu6 oscillation count from a header's `creation_time` field.
+/// Accepts any signed/unsigned integer EtType form and converts to `u64`.
+fn et_to_u64(et: &VsfType) -> u64 {
+    match et {
+        VsfType::e(EtType::e5(v)) => *v as u64,
+        VsfType::e(EtType::e6(v)) => *v as u64,
+        VsfType::e(EtType::e7(v)) => *v as u64,
+        _ => 0,
+    }
+}
 
-        // Header length placeholder (b field)
-        let header_len_pos = w.pos();
-        w.header_length(0); // placeholder, patched below
-
-        let header_body_start = w.pos();
-
-        // Eagle Time (QTIMER ticks — monotonic, not wall clock yet)
-        w.eagle_time_qtimer(self.eagle_time);
-
-        // Provenance hash placeholder — 32 zero bytes, patched after full document is written
-        let hp_pos = match w.hash_p_placeholder() {
-            Some(pos) => pos,
-            None => return blk,
-        };
-
-        // n(1) — one section in the body
-        w.field_count(1);
-
-        // Header close
-        w.close();
-
-        let header_body_end = w.pos();
-
-        // --- Body: one section with 3 fields ---
-        // Section name omitted from body (< 1MB from header per VSF spec).
-        // Name "ring" lives in header TOC only.
-        w.section_open_anonymous();
-
-        // Field 1: generation (ordering key for binary search)
-        w.field_open("generation");
-        w.uint(self.generation);
-        w.field_close();
-
-        // Field 2: prev_hash (chain link to previous entry)
-        w.field_open("prev_hash");
-        w.hash_p(&self.prev_hash);
-        w.field_close();
-
-        // Field 3: hamt_root_hash
-        w.field_open("hamt_root_hash");
-        w.hash_p(&self.hamt_root_hash);
-        w.field_close();
-
-        // Field 4: hamt_root_lba
-        w.field_open("hamt_root_lba");
-        w.uint(self.hamt_root_lba as u64);
-        w.field_close();
-
-        // Field 5: plow_position
-        w.field_open("plow_position");
-        w.uint(self.plow_position as u64);
-        w.field_close();
-
-        w.section_close();
-
-        // Patch header_length
-        let header_body_len = header_body_end - header_body_start - 1; // -1 for '>'
-        drop(w);
-
-        if header_body_len <= 255 {
-            blk[header_len_pos + 2] = header_body_len as u8;
+/// Extract 32-byte hp from a header's `provenance_hash` field.
+fn hp_bytes(hp: &VsfType) -> Option<[u8; 32]> {
+    match hp {
+        VsfType::hp(v) if v.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(v);
+            Some(out)
         }
+        _ => None,
+    }
+}
 
-        // Compute provenance hash: BLAKE3 of entire document with hp zeroed
-        // hp is already zeros (placeholder), so just hash the whole block
-        let doc_hash = blake3::hash(&blk);
-        blk[hp_pos..hp_pos + 32].copy_from_slice(doc_hash.as_bytes());
+/// Parse a 4KB block as a complete VSF doc and return the header + bytes-of-doc length.
+/// hp is verified; padding past the file_length is ignored.
+fn open_doc(blk: &[u8]) -> Option<(VsfHeader, usize)> {
+    let (header, _) = VsfHeader::decode(blk).ok()?;
+    let file_length = header.file_length;
+    if file_length == 0 || file_length > blk.len() {
+        return None;
+    }
+    is_original(&blk[..file_length]).ok()?;
+    Some((header, file_length))
+}
 
-        blk
+/// Locate a section by name in a parsed header and parse its body into a `VsfSection`.
+fn parse_named_section(blk: &[u8], header: &VsfHeader, name: &str) -> Option<VsfSection> {
+    let field = header.fields.iter().find(|f| f.name == name)?;
+    let off = field.offset_bytes;
+    let size = field.size_bytes;
+    if off.checked_add(size)? > blk.len() {
+        return None;
+    }
+    let mut ptr = off;
+    VsfSection::parse(&blk[..off + size], &mut ptr).ok()
+}
+
+impl RingEntry {
+    /// Serialize to a 4KB VSF document. Padding past the encoded length is zero.
+    pub fn to_block(&self) -> [u8; 4096] {
+        let builder = VsfBuilder::new()
+            .version(7, 7)
+            .creation_time_oscillations(self.eagle_time as i64)
+            .provenance_only()
+            .add_section(
+                "ring",
+                vec![
+                    (
+                        "generation".to_string(),
+                        VsfType::u(self.generation as usize, false),
+                    ),
+                    ("prev_hash".to_string(), VsfType::hp(self.prev_hash.to_vec())),
+                    (
+                        "hamt_root_hash".to_string(),
+                        VsfType::hp(self.hamt_root_hash.to_vec()),
+                    ),
+                    (
+                        "hamt_root_lba".to_string(),
+                        VsfType::u(self.hamt_root_lba as usize, false),
+                    ),
+                    (
+                        "plow_position".to_string(),
+                        VsfType::u(self.plow_position as usize, false),
+                    ),
+                ],
+            );
+        build_into_block::<4096>(builder).unwrap_or([0u8; 4096])
     }
 
-    /// Deserialize from a 4KB block. Returns None if not a valid VSF ring entry.
+    /// Deserialize from a 4KB block. Returns `None` if hp verify fails, no `ring` section, or fields missing.
     pub fn from_block(blk: &[u8; 4096]) -> Option<Self> {
-        let mut r = VsfReader::new(blk);
+        let (header, _) = open_doc(blk)?;
+        let section = parse_named_section(blk, &header, "ring")?;
 
-        // --- Header ---
-        if !r.magic() { return None; }
-        let _ver = r.version()?;
-        let _bver = r.backward_version()?;
-        let _hlen = r.header_length()?;
-        let eagle_time = r.eagle_time_qtimer()?;
-
-        // Record hp position for verification
-        let hp_pos_in_buf = r.pos;
-        let hp_hash_ref = r.hash_p()?;
-        let mut hp_hash = [0u8; 32];
-        hp_hash.copy_from_slice(hp_hash_ref);
-
-        let _count = r.field_count()?;
-        if !r.close() { return None; }
-
-        // --- Verify provenance hash ---
-        // BLAKE3 of entire block with hp field zeroed
-        let mut temp = *blk;
-        for i in 0..32 { temp[hp_pos_in_buf + 4 + i] = 0; } // +4 = 'h' 'p' '3' 31
-        let computed = blake3::hash(&temp);
-        if computed.as_bytes() != &hp_hash {
-            return None;
-        }
-
-        // --- Body: parse section [ ...fields... ] ---
-        // Anonymous section (< 1MB from header, name in TOC only)
-        if r.read_byte_raw()? != b'[' { return None; }
-
-        // Parse fields: (d("name"):value)
         let mut generation: u64 = 0;
         let mut prev_hash = [0u8; 32];
         let mut hamt_root_hash = [0u8; 32];
         let mut hamt_root_lba: u32 = 0;
         let mut plow_position: u32 = 0;
 
-        while r.peek_tag() == Some(b'(') {
-            r.read_byte_raw(); // consume '('
-            let fname = r.dict_key_str()?;
-            if r.read_byte_raw()? != b':' { return None; } // field separator
-
-            match fname {
-                "generation" => { generation = r.uint()?; }
+        for f in &section.fields {
+            match f.name.as_str() {
+                "generation" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        generation = *v as u64;
+                    }
+                }
                 "prev_hash" => {
-                    let h = r.hash_p()?;
-                    prev_hash.copy_from_slice(h);
+                    if let Some(VsfType::hp(v)) = f.values.first() {
+                        if v.len() == 32 {
+                            prev_hash.copy_from_slice(v);
+                        }
+                    }
                 }
-                "hamt_root_hash" => {
-                    let h = r.hash_p()?;
-                    hamt_root_hash.copy_from_slice(h);
+                "hamt_root_hash" | "resume_state" => {
+                    if let Some(VsfType::hp(v)) = f.values.first() {
+                        if v.len() == 32 {
+                            hamt_root_hash.copy_from_slice(v);
+                        }
+                    }
                 }
-                "hamt_root_lba" => { hamt_root_lba = r.uint()? as u32; }
-                "plow_position" => { plow_position = r.uint()? as u32; }
-                // Backwards compat: old entries had resume_state
-                "resume_state" => {
-                    let h = r.hash_p()?;
-                    hamt_root_hash.copy_from_slice(h);
+                "hamt_root_lba" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        hamt_root_lba = *v as u32;
+                    }
                 }
-                _ => { r.skip_field(); } // unknown field — skip
+                "plow_position" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        plow_position = *v as u32;
+                    }
+                }
+                _ => {} // unknown field — ignore
             }
-
-            if r.read_byte_raw()? != b')' { return None; } // field close
         }
 
-        if r.read_byte_raw()? != b']' { return None; } // section close
+        if generation == 0 {
+            return None;
+        }
 
-        if generation == 0 { return None; } // 0 = invalid/empty
+        let eagle_time = et_to_u64(&header.creation_time);
+        let hp_hash = hp_bytes(&header.provenance_hash)?;
 
         Some(Self {
             generation,
@@ -240,8 +223,7 @@ impl RingEntry {
     }
 
     /// Create next entry in the chain from this entry.
-    /// Caller should set hamt_root_hash, hamt_root_lba, plow_position
-    /// before writing.
+    /// Caller should set `hamt_root_hash`, `hamt_root_lba`, `plow_position` before writing.
     pub fn next(&self) -> Self {
         Self {
             generation: self.generation + 1,
@@ -268,7 +250,6 @@ pub struct ScanResult {
 }
 
 /// Binary search the ring for the highest valid generation.
-///
 /// Exactly 2 × log2(RING_SIZE) generation reads + 1 full entry read.
 /// Empty slots return generation 0, always lower than any real entry.
 pub fn scan_ring(ufs: &UfsController) -> ScanResult {
@@ -314,45 +295,38 @@ pub fn write_entry(ufs: &UfsController, entry: &RingEntry) -> bool {
     let buf = ufs.data_buffer_mut();
     buf.copy_from_slice(&blk);
     let write_ocs = ufs.write_block(lba);
-    if write_ocs != 0 { return false; }
+    if write_ocs != 0 {
+        return false;
+    }
 
     // Read back and verify
     let read_ocs = ufs.read_block(lba);
-    if read_ocs != 0 { return false; }
+    if read_ocs != 0 {
+        return false;
+    }
 
     let readback = ufs.data_buffer();
     readback == &blk
 }
 
-/// Read just the generation from a VSF ring entry at a position.
-/// Returns 0 if empty, corrupt, or unreadable.
-/// Parses header + section structure to find the generation field.
+/// Read just the `generation` field of a ring entry at a position.
+/// Returns 0 if empty, corrupt, hp-mismatched, or missing the field.
 fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u64 {
     let lba = RING_BASE_BLOCK + pos;
     result.reads += 1;
 
     let ocs = ufs.read_block(lba);
-    if ocs != 0 { return 0; }
-
+    if ocs != 0 {
+        return 0;
+    }
     let data = ufs.data_buffer();
 
-    // Quick parse: skip header to reach body
-    let mut r = VsfReader::new(data);
-    if !r.magic() { return 0; }
-    if r.version().is_none() { return 0; }
-    if r.backward_version().is_none() { return 0; }
-    if r.header_length().is_none() { return 0; }
-    if r.eagle_time_qtimer().is_none() { return 0; }
-    if r.hash_p().is_none() { return 0; }
-    if r.field_count().is_none() { return 0; }
-    if !r.close() { return 0; }
-
-    // Body: [(d("generation"):u(N))...]  (anonymous section, no d("ring"))
-    if r.read_byte_raw() != Some(b'[') { return 0; }
-    if r.read_byte_raw() != Some(b'(') { return 0; } // field open
-    if r.dict_key_str().is_none() { return 0; } // skip field name "generation"
-    if r.read_byte_raw() != Some(b':') { return 0; } // separator
-    r.uint().unwrap_or(0)
+    // Full parse + verify is the simplest correct path; the binary search runs once at boot, not in a hot loop.
+    let blk_ref: &[u8; BLOCK_SIZE] = match data[..BLOCK_SIZE].try_into() {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    RingEntry::from_block(blk_ref).map(|e| e.generation).unwrap_or(0)
 }
 
 /// Read a full entry from the ring at the given position.
@@ -361,14 +335,16 @@ fn read_entry(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> Option<
     result.reads += 1;
 
     let ocs = ufs.read_block(lba);
-    if ocs != 0 { return None; }
-
+    if ocs != 0 {
+        return None;
+    }
     let data = ufs.data_buffer();
-    RingEntry::from_block(data)
+    let blk_ref: &[u8; BLOCK_SIZE] = data[..BLOCK_SIZE].try_into().ok()?;
+    RingEntry::from_block(blk_ref)
 }
 
 // ===========================================================================
-// Kernel Ring — 256 entries, scanned by the seed to find the current kernel
+// Kernel Ring — small ring scanned by the seed to find the current kernel
 // ===========================================================================
 
 /// Kernel ring entry — points the seed to the current kernel binary.
@@ -386,101 +362,46 @@ pub struct KernelRingEntry {
 impl KernelRingEntry {
     /// Serialize to a 4KB VSF document.
     pub fn to_block(&self) -> [u8; BLOCK_SIZE] {
-        let mut blk = [0u8; BLOCK_SIZE];
-        let mut w = VsfWriter::new(&mut blk);
-
-        // VSF header
-        w.magic();
-        w.version(7);
-        w.backward_version(7);
-
-        let header_len_pos = w.pos();
-        w.header_length(0); // placeholder
-        let header_body_start = w.pos();
-
-        w.eagle_time_qtimer(self.eagle_time);
-
-        let hp_pos = match w.hash_p_placeholder() {
-            Some(pos) => pos,
-            None => return blk,
-        };
-
-        w.field_count(1); // one section
-        w.close();
-
-        let header_body_end = w.pos();
-
-        // Body: anonymous section with kernel fields
-        w.section_open_anonymous();
-
-        w.field_open("generation");
-        w.uint(self.generation);
-        w.field_close();
-
-        w.field_open("kernel_lba");
-        w.uint(self.kernel_lba as u64);
-        w.field_close();
-
-        w.field_open("kernel_size");
-        w.uint(self.kernel_size as u64);
-        w.field_close();
-
-        w.field_open("kernel_hash");
-        w.hash_p(&self.kernel_hash);
-        w.field_close();
-
-        // Ed25519 signature: ge(64 bytes)
-        w.field_open("kernel_sig");
-        w.signature(&self.kernel_sig);
-        w.field_close();
-
-        w.section_close();
-
-        // Patch header_length
-        let header_body_len = header_body_end - header_body_start - 1;
-        drop(w);
-        if header_body_len <= 255 {
-            blk[header_len_pos + 2] = header_body_len as u8;
-        }
-
-        // Compute provenance hash
-        let doc_hash = blake3::hash(&blk);
-        blk[hp_pos..hp_pos + 32].copy_from_slice(doc_hash.as_bytes());
-
-        blk
+        let builder = VsfBuilder::new()
+            .version(7, 7)
+            .creation_time_oscillations(self.eagle_time as i64)
+            .provenance_only()
+            .add_section(
+                "kernel",
+                vec![
+                    (
+                        "generation".to_string(),
+                        VsfType::u(self.generation as usize, false),
+                    ),
+                    (
+                        "kernel_lba".to_string(),
+                        VsfType::u(self.kernel_lba as usize, false),
+                    ),
+                    (
+                        "kernel_size".to_string(),
+                        VsfType::u(self.kernel_size as usize, false),
+                    ),
+                    (
+                        "kernel_hash".to_string(),
+                        VsfType::hp(self.kernel_hash.to_vec()),
+                    ),
+                    (
+                        "kernel_sig".to_string(),
+                        VsfType::ge(self.kernel_sig.to_vec()),
+                    ),
+                ],
+            );
+        build_into_block::<BLOCK_SIZE>(builder).unwrap_or([0u8; BLOCK_SIZE])
     }
 
-    /// Deserialize from a 4KB block. Returns None if not valid.
+    /// Deserialize from a 4KB block. Returns `None` if not a valid kernel ring entry.
     pub fn from_block(blk: &[u8]) -> Option<Self> {
-        if blk.len() < BLOCK_SIZE { return None; }
-
-        let mut r = VsfReader::new(blk);
-
-        if !r.magic() { return None; }
-        let _ver = r.version()?;
-        let _bver = r.backward_version()?;
-        let _hlen = r.header_length()?;
-        let eagle_time = r.eagle_time_qtimer()?;
-
-        let hp_pos = r.pos;
-        let hp_hash_ref = r.hash_p()?;
-        let mut hp_hash = [0u8; 32];
-        hp_hash.copy_from_slice(hp_hash_ref);
-
-        let _count = r.field_count()?;
-        if !r.close() { return None; }
-
-        // Verify provenance hash
-        let mut temp = [0u8; BLOCK_SIZE];
-        temp.copy_from_slice(&blk[..BLOCK_SIZE]);
-        for i in 0..32 { temp[hp_pos + 4 + i] = 0; }
-        let computed = blake3::hash(&temp);
-        if computed.as_bytes() != &hp_hash {
+        if blk.len() < BLOCK_SIZE {
             return None;
         }
-
-        // Parse body
-        if r.read_byte_raw()? != b'[' { return None; }
+        let blk_ref: &[u8; BLOCK_SIZE] = blk[..BLOCK_SIZE].try_into().ok()?;
+        let (header, _) = open_doc(blk_ref)?;
+        let section = parse_named_section(blk_ref, &header, "kernel")?;
 
         let mut entry = KernelRingEntry {
             generation: 0,
@@ -488,34 +409,48 @@ impl KernelRingEntry {
             kernel_size: 0,
             kernel_hash: [0u8; 32],
             kernel_sig: [0u8; 64],
-            eagle_time,
-            hp_hash,
+            eagle_time: et_to_u64(&header.creation_time),
+            hp_hash: hp_bytes(&header.provenance_hash)?,
         };
 
-        while r.peek_tag() == Some(b'(') {
-            r.read_byte_raw();
-            let fname = r.dict_key_str()?;
-            if r.read_byte_raw()? != b':' { return None; }
-
-            match fname {
-                "generation" => { entry.generation = r.uint()?; }
-                "kernel_lba" => { entry.kernel_lba = r.uint()? as u32; }
-                "kernel_size" => { entry.kernel_size = r.uint()? as u32; }
+        for f in &section.fields {
+            match f.name.as_str() {
+                "generation" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        entry.generation = *v as u64;
+                    }
+                }
+                "kernel_lba" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        entry.kernel_lba = *v as u32;
+                    }
+                }
+                "kernel_size" => {
+                    if let Some(VsfType::u(v, _)) = f.values.first() {
+                        entry.kernel_size = *v as u32;
+                    }
+                }
                 "kernel_hash" => {
-                    let h = r.hash_p()?;
-                    entry.kernel_hash.copy_from_slice(h);
+                    if let Some(VsfType::hp(v)) = f.values.first() {
+                        if v.len() == 32 {
+                            entry.kernel_hash.copy_from_slice(v);
+                        }
+                    }
                 }
                 "kernel_sig" => {
-                    let sig = r.signature()?;
-                    entry.kernel_sig.copy_from_slice(sig);
+                    if let Some(VsfType::ge(v)) = f.values.first() {
+                        if v.len() == 64 {
+                            entry.kernel_sig.copy_from_slice(v);
+                        }
+                    }
                 }
-                _ => { r.skip_field(); }
+                _ => {}
             }
-
-            if r.read_byte_raw()? != b')' { return None; }
         }
 
-        if entry.generation == 0 { return None; }
+        if entry.generation == 0 {
+            return None;
+        }
         Some(entry)
     }
 }
@@ -555,7 +490,7 @@ pub fn scan_kernel_ring(ufs: &UfsController) -> ScanResult {
         if let Some(ke) = KernelRingEntry::from_block(&blk) {
             result.generation = ke.generation;
             result.position = lo;
-            // Convert to RingEntry-compatible result (entry field unused for kernel ring)
+            // entry field is RingEntry-typed; kernel-ring callers use scan_kernel_ring's result.generation/position + a separate read
             result.entry = None;
         }
     }
@@ -572,39 +507,29 @@ pub fn write_kernel_entry(ufs: &UfsController, entry: &KernelRingEntry) -> bool 
     let buf = ufs.data_buffer_mut();
     buf.copy_from_slice(&blk);
     let write_ocs = ufs.write_block(lba);
-    if write_ocs != 0 { return false; }
+    if write_ocs != 0 {
+        return false;
+    }
 
     // Read back and verify
     let read_ocs = ufs.read_block(lba);
-    if read_ocs != 0 { return false; }
+    if read_ocs != 0 {
+        return false;
+    }
 
     let readback = ufs.data_buffer();
     readback == &blk
 }
 
-/// Read just the generation from a kernel ring position.
+/// Read just the generation field from a kernel ring position.
 fn read_kernel_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u64 {
     let lba = KERNEL_RING_BASE + pos;
     result.reads += 1;
 
     let ocs = ufs.read_block(lba);
-    if ocs != 0 { return 0; }
-
+    if ocs != 0 {
+        return 0;
+    }
     let data = ufs.data_buffer();
-
-    let mut r = VsfReader::new(data);
-    if !r.magic() { return 0; }
-    if r.version().is_none() { return 0; }
-    if r.backward_version().is_none() { return 0; }
-    if r.header_length().is_none() { return 0; }
-    if r.eagle_time_qtimer().is_none() { return 0; }
-    if r.hash_p().is_none() { return 0; }
-    if r.field_count().is_none() { return 0; }
-    if !r.close() { return 0; }
-
-    if r.read_byte_raw() != Some(b'[') { return 0; }
-    if r.read_byte_raw() != Some(b'(') { return 0; }
-    if r.dict_key_str().is_none() { return 0; }
-    if r.read_byte_raw() != Some(b':') { return 0; }
-    r.uint().unwrap_or(0)
+    KernelRingEntry::from_block(data).map(|e| e.generation).unwrap_or(0)
 }
