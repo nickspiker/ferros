@@ -115,8 +115,6 @@ pub mod dtb;
 pub mod ufs;
 pub mod gcc;
 pub mod rpmh;
-pub use vsf_mini;          // re-export the external vsf-mini crate so existing
-                           // `ferros_hal::vsf_mini::*` import paths still work
 pub mod qtimer;            // aarch64 QTIMER read (moved here from old vsf_mini.rs)
 pub mod ring;
 pub mod gic;
