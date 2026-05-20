@@ -66,13 +66,14 @@ fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> 
     Some(blk)
 }
 
-/// Extract eu6 oscillation count from a header's `creation_time` field.
+/// Extract eu6 oscillation count from a header's optional `creation_time` field.
 /// Accepts any signed/unsigned integer EtType form and converts to `u64`.
-fn et_to_u64(et: &VsfType) -> u64 {
+/// Returns 0 when the header omits creation_time (clockless device) or when the variant isn't a known integer Eagle Time.
+fn et_to_u64(et: &Option<VsfType>) -> u64 {
     match et {
-        VsfType::e(EtType::e5(v)) => *v as u64,
-        VsfType::e(EtType::e6(v)) => *v as u64,
-        VsfType::e(EtType::e7(v)) => *v as u64,
+        Some(VsfType::e(EtType::e5(v))) => *v as u64,
+        Some(VsfType::e(EtType::e6(v))) => *v as u64,
+        Some(VsfType::e(EtType::e7(v))) => *v as u64,
         _ => 0,
     }
 }
