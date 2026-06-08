@@ -17,6 +17,8 @@ pub mod anchor_key_store;
 pub mod capability;
 pub mod device;
 pub mod mesh;
+pub mod root_commit;
+pub mod store;
 pub mod vault_anchor;
 pub mod vsf_wrapper;
 
@@ -24,6 +26,8 @@ pub use anchor_key_store::derive_anchor_key;
 pub use capability::{PermissiveCapabilityEngine, ROOT_CAPABILITY_TOKEN};
 pub use device::FileDevice;
 pub use mesh::SingleDeviceMeshEngine;
+pub use root_commit::{RootCommit, RootCommitError};
+pub use store::{FileStore, FileStoreError, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
 pub use vault_anchor::{
     build as build_anchor, compute_hmac as compute_anchor_hmac, decode as decode_anchor,
     derive_slot_offset, derive_slot_offset_with_probe, encode as encode_anchor, AnchorError,
