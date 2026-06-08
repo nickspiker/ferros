@@ -84,8 +84,14 @@ Same block numbers, same layout, same code path.
 
 ## GPT Partition Type
 
-ferros partitions use a deterministic GPT type GUID derived from
-the name itself: BLAKE3("ferros") truncated to 128 bits.
+ferros uses a single GPT partition per device. All internal
+structure — seed, stem, spine, state, ledger, tract — lives at
+fixed block offsets within that one partition. No sub-partitions,
+no filesystem, no allocation table. Just hardcoded power-of-two-
+aligned geometry from byte zero of the partition.
+
+The partition type GUID is deterministic: BLAKE3("ferros")
+truncated to 128 bits.
 
 ```
 BLAKE3("ferros") → a0b51225-61c5-0f5a-ffe7-1b644f9ca954

@@ -291,11 +291,12 @@ process. After spawn, it exists only in the process's ring — which
 is itself isolated by ISOMEM. The computation is gone. The input is
 gone. What remains is what was always going to be recognized.
 
-PIPE (Photonically Isolated Processing Enclave) is the ideal substrate
-— independent power domain, async clock, photonic isolation from the
-main die. The oracle runs correctly on any hardware with write-only
-key registers. PIPE makes the guarantees physically unbreakable rather
-than merely very strong.
+PIPE (Physically Isolated Processing Enclave) is the ideal substrate
+— independent power domain, async clock, physical isolation from the
+main die (photonic, galvanic, inductive, or capacitive). The oracle
+runs correctly on any hardware with write-only key registers. PIPE
+makes the guarantees physically unbreakable rather than merely very
+strong.
 
 ---
 
@@ -404,7 +405,7 @@ SPAGHETTIFY.md      chaos amplifier, path explosion proof
 ARCHITECTURE.md     six kernel responsibilities, structural elimination
 SECURITY_CHAIN.md   boot trust model, signature chain, owner sovereignty
 ISOMEM.md           ring memory, offset/extent isolation (forthcoming)
-PIPE.md             photonic isolation substrate (forthcoming)
+PIPE.md             physically isolated enclave substrate
 ```
 
 ---
