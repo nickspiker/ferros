@@ -16,6 +16,7 @@
 pub mod anchor_key_store;
 pub mod capability;
 pub mod device;
+pub mod inspect;
 pub mod mesh;
 pub mod root_commit;
 pub mod store;
@@ -23,6 +24,7 @@ pub mod vault_anchor;
 pub mod vsf_wrapper;
 
 pub use anchor_key_store::derive_anchor_key;
+pub use inspect::{inspect_vault, InspectError};
 pub use capability::{PermissiveCapabilityEngine, ROOT_CAPABILITY_TOKEN};
 pub use device::FileDevice;
 pub use mesh::SingleDeviceMeshEngine;
