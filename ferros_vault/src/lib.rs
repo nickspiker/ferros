@@ -31,6 +31,10 @@
 
 extern crate alloc;
 
+// `host-file` feature links the standard library at the crate root so `std::fs::File`, `std::path::Path`, etc. resolve from any descendant module. The rest of ferros_vault stays no_std-clean — std is only used inside `host_file/`.
+#[cfg(feature = "host-file")]
+extern crate std;
+
 pub mod hash;
 pub mod object;
 pub mod device;
@@ -42,6 +46,10 @@ pub mod failure;
 pub mod anchor;
 pub mod platform;
 pub mod boot;
+
+/// Linux single-file vault backend — gated on `host-file` feature. Provides `std::fs::File`-backed [`store::ObjectStore`] + [`device::Device`] impls, plus no-op stubs for [`capability::CapabilityEngine`] and [`mesh::MeshEngine`] for single-user single-device userspace consumers like Photon.
+#[cfg(feature = "host-file")]
+pub mod host_file;
 
 /// The top-level Ledger — ties all layers together.
 ///
