@@ -5,7 +5,7 @@ members = [
     "ferros_kernel",
     "ferros_hal",
     "ferros_hal_m1",
-    "ferros_vault",
+    "vault",
     "ferros_ledger",
     "ferros_pt",
     "ferros_seed",

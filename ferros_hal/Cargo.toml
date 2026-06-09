@@ -7,7 +7,7 @@ description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer
 
 [dependencies]
 ferros_layout = { path = "../ferros_layout" }
-ferros_vault = { path = "../ferros_vault", default-features = false, optional = true }
+ferros_vault = { path = "../vault", default-features = false, optional = true }
 vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false }
 
