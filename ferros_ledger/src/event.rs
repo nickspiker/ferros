@@ -1,14 +1,12 @@
 //! Structured event types — the payload section of ledger entries.
 //!
-//! Every production payload is a typed event. No free-form strings.
-//! Debug-only string events exist for dev builds (stripped in production).
+//! Every production payload is a typed event. No free-form strings. Debug-only string events exist for dev builds (stripped in production).
 
 use crate::category::Category;
 
 /// A ledger event — the payload that gets posted.
 ///
-/// Each variant maps to a specific category. The ledger daemon
-/// routes events to the correct chain based on the variant.
+/// Each variant maps to a specific category. The ledger daemon routes events to the correct chain based on the variant.
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
     // ---- Kernel::Boot ----
@@ -127,8 +125,7 @@ impl Event {
 
     /// Encode this event's payload into `buf`. Returns bytes written.
     ///
-    /// Format: event_tag (1 byte) + field values (EWE-encoded).
-    /// No free-form strings — every field is typed.
+    /// Format: event_tag (1 byte) + field values (EWE-encoded). No free-form strings — every field is typed.
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         let mut pos = 0;
 

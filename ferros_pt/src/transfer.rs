@@ -1,19 +1,14 @@
 //! Transfer state machines — inbound and outbound.
 //!
-//! No hardcoded limits. The protocol accepts any size transfer.
-//! The caller provides buffers — if allocation fails, send NAK.
-//! Runtime memory is the only constraint, not compile-time constants.
+//! No hardcoded limits. The protocol accepts any size transfer. The caller provides buffers — if allocation fails, send NAK. Runtime memory is the only constraint, not compile-time constants.
 //!
 //! ## USB transport mode (blast)
 //!
-//! USB bulk guarantees delivery. Sender blasts all DATA packets without
-//! waiting for per-packet ACKs. Each DATA carries its own BLAKE3 hash.
-//! Receiver verifies inline and responds only at the end:
+//! USB bulk guarantees delivery. Sender blasts all DATA packets without waiting for per-packet ACKs. Each DATA carries its own BLAKE3 hash. Receiver verifies inline and responds only at the end:
 //!   - COMPLETE(success) if root hash matches
 //!   - NAK(bad_seqs) if any chunks failed hash verification
 //!
-//! Sender sends FIN after last DATA. If no response, retries FIN with
-//! binary backoff starting at 1/256s (~4ms), doubling each attempt.
+//! Sender sends FIN after last DATA. If no response, retries FIN with binary backoff starting at 1/256s (~4ms), doubling each attempt.
 
 use crate::CHUNK_SIZE;
 use crate::packet::{self, CHUNK_HASH_SIZE, Complete, NAK_MAX_SEQS, Nak, Spec, StreamId};
@@ -74,8 +69,7 @@ pub fn bitmap_words(count: u64) -> usize {
     ((count as usize) + BITS_PER_WORD - 1) / BITS_PER_WORD
 }
 
-/// Calculate the exact bitmap words needed for an outbound transfer of `data_len` bytes.
-/// Use this to pre-allocate the bitmap buffer before calling `OutboundTransfer::start()`.
+/// Calculate the exact bitmap words needed for an outbound transfer of `data_len` bytes. Use this to pre-allocate the bitmap buffer before calling `OutboundTransfer::start()`.
 pub fn outbound_bitmap_words(data_len: usize) -> usize {
     if data_len == 0 {
         return bitmap_words(1);
@@ -98,9 +92,7 @@ pub fn outbound_bitmap_words(data_len: usize) -> usize {
 
 /// Receive state for an inbound transfer.
 ///
-/// Does NOT own the reassembly buffer or bitmap — caller provides them.
-/// The protocol crate is limit-free. The device allocates from its heap
-/// on SPEC arrival; if allocation fails, it sends NAK.
+/// Does NOT own the reassembly buffer or bitmap — caller provides them. The protocol crate is limit-free. The device allocates from its heap on SPEC arrival; if allocation fails, it sends NAK.
 pub struct InboundTransfer<'a> {
     /// Reassembly buffer (caller-provided, length = spec.total).
     pub data: &'a mut [u8],
@@ -131,8 +123,7 @@ pub struct InboundTransfer<'a> {
 impl<'a> InboundTransfer<'a> {
     /// Create from a SPEC and caller-provided buffers.
     ///
-    /// `data_buf` must be at least `spec.total` bytes.
-    /// `bitmap_buf` must be at least `bitmap_words(spec.count)` u32s.
+    /// `data_buf` must be at least `spec.total` bytes. `bitmap_buf` must be at least `bitmap_words(spec.count)` u32s.
     ///
     /// Returns None if buffers are too small (caller should NAK).
     pub fn new(spec: &Spec, data_buf: &'a mut [u8], bitmap_buf: &'a mut [BitmapWord]) -> Option<Self> {
@@ -166,9 +157,7 @@ impl<'a> InboundTransfer<'a> {
 
     /// Handle a received DATA chunk. Verifies per-chunk BLAKE3 hash.
     ///
-    /// Returns true if chunk was accepted (new and hash valid).
-    /// Bad hash chunks are counted but NOT stored — they'll be NAK'd.
-    /// Sends nothing — receiver is silent during transfer.
+    /// Returns true if chunk was accepted (new and hash valid). Bad hash chunks are counted but NOT stored — they'll be NAK'd. Sends nothing — receiver is silent during transfer.
     pub fn handle_data(&mut self, seq: u64, chunk_hash: &[u8; 32], payload: &[u8]) -> bool {
         if self.state != TransferState::Active {
             return false;
@@ -184,8 +173,7 @@ impl<'a> InboundTransfer<'a> {
             return true; // already have it
         }
 
-        // Determine actual payload length (last chunk may be shorter than psize).
-        // USB transport pads to 512 bytes, so payload may have trailing zeros.
+        // Determine actual payload length (last chunk may be shorter than psize). USB transport pads to 512 bytes, so payload may have trailing zeros.
         let offset = seq_idx * self.psize as usize;
         let actual_len = if offset + self.psize as usize > self.expected_total as usize {
             self.expected_total as usize - offset
@@ -222,8 +210,7 @@ impl<'a> InboundTransfer<'a> {
         true
     }
 
-    /// Called when FIN is received or all chunks arrived.
-    /// Returns a COMPLETE or NAK packet written to `buf`.
+    /// Called when FIN is received or all chunks arrived. Returns a COMPLETE or NAK packet written to `buf`.
     ///
     /// - If all chunks present and root hash matches → COMPLETE(success)
     /// - If chunks missing or bad → NAK with their sequence numbers
@@ -316,16 +303,14 @@ pub struct OutboundTransfer<'a> {
 impl<'a> OutboundTransfer<'a> {
     /// Begin a new outbound transfer. Computes BLAKE3 and builds SPEC.
     ///
-    /// `bitmap_buf` must be at least `bitmap_words(chunk_count)` u32s.
-    /// Returns (OutboundTransfer, SPEC packet length written to `spec_buf`).
+    /// `bitmap_buf` must be at least `bitmap_words(chunk_count)` u32s. Returns (OutboundTransfer, SPEC packet length written to `spec_buf`).
     pub fn start(
         sid: StreamId,
         data: &[u8],
         bitmap_buf: &'a mut [BitmapWord],
         spec_buf: &mut [u8],
     ) -> Option<(Self, usize)> {
-        // Compute seq_width and psize iteratively.
-        // DATA overhead: 1 (sid) + seq_width + 32 (blake3 hash)
+        // Compute seq_width and psize iteratively. DATA overhead: 1 (sid) + seq_width + 32 (blake3 hash)
         let rough_psize = CHUNK_SIZE - 1 - 1 - CHUNK_HASH_SIZE;
         let rough_count = if data.is_empty() {
             1
@@ -381,8 +366,7 @@ impl<'a> OutboundTransfer<'a> {
         Some((xfer, spec_len))
     }
 
-    /// Begin a new outbound transfer with automatic bitmap allocation.
-    /// The Vec is resized to exactly the needed capacity.
+    /// Begin a new outbound transfer with automatic bitmap allocation. The Vec is resized to exactly the needed capacity.
     #[cfg(feature = "alloc")]
     pub fn start_vec(
         sid: StreamId,
@@ -399,8 +383,7 @@ impl<'a> OutboundTransfer<'a> {
         Self::start(sid, data, bmap, spec_buf)
     }
 
-    /// Encode the next DATA packet from source data (initial blast).
-    /// Returns bytes written to `pkt_buf`, or 0 if all sent.
+    /// Encode the next DATA packet from source data (initial blast). Returns bytes written to `pkt_buf`, or 0 if all sent.
     pub fn next_data_packet(&mut self, src: &[u8], pkt_buf: &mut [u8]) -> usize {
         if self.state != TransferState::Active {
             return 0;
@@ -424,8 +407,7 @@ impl<'a> OutboundTransfer<'a> {
         n
     }
 
-    /// Encode a specific DATA packet for retransmission.
-    /// Returns bytes written, or 0 on error.
+    /// Encode a specific DATA packet for retransmission. Returns bytes written, or 0 on error.
     pub fn retransmit_packet(&self, seq: u64, src: &[u8], pkt_buf: &mut [u8]) -> usize {
         if seq >= self.count {
             return 0;

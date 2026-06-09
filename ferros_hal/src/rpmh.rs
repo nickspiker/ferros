@@ -1,14 +1,10 @@
 //! Qualcomm RPMh (Resource Power Manager hardened) driver.
 //!
-//! RPMh manages power resources (LDOs, regulators, clocks) on Qualcomm SoCs.
-//! The APPS processor communicates with RPMh via TCS (Trigger Command Sets)
-//! through the APPS RSC (Resource State Coordinator) MMIO registers.
+//! RPMh manages power resources (LDOs, regulators, clocks) on Qualcomm SoCs. The APPS processor communicates with RPMh via TCS (Trigger Command Sets) through the APPS RSC (Resource State Coordinator) MMIO registers.
 //!
 //! ## cmd-db
 //!
-//! A firmware-provided database at a fixed DRAM address maps resource names
-//! (like "ldoc6") to VRM (Voltage Regulator Module) addresses used in TCS
-//! commands. The cmd-db is populated by TF-A before the kernel boots.
+//! A firmware-provided database at a fixed DRAM address maps resource names (like "ldoc6") to VRM (Voltage Regulator Module) addresses used in TCS commands. The cmd-db is populated by TF-A before the kernel boots.
 //!
 //! ## TCS Protocol
 //!
@@ -21,9 +17,7 @@
 //! ## QCM6490 Layout
 //!
 //! ```text
-//! APPS RSC:  0x1822_0000
-//! TCS base:  RSC + 0xD00
-//! cmd-db:    0x8086_0000 (DRAM, read-only)
+//! APPS RSC:  0x1822_0000 TCS base:  RSC + 0xD00 cmd-db:    0x8086_0000 (DRAM, read-only)
 //! ```
 
 use crate::mmio;
@@ -43,8 +37,7 @@ const SLV_ID_VRM: u16 = 4;
 
 /// Parse cmd-db and find the VRM address for a named resource.
 ///
-/// `name` must be <= 8 bytes (zero-padded internally).
-/// Returns the 32-bit VRM address on success.
+/// `name` must be <= 8 bytes (zero-padded internally). Returns the 32-bit VRM address on success.
 pub fn cmd_db_lookup(name: &[u8]) -> Option<u32> {
     let base = CMD_DB_BASE;
 
@@ -73,8 +66,7 @@ pub fn cmd_db_lookup(name: &[u8]) -> Option<u32> {
             continue;
         }
 
-        // Found VRM header — scan entry_headers (24 bytes each)
-        // entry_headers start at data[] which is at base + 0x90 + header_offset
+        // Found VRM header — scan entry_headers (24 bytes each) entry_headers start at data[] which is at base + 0x90 + header_offset
         let entries_base = base + 0x90 + header_offset as usize;
 
         for j in 0..cnt as usize {
@@ -187,9 +179,7 @@ pub const VRM_MODE: u32 = 0x8;      // regulator mode
 
 /// Send a single RPMh write command via TCS.
 ///
-/// Uses TCS slot 0 (active-only, intended for immediate requests).
-/// `addr` is the VRM address from cmd-db + register offset.
-/// `data` is the value to write.
+/// Uses TCS slot 0 (active-only, intended for immediate requests). `addr` is the VRM address from cmd-db + register offset. `data` is the value to write.
 ///
 /// Returns `true` on success.
 pub fn tcs_write(addr: u32, data: u32) -> bool {
@@ -255,24 +245,21 @@ pub fn tcs0_cmd0_status() -> u32 {
 
 /// Enable a VRM regulator via RPMh TCS.
 ///
-/// `vrm_addr` is the base address from cmd-db for the resource.
-/// Sends enable=1 command.
+/// `vrm_addr` is the base address from cmd-db for the resource. Sends enable=1 command.
 pub fn vrm_enable(vrm_addr: u32) -> bool {
     tcs_write(vrm_addr + VRM_ENABLE, 1)
 }
 
 /// Set VRM regulator voltage via RPMh TCS.
 ///
-/// `vrm_addr` is the base address from cmd-db.
-/// `mv` is voltage in millivolts.
+/// `vrm_addr` is the base address from cmd-db. `mv` is voltage in millivolts.
 pub fn vrm_set_voltage(vrm_addr: u32, mv: u32) -> bool {
     tcs_write(vrm_addr + VRM_VOLTAGE, mv)
 }
 
 /// Enable SD card power rails via RPMh.
 ///
-/// Looks up "ldoc6" (vqmmc, I/O voltage) and "ldoc9" (vmmc, card power)
-/// in cmd-db, then sends TCS commands to enable them.
+/// Looks up "ldoc6" (vqmmc, I/O voltage) and "ldoc9" (vmmc, card power) in cmd-db, then sends TCS commands to enable them.
 ///
 /// Returns (ldoc6_ok, ldoc9_ok).
 pub fn sd_power_enable_rpmh() -> (bool, bool) {

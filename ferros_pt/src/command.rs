@@ -4,15 +4,11 @@
 //!
 //!   `[cap: 32][op: 1][params...]`
 //!
-//! `cap` is a BLAKE3 credential — the same hash used by the vault
-//! capability system. It addresses the target object AND proves access.
+//! `cap` is a BLAKE3 credential — the same hash used by the vault capability system. It addresses the target object AND proves access.
 //!
-//! In dev mode, well-known "dev caps" are BLAKE3 hashes of fixed strings.
-//! The kernel recognizes them without validation. In prod mode, the host
-//! authenticates and receives delegated caps — same wire format.
+//! In dev mode, well-known "dev caps" are BLAKE3 hashes of fixed strings. The kernel recognizes them without validation. In prod mode, the host authenticates and receives delegated caps — same wire format.
 //!
-//! Responses use the same cap field (echo back the credential) so the
-//! caller can match responses to requests.
+//! Responses use the same cap field (echo back the credential) so the caller can match responses to requests.
 
 /// Minimum command size: 32-byte cap + 1-byte op.
 pub const CMD_MIN_SIZE: usize = 33;
@@ -79,8 +75,7 @@ pub fn encode(buf: &mut [u8], cap: &[u8; 32], op: Op, params: &[u8]) -> usize {
 // Dev caps — well-known BLAKE3 hashes for development mode
 // ---------------------------------------------------------------------------
 
-/// Compute a dev cap hash at runtime. In dev mode these are not validated,
-/// but both sides must agree on the same hash for matching.
+/// Compute a dev cap hash at runtime. In dev mode these are not validated, but both sides must agree on the same hash for matching.
 ///
 /// Uses BLAKE3 of the string directly.
 pub fn dev_cap(name: &[u8]) -> [u8; 32] {
@@ -101,13 +96,9 @@ pub mod caps {
     pub const REBOOT: &[u8] = b"ferros.dev.reboot";
     /// Reload — write sends new kernel binary, exec jumps to it.
     pub const RELOAD: &[u8] = b"ferros.dev.reload";
-    /// Beam — read ring entries by generation offset.
-    /// Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
-    /// ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state
-    /// mode: 0=latest (~N offset), 1=absolute generation, 2=all
+    /// Beam — read ring entries by generation offset. Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE] ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state mode: 0=latest (~N offset), 1=absolute generation, 2=all
     pub const BEAM: &[u8] = b"ferros.dev.beam";
-    /// Install — write sends signed kernel binary, exec persists to UFS + stem entry.
-    /// Exec params: [size:4 LE][hash:32][sig:64] = 100 bytes
+    /// Install — write sends signed kernel binary, exec persists to UFS + stem entry. Exec params: [size:4 LE][hash:32][sig:64] = 100 bytes
     pub const INSTALL: &[u8] = b"ferros.dev.install";
 }
 

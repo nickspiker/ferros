@@ -1,20 +1,14 @@
 //! SimpleFB — ABL's framebuffer as a pixel surface.
 //!
-//! ABL initializes the display panel (DSI lane training, panel init
-//! sequence, backlight, voltage rails) and leaves a linear framebuffer
-//! running. It advertises the address via a DTB `simple-framebuffer` node.
+//! ABL initializes the display panel (DSI lane training, panel init sequence, backlight, voltage rails) and leaves a linear framebuffer running. It advertises the address via a DTB `simple-framebuffer` node.
 //!
-//! We just map that physical address and write pixels. Zero display
-//! driver code needed for Phase A.
+//! We just map that physical address and write pixels. Zero display driver code needed for Phase A.
 //!
 //! ## Pixel Format
 //!
 //! ABL typically uses ARGB8888 (a8r8g8b8):
 //! ```text
-//! byte 0: Blue
-//! byte 1: Green
-//! byte 2: Red
-//! byte 3: Alpha (ignored, 0xFF)
+//! byte 0: Blue byte 1: Green byte 2: Red byte 3: Alpha (ignored, 0xFF)
 //! ```
 //!
 //! ## FP5 Display
@@ -66,12 +60,10 @@ impl FbConfig {
 
 /// A mapped framebuffer — raw pixel access.
 ///
-/// The `buf` pointer is the virtual address mapping of the physical
-/// framebuffer. On bare metal with identity mapping, phys == virt.
+/// The `buf` pointer is the virtual address mapping of the physical framebuffer. On bare metal with identity mapping, phys == virt.
 pub struct Framebuffer {
     pub config: FbConfig,
-    /// Raw pointer to the mapped framebuffer memory.
-    /// On bare metal with identity map: this equals phys_base.
+    /// Raw pointer to the mapped framebuffer memory. On bare metal with identity map: this equals phys_base.
     buf: *mut u8,
 }
 
@@ -79,9 +71,7 @@ impl Framebuffer {
     /// Create a framebuffer handle.
     ///
     /// # Safety
-    /// `buf` must point to mapped, writable memory of at least
-    /// `config.size_bytes()` bytes. The framebuffer must remain
-    /// valid for the lifetime of this struct.
+    /// `buf` must point to mapped, writable memory of at least `config.size_bytes()` bytes. The framebuffer must remain valid for the lifetime of this struct.
     pub unsafe fn new(config: FbConfig, buf: *mut u8) -> Self {
         Self { config, buf }
     }

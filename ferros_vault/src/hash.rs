@@ -1,15 +1,10 @@
 //! BLAKE3 content addressing and permission hash chain.
 //!
-//! Every object in the Ledger is addressed by a 32-byte BLAKE3 hash of:
-//!   `BLAKE3(content || name || salt || domain || permission_level)`
+//! Every object in the Ledger is addressed by a 32-byte BLAKE3 hash of: `BLAKE3(content || name || salt || domain || permission_level)`
 //!
-//! The permission hash chain derives read/exec hashes from the write hash:
-//!   write_hash = BLAKE3(content || name || salt || domain || "write")
-//!   read_hash  = BLAKE3(write_hash || read_seed)
-//!   exec_hash  = BLAKE3(write_hash || exec_seed)
+//! The permission hash chain derives read/exec hashes from the write hash: write_hash = BLAKE3(content || name || salt || domain || "write") read_hash  = BLAKE3(write_hash || read_seed) exec_hash  = BLAKE3(write_hash || exec_seed)
 //!
-//! Write implies read (derivable). Read cannot escalate to write (one-way).
-//! Revocation = rotate salt → all derived hashes become invalid.
+//! Write implies read (derivable). Read cannot escalate to write (one-way). Revocation = rotate salt → all derived hashes become invalid.
 //!
 //! ## Contrast
 //! - BTRFS: CRC32c checksums stored in a *separate* csum tree. Addressing

@@ -1,7 +1,6 @@
 use nusb::transfer::{RequestBuffer, TransferError};
 
-// VID 0x1209 (pid.codes), PID 0x4665 (ferros, assigned via pid.codes PR #1208 2026-05-13).
-// Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
+// VID 0x1209 (pid.codes), PID 0x4665 (ferros, assigned via pid.codes PR #1208 2026-05-13). Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
 const FERROS_VID: u16 = 0x1209;
 const FERROS_PID: u16 = 0x4665;
 const INTERFACE: u8 = 0;
@@ -70,8 +69,7 @@ impl UsbLink {
         })
     }
 
-    /// Send data via bulk OUT. Always pads to 512 bytes (USB HS bulk MPS)
-    /// so DWC3's TRB ring never sees short packets that break the chain.
+    /// Send data via bulk OUT. Always pads to 512 bytes (USB HS bulk MPS) so DWC3's TRB ring never sees short packets that break the chain.
     pub async fn send(&self, data: &[u8]) -> Result<(), TransferError> {
         let mut padded = vec![0u8; 512];
         let len = data.len().min(512);

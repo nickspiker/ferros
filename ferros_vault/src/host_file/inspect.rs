@@ -35,25 +35,25 @@ use super::vsf_wrapper;
 pub enum InspectError {
     /// The VSF wrapper couldn't be decoded — file is not a vault (or is truncated/corrupted).
     WrapperDecode(String),
-    /// A supplied hex key wasn't 64 hex chars / didn't decode.
-    BadHexKey(String),
+    /// A supplied key wasn't valid hex OR valid voca / didn't decode to 32 bytes.
+    BadKey(String),
 }
 
 impl core::fmt::Display for InspectError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             InspectError::WrapperDecode(s) => write!(f, "wrapper decode: {}", s),
-            InspectError::BadHexKey(s) => write!(f, "bad hex key: {}", s),
+            InspectError::BadKey(s) => write!(f, "bad key: {}", s),
         }
     }
 }
 
-/// Inspect a vault file. `file_bytes` is the entire on-disk file (VSF wrapper + payload). `hex_keys` is 0..=2 hex strings; meaning is auto-detected (see module docs).
-pub fn inspect_vault(file_bytes: &[u8], hex_keys: &[&str]) -> Result<String, InspectError> {
+/// Inspect a vault file. `file_bytes` is the entire on-disk file (VSF wrapper + payload). `keys` is 0..=2 key strings; each is auto-detected as hex (64 chars in `[0-9a-fA-F]`) or voca (PascalCase word concatenation). The two encodings can't collide — hex digits don't form valid English words and voca's mixed-case never produces a 64-char hex string.
+pub fn inspect_vault(file_bytes: &[u8], keys: &[&str]) -> Result<String, InspectError> {
     let payload = vsf_wrapper::decode(file_bytes)
         .map_err(|e| InspectError::WrapperDecode(format!("{:?}", e)))?;
 
-    let parsed_keys = parse_hex_keys(hex_keys)?;
+    let parsed_keys = parse_keys(keys)?;
     let anchor_key = resolve_anchor_key(&payload, &parsed_keys);
 
     let mut out = String::new();
@@ -62,7 +62,7 @@ pub fn inspect_vault(file_bytes: &[u8], hex_keys: &[&str]) -> Result<String, Ins
     let _ = writeln!(
         out,
         "keys supplied:    {} ({})",
-        hex_keys.len(),
+        keys.len(),
         key_supply_summary(&parsed_keys, &anchor_key)
     );
 
@@ -174,22 +174,35 @@ pub fn inspect_vault(file_bytes: &[u8], hex_keys: &[&str]) -> Result<String, Ins
 // Internals
 // ============================================================================
 
-fn parse_hex_keys(hex_keys: &[&str]) -> Result<Vec<[u8; 32]>, InspectError> {
-    hex_keys
-        .iter()
-        .map(|s| {
-            let bytes = decode_hex(s).map_err(InspectError::BadHexKey)?;
-            if bytes.len() != 32 {
-                return Err(InspectError::BadHexKey(format!(
-                    "expected 32 bytes, got {}",
-                    bytes.len()
-                )));
-            }
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            Ok(out)
-        })
-        .collect()
+fn parse_keys(keys: &[&str]) -> Result<Vec<[u8; 32]>, InspectError> {
+    keys.iter().map(|s| parse_one_key(s)).collect()
+}
+
+/// Try a string as hex first (64 chars `[0-9a-fA-F]`); fall back to voca FULL decode. Voca decode produces a `BigUint` which is left-padded to 32 bytes — leading zeros in the key value are recovered because vault keys are fixed-size by construction.
+fn parse_one_key(s: &str) -> Result<[u8; 32], InspectError> {
+    if is_hex_64(s) {
+        let bytes = decode_hex(s).map_err(InspectError::BadKey)?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        return Ok(out);
+    }
+    // Voca path: decode the PascalCase word concatenation. Any unknown token rejects loudly — fuzzy decode would mask a typo'd key, which silently maps to the wrong vault.
+    let big = voca::decode(s)
+        .map_err(|e| InspectError::BadKey(format!("not hex (64 chars) and voca decode failed: {:?}", e)))?;
+    let bytes = big.to_bytes_be();
+    if bytes.len() > 32 {
+        return Err(InspectError::BadKey(format!(
+            "voca decoded value is {} bytes, larger than the 32-byte key window",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn is_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {

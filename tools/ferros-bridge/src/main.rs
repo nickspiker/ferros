@@ -1,23 +1,10 @@
 // FERROS-BRIDGE SOURCE MAP — keep updated when commands change
 //
-// main.rs ── CLI entry point, PT send/recv, command dispatch
-//   Commands:
-//     status   — check device connected (USB VID/PID probe)
-//     diag     — retrieve boot log via PT DIAG cap
-//     read     — read MMIO register via PT MEM cap
-//     reboot   — reboot device (normal or fastboot) via PT REBOOT cap
-//     reload   — hot-reload kernel binary via PT RELOAD cap
-//     install  — install signed kernel to UFS + stem entry via PT INSTALL cap
+// main.rs ── CLI entry point, PT send/recv, command dispatch Commands: status   — check device connected (USB VID/PID probe) diag     — retrieve boot log via PT DIAG cap read     — read MMIO register via PT MEM cap reboot   — reboot device (normal or fastboot) via PT REBOOT cap reload   — hot-reload kernel binary via PT RELOAD cap install  — install signed kernel to UFS + stem entry via PT INSTALL cap
 //
-//   pt_send(link, sid, data) — blast DATA packets with 1ms pacing
-//   pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
+//   pt_send(link, sid, data) — blast DATA packets with 1ms pacing pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
 //
-// usb.rs ── nusb USB link (VID G#1838, PID G#FE01)
-//   struct UsbLink { interface, ep_out, ep_in }
-//     ::open() → Result<Self>
-//     ::send(data) — pads to 512 bytes (DWC3 short packet workaround)
-//     ::recv() → Vec<u8>
-//     ::recv_timeout(duration) → Result<Vec<u8>>
+// usb.rs ── nusb USB link (VID G#1838, PID G#FE01) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
 
 mod usb;
 
@@ -216,8 +203,7 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
 
     eprintln!("  {} DATA packets blasted", sent);
 
-    // Wait for COMPLETE. Kernel responds when all_received().
-    // Timeout proportional to transfer size: ~1ms per packet + 2s base.
+    // Wait for COMPLETE. Kernel responds when all_received(). Timeout proportional to transfer size: ~1ms per packet + 2s base.
     let wait_ms = (1u64 << 15) + (sent << 6); // 32768ms base + 64ms per packet
 
     // Try multiple recv() calls — COMPLETE might not be the first thing back
@@ -252,9 +238,7 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
 // PT recv (device→host) — bridge acts as InboundTransfer receiver
 // ---------------------------------------------------------------------------
 
-/// Receive a PT transfer from the device (blast mode).
-/// Device sends SPEC + DATA blast + FIN. Bridge sends SPEC ACK, then
-/// responds with COMPLETE or NAK after all data received.
+/// Receive a PT transfer from the device (blast mode). Device sends SPEC + DATA blast + FIN. Bridge sends SPEC ACK, then responds with COMPLETE or NAK after all data received.
 async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
     // Read SPEC from device
     let resp = link
@@ -282,8 +266,7 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
     let mut xfer = InboundTransfer::new(&spec, &mut data_buf, &mut bitmap_buf)
         .ok_or_else(|| "Failed to create InboundTransfer".to_string())?;
 
-    // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump.
-    // Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
+    // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump. Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
     eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
 
     // Receive DATA blast — silent, no ACKs

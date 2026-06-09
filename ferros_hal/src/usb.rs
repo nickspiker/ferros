@@ -2,12 +2,10 @@
 //!
 //! # WARNING — Development Quality
 //!
-//! This driver works for the current dev loop (diag, hot-reload) but is NOT
-//! production quality. Known issues:
+//! This driver works for the current dev loop (diag, hot-reload) but is NOT production quality. Known issues:
 //!
 //! - **1ms send pacing**: bridge sleeps 1ms between OUT sends because single-TRB
-//!   re-arm can't keep up with back-to-back host transfers. Proper fix: TRB ring
-//!   or UPDATETRANSFER.
+//!   re-arm can't keep up with back-to-back host transfers. Proper fix: TRB ring or UPDATETRANSFER.
 //! - **ENDTRANSFER per inbound packet**: wasteful, generates spurious events.
 //!   Proper fix: TRB ring with pre-armed slots.
 //! - **No error recovery**: stalled transfer = dead session, needs power cycle.
@@ -17,12 +15,9 @@
 //!   endpoint state machine.
 //! - **No GIC/interrupt support**: polling only, burns CPU. Needs GIC setup + WFI.
 //!
-//! QCM6490 USB layout (from Linux DTS):
-//!   Qualcomm wrapper: 0x0A6F_8800 (0x400 bytes)
-//!   DWC3 core:        0x0A60_0000 (0xE000 bytes)
+//! QCM6490 USB layout (from Linux DTS): Qualcomm wrapper: 0x0A6F_8800 (0x400 bytes) DWC3 core:        0x0A60_0000 (0xE000 bytes)
 //!
-//! DWC3 global registers start at core_base + 0xC100.
-//! Device-mode registers start at core_base + 0xC700.
+//! DWC3 global registers start at core_base + 0xC100. Device-mode registers start at core_base + 0xC700.
 //!
 //! ## DWC3 Device Mode Architecture
 //!
@@ -31,8 +26,7 @@
 //! - **TRBs** (Transfer Request Blocks): Describe DMA transfers for each endpoint
 //! - **DEPCMD**: Per-endpoint command register for config/start/end transfers
 //!
-//! Endpoint numbering: physical EP = direction << 1 | ep_num
-//!   EP0 OUT = 0, EP0 IN = 1, EP1 OUT = 2, EP1 IN = 3, ...
+//! Endpoint numbering: physical EP = direction << 1 | ep_num EP0 OUT = 0, EP0 IN = 1, EP1 OUT = 2, EP1 IN = 3, ...
 
 use crate::mmio;
 
@@ -40,8 +34,7 @@ use crate::mmio;
 // Base addresses
 // ---------------------------------------------------------------------------
 
-/// DWC3 core base address — set by platform init before calling Dwc3Dev::init().
-/// Default: QCM6490 (G#A600000). Tensor G3: G#11210000.
+/// DWC3 core base address — set by platform init before calling Dwc3Dev::init(). Default: QCM6490 (G#A600000). Tensor G3: G#11210000.
 static DWC3_BASE_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0x0A60_0000);
 
 /// Get the current DWC3 base address.
@@ -62,8 +55,7 @@ pub const DWC3_BASE: usize = 0x0A60_0000;
 pub const QCOM_WRAPPER: usize = 0x0A6F_8800;
 
 // ---------------------------------------------------------------------------
-// DWC3 Global register offsets (from DWC3_BASE)
-// Hardware register map — not all used yet, defined for completeness.
+// DWC3 Global register offsets (from DWC3_BASE) Hardware register map — not all used yet, defined for completeness.
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)] const GSBUSCFG0: usize = 0xC100;
@@ -333,15 +325,13 @@ const QSCRATCH_SS_LANE0_PWR_PRESENT: u32 = 1 << 24;
 // Static buffers — placed in BSS, guaranteed DRAM
 // ---------------------------------------------------------------------------
 
-/// Event buffer — 256 entries * 4 bytes = 1024 bytes.
-/// Cache-line aligned (64B) to isolate from other DMA buffers.
+/// Event buffer — 256 entries * 4 bytes = 1024 bytes. Cache-line aligned (64B) to isolate from other DMA buffers.
 #[repr(C, align(64))]
 struct EventBuffer {
     buf: [u32; 256],
 }
 
-/// EP0 TRB ring — small, just 4 TRBs for setup/data/status.
-/// Cache-line aligned (64B) to isolate from other DMA buffers.
+/// EP0 TRB ring — small, just 4 TRBs for setup/data/status. Cache-line aligned (64B) to isolate from other DMA buffers.
 #[repr(C, align(64))]
 struct Ep0Trbs {
     setup: Trb,   // Setup stage TRB
@@ -374,16 +364,14 @@ static mut EP0_TRBS: Ep0Trbs = Ep0Trbs {
     _pad: Trb::zero(),
 };
 
-/// EP0 setup packet buffer (8 bytes, but cache-line aligned to prevent
-/// DMA bleed-over from SETUP DMA writes into adjacent buffers).
+/// EP0 setup packet buffer (8 bytes, but cache-line aligned to prevent DMA bleed-over from SETUP DMA writes into adjacent buffers).
 #[repr(C, align(64))]
 struct SetupPacket {
     data: [u8; 8],
 }
 static mut EP0_SETUP_BUF: SetupPacket = SetupPacket { data: [0; 8] };
 
-/// EP0 data buffer for control transfers.
-/// Cache-line aligned (64B) to isolate from other DMA buffers.
+/// EP0 data buffer for control transfers. Cache-line aligned (64B) to isolate from other DMA buffers.
 #[repr(C, align(64))]
 struct Ep0DataBuf {
     data: [u8; 512],
@@ -455,8 +443,7 @@ pub fn probe() -> Dwc3Info {
     }
 }
 
-/// Diagnostic register dump after init.
-/// Reads back all critical registers so we can see the controller state.
+/// Diagnostic register dump after init. Reads back all critical registers so we can see the controller state.
 pub struct Dwc3Diag {
     pub dctl: u32,
     pub dsts: u32,
@@ -489,8 +476,7 @@ pub struct Dwc3Diag {
     pub evt_buf_raw: [u32; 4],
 }
 
-/// Return the physical addresses of DMA buffers so we can check what
-/// address the kernel computed vs what ended up in the DWC3 register.
+/// Return the physical addresses of DMA buffers so we can check what address the kernel computed vs what ended up in the DWC3 register.
 pub fn dma_buffer_addrs() -> (u64, u64, u64, u64) {
     let evt = &raw const EVT_BUF as usize as u64;
     let trbs = &raw const EP0_TRBS as usize as u64;
@@ -569,15 +555,9 @@ unsafe fn phy_rmw(addr: usize, clear: u32, set: u32) {
 
 /// Initialize the SNPS Femto v2 USB2 HS PHY.
 ///
-/// This is the PHY used on SC7280/QCM6490. ABL tears it down during
-/// boot handoff, so we must re-initialize it for USB to work.
+/// This is the PHY used on SC7280/QCM6490. ABL tears it down during boot handoff, so we must re-initialize it for USB to work.
 ///
-/// Returns true if PHY init completed (no way to verify PLL lock on
-/// this PHY — it relies on timing delays).
-/// Bypass SMMU for all non-secure DMA.
-/// The apps_smmu at 0x15000000 is active and terminates unmatched streams.
-/// Setting nsCR0.CLIENTPD (bit 0) bypasses translation for all NS masters,
-/// allowing DWC3 DMA to use physical addresses directly.
+/// Returns true if PHY init completed (no way to verify PLL lock on this PHY — it relies on timing delays). Bypass SMMU for all non-secure DMA. The apps_smmu at 0x15000000 is active and terminates unmatched streams. Setting nsCR0.CLIENTPD (bit 0) bypasses translation for all NS masters, allowing DWC3 DMA to use physical addresses directly.
 pub fn smmu_bypass() {
     const APPS_SMMU: usize = 0x1500_0000;
     const NS_CR0: usize = APPS_SMMU + 0x400;
@@ -589,10 +569,7 @@ pub fn smmu_bypass() {
 
 pub fn phy_init() -> bool {
     unsafe {
-        // Phase 0: Assert PHYSOFTRST to isolate DWC3 from PHY during reset.
-        // The DWC3↔PHY interface must be disconnected while we reset and
-        // re-init the PHY, otherwise the DWC3 loses sync with the PHY and
-        // falls back to FS (PHY TX corrupted → host sees no valid packets).
+        // Phase 0: Assert PHYSOFTRST to isolate DWC3 from PHY during reset. The DWC3↔PHY interface must be disconnected while we reset and re-init the PHY, otherwise the DWC3 loses sync with the PHY and falls back to FS (PHY TX corrupted → host sees no valid packets).
         let phycfg = mmio::read32(dwc3_base() + GUSB2PHYCFG);
         mmio::write32(dwc3_base() + GUSB2PHYCFG, phycfg | (1 << 31));  // Assert PHYSOFTRST
         let pipectl = mmio::read32(dwc3_base() + GUSB3PIPECTL);
@@ -605,8 +582,7 @@ pub fn phy_init() -> bool {
         mmio::write32(GCC_QUSB2PHY_PRIM_BCR, 0);   // De-assert reset
         phy_delay(50_000);
 
-        // Phase 2: SNPS Femto v2 PHY register init sequence
-        // (follows phy-qcom-snps-femto-v2.c init)
+        // Phase 2: SNPS Femto v2 PHY register init sequence (follows phy-qcom-snps-femto-v2.c init)
         let p = QUSB2_PHY_BASE;
 
         // Enable common control override
@@ -655,9 +631,7 @@ pub fn phy_init() -> bool {
         // Clear common control override
         phy_rmw(p + PHY_CFG0, PHY_CFG0_CMN_CTRL_OVERRIDE, 0);
 
-        // Phase 2b: QSCRATCH wrapper — UTMI clock mux + VBUS override.
-        // Must happen BEFORE clearing PHYSOFTRST so the DWC3 reconnects
-        // to the PHY with the correct clock source already selected.
+        // Phase 2b: QSCRATCH wrapper — UTMI clock mux + VBUS override. Must happen BEFORE clearing PHYSOFTRST so the DWC3 reconnects to the PHY with the correct clock source already selected.
         let q = QCOM_WRAPPER;
 
         // Select UTMI clock (no SS PHY pipe clock)
@@ -674,8 +648,7 @@ pub fn phy_init() -> bool {
         // SS PHY lane power present (needed even if SS not used)
         phy_rmw(q + QCOM_SS_PHY_CTRL, 0, QSCRATCH_SS_LANE0_PWR_PRESENT);
 
-        // Phase 3: Deassert PHYSOFTRST — reconnect DWC3 to the freshly
-        // initialized PHY. Clock mux and VBUS are already configured.
+        // Phase 3: Deassert PHYSOFTRST — reconnect DWC3 to the freshly initialized PHY. Clock mux and VBUS are already configured.
         let phycfg = mmio::read32(dwc3_base() + GUSB2PHYCFG);
         mmio::write32(dwc3_base() + GUSB2PHYCFG, phycfg & !(1 << 31));
         let pipectl = mmio::read32(dwc3_base() + GUSB3PIPECTL);
@@ -770,11 +743,7 @@ pub enum UsbEvent {
 impl Dwc3Dev {
     /// Initialize the DWC3 in device mode.
     ///
-    /// Takes over from ABL without soft reset (preserves PHY state).
-    /// Stops the controller, reconfigures event buffer and EP0, then restarts.
-    /// Returns None if initialization fails.
-    /// Warm takeover: skip CSFTRST, halt controller, reprogram buffers + EPs, restart.
-    /// For use when ABL already initialized the DWC3 (Tensor G3, M1 via m1n1).
+    /// Takes over from ABL without soft reset (preserves PHY state). Stops the controller, reconfigures event buffer and EP0, then restarts. Returns None if initialization fails. Warm takeover: skip CSFTRST, halt controller, reprogram buffers + EPs, restart. For use when ABL already initialized the DWC3 (Tensor G3, M1 via m1n1).
     pub fn warm_init() -> Option<Self> {
         // Check DWC3 is alive
         let snpsid = unsafe { mmio::read32(dwc3_base() + GSNPSID) };
@@ -910,9 +879,7 @@ impl Dwc3Dev {
                 (gctl & !GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAPDIR_DEVICE);
         }
 
-        // Device controller soft reset (CSFTRST) — resets the device-mode
-        // state machine and FIFOs without affecting global/SMMU state.
-        // This ensures clean state after PHY re-init.
+        // Device controller soft reset (CSFTRST) — resets the device-mode state machine and FIFOs without affecting global/SMMU state. This ensures clean state after PHY re-init.
         let halt_ok;
         unsafe {
             let dctl = mmio::read32(dwc3_base() + DCTL);
@@ -1066,20 +1033,16 @@ impl Dwc3Dev {
         self.ep_cmd(1, DEPCMD_SETEPCONFIG, par0, par1, 0);
         self.ep_cmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
 
-        // Enable EP0 OUT (bit 0) and EP0 IN (bit 1) in DALEPENA.
-        // Without this, the endpoint data path is disabled — DMA completes
-        // but the FIFO never drains to the PHY, so no packets reach the wire.
+        // Enable EP0 OUT (bit 0) and EP0 IN (bit 1) in DALEPENA. Without this, the endpoint data path is disabled — DMA completes but the FIFO never drains to the PHY, so no packets reach the wire.
         unsafe {
             let ena = mmio::read32(dwc3_base() + DALEPENA);
             mmio::write32(dwc3_base() + DALEPENA, ena | 0x3); // bits 0+1 = EP0 OUT+IN
         }
     }
 
-    /// Configure bulk endpoints: EP1 OUT (phys 2) and EP1 IN (phys 3).
-    /// Must be called after ep0_configure() and again in handle_connect_done().
+    /// Configure bulk endpoints: EP1 OUT (phys 2) and EP1 IN (phys 3). Must be called after ep0_configure() and again in handle_connect_done().
     fn bulk_configure(&mut self) {
-        // DEPSTARTCFG with XferRscIdx=2 to preserve EP0 config.
-        // XferRscIdx goes in DEPCMD[22:16], issued on EP0.
+        // DEPSTARTCFG with XferRscIdx=2 to preserve EP0 config. XferRscIdx goes in DEPCMD[22:16], issued on EP0.
         self.ep_cmd(0, DEPCMD_DEPSTARTCFG | (2 << 16), 0, 0, 0);
 
         // EP1 OUT (physical EP 2) — Bulk, 512B MPS
@@ -1108,8 +1071,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Arm bulk OUT (phys EP 2) to receive up to 512 bytes from host.
-    /// Whether bulk OUT has been armed (pending STARTTRANSFER).
+    /// Arm bulk OUT (phys EP 2) to receive up to 512 bytes from host. Whether bulk OUT has been armed (pending STARTTRANSFER).
     pub fn bulk_out_needs_arm(&self) -> bool {
         !self.bulk_out_ready && !self.bulk_out_armed
     }
@@ -1117,8 +1079,7 @@ impl Dwc3Dev {
     pub fn bulk_out_arm(&mut self) {
         self.bulk_out_armed = true;
 
-        // Always ENDTRANSFER first to clear any stale/invalidated transfer.
-        // The host may have silently reset the endpoint on reconnect.
+        // Always ENDTRANSFER first to clear any stale/invalidated transfer. The host may have silently reset the endpoint on reconnect.
         self.force_end_transfer_unconditional(2);
 
         let buf_addr = &raw const BULK_OUT_BUF as usize;
@@ -1156,9 +1117,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Queue data for bulk IN (phys EP 3, device→host).
-    /// Copies data to DMA buffer and starts transfer.
-    /// Returns false if a transfer is already in progress.
+    /// Queue data for bulk IN (phys EP 3, device→host). Copies data to DMA buffer and starts transfer. Returns false if a transfer is already in progress.
     pub fn bulk_in_send(&mut self, data: &[u8]) -> bool {
         if !self.bulk_in_idle { return false; }
         let len = data.len().min(4096);
@@ -1209,8 +1168,7 @@ impl Dwc3Dev {
         true
     }
 
-    /// Read received bulk OUT data. Returns slice of received bytes,
-    /// or None if no data available. Caller must call bulk_out_arm() after.
+    /// Read received bulk OUT data. Returns slice of received bytes, or None if no data available. Caller must call bulk_out_arm() after.
     pub fn bulk_out_read(&mut self) -> Option<&[u8]> {
         if !self.bulk_out_ready { return None; }
         self.bulk_out_ready = false;
@@ -1255,8 +1213,7 @@ impl Dwc3Dev {
         false
     }
 
-    /// Prepare EP0 to receive a SETUP packet.
-    /// If STARTTRANSFER fails, force ENDTRANSFER and retry.
+    /// Prepare EP0 to receive a SETUP packet. If STARTTRANSFER fails, force ENDTRANSFER and retry.
     pub fn ep0_start_setup(&mut self) {
         let setup_addr = &raw const EP0_SETUP_BUF as usize;
 
@@ -1306,9 +1263,7 @@ impl Dwc3Dev {
         self.ep0_state = Ep0State::Setup;
     }
 
-    /// Send data on EP0 IN (physical EP 1) with proactive STARTTRANSFER.
-    /// If the transfer resource is occupied, force ENDTRANSFER and retry.
-    /// If both attempts fail, data stays in EP0_DATA_BUF for XferNotReady retry.
+    /// Send data on EP0 IN (physical EP 1) with proactive STARTTRANSFER. If the transfer resource is occupied, force ENDTRANSFER and retry. If both attempts fail, data stays in EP0_DATA_BUF for XferNotReady retry.
     fn ep0_send(&mut self, data: &[u8], trbctl: u32) {
         let len = data.len().min(512);
 
@@ -1338,15 +1293,13 @@ impl Dwc3Dev {
             self.last_send_src_preview = 0;
         }
 
-        // Copy data to DMA buffer using volatile writes to prevent
-        // compiler from optimizing away or reordering stores.
+        // Copy data to DMA buffer using volatile writes to prevent compiler from optimizing away or reordering stores.
         unsafe {
             let dst = &raw mut EP0_DATA_BUF.data as *mut u8;
             for i in 0..len {
                 core::ptr::write_volatile(dst.add(i), data[i]);
             }
-            // Explicit barrier: ensure all volatile stores are visible
-            // to DMA masters before we set up the TRB.
+            // Explicit barrier: ensure all volatile stores are visible to DMA masters before we set up the TRB.
             core::arch::asm!("dsb sy");
         }
 
@@ -1379,8 +1332,7 @@ impl Dwc3Dev {
         self.ep1_start_transfer(len, trbctl);
     }
 
-    /// Actually issue STARTTRANSFER on EP1 with data already in EP0_DATA_BUF.
-    /// Used by both ep0_send (proactive) and XferNotReady handler (reactive).
+    /// Actually issue STARTTRANSFER on EP1 with data already in EP0_DATA_BUF. Used by both ep0_send (proactive) and XferNotReady handler (reactive).
     fn ep1_start_transfer(&mut self, len: usize, trbctl: u32) {
         let buf_addr = &raw const EP0_DATA_BUF as usize;
         let trb_addr = unsafe { &raw mut EP0_TRBS.data } as usize;
@@ -1403,8 +1355,7 @@ impl Dwc3Dev {
             crate::mmio::cache_clean(trb_addr, 16);
         }
 
-        // Issue STARTTRANSFER on EP1. If it fails (resource occupied),
-        // force ENDTRANSFER and retry once.
+        // Issue STARTTRANSFER on EP1. If it fails (resource occupied), force ENDTRANSFER and retry once.
         if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
             self.ep1_start_ok += 1;
         } else {
@@ -1440,8 +1391,7 @@ impl Dwc3Dev {
         self.ep0_state = Ep0State::Status;
     }
 
-    /// Receive zero-length status OUT after sending data.
-    /// If STARTTRANSFER fails, force ENDTRANSFER and retry (like ep0_send).
+    /// Receive zero-length status OUT after sending data. If STARTTRANSFER fails, force ENDTRANSFER and retry (like ep0_send).
     fn ep0_status_out(&mut self) {
         self.status_out_count += 1;
         let buf_addr = &raw const EP0_DATA_BUF as usize;
@@ -1553,8 +1503,7 @@ impl Dwc3Dev {
                     }
 
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
-                        // SETUP packet = host is (re)configuring — clear armed flags
-                        // so bulk endpoints get re-armed by the main loop
+                        // SETUP packet = host is (re)configuring — clear armed flags so bulk endpoints get re-armed by the main loop
                         self.bulk_out_armed = false;
                         // SETUP packet received — invalidate cache to see DMA data
                         let setup_addr = &raw const EP0_SETUP_BUF as usize;
@@ -1570,10 +1519,7 @@ impl Dwc3Dev {
                         self.last_setup_wvalue = (req[3] as u16) << 8 | req[2] as u16;
                         return UsbEvent::Ep0Setup { request: req };
                     }
-                    // EP0 IN data stage complete → transition to Status and
-                    // wait for XferNotReady before arming status OUT.
-                    // (Reactive model — matches Linux DWC3 driver. Proactive
-                    // status arming can race with DWC3's internal state machine.)
+                    // EP0 IN data stage complete → transition to Status and wait for XferNotReady before arming status OUT. (Reactive model — matches Linux DWC3 driver. Proactive status arming can race with DWC3's internal state machine.)
                     if ep_phys == 1 && self.ep0_state == Ep0State::DataIn {
                         self.ep1_xfer_complete += 1;
                         self.ep0_state = Ep0State::Status;
@@ -1607,8 +1553,7 @@ impl Dwc3Dev {
                         return UsbEvent::None;
                     }
 
-                    // EP1 XferNotReady in DataIn → proactive STARTTRANSFER
-                    // failed, retry now that DWC3 is ready
+                    // EP1 XferNotReady in DataIn → proactive STARTTRANSFER failed, retry now that DWC3 is ready
                     if ep_phys == 1 && self.ep0_state == Ep0State::DataIn {
                         self.ep1_data_notready += 1;
                         if self.pending_ep1_trbctl != 0 {
@@ -1641,8 +1586,7 @@ impl Dwc3Dev {
                         self.ep0_status_in();
                         return UsbEvent::None;
                     }
-                    // EP0 XferNotReady in Setup → SETUP TRB wasn't armed
-                    // (ep0_start_setup failed), re-arm now
+                    // EP0 XferNotReady in Setup → SETUP TRB wasn't armed (ep0_start_setup failed), re-arm now
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
                         self.ep0_start_setup();
                         return UsbEvent::None;
@@ -1654,8 +1598,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Cancel a pending bulk IN transfer and fully reset the endpoint.
-    /// Used when the host disconnects/times out mid-transfer.
+    /// Cancel a pending bulk IN transfer and fully reset the endpoint. Used when the host disconnects/times out mid-transfer.
     pub fn cancel_bulk_in(&mut self) {
         if self.bulk_in_resource_idx != 0 {
             self.end_transfer_raw(3, self.bulk_in_resource_idx as u32);
@@ -1666,8 +1609,7 @@ impl Dwc3Dev {
         self.bulk_in_idle = true;
     }
 
-    /// Recover a stale endpoint: ENDTRANSFER + CLEARSTALL + re-arm.
-    /// Call this when bulk_in_send() or bulk_out_arm() fails persistently.
+    /// Recover a stale endpoint: ENDTRANSFER + CLEARSTALL + re-arm. Call this when bulk_in_send() or bulk_out_arm() fails persistently.
     pub fn recover_endpoint(&mut self, ep_phys: u8) {
         self.force_end_transfer_unconditional(ep_phys);
         self.ep_cmd(ep_phys as u8, DEPCMD_CLEARSTALL, 0, 0, 0);
@@ -1684,9 +1626,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Full shutdown: end all transfers, clear Run/Stop, soft reset.
-    /// Call before hot-reload to leave DWC3 in a clean state for the
-    /// next kernel's init().
+    /// Full shutdown: end all transfers, clear Run/Stop, soft reset. Call before hot-reload to leave DWC3 in a clean state for the next kernel's init().
     pub fn shutdown(&mut self) {
         // End any in-flight transfers on all endpoints
         self.handle_disconnect();
@@ -1711,9 +1651,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Clean up all in-flight transfers on disconnect. Call from the
-    /// kernel's Disconnect event handler so endpoints are in a known
-    /// state when the host reconnects.
+    /// Clean up all in-flight transfers on disconnect. Call from the kernel's Disconnect event handler so endpoints are in a known state when the host reconnects.
     pub fn handle_disconnect(&mut self) {
         // End any in-flight bulk transfers
         if self.bulk_out_resource_idx != 0 {
@@ -1732,9 +1670,7 @@ impl Dwc3Dev {
         self.end_transfer_raw(ep_phys, 1);
     }
 
-    /// Issue raw ENDTRANSFER command with HIPRI_FORCERM (force remove).
-    /// No CMDIOC — forced end doesn't generate completion events.
-    /// Silently ignores CMDSTATUS errors.
+    /// Issue raw ENDTRANSFER command with HIPRI_FORCERM (force remove). No CMDIOC — forced end doesn't generate completion events. Silently ignores CMDSTATUS errors.
     fn end_transfer_raw(&mut self, ep_phys: u8, rsc_idx: u32) {
         let base = dwc3_base() + 0xC800 + (ep_phys as usize) * 16;
         let saved = (self.cmd_status_fail, self.last_cmd_status, self.last_cmd_ep, self.last_cmd_type);
@@ -1761,11 +1697,7 @@ impl Dwc3Dev {
         }
     }
 
-    /// Handle a USB bus reset event.
-    /// ENDTRANSFER + clear stall + clear address.
-    /// Full DEPSTARTCFG + SETEPCONFIG + SETTRANSFRESOURCE happens in
-    /// handle_connect_done (after speed is known), ensuring SETTRANSFRESOURCE
-    /// is always the LAST config command before transfers start.
+    /// Handle a USB bus reset event. ENDTRANSFER + clear stall + clear address. Full DEPSTARTCFG + SETEPCONFIG + SETTRANSFRESOURCE happens in handle_connect_done (after speed is known), ensuring SETTRANSFRESOURCE is always the LAST config command before transfers start.
     pub fn handle_reset(&mut self) {
         self.address = 0;
         self.configured = false;
@@ -1805,12 +1737,9 @@ impl Dwc3Dev {
 
     /// Handle ConnectDone — read speed, full EP0 re-init.
     ///
-    /// SETEPCONFIG Modify doesn't work after USB bus reset on DWC3 3.30a
-    /// (QCM6490) — the second enumeration always times out. So we do full
-    /// DEPSTARTCFG + SETEPCONFIG(Init) + SETTRANSFRESOURCE here.
+    /// SETEPCONFIG Modify doesn't work after USB bus reset on DWC3 3.30a (QCM6490) — the second enumeration always times out. So we do full DEPSTARTCFG + SETEPCONFIG(Init) + SETTRANSFRESOURCE here.
     ///
-    /// The previous config descriptor timeout was caused by a separate
-    /// XferNotReady ZLP bug, not by SETTRANSFRESOURCE corruption.
+    /// The previous config descriptor timeout was caused by a separate XferNotReady ZLP bug, not by SETTRANSFRESOURCE corruption.
     pub fn handle_connect_done(&mut self) {
         let dsts = unsafe { mmio::read32(dwc3_base() + DSTS) };
         self.connected_speed = dsts & DSTS_CONNECTSPD_MASK;
@@ -1820,10 +1749,7 @@ impl Dwc3Dev {
             _ => 64,
         };
 
-        // Clear stalls on bulk endpoints before re-init.
-        // handle_reset() does this, but if a transfer was in-flight when
-        // the host disconnected, the endpoint hardware may have stalled
-        // between reset and connect-done.
+        // Clear stalls on bulk endpoints before re-init. handle_reset() does this, but if a transfer was in-flight when the host disconnected, the endpoint hardware may have stalled between reset and connect-done.
         self.ep_cmd(2, DEPCMD_CLEARSTALL, 0, 0, 0);
         self.ep_cmd(3, DEPCMD_CLEARSTALL, 0, 0, 0);
 
@@ -1865,12 +1791,7 @@ impl Dwc3Dev {
 
         match b_request {
             USB_REQ_SET_ADDRESS => {
-                // Write address to DCFG before the status ZLP, matching
-                // Linux's DWC3 driver.  The DWC3 handles the USB 2.0 spec
-                // requirement internally: it responds to the status stage
-                // on the old address, then switches to the new address.
-                // Deferring the write creates a race where the host sends
-                // the next SETUP to the new address before DCFG is updated.
+                // Write address to DCFG before the status ZLP, matching Linux's DWC3 driver.  The DWC3 handles the USB 2.0 spec requirement internally: it responds to the status stage on the old address, then switches to the new address. Deferring the write creates a race where the host sends the next SETUP to the new address before DCFG is updated.
                 self.address = w_value as u8;
                 unsafe {
                     let dcfg = mmio::read32(dwc3_base() + DCFG);
@@ -1911,12 +1832,7 @@ impl Dwc3Dev {
             USB_DT_DEVICE => &DEVICE_DESC,
             USB_DT_CONFIGURATION => &CONFIG_DESC,
             USB_DT_STRING => {
-                // String descriptors are packed into a single static to avoid
-                // the compiler generating a lookup table of absolute pointers.
-                // ABL loads the kernel at a different address than the linker
-                // assumes, so absolute pointers in .rodata tables are wrong.
-                // Using a single base (resolved via PC-relative `adr`) plus
-                // integer offsets is position-independent.
+                // String descriptors are packed into a single static to avoid the compiler generating a lookup table of absolute pointers. ABL loads the kernel at a different address than the linker assumes, so absolute pointers in .rodata tables are wrong. Using a single base (resolved via PC-relative `adr`) plus integer offsets is position-independent.
                 let base = &raw const ALL_STRING_DESCS as *const u8;
                 let (off, slen) = match desc_idx {
                     0 => (0usize, 4usize),
@@ -2052,13 +1968,9 @@ static BOS_DESC: [u8; 22] = [
     0x20, 0x00,         // wU2DevExitLat = 32us
 ];
 
-/// All string descriptors packed contiguously.
-/// Using a single static avoids the compiler generating a lookup table
-/// of absolute pointers (which break when ABL loads the kernel at a
-/// different address than the linker assumed).
+/// All string descriptors packed contiguously. Using a single static avoids the compiler generating a lookup table of absolute pointers (which break when ABL loads the kernel at a different address than the linker assumed).
 ///
-/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (20B)] [STRING_DESC_2 (4B)] [STRING_DESC_3 (4B)]
-/// Offsets: 0, 4, 24, 28  Total: 32 bytes
+/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (20B)] [STRING_DESC_2 (4B)] [STRING_DESC_3 (4B)] Offsets: 0, 4, 24, 28  Total: 32 bytes
 static ALL_STRING_DESCS: [u8; 32] = [
     // String 0: Language ID (English US) — offset 0, length 4
     4, USB_DT_STRING, 0x09, 0x04,

@@ -1,24 +1,16 @@
 //! Layer 2 — Multi-device mesh consensus and arbitration.
 //!
-//! The mesh is how the Ledger achieves reliability without trusting any
-//! single device. Minimum configuration: dual SSD, dual vendor. Neither
-//! device is truth — mesh consensus is truth.
+//! The mesh is how the Ledger achieves reliability without trusting any single device. Minimum configuration: dual SSD, dual vendor. Neither device is truth — mesh consensus is truth.
 //!
-//! The mesh arbitrates before the ledger is considered mounted. Boot
-//! assumes hostile previous state. Failed write states are preserved as
-//! first-class typed VSF records, not silently discarded.
+//! The mesh arbitrates before the ledger is considered mounted. Boot assumes hostile previous state. Failed write states are preserved as first-class typed VSF records, not silently discarded.
 //!
 //! ## Contrast
 //! - BTRFS: RAID via chunk tree. Block-level mirroring — the filesystem
-//!   doesn't know *what* it's replicating, just that stripe N goes to
-//!   device M. Recovery reads the alternate stripe. Superblock at 3
-//!   fixed offsets is the single root of trust.
+//!   doesn't know *what* it's replicating, just that stripe N goes to device M. Recovery reads the alternate stripe. Superblock at 3 fixed offsets is the single root of trust.
 //! - RedoxFS: Single-device only. No replication, no multi-device.
 //!   The 256-slot header ring provides crash recovery on one device.
 //! - Ledger: Semantic replication. The mesh replicates *objects*, not
-//!   blocks. It can reason about conflicts because it understands the
-//!   content. No fixed superblock offsets — mesh protocol establishes
-//!   truth from the ground up.
+//!   blocks. It can reason about conflicts because it understands the content. No fixed superblock offsets — mesh protocol establishes truth from the ground up.
 
 use alloc::vec::Vec;
 
@@ -53,8 +45,7 @@ pub struct MeshMember {
     pub state: DeviceState,
     /// The highest generation this device has confirmed.
     pub confirmed_generation: u64,
-    /// Vendor identifier — mesh requires dual-vendor minimum to avoid
-    /// correlated firmware failures.
+    /// Vendor identifier — mesh requires dual-vendor minimum to avoid correlated firmware failures.
     pub vendor: Vec<u8>,
 }
 
@@ -86,21 +77,18 @@ pub enum MeshRejectReason {
 pub enum ConsensusResult {
     /// All devices confirmed. Commit is durable.
     Committed { generation: u64 },
-    /// Consensus reached but some devices lagging — commit is durable
-    /// but degraded. Lagging devices will catch up.
+    /// Consensus reached but some devices lagging — commit is durable but degraded. Lagging devices will catch up.
     CommittedDegraded {
         generation: u64,
         lagging: Vec<DeviceId>,
     },
-    /// Consensus not reached. Commit is NOT durable.
-    /// The failure records describe what went wrong on each device.
+    /// Consensus not reached. Commit is NOT durable. The failure records describe what went wrong on each device.
     Failed { failures: Vec<(DeviceId, MeshVote)> },
 }
 
 /// The mesh consensus engine.
 ///
-/// Responsible for proposing commits, collecting votes, and determining
-/// whether consensus has been achieved.
+/// Responsible for proposing commits, collecting votes, and determining whether consensus has been achieved.
 pub trait MeshEngine {
     /// Propose a commit to all mesh members. Returns consensus result.
     fn propose_commit(&mut self, commit: &CommitRecord) -> ConsensusResult;
@@ -117,8 +105,7 @@ pub trait MeshEngine {
     /// Remove a device from the mesh. Requires existing mesh consensus.
     fn evict_member(&mut self, device_id: DeviceId) -> Result<(), MeshError>;
 
-    /// Resolve a conflict between two devices that disagree on state.
-    /// Returns the hash of the winner.
+    /// Resolve a conflict between two devices that disagree on state. Returns the hash of the winner.
     fn resolve_conflict(
         &self,
         a: &DeviceId,
@@ -126,8 +113,7 @@ pub trait MeshEngine {
         generation: u64,
     ) -> Result<ObjectHash, MeshError>;
 
-    /// Check whether the mesh meets minimum redundancy requirements
-    /// (dual SSD, dual vendor).
+    /// Check whether the mesh meets minimum redundancy requirements (dual SSD, dual vendor).
     fn is_healthy(&self) -> bool;
 }
 

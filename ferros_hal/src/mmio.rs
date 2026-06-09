@@ -1,10 +1,8 @@
 //! Volatile MMIO register access.
 //!
-//! Every hardware register read/write goes through these primitives.
-//! The compiler must never optimize away, reorder, or cache these.
+//! Every hardware register read/write goes through these primitives. The compiler must never optimize away, reorder, or cache these.
 //!
-//! No unsafe wrappers around unsafe — the callers are all hardware
-//! drivers that inherently know what address they're poking.
+//! No unsafe wrappers around unsafe — the callers are all hardware drivers that inherently know what address they're poking.
 
 use core::ptr;
 
@@ -82,8 +80,7 @@ pub unsafe fn write8(addr: usize, val: u8) {
 
 /// A typed MMIO register at a fixed address.
 ///
-/// Wraps a base address + offset into a reusable handle.
-/// Prevents fat-fingering addresses across a driver.
+/// Wraps a base address + offset into a reusable handle. Prevents fat-fingering addresses across a driver.
 pub struct Reg32 {
     addr: usize,
 }
@@ -120,8 +117,7 @@ impl Reg32 {
     }
 }
 
-/// Clean data cache lines covering [start, start+len) to PoC.
-/// Ensures CPU writes are visible to DMA devices.
+/// Clean data cache lines covering [start, start+len) to PoC. Ensures CPU writes are visible to DMA devices.
 pub unsafe fn cache_clean(start: usize, len: usize) {
     if len == 0 { return; }
     let ctr: u64;
@@ -137,8 +133,7 @@ pub unsafe fn cache_clean(start: usize, len: usize) {
     core::arch::asm!("dsb sy");
 }
 
-/// Invalidate data cache lines covering [start, start+len) to PoC.
-/// Ensures DMA writes are visible to CPU (discard stale cache lines).
+/// Invalidate data cache lines covering [start, start+len) to PoC. Ensures DMA writes are visible to CPU (discard stale cache lines).
 pub unsafe fn cache_invalidate(start: usize, len: usize) {
     if len == 0 { return; }
     let ctr: u64;

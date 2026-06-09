@@ -12,8 +12,7 @@ pub enum UsbEvent {
 
 /// Minimal USB bulk device interface required by the PT event loop.
 ///
-/// Implemented by each platform HAL. All methods operate on the controller's
-/// internal static DMA buffers — no external allocation.
+/// Implemented by each platform HAL. All methods operate on the controller's internal static DMA buffers — no external allocation.
 pub trait UsbBulk {
     /// Poll for the next hardware event. Non-blocking; returns `None` if idle.
     fn poll_event(&mut self) -> UsbEvent;
@@ -21,9 +20,7 @@ pub trait UsbBulk {
     /// Arm the bulk OUT endpoint to receive one packet (≤512 bytes).
     fn bulk_out_arm(&mut self);
 
-    /// Consume bulk OUT data received since the last `bulk_out_arm`.
-    /// Returns `None` if no data is ready.
-    /// Caller must call `bulk_out_arm` again after consuming.
+    /// Consume bulk OUT data received since the last `bulk_out_arm`. Returns `None` if no data is ready. Caller must call `bulk_out_arm` again after consuming.
     fn bulk_out_read(&mut self) -> Option<&[u8]>;
 
     /// Start a bulk IN transfer. Returns `true` if successfully armed.

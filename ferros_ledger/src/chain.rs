@@ -1,7 +1,6 @@
 //! In-memory hash chain — one per category.
 //!
-//! Maintains chain head (prev_hash), category sequence counter,
-//! and a ring buffer of recent entry hashes for verification.
+//! Maintains chain head (prev_hash), category sequence counter, and a ring buffer of recent entry hashes for verification.
 
 use crate::category::Category;
 use crate::entry::{self, Entry, Hash};
@@ -76,8 +75,7 @@ impl CategoryChain {
 ///
 /// This is the ledger daemon's core state. Fixed-size, no alloc.
 pub struct Chain {
-    /// Per-category chains. Indexed by Category as u8.
-    /// We use a flat array — category enum values are the indices.
+    /// Per-category chains. Indexed by Category as u8. We use a flat array — category enum values are the indices.
     chains: [CategoryChain; Chain::NUM_CATEGORIES],
     /// Global sequence counter (across all categories).
     global_seq: u64,

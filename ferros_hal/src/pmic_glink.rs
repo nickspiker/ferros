@@ -3,28 +3,14 @@
 //! The charger PMIC (PM7250B SID 8) is owned by the ADSP. APPS reaches it via:
 //!
 //! ```text
-//! APPS ──[IPCC doorbell G#408000]──► ADSP
-//!                                       ↕
-//!                             SMEM FIFOs G#80900000 TOC[478-480]
-//!                                       ↕
-//!                             GLINK protocol (intentless)
-//!                                       ↕
-//!                      channel "PMIC_RTR_ADSP_APPS"
-//!                                       ↕
-//!                      pmic-glink framing (owner+type+opcode)
-//!                                       ↕
-//!                      BATTMGR opcodes (status, property, charge ctrl)
+//! APPS ──[IPCC doorbell G#408000]──► ADSP ↕ SMEM FIFOs G#80900000 TOC[478-480] ↕ GLINK protocol (intentless) ↕ channel "PMIC_RTR_ADSP_APPS" ↕ pmic-glink framing (owner+type+opcode) ↕ BATTMGR opcodes (status, property, charge ctrl)
 //! ```
 //!
-//! ABL boots the ADSP and initializes GLINK before handing off.
-//! SMEM items 478/479/480 are pre-allocated; ADSP may have already
-//! written a VERSION packet to RX FIFO by the time our kernel starts.
+//! ABL boots the ADSP and initializes GLINK before handing off. SMEM items 478/479/480 are pre-allocated; ADSP may have already written a VERSION packet to RX FIFO by the time our kernel starts.
 //!
 //! ## RTC note
 //!
-//! No pmic-glink RTC path exists. The RTC (PMK8350) lives at SPMI SID=0,
-//! PID=G#61, registers G#6148-G#614B (4 bytes LE = Unix epoch seconds).
-//! [`probe_rtc`] reads it directly if the arbiter grants access.
+//! No pmic-glink RTC path exists. The RTC (PMK8350) lives at SPMI SID=0, PID=G#61, registers G#6148-G#614B (4 bytes LE = Unix epoch seconds). [`probe_rtc`] reads it directly if the arbiter grants access.
 
 use crate::mmio;
 
@@ -35,10 +21,7 @@ use crate::mmio;
 const IPCC_BASE: usize = 0x0040_8000;
 const IPCC_SEND_ID: usize = IPCC_BASE + 0x0C; // write to ring remote doorbell
 
-/// Doorbell to signal ADSP GLINK: client=LPASS(3)<<16 | signal=GLINK_QMP(0).
-/// IPCC client IDs (SC7280/QCM6490 from Linux qcom-ipcc.h):
-///   AOP=0, TZ=1, MPSS=2, LPASS=3, SLPI=4, CDSP=5, NPU=6, APSS=7.
-/// Signal 0 = IPCC_MPROC_SIGNAL_GLINK_QMP (standard GLINK doorbell).
+/// Doorbell to signal ADSP GLINK: client=LPASS(3)<<16 | signal=GLINK_QMP(0). IPCC client IDs (SC7280/QCM6490 from Linux qcom-ipcc.h): AOP=0, TZ=1, MPSS=2, LPASS=3, SLPI=4, CDSP=5, NPU=6, APSS=7. Signal 0 = IPCC_MPROC_SIGNAL_GLINK_QMP (standard GLINK doorbell).
 const ADSP_DOORBELL: u32 = 3 << 16 | 0;  // LPASS client, GLINK_QMP signal
 /// SMP2P doorbell: same LPASS client, signal 2 = IPCC_MPROC_SIGNAL_SMP2P.
 const ADSP_SMP2P_DOORBELL: u32 = 3 << 16 | 2;
@@ -48,65 +31,22 @@ const ADSP_SMP2P_DOORBELL: u32 = 3 << 16 | 2;
 // ---------------------------------------------------------------------------
 
 const SMEM_BASE: usize = 0x8090_0000;
-// Actual smem_header layout (from drivers/soc/qcom/smem.c):
-//   proc_comm[4]:  4 × {command,status,data1,data2} × 4 = 64 bytes → 0x00
-//   version[32]:   32 × 4 = 128 bytes → 0x40
-//   initialized:   u32 → 0xC0
-//   free_offset:   u32 → 0xC4
-//   available:     u32 → 0xC8
-//   reserved:      u32 → 0xCC
-//   toc[512]:      512 × 16 bytes → 0xD0
-// Actual smem_header layout (from drivers/soc/qcom/smem.c):
-//   proc_comm[4]:  4 × {command,status,data1,data2} × 4 = 64 bytes → 0x00
-//   version[32]:   32 × 4 = 128 bytes → 0x40
-//   initialized:   u32 → 0xC0
-//   free_offset:   u32 → 0xC4
-//   available:     u32 → 0xC8
-//   reserved:      u32 → 0xCC
-//   toc[512]:      512 × 16 bytes → 0xD0
+// Actual smem_header layout (from drivers/soc/qcom/smem.c): proc_comm[4]:  4 × {command,status,data1,data2} × 4 = 64 bytes → 0x00 version[32]:   32 × 4 = 128 bytes → 0x40 initialized:   u32 → 0xC0 free_offset:   u32 → 0xC4 available:     u32 → 0xC8 reserved:      u32 → 0xCC toc[512]:      512 × 16 bytes → 0xD0 Actual smem_header layout (from drivers/soc/qcom/smem.c): proc_comm[4]:  4 × {command,status,data1,data2} × 4 = 64 bytes → 0x00 version[32]:   32 × 4 = 128 bytes → 0x40 initialized:   u32 → 0xC0 free_offset:   u32 → 0xC4 available:     u32 → 0xC8 reserved:      u32 → 0xCC toc[512]:      512 × 16 bytes → 0xD0
 const SMEM_INIT_OFF: usize    = 0xC0; // u32 — must be 1 when SMEM is ready
 const SMEM_VERSION_OFF: usize  = 0x40; // version[32] array start
 const SMEM_TOC_OFF: usize     = 0xD0; // global heap TOC: 512 × 16-byte entries
 const SMEM_TOC_STRIDE: usize  = 16;
 
-// Ptable (partition table) — maps private partitions between processor pairs.
-// Located in the last 4KB of SMEM: SMEM_BASE + SMEM_SIZE - 0x1000.
-// smem_ptable header (32 bytes):
-//   [0]  magic[4]    = "$TOC" = bytes 24 54 4F 43, LE u32 = G#434F5424
-//   [4]  version     = u32
-//   [8]  num_entries = u32
-//   [12] reserved[5] = u32 × 5 = 20 bytes
-//   [32] entries[]   = smem_ptable_entry × num_entries
-// smem_ptable_entry (48 bytes):
-//   [0]  offset   u32 — byte offset from SMEM_BASE to partition data
-//   [4]  size     u32 — partition size in bytes
-//   [8]  flags    u32
-//   [12] host0    u16 — first host (APPS=0, ADSP=2, ...)
-//   [14] host1    u16 — second host
-//   [16] cacheline u32
-//   [20] reserved[7] u32
+// Ptable (partition table) — maps private partitions between processor pairs. Located in the last 4KB of SMEM: SMEM_BASE + SMEM_SIZE - 0x1000. smem_ptable header (32 bytes): [0]  magic[4]    = "$TOC" = bytes 24 54 4F 43, LE u32 = G#434F5424 [4]  version     = u32 [8]  num_entries = u32 [12] reserved[5] = u32 × 5 = 20 bytes [32] entries[]   = smem_ptable_entry × num_entries smem_ptable_entry (48 bytes): [0]  offset   u32 — byte offset from SMEM_BASE to partition data [4]  size     u32 — partition size in bytes [8]  flags    u32 [12] host0    u16 — first host (APPS=0, ADSP=2, ...) [14] host1    u16 — second host [16] cacheline u32 [20] reserved[7] u32
 const SMEM_PTABLE_OFF: usize      = 0x1FF000; // last 4KB: SMEM_BASE + SMEM_SIZE - 0x1000
 const SMEM_PTABLE_MAGIC: u32      = 0x434F_5424; // bytes 24 54 4F 43 = "$TOC" LE
 const SMEM_PTABLE_HDR_SIZE: usize = 32;
 const SMEM_PTABLE_ENTRY_SIZE: usize = 48;
 
-// Private partition header (smem_partition_header, 32 bytes):
-//   [0]  magic    u32 = G#54525024 (bytes 24 50 52 54 = "$PRT")
-//   [4]  host0    u16
-//   [6]  host1    u16
-//   [8]  size     u32
-//   [12] offset_free_uncached u32 — next free byte offset from partition base
-//   [16] offset_free_cached   u32
-//   [20] reserved[3] u32
+// Private partition header (smem_partition_header, 32 bytes): [0]  magic    u32 = G#54525024 (bytes 24 50 52 54 = "$PRT") [4]  host0    u16 [6]  host1    u16 [8]  size     u32 [12] offset_free_uncached u32 — next free byte offset from partition base [16] offset_free_cached   u32 [20] reserved[3] u32
 const SMEM_PARTITION_MAGIC: u32    = 0x5452_5024; // bytes 24 50 52 54 = "$PRT" LE
 
-// Private entry header (smem_private_entry, 16 bytes):
-//   [0]  canary       u16 = G#A5A5 for valid entries
-//   [2]  item         u16
-//   [4]  size         u32 — padded data size (data + padding_data)
-//   [8]  padding_data u16 — padding bytes at end of data region
-//   [10] padding_hdr  u16 — padding bytes at end of entry header
-//   [12] reserved     u32
+// Private entry header (smem_private_entry, 16 bytes): [0]  canary       u16 = G#A5A5 for valid entries [2]  item         u16 [4]  size         u32 — padded data size (data + padding_data) [8]  padding_data u16 — padding bytes at end of data region [10] padding_hdr  u16 — padding bytes at end of entry header [12] reserved     u32
 const SMEM_PRIVATE_CANARY: u16 = 0xa5a5;
 
 const SMEM_ITEM_DESC:    usize = 478; // 32-byte GLINK descriptor (head/tail pointers)
@@ -117,29 +57,15 @@ const SMEM_ITEM_APPS_TX: usize = 480; // APPS TX FIFO (APPS writes → ADSP read
 // SMP2P — Shared Memory Point-to-Point (readiness signaling)
 // ---------------------------------------------------------------------------
 //
-// ADSP waits for APPS to clear the "stop" bit in SMP2P before starting
-// GLINK transport. Without this signal, ADSP's charger_pd stays dormant.
+// ADSP waits for APPS to clear the "stop" bit in SMP2P before starting GLINK transport. Without this signal, ADSP's charger_pd stays dormant.
 //
-// SMEM items:
-//   443 = APPS→ADSP (outbound, APPS writes)
-//   429 = ADSP→APPS (inbound, ADSP writes)
+// SMEM items: 443 = APPS→ADSP (outbound, APPS writes) 429 = ADSP→APPS (inbound, ADSP writes)
 //
-// smp2p_smem_item layout (G#154 = 340 bytes):
-//   [0x00] magic          u32 = G#504D5324 ("$SMP")
-//   [0x04] version        u8  = 1
-//   [0x05] features       u24 (3 bytes)
-//   [0x08] local_pid      u16 (writer's processor ID)
-//   [0x0A] remote_pid     u16 (reader's processor ID)
-//   [0x0C] total_entries  u16 (max 16)
-//   [0x0E] valid_entries  u16 (currently valid)
-//   [0x10] flags          u32 (SSR flags)
-//   [0x14] entries[16]    each: name[16] + value[4] = 20 bytes
+// smp2p_smem_item layout (G#154 = 340 bytes): [0x00] magic          u32 = G#504D5324 ("$SMP") [0x04] version        u8  = 1 [0x05] features       u24 (3 bytes) [0x08] local_pid      u16 (writer's processor ID) [0x0A] remote_pid     u16 (reader's processor ID) [0x0C] total_entries  u16 (max 16) [0x0E] valid_entries  u16 (currently valid) [0x10] flags          u32 (SSR flags) [0x14] entries[16]    each: name[16] + value[4] = 20 bytes
 //
 // Processor IDs: APPS=0, Modem=1, ADSP/LPASS=2, WCNSS=3, SLPI=4, CDSP=5
 //
-// Entry "master-kernel": bit 0 of value = stop signal.
-//   Set = APPS requesting ADSP to stop.
-//   Clear = APPS ready, ADSP may proceed.
+// Entry "master-kernel": bit 0 of value = stop signal. Set = APPS requesting ADSP to stop. Clear = APPS ready, ADSP may proceed.
 
 const SMP2P_APPS_TO_ADSP: usize = 443; // SMEM item: APPS→ADSP SMP2P
 const SMP2P_ADSP_TO_APPS: usize = 429; // SMEM item: ADSP→APPS SMP2P
@@ -151,17 +77,9 @@ const SMP2P_HEADER_SIZE: usize = 0x14; // 20 bytes before entries[]
 const FIFO_SIZE: usize = 0x4000; // 16 KiB — must be a power of 2
 const FIFO_MASK: usize = FIFO_SIZE - 1;
 
-// SMEM TOC entry layout (each field u32 LE):
-//   [0] allocated  — 1 = in use
-//   [4] offset     — byte offset from SMEM_BASE to data
-//   [8] size
-//  [12] aux_base
+// SMEM TOC entry layout (each field u32 LE): [0] allocated  — 1 = in use [4] offset     — byte offset from SMEM_BASE to data [8] size [12] aux_base
 
-// GLINK descriptor layout (32 bytes, all u32 LE) — from ADSP's perspective:
-//   [0]  ADSP tx_tail — APPS advances when consuming from item 479 (our rx_tail)
-//   [4]  ADSP tx_head — ADSP advances when writing to item 479     (our rx_head)
-//   [8]  ADSP rx_tail — ADSP advances when consuming from item 480 (our tx_tail)
-//  [12]  ADSP rx_head — APPS advances when writing to item 480     (our tx_head)
+// GLINK descriptor layout (32 bytes, all u32 LE) — from ADSP's perspective: [0]  ADSP tx_tail — APPS advances when consuming from item 479 (our rx_tail) [4]  ADSP tx_head — ADSP advances when writing to item 479     (our rx_head) [8]  ADSP rx_tail — ADSP advances when consuming from item 480 (our tx_tail) [12]  ADSP rx_head — APPS advances when writing to item 480     (our tx_head)
 
 // ---------------------------------------------------------------------------
 // GLINK protocol
@@ -370,8 +288,7 @@ pub fn probe_smem() -> SmemProbe {
     }
 }
 
-/// Dump all ptable entries: fills `out` with (host0, host1, offset, size) tuples.
-/// Returns the number of entries written.
+/// Dump all ptable entries: fills `out` with (host0, host1, offset, size) tuples. Returns the number of entries written.
 pub fn dump_ptable_entries(out: &mut [(u16, u16, u32, u32)]) -> usize {
     let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
@@ -389,14 +306,12 @@ pub fn dump_ptable_entries(out: &mut [(u16, u16, u32, u32)]) -> usize {
     count
 }
 
-/// Scan all items in the APPS↔ADSP private partition.
-/// Fills `out` with (item_id, data_size) pairs.  Returns count found.
+/// Scan all items in the APPS↔ADSP private partition. Fills `out` with (item_id, data_size) pairs.  Returns count found.
 pub fn scan_adsp_items(out: &mut [(u16, u32)]) -> usize {
     scan_partition_items(2, out)
 }
 
-/// Scan all items in the APPS↔CDSP private partition (host0=0, host1=5).
-/// pmic-glink runs on CDSP on some QCM6490 builds.
+/// Scan all items in the APPS↔CDSP private partition (host0=0, host1=5). pmic-glink runs on CDSP on some QCM6490 builds.
 pub fn scan_cdsp_items(out: &mut [(u16, u32)]) -> usize {
     scan_partition_items(5, out)
 }
@@ -492,8 +407,7 @@ fn scan_partition_items(remote_host: u16, out: &mut [(u16, u32)]) -> usize {
 
 /// Dump a slice of the APPS↔ADSP private partition as hex bytes (for diagnostics).
 ///
-/// Returns up to `out.len()` bytes starting at `offset` from the partition base.
-/// Returns the number of bytes actually copied.
+/// Returns up to `out.len()` bytes starting at `offset` from the partition base. Returns the number of bytes actually copied.
 pub fn dump_adsp_partition(offset: usize, out: &mut [u8]) -> usize {
     let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
@@ -553,8 +467,7 @@ pub fn probe_adsp_raw() -> (u32, u32, u32, [u8; 16]) {
 
 /// Battery state from QG (fuel gauge) + SDAM direct SPMI reads.
 ///
-/// Bypasses GLINK entirely — reads raw hardware registers.
-/// QG at SID 8 PID G#C8, SDAM at SID 8 PID G#70.
+/// Bypasses GLINK entirely — reads raw hardware registers. QG at SID 8 PID G#C8, SDAM at SID 8 PID G#70.
 #[derive(Copy, Clone, Default)]
 pub struct QgBatteryState {
     /// Raw QG VBAT ADC code from C8[G#50-G#51] (u16 LE).
@@ -586,8 +499,7 @@ pub fn probe_battery_qg() -> QgBatteryState {
         let lo = spmi::read_byte(apid, 0x50).unwrap_or(0) as u16;
         let hi = spmi::read_byte(apid, 0x51).unwrap_or(0) as u16;
         st.vbat_raw = lo | (hi << 8);
-        // Conversion: ~2.441 mV per code (5000 mV / 2048 codes, 11-bit effective).
-        // Use integer math: raw * 5000 / 2048 = raw * 625 / 256.
+        // Conversion: ~2.441 mV per code (5000 mV / 2048 codes, 11-bit effective). Use integer math: raw * 5000 / 2048 = raw * 625 / 256.
         st.vbat_mv = (st.vbat_raw as u32 * 625) / 256;
     }
 
@@ -623,10 +535,7 @@ pub fn probe_battery_qg() -> QgBatteryState {
 
 /// Probe SID 8 peripherals via SPMI — PM7250B BMS/charger on Fairphone 5.
 ///
-/// Returns (pid, perph_type, perph_subtype, status0) where:
-///   offset 0x04 = PERPH_TYPE (confirmed by C7[04]=0x0B matching BAT_IF)
-///   offset 0x05 = PERPH_SUBTYPE
-///   offset 0x00 = STATUS1 (real-time status bits)
+/// Returns (pid, perph_type, perph_subtype, status0) where: offset 0x04 = PERPH_TYPE (confirmed by C7[04]=0x0B matching BAT_IF) offset 0x05 = PERPH_SUBTYPE offset 0x00 = STATUS1 (real-time status bits)
 pub fn probe_sid8_spmi(out: &mut [(u8, u8, u8, u8)]) -> usize {
     use crate::spmi;
     let mut n = 0;
@@ -645,8 +554,7 @@ pub fn probe_sid8_spmi(out: &mut [(u8, u8, u8, u8)]) -> usize {
 
 /// Read a block of SPMI registers from a SID 8 peripheral for deep probing.
 ///
-/// Reads consecutive bytes starting at `reg_start` from SID 8, PID `pid`.
-/// Returns number of bytes successfully read (capped at 32).
+/// Reads consecutive bytes starting at `reg_start` from SID 8, PID `pid`. Returns number of bytes successfully read (capped at 32).
 pub fn read_sid8_regs(pid: u8, reg_start: u8, out: &mut [u8]) -> usize {
     use crate::spmi;
     let ppid = spmi::ppid(8, pid);
@@ -661,8 +569,7 @@ pub fn read_sid8_regs(pid: u8, reg_start: u8, out: &mut [u8]) -> usize {
 
 /// Probe the PMK8350 RTC via SPMI at SID=0, PID=G#61, offset=G#48.
 ///
-/// Returns `Some(unix_seconds)` if the arbiter grants HLOS access.
-/// RTC registers G#6148-G#614B are four consecutive bytes, LE = epoch seconds.
+/// Returns `Some(unix_seconds)` if the arbiter grants HLOS access. RTC registers G#6148-G#614B are four consecutive bytes, LE = epoch seconds.
 pub fn probe_rtc() -> Option<u32> {
     use crate::spmi;
     let rtc_ppid = spmi::ppid(0, 0x61); // PMK8350: SID=0, PID=G#61
@@ -744,8 +651,7 @@ pub fn probe_smp2p() -> Smp2pProbe {
 
 /// Clear the "stop" bit in SMP2P APPS→ADSP to signal readiness.
 ///
-/// If item 443 doesn't exist yet, allocates it in the APPS↔ADSP partition
-/// and creates a "master-kernel" entry with value 0 (stop cleared).
+/// If item 443 doesn't exist yet, allocates it in the APPS↔ADSP partition and creates a "master-kernel" entry with value 0 (stop cleared).
 ///
 /// If the item exists but has no "master-kernel" entry, appends one.
 ///
@@ -793,8 +699,7 @@ pub fn smp2p_clear_stop() -> bool {
         return false; // full
     }
 
-    // Item 443 not found — allocate in both (0,2) and (7,2) partitions.
-    // ADSP might look in either APPS(0) or APSS(7) partition for SMP2P.
+    // Item 443 not found — allocate in both (0,2) and (7,2) partitions. ADSP might look in either APPS(0) or APSS(7) partition for SMP2P.
     let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
     if ptable_magic != SMEM_PTABLE_MAGIC { return false; }
@@ -886,10 +791,7 @@ fn smp2p_entry_value_addr(item_addr: usize, valid_entries: u16, name: &[u8; 16])
     None
 }
 
-/// Probe IPCC state for diagnostics.
-/// Returns: (recv_id, pending signals read from RECV_ID register).
-/// Also reads all safe IPCC registers into `regs` (offset, value) pairs.
-/// `regs` should have at least 16 entries.
+/// Probe IPCC state for diagnostics. Returns: (recv_id, pending signals read from RECV_ID register). Also reads all safe IPCC registers into `regs` (offset, value) pairs. `regs` should have at least 16 entries.
 pub fn probe_ipcc(regs: &mut [(u32, u32)]) -> (u32, usize) {
     // Only offsets confirmed safe from prior testing
     const OFFSETS: &[u32] = &[0x00, 0x04];
@@ -909,17 +811,13 @@ pub fn probe_ipcc(regs: &mut [(u32, u32)]) -> (u32, usize) {
     (recv_id, n)
 }
 
-/// Enable IPCC receive signal for ADSP→APPS GLINK.
-/// This ensures the IPCC hardware knows APPS is listening for ADSP doorbells.
-/// Returns (recv_enable_ok, clear_ok) — false if MMIO access faulted.
+/// Enable IPCC receive signal for ADSP→APPS GLINK. This ensures the IPCC hardware knows APPS is listening for ADSP doorbells. Returns (recv_enable_ok, clear_ok) — false if MMIO access faulted.
 pub fn ipcc_enable_recv() -> (bool, bool) {
-    // These registers (0x14, 0x1C) may fault on some platforms.
-    // Read IPCC_REV first as a canary — if 0x00 faults, skip everything.
+    // These registers (0x14, 0x1C) may fault on some platforms. Read IPCC_REV first as a canary — if 0x00 faults, skip everything.
     let rev = unsafe { mmio::read32(IPCC_BASE) };
     if rev == 0 { return (false, false); }
 
-    // Try writing — no way to detect fault from bare-metal without exception count.
-    // Just write and hope. If it faults, the exception handler will resume.
+    // Try writing — no way to detect fault from bare-metal without exception count. Just write and hope. If it faults, the exception handler will resume.
     let adsp_glink: u32 = (3 << 16) | 0;
     unsafe {
         mmio::write32(IPCC_BASE + 0x1C, adsp_glink); // clear pending
@@ -939,8 +837,7 @@ pub fn ipcc_send(client: u32, signal: u32) {
 
 /// GLINK-over-SMEM transport to the ADSP charger_pd service.
 ///
-/// Obtain with [`PmicGlink::init`], then call [`open_channel`] before
-/// sending any BATTMGR requests.
+/// Obtain with [`PmicGlink::init`], then call [`open_channel`] before sending any BATTMGR requests.
 pub struct PmicGlink {
     desc:    usize, // address of 32-byte GLINK descriptor in SMEM
     tx_fifo: usize, // TX FIFO base (APPS writes, ADSP reads)
@@ -951,10 +848,7 @@ pub struct PmicGlink {
 impl PmicGlink {
     /// Locate SMEM GLINK items and return a driver handle.
     ///
-    /// Items 478 (descriptor) and 479 (ADSP TX FIFO) are allocated by the ADSP.
-    /// Item 480 (APPS TX FIFO = ADSP's RX) must be allocated by APPS if absent.
-    /// Allocation uses TCSR hardware spinlock 3, writes the entry header + zeroed
-    /// data, advances `offset_free_uncached`, then rings the ADSP doorbell.
+    /// Items 478 (descriptor) and 479 (ADSP TX FIFO) are allocated by the ADSP. Item 480 (APPS TX FIFO = ADSP's RX) must be allocated by APPS if absent. Allocation uses TCSR hardware spinlock 3, writes the entry header + zeroed data, advances `offset_free_uncached`, then rings the ADSP doorbell.
     ///
     /// Returns `None` if SMEM is not initialized or items 478/479 are missing.
     pub fn init() -> Option<Self> {
@@ -962,27 +856,21 @@ impl PmicGlink {
             return None;
         }
 
-        // SMP2P readiness: clear the "stop" bit in APPS→ADSP SMP2P (SMEM 443).
-        // ADSP waits for this signal before starting GLINK transport.
-        // Must happen before any GLINK activity.
+        // SMP2P readiness: clear the "stop" bit in APPS→ADSP SMP2P (SMEM 443). ADSP waits for this signal before starting GLINK transport. Must happen before any GLINK activity.
         smp2p_clear_stop();
         // Give ADSP time to process SMP2P signal and start GLINK transport.
         for _ in 0..1_000_000u32 {
             unsafe { core::arch::asm!("nop") };
         }
 
-        // Signal APPS SMEM readiness: write SMEM_PROTOCOL_VERSION to versions[0].
-        // ADSP's charger_pd checks this before starting the GLINK handshake.
-        // versions[7] is set by ABL; versions[0] = APPS (us) signaling we're up.
+        // Signal APPS SMEM readiness: write SMEM_PROTOCOL_VERSION to versions[0]. ADSP's charger_pd checks this before starting the GLINK handshake. versions[7] is set by ABL; versions[0] = APPS (us) signaling we're up.
         unsafe { mmio::write32(SMEM_BASE + SMEM_VERSION_OFF, 0x000C_0000) };
         // Ring ADSP doorbell immediately after version write so charger_pd wakes up.
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
         }
 
-        // All three items must come from the same private partition.
-        // Partition-centric init: find ADSP partition (host 2).
-        // ADSP is confirmed running: SMEM version[7]=0xC0000 (SMEM_GLOBAL_PART_VERSION).
+        // All three items must come from the same private partition. Partition-centric init: find ADSP partition (host 2). ADSP is confirmed running: SMEM version[7]=0xC0000 (SMEM_GLOBAL_PART_VERSION).
         let ptable_base    = SMEM_BASE + SMEM_PTABLE_OFF;
         let ptable_magic   = unsafe { mmio::read32(ptable_base) };
         if ptable_magic != SMEM_PTABLE_MAGIC { return None; }
@@ -1000,8 +888,7 @@ impl PmicGlink {
                                         free_cac as usize, part_size as usize,
                                         SMEM_ITEM_ADSP_TX)?;
 
-        // Item 480 = APPS TX FIFO (APPS writes → ADSP reads).
-        // Reload free_unc from partition header in case a previous boot already allocated it.
+        // Item 480 = APPS TX FIFO (APPS writes → ADSP reads). Reload free_unc from partition header in case a previous boot already allocated it.
         let free_unc_cur = unsafe { mmio::read32(part_base + 12) };
         let free_cac_cur = unsafe { mmio::read32(part_base + 16) };
         let tx_fifo_was_new;
@@ -1019,8 +906,7 @@ impl PmicGlink {
                 addr
             }
         };
-        // Always ring doorbell after ensuring tx_fifo exists — ADSP needs this
-        // to start charger_pd even if item 480 was pre-allocated from a prior session.
+        // Always ring doorbell after ensuring tx_fifo exists — ADSP needs this to start charger_pd even if item 480 was pre-allocated from a prior session.
         let _ = tx_fifo_was_new; // suppress unused warning
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
@@ -1030,17 +916,7 @@ impl PmicGlink {
             unsafe { core::arch::asm!("nop") };
         }
 
-        // Synchronise descriptor for a clean handshake.
-        // SMEM survives warm reboots so pointers may be stale from a prior
-        // session.  Reset only the fields we own:
-        //   desc[0]  APPS rx_tail  — reset to 0: start reading ADSP TX from beginning.
-        //                            CRITICAL: do NOT set to adsp_tx_head — that would
-        //                            skip ADSP's pre-written VERSION frame and break the
-        //                            handshake (we'd never send VERSION_ACK to ADSP).
-        //   desc[4]  ADSP tx_head  — ADSP owns this; NEVER overwrite.
-        //   desc[8]  ADSP rx_tail  — reset to 0: ADSP re-reads APPS TX from start.
-        //   desc[12] APPS tx_head  — reset to 0: we write item 480 from position 0.
-        // Also zero the APPS TX FIFO so ADSP cannot read leftover bytes.
+        // Synchronise descriptor for a clean handshake. SMEM survives warm reboots so pointers may be stale from a prior session.  Reset only the fields we own: desc[0]  APPS rx_tail  — reset to 0: start reading ADSP TX from beginning. CRITICAL: do NOT set to adsp_tx_head — that would skip ADSP's pre-written VERSION frame and break the handshake (we'd never send VERSION_ACK to ADSP). desc[4]  ADSP tx_head  — ADSP owns this; NEVER overwrite. desc[8]  ADSP rx_tail  — reset to 0: ADSP re-reads APPS TX from start. desc[12] APPS tx_head  — reset to 0: we write item 480 from position 0. Also zero the APPS TX FIFO so ADSP cannot read leftover bytes.
         unsafe {
             mmio::write32(desc + 0,  0); // APPS rx_tail = 0: read from ADSP TX start
             // desc + 4: ADSP tx_head — left as-is
@@ -1092,17 +968,11 @@ impl PmicGlink {
 
     /// Run GLINK VERSION + OPEN handshake to open "PMIC_RTR_ADSP_APPS".
     ///
-    /// Handles all four GLINK control messages in a polling loop. The ADSP
-    /// may have already queued a VERSION packet (ABL leaves GLINK live); we
-    /// process whatever is pending and respond in order.
+    /// Handles all four GLINK control messages in a polling loop. The ADSP may have already queued a VERSION packet (ABL leaves GLINK live); we process whatever is pending and respond in order.
     ///
     /// Returns `true` if the channel is fully open (OPEN_ACK received).
     pub fn open_channel(&mut self) -> bool {
-        // Send our VERSION.  ADSP may have pre-written its own VERSION (desc[4]
-        // nonzero) or may be waiting for APPS to go first.  We send immediately
-        // and ring the doorbell to prod ADSP.  If ADSP is slow to start (e.g.
-        // charger_pd not yet running), we re-ring the doorbell every 500K
-        // iterations throughout the poll loop to ensure ADSP wakes up.
+        // Send our VERSION.  ADSP may have pre-written its own VERSION (desc[4] nonzero) or may be waiting for APPS to go first.  We send immediately and ring the doorbell to prod ADSP.  If ADSP is slow to start (e.g. charger_pd not yet running), we re-ring the doorbell every 500K iterations throughout the poll loop to ensure ADSP wakes up.
         self.tx_push_version();
         self.ring_doorbell();
 
@@ -1111,8 +981,7 @@ impl PmicGlink {
         let mut got_open_ack     = false;
 
         for i in 0..POLL_MAX {
-            // Re-ring the doorbell every 500K iterations to prod ADSP.
-            // Covers slow ADSP startup and any missed interrupts.
+            // Re-ring the doorbell every 500K iterations to prod ADSP. Covers slow ADSP startup and any missed interrupts.
             if i % 500_000 == 499_999 {
                 self.ring_doorbell();
             }
@@ -1154,8 +1023,7 @@ impl PmicGlink {
 
     /// Request a full battery snapshot (voltage, SOC, current, temp).
     ///
-    /// Sends BATTMGR_BAT_STATUS (opcode G#01) and waits for the response.
-    /// Returns `None` on timeout or if the channel is not open.
+    /// Sends BATTMGR_BAT_STATUS (opcode G#01) and waits for the response. Returns `None` on timeout or if the channel is not open.
     pub fn bat_status(&mut self) -> Option<BatStatus> {
         // BatStatusRequest: PmicGlinkHdr(12) + battery_id:u32(4) = 16 bytes
         let mut req = [0u8; 16];
@@ -1176,15 +1044,7 @@ impl PmicGlink {
             let opcode = read_u32(&p[8..]);
             if owner != OWNER_BATTMGR || opcode != OP_BAT_STATUS { continue; }
 
-            // BatStatusResponse layout (offsets from payload start):
-            //  [0..12]  PmicGlinkHdr
-            //  [12..16] battery_state
-            //  [16..20] capacity (percent)
-            //  [20..24] rate (mA)
-            //  [24..28] battery_voltage (mV)
-            //  [28..32] power_state (skip)
-            //  [32..36] charging_source
-            //  [36..40] temperature (tenths K)
+            // BatStatusResponse layout (offsets from payload start): [0..12]  PmicGlinkHdr [12..16] battery_state [16..20] capacity (percent) [20..24] rate (mA) [24..28] battery_voltage (mV) [28..32] power_state (skip) [32..36] charging_source [36..40] temperature (tenths K)
             return Some(BatStatus {
                 state:         read_u32(&p[12..]),
                 capacity_pct:  read_u32(&p[16..]),
@@ -1199,8 +1059,7 @@ impl PmicGlink {
 
     /// Read a single battery property via BATTMGR_BAT_PROPERTY_GET (opcode G#30).
     ///
-    /// Use the `PROP_*` constants for `property`. Returns the raw value on
-    /// success (µV for voltage, µA for current, percent for capacity, etc.).
+    /// Use the `PROP_*` constants for `property`. Returns the raw value on success (µV for voltage, µA for current, percent for capacity, etc.).
     pub fn property_get(&mut self, property: u32) -> Option<u32> {
         // PropertyGetRequest: PmicGlinkHdr(12) + battery:u32 + property:u32 + value:u32 = 24 bytes
         let mut req = [0u8; 24];
@@ -1285,8 +1144,7 @@ impl PmicGlink {
     }
 
     fn tx_push_open(&mut self) {
-        // OPEN: 8-byte header + channel name (19 bytes), padded to 8-byte align.
-        // align8(8 + 19) = align8(27) = 32 bytes.
+        // OPEN: 8-byte header + channel name (19 bytes), padded to 8-byte align. align8(8 + 19) = align8(27) = 32 bytes.
         let name_len = CHANNEL_NAME.len() as u32; // 19
         let total = align8(8 + CHANNEL_NAME.len()); // 32
         let mut buf = [0u8; 32];
@@ -1307,10 +1165,7 @@ impl PmicGlink {
 
     /// Wrap a pmic-glink payload in a TX_DATA frame and push to TX FIFO.
     ///
-    /// TX_DATA header (16 bytes) + payload are written as two separate
-    /// [`tx_write`] calls. Because the header is 16 bytes (already aligned),
-    /// the total frame in the FIFO is 16 + align8(payload.len()), which equals
-    /// align8(16 + payload.len()) — correct for GLINK intentless mode.
+    /// TX_DATA header (16 bytes) + payload are written as two separate [`tx_write`] calls. Because the header is 16 bytes (already aligned), the total frame in the FIFO is 16 + align8(payload.len()), which equals align8(16 + payload.len()) — correct for GLINK intentless mode.
     fn tx_push_data(&mut self, payload: &[u8]) {
         let mut hdr = [0u8; 16];
         write_u16(&mut hdr[0..], GLINK_CMD_TX_DATA);
@@ -1326,8 +1181,7 @@ impl PmicGlink {
     // Low-level FIFO I/O
     // -----------------------------------------------------------------------
 
-    /// Write `data` to TX FIFO (byte-by-byte, wrapping), pad to 8-byte
-    /// alignment with zeros, then advance tx_head.
+    /// Write `data` to TX FIFO (byte-by-byte, wrapping), pad to 8-byte alignment with zeros, then advance tx_head.
     fn tx_write(&mut self, data: &[u8]) {
         let head = self.tx_head() as usize;
         for (i, &b) in data.iter().enumerate() {
@@ -1343,8 +1197,7 @@ impl PmicGlink {
 
     /// Try to read the next complete GLINK frame from RX FIFO.
     ///
-    /// Returns `None` if the FIFO is empty or the frame is incomplete.
-    /// On success the rx_tail is advanced past the consumed frame.
+    /// Returns `None` if the FIFO is empty or the frame is incomplete. On success the rx_tail is advanced past the consumed frame.
     fn rx_read_msg(&mut self) -> Option<GlinkMsg> {
         let head  = self.rx_head() as usize;
         let tail  = self.rx_tail() as usize;
@@ -1413,11 +1266,7 @@ impl PmicGlink {
     // GLINK descriptor accessors
     // -----------------------------------------------------------------------
 
-    // Descriptor from ADSP's perspective:
-    //   [0]  ADSP tx_tail = APPS rx_tail (APPS advances consuming ADSP TX)
-    //   [4]  ADSP tx_head = APPS rx_head (ADSP advances writing to item 479)
-    //   [8]  ADSP rx_tail = APPS tx_tail (ADSP advances consuming APPS TX)
-    //  [12]  ADSP rx_head = APPS tx_head (APPS advances writing to item 480)
+    // Descriptor from ADSP's perspective: [0]  ADSP tx_tail = APPS rx_tail (APPS advances consuming ADSP TX) [4]  ADSP tx_head = APPS rx_head (ADSP advances writing to item 479) [8]  ADSP rx_tail = APPS tx_tail (ADSP advances consuming APPS TX) [12]  ADSP rx_head = APPS tx_head (APPS advances writing to item 480)
     fn tx_head(&self) -> u32 { unsafe { mmio::read32(self.desc + 12) } }
     fn rx_head(&self) -> u32 { unsafe { mmio::read32(self.desc + 4) } }
     fn rx_tail(&self) -> u32 { unsafe { mmio::read32(self.desc + 0) } }
@@ -1426,8 +1275,7 @@ impl PmicGlink {
     fn set_rx_tail(&self, v: u32) { unsafe { mmio::write32(self.desc + 0, v) } }
 
     fn ring_doorbell(&self) {
-        // Try all three ADSP signal IDs — GLINK_TXN signal number on SM7325 unknown.
-        // IPCC write is write-only; hardware clears immediately so rapid succession is fine.
+        // Try all three ADSP signal IDs — GLINK_TXN signal number on SM7325 unknown. IPCC write is write-only; hardware clears immediately so rapid succession is fine.
         unsafe {
             mmio::write32(IPCC_SEND_ID, ADSP_DOORBELL);
             // Signal 0 only — GLINK_QMP is the standard doorbell.
@@ -1439,8 +1287,7 @@ impl PmicGlink {
         unsafe { mmio::write32(IPCC_SEND_ID, (client << 16) | signal) };
     }
 
-    /// Dump IPCC registers for diagnostics (confirmed safe offsets only).
-    /// Returns (offset, value) pairs for all probed offsets.
+    /// Dump IPCC registers for diagnostics (confirmed safe offsets only). Returns (offset, value) pairs for all probed offsets.
     pub fn dump_ipcc(out: &mut [(u32, u32)]) -> usize {
         // Only offsets confirmed non-crashing from prior testing:
         const SAFE_OFFSETS: &[u32] = &[0x000, 0x004, 0x100, 0x104, 0x108, 0x10C, 0x110, 0x114];
@@ -1454,8 +1301,7 @@ impl PmicGlink {
         n
     }
 
-    /// Write a GLINK VERSION frame to the TX FIFO without ringing any doorbell.
-    /// Returns new tx_head after the write.
+    /// Write a GLINK VERSION frame to the TX FIFO without ringing any doorbell. Returns new tx_head after the write.
     pub fn push_version_silent(&mut self) -> u32 {
         self.tx_push_version();
         self.tx_head()
@@ -1468,9 +1314,7 @@ impl PmicGlink {
 
 /// Allocate a new private entry in the APPS↔ADSP partition.
 ///
-/// Writes a `smem_private_entry` header at `offset_free_uncached`,
-/// zeros the `data_size` bytes of payload, then advances
-/// `partition_header->offset_free_uncached`.
+/// Writes a `smem_private_entry` header at `offset_free_uncached`, zeros the `data_size` bytes of payload, then advances `partition_header->offset_free_uncached`.
 ///
 /// Returns the address of the allocated data region on success, `None` on failure.
 ///
@@ -1494,13 +1338,7 @@ fn smem_alloc_private_item(part_base: usize, part_size: usize,
     let entry_addr = part_base + free_unc;
     let data_addr  = entry_addr + 16;
 
-    // Write smem_private_entry header (16 bytes, LE):
-    //   [0..1]  canary       = 0xa5a5
-    //   [2..3]  item         = item as u16
-    //   [4..7]  size         = padded (data size incl. padding_data)
-    //   [8..9]  padding_data = pad_bytes
-    //   [10..11] padding_hdr = 0
-    //   [12..15] reserved    = 0
+    // Write smem_private_entry header (16 bytes, LE): [0..1]  canary       = 0xa5a5 [2..3]  item         = item as u16 [4..7]  size         = padded (data size incl. padding_data) [8..9]  padding_data = pad_bytes [10..11] padding_hdr = 0 [12..15] reserved    = 0
     unsafe {
         mmio::write16(entry_addr + 0,  SMEM_PRIVATE_CANARY);
         mmio::write16(entry_addr + 2,  item as u16);
@@ -1516,8 +1354,7 @@ fn smem_alloc_private_item(part_base: usize, part_size: usize,
     }
     dsb();
 
-    // Advance partition header's offset_free_uncached.
-    // Partition header layout: magic(4)+host0(2)+host1(2)+size(4)+ofs_unc(4)+ofs_cac(4)+...
+    // Advance partition header's offset_free_uncached. Partition header layout: magic(4)+host0(2)+host1(2)+size(4)+ofs_unc(4)+ofs_cac(4)+...
     unsafe { mmio::write32(part_base + 12, new_free as u32) };
     dsb();
 
@@ -1530,8 +1367,7 @@ fn smem_toc_ptr(item: usize) -> usize {
     SMEM_BASE + SMEM_TOC_OFF + item * SMEM_TOC_STRIDE
 }
 
-/// Return the SMEM data pointer for `item`: tries global heap first, then
-/// the APPS↔ADSP private partition (where GLINK items live on modern SMEM).
+/// Return the SMEM data pointer for `item`: tries global heap first, then the APPS↔ADSP private partition (where GLINK items live on modern SMEM).
 fn smem_item_ptr(item: usize) -> Option<usize> {
     // Global heap.
     let entry = smem_toc_ptr(item);
@@ -1544,9 +1380,7 @@ fn smem_item_ptr(item: usize) -> Option<usize> {
     let ptable_magic   = unsafe { mmio::read32(ptable_base) };
     if ptable_magic != SMEM_PTABLE_MAGIC { return None; }
     let ptable_entries = unsafe { mmio::read32(ptable_base + 8) } as usize;
-    // Private partitions — check all relevant host pairs.
-    // Host 0 = APPS (legacy), Host 7 = APSS (newer SoCs like QCM6490).
-    // SMP2P items may be in (7,2) APSS↔ADSP rather than (0,2) APPS↔ADSP.
+    // Private partitions — check all relevant host pairs. Host 0 = APPS (legacy), Host 7 = APSS (newer SoCs like QCM6490). SMP2P items may be in (7,2) APSS↔ADSP rather than (0,2) APPS↔ADSP.
     for &(host_a, host_b) in &[(0u16, 5u16), (0, 2), (7, 2), (7, 5)] {
         let (part_off, part_size, part_magic, free_unc, free_cac) =
             find_host_partition(ptable_base, ptable_entries, host_a, host_b);
@@ -1562,18 +1396,9 @@ fn smem_item_ptr(item: usize) -> Option<usize> {
 
 /// Scan ptable for the APPS(0)↔ADSP(2) private partition.
 ///
-/// Returns (part_off, part_size, part_magic, offset_free_uncached, offset_free_cached).
-/// part_off = G#FFFFFFFF if not found.
+/// Returns (part_off, part_size, part_magic, offset_free_uncached, offset_free_cached). part_off = G#FFFFFFFF if not found.
 ///
-/// Private partition smem_partition_header layout (32 bytes):
-///   [0]  magic                u32 = G#54525024
-///   [4]  host0                u16
-///   [6]  host1                u16
-///   [8]  size                 u32
-///   [12] offset_free_uncached u32 — uncached items grow UP from partition_base+32
-///   [16] offset_free_cached   u32 — cached items grow DOWN from partition_base+part_size
-///   [20] reserved[3]         u32
-/// Find the private partition for (host_a, host_b) — order-insensitive.
+/// Private partition smem_partition_header layout (32 bytes): [0]  magic                u32 = G#54525024 [4]  host0                u16 [6]  host1                u16 [8]  size                 u32 [12] offset_free_uncached u32 — uncached items grow UP from partition_base+32 [16] offset_free_cached   u32 — cached items grow DOWN from partition_base+part_size [20] reserved[3]         u32 Find the private partition for (host_a, host_b) — order-insensitive.
 fn find_host_partition(ptable_base: usize, num_entries: usize,
                        host_a: u16, host_b: u16) -> (u32, u32, u32, u32, u32) {
     let entries_base = ptable_base + SMEM_PTABLE_HDR_SIZE;
@@ -1599,8 +1424,7 @@ fn find_adsp_partition(ptable_base: usize, num_entries: usize) -> (u32, u32, u32
     find_host_partition(ptable_base, num_entries, 0, 2)
 }
 
-/// Walk one region of a private partition looking for `item`.
-/// Scans smem_private_entry records starting at `start` up to `end` (exclusive).
+/// Walk one region of a private partition looking for `item`. Scans smem_private_entry records starting at `start` up to `end` (exclusive).
 fn walk_private_region(start: usize, end: usize, item: usize) -> Option<usize> {
     let mut cur = start;
     while cur + 16 <= end {
@@ -1623,8 +1447,7 @@ fn walk_private_region(start: usize, end: usize, item: usize) -> Option<usize> {
 ///
 /// - Uncached region: entries grow UP from partition_base+32 to free_uncached.
 /// - Cached region:   entries grow DOWN from partition end; occupied range is
-///   [free_cached, part_size). Walk it forward (entries are stored in reverse
-///   allocation order but each entry header still points to the next one up).
+///   [free_cached, part_size). Walk it forward (entries are stored in reverse allocation order but each entry header still points to the next one up).
 fn find_private_item(part_base: usize, free_uncached: usize,
                      free_cached: usize, part_size: usize, item: usize) -> Option<usize> {
     // Uncached region (items grow from the start).

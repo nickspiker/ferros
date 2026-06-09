@@ -1,11 +1,8 @@
 //! Framebuffer console — text rendering on a linear XRGB8888 framebuffer.
 //!
-//! Uses an embedded 8x16 bitmap font (printable ASCII 0x20-0x7E).
-//! All output is hex — no decimal formatting, no `core::fmt` bloat.
+//! Uses an embedded 8x16 bitmap font (printable ASCII 0x20-0x7E). All output is hex — no decimal formatting, no `core::fmt` bloat.
 
-/// 8x16 bitmap font for printable ASCII (0x20 through 0x7E = 95 chars).
-/// Each character: 16 bytes, one per scanline, MSB = leftmost pixel.
-/// Source: classic VGA/BIOS 8x16 font (public domain).
+/// 8x16 bitmap font for printable ASCII (0x20 through 0x7E = 95 chars). Each character: 16 bytes, one per scanline, MSB = leftmost pixel. Source: classic VGA/BIOS 8x16 font (public domain).
 const FONT_FIRST: u8 = 0x20;
 const FONT_LAST: u8 = 0x7E;
 const GLYPH_W: usize = 8;
@@ -226,8 +223,7 @@ impl Console {
     /// Create a new console on a framebuffer with margins for rounded corners/notch.
     ///
     /// # Safety
-    /// `fb` must point to a valid XRGB8888 framebuffer of at least
-    /// `stride * height` pixels.
+    /// `fb` must point to a valid XRGB8888 framebuffer of at least `stride * height` pixels.
     pub const unsafe fn new(
         fb: *mut u32,
         width: usize,
@@ -269,8 +265,7 @@ impl Console {
         self.row = 0;
     }
 
-    /// Draw a single character at text position (col, row) within the margin area.
-    /// Scale factor 2 = double size.
+    /// Draw a single character at text position (col, row) within the margin area. Scale factor 2 = double size.
     const SCALE: usize = 2;
 
     fn draw_char(&self, ch: u8, col: usize, row: usize) {
@@ -395,7 +390,6 @@ impl Console {
     }
 }
 
-// Console is used from a single-core kernel — no Send/Sync needed for safety,
-// but we need it for static storage.
+// Console is used from a single-core kernel — no Send/Sync needed for safety, but we need it for static storage.
 unsafe impl Send for Console {}
 unsafe impl Sync for Console {}

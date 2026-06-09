@@ -10,13 +10,15 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 vsf = { path = "../../vsf", default-features = false, features = ["crypto"], optional = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"], optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
+voca = { path = "../../voca", optional = true }
+num-bigint = { version = "0.4", optional = true }
 
 [features]
 default = ["std"]
 std = ["blake3/std"]
 alloc = []  # enables Vec/String via extern crate alloc
-# Linux single-file vault backend: stores the entire object store + anchor ring inside one VSF-wrapped file. Pulls in `std`, the vsf crate (for the outer wrapper), `chacha20poly1305` (per-key encryption of payload bytes before hashing), and `rand` (random sibling-tmp filenames for atomic rename + nonce generation). Provides PermissiveCapabilityEngine + SingleDeviceMeshEngine stubs so Photon's Ledger compiles with the same type signature it will use on real ferros hardware later.
-host-file = ["std", "alloc", "dep:vsf", "dep:rand", "dep:chacha20poly1305"]
+# Linux single-file vault backend: stores the entire object store + anchor ring inside one VSF-wrapped file. Pulls in `std`, the vsf crate (for the outer wrapper), `chacha20poly1305` (per-key encryption of payload bytes before hashing), and `rand` (random sibling-tmp filenames for atomic rename + nonce generation), and `voca`/`num-bigint` (vaultinfo accepts voca-encoded keys alongside hex). Provides PermissiveCapabilityEngine + SingleDeviceMeshEngine stubs so Photon's Ledger compiles with the same type signature it will use on real ferros hardware later.
+host-file = ["std", "alloc", "dep:vsf", "dep:rand", "dep:chacha20poly1305", "dep:voca", "dep:num-bigint"]
 
 # Binary inspector for vault files. Companion to vsfinfo: vsfinfo shows the outer VSF wrapper, vaultinfo decodes the inner vault structure (anchors, object envelopes, root_commit). Lives here (not in vsf) because the inspector knows ferros_vault's binary format and vsf already depends on nothing that pulls this in.
 [[bin]]

@@ -1,10 +1,8 @@
 //! DWC3 USB device-mode driver for Apple M1.
 //!
-//! Synopsys DWC3 with Apple ATCPHY, PipeHandler, and DART IOMMU.
-//! Implements the `UsbBulk` trait for Photon Transport.
+//! Synopsys DWC3 with Apple ATCPHY, PipeHandler, and DART IOMMU. Implements the `UsbBulk` trait for Photon Transport.
 //!
-//! Register base addresses must be read from the Apple Device Tree (ADT)
-//! and passed to `M1Usb::init()`. Use `tools/m1n1-boot.py` to dump them.
+//! Register base addresses must be read from the Apple Device Tree (ADT) and passed to `M1Usb::init()`. Use `tools/m1n1-boot.py` to dump them.
 
 use ferros_hal::mmio;
 use ferros_hal::{UsbBulk, UsbEvent};
@@ -179,8 +177,7 @@ static mut SCRATCHPAD: Scratchpad = Scratchpad { data: [0; 16384] };
 // USB Descriptors — ferros M1 device
 // ---------------------------------------------------------------------------
 
-// VID/PID: 0x1209/0x4665 (pid.codes, ferros — assigned via pid.codes PR #1208 on 2026-05-13).
-// Same PID used by every ferros-shipped USB device. The VSF document's "PIPE message" section disambiguates protocol/role; PID-level multiplexing isn't needed.
+// VID/PID: 0x1209/0x4665 (pid.codes, ferros — assigned via pid.codes PR #1208 on 2026-05-13). Same PID used by every ferros-shipped USB device. The VSF document's "PIPE message" section disambiguates protocol/role; PID-level multiplexing isn't needed.
 static DEVICE_DESC: [u8; 18] = [
     18, 1,       // bLength, bDescriptorType (DEVICE)
     0x00, 0x02,  // bcdUSB (2.00)
@@ -406,10 +403,7 @@ impl M1Usb {
 
     /// Initialize the M1 DWC3 USB controller.
     ///
-    /// Full bringup: ATCPHY, PipeHandler, core+PHY reset, DART, endpoints.
-    /// PMGR power domains are still active from m1n1.
-    /// Initialize with a pre-computed DMA offset.
-    /// Call `setup_dart()` first to configure the DART and get the offset.
+    /// Full bringup: ATCPHY, PipeHandler, core+PHY reset, DART, endpoints. PMGR power domains are still active from m1n1. Initialize with a pre-computed DMA offset. Call `setup_dart()` first to configure the DART and get the offset.
     pub fn init(addrs: &M1UsbAddrs, dma_offset: i64) -> Option<Self> {
         let base = addrs.dwc3;
 
@@ -420,25 +414,18 @@ impl M1Usb {
             return None;
         }
 
-        // Phase 1: DART setup from kernel.
-        // m1n1's usb_iodev_shutdown calls dart_shutdown which zeroes TTBRs.
-        // We must set up the DART fresh.
+        // Phase 1: DART setup from kernel. m1n1's usb_iodev_shutdown calls dart_shutdown which zeroes TTBRs. We must set up the DART fresh.
         //
-        // First check: is the DART locked? If so, we can't program TTBRs.
-        // Read DART state before we touch it (dart_base0 is the primary bank)
+        // First check: is the DART locked? If so, we can't program TTBRs. Read DART state before we touch it (dart_base0 is the primary bank)
         let dart_config = unsafe { mmio::read32(addrs.dart_base0 + 0x60) };
         let dart_tcr0 = unsafe { mmio::read32(addrs.dart_base0 + 0x100) };
         let dart_ttbr0 = unsafe { mmio::read32(addrs.dart_base0 + 0x200) };
-        // Store for kernel diagnostic printing
-        // (we'll expose these via the M1Usb struct)
+        // Store for kernel diagnostic printing (we'll expose these via the M1Usb struct)
 
-        // DART is set up by kernel_main before calling init().
-        // dma_offset converts physical addresses to < 4GB IOVAs.
+        // DART is set up by kernel_main before calling init(). dma_offset converts physical addresses to < 4GB IOVAs.
         let l1_readback: u64 = 0;
 
-        // Phase 2: Device-mode reconfigure only. No PHY/core reset.
-        // m1n1 left PHY powered (PMGR domains stay active after usb_iodev_shutdown).
-        // Just CSFTRST to reset the device state machine, then reconfigure.
+        // Phase 2: Device-mode reconfigure only. No PHY/core reset. m1n1 left PHY powered (PMGR domains stay active after usb_iodev_shutdown). Just CSFTRST to reset the device state machine, then reconfigure.
         unsafe {
             // Ensure device mode
             let gctl = mmio::read32(base + GCTL);

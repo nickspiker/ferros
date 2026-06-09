@@ -5,15 +5,13 @@
 //!   2. Order: global_seq + cat_seq + eagle_time + prev_hash
 //!   3. Payload: level + structured event
 //!
-//! The entry is hashed with BLAKE3 to produce its provenance hash,
-//! which the next entry references as prev_hash.
+//! The entry is hashed with BLAKE3 to produce its provenance hash, which the next entry references as prev_hash.
 
 use crate::category::Category;
 use crate::event::Event;
 use crate::ewe;
 
-/// Maximum serialized entry size. Entries that exceed this are rejected.
-/// 512 bytes is generous for current event types.
+/// Maximum serialized entry size. Entries that exceed this are rejected. 512 bytes is generous for current event types.
 pub const MAX_ENTRY_SIZE: usize = 512;
 
 /// A 32-byte BLAKE3 hash.
@@ -30,8 +28,7 @@ pub fn genesis_prev_hash() -> Hash {
 
 /// A complete ledger entry, serialized into a fixed buffer.
 ///
-/// The entry bytes are the canonical representation — hashing these
-/// bytes produces the entry's provenance hash.
+/// The entry bytes are the canonical representation — hashing these bytes produces the entry's provenance hash.
 pub struct Entry {
     /// Serialized entry data.
     pub data: [u8; MAX_ENTRY_SIZE],
@@ -43,8 +40,7 @@ pub struct Entry {
 
 /// Build a ledger entry.
 ///
-/// `cap_hash` and `sig` are placeholder fields (populated but not
-/// validated until the capability system is online).
+/// `cap_hash` and `sig` are placeholder fields (populated but not validated until the capability system is online).
 pub fn build_entry(
     category: Category,
     global_seq: u64,
@@ -57,8 +53,7 @@ pub fn build_entry(
     let mut buf = [0u8; MAX_ENTRY_SIZE];
     let mut pos = 0;
 
-    // ---- Schema identifier ----
-    // 'l' tag + length + "ferros.ledger"
+    // ---- Schema identifier ---- 'l' tag + length + "ferros.ledger"
     let schema = b"ferros.ledger";
     if pos + 2 + schema.len() > MAX_ENTRY_SIZE {
         return None;
@@ -70,8 +65,7 @@ pub fn build_entry(
     buf[pos..pos + schema.len()].copy_from_slice(schema);
     pos += schema.len();
 
-    // ---- Identity section ----
-    // Category path
+    // ---- Identity section ---- Category path
     let cat_bytes = category.as_bytes();
     if pos + 2 + cat_bytes.len() > MAX_ENTRY_SIZE {
         return None;
@@ -101,8 +95,7 @@ pub fn build_entry(
     buf[pos..pos + 32].copy_from_slice(sig);
     pos += 32;
 
-    // ---- Order section ----
-    // Global sequence (EWE)
+    // ---- Order section ---- Global sequence (EWE)
     if pos + 10 > MAX_ENTRY_SIZE {
         return None;
     }
@@ -129,8 +122,7 @@ pub fn build_entry(
     buf[pos..pos + 32].copy_from_slice(prev_hash);
     pos += 32;
 
-    // ---- Payload section ----
-    // Event payload
+    // ---- Payload section ---- Event payload
     if pos + 1 > MAX_ENTRY_SIZE {
         return None;
     }

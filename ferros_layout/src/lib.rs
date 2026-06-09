@@ -1,10 +1,8 @@
 //! Partition layout and shared constants for ferros.
 //!
-//! All block addresses are 4KB-aligned (UFS native block size).
-//! Same layout on UFS and SD — the kernel mirrors everything.
+//! All block addresses are 4KB-aligned (UFS native block size). Same layout on UFS and SD — the kernel mirrors everything.
 //!
-//! Edit these constants to resize rings or move regions.
-//! All crates import from here — one edit, one rebuild.
+//! Edit these constants to resize rings or move regions. All crates import from here — one edit, one rebuild.
 
 #![no_std]
 
@@ -21,8 +19,7 @@ pub const fn block_to_bytes(block: u32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Seed (loaded by ABL from boot_a / boot_b partitions, not from these blocks)
-// These are for writing seed copies to UFS data partition for recovery.
+// Seed (loaded by ABL from boot_a / boot_b partitions, not from these blocks) These are for writing seed copies to UFS data partition for recovery.
 // ---------------------------------------------------------------------------
 
 /// Seed copy A — block offset on UFS data partition.
@@ -107,9 +104,7 @@ pub const LEDGER_RING_SIZE: u32 = 1 << 18; // 262144 = 1GB
 /// First block of the tract. Everything before this is ring/reserved.
 pub const TRACT_BASE: u32 = 0xC_0000;
 
-/// Last block (exclusive) of the tract. UFS LUN0 = 60.8M blocks (G#3A10800),
-/// but we round down to a power-of-2 boundary for clean wrapping.
-/// G#3A0_0000 = 60,817,408 blocks ≈ 232GB usable tract.
+/// Last block (exclusive) of the tract. UFS LUN0 = 60.8M blocks (G#3A10800), but we round down to a power-of-2 boundary for clean wrapping. G#3A0_0000 = 60,817,408 blocks ≈ 232GB usable tract.
 pub const TRACT_END: u32 = 0x3A0_0000;
 
 /// Number of blocks in the tract. Power of 2 not required — plow wraps with %.
@@ -122,8 +117,7 @@ pub const HAMT_BASE: u32 = TRACT_BASE;
 // DRAM addresses
 // ---------------------------------------------------------------------------
 
-/// Kernel load address in DRAM. The seed loads the kernel here and jumps.
-/// Must match the kernel's linker script (_start address).
+/// Kernel load address in DRAM. The seed loads the kernel here and jumps. Must match the kernel's linker script (_start address).
 pub const KERNEL_DRAM_BASE: usize = 0x8008_0000;
 
 /// Staging area for hot-reload (kernel loads new image here before jumping).

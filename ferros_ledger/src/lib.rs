@@ -1,11 +1,8 @@
 //! # Ferros Ledger
 //!
-//! Append-only event chain. Every entry is a BLAKE3-chained record with
-//! identity, ordering, and structured payload sections.
+//! Append-only event chain. Every entry is a BLAKE3-chained record with identity, ordering, and structured payload sections.
 //!
-//! `no_std`, no alloc. Fixed-capacity chains backed by static buffers.
-//! The kernel is the ledger daemon — subsystems get handles with
-//! category-scoped capabilities.
+//! `no_std`, no alloc. Fixed-capacity chains backed by static buffers. The kernel is the ledger daemon — subsystems get handles with category-scoped capabilities.
 
 #![no_std]
 

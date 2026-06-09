@@ -1,15 +1,11 @@
 //! Qualcomm SPMI PMIC Arbiter v7 driver.
 //!
-//! SPMI (System Power Management Interface) connects the SoC to PMICs.
-//! The arbiter translates SPMI read/write commands to MMIO register accesses.
+//! SPMI (System Power Management Interface) connects the SoC to PMICs. The arbiter translates SPMI read/write commands to MMIO register accesses.
 //!
 //! ## QCM6490 SPMI layout
 //!
 //! ```text
-//! Core:    0x0C44_0000
-//! Chnls:   0x0C60_0000  (write channels, +0x1000 per APID)
-//! Obsrvr:  0x0E60_0000  (read channels)
-//! APID map: Core + 0x2000 (+4 per entry)
+//! Core:    0x0C44_0000 Chnls:   0x0C60_0000  (write channels, +0x1000 per APID) Obsrvr:  0x0E60_0000  (read channels) APID map: Core + 0x2000 (+4 per entry)
 //! ```
 //!
 //! ## Usage
@@ -52,8 +48,7 @@ const POLL_MAX: u32 = 100_000;
 // PPID construction
 // ---------------------------------------------------------------------------
 
-/// Construct a PPID (Peripheral Port ID) from SID and PID.
-/// PPID = (SID << 8) | PID
+/// Construct a PPID (Peripheral Port ID) from SID and PID. PPID = (SID << 8) | PID
 pub const fn ppid(sid: u8, pid: u8) -> u16 {
     (sid as u16) << 8 | pid as u16
 }
@@ -108,8 +103,7 @@ pub fn write_byte_status(apid: u16, reg_offset: u8, value: u8) -> (bool, u32) {
         // Write data first
         mmio::write32(ch + PMIC_ARB_WDATA0, value as u32);
 
-        // Construct and issue command
-        // EXT_WRITEL opcode=0, reg_offset in bits[11:4], byte_count-1 in bits[3:0]
+        // Construct and issue command EXT_WRITEL opcode=0, reg_offset in bits[11:4], byte_count-1 in bits[3:0]
         let cmd = (OP_EXT_WRITEL << 27)
             | ((reg_offset as u32 & 0xFF) << 4)
             | 0; // 1 byte - 1 = 0
@@ -214,9 +208,7 @@ const LDO_EN_CTL: u8 = 0x46;     // bit 7 = VREG_EN
 #[allow(dead_code)] const LDO_VSET_LB: u8 = 0x40;    // voltage set low byte (some PMICs use 0x44)
 const LDO_STATUS1: u8 = 0x08;    // regulator status
 
-/// Enable an LDO regulator via SPMI.
-/// `sid`: PMIC slave ID, `ldo_pid`: peripheral ID of the LDO.
-/// Returns true on success.
+/// Enable an LDO regulator via SPMI. `sid`: PMIC slave ID, `ldo_pid`: peripheral ID of the LDO. Returns true on success.
 pub fn ldo_enable(sid: u8, ldo_pid: u8) -> bool {
     let ldo_ppid = ppid(sid, ldo_pid);
     let apid = match find_apid(ldo_ppid) {
@@ -248,8 +240,7 @@ pub const PID_LDO6_PM8350C: u8 = 0xAA;
 /// PM8350C LDO9 PID (vmmc — SD card power 2.95V)
 pub const PID_LDO9_PM8350C: u8 = 0xB3;
 
-/// Enable SD card power rails (vmmc + vqmmc) on Fairphone 5.
-/// Returns (vqmmc_ok, vmmc_ok).
+/// Enable SD card power rails (vmmc + vqmmc) on Fairphone 5. Returns (vqmmc_ok, vmmc_ok).
 pub fn sd_power_enable() -> (bool, bool) {
     let vqmmc = ldo_enable(SID_PM8350C, PID_LDO6_PM8350C);
     let vmmc = ldo_enable(SID_PM8350C, PID_LDO9_PM8350C);
@@ -262,8 +253,7 @@ pub fn sd_power_enable() -> (bool, bool) {
 
 /// Fire the PM8350C flash LED for a brief burst (~130ms).
 ///
-/// This is the simplest proof-of-life output — a bright white flash
-/// from the camera flash LED, requiring only SPMI writes.
+/// This is the simplest proof-of-life output — a bright white flash from the camera flash LED, requiring only SPMI writes.
 ///
 /// Returns `true` if all SPMI writes succeeded.
 pub fn flash_led_fire() -> bool {

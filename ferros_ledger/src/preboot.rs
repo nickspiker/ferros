@@ -1,11 +1,8 @@
 //! Pre-boot buffer — fixed ring in BSS for early kernel events.
 //!
-//! Before the ledger daemon is initialized, events are buffered here.
-//! Raw serialized entries, unchained (no prev_hash linking).
-//! On ledger init, the buffer is flushed into the chain as entries 0..N.
+//! Before the ledger daemon is initialized, events are buffered here. Raw serialized entries, unchained (no prev_hash linking). On ledger init, the buffer is flushed into the chain as entries 0..N.
 //!
-//! The buffer is a fixed-size ring: overwrites oldest on full.
-//! No alloc, no heap — pure BSS.
+//! The buffer is a fixed-size ring: overwrites oldest on full. No alloc, no heap — pure BSS.
 
 use crate::event::Event;
 
@@ -71,8 +68,7 @@ impl PrebootBuffer {
         self.total_written
     }
 
-    /// Drain all buffered events in order (oldest first).
-    /// Returns events as an iterator-like callback pattern (no alloc).
+    /// Drain all buffered events in order (oldest first). Returns events as an iterator-like callback pattern (no alloc).
     ///
     /// After drain, the buffer is empty.
     pub fn drain(&mut self, mut f: impl FnMut(Event)) {
@@ -80,8 +76,7 @@ impl PrebootBuffer {
             return;
         }
 
-        // Start position: if ring wrapped, start at write_pos (oldest surviving).
-        // If not wrapped, start at 0.
+        // Start position: if ring wrapped, start at write_pos (oldest surviving). If not wrapped, start at 0.
         let start = if self.count == PREBOOT_CAPACITY {
             self.write_pos // oldest surviving entry
         } else {

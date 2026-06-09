@@ -1,39 +1,13 @@
 //! Platform-specific boot and storage configurations.
 //!
-//! This module captures the concrete hardware reality for each target
-//! platform. No hand-waving — every path maps to a real device, a real
-//! partition, a real driver.
+//! This module captures the concrete hardware reality for each target platform. No hand-waving — every path maps to a real device, a real partition, a real driver.
 //!
 //! # Fairphone 5 Development Layout
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │ Internal UFS (256GB)                                    │
-//! │ Qualcomm QCM6490, GPT, A/B slots                       │
-//! │                                                         │
-//! │ boot_a ──── Android kernel (safety net)                 │
-//! │ boot_b ──── ferros kernel                               │
-//! │ super_a ─── Android system images                       │
-//! │ super_b ─── (unused or minimal ferros initrd)           │
-//! │ userdata ── Android's ~200GB (don't touch)              │
-//! │                                                         │
-//! │ Anchor key: embedded in boot_b image (Phase 1)          │
-//! │             or ferros_anchor partition (if GPT modified) │
-//! └─────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────┐ │ Internal UFS (256GB)                                    │ │ Qualcomm QCM6490, GPT, A/B slots                       │ │                                                         │ │ boot_a ──── Android kernel (safety net)                 │ │ boot_b ──── ferros kernel                               │ │ super_a ─── Android system images                       │ │ super_b ─── (unused or minimal ferros initrd)           │ │ userdata ── Android's ~200GB (don't touch)              │ │                                                         │ │ Anchor key: embedded in boot_b image (Phase 1)          │ │             or ferros_anchor partition (if GPT modified) │ └─────────────────────────────────────────────────────────┘
 //!
-//! ┌─────────────────────────────────────────────────────────┐
-//! │ microSD card (64–256GB, different vendor)                │
-//! │                                                         │
-//! │ THE LEDGER LIVES HERE (Phase 1)                         │
-//! │                                                         │
-//! │ Raw block access — no filesystem on the card.           │
-//! │ Layout:                                                 │
-//! │   [anchor ring: slots at BLAKE3-derived offsets]         │
-//! │   [object store: append-only content-addressed objects]  │
-//! │   [commit chain: generation-linked commit records]       │
-//! │                                                         │
-//! │ Removable: pull card, inspect on PC, dd dump, swap.     │
-//! └─────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────┐ │ microSD card (64–256GB, different vendor)                │ │                                                         │ │ THE LEDGER LIVES HERE (Phase 1)                         │ │                                                         │ │ Raw block access — no filesystem on the card.           │ │ Layout:                                                 │ │   [anchor ring: slots at BLAKE3-derived offsets]         │ │   [object store: append-only content-addressed objects]  │ │   [commit chain: generation-linked commit records]       │ │                                                         │ │ Removable: pull card, inspect on PC, dd dump, swap.     │ └─────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Dev Workflow
@@ -43,9 +17,7 @@
 //! $ fastboot boot ferros.img
 //!
 //! # Persistent dual-boot:
-//! $ fastboot flash boot_b ferros.img
-//! $ fastboot set_active b       # boot ferros
-//! $ fastboot set_active a       # back to android
+//! $ fastboot flash boot_b ferros.img $ fastboot set_active b       # boot ferros $ fastboot set_active a       # back to android
 //!
 //! # Inspect ledger on PC:
 //! $ dd if=/dev/mmcblk0 bs=1M | ferros_inspect --dump
@@ -54,26 +26,13 @@
 //! ## Phase Progression
 //!
 //! ```text
-//! Phase 1 (now):
-//!   Mesh = 1 device (microSD, degraded mode)
-//!   Anchor key = embedded in boot image or small partition
-//!   Object store = raw microSD
-//!   Switch slots via fastboot
+//! Phase 1 (now): Mesh = 1 device (microSD, degraded mode) Anchor key = embedded in boot image or small partition Object store = raw microSD Switch slots via fastboot
 //!
-//! Phase 1.5 (soon):
-//!   Mesh = 2 devices (microSD + internal UFS GPT partition)
-//!   Shrink userdata, add two GPT partitions:
-//!     ferros_anchor (4KB, type 66657272-6f73-416e-...)
-//!     ferros_vault (50GB, type 66657272-6f73-4c65-...)
-//!   Real mesh: dual device, dual vendor
-//!   Anchor key = ferros_anchor partition on internal UFS
+//! Phase 1.5 (soon): Mesh = 2 devices (microSD + internal UFS GPT partition) Shrink userdata, add two GPT partitions: ferros_anchor (4KB, type 66657272-6f73-416e-...) ferros_vault (50GB, type 66657272-6f73-4c65-...) Real mesh: dual device, dual vendor Anchor key = ferros_anchor partition on internal UFS
 //!
-//! Phase 2 (custom ABL):
-//!   Anchor key = RPMB via ABL→DTB handoff
-//!   Mesh = 2 devices with hardware-isolated key store
+//! Phase 2 (custom ABL): Anchor key = RPMB via ABL→DTB handoff Mesh = 2 devices with hardware-isolated key store
 //!
-//! Phase 3 (Glyph):
-//!   Own silicon, own secure world, own everything
+//! Phase 3 (Glyph): Own silicon, own secure world, own everything
 //! ```
 
 use alloc::vec;
@@ -92,12 +51,9 @@ use crate::anchor::KeyStoreBackend;
 /// - GPT-aware tools can identify it as "ferros ledger"
 /// - We're a polite neighbor in a shared partition table
 ///
-/// Generated as a v4 UUID. This is the ferros project's GUID —
-/// any tool that sees this type knows it's a raw ledger partition,
-/// not a filesystem.
+/// Generated as a v4 UUID. This is the ferros project's GUID — any tool that sees this type knows it's a raw ledger partition, not a filesystem.
 ///
-/// `66657272-6f73-4c65-6467-657200000001`
-///  f  e  r  r  o  s  Le  dg  e  r  ...  01
+/// `66657272-6f73-4c65-6467-657200000001` f  e  r  r  o  s  Le  dg  e  r  ...  01
 pub const GPT_TYPE_FERROS_LEDGER: [u8; 16] = [
     0x66, 0x65, 0x72, 0x72, // "ferr"
     0x6f, 0x73,             // "os"
@@ -109,12 +65,9 @@ pub const GPT_TYPE_FERROS_LEDGER: [u8; 16] = [
 
 /// GPT partition type GUID for the ferros anchor key partition.
 ///
-/// Small partition (~4KB–64KB). Holds only the 32-byte anchor key
-/// and ring config. Separate from the ledger data partition so that
-/// the key store can be on a different LUN or device.
+/// Small partition (~4KB–64KB). Holds only the 32-byte anchor key and ring config. Separate from the ledger data partition so that the key store can be on a different LUN or device.
 ///
-/// `66657272-6f73-416e-6368-6f7200000001`
-///  f  e  r  r  o  s  An  ch  o  r  ...  01
+/// `66657272-6f73-416e-6368-6f7200000001` f  e  r  r  o  s  An  ch  o  r  ...  01
 pub const GPT_TYPE_FERROS_ANCHOR: [u8; 16] = [
     0x66, 0x65, 0x72, 0x72, // "ferr"
     0x6f, 0x73,             // "os"
@@ -133,9 +86,7 @@ pub const ANCHOR_PARTITION_MIN_BYTES: u64 = 4096;        // 4KB — holds the 32
 pub const LEDGER_PARTITION_MIN_BYTES: u64 = 8 * 1024;    // 8KB — pico minimum
 pub const LEDGER_PARTITION_RECOMMENDED_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50GB for FP5
 
-/// The anchor ring lives INSIDE the ledger partition (first 1MB).
-/// This constant documents the reservation — the object store starts
-/// after the ring. Both mesh devices need this same layout.
+/// The anchor ring lives INSIDE the ledger partition (first 1MB). This constant documents the reservation — the object store starts after the ring. Both mesh devices need this same layout.
 pub const ANCHOR_RING_RESERVED_BYTES: u64 = crate::anchor::ANCHOR_RING_DEFAULT_BYTES;
 
 // ---------------------------------------------------------------------------
@@ -173,8 +124,7 @@ pub struct PlatformDevice {
 /// How the kernel reaches a storage device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceAccess {
-    /// Linux-style block device path (for early dev on mainline kernel).
-    /// e.g., "/dev/mmcblk1" for microSD, "/dev/sda" for UFS LUN.
+    /// Linux-style block device path (for early dev on mainline kernel). e.g., "/dev/mmcblk1" for microSD, "/dev/sda" for UFS LUN.
     BlockDevice { path: &'static str },
     /// Raw UFS LUN access (for ferros kernel, no Linux).
     UfsLun { lun: u8 },
@@ -184,8 +134,7 @@ pub enum DeviceAccess {
     Memory { size: u64 },
 }
 
-/// Complete platform configuration — everything the boot code needs
-/// to find devices, read anchor keys, and mount the ledger.
+/// Complete platform configuration — everything the boot code needs to find devices, read anchor keys, and mount the ledger.
 #[derive(Clone, Debug)]
 pub struct PlatformConfig {
     pub platform: Platform,
@@ -194,8 +143,7 @@ pub struct PlatformConfig {
     pub anchor_ring_size: u64,
 }
 
-/// FP5 development config: microSD as sole ledger device,
-/// anchor key embedded (or in small partition).
+/// FP5 development config: microSD as sole ledger device, anchor key embedded (or in small partition).
 pub fn fp5_dev_config() -> PlatformConfig {
     PlatformConfig {
         platform: Platform::Fp5Dev,

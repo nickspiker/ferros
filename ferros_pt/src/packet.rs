@@ -1,8 +1,6 @@
 //! PT packet types — encoding and decoding.
 //!
-//! Two packet families, discriminated by first byte:
-//!   DATA: `[sid:1][seq:N][blake3:32][payload]` — first byte 'a'-'z'
-//!   Control: `[TAG:1][...]` — first byte uppercase letter (S/A/N/C/D/F)
+//! Two packet families, discriminated by first byte: DATA: `[sid:1][seq:N][blake3:32][payload]` — first byte 'a'-'z' Control: `[TAG:1][...]` — first byte uppercase letter (S/A/N/C/D/F)
 //!
 //! Sequence width N is implicit from SPEC count (no per-packet tag overhead).
 
@@ -77,10 +75,7 @@ pub const CHUNK_HASH_SIZE: usize = 32;
 // DATA packet
 // ---------------------------------------------------------------------------
 
-/// Encode a DATA packet into `buf`.
-/// Format: [sid:1][seq:N][blake3:32][payload]
-/// The blake3 hash is computed over the payload.
-/// Returns bytes written.
+/// Encode a DATA packet into `buf`. Format: [sid:1][seq:N][blake3:32][payload] The blake3 hash is computed over the payload. Returns bytes written.
 pub fn encode_data(
     buf: &mut [u8],
     sid: StreamId,
@@ -105,8 +100,7 @@ pub fn encode_data(
     total
 }
 
-/// Decode a DATA packet. Caller must provide seq_width (from SPEC).
-/// Returns (sid, seq, chunk_hash, payload).
+/// Decode a DATA packet. Caller must provide seq_width (from SPEC). Returns (sid, seq, chunk_hash, payload).
 pub fn decode_data(buf: &[u8], seq_width: usize) -> Option<(StreamId, u64, [u8; 32], &[u8])> {
     let min_len = 1 + seq_width + CHUNK_HASH_SIZE;
     if buf.len() < min_len {
@@ -413,8 +407,7 @@ pub fn decode_fin(buf: &[u8]) -> Option<StreamId> {
 // Top-level parse
 // ---------------------------------------------------------------------------
 
-/// Parse any PT packet from raw bytes.
-/// For DATA packets, `seq_width` must be provided (from active SPEC).
+/// Parse any PT packet from raw bytes. For DATA packets, `seq_width` must be provided (from active SPEC).
 pub fn parse<'a>(buf: &'a [u8], seq_width: usize) -> Option<PacketKind<'a>> {
     if buf.is_empty() {
         return None;

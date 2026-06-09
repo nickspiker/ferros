@@ -13,8 +13,7 @@
 //!   - CMD_RCGR + 0xC: N value (inverted: NOT(N-M))
 //!   - CMD_RCGR + 0x10: D value (inverted: NOT(2*D))
 //!
-//! Frequency = SRC_CLK * M / N / (2 * HALF_DIV + 1)
-//!   where HALF_DIV = CFG[4:0]
+//! Frequency = SRC_CLK * M / N / (2 * HALF_DIV + 1) where HALF_DIV = CFG[4:0]
 
 const GCC_BASE: usize = 0x0010_0000;
 
@@ -34,8 +33,7 @@ const RCG_SRC_GPLL0: u32 = 1;      // GPLL0_OUT_MAIN = 600 MHz
 #[allow(dead_code)]
 const RCG_SRC_GPLL0_EVEN: u32 = 6; // GPLL0_OUT_EVEN = 300 MHz
 
-/// Enable a GCC clock branch (CBCR register).
-/// Returns true if the clock started running within the timeout.
+/// Enable a GCC clock branch (CBCR register). Returns true if the clock started running within the timeout.
 unsafe fn cbcr_enable(addr: usize) -> bool {
     let val = crate::mmio::read32(addr);
     crate::mmio::write32(addr, val | 1); // set CLK_ENABLE
@@ -56,16 +54,9 @@ unsafe fn cbcr_is_off(addr: usize) -> bool {
 
 /// Configure RCG2 clock rate for SDCC2 APPS clock.
 ///
-/// From gcc-sc7280.c freq_tbl:
-///   400KHz:  TCXO(19.2MHz), div=12, M=1, N=4  → 19.2M / 12 / 4 = 400K
-///   25MHz:   GPLL0_EVEN(300MHz), div=12         → 300M / 12 = 25M
-///   50MHz:   GPLL0_EVEN(300MHz), div=6           → 300M / 6 = 50M
-///   100MHz:  GPLL0_EVEN(300MHz), div=3           → 300M / 3 = 100M
+/// From gcc-sc7280.c freq_tbl: 400KHz:  TCXO(19.2MHz), div=12, M=1, N=4  → 19.2M / 12 / 4 = 400K 25MHz:   GPLL0_EVEN(300MHz), div=12         → 300M / 12 = 25M 50MHz:   GPLL0_EVEN(300MHz), div=6           → 300M / 6 = 50M 100MHz:  GPLL0_EVEN(300MHz), div=3           → 300M / 3 = 100M
 ///
-/// CFG_RCGR format:
-///   [4:0]  = 2*d - 1 (half-integer divider, 0 = div-1)
-///   [8:10] = source select
-///   [12:13] = MND mode (0 = bypass, 2 = dual-edge MND)
+/// CFG_RCGR format: [4:0]  = 2*d - 1 (half-integer divider, 0 = div-1) [8:10] = source select [12:13] = MND mode (0 = bypass, 2 = dual-edge MND)
 unsafe fn rcg2_configure(cmd_rcgr: usize, src: u32, div2m1: u32, m: u32, n: u32) {
     let cfg_addr = cmd_rcgr + 4;
     let m_addr = cmd_rcgr + 8;
@@ -97,8 +88,7 @@ unsafe fn rcg2_configure(cmd_rcgr: usize, src: u32, div2m1: u32, m: u32, n: u32)
     }
 }
 
-/// Configure SDC2 APPS clock to 400KHz (identification mode).
-/// TCXO 19.2MHz / div12 with MND M=1,N=4 → 400KHz.
+/// Configure SDC2 APPS clock to 400KHz (identification mode). TCXO 19.2MHz / div12 with MND M=1,N=4 → 400KHz.
 pub fn sdc2_set_400khz() {
     unsafe {
         // div = 12 → 2*d-1 = 23 = 0x17
@@ -106,8 +96,7 @@ pub fn sdc2_set_400khz() {
     }
 }
 
-/// Configure SDC2 APPS clock to 25MHz (data transfer mode).
-/// GPLL0_OUT_EVEN 300MHz / div12 → 25MHz.
+/// Configure SDC2 APPS clock to 25MHz (data transfer mode). GPLL0_OUT_EVEN 300MHz / div12 → 25MHz.
 pub fn sdc2_set_25mhz() {
     unsafe {
         // div = 12 → 2*d-1 = 23 = 0x17
@@ -115,8 +104,7 @@ pub fn sdc2_set_25mhz() {
     }
 }
 
-/// Configure SDC2 APPS clock to 50MHz (high-speed mode).
-/// GPLL0_OUT_EVEN 300MHz / div6 → 50MHz.
+/// Configure SDC2 APPS clock to 50MHz (high-speed mode). GPLL0_OUT_EVEN 300MHz / div6 → 50MHz.
 #[allow(dead_code)]
 pub fn sdc2_set_50mhz() {
     unsafe {
@@ -125,8 +113,7 @@ pub fn sdc2_set_50mhz() {
     }
 }
 
-/// Deassert SDC2 block reset (BCR).
-/// Must be called before enabling clocks or accessing SDHCI registers.
+/// Deassert SDC2 block reset (BCR). Must be called before enabling clocks or accessing SDHCI registers.
 fn sdc2_deassert_reset() {
     unsafe {
         // Read current BCR — if bit 0 is set, block is held in reset
@@ -140,8 +127,7 @@ fn sdc2_deassert_reset() {
     }
 }
 
-/// Full GCC block reset: assert BCR, wait, deassert, wait.
-/// This resets the entire SDHCI controller hardware — clears all stale state.
+/// Full GCC block reset: assert BCR, wait, deassert, wait. This resets the entire SDHCI controller hardware — clears all stale state.
 pub fn sdc2_block_reset() {
     unsafe {
         // Assert reset (set bit 0)
@@ -158,8 +144,7 @@ pub fn sdc2_bcr_raw() -> u32 {
     unsafe { crate::mmio::read32(GCC_SDCC2_BCR) }
 }
 
-/// Full SDC2 clock init: deassert reset, configure rate, enable branches.
-/// Returns (ahb_ok, apps_ok).
+/// Full SDC2 clock init: deassert reset, configure rate, enable branches. Returns (ahb_ok, apps_ok).
 pub fn sdc2_clock_init() -> (bool, bool) {
     // 1. Deassert block reset
     sdc2_deassert_reset();
@@ -175,8 +160,7 @@ pub fn sdc2_clock_init() -> (bool, bool) {
     }
 }
 
-/// Enable SDC2 (microSD) clocks (branches only, assumes RCG configured).
-/// Returns (ahb_ok, apps_ok).
+/// Enable SDC2 (microSD) clocks (branches only, assumes RCG configured). Returns (ahb_ok, apps_ok).
 pub fn sdc2_clock_enable() -> (bool, bool) {
     unsafe {
         let ahb = cbcr_enable(GCC_SDCC2_AHB_CBCR);
@@ -185,8 +169,7 @@ pub fn sdc2_clock_enable() -> (bool, bool) {
     }
 }
 
-/// Check if SDC2 clocks are currently running.
-/// Returns (ahb_running, apps_running).
+/// Check if SDC2 clocks are currently running. Returns (ahb_running, apps_running).
 pub fn sdc2_clock_status() -> (bool, bool) {
     unsafe {
         let ahb = !cbcr_is_off(GCC_SDCC2_AHB_CBCR);

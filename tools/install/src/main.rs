@@ -1,9 +1,6 @@
 // ferros-install — Partition, format, and bootstrap ferros from macOS.
 //
-// Modeled after the Asahi Linux installer flow but entirely in Rust.
-// Handles the full lifecycle: discover disk, resize macOS, create
-// partition with the BLAKE3-derived GPT type GUID, format the ring
-// layout, and write the genesis spine entry.
+// Modeled after the Asahi Linux installer flow but entirely in Rust. Handles the full lifecycle: discover disk, resize macOS, create partition with the BLAKE3-derived GPT type GUID, format the ring layout, and write the genesis spine entry.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
@@ -21,8 +18,7 @@ const FERROS_TYPE_GUID: &str = "A0B51225-61C5-0F5A-FFE7-1B644F9CA954";
 /// Minimum macOS partition size we'll allow after resize.
 const MIN_MACOS_BYTES: u64 = 40 * (1 << 30); // 40 GB
 
-/// Minimum ferros partition size (must fit all ring regions).
-/// Reserved(4MB) + Stem(1MB) + Kernels(16MB) + Spine(256MB)
+/// Minimum ferros partition size (must fit all ring regions). Reserved(4MB) + Stem(1MB) + Kernels(16MB) + Spine(256MB)
 /// + State(1GB) + Ledger(1GB) + some tract = ~2.3 GB minimum.
 const MIN_FERROS_BYTES: u64 = 4 * (1 << 30); // 4 GB floor
 
@@ -169,12 +165,10 @@ struct PartInfo {
    is_free: bool,
 }
 
-/// Find the system disk by looking for the one with Apple_APFS_ISC
-/// as its first partition (same method as the Asahi installer).
+/// Find the system disk by looking for the one with Apple_APFS_ISC as its first partition (same method as the Asahi installer).
 fn find_system_disk() -> io::Result<String> {
    let list_out = run("diskutil", &["list", "-plist"])?;
-   // On Apple Silicon the system disk always has Apple_APFS_ISC first.
-   // Check disk0 explicitly.
+   // On Apple Silicon the system disk always has Apple_APFS_ISC first. Check disk0 explicitly.
    let disk0_out = run("diskutil", &["list", "disk0"])?;
    if disk0_out.contains("Apple_APFS_ISC") {
       return Ok("disk0".to_string());
@@ -554,8 +548,7 @@ fn install_into_free(disk: &DiskInfo) -> io::Result<()> {
    Ok(())
 }
 
-/// Retry partition discovery with backoff, since the kernel may take
-/// a moment to re-read the partition table after sgdisk writes.
+/// Retry partition discovery with backoff, since the kernel may take a moment to re-read the partition table after sgdisk writes.
 fn retry_find_partition(max_attempts: u32) -> io::Result<Partition> {
    for attempt in 1..=max_attempts {
       if let Some(part) = find_partition() {
@@ -791,8 +784,7 @@ fn cmd_verify(part: &Partition) -> io::Result<()> {
    let mut valid_count = 0u32;
    let mut highest_gen: Option<u64> = None;
 
-   // Binary search would be O(16) reads; for verify we scan linearly
-   // but only the first 256 slots (and last 256) to bound I/O.
+   // Binary search would be O(16) reads; for verify we scan linearly but only the first 256 slots (and last 256) to bound I/O.
    let scan_ranges: &[(u32, u32)] = &[(0, 256), (SPINE_SIZE - 256, SPINE_SIZE)];
 
    for &(start, end) in scan_ranges {
@@ -867,8 +859,7 @@ fn cmd_verify(part: &Partition) -> io::Result<()> {
    Ok(())
 }
 
-/// Decode the plow field from a spine entry's inner document.
-/// Layout: gen(u{...}) prev_hash(hp{32}) plow(u{...})
+/// Decode the plow field from a spine entry's inner document. Layout: gen(u{...}) prev_hash(hp{32}) plow(u{...})
 fn decode_plow(block: &[u8], inner_start: usize) -> Option<u64> {
    let mut pos = inner_start;
 
@@ -936,11 +927,7 @@ fn parse_signed_kernel(path: &str) -> io::Result<SignedKernel> {
    Ok(SignedKernel { flat, hash, sig })
 }
 
-/// Build a stem (kernel ring) entry as a proper VSF document.
-/// Must match the format that ferros_seed's parse_kernel_entry() expects:
-///   RÅ< z(0) y(0) b(hlen) eu(0) hp(hash) n(5) >
-///   [ (generation:u(N)) (kernel_lba:u(N)) (kernel_size:u(N))
-///     (kernel_hash:hp(32)) (kernel_sig:ge(64)) ]
+/// Build a stem (kernel ring) entry as a proper VSF document. Must match the format that ferros_seed's parse_kernel_entry() expects: RÅ< z(0) y(0) b(hlen) eu(0) hp(hash) n(5) > [ (generation:u(N)) (kernel_lba:u(N)) (kernel_size:u(N)) (kernel_hash:hp(32)) (kernel_sig:ge(64)) ]
 fn build_stem_entry(
    generation: u64,
    kernel_lba: u32,

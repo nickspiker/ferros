@@ -1,13 +1,10 @@
 //! Ledger categories — typed namespaces for event chains.
 //!
-//! Each category maintains its own independent BLAKE3 hash chain,
-//! sequence counter, and capability scope.
+//! Each category maintains its own independent BLAKE3 hash chain, sequence counter, and capability scope.
 
 /// Ledger category identifier.
 ///
-/// Categories form a tree. Each leaf has an independent chain.
-/// The `as_bytes()` representation is the canonical category path
-/// used in entry encoding.
+/// Categories form a tree. Each leaf has an independent chain. The `as_bytes()` representation is the canonical category path used in entry encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Category {

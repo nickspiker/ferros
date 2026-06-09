@@ -1,11 +1,8 @@
 //! Ferros Seed — Trust Anchor
 //!
-//! The first code that runs after ABL hands off control.
-//! Self-verifies, finds the current kernel via the kernel ring,
-//! verifies the kernel, and jumps. Nothing else.
+//! The first code that runs after ABL hands off control. Self-verifies, finds the current kernel via the kernel ring, verifies the kernel, and jumps. Nothing else.
 //!
-//! No alloc, no interrupts, no USB, no capability system.
-//! Sub-second runtime. Linear execution.
+//! No alloc, no interrupts, no USB, no capability system. Sub-second runtime. Linear execution.
 //!
 //! ## Boot sequence
 //!
@@ -18,8 +15,7 @@
 //!
 //! ## Fallback
 //!
-//! If kernel verification fails: try other device at same generation,
-//! then decrement generation and repeat. Halt only if all 256 exhausted.
+//! If kernel verification fails: try other device at same generation, then decrement generation and repeat. Halt only if all 256 exhausted.
 
 #![no_std]
 #![no_main]
@@ -35,11 +31,7 @@ use ferros_layout::{
 // ---------------------------------------------------------------------------
 // Bump allocator — pinned to a .bss buffer at startup.
 //
-// The seed needs alloc to use the unified vsf crate (header parsing returns
-// Vec<HeaderField>, section parsing returns Vec<VsfField>, etc).
-// 64 KB is plenty — kernel ring entries are <1 KB each and the seed parses
-// at most a few of them per boot. Static .bss, zero runtime init beyond
-// publishing the base pointer.
+// The seed needs alloc to use the unified vsf crate (header parsing returns Vec<HeaderField>, section parsing returns Vec<VsfField>, etc). 64 KB is plenty — kernel ring entries are <1 KB each and the seed parses at most a few of them per boot. Static .bss, zero runtime init beyond publishing the base pointer.
 // ---------------------------------------------------------------------------
 
 const HEAP_SIZE: usize = 64 * 1024;
@@ -107,11 +99,7 @@ static SEED_SIG: [u8; 64] = [0u8; 64]; // zeroed = unsigned dev build
 // ========================================================================
 // PE/COFF header + ARM64 Image header + boot stub
 //
-// ABL (UEFI-based) requires PE/COFF format. Same structure as the kernel.
-// Layout:
-//   0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew)
-//   0x040: PE header (PE\0\0 + COFF + Optional + Section table)
-//   0x1000: _entry (page-aligned .text section start)
+// ABL (UEFI-based) requires PE/COFF format. Same structure as the kernel. Layout: 0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew) 0x040: PE header (PE\0\0 + COFF + Optional + Section table) 0x1000: _entry (page-aligned .text section start)
 // ========================================================================
 core::arch::global_asm!(
     ".section .text.boot",
@@ -211,9 +199,7 @@ core::arch::global_asm!(
     // Save DTB pointer, mask interrupts
     "    mov x19, x0",
     "    msr daifset, #0xF",
-    // Leave MMU + caches ON — ABL sets up identity-mapped page tables
-    // that cover DRAM + MMIO. The kernel expects this state on entry.
-    // Set up exception vector so crashes are visible
+    // Leave MMU + caches ON — ABL sets up identity-mapped page tables that cover DRAM + MMIO. The kernel expects this state on entry. Set up exception vector so crashes are visible
     "    adr x2, .Lseed_vectors",
     "    msr vbar_el1, x2",
     "    isb",
@@ -292,13 +278,10 @@ core::arch::global_asm!(
 // Rust entry point
 // ---------------------------------------------------------------------------
 
-/// Staging address for kernel binary. 512MB into DRAM, well away from the
-/// seed at DRAM_BASE + G#80000 = G#80080000. The kernel uses PC-relative
-/// addressing (adrp) so it runs correctly from any DRAM address.
+/// Staging address for kernel binary. 512MB into DRAM, well away from the seed at DRAM_BASE + G#80000 = G#80080000. The kernel uses PC-relative addressing (adrp) so it runs correctly from any DRAM address.
 const KERNEL_STAGE: usize = 0x8200_0000;
 
-/// Seed timing record — written to DRAM for the kernel to read.
-/// Located just below KERNEL_STAGE so the kernel read doesn't clobber it.
+/// Seed timing record — written to DRAM for the kernel to read. Located just below KERNEL_STAGE so the kernel read doesn't clobber it.
 const SEED_TIMING_ADDR: usize = 0x81FF_FFE0;
 
 fn qtimer() -> u64 {
@@ -321,9 +304,7 @@ fn write_seed_timing(start: u64, end: u64) {
 extern "C" fn seed_main(dtb_addr: usize) -> ! {
     let t_start = qtimer();
 
-    // Self-verify FIRST — before any memory modifications.
-    // progress() modifies PROGRESS_X (.data), which is in the hashed range.
-    // Stack frames are excluded by hashing only _start..__bss_start.
+    // Self-verify FIRST — before any memory modifications. progress() modifies PROGRESS_X (.data), which is in the hashed range. Stack frames are excluded by hashing only _start..__bss_start.
     if !self_verify() {
         error("SEED INTEGRITY FAILURE");
         halt();
@@ -395,9 +376,7 @@ extern "C" fn seed_main(dtb_addr: usize) -> ! {
 
             progress(0xFF_0000FF); // blue = verification passed
 
-            // ---- Step 6: Cache flush + jump ----
-            // ABL's MMU + caches are on. Flush staged kernel from D-cache
-            // to DRAM, then invalidate I-cache so CPU fetches fresh code.
+            // ---- Step 6: Cache flush + jump ---- ABL's MMU + caches are on. Flush staged kernel from D-cache to DRAM, then invalidate I-cache so CPU fetches fresh code.
             unsafe {
                 let mut addr = KERNEL_STAGE;
                 let end = KERNEL_STAGE + kernel_size;
@@ -440,18 +419,14 @@ extern "C" fn seed_main(dtb_addr: usize) -> ! {
 // Self-verification
 // ---------------------------------------------------------------------------
 
-/// Read PUBKEY from memory via volatile — prevents the compiler from
-/// constant-folding the [0u8; 32] initializer (mkimg patches the bytes).
+/// Read PUBKEY from memory via volatile — prevents the compiler from constant-folding the [0u8; 32] initializer (mkimg patches the bytes).
 fn read_pubkey() -> [u8; 32] {
     unsafe { core::ptr::read_volatile(&raw const PUBKEY as *const [u8; 32]) }
 }
 
-/// Verify seed's own integrity: BLAKE3 hash with signature zeroed,
-/// then Ed25519 verify against embedded public key.
+/// Verify seed's own integrity: BLAKE3 hash with signature zeroed, then Ed25519 verify against embedded public key.
 ///
-/// Hashes _start..__bss_start (file-backed data only). This excludes
-/// BSS and stack, which are modified at runtime before this runs.
-/// MUST be called before any .data modifications (e.g. progress()).
+/// Hashes _start..__bss_start (file-backed data only). This excludes BSS and stack, which are modified at runtime before this runs. MUST be called before any .data modifications (e.g. progress()).
 fn self_verify() -> bool {
     let start = &raw const _start as usize;
     let end = &raw const __bss_start as usize;
@@ -503,9 +478,7 @@ fn ed25519_verify_key(sig_bytes: &[u8], message: &[u8], pubkey: &[u8; 32]) -> bo
 // Kernel ring entry
 // ---------------------------------------------------------------------------
 
-// Kernel ring entries are decoded via `ferros_hal::ring::KernelRingEntry`.
-// The same VSF document format is shared between writer (ferros_kernel) and reader (this seed),
-// and the actual decode/hp-verify logic lives in ferros_hal so there's exactly one impl.
+// Kernel ring entries are decoded via `ferros_hal::ring::KernelRingEntry`. The same VSF document format is shared between writer (ferros_kernel) and reader (this seed), and the actual decode/hp-verify logic lives in ferros_hal so there's exactly one impl.
 use ferros_hal::ring::KernelRingEntry;
 
 /// Read just the generation field at a kernel ring position. Returns 0 on any error.
@@ -553,9 +526,7 @@ fn scan_kernel_ring(ufs: &ferros_hal::ufs::UfsController) -> Option<KernelRingEn
 // Progress display
 // ---------------------------------------------------------------------------
 
-/// Write a colored dot (16x16 px) at the next progress slot on the splash FB.
-/// Row 100, spaced 20px apart — visible below ABL's yellow bar.
-/// Flushes D-cache so the DPU sees the write immediately.
+/// Write a colored dot (16x16 px) at the next progress slot on the splash FB. Row 100, spaced 20px apart — visible below ABL's yellow bar. Flushes D-cache so the DPU sees the write immediately.
 static mut PROGRESS_X: usize = 16;
 fn progress(color: u32) {
     let fb = SPLASH_FB_BASE as *mut u32;

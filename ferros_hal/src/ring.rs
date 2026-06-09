@@ -1,10 +1,8 @@
 //! Boot State Ring — generation-ordered ring of VSF documents on UFS/SD.
 //!
-//! Each ring entry is a complete VSF document (RÅ< magic, EWE-encoded fields, provenance hash).
-//! Any standard VSF reader (`vsfinfo`, the `vsf` crate, anything that follows the spec) can parse them.
+//! Each ring entry is a complete VSF document (RÅ< magic, EWE-encoded fields, provenance hash). Any standard VSF reader (`vsfinfo`, the `vsf` crate, anything that follows the spec) can parse them.
 //!
-//! Binary search finds the highest valid generation in 2×log2(RING_SIZE) generation reads plus one full entry read.
-//! Generation starts at 1 (0 = empty slot).
+//! Binary search finds the highest valid generation in 2×log2(RING_SIZE) generation reads plus one full entry read. Generation starts at 1 (0 = empty slot).
 //!
 //! See RING.md for the full specification.
 
@@ -23,17 +21,13 @@ use vsf::types::{EtType, VsfType};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
 
-/// Ring size: 65536 entries × 4KB = 256MB total.
-/// (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_SIZE` for new code.)
+/// Ring size: 65536 entries × 4KB = 256MB total. (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_SIZE` for new code.)
 pub const RING_SIZE: u32 = VAULT_ROOT_RING_SIZE;
 
-/// Base block for the ring on UFS LUN 0 (4KB blocks).
-/// (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_BASE` for new code.)
+/// Base block for the ring on UFS LUN 0 (4KB blocks). (Legacy alias — use `ferros_layout::VAULT_ROOT_RING_BASE` for new code.)
 pub const RING_BASE_BLOCK: u32 = VAULT_ROOT_RING_BASE;
 
-/// Convert generation number to ring position.
-/// Generation 1 → position 0, generation 2 → position 1, etc.
-/// Generation 0 is invalid (means empty slot).
+/// Convert generation number to ring position. Generation 1 → position 0, generation 2 → position 1, etc. Generation 0 is invalid (means empty slot).
 #[inline]
 pub fn gen_to_pos(generation: u64) -> u32 {
     ((generation - 1) % RING_SIZE as u64) as u32
@@ -54,8 +48,7 @@ pub struct RingEntry {
     pub hp_hash: [u8; 32],
 }
 
-/// Build a complete VSF document into a fixed-size block.
-/// Returns `None` if the encoded doc exceeds `BLK` bytes.
+/// Build a complete VSF document into a fixed-size block. Returns `None` if the encoded doc exceeds `BLK` bytes.
 fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> {
     let doc = builder.build().ok()?;
     if doc.len() > BLK {
@@ -66,9 +59,7 @@ fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> 
     Some(blk)
 }
 
-/// Extract eu6 oscillation count from a header's optional `creation_time` field.
-/// Accepts any signed/unsigned integer EtType form and converts to `u64`.
-/// Returns 0 when the header omits creation_time (clockless device) or when the variant isn't a known integer Eagle Time.
+/// Extract eu6 oscillation count from a header's optional `creation_time` field. Accepts any signed/unsigned integer EtType form and converts to `u64`. Returns 0 when the header omits creation_time (clockless device) or when the variant isn't a known integer Eagle Time.
 fn et_to_u64(et: &Option<VsfType>) -> u64 {
     match et {
         Some(VsfType::e(EtType::e5(v))) => *v as u64,
@@ -90,8 +81,7 @@ fn hp_bytes(hp: &VsfType) -> Option<[u8; 32]> {
     }
 }
 
-/// Parse a 4KB block as a complete VSF doc and return the header + bytes-of-doc length.
-/// hp is verified; padding past the file_length is ignored.
+/// Parse a 4KB block as a complete VSF doc and return the header + bytes-of-doc length. hp is verified; padding past the file_length is ignored.
 fn open_doc(blk: &[u8]) -> Option<(VsfHeader, usize)> {
     let (header, _) = VsfHeader::decode(blk).ok()?;
     let file_length = header.file_length;
@@ -223,8 +213,7 @@ impl RingEntry {
         }
     }
 
-    /// Create next entry in the chain from this entry.
-    /// Caller should set `hamt_root_hash`, `hamt_root_lba`, `plow_position` before writing.
+    /// Create next entry in the chain from this entry. Caller should set `hamt_root_hash`, `hamt_root_lba`, `plow_position` before writing.
     pub fn next(&self) -> Self {
         Self {
             generation: self.generation + 1,
@@ -250,9 +239,7 @@ pub struct ScanResult {
     pub reads: u32,
 }
 
-/// Binary search the ring for the highest valid generation.
-/// Exactly 2 × log2(RING_SIZE) generation reads + 1 full entry read.
-/// Empty slots return generation 0, always lower than any real entry.
+/// Binary search the ring for the highest valid generation. Exactly 2 × log2(RING_SIZE) generation reads + 1 full entry read. Empty slots return generation 0, always lower than any real entry.
 pub fn scan_ring(ufs: &UfsController) -> ScanResult {
     let mut result = ScanResult {
         generation: 0,
@@ -310,8 +297,7 @@ pub fn write_entry(ufs: &UfsController, entry: &RingEntry) -> bool {
     readback == &blk
 }
 
-/// Read just the `generation` field of a ring entry at a position.
-/// Returns 0 if empty, corrupt, hp-mismatched, or missing the field.
+/// Read just the `generation` field of a ring entry at a position. Returns 0 if empty, corrupt, hp-mismatched, or missing the field.
 fn read_generation(ufs: &UfsController, pos: u32, result: &mut ScanResult) -> u64 {
     let lba = RING_BASE_BLOCK + pos;
     result.reads += 1;

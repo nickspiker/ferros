@@ -4,9 +4,7 @@
 //! - **QEMU virt**: PL011 at 0x0900_0000 (for testing)
 //! - **QCM6490**: GENI Serial Engine UART (for FP5)
 //!
-//! We only implement TX (print). RX comes later when we need a console.
-//! ABL typically leaves the debug UART initialized on QCM6490, so we
-//! can start writing to the TX FIFO after cancelling any in-flight command.
+//! We only implement TX (print). RX comes later when we need a console. ABL typically leaves the debug UART initialized on QCM6490, so we can start writing to the TX FIFO after cancelling any in-flight command.
 
 use crate::mmio;
 
@@ -31,9 +29,7 @@ impl Uart {
         Self { backend }
     }
 
-    /// Probe the UART — returns true if the hardware seems present.
-    /// For GENI SE, checks FW_REV (non-zero = firmware loaded).
-    /// HW_PARAM_0 may read as 0 if QUP wrapper clocks are partially gated.
+    /// Probe the UART — returns true if the hardware seems present. For GENI SE, checks FW_REV (non-zero = firmware loaded). HW_PARAM_0 may read as 0 if QUP wrapper clocks are partially gated.
     pub fn probe(&self) -> bool {
         match self.backend {
             UartBackend::Null => true,
@@ -130,8 +126,7 @@ impl Uart {
 
     // -- GENI SE UART (QCM6490) --
     //
-    // Register offsets from Qualcomm downstream kernel (qcom-geni-se.h).
-    // Base address is the SE (Serial Engine) base, e.g. 0x994000.
+    // Register offsets from Qualcomm downstream kernel (qcom-geni-se.h). Base address is the SE (Serial Engine) base, e.g. 0x994000.
 
     const SE_HW_PARAM_0: usize = 0x050;
     const SE_GENI_FW_REV: usize = 0x068;

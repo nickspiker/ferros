@@ -1,18 +1,10 @@
 //! Ramoops / pstore writer.
 //!
-//! Writes log data into the ramoops reserved-memory region using the
-//! `persistent_ram_buffer` header format that Linux's pstore driver
-//! recognizes on next boot.
+//! Writes log data into the ramoops reserved-memory region using the `persistent_ram_buffer` header format that Linux's pstore driver recognizes on next boot.
 //!
-//! Layout of a persistent_ram_buffer zone:
-//!   offset 0: sig   (u32) = 0x43474244 ("DBGC")
-//!   offset 4: start (u32) = read pointer in circular buffer
-//!   offset 8: size  (u32) = total bytes written (may exceed capacity for wrap)
-//!   offset 12+: data[capacity]
+//! Layout of a persistent_ram_buffer zone: offset 0: sig   (u32) = 0x43474244 ("DBGC") offset 4: start (u32) = read pointer in circular buffer offset 8: size  (u32) = total bytes written (may exceed capacity for wrap) offset 12+: data[capacity]
 //!
-//! The ramoops region is split into zones:
-//!   [oops records...][console][ftrace][pmsg]
-//! We write to the console zone.
+//! The ramoops region is split into zones: [oops records...][console][ftrace][pmsg] We write to the console zone.
 
 const PERSISTENT_RAM_SIG: u32 = 0x4347_4244; // "DBGC" in LE
 
@@ -55,8 +47,7 @@ impl Ramoops {
     /// Create a ramoops writer for the console zone.
     ///
     /// # Safety
-    /// `zone_base` must point to writable DRAM of at least `zone_size` bytes
-    /// that persists across warm reboot.
+    /// `zone_base` must point to writable DRAM of at least `zone_size` bytes that persists across warm reboot.
     pub unsafe fn new(zone_base: *mut u8, zone_size: usize) -> Self {
         let cap = if zone_size > PRB_HEADER { zone_size - PRB_HEADER } else { 0 };
 

@@ -1,103 +1,16 @@
 // FERROS SOURCE MAP — keep updated when pub items or files change
 //
-// ferros_kernel/
-// └── main.rs ── kernel entry, boot sequence, USB event loop, SD probe
-//       _start (asm), kernel_main()
-//       Boot: EL check, DTB parse, FB console, UART, pstore, DPU, SPMI
-//       GCC clocks, RPMh power, SDHCI probe, USB DWC3 init
-//       USB event loop: PT command dispatch, hot-reload handler
-//       SD probe: CMD0-CMD8-ACMD41-CMD2-CMD3-CMD9-CMD7-CMD16, R/W verify
+// ferros_kernel/ └── main.rs ── kernel entry, boot sequence, USB event loop, SD probe _start (asm), kernel_main() Boot: EL check, DTB parse, FB console, UART, pstore, DPU, SPMI GCC clocks, RPMh power, SDHCI probe, USB DWC3 init USB event loop: PT command dispatch, hot-reload handler SD probe: CMD0-CMD8-ACMD41-CMD2-CMD3-CMD9-CMD7-CMD16, R/W verify
 //
-// ferros_hal/ ── hardware abstraction (no_std, QCM6490/FP5)
-// ├── lib.rs ── module re-exports
-// ├── mmio.rs ── raw MMIO read/write (8/16/32-bit), cache ops
-// ├── console.rs ── framebuffer text console, 8x16 VGA font, 2x scaling
-// │   struct Console { fb_base, stride, x_off, y_off, col, row }
-// │     ::new(), put_char(), scroll(), clear()
-// ├── fb.rs ── raw framebuffer pixel ops
-// ├── dtb.rs ── FDT/DTB parser (find nodes, read properties)
-// ├── dpu.rs ── display processing unit register reads
-// ├── uart.rs ── GENI UART TX (QUP1 SE5 at 0x994000)
-// ├── pstore.rs ── ramoops/persistent_ram_buffer writer
-// ├── spmi.rs ── SPMI arbiter v5 (observer reads, channel writes)
-// │   find_apid(), read_byte(), write_byte(), ppid()
-// ├── gcc.rs ── GCC clock controller (SDC2 branches + RCG)
-// │   sdc2_set_400khz(), sdc2_set_25mhz(), sdc2_block_reset()
-// ├── rpmh.rs ── RPMh TCS for LDO power enable via cmd-db
-// │   enable_ldo(), cmd_db_lookup()
-// ├── sdmmc.rs ── SD/MMC controller (SDHCI + Qualcomm vendor regs)
-// │   struct SdmmcController { base, initialized, card_id, capacity, rca }
-// │     ::new(), init(), probe_card() → ProbeResult
-// │     ::read_block(), write_block(), read_blocks(), write_blocks()
-// │   struct CsdInfo ::from_response(), max_freq_mhz()
-// │   impl Device for SdmmcController (byte-range read_at/write_at)
-// ├── pmic_glink.rs ── SMEM/GLINK transport to ADSP charger_pd
-// │   probe_smem() → SmemProbe, probe_rtc() → Option<u32>
-// │   struct PmicGlink — init(), open_channel(), bat_status(), property_get(), set_charge_limit()
-// │   struct BatStatus — voltage_mv, capacity_pct, rate_ma, source, temp_tenths_k
-// │   PROP_VOLT_NOW, PROP_CURR_NOW, PROP_CAPACITY, PROP_TEMP, PROP_CHG_CTRL
-// └── usb.rs ── DWC3 USB device controller (1879 lines)
-//     struct Dwc3Dev { evt_read_idx, ep0_state, bulk_out/in state }
-//       ::new() → init, CSFTRST, PHY, endpoint config, Run/Stop
-//       ::poll_event() → UsbEvent (Reset, ConnectDone, TransferComplete)
-//       ::bulk_out_arm(), bulk_out_read() → &[u8]
-//       ::bulk_in_send(data) → bool (ISP_IMI for short packets)
-//       ::ep0_send(), ep0_status_in/out(), handle_setup()
-//     pub fn probe() → Dwc3Info, dump_diag() → Dwc3Diag
-//     pub fn phy_init(), smmu_bypass()
+// ferros_hal/ ── hardware abstraction (no_std, QCM6490/FP5) ├── lib.rs ── module re-exports ├── mmio.rs ── raw MMIO read/write (8/16/32-bit), cache ops ├── console.rs ── framebuffer text console, 8x16 VGA font, 2x scaling │   struct Console { fb_base, stride, x_off, y_off, col, row } │     ::new(), put_char(), scroll(), clear() ├── fb.rs ── raw framebuffer pixel ops ├── dtb.rs ── FDT/DTB parser (find nodes, read properties) ├── dpu.rs ── display processing unit register reads ├── uart.rs ── GENI UART TX (QUP1 SE5 at 0x994000) ├── pstore.rs ── ramoops/persistent_ram_buffer writer ├── spmi.rs ── SPMI arbiter v5 (observer reads, channel writes) │   find_apid(), read_byte(), write_byte(), ppid() ├── gcc.rs ── GCC clock controller (SDC2 branches + RCG) │   sdc2_set_400khz(), sdc2_set_25mhz(), sdc2_block_reset() ├── rpmh.rs ── RPMh TCS for LDO power enable via cmd-db │   enable_ldo(), cmd_db_lookup() ├── sdmmc.rs ── SD/MMC controller (SDHCI + Qualcomm vendor regs) │   struct SdmmcController { base, initialized, card_id, capacity, rca } │     ::new(), init(), probe_card() → ProbeResult │     ::read_block(), write_block(), read_blocks(), write_blocks() │   struct CsdInfo ::from_response(), max_freq_mhz() │   impl Device for SdmmcController (byte-range read_at/write_at) ├── pmic_glink.rs ── SMEM/GLINK transport to ADSP charger_pd │   probe_smem() → SmemProbe, probe_rtc() → Option<u32> │   struct PmicGlink — init(), open_channel(), bat_status(), property_get(), set_charge_limit() │   struct BatStatus — voltage_mv, capacity_pct, rate_ma, source, temp_tenths_k │   PROP_VOLT_NOW, PROP_CURR_NOW, PROP_CAPACITY, PROP_TEMP, PROP_CHG_CTRL └── usb.rs ── DWC3 USB device controller (1879 lines) struct Dwc3Dev { evt_read_idx, ep0_state, bulk_out/in state } ::new() → init, CSFTRST, PHY, endpoint config, Run/Stop ::poll_event() → UsbEvent (Reset, ConnectDone, TransferComplete) ::bulk_out_arm(), bulk_out_read() → &[u8] ::bulk_in_send(data) → bool (ISP_IMI for short packets) ::ep0_send(), ep0_status_in/out(), handle_setup() pub fn probe() → Dwc3Info, dump_diag() → Dwc3Diag pub fn phy_init(), smmu_bypass()
 //
-// ferros_pt/ ── Photon Transport (no_std, optional alloc)
-// ├── lib.rs ── is_data_packet(), is_control_packet(), re-exports
-// ├── packet.rs ── packet encode/decode
-// │   TAG_SPEC='S', TAG_ACK='A', TAG_NAK='N', TAG_DONE='D', TAG_FIN='F'
-// │   struct Spec, Ack, Nak, Complete { sid, fields... }
-// │   encode_data(), decode_data() — per-chunk BLAKE3 hash
-// ├── transfer.rs ── transfer state machines
-// │   struct InboundTransfer { data, received bitmap, expected_count }
-// │     ::new(), handle_data(), all_received(), finish() → COMPLETE/NAK
-// │   struct OutboundTransfer { data, next_seq, count, psize }
-// │     ::start(), start_vec(), next_data_packet(), encode_fin()
-// │   BitmapWord = u64, outbound_bitmap_words()
-// └── command.rs ── cap-addressed command protocol
-//     [cap:32][op:1][params...], dev caps via BLAKE3
-//     caps: DIAG, MEM, RELOAD
-//     enum Op { Read, Write, Exec }
+// ferros_pt/ ── Photon Transport (no_std, optional alloc) ├── lib.rs ── is_data_packet(), is_control_packet(), re-exports ├── packet.rs ── packet encode/decode │   TAG_SPEC='S', TAG_ACK='A', TAG_NAK='N', TAG_DONE='D', TAG_FIN='F' │   struct Spec, Ack, Nak, Complete { sid, fields... } │   encode_data(), decode_data() — per-chunk BLAKE3 hash ├── transfer.rs ── transfer state machines │   struct InboundTransfer { data, received bitmap, expected_count } │     ::new(), handle_data(), all_received(), finish() → COMPLETE/NAK │   struct OutboundTransfer { data, next_seq, count, psize } │     ::start(), start_vec(), next_data_packet(), encode_fin() │   BitmapWord = u64, outbound_bitmap_words() └── command.rs ── cap-addressed command protocol [cap:32][op:1][params...], dev caps via BLAKE3 caps: DIAG, MEM, RELOAD enum Op { Read, Write, Exec }
 //
-// ferros_ledger/ ── append-only event chain (no_std)
-// ├── lib.rs ── re-exports
-// ├── ewe.rs ── EWE variable-width integer encoding
-// │   encode_u64(), decode_u64(), encode_lean(), decode_lean()
-// │   encode_seq(), decode_seq(), seq_width()
-// ├── chain.rs ── BLAKE3 hash chain
-// ├── entry.rs ── ledger entry (VSF document structure)
-// ├── event.rs ── typed boot/USB/SD events
-// ├── category.rs ── log category tree
-// └── preboot.rs ── pre-ledger ring buffer
+// ferros_ledger/ ── append-only event chain (no_std) ├── lib.rs ── re-exports ├── ewe.rs ── EWE variable-width integer encoding │   encode_u64(), decode_u64(), encode_lean(), decode_lean() │   encode_seq(), decode_seq(), seq_width() ├── chain.rs ── BLAKE3 hash chain ├── entry.rs ── ledger entry (VSF document structure) ├── event.rs ── typed boot/USB/SD events ├── category.rs ── log category tree └── preboot.rs ── pre-ledger ring buffer
 //
-// ferros_vault/ ── persistent object store (no_std)
-// ├── lib.rs ── re-exports
-// ├── device.rs ── Device trait, DeviceError, DeviceIoKind
-// ├── hash.rs ── BLAKE3 hashing utilities
-// ├── anchor.rs ── root anchor / superblock
-// ├── boot.rs ── boot sequence validation
-// ├── capability.rs ── capability tokens
-// ├── commit.rs ── atomic commit protocol
-// ├── failure.rs ── failure modes and recovery
-// ├── mesh.rs ── object mesh topology
-// ├── object.rs ── stored objects
-// ├── platform.rs ── platform abstraction
-// └── store.rs ── key-value store
+// ferros_vault/ ── persistent object store (no_std) ├── lib.rs ── re-exports ├── device.rs ── Device trait, DeviceError, DeviceIoKind ├── hash.rs ── BLAKE3 hashing utilities ├── anchor.rs ── root anchor / superblock ├── boot.rs ── boot sequence validation ├── capability.rs ── capability tokens ├── commit.rs ── atomic commit protocol ├── failure.rs ── failure modes and recovery ├── mesh.rs ── object mesh topology ├── object.rs ── stored objects ├── platform.rs ── platform abstraction └── store.rs ── key-value store
 //
-// tools/
-// ├── ferros-bridge/ ── host-side USB tool (tokio + nusb)
-// │   ├── main.rs ── CLI: diag, read, reload, reboot, status
-// │   │   cmd_diag(), cmd_read(), cmd_reload()
-// │   │   pt_send() — blast mode, 512-byte padded OUT, COMPLETE wait
-// │   │   pt_recv() — receive outbound response, no SPEC ACK
-// │   └── usb.rs ── UsbLink { interface, ep_out, ep_in }
-// │       ::open(), send() (512-byte pad), recv()
-// └── mkimg/ ── ELF → flat binary → boot.img v3
-//     main.rs ── PE/COFF header, boot.img v3 packing
+// tools/ ├── ferros-bridge/ ── host-side USB tool (tokio + nusb) │   ├── main.rs ── CLI: diag, read, reload, reboot, status │   │   cmd_diag(), cmd_read(), cmd_reload() │   │   pt_send() — blast mode, 512-byte padded OUT, COMPLETE wait │   │   pt_recv() — receive outbound response, no SPEC ACK │   └── usb.rs ── UsbLink { interface, ep_out, ep_in } │       ::open(), send() (512-byte pad), recv() └── mkimg/ ── ELF → flat binary → boot.img v3 main.rs ── PE/COFF header, boot.img v3 packing
 //
 //! Ferros kernel — bare-metal aarch64 on Fairphone 5 (QCM6490).
 
@@ -127,9 +40,7 @@ use ferros_pt::transfer::{InboundTransfer, OutboundTransfer, bitmap_words};
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// DRAM-based bump allocator. Base address set at startup from __stack_top
-/// linker symbol (right after kernel image + 64KB stack). Keeps binary small
-/// — no BSS heap array — so PT transfers don't grow circularly.
+/// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + 64KB stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -172,18 +83,13 @@ global_asm!(r#"
 // ========================================================================
 // ARM64 Image header with PE/COFF stub
 //
-// Qualcomm ABL (UEFI-based) requires PE/COFF format to find entry point.
-// Stock FP5 kernel starts with "MZ" (PE/COFF). We replicate this.
+// Qualcomm ABL (UEFI-based) requires PE/COFF format to find entry point. Stock FP5 kernel starts with "MZ" (PE/COFF). We replicate this.
 //
-// Layout:
-//   0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew)
-//   0x040: PE header (PE\0\0 + COFF + Optional + Section table)
-//   0x1000: _entry (page-aligned .text section start)
+// Layout: 0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew) 0x040: PE header (PE\0\0 + COFF + Optional + Section table) 0x1000: _entry (page-aligned .text section start)
 // ========================================================================
 
 _start:
-    // Offset 0x00: "MZ" magic — must be valid ARM64: `add x13, x18, #0x16`
-    // Bytes: 4D 5A 00 91. Stock kernel uses this exact encoding.
+    // Offset 0x00: "MZ" magic — must be valid ARM64: `add x13, x18, #0x16` Bytes: 4D 5A 00 91. Stock kernel uses this exact encoding.
     .long   0x91005A4D
     // Offset 0x04: branch to _entry (past all headers)
     b       _entry
@@ -285,11 +191,7 @@ _entry:
     lsr     x20, x20, #2
 
     // ================================================================
-    // Check if MMU is already off. If so, skip the teardown entirely.
-    // ABL (Tensor G3, m1n1) disables MMU + caches before jumping.
-    // FP5/QCM6490 ABL leaves them enabled.
-    // Attempting cache clean + MMU disable when already off faults on
-    // Tensor G3 (Apple SPRR, Samsung SCTLR behavior).
+    // Check if MMU is already off. If so, skip the teardown entirely. ABL (Tensor G3, m1n1) disables MMU + caches before jumping. FP5/QCM6490 ABL leaves them enabled. Attempting cache clean + MMU disable when already off faults on Tensor G3 (Apple SPRR, Samsung SCTLR behavior).
     // ================================================================
     cmp     x20, #2
     b.ne    .Lcheck_el1_mmu
@@ -320,8 +222,7 @@ _m1_entry:
 .Ldo_cache_clean_el2:
     // EL2 path
     mrs     x21, sctlr_el2     // x21 = original SCTLR (saved for diagnostics)
-    // Clean + invalidate data caches before disabling
-    // (otherwise dirty lines are lost)
+    // Clean + invalidate data caches before disabling (otherwise dirty lines are lost)
     mrs     x0, ctr_el0
     ubfx    x0, x0, #16, #4    // DminLine (log2 words)
     mov     x1, #4
@@ -487,8 +388,7 @@ _m1_entry:
     ldp     x0, x1, [sp], #16
     eret
 
-// SError (asynchronous): increment count, do NOT advance ELR (fault is async),
-// just eret — the exception entry consumed the pending SError.
+// SError (asynchronous): increment count, do NOT advance ELR (fault is async), just eret — the exception entry consumed the pending SError.
 .Lexc_serror:
     stp     x0, x1, [sp, #-16]!
     adrp    x0, __exception_count
@@ -667,8 +567,7 @@ use ferros_hal::hamt::BlockIO;
 // Mirror mode — tracks disk health, degrades instead of halting
 // ---------------------------------------------------------------------------
 
-/// Mirror health state. Degrades on verify failure, never recovers at runtime.
-/// Recovery requires physical intervention: replace disk, rebuild, reflash.
+/// Mirror health state. Degrades on verify failure, never recovers at runtime. Recovery requires physical intervention: replace disk, rebuild, reflash.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MirrorMode {
     /// Both disks healthy. Normal operation.
@@ -702,13 +601,7 @@ impl MirrorMode {
     }
 }
 
-/// Mirrored plow: writes to UFS and SD, verifies both, one source of truth.
-/// Degrades gracefully — if one disk fails, continues on the other with a
-/// persistent warning. Mode never recovers at runtime (requires physical
-/// intervention + reflash).
-/// Bounded mirrored block I/O. Owns a slice of the disk — writes and reads
-/// outside `[region_base, region_end)` are rejected. Same principle as Rust
-/// slices: the handle IS the capability.
+/// Mirrored plow: writes to UFS and SD, verifies both, one source of truth. Degrades gracefully — if one disk fails, continues on the other with a persistent warning. Mode never recovers at runtime (requires physical intervention + reflash). Bounded mirrored block I/O. Owns a slice of the disk — writes and reads outside `[region_base, region_end)` are rejected. Same principle as Rust slices: the handle IS the capability.
 struct MirrorIO<'a> {
     ufs: &'a ferros_hal::ufs::UfsController,
     sdc: Option<&'a mut ferros_hal::sdmmc::SdmmcController>,
@@ -930,9 +823,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         None
     };
 
-    // Set up framebuffer console from DTB simplefb, or spin if not found.
-    // M1 DCP uses 10:10:10:2 pixel format (R10:G10:B10:X2, little-endian u32).
-    // White = G#FFFFFFFC, Black = G#00000000.
+    // Set up framebuffer console from DTB simplefb, or spin if not found. M1 DCP uses 10:10:10:2 pixel format (R10:G10:B10:X2, little-endian u32). White = G#FFFFFFFC, Black = G#00000000.
     let mut con = if let Some(cfg) = fb_cfg {
         unsafe {
             ferros_hal::console::Console::new(
@@ -953,10 +844,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     con.clear();
     con.puts("ferros on M1\n");
     con.puts("============\n\n");
-    // --- USB init ---
-    // TODO: read actual addresses from ADT. These are placeholders.
-    // Boot into m1n1 proxy and run m1n1-boot.py to dump real values.
-    // Probe DWC3 before full init — check if controller is powered
+    // --- USB init --- TODO: read actual addresses from ADT. These are placeholders. Boot into m1n1 proxy and run m1n1-boot.py to dump real values. Probe DWC3 before full init — check if controller is powered
     let dwc3_base: usize = 0x3_8228_0000;
     con.puts("DWC3 probe:    ");
     let snpsid = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC120) };
@@ -982,10 +870,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         dart_sid:  0,
     };
 
-    // DART page tables: use fixed addresses after the heap base.
-    // __stack_top is at ~kernel+0x23000. Heap starts there.
-    // We reserve the first 64KB of heap for DART page tables.
-    // L1 at heap+0, L2 at heap+16KB. Then bump HEAP_POS past them.
+    // DART page tables: use fixed addresses after the heap base. __stack_top is at ~kernel+0x23000. Heap starts there. We reserve the first 64KB of heap for DART page tables. L1 at heap+0, L2 at heap+16KB. Then bump HEAP_POS past them.
     con.puts("DART alloc:    ");
     let l1_base = (heap_base + 0x3FFF) & !0x3FFF; // 16KB align
     let l2_base = l1_base + 16384;
@@ -1092,9 +977,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             con.puts("_");
             con.put_hex32(usb.dma_offset_val as u32);
             con.puts("\n");
-            // Read back L1 entry for IOVA 0xF0000000
-            // L1 index = (0xF0000000 >> 25) & 0x1FFF = 0x780
-            // TTBR after has L1 phys = (ttbr & 0x7FFFFFFF) << 12
+            // Read back L1 entry for IOVA 0xF0000000 L1 index = (0xF0000000 >> 25) & 0x1FFF = 0x780 TTBR after has L1 phys = (ttbr & 0x7FFFFFFF) << 12
             let l1_phys = ((usb.dart_ttbr_after & 0x7FFF_FFFF) as usize) << 12;
             con.puts("\nL1 phys:       ");
             con.put_hex32((usb.l1_phys >> 32) as u32);
@@ -1344,8 +1227,7 @@ fn m1_usb_event_loop(
                                                 con.puts("  RELOAD EXEC ");
                                                 con.put_hex32(reload_size as u32);
                                                 con.puts(" bytes\n");
-                                                // TODO: verify + jump
-                                                // For now, just acknowledge
+                                                // TODO: verify + jump For now, just acknowledge
                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                                                 con.puts("  REBOOT\n");
                                                 // PSCI SYSTEM_RESET
@@ -1414,9 +1296,7 @@ fn m1_usb_event_loop(
 #[cfg(feature = "pixel8")]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
-    // Init DRAM heap — must happen before any allocation.
-    // __stack_top is right after kernel image + 64KB stack.
-    // Align to 4KB page boundary for clean start.
+    // Init DRAM heap — must happen before any allocation. __stack_top is right after kernel image + 64KB stack. Align to 4KB page boundary for clean start.
     unsafe extern "C" { static __stack_top: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF; // page-align up
@@ -1432,14 +1312,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     const VOL_DOWN_BIT: u32 = 1 << 1;
     const VOL_UP_BIT: u32 = 1 << 2;
 
-    // ---- Display: deferred ----
-    // Display SYSMMU is write-protected (S2MPU). Writing to G#19840000 locks the CPU.
-    // Display output requires either: walking SYSMMU page tables (read-only) to find
-    // the FB physical address, or USB transport for all I/O. Prioritizing USB.
+    // ---- Display: deferred ---- Display SYSMMU is write-protected (S2MPU). Writing to G#19840000 locks the CPU. Display output requires either: walking SYSMMU page tables (read-only) to find the FB physical address, or USB transport for all I/O. Prioritizing USB.
 
-    // ---- S2MPU bypass (from pkvm_s2mpu.c:187) ----
-    // Bypass ALL relevant S2MPUs so we can access USB PHY, UFS, and display.
-    // Each S2MPU: write G#FF to +G#54 (clear VID protection), 0 to +G#00 (disable)
+    // ---- S2MPU bypass (from pkvm_s2mpu.c:187) ---- Bypass ALL relevant S2MPUs so we can access USB PHY, UFS, and display. Each S2MPU: write G#FF to +G#54 (clear VID protection), 0 to +G#00 (disable)
     const S2MPUS: [usize; 2] = [
         0x1107_0000, // HSI0 — USB PHY + DWC3 DMA
         0x131F_0000, // HSI2 — UFS
@@ -1451,17 +1326,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
-    // ---- USB SYSMMU bypass (now accessible with S2MPU disabled) ----
-    // SYSMMU at G#11040000 translates DWC3 DMA addresses. Without bypass,
-    // DWC3 can't read TRBs or write events to our DRAM buffers.
-    // Samsung SYSMMU v9: write 0 to CTRL (offset 0) to disable translation.
+    // ---- USB SYSMMU bypass (now accessible with S2MPU disabled) ---- SYSMMU at G#11040000 translates DWC3 DMA addresses. Without bypass, DWC3 can't read TRBs or write events to our DRAM buffers. Samsung SYSMMU v9: write 0 to CTRL (offset 0) to disable translation.
     const USB_SYSMMU: usize = 0x1104_0000;
     unsafe {
         core::ptr::write_volatile((USB_SYSMMU + 0x00) as *mut u32, 0); // disable SYSMMU
     }
 
-    // ---- eUSB PHY init (now possible with S2MPU bypassed) ----
-    // Ported from phy-exynos-usbdrd-eusb.c + exynos-usb-blkcon.c
+    // ---- eUSB PHY init (now possible with S2MPU bypassed) ---- Ported from phy-exynos-usbdrd-eusb.c + exynos-usb-blkcon.c
     const USBCON: usize = 0x1110_0000;
     const EUSB_PHY: usize = 0x1111_0000;
 
@@ -1558,10 +1429,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     ferros_hal::usb::set_dwc3_base(DWC3);
     let mut usb = ferros_hal::usb::Dwc3Dev::init();
 
-    // Killswitch + USB event loop.
-    // NOTE: GPA6 (vol up) reads 0 when not pressed — vol-down-only diagnostic
-    // was broken (always fired "both buttons"). Removed the diagnostic.
-    // Both buttons = SYSTEM_OFF (killswitch). That's all we need.
+    // Killswitch + USB event loop. NOTE: GPA6 (vol up) reads 0 when not pressed — vol-down-only diagnostic was broken (always fired "both buttons"). Removed the diagnostic. Both buttons = SYSTEM_OFF (killswitch). That's all we need.
     loop {
         let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
@@ -1607,8 +1475,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     } else {
         None
     };
-    // Fallback: if DTB lookup failed, use known FP5 ramoops region directly.
-    // ramoops@0xBA800000, 2MB, default zone sizes (256KB each).
+    // Fallback: if DTB lookup failed, use known FP5 ramoops region directly. ramoops@0xBA800000, 2MB, default zone sizes (256KB each).
     let ramoops = ramoops.or_else(|| {
         let cfg = RamoopsConfig {
             base: 0xBA80_0000,
@@ -1645,8 +1512,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             let t_start = unsafe { core::ptr::read_volatile(p) };
             let t_end = unsafe { core::ptr::read_volatile(p.add(1)) };
             let ticks = t_end.saturating_sub(t_start);
-            // QCM6490 QTimer = 19.2 MHz → 1 tick = 52.08ns
-            // microseconds = ticks * 1000 / 19200
+            // QCM6490 QTimer = 19.2 MHz → 1 tick = 52.08ns microseconds = ticks * 1000 / 19200
             let us = ticks * 1000 / 19200;
             let ms = us / 1000;
             let us_frac = us % 1000;
@@ -1881,9 +1747,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("CFG_RCGR post: "); log.put_hex32(ferros_hal::gcc::sdc2_cfg_rcgr()); log.puts("\n");
     }
 
-    // ---- SD card power via RPMh mailbox ----
-    // SPMI arbiter blocks direct LDO access (EE ownership). Use RPMh TCS
-    // to request LDO enable through the proper power management channel.
+    // ---- SD card power via RPMh mailbox ---- SPMI arbiter blocks direct LDO access (EE ownership). Use RPMh TCS to request LDO enable through the proper power management channel.
     log.puts("\n-- RPMh cmd-db --\n");
     {
         use ferros_hal::rpmh;
@@ -1965,10 +1829,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let tlmm = 0x0F10_0000usize;
 
         // 1. Configure TLMM SDC2 pads BEFORE probing
-        //    All three pads share one register at TLMM + 0xB4000 (SC7280 pinctrl)
-        //    Bit layout: DATA drv [2:0], CMD drv [5:3], CLK drv [8:6],
-        //                DATA pull [10:9], CMD pull [12:11], CLK pull [15:14]
-        //    Drive: (mA/2)-1. Pull: 0=none, 1=down, 2=keeper, 3=up
+        //    All three pads share one register at TLMM + 0xB4000 (SC7280 pinctrl) Bit layout: DATA drv [2:0], CMD drv [5:3], CLK drv [8:6], DATA pull [10:9], CMD pull [12:11], CLK pull [15:14] Drive: (mA/2)-1. Pull: 0=none, 1=down, 2=keeper, 3=up
         let pack_pre = unsafe { ferros_hal::mmio::read32(tlmm + 0xB4000) };
         log.puts("TLMM pre:  "); log.put_hex32(pack_pre); log.puts("\n");
 
@@ -1983,8 +1844,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("TLMM post: "); log.put_hex32(pack_post); log.puts("\n");
 
         // 2. Card detect — GPIO 91, active-low
-        //    TLMM GPIO regs: base + gpio*0x1000, +0x00=CFG, +0x04=IN_OUT
-        //    CFG: [3:2]=func(0=gpio), [1:0]=pull(3=up), [8:6]=drv
+        //    TLMM GPIO regs: base + gpio*0x1000, +0x00=CFG, +0x04=IN_OUT CFG: [3:2]=func(0=gpio), [1:0]=pull(3=up), [8:6]=drv
         let gpio91_cfg_addr = tlmm + 91 * 0x1000;
         let gpio91_cfg_pre = unsafe { ferros_hal::mmio::read32(gpio91_cfg_addr) };
         log.buf_only("GPIO91 CFG pre: "); log.buf_put_hex32(gpio91_cfg_pre); log.buf_only("\n");
@@ -2320,8 +2180,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 }
                 log.puts("\n");
 
-                // Write-verify test: write a pattern to a safe block, read back
-                // Use block 1048576 (4GB into the disk — well past Android partitions)
+                // Write-verify test: write a pattern to a safe block, read back Use block 1048576 (4GB into the disk — well past Android partitions)
                 let test_lba: u32 = 1 << 20;
                 {
                     let buf = ufs.data_buffer_mut();
@@ -2535,8 +2394,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                     }
                 }
 
-                // If any insert failed, the resumed tree is corrupt.
-                // Discard it, create a fresh root, re-insert everything.
+                // If any insert failed, the resumed tree is corrupt. Discard it, create a fresh root, re-insert everything.
                 if any_fail {
                     log.puts("hamt: corrupt tree, rebuild\n");
                     let root_blk = ferros_hal::hamt::InternalNode::empty().to_block();
@@ -2704,8 +2562,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("rx tail/head:  "); log.put_hex32(smem.rx_tail);
         log.puts(" / ");              log.put_hex32(smem.rx_head);      log.puts("\n");
 
-        // Dump partition header + first two entry headers (each as u32 LE words).
-        // 32-byte partition header + 16-byte entry header × 2 = 64 bytes = 16 u32s
+        // Dump partition header + first two entry headers (each as u32 LE words). 32-byte partition header + 16-byte entry header × 2 = 64 bytes = 16 u32s
         {
             let mut buf = [0u8; 64];
             let n = pmic_glink::dump_adsp_partition(0, &mut buf);
@@ -2771,9 +2628,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             log.buf_only("\n");
         }
 
-        // GLINK handshake + BATTMGR query.
-        // init() will auto-allocate item 480 (APPS TX FIFO) if missing.
-        // We only need SMEM initialized + items 478/479 present (ADSP side).
+        // GLINK handshake + BATTMGR query. init() will auto-allocate item 480 (APPS TX FIFO) if missing. We only need SMEM initialized + items 478/479 present (ADSP side).
         let adsp_ready = smem.initialized == 1
             && (smem.priv_desc_found || smem.desc_alloc == 1)
             && (smem.priv_tx_found   || smem.tx_alloc   == 1);
@@ -2790,8 +2645,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
             log.puts("\n");
         }
-        // Pre-init ADSP raw state — read BEFORE init() modifies anything.
-        // If th>0, ADSP already wrote a VERSION frame to item 479.
+        // Pre-init ADSP raw state — read BEFORE init() modifies anything. If th>0, ADSP already wrote a VERSION frame to item 479.
         {
             let (desc_a, th_a, rx_a, rx_b) = pmic_glink::probe_adsp_raw();
             log.buf_only("adsp raw:      desc="); log.buf_put_hex32(desc_a);
@@ -2994,10 +2848,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             if n == 0 { log.buf_only("none"); }
             log.puts("\n");
         }
-        // Deep register dumps from key SID 8 PIDs.
-        // C8 = type 0x51/0x3F (QG/BMS — fuel gauge, battery voltage/SOC)
-        // CB = type 0x0B/0x01 (BAT_IF)
-        // CA = type 0x0A/0x01 (MBG/ADC)
+        // Deep register dumps from key SID 8 PIDs. C8 = type 0x51/0x3F (QG/BMS — fuel gauge, battery voltage/SOC) CB = type 0x0B/0x01 (BAT_IF) CA = type 0x0A/0x01 (MBG/ADC)
         for pid_u8 in [0xC8u8, 0xCBu8, 0xCAu8] {
             let mut regs = [0xFFu8; 32];
             let n = pmic_glink::read_sid8_regs(pid_u8, 0x00, &mut regs);
@@ -3012,9 +2863,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             for i in 0..n2 { log.buf_put_hex32(regs2[i] as u32); log.buf_only(" "); }
             log.buf_only("\n");
         }
-        // Extended QG/BMS (PID C8) register dump — fuel gauge data regions.
-        // 0x40-0x5F: config/data, 0x60-0x7F: FIFO data, 0x80-0x9F: more data,
-        // 0xA0-0xBF: SDAM/scratch, 0xC0-0xDF: SOC/capacity, 0xE0-0xFF: cal data.
+        // Extended QG/BMS (PID C8) register dump — fuel gauge data regions. 0x40-0x5F: config/data, 0x60-0x7F: FIFO data, 0x80-0x9F: more data, 0xA0-0xBF: SDAM/scratch, 0xC0-0xDF: SOC/capacity, 0xE0-0xFF: cal data.
         {
             log.puts("  QG C8 ext:\n");
             for base in [0x40u8, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
@@ -3037,9 +2886,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
         }
 
-        // SDAM (Shared Direct Access Memory) — PID G#70, G#71 on SID 8.
-        // QG firmware writes battery state (SOC, OCV, ESR) here for HLOS.
-        // SDAM data registers start at offset 0x40 (SDAM_MEM_0).
+        // SDAM (Shared Direct Access Memory) — PID G#70, G#71 on SID 8. QG firmware writes battery state (SOC, OCV, ESR) here for HLOS. SDAM data registers start at offset 0x40 (SDAM_MEM_0).
         {
             log.puts("  SDAM 70:\n");
             for base in [0x00u8, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0] {
@@ -3189,9 +3036,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 loop {
                     match usb.poll_event() {
                         ferros_hal::usb::UsbEvent::None => {
-                            // Yield CPU briefly when no USB events pending.
-                            // GIC + WFI attempted but GICD access may be TZ-protected.
-                            // TODO: probe GIC safely, fall back to spin if protected.
+                            // Yield CPU briefly when no USB events pending. GIC + WFI attempted but GICD access may be TZ-protected. TODO: probe GIC safely, fall back to spin if protected.
                             for _ in 0..64u32 { core::hint::spin_loop(); }
                         }
                         ferros_hal::usb::UsbEvent::Reset => {
@@ -3387,8 +3232,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                     }
                                                                 }
                                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
-                                                                // RELOAD Write: payload is the new kernel binary
-                                                                // Copy into staging DRAM
+                                                                // RELOAD Write: payload is the new kernel binary Copy into staging DRAM
                                                                 let data = cmd.params;
                                                                 let dst = unsafe {
                                                                     core::slice::from_raw_parts_mut(
@@ -3495,8 +3339,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                 pt_out_data.clear();
                                                                 pt_out_data.extend_from_slice(&(reload_size as u32).to_le_bytes());
                                                             } else if cmd.cap == cap_install && cmd.op == ferros_pt::Op::Exec {
-                                                                // INSTALL Exec: persist to UFS + signed stem entry (no jump)
-                                                                // Params: [size:4 LE][hash:32][sig:64] = 100 bytes
+                                                                // INSTALL Exec: persist to UFS + signed stem entry (no jump) Params: [size:4 LE][hash:32][sig:64] = 100 bytes
                                                                 log.buf_only("INSTALL exec size=");
                                                                 log.buf_put_hex32(reload_size as u32);
                                                                 log.buf_only("\n");
@@ -3612,8 +3455,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                     pt_out_data.extend_from_slice(b"ERR:PARAMS");
                                                                 }
                                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
-                                                                // REBOOT Exec: param[0] selects mode
-                                                                // 0x00 = normal reboot, 0x01 = fastboot
+                                                                // REBOOT Exec: param[0] selects mode 0x00 = normal reboot, 0x01 = fastboot
                                                                 let mode = cmd.params.first().copied().unwrap_or(0);
                                                                 log.buf_only("REBOOT mode=");
                                                                 log.buf_put_hex32(mode as u32);
@@ -3624,8 +3466,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                                     psci_reboot();
                                                                 }
                                                             } else if cmd.cap == cap_beam && cmd.op == ferros_pt::Op::Read {
-                                                                // BEAM Read: read ring entries
-                                                                // Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
+                                                                // BEAM Read: read ring entries Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE]
                                                                 if cmd.params.len() >= 10 {
                                                                     let ring_id = cmd.params[0];
                                                                     let mode = cmd.params[1];
@@ -3738,8 +3579,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     } else if ferros_pt::is_control_packet(tmp[0]) {
                                         // Control packet — single-byte tag dispatch
                                         if let Some(spec) = Spec::decode(&tmp[..n]) {
-                                            // SPEC — new inbound transfer (clears stale state)
-                                            // New session — log + cancel stale state
+                                            // SPEC — new inbound transfer (clears stale state) New session — log + cancel stale state
                                             log.screen = false; // was true
                                             log.puts("NEW idle="); log.put_hex32(usb.bulk_in_idle as u32);
                                             log.puts("\n");
@@ -3886,10 +3726,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     }
                                 }
                             } else {
-                                // All DATA sent — no FIN for outbound response.
-                                // Bridge knows chunk count from SPEC. Sending FIN
-                                // would leave a stale IN transfer if bridge already
-                                // returned after all_received().
+                                // All DATA sent — no FIN for outbound response. Bridge knows chunk count from SPEC. Sending FIN would leave a stale IN transfer if bridge already returned after all_received().
                                 pt_outbound = None;
                             }
                         }
@@ -3946,8 +3783,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
 /// Hot-reload: jump to a new kernel image at the given DRAM address.
 ///
-/// The new image is position-independent (uses adrp). We disable caches,
-/// flush the staging area, then branch to _start with x0 = DTB.
+/// The new image is position-independent (uses adrp). We disable caches, flush the staging area, then branch to _start with x0 = DTB.
 fn hot_reload(stage_addr: usize, dtb: u64) -> ! {
     unsafe {
         core::arch::asm!(
@@ -3999,15 +3835,12 @@ fn psci_reboot() -> ! {
 
 /// Reboot into fastboot via PMK8350 SDAM_2 restart reason register.
 ///
-/// SDAM_2 is at SPMI SID 8 (not 0!), PID 0x71 → PPID 0x0871, APID 0x122.
-/// Direct SPMI write returns success but value doesn't stick — try SCM IO
-/// write to the SPMI arbiter channel registers instead (TZ privilege).
+/// SDAM_2 is at SPMI SID 8 (not 0!), PID 0x71 → PPID 0x0871, APID 0x122. Direct SPMI write returns success but value doesn't stick — try SCM IO write to the SPMI arbiter channel registers instead (TZ privilege).
 fn psci_reboot_fastboot() -> ! {
     // APID 0x122 write channel: CHNLS_BASE + 0x122 * 0x1000 = 0x0C722000
     const SDAM2_CH: usize = 0x0C60_0000 + 0x122 * 0x1000;
 
-    // Method 1: SCM IO write through SPMI arbiter channel (TZ privilege)
-    // Write WDATA0 = 0x04 (FASTBOOT_MODE=0x02 << 1)
+    // Method 1: SCM IO write through SPMI arbiter channel (TZ privilege) Write WDATA0 = 0x04 (FASTBOOT_MODE=0x02 << 1)
     scm_io_write(SDAM2_CH + 0x10, 0x04);
     // Write CMD: EXT_WRITEL opcode=0, reg_offset=0x48, 1 byte
     scm_io_write(SDAM2_CH + 0x00, (0x48u32 << 4) | 0);
@@ -4037,8 +3870,7 @@ fn psci_reboot_fastboot() -> ! {
     psci_reboot();
 }
 
-/// SCM IO write: TrustZone-privileged write to a physical address.
-/// SMC64 fast call: SVC_IO(5), CMD_WRITE(2).
+/// SCM IO write: TrustZone-privileged write to a physical address. SMC64 fast call: SVC_IO(5), CMD_WRITE(2).
 fn scm_io_write(addr: usize, val: u32) {
     unsafe {
         core::arch::asm!(

@@ -27,20 +27,10 @@
 //! Supports v4 (Android 13 GKI — required for FP5/QCM6490):
 //!
 //! ```text
-//! boot_img_hdr_v4:
-//! 0x000   8       Magic: "ANDROID!"
-//! 0x008   4       kernel_size
-//! 0x00C   4       ramdisk_size (0)
-//! 0x010   4       os_version (0)
-//! 0x014   4       header_size (1584)
-//! 0x018   16      reserved (zeros)
-//! 0x028   4       header_version (4)
-//! 0x02C   1536    cmdline
-//! 0x62C   4       signature_size (0)
+//! boot_img_hdr_v4: 0x000   8       Magic: "ANDROID!" 0x008   4       kernel_size 0x00C   4       ramdisk_size (0) 0x010   4       os_version (0) 0x014   4       header_size (1584) 0x018   16      reserved (zeros) 0x028   4       header_version (4) 0x02C   1536    cmdline 0x62C   4       signature_size (0)
 //! ```
 //!
-//! Page size is always 4096 for v3/v4. No kernel_addr field —
-//! ABL uses the ARM64 Image header's text_offset instead.
+//! Page size is always 4096 for v3/v4. No kernel_addr field — ABL uses the ARM64 Image header's text_offset instead.
 //!
 //! Also supports legacy v0 via `boot-v0` command.
 
@@ -153,8 +143,7 @@ fn parse_elf_segments(data: &[u8]) -> Vec<ElfSegment> {
     segments
 }
 
-/// Convert ELF to flat binary — concatenate all PT_LOAD segments
-/// into a single contiguous image starting at the lowest vaddr.
+/// Convert ELF to flat binary — concatenate all PT_LOAD segments into a single contiguous image starting at the lowest vaddr.
 fn elf_to_flat(elf_data: &[u8]) -> Vec<u8> {
     let segments = parse_elf_segments(elf_data);
     let base_addr = segments[0].vaddr;
@@ -223,9 +212,7 @@ fn cmd_anchor_key(args: &[String]) {
         "anchor.img".to_string()
     };
 
-    // Generate 32 bytes of random key material.
-    // On a real system this would use /dev/urandom or a CSPRNG.
-    // For dev, we use a deterministic-but-unique seed from the timestamp.
+    // Generate 32 bytes of random key material. On a real system this would use /dev/urandom or a CSPRNG. For dev, we use a deterministic-but-unique seed from the timestamp.
     let mut key = [0u8; 32];
 
     // Read from /dev/urandom
@@ -243,11 +230,7 @@ fn cmd_anchor_key(args: &[String]) {
         }
     }
 
-    // Anchor key image format:
-    // [0..8]   magic: "FEANCH01" (ferros anchor v01)
-    // [8..40]  32-byte anchor key
-    // [40..48] ring_size as u64 LE (default 4096 slots)
-    // [48..64] reserved (zeros)
+    // Anchor key image format: [0..8]   magic: "FEANCH01" (ferros anchor v01) [8..40]  32-byte anchor key [40..48] ring_size as u64 LE (default 4096 slots) [48..64] reserved (zeros)
     let mut img = vec![0u8; 64];
     img[0..8].copy_from_slice(b"FEANCH01");
     img[8..40].copy_from_slice(&key);
@@ -265,50 +248,15 @@ fn cmd_anchor_key(args: &[String]) {
 
 /// Build an Android boot image (v2 format) wrapping a gzip-compressed kernel.
 ///
-/// This matches the format confirmed working on FP5 (QCM6490) per U-Boot docs:
-///   mkbootimg --pagesize 4096 --header_version 2 --kernel_offset 0x00008000
+/// This matches the format confirmed working on FP5 (QCM6490) per U-Boot docs: mkbootimg --pagesize 4096 --header_version 2 --kernel_offset 0x00008000
 ///
-/// ABL detects gzip magic (0x1f8b) and decompresses before loading.
-/// After decompression, it reads the ARM64 Image header's text_offset.
+/// ABL detects gzip magic (0x1f8b) and decompresses before loading. After decompression, it reads the ARM64 Image header's text_offset.
 ///
-/// boot_img_hdr_v0/v1/v2 layout:
-///   0x000  8     magic "ANDROID!"
-///   0x008  4     kernel_size
-///   0x00C  4     kernel_addr (base + kernel_offset)
-///   0x010  4     ramdisk_size (0)
-///   0x014  4     ramdisk_addr
-///   0x018  4     second_size (0)
-///   0x01C  4     second_addr
-///   0x020  4     tags_addr
-///   0x024  4     page_size (4096)
-///   0x028  4     header_version (2)
-///   0x02C  4     os_version (0)
-///   0x030  16    name
-///   0x040  512   cmdline
-///   0x240  32    id
-///   0x260  1024  extra_cmdline
-///   -- v1 fields --
-///   0x660  4     recovery_dtbo_size (0)
-///   0x664  8     recovery_dtbo_offset (0)
-///   0x66C  4     header_size
-///   -- v2 fields --
-///   0x670  4     dtb_size (0)
-///   0x674  8     dtb_addr (0)
+/// boot_img_hdr_v0/v1/v2 layout: 0x000  8     magic "ANDROID!" 0x008  4     kernel_size 0x00C  4     kernel_addr (base + kernel_offset) 0x010  4     ramdisk_size (0) 0x014  4     ramdisk_addr 0x018  4     second_size (0) 0x01C  4     second_addr 0x020  4     tags_addr 0x024  4     page_size (4096) 0x028  4     header_version (2) 0x02C  4     os_version (0) 0x030  16    name 0x040  512   cmdline 0x240  32    id 0x260  1024  extra_cmdline -- v1 fields -- 0x660  4     recovery_dtbo_size (0) 0x664  8     recovery_dtbo_offset (0) 0x66C  4     header_size -- v2 fields -- 0x670  4     dtb_size (0) 0x674  8     dtb_addr (0)
 fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
-    // Pixel 8 ABL requires boot image header v4 (GKI 2.0 format).
-    // v4 extends v3 with a signature_size field at the end.
+    // Pixel 8 ABL requires boot image header v4 (GKI 2.0 format). v4 extends v3 with a signature_size field at the end.
     //
-    // boot_img_hdr_v4 layout:
-    //   0x000  8     magic "ANDROID!"
-    //   0x008  4     kernel_size
-    //   0x00C  4     ramdisk_size (0)
-    //   0x010  4     os_version
-    //   0x014  4     header_size (1584)
-    //   0x018  16    reserved (zeros)
-    //   0x028  4     header_version (4)
-    //   0x02C  1536  cmdline (zeros)
-    //   0x62C  4     signature_size (0 — v4 addition)
-    //   Total header: 1584 bytes, padded to 4096
+    // boot_img_hdr_v4 layout: 0x000  8     magic "ANDROID!" 0x008  4     kernel_size 0x00C  4     ramdisk_size (0) 0x010  4     os_version 0x014  4     header_size (1584) 0x018  16    reserved (zeros) 0x028  4     header_version (4) 0x02C  1536  cmdline (zeros) 0x62C  4     signature_size (0 — v4 addition) Total header: 1584 bytes, padded to 4096
     const PAGE_SIZE: usize = 4096;
     const HEADER_VERSION: u32 = 4;
     const HEADER_SIZE: u32 = 1584;
@@ -353,8 +301,7 @@ fn write_le32(buf: &mut [u8], offset: usize, val: u32) {
     buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
 }
 
-/// Simple hash for the boot image ID field. Not cryptographic —
-/// just for identification in fastboot output.
+/// Simple hash for the boot image ID field. Not cryptographic — just for identification in fastboot output.
 #[allow(dead_code)]
 fn simple_hash(data: &[u8]) -> [u8; 32] {
     let mut hash = [0u8; 32];
@@ -492,8 +439,7 @@ fn elf_find_symbol(elf_data: &[u8], name: &str) -> Option<u64> {
     None
 }
 
-/// Find a symbol whose name ends with the given suffix (for Rust-mangled names).
-/// E.g. suffix "PUBKEY" matches "_ZN11ferros_seed6PUBKEY17h...E".
+/// Find a symbol whose name ends with the given suffix (for Rust-mangled names). E.g. suffix "PUBKEY" matches "_ZN11ferros_seed6PUBKEY17h...E".
 fn elf_find_symbol_suffix(elf_data: &[u8], suffix: &str) -> Option<u64> {
     if elf_data.len() < 64 || elf_data[0..4] != ELF_MAGIC { return None; }
 
@@ -541,8 +487,7 @@ fn elf_find_symbol_suffix(elf_data: &[u8], suffix: &str) -> Option<u64> {
                 .unwrap_or(elf_data.len());
             let sym_name = std::str::from_utf8(&elf_data[name_start..name_end]).ok()?;
 
-            // Rust mangling: look for the suffix between length prefix and hash suffix
-            // e.g. _ZN11ferros_seed6PUBKEY17h...E contains "PUBKEY"
+            // Rust mangling: look for the suffix between length prefix and hash suffix e.g. _ZN11ferros_seed6PUBKEY17h...E contains "PUBKEY"
             if sym_name.contains(suffix) && st_value != 0 {
                 return Some(st_value);
             }
@@ -654,8 +599,7 @@ fn cmd_seed(args: &[String]) {
 
     eprintln!("Building signed seed: {}", input);
 
-    // Find PUBKEY, SEED_SIG, and __bss_start in the ELF symbol table.
-    // Rust mangles statics, so search by suffix.
+    // Find PUBKEY, SEED_SIG, and __bss_start in the ELF symbol table. Rust mangles statics, so search by suffix.
     let pubkey_addr = elf_find_symbol_suffix(&elf_data, "PUBKEY").unwrap_or_else(|| {
         eprintln!("Error: PUBKEY symbol not found in ELF");
         process::exit(1);
@@ -700,9 +644,7 @@ fn cmd_seed(args: &[String]) {
         flat[pubkey_off..pubkey_off + 32].copy_from_slice(pk.as_ref());
         eprintln!("  Patched pubkey at G#{:X}", pubkey_off);
 
-        // Hash only _start..__bss_start (file-backed data, excludes BSS/stack).
-        // Matches seed's self_verify() which hashes the same range.
-        // Signature region is still zero (matches self_verify's zeroing logic).
+        // Hash only _start..__bss_start (file-backed data, excludes BSS/stack). Matches seed's self_verify() which hashes the same range. Signature region is still zero (matches self_verify's zeroing logic).
         let hash = blake3::hash(&flat[..bss_off]);
         eprintln!("  BLAKE3 (..bss): {}", &hash.to_hex()[..16]);
 

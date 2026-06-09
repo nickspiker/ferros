@@ -1,22 +1,16 @@
 //! Layer 1 — Capability tokens and delegation chains.
 //!
-//! Access control in the Ledger is capability-based: possession of a hash
-//! IS the credential. There are no user IDs, no group IDs, no permission
-//! bits checked by a kernel. If you have the hash, you have access.
+//! Access control in the Ledger is capability-based: possession of a hash IS the credential. There are no user IDs, no group IDs, no permission bits checked by a kernel. If you have the hash, you have access.
 //!
-//! Capabilities are structured VSF types that can be delegated (creating
-//! a child capability with equal or reduced permissions) and revoked
-//! (by rotating the salt that produced the parent hash).
+//! Capabilities are structured VSF types that can be delegated (creating a child capability with equal or reduced permissions) and revoked (by rotating the salt that produced the parent hash).
 //!
 //! ## Contrast
 //! - BTRFS: POSIX uid/gid/mode stored in btrfs_inode_item (u32 uid,
-//!   u32 gid, u32 mode). Root (uid 0) bypasses ALL permission checks.
-//!   ACLs via xattrs add complexity but don't change the trust model.
+//!   u32 gid, u32 mode). Root (uid 0) bypasses ALL permission checks. ACLs via xattrs add complexity but don't change the trust model.
 //! - RedoxFS: Unix uid/gid/mode (u32/u32/u16) in Node struct. Root
 //!   bypass explicitly coded: `if uid == 0 { return true; }`.
 //! - Ledger: No superuser. No uid. No mode bits. The hash chain is the
-//!   entire access control system. write_hash → read_hash is derivable;
-//!   read_hash → write_hash is computationally infeasible (one-way).
+//!   entire access control system. write_hash → read_hash is derivable; read_hash → write_hash is computationally infeasible (one-way).
 
 use alloc::vec::Vec;
 
@@ -25,8 +19,7 @@ use crate::object::{IntoObject, Object};
 
 /// A capability token — the fundamental access credential.
 ///
-/// Holding this token grants the specified permission level to the
-/// target object. Tokens are themselves VSF objects stored in the ledger.
+/// Holding this token grants the specified permission level to the target object. Tokens are themselves VSF objects stored in the ledger.
 #[derive(Clone, Debug)]
 pub struct CapabilityToken {
     /// Hash of the object this capability grants access to.
@@ -84,16 +77,14 @@ pub enum CapabilityError {
 
 /// The capability engine — validates and delegates capabilities.
 pub trait CapabilityEngine {
-    /// Verify that a credential hash grants the claimed access level
-    /// to the target object.
+    /// Verify that a credential hash grants the claimed access level to the target object.
     fn verify(
         &self,
         token: &CapabilityToken,
         current_generation: u64,
     ) -> Result<(), CapabilityError>;
 
-    /// Delegate a capability to create a child token with equal or
-    /// reduced permissions.
+    /// Delegate a capability to create a child token with equal or reduced permissions.
     fn delegate(
         &self,
         parent: &CapabilityToken,
@@ -101,8 +92,7 @@ pub trait CapabilityEngine {
         new_constraints: CapabilityConstraints,
     ) -> Result<CapabilityToken, CapabilityError>;
 
-    /// Revoke a capability by rotating its salt. All tokens derived
-    /// from this salt become invalid.
+    /// Revoke a capability by rotating its salt. All tokens derived from this salt become invalid.
     fn revoke(&mut self, target: &ObjectHash, new_salt: Salt) -> Result<(), CapabilityError>;
 
     /// Look up the current salt for an object (needed for verification).
@@ -114,8 +104,7 @@ pub trait CapabilityEngine {
 
 impl IntoObject for CapabilityToken {
     fn into_object(self, domain: &[u8], generation: u64) -> Object {
-        // Stub: serialize the token into VSF binary format.
-        // Real implementation will use VSF EWE encoding.
+        // Stub: serialize the token into VSF binary format. Real implementation will use VSF EWE encoding.
         let _ = (domain, generation);
         todo!("VSF serialization of CapabilityToken")
     }

@@ -5,22 +5,14 @@
 //! - `reserved-memory/ferros-anchor-key` (for Phase 2 ABL handoff)
 //! - Memory regions
 //!
-//! This is NOT a full DTB parser. It's a scanner that finds specific
-//! nodes by name and reads their properties. Full FDT parsing is
-//! overkill for boot — we know exactly what we're looking for.
+//! This is NOT a full DTB parser. It's a scanner that finds specific nodes by name and reads their properties. Full FDT parsing is overkill for boot — we know exactly what we're looking for.
 //!
 //! ## DTB Format (condensed)
 //!
 //! ```text
-//! Header (40 bytes):
-//!   magic: 0xD00DFEED (big-endian)
-//!   totalsize, off_dt_struct, off_dt_strings, ...
+//! Header (40 bytes): magic: 0xD00DFEED (big-endian) totalsize, off_dt_struct, off_dt_strings, ...
 //!
-//! Structure block (tokens, big-endian u32):
-//!   FDT_BEGIN_NODE (0x01) + name\0 + padding
-//!   FDT_PROP       (0x03) + len + nameoff + data + padding
-//!   FDT_END_NODE   (0x02)
-//!   FDT_END        (0x09)
+//! Structure block (tokens, big-endian u32): FDT_BEGIN_NODE (0x01) + name\0 + padding FDT_PROP       (0x03) + len + nameoff + data + padding FDT_END_NODE   (0x02) FDT_END        (0x09)
 //!
 //! Strings block: null-terminated property names
 //! ```
@@ -112,8 +104,7 @@ impl<'a> Dtb<'a> {
     /// Create a DTB from a raw pointer (e.g. from bootloader handoff in x0).
     ///
     /// # Safety
-    /// `ptr` must point to readable memory containing a valid FDT blob.
-    /// The memory must remain valid for the lifetime of the returned Dtb.
+    /// `ptr` must point to readable memory containing a valid FDT blob. The memory must remain valid for the lifetime of the returned Dtb.
     pub unsafe fn from_ptr(ptr: *const u8) -> Option<Self> {
         // Read just the header first to get totalsize
         let header = unsafe { core::slice::from_raw_parts(ptr, 40) };
@@ -144,9 +135,7 @@ impl<'a> Dtb<'a> {
 
     /// Find a property `prop_name` inside a node whose name starts with `node_name`.
     ///
-    /// Scans the structure block linearly. Returns the first match.
-    /// `node_name` matches if the DTB node name starts with it (handles
-    /// unit addresses like `framebuffer@9c000000`).
+    /// Scans the structure block linearly. Returns the first match. `node_name` matches if the DTB node name starts with it (handles unit addresses like `framebuffer@9c000000`).
     pub fn find_node_prop(&self, node_name: &[u8], prop_name: &[u8]) -> Option<DtbProp<'a>> {
         let mut pos = self.struct_offset;
         let mut in_target_node = false;
@@ -205,8 +194,7 @@ impl<'a> Dtb<'a> {
         None
     }
 
-    /// Find all properties of a node, calling `cb` for each.
-    /// Returns true if the node was found.
+    /// Find all properties of a node, calling `cb` for each. Returns true if the node was found.
     pub fn for_each_prop<F>(&self, node_name: &[u8], mut cb: F) -> bool
     where
         F: FnMut(DtbProp<'a>),
@@ -303,8 +291,7 @@ impl<'a> Dtb<'a> {
         }
     }
 
-    /// Iterate direct children of `parent_name`, calling `cb(child_name, reg_data)`
-    /// for each child that has a "reg" property. Used to scan reserved-memory, etc.
+    /// Iterate direct children of `parent_name`, calling `cb(child_name, reg_data)` for each child that has a "reg" property. Used to scan reserved-memory, etc.
     pub fn for_each_child_reg<F>(&self, parent_name: &[u8], mut cb: F)
     where
         F: FnMut(&'a [u8], &'a [u8]), // (child_node_name, reg_data)

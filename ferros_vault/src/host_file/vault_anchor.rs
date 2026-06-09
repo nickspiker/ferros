@@ -4,14 +4,7 @@
 //!
 //! Wire format (in slot bytes):
 //! ```text
-//!   [magic: 4 bytes "VLT0"]
-//!   [version: u8]                   (currently 0)
-//!   [anchor_seq: u64 LE]            (monotonic; clobbers detection)
-//!   [ring_size: u32 LE]             (number of slots; anchor self-describes layout)
-//!   [payload_capacity: u64 LE]      (vault payload bytes; slot offsets % this)
-//!   [object_tail: u64 LE]           (append cursor; bytes 0..object_tail are claimed)
-//!   [root_commit: 32 bytes]         (BLAKE3 hash of the root commit object)
-//!   [hmac: 32 bytes]                (BLAKE3-keyed over all above fields)
+//!   [magic: 4 bytes "VLT0"] [version: u8]                   (currently 0) [anchor_seq: u64 LE]            (monotonic; clobbers detection) [ring_size: u32 LE]             (number of slots; anchor self-describes layout) [payload_capacity: u64 LE]      (vault payload bytes; slot offsets % this) [object_tail: u64 LE]           (append cursor; bytes 0..object_tail are claimed) [root_commit: 32 bytes]         (BLAKE3 hash of the root commit object) [hmac: 32 bytes]                (BLAKE3-keyed over all above fields)
 //! ```
 //! Fixed-width encoding (no EWE) because the vault knows the format intimately and the size is bounded (~93 bytes); EWE would buy nothing here.
 //!
@@ -177,8 +170,7 @@ pub fn derive_slot_offset(key: &AnchorKey, slot_index: u32, payload_capacity: u6
 
 /// Probe forward to resolve a slot offset collision. Calls `derive_slot_offset` then, if the offset was already claimed by another slot or by the object_tail region, picks a probe-derived offset and tries again. Returns `None` if no free offset is found within `max_probes` attempts.
 ///
-/// `claimed_offsets` is the set of offsets already taken by lower-index slots (caller passes this in; only the first `slot_index` slots are populated by the time we derive slot N).
-/// `object_tail` is the current append cursor; offsets `< object_tail + SLOT_STRIDE` would collide with appended object data.
+/// `claimed_offsets` is the set of offsets already taken by lower-index slots (caller passes this in; only the first `slot_index` slots are populated by the time we derive slot N). `object_tail` is the current append cursor; offsets `< object_tail + SLOT_STRIDE` would collide with appended object data.
 pub fn derive_slot_offset_with_probe(
     key: &AnchorKey,
     slot_index: u32,

@@ -1,6 +1,6 @@
 //! Vault inspector CLI — companion to `vsfinfo`. `vsfinfo` decodes the outer VSF wrapper; `vaultinfo` decodes the inner ferros_vault structure (anchors, object envelopes, root_commit dict, optional decrypt).
 //!
-//! Arg sniffing: any arg that is exactly 64 hex characters is treated as a key; everything else is the file path. Order doesn't matter — `vaultinfo file.vsf HEX`, `vaultinfo HEX file.vsf`, `vaultinfo HEX file.vsf HEX` all work.
+//! Arg sniffing: any arg that looks like a key (64 hex chars OR voca PascalCase word concatenation) is treated as a key; everything else is the file path. Order doesn't matter — `vaultinfo file.vsf KEY`, `vaultinfo KEY file.vsf`, `vaultinfo KEY1 file.vsf KEY2` all work. Hex and voca shapes can't collide (hex is all-lowercase digits, voca has inner capitals) so mixing both forms in one invocation is fine.
 //!
 //! - 0 keys: layout view (slot fields, object envelopes, root_commit dict)
 //! - 1 key: treated as anchor_key; HMAC-verifies each slot
@@ -22,10 +22,10 @@ fn main() -> ExitCode {
     }
 
     let mut file: Option<&str> = None;
-    let mut hex_keys: Vec<&str> = Vec::new();
+    let mut keys: Vec<&str> = Vec::new();
     for arg in &argv {
-        if is_hex_key(arg) {
-            hex_keys.push(arg);
+        if looks_like_key(arg) {
+            keys.push(arg);
         } else if file.is_some() {
             eprintln!("error: multiple file paths supplied ({} and {})", file.unwrap(), arg);
             return ExitCode::from(1);
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match inspect_vault(&bytes, &hex_keys) {
+    match inspect_vault(&bytes, &keys) {
         Ok(s) => {
             print!("{}", s);
             ExitCode::from(0)
@@ -60,15 +60,32 @@ fn main() -> ExitCode {
     }
 }
 
-/// A 64-char string of `[0-9a-fA-F]` is unambiguously a key — no path on a sane filesystem looks like that.
-fn is_hex_key(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+/// Classify an arg as key or path. Two shapes both count as keys:
+///  - 64 hex chars `[0-9a-fA-F]` — legacy hex form
+///  - PascalCase word concatenation with an inner uppercase letter — voca FULL form
+///
+/// A 32-byte voca-encoded key is ~22 words concatenated, so an inner uppercase is guaranteed. File paths on every sane filesystem either lack inner uppercase entirely or have path separators (`/`) the voca shape doesn't include — no collision in practice.
+fn looks_like_key(s: &str) -> bool {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true;
+    }
+    if s.contains('/') || s.contains('\\') || s.contains('.') {
+        return false;
+    }
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else { return false };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    bytes.any(|b| b.is_ascii_uppercase())
 }
 
 fn print_usage() {
-    eprintln!("usage: vaultinfo [HEX...] FILE [HEX...]");
+    eprintln!("usage: vaultinfo [KEY...] FILE [KEY...]");
     eprintln!();
-    eprintln!("  HEX  one or two 64-char hex keys (any position)");
+    eprintln!("  KEY  one or two keys (any position). Each is either:");
+    eprintln!("         - 64 hex chars (legacy form)");
+    eprintln!("         - voca PascalCase word concatenation (e.g. BiasZippyMoment…)");
     eprintln!("       0 keys: layout view");
     eprintln!("       1 key:  treated as anchor_key (HMAC verify)");
     eprintln!("       2 keys: identity_seed + device_secret, any order — derives anchor_key");
@@ -76,6 +93,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("examples:");
     eprintln!("  vaultinfo ~/.config/photon.vsf");
-    eprintln!("  vaultinfo ~/.config/photon.vsf DEADBEEF...64chars");
-    eprintln!("  vaultinfo HEX1 HEX2 ~/.config/photon.vsf");
+    eprintln!("  vaultinfo ~/.config/photon.vsf BiasZippyMomentRibbon…");
+    eprintln!("  vaultinfo DEADBEEF…64chars ~/.config/photon.vsf");
+    eprintln!("  vaultinfo KEY1 KEY2 ~/.config/photon.vsf");
 }

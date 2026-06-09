@@ -2,103 +2,41 @@
 //!
 //! # The Problem
 //!
-//! The Ledger has no superblock, no fixed offsets, no magic numbers.
-//! But something has to bootstrap. You need a toehold — a way to go
-//! from "powered on, know nothing" to "found the commit chain."
+//! The Ledger has no superblock, no fixed offsets, no magic numbers. But something has to bootstrap. You need a toehold — a way to go from "powered on, know nothing" to "found the commit chain."
 //!
 //! # The Answer: Two Trust Domains
 //!
-//! The anchor key lives in a *different trust domain* than the data.
-//! The key tells you where to look; the data tells you what's there.
-//! Without the key, the storage device looks like random noise.
+//! The anchor key lives in a *different trust domain* than the data. The key tells you where to look; the data tells you what's there. Without the key, the storage device looks like random noise.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │ Trust Domain A: Key Store (survives power loss)     │
-//! │                                                     │
-//! │  Fairphone 5:  UFS RPMB partition                   │
-//! │  Glyph:        RISC-V CSR / crypto coprocessor      │
-//! │  8KB pico:     eFuse or OTP                         │
-//! │  Dev/test:     file on host, or RAM                 │
-//! │                                                     │
-//! │  Contains: AnchorKey (32 bytes) + ring_size (EWE)   │
-//! └──────────────────────┬──────────────────────────────┘
-//!                        │ key
-//!                        ▼
-//!       derive_ring_offset(key, slot) → offset on device
-//!                        │
-//!                        ▼
-//! ┌─────────────────────────────────────────────────────┐
-//! │ Trust Domain B: Storage Device (UFS main area)      │
-//! │                                                     │
-//! │  At each derived offset: a VSF-encoded anchor       │
-//! │  (variable size, self-describing, HMAC'd)           │
-//! │                                                     │
-//! │  anchor → commit_hash → CommitRecord → objects      │
-//! └─────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────┐ │ Trust Domain A: Key Store (survives power loss)     │ │                                                     │ │  Fairphone 5:  UFS RPMB partition                   │ │  Glyph:        RISC-V CSR / crypto coprocessor      │ │  8KB pico:     eFuse or OTP                         │ │  Dev/test:     file on host, or RAM                 │ │                                                     │ │  Contains: AnchorKey (32 bytes) + ring_size (EWE)   │ └──────────────────────┬──────────────────────────────┘ │ key ▼ derive_ring_offset(key, slot) → offset on device │ ▼ ┌─────────────────────────────────────────────────────┐ │ Trust Domain B: Storage Device (UFS main area)      │ │                                                     │ │  At each derived offset: a VSF-encoded anchor       │ │  (variable size, self-describing, HMAC'd)           │ │                                                     │ │  anchor → commit_hash → CommitRecord → objects      │ └─────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Fairphone 5 Boot Reality
 //!
-//! The FP5 runs a Qualcomm QCM6490. We don't control the early boot
-//! chain — and we shouldn't pretend otherwise.
+//! The FP5 runs a Qualcomm QCM6490. We don't control the early boot chain — and we shouldn't pretend otherwise.
 //!
 //! ```text
-//! Stage        Who Controls   What Happens
-//! ─────        ────────────   ────────────
-//! PBL          Qualcomm ROM   SoC powers on, loads XBL from UFS
-//! XBL          Qualcomm+FP    DDR init, TrustZone, UFS driver
-//! ABL          Qualcomm+FP    fastboot, boot image verification
-//!   ╰── HERE   us (unlocked)  ABL loads our boot.img from boot_a/b
-//! ferros       us             kernel starts, needs to find ledger
+//! Stage        Who Controls   What Happens ─────        ────────────   ──────────── PBL          Qualcomm ROM   SoC powers on, loads XBL from UFS XBL          Qualcomm+FP    DDR init, TrustZone, UFS driver ABL          Qualcomm+FP    fastboot, boot image verification ╰── HERE   us (unlocked)  ABL loads our boot.img from boot_a/b ferros       us             kernel starts, needs to find ledger
 //! ```
 //!
-//! **We enter the picture at ABL.** Bootloader must be unlocked
-//! (`fastboot oem unlock`). ABL loads our kernel from the boot
-//! partition. From that point forward, it's our code.
+//! **We enter the picture at ABL.** Bootloader must be unlocked (`fastboot oem unlock`). ABL loads our kernel from the boot partition. From that point forward, it's our code.
 //!
 //! **Where the anchor key lives on FP5 — the honest version:**
 //!
-//! RPMB (Replay Protected Memory Block) exists on the UFS chip and
-//! would be ideal — but we can't easily reach it:
+//! RPMB (Replay Protected Memory Block) exists on the UFS chip and would be ideal — but we can't easily reach it:
 //!
 //! ```text
-//! ferros kernel (EL1, Normal World)
-//!     │
-//!     │ SMC (Secure Monitor Call)
-//!     ▼
-//! TrustZone / QTEE (EL3, Secure World) ← Qualcomm's signed blob
-//!     │
-//!     │ RPMB auth key (from QFPROM fuses, provisioned at first boot)
-//!     ▼
-//! UFS RPMB partition
+//! ferros kernel (EL1, Normal World) │ │ SMC (Secure Monitor Call) ▼ TrustZone / QTEE (EL3, Secure World) ← Qualcomm's signed blob │ │ RPMB auth key (from QFPROM fuses, provisioned at first boot) ▼ UFS RPMB partition
 //! ```
 //!
-//! The RPMB auth key is derived from hardware fuses, provisioned by
-//! XBL, and held in TrustZone. Normal-world code (our kernel) cannot
-//! access RPMB directly — it must go through Qualcomm's QTEE via SMC
-//! calls, and QTEE may refuse a non-Android caller.
+//! The RPMB auth key is derived from hardware fuses, provisioned by XBL, and held in TrustZone. Normal-world code (our kernel) cannot access RPMB directly — it must go through Qualcomm's QTEE via SMC calls, and QTEE may refuse a non-Android caller.
 //!
-//! **Phase 1 (bring-up): Dedicated partition**
-//! Anchor key lives in a `ferros_anchor` partition on regular UFS.
-//! Flash via `fastboot flash ferros_anchor <key.img>`.
-//! Same trust domain as data — but mesh consensus across two devices
-//! from different vendors still provides the core security property.
-//! An attacker needs BOTH devices, not just one.
+//! **Phase 1 (bring-up): Dedicated partition** Anchor key lives in a `ferros_anchor` partition on regular UFS. Flash via `fastboot flash ferros_anchor <key.img>`. Same trust domain as data — but mesh consensus across two devices from different vendors still provides the core security property. An attacker needs BOTH devices, not just one.
 //!
-//! **Phase 2 (mid-term): Custom ABL handoff**
-//! Build a modified ABL (EDK2-based, Fairphone publishes sources).
-//! Our ABL reads RPMB (ABL has TrustZone access), stashes the anchor
-//! key in a reserved-memory DTB node, then boots our kernel. Our
-//! kernel reads it from the DTB. One-way handoff: RPMB → ABL → DTB
-//! → kernel. Key is in RAM only during boot, cleared after anchor
-//! ring scan completes.
+//! **Phase 2 (mid-term): Custom ABL handoff** Build a modified ABL (EDK2-based, Fairphone publishes sources). Our ABL reads RPMB (ABL has TrustZone access), stashes the anchor key in a reserved-memory DTB node, then boots our kernel. Our kernel reads it from the DTB. One-way handoff: RPMB → ABL → DTB → kernel. Key is in RAM only during boot, cleared after anchor ring scan completes.
 //!
-//! **Phase 3 (Glyph): Own the stack**
-//! On Glyph hardware we control the secure world. Anchor key lives
-//! in a dedicated CSR or crypto coprocessor register. Kill-switch
-//! zeroes the register → anchors become unfindable → ledger
-//! cryptographically erased.
+//! **Phase 3 (Glyph): Own the stack** On Glyph hardware we control the secure world. Anchor key lives in a dedicated CSR or crypto coprocessor register. Kill-switch zeroes the register → anchors become unfindable → ledger cryptographically erased.
 //!
 //! # VSF Encoding
 //!
@@ -110,9 +48,7 @@
 //! - The HMAC is always 32 bytes (fixed by BLAKE3)
 //! - Total size is self-describing — the decoder knows when to stop
 //!
-//! The ring slot allocation reserves space for the *maximum* anchor
-//! size, but only the actual encoded bytes are written. The rest is
-//! don't-care (indistinguishable from noise on encrypted storage).
+//! The ring slot allocation reserves space for the *maximum* anchor size, but only the actual encoded bytes are written. The rest is don't-care (indistinguishable from noise on encrypted storage).
 
 use alloc::vec::Vec;
 
@@ -126,8 +62,7 @@ use crate::mesh::MeshId;
 
 /// The mesh anchor — minimal bootstrap pointer, VSF-encoded on disk.
 ///
-/// This is the in-memory representation. Serialization to/from bytes
-/// uses VSF Elastic Width Encoding (see `encode_anchor`/`decode_anchor`).
+/// This is the in-memory representation. Serialization to/from bytes uses VSF Elastic Width Encoding (see `encode_anchor`/`decode_anchor`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshAnchor {
     /// Which mesh this device belongs to.
@@ -146,8 +81,7 @@ pub struct MeshAnchor {
 
 /// Anchor ring slot reservation size (bytes).
 ///
-/// 256 bytes per slot. VSF EWE-encoded anchor lives inside; unused
-/// bytes are don't-care noise on encrypted storage.
+/// 256 bytes per slot. VSF EWE-encoded anchor lives inside; unused bytes are don't-care noise on encrypted storage.
 ///
 /// Why 256 and not 128:
 /// - Current max encoded anchor is ~120 bytes (fits in 128).
@@ -167,11 +101,7 @@ pub const ANCHOR_SLOT_SIZE: usize = 256;
 
 /// Default anchor ring size: 1MB.
 ///
-/// `1MB ÷ 256B = 4,096 slots`. Each slot is at a BLAKE3-derived
-/// secret offset on the device. The ring provides crash safety
-/// (power loss during write leaves N-1 previous anchors intact)
-/// and rollback depth (boot can recover to any of the last 4,096
-/// committed generations).
+/// `1MB ÷ 256B = 4,096 slots`. Each slot is at a BLAKE3-derived secret offset on the device. The ring provides crash safety (power loss during write leaves N-1 previous anchors intact) and rollback depth (boot can recover to any of the last 4,096 committed generations).
 pub const ANCHOR_RING_DEFAULT_BYTES: u64 = 1024 * 1024;
 
 /// Number of slots that fit in the default 1MB ring.
@@ -184,17 +114,14 @@ pub const ANCHOR_RING_DEFAULT_SLOTS: u64 =
 
 /// 32-byte key stored in a separate trust domain.
 ///
-/// On FP5: lives in UFS RPMB (authenticated, anti-replay).
-/// On Glyph: lives in RISC-V CSR / crypto coprocessor.
-/// On dev: lives in a file or RAM.
+/// On FP5: lives in UFS RPMB (authenticated, anti-replay). On Glyph: lives in RISC-V CSR / crypto coprocessor. On dev: lives in a file or RAM.
 #[derive(Clone, Copy, Debug)]
 pub struct AnchorKey(pub [u8; 32]);
 
 /// Configuration for the anchor ring on a specific device.
 #[derive(Clone, Debug)]
 pub struct AnchorRingConfig {
-    /// Number of anchor slots in the ring.
-    /// 1 (8KB flash) to 256+ (phone/server).
+    /// Number of anchor slots in the ring. 1 (8KB flash) to 256+ (phone/server).
     pub ring_size: u64,
     /// The anchor key for this device.
     pub key: AnchorKey,
@@ -204,17 +131,14 @@ pub struct AnchorRingConfig {
 
 /// Where the anchor key physically lives.
 ///
-/// Each variant maps to a concrete hardware path. The boot code
-/// dispatches on this to know which driver/protocol to use.
+/// Each variant maps to a concrete hardware path. The boot code dispatches on this to know which driver/protocol to use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyStoreBackend {
     /// **FP5 Phase 1 (bring-up):** Dedicated UFS partition.
     ///
     /// `fastboot flash ferros_anchor <key.img>`
     ///
-    /// Same trust domain as data. Security comes from mesh (dual
-    /// device agreement), not from partition isolation. Attacker
-    /// needs both devices.
+    /// Same trust domain as data. Security comes from mesh (dual device agreement), not from partition isolation. Attacker needs both devices.
     UfsPartition {
         /// GPT partition name (e.g., b"ferros_anchor").
         partition_name: Vec<u8>,
@@ -222,12 +146,9 @@ pub enum KeyStoreBackend {
         offset: u64,
     },
 
-    /// **FP5 Phase 2 (custom ABL):** ABL reads RPMB, hands key to
-    /// kernel via DTB reserved-memory node.
+    /// **FP5 Phase 2 (custom ABL):** ABL reads RPMB, hands key to kernel via DTB reserved-memory node.
     ///
-    /// The key is in RAM only during early boot. Kernel reads it
-    /// from the DTB, scans the anchor ring, then zeroes the RAM
-    /// region. Not persisted in normal-world storage.
+    /// The key is in RAM only during early boot. Kernel reads it from the DTB, scans the anchor ring, then zeroes the RAM region. Not persisted in normal-world storage.
     AblDtbHandoff {
         /// DTB node path (e.g., b"/reserved-memory/ferros-anchor-key").
         dtb_node: Vec<u8>,
@@ -235,9 +156,7 @@ pub enum KeyStoreBackend {
 
     /// **FP5 Phase 2 alt:** Direct RPMB via TrustZone SMC calls.
     ///
-    /// Requires reverse-engineering or documentation of Qualcomm's
-    /// QTEE RPMB interface. Non-trivial. May not be possible on all
-    /// firmware versions.
+    /// Requires reverse-engineering or documentation of Qualcomm's QTEE RPMB interface. Non-trivial. May not be possible on all firmware versions.
     UfsRpmb {
         /// RPMB frame address where the anchor key starts.
         rpmb_address: u32,
@@ -245,8 +164,7 @@ pub enum KeyStoreBackend {
 
     /// **Glyph (Phase 3):** RISC-V CSR in crypto coprocessor.
     ///
-    /// Register is hardware write-once-per-boot, read-disabled after
-    /// initial load. Kill-switch zeroes it.
+    /// Register is hardware write-once-per-boot, read-disabled after initial load. Kill-switch zeroes it.
     RiscvCsr {
         /// CSR address.
         csr: u16,
@@ -264,8 +182,7 @@ pub enum KeyStoreBackend {
 
 /// Trait for the out-of-band key store.
 ///
-/// Implementations are platform-specific. The boot code calls this
-/// to get the anchor key before it can read anything from main storage.
+/// Implementations are platform-specific. The boot code calls this to get the anchor key before it can read anything from main storage.
 pub trait AnchorKeyStore {
     /// What backend this store uses (for diagnostics/logging).
     fn backend(&self) -> KeyStoreBackend;
@@ -299,9 +216,7 @@ pub trait AnchorKeyStore {
 ///
 /// `offset = BLAKE3(anchor_key || slot_index || "anchor_offset") % usable_space`
 ///
-/// Without the key, slot offsets look random. The device appears as
-/// undifferentiated noise — there's no magic number or fixed offset
-/// to scan for.
+/// Without the key, slot offsets look random. The device appears as undifferentiated noise — there's no magic number or fixed offset to scan for.
 pub fn derive_ring_offset(key: &AnchorKey, slot_index: u64, device_capacity: u64) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&key.0);
@@ -347,14 +262,9 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 // VSF Elastic Width Encoding for anchors
 // ---------------------------------------------------------------------------
 
-/// VSF EWE tag bytes for anchor fields.
-/// Each field is prefixed with a 1-byte tag that encodes:
-///   bits [7:4] = field id (0..5)
-///   bits [3:0] = payload length in bytes (0..15, 0 means "next byte is length")
+/// VSF EWE tag bytes for anchor fields. Each field is prefixed with a 1-byte tag that encodes: bits [7:4] = field id (0..5) bits [3:0] = payload length in bytes (0..15, 0 means "next byte is length")
 ///
-/// Fixed-size fields (mesh_id, device_id, root_commit, hmac) encode
-/// their length directly. Variable-size fields (generation, anchor_seq)
-/// use only as many bytes as the value requires.
+/// Fixed-size fields (mesh_id, device_id, root_commit, hmac) encode their length directly. Variable-size fields (generation, anchor_seq) use only as many bytes as the value requires.
 mod ewe {
     pub const TAG_MESH_ID: u8 = 0x00;    // field 0, length in low nibble
     pub const TAG_DEVICE_ID: u8 = 0x10;  // field 1
@@ -385,8 +295,7 @@ mod ewe {
 
 /// Encode a MeshAnchor to VSF EWE bytes. Returns the number of bytes written.
 ///
-/// The output buffer must be at least `ANCHOR_SLOT_SIZE` bytes.
-/// Only the actually-used bytes are meaningful; the rest are untouched.
+/// The output buffer must be at least `ANCHOR_SLOT_SIZE` bytes. Only the actually-used bytes are meaningful; the rest are untouched.
 pub fn encode_anchor(anchor: &MeshAnchor, buf: &mut [u8]) -> usize {
     let mut pos = 0;
 
@@ -409,8 +318,7 @@ pub fn encode_anchor(anchor: &MeshAnchor, buf: &mut [u8]) -> usize {
     ewe::write_u64_le(&mut buf[pos..], anchor.generation, gen_len);
     pos += gen_len;
 
-    // Field 3: root_commit (fixed 32 bytes)
-    // 32 doesn't fit in 4 bits, so we use 0 = "next byte is length"
+    // Field 3: root_commit (fixed 32 bytes) 32 doesn't fit in 4 bits, so we use 0 = "next byte is length"
     buf[pos] = ewe::TAG_ROOT_COMMIT | 0;
     pos += 1;
     buf[pos] = 32;
@@ -511,9 +419,7 @@ pub fn decode_anchor(buf: &[u8]) -> Option<MeshAnchor> {
 
 /// Read the newest valid anchor from a device's anchor ring.
 ///
-/// Scans all ring slots, decodes VSF EWE, verifies HMACs, returns
-/// the anchor with the highest sequence number. Returns None if no
-/// valid anchor found (uninitialized or all corrupted).
+/// Scans all ring slots, decodes VSF EWE, verifies HMACs, returns the anchor with the highest sequence number. Returns None if no valid anchor found (uninitialized or all corrupted).
 pub fn read_latest_anchor(
     device: &dyn Device,
     config: &AnchorRingConfig,
@@ -547,8 +453,7 @@ pub fn read_latest_anchor(
 
 /// Write a new anchor to the next ring slot (VSF EWE encoded).
 ///
-/// Computes HMAC, encodes to EWE, writes to the slot at
-/// `anchor_seq % ring_size`, then flushes.
+/// Computes HMAC, encodes to EWE, writes to the slot at `anchor_seq % ring_size`, then flushes.
 pub fn write_anchor(
     device: &mut dyn Device,
     config: &AnchorRingConfig,

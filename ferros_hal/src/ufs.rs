@@ -1,14 +1,10 @@
 //! UFS (Universal Flash Storage) host controller driver.
 //!
-//! Talks to the UFSHCI v3.0 controller on QCM6490 (base 0x1D84000).
-//! ABL initializes the controller and brings up the UniPro link before
-//! handing off to us. We skip link startup and just issue SCSI commands
-//! through the existing link.
+//! Talks to the UFSHCI v3.0 controller on QCM6490 (base 0x1D84000). ABL initializes the controller and brings up the UniPro link before handing off to us. We skip link startup and just issue SCSI commands through the existing link.
 //!
 //! ## Architecture
 //!
-//! UFSHCI uses a Transfer Request List (array of UTRDs in DRAM).
-//! Each UTRD points to a UCD (Command Descriptor) containing:
+//! UFSHCI uses a Transfer Request List (array of UTRDs in DRAM). Each UTRD points to a UCD (Command Descriptor) containing:
 //!   - Command UPIU (SCSI CDB or Query request)
 //!   - Response UPIU (filled by device)
 //!   - PRDT (scatter-gather for data)
@@ -95,11 +91,7 @@ struct Utrd {
     dw: [u32; 8],
 }
 
-/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT.
-/// Must be 128-byte aligned. Fixed layout:
-///   [0x000..0x200) Command UPIU (512 bytes)
-///   [0x200..0x400) Response UPIU (512 bytes)
-///   [0x400..0x410) PRDT entry 0 (16 bytes)
+/// UTP Command Descriptor — Command UPIU + Response UPIU + PRDT. Must be 128-byte aligned. Fixed layout: [0x000..0x200) Command UPIU (512 bytes) [0x200..0x400) Response UPIU (512 bytes) [0x400..0x410) PRDT entry 0 (16 bytes)
 #[repr(C, align(128))]
 struct Ucd {
     cmd_upiu: [u8; 512],
@@ -117,8 +109,7 @@ struct PrdtEntry {
     size: u32, // byte count - 1
 }
 
-/// Static DMA buffers for UFS transfers.
-/// Single slot — we do one command at a time.
+/// Static DMA buffers for UFS transfers. Single slot — we do one command at a time.
 #[repr(C, align(1024))]
 struct UfsBuffers {
     utrd: Utrd,
@@ -182,8 +173,7 @@ impl UfsController {
         Self { base }
     }
 
-    /// Resume from ABL's initialized state at the default QCM6490 base.
-    /// ABL leaves HCE=1 and link up. We just set up our transfer list.
+    /// Resume from ABL's initialized state at the default QCM6490 base. ABL leaves HCE=1 and link up. We just set up our transfer list.
     pub fn resume() -> Self {
         let ctrl = Self::new(ferros_layout::UFS_BASE);
         ctrl.init_transfer_list();
@@ -239,8 +229,7 @@ impl UfsController {
                 | (1 << 28);              // command_type = native UFS
             (*buf).utrd.dw[1] = 0;
             (*buf).utrd.dw[2] = 0x0F00_0000; // OCS = INVALID (byte 8 in LE = DW2 bits [7:0])
-            // Actually OCS is at byte offset 8 of the UTRD = DW2.
-            // On LE: DW2 byte 0 (lowest) = OCS. So 0x0F in bits [7:0].
+            // Actually OCS is at byte offset 8 of the UTRD = DW2. On LE: DW2 byte 0 (lowest) = OCS. So 0x0F in bits [7:0].
             (*buf).utrd.dw[2] = 0x0000_000F; // OCS = INVALID
             (*buf).utrd.dw[3] = 0;
             (*buf).utrd.dw[4] = ucd_addr as u32;
@@ -280,8 +269,7 @@ impl UfsController {
         }
     }
 
-    /// Send a Query Request to read a descriptor.
-    /// Returns the descriptor bytes (up to 255) or empty on failure.
+    /// Send a Query Request to read a descriptor. Returns the descriptor bytes (up to 255) or empty on failure.
     fn query_read_descriptor(&self, idn: u8, index: u8) -> ([u8; 256], usize, u8) {
         let mut desc = [0u8; 256];
         unsafe {
@@ -427,8 +415,7 @@ impl UfsController {
         p
     }
 
-    /// Common UTRD setup, doorbell, poll, return OCS.
-    /// Caller must have already filled ucd.cmd_upiu and prdt.
+    /// Common UTRD setup, doorbell, poll, return OCS. Caller must have already filled ucd.cmd_upiu and prdt.
     fn send_command(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
         unsafe {
             let buf = &raw mut UFS_BUF;
@@ -518,8 +505,7 @@ impl UfsController {
         }
     }
 
-    /// Read one 4KB block from UFS LUN 0.
-    /// Returns OCS (0 = success). Data is in the internal buffer.
+    /// Read one 4KB block from UFS LUN 0. Returns OCS (0 = success). Data is in the internal buffer.
     pub fn read_block(&self, lba: u32) -> u8 {
         // SCSI READ(10) CDB: opcode=0x28, LBA (big-endian), transfer length=1 block
         let cdb = [
@@ -541,9 +527,7 @@ impl UfsController {
         self.send_command(0, 2, 1)
     }
 
-    /// Write one 4KB block to UFS LUN 0.
-    /// Caller must fill data buffer first via `data_buffer_mut()`.
-    /// Returns OCS (0 = success).
+    /// Write one 4KB block to UFS LUN 0. Caller must fill data buffer first via `data_buffer_mut()`. Returns OCS (0 = success).
     pub fn write_block(&self, lba: u32) -> u8 {
         // SCSI WRITE(10) CDB
         let cdb = [

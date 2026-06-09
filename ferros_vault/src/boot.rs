@@ -1,22 +1,14 @@
 //! Boot sequence — hostile-state recovery and mesh mount.
 //!
-//! The Ledger boot sequence assumes nothing about the previous state.
-//! Every boot is a recovery. The mesh must arbitrate and agree on the
-//! current state before the ledger is considered mounted.
+//! The Ledger boot sequence assumes nothing about the previous state. Every boot is a recovery. The mesh must arbitrate and agree on the current state before the ledger is considered mounted.
 //!
 //! ## Contrast
 //! - BTRFS: Boot reads the superblock at offset 0x10000 (or mirrors at
-//!   0x4000000, 0x4000000000). If valid, follow tree roots. If log tree
-//!   exists, replay it. Trust the superblock — it's the root of all truth.
-//!   Fixed offsets mean an attacker knows exactly where to strike.
+//!   0x4000000, 0x4000000000). If valid, follow tree roots. If log tree exists, replay it. Trust the superblock — it's the root of all truth. Fixed offsets mean an attacker knows exactly where to strike.
 //! - RedoxFS: Boot scans 256 header ring slots. Newest valid header
-//!   (highest generation with valid SeaHash) wins. Replay allocation
-//!   log from that header. Simple and effective for single-device.
+//!   (highest generation with valid SeaHash) wins. Replay allocation log from that header. Simple and effective for single-device.
 //! - Ledger: No fixed offsets. No header ring. Mesh protocol queries
-//!   each device for its last confirmed generation, compares state,
-//!   resolves conflicts, and only mounts when consensus is reached.
-//!   If devices disagree, failure records are created and the conflict
-//!   is resolved (or escalated) before any reads are allowed.
+//!   each device for its last confirmed generation, compares state, resolves conflicts, and only mounts when consensus is reached. If devices disagree, failure records are created and the conflict is resolved (or escalated) before any reads are allowed.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -55,17 +47,13 @@ pub enum BootError {
     InsufficientDevices { found: usize },
     /// All devices are from the same vendor (violates dual-vendor).
     SingleVendor,
-    /// The out-of-band key store has no key/config for a device.
-    /// Cannot derive anchor ring offsets without this.
+    /// The out-of-band key store has no key/config for a device. Cannot derive anchor ring offsets without this.
     NoAnchorKey(DeviceId),
-    /// No valid anchor found on a device (uninitialized, all slots
-    /// corrupted, or wrong key).
+    /// No valid anchor found on a device (uninitialized, all slots corrupted, or wrong key).
     NoValidAnchor(DeviceId),
     /// Anchor HMAC failed — possible tampering or key mismatch.
     AnchorTampered(DeviceId),
-    /// The commit chain referenced by an anchor is broken.
-    /// The anchor points to a commit hash that doesn't exist or
-    /// whose parent chain doesn't verify.
+    /// The commit chain referenced by an anchor is broken. The anchor points to a commit hash that doesn't exist or whose parent chain doesn't verify.
     BrokenCommitChain {
         device: DeviceId,
         generation: u64,
@@ -89,9 +77,7 @@ pub enum BootError {
 
 /// State collected from a single device during boot.
 ///
-/// Populated by reading the device's anchor ring via the out-of-band
-/// key store. The anchor tells us where to find the commit chain —
-/// from there we can verify the device's object store is consistent.
+/// Populated by reading the device's anchor ring via the out-of-band key store. The anchor tells us where to find the commit chain — from there we can verify the device's object store is consistent.
 #[derive(Clone, Debug)]
 pub struct DeviceBootState {
     pub device_id: DeviceId,
@@ -105,8 +91,7 @@ pub struct DeviceBootState {
     pub mesh_id: MeshId,
     /// Any failure records this device has from its last operation.
     pub pending_failures: Vec<FailureRecord>,
-    /// Whether this device's state is internally consistent
-    /// (its own hashes check out, anchor HMAC valid).
+    /// Whether this device's state is internally consistent (its own hashes check out, anchor HMAC valid).
     pub self_consistent: bool,
 }
 
@@ -117,29 +102,23 @@ pub struct DeviceBootState {
 /// ```text
 /// 1. DeviceDiscovery:   Enumerate available storage devices.
 /// 2. AnchorRetrieval:   For each device, read anchor key from out-of-band store
-///                       (UEFI/CSR/HSM), derive ring offsets, scan ring for
-///                       newest valid anchor.
+///                       (UEFI/CSR/HSM), derive ring offsets, scan ring for newest valid anchor.
 /// 3. StateCollection:   Each anchor gives us: mesh_id, generation, root_commit.
-///                       Follow root_commit hash into the object store to verify
-///                       the commit chain is intact.
+///                       Follow root_commit hash into the object store to verify the commit chain is intact.
 /// 4. ConflictDetection: Compare anchors across devices. If all agree on
 ///                       generation + root_commit, no conflict.
 /// 5. ConflictResolution: If devices disagree:
 ///                       - Higher generation with valid commit chain wins.
 ///                       - Equal generation but different root = corruption or
-///                         fork — create FailureRecords, attempt repair from
-///                         the device with a valid chain.
+///                         fork — create FailureRecords, attempt repair from the device with a valid chain.
 ///                       - If no device has a valid chain, boot fails.
 /// 6. Mounting:          Write agreed-upon anchor to any stale devices,
 ///                       mount the object store from the agreed root.
 /// ```
 pub trait BootEngine {
-    /// Run the full boot sequence. Returns the mounted mesh state
-    /// or a boot error.
+    /// Run the full boot sequence. Returns the mounted mesh state or a boot error.
     ///
-    /// `key_store` provides the out-of-band anchor keys/configs.
-    /// This is the ONLY external dependency — everything else is
-    /// derived from the devices themselves.
+    /// `key_store` provides the out-of-band anchor keys/configs. This is the ONLY external dependency — everything else is derived from the devices themselves.
     fn boot(
         &mut self,
         devices: &mut [Box<dyn Device>],
@@ -156,8 +135,7 @@ pub trait BootEngine {
     /// Compare boot states from multiple devices and detect conflicts.
     fn detect_conflicts(&self, states: &[DeviceBootState]) -> Vec<BootConflict>;
 
-    /// Attempt to resolve a conflict automatically.
-    /// Returns the winning state's root hash, or fails.
+    /// Attempt to resolve a conflict automatically. Returns the winning state's root hash, or fails.
     fn resolve_conflict(&self, conflict: &BootConflict) -> Result<ObjectHash, BootError>;
 }
 

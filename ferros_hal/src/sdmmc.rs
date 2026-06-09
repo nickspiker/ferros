@@ -1,14 +1,10 @@
 //! SD/MMC controller driver — microSD card access.
 //!
-//! This is the storage driver that lets the ledger read/write the
-//! microSD card. On QCM6490, the SD/MMC controller is a Qualcomm
-//! SDHCI-compatible block at a known MMIO base.
+//! This is the storage driver that lets the ledger read/write the microSD card. On QCM6490, the SD/MMC controller is a Qualcomm SDHCI-compatible block at a known MMIO base.
 //!
 //! ## Boot Sequence
 //!
-//! ABL (or XBL) typically initializes the SDHCI controller during
-//! boot to check for SD card presence. We may inherit an already-
-//! initialized controller, or we may need to do full init:
+//! ABL (or XBL) typically initializes the SDHCI controller during boot to check for SD card presence. We may inherit an already- initialized controller, or we may need to do full init:
 //!
 //! ```text
 //! 1. Reset controller
@@ -25,9 +21,7 @@
 //!
 //! ## Implementation Status
 //!
-//! This is a skeleton. The register definitions are from the SD Host
-//! Controller Simplified Spec v3.00 (SDHCI). QCM6490 uses a Qualcomm
-//! variant with vendor-specific registers in the 0x200+ range.
+//! This is a skeleton. The register definitions are from the SD Host Controller Simplified Spec v3.00 (SDHCI). QCM6490 uses a Qualcomm variant with vendor-specific registers in the 0x200+ range.
 
 use alloc::vec::Vec;
 
@@ -162,11 +156,9 @@ pub struct CsdInfo {
 }
 
 impl CsdInfo {
-    /// Decode CSD from the 4 response words (as read from SDHCI RESPONSE regs).
-    /// SDHCI shifts R2 responses right by 8 bits — the MSB of CSD is in resp[3] bits [23:0].
+    /// Decode CSD from the 4 response words (as read from SDHCI RESPONSE regs). SDHCI shifts R2 responses right by 8 bits — the MSB of CSD is in resp[3] bits [23:0].
     pub fn from_response(resp: &[u32; 4]) -> Self {
-        // SDHCI shifts R2 responses right by 8 bits. Reconstruct as u128.
-        // CSD spec bit X → u128 bit (X - 8).
+        // SDHCI shifts R2 responses right by 8 bits. Reconstruct as u128. CSD spec bit X → u128 bit (X - 8).
         let csd: u128 = (resp[3] as u128) << 96
             | (resp[2] as u128) << 64
             | (resp[1] as u128) << 32
@@ -334,8 +326,7 @@ impl SdmmcController {
         crate::gcc::sdc2_set_400khz();
         Self::delay(50_000);
 
-        // Step 0.5: Clear any pending Qualcomm PWRCTL interrupts — SDHCI
-        // SW_RESET may not complete while PWRCTL is pending.
+        // Step 0.5: Clear any pending Qualcomm PWRCTL interrupts — SDHCI SW_RESET may not complete while PWRCTL is pending.
         unsafe {
             let status = crate::mmio::read32(self.base + regs::PWRCTL_STATUS);
             if status != 0 {
@@ -349,8 +340,7 @@ impl SdmmcController {
 
         // Step 1: Software reset
         unsafe { crate::mmio::write8(self.base + regs::SW_RESET, 0x01) };
-        // Wait for reset with PWRCTL polling — the Qualcomm wrapper generates
-        // PWRCTL interrupts during reset that must be acknowledged.
+        // Wait for reset with PWRCTL polling — the Qualcomm wrapper generates PWRCTL interrupts during reset that must be acknowledged.
         for _ in 0..100_000u32 {
             let val = unsafe { crate::mmio::read8(self.base + regs::SW_RESET) };
             if val & 0x01 == 0 {
@@ -439,17 +429,13 @@ impl SdmmcController {
         Ok(true)
     }
 
-    /// Diagnostic probe: try to talk to the card, returning step-by-step
-    /// results as (step_name, ok, extra_data).
+    /// Diagnostic probe: try to talk to the card, returning step-by-step results as (step_name, ok, extra_data).
     ///
-    /// This doesn't modify `self` state — it's a read-only probe for
-    /// logging to the boot console.
+    /// This doesn't modify `self` state — it's a read-only probe for logging to the boot console.
     pub fn probe_card(&mut self) -> ProbeResult {
         let mut r = ProbeResult::default();
 
-        // GCC block reset — clears all SDHCI controller state.
-        // Essential for hot-reload recovery where the previous kernel
-        // left the controller mid-transfer or with clocks at 25MHz.
+        // GCC block reset — clears all SDHCI controller state. Essential for hot-reload recovery where the previous kernel left the controller mid-transfer or with clocks at 25MHz.
         crate::gcc::sdc2_block_reset();
         crate::gcc::sdc2_set_400khz();
         crate::gcc::sdc2_clock_enable();
@@ -514,13 +500,11 @@ impl SdmmcController {
             }
         }
 
-        // ACMD41 loop — card can take up to 1s to power up.
-        // SD spec requires >= 1ms between retries.
+        // ACMD41 loop — card can take up to 1s to power up. SD spec requires >= 1ms between retries.
         for i in 0..1000u32 {
             let c55 = self.send_cmd_raw(cmd::APP_CMD, 0, RespType::R1);
             if c55.is_err() { break; }
-            // HCS (bit 30) = SDHC/SDXC support
-            // Voltage window 2.7-3.6V (bits 20:15)
+            // HCS (bit 30) = SDHC/SDXC support Voltage window 2.7-3.6V (bits 20:15)
             let c41 = self.send_cmd_raw(cmd::SD_SEND_OP_COND, 0x40FF8000, RespType::R3);
             if c41.is_err() { break; }
             r.ocr = unsafe { crate::mmio::read32(self.base + regs::RESPONSE) };
@@ -537,8 +521,7 @@ impl SdmmcController {
         // Check for pending power IRQ after voltage negotiation
         self.pwrctl_clear_pending();
 
-        // CMD-line reset to clear command engine state after ACMD41 loop.
-        // This only resets the command state machine, not the card.
+        // CMD-line reset to clear command engine state after ACMD41 loop. This only resets the command state machine, not the card.
         unsafe {
             crate::mmio::write8(self.base + regs::SW_RESET, 0x02);
             for _ in 0..10_000u32 {
@@ -582,9 +565,7 @@ impl SdmmcController {
 
         let rca = r.cmd3_resp & 0xFFFF0000; // RCA in upper 16 bits
 
-        // CMD9 — SEND_CSD (card speed/voltage/capacity data, R2 response)
-        // Must be sent while card is in standby state (before CMD7), OR
-        // can be sent to addressed card. We send with RCA.
+        // CMD9 — SEND_CSD (card speed/voltage/capacity data, R2 response) Must be sent while card is in standby state (before CMD7), OR can be sent to addressed card. We send with RCA.
         match self.send_cmd_raw(cmd::SEND_CSD, rca, RespType::R2) {
             Ok(_) => {
                 r.cmd9_ok = true;
@@ -620,12 +601,10 @@ impl SdmmcController {
             }
         }
 
-        // Stay at 400KHz for now — 25MHz needs DLL tuning investigation
-        // Just test 4-bit bus width at the current clock rate
+        // Stay at 400KHz for now — 25MHz needs DLL tuning investigation Just test 4-bit bus width at the current clock rate
         r.clk25_ok = false; // not switching yet
 
-        // Read block 0 — MBR/GPT signature area
-        // For SDHC/SDXC (CCS=1), block address is in 512-byte units
+        // Read block 0 — MBR/GPT signature area For SDHC/SDXC (CCS=1), block address is in 512-byte units
         self.pwrctl_clear_pending();
         match self.read_block_raw(0) {
             Ok(buf) => {
@@ -638,8 +617,7 @@ impl SdmmcController {
             }
         }
 
-        // Write-read-verify test on block 1 (avoid block 0 MBR)
-        // Write a recognizable pattern, read it back, verify
+        // Write-read-verify test on block 1 (avoid block 0 MBR) Write a recognizable pattern, read it back, verify
         if r.read_ok {
             match self.write_block_raw(1, &Self::test_pattern()) {
                 Ok(()) => {
@@ -688,8 +666,7 @@ impl SdmmcController {
 
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
 
-            // CMD17 (READ_SINGLE_BLOCK) with DATA_PRESENT, R1 response
-            // Transfer mode: read (bit 4), single block
+            // CMD17 (READ_SINGLE_BLOCK) with DATA_PRESENT, R1 response Transfer mode: read (bit 4), single block
             let xfer_mode: u16 = 1 << 4; // data direction = read
             let cmd_reg: u16 = (cmd::READ_SINGLE_BLOCK << 8)
                 | regs::CMD_DATA_PRESENT
@@ -757,8 +734,7 @@ impl SdmmcController {
             crate::mmio::write32(self.base + regs::BLOCK_SIZE, 512 | (1 << 16));
             crate::mmio::write32(self.base + regs::ARGUMENT, block_addr);
 
-            // CMD24 (WRITE_SINGLE_BLOCK) with DATA_PRESENT, R1 response
-            // Transfer mode: write (bit 4 = 0), single block
+            // CMD24 (WRITE_SINGLE_BLOCK) with DATA_PRESENT, R1 response Transfer mode: write (bit 4 = 0), single block
             let xfer_mode: u16 = 0; // data direction = write
             let cmd_reg: u16 = (cmd::WRITE_SINGLE_BLOCK << 8)
                 | regs::CMD_DATA_PRESENT
@@ -824,8 +800,7 @@ impl SdmmcController {
         buf
     }
 
-    /// Clear pending Qualcomm power control IRQ and ACK success.
-    /// Returns true if there was a pending IRQ that was cleared.
+    /// Clear pending Qualcomm power control IRQ and ACK success. Returns true if there was a pending IRQ that was cleared.
     fn pwrctl_clear_pending(&self) -> bool {
         let status = unsafe { crate::mmio::read32(self.base + regs::PWRCTL_STATUS) };
         if status == 0 {
@@ -857,9 +832,7 @@ impl SdmmcController {
 
     /// Enable SDHCI clock output — Qualcomm bypass mode (no internal divider).
     ///
-    /// On sdhci-msm, the clock frequency is set entirely by the GCC RCG.
-    /// The SDHCI clock divider is unused — we just enable INT_EN + CARD_EN
-    /// with divider=0 so the GCC clock passes straight through.
+    /// On sdhci-msm, the clock frequency is set entirely by the GCC RCG. The SDHCI clock divider is unused — we just enable INT_EN + CARD_EN with divider=0 so the GCC clock passes straight through.
     fn set_clock_raw(&self, _khz: u32) {
         unsafe {
             // 1. Disable everything
@@ -897,19 +870,14 @@ impl SdmmcController {
             // Set argument
             crate::mmio::write32(self.base + regs::ARGUMENT, arg);
 
-            // Build command register value
-            // [13:8] = command index, [5:0] = flags (response type, CRC, index check)
+            // Build command register value [13:8] = command index, [5:0] = flags (response type, CRC, index check)
             let cmd_reg: u16 = (cmd_idx << 8) | resp.to_cmd_flags();
 
-            // Linux sdhci.c always writes COMMAND + TRANSFER_MODE as a combined
-            // 32-bit write to offset 0x0C. Some controllers require this.
-            // Low 16 bits = TRANSFER_MODE (0 for non-data), high 16 bits = COMMAND.
+            // Linux sdhci.c always writes COMMAND + TRANSFER_MODE as a combined 32-bit write to offset 0x0C. Some controllers require this. Low 16 bits = TRANSFER_MODE (0 for non-data), high 16 bits = COMMAND.
             crate::mmio::write32(self.base + regs::TRANSFER_MODE, (cmd_reg as u32) << 16);
         }
 
-        // Wait for command complete or error.
-        // At 400KHz, a 136-bit R2 response takes ~0.5ms. With CPU loop
-        // overhead (~3-5 cycles/iter at 1GHz), we need a generous timeout.
+        // Wait for command complete or error. At 400KHz, a 136-bit R2 response takes ~0.5ms. With CPU loop overhead (~3-5 cycles/iter at 1GHz), we need a generous timeout.
         for _ in 0..5_000_000u32 {
             let status = unsafe { crate::mmio::read16(self.base + regs::NORMAL_INT_STATUS) };
             if status & regs::ERR_INTERRUPT != 0 {
@@ -1072,8 +1040,7 @@ impl SdmmcController {
         Err(DeviceError::IoError(DeviceIoKind::Timeout))
     }
 
-    /// Read multiple 512-byte blocks using CMD23 + CMD18.
-    /// `buf` must be exactly `count * 512` bytes.
+    /// Read multiple 512-byte blocks using CMD23 + CMD18. `buf` must be exactly `count * 512` bytes.
     pub fn read_blocks(&self, block_addr: u32, buf: &mut [u8], count: u16) -> Result<(), DeviceError> {
         if !self.initialized { return Err(DeviceError::NotReady); }
         if buf.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
@@ -1129,8 +1096,7 @@ impl SdmmcController {
         Err(DeviceError::IoError(DeviceIoKind::Timeout))
     }
 
-    /// Write multiple 512-byte blocks using CMD23 + CMD25.
-    /// `data` must be exactly `count * 512` bytes.
+    /// Write multiple 512-byte blocks using CMD23 + CMD25. `data` must be exactly `count * 512` bytes.
     pub fn write_blocks(&mut self, block_addr: u32, data: &[u8], count: u16) -> Result<(), DeviceError> {
         if !self.initialized { return Err(DeviceError::NotReady); }
         if data.len() < count as usize * 512 { return Err(DeviceError::IoError(DeviceIoKind::InvalidParam)); }
@@ -1192,9 +1158,7 @@ impl SdmmcController {
 
 /// Implement the Ledger's Device trait for the SD/MMC controller.
 ///
-/// The Device trait wants arbitrary byte-range access. The SD card
-/// works in 512-byte blocks. We translate: read the block(s) containing
-/// the requested range, copy out the relevant bytes.
+/// The Device trait wants arbitrary byte-range access. The SD card works in 512-byte blocks. We translate: read the block(s) containing the requested range, copy out the relevant bytes.
 impl Device for SdmmcController {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
         if offset + buf.len() as u64 > self.capacity {
@@ -1267,8 +1231,7 @@ impl Device for SdmmcController {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
-        // SD cards don't have a volatile write cache in the SDHCI sense.
-        // The card controller handles write completion internally.
+        // SD cards don't have a volatile write cache in the SDHCI sense. The card controller handles write completion internally.
         Ok(())
     }
 

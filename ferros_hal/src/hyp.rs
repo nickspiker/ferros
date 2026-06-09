@@ -1,19 +1,15 @@
 //! Hypervisor probing — detect QHEE/Gunyah capabilities via HVC calls.
 //!
-//! Safe probing: all HVC calls are wrapped with exception counting.
-//! If the hypervisor doesn't support a call, we catch the exception
-//! and move on. Zero risk of crash.
+//! Safe probing: all HVC calls are wrapped with exception counting. If the hypervisor doesn't support a call, we catch the exception and move on. Zero risk of crash.
 
 /// Gunyah HVC function IDs (from android14-6.1 kernel).
 #[allow(dead_code)]
 const GH_HYP_IDENTIFY: u64 = 0x6000;
 
-/// SMCCC-compliant Gunyah identify call.
-/// ARM SMCCC: function ID in x0, args in x1-x3, results in x0-x3.
+/// SMCCC-compliant Gunyah identify call. ARM SMCCC: function ID in x0, args in x1-x3, results in x0-x3.
 const GH_IDENTIFY_SMCCC: u64 = 0xC6000000; // SMC64, owner=6 (vendor HYP), func=0
 
-/// Qualcomm-specific HVC to detect QHEE presence.
-/// From qcom_scm.c: OWNER_VENDOR_HYP (6), function 0x3f01
+/// Qualcomm-specific HVC to detect QHEE presence. From qcom_scm.c: OWNER_VENDOR_HYP (6), function 0x3f01
 const QCOM_HYP_IDENTIFY: u64 = 0xC6003F01;
 
 /// Result of probing the hypervisor.

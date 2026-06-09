@@ -1,9 +1,6 @@
 //! ARM GICv3 — minimal init for WFI wakeup on specific SPIs.
 //!
-//! QCM6490 GIC layout (from DTS):
-//!   GICD (Distributor):    G#17A00000 (64KB)
-//!   GICR (Redistributor): G#17A60000 (1MB, 8 CPUs)
-//!   GICR CPU0 SGI_base:   G#17A70000
+//! QCM6490 GIC layout (from DTS): GICD (Distributor):    G#17A00000 (64KB) GICR (Redistributor): G#17A60000 (1MB, 8 CPUs) GICR CPU0 SGI_base:   G#17A70000
 //!
 //! ## Approach
 //!
@@ -40,8 +37,7 @@ pub const SPI_DWC3: u32 = 133;
 #[allow(dead_code)]
 pub const PPI_NS_PHYS_TIMER: u32 = 14;
 
-/// Full GIC init including GICD/GICR MMIO. Returns true if successful.
-/// WARNING: GICD is TZ-protected on QCM6490 — causes exception. Do not use.
+/// Full GIC init including GICD/GICR MMIO. Returns true if successful. WARNING: GICD is TZ-protected on QCM6490 — causes exception. Do not use.
 #[allow(dead_code)]
 pub fn init() -> bool {
     unsafe {
@@ -71,9 +67,7 @@ pub fn init() -> bool {
 
 /// Lightweight GIC init — EL1 system registers only, no MMIO.
 ///
-/// ABL/QHEE already configured GICD and enabled the DWC3 SPI.
-/// We just open the CPU interface so WFI wakes on pending interrupts.
-/// No GICD/GICR MMIO access — safe on TZ-locked QCM6490.
+/// ABL/QHEE already configured GICD and enabled the DWC3 SPI. We just open the CPU interface so WFI wakes on pending interrupts. No GICD/GICR MMIO access — safe on TZ-locked QCM6490.
 pub fn init_el1_only() -> bool {
     unsafe {
         // Verify ICC system register interface is available
@@ -102,8 +96,7 @@ pub fn enable_spi(spi: u32) {
     }
 }
 
-/// Execute WFI — CPU halts until an interrupt fires.
-/// Returns immediately if an interrupt is already pending.
+/// Execute WFI — CPU halts until an interrupt fires. Returns immediately if an interrupt is already pending.
 #[inline]
 pub fn wfi() {
     unsafe {

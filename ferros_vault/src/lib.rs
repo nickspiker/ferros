@@ -1,21 +1,17 @@
 //! # Ferros Ledger
 //!
-//! The persistent object store that ferros boots from and operates on.
-//! Not a filesystem. No directories, no inodes, no POSIX semantics.
+//! The persistent object store that ferros boots from and operates on. Not a filesystem. No directories, no inodes, no POSIX semantics.
 //!
 //! ## Architecture (3 layers)
 //!
 //! - **Layer 0 — Object Store** ([`store`]): Flat hash-indexed VSF objects.
-//!   Append-only, immutable after write. Scales from 8KB flash to
-//!   distributed mesh cluster.
+//!   Append-only, immutable after write. Scales from 8KB flash to distributed mesh cluster.
 //!
 //! - **Layer 1 — Capabilities** ([`capability`]): Access control via hash
-//!   possession. No user IDs, no permission bits, no superuser.
-//!   One-way hash chain: write → read derivable, read → write infeasible.
+//!   possession. No user IDs, no permission bits, no superuser. One-way hash chain: write → read derivable, read → write infeasible.
 //!
 //! - **Layer 2 — Mesh** ([`mesh`]): Multi-device consensus. Dual SSD,
-//!   dual vendor minimum. Neither device is truth — mesh consensus is truth.
-//!   Failed writes are first-class typed records.
+//!   dual vendor minimum. Neither device is truth — mesh consensus is truth. Failed writes are first-class typed records.
 //!
 //! ## Invariants
 //!
@@ -53,8 +49,7 @@ pub mod host_file;
 
 /// The top-level Ledger — ties all layers together.
 ///
-/// This is the main entry point for interacting with a mounted ledger.
-/// It is only constructable via the boot sequence ([`boot::BootEngine`]).
+/// This is the main entry point for interacting with a mounted ledger. It is only constructable via the boot sequence ([`boot::BootEngine`]).
 pub struct Ledger<S, C, M>
 where
     S: store::ObjectStore,
@@ -88,8 +83,7 @@ where
 
     /// Write an object to the ledger via the commit protocol.
     ///
-    /// The object is staged, committed locally, then proposed to the mesh.
-    /// Returns the object's hash only after mesh consensus confirms it.
+    /// The object is staged, committed locally, then proposed to the mesh. Returns the object's hash only after mesh consensus confirms it.
     pub fn put(
         &mut self,
         object: object::Object,

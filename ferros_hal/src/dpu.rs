@@ -5,13 +5,7 @@
 //! All offsets relative to MDP base (`0x0AE0_1000`):
 //!
 //! ```text
-//! MDSS top:    0x0AE0_0000  (HW_VERSION)
-//! MDP core:    0x0AE0_1000
-//! CTL_0..3:    MDP + 0x15000, stride 0x1000
-//! SSPP VIG0:   MDP + 0x04000
-//! SSPP DMA0:   MDP + 0x24000
-//! LM_0:        MDP + 0x44000
-//! INTF_1(DSI): MDP + 0x35000
+//! MDSS top:    0x0AE0_0000  (HW_VERSION) MDP core:    0x0AE0_1000 CTL_0..3:    MDP + 0x15000, stride 0x1000 SSPP VIG0:   MDP + 0x04000 SSPP DMA0:   MDP + 0x24000 LM_0:        MDP + 0x44000 INTF_1(DSI): MDP + 0x35000
 //! ```
 //!
 //! Source: Linux `dpu_7_2_sc7280.h` catalog (QCM6490 = SC7280 display block).
@@ -109,13 +103,10 @@ const LM_BLEND0_CONST_ALPHA: usize = 0x24;
 
 /// SSPP_SRC_FORMAT for XRGB8888 (linear, interleaved).
 ///
-/// Built from: chroma_samp=0, fetch_type=0(interleaved),
-/// bpc_a=3, bpc_r=3, bpc_b=3, bpc_g=3 (all 8-bit),
-/// unpack_count=4-1=3, unpack_tight=1, bpp=4-1=3.
+/// Built from: chroma_samp=0, fetch_type=0(interleaved), bpc_a=3, bpc_r=3, bpc_b=3, bpc_g=3 (all 8-bit), unpack_count=4-1=3, unpack_tight=1, bpp=4-1=3.
 const XRGB8888_SRC_FORMAT: u32 = 0x0002_36FF;
 
-/// SSPP_SRC_UNPACK_PATTERN for XRGB8888.
-/// Component order: B=1(C1), G=0(C0), R=2(C2), A=3(C3).
+/// SSPP_SRC_UNPACK_PATTERN for XRGB8888. Component order: B=1(C1), G=0(C0), R=2(C2), A=3(C3).
 const XRGB8888_UNPACK: u32 = 0x0302_0001;
 
 /// PE_OVERRIDE bit in SSPP_SRC_OP_MODE.
@@ -153,8 +144,7 @@ pub fn read_reg(addr: usize) -> u32 {
 
 /// Try ABL splash handoff: just flush + start all CTLs.
 ///
-/// If ABL left the DPU pipeline configured and clocked, this should
-/// cause a new frame to be sent to the panel with our framebuffer data.
+/// If ABL left the DPU pipeline configured and clocked, this should cause a new frame to be sent to the panel with our framebuffer data.
 pub fn try_splash_handoff() {
     for &ctl in &CTLS {
         unsafe {
@@ -167,9 +157,7 @@ pub fn try_splash_handoff() {
 
 /// Full pipeline setup: VIG0 → LM_0 → CTL_0 → INTF_1 (DSI0).
 ///
-/// Programs SSPP, Layer Mixer, and CTL from scratch, then flushes.
-/// Assumes display clocks are still running from ABL and the INTF
-/// timing generator is still enabled.
+/// Programs SSPP, Layer Mixer, and CTL from scratch, then flushes. Assumes display clocks are still running from ABL and the INTF timing generator is still enabled.
 pub fn setup_pipeline(fb_addr: u32, width: u32, height: u32, stride: u32) {
     let size = (height << 16) | width;
 
@@ -214,8 +202,7 @@ pub fn setup_pipeline(fb_addr: u32, width: u32, height: u32, stride: u32) {
     unsafe {
         let c = CTL_0;
 
-        // Connect VIG0 to LM_0 at blend stage 0
-        // VIG0 mix value = (stage_0 + 1) & 0x7 = 1, at bit 0
+        // Connect VIG0 to LM_0 at blend stage 0 VIG0 mix value = (stage_0 + 1) & 0x7 = 1, at bit 0
         mmio::write32(c + CTL_LAYER_LM0, 0x0000_0001);
         mmio::write32(c + CTL_LAYER_EXT_LM0, 0);
         mmio::write32(c + CTL_LAYER_EXT2_LM0, 0);
@@ -280,8 +267,7 @@ pub fn setup_pipeline_dma0(fb_addr: u32, width: u32, height: u32, stride: u32) {
     }
     dsb();
 
-    // CTL_0 — DMA0 at blend stage 0
-    // DMA0 mix=1 at bit 18 in CTL_LAYER
+    // CTL_0 — DMA0 at blend stage 0 DMA0 mix=1 at bit 18 in CTL_LAYER
     unsafe {
         let c = CTL_0;
         mmio::write32(c + CTL_LAYER_LM0, 1 << 18); // DMA0 at stage 0

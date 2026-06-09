@@ -1,7 +1,6 @@
 //! Apple DART (Device Address Resolution Table) — T8020 variant.
 //!
-//! Minimal IOMMU driver for USB DMA buffer mapping on M1.
-//! Only supports the T8020 DART used by `dart-usb0`.
+//! Minimal IOMMU driver for USB DMA buffer mapping on M1. Only supports the T8020 DART used by `dart-usb0`.
 //!
 //! Reference: m1n1/src/dart.c (Asahi Linux)
 
@@ -63,8 +62,7 @@ const TTBR_COUNT: usize = 4;
 // Static page tables (in BSS, guaranteed DRAM)
 // ---------------------------------------------------------------------------
 
-/// L1 page table — one per TTBR slot (we use TTBR0 only).
-/// Must be 16KB aligned for DART hardware.
+/// L1 page table — one per TTBR slot (we use TTBR0 only). Must be 16KB aligned for DART hardware.
 #[repr(C, align(16384))]
 struct L1Table {
     entries: [u64; L1_ENTRIES],
@@ -80,8 +78,7 @@ pub fn l2_next_val() -> usize {
     unsafe { L2_NEXT }
 }
 
-/// L2 page table — allocated on demand for IOVA ranges we map.
-/// We pre-allocate 4 L2 tables, enough for 4 × 2048 × 16KB = 128MB of IOVA space.
+/// L2 page table — allocated on demand for IOVA ranges we map. We pre-allocate 4 L2 tables, enough for 4 × 2048 × 16KB = 128MB of IOVA space.
 #[repr(C, align(16384))]
 struct L2Table {
     entries: [u64; L2_ENTRIES],
@@ -121,8 +118,7 @@ impl Dart {
         mmio::read32(self.bases[0] + offset)
     }
 
-    /// Attach to an existing DART setup (e.g. from m1n1) without overwriting page tables.
-    /// Reads the existing TTBR to find m1n1's L1 table and adds new mappings to it.
+    /// Attach to an existing DART setup (e.g. from m1n1) without overwriting page tables. Reads the existing TTBR to find m1n1's L1 table and adds new mappings to it.
     pub fn attach(base0: usize, base1: usize, sid: u8) -> Self {
         Dart {
             bases: [base0, base1],
@@ -131,8 +127,7 @@ impl Dart {
         }
     }
 
-    /// Add an identity mapping (iova=phys) to the EXISTING DART page tables.
-    /// Reads the current TTBR to find m1n1's L1, allocates L2 from our pool if needed.
+    /// Add an identity mapping (iova=phys) to the EXISTING DART page tables. Reads the current TTBR to find m1n1's L1, allocates L2 from our pool if needed.
     pub fn map_existing(&self, iova: usize, phys: usize, len: usize) -> bool {
         let pages = len / PAGE_SIZE;
         for i in 0..pages {
@@ -194,8 +189,7 @@ impl Dart {
         true
     }
 
-    /// Initialize the DART for a single stream ID.
-    /// `base0` and `base1` are reg[0] and reg[1] from the ADT.
+    /// Initialize the DART for a single stream ID. `base0` and `base1` are reg[0] and reg[1] from the ADT.
     pub fn init(base0: usize, base1: usize, sid: u8) -> Self {
         let dart = Dart {
             bases: [base0, base1],
@@ -250,8 +244,7 @@ impl Dart {
         dart
     }
 
-    /// Map a contiguous physical region to an IOVA range.
-    /// Both `iova` and `phys` must be 16KB aligned. `len` must be a multiple of 16KB.
+    /// Map a contiguous physical region to an IOVA range. Both `iova` and `phys` must be 16KB aligned. `len` must be a multiple of 16KB.
     pub fn map(&self, iova: usize, phys: usize, len: usize) -> bool {
         debug_assert!(iova & (PAGE_SIZE - 1) == 0, "IOVA not page-aligned");
         debug_assert!(phys & (PAGE_SIZE - 1) == 0, "phys not page-aligned");

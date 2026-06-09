@@ -1,7 +1,6 @@
 //! HAMT — Hash Array Mapped Trie for vault object lookup.
 //!
-//! 32-way branching, 5 bits per hash level, COW by construction.
-//! Every node is one 4KB VSF document in the tract.
+//! 32-way branching, 5 bits per hash level, COW by construction. Every node is one 4KB VSF document in the tract.
 //!
 //! See HAMT.md for the full specification.
 
@@ -55,8 +54,7 @@ fn hash_index(key: &[u8; 32], level: u32) -> u32 {
     ((wide >> bit_shift) & 0x1F) as u32
 }
 
-/// Count of set bits below position `bit` in a u32 bitmap.
-/// This gives the index into the sparse child array.
+/// Count of set bits below position `bit` in a u32 bitmap. This gives the index into the sparse child array.
 #[inline]
 fn sparse_index(bitmap: u32, bit: u32) -> usize {
     (bitmap & ((1u32 << bit) - 1)).count_ones() as usize
@@ -66,8 +64,7 @@ fn sparse_index(bitmap: u32, bit: u32) -> usize {
 // VSF helpers (shared between internal nodes and leaves)
 // ---------------------------------------------------------------------------
 
-/// Build a complete VSF document into a fixed-size block.
-/// Returns `None` if the encoded doc exceeds `BLK` bytes.
+/// Build a complete VSF document into a fixed-size block. Returns `None` if the encoded doc exceeds `BLK` bytes.
 fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> {
     let doc = builder.build().ok()?;
     if doc.len() > BLK {
@@ -78,8 +75,7 @@ fn build_into_block<const BLK: usize>(builder: VsfBuilder) -> Option<[u8; BLK]> 
     Some(blk)
 }
 
-/// Open a 4KB block as a VSF doc and return its parsed header.
-/// Returns `None` if the magic is missing or the header doesn't parse.
+/// Open a 4KB block as a VSF doc and return its parsed header. Returns `None` if the magic is missing or the header doesn't parse.
 fn open_header(blk: &[u8]) -> Option<VsfHeader> {
     let (header, _) = VsfHeader::decode(blk).ok()?;
     Some(header)
@@ -97,10 +93,7 @@ fn parse_named_section(blk: &[u8], header: &VsfHeader, name: &str) -> Option<Vsf
     VsfSection::parse(&blk[..off + size], &mut ptr).ok()
 }
 
-/// Find the position of the hp hash bytes in a VSF document.
-/// Scans for `'h' 'p' '3' 0x1F` (hp + EWE-encoded length 31) after the magic.
-/// Both the old vsf_mini encoder and the new vsf crate emit hp as len-1 in EWE form,
-/// so this byte pattern remains stable.
+/// Find the position of the hp hash bytes in a VSF document. Scans for `'h' 'p' '3' 0x1F` (hp + EWE-encoded length 31) after the magic. Both the old vsf_mini encoder and the new vsf crate emit hp as len-1 in EWE form, so this byte pattern remains stable.
 pub fn find_hp_position(blk: &[u8]) -> Option<usize> {
     for i in 4..blk.len().saturating_sub(36) {
         if blk[i] == b'h' && blk[i + 1] == b'p'
@@ -123,15 +116,12 @@ pub fn has_vsf_magic(blk: &[u8]) -> bool {
 
 /// Trait for reading and writing 4KB blocks.
 ///
-/// The kernel provides this using UFS (+ SD mirror).
-/// The HAMT logic is pure — it doesn't know about UFS, SD, or the plow.
+/// The kernel provides this using UFS (+ SD mirror). The HAMT logic is pure — it doesn't know about UFS, SD, or the plow.
 pub trait BlockIO {
     /// Read a 4KB block at `lba`. Returns None on I/O error.
     fn read_block(&self, lba: u32) -> Option<[u8; BLOCK_SIZE]>;
 
-    /// Write a 4KB block at the current plow position.
-    /// Returns the LBA where it was written, or None on failure.
-    /// The implementation handles write-verify and mirror protocol.
+    /// Write a 4KB block at the current plow position. Returns the LBA where it was written, or None on failure. The implementation handles write-verify and mirror protocol.
     fn write_block(&mut self, data: &[u8; BLOCK_SIZE]) -> Option<u32>;
 }
 
@@ -221,9 +211,7 @@ impl InternalNode {
         build_into_block::<BLOCK_SIZE>(builder).unwrap_or([0u8; BLOCK_SIZE])
     }
 
-    /// Parse from a 4KB block. Returns None if not a valid HAMT node.
-    /// `expected_hash` is the kernel-side block hash (BLAKE3 of full 4KB with hp zeroed);
-    /// it is verified before parsing.
+    /// Parse from a 4KB block. Returns None if not a valid HAMT node. `expected_hash` is the kernel-side block hash (BLAKE3 of full 4KB with hp zeroed); it is verified before parsing.
     pub fn from_block(blk: &[u8; BLOCK_SIZE], expected_hash: &[u8; 32]) -> Option<Self> {
         // Verify kernel block hash: zero hp in a copy, hash full 4KB, compare.
         let mut verify_buf = *blk;
@@ -353,8 +341,7 @@ impl InternalNode {
 /// - `body_hash`: hp (BLAKE3 of the inline content)
 /// - `content`: v(b'b', bytes) — raw inline bytes
 ///
-/// The vsf header's own hp field is the file integrity hash (auto-computed by the builder);
-/// it is separate from the `provenance_key` which is the HAMT lookup key.
+/// The vsf header's own hp field is the file integrity hash (auto-computed by the builder); it is separate from the `provenance_key` which is the HAMT lookup key.
 pub fn lone_leaf_to_block(provenance: &[u8; 32], content: &[u8]) -> Option<[u8; BLOCK_SIZE]> {
     if content.len() > BLOCK_SIZE - 256 {
         // Conservative budget — header + field framing eats ~200B; leave headroom.
@@ -391,8 +378,7 @@ fn section_provenance_key(section: &VsfSection) -> Option<[u8; 32]> {
     }
 }
 
-/// Parse a lone leaf. Returns (provenance_key, body_hash, content_slice) if valid
-/// and the embedded body hash matches BLAKE3(content).
+/// Parse a lone leaf. Returns (provenance_key, body_hash, content_slice) if valid and the embedded body hash matches BLAKE3(content).
 pub fn parse_lone_leaf(blk: &[u8; BLOCK_SIZE]) -> Option<([u8; 32], [u8; 32], Vec<u8>)> {
     let header = open_header(blk)?;
     let section = parse_named_section(blk, &header, "vault.lone")?;
@@ -434,8 +420,7 @@ pub fn parse_lone_leaf(blk: &[u8; BLOCK_SIZE]) -> Option<([u8; 32], [u8; 32], Ve
     Some((provenance, body_hash, content))
 }
 
-/// Read the provenance key from a leaf block without verifying content.
-/// Used by `lookup` / `insert` / `remove` to compare against a query key.
+/// Read the provenance key from a leaf block without verifying content. Used by `lookup` / `insert` / `remove` to compare against a query key.
 fn leaf_provenance(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
     let header = open_header(blk)?;
 
@@ -488,8 +473,7 @@ pub fn identify_block(blk: &[u8; BLOCK_SIZE]) -> NodeKind {
 // Write helper
 // ---------------------------------------------------------------------------
 
-/// Serialize a node, write it via BlockIO, return its BlockRef.
-/// The hash is the kernel block hash (full 4KB BLAKE3 with hp zeroed).
+/// Serialize a node, write it via BlockIO, return its BlockRef. The hash is the kernel block hash (full 4KB BLAKE3 with hp zeroed).
 fn write_node(io: &mut impl BlockIO, node: &InternalNode) -> Option<BlockRef> {
     let blk = node.to_block();
     let hash = block_hash(&blk)?;
@@ -497,9 +481,7 @@ fn write_node(io: &mut impl BlockIO, node: &InternalNode) -> Option<BlockRef> {
     Some(BlockRef { hash, lba })
 }
 
-/// Compute the kernel block hash (BLAKE3 of full 4KB block with hp zeroed).
-/// This is the hash stored in BlockRef — distinct from the vsf-internal hp field,
-/// which only covers the file_length bytes.
+/// Compute the kernel block hash (BLAKE3 of full 4KB block with hp zeroed). This is the hash stored in BlockRef — distinct from the vsf-internal hp field, which only covers the file_length bytes.
 pub fn block_hash(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
     let hp_pos = find_hp_position(blk)?;
     let mut tmp = *blk;
@@ -513,9 +495,7 @@ pub fn block_hash(blk: &[u8; BLOCK_SIZE]) -> Option<[u8; 32]> {
 
 /// Lookup a provenance hash in the HAMT.
 ///
-/// Returns the block reference for the object, or None if not found.
-/// On BLAKE3 mismatch at any node, returns None (caller should try
-/// previous spine generation).
+/// Returns the block reference for the object, or None if not found. On BLAKE3 mismatch at any node, returns None (caller should try previous spine generation).
 pub fn lookup(
     io: &impl BlockIO,
     root: &BlockRef,
@@ -562,12 +542,9 @@ struct PathEntry {
 
 /// Insert or update an object in the HAMT. Returns new root reference.
 ///
-/// `leaf_ref` is the BlockRef of an already-written leaf (lone, direct, or chained).
-/// `leaf_provenance` is the key (provenance hash from the leaf body).
+/// `leaf_ref` is the BlockRef of an already-written leaf (lone, direct, or chained). `leaf_provenance` is the key (provenance hash from the leaf body).
 ///
-/// The caller is responsible for writing the leaf block to storage first.
-/// This function writes new internal nodes via `io.write_block()` and
-/// returns the new root (hash, lba).
+/// The caller is responsible for writing the leaf block to storage first. This function writes new internal nodes via `io.write_block()` and returns the new root (hash, lba).
 pub fn insert(
     io: &mut impl BlockIO,
     root: &BlockRef,
@@ -607,12 +584,10 @@ pub fn insert(
                 let existing_prov = leaf_provenance_or_zero(&blk);
 
                 if &existing_prov == leaf_provenance {
-                    // Update: replace this leaf. Path already collected,
-                    // just rebuild upward with new leaf ref.
+                    // Update: replace this leaf. Path already collected, just rebuild upward with new leaf ref.
                     break;
                 } else {
-                    // Collision: two different keys at same path position.
-                    // Create intermediate nodes until they diverge.
+                    // Collision: two different keys at same path position. Create intermediate nodes until they diverge.
                     let existing_ref = current;
                     let mut collision_level = level;
 
@@ -660,16 +635,14 @@ pub fn insert(
     Some(child_ref)
 }
 
-/// Read the provenance key from a leaf block; returns zeros if parsing fails.
-/// Used in collision paths where we've already identified the block as a leaf.
+/// Read the provenance key from a leaf block; returns zeros if parsing fails. Used in collision paths where we've already identified the block as a leaf.
 fn leaf_provenance_or_zero(blk: &[u8; BLOCK_SIZE]) -> [u8; 32] {
     leaf_provenance(blk).unwrap_or([0u8; 32])
 }
 
 /// Remove a key from the HAMT. Returns new root reference.
 ///
-/// Uses COW: rebuilds the path without the leaf.
-/// Returns None if key not found or on I/O error.
+/// Uses COW: rebuilds the path without the leaf. Returns None if key not found or on I/O error.
 pub fn remove(
     io: &mut impl BlockIO,
     root: &BlockRef,
@@ -719,9 +692,7 @@ pub fn remove(
     // Rebuild bottom-up, removing the leaf from the last node.
     let last = path.len() - 1;
 
-    // If a node ends up with exactly one child, we could collapse it,
-    // but for simplicity we keep single-child nodes.
-    // The plow cleanup can optimize this during rotation.
+    // If a node ends up with exactly one child, we could collapse it, but for simplicity we keep single-child nodes. The plow cleanup can optimize this during rotation.
 
     let mut child_ref = write_node(io, &path[last].node.without_child(path[last].bit))?;
 

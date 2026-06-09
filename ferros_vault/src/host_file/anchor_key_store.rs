@@ -17,8 +17,7 @@ pub const ANCHOR_KEY_CONTEXT: &str = "photon.vault.anchor.v0";
 
 /// Derive the 32-byte anchor key from photon's two storage roots. Deterministic, reproducible across launches, no on-disk key material.
 ///
-/// `identity_seed` is photon's `ihi::handle_to_hash(handle)` — same as what [`crate::storage::FlatStorage`] uses.
-/// `device_secret` is the Ed25519 signing key bytes derived from the machine fingerprint.
+/// `identity_seed` is photon's `ihi::handle_to_hash(handle)` — same as what [`crate::storage::FlatStorage`] uses. `device_secret` is the Ed25519 signing key bytes derived from the machine fingerprint.
 ///
 /// The KDF context is fixed; both inputs are concatenated then fed to `blake3::derive_key`. BLAKE3's derive-key mode is the canonical "produce N bytes of pseudorandom output from key material + context" primitive.
 pub fn derive_anchor_key(identity_seed: &[u8; 32], device_secret: &[u8; 32]) -> AnchorKey {

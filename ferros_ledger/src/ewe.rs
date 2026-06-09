@@ -1,26 +1,19 @@
 //! Elastic Width Encoding (EWE) for unbounded integers.
 //!
-//! VSF uses EWE to encode integers with no fixed ceiling.
-//! Format: type tag + width marker + big-endian payload.
+//! VSF uses EWE to encode integers with no fixed ceiling. Format: type tag + width marker + big-endian payload.
 //!
 //! ```text
-//! Value 0-255:      'u' '3' + 1 byte   = 3 bytes
-//! Value 256-65535:  'u' '4' + 2 bytes   = 4 bytes
-//! Value up to 2^32: 'u' '5' + 4 bytes   = 6 bytes
-//! Value up to 2^64: 'u' '6' + 8 bytes   = 10 bytes
+//! Value 0-255:      'u' '3' + 1 byte   = 3 bytes Value 256-65535:  'u' '4' + 2 bytes   = 4 bytes Value up to 2^32: 'u' '5' + 4 bytes   = 6 bytes Value up to 2^64: 'u' '6' + 8 bytes   = 10 bytes
 //! ```
 //!
-//! Width marker = log2(payload_bytes) + 3:
-//!   '3' = 1 byte, '4' = 2 bytes, '5' = 4 bytes, '6' = 8 bytes.
+//! Width marker = log2(payload_bytes) + 3: '3' = 1 byte, '4' = 2 bytes, '5' = 4 bytes, '6' = 8 bytes.
 //!
 //! All payloads are big-endian, matching VSF canonical encoding.
 
 /// EWE type tag for unsigned integer.
 pub const TAG_U: u8 = b'u';
 
-/// Encode a u64 as EWE into `buf`. Returns bytes written.
-/// Minimum output: 3 bytes. Maximum: 10 bytes.
-/// Payload is big-endian per VSF spec.
+/// Encode a u64 as EWE into `buf`. Returns bytes written. Minimum output: 3 bytes. Maximum: 10 bytes. Payload is big-endian per VSF spec.
 pub fn encode_u64(buf: &mut [u8], val: u64) -> usize {
     buf[0] = TAG_U;
     if val <= 0xFF {
@@ -96,8 +89,7 @@ pub fn encoded_len_u64(val: u64) -> usize {
     }
 }
 
-/// Returns the EWE width (payload bytes only, no tag) for a given count.
-/// Used by PT to determine per-packet sequence field width from SPEC count.
+/// Returns the EWE width (payload bytes only, no tag) for a given count. Used by PT to determine per-packet sequence field width from SPEC count.
 ///
 /// e.g. seq_width(500) = 2, so DATA packets use 2-byte BE sequence numbers.
 pub fn seq_width(count: u64) -> usize {
@@ -112,8 +104,7 @@ pub fn seq_width(count: u64) -> usize {
     }
 }
 
-/// Encode a raw big-endian sequence number at a known width (no tag bytes).
-/// Used for DATA packet sequence fields where width is implicit from SPEC.
+/// Encode a raw big-endian sequence number at a known width (no tag bytes). Used for DATA packet sequence fields where width is implicit from SPEC.
 pub fn encode_seq(buf: &mut [u8], val: u64, width: usize) -> usize {
     let be = val.to_be_bytes();
     // Take the last `width` bytes of the 8-byte BE representation
@@ -134,12 +125,10 @@ pub fn decode_seq(buf: &[u8], width: usize) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Lean EWE — width marker + payload only, no type tag.
-// For PT control packets where field types are known by position.
+// Lean EWE — width marker + payload only, no type tag. For PT control packets where field types are known by position.
 // ---------------------------------------------------------------------------
 
-/// Encode a u64 as lean EWE (width marker + big-endian payload, no 'u' tag).
-/// Minimum output: 2 bytes. Maximum: 9 bytes.
+/// Encode a u64 as lean EWE (width marker + big-endian payload, no 'u' tag). Minimum output: 2 bytes. Maximum: 9 bytes.
 pub fn encode_lean(buf: &mut [u8], val: u64) -> usize {
     if val <= 0xFF {
         buf[0] = b'3';
@@ -164,8 +153,7 @@ pub fn encode_lean(buf: &mut [u8], val: u64) -> usize {
     }
 }
 
-/// Decode a lean EWE u64 (width marker + payload, no 'u' tag).
-/// Returns (value, bytes_consumed) or None.
+/// Decode a lean EWE u64 (width marker + payload, no 'u' tag). Returns (value, bytes_consumed) or None.
 pub fn decode_lean(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
