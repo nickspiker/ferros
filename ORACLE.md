@@ -2,6 +2,7 @@
 **Version:** Zil (0)
 **Author:** Nick Spiker
 **Principle:** Identity is recognized, not asserted.
+**Glossary:** the TOKEN vocabulary (*mana*, *ihi*, *whakaira*, *ira*, *wairua*, the chip states) is defined in [GLOSSARY.md](GLOSSARY.md).
 
 ---
 

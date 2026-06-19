@@ -1,6 +1,6 @@
 //! UFS (Universal Flash Storage) host controller driver.
 //!
-//! Talks to the UFSHCI v3.0 controller on QCM6490 (base 0x1D84000). ABL initializes the controller and brings up the UniPro link before handing off to us. We skip link startup and just issue SCSI commands through the existing link.
+//! Talks to the UFSHCI v3.0 controller on QCM6490 (base 0x1D84000). ABL initializes the controller and brings up the UniPro link before handing off to us. We skip link startup and just issue SCSI commands thru the existing link.
 //!
 //! ## Architecture
 //!

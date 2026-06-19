@@ -2,7 +2,7 @@
 //!
 //! Uses an embedded 8x16 bitmap font (printable ASCII 0x20-0x7E). All output is hex — no decimal formatting, no `core::fmt` bloat.
 
-/// 8x16 bitmap font for printable ASCII (0x20 through 0x7E = 95 chars). Each character: 16 bytes, one per scanline, MSB = leftmost pixel. Source: classic VGA/BIOS 8x16 font (public domain).
+/// 8x16 bitmap font for printable ASCII (0x20 thru 0x7E = 95 chars). Each character: 16 bytes, one per scanline, MSB = leftmost pixel. Source: classic VGA/BIOS 8x16 font (public domain).
 const FONT_FIRST: u8 = 0x20;
 const FONT_LAST: u8 = 0x7E;
 const GLYPH_W: usize = 8;

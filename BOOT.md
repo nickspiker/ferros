@@ -56,7 +56,7 @@ Stage 4: GIC + Interrupt Init
 Stage 5: USB Init
   - DWC3 device mode init (reuse ABL's PHY config)
   - Bulk endpoints for Photon Transport
-  - Device enumerates as "Fairphone 5" (VID G#1838, PID G#FE01)
+  - Device enumerates as "ferros" (VID G#1209, PID G#4665)
   ↓
 Stage 6: Capability Restore
   - Deserialize capability table from vault root snapshot

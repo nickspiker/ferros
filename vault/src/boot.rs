@@ -19,7 +19,7 @@ use crate::failure::FailureRecord;
 use crate::hash::ObjectHash;
 use crate::mesh::{MeshId, MeshMember};
 
-/// Boot stages — the ledger progresses through these in order.
+/// Boot stages — the ledger progresses thru these in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootStage {
     /// Initial probe — discovering which devices are present.

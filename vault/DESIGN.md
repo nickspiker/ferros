@@ -37,7 +37,7 @@ How the Ledger's decisions contrast with BTRFS and RedoxFS at every structural l
 
 | Decision | BTRFS | RedoxFS | Ledger |
 |----------|-------|---------|--------|
-| Block/sector size | Fixed 4K sectors, 16K nodes (configurable at format) | Fixed 4K blocks, level system for larger allocations | **No fixed-size structures.** VSF EWE (Elastic Width Encoding) throughout. |
+| Block/sector size | Fixed 4K sectors, 16K nodes (configurable at format) | Fixed 4K blocks, level system for larger allocations | **No fixed-size structures.** VSF EWE (Elastic Width Encoding) thruout. |
 | Minimum viable volume | ~256 MiB (superblock + system block group + metadata group) | ~1 MiB (header ring + 4 bootstrap blocks) | **No minimum.** Same design from 8KB flash to distributed cluster. |
 | Maximum volume | 16 EiB (64-bit byte offsets) | Disk size (u64 block count) | **No maximum.** Mesh is the scaling mechanism. |
 
@@ -123,7 +123,7 @@ Qualcomm QTEE (EL3, Secure World) ← signed blob, not ours
 UFS RPMB partition
 ```
 
-The RPMB authentication key is derived from Qualcomm hardware fuses at first boot, provisioned by XBL, and held exclusively in TrustZone. Our kernel (EL1) cannot access RPMB directly — it must go through QTEE via SMC calls, and QTEE expects Android's Keymaster HAL on the other end. It may refuse a non-Android caller entirely.
+The RPMB authentication key is derived from Qualcomm hardware fuses at first boot, provisioned by XBL, and held exclusively in TrustZone. Our kernel (EL1) cannot access RPMB directly — it must go thru QTEE via SMC calls, and QTEE expects Android's Keymaster HAL on the other end. It may refuse a non-Android caller entirely.
 
 **This is the honest constraint of building on someone else's silicon.**
 

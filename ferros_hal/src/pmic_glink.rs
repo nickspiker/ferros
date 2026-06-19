@@ -972,7 +972,7 @@ impl PmicGlink {
     ///
     /// Returns `true` if the channel is fully open (OPEN_ACK received).
     pub fn open_channel(&mut self) -> bool {
-        // Send our VERSION.  ADSP may have pre-written its own VERSION (desc[4] nonzero) or may be waiting for APPS to go first.  We send immediately and ring the doorbell to prod ADSP.  If ADSP is slow to start (e.g. charger_pd not yet running), we re-ring the doorbell every 500K iterations throughout the poll loop to ensure ADSP wakes up.
+        // Send our VERSION.  ADSP may have pre-written its own VERSION (desc[4] nonzero) or may be waiting for APPS to go first.  We send immediately and ring the doorbell to prod ADSP.  If ADSP is slow to start (e.g. charger_pd not yet running), we re-ring the doorbell every 500K iterations thruout the poll loop to ensure ADSP wakes up.
         self.tx_push_version();
         self.ring_doorbell();
 

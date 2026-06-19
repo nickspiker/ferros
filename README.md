@@ -6,9 +6,9 @@
 
 ## Overview
 
-ferros is a mobile operating system built from first principles in Rust, designed with zero-downtime power loss tolerance and architectural elimination of entire vulnerability classes. Based on the Redox OS microkernel, ferros extends it with ring memory architecture, hardware key storage, and true killswitch readiness.
+ferros is a mobile operating system distilled down to what an OS is, written in Rust, designed with zero-downtime power loss tolerance and architectural elimination of entire vulnerability classes. Based on the Redox OS microkernel, ferros extends it with ring memory architecture, hardware key storage, and true killswitch readiness.
 
-**Not Android with modifications. Not Linux for mobile. Ground-up rethinking of operating system fundamentals.**
+**Not Android with modifications. Not Linux for mobile. The inherited assumptions removed until only the operating system is left.**
 
 ## Key Innovations
 
@@ -142,7 +142,7 @@ ferros targets ARM devices today and custom silicon tomorrow. x86 is explicitly 
 - Pstore/ramoops log pipeline (warm reboot preserves DRAM)
 - SPMI PMIC access (flash LED, observer channel reads)
 - DPU register reads (splash framebuffer)
-- USB device enumeration (DWC3, VID 0x1838 PID 0xFE01)
+- USB device enumeration (DWC3, VID G#1209 PID G#4665)
 - Bidirectional Photon Transport over USB (blast mode, per-chunk BLAKE3)
 - Hot-reload over USB (72KB kernel binary in <1s, no fastboot needed)
 - SD card read/write (4-bit bus, 400KHz, multi-block)

@@ -30,7 +30,7 @@
 //! ferros kernel (EL1, Normal World) │ │ SMC (Secure Monitor Call) ▼ TrustZone / QTEE (EL3, Secure World) ← Qualcomm's signed blob │ │ RPMB auth key (from QFPROM fuses, provisioned at first boot) ▼ UFS RPMB partition
 //! ```
 //!
-//! The RPMB auth key is derived from hardware fuses, provisioned by XBL, and held in TrustZone. Normal-world code (our kernel) cannot access RPMB directly — it must go through Qualcomm's QTEE via SMC calls, and QTEE may refuse a non-Android caller.
+//! The RPMB auth key is derived from hardware fuses, provisioned by XBL, and held in TrustZone. Normal-world code (our kernel) cannot access RPMB directly — it must go thru Qualcomm's QTEE via SMC calls, and QTEE may refuse a non-Android caller.
 //!
 //! **Phase 1 (bring-up): Dedicated partition** Anchor key lives in a `ferros_anchor` partition on regular UFS. Flash via `fastboot flash ferros_anchor <key.img>`. Same trust domain as data — but mesh consensus across two devices from different vendors still provides the core security property. An attacker needs BOTH devices, not just one.
 //!

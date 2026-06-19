@@ -832,7 +832,7 @@ impl SdmmcController {
 
     /// Enable SDHCI clock output — Qualcomm bypass mode (no internal divider).
     ///
-    /// On sdhci-msm, the clock frequency is set entirely by the GCC RCG. The SDHCI clock divider is unused — we just enable INT_EN + CARD_EN with divider=0 so the GCC clock passes straight through.
+    /// On sdhci-msm, the clock frequency is set entirely by the GCC RCG. The SDHCI clock divider is unused — we just enable INT_EN + CARD_EN with divider=0 so the GCC clock passes straight thru.
     fn set_clock_raw(&self, _khz: u32) {
         unsafe {
             // 1. Disable everything

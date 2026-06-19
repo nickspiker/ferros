@@ -1747,7 +1747,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         log.puts("CFG_RCGR post: "); log.put_hex32(ferros_hal::gcc::sdc2_cfg_rcgr()); log.puts("\n");
     }
 
-    // ---- SD card power via RPMh mailbox ---- SPMI arbiter blocks direct LDO access (EE ownership). Use RPMh TCS to request LDO enable through the proper power management channel.
+    // ---- SD card power via RPMh mailbox ---- SPMI arbiter blocks direct LDO access (EE ownership). Use RPMh TCS to request LDO enable thru the proper power management channel.
     log.puts("\n-- RPMh cmd-db --\n");
     {
         use ferros_hal::rpmh;
@@ -3840,7 +3840,7 @@ fn psci_reboot_fastboot() -> ! {
     // APID 0x122 write channel: CHNLS_BASE + 0x122 * 0x1000 = 0x0C722000
     const SDAM2_CH: usize = 0x0C60_0000 + 0x122 * 0x1000;
 
-    // Method 1: SCM IO write through SPMI arbiter channel (TZ privilege) Write WDATA0 = 0x04 (FASTBOOT_MODE=0x02 << 1)
+    // Method 1: SCM IO write thru SPMI arbiter channel (TZ privilege) Write WDATA0 = 0x04 (FASTBOOT_MODE=0x02 << 1)
     scm_io_write(SDAM2_CH + 0x10, 0x04);
     // Write CMD: EXT_WRITEL opcode=0, reg_offset=0x48, 1 byte
     scm_io_write(SDAM2_CH + 0x00, (0x48u32 << 4) | 0);

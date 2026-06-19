@@ -203,17 +203,17 @@ VSF document:
 
   Header:
     VsfType::h(BLAKE3, block_hash)      mandatory, auto-computed
-    VsfType::l("ferros.vault_root")     schema identifier
+    VsfType::d("ferros.vault_root")     schema identifier
 
   Ordering section ("vault_root.order"):
-    VsfType::l("generation")  → VsfType::u(n)              EWE
-    VsfType::l("prev_hash")   → VsfType::h(BLAKE3, hash)   previous block
+    VsfType::d("generation")  → VsfType::u(n)              EWE
+    VsfType::d("prev_hash")   → VsfType::h(BLAKE3, hash)   previous block
                                 genesis: VsfType::h(BLAKE3, [0u8;32])
 
   Pointer section ("vault_root.ptr"):
-    VsfType::l("vault_ptr")   → VsfType::h(BLAKE3, hash)   vault object root
-    VsfType::l("ledger_head") → VsfType::h(BLAKE3, hash)   ledger chain head
-    VsfType::l("snap_hash")   → VsfType::h(BLAKE3, hash)   boot snapshot
+    VsfType::d("vault_ptr")   → VsfType::h(BLAKE3, hash)   vault object root
+    VsfType::d("ledger_head") → VsfType::h(BLAKE3, hash)   ledger chain head
+    VsfType::d("snap_hash")   → VsfType::h(BLAKE3, hash)   boot snapshot
 ```
 
 Total block size: well within 4KB SSD page.

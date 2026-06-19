@@ -1,6 +1,6 @@
 use nusb::transfer::{RequestBuffer, TransferError};
 
-// VID 0x1209 (pid.codes), PID 0x4665 (ferros, assigned via pid.codes PR #1208 2026-05-13). Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
+// VID 0x1209 (pid.codes), PID 0x4665 (ferros, requested via pid.codes PR #1208 2026-05-13, pending merge). Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
 const FERROS_VID: u16 = 0x1209;
 const FERROS_PID: u16 = 0x4665;
 const INTERFACE: u8 = 0;
@@ -88,7 +88,6 @@ impl UsbLink {
     }
 
     /// Receive data via bulk IN with a timeout.
-    #[allow(dead_code)]
     pub async fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
         tokio::select! {
             completion = self.interface.bulk_in(self.ep_in, RequestBuffer::new(512)) => {

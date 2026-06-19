@@ -1,6 +1,6 @@
 //! Volatile MMIO register access.
 //!
-//! Every hardware register read/write goes through these primitives. The compiler must never optimize away, reorder, or cache these.
+//! Every hardware register read/write goes thru these primitives. The compiler must never optimize away, reorder, or cache these.
 //!
 //! No unsafe wrappers around unsafe — the callers are all hardware drivers that inherently know what address they're poking.
 

@@ -75,7 +75,7 @@ SD sectors. Same block number, same offset, zero translation math.
 Block = 4KB on both media
 
 UFS: block N = LBA N (4KB logical blocks, native)
-SD:  block N = sector N×8 through N×8+7 (8 × 512-byte sectors)
+SD:  block N = sector N×8 thru N×8+7 (8 × 512-byte sectors)
 
 Same block numbers, same layout, same code path.
 ```
@@ -164,7 +164,7 @@ Remainder of 4KB block: zeroed (reserved for future fields)
 ```
 
 Cap table, process snapshots, and display state are vault objects
-reachable through the HAMT root — not separate spine fields.
+reachable thru the HAMT root — not separate spine fields.
 
 **EWE in the kernel:**
 
@@ -191,7 +191,7 @@ hb  BLAKE3 rolling hash — current state hash, 32 bytes
 ge  Ed25519 signature — 64 bytes
 ke  Ed25519 public key — 32 bytes
 u   EWE unsigned integer — variable width, no ceiling
-l   ASCII label — field names, schema identifiers
+d   dictionary key — field names, schema identifiers (validate_name-checked)
 e   Eagle Time — physics-bounded timestamp
 ```
 
@@ -233,12 +233,20 @@ Validation at each read:
 
 Edge cases:
   All entries empty (first boot):
-    Binary search finds no valid entries → genesis
-    Create entry 0 with generation 1
+    Binary search finds no valid entries → genesis (pre-genesis ring)
+    First commit: generation 0 → slot 0. Math straight across, no
+    offset, no reserved generation — the first lap fills slots
+    0, 1, 2, ... N-1 in order. prev_hash of generation 0 is
+    hp([0u8;32]).
+    Empty is a verification state, not a generation number: no magic,
+    no valid hp → fails verification → sorts below every valid entry
+    (None < Some(0)). A zeroed block "could" claim anything — it
+    wouldn't verify.
 
   Sparse ring (< N entries written):
     Empty slots have no valid VSF header → treated as empty
-    Binary search still works — empty = generation 0
+    Binary search still works — empty sorts below every valid
+    generation (None < Some(0)); no generation number is reserved
 
   Single corrupt entry:
     Skipped during search
@@ -337,7 +345,7 @@ Kernel update flow:
   9. If boot fails: fall back to slot A (previous state)
 
 Slot metadata in vault root entry:
-  VsfType::l("active_slot")  → VsfType::u(0 or 1)    A or B
+  VsfType::d("active_slot")  → VsfType::u(0 or 1)    A or B
 ```
 
 ---

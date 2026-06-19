@@ -1,6 +1,6 @@
 //! Qualcomm RPMh (Resource Power Manager hardened) driver.
 //!
-//! RPMh manages power resources (LDOs, regulators, clocks) on Qualcomm SoCs. The APPS processor communicates with RPMh via TCS (Trigger Command Sets) through the APPS RSC (Resource State Coordinator) MMIO registers.
+//! RPMh manages power resources (LDOs, regulators, clocks) on Qualcomm SoCs. The APPS processor communicates with RPMh via TCS (Trigger Command Sets) thru the APPS RSC (Resource State Coordinator) MMIO registers.
 //!
 //! ## cmd-db
 //!

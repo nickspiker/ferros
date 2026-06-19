@@ -17,8 +17,7 @@ pub const ANCHOR_KEY_CONTEXT: &str = "photon.vault.anchor.v0";
 
 /// Derive the 32-byte anchor key from photon's two storage roots. Deterministic, reproducible across launches, no on-disk key material.
 ///
-/// `identity_seed` is photon's `ihi::handle_to_hash(handle)` — same as what [`crate::storage::FlatStorage`] uses.
-/// `device_secret` is the Ed25519 signing key bytes derived from the machine fingerprint.
+/// `identity_seed` is photon's `ihi::handle_to_hash(handle)` — same as what [`crate::storage::FlatStorage`] uses. `device_secret` is the Ed25519 signing key bytes derived from the machine fingerprint.
 ///
 /// The KDF context is fixed; both inputs are concatenated then fed to `blake3::derive_key`. BLAKE3's derive-key mode is the canonical "produce N bytes of pseudorandom output from key material + context" primitive.
 pub fn derive_anchor_key(identity_seed: &[u8; 32], device_secret: &[u8; 32]) -> AnchorKey {
@@ -53,7 +52,7 @@ mod tests {
 
     #[test]
     fn swapping_id_and_secret_yields_different_keys() {
-        // Defensive sanity check: even if the two inputs happened to hold equal bytes (extreme edge case in synthetic tests), the *positions* matter — swapping them through the KDF must produce different output. Catches "we forgot to length-prefix or domain-separate the two inputs" mistakes.
+        // Defensive sanity check: even if the two inputs happened to hold equal bytes (extreme edge case in synthetic tests), the *positions* matter — swapping them thru the KDF must produce different output. Catches "we forgot to length-prefix or domain-separate the two inputs" mistakes.
         let a = [0xAAu8; 32];
         let b = [0xBBu8; 32];
         let key_a = derive_anchor_key(&a, &b);

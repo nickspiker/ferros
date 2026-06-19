@@ -63,7 +63,7 @@ impl CapabilityEngine for PermissiveCapabilityEngine {
         Ok(())
     }
 
-    /// No salt table in the permissive engine; returns None so any code that depends on salt rotation falls through to its no-salt path.
+    /// No salt table in the permissive engine; returns None so any code that depends on salt rotation falls thru to its no-salt path.
     fn current_salt(&self, _target: &ObjectHash) -> Option<Salt> {
         None
     }

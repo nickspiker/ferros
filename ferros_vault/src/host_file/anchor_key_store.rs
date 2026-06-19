@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn swapping_id_and_secret_yields_different_keys() {
-        // Defensive sanity check: even if the two inputs happened to hold equal bytes (extreme edge case in synthetic tests), the *positions* matter — swapping them through the KDF must produce different output. Catches "we forgot to length-prefix or domain-separate the two inputs" mistakes.
+        // Defensive sanity check: even if the two inputs happened to hold equal bytes (extreme edge case in synthetic tests), the *positions* matter — swapping them thru the KDF must produce different output. Catches "we forgot to length-prefix or domain-separate the two inputs" mistakes.
         let a = [0xAAu8; 32];
         let b = [0xBBu8; 32];
         let key_a = derive_anchor_key(&a, &b);

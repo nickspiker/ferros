@@ -2,6 +2,7 @@
 **Version:** Zil (0)
 **Author:** Nick Spiker
 **Principle:** Verify everything. Trust nothing. Be tiny.
+**Glossary:** the TOKEN vocabulary (*mana*, *ihi*, *whakaira*, *ira*, *wairua*, the chip states) is defined in [GLOSSARY.md](GLOSSARY.md).
 
 ---
 
@@ -30,7 +31,7 @@ ABL loads seed as PE/COFF image (same as current kernel)
 3. Read kernel binary from UFS
    - Kernel stored at known LBA (primary copy)
    - Use ABL's existing UFS controller state (HCE=1, link up)
-   - Read via SCSI READ(10) through UTRD ring
+   - Read via SCSI READ(10) thru UTRD ring
    - Load into staging DRAM address
    ↓
 4. Compute BLAKE3 of kernel binary

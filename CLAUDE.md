@@ -1,7 +1,7 @@
 # ferros — Claude Code Project Instructions
 
 ## What This Is
-ferros is a mobile OS built from first principles in Rust on the Redox OS microkernel. Ring memory, hardware key storage, killswitch ready. See README.md for full overview.
+ferros is a mobile OS distilled down to what an OS actually is, in Rust on the Redox OS microkernel. Ring memory, hardware key storage, killswitch ready. See README.md for full overview.
 
 ## Conventions
 - All numeric output uses `[base36]#[number]` format (G# for hex, A# for decimal) — NEVER use 0x prefix
@@ -179,7 +179,7 @@ M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
   m1n1's `mmu_shutdown()` already handles this before jumping. The standard `_entry` code's
   cache clean + MMU disable sequence crashes on M1 (likely interacts badly with Apple SPRR/GXF).
 - **p.reload() not p.call():** `p.call()` runs under SPRR which blocks execute on heap memory.
-  `p.reload()` (P_VECTOR) goes through m1n1's full shutdown path, disabling SPRR before jumping.
+  `p.reload()` (P_VECTOR) goes thru m1n1's full shutdown path, disabling SPRR before jumping.
 - **run_guest.py is wrong tool:** It runs a hypervisor (EL1 guest). We need direct EL2 boot.
   Custom `m1n1-boot.py` uploads kernel + minimal DTB and uses `p.reload()`.
 - **DTB:** m1n1's `kboot_boot()` doesn't auto-generate a DTB — need to build a minimal one with
@@ -195,7 +195,7 @@ All code written, never run on hardware. Next step is boot + validate.
 - `ferros_hal_m1/src/dart.rs` (346 LOC) — DONE. T8020 DART, dual register banks, L1/L2 16KB pages, 128MB IOVA.
 - `ferros_hal_m1/src/usb.rs` (966 LOC) — DONE. Full DWC3 device-mode, all 13 UsbBulk trait methods.
   EP0 control (SET_ADDRESS, GET_DESCRIPTOR, SET_CONFIG), EP1 bulk IN/OUT, TRB-based I/O.
-  USB descriptors: VID=G#1838, PID=G#FE01, "ferros M1". 28 diagnostic fields.
+  USB descriptors: VID=G#1209, PID=G#4665 (pid.codes, pending PR #1208 merge), "ferros M1". 28 diagnostic fields.
 - `ferros_kernel/src/main.rs` M1 path — DONE. DART setup, DWC3 init, USB event loop, PT dispatch stub.
 
 ### Hardcoded M1 register addresses (from m1n1 ADT dump)
@@ -220,7 +220,7 @@ M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
 
 # Watch MacBook framebuffer for DWC3 probe + DART init output
 # Then from Fedora:
-cargo run -p ferros-bridge -- status    # should see VID=G#1838 PID=G#FE01
+cargo run -p ferros-bridge -- status    # should see VID=G#1209 PID=G#4665
 cargo run -p ferros-bridge -- diag      # PT DIAG command
 ```
 

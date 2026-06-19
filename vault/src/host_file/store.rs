@@ -4,13 +4,7 @@
 //!
 //! Object on-disk layout (within the vault payload, starting at the appended offset):
 //! ```text
-//!   [magic: 4 bytes "OBJ0"]
-//!   [version: u8]
-//!   [hash: 32 bytes]          (BLAKE3 of content — the object's identity)
-//!   [content_len: u32 LE]
-//!   [vsf_type: u8]            (cast from object.meta.vsf_type)
-//!   [generation: u64 LE]
-//!   [content: content_len bytes]
+//!   [magic: 4 bytes "OBJ0"] [version: u8] [hash: 32 bytes]          (BLAKE3 of content — the object's identity) [content_len: u32 LE] [vsf_type: u8]            (cast from object.meta.vsf_type) [generation: u64 LE] [content: content_len bytes]
 //! ```
 //! Total = 50 + content_len. No padding between objects — the next append starts immediately after.
 //!
@@ -320,8 +314,7 @@ impl FileStore {
 impl ObjectStore for FileStore {
     fn get(&self, hash: &ObjectHash) -> Result<Object, StoreError> {
         let offset = self.index.get(hash).copied().ok_or(StoreError::NotFound(*hash))?;
-        // Read the envelope header to learn content_len, then read the rest.
-        // For Phase 1 we re-read the whole file and slice from the payload — same trade-off as write.
+        // Read the envelope header to learn content_len, then read the rest. For Phase 1 we re-read the whole file and slice from the payload — same trade-off as write.
         let file_size = self.device.capacity();
         let mut file_bytes = alloc::vec![0u8; file_size as usize];
         self.device.read_at(0, &mut file_bytes).map_err(StoreError::DeviceError)?;

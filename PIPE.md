@@ -1,5 +1,7 @@
 # PIPE — Physically Isolated Processing Enclave
 
+**Glossary:** the TOKEN vocabulary (*mana*, *ihi*, *whakaira*, *ira*, *wairua*, the chip states KORE/WHARA/HARA/ORA/NGARO) is defined in [GLOSSARY.md](GLOSSARY.md); the patent ([../pipe](../pipe/patent/patent.tex)) is authoritative for the hardware terms.
+
 ## What it is
 
 PIPE is the substrate the [oracle](ORACLE.md) wants. A small processing enclave, physically isolated from the host system that uses it — independent power, internal ungoverned clock, single-wire authenticated channel. The enclave holds a write-once key in a register that has no read path, computes keyed BLAKE3 MACs, and answers challenges. The host learns the enclave's identity by enrolling its key once; from then on the host trusts MACs because nothing else can produce them.

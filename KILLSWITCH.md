@@ -88,7 +88,7 @@ discharge (1-4 seconds at room temperature).
 
 ### Trigger: Power Button (single press)
 The M1 has no volume buttons. The power button is the killswitch trigger.
-Unlike the Pixel 8 (GPIO poll), the M1 power button event comes through the **SMC**
+Unlike the Pixel 8 (GPIO poll), the M1 power button event comes thru the **SMC**
 (System Management Controller) — an RTKit coprocessor at `/arm-io/smc` in the ADT.
 
 ### SMC Architecture

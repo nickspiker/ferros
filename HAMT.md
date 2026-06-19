@@ -75,7 +75,7 @@ k=8 (256-way):   32 levels. 3 reads. Fat nodes.
 
 ```
 RÅ<hp(node_hash)>
-  [l("hamt.node")]
+  [d("hamt.node")]
   [v_u0(presence[32])]         ← bit-packed bool vector, 32 elements
   [v_h(child_hashes[])]        ← BLAKE3 hashes, popcount(bitmap) entries
   [v_u(child_lbas[])]          ← LBAs, parallel array, same index
@@ -97,7 +97,7 @@ Object content directly in the leaf. One disk read.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.lone")]
+  [d("vault.lone")]
   [access()                           ← optional, per-object override
     [admin(ke{pubkey})]
     [writers() ke{...} ...]
@@ -114,7 +114,7 @@ wrap). If content + access > 4KB → promote to direct.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.direct")]
+  [d("vault.direct")]
   [size(u{total_bytes})]
   [v_u(furrow_lbas[])]          ← up to ~1000 LBAs
   [access() ...]                ← optional, inline if fits
@@ -128,7 +128,7 @@ The extent list only needs LBAs — no hashes in the list.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.chained")]
+  [d("vault.chained")]
   [size(u{total_bytes})]
   [head(h{hash} u{lba})]       ← first extent node
   [access() ...]                ← optional
@@ -139,7 +139,7 @@ RÅ<hp(provenance) hb(content_hash)>
 
 ```
 RÅ<hp(node_hash)>
-  [l("vault.extent")]
+  [d("vault.extent")]
   [v_u(furrow_lbas[])]          ← up to ~1000 LBAs
   [next(h{hash} u{lba})]       ← absent if last node
 ```
@@ -213,7 +213,7 @@ insert(provenance_hash, value):
 
 Old nodes: untouched in tract
            still referenced by previous spine generation
-           plow tramples them when it rotates through
+           plow tramples them when it rotates thru
 
 Writes: log_32(N) + 1 nodes
         typically 2-4 new blocks per edit

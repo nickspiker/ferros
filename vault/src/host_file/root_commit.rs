@@ -4,13 +4,7 @@
 //!
 //! Wire format (bespoke, deterministic):
 //! ```text
-//!   [magic: 4 bytes "RCM0"]
-//!   [version: u8]
-//!   [entry_count: u32 LE]
-//!   for each entry (sorted by logical_key ascending — deterministic):
-//!     [key_len: u16 LE]
-//!     [key bytes: UTF-8]
-//!     [content_hash: 32 bytes]
+//!   [magic: 4 bytes "RCM0"] [version: u8] [entry_count: u32 LE] for each entry (sorted by logical_key ascending — deterministic): [key_len: u16 LE] [key bytes: UTF-8] [content_hash: 32 bytes]
 //! ```
 //!
 //! Sorted-on-encode is load-bearing: the root commit is itself content-addressed, so the same logical dict must always encode to the same bytes (hence the same hash). Sorting by key gives a canonical order independent of insertion order.

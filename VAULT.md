@@ -209,7 +209,7 @@ returns both the index entry and the object.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.lone")]
+  [d("vault.lone")]
   [v(content)]
 ```
 
@@ -224,7 +224,7 @@ HAMT leaf holds a compact LBA list for all furrows.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.direct")]
+  [d("vault.direct")]
   [size(u{total_bytes})]
   [v_u(furrow_lbas[])]
 ```
@@ -241,13 +241,13 @@ optionally points to the next extent node.
 ```
 Leaf:
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.chained")]
+  [d("vault.chained")]
   [size(u{total_bytes})]
   [head(h{hash} u{lba})]
 
 Extent node (lives in tract):
 RÅ<hp(node_hash)>
-  [l("vault.extent")]
+  [d("vault.extent")]
   [v_u(furrow_lbas[])]
   [next(h{hash} u{lba})]          ← absent if last node
 ```
@@ -487,7 +487,7 @@ private key.
 access() section format (inside the object's VSF document):
 
 RÅ<hp(provenance) hb(content_hash)>
-  [l("vault.lone")]
+  [d("vault.lone")]
   [access()
     [admin(ke{admin_pubkey})]
     [writers()

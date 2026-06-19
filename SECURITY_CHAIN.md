@@ -312,7 +312,7 @@ Link 3 failure (Userspace):
     Effectively impossible
 
   Ledger server crash:
-    Restart, chain valid through last committed entry
+    Restart, chain valid thru last committed entry
     Pre-boot buffer preserved in kernel memory
 ```
 

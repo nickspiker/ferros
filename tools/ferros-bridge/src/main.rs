@@ -1,10 +1,10 @@
 // FERROS-BRIDGE SOURCE MAP — keep updated when commands change
 //
-// main.rs ── CLI entry point, PT send/recv, command dispatch Commands: status   — check device connected (USB VID/PID probe) diag     — retrieve boot log via PT DIAG cap read     — read MMIO register via PT MEM cap reboot   — reboot device (normal or fastboot) via PT REBOOT cap reload   — hot-reload kernel binary via PT RELOAD cap install  — install signed kernel to UFS + stem entry via PT INSTALL cap
+// main.rs ── CLI entry point, PT send/recv, command dispatch Commands: status — USB VID/PID probe diag — boot log via DIAG cap read <addr> [len] — MMIO via MEM cap log — stream bulk IN echo/send — PT test transfers reboot [fastboot] — REBOOT cap reload <kernel> — hot-reload via RELOAD cap install <signed> — UFS + stem via INSTALL cap beam <ring> — pull ring blocks via BEAM cap terminal — interactive PT session. See BRIDGE.md for full reference. (ping is in usage() but unwired.)
 //
 //   pt_send(link, sid, data) — blast DATA packets with 1ms pacing pt_recv(link, sid) → Vec<u8> — receive DATA blast, no outbound ACK
 //
-// usb.rs ── nusb USB link (VID G#1838, PID G#FE01) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
+// usb.rs ── nusb USB link (VID G#1209, PID G#4665) struct UsbLink { interface, ep_out, ep_in } ::open() → Result<Self> ::send(data) — pads to 512 bytes (DWC3 short packet workaround) ::recv() → Vec<u8> ::recv_timeout(duration) → Result<Vec<u8>>
 
 mod usb;
 
@@ -52,7 +52,7 @@ fn usage() {
     eprintln!("  reboot [fastboot]  Reboot device (default: normal, 'fastboot' for bootloader)");
     eprintln!("  reload <kernel>   Hot-reload kernel binary (ELF path, runs mkimg internally)");
     eprintln!("  install <kernel.signed>  Install signed kernel to UFS + stem entry");
-    eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 200)");
+    eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 256)");
     eprintln!("  terminal     Bidirectional PT session");
 }
 
@@ -108,6 +108,13 @@ async fn main() {
             cmd_install(&args[2]).await;
         }
         "terminal" => cmd_terminal().await,
+        "ping" => {
+            let count = args
+                .get(2)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(256);
+            cmd_ping(count).await;
+        }
         "beam" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge beam <ring> [~N] [count]");
@@ -945,6 +952,53 @@ async fn cmd_terminal() {
             }
         }
     }
+}
+
+/// Raw USB ping-pong — no PT framing. Sends a small probe on bulk OUT and reads bulk IN back, `count` times, measuring round-trip latency. Isolates the USB link itself from the PT layer when bringing up a board.
+async fn cmd_ping(count: u32) {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("Raw USB ping-pong: {count} round-trips (no PT)");
+
+    let probe = b"PING";
+    let mut ok = 0u32;
+    let mut total_us: u128 = 0;
+    let mut min_us = u128::MAX;
+    let mut max_us = 0u128;
+
+    for i in 0..count {
+        let start = std::time::Instant::now();
+        if let Err(e) = link.send(probe).await {
+            eprintln!("  ping {i}: OUT failed: {e}");
+            continue;
+        }
+        match link.recv_timeout(std::time::Duration::from_millis(1024)).await {
+            Ok(_) => {
+                let us = start.elapsed().as_micros();
+                total_us += us;
+                min_us = min_us.min(us);
+                max_us = max_us.max(us);
+                ok += 1;
+            }
+            Err(e) => eprintln!("  ping {i}: IN failed: {e}"),
+        }
+    }
+
+    if ok == 0 {
+        eprintln!("0/{count} round-trips — link dead");
+        std::process::exit(1);
+    }
+
+    let avg_us = total_us / ok as u128;
+    println!(
+        "{ok}/{count} OK  rtt avg=A#{avg_us}us min=A#{min_us}us max=A#{max_us}us",
+    );
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

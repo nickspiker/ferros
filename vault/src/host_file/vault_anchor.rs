@@ -10,7 +10,7 @@
 //!
 //! HMAC covers magic + version + anchor_seq + ring_size + payload_capacity + object_tail + root_commit. Tampering with any field flips the HMAC.
 //!
-//! Slot 0 is privileged: always at offset 0 of the vault payload. Slots 1..ring_size are at key-derived offsets via [`derive_slot_offset`], scattered through the payload so an attacker without the key can't distinguish slot regions from object regions.
+//! Slot 0 is privileged: always at offset 0 of the vault payload. Slots 1..ring_size are at key-derived offsets via [`derive_slot_offset`], scattered thru the payload so an attacker without the key can't distinguish slot regions from object regions.
 
 use alloc::vec::Vec;
 
