@@ -105,15 +105,14 @@ the **tract** and the **HAMT**.
 │                         TRACT                                │
 │        the physical ring where all blocks live                │
 │                                                              │
-│  ← plow advances this way ←                                 │
+│        reap →  [occupied: live+dead mix]  → plow             │
+│        plow →  [clean: zero live blocks]  → reap (wrapped)   │
 │                                                              │
-│  [live][dead][dead][live][live][dead][new][new][new]→plow    │
-│                                                              │
-│  plow = write head, advances and wraps                       │
-│  live blocks = relocate to plow as it approaches             │
-│  dead blocks = trample, free                                 │
-│  no block allocator, no free list, no fragmentation          │
-│  free space = [plow, plow-1 wrapped], always contiguous      │
+│  plow = append head. Writes land here, blind, contiguous.    │
+│  reap = cleaning head, trailing the plow by ≤ one lap.       │
+│  occupied = [reap, plow)   clean = [plow, reap + len)        │
+│  INVARIANT: the clean region contains zero live blocks.      │
+│  no block allocator, no free list; new data never fragments  │
 ├──────────────────────────────────────────────────────────────┤
 │                         HAMT                                 │
 │        the logical index, lives INSIDE the tract             │
@@ -127,11 +126,15 @@ the **tract** and the **HAMT**.
 ```
 
 The **tract** is a log-structured ring covering the entire HAMT region
-(block G#C0000 onward — approximately 230GB on UFS). It has a single
-write head called the **plow**. The plow advances forward with every
-write, wraps around at the end, and handles garbage collection
-implicitly: live blocks are relocated to the plow position, dead blocks
-are trampled.
+(block G#C0000 onward — approximately 230GB on UFS). It carries two
+cursors in the same monotone domain: the **plow** (append head) and the
+**reap** (cleaning head), with `reap ≤ plow ≤ reap + len`. The region
+between reap and plow is occupied — a mix of live blocks and dead ones
+(deleted, overwritten, orphaned). The region from plow around to reap
+is clean: it contains no live blocks, by invariant, so appends write
+into it blindly — no read, no classification, no relocation on the
+write path. Reclamation is a separate, windowed activity at the reap
+(see The Reap below).
 
 The **HAMT** (Hash Array Mapped Trie) is the object index. It maps
 provenance hashes to physical block locations. HAMT nodes are themselves
@@ -147,7 +150,8 @@ binary search finds the latest committed generation.
 
 ### The Plow
 
-The plow is the sole write mechanism for the tract.
+The plow is the sole write mechanism for the tract, and it only ever
+appends.
 
 ```
 New object write:
@@ -155,26 +159,86 @@ New object write:
   Write same bytes to SD  → read back → BLAKE3 verify on SD
   Both verified → advance plow
 
-Plow reaches a live block:
-  Always relocate: copy to current plow position, update HAMT
-  Exception: plow is flush against live block → leave in place
-             (it's already where it would be written)
-
-Plow reaches a dead block (not in HAMT):
-  Trample. Advance plow.
-
-Plow reaches a zeroed block (deleted):
-  Check both disks — both must be zero
-  If HAMT entry still points here → remove from HAMT
-  Advance plow
+The clean-region invariant makes the write path trivial:
+  every position in [plow, reap + len) holds nothing live,
+  so a write is a write — no read-before, no classify,
+  no relocate, no reserved slots. Multi-block values land
+  as one contiguous run (split at most once by ring wrap).
 ```
 
-Write amplification is bounded: each object relocation writes
-one data block plus ~4 HAMT node updates (COW path). Relocations
-are batched into spine commits (see Batch Commits below).
+Because appends are contiguous, a value's physical layout is a
+handful of **runs** — (start, count) extents — not a per-block
+scatter. That is what makes unbounded object sizes representable
+in a single 4KB leaf (see Object Storage Modes).
 
-Wear leveling is a free side effect — the plow rotates writes
-across the entire tract uniformly.
+### The Reap (windowed cleaning)
+
+The reap trails the plow by at most one lap and reclaims occupied
+space in bounded windows. This is the compactor, the defragmenter,
+and the wear leveler, in one pass, and it is the ONLY relocation
+mechanism in the engine.
+
+```
+One window (W blocks at the reap, W sized ~len/64):
+  1. Scan [reap, reap + W): sealed + referenced by the live
+     index → survivor; anything else (zeroed, orphaned,
+     superseded, torn) → garbage.
+  2. Append survivors at the plow — ordinary verified writes
+     into clean space, order preserved. Source (reap window)
+     and target (plow) can NEVER overlap: the target is clean
+     by invariant. No staging area, no bounce buffer, and
+     redundancy never drops below two verified copies.
+  3. Repair references: survivors self-address (leaves carry
+     their key, furrows their owner and index, nodes their
+     route and depth), so each names its own repair path.
+     Value runs split at window boundaries update their
+     leaf's extent list; moved nodes and leaves re-anchor
+     thru the COW path.
+  4. Commit one generation: new HAMT root + advanced reap.
+     Everything in the retired window is now provisional
+     garbage; the window joins the clean region — but see
+     the fence below for when it becomes writable.
+
+Crash at any step: the committed head still references every
+survivor at its ORIGINAL position (untouched — cleaning only
+ever writes into clean space), so the window simply replays.
+Copies whose commit never landed are orphans; a later window
+reaps them.
+```
+
+Cleaning runs under space pressure (an append hitting the fence
+triggers a window) and proactively (dead space > 25% of the tract
+→ one window per commit), so amplification stays incremental and
+bounded; nothing ever stops the world.
+
+Wear leveling is a free side effect — appends rotate uniformly,
+and the reap forcibly migrates even never-rewritten cold data once
+per lap, so no position can sit out the rotation.
+
+### The Rollback Fence
+
+The fence keeps the last K generations fully restorable, expressed
+as one integer compare in the monotone domain:
+
+```
+fence = min over the last K spine entries of (reap_i + len_i)
+appends allowed while plow < fence
+```
+
+Why this is sufficient: appends only land in space that was
+already clean at every generation still in the window, and clean
+space contains nothing those generations reference (the invariant
+is re-established by each cleaning commit: survivors are re-homed
+in the SAME generation that advances the reap). A freshly retired
+window is therefore quarantined automatically — it becomes
+writable only once every generation that could reference its
+corpses has aged out of the K-window.
+
+Heartbeat generations (commits that re-assert the head's root,
+reap, and geometry under a new generation number) slide older
+entries out of the window when the tract is too tight to make
+progress; they can never raise the fence past what the committed
+head survives, because they only ever repeat committed values.
 
 ---
 
@@ -199,8 +263,9 @@ Live capacity:        ~12M small objects in 230GB
 
 ## Object Storage Modes
 
-Three modes, determined by object size. Each mode is a different
-HAMT leaf format. See HAMT.md for node encoding details.
+Two modes, determined by object size — Lone (inline) and Extent
+(run list, any size). Each is a HAMT leaf format; see HAMT.md for
+node encoding details.
 
 ### Lone (inline, < ~3.9KB)
 
@@ -217,43 +282,33 @@ Fresh writes are always lone when possible — best read performance.
 During plow rotation, lone objects may be promoted to direct
 (de-inlined) to allow batch commits without HAMT churn.
 
-### Direct (furrow LBAs in leaf, < ~4MB)
+### Extent (run list in leaf, any size)
 
-Object is stored as furrows (extent data blocks) in the tract. The
-HAMT leaf holds a compact LBA list for all furrows.
+Object is stored as furrows (extent data blocks) in the tract. Because
+the plow only appends into clean space, a fresh value's furrows are one
+contiguous run (two if the ring wraps mid-value). The HAMT leaf records
+**runs** — (start, count) pairs — not per-block LBAs:
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [d("vault.direct")]
-  [size(u{total_bytes})]
-  [v_u(furrow_lbas[])]
-```
-
-At ~4 bytes per LBA (EWE, 26-bit addresses), approximately 1000
-LBAs fit in a leaf after overhead ≈ ~4MB max object size.
-
-### Chained (extent chain, > ~4MB)
-
-Object exceeds what one leaf can index. The leaf points to the first
-extent node. Each extent node lists up to ~1000 furrow LBAs and
-optionally points to the next extent node.
-
-```
-Leaf:
-RÅ<hp(provenance) hb(content_hash)>
-  [d("vault.chained")]
-  [size(u{total_bytes})]
-  [head(h{hash} u{lba})]
-
-Extent node (lives in tract):
-RÅ<hp(node_hash)>
   [d("vault.extent")]
-  [v_u(furrow_lbas[])]
-  [next(h{hash} u{lba})]          ← absent if last node
+  [size(u{total_bytes})]
+  [s(u{run_start}) c(u{run_count})]     ← repeated per run
 ```
 
-A 10MB photo: leaf + 3 extent nodes + ~2500 furrows.
-4 reads for the full LBA list, then sequential furrow reads.
+Fragmentation is bounded by construction, not by luck: only the reap
+splits runs (a cleaning window moves the in-window portion of a value
+and leaves the rest, adding at most two boundary fragments per window
+crossed), and consecutive windows re-append a value's blocks in order,
+so fragments coalesce as the reap passes. With ~190 run slots in a
+leaf and windows sized ~len/64, the representable object size exceeds
+the tract itself — the leaf declares ANY size in one 4KB block.
+
+There is no chained mode and no extent-node indirection: runs made
+the pointer count logarithmic in fragmentation instead of linear in
+size, so one leaf suffices. (The former per-LBA "direct" leaf format
+remains decodable for migration; the reap rewrites such values into
+extent form the first time it touches them.)
 
 ### Furrows (extent data blocks)
 
@@ -288,12 +343,18 @@ RÅ<hp(entry_hash)>
   [gen(u{generation})]
   [prev_hash(hp{hash})]
   [hamt_root(h{hash} u{lba})]
-  [plow(u{lba})]
+  [plow(u{monotone_total})]        append head
+  [reap(u{monotone_total})]        cleaning head — fence input
   [ledger_head(hp{hash})]
   [kernel_hash(hb{hash})]
   [kernel_sig(ge{sig})]
   [eagle_time(ei{t})]
 ```
+
+An entry missing the reap field (pre-extent format) contributes the
+maximally restrictive fence value (`plow_i - len_i`, i.e. zero append
+budget); K subsequent generations age it out — old vaults migrate
+themselves thru ordinary cleaning, no format break, no migration tool.
 
 The spine entry is the **transaction commit point**. Everything
 written to the tract between spine entries is provisional — power
@@ -345,10 +406,9 @@ Lookup after deletion:
   HAMT → lba → read block → no VSF magic → return None
 
 Cleanup:
-  Plow encounters zeroed block during rotation
-  Check both disks — both must be zero
-  If HAMT entry still points here → remove from HAMT
-  Advance plow
+  Reap window reaches the zeroed block
+  Not sealed → garbage → left behind, space retired with the window
+  Stale HAMT pointers resolve to None on lookup (zeroed = deleted)
 
 Recovery:
   Zeroed blocks invisible to recovery scan
@@ -686,12 +746,29 @@ Theorem Vault_ObjectIntegrity:
 
   Corollary: you cannot hold the address of a corrupt object
 
-Theorem Vault_PlowLiveness:
-  ∀ block b at plow horizon:
-    b has VSF magic ∧ HAMT[hp(b)].lba == lba(b) → live, relocate
-    b has VSF magic ∧ HAMT[hp(b)].lba ≠ lba(b) → dead, trample
-    b has no VSF magic (zeroed)                   → deleted, trample
-    cleanup of stale HAMT entries: automatic during rotation
+Theorem Vault_CleanInvariant:
+  ∀ committed generation g:
+    ∀ position p ∈ clean(g) = [plow_g, reap_g + len_g):
+      no block referenced by g's HAMT lives at p
+  Established at genesis (all clean), preserved by appends
+  (they only add references INTO clean space at the plow) and
+  by cleaning commits (survivors re-homed in the same generation
+  that retires their window).
+
+Theorem Vault_ReapLiveness:
+  ∀ block b in a reap window:
+    b sealed ∧ live_index[lba(b)] == hp(b) → survivor, re-append + repair
+    b sealed ∧ live_index[lba(b)] ≠ hp(b) → garbage (orphan/superseded)
+    b zeroed                               → deleted, garbage
+  Survivors keep their originals intact until the window commit
+  lands; a crashed window replays from the originals.
+
+Theorem Vault_RollbackFence:
+  ∀ generation i within the last K:
+    appends allowed only while plow < reap_i + len_i
+    → appends land only in space clean AT generation i
+    → (by Vault_CleanInvariant) nothing i references is overwritten
+    → generation i fully restorable until it exits the window
 
 Theorem Vault_CapabilityConfinement:
   ∀ process p without Cap<_, Vault::Namespace::N>:
@@ -739,7 +816,8 @@ Theorem Vault_MirrorRedundancy:
 Theorem Vault_WearUniformity:
   ∀ positions p1, p2 in tract:
     E[writes(p1)] = E[writes(p2)]
-    plow rotation: mathematically uniform
+    appends rotate uniformly; the reap migrates even cold,
+    never-rewritten data once per lap — no position sits out
 ```
 
 ---
@@ -777,34 +855,22 @@ ARCHITECTURE.md:
 ## Implementation Status
 
 ```
-ferros_vault crate:   exists (persistent object store skeleton)
-ferros_hal::ufs:      UFS R/W working (SCSI READ/WRITE, 232GB LUN0)
-ferros_hal::sdmmc:    SD card R/W working (4-bit, 400KHz, multi-block)
-ferros_hal::ring:     Ring binary search working (kernel ring, vault root)
+manifestus (host profile):  the engine, complete and kill-tested
+  Two-cursor tract (plow + reap), blind appends, windowed cleaning
+  Extent leaves (any-size values), legacy direct decode + self-migration
+  Rollback fence min(reap_i + len_i), heartbeat generations
+  Grow (fallocate-first, geometry-second), dual-mirror write-verify
+  Migrating rings (root ring, fixed residency, A/B ordering)
+  62 tests / 9 suites, four kill -9 harnesses
+  Consumers: Photon (kete/FlatStorage), Cairn
 
-Working now:
-  UFS block I/O (read, write, verify)
-  SD card block I/O (read, write, verify)
-  Ring binary search + write-verify
-  Hot-reload over USB (development iteration)
-
-Next:
-  HAMT implementation (v_u0 bitmap, v_h/v_u vectors, COW)
-  Tract with plow (log-structured gravity ring)
-  Spine entry with plow field
-  Lone/direct/chained leaf formats
-  Deletion (zero-header, both disks)
-  Batch commit logic
-
-Future:
-  Vault server (userspace, cap-gated IPC)
-  Full namespace registry
-  Extent chains (chained objects > 4MB)
-  Encryption at rest (ChaCha20, key hierarchy)
-  Per-namespace content keys, X25519 key wrapping
-  access() section format, hard/soft revocation
-  kx (X25519 pubkey) encoder/decoder in vsf_mini
-  Cross-device vault sync (post-networking)
+ferros kernel profile:
+  ferros_hal::ufs / sdmmc / ring:  block I/O + binary search working
+  Engine port (no_std core, HAL BlockDev backends):  next
+  LiveSet retirement (self-address liveness, O(1) resume):  next —
+    required before petabyte-scale tracts are practical
+  Encryption at rest, access() sections, namespaces:  future
+  Cross-device vault sync:  post-networking
 ```
 
 ---

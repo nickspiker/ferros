@@ -154,7 +154,9 @@ RÅ<hp(entry_hash)>
   [prev_hash(hp{hash})]              previous entry provenance
                                      genesis: hp([0u8;32])
   [hamt_root(h{hash} u{lba})]       HAMT root node (hash + physical location)
-  [plow(u{lba})]                     tract write head position
+  [plow(u{total})]                   tract append head (monotone total)
+  [reap(u{total})]                   tract cleaning head (monotone total)
+                                     rollback fence input — see VAULT.md
   [ledger_head(hp{hash})]            ledger chain head provenance
   [kernel_hash(hb{hash})]            kernel rolling hash (BLAKE3)
   [kernel_sig(ge{sig})]              kernel Ed25519 signature
@@ -162,6 +164,15 @@ RÅ<hp(entry_hash)>
 
 Remainder of 4KB block: zeroed (reserved for future fields)
 ```
+
+**Heartbeat generations.** A heartbeat is an entry that re-asserts the
+head's state — same root, same reap, same geometry — under a new
+generation number. It exists to slide older entries out of the K-entry
+rollback window when the tract is too tight to flush the index (the
+fence needs generations; generations need tract writes; heartbeats
+break the cycle from the ring region, which the fence never covers).
+A heartbeat must copy the HEAD's values verbatim: recording in-flight
+cursors would raise the fence past what the committed root survives.
 
 Cap table, process snapshots, and display state are vault objects
 reachable thru the HAMT root — not separate spine fields.
@@ -347,6 +358,105 @@ Kernel update flow:
 Slot metadata in vault root entry:
   VsfType::d("active_slot")  → VsfType::u(0 or 1)    A or B
 ```
+
+---
+
+## Migrating Rings (dumb-flash profile)
+
+Everything above assumes the ring's location is fixed, which is free on managed
+flash: an FTL remaps logical blocks to physical cells, so a fixed logical region
+does not pin physical silicon and the device wear-levels globally underneath us.
+On RAW NAND — no FTL, cells are addresses — a fixed ring region is the one place
+in the design where wear concentrates. This profile removes it with one more
+level of the same idea: a ring that records where the ring is.
+
+### The wear tree
+
+```
+Level 0   root ring     4 slots, fixed        written once per MIGRATION
+Level 1   spine ring    N slots, migrating    written once per COMMIT
+Level 2   tract         rest of device        written once per LAP (reap)
+```
+
+Each level writes ~1/(slots × residency) as often as the level below, so the
+tree converges immediately. The law: every level multiplies total endurance by
+(slots × P/E).
+
+```
+Fixed residency R rotations per residence, then migrate:
+
+  spine slot wear per residence:  R          ≤ P/E
+  root writes:                    rotations / R
+  root budget (4 slots):          4 × P/E migrations
+
+  total commits ≤ 4 × P/E × R × N,  R ≤ P/E
+                ≤ 4 × N × P/E²
+
+  N = 65536, P/E = 3000:  ~2.4 × 10¹² commits — 75,000 years at 1/second.
+```
+
+NOT geometric residency (1 rotation, then 2, then 4… to save root writes):
+that schedule makes residence k absorb 2^k rotations, slamming the final
+residence into the cell limit at 2^log2(P/E) total rotations — it recreates the
+hotspot at the end of the sequence. Fixed residency at R ≈ P/E is strictly
+better; the squaring already ends the conversation, and the root ring's own
+4-slot rotation cubes it if anyone ever asks.
+
+### Root entry format
+
+```
+RÅ<hp(entry_hash)>
+  [gen(u{root_generation})]        EWE, monotonic, slot = gen & 3
+  [prev(hp{hash})]                 previous root entry's body hash
+  [ring(u{log2})]                  spine ring exponent
+  [at(u{block})]                   CURRENT spine residence base
+  [was(u{block})]                  PREVIOUS spine residence base
+  [since(u{generation})]           spine generation at arrival (residency counter)
+  [time(e{t})]
+```
+
+Rotations at the current residence = (spine_head.gen − since) / N.
+Migrate when that reaches R.
+
+### Migration ordering (the A/B pattern)
+
+```
+1. Zero the next residence (it may hold a retired ring's stale entries).
+2. Append a root entry: at = new base, was = old base, since = head.gen + 1.
+3. Spine commits continue at the new base — prev_hash chains straight across
+   the migration; the generation sequence never breaks.
+4. The old residence is reclaimable after the first commit verifies at the
+   new base.
+
+Boot: newest valid root entry → scan spine at `at`; nothing valid there →
+scan `was`. Crash at any step lands in exactly one of those two scans:
+  before 2:  root points at old residence — intact, nothing lost
+  after 2, before any new commit:  `at` is empty → fall back to `was`
+  after first new commit:  `at` has the head
+No torn state is representable. Same classification machinery, same seal
+rule, no new verification path.
+```
+
+### Residence pool
+
+v1: a dedicated band of M residences directly after the root ring —
+`[root: 4][band: M × N][tract]` — keeping tract-relative lbas stable forever.
+Balance arithmetic: perfect spine/tract wear parity wants M × N ≈ tract/3
+(commits carry ~3 tract blocks each); smaller bands are still an absolute
+budget of M × N × P/E commits, which at M = 16 is a century of 1Hz commits.
+
+Endgame: residences allocated from the tract's own clean space via the reap,
+and retired residences handed back as clean tract space — one wear pool, the
+whole device, spine included. E[writes(p1)] = E[writes(p2)] over every block
+of the medium. This couples ring allocation to VAULT.md's reap and is
+deliberately deferred until the raw-NAND target is real.
+
+### Host / managed-flash profile
+
+The degenerate case: spine fixed at block 0, R = ∞, no root ring. Existing
+vaults ARE this profile and remain valid; bootstrap distinguishes the layouts
+by schema at block 0 (root entry vs spine entry) — self-describing, no flag,
+no superblock.
 
 ---
 

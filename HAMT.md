@@ -110,39 +110,33 @@ Objects without `access()` inherit their namespace's ACD.
 With access section inline, content budget shrinks (~116B per reader
 wrap). If content + access > 4KB → promote to direct.
 
-### Leaf Node — Direct (furrow LBAs in leaf, < ~4MB)
+### Leaf Node — Extent (run list in leaf, any size)
+
+The value's furrows are recorded as (start, count) RUNS, not per-block
+LBAs. Appends into clean space are contiguous by invariant (VAULT.md,
+two-cursor tract), so a fresh value is one run — two if the ring wraps —
+and only reap-window boundaries add fragments, which consecutive windows
+re-coalesce. Worst-case run count is a CONSTANT (~66 at window = len/64)
+independent of value and tract size, so one 4KB leaf declares an object
+of any size. There is no chained mode and no extent-node indirection.
 
 ```
 RÅ<hp(provenance) hb(content_hash)>
-  [d("vault.direct")]
-  [size(u{total_bytes})]
-  [v_u(furrow_lbas[])]          ← up to ~1000 LBAs
-  [access() ...]                ← optional, inline if fits
-  [acl(h{hash} u{lba})]        ← optional, spill pointer if access too large
-```
-
-Each furrow carries its own hb for per-block integrity.
-The extent list only needs LBAs — no hashes in the list.
-
-### Leaf Node — Chained (extent chain, > ~4MB)
-
-```
-RÅ<hp(provenance) hb(content_hash)>
-  [d("vault.chained")]
-  [size(u{total_bytes})]
-  [head(h{hash} u{lba})]       ← first extent node
-  [access() ...]                ← optional
-  [acl(h{hash} u{lba})]        ← optional
-```
-
-### Extent Node (chain link)
-
-```
-RÅ<hp(node_hash)>
   [d("vault.extent")]
-  [v_u(furrow_lbas[])]          ← up to ~1000 LBAs
-  [next(h{hash} u{lba})]       ← absent if last node
+  [size(u{total_bytes})]
+  [s(u{run_start}) c(u{run_count})]   ← repeated per run, ~123 slots max
+  [access() ...]                       ← optional, inline if fits
+  [acl(h{hash} u{lba})]               ← optional, spill pointer
+]
 ```
+
+Each furrow carries its own hb for per-block integrity; the run list
+needs no hashes.
+
+Legacy note: the pre-extent `vault.direct` leaf (explicit per-lba list,
+~4MB cap) and the never-built `vault.chained` mode are superseded.
+Direct remains DECODABLE for migration; the reap rewrites such values
+into extent form the first time it touches one of their blocks.
 
 ### Furrow (extent data block)
 
@@ -153,8 +147,10 @@ RÅ<hp(provenance) hb(block_hash)>
 ```
 
 ~45 bytes overhead, ~4050 bytes payload. Minimal VSF envelope.
-Every block on disk has VSF magic — the plow's liveness scanner
-has one code path for all blocks.
+Every block on disk has VSF magic — the reap's liveness scanner
+has one code path for all blocks. Furrows self-address (owner key +
+index), so a furrow in a reap window names the leaf whose run list
+must be rebuilt — no reverse maps.
 
 ---
 
@@ -300,25 +296,27 @@ Forge a node:       BLAKE3 preimage resistance 2^-256
 
 ---
 
-## Plow Interaction
+## Reap Interaction
 
-HAMT nodes live in the tract. The plow treats them like any
-other block.
+HAMT nodes live in the tract. The reap treats them like any other
+block: survivors re-append at the plow, and each survivor's
+self-address names its repair path in the same pass.
 
 ```
-Plow reaches a live HAMT internal node:
-  Relocate: write copy at plow, update PARENT node (COW path upward)
-  This produces a new root → new spine entry
-  Batched with other relocations in the same commit
+Reap window holds a live internal node:
+  Re-append at plow, re-anchor via the COW path (route + depth)
+  This produces a new root → rides the window's retiring commit
 
-Plow reaches a live HAMT leaf (lone):
-  Contains an inlined object
-  Promotion opportunity: de-inline object to separate tract block
-  Leaf becomes direct reference instead of inline content
-  Batched into spine commit
+Reap window holds a live leaf:
+  Lone: re-append, repoint the parent (key)
+  Extent: moved furrows are batched per owner — one leaf rebuild
+          with the patched run list, one repoint
+  Legacy direct: whole value rewritten into extent form (bounded
+          by the old ~4MB cap)
 
-Plow reaches a dead HAMT node (superseded by COW):
-  Trample. No update needed.
+Reap window holds a dead block (superseded by COW, deleted, orphan):
+  Left behind. The window retires; the space joins the clean region
+  after the rollback fence ages it out.
 ```
 
 ---
