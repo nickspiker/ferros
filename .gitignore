@@ -11,8 +11,11 @@ keys/
 .vscode/
 .idea/
 
-# Patent / IP documents — private
-Intellectual Property/
+# Patent / IP — build artifacts only (source + PDFs are public)
+Intellectual Property/*.log
+Intellectual Property/*.aux
+Intellectual Property/*.out
+Intellectual Property/*.synctex.gz
 
 # Signed binaries
 kernel.signed
