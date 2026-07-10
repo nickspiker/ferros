@@ -198,7 +198,14 @@ Ledger (root)
 │   ├── Ledger::Vault::Delete      object deleted (hp)
 │   ├── Ledger::Vault::Update      object updated (hp, old_hb, new_hb)
 │   ├── Ledger::Vault::Commit      spine entry written (gen)
-│   └── Ledger::Vault::Plow        plow relocation events
+│   ├── Ledger::Vault::Plow        plow relocation events
+│   ├── Ledger::Vault::Repair      survivable engine faults: verify-retry
+│   │                              succeeded, bad block relocated, one
+│   │                              mirror degraded — notify-always; the
+│   │                              RATE of repairs is the flash-death
+│   │                              early warning, so silent repairs are
+│   │                              recorded, never swallowed
+│   └── Ledger::Vault::Reap        reap window stats, value migration
 ├── Ledger::RingFS
 │   ├── Ledger::RingFS::Boot
 │   ├── Ledger::RingFS::Write
@@ -207,6 +214,12 @@ Ledger (root)
 └── Ledger::App::<cap_hash>     per-app, minted at install
                                 identified by app cap hash, not name
 ```
+
+**The one event class that must NOT go through the ledger:** engine-fatal storage faults (vault cannot commit, both mirrors failing, spine unwritable).
+The ledger is a tenant of the vault, so "the vault is dying" cannot be recorded via the vault — the watchdog can never be the thing it is watching.
+Fatal storage events go to the RAM diag ring (retrieved via `ferros-bridge diag` / PT DIAG) and the framebuffer console; on Pixel, pstore/ramoops preserves them across a warm reboot.
+See [VAULT.md](VAULT.md) Engine Migration for the event-sink split.
+On the host profile, Photon's `log.vsf` plays the ledger's role for the same VSF event schema — the format is shared, only the sink differs.
 
 Category caps follow standard ferros capability rules:
 

@@ -881,6 +881,14 @@ The run list makes the fix natural: runs are (start, count) pairs, so byte-offse
 So the kernel-side surface becomes `get_range(key, offset, len)` (plus a streaming iterator built on it), with whole-object `get` kept as the degenerate case for lone objects.
 Furrow-level `hb` hashes mean a partial read is still integrity-checked per block without hashing the whole value.
 
+**The event sink (errors and logs):**
+The engine emits events through an injected sink trait, not a logger — manifestus core carries no `log` crate, no `std::io`, no destination knowledge.
+The sink is the fourth, outbound leg of the engine's contract: `read(lba)`, `write(lba)`, `flush()`, `emit(event)`.
+Each embedder picks the destination:
+- **Photon (host):** `log.vsf` — the host-profile stand-in for the ledger, same VSF event schema.
+- **ferros kernel:** `Ledger::Vault::Repair` / `Ledger::Vault::Reap` (see [LEDGER.md](LEDGER.md)) for survivable faults — notify-always, because the repair *rate* is the flash-death early warning.
+- **Engine-fatal faults** (cannot commit, both mirrors failing) never route through the ledger — the ledger is a tenant of the vault, and the vault cannot record its own death. They go to the RAM diag ring (PT DIAG) + framebuffer, pstore/ramoops on warm reboot. The watchdog is never the thing it watches.
+
 **What does not change at the swap:** VSF sealing, spine commit semantics, the rollback fence, dual-mirror write-verify, the capability layers above the store, and the on-disk format — manifestus already implements this spec; the kernel is catching up to it, not the reverse.
 
 ---
