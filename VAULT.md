@@ -1,5 +1,5 @@
 # VAULT — ferros Persistent Object Store
-**Version:** Zila (1)
+**Version:** Zilor (2)
 **Author:** Nick Spiker
 **Principle:** Everything that persists lives in the vault. VSF is the format. The spine is the only way in.
 
@@ -7,10 +7,11 @@
 
 ## What The Vault Is
 
-`ferros_vault` is the persistent object store for ferros. It is not
-a filesystem in the Unix sense. It has no directories, no inodes,
-no path strings, no mount points. It has objects, addresses, and
-a HAMT that makes them findable.
+The vault is the persistent object store for ferros, and [`manifestus`](../manifestus) is the engine that implements it — one engine, host and kernel, no fork.
+(The in-repo `ferros_vault` crate is the legacy implementation the kernel still links today; it is being retired — see Engine Migration below.)
+The vault is not a filesystem in the Unix sense.
+It has no directories, no inodes, no path strings, no mount points.
+It has objects, addresses, and a HAMT that makes them findable.
 
 ```
 Not this:   /home/user/documents/file.txt
@@ -848,7 +849,39 @@ LEDGER.md:
 ARCHITECTURE.md:
   Why this design instead of Linux/Unix patterns
   Structural elimination of vulnerability classes
+
+manifestus README (../manifestus):
+  The engine's own doc: commit-object wire format, threat model,
+  redundancy vs crash-proofness, kill-harness methodology
+  This spec is the contract; that README is the implementation record
 ```
+
+---
+
+## Engine Migration — ferros_vault → manifestus
+
+**The decision:** the kernel swaps off the in-repo `ferros_vault` crate and onto `manifestus`, and `ferros_vault` is retired at the swap.
+Today the kernel links `ferros_vault` (`path = ../vault`, non-optional); all recent engine work — reap, extent leaves, kill harnesses, bad-block relocation — lives in the standalone `manifestus` repo and is not what the kernel compiles.
+This section is the record that the divergence is known and the direction is chosen, so nobody "fixes" the old crate.
+
+**Why manifestus wins:**
+- One engine, kill-tested where it is cheap to test. The commit protocol is proven by exhaustive kill -9 harnesses on the host; the kernel inherits the proof instead of re-earning it on hardware.
+- No size ceilings. Extent leaves declare any-size values in one 4KB block (runs, not per-block pointers), so the old lone/direct/chained mode distinctions collapse.
+- A proper hash-mapped store. 32-way COW HAMT keyed on the content hash — `put`, `get`, `delete`, nothing else.
+
+**The shape of the work:**
+1. `manifestus` core goes `no_std` — the engine already sees only `read(lba)`, `write(lba)`, `flush()`, so this is feature-gating the host conveniences (FileDev, std collections), not a redesign.
+2. The kernel supplies `BlockDev` over `ferros_hal::ufs` / `sdmmc` — block I/O and ring binary search already work there.
+3. **LiveSet retirement** (self-address liveness, O(1) resume) — the current host LiveSet is an in-memory map rebuilt on open; the kernel needs liveness derived from the blocks' own self-addressing. Required before large tracts are practical, and it is the one piece that is new design rather than porting.
+
+**The blob-access rethink (open design, direction chosen):**
+`ferros_vault`'s access patterns assumed objects small enough to materialize whole.
+With extent leaves there is literally no size limit, so the kernel API cannot be `get(key) -> Vec<u8>` — a value can exceed RAM.
+The run list makes the fix natural: runs are (start, count) pairs, so byte-offset → LBA is arithmetic over at most ~190 runs, and random access into a value costs one leaf read plus the target furrows.
+So the kernel-side surface becomes `get_range(key, offset, len)` (plus a streaming iterator built on it), with whole-object `get` kept as the degenerate case for lone objects.
+Furrow-level `hb` hashes mean a partial read is still integrity-checked per block without hashing the whole value.
+
+**What does not change at the swap:** VSF sealing, spine commit semantics, the rollback fence, dual-mirror write-verify, the capability layers above the store, and the on-disk format — manifestus already implements this spec; the kernel is catching up to it, not the reverse.
 
 ---
 
@@ -861,14 +894,18 @@ manifestus (host profile):  the engine, complete and kill-tested
   Rollback fence min(reap_i + len_i), heartbeat generations
   Grow (fallocate-first, geometry-second), dual-mirror write-verify
   Migrating rings (root ring, fixed residency, A/B ordering)
+  Bad-block relocation design (relocate-don't-repair)
   62 tests / 9 suites, four kill -9 harnesses
   Consumers: Photon (kete/FlatStorage), Cairn
 
 ferros kernel profile:
+  ferros_vault (legacy crate):  what the kernel links TODAY — frozen,
+    retired at the swap; do not extend it
   ferros_hal::ufs / sdmmc / ring:  block I/O + binary search working
-  Engine port (no_std core, HAL BlockDev backends):  next
+  Engine swap (manifestus no_std core + HAL BlockDev):  next
   LiveSet retirement (self-address liveness, O(1) resume):  next —
-    required before petabyte-scale tracts are practical
+    prerequisite of the swap at scale
+  Blob access rework (get_range + streaming over run lists):  with swap
   Encryption at rest, access() sections, namespaces:  future
   Cross-device vault sync:  post-networking
 ```
