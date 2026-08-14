@@ -24,7 +24,7 @@
 //!
 //! ## Android Boot Image Format
 //!
-//! Supports v4 (Android 13 GKI — required for FP5/QCM6490):
+//! Supports v4 (Android 13 GKI — required for Pixel 8 / Tensor G3):
 //!
 //! ```text
 //! boot_img_hdr_v4: 0x000   8       Magic: "ANDROID!" 0x008   4       kernel_size 0x00C   4       ramdisk_size (0) 0x010   4       os_version (0) 0x014   4       header_size (1584) 0x018   16      reserved (zeros) 0x028   4       header_version (4) 0x02C   1536    cmdline 0x62C   4       signature_size (0)
@@ -32,7 +32,8 @@
 //!
 //! Page size is always 4096 for v3/v4. No kernel_addr field — ABL uses the ARM64 Image header's text_offset instead.
 //!
-//! Also supports legacy v0 via `boot-v0` command.
+//! Tensor G3 ABL requires the kernel payload LZ4-compressed (legacy frame, magic G#02214C18) — see BOOT.md "Tensor G3 ABL facts".
+//! `--pad <MiB>` pads the flat binary and patches the ARM64 Image header image_size to match, for bisecting ABL's silent minimum-size rejection.
 
 use std::env;
 use std::fs;
@@ -71,10 +72,10 @@ fn usage() {
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  ferros-mkimg flat <kernel.elf> -o <output.bin>");
-    eprintln!("  ferros-mkimg boot <kernel.elf> -o <output.img>");
+    eprintln!("  ferros-mkimg boot <kernel.elf> [--pad <MiB>] -o <output.img>");
     eprintln!("  ferros-mkimg keygen -o <dir/>");
     eprintln!("  ferros-mkimg sign-kernel <kernel.elf> --key <secret> -o <kernel.signed>");
-    eprintln!("  ferros-mkimg seed <seed.elf> --key <secret> -o <seed.img>");
+    eprintln!("  ferros-mkimg seed <seed.elf> --key <secret> [--pad <MiB>] -o <seed.img>");
     eprintln!("  ferros-mkimg anchor-key -o <anchor.img>");
 }
 
@@ -192,17 +193,61 @@ fn cmd_flat(args: &[String]) {
 }
 
 fn cmd_boot(args: &[String]) {
-    let (input, output) = parse_io_args(args);
+    let (args, pad_mib) = extract_pad(args);
+    let (input, output) = parse_io_args(&args);
     let elf_data = fs::read(&input).unwrap_or_else(|e| {
         eprintln!("Error reading {}: {}", input, e);
         process::exit(1);
     });
 
     eprintln!("Building Android boot image: {}", input);
-    let flat = elf_to_flat(&elf_data);
+    let mut flat = elf_to_flat(&elf_data);
+    if let Some(mib) = pad_mib {
+        flat = pad_kernel(flat, mib);
+    }
     let boot_img = make_boot_img(&flat);
     write_output(&output, &boot_img);
     eprintln!("Wrote boot.img -> {} ({} bytes)", output, boot_img.len());
+}
+
+/// Split off `--pad <MiB>` from an arg list so positional parsing stays simple.
+fn extract_pad(args: &[String]) -> (Vec<String>, Option<usize>) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut pad = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--pad" && i + 1 < args.len() {
+            pad = args[i + 1].parse::<usize>().ok();
+            if pad.is_none() {
+                eprintln!("Error: --pad expects a size in MiB, got '{}'", args[i + 1]);
+                process::exit(1);
+            }
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (out, pad)
+}
+
+/// Pad a flat kernel binary with zeros to `pad_mib` MiB and patch the ARM64 Image header's image_size (offset G#10) to match.
+/// ABL silently rejects small kernels (12KB failed, 37MB ran — see BOOT.md); patching image_size is what makes the pad experiment test the suspected header validation, not just the file size.
+fn pad_kernel(mut flat: Vec<u8>, pad_mib: usize) -> Vec<u8> {
+    let target = pad_mib * 1024 * 1024;
+    if flat.len() >= target {
+        eprintln!("  Pad: binary already {} bytes >= {} MiB, leaving as-is", flat.len(), pad_mib);
+        return flat;
+    }
+    if flat.len() < 0x40 || &flat[0x38..0x3C] != b"ARM\x64" {
+        eprintln!("Error: flat binary has no ARM64 Image header magic at G#38 — cannot pad/patch image_size");
+        process::exit(1);
+    }
+    flat.resize(target, 0);
+    let sz = flat.len() as u64;
+    flat[0x10..0x18].copy_from_slice(&sz.to_le_bytes());
+    eprintln!("  Padded to {} MiB, image_size patched to G#{:X}", pad_mib, sz);
+    flat
 }
 
 fn cmd_anchor_key(args: &[String]) {
@@ -261,7 +306,10 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     const HEADER_VERSION: u32 = 4;
     const HEADER_SIZE: u32 = 1584;
 
+    // Tensor G3 ABL requires the kernel LZ4-compressed (legacy frame) — it decompresses, then jumps to the ARM64 Image entry (BOOT.md "Tensor G3 ABL facts").
     eprintln!("  Kernel: {} bytes (uncompressed)", kernel.len());
+    let kernel = lz4_legacy_compress(kernel);
+    eprintln!("  Kernel: {} bytes (LZ4 legacy)", kernel.len());
 
     // Build the header (padded to page_size)
     let mut header = vec![0u8; PAGE_SIZE];
@@ -279,7 +327,7 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     // Pad kernel to page boundary
     let kernel_pages = (kernel.len() + PAGE_SIZE - 1) / PAGE_SIZE;
     let mut kernel_padded = vec![0u8; kernel_pages * PAGE_SIZE];
-    kernel_padded[..kernel.len()].copy_from_slice(kernel);
+    kernel_padded[..kernel.len()].copy_from_slice(&kernel);
 
     let mut img = header;
     img.extend_from_slice(&kernel_padded);
@@ -288,6 +336,22 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
         PAGE_SIZE, kernel_padded.len(), img.len());
 
     img
+}
+
+/// LZ4 legacy frame (magic G#02214C18 on the wire, u32 G#184C2102 LE): magic, then per 8 MiB input block a u32 LE compressed size + raw LZ4 block.
+/// This is the only compression Tensor ABL accepts for the kernel payload.
+fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
+    const LZ4_LEGACY_MAGIC: u32 = 0x184C2102;
+    const LZ4_LEGACY_BLOCK: usize = 8 * 1024 * 1024;
+
+    let mut out = Vec::with_capacity(data.len() / 2 + 16);
+    out.extend_from_slice(&LZ4_LEGACY_MAGIC.to_le_bytes());
+    for chunk in data.chunks(LZ4_LEGACY_BLOCK) {
+        let block = lz4_flex::block::compress(chunk);
+        out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        out.extend_from_slice(&block);
+    }
+    out
 }
 
 #[allow(dead_code)]
@@ -584,10 +648,12 @@ fn cmd_sign_kernel(args: &[String]) {
 /// Build signed seed boot.img: ELF → patch pubkey+sig → boot.img.
 fn cmd_seed(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: ferros-mkimg seed <seed.elf> --key <secret> -o <output>");
+        eprintln!("Usage: ferros-mkimg seed <seed.elf> --key <secret> [--pad <MiB>] -o <output>");
         process::exit(1);
     }
 
+    let (args, pad_mib) = extract_pad(args);
+    let args = &args[..];
     let input = &args[0];
     let output = find_arg(args, "-o", "-o").unwrap_or("seed.img");
     let key_path = find_arg(args, "--key", "-k");
@@ -614,6 +680,11 @@ fn cmd_seed(args: &[String]) {
     });
 
     let mut flat = elf_to_flat(&elf_data);
+
+    // Pad BEFORE hashing/signing: the image_size patch at G#10 is inside the signed _start..__bss_start range, so it must be in place when the hash is computed (and the loaded in-memory copy carries the same bytes, keeping self_verify consistent).
+    if let Some(mib) = pad_mib {
+        flat = pad_kernel(flat, mib);
+    }
 
     // Convert symbol addresses to flat binary offsets
     let segments = parse_elf_segments(&elf_data);
@@ -662,4 +733,33 @@ fn cmd_seed(args: &[String]) {
     let boot_img = make_boot_img(&flat);
     write_output(output, &boot_img);
     eprintln!("Wrote seed.img -> {} ({} bytes)", output, boot_img.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip the LZ4 legacy frame: compress >8 MiB (forces multiple blocks), re-parse the frame, decompress each block, compare byte-exact.
+    #[test]
+    fn lz4_legacy_roundtrip() {
+        const BLOCK: usize = 8 * 1024 * 1024;
+        let mut data = vec![0u8; BLOCK + BLOCK / 2];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 31) ^ (i >> 8)) as u8;
+        }
+
+        let frame = lz4_legacy_compress(&data);
+        assert_eq!(&frame[0..4], &0x184C2102u32.to_le_bytes());
+
+        let mut out = Vec::new();
+        let mut pos = 4;
+        while pos + 4 <= frame.len() {
+            let csize = u32::from_le_bytes(frame[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let block = lz4_flex::block::decompress(&frame[pos..pos + csize], BLOCK).unwrap();
+            out.extend_from_slice(&block);
+            pos += csize;
+        }
+        assert_eq!(out, data);
+    }
 }
