@@ -43,14 +43,17 @@ Pixel 8 / Tensor G3 (primary):
 - Boot image header v4 required (header_size=1584, header_version=4).
 - **Small kernels fail silently** — a 12KB image decompressed but never ran; code injected into the 37MB GrapheneOS kernel executed.
   ABL likely validates the ARM64 Image header image_size or enforces a minimum. Threshold unknown — bisect experiment pending.
-- Hardware watchdog fires at ~60 seconds if the kernel doesn't pet it.
+- Hardware watchdog (Exynos CLUSTER0_NONCPU WDT) fires at ~60 seconds if the kernel doesn't pet it — confirmed 2026-08-14: reboot reason G#CBEA "APC Watchdog Early", RST_STAT G#1.
+- On watchdog reset ABL silently retries the active slot (decrementing its retry counter) — the visible symptom is a frozen Google splash cycling every ~70s until retries exhaust and it falls back to the other slot.
+- AVB verification of an unsigned image logs `avb_ret=ERROR_VERIFICATION, avb_error_parts=boot` and **boots it anyway** while the bootloader is unlocked. Signing (avb_custom_key) is only needed for the locked endgame.
 - A/B rollback observed working: a failing slot is marked and ABL falls back to the other slot or fastboot.
 
 ### Entry teardown hazard (the 2026-03 crash, root-caused)
 
 The original `_entry` cache-clean + SCTLR MMU/cache-disable sequence **faults on Tensor G3** (crash ~2s), same class of failure as the M1.
 Current `_entry` checks the MMU bit first and skips the teardown entirely when the MMU is already off; `_m1_entry` skips unconditionally.
-This guard is written but **not yet hardware-tested on Tensor** — first boot attempt validates it.
+**Hardware-validated 2026-08-14**: first husky boot ran from ABL jump to the ~60s watchdog with no fault — the guard works.
+Full first-boot ABL log archived locally (gitignored — device identifiers) at tools/pixel8/abl_dmesg_first_ferros_boot_2026-08-14.txt.
 
 ---
 
@@ -305,11 +308,13 @@ Boot slot corrupt (Pixel 8):
 
 ## Open Items (Pixel 8 bring-up)
 
-1. **mkimg LZ4**: `ferros-mkimg boot` emits an uncompressed kernel — Tensor ABL requires LZ4 legacy frame (magic G#02214C18). Must be added before any boot attempt.
-2. **Minimum image size**: 12KB kernel failed silently, 37MB succeeded. Bisect ABL's threshold (likely ARM64 header image_size validation) via `fastboot oem dmesg`; pad accordingly.
-3. **Entry guard untested**: the MMU-checked teardown skip is written but has never run on Tensor hardware.
-4. **eUSB PHY init**: sequence from AOSP phy-exynos-usbdrd.c — gating item for USB-first output and the hot-reload dev loop.
-5. **androidboot.* synthesis**: enumerate exactly what Graphene init requires for the chainload path.
+First boot achieved 2026-08-14 (husky, slot a, `--pad 16`): image accepted, kernel ran ~60s to watchdog, no entry fault.
+Validated and closed: mkimg LZ4, pad/image_size, entry guard.
+
+1. **Watchdog**: pet or disable the Exynos CLUSTER0_NONCPU WDT first thing in Stage 0 — currently the kernel dies at ~60s (reboot reason G#CBEA). This now gates everything.
+2. **eUSB PHY init**: sequence from AOSP phy-exynos-usbdrd.c — gating item for USB-first output and the hot-reload dev loop.
+3. **androidboot.* synthesis**: enumerate exactly what Graphene init requires for the chainload path.
+4. **AVB footer** (locked endgame only): unsigned images boot with a logged ERROR_VERIFICATION while unlocked; the avb_custom_key signing path picks this up in Phase 5.
 
 ---
 
