@@ -35,6 +35,24 @@ PIPE has none of that. One wire. One bit to start. Every subsequent bit is real 
 
 That's it. The simplest possible protocol that is also cryptographically authenticated, collision-proof, self-clocking, and physically attested.
 
+## Transport bindings
+
+PIPE's line code is the native L0/L1 of the Photon Transport stack (L0 medium, L1 line code, L2 framing, L3 message format, L4 crypto). PT's upper layers also ride legacy carriers — USB bulk on the Pixel 8 and M1, others later — where the carrier's own silicon owns L0–L2 and PT reuses L3–L4 unchanged. The binding rule:
+
+**The native line code is unmarked, because it is the identity. Every legacy binding declares itself. Endpoints prefer the most efficient mutually-supported binding.**
+
+- **Native is the unmarked zero case.** A marker byte on the native wire would break the 100% efficiency claim and version it forever. None is needed: the medium is the marker. If you are on a PIPE pad and the first edge follows the mirror-XOR timing, that IS the identification — nothing else can be mistaken for it, and it cannot be mistaken for anything else. The physical layer disambiguates for free.
+- **Legacy carriers carry a binding ID.** They already pay framing overhead, so the declaration rides in the envelope they already have. A binding's identity is the BLAKE3 hash of its name — same pattern as the dev caps: self-describing, no central registry. Examples: `pt/l0/usb-hs-bulk`, `pt/l0/ble-gatt`. On USB the declaration lives in the VSF PIPE-message section that already disambiguates protocol/role behind the shared 1209:4665 identity. Full 32-byte hash where space is free; leading bytes as the short form where it is not.
+- **Fallback is a fixed preference order, not a negotiation dance.** Native pad > future carriers > USB bulk > the rest, ordered by efficiency. Each endpoint advertises its supported bindings once (a natural extension of the DIAG/status response); if a better mutual binding exists, switch to it.
+
+What the marker is actually for — the non-obvious jobs:
+
+- Stored captures and ledger entries are self-describing about what carried them.
+- A multi-transport device (ferros silicon with both a PIPE pad and USB) can tell its peer to move to the better link.
+- A relay tunneling PT frames from a legacy carrier onto a real PIPE wire knows exactly what it is carrying and what to strip: the legacy envelope comes off, naked bits go on the wire, 100% efficiency restored at the boundary.
+
+Nothing hard-baked traps us. USB is the lowest rung of a ladder that is explicitly labeled.
+
 ## Module map
 
 The FPGA implementation lives at `/mnt/Octopus/Code/pipe/` (separate repo from ferros). RTL modules:

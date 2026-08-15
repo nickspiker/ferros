@@ -124,6 +124,29 @@ impl UsbLink {
         Ok(out)
     }
 
+    /// Read the raw event-path debug block (VENDOR_REQ_DBG2 G#5B): 12 event words + count + TRB snapshots + last DEPCMD failure.
+    pub async fn read_dbg2(&self) -> Result<[u32; 16], String> {
+        use nusb::transfer::{ControlIn, ControlType, Recipient};
+        let completion = self.interface.control_in(ControlIn {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x5B,
+            value: 0,
+            index: 0,
+            length: 64,
+        }).await;
+        completion.status.map_err(|e| format!("dbg2 control_in failed: {e}"))?;
+        let data = completion.data;
+        if data.len() < 64 {
+            return Err(format!("short dbg2 block: {} bytes", data.len()));
+        }
+        let mut out = [0u32; 16];
+        for i in 0..16 {
+            out[i] = u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        Ok(out)
+    }
+
     #[allow(dead_code)]
     pub fn ep_out(&self) -> u8 { self.ep_out }
     #[allow(dead_code)]

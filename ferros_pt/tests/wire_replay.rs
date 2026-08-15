@@ -94,6 +94,50 @@ fn diag_send_replay() {
 }
 
 #[test]
+fn response_recv_replay() {
+    // Device→host direction: kernel pre-encodes SPEC + DATA packets each padded to exactly 512 (so the idle pump's 512-byte chunks align with packet boundaries), bridge pt_recv decodes with no ACKs. Mirrors the pixel8 kernel_main DIAG response path and bridge pt_recv verbatim.
+    let resp: Vec<u8> = b"ferros on Pixel 8 Pro (Tensor G3)\nUSB: eUSB2 PHY up, enumerated\nSNPSID=12345678\nEND\n".to_vec();
+
+    // ---- Kernel side: build the padded packet queue ----
+    let mut queue: Vec<u8> = Vec::new();
+    let mut ob_bitmap = vec![0u64; ferros_pt::transfer::outbound_bitmap_words(resp.len())];
+    let mut spec_buf = [0u8; 512];
+    let (mut ob, spec_len) = OutboundTransfer::start(StreamId::FIRST, &resp, &mut ob_bitmap, &mut spec_buf)
+        .expect("outbound SPEC build failed");
+    queue.extend_from_slice(&spec_buf[..spec_len]);
+    queue.resize(512, 0);
+    let mut pkt = [0u8; 512];
+    while !ob.all_sent() {
+        let plen = ob.next_data_packet(&resp, &mut pkt);
+        assert!(plen > 0, "next_data_packet returned 0 before all_sent");
+        let start = queue.len();
+        queue.extend_from_slice(&pkt[..plen]);
+        queue.resize(start + 512, 0);
+    }
+    assert_eq!(queue.len() % 512, 0, "queue not packet-aligned");
+
+    // ---- Bridge side: pt_recv logic over 512-byte reads ----
+    let mut reads = queue.chunks(512);
+    let first = reads.next().expect("no SPEC packet");
+    let spec = Spec::decode(first).expect("bridge Spec::decode failed on padded SPEC");
+    let mut data_buf = vec![0u8; spec.total as usize];
+    let mut bitmap_buf = vec![0u64; ferros_pt::transfer::bitmap_words(spec.count)];
+    let mut xfer = InboundTransfer::new(&spec, &mut data_buf, &mut bitmap_buf)
+        .expect("bridge InboundTransfer::new failed");
+    for wire in reads {
+        assert!(ferros_pt::is_data_packet(wire[0]), "expected DATA, got {:02x}", wire[0]);
+        let (_sid, seq, hash, payload) = packet::decode_data(wire, xfer.seq_width)
+            .expect("bridge decode_data failed");
+        assert!(xfer.handle_data(seq, &hash, payload), "bridge rejected chunk seq={}", seq);
+    }
+    assert!(xfer.all_received(), "bridge missing chunks after queue drained");
+    let mut fbuf = [0u8; 128];
+    xfer.finish(&mut fbuf);
+    assert_eq!(xfer.state, ferros_pt::TransferState::Done, "root hash mismatch");
+    assert_eq!(xfer.payload(), &resp[..], "response payload corrupted in transit");
+}
+
+#[test]
 fn multi_chunk_send_replay() {
     // Same replay with a payload big enough to need multiple chunks — covers the RELOAD path shape.
     let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();

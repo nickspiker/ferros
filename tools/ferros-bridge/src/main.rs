@@ -55,6 +55,7 @@ fn usage() {
     eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 256)");
     eprintln!("  terminal     Bidirectional PT session");
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
+    eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
 }
 
 #[tokio::main]
@@ -110,6 +111,7 @@ async fn main() {
         }
         "terminal" => cmd_terminal().await,
         "dbg" => cmd_dbg().await,
+        "dbg2" => cmd_dbg2().await,
         "ping" => {
             let count = args
                 .get(2)
@@ -373,6 +375,50 @@ async fn cmd_dbg() {
             println!("  [14] flags: bulk_in_idle={} out_armed={} out_ready={} configured={}",
                 d[14] & 1, (d[14] >> 1) & 1, (d[14] >> 2) & 1, (d[14] >> 3) & 1);
             println!("  [15] DEPCMD status failures       A#{}", d[15]);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_dbg2() {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match link.read_dbg2().await {
+        Ok(d) => {
+            println!("Raw DWC3 event ring (oldest first; A#{} events total):", d[12]);
+            for i in 0..12 {
+                let evt = d[i];
+                if evt == 0 && d[12] < 12 { continue; }
+                print!("  [{i:2}] G#{evt:08X}");
+                if evt & 1 == 0 {
+                    let ep = (evt >> 1) & 0x1F;
+                    let ty = (evt >> 6) & 0xF;
+                    let status = (evt >> 12) & 0xF;
+                    let name = match ty {
+                        1 => "XferComplete",
+                        2 => "XferInProgress",
+                        3 => "XferNotReady",
+                        6 => "StreamEvt",
+                        7 => "EPCmdCmplt",
+                        _ => "?",
+                    };
+                    println!("  ep=A#{ep} {name} status=G#{status:X}");
+                } else {
+                    let ty = (evt >> 8) & 0xF;
+                    println!("  device event type=A#{ty}");
+                }
+            }
+            println!("ep2 TRB at last XferComplete: size=G#{:08X} (remaining=A#{}) ctrl=G#{:08X} (HWO={})",
+                d[13], d[13] & 0x00FF_FFFF, d[14], d[14] & 1);
+            println!("last DEPCMD failure register: G#{:08X}", d[15]);
         }
         Err(e) => {
             eprintln!("{e}");

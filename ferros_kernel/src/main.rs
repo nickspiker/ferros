@@ -1618,16 +1618,32 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                         if let Some(cmd) = ferros_pt::command::parse(payload) {
                                             if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                                 // Live diagnostics: DWC3 state + exception count.
-                                                pt_out_data.clear();
-                                                pt_out_data.extend_from_slice(b"ferros on Pixel 8 Pro (Tensor G3)\nUSB: eUSB2 PHY up, enumerated\n");
+                                                let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                                resp.extend_from_slice(b"ferros on Pixel 8 Pro (Tensor G3)\nUSB: eUSB2 PHY up, enumerated\n");
                                                 let snpsid = unsafe { core::ptr::read_volatile((DWC3 + 0xC120) as *const u32) };
                                                 let gsts = unsafe { core::ptr::read_volatile((DWC3 + 0xC118) as *const u32) };
                                                 let dsts = unsafe { core::ptr::read_volatile((DWC3 + 0xC70C) as *const u32) };
-                                                append_hex(&mut pt_out_data, b"SNPSID=", snpsid);
-                                                append_hex(&mut pt_out_data, b"GSTS=", gsts);
-                                                append_hex(&mut pt_out_data, b"DSTS=", dsts);
-                                                append_hex(&mut pt_out_data, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
-                                                pt_out_data.extend_from_slice(b"END\n");
+                                                append_hex(&mut resp, b"SNPSID=", snpsid);
+                                                append_hex(&mut resp, b"GSTS=", gsts);
+                                                append_hex(&mut resp, b"DSTS=", dsts);
+                                                append_hex(&mut resp, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
+                                                resp.extend_from_slice(b"END\n");
+                                                // Frame as a PT outbound transfer: SPEC then DATA packets, each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries. Blast mode — pt_recv on the bridge takes SPEC + DATA with no ACKs; no FIN needed since USB bulk never drops packets and a trailing FIN would sit unread and poison the next command's first recv.
+                                                pt_out_data.clear();
+                                                let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(resp.len())];
+                                                let mut spec_buf = [0u8; 512];
+                                                if let Some((mut ob, spec_len)) = OutboundTransfer::start(ferros_pt::StreamId::FIRST, &resp, &mut ob_bitmap, &mut spec_buf) {
+                                                    pt_out_data.extend_from_slice(&spec_buf[..spec_len]);
+                                                    pt_out_data.resize(512, 0);
+                                                    let mut pkt = [0u8; 512];
+                                                    while !ob.all_sent() {
+                                                        let plen = ob.next_data_packet(&resp, &mut pkt);
+                                                        if plen == 0 { break; }
+                                                        let start = pt_out_data.len();
+                                                        pt_out_data.extend_from_slice(&pkt[..plen]);
+                                                        pt_out_data.resize(start + 512, 0);
+                                                    }
+                                                }
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
                                                 // TODO: stage to high DRAM + implement the Exec jump. For now count bytes and ack so the bridge completes instead of hanging.
                                                 reload_size += cmd.params.len();

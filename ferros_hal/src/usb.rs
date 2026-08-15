@@ -262,6 +262,9 @@ const USB_REQ_SET_CONFIGURATION: u8 = 9;
 /// Returns 16 LE u32 counters — a live window into the PT dispatch loop that works even when the bulk path is wedged, since EP0 keeps running.
 pub const VENDOR_REQ_DBG: u8 = 0x5A;
 
+/// Raw event-path readout (bmRequestType G#C0): last 12 EP event words + count + ep2 TRB snapshots + last DEPCMD failure.
+pub const VENDOR_REQ_DBG2: u8 = 0x5B;
+
 /// Debug counter block served by VENDOR_REQ_DBG. Slots 0-11 belong to the kernel PT loop; slots 12-15 are driver state. Single-core, volatile access only.
 pub static mut DBG_PT: [u32; 16] = [0; 16];
 
@@ -738,6 +741,14 @@ pub struct Dwc3Dev {
     pub bulk_in_idle: bool,
     pub bulk_out_xfer_complete: u32,
     pub bulk_in_xfer_complete: u32,
+    /// Rolling ring of the last 12 raw EP event words, oldest overwritten first. Served by VENDOR_REQ_DBG2 to diagnose event-path bugs without a console.
+    pub evt_ring: [u32; 12],
+    /// Total EP events captured into evt_ring.
+    pub evt_ring_n: u32,
+    /// Bulk OUT TRB size word snapshot taken right after cache invalidate at ep2 XferComplete (remaining count in low 24 bits).
+    pub ep2_trb_size_snap: u32,
+    /// Bulk OUT TRB ctrl word snapshot at ep2 XferComplete (HWO bit 0 tells whether hardware ever consumed the TRB).
+    pub ep2_trb_ctrl_snap: u32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -874,6 +885,10 @@ impl Dwc3Dev {
             bulk_in_idle: true,
             bulk_out_xfer_complete: 0,
             bulk_in_xfer_complete: 0,
+            evt_ring: [0; 12],
+            evt_ring_n: 0,
+            ep2_trb_size_snap: 0,
+            ep2_trb_ctrl_snap: 0,
         };
 
         // Configure endpoints
@@ -1011,6 +1026,10 @@ impl Dwc3Dev {
             bulk_in_idle: true,
             bulk_out_xfer_complete: 0,
             bulk_in_xfer_complete: 0,
+            evt_ring: [0; 12],
+            evt_ring_n: 0,
+            ep2_trb_size_snap: 0,
+            ep2_trb_ctrl_snap: 0,
         };
 
         // Configure all endpoints
@@ -1104,8 +1123,10 @@ impl Dwc3Dev {
     pub fn bulk_out_arm(&mut self) {
         self.bulk_out_armed = true;
 
-        // Always ENDTRANSFER first to clear any stale/invalidated transfer. The host may have silently reset the endpoint on reconnect.
-        self.force_end_transfer_unconditional(2);
+        // ENDTRANSFER only if a transfer is actually in flight (resource index nonzero — XferComplete zeroes it). The old unconditional ENDTRANSFER errored a DEPCMD on every normal re-arm and is the prime suspect for the spurious len=0 ep2 event that eats the first PT DATA packet.
+        if self.bulk_out_resource_idx != 0 {
+            self.force_end_transfer_unconditional(2);
+        }
 
         let buf_addr = &raw const BULK_OUT_BUF as usize;
         let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
@@ -1480,6 +1501,8 @@ impl Dwc3Dev {
         unsafe { mmio::write32(dwc3_base() + GEVNTCOUNT, 4) };
 
         self.last_evt_raw = evt;
+        self.evt_ring[(self.evt_ring_n as usize) % 12] = evt;
+        self.evt_ring_n = self.evt_ring_n.wrapping_add(1);
 
         // Parse event
         if evt & EVT_NON_EP != 0 {
@@ -1515,6 +1538,9 @@ impl Dwc3Dev {
                             crate::mmio::cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
                             let remaining = BULK_OUT_TRB.trb.size & 0x00FF_FFFF;
                             self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
+                            // Snapshot the raw TRB words for VENDOR_REQ_DBG2 — distinguishes a stale cache read (size still 512, HWO set) from a spurious event (TRB untouched) from a normal short read.
+                            self.ep2_trb_size_snap = BULK_OUT_TRB.trb.size;
+                            self.ep2_trb_ctrl_snap = BULK_OUT_TRB.trb.ctrl;
                         }
                         self.bulk_out_ready = true;
                         return UsbEvent::TransferComplete { ep: ep_phys };
@@ -1844,6 +1870,23 @@ impl Dwc3Dev {
             USB_REQ_GET_STATUS => {
                 // Return 2 bytes of zeros (self-powered, no remote wakeup)
                 self.ep0_send(&[0, 0], TRBCTL_CONTROL_DATA);
+                self.ep0_state = Ep0State::DataIn;
+                true
+            }
+            VENDOR_REQ_DBG2 if bm_request_type == 0xC0 => {
+                // Raw event-path readout: last 12 EP event words (oldest first), total event count, ep2 TRB size+ctrl snapshots, DEPCMD failure detail.
+                let mut buf = [0u8; 64];
+                let n = self.evt_ring_n as usize;
+                for i in 0..12 {
+                    let idx = if n >= 12 { (n + i) % 12 } else { i };
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&self.evt_ring[idx].to_le_bytes());
+                }
+                buf[48..52].copy_from_slice(&self.evt_ring_n.to_le_bytes());
+                buf[52..56].copy_from_slice(&self.ep2_trb_size_snap.to_le_bytes());
+                buf[56..60].copy_from_slice(&self.ep2_trb_ctrl_snap.to_le_bytes());
+                buf[60..64].copy_from_slice(&self.last_cmd_status.to_le_bytes());
+                let len = (w_length as usize).min(64);
+                self.ep0_send(&buf[..len], TRBCTL_CONTROL_DATA);
                 self.ep0_state = Ep0State::DataIn;
                 true
             }
