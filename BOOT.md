@@ -312,7 +312,8 @@ First boot achieved 2026-08-14 (husky, slot a, `--pad 16`): image accepted, kern
 Watchdog defeated same day — kernel now runs indefinitely (survived 5+ min, no reset).
 Validated and closed: mkimg LZ4, pad/image_size, entry guard, cluster watchdog disable.
 
-1. **USB enumeration** (THE wall): the kernel is alive but blind — no `1209:4665` on the bus. The eUSB PHY init in kernel_main isn't producing enumeration. Needs a side channel (haptic buzz / watchdog heartbeat) to debug, since USB was meant to be the output channel.
+1. **USB enumeration** (THE wall) — ROOT CAUSE FOUND 2026-08-14: `ferros_hal::usb::Dwc3Dev::init()` runs **Qualcomm QCM6490 PHY code on Samsung/Exynos silicon**. `QCOM_WRAPPER = G#0A6F8800` (a Tensor-foreign address), plus a femtoPHY `SIDDQ`/`POR`/`UTMI` sequence — none of which exists on Tensor. `kernel_main` already brings up the correct Samsung eUSB2 PHY (G#11100000/G#11110000), then `Dwc3Dev::init` clobbers it / writes to unmapped MMIO (likely the silent stall). DWC3 *core* regs (GCTL/DCTL/DCFG, PRTCAPDIR=device, Run/Stop at usb.rs:867) are standard Synopsys and fine. **Fix**: an Exynos path in `Dwc3Dev::init` that skips ALL Qualcomm PHY/QSCRATCH writes and does DWC3-core-only (soft reset → PRTCAPDIR device → DCFG HS → event buffers → Run/Stop). Reference: `dwc3-exynos.c` glue. Do it with hardware in the loop, not blind.
+   - Note: the kernel already has a **UFS diagnostic channel** (writes `"FERROS v3 S2MPU_BYPASS=OK"` + live SNPSID/GCTL/DSTS/USB2PHY reads to the ferros partition LBA); a root-readable readback of that block would confirm how far init gets and what DSTS says. Currently unreadable without root on the Android side.
 2. **androidboot.* synthesis**: enumerate exactly what Graphene init requires for the chainload path.
 3. **AVB footer** (locked endgame only): unsigned images boot with a logged ERROR_VERIFICATION while unlocked; the avb_custom_key signing path picks this up in Phase 5.
 
