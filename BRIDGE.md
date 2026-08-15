@@ -28,11 +28,32 @@ See [PIPE.md](PIPE.md) and the Photon Transport stack docs for the layering rati
 | `reload <kernel>` | `fastboot boot` | RAM-boot a new kernel — no storage write |
 | `install <kernel.signed>` | `fastboot flash boot` | Persist a signed kernel to UFS + stem entry |
 | `beam <ring>` | `adb pull` | Pull persistent ring / ledger / vault snapshots |
+| `run <payload.bin>` | *(no analog)* | Hot-load a program blob, CALL it on the device, print its output |
 | `terminal` | `adb shell` | Interactive bidirectional PT session |
 | `echo` / `send` / `ping` | `adb shell ping` (loosely) | Link/PT test harness (no real adb/fastboot equivalent) |
+| `dbg` / `dbg2` | *(no analog)* | Live kernel counters / raw DWC3 event ring over EP0 — work even when the bulk path is wedged |
 
 The difference that matters: adb and fastboot are two separate stacks with two separate transports and two separate device modes.
 ferros-bridge is one tool, one transport (PT), one device that never has to drop into a special "bootloader mode" to accept a new kernel — `reload` works against the running kernel.
+
+## How verbs map to the wire
+
+The wire protocol is the spec; bridge verbs are CLI sugar over it.
+Every verb that touches device state rides a cap-addressed command — `[cap: 32][op: 1][params...]` where cap is a BLAKE3 credential from the registry in [ferros_pt/src/command.rs](ferros_pt/src/command.rs). That registry is the source of truth for what a device can be asked to do.
+
+| Verb | Dev cap | Op(s) |
+|---|---|---|
+| `diag` | `ferros.dev.diag` | Read |
+| `read` | `ferros.dev.mem` | Read |
+| `reboot` | `ferros.dev.reboot` | Exec |
+| `reload` | `ferros.dev.reload` | Write, then Exec (one-way jump) |
+| `run` | `ferros.dev.run` | Write, then Exec (call-and-return) |
+| `beam` | `ferros.dev.beam` | Read |
+| `install` | store path | Write |
+
+`ferros.dev.store` and `ferros.dev.usb` are registered but have no verb yet.
+Everything else (`status`, `ping`, `echo`, `send`, `log`, `terminal`, `dbg`, `dbg2`) lives below the cap layer: transport plumbing and EP0 vendor-request debug that address the link, not device objects.
+Dev caps are unauthenticated BLAKE3 hashes of well-known names; production delegates real credentials over the identical wire format.
 
 ## Commands
 
@@ -128,6 +149,26 @@ Diagnostics for bringing up the link, not part of the operator workflow.
 
 `ping` is the lowest-level probe: it sends a 4-byte `PING` on bulk OUT and reads bulk IN back, `count` times (each round-trip bounded by a A#1024 ms recv timeout), then reports `OK/total` and round-trip latency (avg/min/max).
 Use it to isolate the **USB link itself** from the PT layer — if `ping` flows but `echo` doesn't, the fault is in PT framing, not the wire.
+
+### run
+```
+ferros-bridge run <payload.bin> [hex-input]
+```
+Hot-load a program: stages the blob over PT (write-verified, into the same staging slot `reload` uses — last Write wins), then the kernel **calls** it and ships back its output.
+Payload ABI: `extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64`, entry at blob offset 0, PC-relative code only, `no_std`.
+The optional hex argument becomes the payload's input; the response is `[ret: 8 LE][out bytes]`, printed as UTF-8 when clean, hexdump otherwise.
+Template payload: [payloads/hello/](payloads/hello/) — build with the aarch64-unknown-none target, objcopy to a flat `.bin`.
+Unlike `reload`, the kernel survives — `run` is the experiment primitive: poke registers, time something, dump state, all without a kernel rebuild.
+A payload that never returns hangs the kernel (no preemption exists); recover with a hard reboot.
+
+### dbg / dbg2
+```
+ferros-bridge dbg     # PT dispatch counters: per-stage SPEC/ACK/DATA/COMPLETE progress + driver state
+ferros-bridge dbg2    # raw DWC3 event ring (last 12 events, decoded) + ep2 TRB snapshots + last DEPCMD failure
+```
+EP0 vendor-request readouts (`G#5A` / `G#5B`) — they ride the control endpoint, so they work **even when the bulk path is wedged**.
+`dbg` answers "which PT stage did my command die at"; `dbg2` answers "what did the DWC3 hardware actually see".
+These found the ENDTRANSFER bug in one boot; reach for them before adding any kernel-side printf.
 
 ## Transport contract
 
