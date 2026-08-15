@@ -1524,9 +1524,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut reload_size: usize = 0;
     let mut reload_ok = false;
 
-    // Hot-reload staging area: own load base + 32MiB. The running footprint is image (~300KB flat + bss) + 64KB stack + 4MiB heap, all well under 8MiB above base, so 32MiB is clear of everything including the staged kernel's own bss/stack/heap once it runs there. MMU is off on Tensor (ABL disables it before the jump), so these are straight physical writes — no mapping concerns. Successive reloads march up DRAM 32MiB per generation; fine for a dev loop.
+    // Hot-reload staging: ping-pong between exactly two proven slots. The ABL load base is proven (every cold boot runs there) and base+32MiB is proven by the first hot reload; anything further up is NOT — a jump to base+64MiB died silently on hardware (staging writes verified by hash, execution never came back). So each generation stages into the slot its predecessor vacated. The handoff rides the jump's x0: ABL passes a DTB pointer (8-aligned) or 0, the reloader passes its own base with bit 0 set — the tag says which boot path we came from and where the free slot is. Kernel footprint is image (~300KB flat + bss) + 64KB stack + 4MiB heap, well under the 32MiB slot pitch. MMU is off on Tensor (ABL disables it before the jump), so staging writes are straight physical stores.
     unsafe extern "C" { static _start: u8; }
-    let reload_stage = (&raw const _start as usize) + (32 << 20);
+    let own_base = &raw const _start as usize;
+    let reload_stage = if dtb_addr & 1 == 1 {
+        (dtb_addr & !1) as usize // hot-reload handoff: predecessor's base is now the free slot
+    } else {
+        own_base + (32 << 20) // ABL cold boot: the +32MiB slot is free
+    };
 
     // Append "LABEL=<8 hex digits>\n" to a byte vec.
     let append_hex = |log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32| {
@@ -1651,6 +1656,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"GSTS=", gsts);
                                                 append_hex(&mut resp, b"DSTS=", dsts);
                                                 append_hex(&mut resp, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
+                                                append_hex(&mut resp, b"BASE=", own_base as u32);
+                                                append_hex(&mut resp, b"STAGE=", reload_stage as u32);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
@@ -1692,9 +1699,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                             "ic iallu",
                                                             "dsb sy",
                                                             "isb",
-                                                            "mov x0, xzr",
                                                             "br {stage}",
                                                             stage = in(reg) reload_stage,
+                                                            in("x0") own_base | 1, // handoff tag: our base becomes the successor's free slot
                                                             options(noreturn)
                                                         );
                                                     }
