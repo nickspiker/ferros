@@ -309,12 +309,14 @@ Boot slot corrupt (Pixel 8):
 ## Open Items (Pixel 8 bring-up)
 
 First boot achieved 2026-08-14 (husky, slot a, `--pad 16`): image accepted, kernel ran ~60s to watchdog, no entry fault.
-Validated and closed: mkimg LZ4, pad/image_size, entry guard.
+Watchdog defeated same day — kernel now runs indefinitely (survived 5+ min, no reset).
+Validated and closed: mkimg LZ4, pad/image_size, entry guard, cluster watchdog disable.
 
-1. **Watchdog**: pet or disable the Exynos CLUSTER0_NONCPU WDT first thing in Stage 0 — currently the kernel dies at ~60s (reboot reason G#CBEA). This now gates everything.
-2. **eUSB PHY init**: sequence from AOSP phy-exynos-usbdrd.c — gating item for USB-first output and the hot-reload dev loop.
-3. **androidboot.* synthesis**: enumerate exactly what Graphene init requires for the chainload path.
-4. **AVB footer** (locked endgame only): unsigned images boot with a logged ERROR_VERIFICATION while unlocked; the avb_custom_key signing path picks this up in Phase 5.
+1. **USB enumeration** (THE wall): the kernel is alive but blind — no `1209:4665` on the bus. The eUSB PHY init in kernel_main isn't producing enumeration. Needs a side channel (haptic buzz / watchdog heartbeat) to debug, since USB was meant to be the output channel.
+2. **androidboot.* synthesis**: enumerate exactly what Graphene init requires for the chainload path.
+3. **AVB footer** (locked endgame only): unsigned images boot with a logged ERROR_VERIFICATION while unlocked; the avb_custom_key signing path picks this up in Phase 5.
+
+**Watchdog disable** (done): Exynos cluster watchdogs (`watchdog_cl0@G#10060000`, `watchdog_cl1@G#10070000`, Samsung s3c2410-style) are armed by ABL. Writing 0 to WTCON (base+0) clears the enable bit (halts the counter) and the reset-enable bit — done first thing in kernel_main. No PMU write needed; stopping the counter stops the reset request.
 
 ---
 

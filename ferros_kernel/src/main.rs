@@ -1306,6 +1306,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // ---- Pixel 8 / Tensor G3 ----
 
+    // ---- Disable the cluster watchdogs FIRST ---- ABL arms the Exynos CLUSTER0/1 NONCPU watchdogs so a hung kernel reboots (~60s, reset reason G#CBEA "APC Watchdog Early", confirmed 2026-08-14). Until we run a real timer + pet loop, stop them: Samsung s3c2410-style block, WTCON at base+0. Clearing WTCON.EN (bit 5) halts the counter and WTCON.RSTEN (bit 0) masks reset — writing 0 does both, so no reset is ever requested regardless of the PMU reset mask. Nodes from live DTB: watchdog_cl0@G#10060000, watchdog_cl1@G#10070000.
+    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+    for &wdt in &WATCHDOGS {
+        unsafe {
+            core::ptr::write_volatile((wdt + 0x00) as *mut u32, 0); // WTCON = 0: timer off, reset masked
+        }
+    }
+
     // GPIO registers for volume buttons (from DTB: pinctrl@G#154D0000)
     const GPA4_DAT: usize = 0x154D_0084;
     const GPA6_DAT: usize = 0x154D_00A4;
