@@ -1522,6 +1522,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
     let mut reload_size: usize = 0;
+    let mut reload_ok = false;
+
+    // Hot-reload staging area: own load base + 32MiB. The running footprint is image (~300KB flat + bss) + 64KB stack + 4MiB heap, all well under 8MiB above base, so 32MiB is clear of everything including the staged kernel's own bss/stack/heap once it runs there. MMU is off on Tensor (ABL disables it before the jump), so these are straight physical writes — no mapping concerns. Successive reloads march up DRAM 32MiB per generation; fine for a dev loop.
+    unsafe extern "C" { static _start: u8; }
+    let reload_stage = (&raw const _start as usize) + (32 << 20);
 
     // Append "LABEL=<8 hex digits>\n" to a byte vec.
     let append_hex = |log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32| {
@@ -1529,6 +1534,25 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let hex = b"0123456789ABCDEF";
         for i in (0..8).rev() { log.push(hex[((val >> (i * 4)) & 0xF) as usize]); }
         log.push(b'\n');
+    };
+
+    // Frame a response as a PT outbound transfer: SPEC + DATA packets each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries. Blast mode — bridge pt_recv takes SPEC + DATA with no ACKs; no FIN, since USB bulk never drops packets and a trailing FIN would sit unread and poison the next command's first recv.
+    let queue_pt_response = |out: &mut alloc::vec::Vec<u8>, payload: &[u8]| {
+        out.clear();
+        let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(payload.len())];
+        let mut spec_buf = [0u8; 512];
+        if let Some((mut ob, spec_len)) = OutboundTransfer::start(ferros_pt::StreamId::FIRST, payload, &mut ob_bitmap, &mut spec_buf) {
+            out.extend_from_slice(&spec_buf[..spec_len]);
+            out.resize(512, 0);
+            let mut pkt = [0u8; 512];
+            while !ob.all_sent() {
+                let plen = ob.next_data_packet(payload, &mut pkt);
+                if plen == 0 { break; }
+                let start = out.len();
+                out.extend_from_slice(&pkt[..plen]);
+                out.resize(start + 512, 0);
+            }
+        }
     };
 
     loop {
@@ -1628,28 +1652,54 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"DSTS=", dsts);
                                                 append_hex(&mut resp, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
                                                 resp.extend_from_slice(b"END\n");
-                                                // Frame as a PT outbound transfer: SPEC then DATA packets, each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries. Blast mode — pt_recv on the bridge takes SPEC + DATA with no ACKs; no FIN needed since USB bulk never drops packets and a trailing FIN would sit unread and poison the next command's first recv.
-                                                pt_out_data.clear();
-                                                let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(resp.len())];
-                                                let mut spec_buf = [0u8; 512];
-                                                if let Some((mut ob, spec_len)) = OutboundTransfer::start(ferros_pt::StreamId::FIRST, &resp, &mut ob_bitmap, &mut spec_buf) {
-                                                    pt_out_data.extend_from_slice(&spec_buf[..spec_len]);
-                                                    pt_out_data.resize(512, 0);
-                                                    let mut pkt = [0u8; 512];
-                                                    while !ob.all_sent() {
-                                                        let plen = ob.next_data_packet(&resp, &mut pkt);
-                                                        if plen == 0 { break; }
-                                                        let start = pt_out_data.len();
-                                                        pt_out_data.extend_from_slice(&pkt[..plen]);
-                                                        pt_out_data.resize(start + 512, 0);
+                                                queue_pt_response(&mut pt_out_data, &resp);
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
+                                                // Stage the flat kernel image. The PT transfer already verified per-chunk + root BLAKE3; re-hash the staged copy against the source (write-verify — catches a bad copy, not a bad transfer). Sanity-gate on the ARM64 header MZ magic so a stray Write can't stage garbage.
+                                                let params = cmd.params;
+                                                let is_kernel = params.len() > 0x1000
+                                                    && params[0] == 0x4D && params[1] == 0x5A && params[2] == 0x00 && params[3] == 0x91;
+                                                if is_kernel {
+                                                    let src_hash = blake3::hash(params);
+                                                    unsafe {
+                                                        core::ptr::copy_nonoverlapping(params.as_ptr(), reload_stage as *mut u8, params.len());
+                                                    }
+                                                    let staged = unsafe { core::slice::from_raw_parts(reload_stage as *const u8, params.len()) };
+                                                    reload_ok = blake3::hash(staged) == src_hash;
+                                                    reload_size = params.len();
+                                                } else {
+                                                    reload_ok = false;
+                                                    reload_size = 0;
+                                                }
+                                                // Staged-size ack, PT-framed (bridge pt_recv reads 4 LE bytes; 0 = rejected).
+                                                let ack = (if reload_ok { reload_size as u32 } else { 0 }).to_le_bytes();
+                                                queue_pt_response(&mut pt_out_data, &ack);
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                                                if reload_ok && reload_size > 0 {
+                                                    // Flush this Exec's COMPLETE out the wire before tearing USB down: poll until the bulk IN that carries it finishes, then give the host a grace period to read it.
+                                                    let mut spins = 0u32;
+                                                    while !usb.bulk_in_is_idle() && spins < (1 << 20) {
+                                                        let _ = usb.poll_event();
+                                                        spins += 1;
+                                                    }
+                                                    for _ in 0..(1 << 24) { core::hint::spin_loop(); }
+                                                    unsafe {
+                                                        // Graceful detach: clear DCTL Run/Stop so the host sees a disconnect, not a dead device.
+                                                        let dctl = core::ptr::read_volatile((DWC3 + 0xC704) as *const u32);
+                                                        core::ptr::write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
+                                                        // MMU + caches are off (Tensor ABL entry state), so the staged bytes are already in DRAM; invalidate the icache and jump to the staged image's ARM64 header (code0/code1 branch to _entry, fully PC-relative — it zeroes its own bss and sets its own stack at the new base). x0 = 0: no DTB.
+                                                        core::arch::asm!(
+                                                            "dsb sy",
+                                                            "ic iallu",
+                                                            "dsb sy",
+                                                            "isb",
+                                                            "mov x0, xzr",
+                                                            "br {stage}",
+                                                            stage = in(reg) reload_stage,
+                                                            options(noreturn)
+                                                        );
                                                     }
                                                 }
-                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
-                                                // TODO: stage to high DRAM + implement the Exec jump. For now count bytes and ack so the bridge completes instead of hanging.
-                                                reload_size += cmd.params.len();
-                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
-                                                // TODO: verify staged image + jump. Acknowledge only for now.
-                                                let _ = reload_size;
+                                                // Nothing staged (or verify failed): fall through, COMPLETE already told the bridge the transfer landed; the 0-size ack from Write is the rejection signal.
                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                                                 // PSCI SYSTEM_RESET (Tensor: secure monitor at EL3 via smc).
                                                 unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }
