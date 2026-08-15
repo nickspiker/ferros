@@ -1507,7 +1507,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
     // Guard against unprogrammed CNTFRQ (would make the timeout zero and re-init every iteration): fall back to the Tensor G3 arch timer rate, 24.576 MHz.
     let cntfrq = if cntfrq == 0 { 24_576_000 } else { cntfrq };
-    let enum_timeout = cntfrq * 4;
+    // 2s of total silence = dead attempt. Forensics (2026-08-15) showed failed inits produce ZERO events — the analog path never lights up (LTSTATE/LINKDBG identical to healthy, DSTS bit 17 never sets) — while a good attempt draws the host's bus reset well under a second after attach. Any event pushes the deadline, so slow-but-alive enumeration is never torn down.
+    let enum_timeout = cntfrq * 2;
+    // Second bound: the EP0-wedge failure mode keeps drawing host descriptor-read retries (each an event, each pushing the silence deadline), riding a doomed attempt for 15s+ while the host slowly gives up. A healthy handshake reaches SET_CONFIGURATION well under a second after attach, so 4s since the last init without configuring means the attempt is bad no matter how chatty it looks.
+    let wedge_timeout = cntfrq * 4;
+    let mut t_init = cntpct();
     let mut t_progress = cntpct();
     ferros_hal::usb::dbg_set(3, 1); // PHY init attempts (first one already done above)
 
@@ -1527,6 +1531,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut reload_ok = false;
     let mut run_ok = false;
     let mut run_size: usize = 0;
+    // Enumeration-failure forensics: (LTSTATE_HIS, LINK_DEBUG_L, DSTS) captured at the moment the watchdog declares an init attempt dead, right before re-init. DIAG dumps the collection — flaky boots document themselves. Capped at 32 attempts.
+    let mut init_history: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
 
     // Hot-reload staging: ping-pong between exactly two proven slots. The ABL load base is proven (every cold boot runs there) and base+32MiB is proven by the first hot reload; anything further up is NOT — a jump to base+64MiB died silently on hardware (staging writes verified by hash, execution never came back). So each generation stages into the slot its predecessor vacated. The handoff rides the jump's x0: ABL passes a DTB pointer (8-aligned) or 0, the reloader passes its own base with bit 0 set — the tag says which boot path we came from and where the free slot is. Kernel footprint is image (~300KB flat + bss) + 64KB stack + 4MiB heap, well under the 32MiB slot pitch. MMU is off on Tensor (ABL disables it before the jump), so staging writes are straight physical stores.
     unsafe extern "C" { static _start: u8; }
@@ -1570,14 +1576,27 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         match usb.poll_event() {
             UsbEvent::None => {
                 // Enumeration watchdog: not configured + 4s without any USB event → full PHY + DWC3 re-init (fresh attach from the host's perspective).
-                if !usb.is_configured() && cntpct().wrapping_sub(t_progress) > enum_timeout {
+                let now = cntpct();
+                if !usb.is_configured()
+                    && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout)
+                {
+                    if init_history.len() < 32 {
+                        unsafe {
+                            init_history.push((
+                                core::ptr::read_volatile((USBCON + 0x80) as *const u32),  // LTSTATE_HIS
+                                core::ptr::read_volatile((USBCON + 0x84) as *const u32),  // LINK_DEBUG_L
+                                core::ptr::read_volatile((DWC3 + 0xC70C) as *const u32), // DSTS
+                            ));
+                        }
+                    }
                     eusb_phy_init();
                     if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() { usb = nu; }
                     ferros_hal::usb::dbg_bump(3);
                     pt_inbound = None;
                     pt_seq_width = 0;
                     pt_out_data.clear();
-                    t_progress = cntpct();
+                    t_init = cntpct();
+                    t_progress = t_init;
                 }
                 // Pump a pending outbound response (DIAG payload), 512 bytes per bulk IN.
                 if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
@@ -1662,6 +1681,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
                                                 append_hex(&mut resp, b"BASE=", own_base as u32);
                                                 append_hex(&mut resp, b"STAGE=", reload_stage as u32);
+                                                for (i, &(lt, dbg, dsts)) in init_history.iter().enumerate() {
+                                                    append_hex(&mut resp, b"FAIL_ATT=", i as u32);
+                                                    append_hex(&mut resp, b"  LTSTATE=", lt);
+                                                    append_hex(&mut resp, b"  LINKDBG=", dbg);
+                                                    append_hex(&mut resp, b"  DSTS=", dsts);
+                                                }
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
