@@ -1340,7 +1340,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         core::ptr::write_volatile((USB_SYSMMU + 0x00) as *mut u32, 0); // disable SYSMMU
     }
 
-    // ---- eUSB PHY init (now possible with S2MPU bypassed) ---- Ported from phy-exynos-usbdrd-eusb.c + exynos-usb-blkcon.c
+    // ---- eUSB PHY init (now possible with S2MPU bypassed) ---- NOTE 2026-08-14: these offsets (EUSB_PHY+G#0/4/8/C) do NOT match the real Exynos eUSB2 CR register map (ref tools/pixel8/phy-ref/phy-eusb.c: ref-freq@G#18, termselect@G#8, opmode@G#C, PLL timing@G#200-20C, PLL-lock poll@G#220) and this block is missing the mandatory pre-steps: eUSB repeater power-on (I2C), PMU isolation clear, BLKCON link init. The "trust ABL's PHY" experiment (skip this + warm_init) was tried and FAILED — ABL tears the PHY down on jump — so this bring-up is required, and needs a real port from phy-exynos-eusb.c plus an output channel to debug.
     const USBCON: usize = 0x1110_0000;
     const EUSB_PHY: usize = 0x1111_0000;
 
