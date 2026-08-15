@@ -42,7 +42,7 @@ fn diag_send_replay() {
     let pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
     eprintln!("kernel: decoded SPEC count={} psize={} total={} seq_width={}", spec.count, spec.psize, spec.total, pt_seq_width);
 
-    let bmw = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+    let bmw = ferros_pt::transfer::bitmap_words(spec.count);
     let mut pt_data_buf = vec![0u8; spec.total as usize];
     let mut pt_bitmap_buf = vec![0u64; bmw];
     let mut xfer_in = InboundTransfer::new(&spec, &mut pt_data_buf, &mut pt_bitmap_buf)
@@ -138,6 +138,45 @@ fn response_recv_replay() {
 }
 
 #[test]
+fn kernel_sized_send_replay() {
+    // Regression: a 45KB payload (real kernel size) needs 95 chunks — more than 64, so the receive bitmap needs 2 words. Sizing it with outbound_bitmap_words(count-as-bytes) gives 1 word and InboundTransfer::new returns None, silently dropping the SPEC (the exact hot-reload hang of 2026-08-15). bitmap_words(count) is the correct sizing.
+    let data: Vec<u8> = (0..45064u32 / 4).flat_map(|i| i.to_le_bytes()).collect();
+    let sid = StreamId::FIRST;
+    let mut spec_buf = [0u8; 512];
+    let mut bitmap_buf = vec![0u64; ferros_pt::transfer::outbound_bitmap_words(data.len())];
+    let (mut xfer_out, spec_len) = OutboundTransfer::start(sid, &data, &mut bitmap_buf, &mut spec_buf)
+        .expect("SPEC build failed");
+    assert!(xfer_out.count > 64, "test must exercise a multi-word bitmap (count={})", xfer_out.count);
+
+    let wire_spec = pad512(&spec_buf[..spec_len]);
+    let spec = Spec::decode(&wire_spec[..512]).expect("Spec::decode failed on padded SPEC");
+    let pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
+
+    let bmw = ferros_pt::transfer::bitmap_words(spec.count);
+    let mut pt_data_buf = vec![0u8; spec.total as usize];
+    let mut pt_bitmap_buf = vec![0u64; bmw];
+    let mut xfer_in = InboundTransfer::new(&spec, &mut pt_data_buf, &mut pt_bitmap_buf)
+        .expect("InboundTransfer::new returned None — bitmap sized too small for count > 64");
+
+    let mut pkt_buf = [0u8; 512];
+    while !xfer_out.all_sent() {
+        let pkt_len = xfer_out.next_data_packet(&data, &mut pkt_buf);
+        assert!(pkt_len > 0);
+        let wire = pad512(&pkt_buf[..pkt_len]);
+        let (_sid, seq, hash, payload) = packet::decode_data(&wire[..512], pt_seq_width)
+            .expect("decode_data failed on padded DATA");
+        assert!(xfer_in.handle_data(seq, &hash, payload), "handle_data rejected seq={}", seq);
+    }
+
+    assert!(xfer_in.all_received());
+    let mut complete_buf = [0u8; 512];
+    let clen = xfer_in.finish(&mut complete_buf);
+    assert!(clen > 0, "finish() returned 0");
+    assert!(Complete::decode(&complete_buf[..clen]).expect("Complete::decode failed").success);
+    assert_eq!(xfer_in.payload(), &data[..], "45KB payload corrupted in transit");
+}
+
+#[test]
 fn multi_chunk_send_replay() {
     // Same replay with a payload big enough to need multiple chunks — covers the RELOAD path shape.
     let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
@@ -152,7 +191,7 @@ fn multi_chunk_send_replay() {
     let spec = Spec::decode(&wire_spec[..512]).expect("Spec::decode failed on padded SPEC");
     let pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
 
-    let bmw = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+    let bmw = ferros_pt::transfer::bitmap_words(spec.count);
     let mut pt_data_buf = vec![0u8; spec.total as usize];
     let mut pt_bitmap_buf = vec![0u64; bmw];
     let mut xfer_in = InboundTransfer::new(&spec, &mut pt_data_buf, &mut pt_bitmap_buf)

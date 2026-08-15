@@ -432,6 +432,7 @@ fn tri_state(v: u32) -> &'static str {
         0 => "never attempted",
         1 => "OK",
         2 => "DROPPED (bulk IN busy)",
+        3 => "SPEC REJECTED (buffer sizing)",
         _ => "?",
     }
 }

@@ -1250,7 +1250,7 @@ fn m1_usb_event_loop(
                             // SPEC packet — start new inbound transfer
                             if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
                                 pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
-                                let bitmap_words = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+                                let bitmap_words = ferros_pt::transfer::bitmap_words(spec.count);
                                 pt_data_buf = alloc::vec![0u8; spec.total as usize];
                                 pt_bitmap_buf = alloc::vec![0u64; bitmap_words];
                                 // SAFETY: pt_data_buf and pt_bitmap_buf live as long as pt_inbound
@@ -1715,7 +1715,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                             if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
                                 dbg_bump(4);
                                 pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
-                                let bmw = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+                                let bmw = ferros_pt::transfer::bitmap_words(spec.count);
                                 pt_data_buf = alloc::vec![0u8; spec.total as usize];
                                 pt_bitmap_buf = alloc::vec![0u64; bmw];
                                 // SAFETY: pt_data_buf/pt_bitmap_buf live in this same scope as long as pt_inbound.
@@ -1735,6 +1735,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                         dbg_set(5, if ok { 1 } else { 2 });
                                     }
                                     pt_inbound = Some(xfer);
+                                } else {
+                                    // Buffer sizing rejected the SPEC — no ACK goes out, so make the silence diagnosable.
+                                    dbg_set(5, 3);
                                 }
                             }
                         }
