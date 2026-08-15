@@ -1469,39 +1469,169 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     ferros_hal::usb::set_dwc3_base(DWC3);
     let mut usb = ferros_hal::usb::Dwc3Dev::init();
 
-    // Killswitch + USB event loop. NOTE: GPA6 (vol up) reads 0 when not pressed — vol-down-only diagnostic was broken (always fired "both buttons"). Removed the diagnostic. Both buttons = SYSTEM_OFF (killswitch). That's all we need.
-    loop {
-        let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
-        let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
-        if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
-            unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
-        }
+    // ---- Killswitch + USB event loop with PT command dispatch ----
+    // Both volume buttons held = SYSTEM_OFF (killswitch). PT commands: DIAG (live diagnostics
+    // over USB), RELOAD (stage kernel — Write counts, Exec/jump is TODO), REBOOT (PSCI
+    // SYSTEM_RESET via smc — Tensor has EL3). Mirrors the M1 dispatch loop (m1_usb_event_loop).
+    use ferros_hal::usb::UsbEvent;
 
-        // USB event poll
-        if let Some(ref mut u) = usb {
-            match u.poll_event() {
-                ferros_hal::usb::UsbEvent::Reset => {
-                    u.handle_reset();
-                }
-                ferros_hal::usb::UsbEvent::ConnectDone { .. } => {
-                    u.handle_connect_done();
-                    u.ep0_start_setup();
-                    u.bulk_out_arm();
-                }
-                ferros_hal::usb::UsbEvent::Disconnect => {
-                    u.handle_disconnect();
-                }
-                ferros_hal::usb::UsbEvent::Ep0Setup { request } => {
-                    if !u.handle_setup(&request) {
-                        u.ep0_stall();
-                    }
-                }
-                _ => {}
+    // Killswitch: both volume buttons held → PSCI SYSTEM_OFF. Checked once per iteration.
+    macro_rules! killswitch_check {
+        () => {{
+            let gpa4 = unsafe { core::ptr::read_volatile(GPA4_DAT as *const u32) };
+            let gpa6 = unsafe { core::ptr::read_volatile(GPA6_DAT as *const u32) };
+            if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
+                unsafe { core::arch::asm!("ldr x0, =0x84000008", "smc #0", options(noreturn)); }
             }
-        }
+        }};
+    }
 
-        for _ in 0..64_u32 {
-            core::hint::spin_loop();
+    // If USB init failed, still honor the killswitch.
+    let mut usb = match usb {
+        Some(u) => u,
+        None => loop {
+            killswitch_check!();
+            for _ in 0..1024u32 { core::hint::spin_loop(); }
+        },
+    };
+
+    // PT inbound-transfer state.
+    let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut pt_bitmap_buf: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut pt_inbound: Option<InboundTransfer<'_>> = None;
+    let mut pt_seq_width: usize = 0;
+    let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
+    let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
+    let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
+    let mut reload_size: usize = 0;
+
+    // Append "LABEL=<8 hex digits>\n" to a byte vec.
+    let append_hex = |log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32| {
+        log.extend_from_slice(label);
+        let hex = b"0123456789ABCDEF";
+        for i in (0..8).rev() { log.push(hex[((val >> (i * 4)) & 0xF) as usize]); }
+        log.push(b'\n');
+    };
+
+    loop {
+        killswitch_check!();
+
+        match usb.poll_event() {
+            UsbEvent::None => {
+                // Pump a pending outbound response (DIAG payload), 512 bytes per bulk IN.
+                if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                    let len = pt_out_data.len().min(512);
+                    let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
+                    usb.bulk_in_send(&chunk);
+                }
+                for _ in 0..64u32 { core::hint::spin_loop(); }
+            }
+            UsbEvent::Reset => {
+                usb.handle_reset();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::ConnectDone { .. } => {
+                usb.handle_connect_done();
+                usb.ep0_start_setup();
+                usb.bulk_out_arm();
+            }
+            UsbEvent::Disconnect => {
+                usb.handle_disconnect();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::Ep0Setup { request } => {
+                if !usb.handle_setup(&request) {
+                    usb.ep0_stall();
+                }
+            }
+            UsbEvent::TransferComplete { ep } => {
+                if ep == 2 {
+                    // Bulk OUT — a PT packet (SPEC opens a transfer, DATA fills it).
+                    let mut tmp = [0u8; 512];
+                    let mut n = 0usize;
+                    if let Some(data) = usb.bulk_out_read() {
+                        n = data.len().min(512);
+                        tmp[..n].copy_from_slice(&data[..n]);
+                    }
+                    if n > 0 {
+                        if ferros_pt::is_data_packet(tmp[0]) {
+                            if let Some(ref mut xfer) = pt_inbound {
+                                if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
+                                    xfer.handle_data(seq, &hash, payload);
+                                    if xfer.all_received() {
+                                        let mut complete_buf = [0u8; 512];
+                                        let clen = xfer.finish(&mut complete_buf);
+                                        if clen > 0 {
+                                            usb.bulk_in_send(&complete_buf[..clen]);
+                                        }
+                                        // Dispatch the completed command.
+                                        let payload = xfer.payload();
+                                        if let Some(cmd) = ferros_pt::command::parse(payload) {
+                                            if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                                                // Live diagnostics: DWC3 state + exception count.
+                                                pt_out_data.clear();
+                                                pt_out_data.extend_from_slice(b"ferros on Pixel 8 Pro (Tensor G3)\nUSB: eUSB2 PHY up, enumerated\n");
+                                                let snpsid = unsafe { core::ptr::read_volatile((DWC3 + 0xC120) as *const u32) };
+                                                let gsts = unsafe { core::ptr::read_volatile((DWC3 + 0xC118) as *const u32) };
+                                                let dsts = unsafe { core::ptr::read_volatile((DWC3 + 0xC70C) as *const u32) };
+                                                append_hex(&mut pt_out_data, b"SNPSID=", snpsid);
+                                                append_hex(&mut pt_out_data, b"GSTS=", gsts);
+                                                append_hex(&mut pt_out_data, b"DSTS=", dsts);
+                                                append_hex(&mut pt_out_data, b"EXC=", exception_count().wrapping_sub(exc_start) as u32);
+                                                pt_out_data.extend_from_slice(b"END\n");
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
+                                                // TODO: stage to high DRAM + implement the Exec jump. For now count bytes and ack so the bridge completes instead of hanging.
+                                                reload_size += cmd.params.len();
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                                                // TODO: verify staged image + jump. Acknowledge only for now.
+                                                let _ = reload_size;
+                                            } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
+                                                // PSCI SYSTEM_RESET (Tensor: secure monitor at EL3 via smc).
+                                                unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }
+                                            }
+                                        }
+                                        pt_inbound = None;
+                                        pt_seq_width = 0;
+                                    }
+                                }
+                            }
+                        } else if ferros_pt::is_control_packet(tmp[0]) {
+                            // SPEC — start a new inbound transfer, reply SPEC ACK.
+                            if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
+                                pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
+                                let bmw = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
+                                pt_data_buf = alloc::vec![0u8; spec.total as usize];
+                                pt_bitmap_buf = alloc::vec![0u64; bmw];
+                                // SAFETY: pt_data_buf/pt_bitmap_buf live in this same scope as long as pt_inbound.
+                                let xfer = unsafe {
+                                    InboundTransfer::new(
+                                        &spec,
+                                        core::slice::from_raw_parts_mut(pt_data_buf.as_mut_ptr(), pt_data_buf.len()),
+                                        core::slice::from_raw_parts_mut(pt_bitmap_buf.as_mut_ptr(), pt_bitmap_buf.len()),
+                                    )
+                                };
+                                if let Some(xfer) = xfer {
+                                    let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
+                                    let mut ack_buf = [0u8; 64];
+                                    let ack_len = ack.encode(&mut ack_buf);
+                                    if ack_len > 0 {
+                                        usb.bulk_in_send(&ack_buf[..ack_len]);
+                                    }
+                                    pt_inbound = Some(xfer);
+                                }
+                            }
+                        }
+                    }
+                    usb.bulk_out_arm();
+                }
+            }
+            UsbEvent::TransferNotReady { .. } => {}
         }
     }
 

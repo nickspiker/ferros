@@ -1076,6 +1076,11 @@ impl Dwc3Dev {
         !self.bulk_out_ready && !self.bulk_out_armed
     }
 
+    /// Whether bulk IN (phys EP 3) is idle and ready to send the next chunk.
+    pub fn bulk_in_is_idle(&self) -> bool {
+        self.bulk_in_idle
+    }
+
     pub fn bulk_out_arm(&mut self) {
         self.bulk_out_armed = true;
 
