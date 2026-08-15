@@ -1836,9 +1836,9 @@ impl Dwc3Dev {
                 let base = &raw const ALL_STRING_DESCS as *const u8;
                 let (off, slen) = match desc_idx {
                     0 => (0usize, 4usize),
-                    1 => (4, 20),
-                    2 => (24, 4),
-                    3 => (28, 4),
+                    1 => (4, 24),   // "Nick Spiker"
+                    2 => (28, 14),  // "ferros"
+                    3 => (42, 4),   // "0"
                     _ => return false,
                 };
                 let desc = unsafe {
@@ -1970,17 +1970,17 @@ static BOS_DESC: [u8; 22] = [
 
 /// All string descriptors packed contiguously. Using a single static avoids the compiler generating a lookup table of absolute pointers (which break when ABL loads the kernel at a different address than the linker assumed).
 ///
-/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 (20B)] [STRING_DESC_2 (4B)] [STRING_DESC_3 (4B)] Offsets: 0, 4, 24, 28  Total: 32 bytes
-static ALL_STRING_DESCS: [u8; 32] = [
+/// Layout: [STRING_DESC_0 (4B)] [STRING_DESC_1 "Nick Spiker" (24B)] [STRING_DESC_2 "ferros" (14B)] [STRING_DESC_3 "0" (4B)] Offsets: 0, 4, 28, 42  Total: 46 bytes
+static ALL_STRING_DESCS: [u8; 46] = [
     // String 0: Language ID (English US) — offset 0, length 4
     4, USB_DT_STRING, 0x09, 0x04,
-    // String 1: "Fairphone" — offset 4, length 20
-    20, USB_DT_STRING,
-    b'F', 0, b'a', 0, b'i', 0, b'r', 0, b'p', 0, b'h', 0, b'o', 0, b'n', 0, b'e', 0,
-    // String 2: "5" — offset 24, length 4
-    4, USB_DT_STRING,
-    b'5', 0,
-    // String 3: "0" — offset 28, length 4
+    // String 1 (iManufacturer): "Nick Spiker" — offset 4, length 24
+    24, USB_DT_STRING,
+    b'N', 0, b'i', 0, b'c', 0, b'k', 0, b' ', 0, b'S', 0, b'p', 0, b'i', 0, b'k', 0, b'e', 0, b'r', 0,
+    // String 2 (iProduct): "ferros" — offset 28, length 14
+    14, USB_DT_STRING,
+    b'f', 0, b'e', 0, b'r', 0, b'r', 0, b'o', 0, b's', 0,
+    // String 3 (iSerial): "0" — offset 42, length 4
     4, USB_DT_STRING,
     b'0', 0,
 ];
