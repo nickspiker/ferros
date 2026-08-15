@@ -1521,8 +1521,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
+    let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
     let mut reload_size: usize = 0;
+    // RELOAD and RUN share the staging slot (the free ping-pong slot is THE staging ground for the next executable thing). At most one of these flags is set at a time, so a staged payload can never be jumped-to as a kernel or vice versa.
     let mut reload_ok = false;
+    let mut run_ok = false;
+    let mut run_size: usize = 0;
 
     // Hot-reload staging: ping-pong between exactly two proven slots. The ABL load base is proven (every cold boot runs there) and base+32MiB is proven by the first hot reload; anything further up is NOT — a jump to base+64MiB died silently on hardware (staging writes verified by hash, execution never came back). So each generation stages into the slot its predecessor vacated. The handoff rides the jump's x0: ABL passes a DTB pointer (8-aligned) or 0, the reloader passes its own base with bit 0 set — the tag says which boot path we came from and where the free slot is. Kernel footprint is image (~300KB flat + bss) + 64KB stack + 4MiB heap, well under the 32MiB slot pitch. MMU is off on Tensor (ABL disables it before the jump), so staging writes are straight physical stores.
     unsafe extern "C" { static _start: u8; }
@@ -1707,6 +1711,43 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     }
                                                 }
                                                 // Nothing staged (or verify failed): fall through, COMPLETE already told the bridge the transfer landed; the 0-size ack from Write is the rejection signal.
+                                            } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Write {
+                                                // Stage an arbitrary payload blob into the shared staging slot (overwrites any staged kernel — dev semantics: last Write wins). Size-capped to the 16MiB slot budget; write-verified like a kernel.
+                                                let params = cmd.params;
+                                                if !params.is_empty() && params.len() <= (16 << 20) {
+                                                    let src_hash = blake3::hash(params);
+                                                    unsafe {
+                                                        core::ptr::copy_nonoverlapping(params.as_ptr(), reload_stage as *mut u8, params.len());
+                                                    }
+                                                    let staged = unsafe { core::slice::from_raw_parts(reload_stage as *const u8, params.len()) };
+                                                    run_ok = blake3::hash(staged) == src_hash;
+                                                    run_size = params.len();
+                                                } else {
+                                                    run_ok = false;
+                                                    run_size = 0;
+                                                }
+                                                reload_ok = false;
+                                                let ack = (if run_ok { run_size as u32 } else { 0 }).to_le_bytes();
+                                                queue_pt_response(&mut pt_out_data, &ack);
+                                            } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
+                                                // CALL the staged payload (unlike RELOAD Exec's one-way jump). ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at blob offset 0, PC-relative code only, same EL, full dev trust. Exec params are the payload's input. No preemption exists — a payload that never returns hangs the kernel (dev tool; recover via hard reboot).
+                                                if run_ok && run_size > 0 {
+                                                    unsafe {
+                                                        core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb");
+                                                    }
+                                                    let mut out = alloc::vec![0u8; 4096];
+                                                    let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 =
+                                                        unsafe { core::mem::transmute(reload_stage) };
+                                                    let ret = entry(cmd.params.as_ptr(), cmd.params.len(), out.as_mut_ptr(), out.len());
+                                                    let n = (ret as usize).min(out.len());
+                                                    // Response: [ret: 8 LE][out bytes up to ret, clamped].
+                                                    let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + n);
+                                                    resp.extend_from_slice(&ret.to_le_bytes());
+                                                    resp.extend_from_slice(&out[..n]);
+                                                    queue_pt_response(&mut pt_out_data, &resp);
+                                                } else {
+                                                    queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                                                }
                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                                                 // PSCI SYSTEM_RESET (Tensor: secure monitor at EL3 via smc).
                                                 unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }

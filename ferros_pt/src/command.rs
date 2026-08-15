@@ -96,6 +96,8 @@ pub mod caps {
     pub const REBOOT: &[u8] = b"ferros.dev.reboot";
     /// Reload — write sends new kernel binary, exec jumps to it.
     pub const RELOAD: &[u8] = b"ferros.dev.reload";
+    /// Run — write stages an arbitrary payload blob, exec CALLS it (and returns, unlike RELOAD's one-way jump). Payload ABI: `extern "C" fn(in_ptr: *const u8, in_len: usize, out_ptr: *mut u8, out_cap: usize) -> u64`, entry at blob offset 0, PC-relative code only. Exec params become the payload's input; the response is [ret: 8 LE][out bytes].
+    pub const RUN: &[u8] = b"ferros.dev.run";
     /// Beam — read ring entries by generation offset. Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE] ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state mode: 0=latest (~N offset), 1=absolute generation, 2=all
     pub const BEAM: &[u8] = b"ferros.dev.beam";
     /// Install — write sends signed kernel binary, exec persists to UFS + stem entry. Exec params: [size:4 LE][hash:32][sig:64] = 100 bytes

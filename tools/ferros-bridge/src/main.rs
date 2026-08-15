@@ -56,6 +56,7 @@ fn usage() {
     eprintln!("  terminal     Bidirectional PT session");
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
+    eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
 }
 
 #[tokio::main]
@@ -112,6 +113,13 @@ async fn main() {
         "terminal" => cmd_terminal().await,
         "dbg" => cmd_dbg().await,
         "dbg2" => cmd_dbg2().await,
+        "run" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge run <payload.bin> [hex-input]");
+                std::process::exit(1);
+            }
+            cmd_run(&args[2], args.get(3).map(|s| s.as_str())).await;
+        }
         "ping" => {
             let count = args
                 .get(2)
@@ -346,6 +354,100 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+async fn cmd_run(path: &str, hex_input: Option<&str>) {
+    let blob = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {path}: {e}");
+        std::process::exit(1);
+    });
+    let input: Vec<u8> = match hex_input {
+        Some(h) => {
+            let h = h.trim_start_matches("0x");
+            (0..h.len() / 2)
+                .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16))
+                .collect::<Result<_, _>>()
+                .unwrap_or_else(|e| {
+                    eprintln!("Bad hex input: {e}");
+                    std::process::exit(1);
+                })
+        }
+        None => Vec::new(),
+    };
+
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Stage the payload
+    let cmd = build_cmd(ferros_pt::command::caps::RUN, ferros_pt::Op::Write, &blob);
+    eprintln!("Staging payload ({} bytes)...", blob.len());
+    match pt_send(&link, &cmd).await {
+        Ok(c) if c.success => {}
+        Ok(_) => {
+            eprintln!("Device rejected payload write");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Stage failed: {e}");
+            std::process::exit(1);
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(15), pt_recv(&link)).await {
+        Ok(Ok(resp)) if resp.len() >= 4 => {
+            let staged = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+            if staged == 0 {
+                eprintln!("Device rejected payload (size 0 ack)");
+                std::process::exit(1);
+            }
+            eprintln!("Staged {staged} bytes, executing...");
+        }
+        other => {
+            eprintln!("No staged-size ack: {other:?}");
+            std::process::exit(1);
+        }
+    }
+
+    // Execute — Exec params become the payload's input
+    let cmd = build_cmd(ferros_pt::command::caps::RUN, ferros_pt::Op::Exec, &input);
+    if let Err(e) = pt_send(&link, &cmd).await {
+        eprintln!("Exec failed: {e}");
+        std::process::exit(1);
+    }
+
+    // Response: [ret: 8 LE][out bytes]
+    match tokio::time::timeout(std::time::Duration::from_secs(30), pt_recv(&link)).await {
+        Ok(Ok(resp)) => {
+            if resp.len() >= 8 {
+                let ret = u64::from_le_bytes(resp[..8].try_into().unwrap());
+                let out = &resp[8..];
+                eprintln!("Payload returned A#{ret} ({} output bytes):", out.len());
+                match std::str::from_utf8(out) {
+                    Ok(s) if s.chars().all(|c| !c.is_control() || c == '\n' || c == '\t') => print!("{s}"),
+                    _ => {
+                        for chunk in out.chunks(16) {
+                            for b in chunk { print!("{b:02x} "); }
+                            println!();
+                        }
+                    }
+                }
+            } else if resp.starts_with(b"ERR") {
+                eprintln!("Device error: {}", String::from_utf8_lossy(&resp));
+                std::process::exit(1);
+            } else {
+                eprintln!("Short response: {} bytes", resp.len());
+                std::process::exit(1);
+            }
+        }
+        other => {
+            eprintln!("No payload response: {other:?}");
+            std::process::exit(1);
+        }
+    }
+}
 
 async fn cmd_dbg() {
     let link = match usb::UsbLink::open() {

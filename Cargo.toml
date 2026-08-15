@@ -12,6 +12,7 @@ members = [
     "tools/mkimg",
     "tools/ferros-bridge",
     "tools/install",
+    "payloads/hello",
 ]
 
 [workspace.package]
