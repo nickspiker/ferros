@@ -101,6 +101,29 @@ impl UsbLink {
         }
     }
 
+    /// Read the kernel's vendor debug counter block (VENDOR_REQ_DBG G#5A): 16 LE u32 counters served over EP0, independent of the bulk path.
+    pub async fn read_dbg(&self) -> Result<[u32; 16], String> {
+        use nusb::transfer::{ControlIn, ControlType, Recipient};
+        let completion = self.interface.control_in(ControlIn {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x5A,
+            value: 0,
+            index: 0,
+            length: 64,
+        }).await;
+        completion.status.map_err(|e| format!("debug control_in failed: {e}"))?;
+        let data = completion.data;
+        if data.len() < 64 {
+            return Err(format!("short debug block: {} bytes", data.len()));
+        }
+        let mut out = [0u32; 16];
+        for i in 0..16 {
+            out[i] = u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        Ok(out)
+    }
+
     #[allow(dead_code)]
     pub fn ep_out(&self) -> u8 { self.ep_out }
     #[allow(dead_code)]

@@ -54,6 +54,7 @@ fn usage() {
     eprintln!("  install <kernel.signed>  Install signed kernel to UFS + stem entry");
     eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 256)");
     eprintln!("  terminal     Bidirectional PT session");
+    eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
 }
 
 #[tokio::main]
@@ -108,6 +109,7 @@ async fn main() {
             cmd_install(&args[2]).await;
         }
         "terminal" => cmd_terminal().await,
+        "dbg" => cmd_dbg().await,
         "ping" => {
             let count = args
                 .get(2)
@@ -342,6 +344,51 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+async fn cmd_dbg() {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match link.read_dbg().await {
+        Ok(d) => {
+            println!("PT dispatch debug counters (EP0 vendor readout):");
+            println!("  [0]  ep2 (bulk OUT) events        A#{}", d[0]);
+            println!("  [1]  bulk_out_read returned None  A#{}", d[1]);
+            println!("  [2]  last packet: len=A#{} first_byte=G#{:02X}", d[2] >> 8, d[2] & 0xFF);
+            println!("  [3]  PHY init attempts            A#{}", d[3]);
+            println!("  [4]  SPEC decoded OK              A#{}", d[4]);
+            println!("  [5]  SPEC ACK send                {}", tri_state(d[5]));
+            println!("  [6]  DATA packets seen            A#{}", d[6]);
+            println!("  [7]  decode_data OK               A#{}", d[7]);
+            println!("  [8]  chunks accepted (hash OK)    A#{}", d[8]);
+            println!("  [9]  all_received hit             A#{}", d[9]);
+            println!("  [10] finish() bytes               A#{}", d[10]);
+            println!("  [11] COMPLETE send                {}", tri_state(d[11]));
+            println!("  [12] driver ep2 XferComplete      A#{}", d[12]);
+            println!("  [13] driver ep3 XferComplete      A#{}", d[13]);
+            println!("  [14] flags: bulk_in_idle={} out_armed={} out_ready={} configured={}",
+                d[14] & 1, (d[14] >> 1) & 1, (d[14] >> 2) & 1, (d[14] >> 3) & 1);
+            println!("  [15] DEPCMD status failures       A#{}", d[15]);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn tri_state(v: u32) -> &'static str {
+    match v {
+        0 => "never attempted",
+        1 => "OK",
+        2 => "DROPPED (bulk IN busy)",
+        _ => "?",
+    }
+}
 
 async fn cmd_diag() {
     let link = match usb::UsbLink::open() {

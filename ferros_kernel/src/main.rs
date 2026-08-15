@@ -1344,7 +1344,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     const USBCON: usize = 0x1110_0000;
     const EUSB_PHY: usize = 0x1111_0000;
 
-    unsafe {
+    // Re-runnable: the enumeration watchdog below re-inits the PHY if the host never talks to us (the PLL-lock race makes first-try enumeration flaky).
+    let eusb_phy_init = || unsafe {
         // Tensor cores ~2GHz; ~4000 spin iters/us is generous (over-delay harmless, under-delay breaks PLL/REXT calibration).
         let udelay = |us: u32| { for _ in 0..us.saturating_mul(4000) { core::hint::spin_loop(); } };
 
@@ -1426,7 +1427,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
         reg &= !((1 << 4) | (1 << 5));
         core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
-    }
+    };
+    eusb_phy_init();
 
     // If we survived, S2MPU is bypassed and PHY is initialized. Now try UFS + USB.
     const DWC3: usize = 0x1121_0000;
@@ -1495,6 +1497,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         },
     };
 
+    // ---- Enumeration watchdog ---- The eUSB2 PHY init has a PLL-lock race (blind udelays), so some boots come up marginal: either fully silent, or attach succeeds but EP0 wedges (host logs descriptor-read timeouts and gives up). Instead of forcing a reboot, re-run PHY + DWC3 init after 4 seconds of USB silence without reaching the configured state. The re-init drops us off the bus, so the host sees a fresh attach and restarts enumeration from scratch — this heals both failure modes. Disarm only on SET_CONFIGURATION (a bus reset is NOT proof the data path works — tonight's wedge attached fine and then died in EP0). Any USB event counts as progress and pushes the deadline, so an in-flight enumeration is never torn down mid-exchange. Generic timer: CNTPCT_EL0 counts at CNTFRQ_EL0 regardless of core clock.
+    let cntfrq: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq); }
+    let cntpct = || {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v); }
+        v
+    };
+    // Guard against unprogrammed CNTFRQ (would make the timeout zero and re-init every iteration): fall back to the Tensor G3 arch timer rate, 24.576 MHz.
+    let cntfrq = if cntfrq == 0 { 24_576_000 } else { cntfrq };
+    let enum_timeout = cntfrq * 4;
+    let mut t_progress = cntpct();
+    ferros_hal::usb::dbg_set(3, 1); // PHY init attempts (first one already done above)
+
     // PT inbound-transfer state.
     let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut pt_bitmap_buf: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -1520,6 +1536,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         match usb.poll_event() {
             UsbEvent::None => {
+                // Enumeration watchdog: not configured + 4s without any USB event → full PHY + DWC3 re-init (fresh attach from the host's perspective).
+                if !usb.is_configured() && cntpct().wrapping_sub(t_progress) > enum_timeout {
+                    eusb_phy_init();
+                    if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() { usb = nu; }
+                    ferros_hal::usb::dbg_bump(3);
+                    pt_inbound = None;
+                    pt_seq_width = 0;
+                    pt_out_data.clear();
+                    t_progress = cntpct();
+                }
                 // Pump a pending outbound response (DIAG payload), 512 bytes per bulk IN.
                 if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
                     let len = pt_out_data.len().min(512);
@@ -1529,12 +1555,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 for _ in 0..64u32 { core::hint::spin_loop(); }
             }
             UsbEvent::Reset => {
+                t_progress = cntpct();
                 usb.handle_reset();
                 pt_inbound = None;
                 pt_seq_width = 0;
                 pt_out_data.clear();
             }
             UsbEvent::ConnectDone { .. } => {
+                t_progress = cntpct();
                 usb.handle_connect_done();
                 usb.ep0_start_setup();
                 usb.bulk_out_arm();
@@ -1546,29 +1574,44 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 pt_out_data.clear();
             }
             UsbEvent::Ep0Setup { request } => {
+                t_progress = cntpct();
                 if !usb.handle_setup(&request) {
                     usb.ep0_stall();
                 }
             }
             UsbEvent::TransferComplete { ep } => {
+                t_progress = cntpct();
                 if ep == 2 {
+                    use ferros_hal::usb::{dbg_bump, dbg_set};
                     // Bulk OUT — a PT packet (SPEC opens a transfer, DATA fills it).
+                    // Debug slots (VENDOR_REQ_DBG): 0=ep2 events, 1=read None, 2=(len<<8)|first_byte, 4=SPEC ok, 5=ACK send 1ok/2drop, 6=DATA seen, 7=decode ok, 8=chunk accepted, 9=all_received, 10=finish len, 11=COMPLETE send 1ok/2drop.
+                    dbg_bump(0);
                     let mut tmp = [0u8; 512];
                     let mut n = 0usize;
                     if let Some(data) = usb.bulk_out_read() {
                         n = data.len().min(512);
                         tmp[..n].copy_from_slice(&data[..n]);
+                    } else {
+                        dbg_bump(1);
                     }
+                    dbg_set(2, ((n as u32) << 8) | tmp[0] as u32);
                     if n > 0 {
                         if ferros_pt::is_data_packet(tmp[0]) {
+                            dbg_bump(6);
                             if let Some(ref mut xfer) = pt_inbound {
                                 if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
-                                    xfer.handle_data(seq, &hash, payload);
+                                    dbg_bump(7);
+                                    if xfer.handle_data(seq, &hash, payload) {
+                                        dbg_bump(8);
+                                    }
                                     if xfer.all_received() {
+                                        dbg_bump(9);
                                         let mut complete_buf = [0u8; 512];
                                         let clen = xfer.finish(&mut complete_buf);
+                                        dbg_set(10, clen as u32);
                                         if clen > 0 {
-                                            usb.bulk_in_send(&complete_buf[..clen]);
+                                            let ok = usb.bulk_in_send(&complete_buf[..clen]);
+                                            dbg_set(11, if ok { 1 } else { 2 });
                                         }
                                         // Dispatch the completed command.
                                         let payload = xfer.payload();
@@ -1604,6 +1647,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                         } else if ferros_pt::is_control_packet(tmp[0]) {
                             // SPEC — start a new inbound transfer, reply SPEC ACK.
                             if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
+                                dbg_bump(4);
                                 pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
                                 let bmw = ferros_pt::transfer::outbound_bitmap_words(spec.count as usize);
                                 pt_data_buf = alloc::vec![0u8; spec.total as usize];
@@ -1621,7 +1665,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                     let mut ack_buf = [0u8; 64];
                                     let ack_len = ack.encode(&mut ack_buf);
                                     if ack_len > 0 {
-                                        usb.bulk_in_send(&ack_buf[..ack_len]);
+                                        let ok = usb.bulk_in_send(&ack_buf[..ack_len]);
+                                        dbg_set(5, if ok { 1 } else { 2 });
                                     }
                                     pt_inbound = Some(xfer);
                                 }

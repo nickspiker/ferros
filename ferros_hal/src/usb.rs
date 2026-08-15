@@ -258,6 +258,26 @@ const USB_REQ_SET_ADDRESS: u8 = 5;
 const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_REQ_SET_CONFIGURATION: u8 = 9;
 
+/// Vendor debug readout request (bmRequestType G#C0, device-to-host vendor).
+/// Returns 16 LE u32 counters — a live window into the PT dispatch loop that works even when the bulk path is wedged, since EP0 keeps running.
+pub const VENDOR_REQ_DBG: u8 = 0x5A;
+
+/// Debug counter block served by VENDOR_REQ_DBG. Slots 0-11 belong to the kernel PT loop; slots 12-15 are driver state. Single-core, volatile access only.
+pub static mut DBG_PT: [u32; 16] = [0; 16];
+
+/// Set a debug counter slot.
+pub fn dbg_set(idx: usize, val: u32) {
+    unsafe { core::ptr::write_volatile(&raw mut DBG_PT[idx & 15], val); }
+}
+
+/// Increment a debug counter slot.
+pub fn dbg_bump(idx: usize) {
+    unsafe {
+        let p = &raw mut DBG_PT[idx & 15];
+        core::ptr::write_volatile(p, core::ptr::read_volatile(p).wrapping_add(1));
+    }
+}
+
 const USB_DT_DEVICE: u8 = 1;
 const USB_DT_CONFIGURATION: u8 = 2;
 const USB_DT_STRING: u8 = 3;
@@ -1824,6 +1844,25 @@ impl Dwc3Dev {
             USB_REQ_GET_STATUS => {
                 // Return 2 bytes of zeros (self-powered, no remote wakeup)
                 self.ep0_send(&[0, 0], TRBCTL_CONTROL_DATA);
+                self.ep0_state = Ep0State::DataIn;
+                true
+            }
+            VENDOR_REQ_DBG if bm_request_type == 0xC0 => {
+                // Vendor debug readout: 16 LE u32 counters, independent of the bulk path. Slots 0-11 are written by the kernel PT loop via dbg_set/dbg_bump; slots 12-15 are driver state filled here.
+                dbg_set(12, self.bulk_out_xfer_complete);
+                dbg_set(13, self.bulk_in_xfer_complete);
+                dbg_set(14, (self.bulk_in_idle as u32)
+                    | ((self.bulk_out_armed as u32) << 1)
+                    | ((self.bulk_out_ready as u32) << 2)
+                    | ((self.configured as u32) << 3));
+                dbg_set(15, self.cmd_status_fail);
+                let mut buf = [0u8; 64];
+                for i in 0..16 {
+                    let v = unsafe { core::ptr::read_volatile(&raw const DBG_PT[i]) };
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                let len = (w_length as usize).min(64);
+                self.ep0_send(&buf[..len], TRBCTL_CONTROL_DATA);
                 self.ep0_state = Ep0State::DataIn;
                 true
             }
