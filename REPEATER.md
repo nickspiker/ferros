@@ -65,20 +65,34 @@ Minimal master-transfer flow (mirrors `i2c-exynos5.c`):
 5. Poll `FIFO_STATUS` / `TRANS_STATUS`; push/pull `TXDATA`/`RXDATA`.
 6. Watch `TRANS_STATUS` for NO_ACK / transfer-done.
 
-## The two unknowns (grab from live DT, then this is unblocked)
+## Reference tree
 
-Both come straight from the device tree — read as root from Android (Magisk):
+The full gs-google kernel source (branch `android-gs-shusky-5.15-android15-qpr1`, the exact branch our device runs) is cloned on this machine at **`/mnt/Harbor/ferros-ref/soc-gs`** — all drivers *and* the SoC device tree, 31M shallow clone. `tools/pixel8/phy-ref/` is the old piecemeal subset; the Harbor tree is the whole thing. Grep it instead of fetching files one at a time. Driver: `drivers/phy/samsung/eusb_repeater.c`; SoC DTS: `arch/arm64/boot/dts/google/zuma-usi.dtsi` (HSI2C controllers), `zuma-usb.dtsi` (USB/PHY). The husky *device* overlay (which binds the repeater to a specific bus + address) is NOT in this tree — it ships as a compiled dtbo on the device; read it live (below).
 
-```bash
-# repeater node: its 7-bit I2C address is the 'reg' property; its parent node is the HSI2C bus
-adb shell su -c 'find /proc/device-tree -name "*eusb-repeater*" -o -name "*repeater*"'
-adb shell su -c 'REP=<node>; od -A n -t x1 $REP/reg'                 # -> 7-bit repeater address
-# parent bus node holds the HSI2C controller base:
-adb shell su -c 'od -A n -t x1 /proc/device-tree/<parent-i2c-bus>/reg'   # -> HSI2C base + size
-adb shell su -c 'cat /proc/device-tree/<parent-i2c-bus>/compatible'      # confirm exynos hsi2c/usi
+## The two unknowns (one lives in the SoC DTS, one needs live DT)
+
+**Candidate HSI2C bases (from `zuma-usi.dtsi`, authoritative for Tensor G3):**
+
+```
+hsi2c_0  @ G#10C8_0000    hsi2c_9  @ G#10C9_0000    hsi2c_15 @ G#111B_0000
+hsi2c_2  @ G#1089_0000    hsi2c_10 @ G#10CA_0000    hsi2c_16 @ G#111C_0000
+hsi2c_3  @ G#108A_0000    hsi2c_11 @ G#10CB_0000
+hsi2c_4  @ G#108B_0000    hsi2c_12 @ G#10CC_0000
+hsi2c_5  @ G#108C_0000    hsi2c_13 @ G#10CE_0000
+hsi2c_6  @ G#108D_0000    hsi2c_14 @ G#1098_0000
 ```
 
-Fill these into the probe payload's two constants and iterate.
+The repeater sits on exactly one of these. Which one + the repeater's 7-bit address are set by the husky overlay, so read them from the live DT (Android + Magisk root):
+
+```bash
+# repeater node: 'reg' is its 7-bit I2C address; its parent node is the HSI2C bus
+adb shell su -c 'find /proc/device-tree -iname "*repeater*" -o -iname "*eusb*"'
+adb shell su -c 'REP=<node>; od -A n -t x1 $REP/reg'                     # -> 7-bit repeater address
+adb shell su -c 'od -A n -t x1 /proc/device-tree/<parent-i2c-bus>/reg'   # -> HSI2C base (match to table above)
+adb shell su -c 'cat /proc/device-tree/<parent-i2c-bus>/compatible'      # confirm samsung hsi2c/usi
+```
+
+Alternatively, decompile the on-device dtbo (`dtc`/`fdtget` on the extracted `dtbo.img`) — no reboot needed, but the root command above is faster. Fill both into the probe payload's constants and iterate.
 
 ## Bring-up plan (iterate over the RUN channel, no kernel reflash)
 
