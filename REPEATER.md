@@ -166,7 +166,24 @@ The husky DT `hs_tune_eusb` node (read from the live DT, format `[reg, value, sh
 3. ~~Diff intended vs actual tune~~ **DONE** — better than a flaky-boot diff: NO ferros boot ever had the tune (table above).
 4. ~~Repeater tune sequence proven via payload~~ **DONE** — `repeatertune`, 8/8 verified live.
 5. ~~Fold into the kernel~~ **DONE** — `ferros_hal::hsi2c` + `kernel_main` snapshots then applies the tune (REV_ID-gated) before PHY init; DIAG reports `REP_*` + `REP_TUNED` (`G#8` = full success, `G#FF` = gate skipped). Validated via hot-reload.
-6. **Flash the tuned kernel to slot A** (needs fastboot) and gather cold-boot enumeration statistics vs the 13–240s historical spread. This decides whether the tune closes the coin flip or the remaining flakiness lives elsewhere (PHY init sequence, watchdog bounds, host timing).
+6. ~~Flash the tuned kernel to slot A, gather boot statistics~~ **DONE — verdict below.**
+
+## Tuned-kernel boot statistics (2026-08-16, flashed to slot A)
+
+Every boot: `REP_TUNED=G#8` (kernel tuned all 8 registers, verified). Cold-boot snapshot confirmed the repeater reverts to POR/ABL values on a cold path and the kernel re-tunes it each boot.
+
+| Boot | Wall to enumeration | PHY init attempts |
+|---|---|---|
+| Cold (fastboot reboot) | 41s (~boot-time floor) | **1 — clean** |
+| Warm (PT REBOOT) | 20s | 6 |
+| Warm (PT REBOOT) | 58s | 2 |
+
+**Verdict: the tune is in and correct, but it does NOT close the enumeration coin flip.** Warm boots still burn multiple PHY attempts with the repeater fully tuned before PHY init. Remaining suspects, in order: the eUSB2 PHY init sequence itself (timing/ordering vs ABL's), the watchdog's 2s/4s re-init bounds (may be tearing down inits that would have completed), host-side enumeration timing. Note the wall clock is not linear in attempts (6 attempts in 20s vs 2 in 58s) — instrument per-attempt timestamps next.
+
+## Operational: ABL A/B rollback vs ferros (recurring)
+
+ferros never marks its slot "successful", so ABL decrements slot A's retry counter every boot and rolls back to Android (slot B) after ~7 boots. This ended two test sessions today. `fastboot --set-active=a` resets the counter.
+**Durable fix (work item):** ferros marks slot A successful itself — the boot-control metadata (`bootloader_control` struct, CRC32-protected) lives in the `misc` partition, and ferros has UFS write access. Mirrors the vault write-verify discipline; do it once enumeration is stable.
 
 ## Incident notes: RUN hangs + A/B fallback (2026-08-16, partially resolved)
 
