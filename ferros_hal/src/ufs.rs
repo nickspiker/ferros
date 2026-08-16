@@ -750,6 +750,10 @@ pub struct InitReport {
     pub cmu_unipro_gate: u32,
     /// PCS cal read-back after pre_link (AUX-window path): RX-lane G#2094 (expect G#F6) | G#20BC<<8 (expect G#79) | TX-lane G#22A4<<16 (expect G#02). If these DON'T match, the AUX-window PCS writes aren't landing = the bug.
     pub pcs_readback: u32,
+    /// GPH5CON (G#1306_0000) as full_init found it — pins 0/1 nibbles are the ufs_refclk_out / ufs_rst_n pinmux. Function 2 = both nibbles G#2. If gph5-0 (bits[3:0]) is NOT 2, ABL de-routed REFCLKOUT and the device gets no reference clock (Linux re-routes via pinctrl; we didn't).
+    pub gph5_con_before: u32,
+    /// GPH5CON after full_init routes both pins to function 2.
+    pub gph5_con_after: u32,
 }
 
 impl UfsController {
@@ -900,6 +904,19 @@ impl UfsController {
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_1, unip::DBG_SUITE1_ENABLE);
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
             done(&mut r, step::CONFIG_HOST);
+
+            // Route the UFS pinmux like the pinctrl framework does (pinctrl-0 = ufs_rst_n + ufs_refclk_out, both function 2). ABL may hand off with gph5-0 (REFCLKOUT) de-routed — the device then gets no reference clock and stays silent at link startup. gph5-0 = bits[3:0], gph5-1 = bits[7:4]; function 2 = nibble G#2.
+            const GPH5CON: usize = 0x1306_0000;
+            let con = unsafe { crate::mmio::read32(GPH5CON) };
+            if r.gph5_con_before == 0 {
+                r.gph5_con_before = con;
+            }
+            unsafe {
+                crate::mmio::write32(GPH5CON, (con & !0xFF) | 0x22);
+                core::arch::asm!("dsb sy");
+            }
+            r.gph5_con_after = unsafe { crate::mmio::read32(GPH5CON) };
+            udelay(1_000); // let REFCLKOUT reach the device before reset/link
 
             // Hardware-reset the UFS device via the dedicated reset_n line, then give it time to boot before asking for a link.
             self.hci_w(vs::GPIO_OUT, 0);

@@ -1183,6 +1183,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             clkdiag[3] = rep.cmu_qch;
             clkdiag[4] = rep.cmu_unipro_gate;
             ufs_diag[13] = rep.pcs_readback; // PCS cal readback (expect low bytes F6, 79, 02)
+            ufs_diag[12] = rep.gph5_con_before; // pinmux ABL left (gph5-0 nibble != 2 = refclk de-routed)
+            ufs_diag[14] = rep.gph5_con_after;  // after we route both to function 2
+            // MAXRXHSGEAR after this init attempt (nonzero = the device finally advertised = refclk routing fixed it).
+            ufs_diag[11] = unsafe { core::ptr::read_volatile((0x1328_0000 + 0x321C) as *const u32) };
             pmaf = ufs.snapshot_pma(); // failed-link PMA/PA state for the diff against pmaw
         }
     }
@@ -1435,10 +1439,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_STEPS=", ufs_diag[8]);
                                                 append_hex(&mut resp, b"UFS_FAIL=", ufs_diag[9]);
                                                 append_hex(&mut resp, b"UFS_LS_RES=", ufs_diag[10]);
-                                                append_hex(&mut resp, b"UFS_CAL_TO=", ufs_diag[11]);
-                                                append_hex(&mut resp, b"UFS_DME_ERR=", ufs_diag[12]);
+                                                append_hex(&mut resp, b"UFS_MXGR_AFTER=", ufs_diag[11]);
+                                                append_hex(&mut resp, b"UFS_GPH5CON_BEFORE=", ufs_diag[12]);
                                                 append_hex(&mut resp, b"UFS_PCS_READBACK=", ufs_diag[13]);
-                                                append_hex(&mut resp, b"UFS_PA_TX_STATE=", ufs_diag[14]);
+                                                append_hex(&mut resp, b"UFS_GPH5CON_AFTER=", ufs_diag[14]);
                                                 append_hex(&mut resp, b"UFS_GPH5_DAT=", ufs_diag[15]);
                                                 append_hex(&mut resp, b"UFS_UEC_PACK=", ufs_diag[16]);
                                                 append_hex(&mut resp, b"UFS_AVAIL_RX=", ufs_diag[17]);
