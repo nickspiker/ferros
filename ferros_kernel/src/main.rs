@@ -1119,14 +1119,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         // Register-diff baseline: snapshot ABL's WORKING-link PMA/PA state before we touch anything (only meaningful on a fresh flash+boot where HCS_PRISTINE=G#10F). pmaf is captured after full_init's failed startup; the diff reveals the enable/power-up step the cal table omits.
         pmaw = ufs.snapshot_pma();
 
-        // DECISIVE device-reset test: on ABL's live working link (DP=1, MAXRXHSGEAR=4), assert HCI_GPIO_OUT bit0 = 0 (the reference exynos_ufs_dev_hw_reset mechanism). If the device is actually driven into reset, HCS.DP clears and/or MAXRXHSGEAR drops to 0. If both are UNCHANGED, GPIO_OUT does NOT reach the device reset_n on husky — which is THE bug (device never drops its ABL link state, so it ignores our re-link). Restores GPIO_OUT=1 after. Reported as RST_* (only meaningful when HCS_PRISTINE=G#10F).
+        // DECISIVE device-reset test via DME_PEER_GET (reads an attribute FROM the device over the link — a live reachability probe, NOT a cached controller value like HCS.DP/MAXRXHSGEAR). On ABL's live link the device is reachable (peer-get result 0). Assert HCI_GPIO_OUT bit0 = 0 (the reference exynos_ufs_dev_hw_reset mechanism); if that truly resets the device, the link drops and the second peer-get FAILS (nonzero/timeout). If it still succeeds, GPIO_OUT does NOT reach the device reset_n on husky — THE bug (device never drops its ABL link state, ignores our re-link). Peer attr = PA_Granularity (G#15AA). Restores GPIO_OUT=1 after.
         const HCI_GPIO_OUT: usize = 0x1320_1170;
-        rst_test[0] = r(0x30); // HCS.DP before (bit0)
-        rst_test[1] = unsafe { core::ptr::read_volatile((0x1328_0000 + 0x321C) as *const u32) }; // MAXRXHSGEAR before
+        const DME_PEER_GET: u32 = 0x03;
+        const PA_GRANULARITY: u32 = 0x15AA;
+        rst_test[0] = match ufs.uic_cmd(DME_PEER_GET, PA_GRANULARITY << 16, 0, 0) { Ok(c) => c, Err(()) => 0xFFFF_FFFF }; // reachable before? (expect 0)
         unsafe { core::ptr::write_volatile(HCI_GPIO_OUT as *mut u32, 0); core::arch::asm!("dsb sy"); }
-        ferros_hal::ufs_cal::udelay(2_000);
-        rst_test[2] = r(0x30); // HCS.DP after assert
-        rst_test[3] = unsafe { core::ptr::read_volatile((0x1328_0000 + 0x321C) as *const u32) }; // MAXRXHSGEAR after assert
+        ferros_hal::ufs_cal::udelay(5_000);
+        rst_test[1] = match ufs.uic_cmd(DME_PEER_GET, PA_GRANULARITY << 16, 0, 0) { Ok(c) => c, Err(()) => 0xFFFF_FFFF }; // reachable after reset assert? (expect nonzero if reset worked)
+        rst_test[2] = r(0x30);       // HCS after (secondary)
+        rst_test[3] = unsafe { core::ptr::read_volatile((0x1328_0000 + 0x321C) as *const u32) }; // MAXRXHSGEAR after (secondary)
         unsafe { core::ptr::write_volatile(HCI_GPIO_OUT as *mut u32, 1); core::arch::asm!("dsb sy"); }
         // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
         unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
@@ -1438,9 +1440,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_UECPA=", ufs_diag[22]);
                                                 append_hex(&mut resp, b"UFS_LS_TRIES=", ufs_diag[23]);
                                                 append_hex(&mut resp, b"UFS_DONE=", ufs_diag[27]);
-                                                // Device-reset test: if RST_HCS_A/RST_MXGR_A differ from _B, GPIO_OUT drives the device reset (good). If identical, GPIO_OUT does NOT reach the device — the root cause.
-                                                append_hex(&mut resp, b"UFS_RST_HCS_B=", rst_test[0]);
-                                                append_hex(&mut resp, b"UFS_RST_MXGR_B=", rst_test[1]);
+                                                // Device-reset test via DME_PEER_GET (live device reachability). PEER_B=0 (reachable before). If PEER_A becomes nonzero/G#FFFFFFFF, GPIO_OUT reset the device (works). If PEER_A stays 0, GPIO_OUT does NOT reach the device reset_n — the root cause.
+                                                append_hex(&mut resp, b"UFS_RST_PEER_B=", rst_test[0]);
+                                                append_hex(&mut resp, b"UFS_RST_PEER_A=", rst_test[1]);
                                                 append_hex(&mut resp, b"UFS_RST_HCS_A=", rst_test[2]);
                                                 append_hex(&mut resp, b"UFS_RST_MXGR_A=", rst_test[3]);
                                                 // PMA/PA register diff: W=ABL working link (Phase A), F=post-full_init failed (Phase B). Order: PMA 000/140/150/19C/1A0/C74, PMA-lane0 9F0/9F4/A00, PA_CTRLSTATE, PA_TX_STATE, MAXRXHSGEAR.
