@@ -18,6 +18,7 @@ members = [
     "payloads/pmupoke",
     "payloads/repeaterprobe",
     "payloads/repeatertune",
+    "payloads/dispprobe",
     "payloads/miscprobe",
 ]
 
