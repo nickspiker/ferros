@@ -103,6 +103,27 @@ So the software is faithful — this RULES OUT a missing core step and points ha
 
 (Note on the "analyze the produced assembly" idea: for core ufshcd we now have the C source, which is strictly better than disassembly for logic. Disassembly only pays off for closed blobs like ABL, where the value is limited since ABL's cal == our proven port.)
 
+**HOST SIDE EXHAUSTIVELY VERIFIED (2026-08-16, final elimination) — the residual is wire-level:**
+
+| What | How verified | Result |
+|---|---|---|
+| PMA (analog) cal | register-diff W vs F | lands correctly |
+| PCS (digital) cal | read-back after cal (`UFS_PCS_READBACK=000279F6` = F6/79/02 expected) | lands correctly |
+| M-PHY PLL | `CAL_TO=0` (EmbCalWait G#C74) | locks |
+| Reference clock | `CLKSTOP=0` (REFCLKOUT_STOP clear) | running to device |
+| All UFS clocks | CMU QCH + UNIPRO gate | on |
+| Init sequence | diffed vs core `ufshcd.c` (hba_execute_hce/link_startup/probe_hba) | faithful |
+| Device reset (GPIO_OUT) | non-cached live-link test (UEC + HCS) | **NO-OP — doesn't reach device reset_n on husky** |
+
+Every measurable host-side prerequisite is correct, yet `DME_LINKSTARTUP` returns result=1 with `MAXRXHSGEAR=0` (capability exchange never completes), zero error codes.
+
+**The Linux paradox:** Linux (core ufshcd + exynos vendor) uses the SAME no-op GPIO reset and re-links successfully from ABL's handoff. So either (a) `HCI_GPIO_OUT` bit0 drives the pad for Linux (EL1, full kernel with pinctrl/regulator/clk frameworks live) but not for us (EL2 bare-metal) due to a pad power/routing state we don't set up, or (b) ABL writes device-specific UNIPRO/PCS attributes (outside the OSS cal table) that HCE/SW reset wipes and Linux's frameworks restore. Both are beyond register-diff to see.
+
+**Conclusion: register-level diagnostics are exhausted.** The host is verifiably correct in every dimension we can read; the link-startup PACP/PA handshake fails for a reason not visible in any status register (no error latches anywhere). Resolving it needs a different CLASS of visibility:
+1. **Wire-level** — a logic analyzer / scope on the UFS RESET_n, REFCLK, and M-PHY lanes during link startup, to see whether the device is physically driven and whether it responds. Directly answers "does GPIO_OUT toggle the pad" and "is the device transmitting."
+2. **ABL exact-register-diff** — deep-RE ABL's UFS bring-up (addresses built inline via movz/movk, not literal pools, so it needs following the code from the CMU_HSI2 xrefs) to get the EXACT register writes ABL makes, then diff against ours. Finds any device-specific step outside the OSS cal.
+3. **Pad/power investigation** — why `GPIO_OUT` is a no-op: check the gph5-1 pad's GPIO-vs-function state, output driver enable, and whether the reset_n path needs a PMIC/GPIO the reference frameworks touch that we don't. If the device truly never resets for us, find husky's real reset path.
+
 **Two paths from here (next session):**
 1. **Make the device actually reset.** Find the true RST_n/VCC control (the `ufs_fixed_vcc` regulator is `gpio = <&gpp0 1>` — confirm gpp0-1 is really wired to VCC-enable and that our GPIO write reaches the pad; may need the pad's pull/drive set, or the reset is via a PMIC register not a SoC GPIO). If the device power-cycles, ABL's-equivalent link startup should take.
 2. **Don't reset at all — fix transfers on ABL's live link.** Revisit the ORIGINAL problem with clean tooling: on a fresh ABL boot the link is UP (HCS=G#10F, DP set); only our *transfers* never complete. Early payloads that "proved" NOP-fails-on-clean had the UTRLCLR-offset corruption bug. A minimal, bug-free "init_transfer_list + NOP on the untouched ABL link" test (one reboot to get ABL's link back) would re-check whether a DMA-address / cache / UTRD-format fix makes transfers complete — potentially much closer to done than re-linking. Suspect: UTRD/UCD **physical** address the UFS master sees (node is `dma-coherent`, no iommus → physical DMA), or the `fixed-prdt-req_list-ocs` quirk's UTRD OCS handling.
