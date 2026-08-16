@@ -17,6 +17,7 @@ members = [
     "payloads/pmuprobe",
     "payloads/pmupoke",
     "payloads/repeaterprobe",
+    "payloads/repeatertune",
 ]
 
 [workspace.package]

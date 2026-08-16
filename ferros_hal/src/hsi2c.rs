@@ -49,6 +49,19 @@ const SPIN_MAX: u32 = 4_000_000; // generous per-phase bound (polling, no jiffie
 pub const PIXEL8_HSI2C11_BASE: usize = 0x10CB_0000;
 /// Pixel 8 (husky): eUSB2 repeater 7-bit I2C address (live DT `eusb-repeater@3E`).
 pub const PIXEL8_EUSB_REPEATER_ADDR: u8 = 0x3E;
+/// Pixel 8 (husky): the DT `repeater_tune*` table as (register, value) — Google's calibrated analog tune.
+/// The Android kernel driver applies this at probe; ABL does NOT, so on ferros boots the repeater runs untuned unless we write it (measured 2026-08-16: 7 of 8 registers differ from ABL/POR state).
+/// Hardware-validated by payloads/repeatertune: all 8 write+readback OK with the USB link live.
+pub const PIXEL8_REPEATER_TUNE: [(u8, u8); 8] = [
+    (0x50, 0x0A), // eusb_mode_control
+    (0x70, 0x3C), // u_tx_adjust_port1
+    (0x71, 0x2C), // u_hs_tx_pre_emphasis_p1
+    (0x72, 0x90), // u_rx_adjust_port1
+    (0x73, 0x83), // u_disconnect_squelch_port1
+    (0x77, 0x00), // e_hs_tx_pre_emphasis_p1
+    (0x78, 0x0B), // e_tx_adjust_port1
+    (0x79, 0x40), // e_rx_adjust_port1
+];
 
 pub struct Hsi2c {
     base: usize,

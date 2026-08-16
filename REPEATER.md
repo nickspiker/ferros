@@ -140,24 +140,42 @@ The HSI2C master engine is ported and compiles clean — a faithful translation 
 
 Written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel once proven — and it is now proven (REV_ID + full 17-register baseline read over live I2C).
 
+## THE TUNE FINDING (2026-08-16): ferros boots were running an untuned repeater
+
+The husky DT `hs_tune_eusb` node (read from the live DT, format `[reg, value, shift, mask]`) is applied by the **Android kernel driver at probe — ABL does not apply it**. Diffing DT-intended vs live registers on a ferros boot: **7 of 8 differ**. Every ferros (and fastboot) boot runs Google's analog eye calibration missing:
+
+| Reg | Name | DT wants | ABL/POR state |
+|---|---|---|---|
+| `G#50` | eusb_mode_control | `G#0A` | `G#02` |
+| `G#70` | u_tx_adjust_port1 | `G#3C` | `G#7C` |
+| `G#71` | u_hs_tx_pre_emphasis_p1 | `G#2C` | `G#3C` |
+| `G#72` | u_rx_adjust_port1 | `G#90` | `G#92` |
+| `G#73` | u_disconnect_squelch_port1 | `G#83` | `G#83` |
+| `G#77` | e_hs_tx_pre_emphasis_p1 | `G#00` | `G#C8` |
+| `G#78` | e_tx_adjust_port1 | `G#0B` | `G#16` |
+| `G#79` | e_rx_adjust_port1 | `G#40` | `G#60` |
+
+`payloads/repeatertune` applies the table with write+readback verify (REV_ID-gated — no writes unless the repeater positively identifies): **all 8 verified on hardware, with the USB link staying up through its own re-tune**. These were the first I2C writes from ferros.
+
+**Sober caveat:** a hot-reloaded kernel that tunes before PHY init still took 3 PHY attempts / ~57s to re-enumerate, same `LTSTATE=G#FFFF4`/`LINKDBG=G#115` fingerprint. The tune is correct to apply but is not yet proven to close the coin flip — cold-boot statistics with the tuned kernel *flashed* are the real test.
+
 ## Bring-up plan (iterate over the RUN channel, no kernel reflash)
 
 1. ~~Fill the two DT constants, read REV_ID~~ **DONE** — `REV_ID=G#3`, `REPEATER BUS UP`.
 2. ~~Read the full tuning register set (healthy-boot baseline)~~ **DONE** — baseline block above.
-3. Capture the same dump on a *flaky* boot (watchdog retry streak) and diff — does the repeater lose its tune, or is the bus itself dead? This decides whether the fix is re-tune or full re-init.
-4. Add a repeater re-init + tune sequence; prove via payload that a flaky link can be *rescued* by re-tuning the repeater while up.
-5. Fold into the kernel — engine extracted to `ferros_hal::hsi2c` (**DONE**); DIAG now snapshots REV_ID + tune set before PHY init every boot (**DONE**, `REP_*` lines, untested pending next boot). Remaining: gated repeater re-init in `kernel_main`. Target: deterministic enumeration, sub-5s, no watchdog retries.
+3. ~~Diff intended vs actual tune~~ **DONE** — better than a flaky-boot diff: NO ferros boot ever had the tune (table above).
+4. ~~Repeater tune sequence proven via payload~~ **DONE** — `repeatertune`, 8/8 verified live.
+5. ~~Fold into the kernel~~ **DONE** — `ferros_hal::hsi2c` + `kernel_main` snapshots then applies the tune (REV_ID-gated) before PHY init; DIAG reports `REP_*` + `REP_TUNED` (`G#8` = full success, `G#FF` = gate skipped). Validated via hot-reload.
+6. **Flash the tuned kernel to slot A** (needs fastboot) and gather cold-boot enumeration statistics vs the 13–240s historical spread. This decides whether the tune closes the coin flip or the remaining flakiness lives elsewhere (PHY init sequence, watchdog bounds, host timing).
 
-## Open incident: RUN hangs on PT-REBOOT boots (2026-08-16, device needs power-cycle)
+## Incident notes: RUN hangs + A/B fallback (2026-08-16, partially resolved)
 
-Attempted step 3 by cycling `bridge reboot` (PT REBOOT cap → PSCI SYSTEM_RESET) and probing each boot. Result:
+During reboot-cycle testing, `bridge run` hung indefinitely twice immediately after fresh enumerations, and the device later dropped off the bus needing a physical power-cycle. Controlled follow-up after the power-cycle:
 
-- Original boot (via `fastboot reboot`, 40s enumeration): `bridge run repeaterprobe.bin` worked **3/3**.
-- Cycle 1 (PT REBOOT warm reset, 16s enumeration): `status` fine, `bridge run` **hung indefinitely**. Kernel main loop still alive — the next `bridge reboot` was accepted.
-- Cycle 2 (16s→80s enumeration, flaky streak): same — `status` fine, `run` hung.
-- After killing the hung host processes, the device dropped off the bus entirely (no ferros VID, no fastboot, no adb) — frozen, and our kernel disables the Exynos cluster watchdogs (e42b9a1), so nothing resets it. **Physical power-cycle required.**
-
-Facts, not yet explained: RUN (a 3-chunk PT Write + Exec) hangs 2/2 on warm-reset boots but worked 3/3 on the fastboot-path boot; REBOOT still worked after the first hang, so the kernel loop wasn't wedged — the PT inbound path was. Killing a bridge mid-transfer leaves the kernel's PT recv state stuck (known one-transfer-at-a-time design), which likely compounds. Next session: reproduce with `bridge dbg` counters read BEFORE any run attempt on a warm-reset boot (dbg is EP0, bypasses the bulk path) — measure, then fix.
+- Cold boot: `dbg` clean, `diag` + `run` worked 4/4. Resting-state `out_armed=0` is normal (lazy re-arm); `DEPCMD failures=A#2` at init is boot noise.
+- Warm PSCI-reset boot (89s flaky enumeration, 4 PHY attempts): `diag` AND `run` both worked — **warm reset is NOT the trigger.**
+- Remaining suspect for the 2 hangs: firing the first PT command within the immediate post-enumeration window (the failing loop ran `run` the same second `status` first succeeded). Unreproduced under controlled timing; keep host-side timeouts on all bridge commands so a hang can never again leave the device held-open/wedged.
+- The "no enumeration for 6 minutes" that followed was **ABL A/B rollback doing its job**: repeated warm resets exhausted slot A's retry counter and it silently booted Android from slot B. Not a wedge. Recovery: fastboot `--set-active=a`.
 
 ## What NOT to do
 

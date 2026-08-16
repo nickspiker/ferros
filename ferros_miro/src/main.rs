@@ -1,17 +1,14 @@
 // MIRO-P prototype + measurement harness. See MIRO.md (to be written from these numbers).
 //
-// MIRO-P is BLAKE3's mixing (the G function + column/diagonal round) with the feed-forward
-// removed, so the permutation is a clean bijection: forward = mix, inverse = unmix. The
-// message-word slots that BLAKE3 feeds data into become fixed round constants here, so G is a
-// fixed permutation rather than a compression step.
+// MIRO-P is BLAKE3's mixing (the G function + column/diagonal round) with the feed-forward removed, so the permutation is a clean bijection: forward = mix, inverse = unmix.
+// The message-word slots that BLAKE3 feeds data into become fixed round constants here, so G is a fixed permutation rather than a compression step.
 //
 // This harness measures the three things that must hold before MIRO.md asserts anything:
 //   1. round-trip: permute then permute_inv is the identity (invertibility is real, not hoped)
 //   2. avalanche: one input bit flipped diffuses to ~half the 512 output bits (mixing is real)
 //   3. corruption detection + perf: seal/open catches flips, and how fast it runs vs round count
 //
-// NOT security-audited. First-cut round-constant schedule. The check-word derivation here is a
-// splitmix stand-in for BLAKE3(domain || uid || copy) so the harness has no external deps.
+// NOT security-audited. First-cut round-constant schedule. The check-word derivation here is a splitmix stand-in for BLAKE3(domain || uid || copy) so the harness has no external deps.
 
 use std::hint::black_box;
 use std::time::Instant;

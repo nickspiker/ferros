@@ -573,6 +573,13 @@ name = "ferros-payload-repeaterprobe"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-repeatertune"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
 name = "ferros-payload-usbprobe"
 version = "0.1.0"
 

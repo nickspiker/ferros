@@ -14,7 +14,7 @@ m1 = ["dep:ferros_hal_m1"]
 ferros_hal = { path = "../ferros_hal", default-features = false, features = ["alloc"] }
 ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }
 ferros_layout = { path = "../ferros_layout" }
-blake3 = { version = "1", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 ferros_vault = { path = "../vault", default-features = false }
 ferros_ledger = { path = "../ferros_ledger" }
 ferros_pt = { path = "../ferros_pt", features = ["alloc"] }

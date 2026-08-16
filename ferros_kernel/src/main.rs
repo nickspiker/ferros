@@ -1441,6 +1441,24 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         [rep(0xB0), rep(0x60), rep(0x70), rep(0x71), rep(0x72), rep(0x73), rep(0x77), rep(0x78), rep(0x79)]
     };
 
+    // Apply Google's calibrated repeater tune (the DT repeater_tune* table) before PHY init.
+    // ABL does NOT apply it — only the Android driver does — so without this every ferros boot runs the analog path untuned (the leading suspect for the enumeration coin flip).
+    // Gated on a positive REV_ID identification: the bus is shared with the PMIC chain, so if the snapshot couldn't identify the repeater we write nothing.
+    // rep_tuned: count of verified tune registers (8 = full success), G#FF = skipped (REV_ID gate).
+    let rep_tuned: u32 = if rep_snap[0] == 0x3 {
+        let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+        let mut ok = 0u32;
+        for &(reg, val) in ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE.iter() {
+            let addr = ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR;
+            if i2c.write_reg(addr, reg, val).is_ok() && i2c.read_reg(addr, reg) == Ok(val) {
+                ok += 1;
+            }
+        }
+        ok
+    } else {
+        0xFF
+    };
+
     eusb_phy_init();
 
     // If we survived, S2MPU is bypassed and PHY is initialized. Now try UFS + USB.
@@ -1708,6 +1726,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_T77=", rep_snap[6]);
                                                 append_hex(&mut resp, b"REP_T78=", rep_snap[7]);
                                                 append_hex(&mut resp, b"REP_T79=", rep_snap[8]);
+                                                append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {

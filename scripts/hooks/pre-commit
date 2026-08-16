@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# ferros pre-commit hook. Blocks commits that introduce hard-wrapped comment prose.
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/comment-gate.sh"
