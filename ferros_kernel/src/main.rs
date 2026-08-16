@@ -1306,11 +1306,22 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // ---- Pixel 8 / Tensor G3 ----
 
-    // ---- Disable the cluster watchdogs FIRST ---- ABL arms the Exynos CLUSTER0/1 NONCPU watchdogs so a hung kernel reboots (~60s, reset reason G#CBEA "APC Watchdog Early", confirmed 2026-08-14). Until we run a real timer + pet loop, stop them: Samsung s3c2410-style block, WTCON at base+0. Clearing WTCON.EN (bit 5) halts the counter and WTCON.RSTEN (bit 0) masks reset — writing 0 does both, so no reset is ever requested regardless of the PMU reset mask. Nodes from live DTB: watchdog_cl0@G#10060000, watchdog_cl1@G#10070000.
+    // ---- Recoverable cluster watchdog ---- We KEEP ABL's watchdogs armed and pet them in the main loop, instead of disabling them. Rationale: with the watchdogs off, a genuine hang (stuck payload, hung MMIO read) freezes the phone forever — needs a physical power-cycle. Kept armed + petted, a hang instead auto-resets in ~ABL's window (~60s, reset reason G#CBEA), and ABL's A/B retry brings ferros back. This is the safety net for every risky new-MMIO experiment on this device.
+    // ABL already armed them (RSTEN + PMU int-enable — the CBEA reset proves it) and calibrated the reload for ~60s, so REUSE its WTDAT (read it) rather than recompute the WDT clock. Reload the counter now for a full first window; the main loop then pets continuously (it spins on USB poll + enum re-init, so normal operation — including slow enumeration — always pets; only a true hang stops the pets). Samsung s3c2410 block: WTCON base+0, WTDAT +4, WTCNT +8. Nodes: watchdog_cl0@G#10060000, watchdog_cl1@G#10070000.
+    // We ARM explicitly (not just reuse ABL's WTCON) so this works identically on a cold boot AND on hot-reload — where the prior ferros kernel had DISABLED the watchdog (WTCON=0), so there's nothing to reuse. The PMU-level reset routing (CLUSTERx_NONCPU_INT_EN) that ABL set persists across the kernel→kernel jump (we never reset the PMU), so WTCON.RSTEN is enough to actually reset. Max prescaler + DIV128 + full 16-bit reload = the longest window (~1-2 min), safely clear of any false-fire during normal spinning while still recovering a hang quickly.
+    // WTCON bits (s3c2410): RSTEN=b0, EN=b5, DIV128=3<<3, PRESCALE(0xFF)=0xFF<<8. INTEN left off (we want a reset, not an interrupt).
     const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
-    for &wdt in &WATCHDOGS {
+    const WTDAT: usize = 0x04;
+    const WTCNT: usize = 0x08;
+    const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
+    let wdt_reload = [0xFFFFu32; 2];
+    let mut wdt_con = [0u32; 2];
+    for (i, &wdt) in WATCHDOGS.iter().enumerate() {
         unsafe {
-            core::ptr::write_volatile((wdt + 0x00) as *mut u32, 0); // WTCON = 0: timer off, reset masked
+            core::ptr::write_volatile((wdt + WTDAT) as *mut u32, wdt_reload[i]);
+            core::ptr::write_volatile((wdt + WTCNT) as *mut u32, wdt_reload[i]);
+            core::ptr::write_volatile((wdt + 0x00) as *mut u32, WDT_ARM);
+            wdt_con[i] = core::ptr::read_volatile((wdt + 0x00) as *const u32);
         }
     }
 
@@ -1625,6 +1636,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
 
     loop {
+        // Pet the recoverable watchdog: reload both cluster counters every iteration. This loop spins continuously, so a genuine hang (a payload that never returns, a hung MMIO read) stops the pets → ~60s auto-reset instead of a frozen phone.
+        for (i, &wdt) in WATCHDOGS.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((wdt + WTCNT) as *mut u32, wdt_reload[i]); }
+        }
         killswitch_check!();
 
         match usb.poll_event() {
@@ -1777,6 +1792,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_UTRLBAU=", ufs_diag[21]);
                                                 append_hex(&mut resp, b"UFS_QCH=", ufs_diag[22]);
                                                 append_hex(&mut resp, b"UFS_QCH_FMP=", ufs_diag[23]);
+                                                // Recoverable watchdog state (ABL's config, reused). WTCON bit5=EN bit0=RSTEN; WTDAT = reload (~60s window).
+                                                append_hex(&mut resp, b"WDT0_CON=", wdt_con[0]);
+                                                append_hex(&mut resp, b"WDT0_DAT=", wdt_reload[0]);
+                                                append_hex(&mut resp, b"WDT1_CON=", wdt_con[1]);
+                                                append_hex(&mut resp, b"WDT1_DAT=", wdt_reload[1]);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
