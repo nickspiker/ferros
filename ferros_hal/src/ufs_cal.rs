@@ -109,6 +109,19 @@ fn set_pcs(lane: u32, offset: u16, value: u32) {
     wr(base::UNIPRO + AUX_FIELD, WSTRB);
 }
 
+/// PCS read-back: select the lane through the AUX window WITHOUT the write strobe, then read the offset. Used to verify the PCS cal actually landed (the AUX-window path, distinct from direct PMA writes). RX lanes use index 4+lane, TX lanes 0+lane.
+pub fn read_pcs(lane: u32, offset: u16) -> u32 {
+    wr(base::UNIPRO + AUX_FIELD, lane & 0xFFFF);
+    let v = rd(base::UNIPRO + offset as usize);
+    wr(base::UNIPRO + AUX_FIELD, WSTRB);
+    v
+}
+
+/// RX lane 0 AUX index (matches the cal engine's RX_LANE_0).
+pub const RX_LANE0: u32 = 4;
+/// TX lane 0 AUX index.
+pub const TX_LANE0: u32 = 0;
+
 fn pcs_lr_prd(lane: u32, offset: u16, ticks: u32) {
     set_pcs(lane, offset, (ticks >> 16) & 0xFF);
     set_pcs(lane, offset + 4, (ticks >> 8) & 0xFF);

@@ -748,6 +748,8 @@ pub struct InitReport {
     pub cmu_qch: u32,
     /// CMU_HSI2 UFS UNIPRO clock gate (G#1300_2110).
     pub cmu_unipro_gate: u32,
+    /// PCS cal read-back after pre_link (AUX-window path): RX-lane G#2094 (expect G#F6) | G#20BC<<8 (expect G#79) | TX-lane G#22A4<<16 (expect G#02). If these DON'T match, the AUX-window PCS writes aren't landing = the bug.
+    pub pcs_readback: u32,
 }
 
 impl UfsController {
@@ -937,6 +939,11 @@ impl UfsController {
             r.mphy_refclk_sel = self.hci(0x108);
             r.cmu_qch = unsafe { crate::mmio::read32(0x1300_30C4) };
             r.cmu_unipro_gate = unsafe { crate::mmio::read32(0x1300_2110) };
+            // Verify the AUX-window PCS cal writes actually landed (PMA writes already confirmed via register-diff; PCS is the unverified path).
+            let pcs_2094 = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x2094) & 0xFF; // expect G#F6
+            let pcs_20bc = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x20BC) & 0xFF; // expect G#79
+            let pcs_22a4 = ufs_cal::read_pcs(ufs_cal::TX_LANE0, 0x22A4) & 0xFF; // expect G#02
+            r.pcs_readback = pcs_2094 | (pcs_20bc << 8) | (pcs_22a4 << 16);
             let _ = self.read_reg(0x38); // UECPA is clear-on-read
             self.write_reg(regs::IS, 0xFFFF_FFFF);
 

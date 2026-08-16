@@ -1182,6 +1182,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             clkdiag[2] = rep.mphy_refclk_sel;
             clkdiag[3] = rep.cmu_qch;
             clkdiag[4] = rep.cmu_unipro_gate;
+            ufs_diag[13] = rep.pcs_readback; // PCS cal readback (expect low bytes F6, 79, 02)
             pmaf = ufs.snapshot_pma(); // failed-link PMA/PA state for the diff against pmaw
         }
     }
@@ -1436,7 +1437,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_LS_RES=", ufs_diag[10]);
                                                 append_hex(&mut resp, b"UFS_CAL_TO=", ufs_diag[11]);
                                                 append_hex(&mut resp, b"UFS_DME_ERR=", ufs_diag[12]);
-                                                append_hex(&mut resp, b"UFS_PA_STATE=", ufs_diag[13]);
+                                                append_hex(&mut resp, b"UFS_PCS_READBACK=", ufs_diag[13]);
                                                 append_hex(&mut resp, b"UFS_PA_TX_STATE=", ufs_diag[14]);
                                                 append_hex(&mut resp, b"UFS_GPH5_DAT=", ufs_diag[15]);
                                                 append_hex(&mut resp, b"UFS_UEC_PACK=", ufs_diag[16]);
