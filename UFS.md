@@ -55,7 +55,19 @@ HCE=1 and the link is up, but the doorbell mechanism is inert for us. Two candid
 1. **Enable-time latching** (cheap fix if true): vendor config like `NEXUS_TYPE` is sampled when HCE goes 0→1. ABL enabled HCE with `NEXUS_TYPE=G#FFFFFFFE`, so bit 0 is latched-clear and our runtime write to set it is visible in the register but unused. **Test:** submit a request in slot **1** (whose NEXUS bit IS set) — ring `UTRLDBR=1<<1` with the UTRD in list slot 1 and UPIU tag 1. If it completes, latching is confirmed and using a pre-set slot is the whole fix (no re-init). Needs a manual 2-slot UTRD list (the HAL is single-slot).
 2. **Full re-init required** (the big fix): HCE reset (0→1) with our config applied at enable time, then `DME_LINKSTARTUP` to re-establish UniPro, then M-PHY re-calibration (the Exynos `ufs-cal-if` library — thousands of lines, device-specific tuning). ABL did this; redoing it is a real driver effort.
 
-**Next session:** run the slot-1 latching test first — it's cheap and decides between the two paths. Everything needed (NEXUS value, tag fix, doorbell-clear with the correct 0x5C offset, hibernate-exit UIC) is proven and in `payloads/ufsfix`.
+**RESOLVED — it's path 2 (full re-init).** `payloads/slot1nop` hand-built a 2-slot UTRD list and submitted a NOP in slot **1** (NEXUS bit 1 set since ABL enable): it ALSO fails (`slot1_OCS=F`, doorbell stuck). So latching is NOT the cause — the controller processes no request in any slot. Combined with NOP-fails-clean, this is conclusive: **ABL's handoff state cannot accept host transfers; the controller needs a real re-initialization.**
+
+### The remaining work (a real driver effort, next project)
+
+Full Exynos UFSHCI bring-up from HCE reset:
+1. `HCE = 0`, wait not-ready; apply `config_host` vendor block; `HCE = 1`, wait ready.
+2. `DME_LINKSTARTUP` (UIC 0x16) → establish UniPro link; wait `HCS.DP`.
+3. **M-PHY calibration** — the hard part. Exynos uses `ufs-cal-if` (`drivers/ufs/ufs-cal-if.*`, thousands of lines of device-specific PMA/M-PHY tuning) plus `ufs-vs-regs.h` UNIPRO DME writes (`G#7860`+ hibernate, PA_* attributes). This is what ABL runs; redoing it is the bulk of the effort.
+4. Power-mode change to HS gear (`DME_SET` PA attributes + `PA_PWRMode`), then NOP → device init → SCSI.
+
+Alternative worth considering: rather than re-init, find why ABL's already-working link won't take OUR requests — maybe a single "start transfer processing" or power-mode step is missing, cheaper than full cal. But the evidence (NOP fails in a healthy-looking HCE=1/DP=1 state) points to re-init being the honest path.
+
+All the groundwork — vendor region readable, NEXUS semantics, tag/slot fix, UIC command interface working, doorbell clear — is proven and in `payloads/ufsfix` + `slot1nop`.
 
 ## (superseded) The blocker: UTRL_NEXUS_TYPE is in a region that hangs on access
 

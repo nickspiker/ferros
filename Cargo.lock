@@ -595,6 +595,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-slot1nop"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-ufsfix"
 version = "0.1.0"
 dependencies = [

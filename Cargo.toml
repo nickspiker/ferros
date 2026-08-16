@@ -22,6 +22,7 @@ members = [
     "payloads/hangtest",
     "payloads/vendorprobe",
     "payloads/ufsfix",
+    "payloads/slot1nop",
     "payloads/miscprobe",
 ]
 
