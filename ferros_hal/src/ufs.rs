@@ -738,6 +738,16 @@ pub struct InitReport {
     pub pa_tx_state: u32,
     /// UEC family after link startup: UECDL G#3C | UECN G#40<<8 wouldn't fit; packed as UECDL[7:0]|UECN[15:8]|UECT[23:16]|UECDME[31:24] low bytes.
     pub uec_pack: u32,
+    /// Clock/refclk state captured right before DME_LINKSTARTUP (the device needs its reference clock to respond). HCI_CLKSTOP_CTRL G#B0 (bit4 REFCLKOUT_STOP must be 0 = refclk running to device).
+    pub clkstop_ctrl: u32,
+    /// HCI_FORCE_HCS G#B4 (auto clock-stop enables; all should be clear after unlock).
+    pub force_hcs: u32,
+    /// HCI_MPHY_REFCLK_SEL G#108 (bit0).
+    pub mphy_refclk_sel: u32,
+    /// CMU_HSI2 QCH_CON_UFS_EMBD (G#1300_30C4) — UFS aclk Q-channel gate.
+    pub cmu_qch: u32,
+    /// CMU_HSI2 UFS UNIPRO clock gate (G#1300_2110).
+    pub cmu_unipro_gate: u32,
 }
 
 impl UfsController {
@@ -921,6 +931,12 @@ impl UfsController {
             // Pre-link cal, then clear stale UIC error state so this attempt's codes are its own.
             r.cal_timeouts = (r.cal_timeouts & !0xFF) | (ufs_cal::pre_link(cal) & 0xFF);
             done(&mut r, step::PRE_LINK);
+            // Capture the clock/refclk state the device depends on to respond to link startup.
+            r.clkstop_ctrl = self.hci(vs::CLKSTOP_CTRL);
+            r.force_hcs = self.hci(vs::FORCE_HCS);
+            r.mphy_refclk_sel = self.hci(0x108);
+            r.cmu_qch = unsafe { crate::mmio::read32(0x1300_30C4) };
+            r.cmu_unipro_gate = unsafe { crate::mmio::read32(0x1300_2110) };
             let _ = self.read_reg(0x38); // UECPA is clear-on-read
             self.write_reg(regs::IS, 0xFFFF_FFFF);
 

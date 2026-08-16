@@ -1104,6 +1104,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut pmaw = [0u32; 12]; // ABL working-link PMA/PA snapshot (Phase A)
     let mut pmaf = [0u32; 12]; // post-full_init failed-link PMA/PA snapshot (Phase B)
     let mut rst_test = [0u32; 4]; // GPIO_OUT device-reset test: [HCS_before, MXGR_before, HCS_after, MXGR_after]
+    let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
@@ -1119,15 +1120,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         // Register-diff baseline: snapshot ABL's WORKING-link PMA/PA state before we touch anything (only meaningful on a fresh flash+boot where HCS_PRISTINE=G#10F). pmaf is captured after full_init's failed startup; the diff reveals the enable/power-up step the cal table omits.
         pmaw = ufs.snapshot_pma();
 
-        // HIBERNATE-EXIT hypothesis (highest-value): on ABL's live link local DME reads work but DME_PEER_GET (device round-trip) returns G#0A=DME_FAILURE and transfers never execute — the signature of a link parked in a low-power/hibernate state (registers readable, no device TRAFFIC until exit). Issue DME_HIBERNATE_EXIT (UIC G#18), then retry a peer-get and (below) a NOP. If the peer-get now succeeds (0) and the NOP completes, the link just needed a hibernate exit — no re-link, no device reset. Peer attr = PA_Granularity (G#15AA).
-        const DME_PEER_GET: u32 = 0x03;
-        const DME_HIBER_EXIT: u32 = 0x18;
-        const PA_GRANULARITY: u32 = 0x15AA;
-        rst_test[0] = match ufs.uic_cmd(DME_PEER_GET, PA_GRANULARITY << 16, 0, 0) { Ok(c) => c, Err(()) => 0xFFFF_FFFF }; // peer-get BEFORE hibernate exit (seen: G#0A)
-        rst_test[1] = match ufs.uic_cmd(DME_HIBER_EXIT, 0, 0, 0) { Ok(c) => c, Err(()) => 0xFFFF_FFFF };  // hibernate-exit result
-        ferros_hal::ufs_cal::udelay(5_000);
-        rst_test[2] = match ufs.uic_cmd(DME_PEER_GET, PA_GRANULARITY << 16, 0, 0) { Ok(c) => c, Err(()) => 0xFFFF_FFFF }; // peer-get AFTER hibernate exit (0 = device now reachable)
-        rst_test[3] = r(0x30);       // HCS after
+        // DECISIVE device-reset test (non-cached): on ABL's live working link (HCS=G#10F, DP set), assert HCI_GPIO_OUT bit0=0 (the reference exynos_ufs_dev_hw_reset). If that reaches the device reset_n, the M-PHY link physically drops and the DL layer latches a REAL-TIME link-lost error (UECDL/UECN) and/or HCS.DP clears — unlike cached MXGR. If the UEC family stays clean and DP stays set after a 10ms assert, GPIO_OUT does NOT reach the device on husky → the device never leaves its ABL link state → it ignores every re-link (root cause). rst_test = [uec_before, hcs_before, uec_after, hcs_after]; uec packed UECDL|UECN<<8|UECT<<16|UECDME<<24.
+        let uec = || {
+            let dl = r(0x3C) & 0xFF; let n = r(0x40) & 0xFF; let t = r(0x44) & 0xFF; let dme = r(0x48) & 0xFF;
+            dl | (n << 8) | (t << 16) | (dme << 24)
+        };
+        let _ = uec(); // clear-on-read: flush any stale latched errors first
+        rst_test[0] = uec();          // baseline (expect 0 after flush)
+        rst_test[1] = r(0x30);        // HCS before (expect G#10F)
+        unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 0); core::arch::asm!("dsb sy"); } // assert reset_n
+        ferros_hal::ufs_cal::udelay(10_000);
+        rst_test[2] = uec();          // errors latched? (nonzero = reset reached the device)
+        rst_test[3] = r(0x30);        // HCS after (DP cleared = reset reached the device)
+        unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 1); core::arch::asm!("dsb sy"); } // deassert
         // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
         unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
         ufs.init_transfer_list();
@@ -1172,6 +1177,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ufs_diag[22] = r(0x38);
             ufs_diag[23] = rep.linkstartup_tries;
             ufs_diag[27] = rep.uecpa;
+            clkdiag[0] = rep.clkstop_ctrl;
+            clkdiag[1] = rep.force_hcs;
+            clkdiag[2] = rep.mphy_refclk_sel;
+            clkdiag[3] = rep.cmu_qch;
+            clkdiag[4] = rep.cmu_unipro_gate;
             pmaf = ufs.snapshot_pma(); // failed-link PMA/PA state for the diff against pmaw
         }
     }
@@ -1438,11 +1448,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_UECPA=", ufs_diag[22]);
                                                 append_hex(&mut resp, b"UFS_LS_TRIES=", ufs_diag[23]);
                                                 append_hex(&mut resp, b"UFS_DONE=", ufs_diag[27]);
-                                                // Hibernate-exit test on ABL's live link. PEER_PRE = peer-get before exit (seen G#0A=DME_FAILURE). HIB_EXIT = exit result (0=ok). PEER_POST = peer-get after exit — if 0, the device is now reachable and the link just needed a hibernate exit. Combined with UFS_LIVE_OCS below (NOP after exit): OCS=0 = transfers work on ABL's link, no re-link needed.
-                                                append_hex(&mut resp, b"UFS_PEER_PRE=", rst_test[0]);
-                                                append_hex(&mut resp, b"UFS_HIB_EXIT=", rst_test[1]);
-                                                append_hex(&mut resp, b"UFS_PEER_POST=", rst_test[2]);
-                                                append_hex(&mut resp, b"UFS_HIB_HCS=", rst_test[3]);
+                                                // Clock/refclk state at link-startup. REFCLK is what the device needs to respond. CLKSTOP bit4=REFCLKOUT_STOP (want 0). CMU gates want nonzero/enabled.
+                                                append_hex(&mut resp, b"UFS_CLKSTOP=", clkdiag[0]);
+                                                append_hex(&mut resp, b"UFS_FORCEHCS=", clkdiag[1]);
+                                                append_hex(&mut resp, b"UFS_MPHY_REFCLK_SEL=", clkdiag[2]);
+                                                append_hex(&mut resp, b"UFS_CMU_QCH=", clkdiag[3]);
+                                                append_hex(&mut resp, b"UFS_CMU_UNIPRO_GATE=", clkdiag[4]);
+                                                // Device-reset test on ABL's live link (non-cached). If RST_UEC_A latches nonzero OR RST_HCS_A drops DP (G#10E/G#010E vs G#10F), GPIO_OUT reset reached the device (good). If RST_UEC_A=0 and RST_HCS_A=G#10F unchanged, GPIO_OUT does NOT reach the device reset_n — the device never drops its ABL link state = root cause.
+                                                append_hex(&mut resp, b"UFS_RST_UEC_B=", rst_test[0]);
+                                                append_hex(&mut resp, b"UFS_RST_HCS_B=", rst_test[1]);
+                                                append_hex(&mut resp, b"UFS_RST_UEC_A=", rst_test[2]);
+                                                append_hex(&mut resp, b"UFS_RST_HCS_A=", rst_test[3]);
                                                 // PMA/PA register diff: W=ABL working link (Phase A), F=post-full_init failed (Phase B). Order: PMA 000/140/150/19C/1A0/C74, PMA-lane0 9F0/9F4/A00, PA_CTRLSTATE, PA_TX_STATE, MAXRXHSGEAR.
                                                 let pma_labels: [&[u8]; 12] = [b"P000", b"P140", b"P150", b"P19C", b"P1A0", b"PC74", b"P9F0", b"P9F4", b"PA00", b"PACS", b"PATX", b"MXGR"];
                                                 for i in 0..12 {
