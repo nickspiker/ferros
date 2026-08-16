@@ -174,11 +174,12 @@ Every boot: `REP_TUNED=G#8` (kernel tuned all 8 registers, verified). Cold-boot 
 
 | Boot | Wall to enumeration | PHY init attempts |
 |---|---|---|
-| Cold (fastboot reboot) | 41s (~boot-time floor) | **1 — clean** |
+| Cold (fastboot reboot) | 41s (~boot-time floor) | 1 — clean |
 | Warm (PT REBOOT) | 20s | 6 |
 | Warm (PT REBOOT) | 58s | 2 |
+| Cold (fastboot reboot) | 171s | 7 |
 
-**Verdict: the tune is in and correct, but it does NOT close the enumeration coin flip.** Warm boots still burn multiple PHY attempts with the repeater fully tuned before PHY init. Remaining suspects, in order: the eUSB2 PHY init sequence itself (timing/ordering vs ABL's), the watchdog's 2s/4s re-init bounds (may be tearing down inits that would have completed), host-side enumeration timing. Note the wall clock is not linear in attempts (6 attempts in 20s vs 2 in 58s) — instrument per-attempt timestamps next.
+**Verdict: the tune is in and correct, but it does NOT close the enumeration coin flip** — the second cold boot (171s / 7 attempts, fully tuned) settles it. Warm boots still burn multiple PHY attempts with the repeater fully tuned before PHY init. Remaining suspects, in order: the eUSB2 PHY init sequence itself (timing/ordering vs ABL's), the watchdog's 2s/4s re-init bounds (may be tearing down inits that would have completed), host-side enumeration timing. Note the wall clock is not linear in attempts (6 attempts in 20s vs 2 in 58s) — instrument per-attempt timestamps next.
 
 ## Operational: ABL A/B rollback vs ferros (recurring)
 
