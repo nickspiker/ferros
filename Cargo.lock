@@ -561,6 +561,14 @@ name = "ferros-payload-hello"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-pmupoke"
+version = "0.1.0"
+
+[[package]]
+name = "ferros-payload-pmuprobe"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-usbprobe"
 version = "0.1.0"
 

@@ -1774,7 +1774,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
                                                 }
                                             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
-                                                // PSCI SYSTEM_RESET (Tensor: secure monitor at EL3 via smc).
+                                                // Reboot. params[0] mode byte is accepted but NOT acted on yet: the fastboot-reason PMU write is pulled until a read-only probe (RUN payload) confirms the offset and that S2MPU passes the write. An earlier blind write of G#8000_00FC to G#1546_0810 left USB dead across warm resets — cold power cycle recovered it. Until proven, every reboot is a plain PSCI SYSTEM_RESET (Tensor: secure monitor at EL3 via smc).
+                                                let _ = cmd.params.first().copied().unwrap_or(0);
                                                 unsafe { core::arch::asm!("ldr x0, =0x84000009", "smc #0", options(noreturn)); }
                                             }
                                         }
