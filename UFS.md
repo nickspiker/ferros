@@ -11,12 +11,38 @@ Discovered while building `payloads/miscprobe` (GPT scan → misc partition → 
 
 Consequences: the vault/manifestus work has no storage path on husky until this is fixed. The M1 path is unaffected.
 
-## Leading hypothesis: Exynos UTRL_NEXUS_TYPE
+## Forensics (2026-08-16) — every DMA/state hypothesis eliminated, isolated to the vendor region
 
-Zuma's UFSHCI is `samsung,exynos-ufs` with a vendor-specific block. From the gs-google driver (`drivers/ufs/ufs-exynos.c`, `ufs-vs-regs.h`):
+Kernel boot now runs one read-only `read_block(1)` (GPT header) and dumps the full state via DIAG (`UFS_*` lines; code in `kernel_main`, `ufs_diag[]`). Measured on hardware via hot-reload:
 
-- **`HCI_UTRL_NEXUS_TYPE` (VS+G#40)**: per-tag bit — 1 = SCSI/nexus command, 0 = query/NOP. The Linux driver sets it **per command** before ringing the doorbell (`exynos_ufs_set_nexus_t_xfer_req`). If ABL's last slot-0 command was non-SCSI, bit 0 is clear and our SCSI READ/WRITE gets mishandled → exactly our never-completes symptom.
-- Init also writes: `HCI_DATA_REORDER=G#A`, TX/RXPRDT entry sizes, `NEXUS_TYPE=G#FFFFFFFF` (both), AXIDMA burst config — but those are global and ABL's own transfers needed them, so they're likely fine.
+```
+UFS_LINK=1          link up
+UFS_READ_OCS=F      our read returned the pre-armed INVALID sentinel — controller never wrote a real OCS
+UFS_LASTOCS=F       UTRD OCS field never written back
+UFS_IS=0            no completion interrupt, no error interrupt
+UFS_HCS=10F         DP+UTRLRDY+UTMRLRDY+UCRDY all set, power mode healthy
+UFS_DBR=1           doorbell slot 0 accepted, still set — command never completed
+UFS_RSR=1           transfer list IS running
+UFS_AHIT=0          auto-hibernate DISABLED
+UFS_CAP=1383FF1F    32 slots, 64-bit addressing — sane
+UFS_RSP0/1=0        response UPIU all zero — controller never wrote a response
+UFS_DATA0/1=0       no data delivered (no "EFI PART")
+UFS_S2MPU_CTRL0=0   HSI2 S2MPU disabled — our bypass took
+UFS_UECPA=80000010  latched PHY-adapter UIC error (valid+code G#10); UECDL/UECN/UECT/UECDME all 0
+```
+
+**Eliminated:**
+- **S2MPU** — CTRL0 reads back 0 (disabled), and USB DMA works through the identical disable on the HSI0 S2MPU.
+- **SysMMU / IOMMU** — the UFS DT node has `dma-coherent` and NO `iommus`; the only HSI2 sysmmu (`sysmmu@131C0000`) is `samsung,pcie-sysmmu`, port `PCIe_CH1`, status **disabled**. UFS DMAs physical addresses directly.
+- **Run-stop** (RSR=1), **list-not-ready** (UTRLRDY=1), **auto-hibernate** (AHIT=0).
+
+**Conclusion:** the controller accepts the doorbell but never fetches/executes the request — no descriptor writeback, no response UPIU, no interrupt — with nothing in the DMA path blocking it. That isolates the cause to the **Samsung vendor-specific controller config**, i.e. `HCI_UTRL_NEXUS_TYPE`.
+
+## The blocker: UTRL_NEXUS_TYPE is in a region that hangs on access
+
+- **`HCI_UTRL_NEXUS_TYPE` (`reg_hci`+G#40 = `G#1320_1140`)**: per-tag bit, 1 = this tag is a SCSI/nexus transfer. The Linux driver sets `G#FFFFFFFF` at init (`config_host`) AND per-command (`exynos_ufs_set_nexus_t_xfer_req`). On a stock UFSHCI, RSR+doorbell+ready = execute; on Exynos the controller ignores the doorbell unless the tag's NEXUS bit is set. If ABL left it clear (or a reset cleared it), our command is silently ignored — matches every symptom above.
+- **But `reg_hci` (the vendor region, base `G#1320_1100` — confirmed via the driver's ioremap order, resource index 1) HANGS the AP on any CPU read** (froze the phone via miscprobe; `NEXUS_TYPE` at `G#1320_1140` is inside it). And it is NOT auto-hibernate (AHIT=0), so the cause of the gating is something else — most likely a CMU HSI2 UFS clock gate (the vendor region's APB clock stopped) or the auto-clock-gating controlled by `HCI_FORCE_HCS` (VS+G#B4 — itself in the gated region, a catch-22).
+- Init also programs `HCI_DATA_REORDER=G#A`, TX/RXPRDT entry sizes, AXIDMA burst — all in the same gated region.
 
 ## The trap (learned the hard way, phone frozen twice today)
 
@@ -39,9 +65,17 @@ Also relevant: `s2mpu_s0_hsi2@131f0000`, `sysreg_ufs@13020000`, CMU HSI2 clock d
 
 ## Next steps (in order)
 
-1. **Kernel-boot experiment**: before `init_transfer_list`, try enabling the VS APB path — candidates: CMU HSI2 gates (find the APB gate for HCI VS in the zuma clock driver), `sysreg_ufs`, or reading `HCI_FORCE_HCS` immediately (maybe accessible at boot before something gates it — ABL might hand off ungated and only idle gates it later). Instrument with framebuffer/boot-log-to-DIAG breadcrumbs BEFORE each poke so a hang identifies the culprit line.
-2. Once VS is accessible: set `NEXUS_TYPE |= 1<<tag` before each SCSI command (or `G#FFFFFFFF` once, Linux-style) and retest `read_block(1)` (GPT header, read-only).
-3. Then `miscprobe` works → boot-control block → and the vault storage path opens.
+The whole problem now reduces to: **make the `reg_hci` vendor region (`G#1320_1100`) accessible, then set `NEXUS_TYPE=G#FFFFFFFF`.** Everything else is proven fine.
+
+1. **Find why the vendor region gates and ungate it.** Investigate the CMU HSI2 clock tree in the zuma clock driver (`drivers/clk/...` / `clk-exynos*.c`) for the UFS UNIPRO/HCI APB gate, and `sysreg_ufs@13020000`. Hypothesis: ABL hands off with the vendor-region APB clock auto-gated; ungating it at a CMU register (standard, accessible MMIO — NOT the VS region) restores access. **Risk: a wrong poke or the VS read freezes the phone** (watchdogs disabled → a hang is NOT recovered by A/B; it needs a physical power-cycle). Do it in kernel boot, capture a breadcrumb to DIAG/framebuffer before each new-region access.
+2. Once the vendor region reads without hanging: set `NEXUS_TYPE=G#FFFFFFFF`, also program `DATA_REORDER=G#A` + PRDT entry sizes to match `config_host`, retest `read_block(1)` — expect OCS=0 and "EFI PART" in the data buffer.
+3. Then `miscprobe` works → boot-control block, and the vault/manifestus storage path opens.
+
+**Fallback if ungating proves too deep:** a full UFSHCI HCE reset + our own Samsung-style re-init (link startup DME commands + `config_host` VS programming) — heavier, and still needs vendor-region access, so ungating comes first regardless.
+
+## Instrumentation left in place
+
+`kernel_main` runs the read-only `read_block(1)` forensic every boot and reports `UFS_*` via DIAG (see `ufs_diag[]`). It leaves doorbell slot 0 stuck (UFS is non-functional anyway during bring-up). Remove once the command path works. The old boot-time `write_block(FERROS_PART_LBA)` (the "FERROS v3" log) is retired — it was an unverified write that never landed and polluted the partition LBA.
 
 ## Misc / boot-control context (slot-rollback fix — BLOCKED on format RE)
 

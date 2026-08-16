@@ -1475,27 +1475,49 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         buf[*off] = b'\n'; *off += 1;
     }
 
+    let _ = (hex_to_buf, FERROS_PART_LBA); // retained: hex_to_buf used elsewhere; LBA is the real write target once the command path works
+
+    // ---- UFS command-path forensics (READ ONLY) ----
+    // Our UFS commands have never completed on husky (UFS.md): boot write left the doorbell stuck, IS clean, no error. Capture the full standard-region + S2MPU state around ONE read_block(1) (GPT header — read-only, safe) so the failure mode is unambiguous instead of guessed. All reads here are known-accessible (UFS standard region, and the S2MPU we already write) — NOT the VS region (G#1320_1100) or SysMMU (G#131C_0000), which may hang the AP; those are a separate gated experiment only if this comes back clean.
+    // ufs_diag layout, surfaced via DIAG "UFS_*" lines:
+    //   0 link_up  1 read_ocs  2 IS  3 HCS  4 UTRLDBR  5 UTRLBA
+    //   6 UECPA 7 UECDL 8 UECN 9 UECT 10 UECDME
+    //   11 S2MPU_HSI2_CTRL0 (expect 0 = disabled)  12 S2MPU_HSI2+0x54
+    //   13 databuf[0..4] ("EFI ")  14 databuf[4..8] ("PART")
+    //   15 resp_upiu[0..4]  16 resp_upiu[4..8]  17 last_ocs
     let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
     let ufs_up = ufs.link_is_up();
-
+    let mut ufs_diag = [0u32; 22];
+    ufs_diag[0] = ufs_up as u32;
     if ufs_up {
+        let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         ufs.init_transfer_list();
-
-        let buf = ufs.data_buffer_mut();
-        buf.fill(0);
-        let mut off = 0_usize;
-
-        for &b in b"FERROS v3 S2MPU_BYPASS=OK\n" { buf[off] = b; off += 1; }
-
-        unsafe {
-            hex_to_buf(buf, &mut off, b"SNPSID=", core::ptr::read_volatile((DWC3 + 0xC120) as *const u32));
-            hex_to_buf(buf, &mut off, b"GCTL=", core::ptr::read_volatile((DWC3 + 0xC110) as *const u32));
-            hex_to_buf(buf, &mut off, b"DSTS=", core::ptr::read_volatile((DWC3 + 0xC70C) as *const u32));
-            hex_to_buf(buf, &mut off, b"USB2PHY=", core::ptr::read_volatile((DWC3 + 0xC200) as *const u32));
-        }
-
-        for &b in b"END\n" { buf[off] = b; off += 1; }
-        ufs.write_block(FERROS_PART_LBA);
+        // Capture run-stop + auto-hibernate-timer BEFORE the command (post-init_transfer_list state).
+        ufs_diag[18] = r(0x60); // UTRLRSR — is the transfer list actually running?
+        ufs_diag[19] = r(0x18); // AHIT — auto-hibernate idle timer (nonzero = AH8 on; would gate the VS clock and explain the VS-region hang)
+        ufs_diag[20] = r(0x00); // CAP
+        ufs_diag[21] = r(0x54); // UTRLBAU
+        let ocs = ufs.read_block(1);
+        let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
+        ufs_diag[1] = ocs as u32;
+        ufs_diag[2] = r(0x20); // IS
+        ufs_diag[3] = r(0x30); // HCS
+        ufs_diag[4] = r(0x58); // UTRLDBR
+        ufs_diag[5] = r(0x50); // UTRLBA
+        ufs_diag[6] = r(0x38); // UECPA
+        ufs_diag[7] = r(0x3C); // UECDL
+        ufs_diag[8] = r(0x40); // UECN
+        ufs_diag[9] = r(0x44); // UECT
+        ufs_diag[10] = r(0x48); // UECDME
+        ufs_diag[11] = unsafe { core::ptr::read_volatile((0x131F_0000 + 0x00) as *const u32) };
+        ufs_diag[12] = unsafe { core::ptr::read_volatile((0x131F_0000 + 0x54) as *const u32) };
+        let data = ufs.data_buffer();
+        ufs_diag[13] = le(&data[0..4]);
+        ufs_diag[14] = le(&data[4..8]);
+        let rsp = ufs.response_upiu_head();
+        ufs_diag[15] = le(&rsp[0..4]);
+        ufs_diag[16] = le(&rsp[4..8]);
+        ufs_diag[17] = ufs.last_ocs() as u32;
     }
 
     // ---- DWC3 USB init ----
@@ -1727,6 +1749,29 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_T78=", rep_snap[7]);
                                                 append_hex(&mut resp, b"REP_T79=", rep_snap[8]);
                                                 append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
+                                                // UFS command-path forensics (read_block(1) at boot). See the ufs_diag layout comment.
+                                                append_hex(&mut resp, b"UFS_LINK=", ufs_diag[0]);
+                                                append_hex(&mut resp, b"UFS_READ_OCS=", ufs_diag[1]);
+                                                append_hex(&mut resp, b"UFS_IS=", ufs_diag[2]);
+                                                append_hex(&mut resp, b"UFS_HCS=", ufs_diag[3]);
+                                                append_hex(&mut resp, b"UFS_DBR=", ufs_diag[4]);
+                                                append_hex(&mut resp, b"UFS_UTRLBA=", ufs_diag[5]);
+                                                append_hex(&mut resp, b"UFS_UECPA=", ufs_diag[6]);
+                                                append_hex(&mut resp, b"UFS_UECDL=", ufs_diag[7]);
+                                                append_hex(&mut resp, b"UFS_UECN=", ufs_diag[8]);
+                                                append_hex(&mut resp, b"UFS_UECT=", ufs_diag[9]);
+                                                append_hex(&mut resp, b"UFS_UECDME=", ufs_diag[10]);
+                                                append_hex(&mut resp, b"UFS_S2MPU_CTRL0=", ufs_diag[11]);
+                                                append_hex(&mut resp, b"UFS_S2MPU_54=", ufs_diag[12]);
+                                                append_hex(&mut resp, b"UFS_DATA0=", ufs_diag[13]);
+                                                append_hex(&mut resp, b"UFS_DATA1=", ufs_diag[14]);
+                                                append_hex(&mut resp, b"UFS_RSP0=", ufs_diag[15]);
+                                                append_hex(&mut resp, b"UFS_RSP1=", ufs_diag[16]);
+                                                append_hex(&mut resp, b"UFS_LASTOCS=", ufs_diag[17]);
+                                                append_hex(&mut resp, b"UFS_RSR=", ufs_diag[18]);
+                                                append_hex(&mut resp, b"UFS_AHIT=", ufs_diag[19]);
+                                                append_hex(&mut resp, b"UFS_CAP=", ufs_diag[20]);
+                                                append_hex(&mut resp, b"UFS_UTRLBAU=", ufs_diag[21]);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {

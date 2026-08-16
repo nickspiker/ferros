@@ -565,4 +565,19 @@ impl UfsController {
     pub fn last_response_status(&self) -> u8 {
         unsafe { (*(&raw const UFS_BUF)).ucd.rsp_upiu[7] }
     }
+
+    /// First 16 bytes of the last Response UPIU (transaction code, flags, LUN, tag, response, status, ...). All zero = the controller never wrote a response (it never DMA'd the descriptors — points upstream of the device, at DMA/SysMMU/controller, not the device itself).
+    pub fn response_upiu_head(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        unsafe {
+            let rsp = &(*(&raw const UFS_BUF)).ucd.rsp_upiu;
+            out.copy_from_slice(&rsp[..16]);
+        }
+        out
+    }
+
+    /// Raw UTRD OCS field (dw[2] & 0xFF) from the last command — 0xF is our pre-armed "INVALID" sentinel; if it's still 0xF the controller never wrote the descriptor back.
+    pub fn last_ocs(&self) -> u8 {
+        unsafe { ((*(&raw const UFS_BUF)).utrd.dw[2] & 0xFF) as u8 }
+    }
 }
