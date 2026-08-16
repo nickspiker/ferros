@@ -43,6 +43,12 @@ Also relevant: `s2mpu_s0_hsi2@131f0000`, `sysreg_ufs@13020000`, CMU HSI2 clock d
 2. Once VS is accessible: set `NEXUS_TYPE |= 1<<tag` before each SCSI command (or `G#FFFFFFFF` once, Linux-style) and retest `read_block(1)` (GPT header, read-only).
 3. Then `miscprobe` works → boot-control block → and the vault storage path opens.
 
-## Misc / boot-control context
+## Misc / boot-control context (slot-rollback fix — BLOCKED on format RE)
 
-The slot-rollback fix does NOT wait on this: `tools/pixel8/mark-slot-a-successful.py` patches the AOSP `bootloader_control` block from Android + Magisk root (misc partition offset 2048): `slot_suffix="_a"`, slot A `successful=1 tries=7 pri=15`, CRC32 recomputed. A successful slot is never decremented — one-time fix, then ferros on slot A survives unlimited reboots.
+Goal was to stop ABL's A/B rollback by marking slot A "successful" (a successful slot is never decremented). Investigated 2026-08-16 from Android + Magisk root; **Pixel does NOT use the AOSP-standard layout**:
+
+- `misc` offset 0: BCB command field (`bootonce-bootloader`). Offset 2048: the ASCII string `theme-dark`, **not** the `bootloader_control` struct. No `BCAB`/`ABAB` magic anywhere in the first 64 KB of misc.
+- No dedicated `slot-metadata` partition. Slot state lives in the proprietary **`devinfo`** partition (`DEVI` magic; slot-looking bytes at offset ~32), managed by the gs-common boot HAL `device/google/gs-common/bootctrl/aidl/BootControl.cpp`.
+- `tools/pixel8/mark-slot-a-successful.py` assumed the standard offset; its read-verify gate caught the mismatch and refused to write (working as intended — a blind write here is the S2MPU/PMU-blind-write class of bug). Kept as a runnable record of the finding.
+
+**Workaround (works now):** `fastboot --set-active=a` — the bootloader writes the proprietary format correctly itself; resets slot A's retry count each time it rolls back. **Real fix (future):** get `device/google/gs-common` source, decode `BootControl.cpp`'s devinfo storage, then replicate from a rooted-Android script (short-term) or ferros itself (long-term, and itself blocked on the UFS command path above).
