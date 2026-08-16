@@ -1,6 +1,7 @@
 //! UFS (Universal Flash Storage) host controller driver.
 //!
-//! Talks to the UFSHCI v3.0 controller on QCM6490 (base 0x1D84000). ABL initializes the controller and brings up the UniPro link before handing off to us. We skip link startup and just issue SCSI commands thru the existing link.
+//! Talks to the UFSHCI v3.0 controller on Pixel 8 (zuma, base G#1320_0000).
+//! ABL initializes the controller, but its handoff state does not process host transfer requests (UFS.md) — `full_init()` re-initializes the controller from HCE reset: vendor config, M-PHY/UNIPRO calibration (see `ufs_cal`), DME_LINKSTARTUP, device init, and a power-mode change to HS-G4.
 //!
 //! ## Architecture
 //!
@@ -25,9 +26,17 @@ mod regs {
     pub const UTRLDBR: usize = 0x58;    // Transfer Request List Doorbell
     pub const UTRLCLR: usize = 0x5C;    // Transfer Request List Clear
     pub const UTRLRSR: usize = 0x60;    // Transfer Request List Run-Stop
+    pub const UTMRLBA: usize = 0x70;    // Task Mgmt Request List Base (low)
+    pub const UTMRLBAU: usize = 0x74;   // Task Mgmt Request List Base (high)
+    pub const UTMRLRSR: usize = 0x80;   // Task Mgmt Request List Run-Stop
+    pub const UICCMD: usize = 0x90;     // UIC Command
+    pub const UCMDARG1: usize = 0x94;
+    pub const UCMDARG2: usize = 0x98;
+    pub const UCMDARG3: usize = 0x9C;
 
     // IS bit definitions
     pub const IS_UTRCS: u32 = 1 << 0;   // Transfer Request Completion
+    pub const IS_UPMS: u32 = 1 << 4;    // UIC Power Mode Status
     pub const IS_UCCS: u32 = 1 << 10;   // UIC Command Completion
 
     // HCS bit definitions
@@ -85,6 +94,62 @@ mod ocs {
     pub const INVALID: u8 = 0x0F;  // Not yet completed
 }
 
+/// Exynos vendor-specified HCI register offsets (from `ufs_cal::base::HCI` = G#1320_1100). Subset used by `full_init`; full map in the reference `ufs-vs-regs.h`.
+#[allow(dead_code)]
+mod vs {
+    pub const TXPRDT_ENTRY_SIZE: usize = 0x00;
+    pub const RXPRDT_ENTRY_SIZE: usize = 0x04;
+    pub const US_TO_CNT_VAL: usize = 0x0C;
+    pub const UTRL_NEXUS_TYPE: usize = 0x40;
+    pub const UTMRL_NEXUS_TYPE: usize = 0x44;
+    pub const SW_RST: usize = 0x50;
+    pub const DATA_REORDER: usize = 0x60;
+    pub const AXIDMA_RWDATA_BURST_LEN: usize = 0x6C;
+    pub const GPIO_OUT: usize = 0x70;         // bit 0 = UFS device reset_n line
+    pub const V2P1_CTRL: usize = 0x8C;        // bit 16 = IA_TICK_SEL
+    pub const CLKSTOP_CTRL: usize = 0xB0;     // forced clock stops
+    pub const FORCE_HCS: usize = 0xB4;        // AUTO clock-stop enables — the M-PHY APB hang gate
+    pub const IOP_ACG_DISABLE: usize = 0x100;
+
+    pub const SW_RST_MASK: u32 = 0b11;        // UNIPRO | LINK
+    pub const PRDT_PREFETCH_EN: u32 = 1 << 31;
+    pub const WLU_EN: u32 = 1 << 31;
+    /// All auto clock-stop enable bits (CLK_STOP_CTRL_EN_ALL + core clk). We keep them OFF for the whole session: we poll, power is irrelevant during bring-up, and the auto-gate is what bus-hung the AP on every past PMA/vendor access.
+    pub const FORCE_HCS_ALL_EN: u32 = 0xFF0;
+    pub const CLK_STOP_ALL: u32 = 0x1F;
+}
+
+/// UNIPRO register offsets (from `ufs_cal::base::UNIPRO`) read by `full_init`.
+mod unip {
+    pub const PA_AVAILRXDATALANES: usize = 0x3100;
+    pub const PA_CONNECTEDRXDATALANES: usize = 0x3204;
+    pub const PA_ACTIVERXDATALANES: usize = 0x3200;
+    pub const PA_DBG_OPTION_SUITE_1: usize = 0x39A8;
+    pub const PA_DBG_OPTION_SUITE_2: usize = 0x39B4;
+    // ABL's values (captured on husky via payloads/ufsdump), NOT the gs-kernel runtime values (G#90913C1C / G#E01C115F — bits 27/11 differ). ABL's LK cal is what actually brings this link up from cold, so its debug-suite bits are the proven ones for link startup.
+    pub const DBG_SUITE1_ENABLE: u32 = 0x98913C1C;
+    pub const DBG_SUITE2_ENABLE: u32 = 0xE01C195F;
+}
+
+/// UIC command opcodes.
+mod uic {
+    pub const DME_GET: u32 = 0x01;
+    pub const DME_SET: u32 = 0x02;
+    pub const DME_LINKSTARTUP: u32 = 0x16;
+}
+
+/// UniPro PA-layer MIB attribute IDs for the power-mode change.
+mod pa {
+    pub const ACTIVETXDATALANES: u32 = 0x1560;
+    pub const TXGEAR: u32 = 0x1568;
+    pub const TXTERMINATION: u32 = 0x1569;
+    pub const HSSERIES: u32 = 0x156A;
+    pub const PWRMODE: u32 = 0x1571;
+    pub const ACTIVERXDATALANES: u32 = 0x1580;
+    pub const RXGEAR: u32 = 0x1583;
+    pub const RXTERMINATION: u32 = 0x1584;
+}
+
 /// UTP Transfer Request Descriptor (32 bytes, in DRAM).
 #[repr(C, align(32))]
 struct Utrd {
@@ -117,6 +182,14 @@ struct UfsBuffers {
     ucd: Ucd,
     data: [u8; 4096], // one block data buffer
 }
+
+/// UTP Task Management Request List — 1 slot (80-byte UTMRD). Never ringed; exists so HCS.UTMRLRDY has a valid base and the run-stop bit can be set, matching the standard `make_hba_operational` flow.
+#[repr(C, align(1024))]
+struct UtmrlBuf {
+    utmrd: [u32; 32],
+}
+
+static mut UTMRL_BUF: UtmrlBuf = UtmrlBuf { utmrd: [0; 32] };
 
 static mut UFS_BUF: UfsBuffers = UfsBuffers {
     utrd: Utrd { dw: [0; 8] },
@@ -579,5 +652,390 @@ impl UfsController {
     /// Raw UTRD OCS field (dw[2] & 0xFF) from the last command — 0xF is our pre-armed "INVALID" sentinel; if it's still 0xF the controller never wrote the descriptor back.
     pub fn last_ocs(&self) -> u8 {
         unsafe { ((*(&raw const UFS_BUF)).utrd.dw[2] & 0xFF) as u8 }
+    }
+
+    /// Physical address of the UTRD (== the value written to UTRLBA). No MMU on husky, so the CPU-visible address IS the physical address the UFS DMA master must reach.
+    pub fn utrd_phys(&self) -> u64 {
+        unsafe { &raw const UFS_BUF.utrd as usize as u64 }
+    }
+
+    /// Run one NOP OUT on the CURRENT link state without touching HCE/PHY/config — the pristine-ABL-link transfer test. Returns (ocs, rsp_transaction_code).
+    pub fn live_nop(&self) -> (u8, u8) {
+        let (ocs, rsp, _) = self.send_nop();
+        (ocs, rsp)
+    }
+}
+
+/// Step numbers for `InitReport::fail_step` (0 = no failure). Each is also the bit index set in `steps` on success.
+pub mod step {
+    pub const CLOCKS: u32 = 1;
+    pub const HCE_OFF: u32 = 2;
+    pub const SW_RST: u32 = 3;
+    pub const CONFIG_HOST: u32 = 4;
+    pub const DEV_RESET: u32 = 5;
+    pub const HCE_ON: u32 = 6;
+    pub const LANES: u32 = 7;
+    pub const PRE_LINK: u32 = 8;
+    pub const LINKSTARTUP: u32 = 9;
+    pub const DEVICE_PRESENT: u32 = 10;
+    pub const POST_LINK: u32 = 11;
+    pub const LISTS: u32 = 12;
+    pub const NOP: u32 = 13;
+    pub const FDEVICEINIT: u32 = 14;
+    pub const PMC_CAL: u32 = 15;
+    pub const PMC: u32 = 16;
+}
+
+/// Everything `full_init` measured, for DIAG reporting. All fields are raw u32 so the kernel can dump them without formatting logic.
+#[derive(Default)]
+pub struct InitReport {
+    /// Bit N set = step N completed (see `step`).
+    pub steps: u32,
+    /// First step that failed, 0 if the whole sequence succeeded. HS gear failure (PMC) leaves the link usable at PWM-G1 — check `steps` bit PMC.
+    pub fail_step: u32,
+    pub avail_rx: u32,
+    pub conn_rx: u32,
+    pub active_rx: u32,
+    /// EmbCalWait timeouts: pre_link | post_link<<8 | pre_pmc<<16.
+    pub cal_timeouts: u32,
+    pub linkstartup_tries: u32,
+    /// DME_LINKSTARTUP UCMDARG2 result of the last try (0 = success).
+    pub linkstartup_res: u32,
+    pub hcs_after_link: u32,
+    pub nop_tries: u32,
+    pub nop_ocs: u32,
+    pub fdev_ocs: u32,
+    pub fdev_polls: u32,
+    /// Which DME_SET failed during PMC (1-based index) <<8 | its result code. 0 = all fine.
+    pub pmc_set_fail: u32,
+    /// HCS.UPMCRS after the power-mode change (1 = PWR_LOCAL = success).
+    pub upmcrs: u32,
+    pub hcs_final: u32,
+    /// DME_LINKSTARTUP_CNF_RESULT (UNIPRO G#7854) from the last attempt.
+    pub ls_cnf: u32,
+    /// DME_INTR_ERROR_CODE (UNIPRO G#7B20) from the last attempt.
+    pub dme_err: u32,
+    /// DBG_PA_CTRLSTATE (UNIPRO G#15C) from the last attempt.
+    pub pa_state: u32,
+    /// UECPA after the last attempt (clear-on-read; cleared before each attempt).
+    pub uecpa: u32,
+}
+
+impl UfsController {
+    fn hci(&self, off: usize) -> u32 {
+        unsafe { crate::mmio::read32(crate::ufs_cal::base::HCI + off) }
+    }
+    fn hci_w(&self, off: usize, v: u32) {
+        unsafe { crate::mmio::write32(crate::ufs_cal::base::HCI + off, v) }
+    }
+    fn unipro(&self, off: usize) -> u32 {
+        unsafe { crate::mmio::read32(crate::ufs_cal::base::UNIPRO + off) }
+    }
+    fn unipro_w(&self, off: usize, v: u32) {
+        unsafe { crate::mmio::write32(crate::ufs_cal::base::UNIPRO + off, v) }
+    }
+
+    /// Clear every auto clock-stop enable and forced stop. HCE transitions and SW_RST can restore the power-on defaults (auto-gating ON), and any UNIPRO/PMA access with the M-PHY APB or UNIPRO mclk gated bus-hangs the AP — this is why the reference `ufs_call_cal` re-clears the gates around EVERY cal call. Call before any UNIPRO/PMA/cal access.
+    fn unlock_clocks(&self) {
+        self.hci_w(vs::FORCE_HCS, self.hci(vs::FORCE_HCS) & !vs::FORCE_HCS_ALL_EN);
+        self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !vs::CLK_STOP_ALL);
+    }
+
+    /// Issue a UIC command and wait for completion. Returns the UCMDARG2 result code (0 = success) or Err on timeout / UCRDY never ready.
+    pub fn uic_cmd(&self, cmd: u32, arg1: u32, arg2: u32, arg3: u32) -> Result<u32, ()> {
+        let mut ready = false;
+        for _ in 0..1_000_000u32 {
+            if self.read_reg(regs::HCS) & regs::HCS_UCRDY != 0 {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            return Err(());
+        }
+        self.write_reg(regs::IS, regs::IS_UCCS);
+        self.write_reg(regs::UCMDARG1, arg1);
+        self.write_reg(regs::UCMDARG2, arg2);
+        self.write_reg(regs::UCMDARG3, arg3);
+        self.write_reg(regs::UICCMD, cmd & 0xFF);
+        for _ in 0..1_000_000u32 {
+            if self.read_reg(regs::IS) & regs::IS_UCCS != 0 {
+                self.write_reg(regs::IS, regs::IS_UCCS);
+                return Ok(self.read_reg(regs::UCMDARG2) & 0xFF);
+            }
+        }
+        Err(())
+    }
+
+    /// DME_SET of a PA MIB attribute (selector = lane, 0 for link-global).
+    pub fn dme_set(&self, attr: u32, selector: u32, val: u32) -> Result<(), u32> {
+        match self.uic_cmd(uic::DME_SET, (attr << 16) | selector, 0, val) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(code),
+            Err(()) => Err(0xFFFF_FFFF),
+        }
+    }
+
+    /// DME_GET of a MIB attribute — returns UCMDARG3 (the value).
+    pub fn dme_get(&self, attr: u32, selector: u32) -> Result<u32, u32> {
+        match self.uic_cmd(uic::DME_GET, (attr << 16) | selector, 0, 0) {
+            Ok(0) => Ok(self.read_reg(regs::UCMDARG3)),
+            Ok(code) => Err(code),
+            Err(()) => Err(0xFFFF_FFFF),
+        }
+    }
+
+    /// Send a Query flag request (set / read). Returns (OCS, flag value from the response TSF).
+    fn query_flag(&self, query_fn: u8, opcode: u8, idn: u8) -> (u8, u32) {
+        unsafe {
+            let buf = &raw mut UFS_BUF;
+            core::ptr::write_bytes(&raw mut (*buf).ucd as *mut u8, 0, core::mem::size_of::<Ucd>());
+            (*buf).ucd.cmd_upiu[0] = upiu::QUERY_REQ;
+            (*buf).ucd.cmd_upiu[3] = 0; // task tag = doorbell slot
+            (*buf).ucd.cmd_upiu[5] = query_fn;
+            (*buf).ucd.cmd_upiu[12] = opcode;
+            (*buf).ucd.cmd_upiu[13] = idn;
+        }
+        let ocs = self.send_command(1, 0, 0);
+        let value = unsafe {
+            let rsp = &(*(&raw const UFS_BUF)).ucd.rsp_upiu;
+            ((rsp[20] as u32) << 24) | ((rsp[21] as u32) << 16) | ((rsp[22] as u32) << 8) | rsp[23] as u32
+        };
+        (ocs, value)
+    }
+
+    /// Full Exynos UFSHCI re-initialization from HCE reset, replaying what ABL's LK driver does: vendor config at enable time, M-PHY/UNIPRO cal, DME_LINKSTARTUP, device init, HS-G4 power mode.
+    /// Leaves all UFS clocks forced on (FORCE_HCS = 0) — see `vs::FORCE_HCS_ALL_EN`.
+    pub fn full_init(&self) -> InitReport {
+        use crate::ufs_cal::{self, udelay};
+        let mut r = InitReport::default();
+        let mut done = |r: &mut InitReport, s: u32| r.steps |= 1 << s;
+        macro_rules! fail {
+            ($r:expr, $s:expr) => {{
+                $r.fail_step = $s;
+                return $r;
+            }};
+        }
+
+        // 1. Clocks: kill every auto clock-stop and forced stop so nothing gates mid-sequence.
+        self.unlock_clocks();
+        done(&mut r, step::CLOCKS);
+
+        // 2..9. Host enable + link startup, retried as a UNIT: on a failed DME_LINKSTARTUP, ufshcd re-runs the whole hba_enable (SW_RST, config, device reset, HCE cycle, cal) before trying again — a bare command retry on the same enable never recovers. We mirror that.
+        let mut link_ok = false;
+        let mut cal = ufs_cal::CalParams { available_lane: 2, connected_rx_lane: 1, active_rx_lane: 1 };
+        for attempt in 1..=4u32 {
+            r.linkstartup_tries = attempt;
+
+            // HCE off.
+            self.write_reg(regs::HCE, 0);
+            let mut ok = false;
+            for _ in 0..1_000_000u32 {
+                if self.read_reg(regs::HCE) & 1 == 0 {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                fail!(r, step::HCE_OFF);
+            }
+            done(&mut r, step::HCE_OFF);
+
+            // Vendor SW reset of link + UNIPRO logic.
+            self.hci_w(vs::SW_RST, vs::SW_RST_MASK);
+            let mut ok = false;
+            for _ in 0..1_000_000u32 {
+                if self.hci(vs::SW_RST) & vs::SW_RST_MASK == 0 {
+                    ok = true;
+                    break;
+                }
+            }
+            if !ok {
+                fail!(r, step::SW_RST);
+            }
+            done(&mut r, step::SW_RST);
+
+            // config_host — the vendor block ABL applies before enable. NEXUS_TYPE here, BEFORE HCE 0->1, is the load-bearing line: it marks every tag as a nexus transfer at enable time.
+            self.unlock_clocks();
+            self.hci_w(vs::V2P1_CTRL, 0x4001_0000); // IA_TICK_SEL, as ABL left it
+            self.hci_w(vs::US_TO_CNT_VAL, 0xB2); // ABL's aggregation-timer count (ACLK MHz); unused by our polling driver
+            self.hci_w(vs::DATA_REORDER, 0xA);
+            self.hci_w(vs::TXPRDT_ENTRY_SIZE, vs::PRDT_PREFETCH_EN | 12);
+            self.hci_w(vs::RXPRDT_ENTRY_SIZE, 12);
+            self.hci_w(vs::UTRL_NEXUS_TYPE, 0xFFFF_FFFF);
+            self.hci_w(vs::UTMRL_NEXUS_TYPE, 0xFFFF_FFFF);
+            self.hci_w(vs::AXIDMA_RWDATA_BURST_LEN, (3 << 27) | 3); // ABL's value; the gs kernel also sets WLU_EN but ABL's proven bring-up does not
+            self.hci_w(vs::IOP_ACG_DISABLE, self.hci(vs::IOP_ACG_DISABLE) & !1);
+            self.unipro_w(unip::PA_DBG_OPTION_SUITE_1, unip::DBG_SUITE1_ENABLE);
+            self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
+            done(&mut r, step::CONFIG_HOST);
+
+            // Hardware-reset the UFS device via the dedicated reset_n line, then give it time to boot before asking for a link.
+            self.hci_w(vs::GPIO_OUT, 0);
+            udelay(5);
+            self.hci_w(vs::GPIO_OUT, 1);
+            udelay(2_000);
+            done(&mut r, step::DEV_RESET);
+
+            // HCE on.
+            self.write_reg(regs::HCE, 1);
+            let mut ok = false;
+            for _ in 0..1_000_000u32 {
+                if self.read_reg(regs::HCE) & 1 == 1 {
+                    ok = true;
+                    break;
+                }
+                udelay(1);
+            }
+            if !ok {
+                fail!(r, step::HCE_ON);
+            }
+            done(&mut r, step::HCE_ON);
+
+            // Available lanes from UNIPRO. HCE 0->1 restores the FORCE_HCS defaults — unlock again or this read hangs the bus.
+            self.unlock_clocks();
+            r.avail_rx = self.unipro(unip::PA_AVAILRXDATALANES);
+            cal.available_lane = if r.avail_rx == 2 { 2 } else { 1 };
+            done(&mut r, step::LANES);
+
+            // Pre-link cal, then clear stale UIC error state so this attempt's codes are its own.
+            r.cal_timeouts = (r.cal_timeouts & !0xFF) | (ufs_cal::pre_link(cal) & 0xFF);
+            done(&mut r, step::PRE_LINK);
+            let _ = self.read_reg(0x38); // UECPA is clear-on-read
+            self.write_reg(regs::IS, 0xFFFF_FFFF);
+
+            match self.uic_cmd(uic::DME_LINKSTARTUP, 0, 0, 0) {
+                Ok(0) => {
+                    r.linkstartup_res = 0;
+                    link_ok = true;
+                }
+                Ok(code) => r.linkstartup_res = code,
+                Err(()) => r.linkstartup_res = 0xFFFF_FFFF,
+            }
+            // UNIPRO-level forensics for the last attempt (success or failure).
+            r.ls_cnf = self.unipro(0x7854); // DME_LINKSTARTUP_CNF_RESULT
+            r.dme_err = self.unipro(0x7B20); // DME_INTR_ERROR_CODE
+            r.pa_state = self.unipro(0x15C); // DBG_PA_CTRLSTATE
+            r.uecpa = self.read_reg(0x38);
+            if link_ok {
+                break;
+            }
+            udelay(100_000);
+        }
+        if !link_ok {
+            fail!(r, step::LINKSTARTUP);
+        }
+        done(&mut r, step::LINKSTARTUP);
+
+        // 10. Device present.
+        let mut ok = false;
+        for _ in 0..1_000_000u32 {
+            if self.read_reg(regs::HCS) & regs::HCS_DP != 0 {
+                ok = true;
+                break;
+            }
+        }
+        r.hcs_after_link = self.read_reg(regs::HCS);
+        if !ok {
+            fail!(r, step::DEVICE_PRESENT);
+        }
+        done(&mut r, step::DEVICE_PRESENT);
+
+        // 11. Post-link cal with the lane picture the link negotiated.
+        self.unlock_clocks();
+        r.conn_rx = self.unipro(unip::PA_CONNECTEDRXDATALANES);
+        r.active_rx = self.unipro(unip::PA_ACTIVERXDATALANES);
+        cal.connected_rx_lane = r.conn_rx;
+        cal.active_rx_lane = r.active_rx;
+        r.cal_timeouts |= (ufs_cal::post_link(cal) & 0xFF) << 8;
+        done(&mut r, step::POST_LINK);
+
+        // 12. Transfer + task-management lists (standard make_hba_operational).
+        let utmrl = &raw const UTMRL_BUF as usize as u64;
+        self.write_reg(regs::UTMRLBA, utmrl as u32);
+        self.write_reg(regs::UTMRLBAU, (utmrl >> 32) as u32);
+        self.write_reg(regs::UTMRLRSR, 1);
+        self.init_transfer_list();
+        done(&mut r, step::LISTS);
+
+        // 13. NOP OUT — the device just came out of hardware reset, so give it retries.
+        let mut nop_ocs = 0xFFu8;
+        for attempt in 1..=8u32 {
+            r.nop_tries = attempt;
+            let (ocs, rsp, _) = self.send_nop();
+            nop_ocs = ocs;
+            if ocs == ocs::SUCCESS && rsp == upiu::NOP_IN {
+                break;
+            }
+            udelay(20_000);
+        }
+        r.nop_ocs = nop_ocs as u32;
+        if nop_ocs != ocs::SUCCESS {
+            fail!(r, step::NOP);
+        }
+        done(&mut r, step::NOP);
+
+        // 14. fDeviceInit: set the flag, poll until the device clears it (boot LUN scan etc).
+        let (set_ocs, _) = self.query_flag(0x81, 0x06, 0x01);
+        r.fdev_ocs = set_ocs as u32;
+        if set_ocs != ocs::SUCCESS {
+            fail!(r, step::FDEVICEINIT);
+        }
+        let mut ok = false;
+        for poll in 1..=512u32 {
+            r.fdev_polls = poll;
+            let (ocs, val) = self.query_flag(0x01, 0x05, 0x01);
+            if ocs == ocs::SUCCESS && val & 1 == 0 {
+                ok = true;
+                break;
+            }
+            udelay(4_000);
+        }
+        if !ok {
+            fail!(r, step::FDEVICEINIT);
+        }
+        done(&mut r, step::FDEVICEINIT);
+
+        // 15+16. Power-mode change to FAST HS-G4 x2, series B. Failure past this point is non-fatal: the link still works at PWM-G1.
+        self.unlock_clocks();
+        r.cal_timeouts |= (ufs_cal::pre_pmc_hs_b(cal) & 0xFF) << 16;
+        done(&mut r, step::PMC_CAL);
+        let lanes = if r.conn_rx == 2 { 2 } else { 1 };
+        let sets: [(u32, u32); 8] = [
+            (pa::ACTIVETXDATALANES, lanes),
+            (pa::ACTIVERXDATALANES, lanes),
+            (pa::TXGEAR, 4),
+            (pa::RXGEAR, 4),
+            (pa::TXTERMINATION, 1),
+            (pa::RXTERMINATION, 1),
+            (pa::HSSERIES, 2),
+            (pa::PWRMODE, 0x11), // FAST_MODE rx | tx — must be last, triggers the change
+        ];
+        self.write_reg(regs::IS, regs::IS_UPMS);
+        for (i, &(attr, val)) in sets.iter().enumerate() {
+            if let Err(code) = self.dme_set(attr, 0, val) {
+                r.pmc_set_fail = (((i + 1) as u32) << 8) | (code & 0xFF);
+                r.fail_step = step::PMC;
+                r.hcs_final = self.read_reg(regs::HCS);
+                return r;
+            }
+        }
+        let mut ok = false;
+        for _ in 0..1_000_000u32 {
+            if self.read_reg(regs::IS) & regs::IS_UPMS != 0 {
+                self.write_reg(regs::IS, regs::IS_UPMS);
+                ok = true;
+                break;
+            }
+        }
+        r.hcs_final = self.read_reg(regs::HCS);
+        r.upmcrs = (r.hcs_final >> 8) & 0x7;
+        if !ok || r.upmcrs != 1 {
+            fail!(r, step::PMC);
+        }
+        done(&mut r, step::PMC);
+        // Zuma post_pmc tables are empty with AH8 cal off — nothing to do.
+
+        r
     }
 }

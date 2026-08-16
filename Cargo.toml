@@ -24,6 +24,10 @@ members = [
     "payloads/ufsfix",
     "payloads/slot1nop",
     "payloads/miscprobe",
+    "payloads/ufsdump",
+    "payloads/ufsinit2",
+    "payloads/ufsreset",
+    "payloads/ufsdme",
 ]
 
 [workspace.package]

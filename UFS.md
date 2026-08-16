@@ -1,5 +1,58 @@
 # UFS on Pixel 8 (Zuma) — status and findings — Zil (0)
 
+## FULL RE-INIT BUILT + THE NEW WALL (2026-08-16 pm): link-startup handshake never completes
+
+Built the complete Exynos UFSHCI re-init path and tested it exhaustively on hardware. The wall moved from "transfers don't complete" down one layer to "the UniPro link won't start up for us at all."
+
+**What was built (all committed-ready in the tree):**
+- `ferros_hal/src/ufs_cal.rs` — faithful Rust port of Samsung's `ufs-cal-if` zuma tables (`/mnt/Harbor/ferros-ref/soc-gs/drivers/ufs/zuma/`): the full `init_cfg` PMA/PCS/UNIPRO pre-link table (57 rows), `post_init_cfg`, `calib_of_hs_rate_b`, the PCS AUX-lane-select window, line-reset tick math, mclk periods. Fixed params measured from ABL via `payloads/ufsdump` (mclk 133.33 MHz, 38.4 MHz refclk, 2 lanes, evt0, AH8 off). The critical `unlock_clocks` (clear HCI_FORCE_HCS auto clock-stop enables) is applied before every PMA/UNIPRO touch — this is what made the vendor region readable without the AP hang, definitively killing the old "vendor region hangs" theory.
+- `ferros_hal/src/ufs.rs` — `full_init()` (HCE reset → SW_RST → config_host → device reset → HCE on → pre_link cal → DME_LINKSTARTUP → post_link → lists → NOP → fDeviceInit → HS-G4 PMC), plus `uic_cmd`/`dme_set`/`dme_get`/`query_flag` and a 20-field `InitReport`. Retries the whole hba-enable as a unit (like ufshcd). Config values are ABL's proven ones captured via ufsdump (DBG_SUITE1=G#98913C1C etc), not the gs-kernel runtime values.
+- Kernel boot runs `full_init` and reports all fields over DIAG (`UFS_STEPS`, `UFS_FAIL`, `UFS_LS_RES`, `UFS_UECPA_LS`, …). Validated by hot-reload.
+
+**The hardware result (consistent across every variant):**
+```
+UFS_STEPS=1FE   every step up to LINKSTARTUP ran
+UFS_FAIL=9      step 9 = DME_LINKSTARTUP
+UFS_LS_RES=1    DME_LINKSTARTUP returns result code 1 = FAILURE
+UFS_LS_CNF=1    UNIP_DME_LINKSTARTUP_CNF_RESULT = 1 (same, via the direct UNIPRO reg path)
+UFS_UECPA=80000010   PHY-adapter error latched (valid + code G#10)
+HCS never sets DP    device-present never asserts; link never comes up
+AVAIL_RX=2           M-PHY APB is alive
+```
+
+**Isolation experiments (payloads, no reboots needed except where noted):**
+- `payloads/ufsdump` — vendor/UNIPRO/PMA regions ALL read fine with clocks unlocked. ABL's programmed state captured (NEXUS=G#FFFFFFFF, PRDT=G#C, etc).
+- `payloads/ufsinit2` — bare HCE cycle + config + LINKSTARTUP on **pristine ABL cal** (HCS_before=G#10F, fully healthy handoff): LINKSTARTUP still fails. So the HCE reset throws away the working link and neither ABL's surviving cal nor ours rebuilds it.
+- `payloads/ufsdme` — **DME command path WORKS**: `DME_GET` of PA_AvailTx/RxDataLanes returns 2/2, result 0. Direct UNIPRO `DME_LINKSTARTUP_REQ` (G#7850) also fails (CNF=1). So the host DME engine is fine; it's the link handshake with the device that fails.
+- `payloads/ufsreset` — tried, all no effect on LINKSTARTUP: (a) real device reset via the `gph5-1` RST_n pin (pinctrl G#1306_0000) driven directly as GPIO, held high; (b) routing `gph5-0` ufs_refclk_out to function 2; (c) PHY isolation check at PMU G#1546_3EC0 (already bypassed, bit0=1); (d) device VCC power-cycle via `gpp0-1` (GPIO_PERIC0 G#1084_0000).
+
+**Diagnosis:** the host side is healthy (DME works, M-PHY APB alive, PHY not isolated, cal applied). `DME_LINKSTARTUP` fails at the PHY-adapter/UniPro handshake — the **device** never re-enters its link boot. The most likely cause is that none of the reset paths tried actually resets the UFS device on this board: a UniPro device already in `LinkUp` ignores link-startup, so unless it's truly power/reset-cycled it will keep refusing. `gph5-1`/`gpp0-1` may not be the real reset/VCC controls on husky, or the writes need a different mux/sequence. The DTB (extracted from the factory `vendor_kernel_boot.img`, `/tmp/husky.dtb`) confirms the pin/PMU/regulator mapping matches the dtsi exactly.
+
+**PRISTINE-LINK TRANSFER TEST (2026-08-16, flashed kernel, definitive):** Flashed a kernel that tests a NOP on ABL's untouched link FIRST (before any reset), reporting the DMA physical address. Fresh boot, ABL's link fully healthy:
+```
+UFS_HCS_PRISTINE=010F   ABL link healthy: DP+UTRLRDY+UTMRLRDY+UCRDY, UPMCRS=1
+UFS_BUF_PHYS_LO=8008F400  UFS_BUF_PHYS_HI=0   our UTRD at physical G#8008_F400 (low DRAM, reachable)
+UFS_CTRL_UTRLBA=8008F400            controller holds EXACTLY our buffer address
+UFS_DBR_DUP=0                       no doorbell-duplication error
+UFS_LIVE_OCS=F   UFS_LIVE_DBR=1   UFS_LIVE_IS=0   NOP accepted, never executes, no interrupt, no error
+```
+**Addressing is perfect and the DMA-address theory is dead.** Cache-coherency is also ruled out: on husky ABL hands off with the **MMU and D-cache OFF** (`ferros_kernel` boot stub confirms it skips teardown because SCTLR.M is already clear), so DRAM writes are immediate and the controller reads the true descriptor. So: healthy link + correct address + valid UTRD + NEXUS set + list running → the Exynos controller STILL fetches/executes nothing, with no error bit. The transfer-list engine simply does not run for us on ABL's handed-off controller.
+
+**The wall is now two-sided and confirmed:**
+- **Reuse ABL's link** → the list-fetch engine never executes our doorbell (this test).
+- **Full HCE reset** → can re-arm the list engine but can't rebring the PHY link (DME_LINKSTARTUP fails).
+
+Neither "correct addressing" nor "cache" nor "NEXUS" is the gap. The missing piece is Exynos-specific controller state that (a) ABL's handoff doesn't expose to a second consumer of the transfer list, and (b) a full reset loses along with the PHY link. Prime unexplored suspects for the list engine not running: `HCI_UFS_AXI_DMA_IF_CTRL` (VS+G#F8) / `HCI_WRITE_DMA_CTRL` (VS+G#74) — an AXI-DMA interface enable the controller needs before it will issue descriptor fetches; or the Exynos per-doorbell timer block (`HCI_UTRL_DBR_TIMER_*`, VS+G#144). For the re-link path, the device-side refclk/reset (the device won't re-enter link boot; RST_n pin experiments changed nothing).
+
+**Two paths from here (next session):**
+1. **Make the device actually reset.** Find the true RST_n/VCC control (the `ufs_fixed_vcc` regulator is `gpio = <&gpp0 1>` — confirm gpp0-1 is really wired to VCC-enable and that our GPIO write reaches the pad; may need the pad's pull/drive set, or the reset is via a PMIC register not a SoC GPIO). If the device power-cycles, ABL's-equivalent link startup should take.
+2. **Don't reset at all — fix transfers on ABL's live link.** Revisit the ORIGINAL problem with clean tooling: on a fresh ABL boot the link is UP (HCS=G#10F, DP set); only our *transfers* never complete. Early payloads that "proved" NOP-fails-on-clean had the UTRLCLR-offset corruption bug. A minimal, bug-free "init_transfer_list + NOP on the untouched ABL link" test (one reboot to get ABL's link back) would re-check whether a DMA-address / cache / UTRD-format fix makes transfers complete — potentially much closer to done than re-linking. Suspect: UTRD/UCD **physical** address the UFS master sees (node is `dma-coherent`, no iommus → physical DMA), or the `fixed-prdt-req_list-ocs` quirk's UTRD OCS handling.
+
+Reboots roll back the A/B retry counter → ABL fell back to Android once during this session; recovered with `adb reboot bootloader && fastboot --set-active=a && fastboot reboot`. Budget reboots carefully.
+
+---
+
+
 ## THE FINDING (2026-08-16): our UFS commands have NEVER completed on husky
 
 Discovered while building `payloads/miscprobe` (GPT scan → misc partition → boot-control block). Evidence chain:

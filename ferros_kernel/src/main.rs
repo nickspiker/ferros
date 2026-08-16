@@ -1093,50 +1093,73 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let _ = (hex_to_buf, FERROS_PART_LBA); // retained: hex_to_buf used elsewhere; LBA is the real write target once the command path works
 
-    // ---- UFS command-path forensics (READ ONLY) ----
-    // Our UFS commands have never completed on husky (UFS.md): boot write left the doorbell stuck, IS clean, no error. Capture the full standard-region + S2MPU state around ONE read_block(1) (GPT header — read-only, safe) so the failure mode is unambiguous instead of guessed. All reads here are known-accessible (UFS standard region, and the S2MPU we already write) — NOT the VS region (G#1320_1100) or SysMMU (G#131C_0000), which may hang the AP; those are a separate gated experiment only if this comes back clean.
-    // ufs_diag layout, surfaced via DIAG "UFS_*" lines:
-    //   0 link_up  1 read_ocs  2 IS  3 HCS  4 UTRLDBR  5 UTRLBA
-    //   6 UECPA 7 UECDL 8 UECN 9 UECT 10 UECDME
-    //   11 S2MPU_HSI2_CTRL0 (expect 0 = disabled)  12 S2MPU_HSI2+0x54
-    //   13 databuf[0..4] ("EFI ")  14 databuf[4..8] ("PART")
-    //   15 resp_upiu[0..4]  16 resp_upiu[4..8]  17 last_ocs
+    // ---- UFS full re-initialization ----
+    // ABL's handoff state never processes host transfer requests (UFS.md, proven down to NOP-fails-on-clean-controller), so we re-own the controller from HCE reset: vendor config at enable time, M-PHY/UNIPRO calibration (ferros_hal::ufs_cal, the zuma ufs-cal-if port), DME_LINKSTARTUP, fDeviceInit, HS-G4 power-mode change.
+    // The historical vendor-region/PMA hangs were the HCI_FORCE_HCS auto clock-stop gates; full_init clears them first and leaves them off.
+    // Every wait in full_init is bounded (worst case a few seconds) — far inside the ~87s cluster watchdog, and a hang here auto-recovers via ABL A/B fallback anyway.
+    // Validation: read_block(1) = GPT header (read-only) — success is OCS=0 and "EFI PART" in the first 8 bytes.
+    // ufs_diag layout, surfaced via DIAG "UFS_*" lines (see the append_hex block).
     let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
-    let ufs_up = ufs.link_is_up();
-    let mut ufs_diag = [0u32; 24];
-    ufs_diag[0] = ufs_up as u32;
-    if ufs_up {
+    let mut ufs_diag = [0u32; 28];
+    {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
-        ufs.init_transfer_list();
-        // Capture run-stop + auto-hibernate-timer BEFORE the command (post-init_transfer_list state).
-        ufs_diag[18] = r(0x60); // UTRLRSR — is the transfer list actually running?
-        ufs_diag[19] = r(0x18); // AHIT — auto-hibernate idle timer (nonzero = AH8 on; would gate the VS clock and explain the VS-region hang)
-        ufs_diag[20] = r(0x00); // CAP
-        ufs_diag[21] = r(0x54); // UTRLBAU
-        let ocs = ufs.read_block(1);
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
-        ufs_diag[1] = ocs as u32;
+
+        // ---- Phase A: transfers on ABL's LIVE link (no reset, no full_init) ----
+        // This is the original problem, tested cleanly: on a fresh boot ABL leaves the link up (HCS=G#10F). If a NOP completes here, the transfer engine works and full_init is unnecessary — the whole saga was a transfer-setup bug, not a link bug.
+        // The UTRD physical address the controller must DMA is reported (no MMU → CPU addr == phys); if the UFS master can't reach it, that alone explains OCS=F.
+        let phys = ufs.utrd_phys();
+        ufs_diag[24] = (phys >> 32) as u32;
+        ufs_diag[25] = phys as u32;
+        let hcs_pristine = r(0x30);
+        ufs_diag[26] = hcs_pristine;
+        // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
+        unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
+        ufs.init_transfer_list();
+        let (live_ocs, live_rsp) = ufs.live_nop();
+        ufs_diag[0] = live_ocs as u32;
+        ufs_diag[1] = live_rsp as u32;
         ufs_diag[2] = r(0x20); // IS
-        ufs_diag[3] = r(0x30); // HCS
-        ufs_diag[4] = r(0x58); // UTRLDBR
-        ufs_diag[5] = r(0x50); // UTRLBA
+        ufs_diag[3] = r(0x58); // UTRLDBR
+        ufs_diag[4] = r(0x50); // UTRLBA (what the controller actually holds)
+        ufs_diag[5] = r(0x54); // UTRLBAU
         ufs_diag[6] = r(0x38); // UECPA
-        ufs_diag[7] = r(0x3C); // UECDL
-        ufs_diag[8] = r(0x40); // UECN
-        ufs_diag[9] = r(0x44); // UECT
-        ufs_diag[10] = r(0x48); // UECDME
-        ufs_diag[11] = unsafe { core::ptr::read_volatile((0x131F_0000 + 0x00) as *const u32) };
-        ufs_diag[12] = unsafe { core::ptr::read_volatile((0x131F_0000 + 0x54) as *const u32) };
-        let data = ufs.data_buffer();
-        ufs_diag[13] = le(&data[0..4]);
-        ufs_diag[14] = le(&data[4..8]);
-        let rsp = ufs.response_upiu_head();
-        ufs_diag[15] = le(&rsp[0..4]);
-        ufs_diag[16] = le(&rsp[4..8]);
-        ufs_diag[17] = ufs.last_ocs() as u32;
-        // CMU_HSI2 UFS Q-channel gate (read only): QCH_CON_UFS_EMBD @ CMU_HSI2(G#1300_0000)+G#30C4. Bits [0]=ENABLE(HWACG on) [1]=CLOCK_REQ [2]=IGNORE_FORCE_PM. If ENABLE=1 and the clock isn't forced, auto-gating stops the vendor-region APB clock → explains why reg_hci (G#1320_1100) hangs. This confirms/refutes the clock-gate root cause; NO write. CMU is core infra behind the HSI2 S2MPU we already disabled, so the read is low-risk.
-        ufs_diag[22] = unsafe { core::ptr::read_volatile((0x1300_30C4) as *const u32) };
-        ufs_diag[23] = unsafe { core::ptr::read_volatile((0x1300_30C8) as *const u32) }; // QCH_CON_UFS_EMBD_FMP
+        ufs_diag[7] = unsafe { core::ptr::read_volatile((0x1320_1220) as *const u32) }; // HCI_DBR_DUPLICATION_INFO (VS+G#120)
+        let live_ok = live_ocs == 0x00;
+
+        if live_ok {
+            // Transfer engine works on the live link — validate with a real read and stop.
+            let read_ocs = ufs.read_block(1);
+            ufs_diag[16] = read_ocs as u32;
+            let data = ufs.data_buffer();
+            ufs_diag[17] = le(&data[0..4]);
+            ufs_diag[18] = le(&data[4..8]);
+            ufs_diag[19] = r(0x20);
+            ufs_diag[20] = r(0x30);
+            ufs_diag[27] = 0xA11_00D; // sentinel: live path succeeded
+        } else {
+            // ---- Phase B: fall back to full controller re-init ----
+            let rep = ufs.full_init();
+            ufs_diag[8] = rep.steps;
+            ufs_diag[9] = rep.fail_step;
+            ufs_diag[10] = rep.linkstartup_res;
+            ufs_diag[11] = rep.nop_ocs;
+            ufs_diag[12] = rep.fdev_polls;
+            ufs_diag[13] = rep.pmc_set_fail;
+            ufs_diag[14] = rep.upmcrs;
+            ufs_diag[15] = rep.hcs_final;
+            let read_ocs = ufs.read_block(1);
+            ufs_diag[16] = read_ocs as u32;
+            let data = ufs.data_buffer();
+            ufs_diag[17] = le(&data[0..4]);
+            ufs_diag[18] = le(&data[4..8]);
+            ufs_diag[19] = r(0x20);
+            ufs_diag[20] = r(0x30);
+            ufs_diag[21] = r(0x58);
+            ufs_diag[22] = r(0x38);
+            ufs_diag[23] = ufs.last_response_status() as u32;
+            ufs_diag[27] = rep.uecpa;
+        }
     }
 
     // ---- DWC3 USB init ----
@@ -1372,31 +1395,32 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_T78=", rep_snap[7]);
                                                 append_hex(&mut resp, b"REP_T79=", rep_snap[8]);
                                                 append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
-                                                // UFS command-path forensics (read_block(1) at boot). See the ufs_diag layout comment.
-                                                append_hex(&mut resp, b"UFS_LINK=", ufs_diag[0]);
-                                                append_hex(&mut resp, b"UFS_READ_OCS=", ufs_diag[1]);
-                                                append_hex(&mut resp, b"UFS_IS=", ufs_diag[2]);
-                                                append_hex(&mut resp, b"UFS_HCS=", ufs_diag[3]);
-                                                append_hex(&mut resp, b"UFS_DBR=", ufs_diag[4]);
-                                                append_hex(&mut resp, b"UFS_UTRLBA=", ufs_diag[5]);
-                                                append_hex(&mut resp, b"UFS_UECPA=", ufs_diag[6]);
-                                                append_hex(&mut resp, b"UFS_UECDL=", ufs_diag[7]);
-                                                append_hex(&mut resp, b"UFS_UECN=", ufs_diag[8]);
-                                                append_hex(&mut resp, b"UFS_UECT=", ufs_diag[9]);
-                                                append_hex(&mut resp, b"UFS_UECDME=", ufs_diag[10]);
-                                                append_hex(&mut resp, b"UFS_S2MPU_CTRL0=", ufs_diag[11]);
-                                                append_hex(&mut resp, b"UFS_S2MPU_54=", ufs_diag[12]);
-                                                append_hex(&mut resp, b"UFS_DATA0=", ufs_diag[13]);
-                                                append_hex(&mut resp, b"UFS_DATA1=", ufs_diag[14]);
-                                                append_hex(&mut resp, b"UFS_RSP0=", ufs_diag[15]);
-                                                append_hex(&mut resp, b"UFS_RSP1=", ufs_diag[16]);
-                                                append_hex(&mut resp, b"UFS_LASTOCS=", ufs_diag[17]);
-                                                append_hex(&mut resp, b"UFS_RSR=", ufs_diag[18]);
-                                                append_hex(&mut resp, b"UFS_AHIT=", ufs_diag[19]);
-                                                append_hex(&mut resp, b"UFS_CAP=", ufs_diag[20]);
-                                                append_hex(&mut resp, b"UFS_UTRLBAU=", ufs_diag[21]);
-                                                append_hex(&mut resp, b"UFS_QCH=", ufs_diag[22]);
-                                                append_hex(&mut resp, b"UFS_QCH_FMP=", ufs_diag[23]);
+                                                // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
+                                                append_hex(&mut resp, b"UFS_LIVE_OCS=", ufs_diag[0]);
+                                                append_hex(&mut resp, b"UFS_LIVE_RSP=", ufs_diag[1]);
+                                                append_hex(&mut resp, b"UFS_LIVE_IS=", ufs_diag[2]);
+                                                append_hex(&mut resp, b"UFS_LIVE_DBR=", ufs_diag[3]);
+                                                append_hex(&mut resp, b"UFS_CTRL_UTRLBA=", ufs_diag[4]);
+                                                append_hex(&mut resp, b"UFS_CTRL_UTRLBAU=", ufs_diag[5]);
+                                                append_hex(&mut resp, b"UFS_LIVE_UECPA=", ufs_diag[6]);
+                                                append_hex(&mut resp, b"UFS_DBR_DUP=", ufs_diag[7]);
+                                                append_hex(&mut resp, b"UFS_BUF_PHYS_HI=", ufs_diag[24]);
+                                                append_hex(&mut resp, b"UFS_BUF_PHYS_LO=", ufs_diag[25]);
+                                                append_hex(&mut resp, b"UFS_HCS_PRISTINE=", ufs_diag[26]);
+                                                append_hex(&mut resp, b"UFS_STEPS=", ufs_diag[8]);
+                                                append_hex(&mut resp, b"UFS_FAIL=", ufs_diag[9]);
+                                                append_hex(&mut resp, b"UFS_LS_RES=", ufs_diag[10]);
+                                                append_hex(&mut resp, b"UFS_NOP_OCS=", ufs_diag[11]);
+                                                append_hex(&mut resp, b"UFS_FDEV_POLLS=", ufs_diag[12]);
+                                                append_hex(&mut resp, b"UFS_PMC_SETFAIL=", ufs_diag[13]);
+                                                append_hex(&mut resp, b"UFS_UPMCRS=", ufs_diag[14]);
+                                                append_hex(&mut resp, b"UFS_HCS_FINAL=", ufs_diag[15]);
+                                                append_hex(&mut resp, b"UFS_READ_OCS=", ufs_diag[16]);
+                                                append_hex(&mut resp, b"UFS_DATA0=", ufs_diag[17]);
+                                                append_hex(&mut resp, b"UFS_DATA1=", ufs_diag[18]);
+                                                append_hex(&mut resp, b"UFS_IS=", ufs_diag[19]);
+                                                append_hex(&mut resp, b"UFS_HCS=", ufs_diag[20]);
+                                                append_hex(&mut resp, b"UFS_DONE=", ufs_diag[27]);
                                                 // Recoverable watchdog state (ABL's config, reused). WTCON bit5=EN bit0=RSTEN; WTDAT = reload (~60s window).
                                                 append_hex(&mut resp, b"WDT0_CON=", wdt_con[0]);
                                                 append_hex(&mut resp, b"WDT0_DAT=", wdt_reload[0]);

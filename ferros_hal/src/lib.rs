@@ -16,7 +16,9 @@
 //
 // usb.rs ── DWC3 USB device mode struct Dwc3Dev — full device-mode controller state ::init() → Option<Self> ::poll_event() → UsbEvent ::bulk_in_send(data) → bool ::bulk_out_arm(), bulk_out_read(buf) → usize enum UsbEvent { None, Reset, SetupData, TransferComplete, ... } phy_init(), smmu_bypass(), probe() → Dwc3Info Single-TRB model, 1ms pacing for multi-packet inbound
 //
-// ufs.rs ── UFS host controller (UFSHCI v3.0 at G#1D84000) struct Ufs { base } ::new(), link_is_up() → bool ::nop_out() → bool ::scsi_read(lun, lba, blocks, buf) → bool ::scsi_write(lun, lba, blocks, buf) → bool ::query_descriptor(idn, index, buf) → Option<usize> 4KB blocks, 232GB LUN0, ABL leaves controller enabled
+// ufs.rs ── UFS host controller (UFSHCI v3.0 at G#13200000, Pixel 8) struct UfsController { base } ::new(base), link_is_up() → bool ::full_init() → InitReport (HCE reset → cal → LINKSTARTUP → fDeviceInit → HS-G4 PMC) ::probe() → UfsProbe ::read_block(lba)/write_block(lba) → OCS ::uic_cmd/dme_set/dme_get 4KB blocks, 232GB LUN0
+//
+// ufs_cal.rs ── zuma M-PHY/UNIPRO link calibration (port of Samsung ufs-cal-if) pre_link(), post_link(), pre_pmc_hs_b() region bases (STD/HCI/UNIPRO/PMA), udelay() CRITICAL: clear HCI_FORCE_HCS auto clock-stop enables before ANY PMA access — the auto-gate bus-hangs the AP
 //
 // ring.rs ── vault root ring on UFS (spec in RING.md) (implementation pending)
 //
@@ -41,6 +43,7 @@ pub mod uart;
 pub mod fb;
 pub mod dtb;
 pub mod ufs;
+pub mod ufs_cal;
 pub mod qtimer;            // aarch64 QTIMER read (moved here from old vsf_mini.rs)
 pub mod ring;
 pub mod gic;

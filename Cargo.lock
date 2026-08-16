@@ -599,7 +599,32 @@ name = "ferros-payload-slot1nop"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-ufsdme"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
+name = "ferros-payload-ufsdump"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-ufsfix"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
+name = "ferros-payload-ufsinit2"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
+name = "ferros-payload-ufsreset"
 version = "0.1.0"
 dependencies = [
  "ferros_hal",

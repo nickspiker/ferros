@@ -130,5 +130,5 @@ pub const SPLASH_FB_BASE: usize = 0xE100_0000;
 // Hardware base addresses
 // ---------------------------------------------------------------------------
 
-/// UFSHCI v3.0 controller base address.
-pub const UFS_BASE: usize = 0x01D8_4000;
+/// UFSHCI v3.0 controller base address (Pixel 8 / zuma, standard HCI block).
+pub const UFS_BASE: usize = 0x1320_0000;
