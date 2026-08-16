@@ -38,7 +38,26 @@ UFS_UECPA=80000010  latched PHY-adapter UIC error (valid+code G#10); UECDL/UECN/
 
 **Conclusion:** the controller accepts the doorbell but never fetches/executes the request — no descriptor writeback, no response UPIU, no interrupt — with nothing in the DMA path blocking it. That isolates the cause to the **Samsung vendor-specific controller config**, i.e. `HCI_UTRL_NEXUS_TYPE`.
 
-## The blocker: UTRL_NEXUS_TYPE is in a region that hangs on access
+## BREAKTHROUGH + WALL (2026-08-16, with the recoverable watchdog as safety net)
+
+With hangs now auto-recoverable, ran the vendor-region experiments directly (payloads `vendorprobe`, `ufsfix`):
+
+- **The vendor region does NOT hang.** `vendorprobe` read `NEXUS_TYPE` (`G#1320_1140`) fine = `G#FFFFFFFE`. The earlier "freeze" was a payload misfire (miscprobe also wrote the WRONG offset for UTRLCLR — 0x54/UTRLBAU instead of 0x5C — corrupting the base), NOT the vendor read. **The whole "VS region hangs" theory was wrong.**
+- **Root cause found:** `NEXUS_TYPE = G#FFFFFFFE` — every tag marked a SCSI nexus EXCEPT bit 0, the tag we use. Necessary fix, but not sufficient (below).
+- **Real HAL bug fixed:** `read_block`/`write_block`/query built the Command UPIU with **task tag 1** while `send_command` rings **doorbell slot 0**. In UFSHCI the task tag IS the slot index — must match. Fixed to tag 0 (the NOP path was already correct). This driver was written for the FP5 (QCM6490) and never validated (FP5 bricked), so latent bugs like this were expected.
+- **Vendor config was already set by ABL:** `TXPRDT/RXPRDT = G#C`, `DATA_REORDER = G#A`. Applying the full `config_host` block changed nothing.
+- **Link is fine:** `DME_HIBERNATE_EXIT` UIC command completes (the UIC interface works); clearing `UECPA` and re-running does NOT re-latch a PHY error, so `G#80000010` was historical link-setup noise, not per-command.
+- **THE WALL — even NOP fails on a clean controller:** on a freshly-rebooted controller (`HCS=010F` healthy, `HCE=1`, NEXUS bit 0 set), a bare NOP OUT (`probe()`) returns `OCS=F`, no response, no completion. The controller accepts the doorbell but processes NOTHING — not even the simplest transfer.
+
+### Conclusion: ABL's handoff state can't process our transfer requests
+
+HCE=1 and the link is up, but the doorbell mechanism is inert for us. Two candidate explanations:
+1. **Enable-time latching** (cheap fix if true): vendor config like `NEXUS_TYPE` is sampled when HCE goes 0→1. ABL enabled HCE with `NEXUS_TYPE=G#FFFFFFFE`, so bit 0 is latched-clear and our runtime write to set it is visible in the register but unused. **Test:** submit a request in slot **1** (whose NEXUS bit IS set) — ring `UTRLDBR=1<<1` with the UTRD in list slot 1 and UPIU tag 1. If it completes, latching is confirmed and using a pre-set slot is the whole fix (no re-init). Needs a manual 2-slot UTRD list (the HAL is single-slot).
+2. **Full re-init required** (the big fix): HCE reset (0→1) with our config applied at enable time, then `DME_LINKSTARTUP` to re-establish UniPro, then M-PHY re-calibration (the Exynos `ufs-cal-if` library — thousands of lines, device-specific tuning). ABL did this; redoing it is a real driver effort.
+
+**Next session:** run the slot-1 latching test first — it's cheap and decides between the two paths. Everything needed (NEXUS value, tag fix, doorbell-clear with the correct 0x5C offset, hibernate-exit UIC) is proven and in `payloads/ufsfix`.
+
+## (superseded) The blocker: UTRL_NEXUS_TYPE is in a region that hangs on access
 
 - **`HCI_UTRL_NEXUS_TYPE` (`reg_hci`+G#40 = `G#1320_1140`)**: per-tag bit, 1 = this tag is a SCSI/nexus transfer. The Linux driver sets `G#FFFFFFFF` at init (`config_host`) AND per-command (`exynos_ufs_set_nexus_t_xfer_req`). On a stock UFSHCI, RSR+doorbell+ready = execute; on Exynos the controller ignores the doorbell unless the tag's NEXUS bit is set. If ABL left it clear (or a reset cleared it), our command is silently ignored — matches every symptom above.
 - **But `reg_hci` (the vendor region, base `G#1320_1100` — confirmed via the driver's ioremap order, resource index 1) HANGS the AP on any CPU read** (froze the phone via miscprobe; `NEXUS_TYPE` at `G#1320_1140` is inside it). And it is NOT auto-hibernate (AHIT=0), so the cause of the gating is something else — most likely a CMU HSI2 UFS clock gate (the vendor region's APB clock stopped) or the auto-clock-gating controlled by `HCI_FORCE_HCS` (VS+G#B4 — itself in the gated region, a catch-22).

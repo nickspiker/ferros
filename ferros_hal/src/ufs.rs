@@ -283,7 +283,7 @@ impl UfsController {
             // Query Request UPIU
             (*buf).ucd.cmd_upiu[0] = upiu::QUERY_REQ;
             (*buf).ucd.cmd_upiu[1] = 0; // flags
-            (*buf).ucd.cmd_upiu[3] = 1; // task tag
+            (*buf).ucd.cmd_upiu[3] = 0; // task tag — MUST match the doorbell slot (we always ring slot 0)
             (*buf).ucd.cmd_upiu[5] = upiu::QUERY_FN_READ; // query function
             // Data segment length (big-endian u16 at bytes 10-11)
             (*buf).ucd.cmd_upiu[10] = 0;
@@ -522,7 +522,7 @@ impl UfsController {
             0x00,                        // control
         ];
 
-        self.build_scsi_upiu(0, 1, upiu::FLAG_READ, 4096, &cdb);
+        self.build_scsi_upiu(0, 0, upiu::FLAG_READ, 4096, &cdb);
         self.setup_prdt(4096);
 
         // direction=2 (device→host), cmd_type=0 (SCSI), 1 PRDT entry
@@ -544,7 +544,7 @@ impl UfsController {
             0x00,
         ];
 
-        self.build_scsi_upiu(0, 1, upiu::FLAG_WRITE, 4096, &cdb);
+        self.build_scsi_upiu(0, 0, upiu::FLAG_WRITE, 4096, &cdb);
         self.setup_prdt(4096);
 
         // direction=1 (host→device), cmd_type=0 (SCSI), 1 PRDT entry

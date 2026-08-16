@@ -20,6 +20,8 @@ members = [
     "payloads/repeatertune",
     "payloads/dispprobe",
     "payloads/hangtest",
+    "payloads/vendorprobe",
+    "payloads/ufsfix",
     "payloads/miscprobe",
 ]
 
