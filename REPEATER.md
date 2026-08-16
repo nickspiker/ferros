@@ -146,7 +146,18 @@ Written self-contained so it lifts straight into `ferros_hal::hsi2c` for the ker
 2. ~~Read the full tuning register set (healthy-boot baseline)~~ **DONE** — baseline block above.
 3. Capture the same dump on a *flaky* boot (watchdog retry streak) and diff — does the repeater lose its tune, or is the bus itself dead? This decides whether the fix is re-tune or full re-init.
 4. Add a repeater re-init + tune sequence; prove via payload that a flaky link can be *rescued* by re-tuning the repeater while up.
-5. **Fold into the kernel**: extract the engine to `ferros_hal::hsi2c`, run repeater init in `kernel_main` before the eUSB2 PHY init, gated so it doesn't fight ABL's setup when that survived. Target: deterministic enumeration, sub-5s, no watchdog retries.
+5. Fold into the kernel — engine extracted to `ferros_hal::hsi2c` (**DONE**); DIAG now snapshots REV_ID + tune set before PHY init every boot (**DONE**, `REP_*` lines, untested pending next boot). Remaining: gated repeater re-init in `kernel_main`. Target: deterministic enumeration, sub-5s, no watchdog retries.
+
+## Open incident: RUN hangs on PT-REBOOT boots (2026-08-16, device needs power-cycle)
+
+Attempted step 3 by cycling `bridge reboot` (PT REBOOT cap → PSCI SYSTEM_RESET) and probing each boot. Result:
+
+- Original boot (via `fastboot reboot`, 40s enumeration): `bridge run repeaterprobe.bin` worked **3/3**.
+- Cycle 1 (PT REBOOT warm reset, 16s enumeration): `status` fine, `bridge run` **hung indefinitely**. Kernel main loop still alive — the next `bridge reboot` was accepted.
+- Cycle 2 (16s→80s enumeration, flaky streak): same — `status` fine, `run` hung.
+- After killing the hung host processes, the device dropped off the bus entirely (no ferros VID, no fastboot, no adb) — frozen, and our kernel disables the Exynos cluster watchdogs (e42b9a1), so nothing resets it. **Physical power-cycle required.**
+
+Facts, not yet explained: RUN (a 3-chunk PT Write + Exec) hangs 2/2 on warm-reset boots but worked 3/3 on the fastboot-path boot; REBOOT still worked after the first hang, so the kernel loop wasn't wedged — the PT inbound path was. Killing a bridge mid-transfer leaves the kernel's PT recv state stuck (known one-transfer-at-a-time design), which likely compounds. Next session: reproduce with `bridge dbg` counters read BEFORE any run attempt on a warm-reset boot (dbg is EP0, bypasses the bulk path) — measure, then fix.
 
 ## What NOT to do
 
