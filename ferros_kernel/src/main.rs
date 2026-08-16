@@ -1428,6 +1428,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         reg &= !((1 << 4) | (1 << 5));
         core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
     };
+    // eUSB2 repeater snapshot BEFORE PHY init (reads only — the bus is shared with the PMIC chain).
+    // Answers, on every boot, "did ABL's repeater state survive the jump?" — DIAG reports it, so flaky boots self-document at the analog layer, not just the link layer.
+    // Slot 0 = REV_ID (healthy G#3), slots 1..9 = CONFIG_PORT1 + the 8 tune registers (healthy baseline in REPEATER.md). Read failure = G#8000_0000 | TRANS_STATUS[15:0].
+    let rep_snap: [u32; 9] = {
+        let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+        i2c.init();
+        let rep = |reg: u8| match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
+            Ok(v) => v as u32,
+            Err(trans) => 0x8000_0000 | (trans & 0xFFFF),
+        };
+        [rep(0xB0), rep(0x60), rep(0x70), rep(0x71), rep(0x72), rep(0x73), rep(0x77), rep(0x78), rep(0x79)]
+    };
+
     eusb_phy_init();
 
     // If we survived, S2MPU is bypassed and PHY is initialized. Now try UFS + USB.
@@ -1472,9 +1485,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut usb = ferros_hal::usb::Dwc3Dev::init();
 
     // ---- Killswitch + USB event loop with PT command dispatch ----
-    // Both volume buttons held = SYSTEM_OFF (killswitch). PT commands: DIAG (live diagnostics
-    // over USB), RELOAD (stage kernel — Write counts, Exec/jump is TODO), REBOOT (PSCI
-    // SYSTEM_RESET via smc — Tensor has EL3). Mirrors the M1 dispatch loop (m1_usb_event_loop).
+    // Both volume buttons held = SYSTEM_OFF (killswitch). PT commands: DIAG (live diagnostics over USB), RELOAD (stage kernel — Write counts, Exec/jump is TODO), REBOOT (PSCI SYSTEM_RESET via smc — Tensor has EL3). Mirrors the M1 dispatch loop (m1_usb_event_loop).
     use ferros_hal::usb::UsbEvent;
 
     // Killswitch: both volume buttons held → PSCI SYSTEM_OFF. Checked once per iteration.
@@ -1687,6 +1698,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     append_hex(&mut resp, b"  LINKDBG=", dbg);
                                                     append_hex(&mut resp, b"  DSTS=", dsts);
                                                 }
+                                                // Repeater state as captured before PHY init this boot (REV_ID + CONFIG_PORT1 + tune set; G#8000_xxxx = I2C read failed). Baseline in REPEATER.md.
+                                                append_hex(&mut resp, b"REP_REV=", rep_snap[0]);
+                                                append_hex(&mut resp, b"REP_CFG=", rep_snap[1]);
+                                                append_hex(&mut resp, b"REP_T70=", rep_snap[2]);
+                                                append_hex(&mut resp, b"REP_T71=", rep_snap[3]);
+                                                append_hex(&mut resp, b"REP_T72=", rep_snap[4]);
+                                                append_hex(&mut resp, b"REP_T73=", rep_snap[5]);
+                                                append_hex(&mut resp, b"REP_T77=", rep_snap[6]);
+                                                append_hex(&mut resp, b"REP_T78=", rep_snap[7]);
+                                                append_hex(&mut resp, b"REP_T79=", rep_snap[8]);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {

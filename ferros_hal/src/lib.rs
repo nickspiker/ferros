@@ -30,6 +30,8 @@
 //
 // ring.rs ── vault root ring on UFS/SD (spec in RING.md) (implementation pending)
 //
+// hsi2c.rs ── Exynos HSI2C (USI-I2C) master, polling/auto-mode (port of i2c-exynos5.c, hardware-proven on Pixel 8 hsi2c_11) struct Hsi2c { base } ::new(base), init() — MASTER+AUTO_MODE, reuses ABL timing (no SW_RST) ::xfer(addr, buf, is_read, stop) → Result<(), trans_status> ::read_reg(addr, reg) → Result<u8, u32>, write_reg(addr, reg, val) PIXEL8_HSI2C11_BASE (G#10CB0000), PIXEL8_EUSB_REPEATER_ADDR (G#3E)
+//
 // pmic_glink.rs ── SMEM/GLINK transport to ADSP charger_pd (BATTMGR) probe_smem() → SmemProbe — read-only SMEM/GLINK state for diagnostics probe_rtc() → Option<u32> — PMK8350 RTC via SPMI SID=0 PID=G#61 offset=G#48 struct PmicGlink { desc, tx_fifo, rx_fifo, rcid } ::init() → Option<Self> — locate SMEM items 478/479/480 ::open_channel() → bool — GLINK VERSION + OPEN handshake ::bat_status() → Option<BatStatus> — voltage/SOC/current/temp ::property_get(prop) → Option<u32> — single battery property ::set_charge_limit(target_soc, delta) → bool — cap charging at target% struct BatStatus — state, capacity_pct, rate_ma, voltage_mv, source, temp_tenths_k PROP_VOLT_NOW(7), PROP_CURR_NOW(9), PROP_CAPACITY(4), PROP_TEMP(12)
 
 //! Ferros Hardware Abstraction Layer
@@ -60,6 +62,7 @@ pub mod hyp;
 pub mod dpu;
 pub mod pstore;
 pub mod spmi;
+pub mod hsi2c;
 
 // Modules requiring alloc
 #[cfg(feature = "alloc")]
