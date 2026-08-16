@@ -1101,6 +1101,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // ufs_diag layout, surfaced via DIAG "UFS_*" lines (see the append_hex block).
     let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
     let mut ufs_diag = [0u32; 28];
+    let mut pmaw = [0u32; 12]; // ABL working-link PMA/PA snapshot (Phase A)
+    let mut pmaf = [0u32; 12]; // post-full_init failed-link PMA/PA snapshot (Phase B)
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
@@ -1113,6 +1115,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         ufs_diag[25] = phys as u32;
         let hcs_pristine = r(0x30);
         ufs_diag[26] = hcs_pristine;
+        // Register-diff baseline: snapshot ABL's WORKING-link PMA/PA state before we touch anything (only meaningful on a fresh flash+boot where HCS_PRISTINE=G#10F). pmaf is captured after full_init's failed startup; the diff reveals the enable/power-up step the cal table omits.
+        pmaw = ufs.snapshot_pma();
         // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
         unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
         ufs.init_transfer_list();
@@ -1157,6 +1161,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ufs_diag[22] = r(0x38);
             ufs_diag[23] = rep.linkstartup_tries;
             ufs_diag[27] = rep.uecpa;
+            pmaf = ufs.snapshot_pma(); // failed-link PMA/PA state for the diff against pmaw
         }
     }
 
@@ -1422,6 +1427,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_UECPA=", ufs_diag[22]);
                                                 append_hex(&mut resp, b"UFS_LS_TRIES=", ufs_diag[23]);
                                                 append_hex(&mut resp, b"UFS_DONE=", ufs_diag[27]);
+                                                // PMA/PA register diff: W=ABL working link (Phase A), F=post-full_init failed (Phase B). Order: PMA 000/140/150/19C/1A0/C74, PMA-lane0 9F0/9F4/A00, PA_CTRLSTATE, PA_TX_STATE, MAXRXHSGEAR.
+                                                let pma_labels: [&[u8]; 12] = [b"P000", b"P140", b"P150", b"P19C", b"P1A0", b"PC74", b"P9F0", b"P9F4", b"PA00", b"PACS", b"PATX", b"MXGR"];
+                                                for i in 0..12 {
+                                                    let mut lw = [0u8; 16]; let mut n = 0;
+                                                    for &b in b"UFS_W_" { lw[n] = b; n += 1; }
+                                                    for &b in pma_labels[i] { lw[n] = b; n += 1; }
+                                                    append_hex(&mut resp, &lw[..n], pmaw[i]);
+                                                }
+                                                for i in 0..12 {
+                                                    let mut lf = [0u8; 16]; let mut n = 0;
+                                                    for &b in b"UFS_F_" { lf[n] = b; n += 1; }
+                                                    for &b in pma_labels[i] { lf[n] = b; n += 1; }
+                                                    append_hex(&mut resp, &lf[..n], pmaf[i]);
+                                                }
                                                 // Recoverable watchdog state (ABL's config, reused). WTCON bit5=EN bit0=RSTEN; WTDAT = reload (~60s window).
                                                 append_hex(&mut resp, b"WDT0_CON=", wdt_con[0]);
                                                 append_hex(&mut resp, b"WDT0_DAT=", wdt_reload[0]);

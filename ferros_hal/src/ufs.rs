@@ -664,6 +664,19 @@ impl UfsController {
         let (ocs, rsp, _) = self.send_nop();
         (ocs, rsp)
     }
+
+    /// Snapshot 12 PMA/PA/UNIPRO registers for a working-vs-failed link register-diff (the concrete next lead in UFS.md). Clears the FORCE_HCS auto clock-stop gates first — a PMA read with the gate on bus-hangs the AP. Order: PMA COMN 0x000/0x140/0x150/0x19C/0x1A0/0xC74, PMA TRSV lane0 0x9F0/0x9F4/0xA00, UNIPRO PA_CTRLSTATE 0x15C / PA_TX_STATE 0x160 / MAXRXHSGEAR 0x321C.
+    pub fn snapshot_pma(&self) -> [u32; 12] {
+        self.hci_w(vs::FORCE_HCS, self.hci(vs::FORCE_HCS) & !vs::FORCE_HCS_ALL_EN);
+        self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !vs::CLK_STOP_ALL);
+        let pma = |off: usize| unsafe { crate::mmio::read32(crate::ufs_cal::base::PMA + off) };
+        let uni = |off: usize| unsafe { crate::mmio::read32(crate::ufs_cal::base::UNIPRO + off) };
+        [
+            pma(0x000), pma(0x140), pma(0x150), pma(0x19C),
+            pma(0x1A0), pma(0xC74), pma(0x9F0), pma(0x9F4),
+            pma(0xA00), uni(0x15C), uni(0x160), uni(0x321C),
+        ]
+    }
 }
 
 /// Step numbers for `InitReport::fail_step` (0 = no failure). Each is also the bit index set in `steps` on success.

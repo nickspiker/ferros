@@ -63,6 +63,31 @@ Config was also aligned to the reference re-link path (was speculatively using A
 
 **THE concrete next lead (register-diff against ABL's working link):** boot fresh (ABL link UP + working, HCS=G#10F), dump the full PMA + PA control register state via an extended `ufsdump`, then dump the same after `full_init`'s failed startup. The register(s) that differ are what ABL sets to enable PA transmit that the zuma cal table alone doesn't — likely a PA power-on / TX-lane-enable / `DME_ENABLE`(UNIPRO G#7830) / `DME_POWERON`(G#7800) step the core ufshcd driver does that `full_init` omits. The cal table is faithful, so the gap is in the *orchestration around* it (a DME enable/power-on or PA TX power-up), not the table values. Suspect specifically: a missing `DME_ENABLE_REQ`/`DME_POWERON_REQ` before `DME_LINKSTARTUP`, or a TX-lane power-up the standard ufshcd core issues that we skip.
 
+**REGISTER-DIFF DONE — HOST SIDE CLEARED, DEVICE IS SILENT (2026-08-16, decisive):** Flashed a kernel that snapshots ABL's WORKING-link PMA/PA state (Phase A, fresh boot HCS=G#10F) and the post-`full_init` FAILED state (Phase B), same 12 registers, one boot. Result:
+```
+             WORKING(ABL)   FAILED(full_init)
+PMA 0x000    00000011       00000011     same (top-level power state)
+PMA 0x140    00000000       00000000     same
+PMA 0x150    00000088       00000088     same
+PMA 0x19C    0000004C       0000004C     same
+PMA 0x1A0    000000AE       0000004C     differ — but cal SETS 0x4C; 0xAE is the post-negotiation value
+PMA 0xC74    00000019       00000019     same (cal-done)
+PMA 0x9F0    00000000       000000D0     differ — cal SETS 0xD0; 0x00 is the post-negotiation value
+PMA 0x9F4    00000000       00000000     same (squelch)
+PMA 0xA00    00000030       00000030     same
+PA_CTRLSTATE 00000000       00000000     same  <- PATX/PACS read 0 on BOTH; NOT diagnostic
+PA_TX_STATE  00000000       00000000     same     (kills the earlier "PA never transmits" idea)
+MAXRXHSGEAR  00000004       00000000     differ — THE TELL
+```
+The only PMA diffs (0x1A0, 0x9F0) are registers the cal writes to 0x4C/0xD0 (which the FAILED state correctly shows) and which only change to 0xAE/0x00 once a link successfully negotiates — i.e. **consequences of link-up, not causes of failure.** The failed PMA state exactly matches the correct post-cal state.
+
+**`MAXRXHSGEAR`: 4 (working) vs 0 (failed).** That register holds the max HS gear the DEVICE advertises during the link-startup capability exchange. 0 = the device advertised nothing = **the device is completely silent during link startup.** Combined with PLL-locks + cal-correct + zero-errors, this is conclusive: the host/M-PHY side is fully correct; the flash DEVICE does not respond to our link-startup. It is not being reset (or reference-clocked) into a re-negotiation-ready state.
+
+**So the entire remaining problem is device-side.** The host calibration/sequence is proven correct by three independent lines (audit, ufsinit2, register-diff). The device stays silent. Candidate causes, in order:
+1. **Device reset not actually happening.** `full_init` pulses HCI_GPIO_OUT bit0 (the reference `exynos_ufs_dev_hw_reset` mechanism) — but if that GPIO doesn't reach the device reset_n on husky, or the pulse is too short, the device never drops its ABL link state and ignores our new link-startup. Decisive test: on ABL's live link, pulse GPIO_OUT=0 and watch HCS.DP — if the device drops, GPIO_OUT controls reset; if not, it doesn't and that's the bug.
+2. **Reference clock to the device not running after our reset** — the device PHY needs REFCLKOUT to boot; if our HCE/SW reset stops it and we don't restart it, the device is clockless. (We keep FORCE_HCS refclk-stop bits clear, but there may be a separate refclk enable ABL/Linux sets via the clk framework.)
+3. **My device reset is HARMING** — untested hypothesis: skip the device reset entirely in `full_init` (or give a much longer post-reset settle) and see if link-startup then completes. Linux gives the device time via the slow clk/regulator framework path; our tight sequence may reset then link-startup before the device finishes booting.
+
 **Two paths from here (next session):**
 1. **Make the device actually reset.** Find the true RST_n/VCC control (the `ufs_fixed_vcc` regulator is `gpio = <&gpp0 1>` — confirm gpp0-1 is really wired to VCC-enable and that our GPIO write reaches the pad; may need the pad's pull/drive set, or the reset is via a PMIC register not a SoC GPIO). If the device power-cycles, ABL's-equivalent link startup should take.
 2. **Don't reset at all — fix transfers on ABL's live link.** Revisit the ORIGINAL problem with clean tooling: on a fresh ABL boot the link is UP (HCS=G#10F, DP set); only our *transfers* never complete. Early payloads that "proved" NOP-fails-on-clean had the UTRLCLR-offset corruption bug. A minimal, bug-free "init_transfer_list + NOP on the untouched ABL link" test (one reboot to get ABL's link back) would re-check whether a DMA-address / cache / UTRD-format fix makes transfers complete — potentially much closer to done than re-linking. Suspect: UTRD/UCD **physical** address the UFS master sees (node is `dma-coherent`, no iommus → physical DMA), or the `fixed-prdt-req_list-ocs` quirk's UTRD OCS handling.
