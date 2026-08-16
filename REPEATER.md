@@ -94,14 +94,24 @@ adb shell su -c 'cat /proc/device-tree/<parent-i2c-bus>/compatible'      # confi
 
 Alternatively, decompile the on-device dtbo (`dtc`/`fdtget` on the extracted `dtbo.img`) — no reboot needed, but the root command above is faster. Fill both into the probe payload's constants and iterate.
 
+## HSI2C engine — WRITTEN (payloads/repeaterprobe)
+
+The HSI2C master engine is ported and compiles clean — a faithful translation of the `i2c-exynos5.c` **polling / auto-mode** path (the controller drives START/ADDR/STOP itself once `ADDR` + `AUTO_CONF.len` + `MASTER_RUN` are set; no manual bit-banging). Register map and bit constants copied verbatim from the ref. Key decisions, both from the "do less than the C driver" principle:
+
+- **No SW_RST in `init()`** — it would force recomputing the SCL timing. We ensure only `MASTER` + `AUTO_MODE` and *reuse ABL's calibrated `TIMING_*`* (same trick that fixed the PHY). The probe dumps `CTL`/`CONF`/`TIMING_*` first so we can see ABL's state before trusting it.
+- **Polling, our own spin bound** — hardware `TIMEOUT_EN` disabled; we bound each phase with a spin counter (no jiffies/IRQs), matching the rest of ferros.
+- `read_reg` = write reg pointer (repeated-start, `stop=false`) then read the byte (`stop=true`) — exactly the ref's 2-message read.
+
+Written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel once proven. **Two placeholders remain** (`HSI2C_BASE`, `REPEATER_ADDR`) — fill from DT (above) and it's ready to run. (Note: with the placeholders in place the compiler DCEs the whole engine down to the guard message — that's expected; real addresses restore the full ~1.1KB blob.)
+
 ## Bring-up plan (iterate over the RUN channel, no kernel reflash)
 
-The beauty: this is testable as a **payload**. `bridge run repeaterprobe.bin` runs against the already-enumerated device and reports back — no reflash, no re-rolling enumeration per iteration. The hard 80% (HSI2C bring-up + talking to the chip) is fully iterable this way.
+The beauty: this is testable as a **payload**. `bridge run repeaterprobe.bin` runs against the already-enumerated device and reports back — no reflash, no re-rolling enumeration per iteration. The hard 80% (the HSI2C engine) is done.
 
-1. **`repeaterprobe` payload** — bring up HSI2C (reuse ABL timing), read `REV_ID` (`G#B0`), report it. First success = the driver works.
-2. Read the full tuning register set; compare against a healthy-boot baseline (the same before/after discipline `usbprobe` established).
+1. **Fill the two DT constants**, `bridge run repeaterprobe.bin` — expect the config dump then `REV_ID=…` + `REPEATER BUS UP`. First success = the engine works and the bus is ours. A `no ACK / timeout` with `TRANS_STATUS`/`ERR_STATUS` means wrong base or address — try the next `hsi2c@` candidate.
+2. Read the full tuning register set; compare against a healthy-boot baseline (the before/after discipline `usbprobe` established).
 3. Add a repeater re-init + tune sequence; prove via payload that a flaky link can be *rescued* by re-tuning the repeater while up.
-4. **Fold into the kernel**: run repeater init in `kernel_main` before the eUSB2 PHY init, gated so it doesn't fight ABL's setup when that survived. Target: deterministic enumeration, sub-5s, no watchdog retries.
+4. **Fold into the kernel**: extract the engine to `ferros_hal::hsi2c`, run repeater init in `kernel_main` before the eUSB2 PHY init, gated so it doesn't fight ABL's setup when that survived. Target: deterministic enumeration, sub-5s, no watchdog retries.
 
 ## What NOT to do
 
