@@ -48,9 +48,9 @@ We don't fight the IOVA translation; we replace the surface. Exactly what `kerne
 3. **Point DECON at our own buffer.** Allocate a physical pixel buffer in kernel DRAM (known physical address), write `DPP0 RDMA_BASEADDR_P0` (`G#1990_0040`) to it. With the SYSMMU bypassed, DECON DMAs that physical address directly.
 4. **Write pixels** (reuse `ferros_hal::console` 8x16 font for text), then **re-trigger one DECON frame** (`decon_reg.c` shadow-update + `GLOBAL_CON` trigger) → DSC-compressed frame → panel GRAM → latched. One trigger per screen change (command mode).
 
-## The catch: chicken-and-egg + freeze risk
+## The catch: chicken-and-egg + freeze risk — safety net now DONE
 
-Every step above is a NEW MMIO write on this device, and there's no screen yet to show a breadcrumb if one hangs — and the cluster watchdogs are disabled, so a hang is a silent physical-power-cycle, not an A/B recovery. **Recommended ordering: bring up a recoverable cluster watchdog FIRST** (re-enable with a ~60s timeout, pet it in the main loop; a hang stops the petting → self-reset). That makes the display bring-up (and the UFS vendor-region experiment) recoverable instead of freeze-on-mistake. It is the one piece of safety infrastructure that unblocks everything else on this device.
+Every step above is a NEW MMIO write on this device, and there's no screen yet to show a breadcrumb if one hangs. **The recoverable cluster watchdog (b602854) is now live and proven**: a hang auto-resets in ~87s and the phone re-enumerates on its own (verified with `payloads/hangtest`). So the display bring-up is no longer freeze-on-mistake — a bad DPU S2MPU / SYSMMU / DECON write that hangs recovers automatically. That was the one blocking piece of safety infrastructure; the SYSMMU-bypass steps above can now be attempted one at a time.
 
 ## Effort estimate
 
