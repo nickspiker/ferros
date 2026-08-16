@@ -127,11 +127,8 @@ pub const RELOAD_STAGE_BASE: usize = 0x9000_0000;
 pub const SPLASH_FB_BASE: usize = 0xE100_0000;
 
 // ---------------------------------------------------------------------------
-// Hardware base addresses (QCM6490 / Fairphone 5)
+// Hardware base addresses
 // ---------------------------------------------------------------------------
 
 /// UFSHCI v3.0 controller base address.
 pub const UFS_BASE: usize = 0x01D8_4000;
-
-/// SDHCI controller base for SD card (SDC2).
-pub const SDHCI_BASE: usize = 0x08804000;

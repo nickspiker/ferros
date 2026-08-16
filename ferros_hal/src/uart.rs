@@ -2,9 +2,9 @@
 //!
 //! Two backends:
 //! - **QEMU virt**: PL011 at 0x0900_0000 (for testing)
-//! - **QCM6490**: GENI Serial Engine UART (for FP5)
+//! - **GENI SE**: GENI Serial Engine UART (legacy backend, kept for QEMU/bring-up)
 //!
-//! We only implement TX (print). RX comes later when we need a console. ABL typically leaves the debug UART initialized on QCM6490, so we can start writing to the TX FIFO after cancelling any in-flight command.
+//! We only implement TX (print). RX comes later when we need a console. The bootloader typically leaves the debug UART initialized, so we can start writing to the TX FIFO after cancelling any in-flight command.
 
 use crate::mmio;
 
@@ -15,7 +15,7 @@ pub enum UartBackend {
     Null,
     /// ARM PL011 UART (QEMU virt machine).
     Pl011 { base: usize },
-    /// Qualcomm GENI SE UART (QCM6490).
+    /// GENI SE UART (legacy backend).
     GeniSe { base: usize },
 }
 
