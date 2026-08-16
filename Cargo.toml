@@ -16,6 +16,7 @@ members = [
     "payloads/usbprobe",
     "payloads/pmuprobe",
     "payloads/pmupoke",
+    "payloads/repeaterprobe",
 ]
 
 [workspace.package]
