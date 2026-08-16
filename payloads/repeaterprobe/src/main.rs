@@ -1,28 +1,22 @@
 //! eUSB2 repeater probe — bring up HSI2C and read the repeater's REV_ID (G#B0).
 //!
-//! First bring-up milestone for [REPEATER.md]. A successful REV_ID read proves the HSI2C
-//! engine works and the repeater bus is ours; everything after is tuning writes.
+//! First bring-up milestone for [REPEATER.md]. A successful REV_ID read proves the HSI2C engine works and the repeater bus is ours; everything after is tuning writes.
 //!
-//! The HSI2C engine below is a faithful port of the Linux `i2c-exynos5.c` POLLING path
-//! (auto-mode: the controller drives START/ADDR/STOP itself once ADDR + AUTO_CONF.len +
-//! MASTER_RUN are set). Register map and bit constants are copied verbatim from that driver.
-//! It is written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel's
-//! enumeration path once proven here.
+//! The HSI2C engine below is a faithful port of the Linux `i2c-exynos5.c` POLLING path (auto-mode: the controller drives START/ADDR/STOP itself once ADDR + AUTO_CONF.len + MASTER_RUN are set). Register map and bit constants are copied verbatim from that driver.
+//! It is written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel's enumeration path once proven here.
 //!
-//! Runs over the RUN channel against the already-enumerated device — no kernel reflash, no
-//! re-rolling enumeration per iteration.
+//! Runs over the RUN channel against the already-enumerated device — no kernel reflash, no re-rolling enumeration per iteration.
 //!
-//! !!! TWO CONSTANTS BELOW ARE PLACEHOLDERS !!! Fill from the live DT (Android + Magisk root),
-//! see REPEATER.md "The two unknowns": HSI2C_BASE (one of the zuma-usi.dtsi bases) and
-//! REPEATER_ADDR (the eusb-repeater node's 7-bit 'reg').
+//! Constants mined from the live husky DT (2026-08-16): repeater is `eusb-repeater@3E` on `hsi2c@10CB0000` (hsi2c_11, `samsung,exynos5-hsi2c`, status okay).
+//! That bus is SHARED with the battery/USB-C management chain (max77759 PMIC/charger/fuel-gauge/TCPC, pca9468) — reads only until the repeater is positively identified; never write blind.
 
 #![no_std]
 #![no_main]
 
-// ---- FILL THESE FROM DT (REPEATER.md) ----
-const HSI2C_BASE: usize = 0xDEAD_0000; // TODO: parent i2c bus 'reg' base (a zuma-usi.dtsi hsi2c@ addr)
-const REPEATER_ADDR: u8 = 0x00; // TODO: eusb-repeater 'reg' (7-bit)
-// ------------------------------------------
+// ---- from live DT: /proc/device-tree/hsi2c@10CB0000/eusb-repeater@3E ----
+const HSI2C_BASE: usize = 0x10CB_0000; // hsi2c_11 (zuma-usi.dtsi), bus 'reg' = G#10CB_0000 size G#1000
+const REPEATER_ADDR: u8 = 0x3E; // eusb-repeater 'reg' (7-bit)
+// -------------------------------------------------------------------------
 
 const REV_ID: u8 = 0xB0; // repeater chip-revision register — the bring-up target
 
@@ -220,11 +214,6 @@ impl Out {
 pub extern "C" fn _entry(_inp: *const u8, _in_len: usize, out: *mut u8, out_cap: usize) -> u64 {
     let mut o = Out { ptr: out, cap: out_cap, n: 0 };
 
-    if HSI2C_BASE == 0xDEAD_0000 || REPEATER_ADDR == 0 {
-        o.s(b"HSI2C_BASE / REPEATER_ADDR are placeholders - fill from DT (REPEATER.md)\n");
-        return o.n as u64;
-    }
-
     let i2c = Hsi2c { base: HSI2C_BASE };
 
     // Recon first: dump what ABL left in the controller (confirms the right base + calibrated timing).
@@ -246,8 +235,38 @@ pub extern "C" fn _entry(_inp: *const u8, _in_len: usize, out: *mut u8, out_cap:
             o.line(b"REV_ID_FAIL_TRANS_STATUS", trans);
             o.line(b"ERR_STATUS", i2c.rd(ERR_STATUS));
             o.s(b"no ACK / timeout - wrong base or addr?\n");
+            return o.n as u64;
         }
     }
+
+    // Full tuning/config register baseline (reads only) — compare healthy vs flaky boots.
+    // Names passed at call sites (adr, PC-relative), NOT via a const pointer table: the blob runs relocated from its link base of 0, so data-section absolute pointers read garbage.
+    let dump = |o: &mut Out, name: &[u8], reg: u8| match i2c.read_reg(REPEATER_ADDR, reg) {
+        Ok(v) => o.line(name, v as u32),
+        Err(trans) => {
+            o.s(name);
+            o.s(b"=READ_FAIL trans=");
+            o.hex(trans);
+            o.put(b'\n');
+        }
+    };
+    dump(&mut o, b"GPIO0_CONFIG", 0x00);
+    dump(&mut o, b"GPIO1_CONFIG", 0x40);
+    dump(&mut o, b"UART_PORT1", 0x50);
+    dump(&mut o, b"CONFIG_PORT1", 0x60);
+    dump(&mut o, b"U_TX_ADJUST_PORT1", 0x70);
+    dump(&mut o, b"U_HS_TX_PRE_EMPHASIS_P1", 0x71);
+    dump(&mut o, b"U_RX_ADJUST_PORT1", 0x72);
+    dump(&mut o, b"U_DISCONNECT_SQUELCH_PORT1", 0x73);
+    dump(&mut o, b"E_HS_TX_PRE_EMPHASIS_P1", 0x77);
+    dump(&mut o, b"E_TX_ADJUST_PORT1", 0x78);
+    dump(&mut o, b"E_RX_ADJUST_PORT1", 0x79);
+    dump(&mut o, b"INT_STATUS_1", 0xA3);
+    dump(&mut o, b"INT_STATUS_2", 0xA4);
+    dump(&mut o, b"I2C_GLOBAL_CONFIG", 0xB2);
+    dump(&mut o, b"INT_ENABLE_1", 0xB3);
+    dump(&mut o, b"INT_ENABLE_2", 0xB4);
+    dump(&mut o, b"BC_CONTROL", 0xB6);
 
     o.n as u64
 }

@@ -69,7 +69,16 @@ Minimal master-transfer flow (mirrors `i2c-exynos5.c`):
 
 The full gs-google kernel source (branch `android-gs-shusky-5.15-android15-qpr1`, the exact branch our device runs) is cloned on this machine at **`/mnt/Harbor/ferros-ref/soc-gs`** — all drivers *and* the SoC device tree, 31M shallow clone. `tools/pixel8/phy-ref/` is the old piecemeal subset; the Harbor tree is the whole thing. Grep it instead of fetching files one at a time. Driver: `drivers/phy/samsung/eusb_repeater.c`; SoC DTS: `arch/arm64/boot/dts/google/zuma-usi.dtsi` (HSI2C controllers), `zuma-usb.dtsi` (USB/PHY). The husky *device* overlay (which binds the repeater to a specific bus + address) is NOT in this tree — it ships as a compiled dtbo on the device; read it live (below).
 
-## The two unknowns (one lives in the SoC DTS, one needs live DT)
+## The two unknowns — SOLVED (live DT, 2026-08-16)
+
+Mined from `/proc/device-tree` on the running device (Android + Magisk root):
+
+- **Bus: `hsi2c@10CB0000`** = `hsi2c_11` from the zuma-usi.dtsi table. Compatible `samsung,exynos5-hsi2c`, status okay, `reg` = `G#10CB_0000` size `G#1000`.
+- **Repeater: `eusb-repeater@3E`** — 7-bit address `G#3E`.
+- **The bus is shared** with the entire battery/USB-C management chain: max77729 PMIC, max77759 charger/fuel-gauge/TCPC, pca9468 charge pump, all on `hsi2c_11`. Reads are safe; a stray write on this bus can touch power management. Never write blind.
+- DT search quirk: the repeater node does NOT match `find -iname '*repeater*'` on the device's toybox find; list `hsi2c@*/` children and read their `compatible` instead.
+
+<details><summary>Original mining procedure (for reference)</summary>
 
 **Candidate HSI2C bases (from `zuma-usi.dtsi`, authoritative for Tensor G3):**
 
@@ -94,7 +103,34 @@ adb shell su -c 'cat /proc/device-tree/<parent-i2c-bus>/compatible'      # confi
 
 Alternatively, decompile the on-device dtbo (`dtc`/`fdtget` on the extracted `dtbo.img`) — no reboot needed, but the root command above is faster. Fill both into the probe payload's constants and iterate.
 
-## HSI2C engine — WRITTEN (payloads/repeaterprobe)
+</details>
+
+## MILESTONE: REPEATER BUS UP (2026-08-16)
+
+`bridge run repeaterprobe.bin` succeeded **first try** against the live device: `REV_ID = G#3`. The HSI2C engine works, the bus is ours, and the no-SW_RST design bet paid off — ABL left the controller in master + auto mode with calibrated FS timing, and we rode it as-is.
+
+**Healthy-boot baseline** (this boot enumerated normally, ~40s):
+
+```
+HSI2C controller state as ABL left it:
+CTL=G#48  CONF=G#980110FF  TIMING_FS1=G#01F0FF00  TIMING_FS3=G#3E0000  TIMING_SLA=G#0  TRANS_STATUS=G#80001
+
+Repeater registers (all 8-bit):
+REV_ID=G#03                          GPIO0_CONFIG=G#10   GPIO1_CONFIG=G#00
+UART_PORT1=G#02                      CONFIG_PORT1=G#10
+U_TX_ADJUST_PORT1=G#7C               U_HS_TX_PRE_EMPHASIS_P1=G#3C
+U_RX_ADJUST_PORT1=G#92               U_DISCONNECT_SQUELCH_PORT1=G#83
+E_HS_TX_PRE_EMPHASIS_P1=G#C8         E_TX_ADJUST_PORT1=G#16
+E_RX_ADJUST_PORT1=G#60               INT_STATUS_1=G#00   INT_STATUS_2=G#00
+I2C_GLOBAL_CONFIG=G#00               INT_ENABLE_1=G#00   INT_ENABLE_2=G#00
+BC_CONTROL=G#C0
+```
+
+The nonzero `*_ADJUST`/`*_EMPHASIS` values are ABL's applied tune set (the DT `repeater_tune*` table). On a flaky boot, run the same probe and diff against this block — a mismatch (or a dead bus) fingerprints the failure.
+
+Payload gotcha for the record: register *names* were first emitted via a `const` pointer table and came out as NULs — the blob runs relocated from link base 0, so data-section absolute pointers are garbage. Pass byte-string literals at call sites (compiler emits PC-relative `adr`); this applies to every future payload.
+
+## HSI2C engine — PROVEN ON HARDWARE (payloads/repeaterprobe)
 
 The HSI2C master engine is ported and compiles clean — a faithful translation of the `i2c-exynos5.c` **polling / auto-mode** path (the controller drives START/ADDR/STOP itself once `ADDR` + `AUTO_CONF.len` + `MASTER_RUN` are set; no manual bit-banging). Register map and bit constants copied verbatim from the ref. Key decisions, both from the "do less than the C driver" principle:
 
@@ -102,16 +138,15 @@ The HSI2C master engine is ported and compiles clean — a faithful translation 
 - **Polling, our own spin bound** — hardware `TIMEOUT_EN` disabled; we bound each phase with a spin counter (no jiffies/IRQs), matching the rest of ferros.
 - `read_reg` = write reg pointer (repeated-start, `stop=false`) then read the byte (`stop=true`) — exactly the ref's 2-message read.
 
-Written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel once proven. **Two placeholders remain** (`HSI2C_BASE`, `REPEATER_ADDR`) — fill from DT (above) and it's ready to run. (Note: with the placeholders in place the compiler DCEs the whole engine down to the guard message — that's expected; real addresses restore the full ~1.1KB blob.)
+Written self-contained so it lifts straight into `ferros_hal::hsi2c` for the kernel once proven — and it is now proven (REV_ID + full 17-register baseline read over live I2C).
 
 ## Bring-up plan (iterate over the RUN channel, no kernel reflash)
 
-The beauty: this is testable as a **payload**. `bridge run repeaterprobe.bin` runs against the already-enumerated device and reports back — no reflash, no re-rolling enumeration per iteration. The hard 80% (the HSI2C engine) is done.
-
-1. **Fill the two DT constants**, `bridge run repeaterprobe.bin` — expect the config dump then `REV_ID=…` + `REPEATER BUS UP`. First success = the engine works and the bus is ours. A `no ACK / timeout` with `TRANS_STATUS`/`ERR_STATUS` means wrong base or address — try the next `hsi2c@` candidate.
-2. Read the full tuning register set; compare against a healthy-boot baseline (the before/after discipline `usbprobe` established).
-3. Add a repeater re-init + tune sequence; prove via payload that a flaky link can be *rescued* by re-tuning the repeater while up.
-4. **Fold into the kernel**: extract the engine to `ferros_hal::hsi2c`, run repeater init in `kernel_main` before the eUSB2 PHY init, gated so it doesn't fight ABL's setup when that survived. Target: deterministic enumeration, sub-5s, no watchdog retries.
+1. ~~Fill the two DT constants, read REV_ID~~ **DONE** — `REV_ID=G#3`, `REPEATER BUS UP`.
+2. ~~Read the full tuning register set (healthy-boot baseline)~~ **DONE** — baseline block above.
+3. Capture the same dump on a *flaky* boot (watchdog retry streak) and diff — does the repeater lose its tune, or is the bus itself dead? This decides whether the fix is re-tune or full re-init.
+4. Add a repeater re-init + tune sequence; prove via payload that a flaky link can be *rescued* by re-tuning the repeater while up.
+5. **Fold into the kernel**: extract the engine to `ferros_hal::hsi2c`, run repeater init in `kernel_main` before the eUSB2 PHY init, gated so it doesn't fight ABL's setup when that survived. Target: deterministic enumeration, sub-5s, no watchdog retries.
 
 ## What NOT to do
 
