@@ -30,28 +30,41 @@ DPP0_RDMA_BASE_P0  = FAC00000   framebuffer base DECON DMAs from
 
 **This is the good news:** ABL leaves DECON *fully configured* — enabled, command mode, holding the splash, DMA pointed at a real surface. We do NOT need to bring up DECON/DSIM/DSC/panel from scratch. Breadcrumbs reduce to: **write new pixels into the FB, then re-trigger one DECON frame** (a small `decon_reg_start` / shadow-update + trigger sequence from `cal_9865/decon_reg.c`).
 
-## The open question: is `G#FAC0_0000` physical or an IOVA?
+## `G#FAC0_0000` is an IOVA behind the DPU SYSMMU (confirmed via DT)
 
-DECON's RDMA reads through the **display SYSMMU** (`G#1984_0000`), so `G#FAC0_0000` is what *DECON* uses — an IOVA. Two cases:
-- **Identity-mapped / SYSMMU bypass** → `G#FAC0_0000` is also the CPU physical address; we write pixels there directly. Easy. (ABL FBs are often physically contiguous and identity-mapped.)
-- **Translated** → the CPU-physical address differs; we must read the display SYSMMU page tables (IOVA `G#FAC0_0000` → physical) to find where to write. The SYSMMU is write-protected but reads may be allowed — TBD.
+DECON0 in the DT has `iommus = <&sysmmu_dpuf0>, <&sysmmu_dpuf1>`, and there is NO reserved-memory carveout at `G#FAC0_0000` (the only 0xF-range rmem is `G#FD80_0000`). So `G#FAC0_0000` is a **DPU-SYSMMU IOVA**, not a CPU-physical address. DPU SYSMMU bases (zuma-sysmmu.dtsi):
 
-### Deciding it SAFELY (next step)
+```
+sysmmu_dpuf0  G#1984_0000   (the "write locks the CPU" one from the boot notes)
+sysmmu_dpuf1  G#19C4_0000
+```
 
-A blind CPU read of `G#FAC0_0000` risks a fault/freeze if that region sits under an active DPU S2MPU (we've only disabled the HSI0/HSI2 S2MPUs, not the DPU's) — and with no screen yet and watchdogs disabled, a freeze is a silent physical-power-cycle. So do NOT read it blind. Options, cheapest first:
-1. Check `G#FAC0_0000` against the live DT `/reserved-memory` and the DPU S2MPU's allowed ranges (from Android, read-only) — is it a known FB carveout, and is it CPU-reachable?
-2. Read the display SYSMMU (`G#1984_0000`) context/page-table-base register (read, not write) to see if translation is even enabled; if disabled/bypass, IOVA==physical.
-3. Only then attempt a guarded read, ideally once a recoverable-watchdog or a second breadcrumb channel exists.
+## The plan — same pattern as the USB SYSMMU bypass we already ship
 
-## Re-trigger sequence (once the FB is writable) — from cal_9865
+We don't fight the IOVA translation; we replace the surface. Exactly what `kernel_main` already does for DWC3 (disable S2MPU → disable SYSMMU → DMA physical addresses):
 
-Command-mode frame kick (to be confirmed against `decon_reg.c`): update the DPP RDMA base if needed → set the DECON shadow-update/`GLOBAL_CON` trigger → DECON sends one frame over DSI (DSC-compressed) to the panel GRAM → new image latches. No continuous scanout needed; one trigger per screen change.
+1. **Disable the DPU S2MPU.** The DPU SYSMMU at `G#1984_0000` currently "locks the CPU on write" because a DPU-block S2MPU protects it. Find that S2MPU (an `s2mpu_*dpu*` in zuma-sysmmu/s2mpu DTS) and disable it (write 0 to CTRL0 — the proven sequence). Then the SYSMMU CTRL becomes writable.
+2. **Disable/bypass the DPU SYSMMU** (`G#1984_0000` + `G#19C4_0000`): Samsung SysMMU v9 `MMU_CTRL` (offset 0) bit0=0 → translation off (same as the USB SysMMU bypass at `G#1104_0000`).
+3. **Point DECON at our own buffer.** Allocate a physical pixel buffer in kernel DRAM (known physical address), write `DPP0 RDMA_BASEADDR_P0` (`G#1990_0040`) to it. With the SYSMMU bypassed, DECON DMAs that physical address directly.
+4. **Write pixels** (reuse `ferros_hal::console` 8x16 font for text), then **re-trigger one DECON frame** (`decon_reg.c` shadow-update + `GLOBAL_CON` trigger) → DSC-compressed frame → panel GRAM → latched. One trigger per screen change (command mode).
+
+## The catch: chicken-and-egg + freeze risk
+
+Every step above is a NEW MMIO write on this device, and there's no screen yet to show a breadcrumb if one hangs — and the cluster watchdogs are disabled, so a hang is a silent physical-power-cycle, not an A/B recovery. **Recommended ordering: bring up a recoverable cluster watchdog FIRST** (re-enable with a ~60s timeout, pet it in the main loop; a hang stops the petting → self-reset). That makes the display bring-up (and the UFS vendor-region experiment) recoverable instead of freeze-on-mistake. It is the one piece of safety infrastructure that unblocks everything else on this device.
+
+## Effort estimate
+
+Feasible and the path is known, but it's a **multi-step bring-up** (~a few focused hardware sessions), not a one-shot: DPU S2MPU discovery + disable, SYSMMU bypass, DECON RDMA re-point, pixel write, frame re-trigger — each an iteration. ABL having left DECON configured (command mode, holding a frame) removes the hardest part (no DSIM/DSC/panel bring-up from scratch).
 
 ## Status
 
 - [x] Identify panel/DPU (command mode + DSC, cal_9865)
 - [x] Clone the display driver (Harbor `display-gs`)
 - [x] Confirm ABL leaves DECON enabled + holding a frame; find FB base `G#FAC0_0000`
-- [ ] Determine physical-vs-IOVA for `G#FAC0_0000` (safely — see above)
+- [x] Determine physical-vs-IOVA: it's a DPU-SYSMMU IOVA (DT `iommus`, no rmem carveout)
+- [ ] Recoverable cluster watchdog first (safety net for all further pokes)
+- [ ] Find + disable the DPU S2MPU (unlocks SYSMMU CTRL writes)
+- [ ] Bypass DPU SYSMMU (`G#1984_0000`/`G#19C4_0000`, MMU_CTRL bit0=0)
+- [ ] Re-point DECON DPP RDMA base to our physical buffer
 - [ ] Write test pattern + re-trigger one frame
 - [ ] Minimal text glyph writer (reuse `ferros_hal::console` font) → boot breadcrumbs
