@@ -63,13 +63,29 @@ G#1320_8000  G#804   CPORT
 
 Also relevant: `s2mpu_s0_hsi2@131f0000`, `sysreg_ufs@13020000`, CMU HSI2 clock domain.
 
+## CMU clock gate checked (2026-08-16): core UFS clock appears ON
+
+Found the UFS Q-channel gate: `QCH_CON_UFS_EMBD` at `CMU_HSI2`(`G#1300_0000`)+`G#30C4` = **`G#1300_30C4`** (bits [0]=ENABLE/HWACG, [1]=CLOCK_REQ, [2]=IGNORE_FORCE_PM). Base + offset from `cmucal-sfr.c` / `cmucal-qch.c`. **The CMU read did NOT hang** (it's core infra behind the already-disabled HSI2 S2MPU — safe), and returned:
+
+```
+UFS_QCH     = 00000002   ENABLE=0 (HWACG off), CLOCK_REQ=1 (clock requested/on)
+UFS_QCH_FMP = 00000002   same for the FMP (inline-crypto) clock
+```
+
+So the UFS_EMBD **core clock is on and not auto-gating** — which *weakens* the "vendor region is clock-gated" theory. The vendor-register block must be on a separate gate (a UNIPRO/HCI APB PCLK), or the hang is not a clock issue at all (a link-level low-power stall, or a genuine bus fault on that sub-range).
+
+**Caveat on the hang itself:** it has only ever been observed from the miscprobe *payload*, which also ran a doorbell-recovery loop, `UTRLCLR`, and `read_block` — the vendor read was never isolated as the sole cause. Before chasing the gate further, the hang needs clean confirmation.
+
 ## Next steps (in order)
 
-The whole problem now reduces to: **make the `reg_hci` vendor region (`G#1320_1100`) accessible, then set `NEXUS_TYPE=G#FFFFFFFF`.** Everything else is proven fine.
+The problem still reduces to: **set `NEXUS_TYPE=G#FFFFFFFF` in the `reg_hci` vendor region (`G#1320_1100`)** — everything else is proven fine. But the vendor region's accessibility is the open question.
 
-1. **Find why the vendor region gates and ungate it.** Investigate the CMU HSI2 clock tree in the zuma clock driver (`drivers/clk/...` / `clk-exynos*.c`) for the UFS UNIPRO/HCI APB gate, and `sysreg_ufs@13020000`. Hypothesis: ABL hands off with the vendor-region APB clock auto-gated; ungating it at a CMU register (standard, accessible MMIO — NOT the VS region) restores access. **Risk: a wrong poke or the VS read freezes the phone** (watchdogs disabled → a hang is NOT recovered by A/B; it needs a physical power-cycle). Do it in kernel boot, capture a breadcrumb to DIAG/framebuffer before each new-region access.
-2. Once the vendor region reads without hanging: set `NEXUS_TYPE=G#FFFFFFFF`, also program `DATA_REORDER=G#A` + PRDT entry sizes to match `config_host`, retest `read_block(1)` — expect OCS=0 and "EFI PART" in the data buffer.
-3. Then `miscprobe` works → boot-control block, and the vault/manifestus storage path opens.
+1. **Cleanly confirm (or refute) the vendor-region hang** with an isolated single read of `NEXUS_TYPE` (`G#1320_1140`). Two blockers to doing it safely: the pixel8 boot path has NO framebuffer console (display SysMMU is write-protected), so a boot hang is *silent* (no screen, no USB) — indistinguishable from any other freeze; and the cluster watchdogs are disabled (e42b9a1), so a hang needs a physical power-cycle, not A/B recovery. **Prereq: either (a) bring up a framebuffer breadcrumb in the pixel8 path, or (b) temporarily re-enable a cluster watchdog so a hang self-resets (~60s) and becomes recoverable.** Then the isolated vendor read is safe to attempt.
+2. If the vendor region reads fine → the whole saga was a payload-specific misfire; just set `NEXUS_TYPE=G#FFFFFFFF` + `DATA_REORDER=G#A` + PRDT sizes (per `config_host`), retest `read_block(1)` → expect OCS=0 and "EFI PART".
+3. If it truly hangs → find the vendor-region APB/UNIPRO PCLK gate (separate from `UFS_EMBD` QCH) or the link low-power state keeping it stalled; ungate via a CMU/sysreg register (accessible), then step 2.
+4. Then `miscprobe` works → boot-control block, and the vault/manifestus storage path opens.
+
+The safety prereq in step 1 (framebuffer breadcrumb or recoverable watchdog) is itself the highest-value next task — it de-risks every future new-MMIO experiment on this device, not just UFS.
 
 **Fallback if ungating proves too deep:** a full UFSHCI HCE reset + our own Samsung-style re-init (link startup DME commands + `config_host` VS programming) — heavier, and still needs vendor-region access, so ungating comes first regardless.
 

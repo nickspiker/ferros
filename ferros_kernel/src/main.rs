@@ -1487,7 +1487,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     //   15 resp_upiu[0..4]  16 resp_upiu[4..8]  17 last_ocs
     let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
     let ufs_up = ufs.link_is_up();
-    let mut ufs_diag = [0u32; 22];
+    let mut ufs_diag = [0u32; 24];
     ufs_diag[0] = ufs_up as u32;
     if ufs_up {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
@@ -1518,6 +1518,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         ufs_diag[15] = le(&rsp[0..4]);
         ufs_diag[16] = le(&rsp[4..8]);
         ufs_diag[17] = ufs.last_ocs() as u32;
+        // CMU_HSI2 UFS Q-channel gate (read only): QCH_CON_UFS_EMBD @ CMU_HSI2(G#1300_0000)+G#30C4. Bits [0]=ENABLE(HWACG on) [1]=CLOCK_REQ [2]=IGNORE_FORCE_PM. If ENABLE=1 and the clock isn't forced, auto-gating stops the vendor-region APB clock → explains why reg_hci (G#1320_1100) hangs. This confirms/refutes the clock-gate root cause; NO write. CMU is core infra behind the HSI2 S2MPU we already disabled, so the read is low-risk.
+        ufs_diag[22] = unsafe { core::ptr::read_volatile((0x1300_30C4) as *const u32) };
+        ufs_diag[23] = unsafe { core::ptr::read_volatile((0x1300_30C8) as *const u32) }; // QCH_CON_UFS_EMBD_FMP
     }
 
     // ---- DWC3 USB init ----
@@ -1772,6 +1775,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_AHIT=", ufs_diag[19]);
                                                 append_hex(&mut resp, b"UFS_CAP=", ufs_diag[20]);
                                                 append_hex(&mut resp, b"UFS_UTRLBAU=", ufs_diag[21]);
+                                                append_hex(&mut resp, b"UFS_QCH=", ufs_diag[22]);
+                                                append_hex(&mut resp, b"UFS_QCH_FMP=", ufs_diag[23]);
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
