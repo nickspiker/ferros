@@ -126,9 +126,9 @@ mod unip {
     pub const PA_ACTIVERXDATALANES: usize = 0x3200;
     pub const PA_DBG_OPTION_SUITE_1: usize = 0x39A8;
     pub const PA_DBG_OPTION_SUITE_2: usize = 0x39B4;
-    // ABL's values (captured on husky via payloads/ufsdump), NOT the gs-kernel runtime values (G#90913C1C / G#E01C115F — bits 27/11 differ). ABL's LK cal is what actually brings this link up from cold, so its debug-suite bits are the proven ones for link startup.
-    pub const DBG_SUITE1_ENABLE: u32 = 0x98913C1C;
-    pub const DBG_SUITE2_ENABLE: u32 = 0xE01C195F;
+    // gs-kernel runtime values — the proven Linux re-link path (which, like us, re-links from a fresh HCE reset rather than reusing ABL's link). Toggling these to ABL's captured values (G#98913C1C/G#E01C195F) made no difference to link startup, so match the reference.
+    pub const DBG_SUITE1_ENABLE: u32 = 0x90913C1C;
+    pub const DBG_SUITE2_ENABLE: u32 = 0xE01C115F;
 }
 
 /// UIC command opcodes.
@@ -719,6 +719,12 @@ pub struct InitReport {
     pub pa_state: u32,
     /// UECPA after the last attempt (clear-on-read; cleared before each attempt).
     pub uecpa: u32,
+    /// gph5 DAT (G#1306_0004) after the GPIO_OUT device-reset pulse — bit1 should track the reset_n line if the pad is muxed to UFS function and GPIO_OUT reaches it.
+    pub gph5_dat: u32,
+    /// DBG_PA_TX_STATE (UNIPRO G#160) after link startup.
+    pub pa_tx_state: u32,
+    /// UEC family after link startup: UECDL G#3C | UECN G#40<<8 wouldn't fit; packed as UECDL[7:0]|UECN[15:8]|UECT[23:16]|UECDME[31:24] low bytes.
+    pub uec_pack: u32,
 }
 
 impl UfsController {
@@ -864,7 +870,7 @@ impl UfsController {
             self.hci_w(vs::RXPRDT_ENTRY_SIZE, 12);
             self.hci_w(vs::UTRL_NEXUS_TYPE, 0xFFFF_FFFF);
             self.hci_w(vs::UTMRL_NEXUS_TYPE, 0xFFFF_FFFF);
-            self.hci_w(vs::AXIDMA_RWDATA_BURST_LEN, (3 << 27) | 3); // ABL's value; the gs kernel also sets WLU_EN but ABL's proven bring-up does not
+            self.hci_w(vs::AXIDMA_RWDATA_BURST_LEN, vs::WLU_EN | (3 << 27) | 3); // WLU_EN | BURST_LEN(3), matching the reference re-link path
             self.hci_w(vs::IOP_ACG_DISABLE, self.hci(vs::IOP_ACG_DISABLE) & !1);
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_1, unip::DBG_SUITE1_ENABLE);
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
@@ -874,6 +880,7 @@ impl UfsController {
             self.hci_w(vs::GPIO_OUT, 0);
             udelay(5);
             self.hci_w(vs::GPIO_OUT, 1);
+            r.gph5_dat = unsafe { crate::mmio::read32(0x1306_0004) }; // confirm the reset_n pad tracks GPIO_OUT
             udelay(2_000);
             done(&mut r, step::DEV_RESET);
 
@@ -916,7 +923,14 @@ impl UfsController {
             r.ls_cnf = self.unipro(0x7854); // DME_LINKSTARTUP_CNF_RESULT
             r.dme_err = self.unipro(0x7B20); // DME_INTR_ERROR_CODE
             r.pa_state = self.unipro(0x15C); // DBG_PA_CTRLSTATE
+            r.pa_tx_state = self.unipro(0x160); // DBG_PA_TX_STATE
             r.uecpa = self.read_reg(0x38);
+            // UEC family (each clear-on-read): DL G#3C, N G#40, T G#44, DME G#48. Pack the low bytes.
+            let uecdl = self.read_reg(0x3C) & 0xFF;
+            let uecn = self.read_reg(0x40) & 0xFF;
+            let uect = self.read_reg(0x44) & 0xFF;
+            let uecdme = self.read_reg(0x48) & 0xFF;
+            r.uec_pack = uecdl | (uecn << 8) | (uect << 16) | (uecdme << 24);
             if link_ok {
                 break;
             }

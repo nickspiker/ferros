@@ -4,7 +4,7 @@
 //! ABL runs the LK build of this exact library at boot; this is the same table data (evt0 == evt1 for zuma) replayed from our own driver so the controller can be fully re-initialized without ABL.
 //!
 //! Fixed parameters, measured from ABL's programmed state on husky (payloads/ufsdump):
-//! - mclk (UNIPRO main clock) = 133.33 MHz: ABL's UNIPRO_DBG_PRD reads A#120 = 16e9*1000/rate, PLL_SHARED0(2133MHz)/4/4
+//! - mclk (UNIPRO main clock) = 133.33 MHz: ABL's UNIPRO_DBG_PRD reads A#120 = (16*1000*1e6)/rate, PLL_SHARED0(2133MHz)/4/4
 //! - 38.4 MHz refclk variant (USE_38_4_MHZ), 2 lanes available/connected
 //! - evt_ver 0, board filter unused (all rows BRD_ALL), AH8 cal off (no samsung,support-ah8 in the zuma DT) so the HCI_AH8_* rows are omitted entirely
 //!
@@ -31,7 +31,7 @@ pub const MCLK_RATE: u64 = 133_333_333;
 const MCLK_PERIOD: u32 = 7;
 /// 1e9 / MCLK_RATE rounded half-up (the PCS PRD registers take the rounded value).
 const MCLK_PERIOD_RND: u32 = 8;
-/// 16e12 / MCLK_RATE — the UNIPRO "period for 1.8" debug value. A#120, matches what ABL programmed (read back as G#78).
+/// (16 * 1000 * 1_000_000) / MCLK_RATE = 1.6e10 / rate — the UNIPRO "period for 1.8" debug value. A#120, matches what ABL programmed (read back as G#78).
 const MCLK_PERIOD_UNIPRO_18: u32 = 120;
 
 /// TX line reset time, ticks of mclk for 3200us.

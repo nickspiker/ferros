@@ -44,6 +44,25 @@ UFS_LIVE_OCS=F   UFS_LIVE_DBR=1   UFS_LIVE_IS=0   NOP accepted, never executes, 
 
 Neither "correct addressing" nor "cache" nor "NEXUS" is the gap. The missing piece is Exynos-specific controller state that (a) ABL's handoff doesn't expose to a second consumer of the transfer list, and (b) a full reset loses along with the PHY link. Prime unexplored suspects for the list engine not running: `HCI_UFS_AXI_DMA_IF_CTRL` (VS+G#F8) / `HCI_WRITE_DMA_CTRL` (VS+G#74) — an AXI-DMA interface enable the controller needs before it will issue descriptor fetches; or the Exynos per-doorbell timer block (`HCI_UTRL_DBR_TIMER_*`, VS+G#144). For the re-link path, the device-side refclk/reset (the device won't re-enter link boot; RST_n pin experiments changed nothing).
 
+**CAL PROVEN CORRECT + FAILURE NARROWED (2026-08-16, later):** A row-by-row audit of the entire `ufs_cal.rs` port against Samsung's zuma `ufs-cal.h`/`ufs-cal-if.c` found **zero functional transcription errors** — all 57 pre-link rows, post-link, HS-rate-B, the lane-skip logic, PCS window, line-reset ticks, and mclk constants are faithful. So the M-PHY cal is NOT the bug. Confirmed independently by `payloads/ufsinit2` (link startup fails even reusing ABL's untouched PHY cal).
+
+Instrumented `full_init` then captured the exact failure state (DIAG, Phase B):
+```
+UFS_CAL_TO=0        M-PHY PLL LOCKS — EmbCalWait(G#C74) cal-done poll succeeds; analog cal works
+UFS_PA_STATE=0      DBG_PA_CTRLSTATE — PHY adapter never leaves idle
+UFS_PA_TX_STATE=0   DBG_PA_TX_STATE — host PA NEVER TRANSMITS the link-startup negotiation
+UFS_DME_ERR=0  UFS_UEC_PACK=0  UFS_UECPA=0   zero errors anywhere (UECPA G#80000010 was stale/benign — clean here)
+UFS_LS_RES=1  UFS_LS_CNF=1     DME_LINKSTARTUP returns plain FAILURE, no error detail
+UFS_AVAIL_RX=2      M-PHY APB alive, 2 lanes
+UFS_GPH5_DAT=0      gph5 DAT bit1 reads 0 after GPIO_OUT=1 — but pad is muxed to UFS function 2, so GPIO DAT is likely not meaningful (inconclusive on whether reset_n actually toggles)
+```
+
+**The precise signature: PLL locked, state clean, but the host PHY-adapter never transmits.** Link startup returns FAILURE because the PA never engages the line negotiation — not because the device fails to answer (the host isn't even talking). This is upstream of the device entirely.
+
+Config was also aligned to the reference re-link path (was speculatively using ABL's captured values): `AXIDMA_RWDATA_BURST_LEN` now includes `WLU_EN`, `DBG_SUITE1/2` back to the gs-kernel values G#90913C1C/G#E01C115F. Neither changed the result (expected — they're not PA-transmit gates).
+
+**THE concrete next lead (register-diff against ABL's working link):** boot fresh (ABL link UP + working, HCS=G#10F), dump the full PMA + PA control register state via an extended `ufsdump`, then dump the same after `full_init`'s failed startup. The register(s) that differ are what ABL sets to enable PA transmit that the zuma cal table alone doesn't — likely a PA power-on / TX-lane-enable / `DME_ENABLE`(UNIPRO G#7830) / `DME_POWERON`(G#7800) step the core ufshcd driver does that `full_init` omits. The cal table is faithful, so the gap is in the *orchestration around* it (a DME enable/power-on or PA TX power-up), not the table values. Suspect specifically: a missing `DME_ENABLE_REQ`/`DME_POWERON_REQ` before `DME_LINKSTARTUP`, or a TX-lane power-up the standard ufshcd core issues that we skip.
+
 **Two paths from here (next session):**
 1. **Make the device actually reset.** Find the true RST_n/VCC control (the `ufs_fixed_vcc` regulator is `gpio = <&gpp0 1>` — confirm gpp0-1 is really wired to VCC-enable and that our GPIO write reaches the pad; may need the pad's pull/drive set, or the reset is via a PMIC register not a SoC GPIO). If the device power-cycles, ABL's-equivalent link startup should take.
 2. **Don't reset at all — fix transfers on ABL's live link.** Revisit the ORIGINAL problem with clean tooling: on a fresh ABL boot the link is UP (HCS=G#10F, DP set); only our *transfers* never complete. Early payloads that "proved" NOP-fails-on-clean had the UTRLCLR-offset corruption bug. A minimal, bug-free "init_transfer_list + NOP on the untouched ABL link" test (one reboot to get ABL's link back) would re-check whether a DMA-address / cache / UTRD-format fix makes transfers complete — potentially much closer to done than re-linking. Suspect: UTRD/UCD **physical** address the UFS master sees (node is `dma-coherent`, no iommus → physical DMA), or the `fixed-prdt-req_list-ocs` quirk's UTRD OCS handling.
