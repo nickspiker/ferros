@@ -561,6 +561,13 @@ name = "ferros-payload-hello"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-miscprobe"
+version = "0.1.0"
+dependencies = [
+ "ferros_hal",
+]
+
+[[package]]
 name = "ferros-payload-pmupoke"
 version = "0.1.0"
 

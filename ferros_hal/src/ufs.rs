@@ -196,9 +196,11 @@ impl UfsController {
     }
 
     /// Set up our own transfer request list and start it.
+    /// Stops the list first: UTRLBA is only sampled while UTRLRSR=0, so rebasing a running list (e.g. a RUN payload attaching with its own UFS_BUF after the kernel already started one) is silently ignored and every command then completes into the OLD descriptor — the payload sees its UTRD stuck at OCS=G#F.
     pub fn init_transfer_list(&self) {
         unsafe {
             let utrd_addr = &raw const UFS_BUF.utrd as usize as u64;
+            self.write_reg(regs::UTRLRSR, 0);
             self.write_reg(regs::UTRLBA, utrd_addr as u32);
             self.write_reg(regs::UTRLBAU, (utrd_addr >> 32) as u32);
             // Clear any pending interrupts
