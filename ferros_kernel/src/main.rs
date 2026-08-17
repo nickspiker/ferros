@@ -1105,9 +1105,55 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut pmaf = [0u32; 12]; // post-full_init failed-link PMA/PA snapshot (Phase B)
     let mut rst_test = [0u32; 4]; // GPIO_OUT device-reset test: [HCS_before, MXGR_before, HCS_after, MXGR_after]
     let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
+    let mut reuse = [0u32; 10]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
+
+        // ---- Phase A0: pbl-style descriptor REUSE (before touching anything) ----
+        // pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
+        {
+            let rd8 = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+            let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v); };
+            let utrlba = r(0x50);
+            let utrlbau = r(0x54);
+            reuse[0] = utrlba;
+            reuse[1] = utrlbau;
+            reuse[9] = r(0x60); // UTRLRSR (is ABL's list running?)
+            let utrd = ((utrlbau as u64) << 32 | utrlba as u64) as usize;
+            // Sanity: ABL's UTRD base must be a plausible DRAM address before we poke it.
+            if utrlbau == 0 && utrlba >= 0x8000_0000 && utrlba < 0xF000_0000 {
+                let ucd_lo = rd8(utrd + 16); // UTRD DW4 = UCD base low
+                let ucd_hi = rd8(utrd + 20); // UTRD DW5 = UCD base high
+                reuse[2] = ucd_lo;
+                reuse[3] = ucd_hi;
+                let dw7 = rd8(utrd + 28); // keep response/PRDT offsets, zero PRDT count
+                let ucd = ((ucd_hi as u64) << 32 | ucd_lo as u64) as usize;
+                if ucd_hi == 0 && ucd_lo >= 0x8000_0000 && ucd_lo < 0xF000_0000 {
+                    // NOP OUT UPIU at the command UPIU (UCD offset 0): transaction code 0, tag 0.
+                    unsafe { core::ptr::write_bytes(ucd as *mut u8, 0, 32); }
+                    wr32(utrd + 0, (1 << 24) | (1 << 28)); // DW0: interrupt | cmd_type=native UFS
+                    wr32(utrd + 8, 0x0000_000F);           // DW2: OCS = INVALID sentinel
+                    wr32(utrd + 28, dw7 & 0xFFFF_0000);    // DW7: keep PRDT offset, 0 entries
+                    // NEXUS bit 0, clear IS, ring doorbell slot 0 — NO rebase, NO RSR toggle.
+                    wr32(0x1320_1140, 0xFFFF_FFFF);
+                    unsafe { core::arch::asm!("dsb sy"); }
+                    reuse[4] = r(0x58); // DBR before
+                    wr32(UFS_BASE + 0x20, 0xFFFF_FFFF); // clear IS
+                    wr32(UFS_BASE + 0x58, 1);           // ring slot 0
+                    unsafe { core::arch::asm!("dsb sy"); }
+                    let mut done = false;
+                    for _ in 0..4_000_000u32 {
+                        if r(0x20) & 1 != 0 { done = true; break; } // IS.UTRCS
+                        if rd8(utrd + 8) & 0xFF != 0x0F { done = true; break; } // OCS written
+                    }
+                    reuse[5] = rd8(utrd + 8) & 0xFF; // OCS
+                    reuse[6] = r(0x20);              // IS
+                    reuse[7] = r(0x58);              // DBR after
+                    reuse[8] = done as u32;
+                }
+            }
+        }
 
         // ---- Phase A: transfers on ABL's LIVE link (no reset, no full_init) ----
         // This is the original problem, tested cleanly: on a fresh boot ABL leaves the link up (HCS=G#10F). If a NOP completes here, the transfer engine works and full_init is unnecessary — the whole saga was a transfer-setup bug, not a link bug.
@@ -1425,6 +1471,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_T79=", rep_snap[8]);
                                                 append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
                                                 // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
+                                                // pbl-style descriptor-reuse NOP (ABL's own UCD, no rebase). REUSE_OCS=0 = transfer completed → our UFS_BUF region was unreachable by the UFS DMA master (S2MPU/protected region) and rebasing was the bug.
+                                                append_hex(&mut resp, b"UFS_REUSE_UTRLBA=", reuse[0]);
+                                                append_hex(&mut resp, b"UFS_REUSE_UTRLBAU=", reuse[1]);
+                                                append_hex(&mut resp, b"UFS_REUSE_UCD_LO=", reuse[2]);
+                                                append_hex(&mut resp, b"UFS_REUSE_UCD_HI=", reuse[3]);
+                                                append_hex(&mut resp, b"UFS_REUSE_DBR_B=", reuse[4]);
+                                                append_hex(&mut resp, b"UFS_REUSE_OCS=", reuse[5]);
+                                                append_hex(&mut resp, b"UFS_REUSE_IS=", reuse[6]);
+                                                append_hex(&mut resp, b"UFS_REUSE_DBR_A=", reuse[7]);
+                                                append_hex(&mut resp, b"UFS_REUSE_DONE=", reuse[8]);
+                                                append_hex(&mut resp, b"UFS_REUSE_RSR=", reuse[9]);
                                                 append_hex(&mut resp, b"UFS_LIVE_OCS=", ufs_diag[0]);
                                                 append_hex(&mut resp, b"UFS_LIVE_RSP=", ufs_diag[1]);
                                                 append_hex(&mut resp, b"UFS_LIVE_IS=", ufs_diag[2]);
