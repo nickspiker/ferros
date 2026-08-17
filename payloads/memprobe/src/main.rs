@@ -48,16 +48,24 @@ pub extern "C" fn _entry(_i: *const u8, _il: usize, out: *mut u8, cap: usize) ->
     o.line(b"LOW_80000000", rd(0x8000_0000));
     o.line(b"LOW_80100000", rd(0x8010_0000));
 
-    // HSI2 UFS S2MPU (G#131F0000): CTRL0 + a window of config/whitelist registers.
-    o.s(b"-- S2MPU 131F0000 --\n");
-    for off in [0x00usize, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x40, 0x100, 0x200] {
-        let mut lbl = [b'S', b'2', b'_', 0, 0, 0];
-        let h = b"0123456789ABCDEF";
-        lbl[3] = h[(off >> 8) & 0xF];
-        lbl[4] = h[(off >> 4) & 0xF];
-        lbl[5] = h[off & 0xF];
-        o.line(&lbl, rd(0x131F_0000 + off));
-    }
+    // V9 S2MPU bypass check for BOTH masters. PROT_EN_PER_VID (0x50) = current per-VID protection bitmap; 0 = bypassed. USB (HSI0) works, UFS (HSI2) doesn't — compare.
+    // HSI0 (USB, works):
+    o.line(b"USB_PROTEN", rd(0x1107_0000 + 0x50));
+    // HSI2 (UFS, fails):
+    o.line(b"UFS_PROTEN", rd(0x131F_0000 + 0x50));
+    // Re-write the CLR bypass to UFS S2MPU and re-read — does our write stick (0) or is protection held on (nonzero = pKVM trap / locked)?
+    unsafe { core::ptr::write_volatile((0x131F_0000 + 0x54) as *mut u32, 0xFF); core::arch::asm!("dsb sy"); }
+    o.line(b"UFS_PROTEN2", rd(0x131F_0000 + 0x50));
+
+    // UFS Protector (UFSP, G#132A0000): is UFS DMA marked SECURE? If so, our non-secure descriptors are unreachable by the secure-marked DMA. RSECURITY 0x10 / WSECURITY 0x110 hold NSSMU(bit14)+AXPROT bits; region0 SBEGIN/END/LUN/CTRL at 0x200. AxPROT[1]=1 = non-secure.
+    o.s(b"-- UFSP 132A0000 --\n");
+    o.line(b"UFSPRCTRL", rd(0x132A_0000 + 0x000));
+    o.line(b"UFSPRSECUR", rd(0x132A_0000 + 0x010));
+    o.line(b"UFSPWCTRL", rd(0x132A_0000 + 0x100));
+    o.line(b"UFSPWSECUR", rd(0x132A_0000 + 0x110));
+    // THE candidate fix: write path is SECURE (WSECUR=0), so controller write-backs (OCS/response/data) can't reach our non-secure buffer. Mirror the read path's non-secure config to the write path and check it sticks (vs secure-locked).
+    unsafe { core::ptr::write_volatile((0x132A_0000 + 0x110) as *mut u32, 0xFFE2_6492); core::arch::asm!("dsb sy"); }
+    o.line(b"UFSPWSECUR_AFTER", rd(0x132A_0000 + 0x110));
 
     o.n as u64
 }

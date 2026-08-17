@@ -1125,8 +1125,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             // Confirm whether ABL's descriptor region is even CPU-readable (a protected UFS-DMA carveout reads 0 from the CPU) and dump the UFS S2MPU. HSI2 S2MPU at G#131F0000: CTRL0 (+0) and a config/whitelist word (+0x10).
             reuse[10] = rd8(utrd + 0);   // ABL UTRD DW0 (0 = region not CPU-readable)
             reuse[11] = rd8(utrd + 8);   // ABL UTRD DW2
-            reuse[12] = rd8(0x131F_0000 + 0x00); // S2MPU CTRL0
-            reuse[13] = rd8(0x131F_0000 + 0x10); // S2MPU cfg/whitelist
+            // V9 S2MPU: did our bypass take on HSI2? Read PROT_EN state (0x50 reads the current per-VID enable bitmap; 0 = protection off = bypassed). Then re-write the CLR and re-read to see if the write sticks (nonzero after = something is holding protection on, e.g. pKVM trapping our writes).
+            reuse[12] = rd8(0x131F_0000 + 0x50); // PROT_EN_PER_VID state as boot-bypass left it
+            unsafe { core::ptr::write_volatile((0x131F_0000 + 0x54) as *mut u32, 0xFF); core::arch::asm!("dsb sy"); }
+            reuse[13] = rd8(0x131F_0000 + 0x50); // PROT_EN after re-clearing (still nonzero = write not sticking)
             if utrlbau == 0 && utrlba >= 0x8000_0000 && utrlba < 0xFFFF_0000 {
                 let ucd_lo = rd8(utrd + 16); // UTRD DW4 = UCD base low
                 let ucd_hi = rd8(utrd + 20); // UTRD DW5 = UCD base high
@@ -1480,8 +1482,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRLBA=", reuse[0]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRD_DW0=", reuse[10]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRD_DW2=", reuse[11]);
-                                                append_hex(&mut resp, b"UFS_REUSE_S2MPU_CTRL=", reuse[12]);
-                                                append_hex(&mut resp, b"UFS_REUSE_S2MPU_CFG=", reuse[13]);
+                                                append_hex(&mut resp, b"UFS_REUSE_PROTEN=", reuse[12]);
+                                                append_hex(&mut resp, b"UFS_REUSE_PROTEN2=", reuse[13]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UCD_LO=", reuse[2]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UCD_HI=", reuse[3]);
                                                 append_hex(&mut resp, b"UFS_REUSE_DBR_B=", reuse[4]);
