@@ -952,6 +952,11 @@ impl UfsController {
                 r.gph5_con_before = con;
             }
             crate::ufs_cal::trace_write32(GPH5CON, (con & !0xFF) | 0x22);
+            // The ufs_refclk_out pad (gph5-0) needs drive strength X3 and no pull, per the pinctrl (samsung,pin-drv=ZUMA_PIN_DRV_X3=2, pin-pud=0). ferros set only the function nibble; without X3 drive the reference clock may reach the device too weakly to respond at link startup (the whole MMIO sequence otherwise matches Linux yet the device stays silent). zuma GPH5 bank: CON+0, DAT+4, PUD+8, DRV+0xC; 4 bits/pin, pin0 = bits[3:0]. rst_n (gph5-1) keeps default drive.
+            let drv = unsafe { crate::mmio::read32(0x1306_000C) };
+            crate::ufs_cal::trace_write32(0x1306_000C, (drv & !0xF) | 0x2); // gph5-0 = X3
+            let pud = unsafe { crate::mmio::read32(0x1306_0008) };
+            crate::ufs_cal::trace_write32(0x1306_0008, pud & !0xF); // gph5-0 = no pull
             unsafe { core::arch::asm!("dsb sy") };
             r.gph5_con_after = unsafe { crate::mmio::read32(GPH5CON) };
             udelay(1_000); // let REFCLKOUT reach the device before reset/link
@@ -961,7 +966,7 @@ impl UfsController {
             udelay(5);
             self.hci_w(vs::GPIO_OUT, 1);
             r.gph5_dat = unsafe { crate::mmio::read32(0x1306_0004) }; // confirm the reset_n pad tracks GPIO_OUT
-            udelay(2_000);
+            udelay(10_000); // device settle after reset — Linux's trace shows ~5ms here; ferros's 2ms may fire link startup before the device is ready
             done(&mut r, step::DEV_RESET);
 
             // HCE on.
@@ -1009,6 +1014,7 @@ impl UfsController {
             let _ = self.read_reg(0x38); // UECPA is clear-on-read
             self.write_reg(regs::IS, 0xFFFF_FFFF);
 
+            udelay(20_000); // let the PHY/device settle after cal before link startup — Linux's trace spans ~30ms of PHY bring-up before DME_LINKSTARTUP; ferros compresses it to microseconds
             match self.uic_cmd(uic::DME_LINKSTARTUP, 0, 0, 0) {
                 Ok(0) => {
                     r.linkstartup_res = 0;
