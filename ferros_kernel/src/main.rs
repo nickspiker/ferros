@@ -1106,9 +1106,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut rst_test = [0u32; 4]; // GPIO_OUT device-reset test: [HCS_before, MXGR_before, HCS_after, MXGR_after]
     let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
     let mut reuse = [0u32; 14]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr, utrd_dw0, utrd_dw2, s2mpu_ctrl, s2mpu_cfg]
+    let mut clean = [0u32; 4]; // absolute-first clean NOP: [ocs, rsp, IS, DBR]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
+
+        // ---- CLEAN NOP: the ABSOLUTE first UFS touch, before any snapshot/reset/reuse poke ----
+        // Isolates whether Phase A's own writes (clock-unlock, GPIO reset test, NEXUS write, ABL-UCD scribble) perturb the live ABL link before the NOP. If this clean NOP completes (OCS=0) but the later ones don't, our own diagnostics were breaking the link.
+        ufs.init_transfer_list();
+        let (clean_ocs, clean_rsp) = ufs.live_nop();
+        clean[0] = clean_ocs as u32;
+        clean[1] = clean_rsp as u32;
+        clean[2] = r(0x20); // IS
+        clean[3] = r(0x58); // DBR
 
         // ---- Phase A0: pbl-style descriptor REUSE (before touching anything) ----
         // pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
@@ -1479,6 +1489,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
                                                 // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
                                                 // pbl-style descriptor-reuse NOP (ABL's own UCD, no rebase). REUSE_OCS=0 = transfer completed → our UFS_BUF region was unreachable by the UFS DMA master (S2MPU/protected region) and rebasing was the bug.
+                                                append_hex(&mut resp, b"UFS_CLEAN_OCS=", clean[0]);
+                                                append_hex(&mut resp, b"UFS_CLEAN_RSP=", clean[1]);
+                                                append_hex(&mut resp, b"UFS_CLEAN_IS=", clean[2]);
+                                                append_hex(&mut resp, b"UFS_CLEAN_DBR=", clean[3]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRLBA=", reuse[0]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRD_DW0=", reuse[10]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRD_DW2=", reuse[11]);
