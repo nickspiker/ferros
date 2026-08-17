@@ -1115,6 +1115,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut regfile = [0u32; 14]; // ABL pristine register file: CAP,VER,IS,IE,HCS,HCE,UTRLBA,UTRLBAU,UTRLDBR,UTRLCLR,UTRLRSR,UTMRLBA,UTMRLRSR,UICCMD
     let mut clr_nop = [0u32; 4]; // NOP with UTRLCLR forced to all-ones first: [ocs, rsp, is, dbr]
     let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
+    let mut dbg_prd_pristine = 0u32; // pristine UNIPRO DBG_PRD (actual clock indicator: G#78=133MHz, G#59=178MHz)
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
@@ -1134,6 +1135,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[2] = rd(0x132A_0010); // UFSP RSECURITY
             ext[3] = rd(0x132A_0110); // UFSP WSECURITY
             ext[4] = rd(0x131F_0000); // S2MPU CTRL0
+            // PRISTINE UNIPRO DBG_PRD (G#1328_0044) as ABL left it — the actual UNIPRO clock indicator. ABL writes this = 16e9/mclk. G#78 (120) = 133MHz (ABL's rate). G#59 (89) = 178MHz. If this reads 120, ferros runs at 133 but we calibrate for 178 = the mismatch (Linux's clk driver bumps 133->178; ferros never does). Read before full_init overwrites it.
+            dbg_prd_pristine = rd(0x1328_0044);
 
             // CANDIDATE FIX for the dead doorbell: ABL sets sysreg_ufs iocc bits[1:0]=3 => the UFS AXI master issues COHERENT (inner/outer-shareable) transactions that must snoop the CPU caches. ABL/Linux run in the coherency domain so snoops resolve; ferros manages caches MANUALLY (ufs.rs does explicit clean/invalidate around DMA — the non-coherent model) and is not answering coherent snoops, so the master's coherent read STALLS forever = doorbell stuck, every address. Clear the coherency bits so the master does plain non-coherent DMA straight to DRAM, matching ferros's driver. Reversible on reboot.
             iocc_fix[0] = ext[0];                       // IOCC as ABL left it
@@ -1617,6 +1620,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
                                                 // pbl-style descriptor-reuse NOP (ABL's own UCD, no rebase). REUSE_OCS=0 = transfer completed → our UFS_BUF region was unreachable by the UFS DMA master (S2MPU/protected region) and rebasing was the bug.
                                                 // External-block ABL-handoff state vs Linux's probe-time values: IOCC expect Linux=3, PHYISO expect 1, UFSP_RSEC Linux=G#FFFA6492, UFSP_WSEC Linux=0.
+                                                append_hex(&mut resp, b"UFS_DBG_PRD=", dbg_prd_pristine);
                                                 append_hex(&mut resp, b"UFS_EXT_IOCC=", ext[0]);
                                                 append_hex(&mut resp, b"UFS_EXT_PHYISO=", ext[1]);
                                                 append_hex(&mut resp, b"UFS_EXT_UFSP_RSEC=", ext[2]);
