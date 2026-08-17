@@ -1112,6 +1112,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut dma_dbg = [0u32; 6]; // Exynos DMA-engine state captured mid-stall: [fsm, dma0_state, dma0_cnt, dma0_doorbell, vendor_is, axi_if_ctrl]
     let mut h8 = [0u32; 6]; // hibern8-exit probe: [pa_ctrlstate_before, pwrmode_before, uic_result, upms_completed, pa_ctrlstate_after, hcs_after]
     let mut h8_nop = [0u32; 4]; // NOP after hibern8 exit: [ocs, rsp, is, dbr]
+    let mut regfile = [0u32; 14]; // ABL pristine register file: CAP,VER,IS,IE,HCS,HCE,UTRLBA,UTRLBAU,UTRLDBR,UTRLCLR,UTRLRSR,UTMRLBA,UTMRLRSR,UICCMD
+    let mut clr_nop = [0u32; 4]; // NOP with UTRLCLR forced to all-ones first: [ocs, rsp, is, dbr]
     let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
@@ -1139,6 +1141,23 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             unsafe { core::arch::asm!("dsb sy") };
             iocc_fix[1] = rd(0x1302_0710);              // IOCC after clear (should be ext[0] & !3)
         }
+
+        // ---- ABL pristine register file (before ANY UFS write) ----
+        // Characterize why the transfer manager sits idle on a doorbell. Reads only, so ABL's handoff state is untouched.
+        regfile[0] = r(0x00);  // CAP
+        regfile[1] = r(0x08);  // VER
+        regfile[2] = r(0x20);  // IS
+        regfile[3] = r(0x24);  // IE
+        regfile[4] = r(0x30);  // HCS
+        regfile[5] = r(0x34);  // HCE
+        regfile[6] = r(0x50);  // UTRLBA
+        regfile[7] = r(0x54);  // UTRLBAU
+        regfile[8] = r(0x58);  // UTRLDBR
+        regfile[9] = r(0x5C);  // UTRLCLR — must have slot bit SET (1) to run; 0 = slot cleared, silently ignored
+        regfile[10] = r(0x60); // UTRLRSR
+        regfile[11] = r(0x70); // UTMRLBA
+        regfile[12] = r(0x80); // UTMRLRSR
+        regfile[13] = r(0x90); // UICCMD
 
         // ---- Phase A0: pbl-style descriptor REUSE (the ABSOLUTE first UFS touch) ----
         // MUST run before init_transfer_list (clean-NOP) or the rebase clobbers ABL's UTRLBA and this tests ferros's own ring instead. pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
@@ -1262,6 +1281,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             h8_nop[1] = rsp as u32;
             h8_nop[2] = r(0x20); // IS
             h8_nop[3] = r(0x58); // DBR
+        }
+
+        // ---- UTRLCLR-forced NOP: set the slot-clear register to all-ones before ringing ----
+        // If the transfer manager ignores the doorbell because UTRLCLR slot bit is 0 (slot considered cleared/aborted), forcing UTRLCLR=0xFFFFFFFF first unblocks it. RSR is toggled by init_transfer_list; we set UTRLCLR between rebase and doorbell.
+        {
+            let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+            ufs.init_transfer_list();
+            wr32(UFS_BASE + 0x5C, 0xFFFF_FFFF); // UTRLCLR = all slots active
+            unsafe { core::arch::asm!("dsb sy") };
+            let (ocs, rsp) = ufs.live_nop();
+            clr_nop[0] = ocs as u32;
+            clr_nop[1] = rsp as u32;
+            clr_nop[2] = r(0x20); // IS
+            clr_nop[3] = r(0x58); // DBR
         }
 
         // ---- Phase A: transfers on ABL's LIVE link (no reset, no full_init) ----
@@ -1590,6 +1623,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
                                                 // IOCC coherency clear (candidate fix): if CLEAN/HITEST/REUSE OCS now land 0, the coherent-DMA-snoop-stall was the dead-doorbell root cause.
                                                 // HIBERN8-exit probe: was ABL parking the link in hibernate? H8_NOP_OCS=0 after exit ⇒ yes, that was the dead-doorbell cause. PA_CTRLSTATE/PWRMODE show the link state before/after.
+                                                // ABL pristine register file — why the transfer manager sits idle. UTRLCLR (slot-clear) must read with slot0 bit SET to run.
+                                                append_hex(&mut resp, b"UFS_RF_CAP=", regfile[0]);
+                                                append_hex(&mut resp, b"UFS_RF_IS=", regfile[2]);
+                                                append_hex(&mut resp, b"UFS_RF_IE=", regfile[3]);
+                                                append_hex(&mut resp, b"UFS_RF_HCS=", regfile[4]);
+                                                append_hex(&mut resp, b"UFS_RF_HCE=", regfile[5]);
+                                                append_hex(&mut resp, b"UFS_RF_UTRLBA=", regfile[6]);
+                                                append_hex(&mut resp, b"UFS_RF_UTRLDBR=", regfile[8]);
+                                                append_hex(&mut resp, b"UFS_RF_UTRLCLR=", regfile[9]);
+                                                append_hex(&mut resp, b"UFS_RF_UTRLRSR=", regfile[10]);
+                                                append_hex(&mut resp, b"UFS_RF_UTMRLRSR=", regfile[12]);
+                                                append_hex(&mut resp, b"UFS_RF_UICCMD=", regfile[13]);
+                                                append_hex(&mut resp, b"UFS_CLR_NOP_OCS=", clr_nop[0]);
+                                                append_hex(&mut resp, b"UFS_CLR_NOP_IS=", clr_nop[2]);
+                                                append_hex(&mut resp, b"UFS_CLR_NOP_DBR=", clr_nop[3]);
                                                 append_hex(&mut resp, b"UFS_H8_PACS_BEFORE=", h8[0]);
                                                 append_hex(&mut resp, b"UFS_H8_PWRMODE_BEFORE=", h8[1]);
                                                 append_hex(&mut resp, b"UFS_H8_UIC_RES=", h8[2]);
