@@ -25,6 +25,7 @@ members = [
     "payloads/slot1nop",
     "payloads/miscprobe",
     "payloads/ufsdump",
+    "payloads/memprobe",
     "payloads/ufsinit2",
     "payloads/ufsreset",
     "payloads/ufsdme",

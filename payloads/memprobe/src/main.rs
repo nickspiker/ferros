@@ -1,0 +1,66 @@
+//! Probe whether ABL's UFS descriptor carveout (UTRLBA G#F8C42000) is CPU-readable, and dump the UFS S2MPU.
+//!
+//! The pbl-style reuse test showed UTRLBA=G#F8C42000 (a high region) but reads of its UTRD DW4/DW5 came back 0.
+//! This isolates: is that high region CPU-accessible at all (reads nonzero = readable; all-zero = protected carveout the UFS master reaches but the CPU can't)? And what does the HSI2 UFS S2MPU (G#131F0000) actually hold — is it truly disabled, or is there a whitelist that only admits the carveout?
+
+#![no_std]
+#![no_main]
+
+struct NoAlloc;
+unsafe impl core::alloc::GlobalAlloc for NoAlloc {
+    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 { core::ptr::null_mut() }
+    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {}
+}
+#[global_allocator]
+static NO_ALLOC: NoAlloc = NoAlloc;
+
+struct Out { ptr: *mut u8, cap: usize, n: usize }
+impl Out {
+    fn put(&mut self, b: u8) { if self.n < self.cap { unsafe { *self.ptr.add(self.n) = b; } self.n += 1; } }
+    fn s(&mut self, s: &[u8]) { for &b in s { self.put(b); } }
+    fn hex(&mut self, v: u32) { let h = b"0123456789ABCDEF"; for i in (0..8).rev() { self.put(h[((v >> (i * 4)) & 0xF) as usize]); } }
+    fn line(&mut self, l: &[u8], v: u32) { self.s(l); self.put(b'='); self.hex(v); self.put(b'\n'); }
+}
+fn rd(a: usize) -> u32 { unsafe { core::ptr::read_volatile(a as *const u32) } }
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.entry")]
+pub extern "C" fn _entry(_i: *const u8, _il: usize, out: *mut u8, cap: usize) -> u64 {
+    unsafe extern "C" { static mut __bss_start: u8; static mut __bss_end: u8; }
+    unsafe { let mut p = &raw mut __bss_start as *mut u8; let e = &raw mut __bss_end as *mut u8; while p < e { core::ptr::write_volatile(p, 0); p = p.add(1); } }
+    let mut o = Out { ptr: out, cap, n: 0 };
+
+    // UFS transfer-list base ABL left running.
+    let utrlba = rd(0x1320_0050);
+    o.line(b"UTRLBA", utrlba);
+    o.line(b"UTRLBAU", rd(0x1320_0054));
+    o.line(b"UTRLRSR", rd(0x1320_0060));
+
+    // Is ABL's descriptor region CPU-readable? Dump the first 8 words of the UTRD.
+    let base = utrlba as usize;
+    for i in 0..8u32 {
+        let mut lbl = *b"DW0 ";
+        lbl[2] = b'0' + i as u8;
+        o.line(&lbl[..3], rd(base + (i as usize) * 4));
+    }
+
+    // Compare against a known-CPU-readable low DRAM address (our own region ~2GB).
+    o.line(b"LOW_80000000", rd(0x8000_0000));
+    o.line(b"LOW_80100000", rd(0x8010_0000));
+
+    // HSI2 UFS S2MPU (G#131F0000): CTRL0 + a window of config/whitelist registers.
+    o.s(b"-- S2MPU 131F0000 --\n");
+    for off in [0x00usize, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x40, 0x100, 0x200] {
+        let mut lbl = [b'S', b'2', b'_', 0, 0, 0];
+        let h = b"0123456789ABCDEF";
+        lbl[3] = h[(off >> 8) & 0xF];
+        lbl[4] = h[(off >> 4) & 0xF];
+        lbl[5] = h[off & 0xF];
+        o.line(&lbl, rd(0x131F_0000 + off));
+    }
+
+    o.n as u64
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }

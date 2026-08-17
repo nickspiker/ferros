@@ -1105,7 +1105,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut pmaf = [0u32; 12]; // post-full_init failed-link PMA/PA snapshot (Phase B)
     let mut rst_test = [0u32; 4]; // GPIO_OUT device-reset test: [HCS_before, MXGR_before, HCS_after, MXGR_after]
     let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
-    let mut reuse = [0u32; 10]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr]
+    let mut reuse = [0u32; 14]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr, utrd_dw0, utrd_dw2, s2mpu_ctrl, s2mpu_cfg]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
@@ -1121,15 +1121,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             reuse[1] = utrlbau;
             reuse[9] = r(0x60); // UTRLRSR (is ABL's list running?)
             let utrd = ((utrlbau as u64) << 32 | utrlba as u64) as usize;
-            // Sanity: ABL's UTRD base must be a plausible DRAM address before we poke it.
-            if utrlbau == 0 && utrlba >= 0x8000_0000 && utrlba < 0xF000_0000 {
+            // Sanity: ABL's UTRD base must be a plausible DRAM address before we poke it. (ABL's ring lives high — G#F8C42000 — a reserved UFS DMA carveout, so allow the full 32-bit DRAM range.)
+            // Confirm whether ABL's descriptor region is even CPU-readable (a protected UFS-DMA carveout reads 0 from the CPU) and dump the UFS S2MPU. HSI2 S2MPU at G#131F0000: CTRL0 (+0) and a config/whitelist word (+0x10).
+            reuse[10] = rd8(utrd + 0);   // ABL UTRD DW0 (0 = region not CPU-readable)
+            reuse[11] = rd8(utrd + 8);   // ABL UTRD DW2
+            reuse[12] = rd8(0x131F_0000 + 0x00); // S2MPU CTRL0
+            reuse[13] = rd8(0x131F_0000 + 0x10); // S2MPU cfg/whitelist
+            if utrlbau == 0 && utrlba >= 0x8000_0000 && utrlba < 0xFFFF_0000 {
                 let ucd_lo = rd8(utrd + 16); // UTRD DW4 = UCD base low
                 let ucd_hi = rd8(utrd + 20); // UTRD DW5 = UCD base high
                 reuse[2] = ucd_lo;
                 reuse[3] = ucd_hi;
                 let dw7 = rd8(utrd + 28); // keep response/PRDT offsets, zero PRDT count
                 let ucd = ((ucd_hi as u64) << 32 | ucd_lo as u64) as usize;
-                if ucd_hi == 0 && ucd_lo >= 0x8000_0000 && ucd_lo < 0xF000_0000 {
+                if ucd_hi == 0 && ucd_lo >= 0x8000_0000 && ucd_lo < 0xFFFF_0000 {
                     // NOP OUT UPIU at the command UPIU (UCD offset 0): transaction code 0, tag 0.
                     unsafe { core::ptr::write_bytes(ucd as *mut u8, 0, 32); }
                     wr32(utrd + 0, (1 << 24) | (1 << 28)); // DW0: interrupt | cmd_type=native UFS
@@ -1473,7 +1478,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
                                                 // pbl-style descriptor-reuse NOP (ABL's own UCD, no rebase). REUSE_OCS=0 = transfer completed → our UFS_BUF region was unreachable by the UFS DMA master (S2MPU/protected region) and rebasing was the bug.
                                                 append_hex(&mut resp, b"UFS_REUSE_UTRLBA=", reuse[0]);
-                                                append_hex(&mut resp, b"UFS_REUSE_UTRLBAU=", reuse[1]);
+                                                append_hex(&mut resp, b"UFS_REUSE_UTRD_DW0=", reuse[10]);
+                                                append_hex(&mut resp, b"UFS_REUSE_UTRD_DW2=", reuse[11]);
+                                                append_hex(&mut resp, b"UFS_REUSE_S2MPU_CTRL=", reuse[12]);
+                                                append_hex(&mut resp, b"UFS_REUSE_S2MPU_CFG=", reuse[13]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UCD_LO=", reuse[2]);
                                                 append_hex(&mut resp, b"UFS_REUSE_UCD_HI=", reuse[3]);
                                                 append_hex(&mut resp, b"UFS_REUSE_DBR_B=", reuse[4]);
