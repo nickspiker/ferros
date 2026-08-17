@@ -1142,6 +1142,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             iocc_fix[1] = rd(0x1302_0710);              // IOCC after clear (should be ext[0] & !3)
         }
 
+        // ---- WAKE THE LINK FIRST: ABL parks UFS in HIBERN8 (pristine UICCMD reads G#17 = HIBERN8_ENTER). ----
+        // Must run before any doorbell ring or IS clear, on the truly pristine hibernating link. Everything downstream (regfile snapshot, reuse, clean NOP, Phase A) then runs on the woken link.
+        h8 = ufs.live_hibern8_exit();
+
         // ---- ABL pristine register file (before ANY UFS write) ----
         // Characterize why the transfer manager sits idle on a doorbell. Reads only, so ABL's handoff state is untouched.
         regfile[0] = r(0x00);  // CAP
@@ -1271,9 +1275,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             dma_dbg[5] = hci(0xF8); // UFS_AXI_DMA_IF_CTRL
         }
 
-        // ---- HIBERN8-EXIT probe: is ABL parking the link in hibernate before handoff? ----
-        // The idle-DMA signature (doorbell accepted, DMA0_CNT=0, no error, no timeout) is what HIBERN8 looks like: HCS reads ready but the transfer manager won't fetch a descriptor until the link leaves hibernate. Exit it, then retry the NOP on the same live link.
-        h8 = ufs.live_hibern8_exit();
+        // ---- Post-wake NOP validation (link was already woken at the top of the block) ----
         {
             ufs.init_transfer_list();
             let (ocs, rsp) = ufs.live_nop();

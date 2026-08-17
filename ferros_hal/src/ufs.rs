@@ -37,6 +37,8 @@ mod regs {
     // IS bit definitions
     pub const IS_UTRCS: u32 = 1 << 0;   // Transfer Request Completion
     pub const IS_UPMS: u32 = 1 << 4;    // UIC Power Mode Status
+    pub const IS_UHXS: u32 = 1 << 5;    // UIC Hibernate Exit Status
+    pub const IS_UHES: u32 = 1 << 6;    // UIC Hibernate Enter Status
     pub const IS_UCCS: u32 = 1 << 10;   // UIC Command Completion
 
     // HCS bit definitions
@@ -670,27 +672,27 @@ impl UfsController {
         (ocs, rsp)
     }
 
-    /// Exit UFS hibernate on the live link. Bootloaders often park UFS in HIBERN8 before handoff: HCS reads link-up/ready but the transfer manager sits idle (never fetches the descriptor) until DME_HIBERN8_EXIT is issued. Returns [pa_ctrlstate_before, pwrmode_before, uic_result, upms_completed, pa_ctrlstate_after, hcs_after]. uic_result 0 = command accepted; upms_completed 1 = IS.UPMS latched (the link actually left hibernate).
+    /// Exit UFS hibernate on the live link. ABL parks UFS in HIBERN8 before handoff (its last UIC command reads DME_HIBERN8_ENTER=G#17): HCS reads link-up/ready but the transfer manager sits idle (never fetches the descriptor, no error, no timeout) until DME_HIBERN8_EXIT. Hibernate-exit completion is signalled by IS.UHXS (bit 5), NOT IS.UPMS (bit 4, which is for power-MODE changes) — waiting on UPMS reports a false failure and can trip UPMCRS fatal. MUST be the first UFS operation on the pristine link, before any doorbell ring or IS clear perturbs the hibernating state. Returns [is_before, uiccmd_last, uic_result, uhxs_completed, hcs_after, is_after]. uhxs_completed 1 = the link actually left hibernate.
     pub fn live_hibern8_exit(&self) -> [u32; 6] {
         let mut out = [0u32; 6];
-        out[0] = self.unipro(0x15C); // DBG_PA_CTRLSTATE before
-        out[1] = self.dme_get(pa::PWRMODE, 0).unwrap_or(0xFFFF_FFFF); // PA_PWRMODE before
-        self.write_reg(regs::IS, regs::IS_UPMS);
+        out[0] = self.read_reg(regs::IS);          // IS as ABL left it (UCCS from its HIBERN8_ENTER)
+        out[1] = self.read_reg(regs::UICCMD);       // last UIC command (G#17 = HIBERN8_ENTER confirms hibernate)
+        self.write_reg(regs::IS, 0xFFFF_FFFF);      // clear ABL's stale UCCS/UHES before issuing exit
         out[2] = match self.uic_cmd(uic::DME_HIBERN8_EXIT, 0, 0, 0) {
             Ok(code) => code,
             Err(()) => 0xFFFF_FFFF,
         };
         let mut ok = false;
         for _ in 0..1_000_000u32 {
-            if self.read_reg(regs::IS) & regs::IS_UPMS != 0 {
-                self.write_reg(regs::IS, regs::IS_UPMS);
+            if self.read_reg(regs::IS) & regs::IS_UHXS != 0 {
+                self.write_reg(regs::IS, regs::IS_UHXS);
                 ok = true;
                 break;
             }
         }
         out[3] = ok as u32;
-        out[4] = self.unipro(0x15C); // DBG_PA_CTRLSTATE after
-        out[5] = self.read_reg(regs::HCS);
+        out[4] = self.read_reg(regs::HCS);
+        out[5] = self.read_reg(regs::IS);
         out
     }
 
