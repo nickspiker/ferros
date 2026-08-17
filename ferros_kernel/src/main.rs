@@ -1107,9 +1107,27 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
     let mut reuse = [0u32; 14]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr, utrd_dw0, utrd_dw2, s2mpu_ctrl, s2mpu_cfg]
     let mut clean = [0u32; 4]; // absolute-first clean NOP: [ocs, rsp, IS, DBR]
+    let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
         let le = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]); // big-endian display: bytes read left-to-right
+
+        // External-block state as ABL left it, read before ANY UFS touch. These are the probe-time writes Linux does OUTSIDE the FWTRACE window: sysreg_ufs iocc G#1302_0710 = 3 (UFS DMA coherency/shareability), PMU ufs-phy-iso G#1546_3EC0 = 1 (PHY isolation bypass). Linux's running UFSP reads RSECURITY=G#FFFA6492 WSECURITY=0. Any delta here is a candidate for both the dead doorbell and the silent link startup.
+        {
+            let rd = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+            let wr = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+            // Always-on-domain reads first.
+            ext[0] = rd(0x1302_0710); // sysreg_ufs iocc
+            ext[5] = rd(0x1306_0000); // GPH5CON at handoff
+            ext[1] = rd(0x1546_3EC0); // PMU ufs-phy-iso
+            // UFSP is behind the auto-gated UFS clock domain (FORCE_HCS UFSP_DRCG_EN) — reading it with the gate armed bus-hangs the AP (proved by hot-reload: this block hung until these unlock writes were added). Clear the auto-stop enables and forced stops first, exactly like unlock_clocks().
+            wr(0x1320_11B4, rd(0x1320_11B4) & !0xFF0); // HCI_FORCE_HCS
+            wr(0x1320_11B0, rd(0x1320_11B0) & !0x1F);  // HCI_CLKSTOP_CTRL
+            unsafe { core::arch::asm!("dsb sy") };
+            ext[2] = rd(0x132A_0010); // UFSP RSECURITY
+            ext[3] = rd(0x132A_0110); // UFSP WSECURITY
+            ext[4] = rd(0x131F_0000); // S2MPU CTRL0
+        }
 
         // ---- CLEAN NOP: the ABSOLUTE first UFS touch, before any snapshot/reset/reuse poke ----
         // Isolates whether Phase A's own writes (clock-unlock, GPIO reset test, NEXUS write, ABL-UCD scribble) perturb the live ABL link before the NOP. If this clean NOP completes (OCS=0) but the later ones don't, our own diagnostics were breaking the link.
@@ -1489,6 +1507,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"REP_TUNED=", rep_tuned);
                                                 // UFS: Phase A = live-link NOP (no reset); Phase B (only if A fails) = full_init. Success (live) = UFS_LIVE_OCS=0 + UFS_DONE=00A1100D + UFS_DATA0/1="EFI PART".
                                                 // pbl-style descriptor-reuse NOP (ABL's own UCD, no rebase). REUSE_OCS=0 = transfer completed → our UFS_BUF region was unreachable by the UFS DMA master (S2MPU/protected region) and rebasing was the bug.
+                                                // External-block ABL-handoff state vs Linux's probe-time values: IOCC expect Linux=3, PHYISO expect 1, UFSP_RSEC Linux=G#FFFA6492, UFSP_WSEC Linux=0.
+                                                append_hex(&mut resp, b"UFS_EXT_IOCC=", ext[0]);
+                                                append_hex(&mut resp, b"UFS_EXT_PHYISO=", ext[1]);
+                                                append_hex(&mut resp, b"UFS_EXT_UFSP_RSEC=", ext[2]);
+                                                append_hex(&mut resp, b"UFS_EXT_UFSP_WSEC=", ext[3]);
+                                                append_hex(&mut resp, b"UFS_EXT_S2MPU_CTRL=", ext[4]);
+                                                append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_OCS=", clean[0]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_RSP=", clean[1]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_IS=", clean[2]);

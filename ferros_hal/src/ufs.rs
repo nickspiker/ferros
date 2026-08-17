@@ -106,6 +106,9 @@ mod vs {
     pub const DATA_REORDER: usize = 0x60;
     pub const AXIDMA_RWDATA_BURST_LEN: usize = 0x6C;
     pub const GPIO_OUT: usize = 0x70;         // bit 0 = UFS device reset_n line
+    pub const ERROR_EN_DL_LAYER: usize = 0x7C;
+    pub const ERROR_EN_N_LAYER: usize = 0x80;
+    pub const ERROR_EN_T_LAYER: usize = 0x84;
     pub const V2P1_CTRL: usize = 0x8C;        // bit 16 = IA_TICK_SEL
     pub const CLKSTOP_CTRL: usize = 0xB0;     // forced clock stops
     pub const FORCE_HCS: usize = 0xB4;        // AUTO clock-stop enables — the M-PHY APB hang gate
@@ -892,7 +895,8 @@ impl UfsController {
 
             // config_host — the vendor block ABL applies before enable. NEXUS_TYPE here, BEFORE HCE 0->1, is the load-bearing line: it marks every tag as a nexus transfer at enable time.
             self.unlock_clocks();
-            self.hci_w(vs::V2P1_CTRL, 0x4001_0000); // IA_TICK_SEL, as ABL left it
+            // IA_TICK_SEL via read-modify-write, matching exynos_ufs_fit_aggr_timeout. SW_RST resets this register to G#1, so Linux's working value is G#10001 — forcing ABL's captured G#40010000 here wrote a stale pre-reset value.
+            self.hci_w(vs::V2P1_CTRL, self.hci(vs::V2P1_CTRL) | 1 << 16);
             self.hci_w(vs::US_TO_CNT_VAL, 0xB2); // ABL's aggregation-timer count (ACLK MHz); unused by our polling driver
             self.hci_w(vs::DATA_REORDER, 0xA);
             self.hci_w(vs::TXPRDT_ENTRY_SIZE, vs::PRDT_PREFETCH_EN | 12);
@@ -946,6 +950,13 @@ impl UfsController {
             r.avail_rx = self.unipro(unip::PA_AVAILRXDATALANES);
             cal.available_lane = if r.avail_rx == 2 { 2 } else { 1 };
             done(&mut r, step::LANES);
+
+            // Linux's link_startup_notify PRE block (from the FWTRACE of a working bring-up): DFES layer error enables, then RE-write the PA debug option suites. The HCE 0->1 cycle resets the option suites, and the reference rewrites them here "to keep phy context ... for unipro v1.8" — writing them only in config_host (pre-HCE, as we did) leaves reset defaults in place at DME_LINKSTARTUP.
+            self.hci_w(vs::ERROR_EN_DL_LAYER, 0x8000_2020);
+            self.hci_w(vs::ERROR_EN_N_LAYER, 0x8000_0007);
+            self.hci_w(vs::ERROR_EN_T_LAYER, 0x8000_0017);
+            self.unipro_w(unip::PA_DBG_OPTION_SUITE_1, unip::DBG_SUITE1_ENABLE);
+            self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
 
             // Pre-link cal, then clear stale UIC error state so this attempt's codes are its own.
             r.cal_timeouts = (r.cal_timeouts & !0xFF) | (ufs_cal::pre_link(cal) & 0xFF);
