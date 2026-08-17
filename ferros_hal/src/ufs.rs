@@ -808,9 +808,9 @@ impl UfsController {
         crate::ufs_cal::trace_write32(crate::ufs_cal::base::UNIPRO + off, v)
     }
 
-    /// Clear every auto clock-stop enable and forced stop. HCE transitions and SW_RST can restore the power-on defaults (auto-gating ON), and any UNIPRO/PMA access with the M-PHY APB or UNIPRO mclk gated bus-hangs the AP — this is why the reference `ufs_call_cal` re-clears the gates around EVERY cal call. Call before any UNIPRO/PMA/cal access.
+    /// Set the M-PHY clock gating to match Linux's working bring-up exactly. A ferros-vs-Linux FWTRACE diff showed HCI_FORCE_HCS (G#B4) was the ONLY register ferros programmed differently across the whole init: ferros zeroed it (all auto clock-stop enables OFF), Linux holds it at G#9C0 during cal and at DME_LINKSTARTUP. Zeroing it left the M-PHY clocked differently than the device expects, so the peer stayed silent at link startup. G#9C0 keeps REFCLKOUT_STOP_EN | UFSP_DRCG_EN | REFCLK_STOP_EN | UNIPRO_PCLK_STOP_EN enabled (auto-gate only when idle — harmless during active bring-up) while clearing MPHY_APBCLK_STOP_EN (bit10) and UNIPRO_MCLK_STOP_EN (bit5) so PMA/mclk stay accessible — which is exactly why we cleared FORCE_HCS in the first place (a PMA access with bit10 set bus-hangs the AP). CLKSTOP_CTRL (forced stops) still fully cleared, as Linux's gate_clk(false) does.
     fn unlock_clocks(&self) {
-        self.hci_w(vs::FORCE_HCS, self.hci(vs::FORCE_HCS) & !vs::FORCE_HCS_ALL_EN);
+        self.hci_w(vs::FORCE_HCS, 0x9C0);
         self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !vs::CLK_STOP_ALL);
     }
 
