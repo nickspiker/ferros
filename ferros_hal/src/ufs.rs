@@ -677,6 +677,13 @@ impl UfsController {
         let mut out = [0u32; 6];
         out[0] = self.read_reg(regs::IS);          // IS as ABL left it (UCCS from its HIBERN8_ENTER)
         out[1] = self.read_reg(regs::UICCMD);       // last UIC command (G#17 = HIBERN8_ENTER confirms hibernate)
+        // Exynos hibern8_notify EXIT/PRE_CHANGE: ungate the internal clock, then run the pre-h8-exit PMA cal, BEFORE the DME command — else the exit hits an untuned PHY and UPMCRS goes fatal.
+        self.unlock_clocks();
+        let _ = crate::ufs_cal::pre_h8_exit(crate::ufs_cal::CalParams {
+            available_lane: 2,
+            connected_rx_lane: 2,
+            active_rx_lane: 2,
+        });
         self.write_reg(regs::IS, 0xFFFF_FFFF);      // clear ABL's stale UCCS/UHES before issuing exit
         out[2] = match self.uic_cmd(uic::DME_HIBERN8_EXIT, 0, 0, 0) {
             Ok(code) => code,

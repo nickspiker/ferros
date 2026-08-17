@@ -298,6 +298,24 @@ pub fn post_link(p: CalParams) -> u32 {
     t
 }
 
+/// Pre-hibernate-EXIT cal (`ufs_cal_pre_h8_exit`, zuma `pre_h8_exit` table). ABL parks the link in HIBERN8 before handoff; the Exynos hibern8_notify EXIT/PRE_CHANGE hook ungates the internal clock and runs THIS before issuing DME_HIBERN8_EXIT. Without it the exit reaches the PHY in an untuned state and UPMCRS goes fatal. Caller must have the FORCE_HCS clock-stop enables cleared (unlock_clocks). Rows: PMA_COMN 0x000=0x11 (once), wait ~10us, per-connected-lane PMA_TRSV_SQ 0x9F4=0x00 / 0xA00=0x30, per-lane PMA_TRSV 0xB64=0x32 then 0x22 (write-then-write, table order is per-row-then-per-lane).
+pub fn pre_h8_exit(p: CalParams) -> u32 {
+    wr(base::PMA + 0x000, 0x11);
+    udelay(10);
+    for lane in 0..p.connected_rx_lane {
+        let l = base::PMA + PMA_LANE_STRIDE * lane as usize;
+        wr(l + 0x9F4, 0x00);
+        wr(l + 0xA00, 0x30);
+    }
+    for lane in 0..p.available_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0xB64, 0x32);
+    }
+    for lane in 0..p.available_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0xB64, 0x22);
+    }
+    0
+}
+
 /// Pre power-mode-change cal for FAST mode, HS series B. Also masks PA_ERROR_IND_RECEIVED in the DL error IRQ shadow, as the reference does before every PMC.
 pub fn pre_pmc_hs_b(p: CalParams) -> u32 {
     const DL_ERROR_IRQ_MASK: usize = 0x4844;
