@@ -25,14 +25,15 @@ pub mod base {
 }
 
 /// UNIPRO main clock, Hz. See module docs for the derivation.
-pub const MCLK_RATE: u64 = 133_333_333;
+/// UNIPRO main clock, Hz. 178 MHz — confirmed two ways: Linux's exynos-ufs logs `mclk: 178000000` (clk_get_rate of clk_unipro), and HCI_1US_TO_CNT_VAL (= mclk/1e6) reads G#B2 = 178 on husky. The earlier 133 MHz derivation (from DBG_PRD=G#78) was WRONG — calibrating the M-PHY for 133 against the real 178 mistunes the PHY and DME_LINKSTARTUP fails with the device silent. All derived constants below recompute from this.
+pub const MCLK_RATE: u64 = 178_000_000;
 
-/// 1e9 / MCLK_RATE truncated — mclk period in ns.
-const MCLK_PERIOD: u32 = 7;
-/// 1e9 / MCLK_RATE rounded half-up (the PCS PRD registers take the rounded value).
-const MCLK_PERIOD_RND: u32 = 8;
-/// (16 * 1000 * 1_000_000) / MCLK_RATE = 1.6e10 / rate — the UNIPRO "period for 1.8" debug value. A#120, matches what ABL programmed (read back as G#78).
-const MCLK_PERIOD_UNIPRO_18: u32 = 120;
+/// 1e9 / MCLK_RATE truncated (`__get_mclk_period`) — mclk period in ns. = 5 at 178 MHz.
+const MCLK_PERIOD: u32 = (1_000_000_000u64 / MCLK_RATE) as u32;
+/// 1e9 / MCLK_RATE rounded half-up (`__get_round_off`) — the PCS PRD registers take the rounded value. = 6 at 178 MHz.
+const MCLK_PERIOD_RND: u32 = ((1_000_000_000u64 + MCLK_RATE / 2) / MCLK_RATE) as u32;
+/// (16 * 1000 * 1_000_000) / MCLK_RATE = 1.6e10 / rate — the UNIPRO "period for 1.8" debug value (`__get_mclk_period_unipro_18`). = 89 at 178 MHz.
+const MCLK_PERIOD_UNIPRO_18: u32 = (16_000_000_000u64 / MCLK_RATE) as u32;
 
 /// TX line reset time, ticks of mclk for 3200us.
 const TX_LINE_RESET_TICKS: u32 = ((MCLK_RATE * 3200) / 1_000_000) as u32;
