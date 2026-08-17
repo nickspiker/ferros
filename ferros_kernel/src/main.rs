@@ -1107,6 +1107,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut clkdiag = [0u32; 5]; // clock/refclk state at link-startup: [CLKSTOP_CTRL, FORCE_HCS, MPHY_REFCLK_SEL, CMU_QCH, CMU_UNIPRO_GATE]
     let mut reuse = [0u32; 14]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr, utrd_dw0, utrd_dw2, s2mpu_ctrl, s2mpu_cfg]
     let mut clean = [0u32; 4]; // absolute-first clean NOP: [ocs, rsp, IS, DBR]
+    let mut hitest = [0u32; 4]; // high-DRAM reachability probe: [ocs, is, dbr_after, done]
     let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
@@ -1129,17 +1130,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[4] = rd(0x131F_0000); // S2MPU CTRL0
         }
 
-        // ---- CLEAN NOP: the ABSOLUTE first UFS touch, before any snapshot/reset/reuse poke ----
-        // Isolates whether Phase A's own writes (clock-unlock, GPIO reset test, NEXUS write, ABL-UCD scribble) perturb the live ABL link before the NOP. If this clean NOP completes (OCS=0) but the later ones don't, our own diagnostics were breaking the link.
-        ufs.init_transfer_list();
-        let (clean_ocs, clean_rsp) = ufs.live_nop();
-        clean[0] = clean_ocs as u32;
-        clean[1] = clean_rsp as u32;
-        clean[2] = r(0x20); // IS
-        clean[3] = r(0x58); // DBR
-
-        // ---- Phase A0: pbl-style descriptor REUSE (before touching anything) ----
-        // pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
+        // ---- Phase A0: pbl-style descriptor REUSE (the ABSOLUTE first UFS touch) ----
+        // MUST run before init_transfer_list (clean-NOP) or the rebase clobbers ABL's UTRLBA and this tests ferros's own ring instead. pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
         {
             let rd8 = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
             let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v); };
@@ -1189,6 +1181,56 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                 }
             }
         }
+
+        // ---- HIGH-DRAM reachability probe (on ABL's live link, before any rebase settles) ----
+        // The dead-doorbell hypothesis: ferros's UFS_BUF at G#8009_0400 sits in the low bootloader-reserved DRAM the UFS DMA master / SysMMU can't reach, while ABL (G#F8C4_2000) and Linux (G#8826_1000) both place descriptors in HIGH DRAM and their transfers work. Build a self-contained UTRD+UCD at a fixed high address and ring the doorbell WITHOUT using UFS_BUF. If OCS lands 0 here but not at G#8009_0400, the buffer region was the whole problem and the fix is to relocate UFS_BUF high. hitest = [ocs, is, dbr_after, done].
+        {
+            let rd8 = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+            let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+            const HI_UTRD: usize = 0x9000_0000; // 256MB into DRAM — above kernel/bootloader low carveout, below ABL/Linux rings
+            const HI_UCD: usize = 0x9000_1000;
+            // Zero UTRD (32B) and the UCD command+response region we use (1KB).
+            unsafe {
+                core::ptr::write_bytes(HI_UTRD as *mut u8, 0, 32);
+                core::ptr::write_bytes(HI_UCD as *mut u8, 0, 1024);
+            }
+            // NOP OUT UPIU at UCD offset 0 (transaction code 0, tag 0) — already zeroed.
+            wr32(HI_UTRD + 0, (1 << 24) | (1 << 28));   // DW0: interrupt | cmd_type=native UFS
+            wr32(HI_UTRD + 8, 0x0000_000F);             // DW2: OCS = INVALID sentinel
+            wr32(HI_UTRD + 16, HI_UCD as u32);          // DW4: UCD base low
+            wr32(HI_UTRD + 20, 0);                      // DW5: UCD base high
+            wr32(HI_UTRD + 24, (0x0080 << 16) | 0x0080); // DW6: response offset/len
+            wr32(HI_UTRD + 28, (0x0100 << 16) | 0x0000); // DW7: PRDT offset, 0 entries
+            unsafe { core::arch::asm!("dsb sy") };
+            // Point the controller at the high UTRD (RSR=0 to sample the new base), nexus every tag, ring slot 0.
+            wr32(UFS_BASE + 0x60, 0);                    // UTRLRSR = 0
+            wr32(UFS_BASE + 0x50, HI_UTRD as u32);       // UTRLBA
+            wr32(UFS_BASE + 0x54, 0);                    // UTRLBAU
+            wr32(0x1320_1140, 0xFFFF_FFFF);              // HCI_UTRL_NEXUS_TYPE
+            wr32(UFS_BASE + 0x20, 0xFFFF_FFFF);          // clear IS
+            wr32(UFS_BASE + 0x60, 1);                    // UTRLRSR = 1
+            unsafe { core::arch::asm!("dsb sy") };
+            wr32(UFS_BASE + 0x58, 1);                    // ring doorbell slot 0
+            unsafe { core::arch::asm!("dsb sy") };
+            let mut done = false;
+            for _ in 0..4_000_000u32 {
+                if r(0x20) & 1 != 0 { done = true; break; }             // IS.UTRCS
+                if rd8(HI_UTRD + 8) & 0xFF != 0x0F { done = true; break; } // OCS written back by DMA
+            }
+            hitest[0] = rd8(HI_UTRD + 8) & 0xFF; // OCS
+            hitest[1] = r(0x20);                 // IS
+            hitest[2] = r(0x58);                 // DBR after
+            hitest[3] = done as u32;
+        }
+
+        // ---- CLEAN NOP: first touch AFTER the reuse test, using ferros's own rebased ring ----
+        // Isolates whether Phase A's own writes (clock-unlock, GPIO reset test, NEXUS write, ABL-UCD scribble) perturb the live ABL link before the NOP. If this clean NOP completes (OCS=0) but the later ones don't, our own diagnostics were breaking the link.
+        ufs.init_transfer_list();
+        let (clean_ocs, clean_rsp) = ufs.live_nop();
+        clean[0] = clean_ocs as u32;
+        clean[1] = clean_rsp as u32;
+        clean[2] = r(0x20); // IS
+        clean[3] = r(0x58); // DBR
 
         // ---- Phase A: transfers on ABL's LIVE link (no reset, no full_init) ----
         // This is the original problem, tested cleanly: on a fresh boot ABL leaves the link up (HCS=G#10F). If a NOP completes here, the transfer engine works and full_init is unnecessary — the whole saga was a transfer-setup bug, not a link bug.
@@ -1514,6 +1556,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_EXT_UFSP_WSEC=", ext[3]);
                                                 append_hex(&mut resp, b"UFS_EXT_S2MPU_CTRL=", ext[4]);
                                                 append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
+                                                // High-DRAM reachability probe: does a doorbell against a G#9000_0000 descriptor complete on ABL's live link? HITEST_OCS=0 while CLEAN_OCS=F ⇒ ferros's low UFS_BUF was unreachable; relocate it high.
+                                                append_hex(&mut resp, b"UFS_HITEST_OCS=", hitest[0]);
+                                                append_hex(&mut resp, b"UFS_HITEST_IS=", hitest[1]);
+                                                append_hex(&mut resp, b"UFS_HITEST_DBR=", hitest[2]);
+                                                append_hex(&mut resp, b"UFS_HITEST_DONE=", hitest[3]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_OCS=", clean[0]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_RSP=", clean[1]);
                                                 append_hex(&mut resp, b"UFS_CLEAN_IS=", clean[2]);
