@@ -1108,6 +1108,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut reuse = [0u32; 14]; // pbl-style descriptor-reuse NOP: [utrlba, utrlbau, ucd_lo, ucd_hi, dbr_before, ocs, is, dbr_after, done, rsr, utrd_dw0, utrd_dw2, s2mpu_ctrl, s2mpu_cfg]
     let mut clean = [0u32; 4]; // absolute-first clean NOP: [ocs, rsp, IS, DBR]
     let mut hitest = [0u32; 4]; // high-DRAM reachability probe: [ocs, is, dbr_after, done]
+    let mut iocc_fix = [0u32; 2]; // IOCC coherency clear: [before, after]
+    let mut dma_dbg = [0u32; 6]; // Exynos DMA-engine state captured mid-stall: [fsm, dma0_state, dma0_cnt, dma0_doorbell, vendor_is, axi_if_ctrl]
+    let mut h8 = [0u32; 6]; // hibern8-exit probe: [pa_ctrlstate_before, pwrmode_before, uic_result, upms_completed, pa_ctrlstate_after, hcs_after]
+    let mut h8_nop = [0u32; 4]; // NOP after hibern8 exit: [ocs, rsp, is, dbr]
     let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
@@ -1128,6 +1132,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[2] = rd(0x132A_0010); // UFSP RSECURITY
             ext[3] = rd(0x132A_0110); // UFSP WSECURITY
             ext[4] = rd(0x131F_0000); // S2MPU CTRL0
+
+            // CANDIDATE FIX for the dead doorbell: ABL sets sysreg_ufs iocc bits[1:0]=3 => the UFS AXI master issues COHERENT (inner/outer-shareable) transactions that must snoop the CPU caches. ABL/Linux run in the coherency domain so snoops resolve; ferros manages caches MANUALLY (ufs.rs does explicit clean/invalidate around DMA — the non-coherent model) and is not answering coherent snoops, so the master's coherent read STALLS forever = doorbell stuck, every address. Clear the coherency bits so the master does plain non-coherent DMA straight to DRAM, matching ferros's driver. Reversible on reboot.
+            iocc_fix[0] = ext[0];                       // IOCC as ABL left it
+            wr(0x1302_0710, ext[0] & !0x3);             // clear shareable/coherent bits
+            unsafe { core::arch::asm!("dsb sy") };
+            iocc_fix[1] = rd(0x1302_0710);              // IOCC after clear (should be ext[0] & !3)
         }
 
         // ---- Phase A0: pbl-style descriptor REUSE (the ABSOLUTE first UFS touch) ----
@@ -1231,6 +1241,28 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         clean[1] = clean_rsp as u32;
         clean[2] = r(0x20); // IS
         clean[3] = r(0x58); // DBR
+        // Exynos DMA-engine debug regs, captured right after the (stalled) doorbell. HCI vendor block base G#1320_1100. If the engine is stuck fetching the descriptor these show where: FSM_MONITOR G#C0, DMA0_MONITOR_STATE G#C8 / _CNT G#CC (nonzero cnt = AXI beats moved), DMA0_DOORBELL_DEBUG G#D8, HCI_VENDOR_SPECIFIC_IS G#38 (latches AXI/DMA errors), UFS_AXI_DMA_IF_CTRL G#F8.
+        {
+            let hci = |off: usize| unsafe { core::ptr::read_volatile((0x1320_1100 + off) as *const u32) };
+            dma_dbg[0] = hci(0xC0); // FSM_MONITOR
+            dma_dbg[1] = hci(0xC8); // DMA0_MONITOR_STATE
+            dma_dbg[2] = hci(0xCC); // DMA0_MONITOR_CNT
+            dma_dbg[3] = hci(0xD8); // DMA0_DOORBELL_DEBUG
+            dma_dbg[4] = hci(0x38); // HCI_VENDOR_SPECIFIC_IS
+            dma_dbg[5] = hci(0xF8); // UFS_AXI_DMA_IF_CTRL
+        }
+
+        // ---- HIBERN8-EXIT probe: is ABL parking the link in hibernate before handoff? ----
+        // The idle-DMA signature (doorbell accepted, DMA0_CNT=0, no error, no timeout) is what HIBERN8 looks like: HCS reads ready but the transfer manager won't fetch a descriptor until the link leaves hibernate. Exit it, then retry the NOP on the same live link.
+        h8 = ufs.live_hibern8_exit();
+        {
+            ufs.init_transfer_list();
+            let (ocs, rsp) = ufs.live_nop();
+            h8_nop[0] = ocs as u32;
+            h8_nop[1] = rsp as u32;
+            h8_nop[2] = r(0x20); // IS
+            h8_nop[3] = r(0x58); // DBR
+        }
 
         // ---- Phase A: transfers on ABL's LIVE link (no reset, no full_init) ----
         // This is the original problem, tested cleanly: on a fresh boot ABL leaves the link up (HCS=G#10F). If a NOP completes here, the transfer engine works and full_init is unnecessary — the whole saga was a transfer-setup bug, not a link bug.
@@ -1556,6 +1588,27 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_EXT_UFSP_WSEC=", ext[3]);
                                                 append_hex(&mut resp, b"UFS_EXT_S2MPU_CTRL=", ext[4]);
                                                 append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
+                                                // IOCC coherency clear (candidate fix): if CLEAN/HITEST/REUSE OCS now land 0, the coherent-DMA-snoop-stall was the dead-doorbell root cause.
+                                                // HIBERN8-exit probe: was ABL parking the link in hibernate? H8_NOP_OCS=0 after exit ⇒ yes, that was the dead-doorbell cause. PA_CTRLSTATE/PWRMODE show the link state before/after.
+                                                append_hex(&mut resp, b"UFS_H8_PACS_BEFORE=", h8[0]);
+                                                append_hex(&mut resp, b"UFS_H8_PWRMODE_BEFORE=", h8[1]);
+                                                append_hex(&mut resp, b"UFS_H8_UIC_RES=", h8[2]);
+                                                append_hex(&mut resp, b"UFS_H8_UPMS_DONE=", h8[3]);
+                                                append_hex(&mut resp, b"UFS_H8_PACS_AFTER=", h8[4]);
+                                                append_hex(&mut resp, b"UFS_H8_HCS_AFTER=", h8[5]);
+                                                append_hex(&mut resp, b"UFS_H8_NOP_OCS=", h8_nop[0]);
+                                                append_hex(&mut resp, b"UFS_H8_NOP_RSP=", h8_nop[1]);
+                                                append_hex(&mut resp, b"UFS_H8_NOP_IS=", h8_nop[2]);
+                                                append_hex(&mut resp, b"UFS_H8_NOP_DBR=", h8_nop[3]);
+                                                append_hex(&mut resp, b"UFS_IOCC_BEFORE=", iocc_fix[0]);
+                                                append_hex(&mut resp, b"UFS_IOCC_AFTER=", iocc_fix[1]);
+                                                // Exynos DMA-engine state captured right after the (possibly stalled) clean-NOP doorbell.
+                                                append_hex(&mut resp, b"UFS_DMA_FSM=", dma_dbg[0]);
+                                                append_hex(&mut resp, b"UFS_DMA0_STATE=", dma_dbg[1]);
+                                                append_hex(&mut resp, b"UFS_DMA0_CNT=", dma_dbg[2]);
+                                                append_hex(&mut resp, b"UFS_DMA0_DBELL=", dma_dbg[3]);
+                                                append_hex(&mut resp, b"UFS_VENDOR_IS=", dma_dbg[4]);
+                                                append_hex(&mut resp, b"UFS_AXI_IF_CTRL=", dma_dbg[5]);
                                                 // High-DRAM reachability probe: does a doorbell against a G#9000_0000 descriptor complete on ABL's live link? HITEST_OCS=0 while CLEAN_OCS=F ⇒ ferros's low UFS_BUF was unreachable; relocate it high.
                                                 append_hex(&mut resp, b"UFS_HITEST_OCS=", hitest[0]);
                                                 append_hex(&mut resp, b"UFS_HITEST_IS=", hitest[1]);

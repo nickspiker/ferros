@@ -139,6 +139,8 @@ mod uic {
     pub const DME_GET: u32 = 0x01;
     pub const DME_SET: u32 = 0x02;
     pub const DME_LINKSTARTUP: u32 = 0x16;
+    pub const DME_HIBERN8_ENTER: u32 = 0x17;
+    pub const DME_HIBERN8_EXIT: u32 = 0x18;
 }
 
 /// UniPro PA-layer MIB attribute IDs for the power-mode change.
@@ -666,6 +668,30 @@ impl UfsController {
     pub fn live_nop(&self) -> (u8, u8) {
         let (ocs, rsp, _) = self.send_nop();
         (ocs, rsp)
+    }
+
+    /// Exit UFS hibernate on the live link. Bootloaders often park UFS in HIBERN8 before handoff: HCS reads link-up/ready but the transfer manager sits idle (never fetches the descriptor) until DME_HIBERN8_EXIT is issued. Returns [pa_ctrlstate_before, pwrmode_before, uic_result, upms_completed, pa_ctrlstate_after, hcs_after]. uic_result 0 = command accepted; upms_completed 1 = IS.UPMS latched (the link actually left hibernate).
+    pub fn live_hibern8_exit(&self) -> [u32; 6] {
+        let mut out = [0u32; 6];
+        out[0] = self.unipro(0x15C); // DBG_PA_CTRLSTATE before
+        out[1] = self.dme_get(pa::PWRMODE, 0).unwrap_or(0xFFFF_FFFF); // PA_PWRMODE before
+        self.write_reg(regs::IS, regs::IS_UPMS);
+        out[2] = match self.uic_cmd(uic::DME_HIBERN8_EXIT, 0, 0, 0) {
+            Ok(code) => code,
+            Err(()) => 0xFFFF_FFFF,
+        };
+        let mut ok = false;
+        for _ in 0..1_000_000u32 {
+            if self.read_reg(regs::IS) & regs::IS_UPMS != 0 {
+                self.write_reg(regs::IS, regs::IS_UPMS);
+                ok = true;
+                break;
+            }
+        }
+        out[3] = ok as u32;
+        out[4] = self.unipro(0x15C); // DBG_PA_CTRLSTATE after
+        out[5] = self.read_reg(regs::HCS);
+        out
     }
 
     /// Snapshot 12 PMA/PA/UNIPRO registers for a working-vs-failed link register-diff (the concrete next lead in UFS.md). Clears the FORCE_HCS auto clock-stop gates first — a PMA read with the gate on bus-hangs the AP. Order: PMA COMN 0x000/0x140/0x150/0x19C/0x1A0/0xC74, PMA TRSV lane0 0x9F0/0x9F4/0xA00, UNIPRO PA_CTRLSTATE 0x15C / PA_TX_STATE 0x160 / MAXRXHSGEAR 0x321C.
