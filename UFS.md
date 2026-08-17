@@ -1,5 +1,27 @@
 # UFS on Pixel 8 (Zuma) — status and findings — Zil (0)
 
+## MORNING PLAN (2026-08-16 overnight) — debug kernel proved it, mclk fixed, FWTRACE next
+
+**What the custom debug kernel proved (ground truth from Linux's WORKING UFS):**
+- **Secure-DMA / GSA theory: DEAD.** Linux runs `WSECURITY=0` (write path "secure") with descriptors in plain low DRAM (`utrdl_dma=0x87570000`) and works. No secure memory / GSA needed.
+- **The real bug (partially): mclk was wrong.** Linux logs `mclk: 178000000`; HCI_1US_TO_CNT_VAL reads G#B2=178. ferros hardcoded 133 MHz and calibrated the entire M-PHY for the wrong clock. **FIXED** in `ferros_hal/src/ufs_cal.rs` (MCLK_RATE=178_000_000, derived consts recompute). Committed e03494e.
+- **But mclk alone didn't fix it:** ferros full_init still fails at DME_LINKSTARTUP (device silent, MXGR=0), and the live-link doorbell still won't execute even with ABL's own descriptors (`REUSE_OCS=F`). So there's a FURTHER difference vs Linux.
+
+**THE decisive next step — flash the enhanced debug kernel, get the FWTRACE:**
+The debug kernel is REBUILT with MMIO write tracing (`FWTRACE <region> <ofs>=<val>` for every std/hci/unipro/pma write across the whole working bring-up) plus the FERROS_UFSP/DESC dumps. Built at `/mnt/Harbor/husky-kernel/out/shusky/dist`. Flash it (needs fastboot — device is on ferros now, so hold Power+VolDown):
+```
+# device in bootloader fastboot:
+/mnt/Harbor/husky-kernel/flash-debug-kernel.sh      # handles logical partitions via fastbootd
+# after boot:
+adb bugreport /tmp/br.zip && unzip -p /tmp/br.zip | grep -aE 'FWTRACE|FERROS_'
+```
+That yields Linux's EXACT ordered register-write sequence of a working link bring-up. Diff it against `ferros_hal/src/ufs.rs::full_init` (and the cal in `ufs_cal.rs`) to find the missing/different step that makes DME_LINKSTARTUP succeed. **This is the artifact that ends the guessing.**
+
+**Device state overnight:** boot_a = ferros (with the mclk fix + clean-NOP diag), boot_b = the earlier debug Linux kernel. Device sitting on ferros, enumerating. To return to Android: reflash the husky factory boot images (`/mnt/Harbor/tmp/husky-restore/` + factory image), or the debug kernel via the script above. USB stable on the 1m cable (the 3m cable caused all the earlier flakiness). Reboots decrement A/B retry — if a slot exhausts, ABL falls to the other slot (both bootable).
+
+---
+
+
 ## FULL RE-INIT BUILT + THE NEW WALL (2026-08-16 pm): link-startup handshake never completes
 
 Built the complete Exynos UFSHCI re-init path and tested it exhaustively on hardware. The wall moved from "transfers don't complete" down one layer to "the UniPro link won't start up for us at all."
