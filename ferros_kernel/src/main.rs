@@ -1739,6 +1739,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"WDT0_DAT=", wdt_reload[0]);
                                                 append_hex(&mut resp, b"WDT1_CON=", wdt_con[1]);
                                                 append_hex(&mut resp, b"WDT1_DAT=", wdt_reload[1]);
+                                                // ferros-side FWTRACE: every MMIO write full_init issued, in order, to diff against Linux's captured working trace. Format matches Linux: "FTRACE <addr>=<val>".
+                                                let n = ferros_hal::ufs_cal::trace_len().min(160);
+                                                append_hex(&mut resp, b"UFS_TRACE_N=", ferros_hal::ufs_cal::trace_len() as u32);
+                                                for i in 0..n {
+                                                    let (a, v) = ferros_hal::ufs_cal::trace_get(i);
+                                                    let mut lbl = [0u8; 16]; let mut ln = 0;
+                                                    for &b in b"FTRACE_" { lbl[ln] = b; ln += 1; }
+                                                    // encode addr as hex into the label so each line is unique
+                                                    let hexd = b"0123456789ABCDEF";
+                                                    for shift in [28,24,20,16,12,8,4,0] {
+                                                        lbl[ln] = hexd[((a >> shift) & 0xF) as usize]; ln += 1;
+                                                    }
+                                                    lbl[ln] = b'='; ln += 1;
+                                                    append_hex(&mut resp, &lbl[..ln], v);
+                                                }
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {

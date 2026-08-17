@@ -265,7 +265,7 @@ impl UfsController {
     }
 
     fn write_reg(&self, offset: usize, val: u32) {
-        unsafe { crate::mmio::write32(self.base + offset, val) }
+        crate::ufs_cal::trace_write32(self.base + offset, val)
     }
 
     /// Check if the controller is enabled and the link is up.
@@ -799,13 +799,13 @@ impl UfsController {
         unsafe { crate::mmio::read32(crate::ufs_cal::base::HCI + off) }
     }
     fn hci_w(&self, off: usize, v: u32) {
-        unsafe { crate::mmio::write32(crate::ufs_cal::base::HCI + off, v) }
+        crate::ufs_cal::trace_write32(crate::ufs_cal::base::HCI + off, v)
     }
     fn unipro(&self, off: usize) -> u32 {
         unsafe { crate::mmio::read32(crate::ufs_cal::base::UNIPRO + off) }
     }
     fn unipro_w(&self, off: usize, v: u32) {
-        unsafe { crate::mmio::write32(crate::ufs_cal::base::UNIPRO + off, v) }
+        crate::ufs_cal::trace_write32(crate::ufs_cal::base::UNIPRO + off, v)
     }
 
     /// Clear every auto clock-stop enable and forced stop. HCE transitions and SW_RST can restore the power-on defaults (auto-gating ON), and any UNIPRO/PMA access with the M-PHY APB or UNIPRO mclk gated bus-hangs the AP — this is why the reference `ufs_call_cal` re-clears the gates around EVERY cal call. Call before any UNIPRO/PMA/cal access.
@@ -882,6 +882,7 @@ impl UfsController {
     pub fn full_init(&self) -> InitReport {
         use crate::ufs_cal::{self, udelay};
         let mut r = InitReport::default();
+        ufs_cal::trace_reset(); // record every MMIO write for a ferros-side FWTRACE vs Linux
         let mut done = |r: &mut InitReport, s: u32| r.steps |= 1 << s;
         macro_rules! fail {
             ($r:expr, $s:expr) => {{
@@ -950,10 +951,8 @@ impl UfsController {
             if r.gph5_con_before == 0 {
                 r.gph5_con_before = con;
             }
-            unsafe {
-                crate::mmio::write32(GPH5CON, (con & !0xFF) | 0x22);
-                core::arch::asm!("dsb sy");
-            }
+            crate::ufs_cal::trace_write32(GPH5CON, (con & !0xFF) | 0x22);
+            unsafe { core::arch::asm!("dsb sy") };
             r.gph5_con_after = unsafe { crate::mmio::read32(GPH5CON) };
             udelay(1_000); // let REFCLKOUT reach the device before reset/link
 

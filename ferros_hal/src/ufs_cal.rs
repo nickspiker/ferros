@@ -50,7 +50,45 @@ fn rd(addr: usize) -> u32 {
     unsafe { crate::mmio::read32(addr) }
 }
 fn wr(addr: usize, val: u32) {
-    unsafe { crate::mmio::write32(addr, val) }
+    trace_write32(addr, val);
+}
+
+/// MMIO write trace for a ferros-side FWTRACE: records (addr, val) pairs so full_init's exact register sequence can be diffed against Linux's captured working trace. Flat array of [addr, val, addr, val, ...].
+const TRACE_CAP: usize = 1024;
+pub static mut TRACE: [u32; TRACE_CAP] = [0; TRACE_CAP];
+pub static mut TRACE_N: usize = 0;
+pub static mut TRACE_ON: bool = false;
+
+/// Begin recording MMIO writes (clears the buffer).
+pub fn trace_reset() {
+    unsafe {
+        TRACE_N = 0;
+        TRACE_ON = true;
+    }
+}
+/// Stop recording.
+pub fn trace_stop() {
+    unsafe { TRACE_ON = false };
+}
+/// Number of recorded (addr,val) pairs.
+pub fn trace_len() -> usize {
+    unsafe { TRACE_N / 2 }
+}
+/// Recorded pair i as (addr, val).
+pub fn trace_get(i: usize) -> (u32, u32) {
+    unsafe { (TRACE[i * 2], TRACE[i * 2 + 1]) }
+}
+
+/// Write an MMIO register, recording it when tracing is on. All UFS register writes (cal + driver) route through this.
+pub fn trace_write32(addr: usize, val: u32) {
+    unsafe {
+        if TRACE_ON && TRACE_N + 2 <= TRACE_CAP {
+            TRACE[TRACE_N] = addr as u32;
+            TRACE[TRACE_N + 1] = val;
+            TRACE_N += 2;
+        }
+        crate::mmio::write32(addr, val);
+    }
 }
 
 /// Busy-wait using the generic timer (CNTPCT/CNTFRQ) — no dependency on kernel time infra.
