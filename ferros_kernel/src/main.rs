@@ -1114,7 +1114,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut h8_nop = [0u32; 4]; // NOP after hibern8 exit: [ocs, rsp, is, dbr]
     let mut regfile = [0u32; 14]; // ABL pristine register file: CAP,VER,IS,IE,HCS,HCE,UTRLBA,UTRLBAU,UTRLDBR,UTRLCLR,UTRLRSR,UTMRLBA,UTMRLRSR,UICCMD
     let mut clr_nop = [0u32; 4]; // NOP with UTRLCLR forced to all-ones first: [ocs, rsp, is, dbr]
-    let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
+    let mut ext = [0u32; 8]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con, gpp0con, gpp0dat]
     let mut cmu = [0u32; 10]; // mclk clock tree at ABL handoff: [pll_shared0_con3, pll_shared2_con3, pll_spare_con3, top_mux, top_div, top_gate, hsi2_user_mux, leaf_aclk, leaf_unipro, leaf_fmp]
     let mut dbg_prd_pristine = 0u32; // pristine UNIPRO DBG_PRD (actual clock indicator: G#78=133MHz, G#59=178MHz)
     {
@@ -1129,6 +1129,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[0] = rd(0x1302_0710); // sysreg_ufs iocc
             ext[5] = rd(0x1306_0000); // GPH5CON at handoff
             ext[1] = rd(0x1546_3EC0); // PMU ufs-phy-iso
+
+            // UFS device VCC rail: fixed regulator switched by gpp0-1 (zuma-ufs.dtsi ufs_fixed_vcc, enable-active-high). Linux's regulator core CLAIMS this GPIO at probe and drives it — its "vcc en=1" may be Linux TURNING IT ON, not inheriting it. ABL parks the link in HIBERN8 where dropping VCC is legitimate power management; if ABL cuts VCC at handoff the device is silent at line-reset with zero PHY error — our exact signature.
+            // HANG LESSON: reading gpp0 directly (PERIC0 GPIO G#1084_0000) bus-hung the AP — the PERIC0 domain/bridge isn't up at ABL handoff for ferros. This round reads ONLY safe always-on blocks: PMU domain status + the NOCL0-side PERIC0 bridge QCH states, to plan the ungate.
+            ext[6] = rd(0x1546_2804); // PMU PERIC0 domain status (bit0 = powered, per PMUCAL cond refs)
+            ext[7] = rd(0x2600_3290); // CMU_NOCL0 QCH_CON_SLH_AXI_SI_P_PERIC0 (the config-bus bridge into PERIC0)
             // UFSP is behind the auto-gated UFS clock domain (FORCE_HCS UFSP_DRCG_EN) — reading it with the gate armed bus-hangs the AP (proved by hot-reload: this block hung until these unlock writes were added). Clear the auto-stop enables and forced stops first, exactly like unlock_clocks().
             let found_b4 = rd(0x1320_11B4); // ABL leaves G#900
             let found_b0 = rd(0x1320_11B0); // ABL leaves G#10
@@ -1657,6 +1662,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_EXT_UFSP_WSEC=", ext[3]);
                                                 append_hex(&mut resp, b"UFS_EXT_S2MPU_CTRL=", ext[4]);
                                                 append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
+                                                append_hex(&mut resp, b"UFS_PD_PERIC0=", ext[6]);
+                                                append_hex(&mut resp, b"UFS_QCH_P_PERIC0=", ext[7]);
                                                 append_hex(&mut resp, b"UFS_CMU_PLL_SH0=", cmu[0]);
                                                 append_hex(&mut resp, b"UFS_CMU_PLL_SH2=", cmu[1]);
                                                 append_hex(&mut resp, b"UFS_CMU_PLL_SPARE=", cmu[2]);

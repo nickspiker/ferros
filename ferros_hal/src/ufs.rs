@@ -920,6 +920,8 @@ impl UfsController {
             udelay(1_000); // let REFCLKOUT reach the device before reset/link
         }
 
+        // (2s pristine-state runway tested 2026-08-18: identical FAIL=9 — wall-clock settle time is not the variable.)
+
         // Host enable + link startup, retried as a UNIT: on a failed DME_LINKSTARTUP, ufshcd re-runs the whole hba_enable (SW_RST, config, device reset, HCE cycle, cal) before trying again — a bare command retry on the same enable never recovers. We mirror that.
         let mut link_ok = false;
         let mut cal = ufs_cal::CalParams { available_lane: 2, connected_rx_lane: 1, active_rx_lane: 1 };
@@ -1032,6 +1034,8 @@ impl UfsController {
 
             // THE FCORE-TRACE DISCOVERY: Linux never issues DME_LINKSTARTUP at G#9C0 — right before the UIC command it re-arms MPHY_APBCLK_STOP_EN (bit10) and fires at G#DC0. The combined trace shows the rule everywhere: G#9C0 only brackets M-PHY APB (PMA/PCS) access windows; G#DC0 for actual link operation. With the APB config clock forced on, the M-PHY appears to stay held in its configuration interface — arming the auto-stop lets the APB domain gate when idle, releasing the PHY to mission mode so the transmitter actually runs. Firing at 9C0 (all previous attempts) = device silent, MXGR=0, no PHY error — our exact signature.
             self.hci_w(vs::FORCE_HCS, 0xDC0);
+            // DOES DC0 STICK? Read B4 straight back. The Linux-vs-ferros READ diff shows ferros never reads DE0/DC0 back — if bit10 (MPHY_APBCLK_STOP_EN) is gated/read-only in ferros's context, the M-PHY never releases to mission mode. force_hcs_readback low16 = actual B4 after the DC0 write.
+            r.force_hcs = (r.force_hcs & 0xFFFF_0000) | (self.hci(vs::FORCE_HCS) & 0xFFFF);
             // Linux fires DME_LINKSTARTUP immediately after cal — no settle delay.
             match self.uic_cmd(uic::DME_LINKSTARTUP, 0, 0, 0) {
                 Ok(0) => {
@@ -1041,7 +1045,8 @@ impl UfsController {
                 Ok(code) => r.linkstartup_res = code,
                 Err(()) => r.linkstartup_res = 0xFFFF_FFFF,
             }
-            // PCS readback diag, now safely after the attempt (state no longer sacred).
+            // PCS readback diag, now safely after the attempt (state no longer sacred). PCS is M-PHY APB — if the DC0 write actually landed (bit10 armed) this read bus-hangs the AP, so open the 9C0 window first exactly like Linux brackets its own PCS access. The suspected hang of the first DC0-readback build was this line running at a truly-armed DC0.
+            self.hci_w(vs::FORCE_HCS, 0x9C0);
             let pcs_2094 = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x2094) & 0xFF; // expect G#F6
             let pcs_20bc = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x20BC) & 0xFF; // expect G#79
             let pcs_22a4 = ufs_cal::read_pcs(ufs_cal::TX_LANE0, 0x22A4) & 0xFF; // expect G#02
