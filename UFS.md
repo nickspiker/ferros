@@ -1,5 +1,31 @@
 # UFS on Pixel 8 (Zuma) — status and findings — Zil (0)
 
+---
+## DEFINITIVE CONCLUSION (2026-08-18): host proven byte-identical to Linux, digital AND analog — the difference is off-chip
+
+After an exhaustive campaign (custom instrumented Linux kernels built from source, root dmesg capture, ferros-side read+write+analog tracing, machine-diffed against Linux's working bring-up), **every register-level dimension of ferros's UFS bring-up is now PROVEN identical to Linux's, yet the flash device answers Linux and stays silent for ferros.** The blocker is not in any host register.
+
+**Elimination ledger — all closed with evidence:**
+- **Write stream** — machine-diffed byte+order identical to Linux (core `ufshcd` accessors + Exynos vendor accessors both traced via `ferros_core_trace`/FWTRACE, ordered-diffed). The `FORCE_HCS` choreography is faithfully replayed: 900→DE0(link-idle window)→9C0(PMA cal)→**DC0**(linkstartup). The DC0 discovery: Linux fires `DME_LINKSTARTUP` with `MPHY_APBCLK_STOP_EN` **armed** (DC0), not forced-on (9C0); 9C0 only brackets M-PHY APB (PMA/PCS) access windows. DC0 readback-confirmed to land.
+- **Read-backs / write-effects** — identical; `IS` reaches 0x404 (linkstartup command completes) but `HCS.DP` never sets (device not found).
+- **Analog M-PHY (PMA)** — dumped 384 registers (COMN 0x000-0x1FC + TRSV0 0x800-0xBFC, **including the 0xA00-0xBFF squelch / TX-enable / line-reset band**) at the identical PWM-G1 point on BOTH the working Linux link and ferros's failed link. **383/384 byte-identical.** The one diff (0xBFC bit1) is a PHY status bit the cal never writes (cal touches 0xB84/0xB9C) — it reflects link-partner presence, i.e. a *symptom* of Linux having a link and ferros not.
+- **Exception Level** — `BOOT_EL=2`: ferros runs bare-metal at EL2. No pKVM, no stage-2 translation, no S2MPU mediating MMIO. Nothing invisible sits between ferros and the hardware.
+- **Device refclk** — `ufs_refclk_out` (gph5-0 func2) is the controller's internal REFCLKOUT; all routing/drive/gates (`CLKSTOP` bit4, `FORCE_HCS` bit11) are software-matched. No CMU source to enable that ferros misses.
+- **Also eliminated:** KDN/GSA (Linux links with zero GSA traffic — experiment), no SMC in the linkstartup path, no UFS power-domain (HSI2 always-on, no `power-domains` phandle), clock tree byte-identical (mclk=177.66MHz both; the old "133MHz" was a DBG_PRD mis-decode), 2s settle-runway (no change), `ect_parser` module (innocent).
+
+**What's left (all off-chip, none observable from EL2 with identical registers):**
+1. The 38.4MHz device refclk physically present + correct on the gph5-0 pad? (host TX config identical → if the device can't lock its refclk PLL it can't decode the line-reset → silent, no host PHY error — fits every symptom).
+2. Is the host physically driving the TX diff-pairs during linkstartup?
+
+**This is now a bench measurement, not a code change.** Two probe points settle it: scope/LA on (a) `ufs_refclk_out` (gph5-0) for 38.4MHz presence/quality, (b) the UFS TX pairs during a boot's linkstartup window. The strip-down-Android / module-trace path won't help — modules only configure host registers, proven identical; the sole remaining variable is a physical rail/refclk/signal, i.e. the probe.
+
+**Aside (not UFS):** ferros can't warm-reboot to fastboot because it never writes ABL's reboot-reason cookie (a warm-reset handoff), NOT because of any EL/security gate (`BOOT_EL=2` confirms bare EL2). Cheap to add later for iteration QoL.
+
+Key commits: f24e083 (PMA-identical proof), aef776e (EL2 confirmation), 2fb15d2 (host exoneration), 80243cd (faithful replay). Diag adds: `BOOT_EL`, `BOOT_SCTLR`, `PMA_C*/PMA_T*` (384-reg dump), `UFS_FORCEHCS` (DC0 readback). Capture files under `/mnt/Harbor/tmp/`: `linux_pma3_norm.txt` vs `ferros_pma3_norm.txt` (the decisive analog diff), `linux_combined.txt` (full core+vendor ordered trace). Debug-kernel build: `tools/bazel run --config=stamp --config=shusky --config=use_source_tree_aosp //private/devices/google/shusky:zuma_shusky_dist` (source GKI, needed because `ufshcd` is builtin). See [[ufs_husky_wall]] in project memory for the running log.
+
+---
+
+
 ## MORNING PLAN (2026-08-16 overnight) — debug kernel proved it, mclk fixed, FWTRACE next
 
 **What the custom debug kernel proved (ground truth from Linux's WORKING UFS):**
