@@ -1805,6 +1805,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                     lbl[ln] = b'='; ln += 1;
                                                     append_hex(&mut resp, &lbl[..ln], v);
                                                 }
+                                                // Full PMA analog capture (256 regs) at ferros's failed-linkstartup point, to diff against the debug kernel's FPMA dump. Label PMA_C<off>/PMA_T<off> mirrors the kernel's C/T tags. [0..128]=COMN 0x000-0x1FC, [128..256]=TRSV0 0x800-0x9FC.
+                                                let hexd = b"0123456789ABCDEF";
+                                                for i in 0..384usize {
+                                                    let v = unsafe { ferros_hal::ufs_cal::PMA_FULL[i] };
+                                                    let (tag, off) = if i < 128 { (b'C', (i * 4) as u32) } else { (b'T', (0x800 + (i - 128) * 4) as u32) };
+                                                    let mut lbl = [0u8; 16]; let mut ln = 0;
+                                                    for &b in b"PMA_" { lbl[ln] = b; ln += 1; }
+                                                    lbl[ln] = tag; ln += 1;
+                                                    for shift in [12,8,4,0] { lbl[ln] = hexd[((off >> shift) & 0xF) as usize]; ln += 1; }
+                                                    lbl[ln] = b'='; ln += 1;
+                                                    append_hex(&mut resp, &lbl[..ln], v);
+                                                }
                                                 resp.extend_from_slice(b"END\n");
                                                 queue_pt_response(&mut pt_out_data, &resp);
                                             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {

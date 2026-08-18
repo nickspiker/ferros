@@ -54,6 +54,9 @@ fn wr(addr: usize, val: u32) {
 }
 
 /// MMIO write trace for a ferros-side FWTRACE: records (addr, val) pairs so full_init's exact register sequence can be diffed against Linux's captured working trace. Flat array of [addr, val, addr, val, ...].
+/// Full PMA analog capture, 384 regs: [0..128] COMN 0x000-0x1FC, [128..384] TRSV0 0x800-0xBFC (INCLUDING the 0xA00-0xBFF squelch/TX-enable/line-reset region). Diffed against the debug kernel's FPMA dump at the same PWM-G1 point.
+pub static mut PMA_FULL: [u32; 384] = [0; 384];
+
 const TRACE_CAP: usize = 4096;
 pub static mut TRACE: [u32; TRACE_CAP] = [0; TRACE_CAP];
 pub static mut TRACE_N: usize = 0;

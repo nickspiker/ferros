@@ -704,6 +704,23 @@ impl UfsController {
     }
 
     /// Snapshot 12 PMA/PA/UNIPRO registers for a working-vs-failed link register-diff (the concrete next lead in UFS.md). Clears the FORCE_HCS auto clock-stop gates first — a PMA read with the gate on bus-hangs the AP. Order: PMA COMN 0x000/0x140/0x150/0x19C/0x1A0/0xC74, PMA TRSV lane0 0x9F0/0x9F4/0xA00, UNIPRO PA_CTRLSTATE 0x15C / PA_TX_STATE 0x160 / MAXRXHSGEAR 0x321C.
+    /// Full-range PMA dump into a dedicated array, matching the debug kernel's FPMA capture: [0..128] = COMN 0x000-0x1FC, [128..256] = TRSV0 0x800-0x9FC, stepping 4. Gates the APB clock per Linux's pma_readl (9C0 window). Call at the same PWM-G1 point as the kernel (post-linkstartup).
+    pub fn dump_pma_full(&self) {
+        let saved = self.hci(vs::FORCE_HCS);
+        self.hci_w(vs::FORCE_HCS, 0x9C0); // open the M-PHY APB window
+        unsafe {
+            for i in 0..128usize {
+                crate::ufs_cal::PMA_FULL[i] =
+                    crate::mmio::read32(crate::ufs_cal::base::PMA + i * 4);
+            }
+            for i in 0..256usize {
+                crate::ufs_cal::PMA_FULL[128 + i] =
+                    crate::mmio::read32(crate::ufs_cal::base::PMA + 0x800 + i * 4);
+            }
+        }
+        self.hci_w(vs::FORCE_HCS, saved);
+    }
+
     pub fn snapshot_pma(&self) -> [u32; 12] {
         self.hci_w(vs::FORCE_HCS, self.hci(vs::FORCE_HCS) & !vs::FORCE_HCS_ALL_EN);
         self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !vs::CLK_STOP_ALL);
@@ -1068,6 +1085,8 @@ impl UfsController {
             }
             udelay(100_000);
         }
+        // Analog capture at the post-linkstartup point (PWM-G1 on success, failed-state on failure) — same instant as the debug kernel's FPMA dump. Diff isolates any M-PHY analog delta.
+        self.dump_pma_full();
         if !link_ok {
             fail!(r, step::LINKSTARTUP);
         }
