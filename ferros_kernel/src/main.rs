@@ -1130,8 +1130,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[5] = rd(0x1306_0000); // GPH5CON at handoff
             ext[1] = rd(0x1546_3EC0); // PMU ufs-phy-iso
             // UFSP is behind the auto-gated UFS clock domain (FORCE_HCS UFSP_DRCG_EN) — reading it with the gate armed bus-hangs the AP (proved by hot-reload: this block hung until these unlock writes were added). Clear the auto-stop enables and forced stops first, exactly like unlock_clocks().
-            wr(0x1320_11B4, rd(0x1320_11B4) & !0xFF0); // HCI_FORCE_HCS
-            wr(0x1320_11B0, rd(0x1320_11B0) & !0x1F);  // HCI_CLKSTOP_CTRL
+            let found_b4 = rd(0x1320_11B4); // ABL leaves G#900
+            let found_b0 = rd(0x1320_11B0); // ABL leaves G#10
+            wr(0x1320_11B4, found_b4 & !0xFF0); // HCI_FORCE_HCS
+            wr(0x1320_11B0, found_b0 & !0x1F);  // HCI_CLKSTOP_CTRL
             unsafe { core::arch::asm!("dsb sy") };
             ext[2] = rd(0x132A_0010); // UFSP RSECURITY
             ext[3] = rd(0x132A_0110); // UFSP WSECURITY
@@ -1151,6 +1153,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             cmu[8] = rd(0x1300_2110); // leaf gate I_CLK_UNIPRO
             cmu[9] = rd(0x1300_2114); // leaf gate I_FMP_CLK
 
+            // FAITHFUL_REPLAY: restore the clock-gating regs to ABL's found values (B4=G#900, B0=G#10) so full_init sees the same pristine state Linux's probe does. Linux preserves B4 through HCE enable, arms ALL auto-stops (G#DE0) at link_startup PRE, and drops to G#9C0 only as the cal's first act — full_init now replays that choreography and needs the true starting point.
+            if FAITHFUL_REPLAY {
+                wr(0x1320_11B4, found_b4);
+                wr(0x1320_11B0, found_b0);
+                unsafe { core::arch::asm!("dsb sy") };
+            }
+
             // CANDIDATE FIX for the dead doorbell: ABL sets sysreg_ufs iocc bits[1:0]=3 => the UFS AXI master issues COHERENT (inner/outer-shareable) transactions that must snoop the CPU caches. ABL/Linux run in the coherency domain so snoops resolve; ferros manages caches MANUALLY (ufs.rs does explicit clean/invalidate around DMA — the non-coherent model) and is not answering coherent snoops, so the master's coherent read STALLS forever = doorbell stuck, every address. Clear the coherency bits so the master does plain non-coherent DMA straight to DRAM, matching ferros's driver. Reversible on reboot.
             iocc_fix[0] = ext[0];                       // IOCC as ABL left it
             wr(0x1302_0710, ext[0] & !0x3);             // clear shareable/coherent bits
@@ -1158,9 +1167,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             iocc_fix[1] = rd(0x1302_0710);              // IOCC after clear (should be ext[0] & !3)
         }
 
+        // FAITHFUL_REPLAY: skip every mutating pre-probe (h8 exit, reuse doorbell, hitest, NOPs, reset test) so full_init runs on the same pristine ABL state Linux's probe sees, replaying Linux's exact combined core+vendor sequence. The pre-probes poisoned the state Linux never sees (the h8 exit alone drives UPMCRS to PWR_FATAL before full_init even starts).
+        const FAITHFUL_REPLAY: bool = true;
+
         // ---- WAKE THE LINK FIRST: ABL parks UFS in HIBERN8 (pristine UICCMD reads G#17 = HIBERN8_ENTER). ----
         // Must run before any doorbell ring or IS clear, on the truly pristine hibernating link. Everything downstream (regfile snapshot, reuse, clean NOP, Phase A) then runs on the woken link.
-        h8 = ufs.live_hibern8_exit();
+        if !FAITHFUL_REPLAY {
+            h8 = ufs.live_hibern8_exit();
+        }
 
         // ---- ABL pristine register file (before ANY UFS write) ----
         // Characterize why the transfer manager sits idle on a doorbell. Reads only, so ABL's handoff state is untouched.
@@ -1181,7 +1195,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         // ---- Phase A0: pbl-style descriptor REUSE (the ABSOLUTE first UFS touch) ----
         // MUST run before init_transfer_list (clean-NOP) or the rebase clobbers ABL's UTRLBA and this tests ferros's own ring instead. pbl/ABL do transfers by reusing the BootROM's descriptor ring at the EXISTING UTRLBA (never rebasing). If that ring lives in an S2MPU/protected DMA region the UFS master can reach but our UFS_BUF (ferros load addr) can't, our rebased doorbell is accepted but the descriptor is never DMA'd (OCS=F). Test: build a NOP in ABL's OWN UCD (reachable region), ring the doorbell WITHOUT rebasing. OCS=0 here = the region was the whole problem.
-        {
+        if !FAITHFUL_REPLAY {
             let rd8 = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
             let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v); };
             let utrlba = r(0x50);
@@ -1233,7 +1247,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         // ---- HIGH-DRAM reachability probe (on ABL's live link, before any rebase settles) ----
         // The dead-doorbell hypothesis: ferros's UFS_BUF at G#8009_0400 sits in the low bootloader-reserved DRAM the UFS DMA master / SysMMU can't reach, while ABL (G#F8C4_2000) and Linux (G#8826_1000) both place descriptors in HIGH DRAM and their transfers work. Build a self-contained UTRD+UCD at a fixed high address and ring the doorbell WITHOUT using UFS_BUF. If OCS lands 0 here but not at G#8009_0400, the buffer region was the whole problem and the fix is to relocate UFS_BUF high. hitest = [ocs, is, dbr_after, done].
-        {
+        if !FAITHFUL_REPLAY {
             let rd8 = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
             let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
             const HI_UTRD: usize = 0x9000_0000; // 256MB into DRAM — above kernel/bootloader low carveout, below ABL/Linux rings
@@ -1274,14 +1288,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         // ---- CLEAN NOP: first touch AFTER the reuse test, using ferros's own rebased ring ----
         // Isolates whether Phase A's own writes (clock-unlock, GPIO reset test, NEXUS write, ABL-UCD scribble) perturb the live ABL link before the NOP. If this clean NOP completes (OCS=0) but the later ones don't, our own diagnostics were breaking the link.
-        ufs.init_transfer_list();
-        let (clean_ocs, clean_rsp) = ufs.live_nop();
-        clean[0] = clean_ocs as u32;
-        clean[1] = clean_rsp as u32;
-        clean[2] = r(0x20); // IS
-        clean[3] = r(0x58); // DBR
-        // Exynos DMA-engine debug regs, captured right after the (stalled) doorbell. HCI vendor block base G#1320_1100. If the engine is stuck fetching the descriptor these show where: FSM_MONITOR G#C0, DMA0_MONITOR_STATE G#C8 / _CNT G#CC (nonzero cnt = AXI beats moved), DMA0_DOORBELL_DEBUG G#D8, HCI_VENDOR_SPECIFIC_IS G#38 (latches AXI/DMA errors), UFS_AXI_DMA_IF_CTRL G#F8.
-        {
+        if !FAITHFUL_REPLAY {
+            ufs.init_transfer_list();
+            let (clean_ocs, clean_rsp) = ufs.live_nop();
+            clean[0] = clean_ocs as u32;
+            clean[1] = clean_rsp as u32;
+            clean[2] = r(0x20); // IS
+            clean[3] = r(0x58); // DBR
+            // Exynos DMA-engine debug regs, captured right after the (stalled) doorbell. HCI vendor block base G#1320_1100. If the engine is stuck fetching the descriptor these show where: FSM_MONITOR G#C0, DMA0_MONITOR_STATE G#C8 / _CNT G#CC (nonzero cnt = AXI beats moved), DMA0_DOORBELL_DEBUG G#D8, HCI_VENDOR_SPECIFIC_IS G#38 (latches AXI/DMA errors), UFS_AXI_DMA_IF_CTRL G#F8.
             let hci = |off: usize| unsafe { core::ptr::read_volatile((0x1320_1100 + off) as *const u32) };
             dma_dbg[0] = hci(0xC0); // FSM_MONITOR
             dma_dbg[1] = hci(0xC8); // DMA0_MONITOR_STATE
@@ -1292,7 +1306,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
 
         // ---- Post-wake NOP validation (link was already woken at the top of the block) ----
-        {
+        if !FAITHFUL_REPLAY {
             ufs.init_transfer_list();
             let (ocs, rsp) = ufs.live_nop();
             h8_nop[0] = ocs as u32;
@@ -1303,7 +1317,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
         // ---- UTRLCLR-forced NOP: set the slot-clear register to all-ones before ringing ----
         // If the transfer manager ignores the doorbell because UTRLCLR slot bit is 0 (slot considered cleared/aborted), forcing UTRLCLR=0xFFFFFFFF first unblocks it. RSR is toggled by init_transfer_list; we set UTRLCLR between rebase and doorbell.
-        {
+        if !FAITHFUL_REPLAY {
             let wr32 = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
             ufs.init_transfer_list();
             wr32(UFS_BASE + 0x5C, 0xFFFF_FFFF); // UTRLCLR = all slots active
@@ -1327,31 +1341,34 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         pmaw = ufs.snapshot_pma();
 
         // DECISIVE device-reset test (non-cached): on ABL's live working link (HCS=G#10F, DP set), assert HCI_GPIO_OUT bit0=0 (the reference exynos_ufs_dev_hw_reset). If that reaches the device reset_n, the M-PHY link physically drops and the DL layer latches a REAL-TIME link-lost error (UECDL/UECN) and/or HCS.DP clears — unlike cached MXGR. If the UEC family stays clean and DP stays set after a 10ms assert, GPIO_OUT does NOT reach the device on husky → the device never leaves its ABL link state → it ignores every re-link (root cause). rst_test = [uec_before, hcs_before, uec_after, hcs_after]; uec packed UECDL|UECN<<8|UECT<<16|UECDME<<24.
-        let uec = || {
-            let dl = r(0x3C) & 0xFF; let n = r(0x40) & 0xFF; let t = r(0x44) & 0xFF; let dme = r(0x48) & 0xFF;
-            dl | (n << 8) | (t << 16) | (dme << 24)
-        };
-        let _ = uec(); // clear-on-read: flush any stale latched errors first
-        rst_test[0] = uec();          // baseline (expect 0 after flush)
-        rst_test[1] = r(0x30);        // HCS before (expect G#10F)
-        unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 0); core::arch::asm!("dsb sy"); } // assert reset_n
-        ferros_hal::ufs_cal::udelay(10_000);
-        rst_test[2] = uec();          // errors latched? (nonzero = reset reached the device)
-        rst_test[3] = r(0x30);        // HCS after (DP cleared = reset reached the device)
-        unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 1); core::arch::asm!("dsb sy"); } // deassert
-        // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
-        unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
-        ufs.init_transfer_list();
-        let (live_ocs, live_rsp) = ufs.live_nop();
-        ufs_diag[0] = live_ocs as u32;
-        ufs_diag[1] = live_rsp as u32;
-        ufs_diag[2] = r(0x20); // IS
-        ufs_diag[3] = r(0x58); // UTRLDBR
-        ufs_diag[4] = r(0x50); // UTRLBA (what the controller actually holds)
-        ufs_diag[5] = r(0x54); // UTRLBAU
-        ufs_diag[6] = r(0x38); // UECPA
-        ufs_diag[7] = unsafe { core::ptr::read_volatile((0x1320_1220) as *const u32) }; // HCI_DBR_DUPLICATION_INFO (VS+G#120)
-        let live_ok = live_ocs == 0x00;
+        let mut live_ok = false;
+        if !FAITHFUL_REPLAY {
+            let uec = || {
+                let dl = r(0x3C) & 0xFF; let n = r(0x40) & 0xFF; let t = r(0x44) & 0xFF; let dme = r(0x48) & 0xFF;
+                dl | (n << 8) | (t << 16) | (dme << 24)
+            };
+            let _ = uec(); // clear-on-read: flush any stale latched errors first
+            rst_test[0] = uec();          // baseline (expect 0 after flush)
+            rst_test[1] = r(0x30);        // HCS before (expect G#10F)
+            unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 0); core::arch::asm!("dsb sy"); } // assert reset_n
+            ferros_hal::ufs_cal::udelay(10_000);
+            rst_test[2] = uec();          // errors latched? (nonzero = reset reached the device)
+            rst_test[3] = r(0x30);        // HCS after (DP cleared = reset reached the device)
+            unsafe { core::ptr::write_volatile((0x1320_1170) as *mut u32, 1); core::arch::asm!("dsb sy"); } // deassert
+            // Belt-and-suspenders: mark every tag a nexus at runtime (visible even if not latched).
+            unsafe { core::ptr::write_volatile((0x1320_1140) as *mut u32, 0xFFFF_FFFF); core::arch::asm!("dsb sy"); }
+            ufs.init_transfer_list();
+            let (live_ocs, live_rsp) = ufs.live_nop();
+            ufs_diag[0] = live_ocs as u32;
+            ufs_diag[1] = live_rsp as u32;
+            ufs_diag[2] = r(0x20); // IS
+            ufs_diag[3] = r(0x58); // UTRLDBR
+            ufs_diag[4] = r(0x50); // UTRLBA (what the controller actually holds)
+            ufs_diag[5] = r(0x54); // UTRLBAU
+            ufs_diag[6] = r(0x38); // UECPA
+            ufs_diag[7] = unsafe { core::ptr::read_volatile((0x1320_1220) as *const u32) }; // HCI_DBR_DUPLICATION_INFO (VS+G#120)
+            live_ok = live_ocs == 0x00;
+        }
 
         if live_ok {
             // Transfer engine works on the live link — validate with a real read and stop.

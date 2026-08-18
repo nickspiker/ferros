@@ -826,14 +826,15 @@ impl UfsController {
         if !ready {
             return Err(());
         }
-        self.write_reg(regs::IS, regs::IS_UCCS);
+        // No IS pre-clear — Linux goes straight from the UCRDY check to the arg writes (pending bits were cleared once at probe). On completion, write back exactly the IS value read (Linux clears UCCS|ULSS=G#404 together after linkstartup).
         self.write_reg(regs::UCMDARG1, arg1);
         self.write_reg(regs::UCMDARG2, arg2);
         self.write_reg(regs::UCMDARG3, arg3);
         self.write_reg(regs::UICCMD, cmd & 0xFF);
         for _ in 0..1_000_000u32 {
-            if self.read_reg(regs::IS) & regs::IS_UCCS != 0 {
-                self.write_reg(regs::IS, regs::IS_UCCS);
+            let isv = self.read_reg(regs::IS);
+            if isv & regs::IS_UCCS != 0 {
+                self.write_reg(regs::IS, isv);
                 return Ok(self.read_reg(regs::UCMDARG2) & 0xFF);
             }
         }
@@ -891,17 +892,41 @@ impl UfsController {
             }};
         }
 
-        // 1. Clocks: kill every auto clock-stop and forced stop so nothing gates mid-sequence.
-        self.unlock_clocks();
+        // FAITHFUL REPLAY of Linux's combined core+vendor sequence (from the FWTRACE/FRTRACE ordered diff + ufshcd core source, ufshcd_hba_execute_hce):
+        // 1. HCE=0 FIRST (core's hba_stop runs before the vendor PRE notify), then SW_RST + config with the controller stopped, then HCE=1.
+        // 2. FORCE_HCS choreography: preserve the found value (G#900) through the config phase, arm ALL auto-stops (G#DE0) at link_startup PRE, drop to G#9C0 only as the cal's first act. The DE0 window lets the mclk/M-PHY-APB domains physically gate while the link idles.
+        // 3. CLKSTOP_CTRL is cleared ONCE, at link_startup PRE (after the DE0 write), not repeatedly.
         done(&mut r, step::CLOCKS);
 
-        // 2..9. Host enable + link startup, retried as a UNIT: on a failed DME_LINKSTARTUP, ufshcd re-runs the whole hba_enable (SW_RST, config, device reset, HCE cycle, cal) before trying again — a bare command retry on the same enable never recovers. We mirror that.
+        // Linux's probe prologue (FCORE trace): read IS, write the found value back (write-1-to-clear the pending UCCS from ABL's hibern8 command), and zero IE. ferros ran the whole bring-up with ABL's stale IE=G#201.
+        let pending_is = self.read_reg(regs::IS);
+        self.write_reg(regs::IS, pending_is);
+        self.write_reg(0x24, 0); // IE = 0
+
+        // Pinmux once, before the attempt loop (Linux's pinctrl does this at probe, outside the UFS sequence): ufs_rst_n + ufs_refclk_out to function 2, gph5-0 drive X3, no pull.
+        {
+            const GPH5CON: usize = 0x1306_0000;
+            let con = unsafe { crate::mmio::read32(GPH5CON) };
+            if r.gph5_con_before == 0 {
+                r.gph5_con_before = con;
+            }
+            crate::ufs_cal::trace_write32(GPH5CON, (con & !0xFF) | 0x22);
+            let drv = unsafe { crate::mmio::read32(0x1306_000C) };
+            crate::ufs_cal::trace_write32(0x1306_000C, (drv & !0xF) | 0x2); // gph5-0 = X3
+            let pud = unsafe { crate::mmio::read32(0x1306_0008) };
+            crate::ufs_cal::trace_write32(0x1306_0008, pud & !0xF); // gph5-0 = no pull
+            unsafe { core::arch::asm!("dsb sy") };
+            r.gph5_con_after = unsafe { crate::mmio::read32(GPH5CON) };
+            udelay(1_000); // let REFCLKOUT reach the device before reset/link
+        }
+
+        // Host enable + link startup, retried as a UNIT: on a failed DME_LINKSTARTUP, ufshcd re-runs the whole hba_enable (SW_RST, config, device reset, HCE cycle, cal) before trying again — a bare command retry on the same enable never recovers. We mirror that.
         let mut link_ok = false;
         let mut cal = ufs_cal::CalParams { available_lane: 2, connected_rx_lane: 1, active_rx_lane: 1 };
         for attempt in 1..=4u32 {
             r.linkstartup_tries = attempt;
 
-            // HCE off.
+            // HCE=0 first — core's hba_stop runs before the vendor PRE notify (ufshcd_hba_execute_hce).
             self.write_reg(regs::HCE, 0);
             let mut ok = false;
             for _ in 0..1_000_000u32 {
@@ -915,7 +940,7 @@ impl UfsController {
             }
             done(&mut r, step::HCE_OFF);
 
-            // Vendor SW reset of link + UNIPRO logic.
+            // Vendor SW reset of link + UNIPRO logic (hce_enable PRE, controller stopped).
             self.hci_w(vs::SW_RST, vs::SW_RST_MASK);
             let mut ok = false;
             for _ in 0..1_000_000u32 {
@@ -929,8 +954,10 @@ impl UfsController {
             }
             done(&mut r, step::SW_RST);
 
-            // config_host — the vendor block ABL applies before enable. NEXUS_TYPE here, BEFORE HCE 0->1, is the load-bearing line: it marks every tag as a nexus transfer at enable time.
-            self.unlock_clocks();
+            // FORCE_HCS: RMW that clears only the M-PHY APB stop enable — on pristine G#900 this writes back G#900 exactly like Linux's observed no-op write. Do NOT force G#9C0 here.
+            self.hci_w(vs::FORCE_HCS, self.hci(vs::FORCE_HCS) & !(1 << 10));
+
+            // config_host — the vendor block, programmed against ABL's still-enabled controller. NEXUS_TYPE here, BEFORE the HCE cycle, marks every tag as a nexus transfer at enable time.
             // IA_TICK_SEL via read-modify-write, matching exynos_ufs_fit_aggr_timeout. SW_RST resets this register to G#1, so Linux's working value is G#10001 — forcing ABL's captured G#40010000 here wrote a stale pre-reset value.
             self.hci_w(vs::V2P1_CTRL, self.hci(vs::V2P1_CTRL) | 1 << 16);
             self.hci_w(vs::US_TO_CNT_VAL, 0xB2); // ABL's aggregation-timer count (ACLK MHz); unused by our polling driver
@@ -945,31 +972,15 @@ impl UfsController {
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
             done(&mut r, step::CONFIG_HOST);
 
-            // Route the UFS pinmux like the pinctrl framework does (pinctrl-0 = ufs_rst_n + ufs_refclk_out, both function 2). ABL may hand off with gph5-0 (REFCLKOUT) de-routed — the device then gets no reference clock and stays silent at link startup. gph5-0 = bits[3:0], gph5-1 = bits[7:4]; function 2 = nibble G#2.
-            const GPH5CON: usize = 0x1306_0000;
-            let con = unsafe { crate::mmio::read32(GPH5CON) };
-            if r.gph5_con_before == 0 {
-                r.gph5_con_before = con;
-            }
-            crate::ufs_cal::trace_write32(GPH5CON, (con & !0xFF) | 0x22);
-            // The ufs_refclk_out pad (gph5-0) needs drive strength X3 and no pull, per the pinctrl (samsung,pin-drv=ZUMA_PIN_DRV_X3=2, pin-pud=0). ferros set only the function nibble; without X3 drive the reference clock may reach the device too weakly to respond at link startup (the whole MMIO sequence otherwise matches Linux yet the device stays silent). zuma GPH5 bank: CON+0, DAT+4, PUD+8, DRV+0xC; 4 bits/pin, pin0 = bits[3:0]. rst_n (gph5-1) keeps default drive.
-            let drv = unsafe { crate::mmio::read32(0x1306_000C) };
-            crate::ufs_cal::trace_write32(0x1306_000C, (drv & !0xF) | 0x2); // gph5-0 = X3
-            let pud = unsafe { crate::mmio::read32(0x1306_0008) };
-            crate::ufs_cal::trace_write32(0x1306_0008, pud & !0xF); // gph5-0 = no pull
-            unsafe { core::arch::asm!("dsb sy") };
-            r.gph5_con_after = unsafe { crate::mmio::read32(GPH5CON) };
-            udelay(1_000); // let REFCLKOUT reach the device before reset/link
-
             // Hardware-reset the UFS device via the dedicated reset_n line, then give it time to boot before asking for a link.
             self.hci_w(vs::GPIO_OUT, 0);
             udelay(5);
             self.hci_w(vs::GPIO_OUT, 1);
             r.gph5_dat = unsafe { crate::mmio::read32(0x1306_0004) }; // confirm the reset_n pad tracks GPIO_OUT
-            udelay(10_000); // device settle after reset — Linux's trace shows ~5ms here; ferros's 2ms may fire link startup before the device is ready
+            udelay(10_000); // device settle after reset — Linux's trace shows ~5ms between reset and the link PRE writes
             done(&mut r, step::DEV_RESET);
 
-            // HCE on.
+            // HCE=1 (core's hba_start, after the vendor PRE completes).
             self.write_reg(regs::HCE, 1);
             let mut ok = false;
             for _ in 0..1_000_000u32 {
@@ -984,20 +995,31 @@ impl UfsController {
             }
             done(&mut r, step::HCE_ON);
 
-            // Available lanes from UNIPRO. HCE 0->1 restores the FORCE_HCS defaults — unlock again or this read hangs the bus.
-            self.unlock_clocks();
+            // ufshcd_enable_intr(UFSHCD_UIC_MASK) — Linux writes IE=G#470 (UCCS + UIC power-mode bits) immediately after HCE=1, before the link PRE. IS latches regardless of IE, but this is a real register the working system programs differently at linkstartup.
+            self.write_reg(0x24, 0x470);
+
+            // Linux's schedule, not just its sequence: ~5ms passes between HCE=1 and the link PRE writes (GSA/KDN chatter fills it on Linux; the gap itself may be load-bearing).
+            udelay(5_000);
+
+            // link_startup PRE, Linux's exact order: arm ALL auto clock-stops (DE0 — the M-PHY/mclk domains may physically gate while the link idles), clear the forced stops, read lanes, thaw the CPort logger, layer error enables, re-write the PA debug option suites (the HCE cycle reset them).
+            self.hci_w(vs::FORCE_HCS, 0xDE0);
+            self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !0x1F);
+            // Linux holds the DE0 window ~1.8ms before the cal drops to 9C0 — long enough for the idle-detection auto-gates to actually STOP and restart the mclk/M-PHY-APB domains. Blowing through in microseconds may skip the stop/restart entirely.
+            udelay(2_000);
+            let _avail_tx = self.unipro(0x3080); // PA_AVAILTXDATALANES — Linux reads both
             r.avail_rx = self.unipro(unip::PA_AVAILRXDATALANES);
             cal.available_lane = if r.avail_rx == 2 { 2 } else { 1 };
             done(&mut r, step::LANES);
-
-            // Linux's link_startup_notify PRE block (from the FWTRACE of a working bring-up): DFES layer error enables, then RE-write the PA debug option suites. The HCE 0->1 cycle resets the option suites, and the reference rewrites them here "to keep phy context ... for unipro v1.8" — writing them only in config_host (pre-HCE, as we did) leaves reset defaults in place at DME_LINKSTARTUP.
+            self.hci_w(0x114, 0x22); // CPort logger type (__thaw_cport_logger)
+            self.hci_w(0x110, 1); // CPort logger enable
             self.hci_w(vs::ERROR_EN_DL_LAYER, 0x8000_2020);
             self.hci_w(vs::ERROR_EN_N_LAYER, 0x8000_0007);
             self.hci_w(vs::ERROR_EN_T_LAYER, 0x8000_0017);
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_1, unip::DBG_SUITE1_ENABLE);
             self.unipro_w(unip::PA_DBG_OPTION_SUITE_2, unip::DBG_SUITE2_ENABLE);
 
-            // Pre-link cal, then clear stale UIC error state so this attempt's codes are its own.
+            // Cal's first act, per Linux's trace: FORCE_HCS DE0 -> 9C0 (re-enable mclk + M-PHY APB access for the PMA writes). Then pre-link cal, then clear stale UIC error state so this attempt's codes are its own.
+            self.hci_w(vs::FORCE_HCS, 0x9C0);
             r.cal_timeouts = (r.cal_timeouts & !0xFF) | (ufs_cal::pre_link(cal) & 0xFF);
             done(&mut r, step::PRE_LINK);
             // Capture the clock/refclk state the device depends on to respond to link startup.
@@ -1006,15 +1028,11 @@ impl UfsController {
             r.mphy_refclk_sel = self.hci(0x108);
             r.cmu_qch = unsafe { crate::mmio::read32(0x1300_30C4) };
             r.cmu_unipro_gate = unsafe { crate::mmio::read32(0x1300_2110) };
-            // Verify the AUX-window PCS cal writes actually landed (PMA writes already confirmed via register-diff; PCS is the unverified path).
-            let pcs_2094 = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x2094) & 0xFF; // expect G#F6
-            let pcs_20bc = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x20BC) & 0xFF; // expect G#79
-            let pcs_22a4 = ufs_cal::read_pcs(ufs_cal::TX_LANE0, 0x22A4) & 0xFF; // expect G#02
-            r.pcs_readback = pcs_2094 | (pcs_20bc << 8) | (pcs_22a4 << 16);
-            let _ = self.read_reg(0x38); // UECPA is clear-on-read
-            self.write_reg(regs::IS, 0xFFFF_FFFF);
+            // (PCS readback diag moved to AFTER the linkstartup attempt — Linux does NOTHING between cal end and the UIC command; our AUX-window pokes and IS blast were extra divergences in that gap.)
 
-            udelay(20_000); // let the PHY/device settle after cal before link startup — Linux's trace spans ~30ms of PHY bring-up before DME_LINKSTARTUP; ferros compresses it to microseconds
+            // THE FCORE-TRACE DISCOVERY: Linux never issues DME_LINKSTARTUP at G#9C0 — right before the UIC command it re-arms MPHY_APBCLK_STOP_EN (bit10) and fires at G#DC0. The combined trace shows the rule everywhere: G#9C0 only brackets M-PHY APB (PMA/PCS) access windows; G#DC0 for actual link operation. With the APB config clock forced on, the M-PHY appears to stay held in its configuration interface — arming the auto-stop lets the APB domain gate when idle, releasing the PHY to mission mode so the transmitter actually runs. Firing at 9C0 (all previous attempts) = device silent, MXGR=0, no PHY error — our exact signature.
+            self.hci_w(vs::FORCE_HCS, 0xDC0);
+            // Linux fires DME_LINKSTARTUP immediately after cal — no settle delay.
             match self.uic_cmd(uic::DME_LINKSTARTUP, 0, 0, 0) {
                 Ok(0) => {
                     r.linkstartup_res = 0;
@@ -1023,6 +1041,11 @@ impl UfsController {
                 Ok(code) => r.linkstartup_res = code,
                 Err(()) => r.linkstartup_res = 0xFFFF_FFFF,
             }
+            // PCS readback diag, now safely after the attempt (state no longer sacred).
+            let pcs_2094 = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x2094) & 0xFF; // expect G#F6
+            let pcs_20bc = ufs_cal::read_pcs(ufs_cal::RX_LANE0, 0x20BC) & 0xFF; // expect G#79
+            let pcs_22a4 = ufs_cal::read_pcs(ufs_cal::TX_LANE0, 0x22A4) & 0xFF; // expect G#02
+            r.pcs_readback = pcs_2094 | (pcs_20bc << 8) | (pcs_22a4 << 16);
             // UNIPRO-level forensics for the last attempt (success or failure).
             r.ls_cnf = self.unipro(0x7854); // DME_LINKSTARTUP_CNF_RESULT
             r.dme_err = self.unipro(0x7B20); // DME_INTR_ERROR_CODE
@@ -1066,6 +1089,7 @@ impl UfsController {
         cal.connected_rx_lane = r.conn_rx;
         cal.active_rx_lane = r.active_rx;
         r.cal_timeouts |= (ufs_cal::post_link(cal) & 0xFF) << 8;
+        self.hci_w(vs::FORCE_HCS, 0xDC0); // cal window closed — back to mission mode (M-PHY APB auto-stop armed) for transfers
         done(&mut r, step::POST_LINK);
 
         // 12. Transfer + task-management lists (standard make_hba_operational).
@@ -1115,8 +1139,9 @@ impl UfsController {
         done(&mut r, step::FDEVICEINIT);
 
         // 15+16. Power-mode change to FAST HS-G4 x2, series B. Failure past this point is non-fatal: the link still works at PWM-G1.
-        self.unlock_clocks();
+        self.unlock_clocks(); // 9C0: open the M-PHY APB window for the pmc cal
         r.cal_timeouts |= (ufs_cal::pre_pmc_hs_b(cal) & 0xFF) << 16;
+        self.hci_w(vs::FORCE_HCS, 0xDC0); // cal window closed — DME commands run in mission mode
         done(&mut r, step::PMC_CAL);
         let lanes = if r.conn_rx == 2 { 2 } else { 1 };
         let sets: [(u32, u32); 8] = [
