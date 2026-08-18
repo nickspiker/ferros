@@ -1115,6 +1115,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let mut regfile = [0u32; 14]; // ABL pristine register file: CAP,VER,IS,IE,HCS,HCE,UTRLBA,UTRLBAU,UTRLDBR,UTRLCLR,UTRLRSR,UTMRLBA,UTMRLRSR,UICCMD
     let mut clr_nop = [0u32; 4]; // NOP with UTRLCLR forced to all-ones first: [ocs, rsp, is, dbr]
     let mut ext = [0u32; 6]; // external-block state at ABL handoff: [sysreg_iocc, pmu_phy_iso, ufsp_rsec, ufsp_wsec, s2mpu_ctrl0, gph5con]
+    let mut cmu = [0u32; 10]; // mclk clock tree at ABL handoff: [pll_shared0_con3, pll_shared2_con3, pll_spare_con3, top_mux, top_div, top_gate, hsi2_user_mux, leaf_aclk, leaf_unipro, leaf_fmp]
     let mut dbg_prd_pristine = 0u32; // pristine UNIPRO DBG_PRD (actual clock indicator: G#78=133MHz, G#59=178MHz)
     {
         let r = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
@@ -1137,6 +1138,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             ext[4] = rd(0x131F_0000); // S2MPU CTRL0
             // PRISTINE UNIPRO DBG_PRD (G#1328_0044) as ABL left it — the actual UNIPRO clock indicator. ABL writes this = 16e9/mclk. G#78 (120) = 133MHz (ABL's rate). G#59 (89) = 178MHz. If this reads 120, ferros runs at 133 but we calibrate for 178 = the mismatch (Linux's clk driver bumps 133->178; ferros never does). Read before full_init overwrites it.
             dbg_prd_pristine = rd(0x1328_0044);
+
+            // PRISTINE mclk clock tree (CMU_TOP G#2604_0000 + CMU_HSI2 G#1300_0000), the registers cal-if programs for the UFS_EMBD vclk. PLL rate = 24.576MHz*M/(P*2^S) with M=[25:16] P=[13:8] S=[2:0] of CON3. TOP mux SELECT=[1:0] (0=OSC 1=SHARED0_D4 2=SHARED2_D2 3=SPARE_D1), TOP div DIVRATIO=[3:0] (÷N+1), gates: CG_VAL=[21] MANUAL=[20]. Linux gets mclk=178MHz from this tree; ABL leaves 133 (DBG_PRD=G#78). Reading both sides tells us the exact mux/div delta to replay.
+            cmu[0] = rd(0x2604_014C); // PLL_CON3_PLL_SHARED0
+            cmu[1] = rd(0x2604_01CC); // PLL_CON3_PLL_SHARED2
+            cmu[2] = rd(0x2604_024C); // PLL_CON3_PLL_SPARE
+            cmu[3] = rd(0x2604_10B8); // CLK_CON_MUX_MUX_CLKCMU_HSI2_UFS_EMBD
+            cmu[4] = rd(0x2604_18B0); // CLK_CON_DIV_CLKCMU_HSI2_UFS_EMBD
+            cmu[5] = rd(0x2604_20E0); // CLK_CON_GAT_GATE_CLKCMU_HSI2_UFS_EMBD
+            cmu[6] = rd(0x1300_0630); // PLL_CON0_MUX_CLKCMU_HSI2_UFS_EMBD_USER (MUX_SEL=[4]: 0=OSC 1=TOP)
+            cmu[7] = rd(0x1300_210C); // leaf gate I_ACLK
+            cmu[8] = rd(0x1300_2110); // leaf gate I_CLK_UNIPRO
+            cmu[9] = rd(0x1300_2114); // leaf gate I_FMP_CLK
 
             // CANDIDATE FIX for the dead doorbell: ABL sets sysreg_ufs iocc bits[1:0]=3 => the UFS AXI master issues COHERENT (inner/outer-shareable) transactions that must snoop the CPU caches. ABL/Linux run in the coherency domain so snoops resolve; ferros manages caches MANUALLY (ufs.rs does explicit clean/invalidate around DMA — the non-coherent model) and is not answering coherent snoops, so the master's coherent read STALLS forever = doorbell stuck, every address. Clear the coherency bits so the master does plain non-coherent DMA straight to DRAM, matching ferros's driver. Reversible on reboot.
             iocc_fix[0] = ext[0];                       // IOCC as ABL left it
@@ -1627,6 +1640,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_EXT_UFSP_WSEC=", ext[3]);
                                                 append_hex(&mut resp, b"UFS_EXT_S2MPU_CTRL=", ext[4]);
                                                 append_hex(&mut resp, b"UFS_EXT_GPH5CON=", ext[5]);
+                                                append_hex(&mut resp, b"UFS_CMU_PLL_SH0=", cmu[0]);
+                                                append_hex(&mut resp, b"UFS_CMU_PLL_SH2=", cmu[1]);
+                                                append_hex(&mut resp, b"UFS_CMU_PLL_SPARE=", cmu[2]);
+                                                append_hex(&mut resp, b"UFS_CMU_TOP_MUX=", cmu[3]);
+                                                append_hex(&mut resp, b"UFS_CMU_TOP_DIV=", cmu[4]);
+                                                append_hex(&mut resp, b"UFS_CMU_TOP_GATE=", cmu[5]);
+                                                append_hex(&mut resp, b"UFS_CMU_USER_MUX=", cmu[6]);
+                                                append_hex(&mut resp, b"UFS_CMU_LEAF_ACLK=", cmu[7]);
+                                                append_hex(&mut resp, b"UFS_CMU_LEAF_UNIPRO=", cmu[8]);
+                                                append_hex(&mut resp, b"UFS_CMU_LEAF_FMP=", cmu[9]);
                                                 // IOCC coherency clear (candidate fix): if CLEAN/HITEST/REUSE OCS now land 0, the coherent-DMA-snoop-stall was the dead-doorbell root cause.
                                                 // HIBERN8-exit probe: was ABL parking the link in hibernate? H8_NOP_OCS=0 after exit ⇒ yes, that was the dead-doorbell cause. PA_CTRLSTATE/PWRMODE show the link state before/after.
                                                 // ABL pristine register file — why the transfer manager sits idle. UTRLCLR (slot-clear) must read with slot0 bit SET to run.
@@ -1743,8 +1766,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"WDT0_DAT=", wdt_reload[0]);
                                                 append_hex(&mut resp, b"WDT1_CON=", wdt_con[1]);
                                                 append_hex(&mut resp, b"WDT1_DAT=", wdt_reload[1]);
-                                                // ferros-side FWTRACE: every MMIO write full_init issued, in order, to diff against Linux's captured working trace. Format matches Linux: "FTRACE <addr>=<val>".
-                                                let n = ferros_hal::ufs_cal::trace_len().min(160);
+                                                // ferros-side FWTRACE: every MMIO access full_init issued, in order, to diff against Linux's captured working trace. Addr bit31 set = READ (FRTRACE), clear = WRITE (FWTRACE).
+                                                let n = ferros_hal::ufs_cal::trace_len().min(600);
                                                 append_hex(&mut resp, b"UFS_TRACE_N=", ferros_hal::ufs_cal::trace_len() as u32);
                                                 for i in 0..n {
                                                     let (a, v) = ferros_hal::ufs_cal::trace_get(i);

@@ -47,14 +47,14 @@ const RX_LANE_0: u32 = 4;
 const PMA_LANE_STRIDE: usize = 0x800;
 
 fn rd(addr: usize) -> u32 {
-    unsafe { crate::mmio::read32(addr) }
+    trace_read32(addr)
 }
 fn wr(addr: usize, val: u32) {
     trace_write32(addr, val);
 }
 
 /// MMIO write trace for a ferros-side FWTRACE: records (addr, val) pairs so full_init's exact register sequence can be diffed against Linux's captured working trace. Flat array of [addr, val, addr, val, ...].
-const TRACE_CAP: usize = 1024;
+const TRACE_CAP: usize = 4096;
 pub static mut TRACE: [u32; TRACE_CAP] = [0; TRACE_CAP];
 pub static mut TRACE_N: usize = 0;
 pub static mut TRACE_ON: bool = false;
@@ -88,6 +88,23 @@ pub fn trace_write32(addr: usize, val: u32) {
             TRACE_N += 2;
         }
         crate::mmio::write32(addr, val);
+    }
+}
+
+/// Read an MMIO register, recording (addr | bit31, value) when tracing is on. Bit31 tags the entry as a READ — all UFS MMIO physical addresses sit under G#8000_0000, so the bit is free. Consecutive duplicate reads (same addr, same value as the previous entry) are collapsed to match Linux's FRTRACE dedup, so the two read streams align for a first-divergence diff.
+pub fn trace_read32(addr: usize) -> u32 {
+    unsafe {
+        let val = crate::mmio::read32(addr);
+        if TRACE_ON && TRACE_N + 2 <= TRACE_CAP {
+            let tagged = addr as u32 | 0x8000_0000;
+            let dup = TRACE_N >= 2 && TRACE[TRACE_N - 2] == tagged && TRACE[TRACE_N - 1] == val;
+            if !dup {
+                TRACE[TRACE_N] = tagged;
+                TRACE[TRACE_N + 1] = val;
+                TRACE_N += 2;
+            }
+        }
+        val
     }
 }
 

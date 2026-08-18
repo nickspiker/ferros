@@ -261,7 +261,7 @@ impl UfsController {
     }
 
     fn read_reg(&self, offset: usize) -> u32 {
-        unsafe { crate::mmio::read32(self.base + offset) }
+        crate::ufs_cal::trace_read32(self.base + offset)
     }
 
     fn write_reg(&self, offset: usize, val: u32) {
@@ -796,13 +796,13 @@ pub struct InitReport {
 
 impl UfsController {
     fn hci(&self, off: usize) -> u32 {
-        unsafe { crate::mmio::read32(crate::ufs_cal::base::HCI + off) }
+        crate::ufs_cal::trace_read32(crate::ufs_cal::base::HCI + off)
     }
     fn hci_w(&self, off: usize, v: u32) {
         crate::ufs_cal::trace_write32(crate::ufs_cal::base::HCI + off, v)
     }
     fn unipro(&self, off: usize) -> u32 {
-        unsafe { crate::mmio::read32(crate::ufs_cal::base::UNIPRO + off) }
+        crate::ufs_cal::trace_read32(crate::ufs_cal::base::UNIPRO + off)
     }
     fn unipro_w(&self, off: usize, v: u32) {
         crate::ufs_cal::trace_write32(crate::ufs_cal::base::UNIPRO + off, v)
