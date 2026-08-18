@@ -1764,6 +1764,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
                                                 append_hex(&mut resp, b"UFS_CLKSTOP=", clkdiag[0]);
                                                 append_hex(&mut resp, b"UFS_FORCEHCS=", clkdiag[1]);
                                                 append_hex(&mut resp, b"UFS_MPHY_REFCLK_SEL=", clkdiag[2]);
+                                                // Foundational: what Exception Level did ferros actually boot into? CLAUDE.md assumes EL2 (bare, pkvm disabled). If __boot_el reads 1, a pKVM hypervisor is at EL2 above us and every "we have full hardware access" assumption is wrong. __boot_sctlr is the SCTLR at that EL for cross-check.
+                                                append_hex(&mut resp, b"BOOT_EL=", unsafe { __boot_el } as u32);
+                                                append_hex(&mut resp, b"BOOT_SCTLR=", unsafe { __boot_sctlr } as u32);
                                                 append_hex(&mut resp, b"UFS_CMU_QCH=", clkdiag[3]);
                                                 append_hex(&mut resp, b"UFS_CMU_UNIPRO_GATE=", clkdiag[4]);
                                                 // Device-reset test on ABL's live link (non-cached). If RST_UEC_A latches nonzero OR RST_HCS_A drops DP (G#10E/G#010E vs G#10F), GPIO_OUT reset reached the device (good). If RST_UEC_A=0 and RST_HCS_A=G#10F unchanged, GPIO_OUT does NOT reach the device reset_n — the device never drops its ABL link state = root cause.
