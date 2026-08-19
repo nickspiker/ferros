@@ -163,4 +163,70 @@ mod tests {
         assert!(matches!(res, Err(StoreError::NotFound(_))));
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn keyed_set_get_round_trip() {
+        let path = tmp_path("keyed_rt");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store =
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        store.set("contacts/alice", b"alice bytes".to_vec()).unwrap();
+        store.set("contacts/bob", b"bob bytes".to_vec()).unwrap();
+        assert_eq!(store.get_by_key("contacts/alice").unwrap().as_deref(), Some(&b"alice bytes"[..]));
+        assert_eq!(store.get_by_key("contacts/bob").unwrap().as_deref(), Some(&b"bob bytes"[..]));
+        assert_eq!(store.get_by_key("contacts/carol").unwrap(), None);
+        assert!(store.contains_key("contacts/alice").unwrap());
+        assert!(!store.contains_key("contacts/carol").unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn keyed_persist_then_reopen_survives() {
+        // Host analog of the on-hardware persistence proof: set by key, drop, reopen a fresh device, and read the value back.
+        let path = tmp_path("keyed_persist");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store =
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        store.set("greeting", b"hello ferros".to_vec()).unwrap();
+        drop(store);
+
+        let device = FileDevice::open(&path, DeviceId([1u8; 16])).unwrap();
+        let store = FileStore::open(device, test_key()).unwrap();
+        assert_eq!(store.get_by_key("greeting").unwrap().as_deref(), Some(&b"hello ferros"[..]));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn keyed_overwrite_repoints() {
+        let path = tmp_path("keyed_overwrite");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store =
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        store.set("k", b"v1".to_vec()).unwrap();
+        store.set("k", b"v2 longer".to_vec()).unwrap();
+        assert_eq!(store.get_by_key("k").unwrap().as_deref(), Some(&b"v2 longer"[..]));
+        assert_eq!(store.keys().unwrap(), alloc::vec!["k".to_string()]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn keyed_remove_and_keys() {
+        let path = tmp_path("keyed_remove");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store =
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        store.set("a", b"1".to_vec()).unwrap();
+        store.set("b", b"2".to_vec()).unwrap();
+        store.set("c", b"3".to_vec()).unwrap();
+        assert_eq!(store.keys().unwrap(), alloc::vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert!(store.remove_key("b").unwrap());
+        assert!(!store.remove_key("b").unwrap());
+        assert_eq!(store.keys().unwrap(), alloc::vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(store.get_by_key("b").unwrap(), None);
+        std::fs::remove_file(&path).ok();
+    }
 }

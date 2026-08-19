@@ -21,6 +21,7 @@
 //! Hash index is rebuilt on every open via a linear scan from payload offset `2 * SLOT_STRIDE` (past slot 0 + at least one other slot's worth of reserved space) up to `object_tail`. Vaults of 64 KiB scan in microseconds; even multi-MB vaults scan in single-digit ms. No persistent index needed for Phase 1.
 
 use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::anchor::AnchorKey;
@@ -240,6 +241,51 @@ impl<D: Device> Store<D> {
         self.write_anchor(&new_anchor)?;
         self.anchor = new_anchor;
         Ok(hash)
+    }
+
+    // ── Keyed key-value API ──
+    //
+    // The layer Photon actually consumes: store and retrieve opaque bytes by a logical key (e.g. "contacts/alice/state") instead of by content hash. Each `set` appends the value as a content-addressed object, maps the key to that object's hash in the root commit dict, and seals with `commit_root` — so a value written by `set` survives a re-open, unlike a bare `put`. Reads walk anchor → root commit → dict → object.
+
+    /// Store `content` under `logical_key`, durably (sealed via `commit_root`). Returns the value object's content hash. Content-addressed, so identical values dedupe; overwriting a key just repoints it.
+    pub fn set(&mut self, logical_key: &str, content: Vec<u8>) -> Result<ObjectHash, StoreError> {
+        let obj = Object::content_addressed(VsfType::Blob, content);
+        let hash = obj.meta.hash;
+        self.put(obj)?;
+        let mut root = self.load_root_commit()?;
+        root.insert(logical_key.to_string(), hash);
+        self.commit_root(&root)?;
+        Ok(hash)
+    }
+
+    /// Retrieve the bytes stored under `logical_key`, or `None` if the key isn't set.
+    pub fn get_by_key(&self, logical_key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let root = self.load_root_commit()?;
+        match root.get(logical_key) {
+            Some(hash) => Ok(Some(self.get(hash)?.content)),
+            None => Ok(None),
+        }
+    }
+
+    /// True if `logical_key` currently maps to a value.
+    pub fn contains_key(&self, logical_key: &str) -> Result<bool, StoreError> {
+        Ok(self.load_root_commit()?.get(logical_key).is_some())
+    }
+
+    /// Unmap `logical_key` (the underlying object stays until garbage collection). Returns true if the key existed. Sealed via `commit_root` when it did.
+    pub fn remove_key(&mut self, logical_key: &str) -> Result<bool, StoreError> {
+        let mut root = self.load_root_commit()?;
+        if root.remove(logical_key).is_some() {
+            self.commit_root(&root)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// All logical keys currently mapped, in canonical (sorted) order.
+    pub fn keys(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.load_root_commit()?.iter().map(|(k, _)| k.clone()).collect())
     }
 
     /// Write an anchor to its target slot offset within the payload, then sync the device, then read it back and verify the HMAC matches what we wrote. Slot 0 is at offset 0; other slots are at `derive_slot_offset_with_probe`.
