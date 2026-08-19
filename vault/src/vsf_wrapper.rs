@@ -52,6 +52,17 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>, WrapperError> {
         .map_err(WrapperError::BuildFailed)
 }
 
+/// Read the total wrapped-file length from a header prefix, without decoding the payload.
+///
+/// The VSF header encodes `file_length` (total bytes) right after the magic — for exactly this purpose (TCP streaming / bounded reads).
+/// A caller that only has the device can read a small prefix (a few hundred bytes covers the single-section vault header), learn the true size, then read precisely that many bytes — instead of the whole device.
+/// The prefix must contain the full header; a few KiB is ample for a one-section vault.
+pub fn wrapped_len(prefix: &[u8]) -> Result<usize, WrapperError> {
+    let (header, _header_len) =
+        VsfHeader::decode(prefix).map_err(WrapperError::HeaderDecodeFailed)?;
+    Ok(header.file_length)
+}
+
 /// Decode the outer VSF envelope from `bytes`, returning the vault payload bytes (the inner opaque data). Verifies the file parses as VSF and contains the expected `vault` section + `v` field.
 pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, WrapperError> {
     // Step 1: parse the header.

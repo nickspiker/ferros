@@ -1,19 +1,15 @@
 //! `ferros_vault::Device` backed by the live UFS link, windowed onto the ferros partition.
 //!
-//! The vault speaks in arbitrary byte ranges (`read_at`/`write_at`); UFS speaks in
-//! 4 KiB logical blocks. This adapter bridges the two: it translates a device-relative
-//! byte offset into an absolute UFS LBA inside the ferros partition, reads/writes whole
-//! blocks, and does read-modify-write for any access that doesn't land on block edges.
+//! The vault speaks in arbitrary byte ranges (`read_at`/`write_at`); UFS speaks in 4 KiB logical blocks.
+//! This adapter bridges the two: it translates a device-relative byte offset into an absolute UFS LBA inside the ferros partition, reads/writes whole blocks, and does read-modify-write for any access that doesn't land on block edges.
 //!
 //! The partition is the one carved from userdata's tail on husky (Pixel 8):
 //! GPT LBA 28_881_920..=62_436_346, type GUID BLAKE3("ferros"), 128 GiB, `by-name/ferros`.
 //! Because the vault offset is partition-relative, LBA 0 of this device is that base LBA —
 //! the vault can never address a block outside its own partition.
 //!
-//! Exynos per-command nexus: every SCSI command must set its tag's bit in
-//! HCI_UTRL_NEXUS_TYPE (reg_hci + 0x40) before the doorbell, exactly as the vendor
-//! driver's `setup_xfer_req` hook does. `send_command` in the HAL is vendor-neutral and
-//! does not do this, so — like the proven adopt-path shim — we set it here before each op.
+//! Exynos per-command nexus: every SCSI command must set its tag's bit in HCI_UTRL_NEXUS_TYPE (reg_hci + 0x40) before the doorbell, exactly as the vendor driver's `setup_xfer_req` hook does.
+//! `send_command` in the HAL is vendor-neutral and does not do this, so — like the proven adopt-path shim — we set it here before each op.
 
 use alloc::vec::Vec;
 use ferros_hal::ufs::UfsController;
@@ -62,10 +58,8 @@ impl UfsDevice {
         Self::new(ufs, REG_HCI, FERROS_BASE_LBA, FERROS_BLOCKS)
     }
 
-    /// A small window at the ferros partition base — bounds `capacity()` so the store's
-    /// Phase-1 whole-file reads (`open`/`put`/`get` alloc `capacity()` bytes) stay within
-    /// the carveout heap. Until the store tracks the payload extent and reads only that,
-    /// the vault lives in the first `blocks * 4 KiB` of the partition.
+    /// A small window at the ferros partition base — bounds `capacity()` so the store's Phase-1 whole-file reads (`open`/`put`/`get` alloc `capacity()` bytes) stay within the carveout heap.
+    /// Until the store tracks the payload extent and reads only that, the vault lives in the first `blocks * 4 KiB` of the partition.
     pub fn ferros_windowed(ufs: UfsController, blocks: u32) -> Self {
         Self::new(ufs, REG_HCI, FERROS_BASE_LBA, blocks)
     }
@@ -152,8 +146,7 @@ impl Device for UfsDevice {
 
     fn flush(&mut self) -> Result<(), DeviceError> {
         // write_block completes synchronously (OCS polled), so writes are on the device.
-        // A SCSI SYNCHRONIZE CACHE (10) to flush the device-side write cache is not yet
-        // wired; the vault's write-verify-then-mirror protocol is the durability guard.
+        // A SCSI SYNCHRONIZE CACHE (10) to flush the device-side write cache is not yet wired; the vault's write-verify-then-mirror protocol is the durability guard.
         Ok(())
     }
 

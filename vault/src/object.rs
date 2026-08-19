@@ -70,10 +70,8 @@ pub struct Object {
 impl Object {
     /// Build a content-addressed object whose hash is the plain BLAKE3 of the content.
     ///
-    /// This is the identity scheme [`crate::store::ObjectStore::put`] verifies against, so
-    /// it is the correct way to mint an anonymous object for storage. (`ObjectBuilder`
-    /// derives a salted permission-chain hash for a different purpose and its objects are
-    /// not directly `put`-compatible.)
+    /// This is the identity scheme [`crate::store::ObjectStore::put`] verifies against, so it is the correct way to mint an anonymous object for storage.
+    /// (`ObjectBuilder` derives a salted permission-chain hash for a different purpose and its objects are not directly `put`-compatible.)
     pub fn content_addressed(vsf_type: VsfType, content: Vec<u8>) -> Self {
         let hash = crate::hash::ObjectHash(*blake3::hash(&content).as_bytes());
         Object {

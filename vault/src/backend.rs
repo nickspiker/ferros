@@ -6,7 +6,13 @@
 //!
 //! Object on-disk layout (within the vault payload, starting at the appended offset):
 //! ```text
-//!   [magic: 4 bytes "OBJ0"] [version: u8] [hash: 32 bytes]          (BLAKE3 of content — the object's identity) [content_len: u32 LE] [vsf_type: u8]            (cast from object.meta.vsf_type) [generation: u64 LE] [content: content_len bytes]
+//!   [magic: 4 bytes "OBJ0"]
+//!   [version: u8]
+//!   [hash: 32 bytes]          (BLAKE3 of content — the object's identity)
+//!   [content_len: u32 LE]
+//!   [vsf_type: u8]            (cast from object.meta.vsf_type)
+//!   [generation: u64 LE]
+//!   [content: content_len bytes]
 //! ```
 //! Total = 50 + content_len. No padding between objects — the next append starts immediately after.
 //!
@@ -73,9 +79,7 @@ impl<D: Device> Store<D> {
     /// Open an existing vault file. Decodes the VSF wrapper, locates the payload, reads slot 0's anchor, scans appended objects to rebuild the hash index. Errors if the file isn't a valid vault.
     pub fn open(device: D, anchor_key: AnchorKey) -> Result<Self, StoreBackendError> {
         // Step 1: read the entire file into memory so we can hand it to vsf_wrapper::decode (which expects a contiguous byte slice). For Phase 1 this is fine; multi-MB vaults are still small relative to RAM.
-        let file_size = device.capacity();
-        let mut file_bytes = alloc::vec![0u8; file_size as usize];
-        device.read_at(0, &mut file_bytes).map_err(StoreBackendError::Device)?;
+        let file_bytes = read_wrapped(&device).map_err(StoreBackendError::Device)?;
 
         let payload = crate::vsf_wrapper::decode(&file_bytes).map_err(StoreBackendError::Wrapper)?;
 
@@ -254,11 +258,7 @@ impl<D: Device> Store<D> {
         )))?;
 
         // Read the current full file, splice the new anchor into the right payload offset, re-wrap, write back. For Phase 1 we rewrite the whole file every anchor write (high write amplification; acceptable proving-ground tradeoff).
-        let file_size = self.device.capacity();
-        let mut file_bytes = alloc::vec![0u8; file_size as usize];
-        self.device
-            .read_at(0, &mut file_bytes)
-            .map_err(StoreError::DeviceError)?;
+        let file_bytes = read_wrapped(&self.device).map_err(StoreError::DeviceError)?;
         let mut payload = crate::vsf_wrapper::decode(&file_bytes).map_err(|_| {
             StoreError::DeviceError(DeviceError::IoError(crate::device::DeviceIoKind::ReadFailed))
         })?;
@@ -288,11 +288,7 @@ impl<D: Device> Store<D> {
         // Read-back verify: re-read just the anchor slot and decode.
         let mut readback = [0u8; SLOT_STRIDE as usize];
         // The slot is at payload_offset slot_offset; in the file that's after the VSF header. Easier: re-read everything and re-decode payload.
-        let file_size2 = self.device.capacity();
-        let mut file_bytes2 = alloc::vec![0u8; file_size2 as usize];
-        self.device
-            .read_at(0, &mut file_bytes2)
-            .map_err(StoreError::DeviceError)?;
+        let file_bytes2 = read_wrapped(&self.device).map_err(StoreError::DeviceError)?;
         let payload2 = crate::vsf_wrapper::decode(&file_bytes2).map_err(|_| {
             StoreError::DeviceError(DeviceError::IoError(crate::device::DeviceIoKind::ReadFailed))
         })?;
@@ -316,9 +312,7 @@ impl<D: Device> ObjectStore for Store<D> {
     fn get(&self, hash: &ObjectHash) -> Result<Object, StoreError> {
         let offset = self.index.get(hash).copied().ok_or(StoreError::NotFound(*hash))?;
         // Read the envelope header to learn content_len, then read the rest. For Phase 1 we re-read the whole file and slice from the payload — same trade-off as write.
-        let file_size = self.device.capacity();
-        let mut file_bytes = alloc::vec![0u8; file_size as usize];
-        self.device.read_at(0, &mut file_bytes).map_err(StoreError::DeviceError)?;
+        let file_bytes = read_wrapped(&self.device).map_err(StoreError::DeviceError)?;
         let payload = crate::vsf_wrapper::decode(&file_bytes).map_err(|_| {
             StoreError::DeviceError(DeviceError::IoError(crate::device::DeviceIoKind::ReadFailed))
         })?;
@@ -377,9 +371,7 @@ impl<D: Device> ObjectStore for Store<D> {
         }
 
         // Splice the new envelope into the payload at object_tail, re-wrap, write back. Same whole-file-rewrite pattern as write_anchor.
-        let file_size = self.device.capacity();
-        let mut file_bytes = alloc::vec![0u8; file_size as usize];
-        self.device.read_at(0, &mut file_bytes).map_err(StoreError::DeviceError)?;
+        let file_bytes = read_wrapped(&self.device).map_err(StoreError::DeviceError)?;
         let mut payload = crate::vsf_wrapper::decode(&file_bytes).map_err(|_| {
             StoreError::DeviceError(DeviceError::IoError(crate::device::DeviceIoKind::ReadFailed))
         })?;
@@ -431,6 +423,25 @@ impl<D: Device> ObjectStore for Store<D> {
 
 fn blake3_hash_of(bytes: &[u8]) -> ObjectHash {
     ObjectHash(*blake3::hash(bytes).as_bytes())
+}
+
+/// Read exactly the wrapped vault file from the device — not the whole device.
+///
+/// Reads a small header prefix, learns the true wrapped length from the VSF `file_length` field, then reads precisely that many bytes.
+/// This replaces the Phase-1 `capacity()`-sized reads, which allocated the entire device (fatal on a 128 GiB partition, and — on a never-freeing bump allocator — fatal even at 1 MiB across several ops per commit).
+fn read_wrapped<D: Device>(device: &D) -> Result<Vec<u8>, DeviceError> {
+    let cap = device.capacity();
+    let prefix_len = core::cmp::min(cap, 4096) as usize;
+    let mut prefix = alloc::vec![0u8; prefix_len];
+    device.read_at(0, &mut prefix)?;
+    let total = crate::vsf_wrapper::wrapped_len(&prefix)
+        .map_err(|_| DeviceError::IoError(crate::device::DeviceIoKind::ReadError))? as u64;
+    if total == 0 || total > cap {
+        return Err(DeviceError::IoError(crate::device::DeviceIoKind::ReadError));
+    }
+    let mut buf = alloc::vec![0u8; total as usize];
+    device.read_at(0, &mut buf)?;
+    Ok(buf)
 }
 
 fn build_object(hash: ObjectHash, vsf_type: VsfType, content: &[u8]) -> Object {
