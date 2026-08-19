@@ -67,6 +67,30 @@ pub struct Object {
     pub content: Vec<u8>,
 }
 
+impl Object {
+    /// Build a content-addressed object whose hash is the plain BLAKE3 of the content.
+    ///
+    /// This is the identity scheme [`crate::store::ObjectStore::put`] verifies against, so
+    /// it is the correct way to mint an anonymous object for storage. (`ObjectBuilder`
+    /// derives a salted permission-chain hash for a different purpose and its objects are
+    /// not directly `put`-compatible.)
+    pub fn content_addressed(vsf_type: VsfType, content: Vec<u8>) -> Self {
+        let hash = crate::hash::ObjectHash(*blake3::hash(&content).as_bytes());
+        Object {
+            meta: ObjectMeta {
+                hash,
+                vsf_type,
+                name: Vec::new(),
+                domain: Vec::new(),
+                content_len: content.len() as u64,
+                generation: 0,
+                parent: None,
+            },
+            content,
+        }
+    }
+}
+
 /// Trait for types that can be serialized into a VSF object.
 ///
 /// This is how higher-level structures (capability tokens, mesh records, failure states) get stored in the ledger — they serialize to Object.

@@ -62,6 +62,14 @@ impl UfsDevice {
         Self::new(ufs, REG_HCI, FERROS_BASE_LBA, FERROS_BLOCKS)
     }
 
+    /// A small window at the ferros partition base — bounds `capacity()` so the store's
+    /// Phase-1 whole-file reads (`open`/`put`/`get` alloc `capacity()` bytes) stay within
+    /// the carveout heap. Until the store tracks the payload extent and reads only that,
+    /// the vault lives in the first `blocks * 4 KiB` of the partition.
+    pub fn ferros_windowed(ufs: UfsController, blocks: u32) -> Self {
+        Self::new(ufs, REG_HCI, FERROS_BASE_LBA, blocks)
+    }
+
     /// Set tag 0's SCSI nexus bit before a data-transfer command (Exynos setup_xfer_req).
     fn scsi_nexus(&self) {
         unsafe {

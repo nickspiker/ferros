@@ -27,9 +27,7 @@ use core::panic::PanicInfo;
 #[cfg(shim_handoff)]
 mod shim;
 
-// UFS-backed vault Device (windowed onto the ferros partition). Not yet wired into a
-// boot path; kept building so the vault storage layer stays honest against the HAL.
-#[allow(dead_code)]
+// UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;
 
 use ferros_pt::packet;
@@ -934,7 +932,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     HEAP_BASE.store(heap_base, Ordering::SeqCst);
 
-    shim::entry_m1(dtb_addr)
+    shim::entry_genesis(dtb_addr)
 }
 
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]

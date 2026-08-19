@@ -225,3 +225,107 @@ pub fn entry_m1(x0: u64) -> ! {
         );
     }
 }
+
+/// Genesis entry: adopt the live UFS link, then format a fresh ferros vault onto
+/// the ferros partition (sda35, LBA 28_881_920..) and prove a store/retrieve
+/// round-trip through the real `Store<UfsDevice>` — the same append-only backend
+/// the host tests exercise, now driving flash over the adopted link.
+///
+/// We do NOT re-open on-device to prove persistence: `Store::open` allocates
+/// `device.capacity()` bytes (128 GiB here) — a Phase-2 fix. Persistence is
+/// verified out-of-band from rooted Android: `dd` the partition, decode with
+/// vaultinfo. format/put/get never allocate capacity-sized buffers, so they run
+/// fine in the carveout heap.
+pub fn entry_genesis(x0: u64) -> ! {
+    use crate::ufs_device::UfsDevice;
+    use ferros_hal::ufs::UfsController;
+    use ferros_vault::anchor::AnchorKey;
+    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
+    use ferros_vault::object::{Object, VsfType};
+    use ferros_vault::store::ObjectStore;
+
+    // --- adopt the live link (identical prologue to entry_m1) ---
+    unsafe {
+        write_volatile((S2MPU_HSI2 + 0x54) as *mut u32, 0xFF);
+        write_volatile((S2MPU_HSI2 + 0x00) as *mut u32, 0x00);
+        write_volatile(0x1302_0710 as *mut u32, 0);
+        core::arch::asm!("dsb sy");
+    }
+    let rd = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
+    let wr = |off: usize, v: u32| unsafe { core::ptr::write_volatile((UFS_BASE + off) as *mut u32, v) };
+    let hci_w = |off: usize, v: u32| unsafe { core::ptr::write_volatile((0x1320_1100 + off) as *mut u32, v) };
+
+    let ufs = UfsController::new(UFS_BASE);
+    let ferros_utrd = ufs.utrd_phys();
+    let is_pending = rd(0x20);
+    wr(0x60, 0);
+    wr(0x50, ferros_utrd as u32);
+    wr(0x54, (ferros_utrd >> 32) as u32);
+    wr(0x20, is_pending);
+    wr(0x60, 1);
+    hci_w(0x38, 0x0018_0000); // clear stale vendor_IS
+    let link_up = ufs.link_is_up();
+    drop(ufs);
+
+    // --- genesis + round-trip on the ferros partition ---
+    // Window the device to 1 MiB so put/get's whole-file read (device.capacity() bytes)
+    // fits the carveout heap. The vault lives in the first 256 blocks of the partition.
+    const MSG: &[u8] = b"FERROS-GENESIS-0";
+    let dev = UfsDevice::ferros_windowed(UfsController::new(UFS_BASE), 256);
+
+    let mut format_ok = 0u8;
+    let mut put_ok = 0u8;
+    let mut get_ok = 0u8;
+    let mut verify_ok = 0u8;
+    let mut stage = 0u8; // 0 all-ok; 1 format 2 put 3 get 4 verify failed
+    let mut root16 = [0u8; 16];
+
+    match Store::format(dev, AnchorKey([0x5Au8; 32]), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE) {
+        Ok(mut store) => {
+            format_ok = 1;
+            root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+            let obj = Object::content_addressed(VsfType::Record, MSG.to_vec());
+            match store.put(obj) {
+                Ok(h) => {
+                    put_ok = 1;
+                    match store.get(&h) {
+                        Ok(got) => {
+                            get_ok = 1;
+                            verify_ok = (got.content.as_slice() == MSG) as u8;
+                            if verify_ok == 0 {
+                                stage = 4;
+                            }
+                        }
+                        Err(_) => stage = 3,
+                    }
+                }
+                Err(_) => stage = 2,
+            }
+        }
+        Err(_) => stage = 1,
+    }
+
+    // Report into entry_m1's ramoops layout (kernel reader prints the same fields;
+    // reinterpret: +0x10 bytes = format|put|get|verify, +0x18 = stage, pattern = root[..16]).
+    unsafe {
+        let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
+        w(0x00, RESULT_MAGIC);
+        w(0x08, link_up as u64);
+        w(0x10, (format_ok as u64) | ((put_ok as u64) << 8) | ((get_ok as u64) << 16) | ((verify_ok as u64) << 24));
+        w(0x18, stage as u64);
+        w(0x20, 0);
+        w(0x28, 0);
+        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 192);
+    }
+
+    let _ = (x0, SCRATCH, MAGIC, STAGE_M0, STAGE_M1, CRUMB_ENTRY, CRUMB_RUST);
+    unsafe {
+        core::arch::asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
