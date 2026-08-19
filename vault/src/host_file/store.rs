@@ -229,4 +229,18 @@ mod tests {
         assert_eq!(store.get_by_key("b").unwrap(), None);
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn keyed_oversized_key_errors_not_panics() {
+        // A key past the encoder's u16 limit must return an error, never panic (a no_std panic hangs the kernel).
+        let path = tmp_path("keyed_toobig");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store =
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        let huge = "x".repeat(70_000); // > u16::MAX
+        let res = store.set(&huge, b"v".to_vec());
+        assert!(matches!(res, Err(StoreError::KeyTooLarge { .. })));
+        std::fs::remove_file(&path).ok();
+    }
 }

@@ -29,6 +29,8 @@ pub enum StoreError {
     DeviceError(crate::device::DeviceError),
     /// Mesh consensus was not achieved for this write.
     MeshRejected,
+    /// A logical key exceeds what the root-commit encoder can represent. Returned instead of panicking; the limit is the encoder's current `u16` length field and relaxes once keys are EWE-encoded. A key this large almost always means content was passed where a name belongs.
+    KeyTooLarge { len: usize, max: usize },
 }
 
 /// The object store — Layer 0 of the Ledger.

@@ -249,6 +249,10 @@ impl<D: Device> Store<D> {
 
     /// Store `content` under `logical_key`, durably (sealed via `commit_root`). Returns the value object's content hash. Content-addressed, so identical values dedupe; overwriting a key just repoints it.
     pub fn set(&mut self, logical_key: &str, content: Vec<u8>) -> Result<ObjectHash, StoreError> {
+        // Guard the root-commit encoder's u16 key-length field: return an error rather than letting encode() panic (a no_std panic hangs the kernel). This ceiling relaxes when keys become EWE-encoded.
+        if logical_key.len() > u16::MAX as usize {
+            return Err(StoreError::KeyTooLarge { len: logical_key.len(), max: u16::MAX as usize });
+        }
         let obj = Object::content_addressed(VsfType::Blob, content);
         let hash = obj.meta.hash;
         self.put(obj)?;
