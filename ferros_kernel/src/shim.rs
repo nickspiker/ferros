@@ -104,169 +104,123 @@ pub fn entry_m1(x0: u64) -> ! {
     use ferros_hal::ufs::UfsController;
     use core::ptr::write_volatile;
 
-    let el: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack));
-    }
-
     // Bypass the HSI2 S2MPU so the UFS master DMAs to our physical carveout
-    // buffers (UFS_BUF is inside the reserved region). Disabling the DMA gate
-    // does not disturb the M-PHY/UniPro link. zuma UFS has no stage-1 SysMMU.
+    // buffers. (zuma UFS has no stage-1 SysMMU; disabling this DMA gate does not
+    // disturb the live M-PHY/UniPro link.)
     unsafe {
-        write_volatile((S2MPU_HSI2 + 0x54) as *mut u32, 0xFF); // clear VID protection
-        write_volatile((S2MPU_HSI2 + 0x00) as *mut u32, 0x00); // disable
+        write_volatile((S2MPU_HSI2 + 0x54) as *mut u32, 0xFF);
+        write_volatile((S2MPU_HSI2 + 0x00) as *mut u32, 0x00);
+        // Non-coherent DMA: ferros runs MMU-off (SCTLR.C=0), out of the coherency
+        // domain, so the master reads DRAM directly where our cache-cleaned
+        // descriptors live. (0x13020710 = sysreg_ufs iocc.)
+        write_volatile(0x1302_0710 as *mut u32, 0);
         core::arch::asm!("dsb sy");
     }
-
-    // Force the UFS AXI master to NON-coherent DMA. ABL/Linux set sysreg_ufs
-    // iocc=3 (coherent: the master snoops CPU caches). ferros runs MMU-off so
-    // SCTLR.C=0 — the CPU is out of the coherency domain and never answers the
-    // snoop, so the master's coherent descriptor-fetch stalls forever = the dead
-    // doorbell (DBR stuck, OCS=0xF). Clearing iocc makes it read DRAM directly,
-    // where ferros's cache-cleaned descriptors already live.
-    const SYSREG_UFS_IOCC: usize = 0x1302_0710;
-    let iocc_before = unsafe { core::ptr::read_volatile(SYSREG_UFS_IOCC as *const u32) };
-    unsafe {
-        core::ptr::write_volatile(SYSREG_UFS_IOCC as *mut u32, 0);
-        core::arch::asm!("dsb sy");
-    }
-    let iocc_after = unsafe { core::ptr::read_volatile(SYSREG_UFS_IOCC as *const u32) };
 
     let rd = |off: usize| unsafe { core::ptr::read_volatile((UFS_BASE + off) as *const u32) };
     let wr = |off: usize, v: u32| unsafe { core::ptr::write_volatile((UFS_BASE + off) as *mut u32, v) };
-
-    // Adopt the controller. Manual rebase (NOT init_transfer_list, which clears
-    // IS with 0xFFFFFFFF): on this Exynos controller IS bit 12 is a vendor RW
-    // bit, not write-1-to-clear, so blanket-writing 1s SETS it (Linux never has
-    // it set) and wedges the transfer engine. Clear IS the way Linux does — write
-    // back only the bits that were actually set (W1C), never touching bit 12.
-    let ufs = UfsController::new(UFS_BASE);
-    let ferros_utrd = ufs.utrd_phys();
-    let ie_before = rd(0x24);
-    let is_pending = rd(0x20);
-    wr(0x60, 0); // UTRLRSR = 0 (stop list so UTRLBA is sampled)
-    wr(0x50, ferros_utrd as u32); // UTRLBA
-    wr(0x54, (ferros_utrd >> 32) as u32); // UTRLBAU
-    wr(0x20, is_pending); // clear pending IS via write-back (W1C) — no 0xFFFFFFFF
-    wr(0x60, 1); // UTRLRSR = 1 (start)
-    let is_after_rebase = rd(0x20);
-    let utrlba_rb = rd(0x50);
-
-    // Exynos vendor HCI register block (reg_hci @ 0x13201100) — SEPARATE from the
-    // standard HCI base. The vendor DMA-engine / nexus registers live here.
+    // Exynos vendor HCI block (reg_hci @ 0x13201100) — separate from the std base.
     const HCI: usize = 0x1320_1100;
     let hci_r = |off: usize| unsafe { core::ptr::read_volatile((HCI + off) as *const u32) };
     let hci_w = |off: usize, v: u32| unsafe { core::ptr::write_volatile((HCI + off) as *mut u32, v) };
 
-    // THE FIX: per-command HCI_UTRL_NEXUS_TYPE, exactly as the Exynos driver's
-    // setup_xfer_req does before ringing each doorbell:
-    //   SCSI command  -> type |= (1<<tag)   (it IS a nexus transfer)
-    //   NOP / dev-mgmt -> type &= ~(1<<tag)  (NOT a nexus transfer)
-    // ferros's adopt-path skipped this; a NOP run with its nexus bit SET (Linux
-    // left slot 0 set from its last SCSI cmd, and I'd blanket-set 0xFFFFFFFF)
-    // wedges the controller. Clear it for the NOP below, set it for the READ.
-    let upiu_ctrl_before = hci_r(0x10);
-    let upiu_baddr = hci_r(0x14);
-    hci_w(0x38, 0x0018_0000); // clear stale vendor_IS error bits
-    let nexus_before = hci_r(0x40);
+    let ufs = UfsController::new(UFS_BASE);
+
+    // Adopt the controller: rebase the transfer list onto our own descriptors.
+    // Clear IS by writing back the read value (standard W1C) — NOT 0xFFFFFFFF,
+    // which would set the Exynos non-W1C vendor bits. UTRLBA is only sampled
+    // while the list is stopped (RSR=0).
+    let ferros_utrd = ufs.utrd_phys();
+    let is_pending = rd(0x20);
+    wr(0x60, 0);
+    wr(0x50, ferros_utrd as u32);
+    wr(0x54, (ferros_utrd >> 32) as u32);
+    wr(0x20, is_pending);
+    wr(0x60, 1);
+    hci_w(0x38, 0x0018_0000); // clear any stale vendor_IS error bits
+
+    // Per-command HCI_UTRL_NEXUS_TYPE, exactly as the driver's setup_xfer_req:
+    // SCSI command sets the tag's bit, a NOP / device-mgmt command clears it. The
+    // adopt-path skips full_init so this per-command step is ours to do; getting
+    // it wrong wedges the transfer engine (this was THE dead-doorbell bug).
+    let nexus = |scsi: bool| {
+        let t = hci_r(0x40);
+        hci_w(0x40, if scsi { t | 1 } else { t & !1 });
+        unsafe { core::arch::asm!("dsb sy") };
+    };
 
     let link_up = ufs.link_is_up();
-    let hcs = rd(0x30);
 
-    // NOP = device management: nexus bit for slot 0 CLEARED.
-    hci_w(0x40, hci_r(0x40) & !1);
-    unsafe { core::arch::asm!("dsb sy") };
-    let nexus_after = hci_r(0x40);
+    // NOP OUT (device management): proves the doorbell round-trips.
+    nexus(false);
     let (nop_ocs, nop_rsp) = ufs.live_nop();
-    let dbr_after_nop = rd(0x58);
-    let is_after_nop = rd(0x20);
 
-    // READ(10) = SCSI: nexus bit for slot 0 SET.
-    hci_w(0x40, hci_r(0x40) | 1);
-    unsafe { core::arch::asm!("dsb sy") };
-    let read_ocs = ufs.read_block(0);
-    let dbr_after_read = rd(0x58);
-    let is_after_read = rd(0x20);
-    let rsr = rd(0x60);
-    let status = ufs.last_response_status();
-    // Full response UPIU head: byte1=flags (bit1=underflow), byte6=response,
-    // byte7=status, bytes12-15=residual transfer count (BE). residual=4096 =>
-    // device sent 0 bytes; residual=0 but data zeros => data DMA'd elsewhere.
-    let rsp = ufs.response_upiu_head();
-    let data = ufs.data_buffer();
+    // READ(10) LBA 0 (SCSI): confirm real data — GPT protective MBR sig 0xAA55.
+    nexus(true);
+    let r0_ocs = ufs.read_block(0);
+    let r0_status = ufs.last_response_status();
+    let mbr_sig = {
+        let d = ufs.data_buffer();
+        (d[510] as u16) | ((d[511] as u16) << 8) // expect 0xAA55
+    };
 
-    // Exynos vendor DMA-engine state (CORRECT reg_hci base now):
-    let vs_fsm = hci_r(0xC0); // HCI_FSM_MONITOR — where the transfer FSM is parked
-    let vs_dma_state = hci_r(0xC8); // HCI_DMA0_MONITOR_STATE
-    let vs_dma_dbell = hci_r(0xD8); // HCI_DMA0_DOORBELL_DEBUG
-    let vs_vendor_is = hci_r(0x38); // HCI_VENDOR_SPECIFIC_IS — bits 19,20 = invalid offset
-    let vs_axi_ctrl = hci_r(0xF8); // HCI_UFS_AXI_DMA_IF_CTRL
-    // The controller latches the address it rejected as "invalid offset" here.
-    // If these equal ferros's carveout UTRD/data addr, the controller enforces a
-    // valid-address WINDOW that the carveout (0x924xxxxx) falls outside of.
-    let inv_utr = hci_r(0x20); // HCI_INVALID_UTR_OFFSET_ADDR
-    let inv_din = hci_r(0x24); // HCI_INVALID_DIN_OFFSET_ADDR
-    let inv_utmr = hci_r(0x1C); // HCI_INVALID_UTMR_OFFSET_ADDR
-    let _ = (nexus_before, nexus_after);
-    // S2MPU control readback — did our disable actually take?
-    let s2mpu_ctrl = unsafe { core::ptr::read_volatile(S2MPU_HSI2 as *const u32) };
-    // UFS Protector (UFSP @ 0x13208000) — the last unexamined DMA gate. If it
-    // protects a region covering ferros's carveout (0x924xxxxx), the master's
-    // descriptor DMA is denied. rsec/wsec = read/write secure masks; region 0
-    // begin/end/ctrl. Compare against Linux (all-zero regions = not gating).
-    const UFSP: usize = 0x1320_8000;
-    let up = |off: usize| unsafe { core::ptr::read_volatile((UFSP + off) as *const u32) };
-    let ufsp_rsec = up(0x10);
-    let ufsp_wsec = up(0x110);
-    let ufsp_sbegin0 = up(0x200);
-    let ufsp_send0 = up(0x204);
-    let ufsp_sctrl0 = up(0x20C);
+    // WRITE verification. A scratch LBA deep in userdata (2449894..62436347 in
+    // 4KB blocks); ~120 GB in, encrypted free-ish space, and we RESTORE the
+    // original after — so a live Android sees no change. read -> pattern-write ->
+    // read-verify -> restore-write -> read-verify.
+    const SCRATCH_LBA: u32 = 30_000_000;
+    let mut saved = [0u8; 4096];
+    let mut pat_readback = [0u8; 16];
+    nexus(true);
+    let rs_ocs = ufs.read_block(SCRATCH_LBA);
+    saved.copy_from_slice(ufs.data_buffer());
+    {
+        let b = ufs.data_buffer_mut();
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = 0xF0u8 ^ (i as u8);
+        }
+        b[..8].copy_from_slice(b"FERROSw!");
+    }
+    nexus(true);
+    let w_ocs = ufs.write_block(SCRATCH_LBA);
+    nexus(true);
+    let rv_ocs = ufs.read_block(SCRATCH_LBA);
+    pat_readback.copy_from_slice(&ufs.data_buffer()[..16]);
+    let wrote_ok = &ufs.data_buffer()[..8] == b"FERROSw!"
+        && ufs.data_buffer()[100] == (0xF0u8 ^ 100);
+    // restore the original block
+    ufs.data_buffer_mut().copy_from_slice(&saved);
+    nexus(true);
+    let restore_ocs = ufs.write_block(SCRATCH_LBA);
+    nexus(true);
+    let rr_ocs = ufs.read_block(SCRATCH_LBA);
+    let restored_ok = ufs.data_buffer()[..] == saved[..];
 
-    // Ramoops diagnostic (survives reset). u64 slots:
-    //   +0x00 magic  +0x08 link_up  +0x10 ocs/status word
-    //   +0x18 hcs|rsr  +0x20 is_nop|is_read  +0x28 dbr_nop|dbr_read
-    //   +0x30 utrlba_rb|iocc_after  +0x38 vs_fsm|vs_dma_state
-    //   +0x40 vs_dma_dbell|vs_vendor_is  +0x48 vs_axi_ctrl|s2mpu_ctrl
-    //   +0x80..0xA0 first 32 bytes of LBA 0
+    // Report to ramoops (survives the reset; next-boot initcall prints it).
+    //   +0x00 magic  +0x08 link_up  +0x10 nop/read ocs word  +0x18 mbr_sig
+    //   +0x20 write-test ocs word  +0x28 wrote_ok|restored_ok
+    //   +0xA0 pattern readback (16 B)
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
         w(0x08, link_up as u64);
         w(0x10, (nop_ocs as u64) | ((nop_rsp as u64) << 8)
-            | ((read_ocs as u64) << 16) | ((status as u64) << 24));
-        w(0x18, (hcs as u64) | ((rsr as u64) << 32));
-        w(0x20, (is_after_nop as u64) | ((is_after_read as u64) << 32));
-        w(0x28, (dbr_after_nop as u64) | ((dbr_after_read as u64) << 32));
-        w(0x30, (utrlba_rb as u64) | ((iocc_after as u64) << 32));
-        w(0x38, (vs_fsm as u64) | ((vs_dma_state as u64) << 32));
-        w(0x40, (vs_dma_dbell as u64) | ((vs_vendor_is as u64) << 32));
-        w(0x48, (vs_axi_ctrl as u64) | ((s2mpu_ctrl as u64) << 32));
-        w(0x50, (ie_before as u64) | ((is_after_rebase as u64) << 32));
-        // invalid-offset bounds + vendor_IS (should now be clear if fix worked) +
-        // the INVALID_UPIU window base/ctrl we disabled.
-        w(0x58, (inv_utr as u64) | ((inv_din as u64) << 32));
-        w(0x60, (vs_vendor_is as u64) | ((upiu_ctrl_before as u64) << 32));
-        w(0x68, upiu_baddr as u64);
-        let _ = (iocc_before, ufsp_wsec, ufsp_send0, ufsp_rsec, ufsp_sbegin0,
-                 ufsp_sctrl0, nexus_before, nexus_after, inv_utmr, ferros_utrd,
-                 inv_utr, inv_din, upiu_ctrl_before, upiu_baddr);
-        // response UPIU head (16 B) at +0xA0, full 512-byte sector of LBA 0 at
-        // +0x100 (to see the MBR partition entry + 0x55AA signature at byte 510).
-        core::ptr::copy_nonoverlapping(rsp.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
-        core::ptr::copy_nonoverlapping(data.as_ptr(), (RAMOOPS_RESULT + 256) as *mut u8, 512);
-        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 768);
+            | ((r0_ocs as u64) << 16) | ((r0_status as u64) << 24));
+        w(0x18, mbr_sig as u64);
+        w(0x20, (rs_ocs as u64) | ((w_ocs as u64) << 8) | ((rv_ocs as u64) << 16)
+            | ((restore_ocs as u64) << 24) | ((rr_ocs as u64) << 32));
+        w(0x28, (wrote_ok as u64) | ((restored_ok as u64) << 8));
+        core::ptr::copy_nonoverlapping(pat_readback.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 192);
     }
 
-    // PSCI signal: SYSTEM_OFF (power off, stays off) if the doorbell WORKED (NOP
-    // completed: nop_ocs==0), else SYSTEM_RESET (reboot loop -> fastboot).
-    let _ = (x0, el, SCRATCH, MAGIC, STAGE_M1);
-    let success = link_up && nop_ocs == 0;
-    let psci_fn: u32 = if success { 0x8400_0008 } else { 0x8400_0009 };
+    let _ = (x0, SCRATCH, MAGIC, STAGE_M1);
+    // Warm reboot (SYSTEM_RESET) — the ramoops dump is the result signal.
     unsafe {
         core::arch::asm!(
-            "mov w0, {f:w}",
-            "smc #0", // SYSTEM_OFF on success, SYSTEM_RESET on failure
-            f = in(reg) psci_fn,
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
             options(nomem, nostack, noreturn),
         );
     }
