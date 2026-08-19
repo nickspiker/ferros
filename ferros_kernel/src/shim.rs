@@ -314,15 +314,12 @@ pub fn entry_genesis(x0: u64) -> ! {
 /// Reports opened=1, verified=1 — PERSISTED ACROSS REBOOT.
 /// Idempotent thereafter.
 ///
-/// Uses a 1 MiB device window (the store's Phase-1 reads alloc device.capacity()).
+/// Spans the whole partition (bounded reads mean the store never allocs capacity()), stores by logical key through the vault's keyed API, and runs on the freeing free-list allocator.
 pub fn entry_vault(x0: u64) -> ! {
     use crate::ufs_device::UfsDevice;
     use ferros_hal::ufs::UfsController;
     use ferros_vault::anchor::AnchorKey;
     use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
-    use ferros_vault::object::{Object, VsfType};
-    use ferros_vault::root_commit::RootCommit;
-    use ferros_vault::store::ObjectStore;
 
     // --- adopt the live link (identical prologue to entry_genesis) ---
     unsafe {
@@ -347,16 +344,15 @@ pub fn entry_vault(x0: u64) -> ! {
     let link_up = ufs.link_is_up();
     drop(ufs);
 
-    // --- open-or-genesis ---
+    // --- open-or-genesis, by logical key ---
+    const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";
     const KEY: AnchorKey = AnchorKey([0x5Au8; 32]);
-    let obj = Object::content_addressed(VsfType::Record, MSG.to_vec());
-    let known = obj.meta.hash;
 
     let mut opened = 0u8;
     let mut verified = 0u8;
     let mut sealed = 0u8;
-    let mut stage = 0u8; // 0 ok; 1 format 2 put 5 commit failed
+    let mut stage = 0u8; // 0 ok; 1 format 2 set 3 read failed
     let mut root16 = [0u8; 16];
     let mut need_seal = false;
 
@@ -367,9 +363,10 @@ pub fn entry_vault(x0: u64) -> ! {
         Ok(store) => {
             opened = 1;
             root16.copy_from_slice(&store.root_commit_hash().0[..16]);
-            match store.get(&known) {
-                Ok(got) if got.content.as_slice() == MSG => verified = 1,
-                _ => need_seal = true, // vault present but our object not sealed yet
+            match store.get_by_key(LKEY) {
+                Ok(Some(v)) if v.as_slice() == MSG => verified = 1,
+                Ok(_) => need_seal = true, // vault present but key absent or mismatched
+                Err(_) => stage = 3,
             }
         }
         Err(_) => need_seal = true, // no vault — genesis it
@@ -377,14 +374,11 @@ pub fn entry_vault(x0: u64) -> ! {
 
     if need_seal {
         match Store::format(fresh_dev(), KEY, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE) {
-            Ok(mut store) => match store.put(obj) {
-                Ok(_) => match store.commit_root(&RootCommit::new()) {
-                    Ok(_) => {
-                        sealed = 1;
-                        root16.copy_from_slice(&store.root_commit_hash().0[..16]);
-                    }
-                    Err(_) => stage = 5,
-                },
+            Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
+                Ok(_) => {
+                    sealed = 1;
+                    root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+                }
                 Err(_) => stage = 2,
             },
             Err(_) => stage = 1,
