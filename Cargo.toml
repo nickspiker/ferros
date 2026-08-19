@@ -8,6 +8,7 @@ members = [
     "vault",
     "ferros_ledger",
     "ferros_pt",
+    "ferros_heap",
     "ferros_seed",
     "tools/mkimg",
     "tools/ferros-bridge",

@@ -18,4 +18,5 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 ferros_vault = { path = "../vault", default-features = false }
 ferros_ledger = { path = "../ferros_ledger" }
 ferros_pt = { path = "../ferros_pt", features = ["alloc"] }
+ferros_heap = { path = "../ferros_heap" }
 ihi = { version = "0.0.3", default-features = false }

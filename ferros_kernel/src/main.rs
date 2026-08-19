@@ -43,9 +43,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + 64KB stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
+#[cfg_attr(shim_handoff, allow(dead_code))]
 static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
+#[cfg_attr(shim_handoff, allow(dead_code))]
 static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg_attr(shim_handoff, allow(dead_code))]
 struct BumpAlloc;
 
 unsafe impl GlobalAlloc for BumpAlloc {
@@ -69,8 +72,15 @@ unsafe impl GlobalAlloc for BumpAlloc {
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
 
+// Cold-boot and m1 paths keep the lean leak-forever bump: their allocation is bounded (page tables, PT buffers) and set up once.
+#[cfg(not(shim_handoff))]
 #[global_allocator]
 static ALLOC: BumpAlloc = BumpAlloc;
+
+// The chainload/shim path runs the vault, whose commits do many alloc/free cycles per operation (bounded reads + VSF encode/decode); a leak-forever bump OOMs the 4 MiB carveout heap in a handful of commits, so this build gets a freeing free-list allocator instead.
+#[cfg(shim_handoff)]
+#[global_allocator]
+static SHIM_ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 
 // ---------------------------------------------------------------------------
 // Boot stub — minimal, no MMU
@@ -925,7 +935,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     unsafe extern "C" { static __stack_top: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
-    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+    unsafe { SHIM_ALLOC.init(heap_base, HEAP_SIZE) };
 
     shim::entry_vault(dtb_addr)
 }

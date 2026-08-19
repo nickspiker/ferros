@@ -1,0 +1,5 @@
+[package]
+name = "ferros_heap"
+edition.workspace = true
+license.workspace = true
+description = "no_std free-list heap allocator with coalescing for the ferros kernel"
