@@ -13,15 +13,14 @@
 //!
 //! Type alias [`PhotonLedger`] collapses the three-generic [`crate::Ledger`] into the concrete combo Photon uses.
 
-pub mod anchor_key_store;
 pub mod capability;
 pub mod device;
 pub mod inspect;
 pub mod mesh;
-pub mod root_commit;
 pub mod store;
-pub mod vault_anchor;
-pub mod vsf_wrapper;
+
+// These four modules are no_std-clean and now live at the crate root (compiled unconditionally). Re-export them here so existing `host_file::vsf_wrapper` / `host_file::root_commit::RootCommit` paths keep resolving.
+pub use crate::{anchor_key_store, root_commit, vault_anchor, vsf_wrapper};
 
 pub use anchor_key_store::derive_anchor_key;
 pub use inspect::{inspect_vault, InspectError};

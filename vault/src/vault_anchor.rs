@@ -12,7 +12,6 @@
 //!
 //! Slot 0 is privileged: always at offset 0 of the vault payload. Slots 1..ring_size are at key-derived offsets via [`derive_slot_offset`], scattered thru the payload so an attacker without the key can't distinguish slot regions from object regions.
 
-use alloc::vec::Vec;
 
 use crate::anchor::AnchorKey;
 use crate::hash::ObjectHash;
@@ -349,7 +348,7 @@ mod tests {
         let key = test_key();
         let cap = 64 * 1024;
         // Pretend slot 1 is already at offset 2000; slot 2's probe must not land within SLOT_STRIDE of that.
-        let claimed: Vec<u64> = alloc::vec![2000];
+        let claimed: alloc::vec::Vec<u64> = alloc::vec![2000];
         let off = derive_slot_offset_with_probe(&key, 2, cap, &claimed, 0, 8).unwrap();
         assert!(off.abs_diff(2000) >= SLOT_STRIDE);
     }

@@ -79,4 +79,10 @@ pub trait Device {
     fn capacity(&self) -> u64 {
         self.info().capacity
     }
+
+    /// Grow the device to `new_capacity` bytes. The default implementation refuses — most devices (raw partitions, UFS windows) are fixed-size and cannot grow. Backends over a growable medium (a single host file, a sparse image) override this. The store only calls it on the grow path, guarded by a capacity check, so fixed-size devices that never need to grow never hit the default error.
+    fn set_capacity(&mut self, new_capacity: u64) -> Result<(), DeviceError> {
+        let _ = new_capacity;
+        Err(DeviceError::IoError(DeviceIoKind::InvalidParam))
+    }
 }

@@ -27,6 +27,11 @@ use core::panic::PanicInfo;
 #[cfg(shim_handoff)]
 mod shim;
 
+// UFS-backed vault Device (windowed onto the ferros partition). Not yet wired into a
+// boot path; kept building so the vault storage layer stays honest against the HAL.
+#[allow(dead_code)]
+mod ufs_device;
+
 use ferros_pt::packet;
 use ferros_pt::transfer::{InboundTransfer, OutboundTransfer};
 

@@ -42,6 +42,11 @@ pub mod failure;
 pub mod anchor;
 pub mod platform;
 pub mod boot;
+pub mod vsf_wrapper;
+pub mod vault_anchor;
+pub mod root_commit;
+pub mod anchor_key_store;
+pub mod backend;
 
 /// Linux single-file vault backend — gated on `host-file` feature. Provides `std::fs::File`-backed [`store::ObjectStore`] + [`device::Device`] impls, plus no-op stubs for [`capability::CapabilityEngine`] and [`mesh::MeshEngine`] for single-user single-device userspace consumers like Photon.
 #[cfg(feature = "host-file")]

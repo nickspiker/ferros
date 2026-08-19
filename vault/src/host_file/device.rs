@@ -66,9 +66,11 @@ impl FileDevice {
         };
         Ok(Self { file, info })
     }
+}
 
+impl Device for FileDevice {
     /// Grow the file to the new capacity. Used by the vault when `payload_capacity` needs to expand. Shrink not exposed — the vault uses sibling-file + rename for shrinks (compact pass), not in-place truncation.
-    pub fn set_capacity(&mut self, new_capacity: u64) -> Result<(), DeviceError> {
+    fn set_capacity(&mut self, new_capacity: u64) -> Result<(), DeviceError> {
         if new_capacity < self.info.capacity {
             // Refuse in-place shrink — vault should use the compact/rewrite path instead.
             return Err(DeviceError::IoError(DeviceIoKind::InvalidParam));
@@ -79,9 +81,7 @@ impl FileDevice {
         self.info.capacity = new_capacity;
         Ok(())
     }
-}
 
-impl Device for FileDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
         let len = buf.len() as u64;
         if offset.saturating_add(len) > self.info.capacity {
