@@ -22,6 +22,11 @@ extern crate alloc;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
+// Post-handoff entry (ferros chainloaded from a running Linux shim). Only built
+// for the shim-linked image (FERROS_SHIM_HANDOFF=1 → cfg shim_handoff).
+#[cfg(shim_handoff)]
+mod shim;
+
 use ferros_pt::packet;
 use ferros_pt::transfer::{InboundTransfer, OutboundTransfer};
 
@@ -175,6 +180,17 @@ _start:
 // ---------- Actual kernel entry (page-aligned at RVA 0x1000) ----------
 .balign 0x1000
 _entry:
+    // Handoff diagnostic breadcrumb: prove we reached ferros's first instruction.
+    // Written to the shim scratch (0x92F00100) so it survives a later crash and
+    // the kernel readback can see the EL2 jump landed. Harmless on cold boot —
+    // 0x92F00100 is DRAM the cold-boot image (at 0x80000) never touches. MMU is
+    // off on all our entry paths (shim jump + Tensor ABL), so this hits DRAM.
+    movz    x9, #0x92F0, lsl #16    // x9 = 0x92F00000
+    add     x9, x9, #0x100          // x9 = 0x92F00100 (entry breadcrumb slot)
+    movz    x10, #0xBEE1            // "reached _entry"
+    str     x10, [x9]
+    dc      civac, x9               // push the breadcrumb to PoC so it survives a reset
+    dsb     sy
     // Save DTB pointer, mask interrupts
     mov     x19, x0
     msr     daifset, #0xF
@@ -898,7 +914,25 @@ fn m1_usb_event_loop(
 // Pixel 8 / QCM6490 kernel entry
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "pixel8")]
+// Post-handoff entry: ferros was chainloaded by the Linux shim via
+// cpu_soft_restart into the 0x92400000 carveout, MMU off at EL2, with the UFS
+// link already alive. This kernel_main replaces the cold-boot one for the
+// shim-linked image; it must NOT run the ABL-state-dependent cold-boot setup
+// (watchdog reuse, S2MPU/eUSB assumptions), so it dispatches straight to shim.
+#[cfg(all(feature = "pixel8", shim_handoff))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Init the DRAM bump heap (same as cold boot; __stack_top is inside the
+    // carveout for the shim link, so this stays in reserved DRAM).
+    unsafe extern "C" { static __stack_top: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF;
+    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+
+    shim::entry_m1(dtb_addr)
+}
+
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Init DRAM heap — must happen before any allocation. __stack_top is right after kernel image + 64KB stack. Align to 4KB page boundary for clean start.
