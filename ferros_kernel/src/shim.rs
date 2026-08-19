@@ -158,35 +158,41 @@ pub fn entry_m1(x0: u64) -> ! {
     let hci_r = |off: usize| unsafe { core::ptr::read_volatile((HCI + off) as *const u32) };
     let hci_w = |off: usize, v: u32| unsafe { core::ptr::write_volatile((HCI + off) as *mut u32, v) };
 
-    // THE ROOT-CAUSE FIX: Exynos "INVALID_UPIU" address-window protection.
-    // Linux programs HCI_INVALID_UPIU_BADDR (0x14/0x18) + UTR/DIN offset bounds
-    // (0x20=0x8000, 0x24=0x10000) around ITS descriptor region, then the
-    // controller BLOCKS any transfer whose UTR/data address falls outside that
-    // window and raises vendor_IS bits 19,20 (invalid UTR/DIN offset). ferros's
-    // carveout (0x924xxxxx) is outside Linux's window, so every doorbell is
-    // rejected — THE dead doorbell. Disable the check so our physical addresses
-    // are accepted. (Also nexus-type, already 0x7fffffff, harmless to re-set.)
-    let upiu_ctrl_before = hci_r(0x10); // HCI_INVALID_UPIU_CTRL
-    let upiu_baddr = hci_r(0x14); // HCI_INVALID_UPIU_BADDR (window base)
-    hci_w(0x10, 0); // disable INVALID_UPIU window enforcement
-    hci_w(0x38, 0x0018_0000); // clear vendor_IS invalid-offset error bits (W1C)
+    // THE FIX: per-command HCI_UTRL_NEXUS_TYPE, exactly as the Exynos driver's
+    // setup_xfer_req does before ringing each doorbell:
+    //   SCSI command  -> type |= (1<<tag)   (it IS a nexus transfer)
+    //   NOP / dev-mgmt -> type &= ~(1<<tag)  (NOT a nexus transfer)
+    // ferros's adopt-path skipped this; a NOP run with its nexus bit SET (Linux
+    // left slot 0 set from its last SCSI cmd, and I'd blanket-set 0xFFFFFFFF)
+    // wedges the controller. Clear it for the NOP below, set it for the READ.
+    let upiu_ctrl_before = hci_r(0x10);
+    let upiu_baddr = hci_r(0x14);
+    hci_w(0x38, 0x0018_0000); // clear stale vendor_IS error bits
     let nexus_before = hci_r(0x40);
-    hci_w(0x40, 0xFFFF_FFFF);
-    unsafe { core::arch::asm!("dsb sy") };
-    let nexus_after = hci_r(0x40);
 
     let link_up = ufs.link_is_up();
     let hcs = rd(0x30);
 
+    // NOP = device management: nexus bit for slot 0 CLEARED.
+    hci_w(0x40, hci_r(0x40) & !1);
+    unsafe { core::arch::asm!("dsb sy") };
+    let nexus_after = hci_r(0x40);
     let (nop_ocs, nop_rsp) = ufs.live_nop();
     let dbr_after_nop = rd(0x58);
     let is_after_nop = rd(0x20);
 
+    // READ(10) = SCSI: nexus bit for slot 0 SET.
+    hci_w(0x40, hci_r(0x40) | 1);
+    unsafe { core::arch::asm!("dsb sy") };
     let read_ocs = ufs.read_block(0);
     let dbr_after_read = rd(0x58);
     let is_after_read = rd(0x20);
     let rsr = rd(0x60);
     let status = ufs.last_response_status();
+    // Full response UPIU head: byte1=flags (bit1=underflow), byte6=response,
+    // byte7=status, bytes12-15=residual transfer count (BE). residual=4096 =>
+    // device sent 0 bytes; residual=0 but data zeros => data DMA'd elsewhere.
+    let rsp = ufs.response_upiu_head();
     let data = ufs.data_buffer();
 
     // Exynos vendor DMA-engine state (CORRECT reg_hci base now):
@@ -242,9 +248,13 @@ pub fn entry_m1(x0: u64) -> ! {
         w(0x60, (vs_vendor_is as u64) | ((upiu_ctrl_before as u64) << 32));
         w(0x68, upiu_baddr as u64);
         let _ = (iocc_before, ufsp_wsec, ufsp_send0, ufsp_rsec, ufsp_sbegin0,
-                 ufsp_sctrl0, nexus_before, nexus_after, inv_utmr, ferros_utrd);
-        core::ptr::copy_nonoverlapping(data.as_ptr(), (RAMOOPS_RESULT + 128) as *mut u8, 32);
-        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 192);
+                 ufsp_sctrl0, nexus_before, nexus_after, inv_utmr, ferros_utrd,
+                 inv_utr, inv_din, upiu_ctrl_before, upiu_baddr);
+        // response UPIU head (16 B) at +0xA0, full 512-byte sector of LBA 0 at
+        // +0x100 (to see the MBR partition entry + 0x55AA signature at byte 510).
+        core::ptr::copy_nonoverlapping(rsp.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), (RAMOOPS_RESULT + 256) as *mut u8, 512);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 768);
     }
 
     // PSCI signal: SYSTEM_OFF (power off, stays off) if the doorbell WORKED (NOP
