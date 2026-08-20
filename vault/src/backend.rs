@@ -8,23 +8,30 @@
 //! ```text
 //!   [magic: 4 bytes "OBJ0"]
 //!   [version: u8]
-//!   [hash: 32 bytes]          (BLAKE3 of content — the object's identity)
-//!   [content_len: u32 LE]
+//!   [address: 32 bytes]       (keyed content address — BLAKE3-keyed(addr_key, plaintext) — the object's identity)
+//!   [sealed_len: u32 LE]      (length of the sealed bytes that follow)
 //!   [vsf_type: u8]            (cast from object.meta.vsf_type)
 //!   [generation: u64 LE]
-//!   [content: content_len bytes]
+//!   [sealed: sealed_len bytes] (nonce ‖ XChaCha20-Poly1305 ciphertext ‖ tag of the plaintext content)
 //! ```
-//! Total = 50 + content_len. No padding between objects — the next append starts immediately after.
+//! Total = 50 + sealed_len. No padding between objects — the next append starts immediately after.
+//!
+//! Two crypto invariants live in this envelope (see [`crate::crypto`] and VAULT-INDEX.md):
+//! - The **address is a keyed hash of the *plaintext***, so identical content still dedups within this vault, but a disk-holder can't guess-and-confirm content and two vaults don't converge.
+//! - The stored **bytes are AEAD-sealed**, so both object values and the root-commit dict (itself just a `Record` object) are opaque at rest — plaintext names never touch the disk.
+//! A scan to rebuild the index reads only the address from the header and never needs the key; `get` is the only path that decrypts.
 //!
 //! Object metadata (name, domain, parent) is NOT serialized in this minimal Phase 1 envelope; on `get` they default to empty. Photon doesn't use those fields for its storage use case. The ferros hardware-side implementation can do the full envelope when those fields matter.
 //!
 //! Hash index is rebuilt on every open via a linear scan from payload offset `2 * SLOT_STRIDE` (past slot 0 + at least one other slot's worth of reserved space) up to `object_tail`. Vaults of 64 KiB scan in microseconds; even multi-MB vaults scan in single-digit ms. No persistent index needed for Phase 1.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::anchor::AnchorKey;
+use crate::crypto::{self, NonceSource};
 use crate::device::{Device, DeviceError};
 use crate::hash::ObjectHash;
 use crate::object::{Object, ObjectMeta, VsfType};
@@ -52,9 +59,15 @@ pub fn object_region_start(ring_size: u32) -> u64 {
 pub struct Store<D: Device> {
     device: D,
     anchor_key: AnchorKey,
+    /// Payload (object/index) encryption key, derived from `anchor_key` (domain-separated). Seals every object body.
+    payload_key: [u8; 32],
+    /// Content-addressing key, derived from `anchor_key` (domain-separated). Keys every object address so addresses don't converge across vaults. Distinct from `payload_key`.
+    addr_key: [u8; 32],
+    /// Fresh-nonce source for [`crate::crypto::seal`] — injected by the platform (kernel: TRNG; host: `rand`). Held so every write can seal with a unique nonce.
+    nonce: Box<dyn NonceSource>,
     /// Latest known good anchor — loaded at open, rewritten after every put.
     anchor: VaultAnchor,
-    /// Hash → offset in the vault PAYLOAD (i.e. offset 0 = first byte of payload, NOT first byte of file). Built at open time via a linear scan from `object_region_start(ring_size)` to `anchor.object_tail`.
+    /// Keyed-address → offset in the vault PAYLOAD (i.e. offset 0 = first byte of payload, NOT first byte of file). Built at open time via a linear scan from `object_region_start(ring_size)` to `anchor.object_tail`.
     index: BTreeMap<ObjectHash, u64>,
     /// Bytes from the start of the file to the start of the vault payload. The VSF-wrapped layout: file bytes `[0, payload_file_offset)` are the VSF header, `[payload_file_offset, payload_file_offset + payload_capacity)` are the opaque vault payload. Set at open time once we've identified where the VSF "vault" section's `v` field's bytes begin.
     payload_file_offset: u64,
@@ -77,8 +90,10 @@ pub enum StoreBackendError {
 }
 
 impl<D: Device> Store<D> {
-    /// Open an existing vault file. Decodes the VSF wrapper, locates the payload, reads slot 0's anchor, scans appended objects to rebuild the hash index. Errors if the file isn't a valid vault.
-    pub fn open(device: D, anchor_key: AnchorKey) -> Result<Self, StoreBackendError> {
+    /// Open an existing vault file. Decodes the VSF wrapper, locates the payload, reads slot 0's anchor, scans appended objects to rebuild the address index. Errors if the file isn't a valid vault.
+    ///
+    /// `nonce` is the platform's fresh-nonce source, held for later seals (kernel: TRNG; host: [`crate::crypto::RandNonce`]).
+    pub fn open(device: D, anchor_key: AnchorKey, nonce: Box<dyn NonceSource>) -> Result<Self, StoreBackendError> {
         // Step 1: read the entire file into memory so we can hand it to vsf_wrapper::decode (which expects a contiguous byte slice). For Phase 1 this is fine; multi-MB vaults are still small relative to RAM.
         let file_bytes = read_wrapped(&device).map_err(StoreBackendError::Device)?;
 
@@ -135,6 +150,9 @@ impl<D: Device> Store<D> {
         Ok(Self {
             device,
             anchor_key,
+            payload_key: crypto::payload_key(&anchor_key),
+            addr_key: crypto::addr_key(&anchor_key),
+            nonce,
             anchor,
             index,
             payload_file_offset,
@@ -142,19 +160,27 @@ impl<D: Device> Store<D> {
     }
 
     /// Format a fresh vault. Creates the file (caller provides the device via the device's own constructor), writes an empty root commit object, builds the initial anchor at slot 0, encodes the VSF wrapper around the payload, writes everything to disk. Use this when the vault file doesn't exist yet.
+    ///
+    /// `nonce` is the platform's fresh-nonce source (kernel: TRNG; host: [`crate::crypto::RandNonce`]); the initial root object is sealed with it.
     pub fn format(
         mut device: D,
         anchor_key: AnchorKey,
         payload_capacity: u64,
         ring_size: u32,
+        mut nonce: Box<dyn NonceSource>,
     ) -> Result<Self, StoreBackendError> {
-        // Build the empty root commit object and write it as the first object.
+        let payload_key = crypto::payload_key(&anchor_key);
+        let addr_key = crypto::addr_key(&anchor_key);
+
+        // Build the empty root commit object; its address is the keyed hash of the plaintext, its stored bytes are sealed.
         let empty_root = crate::root_commit::RootCommit::new();
         let root_bytes = empty_root.encode();
-        let root_hash = blake3_hash_of(&root_bytes);
+        let root_hash = ObjectHash(crypto::content_address(&addr_key, &root_bytes));
+        let sealed_root = crypto::seal(&payload_key, &nonce.next_nonce(), &root_bytes)
+            .map_err(|_| StoreBackendError::NoValidAnchor)?;
 
         let obj_region_start = object_region_start(ring_size);
-        let envelope = encode_object_envelope(&root_hash, VsfType::Record, 0, &root_bytes);
+        let envelope = encode_object_envelope(&root_hash, VsfType::Record, 0, &sealed_root);
         let new_tail = obj_region_start.saturating_add(envelope.len() as u64);
         if new_tail > payload_capacity {
             return Err(StoreBackendError::OutOfPayloadSpace {
@@ -190,13 +216,16 @@ impl<D: Device> Store<D> {
         device.write_at(0, &wrapped).map_err(StoreBackendError::Device)?;
         device.flush().map_err(StoreBackendError::Device)?;
 
-        // Build the in-memory index with the root commit's hash → offset entry.
+        // Build the in-memory index with the root commit's address → offset entry.
         let mut index = BTreeMap::new();
         index.insert(root_hash, obj_region_start);
 
         Ok(Self {
             device,
             anchor_key,
+            payload_key,
+            addr_key,
+            nonce,
             anchor,
             index,
             payload_file_offset: 0,
@@ -225,9 +254,9 @@ impl<D: Device> Store<D> {
     /// Atomically replace the root commit. Computes the new root's hash, appends it as an object, builds a new anchor pointing at it, writes the anchor to its slot, fsyncs the device. Read-back verifies the anchor decoded with the same root_commit before returning success.
     pub fn commit_root(&mut self, new_root: &crate::root_commit::RootCommit) -> Result<ObjectHash, StoreError> {
         let bytes = new_root.encode();
-        let hash = blake3_hash_of(&bytes);
-        let obj = build_object(hash, VsfType::Record, &bytes);
-        self.put(obj)?;
+        // The dict is stored like any object: keyed address of the plaintext, sealed body. `put` returns that keyed address.
+        let obj = build_object(ObjectHash([0; 32]), VsfType::Record, &bytes);
+        let hash = self.put(obj)?;
         // Build next anchor.
         let new_seq = self.anchor.anchor_seq.saturating_add(1);
         let new_anchor = vault_anchor::build(
@@ -253,9 +282,9 @@ impl<D: Device> Store<D> {
         if logical_key.len() > u16::MAX as usize {
             return Err(StoreError::KeyTooLarge { len: logical_key.len(), max: u16::MAX as usize });
         }
-        let obj = Object::content_addressed(VsfType::Blob, content);
-        let hash = obj.meta.hash;
-        self.put(obj)?;
+        // `put` computes the keyed address of the plaintext and seals the body; use the address it returns as the dict value.
+        let obj = build_object(ObjectHash([0; 32]), VsfType::Blob, &content);
+        let hash = self.put(obj)?;
         let mut root = self.load_root_commit()?;
         root.insert(logical_key.to_string(), hash);
         self.commit_root(&root)?;
@@ -361,49 +390,65 @@ impl<D: Device> Store<D> {
 impl<D: Device> ObjectStore for Store<D> {
     fn get(&self, hash: &ObjectHash) -> Result<Object, StoreError> {
         let offset = self.index.get(hash).copied().ok_or(StoreError::NotFound(*hash))?;
-        // Read the envelope header to learn content_len, then read the rest. For Phase 1 we re-read the whole file and slice from the payload — same trade-off as write.
+        // Read the envelope header to learn sealed_len, then read the rest. For Phase 1 we re-read the whole file and slice from the payload — same trade-off as write.
         let file_bytes = read_wrapped(&self.device).map_err(StoreError::DeviceError)?;
         let payload = crate::vsf_wrapper::decode(&file_bytes).map_err(|_| {
             StoreError::DeviceError(DeviceError::IoError(crate::device::DeviceIoKind::ReadFailed))
         })?;
-        let (obj, _bytes_consumed) =
+        let (raw, _bytes_consumed) =
             decode_object_envelope(&payload, offset as usize).map_err(|_| {
                 StoreError::IntegrityViolation {
                     expected: *hash,
                     actual: ObjectHash([0; 32]),
                 }
             })?;
-        // Verify hash matches.
-        let computed = blake3_hash_of(&obj.content);
+        // Decrypt the sealed body, then verify the keyed address recomputes from the plaintext (integrity via both the AEAD tag and the keyed hash).
+        let content = crypto::open(&self.payload_key, &raw.sealed).map_err(|_| {
+            StoreError::IntegrityViolation {
+                expected: *hash,
+                actual: ObjectHash([0; 32]),
+            }
+        })?;
+        let computed = ObjectHash(crypto::content_address(&self.addr_key, &content));
         if computed != *hash {
             return Err(StoreError::IntegrityViolation {
                 expected: *hash,
                 actual: computed,
             });
         }
+        let obj = Object {
+            meta: ObjectMeta {
+                hash: *hash,
+                vsf_type: raw.vsf_type,
+                name: Vec::new(),
+                domain: Vec::new(),
+                content_len: content.len() as u64,
+                generation: raw.generation,
+                parent: None,
+            },
+            content,
+        };
         Ok(obj)
     }
 
     fn put(&mut self, object: Object) -> Result<ObjectHash, StoreError> {
-        let hash = object.meta.hash;
-        // Verify the claimed hash matches the content.
-        let computed = blake3_hash_of(&object.content);
-        if computed != hash {
-            return Err(StoreError::IntegrityViolation {
-                expected: hash,
-                actual: computed,
-            });
-        }
-        // Dedup: already-stored objects are no-ops.
+        // The object's identity is the keyed address of its plaintext content — computed here, so the caller's `meta.hash` is advisory and ignored.
+        let hash = ObjectHash(crypto::content_address(&self.addr_key, &object.content));
+        // Dedup: already-stored objects are no-ops (same plaintext → same keyed address).
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
 
+        // Seal the plaintext with a fresh nonce; the envelope stores the sealed body under the keyed address.
+        let sealed = crypto::seal(&self.payload_key, &self.nonce.next_nonce(), &object.content)
+            .map_err(|_| StoreError::DeviceError(DeviceError::IoError(
+                crate::device::DeviceIoKind::WriteFailed,
+            )))?;
         let envelope = encode_object_envelope(
             &hash,
             object.meta.vsf_type,
             object.meta.generation,
-            &object.content,
+            &sealed,
         );
 
         let new_tail = self
@@ -471,10 +516,6 @@ impl<D: Device> ObjectStore for Store<D> {
 // ============================================================================
 // Helpers ============================================================================
 
-fn blake3_hash_of(bytes: &[u8]) -> ObjectHash {
-    ObjectHash(*blake3::hash(bytes).as_bytes())
-}
-
 /// Read exactly the wrapped vault file from the device — not the whole device.
 ///
 /// Reads a small header prefix, learns the true wrapped length from the VSF `file_length` field, then reads precisely that many bytes.
@@ -510,24 +551,32 @@ fn build_object(hash: ObjectHash, vsf_type: VsfType, content: &[u8]) -> Object {
 }
 
 fn encode_object_envelope(
-    hash: &ObjectHash,
+    address: &ObjectHash,
     vsf_type: VsfType,
     generation: u64,
-    content: &[u8],
+    sealed: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(OBJ_HEADER_BYTES + content.len());
+    let mut out = Vec::with_capacity(OBJ_HEADER_BYTES + sealed.len());
     out.extend_from_slice(&OBJ_MAGIC);
     out.push(OBJ_VERSION);
-    out.extend_from_slice(&hash.0);
-    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    out.extend_from_slice(&address.0);
+    out.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
     out.push(vsf_type as u8);
     out.extend_from_slice(&generation.to_le_bytes());
-    out.extend_from_slice(content);
+    out.extend_from_slice(sealed);
     out
 }
 
-/// Decode an object envelope from `payload` starting at `offset`. Returns the Object plus the number of bytes consumed (so the caller can advance past it). Errors if magic/version don't match or the buffer is truncated.
-fn decode_object_envelope(payload: &[u8], offset: usize) -> Result<(Object, usize), ()> {
+/// A decoded object envelope, still sealed. `get` decrypts `sealed`; the index scan needs only `address` and never touches the key.
+struct RawEnvelope {
+    address: ObjectHash,
+    vsf_type: VsfType,
+    generation: u64,
+    sealed: Vec<u8>,
+}
+
+/// Decode an object envelope from `payload` starting at `offset`, WITHOUT decrypting. Returns the raw envelope plus the number of bytes consumed. Errors if magic/version don't match or the buffer is truncated.
+fn decode_object_envelope(payload: &[u8], offset: usize) -> Result<(RawEnvelope, usize), ()> {
     if offset + OBJ_HEADER_BYTES > payload.len() {
         return Err(());
     }
@@ -539,15 +588,15 @@ fn decode_object_envelope(payload: &[u8], offset: usize) -> Result<(Object, usiz
     if version != OBJ_VERSION {
         return Err(());
     }
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes.copy_from_slice(&p[5..37]);
-    let content_len = u32::from_le_bytes(p[37..41].try_into().unwrap()) as usize;
+    let mut addr_bytes = [0u8; 32];
+    addr_bytes.copy_from_slice(&p[5..37]);
+    let sealed_len = u32::from_le_bytes(p[37..41].try_into().unwrap()) as usize;
     let vsf_type_byte = p[41];
     let generation = u64::from_le_bytes(p[42..50].try_into().unwrap());
-    if offset + OBJ_HEADER_BYTES + content_len > payload.len() {
+    if offset + OBJ_HEADER_BYTES + sealed_len > payload.len() {
         return Err(());
     }
-    let content = payload[offset + OBJ_HEADER_BYTES..offset + OBJ_HEADER_BYTES + content_len].to_vec();
+    let sealed = payload[offset + OBJ_HEADER_BYTES..offset + OBJ_HEADER_BYTES + sealed_len].to_vec();
     // Reconstruct VsfType from byte. Reverse of `vsf_type as u8`.
     let vsf_type = match vsf_type_byte {
         0x01 => VsfType::Blob,
@@ -559,19 +608,13 @@ fn decode_object_envelope(payload: &[u8], offset: usize) -> Result<(Object, usiz
         0x40 => VsfType::BootAnchor,
         _ => return Err(()),
     };
-    let obj = Object {
-        meta: ObjectMeta {
-            hash: ObjectHash(hash_bytes),
-            vsf_type,
-            name: Vec::new(),
-            domain: Vec::new(),
-            content_len: content_len as u64,
-            generation,
-            parent: None,
-        },
-        content,
+    let raw = RawEnvelope {
+        address: ObjectHash(addr_bytes),
+        vsf_type,
+        generation,
+        sealed,
     };
-    Ok((obj, OBJ_HEADER_BYTES + content_len))
+    Ok((raw, OBJ_HEADER_BYTES + sealed_len))
 }
 
 fn scan_objects(
@@ -583,9 +626,9 @@ fn scan_objects(
     let mut pos = start as usize;
     let end_usize = end as usize;
     while pos < end_usize {
-        let (obj, consumed) = decode_object_envelope(payload, pos)
+        let (raw, consumed) = decode_object_envelope(payload, pos)
             .map_err(|_| StoreBackendError::CorruptObject(pos as u64))?;
-        index.insert(obj.meta.hash, pos as u64);
+        index.insert(raw.address, pos as u64);
         pos += consumed;
     }
     Ok(())

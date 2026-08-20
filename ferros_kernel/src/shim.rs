@@ -255,7 +255,7 @@ pub fn entry_genesis(x0: u64) -> ! {
     let mut stage = 0u8; // 0 all-ok; 1 format 2 put 3 get 4 verify failed
     let mut root16 = [0u8; 16];
 
-    match Store::format(dev, AnchorKey([0x5Au8; 32]), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE) {
+    match Store::format(dev, AnchorKey([0x5Au8; 32]), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
         Ok(mut store) => {
             format_ok = 1;
             root16.copy_from_slice(&store.root_commit_hash().0[..16]);
@@ -347,7 +347,8 @@ pub fn entry_vault(x0: u64) -> ! {
     // --- open-or-genesis, by logical key ---
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";
-    const KEY: AnchorKey = AnchorKey([0x5Au8; 32]);
+    // AnchorKey derived from this phone's chip-ID ira, not the old [0x5A; 32] constant (see ira.rs / VAULT-KEY.md).
+    let key: AnchorKey = crate::ira::anchor_key();
 
     let mut opened = 0u8;
     let mut verified = 0u8;
@@ -359,7 +360,7 @@ pub fn entry_vault(x0: u64) -> ! {
     // Bounded reads (read_wrapped) mean the store never allocs capacity() — so the device spans the whole 128 GiB partition, no window.
     let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
 
-    match Store::open(fresh_dev(), KEY) {
+    match Store::open(fresh_dev(), key, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
         Ok(store) => {
             opened = 1;
             root16.copy_from_slice(&store.root_commit_hash().0[..16]);
@@ -373,7 +374,7 @@ pub fn entry_vault(x0: u64) -> ! {
     }
 
     if need_seal {
-        match Store::format(fresh_dev(), KEY, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE) {
+        match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
             Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
                 Ok(_) => {
                     sealed = 1;
@@ -385,16 +386,31 @@ pub fn entry_vault(x0: u64) -> ! {
         }
     }
 
+    // --- measure-before-keying instrumentation (not yet part of the key) ---
+    // ap_hw_tune: candidate ira ingredient. Should read IDENTICAL across two boots (stable fuse) before it can be keyed on.
+    // wairua: fresh session entropy. Should read DIFFERENT every boot (proves husky's TRNG path works bare-metal).
+    let ap_tune = crate::ira::read_ap_hw_tune();
+    let wairua = crate::wairua::draw();
+    let (wairua_ok, wairua_head) = match wairua {
+        Some(w) => (1u8, {
+            let mut h = [0u8; 8];
+            h.copy_from_slice(&w[..8]);
+            u64::from_le_bytes(h)
+        }),
+        None => (0u8, 0),
+    };
+
     // Report (reuse the ramoops layout; reinterpret: +0x10 bytes = opened|verified|sealed,
-    // +0x18 = stage, pattern-readback = root_commit[..16]).
+    // +0x18 = stage, +0x20/0x28 = ap_hw_tune[0..16], +0x30 = wairua_ok, +0x38 = wairua[0..8], pattern-readback = root_commit[..16]).
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
         w(0x08, link_up as u64);
         w(0x10, (opened as u64) | ((verified as u64) << 8) | ((sealed as u64) << 16));
         w(0x18, stage as u64);
-        w(0x20, 0);
-        w(0x28, 0);
+        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 16);
+        w(0x30, wairua_ok as u64);
+        w(0x38, wairua_head);
         core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 192);
     }

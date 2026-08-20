@@ -25,6 +25,10 @@ use core::panic::PanicInfo;
 // Post-handoff entry (ferros chainloaded from a running Linux shim).
 // Only built for the shim-linked image (FERROS_SHIM_HANDOFF=1 → cfg shim_handoff).
 #[cfg(shim_handoff)]
+mod ira;
+#[cfg(shim_handoff)]
+mod wairua;
+#[cfg(shim_handoff)]
 mod shim;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.

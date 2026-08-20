@@ -58,12 +58,17 @@ mod tests {
         AnchorKey([0x7Bu8; 32])
     }
 
+    /// True if `needle` appears anywhere in `haystack` — used to prove plaintext does NOT.
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[test]
     fn format_then_open_round_trip() {
         let path = tmp_path("format_open");
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
-        let store = FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+        let store = FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         // Initial state: anchor seq 0, one root-commit object stored, root_commit dict empty.
         assert_eq!(store.anchor().anchor_seq, 0);
         assert_eq!(store.count(), 1);
@@ -73,7 +78,7 @@ mod tests {
 
         // Reopen the same file, verify state survives.
         let device = FileDevice::open(&path, DeviceId([1u8; 16])).unwrap();
-        let store = FileStore::open(device, test_key()).unwrap();
+        let store = FileStore::open(device, test_key(), alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         assert_eq!(store.anchor().anchor_seq, 0);
         assert_eq!(store.count(), 1);
         let rc = store.load_root_commit().unwrap();
@@ -87,17 +92,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
 
         let content = b"hello vault".to_vec();
-        let hash = blake3_hash_of(&content);
-        let obj = build_object(hash, VsfType::Blob, &content);
-        let returned = store.put(obj).unwrap();
-        assert_eq!(returned, hash);
+        // The store computes the keyed address itself (put ignores the object's advisory hash); it is NOT the bare blake3 of the content.
+        let obj = build_object(blake3_hash_of(&content), VsfType::Blob, &content);
+        let addr = store.put(obj).unwrap();
+        assert_ne!(addr, blake3_hash_of(&content), "address must be keyed, not bare blake3");
 
-        let fetched = store.get(&hash).unwrap();
+        let fetched = store.get(&addr).unwrap();
         assert_eq!(fetched.content, content);
-        assert_eq!(fetched.meta.hash, hash);
+        assert_eq!(fetched.meta.hash, addr);
         std::fs::remove_file(&path).ok();
     }
 
@@ -107,26 +112,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
 
         let content = b"persistence test".to_vec();
-        let hash = blake3_hash_of(&content);
-        let obj = build_object(hash, VsfType::Blob, &content);
-        store.put(obj).unwrap();
+        let obj = build_object(blake3_hash_of(&content), VsfType::Blob, &content);
+        // The keyed address the store assigns is what the dict must reference.
+        let addr = store.put(obj).unwrap();
 
         // Update root_commit dict to reference the new object — exercises the commit_root path.
         let mut rc = store.load_root_commit().unwrap();
-        rc.insert("test_key".to_string(), hash);
+        rc.insert("test_key".to_string(), addr);
         store.commit_root(&rc).unwrap();
 
         drop(store);
 
         // Reopen and verify the dict + object survive.
         let device = FileDevice::open(&path, DeviceId([1u8; 16])).unwrap();
-        let store = FileStore::open(device, test_key()).unwrap();
+        let store = FileStore::open(device, test_key(), alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         let rc = store.load_root_commit().unwrap();
-        assert_eq!(rc.get("test_key"), Some(&hash));
-        let fetched = store.get(&hash).unwrap();
+        assert_eq!(rc.get("test_key"), Some(&addr));
+        let fetched = store.get(&addr).unwrap();
         assert_eq!(fetched.content, content);
         std::fs::remove_file(&path).ok();
     }
@@ -137,7 +142,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         let content = b"dedup me".to_vec();
         let hash = blake3_hash_of(&content);
         let obj1 = build_object(hash, VsfType::Blob, &content);
@@ -157,7 +162,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         let unknown = ObjectHash([0xFFu8; 32]);
         let res = store.get(&unknown);
         assert!(matches!(res, Err(StoreError::NotFound(_))));
@@ -170,7 +175,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         store.set("contacts/alice", b"alice bytes".to_vec()).unwrap();
         store.set("contacts/bob", b"bob bytes".to_vec()).unwrap();
         assert_eq!(store.get_by_key("contacts/alice").unwrap().as_deref(), Some(&b"alice bytes"[..]));
@@ -188,12 +193,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         store.set("greeting", b"hello ferros".to_vec()).unwrap();
         drop(store);
 
         let device = FileDevice::open(&path, DeviceId([1u8; 16])).unwrap();
-        let store = FileStore::open(device, test_key()).unwrap();
+        let store = FileStore::open(device, test_key(), alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         assert_eq!(store.get_by_key("greeting").unwrap().as_deref(), Some(&b"hello ferros"[..]));
         std::fs::remove_file(&path).ok();
     }
@@ -204,7 +209,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         store.set("k", b"v1".to_vec()).unwrap();
         store.set("k", b"v2 longer".to_vec()).unwrap();
         assert_eq!(store.get_by_key("k").unwrap().as_deref(), Some(&b"v2 longer"[..]));
@@ -218,7 +223,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         store.set("a", b"1".to_vec()).unwrap();
         store.set("b", b"2".to_vec()).unwrap();
         store.set("c", b"3".to_vec()).unwrap();
@@ -237,10 +242,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
         let mut store =
-            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE).unwrap();
+            FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
         let huge = "x".repeat(70_000); // > u16::MAX
         let res = store.set(&huge, b"v".to_vec());
         assert!(matches!(res, Err(StoreError::KeyTooLarge { .. })));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn on_disk_bytes_are_opaque() {
+        // The whole point of encryption: neither the logical key NAME nor the VALUE appears in plaintext on the device.
+        let path = tmp_path("opacity");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store = FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
+        store.set("contacts/alice", b"alice+15551234567".to_vec()).unwrap();
+        drop(store);
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!contains_subslice(&raw, b"contacts/alice"), "logical key name leaked in plaintext on disk");
+        assert!(!contains_subslice(&raw, b"alice+15551234567"), "value leaked in plaintext on disk");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wrong_key_cannot_open() {
+        // A disk-holder without the anchor key can't open the vault — the anchor HMAC gate rejects it, and past that the derived payload/addr keys wouldn't match anyway.
+        let path = tmp_path("wrongkey");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::create(&path, DeviceId([1u8; 16]), 1024 * 1024).unwrap();
+        let mut store = FileStore::format(device, test_key(), DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::crypto::RandNonce)).unwrap();
+        store.set("k", b"v".to_vec()).unwrap();
+        drop(store);
+        let device = FileDevice::open(&path, DeviceId([1u8; 16])).unwrap();
+        let wrong = AnchorKey([0x00u8; 32]);
+        assert!(FileStore::open(device, wrong, alloc::boxed::Box::new(crate::crypto::RandNonce)).is_err());
         std::fs::remove_file(&path).ok();
     }
 }

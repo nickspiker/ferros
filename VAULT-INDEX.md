@@ -24,10 +24,10 @@ The vault stacks two addressing schemes, and they answer different questions.
 
 - **Flat dictionary.** `RootCommit` is one flat `BTreeMap<String, ObjectHash>`, stored as a single content-addressed object; the anchor's `root_commit` field points at it. Every write re-encodes the *entire* namespace — `O(total keys)` per commit.
 - **Keys stored verbatim**, length-prefixed `[key_len: u16][key bytes][hash: 32]`. That `u16` is a fixed-width integer on disk — already a violation of the EWE convention ("no fixed-width integers on persistent storage, ever") — and it panics via `assert!(key.len() <= u16::MAX)` above 64 KiB (a hung kernel in the shim, since nothing warm-resets after a panic).
-- **Addresses are bare `blake3(plaintext)`** (`blake3_hash_of`). Convergent and unkeyed: an attacker with the disk can hash a guessed plaintext and confirm its presence.
-- **Nothing is encrypted.** The `FERROS-GENESIS-0` proof object is plaintext ASCII on the partition. The VSF wrapper's `v(b'e', ...)` marker is a *marker*, not encryption.
+- **~~Addresses are bare `blake3(plaintext)`~~** — NOW keyed (`crypto::content_address`), see the checklist below.
+- **~~Nothing is encrypted.~~** — NOW every object body is XChaCha20-Poly1305 sealed, and because the root-commit dict is itself an object, the plaintext key names are encrypted too. The `v(b'e', ...)` VSF marker finally means what it says.
 
-This is the correct Phase-1: it proves the semantics (name -> hash -> content, durable across a power cycle) with the simplest honest structure. The evolution below replaces the *index*, not the object store, the anchor ring, or the persistence path.
+The original Phase-1 flat dict (names stored verbatim, one `BTreeMap` re-encoded per commit) still stands as the *index structure*; what changed is that its bytes are now keyed-addressed and sealed. The evolution below still replaces the flat dict with a HAMT — that is the remaining *index* work, orthogonal to the encryption just landed.
 
 ---
 
@@ -75,8 +75,10 @@ VSF *itself* still needs additions — hygiene for its native encrypted fields, 
 
 ## Near-term checklist (concrete, in order of cheapness)
 
-1. **Kill the `assert!` panic -> `Err`.** Non-negotiable; a hung kernel is never acceptable.
-2. **Encrypt the flat dict blob** (XChaCha, random nonce). Nearly free — it is rewritten every commit anyway — and it plugs the plaintext-name metadata leak *now*, buying time before the HAMT.
-3. **Key the addresses** — swap bare `blake3` for `BLAKE3-keyed(vault_secret, ·)`.
-4. **Add XChaCha20-Poly1305** to the crypto surface (in `vsf` or the vault layer) before any object encryption ships.
-5. **Build the HMAC-keyed HAMT index** ([HAMT.md](HAMT.md)) when scale (commit cost, key count) demands more than the flat dict.
+1. **~~Kill the `assert!` panic -> `Err`.~~** DONE — `StoreError::KeyTooLarge` (`set` guards the u16 key ceiling).
+2. **~~Encrypt the flat dict blob~~** DONE — and better than planned: the dict is itself a `Record` object, so encrypting *all* object bodies (below) sealed the names for free. Proven by the `on_disk_bytes_are_opaque` test (neither key names nor values appear in plaintext on disk).
+3. **~~Key the addresses~~** DONE — `crypto::content_address` = `blake3::keyed_hash(addr_key, plaintext)`; the store's object identity is now the keyed address, dedup stays vault-scoped, convergence defeated.
+4. **~~Add XChaCha20-Poly1305~~** DONE — [`vault/src/crypto.rs`](vault/src/crypto.rs): `seal`/`open` (24-byte nonce), `NonceSource` (kernel TRNG / host `rand`), domain-separated `payload_key`/`addr_key`. Non-optional core, compiles no_std on `aarch64-unknown-none`. The store seals every object body; VSF stays a pure opaque container.
+5. **Build the HMAC-keyed HAMT index** ([HAMT.md](HAMT.md)) when scale (commit cost, key count) demands more than the flat dict. **← next**
+
+Implementation notes for the current encrypted store (see [`vault/src/backend.rs`](vault/src/backend.rs)): object envelope is `[magic][ver][keyed-address 32][sealed_len u32][vsf_type][generation][sealed = nonce‖ct‖tag]`. The index scan reads only the address (no key needed); `get` is the only decrypt path. Nonces are caller-supplied per seal — the kernel's `TrngNonce` is `BLAKE3-keyed(fresh-per-boot wairua seed, monotonic counter)`, so it needs one entropy draw at boot rather than one per nonce, and nonces never repeat across boots (fresh seed each time). Still open: the `sealed_len` is a fixed-width `u32` on disk (an EWE-convention violation, same class as the root-commit `u16`), to fold into the EWE pass with the HAMT.

@@ -48,6 +48,9 @@ pub mod root_commit;
 pub mod anchor_key_store;
 pub mod backend;
 
+/// Vault crypto — XChaCha20-Poly1305 AEAD + keyed content addressing. Core (no_std, non-optional): every store path encrypts. See [`crypto`] and VAULT-INDEX.md.
+pub mod crypto;
+
 /// Linux single-file vault backend — gated on `host-file` feature. Provides `std::fs::File`-backed [`store::ObjectStore`] + [`device::Device`] impls, plus no-op stubs for [`capability::CapabilityEngine`] and [`mesh::MeshEngine`] for single-user single-device userspace consumers like Photon.
 #[cfg(feature = "host-file")]
 pub mod host_file;

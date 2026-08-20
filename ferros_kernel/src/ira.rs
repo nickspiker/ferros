@@ -1,0 +1,70 @@
+//! Interim husky device *ira* — the permanent device root, from the Tensor G3 chip-ID.
+//!
+//! The *ira* is criterion-0 (see VAULT-KEY.md): permanent, survives factory reset, unchangeable by anyone.
+//! On husky the interim source is the gs-chipid block — a die-unique 64-bit serial plus product/lot and silicon revision — read straight from MMIO at EL2: no Linux, no Titan, no keystore stack.
+//! It is vendor-known, not secret; secrecy is the sovereignty gap PIPE closes. Confidentiality here is structural (opaque to Android/Google's stack, keyed addressing, no cross-device convergence), and anti-theft is enforced by the fleet registry, not by this value.
+//!
+//! Layer split: this module only reads husky's hardware identity and names the KDF contexts; the derivation itself is `ferros_vault::anchor::AnchorKey` (the crypto authority) so nothing is hand-rolled here.
+
+use ferros_vault::anchor::AnchorKey;
+
+/// gs-chipid MMIO base on Tensor G3 (zuma.dtsi `chipid@10000000`, size G#D000).
+/// Reachable MMU-off at EL2, same as the UFS/S2MPU blocks the shim path already pokes.
+const CHIPID_BASE: usize = 0x1000_0000;
+
+/// product_id — SoC product code; low 21 bits carry the lot id (gs-chipid.c `LOTID_MASK`).
+const OFF_PRODUCT_ID: usize = 0x00;
+/// die-unique serial, low 32 bits (`unique_id_reg`).
+const OFF_UNIQUE_ID0: usize = 0x04;
+/// die-unique serial, high 32 bits (`unique_id_reg + 4`).
+const OFF_UNIQUE_ID1: usize = 0x08;
+/// silicon revision (`rev_reg`).
+const OFF_REVISION: usize = 0x10;
+
+/// AP hardware-tuning block — 32 bytes of per-*device* fuse trim (gs-chipid.c `ap_hw_tune`, offset G#C300).
+/// Un-quantized per-unit calibration, unlike the binned ASV beside it — a candidate ira ingredient, but NOT keyed until a hardware stability probe confirms every bit is fuse-stable (a drifting bit bricks the vault) and that it is actually populated (not zeros).
+/// Read and reported for the probe; see `read_ap_hw_tune`.
+const OFF_AP_HW_TUNE: usize = 0xC300;
+const AP_HW_TUNE_LEN: usize = 32;
+
+/// BLAKE3 KDF context for the interim husky ira. Versioned: bump on any change to the material set below, since that re-keys every vault derived from it.
+const IRA_CONTEXT: &str = "ferros.ira.husky.v0";
+
+/// Read husky's 16-byte hardware identity: `[product_id, unique_id0, unique_id1, revision]`, each u32 little-endian.
+///
+/// The die-unique 64-bit serial (`unique_id0`/`unique_id1`) is the permanent per-device part; `product_id`/`revision` pin the SoC model and stepping so a die-collision across product lines can't converge.
+/// Pure MMIO reads of the always-mapped chipid block — no side effects, no ordering requirements against anything else.
+pub fn read_hw_identity() -> [u8; 16] {
+    let rd = |off: usize| unsafe { ferros_hal::mmio::read32(CHIPID_BASE + off) };
+    let mut id = [0u8; 16];
+    id[0..4].copy_from_slice(&rd(OFF_PRODUCT_ID).to_le_bytes());
+    id[4..8].copy_from_slice(&rd(OFF_UNIQUE_ID0).to_le_bytes());
+    id[8..12].copy_from_slice(&rd(OFF_UNIQUE_ID1).to_le_bytes());
+    id[12..16].copy_from_slice(&rd(OFF_REVISION).to_le_bytes());
+    id
+}
+
+/// Read the 32-byte AP hardware-tuning fuse block (`G#C300`..`G#C31F`), byte-wide like gs-chipid.c.
+///
+/// This is *instrumentation*, not key material yet. The stability probe reports these bytes to ramoops across a reboot + temperature cycle; only bits proven fuse-stable (and non-zero) graduate into `derive_ira`, and drifty bits would instead ride fuzzy extraction (see VAULT-KEY.md physics leg). Keyed use before that check risks an unrecoverable vault.
+pub fn read_ap_hw_tune() -> [u8; AP_HW_TUNE_LEN] {
+    let mut buf = [0u8; AP_HW_TUNE_LEN];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_AP_HW_TUNE + i) };
+    }
+    buf
+}
+
+/// Derive the interim husky *ira* from the chip-ID hardware identity.
+///
+/// Keyed material is `read_hw_identity()` only — the die-unique serial plus SoC model/stepping, all proven-stable fuse reads. `ap_hw_tune` and the vendor-dispersion sources (UFS serial, battery ROM id, radio MACs, …) are deliberately excluded until their read paths and stability are validated on hardware; each addition re-keys the vault, which is fine during bring-up (open-or-genesis re-genesises) but must be a deliberate, tested step, never a speculative one.
+pub fn derive_ira() -> [u8; 32] {
+    AnchorKey::derive(IRA_CONTEXT, &read_hw_identity())
+}
+
+/// The vault AnchorKey for this husky device: `from_ira(derive_ira())`.
+///
+/// Replaces the `[0x5A; 32]` bring-up constant. Same value every boot on the same phone; a different phone yields a different key; survives factory reset because the chip-ID does. Any vault sealed under the old constant will not open under this key — the open-or-genesis path simply re-genesises, which is correct for the bring-up transition.
+pub fn anchor_key() -> AnchorKey {
+    AnchorKey::from_ira(&derive_ira())
+}

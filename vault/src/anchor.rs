@@ -118,6 +118,24 @@ pub const ANCHOR_RING_DEFAULT_SLOTS: u64 =
 #[derive(Clone, Copy, Debug)]
 pub struct AnchorKey(pub [u8; 32]);
 
+impl AnchorKey {
+    /// Domain-separated key derivation (BLAKE3 `derive_key`).
+    ///
+    /// `context` MUST be a hardcoded, globally-unique, application-specific string — never attacker-influenced, never reused across purposes (the BLAKE3 KDF contract).
+    /// This is the one derivation primitive the key layer exposes; keeping it here keeps the vault the crypto authority (see VAULT-INDEX.md), so platform callers like the kernel's ira module never hand-roll their own.
+    pub fn derive(context: &str, key_material: &[u8]) -> [u8; 32] {
+        blake3::derive_key(context, key_material)
+    }
+
+    /// The vault confidentiality key derived from a device *ira* (the permanent device root).
+    ///
+    /// `anchor_key = derive_key("ferros.vault.anchor.v0", ira)` — see VAULT-KEY.md.
+    /// The ira itself is sourced per-platform (husky: hashed chip-ID + friends); this half is platform-neutral, and is where the `[0x5A; 32]` bring-up constant retires to.
+    pub fn from_ira(ira: &[u8; 32]) -> AnchorKey {
+        AnchorKey(Self::derive("ferros.vault.anchor.v0", ira))
+    }
+}
+
 /// Configuration for the anchor ring on a specific device.
 #[derive(Clone, Debug)]
 pub struct AnchorRingConfig {
@@ -496,4 +514,54 @@ pub enum AnchorError {
     RpmbAuthFailed,
     /// Device I/O error.
     DeviceError(DeviceError),
+}
+
+// ---------------------------------------------------------------------------
+// ira -> anchor key derivation tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ira_derive_tests {
+    use super::*;
+
+    #[test]
+    fn from_ira_is_deterministic() {
+        // Same ira, same phone, every boot: the key must be identical or the vault won't reopen.
+        let ira = [0x11u8; 32];
+        assert_eq!(AnchorKey::from_ira(&ira).0, AnchorKey::from_ira(&ira).0);
+    }
+
+    #[test]
+    fn distinct_ira_distinct_key() {
+        // Different phone (different chip-ID -> different ira) must yield a different key: no cross-device convergence.
+        let a = AnchorKey::from_ira(&[0x01u8; 32]).0;
+        let b = AnchorKey::from_ira(&[0x02u8; 32]).0;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn context_domain_separation() {
+        // The KDF context is what stops the ira and the anchor key (and any other derived secret) from colliding on the same material.
+        let material = [0x42u8; 32];
+        let as_ira = AnchorKey::derive("ferros.ira.husky.v0", &material);
+        let as_anchor = AnchorKey::derive("ferros.vault.anchor.v0", &material);
+        assert_ne!(as_ira, as_anchor);
+        // from_ira must use exactly the anchor context, not the raw material.
+        assert_eq!(AnchorKey::from_ira(&material).0, as_anchor);
+        assert_ne!(AnchorKey::from_ira(&material).0, material);
+    }
+
+    #[test]
+    fn anchor_context_known_answer() {
+        // Pins the "ferros.vault.anchor.v0" context string: a typo or accidental bump breaks this, not silently a phone's whole vault.
+        let ira = [0u8; 32];
+        let got = AnchorKey::from_ira(&ira).0;
+        assert_eq!(got, KAT_ANCHOR_FROM_ZERO_IRA, "anchor-from-ira KAT drift: got {:02x?}", got);
+    }
+
+    // blake3::derive_key("ferros.vault.anchor.v0", &[0u8; 32]) — captured KAT, pins the context string.
+    const KAT_ANCHOR_FROM_ZERO_IRA: [u8; 32] = [
+        0x08, 0x3f, 0x0f, 0x31, 0x0a, 0x25, 0x2c, 0xa1, 0xe3, 0x25, 0xf6, 0xf4, 0x01, 0xb7, 0x76, 0xf7,
+        0x12, 0xd9, 0x95, 0x21, 0xd3, 0x10, 0xeb, 0xde, 0x68, 0x56, 0x35, 0xf1, 0x75, 0x86, 0x88, 0xab,
+    ];
 }
