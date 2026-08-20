@@ -45,8 +45,7 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 Validate M1 DWC3 USB end-to-end: boot kernel via m1n1 proxy, verify USB enumeration, test PT transport with ferros-bridge. Then hot-reload.
 
 ## Do NOT
-- Commit **unfiled** patent material from `Intellectual Property/`. Filed patents may be committed (e.g. ISOMEM — provisional on file with USPTO); their `.tex`/`.pdf`/`.ots`/figures are already public in this repo. Latex build artifacts stay gitignored. If unsure whether something is filed, ask before committing — a public push is irreversible disclosure.
-- Commit `CLAUDE MEMORY.md` or `memory/` — local project memory
+- Commit **unfiled** patent material from `Intellectual Property/`. As of 2026-08-20 **all patents are FILED** (ISOMEM provisional on file with USPTO, etc.), so that directory is public and committable (`.tex`/`.pdf`/`.ots`/figures; Latex build artifacts stay gitignored). This guard only re-arms if genuinely new, unfiled patent work ever appears — then ask before committing, since a public push is irreversible.
 - Use 0x prefix for numbers
 - Add cleanup code, destructors, or shutdown procedures in critical paths
 - Touch FP5/QCM6490-specific code — it's dropped
