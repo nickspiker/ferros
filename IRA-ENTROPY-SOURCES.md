@@ -78,18 +78,18 @@ The probe's report is laid out to land in those printed slots (see [[husky_ferro
 | WRITE-test bytes (r[4],r[5]) | asv_tbl[0..5], hpm_asv[0..2] | trim bytes (stable?) |
 | `pattern-readback` (r[20..24]) | ap_hw_tune[0..16] | the fuse block — populated? stable? |
 
-## HARDWARE-VALIDATED (2026-08-21, husky) — POPULATED + STABLE across boots AND a ~40 C thermal swing
+## HARDWARE-VALIDATED (2026-08-21, husky) — POPULATED + STABLE across the full cold-to-hot thermal range
 
-**All four Tier-1 chipid trims are POPULATED and read BYTE-IDENTICAL across three boots — two at room temp and one after a full freezer cold-soak (die ~-18 C, a ~40 C swing) — with zero drift. wairua produced a distinct fresh sample on all three (live TRNG, cold included). Nothing in the probe hangs — the entire prior "hang" saga was a bad module strip in the ramdisk, not the code (see [[husky_ferros_probe_boot]]).**
+**All four Tier-1 chipid trims are POPULATED and read BYTE-IDENTICAL across FOUR boots spanning the full practical thermal range — two at room temp, one after a freezer cold-soak (die ~-18 C), one after a toaster heat-soak — with zero drift. wairua produced a distinct fresh sample on all four (live TRNG, cold and hot included). Nothing in the probe hangs — the entire prior "hang" saga was a bad module strip in the ramdisk, not the code (see [[husky_ferros_probe_boot]]).**
 
-- `ap_hw_tune[0..16]` = `90 89 06 00 23 43 04 43 01 00 00 00 00 00 00 00` (room == room == cold)
+- `ap_hw_tune[0..16]` = `90 89 06 00 23 43 04 43 01 00 00 00 00 00 00 00` (room == room == cold == hot)
 - `asv_tbl[0..5]` = `66 65 56 66 77` (identical)
 - `hpm_asv[0..2]` = `01 1c` (identical)
 - `dvfs_version` = 4 (identical)
-- wairua samples: `13223761313028347240`, `13824004136481236903`, `6525352000664193959` — three boots, three distinct values
+- wairua samples: `13223761313028347240`, `13824004136481236903`, `6525352000664193959`, `15941918029273694738` — four boots, four distinct values
 - wairua_ok=1, UFS link=1, completed (mbr_sig low byte 0, no crumb) every time
 
-**Conclusion: these fuses are temperature-stable and keyable DIRECTLY — no fuzzy extraction needed for the bytes measured.**
+**Conclusion: these fuses are temperature-stable (cold AND hot) and keyable DIRECTLY — no fuzzy extraction needed for the bytes measured. Remaining unknown is per-die ENTROPY (variance across the fleet), which one device cannot measure — needs a second Pixel 8 or fuse-semantics analysis; the tail-zeros in ap_hw_tune[0..16] hint width > entropy.**
 
 ## Next step
 
