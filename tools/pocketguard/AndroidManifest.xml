@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pocketguard" android:versionCode="3" android:versionName="3.0">
+    <application android:name=".PocketApp" android:persistent="true"
+        android:label="PocketGuard" android:allowBackup="false" android:hasCode="true" />
+</manifest>

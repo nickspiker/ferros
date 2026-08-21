@@ -1,0 +1,5 @@
+build/
+framework-res.apk
+*.apk
+*.jks
+*.keystore

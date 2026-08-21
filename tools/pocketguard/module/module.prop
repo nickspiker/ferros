@@ -1,0 +1,6 @@
+id=pocketguard
+name=PocketGuard (raw-proximity screen-off)
+version=v3
+versionCode=3
+author=nick
+description=Watches the RAW proximity sensor; anything near + screen on -> force sleep. No on-ear fusion.
