@@ -386,10 +386,15 @@ pub fn entry_vault(x0: u64) -> ! {
         }
     }
 
-    // --- measure-before-keying instrumentation (not yet part of the key) ---
-    // ap_hw_tune: candidate ira ingredient. Should read IDENTICAL across two boots (stable fuse) before it can be keyed on.
-    // wairua: fresh session entropy. Should read DIFFERENT every boot (proves husky's TRNG path works bare-metal).
+    // --- measure-before-keying instrumentation (candidate ira ingredients; NOT part of the key) ---
+    // chipid trims (ap_hw_tune/asv_tbl/hpm_asv/dvfs): should read IDENTICAL across two boots (stable fuse) AND non-zero (populated) before any bit graduates into derive_ira. A drifting bit bricks the vault, so this probe gates keying.
+    // hw_identity: the current Tier-0 key material (unique_id + product/rev) — dumped for reference/collision-checking.
+    // wairua: fresh session entropy; should read DIFFERENT every boot (proves husky's TRNG path works bare-metal).
     let ap_tune = crate::ira::read_ap_hw_tune();
+    let asv = crate::ira::read_asv_tbl();
+    let hpm = crate::ira::read_hpm_asv();
+    let dvfs = crate::ira::read_dvfs_version();
+    let hwid = crate::ira::read_hw_identity();
     let wairua = crate::wairua::draw();
     let (wairua_ok, wairua_head) = match wairua {
         Some(w) => (1u8, {
@@ -400,8 +405,10 @@ pub fn entry_vault(x0: u64) -> ! {
         None => (0u8, 0),
     };
 
-    // Report (reuse the ramoops layout; reinterpret: +0x10 bytes = opened|verified|sealed,
-    // +0x18 = stage, +0x20/0x28 = ap_hw_tune[0..16], +0x30 = wairua_ok, +0x38 = wairua[0..8], pattern-readback = root_commit[..16]).
+    // Report to ramoops. Offset map for the host hexdump readback (see IRA-ENTROPY-SOURCES.md "ramoops offset map"):
+    //   G#00 magic  G#08 link_up  G#10 opened|verified<<8|sealed<<16  G#18 stage
+    //   G#20 ap_hw_tune[0..16]  G#30 wairua_ok  G#38 wairua[0..8]  G#40 dvfs_version  G#48 hw_identity[0..16]
+    //   G#A0 root_commit[0..16]  G#C0 ap_hw_tune[0..32]  G#E0 asv_tbl[0..64]  G#120 hpm_asv[0..64]
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
@@ -411,8 +418,13 @@ pub fn entry_vault(x0: u64) -> ! {
         core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 16);
         w(0x30, wairua_ok as u64);
         w(0x38, wairua_head);
-        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 160) as *mut u8, 16);
-        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 192);
+        w(0x40, dvfs as u64);
+        core::ptr::copy_nonoverlapping(hwid.as_ptr(), (RAMOOPS_RESULT + 0x48) as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0xC0) as *mut u8, 32);
+        core::ptr::copy_nonoverlapping(asv.as_ptr(), (RAMOOPS_RESULT + 0xE0) as *mut u8, 64);
+        core::ptr::copy_nonoverlapping(hpm.as_ptr(), (RAMOOPS_RESULT + 0x120) as *mut u8, 64);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
 
     let _ = (x0, SCRATCH, MAGIC, STAGE_M0, STAGE_M1, CRUMB_ENTRY, CRUMB_RUST);

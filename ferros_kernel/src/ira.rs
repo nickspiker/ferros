@@ -27,6 +27,18 @@ const OFF_REVISION: usize = 0x10;
 const OFF_AP_HW_TUNE: usize = 0xC300;
 const AP_HW_TUNE_LEN: usize = 32;
 
+/// ASV table — 64 bytes of per-die leakage/voltage binning trim (gs-chipid.c `asv_tbl`, offset G#9000).
+/// Binned (coarser than ap_hw_tune) but still per-die; a candidate ira ingredient, reported for the probe, NOT keyed until stability is confirmed.
+const OFF_ASV_TBL: usize = 0x9000;
+const ASV_TBL_LEN: usize = 64;
+
+/// HPM/ASV extended block — 64 bytes of per-die high-performance-monitor / leakage data (gs-chipid.c `hpm_asv`, offset G#A000).
+const OFF_HPM_ASV: usize = 0xA000;
+const HPM_ASV_LEN: usize = 64;
+
+/// Per-die DVFS speed-bin class — one byte (gs-chipid.c `dvfs_version`, offset G#900C).
+const OFF_DVFS_VERSION: usize = 0x900C;
+
 /// BLAKE3 KDF context for the interim husky ira. Versioned: bump on any change to the material set below, since that re-keys every vault derived from it.
 const IRA_CONTEXT: &str = "ferros.ira.husky.v0";
 
@@ -53,6 +65,31 @@ pub fn read_ap_hw_tune() -> [u8; AP_HW_TUNE_LEN] {
         *b = unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_AP_HW_TUNE + i) };
     }
     buf
+}
+
+/// Read the 64-byte ASV table (`G#9000`..`G#903F`), byte-wide like gs-chipid.c.
+///
+/// Instrumentation only — same probe gate as `read_ap_hw_tune`: must be non-zero (populated) and bit-stable across boots before any of these bits graduate into `derive_ira`.
+pub fn read_asv_tbl() -> [u8; ASV_TBL_LEN] {
+    let mut buf = [0u8; ASV_TBL_LEN];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_ASV_TBL + i) };
+    }
+    buf
+}
+
+/// Read the 64-byte HPM/ASV extended block (`G#A000`..`G#A03F`), byte-wide like gs-chipid.c. Instrumentation only; same probe gate as the ASV table.
+pub fn read_hpm_asv() -> [u8; HPM_ASV_LEN] {
+    let mut buf = [0u8; HPM_ASV_LEN];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_HPM_ASV + i) };
+    }
+    buf
+}
+
+/// Read the per-die DVFS speed-bin class byte (`G#900C`). Instrumentation only.
+pub fn read_dvfs_version() -> u8 {
+    unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_DVFS_VERSION) }
 }
 
 /// Derive the interim husky *ira* from the chip-ID hardware identity.

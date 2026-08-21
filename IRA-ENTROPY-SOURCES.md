@@ -63,7 +63,31 @@ Today ira.rs keys on `unique_id` alone; `dvfs_version`, `asv_tbl`, `hpm_asv` are
 - **Camera module OTP** (serial + AWB/LSC/AF/PDAF) and **fuel-gauge ROM id** — sensor/fuel-gauge drivers are NOT in this reference tree (proprietary/binary). Present on the device, but no grounded read path here. Fuel gauge is replaceable → breadth only, never stability-critical.
 - **IMEI + modem RF calibration** — per-unit, in modem NV; falls out of radio bring-up. Google-issued = the "opacity is a plus" case.
 
+## Probe: ramoops offset map
+
+`entry_vault` (shim.rs) dumps the reachable-now chipid trim family to the ramoops result region at physical G#FD60_0000, cache-cleaned for G#180 bytes.
+Read it back as a raw hexdump of that region and interpret by offset:
+
+| Offset | Bytes | Field | Probe question it answers |
+|---|---|---|---|
+| G#00 | 8 | RESULT_MAGIC | dump is valid |
+| G#08 | 8 | link_up | UFS link came up |
+| G#10 | 8 | opened \| verified<<8 \| sealed<<16 | vault open/genesis result |
+| G#18 | 8 | stage | failure stage (0 = ok) |
+| G#20 | 16 | ap_hw_tune[0..16] | (compat with the first probe) |
+| G#30 | 8 | wairua_ok | TRNG path produced entropy |
+| G#38 | 8 | wairua[0..8] | should DIFFER every boot |
+| G#40 | 8 | dvfs_version (low byte) | populated? stable? |
+| G#48 | 16 | hw_identity[0..16] | current Tier-0 key material (unique_id + product/rev); identity/collision reference |
+| G#A0 | 16 | root_commit[0..16] | vault root hash |
+| G#C0 | 32 | ap_hw_tune[0..32] | populated (non-zero)? stable across two boots? |
+| G#E0 | 64 | asv_tbl[0..64] | populated? stable? |
+| G#120 | 64 | hpm_asv[0..64] | populated? stable? |
+
 ## Next step
 
-Extend the `entry_vault` measure-before-keying instrumentation (already reports `ap_hw_tune` + a wairua sample to ramoops) into a multi-source probe: read every reachable-now candidate — chipid trim family, UFS serial + geometry delta, MCT counter windows — dump across two boots and a temperature swing, and score each source on `entropy x per-bit stability x unforgeability`.
-That ranking decides what graduates from Tier 1/2 into `derive_ira`. Measured, not guessed.
+Probe extended (this commit) — the chipid trim family now lands in ramoops.
+The forensics run: flash + boot husky twice (cold, then again after a temperature swing), hexdump G#FD60_0000 each time, and check per source — is it non-zero (populated), and does it read bit-identical across the two boots (stable)?
+`wairua[0..8]` is the control: it MUST differ every boot, or the TRNG path is dead.
+Whatever is populated AND stable graduates from Tier 1 into `derive_ira`; anything drifty stays out (or rides fuzzy extraction later).
+Following iteration: add UFS `iSerialNumber` + geometry defect delta, then the MCT clock-ratio ring-osc — each scored on `entropy x per-bit stability x unforgeability`. Measured, not guessed.
