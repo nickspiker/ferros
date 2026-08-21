@@ -78,19 +78,21 @@ The probe's report is laid out to land in those printed slots (see [[husky_ferro
 | WRITE-test bytes (r[4],r[5]) | asv_tbl[0..5], hpm_asv[0..2] | trim bytes (stable?) |
 | `pattern-readback` (r[20..24]) | ap_hw_tune[0..16] | the fuse block — populated? stable? |
 
-## HARDWARE-VALIDATED (2026-08-21, husky, two consecutive boots, room temp)
+## HARDWARE-VALIDATED (2026-08-21, husky) — POPULATED + STABLE across boots AND a ~40 C thermal swing
 
-**All four Tier-1 chipid trims are POPULATED and read BYTE-IDENTICAL across two boots; wairua differs every boot (live TRNG). Nothing in the probe hangs — the entire prior "hang" saga was a bad module strip in the ramdisk, not the code (see [[husky_ferros_probe_boot]]).**
+**All four Tier-1 chipid trims are POPULATED and read BYTE-IDENTICAL across three boots — two at room temp and one after a full freezer cold-soak (die ~-18 C, a ~40 C swing) — with zero drift. wairua produced a distinct fresh sample on all three (live TRNG, cold included). Nothing in the probe hangs — the entire prior "hang" saga was a bad module strip in the ramdisk, not the code (see [[husky_ferros_probe_boot]]).**
 
-- `ap_hw_tune[0..16]` = `90 89 06 00 23 43 04 43 01 00 00 00 00 00 00 00` (identical boot1==boot2)
+- `ap_hw_tune[0..16]` = `90 89 06 00 23 43 04 43 01 00 00 00 00 00 00 00` (room == room == cold)
 - `asv_tbl[0..5]` = `66 65 56 66 77` (identical)
 - `hpm_asv[0..2]` = `01 1c` (identical)
 - `dvfs_version` = 4 (identical)
-- wairua: boot1 `13223761313028347240` != boot2 `13824004136481236903` — fresh entropy each boot
-- wairua_ok=1, UFS link=1, completed (mbr_sig low byte 0, no crumb)
+- wairua samples: `13223761313028347240`, `13824004136481236903`, `6525352000664193959` — three boots, three distinct values
+- wairua_ok=1, UFS link=1, completed (mbr_sig low byte 0, no crumb) every time
+
+**Conclusion: these fuses are temperature-stable and keyable DIRECTLY — no fuzzy extraction needed for the bytes measured.**
 
 ## Next step
 
-1. **Temperature-cycle stability**: reboot after a fridge/toaster swing and re-compare — the trims must stay identical across temperature before any bit graduates into `derive_ira`. (Two-boot room-temp stability is proven; thermal is the remaining gate.)
-2. **Full 64-byte dumps** of asv_tbl/hpm_asv (only 5/2 bytes surfaced through the kernel's fixed slots; rotate the G#A0 hex-dump slot across the full arrays over successive fires).
+1. ~~Temperature-cycle stability~~ — DONE (cold-soak, byte-identical, above).
+2. **Full 64-byte dumps** of asv_tbl/hpm_asv (only 5/2 bytes surfaced through the kernel's fixed print slots; rotate the G#A0 hex-dump slot across the full arrays over successive fires) — confirm the whole arrays are stable, not just the head bytes.
 3. Then graduate the proven-stable trims into `derive_ira` (currently Tier-0 `unique_id` only), and add UFS `iSerialNumber` + MCT ring-osc. Measured, not guessed.
