@@ -1,5 +1,6 @@
 the memory for the ferros project is in the ferros project folder. ferros/CLAUDE MEMORY.md
 
+- [husky ferros probe boot procedure](husky_ferros_probe_boot.md) — how to actually RUN the shim/probe: inject /ferros.bin into vendor_kernel_boot ramdisk, disable pKVM, flash, reboot, read dmesg; reconstructed from transcript, should become a committed script
 - [ira is a brand not a credential](ira_is_brand_not_credential.md) — theft/reset/enumeration defended by fleet-key wraps + lock/shrink, not ira secrecy; handle is secret + fleet is physical-local
 - [ira entropy = unforgeability](ira_entropy_is_unforgeability.md) — ira entropy is about forgery-resistance not confidentiality; forgeable+unlocked ira = unevictable rekeyed fleet member; PUF core + vendor breadth
 - [ira entropy sources (husky)](ira_entropy_sources_husky.md) — grounded per-die source catalog + register addresses; chipid trim extras, UFS serial, MCT ring-osc; TMU/DRAM blocked; full doc ferros/IRA-ENTROPY-SOURCES.md
