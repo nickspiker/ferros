@@ -40,7 +40,7 @@ const HPM_ASV_LEN: usize = 64;
 const OFF_DVFS_VERSION: usize = 0x900C;
 
 /// BLAKE3 KDF context for the interim husky ira. Versioned: bump on any change to the material set below, since that re-keys every vault derived from it.
-const IRA_CONTEXT: &str = "ferros.ira.husky.v0";
+const IRA_CONTEXT: &str = "ferros.ira.husky.v1";
 
 /// Read husky's 16-byte hardware identity: `[product_id, unique_id0, unique_id1, revision]`, each u32 little-endian.
 ///
@@ -92,11 +92,25 @@ pub fn read_dvfs_version() -> u8 {
     unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_DVFS_VERSION) }
 }
 
-/// Derive the interim husky *ira* from the chip-ID hardware identity.
+/// Derive the husky *ira* from the per-die chip-ID material proven stable on hardware.
 ///
-/// Keyed material is `read_hw_identity()` only — the die-unique serial plus SoC model/stepping, all proven-stable fuse reads. `ap_hw_tune` and the vendor-dispersion sources (UFS serial, battery ROM id, radio MACs, …) are deliberately excluded until their read paths and stability are validated on hardware; each addition re-keys the vault, which is fine during bring-up (open-or-genesis re-genesises) but must be a deliberate, tested step, never a speculative one.
+/// Keyed material (all validated 2026-08-21 — populated AND byte-identical across four boots spanning a freezer cold-soak and a toaster heat-soak; see IRA-ENTROPY-SOURCES.md):
+/// `read_hw_identity()` (16B: die-unique serial + SoC model/stepping) ‖ `ap_hw_tune` (32B analog per-die trim — the unforgeable core) ‖ `asv_tbl` (64B) ‖ `hpm_asv` (64B) ‖ `dvfs_version` (1B speed bin) = 177 bytes folded through the KDF.
+/// Context bumped v0 -> v1 to mark this material set: a vault sealed under v0's identity-only key won't reopen (open-or-genesis re-genesises — correct for the bring-up transition).
+/// Still EXCLUDED until their read paths + stability are validated: UFS serial, MCT ring-osc, and the vendor-dispersion sources — each further addition re-keys and must be a deliberate, tested step. NOTE: these fields are proven STABLE (won't brick the vault), not yet proven HIGH-ENTROPY — per-die fleet variance is unmeasured from one device (ap_hw_tune's tail-zeros hint width > entropy).
 pub fn derive_ira() -> [u8; 32] {
-    AnchorKey::derive(IRA_CONTEXT, &read_hw_identity())
+    let hwid = read_hw_identity();
+    let ap = read_ap_hw_tune();
+    let asv = read_asv_tbl();
+    let hpm = read_hpm_asv();
+    let dvfs = read_dvfs_version();
+    let mut m = [0u8; 16 + 32 + 64 + 64 + 1];
+    m[0..16].copy_from_slice(&hwid);
+    m[16..48].copy_from_slice(&ap);
+    m[48..112].copy_from_slice(&asv);
+    m[112..176].copy_from_slice(&hpm);
+    m[176] = dvfs;
+    AnchorKey::derive(IRA_CONTEXT, &m)
 }
 
 /// The vault AnchorKey for this husky device: `from_ira(derive_ira())`.
