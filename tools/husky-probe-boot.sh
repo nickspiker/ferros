@@ -28,9 +28,12 @@ LZ4=$HK/prebuilts/kernel-build-tools/linux-x86/bin/lz4
 W=/mnt/Harbor/tmp/vkb_probe
 REPO=/mnt/Harbor/Code/ferros
 BIN=$REPO/target/aarch64-unknown-none/release/ferros_kernel.bin
-# Power-domain / pKVM-S2MPU / PMIC modules stripped from modules.load so they don't own
-# hardware the EL2 handoff needs. From the working 873bc7fe recipe.
-STRIP='exynos-pd\.ko|exynos-pd-dbg|exynos-pd_el3|exynos-pd_hsi0|ect_parser|gs_acpm|acpm_flexpmu_dbg|power_stats|pkvm-s2mpu-v9|pmic_class|s2mpg14-regulator|s2mpg14-powermeter|s2mpg15-regulator|s2mpg15-powermeter|slg51002-regulator|s2mpg14-mfd|s2mpg15-mfd|s2mpg1415-gpio|slg51002-core'
+# DO NOT strip modules. The canonical kernel-tree repack (husky-kernel/repack-ferros-vkb.sh)
+# injects /ferros.bin into the STOCK ramdisk and strips nothing. An earlier reconstruction of
+# this script stripped the power-domain/PMIC/regulator modules — which breaks Android boot
+# entirely (kernel sticks at the Google logo, cool), poisoning every handoff result. Proven
+# 2026-08-21: stock modules + /ferros.bin boots, fires ferros, round-trips a result; the same
+# ramdisk with those modules removed can't reach Android even with ferros absent.
 
 if [ "${1:-}" = "--read" ]; then
     echo "== ferros scan line (dmesg) =="
@@ -52,12 +55,8 @@ rm -rf "$W"; mkdir -p "$W"
 python3 "$MKB/unpack_bootimg.py" --boot_img "$DIST/vendor_kernel_boot.img" --out "$W/unpacked" --format=mkbootimg 2>/dev/null > "$W/mkargs.txt"
 mkdir -p "$W/rd"; ( cd "$W/rd" && "$LZ4" -dc "$W/unpacked/vendor_ramdisk00" | cpio -id 2>/dev/null )
 
-echo "== inject /ferros.bin + strip power-domain/pKVM modules =="
+echo "== inject /ferros.bin (NO module strip — stock ramdisk, matches repack-ferros-vkb.sh) =="
 cp "$BIN" "$W/rd/ferros.bin"
-MDIR=$(ls -d "$W"/rd/lib/modules/*/)
-sed -E "/$STRIP/d" "${MDIR}modules.load" > "${MDIR}modules.load.new"
-echo "  modules.load: $(wc -l < "${MDIR}modules.load") -> $(wc -l < "${MDIR}modules.load.new")"
-mv "${MDIR}modules.load.new" "${MDIR}modules.load"
 
 echo "== repack ramdisk + vendor_kernel_boot =="
 ( cd "$W/rd" && find . | cpio -o -H newc 2>/dev/null | "$LZ4" -l -9 > "$W/unpacked/vendor_ramdisk00.new" )
