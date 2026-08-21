@@ -63,31 +63,34 @@ Today ira.rs keys on `unique_id` alone; `dvfs_version`, `asv_tbl`, `hpm_asv` are
 - **Camera module OTP** (serial + AWB/LSC/AF/PDAF) and **fuel-gauge ROM id** — sensor/fuel-gauge drivers are NOT in this reference tree (proprietary/binary). Present on the device, but no grounded read path here. Fuel gauge is replaceable → breadth only, never stability-critical.
 - **IMEI + modem RF calibration** — per-unit, in modem NV; falls out of radio bring-up. Google-issued = the "opacity is a plus" case.
 
-## Probe: ramoops offset map
+## Probe readback (kernel print format)
 
-`entry_vault` (shim.rs) dumps the reachable-now chipid trim family to the ramoops result region at physical G#FD60_0000, cache-cleaned for G#180 bytes.
-Read it back as a raw hexdump of that region and interpret by offset:
+`entry_vault` (shim.rs) runs a chipid-trim + wairua probe and drops a result at physical G#FD60_0000, then PSCI-warm-resets.
+The husky kernel patch `ferros_ramoops_read` (husky-kernel/aosp/arch/arm64/kernel/ferros_handoff.c) reads it on the next boot with a HARDCODED print format, auto-consumes it (re-arms), and skips the handoff so Android boots.
+The probe's report is laid out to land in those printed slots (see [[husky_ferros_probe_boot]] for the full map):
 
-| Offset | Bytes | Field | Probe question it answers |
-|---|---|---|---|
-| G#00 | 8 | RESULT_MAGIC | dump is valid |
-| G#08 | 8 | link_up | UFS link came up |
-| G#10 | 8 | opened \| verified<<8 \| sealed<<16 | vault open/genesis result |
-| G#18 | 8 | stage | failure stage (0 = ok) |
-| G#20 | 16 | ap_hw_tune[0..16] | (compat with the first probe) |
-| G#30 | 8 | wairua_ok | TRNG path produced entropy |
-| G#38 | 8 | wairua[0..8] | should DIFFER every boot |
-| G#40 | 8 | dvfs_version (low byte) | populated? stable? |
-| G#48 | 16 | hw_identity[0..16] | current Tier-0 key material (unique_id + product/rev); identity/collision reference |
-| G#A0 | 16 | root_commit[0..16] | vault root hash |
-| G#C0 | 32 | ap_hw_tune[0..32] | populated (non-zero)? stable across two boots? |
-| G#E0 | 64 | asv_tbl[0..64] | populated? stable? |
-| G#120 | 64 | hpm_asv[0..64] | populated? stable? |
+| dmesg field | ferros meaning | question |
+|---|---|---|
+| `link_up=` (r[1]) | wairua[0..8] sample | MUST differ every boot (live TRNG) |
+| `nop_ocs` (r[2] b0) | wairua_ok \| link_up<<1 | entropy present? UFS link up? |
+| `nop_rsp`/`read_ocs`/`scsi_status` | ap_nz / asv_nz / hpm_nz | each trim non-zero (populated)? |
+| `mbr_sig=` (r[3]) | stage(0=done) \| dvfs_version<<8 | completed? which speed bin? |
+| WRITE-test bytes (r[4],r[5]) | asv_tbl[0..5], hpm_asv[0..2] | trim bytes (stable?) |
+| `pattern-readback` (r[20..24]) | ap_hw_tune[0..16] | the fuse block — populated? stable? |
+
+## HARDWARE-VALIDATED (2026-08-21, husky, two consecutive boots, room temp)
+
+**All four Tier-1 chipid trims are POPULATED and read BYTE-IDENTICAL across two boots; wairua differs every boot (live TRNG). Nothing in the probe hangs — the entire prior "hang" saga was a bad module strip in the ramdisk, not the code (see [[husky_ferros_probe_boot]]).**
+
+- `ap_hw_tune[0..16]` = `90 89 06 00 23 43 04 43 01 00 00 00 00 00 00 00` (identical boot1==boot2)
+- `asv_tbl[0..5]` = `66 65 56 66 77` (identical)
+- `hpm_asv[0..2]` = `01 1c` (identical)
+- `dvfs_version` = 4 (identical)
+- wairua: boot1 `13223761313028347240` != boot2 `13824004136481236903` — fresh entropy each boot
+- wairua_ok=1, UFS link=1, completed (mbr_sig low byte 0, no crumb)
 
 ## Next step
 
-Probe extended (this commit) — the chipid trim family now lands in ramoops.
-The forensics run: flash + boot husky twice (cold, then again after a temperature swing), hexdump G#FD60_0000 each time, and check per source — is it non-zero (populated), and does it read bit-identical across the two boots (stable)?
-`wairua[0..8]` is the control: it MUST differ every boot, or the TRNG path is dead.
-Whatever is populated AND stable graduates from Tier 1 into `derive_ira`; anything drifty stays out (or rides fuzzy extraction later).
-Following iteration: add UFS `iSerialNumber` + geometry defect delta, then the MCT clock-ratio ring-osc — each scored on `entropy x per-bit stability x unforgeability`. Measured, not guessed.
+1. **Temperature-cycle stability**: reboot after a fridge/toaster swing and re-compare — the trims must stay identical across temperature before any bit graduates into `derive_ira`. (Two-boot room-temp stability is proven; thermal is the remaining gate.)
+2. **Full 64-byte dumps** of asv_tbl/hpm_asv (only 5/2 bytes surfaced through the kernel's fixed slots; rotate the G#A0 hex-dump slot across the full arrays over successive fires).
+3. Then graduate the proven-stable trims into `derive_ira` (currently Tier-0 `unique_id` only), and add UFS `iSerialNumber` + MCT ring-osc. Measured, not guessed.

@@ -316,10 +316,8 @@ pub fn entry_genesis(x0: u64) -> ! {
 ///
 /// Spans the whole partition (bounded reads mean the store never allocs capacity()), stores by logical key through the vault's keyed API, and runs on the freeing free-list allocator.
 pub fn entry_vault(x0: u64) -> ! {
-    use crate::ufs_device::UfsDevice;
     use ferros_hal::ufs::UfsController;
     use ferros_vault::anchor::AnchorKey;
-    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
 
     // --- adopt the live link (identical prologue to entry_genesis) ---
     unsafe {
@@ -344,86 +342,51 @@ pub fn entry_vault(x0: u64) -> ! {
     let link_up = ufs.link_is_up();
     drop(ufs);
 
-    // --- open-or-genesis, by logical key ---
-    const LKEY: &str = "genesis";
-    const MSG: &[u8] = b"FERROS-GENESIS-0";
-    // AnchorKey derived from this phone's chip-ID ira, not the old [0x5A; 32] constant (see ira.rs / VAULT-KEY.md).
-    let key: AnchorKey = crate::ira::anchor_key();
+    // --- ira probe: chipid trims + wairua, mapped onto the kernel's HARDCODED ramoops print slots (husky-kernel ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory). The vault is intentionally skipped — the probe needs no UFS I/O, and the vault's transfers are a separate concern. ---
+    let key: AnchorKey = crate::ira::anchor_key(); // exercises the chipid low reads + BLAKE3 ira derivation
+    let _ = &key;
 
-    let mut opened = 0u8;
-    let mut verified = 0u8;
-    let mut sealed = 0u8;
-    let mut stage = 0u8; // 0 ok; 1 format 2 set 3 read failed
-    let mut root16 = [0u8; 16];
-    let mut need_seal = false;
+    // Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per risky step so a stall leaves the last-reached marker in DRAM. Distinct values (G#C1/G#C2/G#D0..) vs the completed report (mbr_sig low byte 0). Now genuinely readable — no-strip means recovery AND the pmsg readback both work.
+    let crumb = |c: u64| unsafe {
+        write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
+        write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x20);
+    };
+    crumb(0xC1); // anchor_key (chipid low + BLAKE3) returned
 
-    // Bounded reads (read_wrapped) mean the store never allocs capacity() — so the device spans the whole 128 GiB partition, no window.
-    let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
-
-    match Store::open(fresh_dev(), key, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
-        Ok(store) => {
-            opened = 1;
-            root16.copy_from_slice(&store.root_commit_hash().0[..16]);
-            match store.get_by_key(LKEY) {
-                Ok(Some(v)) if v.as_slice() == MSG => verified = 1,
-                Ok(_) => need_seal = true, // vault present but key absent or mismatched
-                Err(_) => stage = 3,
-            }
-        }
-        Err(_) => need_seal = true, // no vault — genesis it
-    }
-
-    if need_seal {
-        match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
-            Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
-                Ok(_) => {
-                    sealed = 1;
-                    root16.copy_from_slice(&store.root_commit_hash().0[..16]);
-                }
-                Err(_) => stage = 2,
-            },
-            Err(_) => stage = 1,
-        }
-    }
-
-    // --- measure-before-keying instrumentation (candidate ira ingredients; NOT part of the key) ---
-    // chipid trims (ap_hw_tune/asv_tbl/hpm_asv/dvfs): should read IDENTICAL across two boots (stable fuse) AND non-zero (populated) before any bit graduates into derive_ira. A drifting bit bricks the vault, so this probe gates keying.
-    // hw_identity: the current Tier-0 key material (unique_id + product/rev) — dumped for reference/collision-checking.
-    // wairua: fresh session entropy; should read DIFFERENT every boot (proves husky's TRNG path works bare-metal).
-    let ap_tune = crate::ira::read_ap_hw_tune();
-    let asv = crate::ira::read_asv_tbl();
-    let hpm = crate::ira::read_hpm_asv();
-    let dvfs = crate::ira::read_dvfs_version();
-    let hwid = crate::ira::read_hw_identity();
+    // TRNG (SMC then RNDR fallback)
     let wairua = crate::wairua::draw();
+    crumb(0xC2); // SMC/RNDR returned
     let (wairua_ok, wairua_head) = match wairua {
-        Some(w) => (1u8, {
+        Some(w) => {
             let mut h = [0u8; 8];
             h.copy_from_slice(&w[..8]);
-            u64::from_le_bytes(h)
-        }),
+            (1u8, u64::from_le_bytes(h))
+        }
         None => (0u8, 0),
     };
 
-    // Report to ramoops. Offset map for the host hexdump readback (see IRA-ENTROPY-SOURCES.md "ramoops offset map"):
-    //   G#00 magic  G#08 link_up  G#10 opened|verified<<8|sealed<<16  G#18 stage
-    //   G#20 ap_hw_tune[0..16]  G#30 wairua_ok  G#38 wairua[0..8]  G#40 dvfs_version  G#48 hw_identity[0..16]
-    //   G#A0 root_commit[0..16]  G#C0 ap_hw_tune[0..32]  G#E0 asv_tbl[0..64]  G#120 hpm_asv[0..64]
+    // chipid trims, one crumb per offset so a bus-stall pins the exact register
+    let ap_tune = crate::ira::read_ap_hw_tune(); crumb(0xD0); // G#C300
+    let asv = crate::ira::read_asv_tbl();        crumb(0xD1); // G#9000
+    let hpm = crate::ira::read_hpm_asv();         crumb(0xD2); // G#A000
+    let dvfs = crate::ira::read_dvfs_version();
+
+    let nz = |b: &[u8]| b.iter().any(|&x| x != 0) as u64;
+    // kernel shows r[2]'s bytes as nop_ocs / nop_rsp / read_ocs / scsi_status:
+    let flags = (wairua_ok as u64) | ((link_up as u64) << 1)
+        | (nz(&ap_tune) << 8) | (nz(&asv) << 16) | (nz(&hpm) << 24);
+
+    // Report -> kernel print slots (ferros_ramoops_read): r[1]/0x08 `link_up=` := wairua sample (MUST differ each boot if TRNG works); r[2]/0x10 flags (nop_ocs=wairua_ok|link_up<<1, nop_rsp=ap_nz, read_ocs=asv_nz, scsi_status=hpm_nz); r[3]/0x18 `mbr_sig` := stage(0) | dvfs<<8; r[4]/0x20 := asv[0..5]; r[5]/0x28 := hpm[0..2]; r[20..24]/0xA0 `pattern-readback` := ap_hw_tune[0..16].
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
-        w(0x08, link_up as u64);
-        w(0x10, (opened as u64) | ((verified as u64) << 8) | ((sealed as u64) << 16));
-        w(0x18, stage as u64);
-        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 16);
-        w(0x30, wairua_ok as u64);
-        w(0x38, wairua_head);
-        w(0x40, dvfs as u64);
-        core::ptr::copy_nonoverlapping(hwid.as_ptr(), (RAMOOPS_RESULT + 0x48) as *mut u8, 16);
-        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
-        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0xC0) as *mut u8, 32);
-        core::ptr::copy_nonoverlapping(asv.as_ptr(), (RAMOOPS_RESULT + 0xE0) as *mut u8, 64);
-        core::ptr::copy_nonoverlapping(hpm.as_ptr(), (RAMOOPS_RESULT + 0x120) as *mut u8, 64);
+        w(0x08, wairua_head);
+        w(0x10, flags);
+        w(0x18, (dvfs as u64) << 8);
+        core::ptr::copy_nonoverlapping(asv.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
+        core::ptr::copy_nonoverlapping(hpm.as_ptr(), (RAMOOPS_RESULT + 0x28) as *mut u8, 2);
+        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
 
