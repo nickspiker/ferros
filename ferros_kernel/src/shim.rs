@@ -316,8 +316,10 @@ pub fn entry_genesis(x0: u64) -> ! {
 ///
 /// Spans the whole partition (bounded reads mean the store never allocs capacity()), stores by logical key through the vault's keyed API, and runs on the freeing free-list allocator.
 pub fn entry_vault(x0: u64) -> ! {
+    use crate::ufs_device::UfsDevice;
     use ferros_hal::ufs::UfsController;
     use ferros_vault::anchor::AnchorKey;
+    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
 
     // --- adopt the live link (identical prologue to entry_genesis) ---
     unsafe {
@@ -342,21 +344,20 @@ pub fn entry_vault(x0: u64) -> ! {
     let link_up = ufs.link_is_up();
     drop(ufs);
 
-    // --- ira probe: chipid trims + wairua, mapped onto the kernel's HARDCODED ramoops print slots (husky-kernel ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory). The vault is intentionally skipped — the probe needs no UFS I/O, and the vault's transfers are a separate concern. ---
-    let key: AnchorKey = crate::ira::anchor_key(); // exercises the chipid low reads + BLAKE3 ira derivation
-    let _ = &key;
+    // --- ira-rooted vault genesis + probe, mapped onto the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory). The vault now boots from the validated ira; crumbs bracket the crypto/allocator/UFS (first on hardware) so any stall pins the step. ---
+    let key: AnchorKey = crate::ira::anchor_key(); // ira-rooted key from the validated chipid trims (derive_ira v1)
 
-    // Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per risky step so a stall leaves the last-reached marker in DRAM. Distinct values (G#C1/G#C2/G#D0..) vs the completed report (mbr_sig low byte 0). Now genuinely readable — no-strip means recovery AND the pmsg readback both work.
+    // Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0.
     let crumb = |c: u64| unsafe {
         write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
         write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x20);
     };
-    crumb(0xC1); // anchor_key (chipid low + BLAKE3) returned
+    crumb(0xC1); // anchor_key (chipid trims + BLAKE3 ira) returned
 
     // TRNG (SMC then RNDR fallback)
     let wairua = crate::wairua::draw();
-    crumb(0xC2); // SMC/RNDR returned
+    crumb(0xC2);
     let (wairua_ok, wairua_head) = match wairua {
         Some(w) => {
             let mut h = [0u8; 8];
@@ -366,27 +367,70 @@ pub fn entry_vault(x0: u64) -> ! {
         None => (0u8, 0),
     };
 
-    // chipid trims, one crumb per offset so a bus-stall pins the exact register
-    let ap_tune = crate::ira::read_ap_hw_tune(); crumb(0xD0); // G#C300
-    let asv = crate::ira::read_asv_tbl();        crumb(0xD1); // G#9000
-    let hpm = crate::ira::read_hpm_asv();         crumb(0xD2); // G#A000
+    // chipid trims (already validated; kept for the populated flags + a few readable bytes)
+    let ap_tune = crate::ira::read_ap_hw_tune();
+    let asv = crate::ira::read_asv_tbl();
+    let hpm = crate::ira::read_hpm_asv();
     let dvfs = crate::ira::read_dvfs_version();
 
-    let nz = |b: &[u8]| b.iter().any(|&x| x != 0) as u64;
-    // kernel shows r[2]'s bytes as nop_ocs / nop_rsp / read_ocs / scsi_status:
-    let flags = (wairua_ok as u64) | ((link_up as u64) << 1)
-        | (nz(&ap_tune) << 8) | (nz(&asv) << 16) | (nz(&hpm) << 24);
+    // --- vault genesis keyed by the ira (XChaCha20-Poly1305 crypto + heap alloc + UFS I/O — first on hardware) ---
+    const LKEY: &str = "genesis";
+    const MSG: &[u8] = b"FERROS-GENESIS-0";
+    let mut opened = 0u8;
+    let mut verified = 0u8;
+    let mut sealed = 0u8;
+    let mut stage = 0u8; // 0 ok; 1 format 2 set 3 read failed
+    let mut root16 = [0u8; 16];
+    let mut need_seal = false;
+    let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
 
-    // Report -> kernel print slots (ferros_ramoops_read): r[1]/0x08 `link_up=` := wairua sample (MUST differ each boot if TRNG works); r[2]/0x10 flags (nop_ocs=wairua_ok|link_up<<1, nop_rsp=ap_nz, read_ocs=asv_nz, scsi_status=hpm_nz); r[3]/0x18 `mbr_sig` := stage(0) | dvfs<<8; r[4]/0x20 := asv[0..5]; r[5]/0x28 := hpm[0..2]; r[20..24]/0xA0 `pattern-readback` := ap_hw_tune[0..16].
+    crumb(0xE0); // before Store::open (TrngNonce SMC -> crypto -> UFS read)
+    match Store::open(fresh_dev(), key, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
+        Ok(store) => {
+            opened = 1;
+            root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+            match store.get_by_key(LKEY) {
+                Ok(Some(v)) if v.as_slice() == MSG => verified = 1,
+                Ok(_) => need_seal = true, // vault present but key absent/mismatched
+                Err(_) => stage = 3,
+            }
+        }
+        Err(_) => need_seal = true, // no vault (or wrong key) — genesis it
+    }
+    crumb(0xE1); // Store::open returned
+    if need_seal {
+        crumb(0xE2); // before Store::format (seal + UFS write)
+        match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
+            Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
+                Ok(_) => {
+                    sealed = 1;
+                    root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+                }
+                Err(_) => stage = 2,
+            },
+            Err(_) => stage = 1,
+        }
+    }
+    crumb(0xE3); // vault path returned
+
+    let nz = |b: &[u8]| b.iter().any(|&x| x != 0) as u64;
+    // r[2] bytes (kernel prints nop_ocs/nop_rsp/read_ocs/scsi_status):
+    //   nop_ocs  = opened | verified<<1 | sealed<<2 | wairua_ok<<3 | link_up<<4
+    //   nop_rsp  = vault stage (0=ok, 1 format / 2 set / 3 read failed)
+    //   read_ocs = ap_nz | asv_nz<<1 | hpm_nz<<2
+    let f_open = (opened as u64) | ((verified as u64) << 1) | ((sealed as u64) << 2) | ((wairua_ok as u64) << 3) | ((link_up as u64) << 4);
+    let flags = f_open | ((stage as u64) << 8) | ((nz(&ap_tune) | (nz(&asv) << 1) | (nz(&hpm) << 2)) << 16);
+
+    // Report -> kernel print slots: r[1]/0x08 `link_up=` := wairua (differs each boot); r[2]/0x10 flags (above); r[3]/0x18 `mbr_sig` := 0(done) | dvfs<<8; r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := hpm[0..2]; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — the ira-rooted genesis root: non-zero + stable across boots == the vault booted from the ira.
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
         w(0x08, wairua_head);
         w(0x10, flags);
         w(0x18, (dvfs as u64) << 8);
-        core::ptr::copy_nonoverlapping(asv.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
+        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
         core::ptr::copy_nonoverlapping(hpm.as_ptr(), (RAMOOPS_RESULT + 0x28) as *mut u8, 2);
-        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
 
