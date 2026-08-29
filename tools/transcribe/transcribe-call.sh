@@ -21,7 +21,7 @@ LANG="${WHISPER_LANG:-en}"
 [ -x "$WHISPER" ] || { echo "whisper-cli not found at $WHISPER" >&2; exit 1; }
 [ -f "$MODEL" ]   || { echo "model not found at $MODEL" >&2; exit 1; }
 
-WFLAGS=(-m "$MODEL" -l "$LANG" -oj -mc 0)
+WFLAGS=(-m "$MODEL" -l "$LANG" -oj -mc 0 -ml 1)   # -ml 1 = word-level timestamps (merge needs them)
 if [ -f "$VAD_MODEL" ]; then
   WFLAGS+=(--vad --vad-model "$VAD_MODEL")
 else

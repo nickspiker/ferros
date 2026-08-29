@@ -13,8 +13,21 @@ Because each speaker is already on their own channel, attribution is **physical 
 ## Pipeline
 
 1. `ffmpeg` splits the stereo `.ogg` into two 16 kHz mono WAVs (L/R).
-2. `whisper.cpp` transcribes each channel → JSON with per-segment timestamps.
-3. `merge_transcript.py` interleaves them by time into one `You:` / `Them:` script.
+2. `whisper.cpp` transcribes each channel → JSON with **word-level** timestamps (`-ml 1`).
+3. `merge_transcript.py` regroups each channel's words into utterances (bursts split on a
+   pause) and interleaves those by start time into one `You:` / `Them:` script.
+
+## Ordering (why word-level → utterances)
+
+Merging at whisper's coarse VAD-segment level puts things **out of order**: VAD can lump a
+37-second monologue into one segment stamped at its start, so it sorts as a block *before*
+the other speaker's interjections that happened during it. Merging at raw word level fixes
+ordering but shreds genuinely-overlapping speech into alternating one-word fragments. The
+sweet spot is **utterances**: group each channel's words into bursts (start-to-start gap
+> `TRANSCRIBE_GAP_MS`, default 2000) and interleave the bursts. Because turns are
+per-channel, a normal turn-taking call lands one turn per line; only a rude talk-over
+counterpart (an IVR) produces overlap choppiness. Tune granularity with
+`TRANSCRIBE_GAP_MS` (smaller = finer/choppier, larger = coarser/longer turns).
 
 ## Anti-hallucination (why VAD is required)
 
