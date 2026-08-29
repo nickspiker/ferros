@@ -1,0 +1,6 @@
+id=callrec
+name=CallRec (VoIP call recorder)
+version=v1
+versionCode=1
+author=nick
+description=Auto-records VoIP call audio at the AudioFlinger level. Route-independent. Phase 1 validation build.
