@@ -60,8 +60,15 @@ GPU is optional — an AMD card works via whisper.cpp's Vulkan/HIP backend, but 
 ## Use
 
 ```bash
-~/whisper.cpp/transcribe-latest.sh            # pull newest recording off the phone + transcribe
-~/whisper.cpp/transcribe-call.sh <call.ogg>   # transcribe a specific local file
+~/whisper.cpp/transcribe-sync.sh              # archive EVERY new call: pull + transcribe + save
+                                              #   audio+transcript side by side, skip done ones
+~/whisper.cpp/transcribe-latest.sh            # just the newest recording, printed
+~/whisper.cpp/transcribe-call.sh <call.ogg>   # a specific local file, printed
 ```
+
+`transcribe-sync.sh` is the "never think about it" one: idempotent, keeps a local archive
+(`CALL_ARCHIVE`, default `~/call-transcripts/`) of both the `.ogg` and its `.txt`, and pulls
+recordings off the phone as a durable backup. Run it anytime, or from cron (it no-ops when
+the phone isn't connected and catches up when it is).
 
 Env overrides: `WHISPER_MODEL` (default `~/whisper-models/ggml-large-v3.bin`), `WHISPER_LANG` (default `en`).
