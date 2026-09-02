@@ -82,6 +82,10 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 | [`miro`](../ferros_miro) | reversible avalanching permutation with tunable secret/check split; seals a payload into an opaque codeword (see [MIRO.md](MIRO.md)) | *miro* (to twist strands into cord) |
 | [`custodes`](../custodes) | K-of-N social recovery for total device loss | custodians |
 | `photon` | the messenger — CLUTCH key ceremony, CHAIN rolling encryption, FGTW transport, RUA dead-drop | a quantum of light |
+| *photon* (unit) | a message: discrete, quantized, arrives whole — "shoot me a photon" | the particle |
+| *wave* | a voice call: continuous, real-time — "wave me"; an incoming call is someone waving | the wave; also the gesture |
+| *beam* | a video call: a directed, continuous stream of light you can see by — "beam me" | directed light |
+| *detected* | read receipt, consent-gated: no observation until the detector fires, and the sender learns nothing until the receiver's does; states run *in flight* → *arrived* → *detected* | the measurement |
 | `fluor` | CPU compositor / GUI toolkit | fluorescence |
 | `ferros` | the field — OS, kernel, oracle, vault, ledger, RUA | iron (Fe) |
 | `pipe` | the PIPE identity chip — patent + RTL; *whakaira*/*ira*/*wairua* in silicon | the wire interface |
