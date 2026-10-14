@@ -6,8 +6,11 @@
 # ferros reports into ramoops (0xFD60_0000) and PSCI warm-resets; the next Linux boot prints the report in dmesg.
 # Nothing is armed at boot, so every reset — report, fault sink, panic reporter, watchdog — lands back in Android with adb, and `adb reboot bootloader` is always one command away. Measured round trip: about one minute.
 #
+# The default shim build is the USB service (ferros_kernel/src/shim_usb.rs): it adopts UFS, probes the vault, then serves Photon Transport on the inherited USB controller, so `ferros-bridge diag|reload|run|reboot` work with the disk live. It leaves (report + reset to Android) on `bridge reboot`, 64 s without enumerating, 512 s without a command, or both volume buttons. `bridge reboot fastboot` asks the next Linux boot to drop into the bootloader.
+#
 # Usage:
-#   tools/husky-hotload.sh            # build the shim, hot-load it, print the report
+#   tools/husky-hotload.sh            # build the USB-service shim, hot-load it, wait for it on USB, print DIAG
+#   tools/husky-hotload.sh --vault    # build the one-shot vault probe instead (reports + resets, prints the report)
 #   tools/husky-hotload.sh <flat.bin> # hot-load a prebuilt flat binary
 #   tools/husky-hotload.sh --read     # print the last report again
 set -euo pipefail
@@ -26,11 +29,13 @@ report() {
 
 if [ "${1:-}" = "--read" ]; then report; exit 0; fi
 
+ENTRY=usb
+if [ "${1:-}" = "--vault" ]; then ENTRY=vault; shift; fi
 if [ -n "${1:-}" ]; then
     BIN=$1
 else
     BIN=$REPO/target/aarch64-unknown-none/release/ferros_kernel.bin
-    ( cd "$REPO" && FERROS_SHIM_HANDOFF=1 cargo build -p ferros_kernel --target aarch64-unknown-none --release )
+    ( cd "$REPO" && FERROS_SHIM_HANDOFF=1 FERROS_SHIM_ENTRY=$ENTRY cargo build -p ferros_kernel --target aarch64-unknown-none --release )
     if command -v aarch64-linux-gnu-objcopy >/dev/null; then OBJ=aarch64-linux-gnu-objcopy; else OBJ=rust-objcopy; fi
     "$OBJ" -O binary "$REPO/target/aarch64-unknown-none/release/ferros_kernel" "$BIN"
 fi
@@ -51,9 +56,17 @@ echo "== staged; adb reboot ferros"
 t0=$(date +%s)
 adb reboot ferros
 sleep 8
-until [ "$(timeout 3 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; do
-    [ $(( $(date +%s) - t0 )) -gt 900 ] && { echo "no Android after 15 min — phone needs hands (Power+VolDown)" >&2; exit 1; }
-    sleep 2
+while :; do
+    if lsusb -d 1209:4665 >/dev/null 2>&1; then
+        echo "== ferros on USB after $(( $(date +%s) - t0 ))s"
+        ( cd "$REPO" && cargo run -q -p ferros-bridge -- diag ) || echo "(diag failed — retry: cargo run -p ferros-bridge -- diag)"
+        exit 0
+    fi
+    if [ "$(timeout 3 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+        echo "== back in Android after $(( $(date +%s) - t0 ))s"
+        report
+        exit 0
+    fi
+    [ $(( $(date +%s) - t0 )) -gt 900 ] && { echo "neither ferros on USB nor Android after 15 min — phone needs hands (Power+VolDown)" >&2; exit 1; }
+    sleep 1
 done
-echo "== back in Android after $(( $(date +%s) - t0 ))s"
-report

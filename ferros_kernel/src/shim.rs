@@ -366,23 +366,9 @@ pub fn entry_genesis(x0: u64) -> ! {
     }
 }
 
-/// Persistence entry: the real boot pattern — open the ferros vault if one exists,
-/// else genesis + seal it — proving a populated vault survives a power cycle.
-///
-/// Boot 1 (empty/unsealed partition): format, put "FERROS-GENESIS-0", then `commit_root` — the store's durable seal (advances the on-disk anchor's object_tail past the object + read-back-verifies).
-/// Reports opened=?, sealed=1.
-/// Boot 2 (after a real warm reset): open succeeds, the anchor scan rediscovers the object, `get` returns it byte-exact.
-/// Reports opened=1, verified=1 — PERSISTED ACROSS REBOOT.
-/// Idempotent thereafter.
-///
-/// Spans the whole partition (bounded reads mean the store never allocs capacity()), stores by logical key through the vault's keyed API, and runs on the freeing free-list allocator.
-pub fn entry_vault(x0: u64) -> ! {
-    use crate::ufs_device::UfsDevice;
+/// Adopt the live UFS link Linux left running: bypass the HSI2 S2MPU, clear UFS IOCC coherency (ferros does non-coherent DMA), rebase the transfer list onto ferros's own descriptors, clear the stale vendor IS. Returns whether the link reports up.
+pub fn adopt_ufs() -> bool {
     use ferros_hal::ufs::UfsController;
-    use ferros_vault::anchor::AnchorKey;
-    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
-
-    // --- adopt the live link (identical prologue to entry_genesis) ---
     unsafe {
         write_volatile((S2MPU_HSI2 + 0x54) as *mut u32, 0xFF);
         write_volatile((S2MPU_HSI2 + 0x00) as *mut u32, 0x00);
@@ -402,12 +388,16 @@ pub fn entry_vault(x0: u64) -> ! {
     wr(0x20, is_pending);
     wr(0x60, 1);
     hci_w(0x38, 0x0018_0000);
-    let link_up = ufs.link_is_up();
-    drop(ufs);
+    ufs.link_is_up()
+}
 
-    // --- make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg) ---
-    // 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into this result block and warm-resets, so the next Linux boot prints it. Faults were previously skip-and-continue, i.e. silent corruption followed by a spin.
-    // The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so zero the report slots first.
+/// Cluster watchdogs (s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8). Armed at the longest window (~1-2 min); a pure spin with no pets resets warm instead of hanging forever.
+const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+
+/// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
+/// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
+/// 2. Cluster watchdogs armed.
+pub fn arm_safety() {
     unsafe {
         for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8] {
             write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
@@ -415,8 +405,6 @@ pub fn entry_vault(x0: u64) -> ! {
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
         write_volatile(&raw mut crate::__exc_sink, RAMOOPS_RESULT as u64);
     }
-    // 2. Cluster watchdogs (same block as the cold-boot path): a pure spin with no fault resets warm in ~1-2 min instead of hanging forever. s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8.
-    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
     const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
     for &wdt in &WATCHDOGS {
         unsafe {
@@ -425,21 +413,53 @@ pub fn entry_vault(x0: u64) -> ! {
             write_volatile(wdt as *mut u32, WDT_ARM);
         }
     }
+}
 
-    // --- ira-rooted vault genesis + probe, mapped onto the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory). The vault now boots from the validated ira; crumbs bracket the crypto/allocator/UFS (first on hardware) so any stall pins the step. ---
-    let key: AnchorKey = crate::ira::anchor_key(); // ira-rooted key from the validated chipid trims (derive_ira v1)
+/// Reload both cluster watchdog counters. Loops that legitimately run long (the USB service loop) call this every iteration; a real hang stops the pets and the watchdog resets warm.
+pub fn pet_watchdogs() {
+    for &wdt in &WATCHDOGS {
+        unsafe { write_volatile((wdt + 0x08) as *mut u32, 0xFFFF) };
+    }
+}
 
-    // Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0.
-    let crumb = |c: u64| unsafe {
-        LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
+/// Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0 (or an exit reason).
+pub fn crumb(c: u64) {
+    LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
         write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
         write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x20);
-    };
+    }
+}
+
+/// What one ira-rooted vault open-or-genesis found, plus the ira/wairua side readings reported with it.
+pub struct VaultProbe {
+    pub link_up: bool,
+    pub opened: u8,
+    pub verified: u8,
+    pub sealed: u8,
+    /// 0 ok; 1 format, 2 set, 3 read failed.
+    pub stage: u8,
+    pub root16: [u8; 16],
+    pub wairua_ok: u8,
+    pub wairua_head: u64,
+    pub ap_tune: [u8; 32],
+    pub asv_nz: bool,
+    pub hpm_nz: bool,
+    pub dvfs: u8,
+}
+
+/// The real boot pattern on the adopted link: open the ferros vault keyed by the ira, else genesis + seal it. Crumbs bracket each first-on-hardware step so a stall pins it.
+pub fn vault_probe(link_up: bool) -> VaultProbe {
+    use crate::ufs_device::UfsDevice;
+    use ferros_hal::ufs::UfsController;
+    use ferros_vault::anchor::AnchorKey;
+    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
+
+    let key: AnchorKey = crate::ira::anchor_key(); // ira-rooted key from the validated chipid trims (derive_ira v1)
     crumb(0xC1); // anchor_key (chipid trims + BLAKE3 ira) returned
 
-    // TRNG (SMC then RNDR fallback)
-    let wairua = crate::wairua::draw();
+    let wairua = crate::wairua::draw(); // TRNG (SMC then RNDR fallback)
     crumb(0xC2);
     let (wairua_ok, wairua_head) = match wairua {
         Some(w) => {
@@ -450,24 +470,27 @@ pub fn entry_vault(x0: u64) -> ! {
         None => (0u8, 0),
     };
 
-    // chipid trims (already validated; kept for the populated flags + a few readable bytes)
-    let ap_tune = crate::ira::read_ap_hw_tune();
-    let asv = crate::ira::read_asv_tbl();
-    let hpm = crate::ira::read_hpm_asv();
-    let dvfs = crate::ira::read_dvfs_version();
+    let nz = |b: &[u8]| b.iter().any(|&x| x != 0);
+    let mut p = VaultProbe {
+        link_up,
+        opened: 0,
+        verified: 0,
+        sealed: 0,
+        stage: 0,
+        root16: [0u8; 16],
+        wairua_ok,
+        wairua_head,
+        ap_tune: crate::ira::read_ap_hw_tune(),
+        asv_nz: nz(&crate::ira::read_asv_tbl()),
+        hpm_nz: nz(&crate::ira::read_hpm_asv()),
+        dvfs: crate::ira::read_dvfs_version(),
+    };
 
-    // --- vault genesis keyed by the ira (XChaCha20-Poly1305 crypto + heap alloc + UFS I/O — first on hardware) ---
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";
-    let mut opened = 0u8;
-    let mut verified = 0u8;
-    let mut sealed = 0u8;
-    let mut stage = 0u8; // 0 ok; 1 format 2 set 3 read failed
-    let mut root16 = [0u8; 16];
     let mut need_seal = false;
     let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
 
-    // Prologue split so the crumb pins which first-on-hardware step stalls: device adapter, TRNG draw, first heap allocation (freeing allocator), then open itself.
     crumb(0xE4);
     let dev0 = fresh_dev();
     crumb(0xE5); // UfsDevice constructed
@@ -477,12 +500,12 @@ pub fn entry_vault(x0: u64) -> ! {
     crumb(0xE0); // first heap allocation done; before Store::open (UFS prefix read -> bounded read -> decode -> anchor decrypt)
     match Store::open(dev0, key, nonce0) {
         Ok(store) => {
-            opened = 1;
-            root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+            p.opened = 1;
+            p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
             match store.get_by_key(LKEY) {
-                Ok(Some(v)) if v.as_slice() == MSG => verified = 1,
+                Ok(Some(v)) if v.as_slice() == MSG => p.verified = 1,
                 Ok(_) => need_seal = true, // vault present but key absent/mismatched
-                Err(_) => stage = 3,
+                Err(_) => p.stage = 3,
             }
         }
         Err(_) => need_seal = true, // no vault (or wrong key) — genesis it
@@ -493,44 +516,91 @@ pub fn entry_vault(x0: u64) -> ! {
         match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
             Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
                 Ok(_) => {
-                    sealed = 1;
-                    root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+                    p.sealed = 1;
+                    p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
                 }
-                Err(_) => stage = 2,
+                Err(_) => p.stage = 2,
             },
-            Err(_) => stage = 1,
+            Err(_) => p.stage = 1,
         }
     }
     crumb(0xE3); // vault path returned
+    p
+}
 
-    let nz = |b: &[u8]| b.iter().any(|&x| x != 0) as u64;
-    // r[2] bytes (kernel prints nop_ocs/nop_rsp/read_ocs/scsi_status):
-    //   nop_ocs  = opened | verified<<1 | sealed<<2 | wairua_ok<<3 | link_up<<4
-    //   nop_rsp  = vault stage (0=ok, 1 format / 2 set / 3 read failed)
-    //   read_ocs = ap_nz | asv_nz<<1 | hpm_nz<<2
-    let f_open = (opened as u64) | ((verified as u64) << 1) | ((sealed as u64) << 2) | ((wairua_ok as u64) << 3) | ((link_up as u64) << 4);
-    let flags = f_open | ((stage as u64) << 8) | ((nz(&ap_tune) | (nz(&asv) << 1) | (nz(&hpm) << 2)) << 16);
-
-    // Report -> kernel print slots: r[1]/0x08 `link_up=` := wairua (differs each boot); r[2]/0x10 flags (above); r[3]/0x18 `mbr_sig` := 0(done) | dvfs<<8; r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — the ira-rooted genesis root: non-zero + stable across boots == the vault booted from the ira.
+/// Write the vault probe into the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory).
+/// r[1]/0x08 `link_up=` := wairua (differs each boot); r[2]/0x10 bytes := opened|verified<<1|sealed<<2|wairua_ok<<3|link_up<<4, then stage, then ap_nz|asv_nz<<1|hpm_nz<<2; r[3]/0x18 `mbr_sig` := exit | dvfs<<8 (exit 0 = vault run done, G#Bx = USB service exit reason); r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — non-zero + stable across boots == the vault booted from the ira.
+pub fn report_vault(p: &VaultProbe, exit: u8) {
+    let f_open = (p.opened as u64) | ((p.verified as u64) << 1) | ((p.sealed as u64) << 2) | ((p.wairua_ok as u64) << 3) | ((p.link_up as u64) << 4);
+    let ap_nz = p.ap_tune.iter().any(|&x| x != 0) as u64;
+    let flags = f_open | ((p.stage as u64) << 8) | ((ap_nz | ((p.asv_nz as u64) << 1) | ((p.hpm_nz as u64) << 2)) << 16);
+    LAST_CRUMB.store(exit as u64, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
-        w(0x08, wairua_head);
+        w(0x08, p.wairua_head);
         w(0x10, flags);
-        w(0x18, (dvfs as u64) << 8);
-        core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
+        w(0x18, (exit as u64) | ((p.dvfs as u64) << 8));
+        core::ptr::copy_nonoverlapping(p.ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
         w(0x28, crate::exception_count()); // r[5] wrote_ok := sync exceptions taken (0 expected; the sink resets on the first one, so nonzero here means a fault slipped past)
-        core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(p.root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
+}
 
-    let _ = (x0, SCRATCH, MAGIC, STAGE_M0, STAGE_M1, CRUMB_ENTRY, CRUMB_RUST);
+/// Exynos EL3 monitor "privileged register" call: the secure monitor performs the MMIO access for us, so registers the S2MPU blocks from EL2 (the PMU) are still reachable. Same call Linux's set_priv_reg/get_priv_reg make (exynos-pd_el3.c): x0 = SMC_CMD_PRIV_REG, x1 = physical address, x2 = 0 read / 1 write, x3 = value. Returns x0: 0 on a successful write, the register value on a read.
+const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
+
+pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
+    let ret: u64;
     unsafe {
         core::arch::asm!(
+            "smc #0",
+            inout("x0") SMC_CMD_PRIV_REG => ret,
+            inout("x1") addr => _,
+            inout("x2") write as u64 => _,
+            inout("x3") val as u64 => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _,
+        );
+    }
+    ret
+}
+
+/// PMU SYSIP_DAT0 (pmu_alive G#1546_0000 + reboot-cmd-offset G#810): the reboot mode the bootloader reads after a reset. Values from pixel-zuma-reboot.c: G#FC bootloader, G#FA fastbootd, G#FF recovery, 0 normal.
+pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
+pub const REBOOT_MODE_BOOTLOADER: u32 = 0xFC;
+
+/// Reset straight into the bootloader (fastboot): stamp the reboot mode through the EL3 monitor, then PSCI SYSTEM_RESET. Returns only if the monitor refused the write (nonzero), so the caller can report it.
+pub fn reboot_to_bootloader() -> u64 {
+    let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
+    if r == 0 {
+        psci_reset();
+    }
+    r
+}
+
+/// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.
+pub fn psci_reset() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
             "mov w0, #0x0009",
             "movk w0, #0x8400, lsl #16",
             "smc #0",
             options(nomem, nostack, noreturn),
         );
     }
+}
+
+/// Persistence entry: open the ferros vault if one exists, else genesis + seal it, report, warm-reset. Proven on hardware: root stable across boots, opened=1 verified=1.
+pub fn entry_vault(x0: u64) -> ! {
+    let link_up = adopt_ufs();
+    arm_safety();
+    let p = vault_probe(link_up);
+    report_vault(&p, 0);
+    let _ = (x0, SCRATCH, MAGIC, STAGE_M0, STAGE_M1, CRUMB_ENTRY, CRUMB_RUST);
+    psci_reset()
 }

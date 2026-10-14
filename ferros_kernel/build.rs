@@ -16,4 +16,5 @@ fn main() {
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64.ld");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64-shim.ld");
     println!("cargo:rerun-if-env-changed=FERROS_SHIM_HANDOFF");
+    println!("cargo:rerun-if-env-changed=FERROS_SHIM_ENTRY");
 }

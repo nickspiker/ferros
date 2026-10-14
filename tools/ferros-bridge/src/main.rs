@@ -20,12 +20,13 @@ struct SessionClock {
 }
 
 impl SessionClock {
-    async fn calibrate() -> Self {
+    /// None when too few time sources answer. Nothing on the device path needs the session clock yet, so a flaky network must never stop a USB command (unattended hardware loops died on "got 4, need 8").
+    async fn calibrate() -> Option<Self> {
         match nunc::query(nunc::Mode::Fast).await {
-            Ok(t) => Self { base_et: t.timestamp_et, base_instant: std::time::Instant::now() },
+            Ok(t) => Some(Self { base_et: t.timestamp_et, base_instant: std::time::Instant::now() }),
             Err(e) => {
-                eprintln!("nunc: clock calibration failed: {e}");
-                std::process::exit(1);
+                eprintln!("nunc: clock calibration failed ({e}); continuing without a session clock");
+                None
             }
         }
     }
@@ -67,7 +68,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let clock = SessionClock::calibrate().await;
+    let _clock = SessionClock::calibrate().await;
 
     match args[1].as_str() {
         "status" => cmd_status(),

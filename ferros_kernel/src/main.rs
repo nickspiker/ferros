@@ -30,6 +30,8 @@ mod ira;
 mod wairua;
 #[cfg(shim_handoff)]
 mod shim;
+#[cfg(all(feature = "pixel8", shim_handoff))]
+mod shim_usb;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;
@@ -979,6 +981,96 @@ fn m1_usb_event_loop(
 
 // Post-handoff entry: ferros was chainloaded by the Linux shim via cpu_soft_restart into the 0x92400000 carveout, MMU off at EL2, with the UFS link already alive.
 // This kernel_main replaces the cold-boot one for the shim-linked image; it must NOT run the ABL-state-dependent cold-boot setup (watchdog reuse, S2MPU/eUSB assumptions), so it dispatches straight to shim.
+/// eUSB2 PHY + USB link bring-up on Tensor G3. Faithful port of phy_exynos_eusb_initiate (tools/pixel8/phy-ref/phy-exynos-eusb.c), 19.2MHz / 4nm; bit positions from eusb-con-reg.h, link init from exynos-usb-blkcon.c. Re-runnable: the enumeration watchdog re-inits the PHY when the host never talks to us. Shared by the cold-boot path and the shim (post-handoff) USB path.
+#[cfg(feature = "pixel8")]
+pub(crate) fn pixel8_eusb_phy_init() {
+    const USBCON: usize = 0x1110_0000;
+    const EUSB_PHY: usize = 0x1111_0000;
+    unsafe {
+            // Tensor cores ~2GHz; ~4000 spin iters/us is generous (over-delay harmless, under-delay breaks PLL/REXT calibration).
+            let udelay = |us: u32| { for _ in 0..us.saturating_mul(4000) { core::hint::spin_loop(); } };
+
+            // --- BLKCON link init (exynos_usbcon_init_link) --- LINKCTRL(G#04): disable qact autogating, force qact, bypass bus filter.
+            let mut reg = core::ptr::read_volatile((USBCON + 0x0004) as *const u32);
+            reg |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7); // dis_id0/bvalid/vbusvalid/linkgate_qact
+            reg &= !(1 << 8);                                  // force_qact = 0
+            core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+            reg |= 1 << 8;        // force_qact = 1
+            reg |= 0xF << 12;     // bus_filter_bypass = G#F
+            core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+
+            // LINK_CLKRST(G#0C): pulse link software reset.
+            reg = core::ptr::read_volatile((USBCON + 0x000C) as *const u32);
+            reg |= 1 << 0;
+            core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+            udelay(10);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+
+            // UTMI_CTRL(G#10): force VBUS/BVALID valid (device mode, no VBUS-detect HW path).
+            reg = core::ptr::read_volatile((USBCON + 0x0010) as *const u32);
+            reg |= (1 << 1) | (1 << 2);
+            core::ptr::write_volatile((USBCON + 0x0010) as *mut u32, reg);
+
+            // --- PHY init (phy_exynos_eusb_initiate) ---
+            // 1. Hold PHY + UTMI port in reset, override-enabled. RST_CTRL(G#00): phy_reset b0, phy_reset_ovrd_en b1, utmi_port_reset b4, utmi_port_reset_ovrd_en b5.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg |= (1 << 0) | (1 << 1) | (1 << 4) | (1 << 5);
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+            // 2. Strapping. CMN_CTRL(G#04): rptr_mode b10 = 1, ref_freq_sel b6:4 = 0 (19.2MHz).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg |= 1 << 10;
+            reg &= !(0x7 << 4);
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            // PLLCFG0(G#08): pll_fb_div b19:8 = 368, pll_cpbias_cntrl b6:0 = 0.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0008) as *const u32);
+            reg &= !(0xFFF << 8);
+            reg |= 368 << 8;
+            reg &= !0x7F;
+            core::ptr::write_volatile((EUSB_PHY + 0x0008) as *mut u32, reg);
+
+            // PLLCFG1(G#0C): pll_ref_div b11:8 = 0.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x000C) as *const u32);
+            reg &= !(0xF << 8);
+            core::ptr::write_volatile((EUSB_PHY + 0x000C) as *mut u32, reg);
+
+            // 3. Clear analog IDDQ — TESTSE(G#20) test_iddq b6 = 0 — powers the PHY analog UP. (The step the old port missed.)
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0020) as *const u32);
+            reg &= !(1 << 6);
+            core::ptr::write_volatile((EUSB_PHY + 0x0020) as *mut u32, reg);
+
+            // Keep phy_enable(b0) = 0 during the power-up window.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            udelay(10); // phy_reset held >=10us after test_iddq clear
+
+            // 6. Release phy_reset (b0=0); KEEP utmi_port_reset asserted.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+            udelay(10); // REXT calibration
+
+            // 7. Enable PHY. CMN_CTRL phy_enable(b0) = 1.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg |= 1 << 0;
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            udelay(1000); // REXT calibration
+            udelay(28);   // T4: analog+digital powered, utmi_clk toggles
+            udelay(2500); // T5: Port Reset (ESE1) transmit complete
+
+            // Release UTMI port reset (RST_CTRL b4=0, b5=0).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg &= !((1 << 4) | (1 << 5));
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+    }
+}
+
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
@@ -988,7 +1080,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { SHIM_ALLOC.init(heap_base, HEAP_SIZE) };
 
-    shim::entry_vault(dtb_addr)
+    // Default: the USB service (PT over the inherited controller, disk live). FERROS_SHIM_ENTRY=vault builds the one-shot vault probe that reports and resets.
+    if option_env!("FERROS_SHIM_ENTRY") == Some("vault") {
+        shim::entry_vault(dtb_addr)
+    } else {
+        shim_usb::entry_usb(dtb_addr)
+    }
 }
 
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
@@ -1054,89 +1151,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     const EUSB_PHY: usize = 0x1111_0000;
 
     // Re-runnable: the enumeration watchdog below re-inits the PHY if the host never talks to us (the PLL-lock race makes first-try enumeration flaky).
-    let eusb_phy_init = || unsafe {
-        // Tensor cores ~2GHz; ~4000 spin iters/us is generous (over-delay harmless, under-delay breaks PLL/REXT calibration).
-        let udelay = |us: u32| { for _ in 0..us.saturating_mul(4000) { core::hint::spin_loop(); } };
-
-        // --- BLKCON link init (exynos_usbcon_init_link) --- LINKCTRL(G#04): disable qact autogating, force qact, bypass bus filter.
-        let mut reg = core::ptr::read_volatile((USBCON + 0x0004) as *const u32);
-        reg |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7); // dis_id0/bvalid/vbusvalid/linkgate_qact
-        reg &= !(1 << 8);                                  // force_qact = 0
-        core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
-        reg |= 1 << 8;        // force_qact = 1
-        reg |= 0xF << 12;     // bus_filter_bypass = G#F
-        core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
-
-        // LINK_CLKRST(G#0C): pulse link software reset.
-        reg = core::ptr::read_volatile((USBCON + 0x000C) as *const u32);
-        reg |= 1 << 0;
-        core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
-        udelay(10);
-        reg &= !(1 << 0);
-        core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
-
-        // UTMI_CTRL(G#10): force VBUS/BVALID valid (device mode, no VBUS-detect HW path).
-        reg = core::ptr::read_volatile((USBCON + 0x0010) as *const u32);
-        reg |= (1 << 1) | (1 << 2);
-        core::ptr::write_volatile((USBCON + 0x0010) as *mut u32, reg);
-
-        // --- PHY init (phy_exynos_eusb_initiate) ---
-        // 1. Hold PHY + UTMI port in reset, override-enabled. RST_CTRL(G#00): phy_reset b0, phy_reset_ovrd_en b1, utmi_port_reset b4, utmi_port_reset_ovrd_en b5.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
-        reg |= (1 << 0) | (1 << 1) | (1 << 4) | (1 << 5);
-        core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
-
-        // 2. Strapping. CMN_CTRL(G#04): rptr_mode b10 = 1, ref_freq_sel b6:4 = 0 (19.2MHz).
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
-        reg |= 1 << 10;
-        reg &= !(0x7 << 4);
-        core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
-
-        // PLLCFG0(G#08): pll_fb_div b19:8 = 368, pll_cpbias_cntrl b6:0 = 0.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0008) as *const u32);
-        reg &= !(0xFFF << 8);
-        reg |= 368 << 8;
-        reg &= !0x7F;
-        core::ptr::write_volatile((EUSB_PHY + 0x0008) as *mut u32, reg);
-
-        // PLLCFG1(G#0C): pll_ref_div b11:8 = 0.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x000C) as *const u32);
-        reg &= !(0xF << 8);
-        core::ptr::write_volatile((EUSB_PHY + 0x000C) as *mut u32, reg);
-
-        // 3. Clear analog IDDQ — TESTSE(G#20) test_iddq b6 = 0 — powers the PHY analog UP. (The step the old port missed.)
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0020) as *const u32);
-        reg &= !(1 << 6);
-        core::ptr::write_volatile((EUSB_PHY + 0x0020) as *mut u32, reg);
-
-        // Keep phy_enable(b0) = 0 during the power-up window.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
-        reg &= !(1 << 0);
-        core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
-
-        udelay(10); // phy_reset held >=10us after test_iddq clear
-
-        // 6. Release phy_reset (b0=0); KEEP utmi_port_reset asserted.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
-        reg &= !(1 << 0);
-        core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
-
-        udelay(10); // REXT calibration
-
-        // 7. Enable PHY. CMN_CTRL phy_enable(b0) = 1.
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
-        reg |= 1 << 0;
-        core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
-
-        udelay(1000); // REXT calibration
-        udelay(28);   // T4: analog+digital powered, utmi_clk toggles
-        udelay(2500); // T5: Port Reset (ESE1) transmit complete
-
-        // Release UTMI port reset (RST_CTRL b4=0, b5=0).
-        reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
-        reg &= !((1 << 4) | (1 << 5));
-        core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
-    };
+    let eusb_phy_init = pixel8_eusb_phy_init;
     // eUSB2 repeater snapshot BEFORE PHY init (reads only — the bus is shared with the PMIC chain).
     // Answers, on every boot, "did ABL's repeater state survive the jump?" — DIAG reports it, so flaky boots self-document at the analog layer, not just the link layer.
     // Slot 0 = REV_ID (healthy G#3), slots 1..9 = CONFIG_PORT1 + the 8 tune registers (healthy baseline in REPEATER.md). Read failure = G#8000_0000 | TRANS_STATUS[15:0].
