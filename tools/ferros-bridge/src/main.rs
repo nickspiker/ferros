@@ -78,7 +78,7 @@ async fn main() {
         "diag" => cmd_diag().await,
         "read" => {
             if args.len() < 3 {
-                eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU, whose direct reads hang the bus on husky)");
+                eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU: on husky a direct PMU read makes the next EL3 call hang)");
                 std::process::exit(1);
             }
             let len = args
