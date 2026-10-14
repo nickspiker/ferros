@@ -1,6 +1,6 @@
 ---
 name: husky_cold_slot_b
-description: Slot b on husky boots ferros straight from ABL (no Linux) since 2026-10-14 — tools/husky-cold.sh, link base, exits to fastboot, delayed watchdog reset, cold display on ABL's splash; disk still blocked
+description: Slot b on husky boots ferros straight from ABL (no Linux) since 2026-10-14 — tools/husky-cold.sh, link base, exits to fastboot, delayed watchdog reset, cold display on ABL's splash, cold UFS + vault (44 ms + 84 ms)
 metadata:
   type: project
 ---
@@ -21,4 +21,8 @@ metadata:
 - **Watchdog-triggered reset is DELAYED:** about 15-20 s after the cluster watchdogs start expiring (about 1 min for a single expiry). `reboot_to_bootloader` waits up to 64 s. Measured with `payloads/wdtfire`, a RUN payload that owns the CPU so nothing pets. The earlier "fastboot works" test only passed because the bridge waited 60 s.
 - **EL3 poison extends beyond the PMU:** reading the watchdog block's undefined offsets (+0x14..+0x1C) also hung the next EL3 call. Read only defined registers.
 
-**Still blocked:** the cold UFS link (UFS.md, [[ufs_husky_wall]]), so there is no vault or devinfo slot marking on slot b. ABL's retry counter for b decrements per cold boot and is reset by `--set-active=b`.
+**Disk works cold (2026-10-14):**
+- ABL powers the flash off on its way out. `cold_ufs::bring_up` turns VCC (gpp0-1) back on and runs full_init with the per-command nexus. Link + first read take 44 ms; the vault opens and verifies in 84 ms.
+- It is the same ira-rooted vault as the handoff path: the `note` written via the handoff reads back on the cold boot.
+- Not yet done: devinfo slot marking, so ABL's retry counter for b still decrements per cold boot and resets on `--set-active=b`.
+- See [[ufs_husky_wall]].

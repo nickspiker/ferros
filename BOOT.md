@@ -56,12 +56,12 @@ Pixel 8 / Tensor G3 (primary):
 - **Slot a = Android + the handoff kernel.** This is the dev host and the escape hatch: `tools/husky-hotload.sh` chainloads ferros from it with the disk live.
 - **Back to Android:** `tools/husky-cold.sh --android` (fastboot, `--set-active=a`, reboot, about 40 s, no buttons).
 - **Exits from cold ferros:**
-  - A cold ferros has no disk to mark slots with, and a plain reset would just boot ferros again. So every exit except a plain host `bridge reboot` goes to fastboot: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
+  - Slot marking isn't implemented yet (the devinfo format is still unknown), and a plain reset would just boot ferros again. So every exit except a plain host `bridge reboot` goes to fastboot: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
   - The report block at G#FD60_0000 survives warm resets and the trip through fastboot. The next cold boot shows it as `PREV_*` in DIAG, and Android's handoff kernel prints it as `ferros: r[..]`.
 - **Fastboot from ferros:** stamp PMU SYSIP_DAT0 = G#FC through the EL3 monitor, then fire the cluster watchdogs (count = reload = 1).
   - **The reset is not immediate:** these watchdogs reset the SoC about 15-20 s after they start expiring, so ferros waits up to 64 s by the clock.
   - A PSCI SYSTEM_RESET from ferros loses the reboot mode (ABL sees a PIN reset).
-- **Slot b is never marked successful.** That needs the proprietary `devinfo` partition, and so a disk. ABL's retry counter for b decrements on every cold boot and is reset by each `--set-active=b`; when it runs out, ABL falls back to slot a by itself.
+- **Slot b is never marked successful.** That needs writing the proprietary `devinfo` partition. The disk works cold now (`cold_ufs.rs`: ABL powers the flash off, ferros turns VCC back on; 44 ms link + 84 ms vault), so this is just the format work left. ABL's retry counter for b decrements on every cold boot and is reset by each `--set-active=b`; when it runs out, ABL falls back to slot a by itself.
 
 ### Entry teardown hazard (the 2026-03 crash, root-caused)
 
