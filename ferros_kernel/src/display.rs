@@ -1,6 +1,8 @@
 //! Display adoption after a live handoff: take over the DECON0 pipeline Linux left running and put ferros's own pixels on the panel.
 //!
-//! Preconditions (tools/husky-hotload.sh --live): Android was running with the screen on and DECON hibernation off, so DECON0 is powered, configured (command mode, DSC, panel initialized) and holding the last frame. After a normal `adb reboot ferros` the DPU is powered down and DECON reads all zeros; `show` then reports that and touches nothing.
+//! Cold boot (slot b): ABL leaves DECON running its splash with the DPU SYSMMUs' translation off, so the layer's DMA address is physical; `show` handles both.
+//!
+//! Preconditions after a Linux handoff (tools/husky-hotload.sh --live): Android was running with the screen on and DECON hibernation off, so DECON0 is powered, configured (command mode, DSC, panel initialized) and holding the last frame. After a normal `adb reboot ferros` the DPU is powered down and DECON reads all zeros; `show` then reports that and touches nothing.
 //!
 //! What Linux leaves (measured on husky): DECON v7.6 and a screen-dependent stack of windows (seen: win2 on DPP0 + win3 on DPP8; win0..3,5..7 with win0 on DPP8), 1008x2244 (the default FHD+ render size, scaled by the DPU to the 1344x2992 panel), RGBA8888 with AFBC compression, at DPU-SYSMMU IOVA G#F700_0000. The SYSMMU (dpuf0, v9, VM0) maps that IOVA as 1 MiB sections onto contiguous DRAM from G#9F40_0000 for the first 8 MiB, the tail through a level-2 table.
 //!
@@ -55,6 +57,10 @@ fn wr(a: usize, v: u32) {
 
 /// Translate a DPU IOVA through a DPU SYSMMU's VM0 (samsung-iommu.h: level-1 entries cover 1 MiB, flag 2 = section, 1 = level-2 table; level-2 flag 2 = 4 KiB page, 1 = 64 KiB page; entry addresses are stored >> 4).
 fn iova_to_phys(sysmmu: usize, iova: u64) -> Option<u64> {
+    // VM0 translation off (MMU_CTRL_VM bit 0 clear) = DMA addresses are physical. That is what ABL leaves on a cold boot (ctrl G#24, no page table); Linux turns translation on.
+    if rd(sysmmu + 0x8000) & 1 == 0 {
+        return Some(iova);
+    }
     let flpt = ((rd(sysmmu + 0x8404) & 0xFF_FFFF) as u64) << 12;
     if flpt == 0 {
         return None;
