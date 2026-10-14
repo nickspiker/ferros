@@ -67,7 +67,7 @@ What it does, all from measured state:
 - **Switches the layer to linear:** RDMA_IN_CTRL_0 goes from `G#FF400108` (RGBA8888 + AFBC) to `G#FF400700` (linear XRGB8888, matching the console's `0x00RRGGBB`). Every other window is turned off.
 - **Pushes one frame:** SHD_REG_UP_REQ (window bits + GLOBAL + CMP), unmask TRIG_CON HW_TRIG_EN, wait for FRAME_COUNT to move, then mask the trigger again.
 
-First run: FRAME_COUNT `G#4C -> G#4D`, shadow request consumed, INT_PEND = FRAME_START|FRAME_DONE, INT_PEND_EXTRA = 0 (no timeout or resource conflict). Every register says the frame reached the panel; the human-eye check is still pending.
+First run: FRAME_COUNT `G#4C -> G#4D`, shadow request consumed, INT_PEND = FRAME_START|FRAME_DONE, INT_PEND_EXTRA = 0 (no timeout or resource conflict). Every register says the frame reached the panel, and on 2026-10-14 the owner confirmed by eye: the amber console text is on the screen.
 
 ## Status
 
@@ -79,5 +79,5 @@ First run: FRAME_COUNT `G#4C -> G#4D`, shadow request consumed, INT_PEND = FRAME
 - [ ] Find + disable the DPU S2MPU (unlocks SYSMMU CTRL writes)
 - [ ] Bypass DPU SYSMMU (`G#1984_0000`/`G#19C4_0000`, MMU_CTRL bit0=0)
 - [x] Re-point a DPP layer at linear pixels (adoption: keep its IOVA + mapping, switch AFBC off)
-- [x] Write pixels + trigger one frame (registers confirm; visual check pending)
+- [x] Write pixels + trigger one frame (registers confirm, visually confirmed 2026-10-14)
 - [x] Minimal text glyph writer (`ferros_hal::console`, `bridge display "text"`)

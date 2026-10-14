@@ -8,7 +8,7 @@ metadata:
   modified: 2026-10-14T05:39:48.285Z
 ---
 
-**Also:** `bridge store put|get|ls|rm` (vault by logical key, persists), `bridge display [--hold] "text"` + automatic boot status screen after a `--live` handoff (DECON adoption, see ferros DISPLAY.md), `--live` = /sys/kernel/ferros/go from running Android (screen on, DECON hibernation off).
+**Also:** `bridge store put|get|ls|rm` (vault by logical key, persists), `bridge display [--hold] "text"` + automatic boot status screen after a `--live` handoff (DECON adoption, see ferros DISPLAY.md; text on the panel visually confirmed by the owner 2026-10-14), `--live` = /sys/kernel/ferros/go from running Android (screen on, DECON hibernation off).
 
 **Loop:** `tools/husky-hotload.sh` (push + /sys/kernel/ferros/stage + `adb reboot ferros`) → ferros on USB as 1209:4665 in ~35 s → `ferros-bridge diag | run <payload.bin> [hex] | reload <flat.bin> | read <addr> [len] [file] | poke <addr> <val> | reboot [fastboot]`. Disk (UFS) stays live, vault opens from the ira. Built by `shim_usb.rs` (default shim entry; `FERROS_SHIM_ENTRY=vault` = old one-shot probe). See [[husky_ferros_probe_boot]], [[ufs_linux_handoff]].
 
