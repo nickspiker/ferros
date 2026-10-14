@@ -1,11 +1,13 @@
 ---
 name: husky_ferros_probe_boot
-description: "How to actually run a ferros shim/probe on husky (Pixel 8): inject /ferros.bin into the vendor_kernel_boot ramdisk, disable pKVM, flash, reboot, read dmesg. The run procedure, reconstructed from the 873bc7fe transcript."
+description: "How to run a ferros shim/probe on husky: tools/husky-hotload.sh (runtime trigger, no flash, ~1 min) since 2026-10-13; the older inject-/ferros.bin-into-vendor_kernel_boot + flash path; report decoding; disarm/backup facts"
 metadata: 
   node_type: memory
   type: reference
   originSessionId: 35f77793-aafd-4fba-bd97-4cd4e60013b9
 ---
+
+**USE THIS FIRST (2026-10-13): `tools/husky-hotload.sh` — hot-load with no flashing, ~52 s round trip including the cargo build.** The kernel (husky-kernel aosp, flashed to slot a) has `/sys/kernel/ferros/stage` (root writes an image path → copied into the 0x92400000 carveout) and a top-priority reboot notifier in ufshcd.c: `adb reboot ferros` → Android shuts down cleanly (sync+unmount) → notifier resumes the host, ungates clocks, turns auto-hibern8 off, pins clock scaling at the top gear, drains doorbells → `ferros_handoff_now()`. Nothing is armed at boot (the flashed vendor_kernel_boot has no /ferros.bin), so every reset lands back in Android with adb and `adb reboot bootloader` is always one command away — no buttons needed unless ferros wedges with the watchdog dead. First run: link idle at gear 4, AHIT=0, vault opened+verified, root hash `ca8171f6 18d243f3 ecccc2a18 3cea25f6` identical to the boot-time-trigger run the same day (ira-rooted root stable across boots and trigger paths). The "~10 min cycle" below was the watchdog-recovery era; a healthy boot-time cycle measured 65 s. Kernel-side changes (ferros_handoff.c, ferros_reset.S, the ufshcd.c hooks) are UNCOMMITTED in the aosp tree (detached HEAD) — not in the ferros repo. Pre-flash backups of boot_a/vendor_kernel_boot_a: `/mnt/Harbor/tmp/husky-backup-2026-10-13/`.
 
 The shim/probe (entry_vault, the ira instrumentation) runs on husky via a CUSTOM Android kernel handoff, NOT a standalone boot. Reconstructed 2026-08-20 from transcript 873bc7fe (it was never scripted — assembled ad-hoc).
 

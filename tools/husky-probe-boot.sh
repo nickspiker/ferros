@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run a ferros shim/probe on husky (Pixel 8) via the custom-kernel handoff.
 #
+# SUPERSEDED for iteration by tools/husky-hotload.sh (runtime trigger, no flashing, ~1 min round trip). This boot-time path is kept for cases that need ferros to adopt the link at first scan, before Android ever touches it.
+#
 # The shim (entry_vault / the ira instrumentation) does NOT boot standalone on husky.
 # A custom -dirty android14 GKI kernel fires it from inside ufshcd_async_scan (so it
 # inherits the live UFS link), staged at phys 0x92400000, one-shot, then soft-restarts
