@@ -1,6 +1,6 @@
 //! The cold boot's UFS link-startup probe, behind `bridge diag ufs` (it used to run on every cold boot and fail).
 //!
-//! On a cold boot ABL leaves the UFS link parked in HIBERN8 and ferros must bring it up itself with `full_init`. Every MMIO write, read, clock and 383 of 384 PMA registers match Linux's working bring-up, yet the device stays silent at link startup (FAIL=9, MXGR=0, LS_RES=1, UECPA=0); the remaining suspects are off-chip (refclk delivery, TX). UFS.md has the whole trail. This keeps the measurement runnable on demand: the external-block and clock-tree state ABL left, the pristine register file, the PMA/PA snapshots before and after, the full_init report, the ferros-side MMIO trace and the full PMA dump, under the same labels as the old boot-time DIAG so new captures diff against the old ones.
+//! On a cold boot ABL leaves the UFS device POWERED OFF (see `power_on_device`), which is why every register-identical bring-up attempt met a silent device (UFS.md). With VCC restored, full_init's link startup succeeds. This keeps the measurement runnable on demand: the external-block and clock-tree state ABL left, the pristine register file, the PMA/PA snapshots before and after, the full_init report, the ferros-side MMIO trace and the full PMA dump, under the same labels as the old boot-time DIAG so new captures diff against the old ones.
 //!
 //! Changed from the boot-time version: the PMU reads go through the EL3 monitor (a direct EL2 PMU read makes the next EL3 call hang, which would break the fastboot exit), and the experiments FAITHFUL_REPLAY had already switched off are gone (git history and UFS.md keep them).
 
@@ -20,10 +20,29 @@ fn wr(a: usize, v: u32) {
     unsafe { write_volatile(a as *mut u32, v) }
 }
 
+/// GPIO_PERIC0 bank gpp0 (zuma.dtsi pinctrl@10840000): CON at +0 (4 bits per pin), DAT at +4. gpp0-1 switches the UFS device's VCC rail (zuma-ufs.dtsi ufs_fixed_vcc, enable-active-high).
+const GPP0: usize = 0x1084_0000;
+
+/// Power the UFS device back on. ABL's UFS shutdown (reverse-engineered from ripcurrent-16.4-14540574: vendor hook stage 10, called right after it reads the boot image and before it jumps to the kernel) hibernates the link, asserts the device reset, re-purposes the gph5-0 refclk pin and drives gpp0-1 LOW — the flash device is unpowered when ferros starts. Linux's regulator framework turns it back on at probe; ferros never did, which is the whole "device silent at link startup" wall in UFS.md. Measured: gpp0 CON G#2010 (pin 1 output), DAT G#0 at handoff; with DAT bit 1 set, link startup succeeds first try (LS_RES 0, MXGR 4, two RX lanes).
+pub fn power_on_device() {
+    let con = rd(GPP0);
+    wr(GPP0, (con & !(0xF << 4)) | (1 << 4)); // gpp0-1 = output
+    wr(GPP0 + 4, rd(GPP0 + 4) | (1 << 1)); // drive high: VCC on
+    unsafe { core::arch::asm!("dsb sy") };
+    // Let the rail settle before full_init's device reset pulse (the DT gives the fixed regulator no startup delay; 4 ms is generous).
+    let freq = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    while crate::platform::cntpct().wrapping_sub(t0) < freq / 250 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Run the full cold UFS bring-up once and return the report text.
 pub fn probe() -> Vec<u8> {
     let mut resp = Vec::new();
-    resp.extend_from_slice(b"cold UFS link-startup probe (full_init from ABL's parked link)\n");
+    resp.extend_from_slice(b"cold UFS link-startup probe (VCC on, then full_init from ABL's parked link)\n");
+    let gpp0_dat_before = rd(GPP0 + 4);
+    power_on_device();
 
     // UFS DMA straight to physical addresses (zuma UFS has no stage-1 SYSMMU; the S2MPU is the only gate).
     wr(S2MPU_HSI2 + 0x54, 0xFF);
@@ -75,8 +94,24 @@ pub fn probe() -> Vec<u8> {
     let hcs_pristine = r(0x30);
     let pmaw = ufs.snapshot_pma(); // ABL's working (hibernated) link
     let rep = ufs.full_init();
-    let pmaf = ufs.snapshot_pma(); // after the failed startup
+    let pmaf = ufs.snapshot_pma(); // after the startup (failed or not)
+    // If the device answered, read LBA 0 (the GPT's protective MBR) — the end-to-end proof.
+    // The first command after the device's power-on reset typically completes with OCS 0 but SCSI CHECK CONDITION (UNIT ATTENTION: power on occurred) and no data, so retry until the signature shows (first cold run: OCS 0, signature 0).
+    let (mut read_ocs, mut mbr_sig, mut read_tries) = (0xFFu32, 0u32, 0u32);
+    if rep.fail_step == 0 || rep.nop_ocs == 0 {
+        for t in 1..=4u32 {
+            read_tries = t;
+            read_ocs = ufs.read_block(0) as u32;
+            let d = ufs.data_buffer();
+            mbr_sig = u16::from_le_bytes([d[0x1FE], d[0x1FF]]) as u32;
+            if read_ocs == 0 && mbr_sig == 0xAA55 {
+                break;
+            }
+        }
+    }
 
+    append_hex(&mut resp, b"UFS_GPP0_DAT_BEFORE=", gpp0_dat_before);
+    append_hex(&mut resp, b"UFS_GPP0_DAT_AFTER=", rd(GPP0 + 4));
     append_hex(&mut resp, b"UFS_DBG_PRD=", dbg_prd);
     append_hex(&mut resp, b"UFS_EXT_IOCC=", iocc);
     append_hex(&mut resp, b"UFS_EXT_PHYISO=", phy_iso);
@@ -99,6 +134,9 @@ pub fn probe() -> Vec<u8> {
     append_hex(&mut resp, b"UFS_BUF_PHYS_HI=", (phys >> 32) as u32);
     append_hex(&mut resp, b"UFS_BUF_PHYS_LO=", phys as u32);
     append_hex(&mut resp, b"UFS_HCS_PRISTINE=", hcs_pristine);
+    append_hex(&mut resp, b"UFS_READ_LBA0_OCS=", read_ocs);
+    append_hex(&mut resp, b"UFS_MBR_SIG=", mbr_sig);
+    append_hex(&mut resp, b"UFS_READ_TRIES=", read_tries);
     append_hex(&mut resp, b"UFS_STEPS=", rep.steps);
     append_hex(&mut resp, b"UFS_FAIL=", rep.fail_step);
     append_hex(&mut resp, b"UFS_LS_RES=", rep.linkstartup_res);

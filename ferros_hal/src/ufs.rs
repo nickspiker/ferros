@@ -329,6 +329,7 @@ impl UfsController {
             core::arch::asm!("dsb sy");
 
             // Ring doorbell (slot 0)
+            self.nexus(false); // device-management UPIU: nexus bit clear
             self.write_reg(regs::UTRLDBR, 1);
 
             // Poll for completion
@@ -398,6 +399,7 @@ impl UfsController {
             crate::mmio::cache_clean(ucd_phys, 1024);
             core::arch::asm!("dsb sy");
 
+            self.nexus(false); // device-management UPIU: nexus bit clear
             self.write_reg(regs::UTRLDBR, 1);
 
             // Poll
@@ -525,6 +527,7 @@ impl UfsController {
             core::arch::asm!("dsb sy");
 
             // Ring doorbell
+            self.nexus(cmd_type == 0); // SCSI (cmd_type 0) sets the nexus bit, native UFS (query) clears it
             self.write_reg(regs::UTRLDBR, 1);
 
             // Poll for completion
@@ -817,6 +820,12 @@ impl UfsController {
     }
     fn hci_w(&self, off: usize, v: u32) {
         crate::ufs_cal::trace_write32(crate::ufs_cal::base::HCI + off, v)
+    }
+
+    /// Exynos per-command nexus (the vendor driver's setup_xfer_req): tag 0's bit in HCI_UTRL_NEXUS_TYPE must be SET for a SCSI command and CLEAR for NOP OUT / query (device-management) UPIUs, rung just before the doorbell. The all-ones value config_host leaves wedges the NOP (OCS stays G#F): seen on the adopted handoff link (2026-08-19) and on the first cold link that came up (2026-10-14).
+    fn nexus(&self, scsi: bool) {
+        let v = self.hci(vs::UTRL_NEXUS_TYPE);
+        self.hci_w(vs::UTRL_NEXUS_TYPE, if scsi { v | 1 } else { v & !1 });
     }
     fn unipro(&self, off: usize) -> u32 {
         crate::ufs_cal::trace_read32(crate::ufs_cal::base::UNIPRO + off)
