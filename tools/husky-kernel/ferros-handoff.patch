@@ -12,10 +12,10 @@ index 3e38b2694..f7712d451 100644
  ifeq ($(CONFIG_DEBUG_EFI),y)
 diff --git a/arch/arm64/kernel/ferros_handoff.c b/arch/arm64/kernel/ferros_handoff.c
 new file mode 100644
-index 000000000..b9de020ff
+index 000000000..eea169bb1
 --- /dev/null
 +++ b/arch/arm64/kernel/ferros_handoff.c
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,291 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * ferros_handoff — chainload the ferros microkernel from a running Linux.
@@ -274,6 +274,17 @@ index 000000000..b9de020ff
 +			r[5] & 0xff, (r[5] >> 8) & 0xff);
 +		print_hex_dump(KERN_INFO, "ferros pattern-readback: ",
 +			       DUMP_PREFIX_OFFSET, 16, 1, &r[20], 16, false);
++		/* The whole 256-byte result block as raw u64 words: the fixed labels above predate the USB service, which reports its own fields (layout in ferros shim_usb.rs). */
++		{
++			u64 *full = memremap(FERROS_RAMOOPS, 256, MEMREMAP_WB);
++			int i;
++
++			for (i = 0; full && i < 32; i += 4)
++				pr_info("ferros: r[%02d..%02d] %016llx %016llx %016llx %016llx\n",
++					i, i + 3, full[i], full[i + 1], full[i + 2], full[i + 3]);
++			if (full)
++				memunmap(full);
++		}
 +		ferros_reported = true;	/* one-shot: skip this boot's handoff */
 +		r[0] = 0;	/* consume so the next boot re-arms */
 +		dcache_clean_inval_poc((unsigned long)r, (unsigned long)r + 8);
@@ -353,18 +364,19 @@ index 000000000..6417bd2f4
 +
 +.popsection
 diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
-index 9134a1fec..03a83e488 100644
+index 9134a1fec..353ea69ed 100644
 --- a/drivers/ufs/core/ufshcd.c
 +++ b/drivers/ufs/core/ufshcd.c
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,8 @@
  #include <linux/delay.h>
  #include <linux/interrupt.h>
  #include <linux/module.h>
 +#include <linux/reboot.h>
++#include <linux/platform_device.h>
  #include <linux/regulator/consumer.h>
  #include <linux/sched/clock.h>
  #include <linux/iopoll.h>
-@@ -5030,6 +5031,12 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
+@@ -5030,6 +5032,12 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
  		ufshcd_print_host_state(hba);
  		ufshcd_print_pwr_info(hba);
  		ufshcd_print_evt_hist(hba);
@@ -377,7 +389,7 @@ index 9134a1fec..03a83e488 100644
  	}
  	return ret;
  }
-@@ -8904,6 +8911,46 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
+@@ -8904,6 +8912,64 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
  	return ret;
  }
  
@@ -396,6 +408,24 @@ index 9134a1fec..03a83e488 100644
 +	if (!ferros_is_staged()) {
 +		pr_err("ferros: reboot ferros with nothing staged; rebooting normally\n");
 +		return NOTIFY_DONE;
++	}
++	/* ferros also brings USB up on the inherited controller: keep the USB glue, DWC3 core and PHY runtime-resumed (clocks and power domain on) so ferros never touches an unclocked block, whatever Android's shutdown did to the gadget. */
++	{
++		static const char * const usb_devs[] = { "11210000.usb", "11210000.dwc3", "11100000.phy" };
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(usb_devs); i++) {
++			struct device *d = bus_find_device_by_name(&platform_bus_type, NULL, usb_devs[i]);
++
++			if (!d) {
++				pr_err("ferros: %s not found\n", usb_devs[i]);
++				continue;
++			}
++			pm_runtime_get_sync(d);
++			pr_info("ferros: %s runtime %s\n", usb_devs[i],
++				pm_runtime_active(d) ? "active" : "NOT active");
++			put_device(d);
++		}
 +	}
 +	ufshcd_rpm_get_sync(hba);
 +	ufshcd_hold(hba, false);
@@ -424,7 +454,7 @@ index 9134a1fec..03a83e488 100644
  /**
   * ufshcd_async_scan - asynchronous execution for probing hba
   * @data: data pointer to pass to this function
-@@ -8924,6 +8971,39 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+@@ -8924,6 +8990,39 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
  	/* Probe and add UFS logical units  */
  	ret = ufshcd_add_lus(hba);
  
