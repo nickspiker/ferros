@@ -32,6 +32,8 @@ mod wairua;
 mod shim;
 #[cfg(all(feature = "pixel8", shim_handoff))]
 mod shim_usb;
+#[cfg(all(feature = "pixel8", shim_handoff))]
+mod shim_display;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;

@@ -100,6 +100,8 @@ pub mod caps {
     pub const RUN: &[u8] = b"ferros.dev.run";
     /// Beam — read ring entries by generation offset. Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE] ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state mode: 0=latest (~N offset), 1=absolute generation, 2=all
     pub const BEAM: &[u8] = b"ferros.dev.beam";
+    /// Display — write renders the params (text, '\n'-separated) on the panel through the adopted DECON pipeline; the response is a register report.
+    pub const DISPLAY: &[u8] = b"ferros.dev.display";
     /// Install — write sends signed kernel binary, exec persists to UFS + stem entry. Exec params: [size:4 LE][hash:32][sig:64] = 100 bytes
     pub const INSTALL: &[u8] = b"ferros.dev.install";
 }

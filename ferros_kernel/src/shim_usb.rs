@@ -242,6 +242,7 @@ pub fn entry_usb(x0: u64) -> ! {
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
     let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
     let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
+    let cap_display = ferros_pt::command::dev_cap(ferros_pt::command::caps::DISPLAY);
     // RELOAD and RUN share STAGE; at most one of these is set, so a payload can never be jumped to as a kernel or vice versa.
     let mut reload_ok = false;
     let mut reload_size = 0usize;
@@ -406,6 +407,9 @@ pub fn entry_usb(x0: u64) -> ! {
                                         }
                                         resp.extend_from_slice(b"END\n");
                                         queue_pt_response(&mut pt_out_data, &resp);
+                                    } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
+                                        let rep = crate::shim_display::show(cmd.params, freq);
+                                        queue_pt_response(&mut pt_out_data, &rep);
                                     } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
                                         let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());

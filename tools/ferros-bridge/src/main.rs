@@ -58,6 +58,7 @@ fn usage() {
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
+    eprintln!("  display [text]    Render text on the panel (shim after a --live handoff; '\\n' = newline)");
 }
 
 #[tokio::main]
@@ -91,6 +92,10 @@ async fn main() {
                 std::process::exit(1);
             }
             cmd_poke(&args[2], &args[3]).await;
+        }
+        "display" => {
+            let text = args.get(2).cloned().unwrap_or_else(|| "ferros".to_string()).replace("\\n", "\n");
+            cmd_display(&text).await;
         }
         "echo" => cmd_echo().await,
         "send" => {
@@ -588,6 +593,23 @@ async fn cmd_diag() {
             eprintln!("Response receive failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
+async fn cmd_display(text: &str) {
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let cmd = build_cmd(ferros_pt::command::caps::DISPLAY, ferros_pt::Op::Write, text.as_bytes());
+    if let Err(e) = pt_send(&link, &cmd).await {
+        eprintln!("Command send failed: {e}");
+        std::process::exit(1);
+    }
+    match pt_recv(&link).await {
+        Ok(r) => print!("{}", String::from_utf8_lossy(&r)),
+        Err(e) => eprintln!("Response receive failed: {e}"),
     }
 }
 

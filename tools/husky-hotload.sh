@@ -13,6 +13,7 @@
 #   tools/husky-hotload.sh --vault    # build the one-shot vault probe instead (reports + resets, prints the report)
 #   tools/husky-hotload.sh <flat.bin> # hot-load a prebuilt flat binary
 #   tools/husky-hotload.sh --read     # print the last report again
+#   tools/husky-hotload.sh --live ... # hand off from RUNNING Android (screen woken and kept on) via /sys/kernel/ferros/go instead of `adb reboot ferros`: no Android shutdown, so the display pipeline is still live for ferros to adopt. Filesystems are synced first; otherwise it is a sudden power loss to Android.
 set -euo pipefail
 
 REPO=/mnt/Harbor/Code/ferros
@@ -30,6 +31,8 @@ report() {
 if [ "${1:-}" = "--read" ]; then report; exit 0; fi
 
 ENTRY=usb
+LIVE=0
+if [ "${1:-}" = "--live" ]; then LIVE=1; shift; fi
 if [ "${1:-}" = "--vault" ]; then ENTRY=vault; shift; fi
 if [ -n "${1:-}" ]; then
     BIN=$1
@@ -51,10 +54,17 @@ adb shell su -c "'test -e $STAGE'" || { echo "no $STAGE — flash the runtime-tr
 adb push -q "$BIN" "$DEV_BIN"
 adb shell su -c "'echo $DEV_BIN > $STAGE'"
 [ "$(adb shell su -c "'cat $STAGE'" | tr -d '\r')" = "1" ] || { echo "staging failed:" >&2; adb shell su -c "'dmesg | grep ferros: | tail -3'" >&2; exit 1; }
-echo "== staged; adb reboot ferros"
-
 t0=$(date +%s)
-adb reboot ferros
+if [ $LIVE = 1 ]; then
+    # Screen on and kept on; DECON hibernation off (in command mode the driver powers the whole DPU down a few idle frames after each update, so without this ferros finds DECON reading all zeros).
+    adb shell su -c "'svc power stayon true; input keyevent KEYCODE_WAKEUP; echo 0 > /sys/devices/platform/19470000.drmdecon/hibernation'"
+    sleep 2
+    echo "== staged; live handoff (screen on)"
+    timeout 10 adb shell su -c "'echo 1 > /sys/kernel/ferros/go'" || true
+else
+    echo "== staged; adb reboot ferros"
+    adb reboot ferros
+fi
 sleep 8
 while :; do
     if lsusb -d 1209:4665 >/dev/null 2>&1; then
