@@ -191,6 +191,75 @@ fn leave(p: &VaultProbe, exit: u8, attempts: u32, configured_ever: bool, usb: Op
     shim::psci_reset()
 }
 
+/// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open.
+/// Write [keylen:2 BE][key][value] -> [0][object hash:32]. Read [key] -> [0][value]; an empty key lists every key, '\n'-separated. Exec [key] -> remove -> [0] or [1].
+fn store_command(store: Option<&mut shim::ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
+    let store = match store {
+        Some(s) => s,
+        None => return alloc::vec![4],
+    };
+    let key_of = |b: &[u8]| core::str::from_utf8(b).ok().map(alloc::string::String::from);
+    match op {
+        ferros_pt::Op::Write => {
+            if params.len() < 2 {
+                return alloc::vec![3];
+            }
+            let klen = u16::from_be_bytes([params[0], params[1]]) as usize;
+            if params.len() < 2 + klen {
+                return alloc::vec![3];
+            }
+            let key = match key_of(&params[2..2 + klen]) {
+                Some(k) if !k.is_empty() => k,
+                _ => return alloc::vec![3],
+            };
+            match store.set(&key, params[2 + klen..].to_vec()) {
+                Ok(h) => {
+                    let mut r = alloc::vec![0u8];
+                    r.extend_from_slice(&h.0);
+                    r
+                }
+                Err(_) => alloc::vec![2],
+            }
+        }
+        ferros_pt::Op::Read => {
+            let key = match key_of(params) {
+                Some(k) => k,
+                None => return alloc::vec![3],
+            };
+            if key.is_empty() {
+                return match store.keys() {
+                    Ok(keys) => {
+                        let mut r = alloc::vec![0u8];
+                        for k in keys {
+                            r.extend_from_slice(k.as_bytes());
+                            r.push(b'\n');
+                        }
+                        r
+                    }
+                    Err(_) => alloc::vec![2],
+                };
+            }
+            match store.get_by_key(&key) {
+                Ok(Some(v)) => {
+                    let mut r = alloc::vec![0u8];
+                    r.extend_from_slice(&v);
+                    r
+                }
+                Ok(None) => alloc::vec![1],
+                Err(_) => alloc::vec![2],
+            }
+        }
+        ferros_pt::Op::Exec => match key_of(params) {
+            Some(k) if !k.is_empty() => match store.remove_key(&k) {
+                Ok(true) => alloc::vec![0],
+                Ok(false) => alloc::vec![1],
+                Err(_) => alloc::vec![2],
+            },
+            _ => alloc::vec![3],
+        },
+    }
+}
+
 /// The boot screen: generation, vault state + root, and how to get out.
 fn status_text(generation: u64, p: &VaultProbe) -> alloc::vec::Vec<u8> {
     let mut t = alloc::vec::Vec::new();
@@ -218,7 +287,7 @@ fn status_text(generation: u64, p: &VaultProbe) -> alloc::vec::Vec<u8> {
 pub fn entry_usb(x0: u64) -> ! {
     let link_up = shim::adopt_ufs();
     shim::arm_safety();
-    let probe = shim::vault_probe(link_up);
+    let (probe, mut store) = shim::vault_probe(link_up);
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result and the crumb shows how far USB got.
     shim::report_vault(&probe, 0xA0);
     let generation = if x0 & 1 == 1 { x0 >> 1 } else { 0 };
@@ -259,8 +328,9 @@ pub fn entry_usb(x0: u64) -> ! {
     // `display --hold` keeps a message on the panel: the idle exit is off until both volume keys (or a host REBOOT) end the session.
     let mut hold = false;
 
-    let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let mut pt_bitmap_buf: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    // Backing storage for the open inbound transfer (it holds raw slices into these); assigned on every SPEC.
+    let mut pt_data_buf: alloc::vec::Vec<u8>;
+    let mut pt_bitmap_buf: alloc::vec::Vec<u64>;
     let mut pt_inbound: Option<InboundTransfer<'_>> = None;
     let mut pt_seq_width: usize = 0;
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -271,6 +341,7 @@ pub fn entry_usb(x0: u64) -> ! {
     let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
     let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
     let cap_display = ferros_pt::command::dev_cap(ferros_pt::command::caps::DISPLAY);
+    let cap_store = ferros_pt::command::dev_cap(ferros_pt::command::caps::STORE);
     // RELOAD and RUN share STAGE; at most one of these is set, so a payload can never be jumped to as a kernel or vice versa.
     let mut reload_ok = false;
     let mut reload_size = 0usize;
@@ -434,6 +505,9 @@ pub fn entry_usb(x0: u64) -> ! {
                                             append_hex(&mut resp, b"  DSTS=", dsts);
                                         }
                                         resp.extend_from_slice(b"END\n");
+                                        queue_pt_response(&mut pt_out_data, &resp);
+                                    } else if cmd.cap == cap_store {
+                                        let resp = store_command(store.as_mut(), cmd.op, cmd.params);
                                         queue_pt_response(&mut pt_out_data, &resp);
                                     } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
                                         // A leading G#01 byte = hold (bridge `display --hold`).

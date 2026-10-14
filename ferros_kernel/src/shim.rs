@@ -449,8 +449,11 @@ pub struct VaultProbe {
     pub dvfs: u8,
 }
 
-/// The real boot pattern on the adopted link: open the ferros vault keyed by the ira, else genesis + seal it. Crumbs bracket each first-on-hardware step so a stall pins it.
-pub fn vault_probe(link_up: bool) -> VaultProbe {
+/// The ira-keyed vault on the ferros partition, kept open by the USB service for `ferros.dev.store`.
+pub type ShimStore = ferros_vault::backend::Store<crate::ufs_device::UfsDevice>;
+
+/// The real boot pattern on the adopted link: open the ferros vault keyed by the ira, else genesis + seal it. Crumbs bracket each first-on-hardware step so a stall pins it. Returns the open store too (None if open and genesis both failed).
+pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     use crate::ufs_device::UfsDevice;
     use ferros_hal::ufs::UfsController;
     use ferros_vault::anchor::AnchorKey;
@@ -489,6 +492,7 @@ pub fn vault_probe(link_up: bool) -> VaultProbe {
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";
     let mut need_seal = false;
+    let mut kept: Option<ShimStore> = None;
     let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
 
     crumb(0xE4);
@@ -507,6 +511,9 @@ pub fn vault_probe(link_up: bool) -> VaultProbe {
                 Ok(_) => need_seal = true, // vault present but key absent/mismatched
                 Err(_) => p.stage = 3,
             }
+            if !need_seal {
+                kept = Some(store);
+            }
         }
         Err(_) => need_seal = true, // no vault (or wrong key) — genesis it
     }
@@ -518,6 +525,7 @@ pub fn vault_probe(link_up: bool) -> VaultProbe {
                 Ok(_) => {
                     p.sealed = 1;
                     p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+                    kept = Some(store);
                 }
                 Err(_) => p.stage = 2,
             },
@@ -525,7 +533,7 @@ pub fn vault_probe(link_up: bool) -> VaultProbe {
         }
     }
     crumb(0xE3); // vault path returned
-    p
+    (p, kept)
 }
 
 /// Write the vault probe into the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory).
@@ -636,7 +644,7 @@ pub fn psci_reset() -> ! {
 pub fn entry_vault(x0: u64) -> ! {
     let link_up = adopt_ufs();
     arm_safety();
-    let p = vault_probe(link_up);
+    let (p, _store) = vault_probe(link_up);
     report_vault(&p, 0);
     let _ = (x0, SCRATCH, MAGIC, STAGE_M0, STAGE_M1, CRUMB_ENTRY, CRUMB_RUST);
     psci_reset()

@@ -58,6 +58,7 @@ fn usage() {
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
+    eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
     eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until both volume keys)");
 }
 
@@ -93,6 +94,7 @@ async fn main() {
             }
             cmd_poke(&args[2], &args[3]).await;
         }
+        "store" => cmd_store(&args[2..]).await,
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until both volume keys or a REBOOT).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);
@@ -599,6 +601,82 @@ async fn cmd_diag() {
     }
 }
 
+/// Vault access on the device (shim USB service, ira-keyed vault on the ferros partition): put / get / ls / rm by logical key.
+async fn cmd_store(args: &[String]) {
+    let usage = || {
+        eprintln!("Usage: ferros-bridge store put <key> <text|@file> | get <key> [out-file] | ls | rm <key>");
+        std::process::exit(1);
+    };
+    let (op, params) = match args.first().map(|s| s.as_str()) {
+        Some("put") if args.len() >= 3 => {
+            let value = match args[2].strip_prefix('@') {
+                Some(path) => std::fs::read(path).unwrap_or_else(|e| {
+                    eprintln!("Failed to read {path}: {e}");
+                    std::process::exit(1);
+                }),
+                None => args[2].as_bytes().to_vec(),
+            };
+            let key = args[1].as_bytes();
+            let mut p = Vec::with_capacity(2 + key.len() + value.len());
+            p.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            p.extend_from_slice(key);
+            p.extend_from_slice(&value);
+            (ferros_pt::Op::Write, p)
+        }
+        Some("get") if args.len() >= 2 => (ferros_pt::Op::Read, args[1].as_bytes().to_vec()),
+        Some("ls") => (ferros_pt::Op::Read, Vec::new()),
+        Some("rm") if args.len() >= 2 => (ferros_pt::Op::Exec, args[1].as_bytes().to_vec()),
+        _ => usage(),
+    };
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let cmd = build_cmd(ferros_pt::command::caps::STORE, op, &params);
+    if let Err(e) = pt_send(&link, &cmd).await {
+        eprintln!("Command send failed: {e}");
+        std::process::exit(1);
+    }
+    let r = pt_recv(&link).await.unwrap_or_else(|e| {
+        eprintln!("Response receive failed: {e}");
+        std::process::exit(1);
+    });
+    match r.first().copied() {
+        Some(0) => {}
+        Some(1) => {
+            eprintln!("not found");
+            std::process::exit(1);
+        }
+        Some(s) => {
+            eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", _ => "unknown status" });
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("empty response");
+            std::process::exit(1);
+        }
+    }
+    let body = &r[1..];
+    match args[0].as_str() {
+        "put" => println!("stored, object {}", body.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "get" => match args.get(2) {
+            Some(out) => {
+                std::fs::write(out, body).unwrap_or_else(|e| {
+                    eprintln!("Failed to write {out}: {e}");
+                    std::process::exit(1);
+                });
+                eprintln!("Wrote {} bytes to {out}", body.len());
+            }
+            None => {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(body);
+            }
+        },
+        "ls" => print!("{}", String::from_utf8_lossy(body)),
+        _ => println!("removed"),
+    }
+}
+
 /// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
 async fn cmd_display(text: &str, hold: bool) {
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
@@ -707,7 +785,7 @@ async fn cmd_read(addr_str: &str, len: usize, out_file: Option<&str>) {
         Ok(data) => {
             // Hex dump
             for (i, chunk) in data.chunks(16).enumerate() {
-                print!("{:08X}  ", addr as usize + i * 16);
+                print!("{:08X}  ", (addr & !(1 << 63)) as usize + i * 16);
                 for b in chunk {
                     print!("{:02X} ", b);
                 }
