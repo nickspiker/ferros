@@ -1,0 +1,311 @@
+//! Pixel 8 Pro (husky, Tensor G3) platform services shared by both boot paths — the cold boot from ABL and the Linux-shim handoff: the ramoops report block, crumbs, the panic reporter, cluster watchdogs, the EL3 privileged-register call, DSS clean-reboot marking, resets (PSCI, or straight into fastboot), the USB DMA path, and the PT framing helpers.
+
+use core::ptr::{read_volatile, write_volatile};
+
+use ferros_pt::transfer::OutboundTransfer;
+
+/// Result drop inside the ramoops pmsg zone (zuma-rmem ramoops_mem@fd3ff000: console [0xfd3ff000,0xfd5ff000), pmsg [0xfd5ff000,0xfd7ff000)).
+/// Unlike the low carveout scratch, this DRAM survives a reset (bootloader preserves ramoops), so the next boot's early initcall can read what ferros left here.
+pub const RAMOOPS_RESULT: usize = 0xFD60_0000;
+/// Marks a valid ferros result block at RAMOOPS_RESULT. "FeRoUfS1" LE.
+pub const RESULT_MAGIC: u64 = 0x3153_6655_6F52_6546;
+
+/// Last crumb stamped by either boot path, so `report_panic` can say how far the run got.
+pub static LAST_CRUMB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Panic → ramoops report + PSCI warm reset (the pixel8 `#[panic_handler]`, both boot paths).
+/// Slots (kernel print names): r[3]/0x18 `mbr_sig` := G#EE00 | last crumb; r[1]/0x08 `link_up` := first decimal number in the panic message (e.g. the failed allocation size), 0 if none; r[2]/0x10 bytes := heap free bytes (3 bytes LE) + free block count (`scsi_status`), all FF if the heap lock was held; r[4]/0x20 `read..verify` := line (u32 LE) + column byte; r[5]/0x28 `wrote_ok` := sync exception count; 0xA0 `pattern-readback` := last 8 bytes of the panicking file's path + first 8 bytes of the message.
+pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
+    struct Head { buf: [u8; 64], n: usize }
+    impl core::fmt::Write for Head {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if self.n < 64 { self.buf[self.n] = b; self.n += 1; }
+            }
+            Ok(())
+        }
+    }
+    let mut head = Head { buf: [0u8; 64], n: 0 };
+    let _ = core::fmt::write(&mut head, format_args!("{}", info.message()));
+    // First decimal run in the message.
+    let mut num = 0u64;
+    let mut seen = false;
+    for &b in &head.buf[..head.n] {
+        if b.is_ascii_digit() {
+            seen = true;
+            num = num.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        } else if seen {
+            break;
+        }
+    }
+    let heap = match crate::KERNEL_HEAP.try_lock() {
+        Some(h) => ((h.free_bytes() as u64) & 0xFF_FFFF) | (((h.free_blocks() as u64) & 0xFF) << 24),
+        None => 0xFFFF_FFFF,
+    };
+    let (line, col, file) = match info.location() {
+        Some(l) => (l.line(), l.column(), l.file()),
+        None => (0, 0, ""),
+    };
+    let fb = file.as_bytes();
+    let tail = &fb[fb.len().saturating_sub(8)..];
+    let mut t = [0u8; 16];
+    t[..tail.len()].copy_from_slice(tail);
+    t[8..].copy_from_slice(&head.buf[..8]);
+    unsafe {
+        let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
+        w(0x00, RESULT_MAGIC);
+        w(0x08, num);
+        w(0x10, heap);
+        w(0x18, 0xEE00 | (LAST_CRUMB.load(core::sync::atomic::Ordering::Relaxed) & 0xFF));
+        w(0x20, (line as u64) | (((col as u64) & 0xFF) << 32));
+        w(0x28, crate::exception_count());
+        core::ptr::copy_nonoverlapping(t.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
+        core::arch::asm!("dsb sy");
+        core::arch::asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
+/// Cluster watchdogs (s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8). Armed at the longest window (~1-2 min); a pure spin with no pets resets warm instead of hanging forever.
+const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+
+/// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
+/// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
+/// 2. Cluster watchdogs armed.
+pub fn arm_safety() {
+    unsafe {
+        for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8] {
+            write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
+        }
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
+        write_volatile(&raw mut crate::__exc_sink, RAMOOPS_RESULT as u64);
+    }
+    const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
+    for &wdt in &WATCHDOGS {
+        unsafe {
+            write_volatile((wdt + 0x04) as *mut u32, 0xFFFF);
+            write_volatile((wdt + 0x08) as *mut u32, 0xFFFF);
+            write_volatile(wdt as *mut u32, WDT_ARM);
+        }
+    }
+}
+
+/// Reload both cluster watchdog counters. Loops that legitimately run long (the USB service loop) call this every iteration; a real hang stops the pets and the watchdog resets warm.
+pub fn pet_watchdogs() {
+    for &wdt in &WATCHDOGS {
+        unsafe { write_volatile((wdt + 0x08) as *mut u32, 0xFFFF) };
+    }
+}
+
+/// Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0 (or an exit reason).
+pub fn crumb(c: u64) {
+    LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
+        write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x20);
+    }
+}
+
+/// Exynos EL3 monitor "privileged register" call: the secure monitor performs the MMIO access for us, so registers the S2MPU blocks from EL2 (the PMU) are still reachable. Same call Linux's set_priv_reg/get_priv_reg make (exynos-pd_el3.c): x0 = SMC_CMD_PRIV_REG, x1 = physical address, x2 = 0 read / 1 write, x3 = value. Returns x0: 0 on a successful write, the register value on a read.
+const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
+
+pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") SMC_CMD_PRIV_REG => ret,
+            inout("x1") addr => _,
+            inout("x2") write as u64 => _,
+            inout("x3") val as u64 => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _,
+        );
+    }
+    ret
+}
+
+/// PMU SYSIP_DAT0 (pmu_alive G#1546_0000 + reboot-cmd-offset G#810): the reboot mode the bootloader reads after a reset. Values from pixel-zuma-reboot.c: G#FC bootloader, G#FA fastbootd, G#FF recovery, 0 normal.
+pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
+pub const REBOOT_MODE_BOOTLOADER: u32 = 0xFC;
+
+/// Debug-snapshot (DSS) header, reserved-memory `header` node (G#D810_0000, 64 KiB, no-map). Offsets from debug-snapshot-def.h. The bootloader reads it to classify the last reset: Linux's clean-reboot path (dbg_snapshot_restart_handler) stamps EMERGENCY_REASON = DSS_SIGN_NORMAL_REBOOT, clears SCRATCH and every core's PANIC_STAT. Without that stamp the bootloader logs an unexpected "PIN Reset" (reason G#CECA) and boots normally with the reboot mode ignored — measured on hardware: mode G#FC written via EL3, bootloader read "Reboot mode: 0x0".
+pub const DSS_HEADER: usize = 0xD810_0000;
+pub const DSS_OFFSET_SCRATCH: usize = 0x100;
+pub const DSS_OFFSET_EMERGENCY_REASON: usize = 0x300;
+const DSS_OFFSET_PANIC_STAT: usize = 0x500;
+const DSS_SIGN_NORMAL_REBOOT: u32 = 0xCAFE;
+const NR_CPUS: usize = 9;
+
+/// Mark the coming reset as a clean reboot in the DSS header, exactly as Linux's restart handler does.
+pub fn dss_mark_clean_reboot() {
+    unsafe {
+        write_volatile((DSS_HEADER + DSS_OFFSET_EMERGENCY_REASON) as *mut u32, DSS_SIGN_NORMAL_REBOOT);
+        write_volatile((DSS_HEADER + DSS_OFFSET_SCRATCH) as *mut u32, 0);
+        for cpu in 0..NR_CPUS {
+            write_volatile((DSS_HEADER + DSS_OFFSET_PANIC_STAT + cpu * 4) as *mut u32, 0);
+        }
+        ferros_hal::mmio::cache_clean(DSS_HEADER, 0x600);
+        core::arch::asm!("dsb sy");
+    }
+}
+
+/// Reset straight into the bootloader (fastboot): mark the reset clean in the DSS header, stamp the reboot mode through the EL3 monitor, then fire the cluster watchdog with a count of 1.
+/// Why the watchdog and not PSCI: measured on husky, a PSCI SYSTEM_RESET issued by ferros comes back as RST_STAT PIN_RESET (reason G#CECA) and the bootloader reads "Reboot mode: 0x0" even though the EL3 readback showed G#FC just before; an APC watchdog reset (RST_STAT CLUSTER0_NONCPU_WDTRESET) with the same mode stamped boots into fastboot ("Reboot mode: 0xfc - Bootloader"). Linux's own PSCI reset comes back as PIN_RESET|PO_RESET with the mode intact, so EL3 treats the two differently; the watchdog sidesteps whatever that is.
+/// Returns only if the monitor refused the write (nonzero) or the watchdog never fired, so the caller can report it.
+pub fn reboot_to_bootloader() -> u64 {
+    dss_mark_clean_reboot();
+    let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
+    if r != 0 {
+        return r;
+    }
+    // WTCON: RSTEN b0 + EN b5, prescaler 0, DIV16 (0 << 3); WTDAT = WTCNT = 1 → reset on the next watchdog tick.
+    for &wdt in &WATCHDOGS {
+        unsafe {
+            write_volatile(wdt as *mut u32, 0);
+            write_volatile((wdt + 0x04) as *mut u32, 1);
+            write_volatile((wdt + 0x08) as *mut u32, 1);
+            write_volatile(wdt as *mut u32, (1 << 5) | (1 << 0));
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    for _ in 0..(1u32 << 28) {
+        core::hint::spin_loop();
+    }
+    u64::MAX
+}
+
+/// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.
+pub fn psci_reset() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
+/// HSI0 S2MPU in front of the USB DMA master.
+const S2MPU_HSI0: usize = 0x1107_0000;
+/// USB SYSMMU (samsung sysmmu v9). Per-VM control at 0x8000 + vm * 0x1000, bit 0 = translation enable; VM count in NUM_CONTEXT (0x100) bits 4:0.
+const USB_SYSMMU: usize = 0x1104_0000;
+const SYSMMU_CTRL_VM: usize = 0x8000;
+const SYSMMU_VM_STRIDE: usize = 0x1000;
+const SYSMMU_NUM_CONTEXT: usize = 0x100;
+
+pub fn cntpct() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v) };
+    v
+}
+
+pub fn cntfrq() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v) };
+    // Unprogrammed CNTFRQ would make every timeout zero; fall back to the Tensor G3 arch timer rate.
+    if v == 0 { 24_576_000 } else { v }
+}
+
+/// Append "LABEL=<8 hex digits>\n".
+pub fn append_hex(log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32) {
+    log.extend_from_slice(label);
+    let hex = b"0123456789ABCDEF";
+    for i in (0..8).rev() {
+        log.push(hex[((val >> (i * 4)) & 0xF) as usize]);
+    }
+    log.push(b'\n');
+}
+
+/// Frame a response as a PT outbound transfer: SPEC + DATA packets each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries (blast mode, no FIN — see the cold-boot loop).
+pub fn queue_pt_response(out: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
+    out.clear();
+    let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(payload.len())];
+    let mut spec_buf = [0u8; 512];
+    if let Some((mut ob, spec_len)) = OutboundTransfer::start(ferros_pt::StreamId::FIRST, payload, &mut ob_bitmap, &mut spec_buf) {
+        out.extend_from_slice(&spec_buf[..spec_len]);
+        out.resize(512, 0);
+        let mut pkt = [0u8; 512];
+        while !ob.all_sent() {
+            let plen = ob.next_data_packet(payload, &mut pkt);
+            if plen == 0 {
+                break;
+            }
+            let start = out.len();
+            out.extend_from_slice(&pkt[..plen]);
+            out.resize(start + 512, 0);
+        }
+    }
+}
+
+/// SYSMMU + S2MPU state as Linux left it, and what the disable read back. DIAG reports it.
+pub struct DmaPath {
+    pub s2mpu_ctrl: u32,
+    pub num_vm: usize,
+    pub vm_ctrl_before: [u32; 8],
+    pub vm_ctrl_after: [u32; 8],
+}
+
+/// Put the DWC3 DMA master on physical addresses: bypass the HSI0 S2MPU, disable translation in every SYSMMU VM context.
+pub fn open_usb_dma_path() -> DmaPath {
+    let rd = |a: usize| unsafe { read_volatile(a as *const u32) };
+    let wr = |a: usize, v: u32| unsafe { write_volatile(a as *mut u32, v) };
+    let s2mpu_ctrl = rd(S2MPU_HSI0);
+    wr(S2MPU_HSI0 + 0x54, 0xFF);
+    wr(S2MPU_HSI0, 0);
+    let num_vm = ((rd(USB_SYSMMU + SYSMMU_NUM_CONTEXT) & 0x1F) as usize).clamp(1, 8);
+    let mut d = DmaPath { s2mpu_ctrl, num_vm, vm_ctrl_before: [0; 8], vm_ctrl_after: [0; 8] };
+    for vm in 0..num_vm {
+        let reg = USB_SYSMMU + SYSMMU_CTRL_VM + vm * SYSMMU_VM_STRIDE;
+        d.vm_ctrl_before[vm] = rd(reg);
+        wr(reg, d.vm_ctrl_before[vm] & !1);
+        d.vm_ctrl_after[vm] = rd(reg);
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    d
+}
+
+/// Instruction cache on (SCTLR_EL2.I). Both boot paths enter with the MMU and caches off; with I=0 every instruction fetch goes to DRAM (a 258 KB RELOAD took ~55 s, ~3 s with I=1). With the MMU off, I=1 makes fetches Normal inner write-through cacheable and touches nothing on the data side, so DMA coherency is unaffected. Code is only ever written by the RELOAD stub and RUN staging, and both invalidate the I-cache before executing it.
+pub fn enable_icache() {
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "mrs {t}, sctlr_el2",
+            "orr {t}, {t}, #(1 << 12)",
+            "msr sctlr_el2, {t}",
+            "isb",
+            t = out(reg) _,
+        );
+    }
+}
+
+/// The previous run's report block (32 words at RAMOOPS_RESULT), if it carries the result magic. Read it before `arm_safety`, which zeroes the report slots. Ramoops DRAM survives warm resets (PSCI, watchdog), so a cold boot can show why the last session ended.
+pub fn read_report() -> Option<[u64; 32]> {
+    let mut r = [0u64; 32];
+    for (i, w) in r.iter_mut().enumerate() {
+        *w = unsafe { read_volatile((RAMOOPS_RESULT + i * 8) as *const u64) };
+    }
+    if r[0] == RESULT_MAGIC { Some(r) } else { None }
+}
+
+/// Minimal report for a run without a vault probe (the cold boot): magic, the exit crumb, the sync exception count.
+pub fn report_exit(exit: u8) {
+    LAST_CRUMB.store(exit as u64, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        write_volatile(RAMOOPS_RESULT as *mut u64, RESULT_MAGIC);
+        write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, exit as u64);
+        write_volatile((RAMOOPS_RESULT + 0x28) as *mut u64, crate::exception_count());
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x40);
+    }
+}

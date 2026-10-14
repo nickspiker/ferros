@@ -88,7 +88,7 @@ fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
 pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     let mut rep = alloc::vec::Vec::new();
     // Never touch a powered-down DPU: on husky a CPU read of DECON with the DPU domain off returns 0 but leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever (measured: the boot screen's single DECON_VERSION read in the reboot path made DIAG's PMU readback hang). The domain state is read through the EL3 monitor, which is safe: word 0 of each PMU power-domain block is 1 when on (pd-dpub G#1546_1D00, pd-dpuf0 G#1546_1D80, pd-dpuf1 G#1546_1E00; other offsets are not whitelisted and return -EINVAL).
-    let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::shim::priv_reg(a, false, 0));
+    let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::platform::priv_reg(a, false, 0));
     append_hex(&mut rep, b"PD_DPUB=", pd[0] as u32);
     append_hex(&mut rep, b"PD_DPUF0=", pd[1] as u32);
     append_hex(&mut rep, b"PD_DPUF1=", pd[2] as u32);

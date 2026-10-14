@@ -1,38 +1,57 @@
-//! Post-handoff USB service: ferros keeps the UFS link Linux brought up AND serves Photon Transport over the USB controller Linux was running, so the bridge's DIAG / RELOAD / RUN / REBOOT work with the disk live.
+//! The ferros USB service: Photon Transport on the phone's DWC3, shared by both ways ferros boots on husky.
 //!
-//! Linux's reboot notifier (husky-kernel ferros-handoff.patch) keeps the USB glue, DWC3 core and PHY runtime-resumed before the jump, so every block here is clocked and powered.
-//! What Linux leaves that ferros must undo: the DWC3 DMA goes through the USB SYSMMU (dwc3 has `iommus` in the DT) with Linux's page tables, so every VM context is disabled to put the master on physical addresses; the HSI0 S2MPU is bypassed like the cold path does.
-//! Everything else is the cold-boot recipe: eUSB2 PHY init, DWC3 init with soft reset, the enumeration watchdog, and the same PT dispatch.
+//! - **Handoff** (slot a, chainloaded from the patched Linux): UFS is live and the ira-rooted vault is open, so STORE works; every exit warm-resets back into Android.
+//! - **Cold** (slot b, straight from ABL): no Linux, no disk yet (the cold UFS link startup is still blocked, UFS.md); exits other than a plain host REBOOT go to fastboot, since a plain reset would just boot ferros again and there is no disk to mark slots with.
 //!
-//! Exits always land back in Android with a ramoops report (exit reason in the crumb byte): REBOOT from the host, 64 s without enumerating, 512 s without a PT command, or both volume buttons. A fault or a hang is caught by the fault sink or the watchdog. So the phone never needs hands.
+//! Both paths: the USB DMA master is put on physical addresses (HSI0 S2MPU bypassed, every USB SYSMMU VM context disabled), the eUSB2 PHY + DWC3 are (re)initialised with the enumeration watchdog, and PT serves DIAG / RUN / RELOAD / MEM / DISPLAY / STORE / REBOOT. Exits leave a ramoops report (exit reason in the crumb byte): REBOOT from the host, 64 s without enumerating, 512 s without a PT command, a 16 s mid-transfer stall, or both volume buttons; faults and hangs are caught by the fault sink and the watchdog.
 //!
-//! RELOAD: the image is linked at 0x92400000 with absolute addresses in its data, so it must run there. The new image is staged at STAGE, a tiny copy stub is placed at STUB, and the stub copies the image over the link base and jumps to it; x0 carries the generation (bit 0 = reloaded).
+//! RELOAD: the image is statically linked with absolute addresses in its data, so every generation must run at its link base. The new image is staged at `Boot::stage`, a tiny copy stub is placed at `Boot::stub`, and the stub copies the image over the link base and jumps to it; x0 carries the generation (bit 0 = reloaded).
 
 use core::ptr::{read_volatile, write_volatile};
 
 use ferros_hal::usb::UsbEvent;
 use ferros_pt::packet;
-use ferros_pt::transfer::{InboundTransfer, OutboundTransfer};
+use ferros_pt::transfer::InboundTransfer;
 
-use crate::shim::{self, VaultProbe};
+use crate::platform::{self, append_hex, cntfrq, cntpct, open_usb_dma_path, queue_pt_response};
+use crate::vault_boot::{report_vault, ShimStore, VaultProbe};
 
 const DWC3: usize = 0x1121_0000;
 const USBCON: usize = 0x1110_0000;
-/// HSI0 S2MPU in front of the USB DMA master.
-const S2MPU_HSI0: usize = 0x1107_0000;
-/// USB SYSMMU (samsung sysmmu v9). Per-VM control at 0x8000 + vm * 0x1000, bit 0 = translation enable; VM count in NUM_CONTEXT (0x100) bits 4:0.
-const USB_SYSMMU: usize = 0x1104_0000;
-const SYSMMU_CTRL_VM: usize = 0x8000;
-const SYSMMU_VM_STRIDE: usize = 0x1000;
-const SYSMMU_NUM_CONTEXT: usize = 0x100;
 
-/// Link base of the shim image (aarch64-shim.ld) — every generation runs here.
-const LINK_BASE: usize = 0x9240_0000;
-/// Staging slot for RELOAD and RUN, inside the carveout past this generation's image + stack + 4 MiB heap.
-const STAGE: usize = 0x92A0_0000;
+/// Which way ferros got here; decides the DIAG banner and where exits go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BootKind {
+    /// Chainloaded from the patched Linux on slot a (runtime trigger): exits warm-reset back into Android.
+    #[cfg_attr(not(shim_handoff), allow(dead_code))]
+    Handoff,
+    /// Booted straight from ABL on slot b: exits other than a plain host REBOOT go to fastboot.
+    Cold,
+}
+
+/// Everything the service needs from the boot path that brought ferros up.
+pub struct Boot {
+    pub kind: BootKind,
+    /// Address the image is linked at (absolute pointers in its data assume it); RELOAD's copy stub lands every generation here.
+    pub link_base: usize,
+    /// RELOAD/RUN staging slot, clear of this image, its stack and its heap.
+    pub stage: usize,
+    /// Where the RELOAD copy stub runs from (clear of both the image and the staging slot).
+    pub stub: usize,
+    /// x0 at entry: 0 or a DTB pointer from the loader, or ((generation << 1) | 1) from a RELOAD.
+    pub x0: u64,
+    pub probe: Option<VaultProbe>,
+    pub store: Option<ShimStore>,
+    /// The previous session's report block, read before `arm_safety` cleared it (survives warm resets).
+    pub prev: Option<[u64; 32]>,
+    /// Boot-path specific DIAG lines.
+    pub extras: alloc::vec::Vec<(&'static [u8], u32)>,
+    /// `bridge diag ufs`: the cold path's UFS link-startup probe.
+    pub ufs_probe: Option<fn() -> alloc::vec::Vec<u8>>,
+}
+
+/// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
-/// Where the reload copy stub runs from (past the staging slot, below the 0x92F00000 result scratch).
-const STUB: usize = 0x92E8_0000;
 
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
 const EXIT_REBOOT: u8 = 0xB0;
@@ -60,8 +79,8 @@ const GPA6_DAT: usize = 0x154D_00A4;
 const VOL_DOWN_BIT: u32 = 1 << 1;
 const VOL_UP_BIT: u32 = 1 << 2;
 
-// Reload copy stub. Position-independent; runs from STUB after being copied there, so it can overwrite the image that called it.
-// x0 = source (STAGE), x1 = destination (LINK_BASE), x2 = byte count (multiple of 8, nonzero), x3 = x0 for the new image.
+// Reload copy stub. Position-independent; runs from `Boot::stub` after being copied there, so it can overwrite the image that called it.
+// x0 = source (`Boot::stage`), x1 = destination (`Boot::link_base`), x2 = byte count (multiple of 8, nonzero), x3 = x0 for the new image.
 // MMU is off at EL2 after the handoff, so data stores go straight to DRAM; only the I-side needs invalidating.
 core::arch::global_asm!(
     ".section .text.reload_stub, \"ax\"",
@@ -88,81 +107,10 @@ unsafe extern "C" {
     static ferros_reload_stub_end: u8;
 }
 
-fn cntpct() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v) };
-    v
-}
-
-fn cntfrq() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v) };
-    // Unprogrammed CNTFRQ would make every timeout zero; fall back to the Tensor G3 arch timer rate.
-    if v == 0 { 24_576_000 } else { v }
-}
-
-/// Append "LABEL=<8 hex digits>\n".
-fn append_hex(log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32) {
-    log.extend_from_slice(label);
-    let hex = b"0123456789ABCDEF";
-    for i in (0..8).rev() {
-        log.push(hex[((val >> (i * 4)) & 0xF) as usize]);
-    }
-    log.push(b'\n');
-}
-
-/// Frame a response as a PT outbound transfer: SPEC + DATA packets each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries (blast mode, no FIN — see the cold-boot loop).
-fn queue_pt_response(out: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
-    out.clear();
-    let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(payload.len())];
-    let mut spec_buf = [0u8; 512];
-    if let Some((mut ob, spec_len)) = OutboundTransfer::start(ferros_pt::StreamId::FIRST, payload, &mut ob_bitmap, &mut spec_buf) {
-        out.extend_from_slice(&spec_buf[..spec_len]);
-        out.resize(512, 0);
-        let mut pkt = [0u8; 512];
-        while !ob.all_sent() {
-            let plen = ob.next_data_packet(payload, &mut pkt);
-            if plen == 0 {
-                break;
-            }
-            let start = out.len();
-            out.extend_from_slice(&pkt[..plen]);
-            out.resize(start + 512, 0);
-        }
-    }
-}
-
-/// SYSMMU + S2MPU state as Linux left it, and what the disable read back. DIAG reports it.
-struct DmaPath {
-    s2mpu_ctrl: u32,
-    num_vm: usize,
-    vm_ctrl_before: [u32; 8],
-    vm_ctrl_after: [u32; 8],
-}
-
-/// Put the DWC3 DMA master on physical addresses: bypass the HSI0 S2MPU, disable translation in every SYSMMU VM context.
-fn open_usb_dma_path() -> DmaPath {
-    let rd = |a: usize| unsafe { read_volatile(a as *const u32) };
-    let wr = |a: usize, v: u32| unsafe { write_volatile(a as *mut u32, v) };
-    let s2mpu_ctrl = rd(S2MPU_HSI0);
-    wr(S2MPU_HSI0 + 0x54, 0xFF);
-    wr(S2MPU_HSI0, 0);
-    let num_vm = ((rd(USB_SYSMMU + SYSMMU_NUM_CONTEXT) & 0x1F) as usize).clamp(1, 8);
-    let mut d = DmaPath { s2mpu_ctrl, num_vm, vm_ctrl_before: [0; 8], vm_ctrl_after: [0; 8] };
-    for vm in 0..num_vm {
-        let reg = USB_SYSMMU + SYSMMU_CTRL_VM + vm * SYSMMU_VM_STRIDE;
-        d.vm_ctrl_before[vm] = rd(reg);
-        wr(reg, d.vm_ctrl_before[vm] & !1);
-        d.vm_ctrl_after[vm] = rd(reg);
-    }
-    unsafe { core::arch::asm!("dsb sy") };
-    d
-}
-
 /// Report the vault + the USB session and warm-reset back to Android. The kernel dumps the whole 256-byte block as r[00..31].
 /// USB-service layout: r[4] (0x20) bytes = init attempts, ever-configured, DSTS[7:0], DSTS[15:8], DSTS[23:16]; r[6] = bulk OUT completes | bulk IN completes << 32; r[7] = XferNotReady (HAL) | DEPCMD status failures << 32; r[8] = EP events seen | SETUPs << 32; r[9] = GEVNTCOUNT | GEVNTSIZ << 32; r[10] = last failed DEPCMD | its ep << 32 | its type << 40; r[11] = bulk_out_armed | bulk_out_ready << 8 | bulk_in_idle << 16 | configured << 24 | ep2 TRB ctrl snapshot << 32; r[12..17] = last 12 raw EP events (oldest-first order is evt_ring_n mod 12); r[18] = PT SPECs | DATA packets << 32; r[19] = DATA decoded | DATA accepted << 32; r[22] = commands | loop XferNotReady << 32.
-fn leave(p: &VaultProbe, exit: u8, attempts: u32, configured_ever: bool, usb: Option<&ferros_hal::usb::Dwc3Dev>, st: &PtStats) -> ! {
-    shim::report_vault(p, exit);
+fn leave(b: &Boot, exit: u8, attempts: u32, configured_ever: bool, usb: Option<&ferros_hal::usb::Dwc3Dev>, st: &PtStats) -> ! {
+    report(b, exit);
     let rd = |a: usize| unsafe { read_volatile(a as *const u32) };
     let dsts = rd(DWC3 + 0xC70C);
     let usb_b = [attempts.min(255) as u8, configured_ever as u8, dsts as u8, (dsts >> 8) as u8, (dsts >> 16) as u8];
@@ -188,12 +136,24 @@ fn leave(p: &VaultProbe, exit: u8, attempts: u32, configured_ever: bool, usb: Op
         let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
         write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
     }
-    shim::psci_reset()
+    // Cold boot: a plain reset would just boot ferros again, so anything but an explicit host REBOOT goes to fastboot for the host to decide (falls back to a plain reset if the EL3 monitor refuses the reboot-mode write).
+    if b.kind == BootKind::Cold && exit != EXIT_REBOOT {
+        let _ = platform::reboot_to_bootloader();
+    }
+    platform::psci_reset()
+}
+
+/// Write this session's report: the full vault report when a vault was probed, the minimal one otherwise.
+fn report(b: &Boot, exit: u8) {
+    match &b.probe {
+        Some(p) => report_vault(p, exit),
+        None => platform::report_exit(exit),
+    }
 }
 
 /// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open.
 /// Write [keylen:2 BE][key][value] -> [0][object hash:32]. Read [key] -> [0][value]; an empty key lists every key, '\n'-separated. Exec [key] -> remove -> [0] or [1].
-fn store_command(store: Option<&mut shim::ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
+fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
     let store = match store {
         Some(s) => s,
         None => return alloc::vec![4],
@@ -260,14 +220,24 @@ fn store_command(store: Option<&mut shim::ShimStore>, op: ferros_pt::Op, params:
     }
 }
 
-/// The boot screen: generation, vault state + root, and how to get out.
-fn status_text(generation: u64, p: &VaultProbe) -> alloc::vec::Vec<u8> {
+/// The boot screen: boot path, generation, vault state + root, and how to get out.
+fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> alloc::vec::Vec<u8> {
     let mut t = alloc::vec::Vec::new();
     let hex = b"0123456789ABCDEF";
-    t.extend_from_slice(b"ferros\n\nchainloaded from Linux, generation G#");
+    t.extend_from_slice(match kind {
+        BootKind::Handoff => b"ferros\n\nchainloaded from Linux, generation G#".as_slice(),
+        BootKind::Cold => b"ferros\n\nbooted from ABL, generation G#",
+    });
     for i in (0..4).rev() {
         t.push(hex[((generation >> (i * 4)) & 0xF) as usize]);
     }
+    let p = match probe {
+        Some(p) => p,
+        None => {
+            t.extend_from_slice(b"\n\nufs: not up on a cold boot yet\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nfor fastboot\n");
+            return t;
+        }
+    };
     t.extend_from_slice(b"\n\nufs: ");
     t.extend_from_slice(if p.link_up { b"adopted, link up" } else { b"LINK DOWN" });
     t.extend_from_slice(b"\nvault: ");
@@ -284,29 +254,27 @@ fn status_text(generation: u64, p: &VaultProbe) -> alloc::vec::Vec<u8> {
 }
 
 /// Shim entry with the USB service: adopt UFS, arm the safety nets, probe the vault, then serve PT over USB until told to leave.
-pub fn entry_usb(x0: u64) -> ! {
-    let link_up = shim::adopt_ufs();
-    shim::arm_safety();
-    let (probe, mut store) = shim::vault_probe(link_up);
-    // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result and the crumb shows how far USB got.
-    shim::report_vault(&probe, 0xA0);
-    let generation = if x0 & 1 == 1 { x0 >> 1 } else { 0 };
+pub fn run(mut b: Boot) -> ! {
+    // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
+    report(&b, 0xA0);
+    let generation = if b.x0 & 1 == 1 { b.x0 >> 1 } else { 0 };
+    let mut store = b.store.take();
     let t_boot = cntpct();
     let exc_start = crate::exception_count();
 
     // Boot screen: after a --live handoff DECON is still running, so show where this generation stands before USB even comes up (show() touches nothing when the DPU is powered down).
-    let _ = crate::shim_display::show(&status_text(generation, &probe), cntfrq());
+    let _ = crate::display::show(&status_text(b.kind, generation, b.probe.as_ref()), cntfrq());
 
     let dma = open_usb_dma_path();
-    shim::crumb(0xA1);
+    platform::crumb(0xA1);
     crate::pixel8_eusb_phy_init();
-    shim::crumb(0xA2);
+    platform::crumb(0xA2);
     ferros_hal::usb::set_dwc3_base(DWC3);
     let mut usb = match ferros_hal::usb::Dwc3Dev::init() {
         Some(u) => u,
-        None => leave(&probe, EXIT_NO_USB, 1, false, None, &PtStats::default()),
+        None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),
     };
-    shim::crumb(0xA3);
+    platform::crumb(0xA3);
 
     let freq = cntfrq();
     // Enumeration watchdog (cold-boot values): 2 s of total silence = dead attempt; 4 s since init without SET_CONFIGURATION = wedged EP0. Either re-inits PHY + DWC3, which the host sees as a fresh attach.
@@ -354,21 +322,21 @@ pub fn entry_usb(x0: u64) -> ! {
     let heap_end = ((&raw const __stack_top as usize + 0xFFF) & !0xFFF) + crate::HEAP_SIZE;
 
     loop {
-        shim::pet_watchdogs();
+        platform::pet_watchdogs();
         let gpa4 = unsafe { read_volatile(GPA4_DAT as *const u32) };
         let gpa6 = unsafe { read_volatile(GPA6_DAT as *const u32) };
         if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
-            leave(&probe, EXIT_BUTTONS, attempts, configured_ever, Some(&usb), &st);
+            leave(&b, EXIT_BUTTONS, attempts, configured_ever, Some(&usb), &st);
         }
         let now = cntpct();
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
-            leave(&probe, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
+            leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
         }
         if configured_ever && !hold && now.wrapping_sub(t_command) > idle_giveup {
-            leave(&probe, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
+            leave(&b, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
         }
         if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
-            leave(&probe, EXIT_PT_STALL, attempts, configured_ever, Some(&usb), &st);
+            leave(&b, EXIT_PT_STALL, attempts, configured_ever, Some(&usb), &st);
         }
 
         match usb.poll_event() {
@@ -430,7 +398,7 @@ pub fn entry_usb(x0: u64) -> ! {
                 if usb.is_configured() && !configured_ever {
                     configured_ever = true;
                     t_command = cntpct();
-                    shim::crumb(0xA4);
+                    platform::crumb(0xA4);
                 }
             }
             UsbEvent::TransferComplete { ep } => {
@@ -466,7 +434,18 @@ pub fn entry_usb(x0: u64) -> ! {
                                 if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                                        resp.extend_from_slice(b"ferros shim on Pixel 8 Pro (Tensor G3), chainloaded from Linux\nUSB: inherited DWC3, enumerated\n");
+                                        if cmd.params == b"ufs" {
+                                            match b.ufs_probe {
+                                                Some(f) => resp = f(),
+                                                None => resp.extend_from_slice(b"no UFS probe on this boot path (the handoff adopts Linux's live link)\n"),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        resp.extend_from_slice(match b.kind {
+                                            BootKind::Handoff => b"ferros on Pixel 8 Pro (Tensor G3), chainloaded from Linux\n".as_slice(),
+                                            BootKind::Cold => b"ferros on Pixel 8 Pro (Tensor G3), cold boot from ABL\n",
+                                        });
                                         let r = |a: usize| unsafe { read_volatile(a as *const u32) };
                                         append_hex(&mut resp, b"GEN=", generation as u32);
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
@@ -475,23 +454,40 @@ pub fn entry_usb(x0: u64) -> ! {
                                         append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
                                         append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
                                         append_hex(&mut resp, b"USB_ATTEMPTS=", attempts);
-                                        append_hex(&mut resp, b"BASE=", LINK_BASE as u32);
-                                        append_hex(&mut resp, b"STAGE=", STAGE as u32);
-                                        append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
-                                        append_hex(&mut resp, b"UFS_LINK=", probe.link_up as u32);
-                                        append_hex(&mut resp, b"VAULT_OPENED=", probe.opened as u32);
-                                        append_hex(&mut resp, b"VAULT_VERIFIED=", probe.verified as u32);
-                                        append_hex(&mut resp, b"VAULT_SEALED=", probe.sealed as u32);
-                                        append_hex(&mut resp, b"VAULT_STAGE=", probe.stage as u32);
-                                        for (i, w) in probe.root16.chunks(4).enumerate() {
-                                            let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
-                                            append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+                                        unsafe extern "C" {
+                                            static _start: u8;
                                         }
-                                        append_hex(&mut resp, b"WAIRUA_OK=", probe.wairua_ok as u32);
+                                        append_hex(&mut resp, b"BASE=", b.link_base as u32);
+                                        append_hex(&mut resp, b"RUNNING_AT=", &raw const _start as usize as u32);
+                                        append_hex(&mut resp, b"STAGE=", b.stage as u32);
+                                        append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
+                                        append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
+                                        if let Some(probe) = &b.probe {
+                                            append_hex(&mut resp, b"UFS_LINK=", probe.link_up as u32);
+                                            append_hex(&mut resp, b"VAULT_OPENED=", probe.opened as u32);
+                                            append_hex(&mut resp, b"VAULT_VERIFIED=", probe.verified as u32);
+                                            append_hex(&mut resp, b"VAULT_SEALED=", probe.sealed as u32);
+                                            append_hex(&mut resp, b"VAULT_STAGE=", probe.stage as u32);
+                                            for (i, w) in probe.root16.chunks(4).enumerate() {
+                                                let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
+                                                append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+                                            }
+                                            append_hex(&mut resp, b"WAIRUA_OK=", probe.wairua_ok as u32);
+                                        }
+                                        if let Some(prev) = &b.prev {
+                                            // Why the previous session ended (crumb byte G#Bx = exit reason, G#EExx = panic; a nonzero fault ELR = the fault sink fired).
+                                            append_hex(&mut resp, b"PREV_EXIT=", prev[3] as u32);
+                                            append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
+                                            append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
+                                            append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
+                                        }
+                                        for (label, v) in &b.extras {
+                                            append_hex(&mut resp, label, *v);
+                                        }
                                         // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
-                                        append_hex(&mut resp, b"PMU_REBOOT_CMD=", shim::priv_reg(shim::PMU_REBOOT_CMD, false, 0) as u32);
-                                        append_hex(&mut resp, b"DSS_REASON=", r(shim::DSS_HEADER + shim::DSS_OFFSET_EMERGENCY_REASON));
-                                        append_hex(&mut resp, b"DSS_SCRATCH=", r(shim::DSS_HEADER + shim::DSS_OFFSET_SCRATCH));
+                                        append_hex(&mut resp, b"PMU_REBOOT_CMD=", platform::priv_reg(platform::PMU_REBOOT_CMD, false, 0) as u32);
+                                        append_hex(&mut resp, b"DSS_REASON=", r(platform::DSS_HEADER + platform::DSS_OFFSET_EMERGENCY_REASON));
+                                        append_hex(&mut resp, b"DSS_SCRATCH=", r(platform::DSS_HEADER + platform::DSS_OFFSET_SCRATCH));
                                         append_hex(&mut resp, b"S2MPU_HSI0_CTRL_LINUX=", dma.s2mpu_ctrl);
                                         append_hex(&mut resp, b"SYSMMU_NUM_VM=", dma.num_vm as u32);
                                         for vm in 0..dma.num_vm {
@@ -516,7 +512,7 @@ pub fn entry_usb(x0: u64) -> ! {
                                             _ => (cmd.params, false),
                                         };
                                         hold |= h;
-                                        let rep = crate::shim_display::show(text, freq);
+                                        let rep = crate::display::show(text, freq);
                                         queue_pt_response(&mut pt_out_data, &rep);
                                     } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
@@ -524,8 +520,8 @@ pub fn entry_usb(x0: u64) -> ! {
                                         let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
                                         let addr = raw & !(1 << 63);
                                         let (ret, back) = if raw >> 63 == 1 {
-                                            let ret = shim::priv_reg(addr, true, val);
-                                            (ret, shim::priv_reg(addr, false, 0) as u32)
+                                            let ret = platform::priv_reg(addr, true, val);
+                                            (ret, platform::priv_reg(addr, false, 0) as u32)
                                         } else {
                                             unsafe {
                                                 write_volatile(addr as usize as *mut u32, val);
@@ -545,7 +541,7 @@ pub fn entry_usb(x0: u64) -> ! {
                                         let mut out = alloc::vec![0u8; len];
                                         if raw >> 63 == 1 {
                                             for (i, c) in out.chunks_mut(4).enumerate() {
-                                                let v = shim::priv_reg((addr + i * 4) as u64, false, 0) as u32;
+                                                let v = platform::priv_reg((addr + i * 4) as u64, false, 0) as u32;
                                                 c.copy_from_slice(&v.to_le_bytes()[..c.len()]);
                                             }
                                         } else if addr % 4 == 0 && len % 4 == 0 {
@@ -562,13 +558,13 @@ pub fn entry_usb(x0: u64) -> ! {
                                         // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
                                         let params = cmd.params;
                                         let is_kernel = params.len() > 0x1000 && params[..4] == [0x4D, 0x5A, 0x00, 0x91];
-                                        let fits = !params.is_empty() && params.len() <= STAGE_MAX && heap_end <= STAGE;
+                                        let fits = !params.is_empty() && params.len() <= STAGE_MAX && heap_end <= b.stage;
                                         let ok_shape = if cmd.cap == cap_reload { is_kernel && fits } else { fits };
                                         let mut ok = false;
                                         if ok_shape {
                                             let src_hash = blake3::hash(params);
-                                            unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), STAGE as *mut u8, params.len()) };
-                                            let staged = unsafe { core::slice::from_raw_parts(STAGE as *const u8, params.len()) };
+                                            unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), b.stage as *mut u8, params.len()) };
+                                            let staged = unsafe { core::slice::from_raw_parts(b.stage as *const u8, params.len()) };
                                             ok = blake3::hash(staged) == src_hash;
                                         }
                                         let size = if ok { params.len() } else { 0 };
@@ -593,13 +589,13 @@ pub fn entry_usb(x0: u64) -> ! {
                                             for _ in 0..(1 << 24) {
                                                 core::hint::spin_loop();
                                             }
-                                            shim::crumb(0xA6);
+                                            platform::crumb(0xA6);
                                             unsafe {
                                                 let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                                                 write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
                                                 let stub = &raw const ferros_reload_stub as usize;
                                                 let stub_len = &raw const ferros_reload_stub_end as usize - stub;
-                                                core::ptr::copy_nonoverlapping(stub as *const u8, STUB as *mut u8, stub_len);
+                                                core::ptr::copy_nonoverlapping(stub as *const u8, b.stub as *mut u8, stub_len);
                                                 let len = (reload_size + 7) & !7;
                                                 let next_x0 = ((generation + 1) << 1) | 1;
                                                 core::arch::asm!(
@@ -608,9 +604,9 @@ pub fn entry_usb(x0: u64) -> ! {
                                                     "dsb sy",
                                                     "isb",
                                                     "br {stub}",
-                                                    stub = in(reg) STUB,
-                                                    in("x0") STAGE,
-                                                    in("x1") LINK_BASE,
+                                                    stub = in(reg) b.stub,
+                                                    in("x0") b.stage,
+                                                    in("x1") b.link_base,
                                                     in("x2") len,
                                                     in("x3") next_x0,
                                                     options(noreturn)
@@ -622,7 +618,7 @@ pub fn entry_usb(x0: u64) -> ! {
                                         if run_ok && run_size > 0 {
                                             unsafe { core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb") };
                                             let mut out = alloc::vec![0u8; 4096];
-                                            let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(STAGE) };
+                                            let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(b.stage) };
                                             let ret = entry(cmd.params.as_ptr(), cmd.params.len(), out.as_mut_ptr(), out.len());
                                             let n = (ret as usize).min(out.len());
                                             let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + n);
@@ -641,14 +637,14 @@ pub fn entry_usb(x0: u64) -> ! {
                                             spins += 1;
                                         }
                                         if fastboot {
-                                            shim::report_vault(&probe, EXIT_FASTBOOT);
+                                            report(&b, EXIT_FASTBOOT);
                                             unsafe {
                                                 let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                                                 write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
                                             }
-                                            let _ = shim::reboot_to_bootloader();
+                                            let _ = platform::reboot_to_bootloader();
                                         }
-                                        leave(&probe, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
+                                        leave(&b, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
                                     }
                                 }
                             }

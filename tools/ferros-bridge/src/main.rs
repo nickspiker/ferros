@@ -45,7 +45,7 @@ fn usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  status       Check if device is connected");
-    eprintln!("  diag         Retrieve boot diagnostics from device");
+    eprintln!("  diag [ufs]   Retrieve boot diagnostics from device (ufs = run the cold UFS link-startup probe)");
     eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
     eprintln!("  echo         PT echo test — send pattern, verify round-trip");
     eprintln!("  send <hex>   Send hex bytes via PT transfer");
@@ -75,7 +75,8 @@ async fn main() {
 
     match args[1].as_str() {
         "status" => cmd_status(),
-        "diag" => cmd_diag().await,
+        // `diag ufs` runs the cold boot's UFS link-startup probe (long report).
+        "diag" => cmd_diag(args.get(2).map(|s| s.as_bytes()).unwrap_or(&[])).await,
         "read" => {
             if args.len() < 3 {
                 eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU: on husky a direct PMU read makes the next EL3 call hang)");
@@ -560,7 +561,7 @@ fn tri_state(v: u32) -> &'static str {
     }
 }
 
-async fn cmd_diag() {
+async fn cmd_diag(params: &[u8]) {
     let link = match usb::UsbLink::open() {
         Ok(l) => l,
         Err(e) => {
@@ -570,7 +571,7 @@ async fn cmd_diag() {
     };
 
     // Send DIAG Read command
-    let cmd = build_cmd(ferros_pt::command::caps::DIAG, ferros_pt::Op::Read, &[]);
+    let cmd = build_cmd(ferros_pt::command::caps::DIAG, ferros_pt::Op::Read, params);
     eprintln!("Sending DIAG Read ({} bytes)", cmd.len());
 
     match pt_send(&link, &cmd).await {
