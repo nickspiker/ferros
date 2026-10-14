@@ -12,10 +12,10 @@ index 3e38b2694..f7712d451 100644
  ifeq ($(CONFIG_DEBUG_EFI),y)
 diff --git a/arch/arm64/kernel/ferros_handoff.c b/arch/arm64/kernel/ferros_handoff.c
 new file mode 100644
-index 000000000..eea169bb1
+index 000000000..2e93ef6e9
 --- /dev/null
 +++ b/arch/arm64/kernel/ferros_handoff.c
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,316 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * ferros_handoff — chainload the ferros microkernel from a running Linux.
@@ -52,6 +52,7 @@ index 000000000..eea169bb1
 +#include <linux/kobject.h>
 +#include <linux/sysfs.h>
 +#include <linux/string.h>
++#include <linux/syscalls.h>
 +#include <linux/cpumask.h>
 +#include <linux/smp.h>
 +#include <asm/cacheflush.h>
@@ -238,13 +239,37 @@ index 000000000..eea169bb1
 +
 +static struct kobj_attribute ferros_stage_attr = __ATTR(stage, 0600, stage_show, stage_store);
 +
++/* Set by ufshcd once the UFS host is probed: resumes + drains UFS and pins USB awake (ufshcd_ferros_quiesce). */
++void (*ferros_quiesce_hook)(void);
++
++/*
++ * Live trigger: `echo 1 > /sys/kernel/ferros/go` hands off from a running Android, skipping its shutdown — so the display is still on and DECON still holds the last frame for ferros to adopt (after a normal shutdown the DPU is powered off). Filesystems are synced first; what remains is the same exposure as a sudden power loss after a sync, which f2fs is designed for. ferros then owns the machine exactly as after `adb reboot ferros`.
++ */
++static ssize_t go_store(struct kobject *kobj, struct kobj_attribute *attr,
++			const char *buf, size_t count)
++{
++	if (!ferros_entry_phys || !ferros_quiesce_hook)
++		return -ENODEV;
++	pr_info("ferros: live handoff, syncing filesystems\n");
++	ksys_sync();
++	ferros_quiesce_hook();
++	ferros_handoff_now();
++	return -EIO;	/* not reached */
++}
++
++static struct kobj_attribute ferros_go_attr = __ATTR(go, 0200, NULL, go_store);
++
 +static int __init ferros_sysfs_init(void)
 +{
 +	struct kobject *k = kobject_create_and_add("ferros", kernel_kobj);
++	int ret;
 +
 +	if (!k)
 +		return -ENOMEM;
-+	return sysfs_create_file(k, &ferros_stage_attr.attr);
++	ret = sysfs_create_file(k, &ferros_stage_attr.attr);
++	if (!ret)
++		ret = sysfs_create_file(k, &ferros_go_attr.attr);
++	return ret;
 +}
 +late_initcall(ferros_sysfs_init);
 +
@@ -364,7 +389,7 @@ index 000000000..6417bd2f4
 +
 +.popsection
 diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
-index 9134a1fec..353ea69ed 100644
+index 9134a1fec..287049c98 100644
 --- a/drivers/ufs/core/ufshcd.c
 +++ b/drivers/ufs/core/ufshcd.c
 @@ -20,6 +20,8 @@
@@ -389,26 +414,21 @@ index 9134a1fec..353ea69ed 100644
  	}
  	return ret;
  }
-@@ -8904,6 +8912,64 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
+@@ -8904,6 +8912,73 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
  	return ret;
  }
  
 +/* FERROS runtime hot-load trigger: `adb reboot ferros` with an image staged via /sys/kernel/ferros/stage. Runs first in the reboot notifier chain — Android has already synced and unmounted, device_shutdown() has not run yet — and puts the link back into the state the boot-time handoff proved ferros can adopt: host resumed, clocks ungated (which also exits hibern8), auto-hibern8 off so the link cannot drop into H8 under ferros, clock scaling pinned at the top gear, request queue blocked and drained. Returns only if nothing is staged or the jump fails, and the reboot then proceeds normally. */
 +static struct ufs_hba *ferros_hba;
 +
-+static int ufshcd_ferros_reboot(struct notifier_block *nb, unsigned long action, void *cmd)
++/* Put UFS and USB into the state ferros adopts: shared by the reboot trigger and the live trigger (/sys/kernel/ferros/go). */
++static void ufshcd_ferros_quiesce(void)
 +{
 +	struct ufs_hba *hba = ferros_hba;
-+	bool ferros_is_staged(void);
-+	void ferros_handoff_now(void);
 +	void __iomem *b;
 +
-+	if (action != SYS_RESTART || !cmd || strcmp(cmd, "ferros") || !hba)
-+		return NOTIFY_DONE;
-+	if (!ferros_is_staged()) {
-+		pr_err("ferros: reboot ferros with nothing staged; rebooting normally\n");
-+		return NOTIFY_DONE;
-+	}
++	if (!hba)
++		return;
 +	/* ferros also brings USB up on the inherited controller: keep the USB glue, DWC3 core and PHY runtime-resumed (clocks and power domain on) so ferros never touches an unclocked block, whatever Android's shutdown did to the gadget. */
 +	{
 +		static const char * const usb_devs[] = { "11210000.usb", "11210000.dwc3", "11100000.phy" };
@@ -442,6 +462,20 @@ index 9134a1fec..353ea69ed 100644
 +	pr_info("ferros: RUNTIME UFS IS=%#x HCS=%#x DBR=%#x RSR=%#x AHIT=%#x gear=%u\n",
 +		readl(b + 0x20), readl(b + 0x30), readl(b + 0x58), readl(b + 0x60),
 +		readl(b + 0x18), hba->pwr_info.gear_rx);
++}
++
++static int ufshcd_ferros_reboot(struct notifier_block *nb, unsigned long action, void *cmd)
++{
++	bool ferros_is_staged(void);
++	void ferros_handoff_now(void);
++
++	if (action != SYS_RESTART || !cmd || strcmp(cmd, "ferros") || !ferros_hba)
++		return NOTIFY_DONE;
++	if (!ferros_is_staged()) {
++		pr_err("ferros: reboot ferros with nothing staged; rebooting normally\n");
++		return NOTIFY_DONE;
++	}
++	ufshcd_ferros_quiesce();
 +	ferros_handoff_now();
 +	return NOTIFY_DONE;
 +}
@@ -454,7 +488,7 @@ index 9134a1fec..353ea69ed 100644
  /**
   * ufshcd_async_scan - asynchronous execution for probing hba
   * @data: data pointer to pass to this function
-@@ -8924,6 +8990,39 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+@@ -8924,6 +8999,42 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
  	/* Probe and add UFS logical units  */
  	ret = ufshcd_add_lus(hba);
  
@@ -465,7 +499,10 @@ index 9134a1fec..353ea69ed 100644
 +	 * (same vmlinux, no module symbol export needed); it freezes all CPUs and
 +	 * branches to ferros, returning only if disarmed (no /ferros.bin staged). */
 +	if (!ret && !ferros_hba) {
++		extern void (*ferros_quiesce_hook)(void);
++
 +		ferros_hba = hba;
++		ferros_quiesce_hook = ufshcd_ferros_quiesce;
 +		register_reboot_notifier(&ufshcd_ferros_reboot_nb);
 +	}
 +	if (!ret) {
