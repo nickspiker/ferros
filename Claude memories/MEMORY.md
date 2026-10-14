@@ -1,6 +1,7 @@
 the memory for the ferros project is in the ferros project folder. ferros/CLAUDE MEMORY.md
 
 - [opsin recordings on Harbor](opsin_recordings_on_harbor.md) — live recordings go to /mnt/Harbor/Videos/opsin (fragmented MOV since 2026-09-23; $HOME filled at 25 GB/h and killed one); transcript/downmix/recovery tools in ferros tools/transcribe + tools/recover-mov-audio; whisper.cpp lives at ~/whisper.cpp
+- [firmware validate on demand](firmware_validate_on_demand.md) — no per-boot boot-chain hashing/sealing (1 s boot budget, owner flashes); on-demand validate screen for slots A/B + parts vs known-good, with "informational only, EL3 could spoof" disclaimer; never a green "secure" badge
 - [husky cold boot on slot b](husky_cold_slot_b.md) — slot b boots ferros straight from ABL (no Linux): husky-cold.sh, link base G#8008_0000, exits→fastboot, delayed watchdog reset, cold display on ABL splash; disk still blocked
 - [husky shim USB service](husky_shim_usb_service.md) — THE husky dev loop: hotload → ferros on USB with UFS live (diag/run/reload/read/poke), button-free fastboot via EL3+watchdog, vault store + display; SYSMMU/XferNotReady facts + the EL3 poison rule
 - [husky ferros probe boot procedure](husky_ferros_probe_boot.md) — how to RUN the shim/probe on husky: tools/husky-hotload.sh = no-flash runtime trigger, ~1 min (since 2026-10-13); older inject+flash path; vendor_boot has log_buf_len=16M; panic/fault/watchdog report decoding; the 2026-09-12 heap-rounding root cause
