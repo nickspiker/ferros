@@ -1080,6 +1080,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { SHIM_ALLOC.init(heap_base, HEAP_SIZE) };
 
+    // Instruction cache on (SCTLR_EL2.I). The handoff leaves the MMU and caches off; with I=0 every instruction fetch goes to DRAM. With the MMU off, I=1 makes fetches Normal inner write-through cacheable and touches nothing on the data side, so DMA coherency is unaffected. Code is only ever written by the RELOAD stub and RUN staging, and both invalidate the I-cache before executing it.
+    unsafe {
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "mrs {t}, sctlr_el2",
+            "orr {t}, {t}, #(1 << 12)",
+            "msr sctlr_el2, {t}",
+            "isb",
+            t = out(reg) _,
+        );
+    }
+
     // Default: the USB service (PT over the inherited controller, disk live). FERROS_SHIM_ENTRY=vault builds the one-shot vault probe that reports and resets.
     if option_env!("FERROS_SHIM_ENTRY") == Some("vault") {
         shim::entry_vault(dtb_addr)

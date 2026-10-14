@@ -68,7 +68,8 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let _clock = SessionClock::calibrate().await;
+    // Calibrate in the background: nothing on the device path reads the session clock yet, and a slow or failing nunc query (seconds to a minute when sources don't answer) must never delay a USB command.
+    let _clock = tokio::spawn(SessionClock::calibrate());
 
     match args[1].as_str() {
         "status" => cmd_status(),
@@ -152,6 +153,8 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    // Exit now: returning from main would wait for the background clock query's blocking DNS/HTTP threads.
+    std::process::exit(0);
 }
 
 fn cmd_status() {
