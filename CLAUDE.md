@@ -25,7 +25,7 @@ cargo run -p ferros-bridge -- reload target/aarch64-unknown-none/release/ferros_
 ```
 
 ## Target Hardware
-- **Pixel 8** (G9BQD, Tensor G3) — PRIMARY. ARMv9, EL2 via `fastboot oem pkvm disable`. Boxed for now.
+- **Pixel 8 Pro** (husky, Tensor G3, serial in memory) — PRIMARY. ARMv9, EL2 via `fastboot oem pkvm disable`. Runs via the husky-kernel handoff (tools/husky-probe-boot.sh). Not "Pixel 8"/shiba/G9BQD — that was the original purchase note.
 - **M1 MacBook Air** — ACTIVE. EL2 via m1n1. macOS 26.4, Asahi/m1n1 UEFI entry installed (120 GB free). Fedora x86 box is the dev host connected via USB-C.
 - **Fairphone 5** (QCM6490) — DROPPED. Bricked + Qualcomm security restrictions. Do not touch.
 
@@ -194,7 +194,7 @@ All code written, never run on hardware. Next step is boot + validate.
 - `ferros_hal_m1/src/dart.rs` (346 LOC) — DONE. T8020 DART, dual register banks, L1/L2 16KB pages, 128MB IOVA.
 - `ferros_hal_m1/src/usb.rs` (966 LOC) — DONE. Full DWC3 device-mode, all 13 UsbBulk trait methods.
   EP0 control (SET_ADDRESS, GET_DESCRIPTOR, SET_CONFIG), EP1 bulk IN/OUT, TRB-based I/O.
-  USB descriptors: VID=G#1209, PID=G#4665 (pid.codes, pending PR #1208 merge), "ferros M1". 28 diagnostic fields.
+  USB descriptors: VID=G#1209, PID=G#4665 (pid.codes PR #1208, merged 2026-09-28), "ferros M1". 28 diagnostic fields.
 - `ferros_kernel/src/main.rs` M1 path — DONE. DART setup, DWC3 init, USB event loop, PT dispatch stub.
 
 ### Hardcoded M1 register addresses (from m1n1 ADT dump)

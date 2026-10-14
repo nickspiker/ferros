@@ -1,6 +1,6 @@
 use nusb::transfer::{RequestBuffer, TransferError};
 
-// VID 0x1209 (pid.codes), PID 0x4665 (ferros, requested via pid.codes PR #1208 2026-05-13, pending merge). Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
+// VID G#1209 (pid.codes), PID G#4665 (ferros, pid.codes PR #1208, merged 2026-09-28). Same PID used by every ferros-shipped USB device; the VSF document's "PIPE message" section disambiguates protocol/role, so PID-level multiplexing isn't needed.
 const FERROS_VID: u16 = 0x1209;
 const FERROS_PID: u16 = 0x4665;
 const INTERFACE: u8 = 0;

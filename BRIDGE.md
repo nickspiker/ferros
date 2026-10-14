@@ -9,8 +9,8 @@ The kernel exposes capabilities; the bridge addresses them.
 ## Identity
 
 The device enumerates as **VID G#1209 / PID G#4665** (pid.codes, "ferros").
-The PID was requested via pid.codes PR #1208 (2026-05-13) and is **pending merge** — once merged, any updated Linux host identifies ferros by name in `lsusb` from the canonical USB ID database.
-Until then the value is reserved-in-spirit by the open PR.
+The PID was requested via pid.codes PR #1208 (2026-05-13) and **merged 2026-09-28**, so any Linux host with an updated USB ID database identifies ferros by name in `lsusb`.
+The ruling set pid.codes precedent: open-source software on closed third-party hardware (a Pixel phone) qualifies.
 
 Every ferros-shipped USB device uses the **same** PID.
 Roles and protocols are not multiplexed at the PID level — the VSF document's "PIPE message" section disambiguates them inside the transport.

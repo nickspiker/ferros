@@ -1971,7 +1971,7 @@ static DEVICE_DESC: [u8; 18] = [
     0x00,               // bDeviceProtocol
     64,                 // bMaxPacketSize0 = 64 (required for HS, valid for FS)
     0x09, 0x12,         // idVendor = 0x1209 (pid.codes)
-    0x65, 0x46,         // idProduct = 0x4665 (ferros — requested via pid.codes PR #1208, pending merge)
+    0x65, 0x46,         // idProduct = G#4665 (ferros — pid.codes PR #1208, merged 2026-09-28)
     0x00, 0x01,         // bcdDevice = 1.00
     1,                  // iManufacturer (string index 1)
     2,                  // iProduct (string index 2)
