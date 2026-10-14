@@ -69,6 +69,16 @@ What it does, all from measured state:
 
 First run: FRAME_COUNT `G#4C -> G#4D`, shadow request consumed, INT_PEND = FRAME_START|FRAME_DONE, INT_PEND_EXTRA = 0 (no timeout or resource conflict). Every register says the frame reached the panel, and on 2026-10-14 the owner confirmed by eye: the amber console text is on the screen.
 
+## Cold boot (slot b, no Linux) — ferros draws on ABL's splash surface (2026-10-14)
+
+On a cold boot ABL leaves:
+- the DPU power domains on (EL3 reads of pd-dpub/dpuf0/dpuf1 = 1);
+- DECON v7.6 running its splash on window 5 / DPP0, at the panel's native 1344x2992;
+- the layer already linear XRGB8888 (IN_CTRL_0 G#FF400700);
+- both DPU SYSMMUs with translation off (VM0 ctrl G#24, no page table), so the layer's DMA address G#FAC0_0000 is physical (15.3 MB contiguous).
+
+`display::show` treats "translation off" as an identity mapping and otherwise runs exactly as after a handoff. FRAME_COUNT 4 -> 5, and the owner saw the text. Each cold boot also paints its status screen automatically. Text is smaller than after a handoff because nothing scales it: the console draws 8x16 glyphs at 2x straight onto the native grid.
+
 ## Status
 
 - [x] Identify panel/DPU (command mode + DSC, cal_9865)

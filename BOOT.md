@@ -48,6 +48,21 @@ Pixel 8 / Tensor G3 (primary):
 - AVB verification of an unsigned image logs `avb_ret=ERROR_VERIFICATION, avb_error_parts=boot` and **boots it anyway** while the bootloader is unlocked. Signing (avb_custom_key) is only needed for the locked endgame.
 - A/B rollback observed working: a failing slot is marked and ABL falls back to the other slot or fastboot.
 
+### Current husky layout (2026-10-14): slot b boots ferros, slot a is Android
+
+- **Slot b = ferros, cold.** `tools/husky-cold.sh` builds the cold image (`ferros-mkimg boot --pad 16`), flashes `boot_b`, runs `--set-active=b`, and reboots. ABL loads the kernel at G#8008_0000, the cold link base (`ferros_kernel/aarch64-pixel8.ld`; m1 keeps `aarch64.ld`). The image is statically linked, so it must run where it is linked: DIAG reports `BASE` and `RUNNING_AT`.
+  - Slot b's other partitions are stock, and `product_b` is empty; ABL doesn't care.
+  - Measured first boot: EL2, USB enumerated, `EXC=0`, hot RELOAD to GEN=1/2, RUN payloads, and text drawn on ABL's splash surface.
+- **Slot a = Android + the handoff kernel.** This is the dev host and the escape hatch: `tools/husky-hotload.sh` chainloads ferros from it with the disk live.
+- **Back to Android:** `tools/husky-cold.sh --android` (fastboot, `--set-active=a`, reboot, about 40 s, no buttons).
+- **Exits from cold ferros:**
+  - A cold ferros has no disk to mark slots with, and a plain reset would just boot ferros again. So every exit except a plain host `bridge reboot` goes to fastboot: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
+  - The report block at G#FD60_0000 survives warm resets and the trip through fastboot. The next cold boot shows it as `PREV_*` in DIAG, and Android's handoff kernel prints it as `ferros: r[..]`.
+- **Fastboot from ferros:** stamp PMU SYSIP_DAT0 = G#FC through the EL3 monitor, then fire the cluster watchdogs (count = reload = 1).
+  - **The reset is not immediate:** these watchdogs reset the SoC about 15-20 s after they start expiring, so ferros waits up to 64 s by the clock.
+  - A PSCI SYSTEM_RESET from ferros loses the reboot mode (ABL sees a PIN reset).
+- **Slot b is never marked successful.** That needs the proprietary `devinfo` partition, and so a disk. ABL's retry counter for b decrements on every cold boot and is reset by each `--set-active=b`; when it runs out, ABL falls back to slot a by itself.
+
 ### Entry teardown hazard (the 2026-03 crash, root-caused)
 
 The original `_entry` cache-clean + SCTLR MMU/cache-disable sequence **faults on Tensor G3** (crash ~2s), same class of failure as the M1.
