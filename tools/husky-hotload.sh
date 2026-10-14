@@ -59,6 +59,8 @@ if [ $LIVE = 1 ]; then
     # Screen on and kept on; DECON hibernation off (in command mode the driver powers the whole DPU down a few idle frames after each update, so without this ferros finds DECON reading all zeros).
     adb shell su -c "'svc power stayon true; input keyevent KEYCODE_WAKEUP; echo 0 > /sys/devices/platform/19470000.drmdecon/hibernation'"
     sleep 2
+    # stayon is a persistent Android setting; drop it again now that the screen is lit (it stays on well past the handoff), so Android doesn't keep the panel on forever after ferros exits.
+    adb shell su -c "'svc power stayon false'"
     echo "== staged; live handoff (screen on)"
     timeout 10 adb shell su -c "'echo 1 > /sys/kernel/ferros/go'" || true
 else
