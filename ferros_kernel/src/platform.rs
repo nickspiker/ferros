@@ -161,26 +161,41 @@ pub fn dss_mark_clean_reboot() {
 /// Reset straight into the bootloader (fastboot): mark the reset clean in the DSS header, stamp the reboot mode through the EL3 monitor, then fire the cluster watchdog with a count of 1.
 /// Why the watchdog and not PSCI: measured on husky, a PSCI SYSTEM_RESET issued by ferros comes back as RST_STAT PIN_RESET (reason G#CECA) and the bootloader reads "Reboot mode: 0x0" even though the EL3 readback showed G#FC just before; an APC watchdog reset (RST_STAT CLUSTER0_NONCPU_WDTRESET) with the same mode stamped boots into fastboot ("Reboot mode: 0xfc - Bootloader"). Linux's own PSCI reset comes back as PIN_RESET|PO_RESET with the mode intact, so EL3 treats the two differently; the watchdog sidesteps whatever that is.
 /// Returns only if the monitor refused the write (nonzero) or the watchdog never fired, so the caller can report it.
+/// `reboot_to_bootloader` result when the watchdog never reset the SoC. Distinct from every EL3 return: the monitor reports errors as negative values (e.g. -1 = G#FFFF_FFFF_FFFF_FFFF), which an earlier u64::MAX sentinel could not be told apart from.
+pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
+
 pub fn reboot_to_bootloader() -> u64 {
     dss_mark_clean_reboot();
     let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
     if r != 0 {
         return r;
     }
-    // WTCON: RSTEN b0 + EN b5, prescaler 0, DIV16 (0 << 3); WTDAT = WTCNT = 1 → reset on the next watchdog tick.
+    // Fire the cluster watchdogs: count = reload = 1, prescaler 0, DIV16, RSTEN, so the counter expires every tick. Measured on husky with payloads/wdtfire: the reset is NOT immediate — these watchdogs reset the SoC about 15-20 s after they start expiring (a single expiry with the running configuration reset ~1 min later), so this waits up to 64 s by the clock. Writes are spaced 1 ms apart (the block sits behind a slow clock; back-to-back writes with the I-cache on were not proven). The bootloader then reads the stamped mode and stops in fastboot (RST_STAT CLUSTER0_NONCPU_WDTRESET, "Reboot mode: 0xfc").
+    let ms = |n: u64| {
+        let t0 = cntpct();
+        while cntpct().wrapping_sub(t0) < cntfrq() / 1000 * n {
+            core::hint::spin_loop();
+        }
+    };
     for &wdt in &WATCHDOGS {
         unsafe {
             write_volatile(wdt as *mut u32, 0);
+            ms(1);
             write_volatile((wdt + 0x04) as *mut u32, 1);
+            ms(1);
             write_volatile((wdt + 0x08) as *mut u32, 1);
+            ms(1);
             write_volatile(wdt as *mut u32, (1 << 5) | (1 << 0));
+            ms(1);
         }
     }
-    unsafe { core::arch::asm!("dsb sy") };
-    for _ in 0..(1u32 << 28) {
+    let t0 = cntpct();
+    while cntpct().wrapping_sub(t0) < cntfrq() * 64 {
         core::hint::spin_loop();
     }
-    u64::MAX
+    // Still here after 64 s: report it.
+    crumb(0xB7);
+    WATCHDOG_DID_NOT_FIRE
 }
 
 /// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.

@@ -643,6 +643,10 @@ name = "ferros-payload-vendorprobe"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-wdtfire"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [

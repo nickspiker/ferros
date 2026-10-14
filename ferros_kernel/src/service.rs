@@ -50,6 +50,9 @@ pub struct Boot {
     pub ufs_probe: Option<fn() -> alloc::vec::Vec<u8>>,
 }
 
+/// What `reboot_to_bootloader` returned when a fastboot request fell through (0 = never tried); reported in r[23].
+static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
 
@@ -129,6 +132,7 @@ fn leave(b: &Boot, exit: u8, attempts: u32, configured_ever: bool, usb: Option<&
     w(18, st.specs as u64 | (st.data_pkts as u64) << 32);
     w(19, st.data_decoded as u64 | (st.data_accepted as u64) << 32);
     w(22, st.commands as u64 | (st.not_ready as u64) << 32);
+    w(23, FASTBOOT_FAIL.load(core::sync::atomic::Ordering::Relaxed));
     unsafe {
         core::ptr::copy_nonoverlapping(usb_b.as_ptr(), (0xFD60_0000usize + 0x20) as *mut u8, 5);
         ferros_hal::mmio::cache_clean(0xFD60_0000, 0x100);
@@ -642,7 +646,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                                                 write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
                                             }
-                                            let _ = platform::reboot_to_bootloader();
+                                            // Only returns on failure: platform::WATCHDOG_DID_NOT_FIRE, or the EL3 monitor's refusal (nonzero, negative = error). Kept in report slot r[23] so the exit report says which.
+                                            FASTBOOT_FAIL.store(platform::reboot_to_bootloader(), core::sync::atomic::Ordering::Relaxed);
                                         }
                                         leave(&b, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
                                     }
