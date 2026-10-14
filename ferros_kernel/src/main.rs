@@ -29,15 +29,12 @@ mod platform;
 mod service;
 #[cfg(feature = "pixel8")]
 mod display;
-// The vault probe and its ira/wairua sources need a live UFS link, which only the handoff has today; the cold build carries them for the shared types.
+// The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
-#[cfg_attr(not(shim_handoff), allow(dead_code))]
 mod vault_boot;
 #[cfg(feature = "pixel8")]
-#[cfg_attr(not(shim_handoff), allow(dead_code))]
 mod ira;
 #[cfg(feature = "pixel8")]
-#[cfg_attr(not(shim_handoff), allow(dead_code))]
 mod wairua;
 // Post-handoff entry (ferros chainloaded from a running Linux shim; FERROS_SHIM_HANDOFF=1 → cfg shim_handoff).
 #[cfg(all(feature = "pixel8", shim_handoff))]
@@ -1152,8 +1149,19 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     platform::crumb(0xC1);
 
+    // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
+    let t_ufs = platform::cntpct();
+    let link_up = cold_ufs::bring_up();
+    let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
+    platform::crumb(0xC2);
+    let t_vault = platform::cntpct();
+    let (probe, store) = vault_boot::vault_probe(link_up);
+    let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
+
     let own_base = &raw const _start as usize;
     let extras = alloc::vec![
+        (b"COLD_UFS_MS=".as_slice(), ufs_ms),
+        (b"COLD_VAULT_MS=".as_slice(), vault_ms),
         (b"REP_REV=".as_slice(), rep_snap[0]),
         (b"REP_CFG=".as_slice(), rep_snap[1]),
         (b"REP_T70=".as_slice(), rep_snap[2]),
@@ -1173,8 +1181,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         stage: own_base + (32 << 20),
         stub: own_base + (32 << 20) - 0x1_0000,
         x0: if dtb_addr & 1 == 1 { dtb_addr } else { 0 },
-        probe: None,
-        store: None,
+        probe: Some(probe),
+        store,
         prev,
         extras,
         ufs_probe: Some(cold_ufs::probe),

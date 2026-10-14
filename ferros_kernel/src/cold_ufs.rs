@@ -37,6 +37,29 @@ pub fn power_on_device() {
     }
 }
 
+/// Cold boot UFS bring-up for real use: DMA path open, VCC on, full_init, then one read to consume the power-on UNIT ATTENTION. Returns whether the device answers block reads (link up, NOP and LBA 0 read OK).
+pub fn bring_up() -> bool {
+    wr(S2MPU_HSI2 + 0x54, 0xFF);
+    wr(S2MPU_HSI2, 0);
+    wr(0x1302_0710, rd(0x1302_0710) & !0x3); // non-coherent DMA (ferros does explicit cache maintenance)
+    unsafe { core::arch::asm!("dsb sy") };
+    power_on_device();
+    let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
+    let rep = ufs.full_init();
+    if rep.fail_step != 0 && rep.nop_ocs != 0 {
+        return false;
+    }
+    for _ in 0..4 {
+        if ufs.read_block(0) == 0 {
+            let d = ufs.data_buffer();
+            if d[0x1FE] == 0x55 && d[0x1FF] == 0xAA {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Run the full cold UFS bring-up once and return the report text.
 pub fn probe() -> Vec<u8> {
     let mut resp = Vec::new();

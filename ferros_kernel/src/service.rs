@@ -1,7 +1,7 @@
 //! The ferros USB service: Photon Transport on the phone's DWC3, shared by both ways ferros boots on husky.
 //!
 //! - **Handoff** (slot a, chainloaded from the patched Linux): UFS is live and the ira-rooted vault is open, so STORE works; every exit warm-resets back into Android.
-//! - **Cold** (slot b, straight from ABL): no Linux, no disk yet (the cold UFS link startup is still blocked, UFS.md); exits other than a plain host REBOOT go to fastboot, since a plain reset would just boot ferros again and there is no disk to mark slots with.
+//! - **Cold** (slot b, straight from ABL): no Linux; ferros powers the flash back on and brings UFS up itself (cold_ufs.rs), so the vault opens here too. Exits other than a plain host REBOOT go to fastboot, since a plain reset would just boot ferros again (slot marking via devinfo is not implemented yet).
 //!
 //! Both paths: the USB DMA master is put on physical addresses (HSI0 S2MPU bypassed, every USB SYSMMU VM context disabled), the eUSB2 PHY + DWC3 are (re)initialised with the enumeration watchdog, and PT serves DIAG / RUN / RELOAD / MEM / DISPLAY / STORE / REBOOT. Exits leave a ramoops report (exit reason in the crumb byte): REBOOT from the host, 64 s without enumerating, 512 s without a PT command, a 16 s mid-transfer stall, or both volume buttons; faults and hangs are caught by the fault sink and the watchdog.
 //!
@@ -238,12 +238,12 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
     let p = match probe {
         Some(p) => p,
         None => {
-            t.extend_from_slice(b"\n\nufs: not up on a cold boot yet\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nfor fastboot\n");
+            t.extend_from_slice(b"\n\nufs: no vault probe\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nfor fastboot\n");
             return t;
         }
     };
     t.extend_from_slice(b"\n\nufs: ");
-    t.extend_from_slice(if p.link_up { b"adopted, link up" } else { b"LINK DOWN" });
+    t.extend_from_slice(if p.link_up { b"link up" } else { b"LINK DOWN" });
     t.extend_from_slice(b"\nvault: ");
     t.extend_from_slice(if p.verified == 1 { b"opened + verified".as_slice() } else if p.sealed == 1 { b"genesis sealed" } else if p.opened == 1 { b"opened, NOT verified" } else { b"NOT OPENED" });
     t.extend_from_slice(b"\nroot: ");
