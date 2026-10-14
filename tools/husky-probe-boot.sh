@@ -61,6 +61,7 @@ cp "$BIN" "$W/rd/ferros.bin"
 echo "== repack ramdisk + vendor_kernel_boot =="
 ( cd "$W/rd" && find . | cpio -o -H newc 2>/dev/null | "$LZ4" -l -9 > "$W/unpacked/vendor_ramdisk00.new" )
 mv "$W/unpacked/vendor_ramdisk00.new" "$W/unpacked/vendor_ramdisk00"
+# NOTE: the kernel cmdline (incl. log_buf_len) lives in vendor_boot, NOT here — vendor_kernel_boot's cmdline is ignored by the husky bootloader. The stock 1 MB printk ring wraps past the early ferros_ramoops_read report; vendor_boot_a was repacked once with log_buf_len=16M (stock copy: /mnt/Harbor/tmp/vendor_boot/vendor_boot_a.stock.img).
 python3 "$MKB/mkbootimg.py" $(cat "$W/mkargs.txt") --vendor_boot "$W/vendor_kernel_boot.img"
 echo "  image: $W/vendor_kernel_boot.img ($(stat -c%s "$W/vendor_kernel_boot.img") bytes)"
 

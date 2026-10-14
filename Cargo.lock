@@ -648,7 +648,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.9.2",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -705,7 +705,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi",
- "vsf 0.9.2",
+ "vsf 0.9.3",
 ]
 
 [[package]]
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "bitvec",
  "blake3",

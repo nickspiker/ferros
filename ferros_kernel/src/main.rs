@@ -396,6 +396,50 @@ _m1_entry:
     ldr     x1, [x0]
     add     x1, x1, #1
     str     x1, [x0]
+    // Fault sink (shim path): if __exc_sink is armed (a ramoops result block), record the FIRST sync fault into the block's hardcoded print slots — ELR@+0xA0, FAR@+0xA8 (the 16-byte hexdump), ESR@+0x20 (the r[4] byte fields), count@+0x28 (r[5]) — stamp the magic, and warm-reset via PSCI so DRAM survives and the next Linux boot prints it. Skipping the faulting instruction (the default below) only produces garbage state, so on the shim path a fault is terminal by design. Cold/m1 builds leave the sink at 0 and keep the skip-and-count behaviour.
+    stp     x2, x3, [sp, #-16]!
+    adrp    x0, __exc_sink
+    add     x0, x0, :lo12:__exc_sink
+    ldr     x0, [x0]
+    cbz     x0, .Lexc_nosink
+    ldr     x1, [x0, #0xA0]
+    cbnz    x1, .Lexc_nosink
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.eq    .Lexc_sink_el2
+    mrs     x1, elr_el1
+    mrs     x2, far_el1
+    mrs     x3, esr_el1
+    b       .Lexc_sink_store
+.Lexc_sink_el2:
+    mrs     x1, elr_el2
+    mrs     x2, far_el2
+    mrs     x3, esr_el2
+.Lexc_sink_store:
+    str     x1, [x0, #0xA0]
+    str     x2, [x0, #0xA8]
+    str     x3, [x0, #0x20]
+    adrp    x1, __exception_count
+    add     x1, x1, :lo12:__exception_count
+    ldr     x1, [x1]
+    str     x1, [x0, #0x28]
+    movz    x1, #0x6546
+    movk    x1, #0x6F52, lsl #16
+    movk    x1, #0x6655, lsl #32
+    movk    x1, #0x3153, lsl #48
+    str     x1, [x0]
+    dc      cvac, x0
+    add     x1, x0, #0x20
+    dc      cvac, x1
+    add     x1, x0, #0xA0
+    dc      cvac, x1
+    dsb     sy
+    mov     w0, #0x0009
+    movk    w0, #0x8400, lsl #16
+    smc     #0
+.Lexc_nosink:
+    ldp     x2, x3, [sp], #16
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     cmp     x1, #2
@@ -432,6 +476,9 @@ _m1_entry:
 static mut __exception_count: u64 = 0;
 #[unsafe(no_mangle)]
 static mut __boot_el: u64 = 0;
+/// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).
+#[unsafe(no_mangle)]
+pub static mut __exc_sink: u64 = 0;
 #[unsafe(no_mangle)]
 static mut __boot_sctlr: u64 = 0;
 
@@ -2059,7 +2106,15 @@ fn psci_reboot() -> ! {
     }
 }
 
+#[cfg(not(shim_handoff))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop { unsafe { core::arch::asm!("wfe") }; }
+}
+
+// Shim path: a silent wfe loop is indistinguishable from a hang and only the watchdog gets us out. Report the panic (message head, file, line, last crumb) into the ramoops result block and warm-reset so the next Linux boot prints it.
+#[cfg(shim_handoff)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    shim::report_panic(info)
 }

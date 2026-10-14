@@ -47,6 +47,8 @@ pub const OBJ_HEADER_BYTES: usize = 4 + 1 + 32 + 4 + 1 + 8; // = 50
 /// Default vault sizing. A fresh empty vault needs <4 KiB (16 anchor slots @ 128 B + root commit + VSF wrapper); 64 KiB holds dozens of contacts before growth kicks in.
 pub const DEFAULT_PAYLOAD_CAPACITY: u64 = 64 * 1024; // 64 KiB
 pub const DEFAULT_RING_SIZE: u32 = 16;
+/// Largest wrapped vault file `open`/`read_wrapped` will ever load; larger claims from a header are treated as corrupt.
+pub const MAX_WRAPPED_LEN: u64 = 1 << 20;
 
 /// First byte after the anchor-ring region — where the object store begins. Reserves `(ring_size + 1) * SLOT_STRIDE` bytes for the ring (slot 0 + scattered slots conservatively assumed to fit within `ring_size * SLOT_STRIDE` past slot 0).
 ///
@@ -527,7 +529,8 @@ fn read_wrapped<D: Device>(device: &D) -> Result<Vec<u8>, DeviceError> {
     device.read_at(0, &mut prefix)?;
     let total = crate::vsf_wrapper::wrapped_len(&prefix)
         .map_err(|_| DeviceError::IoError(crate::device::DeviceIoKind::ReadError))? as u64;
-    if total == 0 || total > cap {
+    // Bound by what any caller can actually hold, not by the device: on a 128 GiB partition `cap` is no bound at all, and a corrupt or foreign header would make this `vec!` fail — a panic, not an `Err`. 1 MiB is 16x the default payload capacity plus header.
+    if total == 0 || total > cap || total > MAX_WRAPPED_LEN {
         return Err(DeviceError::IoError(crate::device::DeviceIoKind::ReadError));
     }
     let mut buf = alloc::vec![0u8; total as usize];

@@ -60,6 +60,9 @@ impl Heap {
     /// # Safety
     /// The caller must ensure the region is valid, unused, and lives for `'static`, and must call `init` exactly once.
     pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
+        // Header-sized alignment of the base keeps every free region header-aligned (see `size_align`).
+        assert_eq!(align_up(heap_start, size_of::<ListNode>()), heap_start, "heap base must be header-aligned");
+        assert_eq!(align_up(heap_size, size_of::<ListNode>()), heap_size, "heap size must be a multiple of the header size");
         unsafe {
             self.add_free_region(heap_start, heap_size);
         }
@@ -191,6 +194,28 @@ impl Heap {
         }
     }
 
+    /// Total bytes on the free list (diagnostics).
+    pub fn free_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut cur = self.head.next.as_deref();
+        while let Some(node) = cur {
+            total += node.size;
+            cur = node.next.as_deref();
+        }
+        total
+    }
+
+    /// Number of free blocks (diagnostics; 1 == fully coalesced).
+    pub fn free_blocks(&self) -> usize {
+        let mut n = 0usize;
+        let mut cur = self.head.next.as_deref();
+        while let Some(node) = cur {
+            n += 1;
+            cur = node.next.as_deref();
+        }
+        n
+    }
+
     /// Frees `ptr` and coalesces with adjacent free neighbors.
     ///
     /// # Safety
@@ -208,7 +233,8 @@ impl Heap {
             .align_to(align_of::<ListNode>())
             .expect("adjusting alignment failed")
             .pad_to_align();
-        let size = layout.size().max(size_of::<ListNode>());
+        // Round the size to a whole number of headers, not just to the header's alignment. With every block a multiple of `size_of::<ListNode>()` (and the heap base aligned likewise, see `init`), every free region starts header-aligned, so an alignment up to the header size never leaves a head gap, and any gap or tail that does appear is a multiple of the header size — never the unrecoverable sub-header sliver that `alloc_from_region` must reject. Rounding only to `align_of` (8) let a region start at 8 mod 16, after which every 16-aligned request was refused with the heap nearly empty (seen on hardware: 512-byte request, 4 MiB free, one block).
+        let size = align_up(layout.size().max(size_of::<ListNode>()), size_of::<ListNode>());
         (size, layout.align())
     }
 }
@@ -235,6 +261,14 @@ impl<T> SpinLock<T> {
             locked: AtomicBool::new(false),
             value: core::cell::UnsafeCell::new(value),
         }
+    }
+
+    /// Acquires the lock only if it is free right now (for reporters that must never deadlock, e.g. a panic handler).
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinGuard { lock: self })
     }
 
     /// Acquires the lock, spinning until it is free; returns an RAII guard.
@@ -298,6 +332,11 @@ impl LockedHeap {
     /// Locks the heap and returns a guard for direct access (mainly for tests).
     pub fn lock(&self) -> SpinGuard<'_, Heap> {
         self.0.lock()
+    }
+
+    /// Non-blocking lock for diagnostics from contexts that may already hold the heap (panic paths).
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, Heap>> {
+        self.0.try_lock()
     }
 }
 

@@ -35,6 +35,67 @@ const RAMOOPS_RESULT: usize = 0xFD60_0000;
 /// Marks a valid ferros result block at RAMOOPS_RESULT. "FeRoUfS1" LE.
 const RESULT_MAGIC: u64 = 0x3153_6655_6F52_6546;
 
+/// Last crumb stamped by `entry_vault`, so `report_panic` can say how far the run got.
+static LAST_CRUMB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Panic → ramoops report + PSCI warm reset (shim build's `#[panic_handler]`).
+/// Slots (kernel print names): r[3]/0x18 `mbr_sig` := G#EE00 | last crumb; r[1]/0x08 `link_up` := first decimal number in the panic message (e.g. the failed allocation size), 0 if none; r[2]/0x10 bytes := heap free bytes (3 bytes LE) + free block count (`scsi_status`), all FF if the heap lock was held; r[4]/0x20 `read..verify` := line (u32 LE) + column byte; r[5]/0x28 `wrote_ok` := sync exception count; 0xA0 `pattern-readback` := last 8 bytes of the panicking file's path + first 8 bytes of the message.
+pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
+    struct Head { buf: [u8; 64], n: usize }
+    impl core::fmt::Write for Head {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if self.n < 64 { self.buf[self.n] = b; self.n += 1; }
+            }
+            Ok(())
+        }
+    }
+    let mut head = Head { buf: [0u8; 64], n: 0 };
+    let _ = core::fmt::write(&mut head, format_args!("{}", info.message()));
+    // First decimal run in the message.
+    let mut num = 0u64;
+    let mut seen = false;
+    for &b in &head.buf[..head.n] {
+        if b.is_ascii_digit() {
+            seen = true;
+            num = num.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+        } else if seen {
+            break;
+        }
+    }
+    let heap = match crate::SHIM_ALLOC.try_lock() {
+        Some(h) => ((h.free_bytes() as u64) & 0xFF_FFFF) | (((h.free_blocks() as u64) & 0xFF) << 24),
+        None => 0xFFFF_FFFF,
+    };
+    let (line, col, file) = match info.location() {
+        Some(l) => (l.line(), l.column(), l.file()),
+        None => (0, 0, ""),
+    };
+    let fb = file.as_bytes();
+    let tail = &fb[fb.len().saturating_sub(8)..];
+    let mut t = [0u8; 16];
+    t[..tail.len()].copy_from_slice(tail);
+    t[8..].copy_from_slice(&head.buf[..8]);
+    unsafe {
+        let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
+        w(0x00, RESULT_MAGIC);
+        w(0x08, num);
+        w(0x10, heap);
+        w(0x18, 0xEE00 | (LAST_CRUMB.load(core::sync::atomic::Ordering::Relaxed) & 0xFF));
+        w(0x20, (line as u64) | (((col as u64) & 0xFF) << 32));
+        w(0x28, crate::exception_count());
+        core::ptr::copy_nonoverlapping(t.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
+        core::arch::asm!("dsb sy");
+        core::arch::asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16",
+            "smc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
 /// Diagnostic breadcrumb slots (survive a crash for the kernel readback):
 ///   +0x100 = 0xBEE1 written by _entry asm  (jump landed, ferros started)
 ///   +0x108 = 0xBEE2 written here in Rust   (BSS zero + stack + kernel_main OK)
@@ -344,11 +405,33 @@ pub fn entry_vault(x0: u64) -> ! {
     let link_up = ufs.link_is_up();
     drop(ufs);
 
+    // --- make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg) ---
+    // 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into this result block and warm-resets, so the next Linux boot prints it. Faults were previously skip-and-continue, i.e. silent corruption followed by a spin.
+    // The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so zero the report slots first.
+    unsafe {
+        for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8] {
+            write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
+        }
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
+        write_volatile(&raw mut crate::__exc_sink, RAMOOPS_RESULT as u64);
+    }
+    // 2. Cluster watchdogs (same block as the cold-boot path): a pure spin with no fault resets warm in ~1-2 min instead of hanging forever. s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8.
+    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+    const WDT_ARM: u32 = 0xFF00 | (3 << 3) | (1 << 5) | (1 << 0);
+    for &wdt in &WATCHDOGS {
+        unsafe {
+            write_volatile((wdt + 0x04) as *mut u32, 0xFFFF);
+            write_volatile((wdt + 0x08) as *mut u32, 0xFFFF);
+            write_volatile(wdt as *mut u32, WDT_ARM);
+        }
+    }
+
     // --- ira-rooted vault genesis + probe, mapped onto the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory). The vault now boots from the validated ira; crumbs bracket the crypto/allocator/UFS (first on hardware) so any stall pins the step. ---
     let key: AnchorKey = crate::ira::anchor_key(); // ira-rooted key from the validated chipid trims (derive_ira v1)
 
     // Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0.
     let crumb = |c: u64| unsafe {
+        LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
         write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
         write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x20);
@@ -384,8 +467,15 @@ pub fn entry_vault(x0: u64) -> ! {
     let mut need_seal = false;
     let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
 
-    crumb(0xE0); // before Store::open (TrngNonce SMC -> crypto -> UFS read)
-    match Store::open(fresh_dev(), key, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
+    // Prologue split so the crumb pins which first-on-hardware step stalls: device adapter, TRNG draw, first heap allocation (freeing allocator), then open itself.
+    crumb(0xE4);
+    let dev0 = fresh_dev();
+    crumb(0xE5); // UfsDevice constructed
+    let nonce_src = crate::wairua::TrngNonce::new();
+    crumb(0xE6); // TRNG seed drawn (SMC)
+    let nonce0 = alloc::boxed::Box::new(nonce_src); // coerces to Box<dyn NonceSource> at the call
+    crumb(0xE0); // first heap allocation done; before Store::open (UFS prefix read -> bounded read -> decode -> anchor decrypt)
+    match Store::open(dev0, key, nonce0) {
         Ok(store) => {
             opened = 1;
             root16.copy_from_slice(&store.root_commit_hash().0[..16]);
@@ -421,7 +511,7 @@ pub fn entry_vault(x0: u64) -> ! {
     let f_open = (opened as u64) | ((verified as u64) << 1) | ((sealed as u64) << 2) | ((wairua_ok as u64) << 3) | ((link_up as u64) << 4);
     let flags = f_open | ((stage as u64) << 8) | ((nz(&ap_tune) | (nz(&asv) << 1) | (nz(&hpm) << 2)) << 16);
 
-    // Report -> kernel print slots: r[1]/0x08 `link_up=` := wairua (differs each boot); r[2]/0x10 flags (above); r[3]/0x18 `mbr_sig` := 0(done) | dvfs<<8; r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := hpm[0..2]; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — the ira-rooted genesis root: non-zero + stable across boots == the vault booted from the ira.
+    // Report -> kernel print slots: r[1]/0x08 `link_up=` := wairua (differs each boot); r[2]/0x10 flags (above); r[3]/0x18 `mbr_sig` := 0(done) | dvfs<<8; r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — the ira-rooted genesis root: non-zero + stable across boots == the vault booted from the ira.
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
@@ -429,7 +519,7 @@ pub fn entry_vault(x0: u64) -> ! {
         w(0x10, flags);
         w(0x18, (dvfs as u64) << 8);
         core::ptr::copy_nonoverlapping(ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
-        core::ptr::copy_nonoverlapping(hpm.as_ptr(), (RAMOOPS_RESULT + 0x28) as *mut u8, 2);
+        w(0x28, crate::exception_count()); // r[5] wrote_ok := sync exceptions taken (0 expected; the sink resets on the first one, so nonzero here means a fault slipped past)
         core::ptr::copy_nonoverlapping(root16.as_ptr(), (RAMOOPS_RESULT + 0xA0) as *mut u8, 16);
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x180);
     }
