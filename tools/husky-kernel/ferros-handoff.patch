@@ -1,0 +1,509 @@
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 3e38b2694..f7712d451 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -94,6 +94,7 @@ $(obj)/vdso32-wrap.o: $(obj)/vdso32/vdso.so
+ 
+ obj-y					+= probes/
+ obj-y					+= head.o
++obj-y					+= ferros_handoff.o ferros_reset.o
+ extra-y					+= vmlinux.lds
+ 
+ ifeq ($(CONFIG_DEBUG_EFI),y)
+diff --git a/arch/arm64/kernel/ferros_handoff.c b/arch/arm64/kernel/ferros_handoff.c
+new file mode 100644
+index 000000000..b9de020ff
+--- /dev/null
++++ b/arch/arm64/kernel/ferros_handoff.c
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ferros_handoff — chainload the ferros microkernel from a running Linux.
++ *
++ * Why this exists: ferros's own UFS link startup is register-identical to this
++ * kernel's (machine-diffed: write stream, read-backs, analog M-PHY PMA, EL2),
++ * yet the UFS device stays silent for ferros. The remaining difference is
++ * off-chip (refclk arrival / TX signal integrity / device-side firmware timing)
++ * and invisible to a register trace. Rather than reproduce whatever this kernel
++ * does that ferros doesn't, we let this kernel bring the UFS link fully up and
++ * then jump into ferros WITHOUT resetting the controller, so ferros adopts the
++ * living link.
++ *
++ * The jump reuses the kexec EL2 re-entry primitive, cpu_soft_restart() with
++ * is_hyp_nvhe() — the same path machine_kexec() takes for an IND_DONE image —
++ * but deliberately WITHOUT kernel_restart_prepare()/device_shutdown(), which a
++ * normal reboot/kexec would run and which would suspend the UFS link we are
++ * trying to preserve.
++ *
++ * ferros is relinked to 0x92400000 (ferros_handoff_reserved, zuma-rmem.dtsi:
++ * 12 MB no-map carveout). We load /ferros.bin there, freeze every CPU with
++ * stop_machine, and CPU0 branches in. ferros's image, stack, page tables, and
++ * static UFS DMA buffers all live inside that reserved region, so the UFS master
++ * only ever DMAs into DRAM this kernel guaranteed it never mapped.
++ */
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/export.h>
++#include <linux/io.h>
++#include <linux/vmalloc.h>
++#include <linux/delay.h>
++#include <linux/kernel_read_file.h>
++#include <linux/stop_machine.h>
++#include <linux/kobject.h>
++#include <linux/sysfs.h>
++#include <linux/string.h>
++#include <linux/cpumask.h>
++#include <linux/smp.h>
++#include <asm/cacheflush.h>
++#include <asm/mmu_context.h>
++#include <asm/virt.h>
++#include <asm/daifflags.h>
++
++/* Our own reset trampoline (ferros_reset.S) — CONFIG_KEXEC_CORE is off, so the
++ * kexec cpu_soft_restart is not built. Same signature. */
++void ferros_soft_restart(unsigned long el2_switch, unsigned long entry,
++			 unsigned long arg0, unsigned long arg1,
++			 unsigned long arg2);
++
++#define FERROS_PHYS	0x92400000UL		/* carveout base == ferros link base */
++#define FERROS_SIZE	0x00C00000UL		/* 12 MB carveout */
++#define FERROS_MAXIMG	0x00400000UL		/* accept up to 4 MB of image */
++#define FERROS_PATH	"/ferros.bin"
++
++/* Result scratch — last 1 MB of the carveout.
++ *   +0x00 = MAGIC once ferros entry() completes
++ *   +0x08 = x0 handed in   +0x10 = stage tag   +0x18 = landed EL
++ *   +0x80 = ARM sentinel (set before we jump; seen on the recovery boot)
++ *   +0x100 = 0xBEE1 written by ferros _entry asm  (jump landed)
++ *   +0x108 = 0xBEE2 written by ferros Rust entry  (BSS/stack/kernel_main OK) */
++#define FERROS_SCRATCH	0x92F00000UL
++#define FERROS_MAGIC	0x6D49685366526546ULL	/* "FeRoShIm" LE */
++#define FERROS_ARMED	0xA5A5A5A5A5A5A5A5ULL	/* sentinel at +0x80 */
++#define OFF_ARMED	(0x80 / 8)
++#define OFF_CRUMB_ENTRY	(0x100 / 8)
++#define OFF_CRUMB_RUST	(0x108 / 8)
++
++/* set once the image is staged in the carveout */
++static phys_addr_t ferros_entry_phys;
++
++/* One-shot gate: set by ferros_ramoops_read (postcore, before the UFS hook) when
++ * a result from the last handoff is present. ferros_handoff() then skips this
++ * boot, so ferros runs once, warm-resets, and the next boot reports + boots to
++ * Android instead of looping. Makes the ramoops read reliable. */
++static bool ferros_reported;
++
++/*
++ * The jump. Mirrors machine_kexec()'s IND_DONE branch with no relocation: the
++ * image is already at its final physical address. el2_switch = is_hyp_nvhe()
++ * routes through the hyp stub's HVC_SOFT_RESTART so ferros re-enters at EL2 with
++ * the MMU off — exactly the state ferros's _entry fast path detects and expects.
++ */
++static void __noreturn ferros_do_jump(void)
++{
++	typeof(ferros_soft_restart) *restart;
++	bool el2_switch = is_hyp_nvhe();
++
++	/*
++	 * CONFIG_KVM=y: KVM may own the EL2 vectors. Reinstall the hyp stub so the
++	 * HVC_SOFT_RESTART below is handled by the stub (which disables the EL2 MMU
++	 * and branches to ferros at EL2). Harmless if the stub is already there.
++	 * Only meaningful for the nvhe case; in VHE the kernel is already at EL2 and
++	 * el2_switch is false.
++	 */
++	if (el2_switch)
++		__hyp_reset_vectors();
++
++	local_daif_mask();
++	cpu_install_idmap();
++	restart = (void *)__pa_symbol(ferros_soft_restart);
++	/* x0 = 0: ferros/pixel8 hardcodes its register addresses, no DTB needed. */
++	restart(el2_switch, ferros_entry_phys, 0, 0, 0);
++	unreachable();
++}
++
++/*
++ * Runs on every online CPU, synchronized, with IRQs already disabled by the
++ * stop_machine state machine. CPU0 jumps; the rest park with all exceptions
++ * masked. We never return to Linux, so leaving stop_machine's state machine
++ * pinned at MULTI_STOP_RUN (all CPUs frozen) is intentional — that IS the
++ * "secondaries quiesced" state ferros wants, equivalent to ABL's holding pen.
++ */
++static int ferros_stop_fn(void *unused)
++{
++	if (smp_processor_id() == 0)
++		ferros_do_jump();		/* never returns */
++
++	local_daif_mask();
++	while (1)
++		cpu_relax();
++	return 0;
++}
++
++/* Stage an image file into the carveout and flush it to PoC/PoU. */
++static int ferros_stage_path(const char *path)
++{
++	void *buf = NULL;
++	size_t fsize = 0;
++	ssize_t ret;
++	void *dst;
++
++	ret = kernel_read_file_from_path(path, 0, &buf, FERROS_MAXIMG,
++					 &fsize, READING_UNKNOWN);
++	if (ret < 0) {
++		pr_err("ferros: cannot read %s: %zd\n", path, ret);
++		return ret;
++	}
++	if (!fsize || fsize > FERROS_SIZE) {
++		pr_err("ferros: bad image size %zu\n", fsize);
++		vfree(buf);
++		return -EINVAL;
++	}
++
++	/* carveout is no-map (not in the linear map) — memremap a window to copy */
++	dst = memremap(FERROS_PHYS, FERROS_SIZE, MEMREMAP_WB);
++	if (!dst) {
++		pr_err("ferros: memremap %#lx failed\n", FERROS_PHYS);
++		vfree(buf);
++		return -ENOMEM;
++	}
++	memcpy(dst, buf, fsize);
++	/* CPU0 fetches ferros with caches/MMU off after the jump: push to PoC and
++	 * invalidate the I-side to PoU so it sees the bytes we just wrote. */
++	dcache_clean_inval_poc((unsigned long)dst, (unsigned long)dst + fsize);
++	icache_inval_pou((unsigned long)dst, (unsigned long)dst + fsize);
++	memunmap(dst);
++	vfree(buf);
++
++	ferros_entry_phys = FERROS_PHYS;
++	pr_info("ferros: staged %zu bytes from %s at %#lx\n", fsize, path, FERROS_PHYS);
++	return 0;
++}
++
++/*
++ * Public entry. Called by the trigger (M0: the late_initcall below; M1: the UFS
++ * link-up hook). Stages the image if needed, then freezes all CPUs and jumps.
++ * Returns only on staging failure.
++ */
++void ferros_handoff(void)
++{
++	if (ferros_reported) {
++		pr_info("ferros: result already reported this boot; skipping handoff\n");
++		return;
++	}
++	if (!ferros_entry_phys && ferros_stage_path(FERROS_PATH))
++		return;
++
++	pr_info("ferros: freezing CPUs, jumping to %#llx (el2_switch=%d)\n",
++		(u64)ferros_entry_phys, is_hyp_nvhe());
++	stop_machine(ferros_stop_fn, NULL, cpu_online_mask);
++	/* not reached */
++}
++
++/*
++ * Runtime hot-load (no reflash). `echo <path> > /sys/kernel/ferros/stage` copies an image into the carveout; `adb reboot ferros` then reaches ufshcd's reboot notifier, which quiesces the UFS host (resumed, clocks ungated, auto-hibern8 off, queue drained) and calls ferros_handoff_now(). Android's own shutdown has already synced and unmounted by then, and device_shutdown() has not yet run, so ferros still adopts a live link. Nothing is armed at boot, so any reset — ferros's report, a fault, the watchdog — just boots Android again.
++ */
++bool ferros_is_staged(void)
++{
++	return ferros_entry_phys != 0;
++}
++
++void ferros_handoff_now(void)
++{
++	pr_info("ferros: runtime handoff, freezing CPUs, jumping to %#llx (el2_switch=%d)\n",
++		(u64)ferros_entry_phys, is_hyp_nvhe());
++	stop_machine(ferros_stop_fn, NULL, cpu_online_mask);
++}
++
++static ssize_t stage_store(struct kobject *kobj, struct kobj_attribute *attr,
++			   const char *buf, size_t count)
++{
++	char path[256];
++	int ret;
++
++	if (!count || count >= sizeof(path))
++		return -EINVAL;
++	memcpy(path, buf, count);
++	path[count] = 0;
++	strim(path);
++	ferros_entry_phys = 0;
++	ret = ferros_stage_path(path);
++	return ret ? ret : count;
++}
++
++static ssize_t stage_show(struct kobject *kobj, struct kobj_attribute *attr,
++			  char *buf)
++{
++	return sysfs_emit(buf, "%d\n", ferros_entry_phys != 0);
++}
++
++static struct kobj_attribute ferros_stage_attr = __ATTR(stage, 0600, stage_show, stage_store);
++
++static int __init ferros_sysfs_init(void)
++{
++	struct kobject *k = kobject_create_and_add("ferros", kernel_kobj);
++
++	if (!k)
++		return -ENOMEM;
++	return sysfs_create_file(k, &ferros_stage_attr.attr);
++}
++late_initcall(ferros_sysfs_init);
++
++/*
++ * Read the UFS result block ferros dropped in the ramoops region (which survives
++ * the reset, unlike the low carveout scratch). Runs early, before the ramoops
++ * driver touches the zone. On the disarmed read-back boot this prints the last
++ * armed run's link/OCS/status and the first 64 bytes of LBA 0.
++ */
++#define FERROS_RAMOOPS	0xFD600000UL
++#define FERROS_RESULT_MAGIC	0x315366556F526546ULL	/* "FeRoUfS1" LE */
++static int __init ferros_ramoops_read(void)
++{
++	u64 *r = memremap(FERROS_RAMOOPS, 128, MEMREMAP_WB);
++
++	if (!r)
++		return 0;
++	if (r[0] == FERROS_RESULT_MAGIC) {
++		u64 rw = r[2], wt = r[4];
++
++		pr_info("ferros: UFS READ link_up=%llu nop_ocs=%#llx nop_rsp=%#llx(NOP_IN) read_ocs=%#llx scsi_status=%#llx mbr_sig=%#llx(want 0xaa55)\n",
++			r[1], rw & 0xff, (rw >> 8) & 0xff, (rw >> 16) & 0xff,
++			(rw >> 24) & 0xff, r[3] & 0xffff);
++		pr_info("ferros: UFS WRITE-test read=%#llx write=%#llx readback=%#llx restore=%#llx verify=%#llx | wrote_ok=%llu restored_ok=%llu\n",
++			wt & 0xff, (wt >> 8) & 0xff, (wt >> 16) & 0xff,
++			(wt >> 24) & 0xff, (wt >> 32) & 0xff,
++			r[5] & 0xff, (r[5] >> 8) & 0xff);
++		print_hex_dump(KERN_INFO, "ferros pattern-readback: ",
++			       DUMP_PREFIX_OFFSET, 16, 1, &r[20], 16, false);
++		ferros_reported = true;	/* one-shot: skip this boot's handoff */
++		r[0] = 0;	/* consume so the next boot re-arms */
++		dcache_clean_inval_poc((unsigned long)r, (unsigned long)r + 8);
++	} else {
++		pr_info("ferros: no UFS result in ramoops (magic=%#llx)\n", r[0]);
++	}
++	memunmap(r);
++	return 0;
++}
++postcore_initcall(ferros_ramoops_read);
++
++/*
++ * M1 trigger lives in the ufs-exynos module: it calls ferros_handoff() from the
++ * power-mode-change POST notify, once the link is at HS-G4 and the device is
++ * initialized — the whole point being that ferros inherits a live, fully-up UFS
++ * link. (M0 proved the jump from an early late_initcall; that is retired now.)
++ *
++ * ferros signals its result by reboot cadence, since the scratch does not
++ * survive a reset: fast reboot-logo loop = LBA 0 read succeeded, slow loop =
++ * read failed but ferros ran, hang→fastboot = ferros crashed. Disarm by flashing
++ * a vendor_kernel_boot without /ferros.bin (ferros_handoff then no-ops).
++ */
+diff --git a/arch/arm64/kernel/ferros_reset.S b/arch/arm64/kernel/ferros_reset.S
+new file mode 100644
+index 000000000..6417bd2f4
+--- /dev/null
++++ b/arch/arm64/kernel/ferros_reset.S
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * ferros_soft_restart — self-contained copy of cpu_soft_restart (cpu-reset.S).
++ *
++ * The handoff needs the same "put the CPU back to a reset-like state and branch
++ * to a physical entry, optionally switching up to EL2 via the hyp stub" routine
++ * that kexec uses. But CONFIG_KEXEC_CORE is not set on this build, so cpu-reset.o
++ * is not compiled. We ship our own identical copy in .idmap.text rather than
++ * pull in all of KEXEC and perturb the GKI config surface.
++ */
++#include <linux/linkage.h>
++#include <linux/cfi_types.h>
++#include <asm/assembler.h>
++#include <asm/sysreg.h>
++#include <asm/virt.h>
++
++.text
++.pushsection    .idmap.text, "awx"
++
++/*
++ * ferros_soft_restart(el2_switch, entry, arg0, arg1, arg2)
++ *
++ * @el2_switch: nonzero => HVC through the hyp stub to re-enter @entry at EL2.
++ * @entry:      physical address to branch to (ferros _start).
++ * arg0..arg2:  passed to @entry in x0..x2.
++ *
++ * Must run with the flat identity mapping installed (cpu_install_idmap()).
++ */
++SYM_TYPED_FUNC_START(ferros_soft_restart)
++	mov_q	x12, INIT_SCTLR_EL1_MMU_OFF
++	pre_disable_mmu_workaround
++	/*
++	 * either disable EL1&0 translation regime or disable EL2&0 translation
++	 * regime if HCR_EL2.E2H == 1 (VHE).
++	 */
++	msr	sctlr_el1, x12
++	isb
++
++	cbz	x0, 1f				// el2_switch?
++	mov	x0, #HVC_SOFT_RESTART
++	hvc	#0				// no return
++
++1:	mov	x8, x1				// entry
++	mov	x0, x2				// arg0
++	mov	x1, x3				// arg1
++	mov	x2, x4				// arg2
++	br	x8
++SYM_FUNC_END(ferros_soft_restart)
++
++.popsection
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 9134a1fec..03a83e488 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -20,6 +20,7 @@
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
++#include <linux/reboot.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/sched/clock.h>
+ #include <linux/iopoll.h>
+@@ -5030,6 +5031,12 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
+ 		ufshcd_print_host_state(hba);
+ 		ufshcd_print_pwr_info(hba);
+ 		ufshcd_print_evt_hist(hba);
++		/* FERROS bisect verdict channel: a linkstartup failure reboots
++		 * straight to bootloader so a stripped-modules boot self-reports
++		 * (fastboot appears = link failed; adb = link OK; neither =
++		 * unrelated hang). pstore proved unreliable across forced
++		 * power-cycles. */
++		kernel_restart("bootloader");
+ 	}
+ 	return ret;
+ }
+@@ -8904,6 +8911,46 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
+ 	return ret;
+ }
+ 
++/* FERROS runtime hot-load trigger: `adb reboot ferros` with an image staged via /sys/kernel/ferros/stage. Runs first in the reboot notifier chain — Android has already synced and unmounted, device_shutdown() has not run yet — and puts the link back into the state the boot-time handoff proved ferros can adopt: host resumed, clocks ungated (which also exits hibern8), auto-hibern8 off so the link cannot drop into H8 under ferros, clock scaling pinned at the top gear, request queue blocked and drained. Returns only if nothing is staged or the jump fails, and the reboot then proceeds normally. */
++static struct ufs_hba *ferros_hba;
++
++static int ufshcd_ferros_reboot(struct notifier_block *nb, unsigned long action, void *cmd)
++{
++	struct ufs_hba *hba = ferros_hba;
++	bool ferros_is_staged(void);
++	void ferros_handoff_now(void);
++	void __iomem *b;
++
++	if (action != SYS_RESTART || !cmd || strcmp(cmd, "ferros") || !hba)
++		return NOTIFY_DONE;
++	if (!ferros_is_staged()) {
++		pr_err("ferros: reboot ferros with nothing staged; rebooting normally\n");
++		return NOTIFY_DONE;
++	}
++	ufshcd_rpm_get_sync(hba);
++	ufshcd_hold(hba, false);
++	if (ufshcd_is_auto_hibern8_supported(hba))
++		ufshcd_auto_hibern8_update(hba, 0);
++	if (ufshcd_is_clkscaling_supported(hba)) {
++		ufshcd_clk_scaling_suspend(hba, true);
++		ufshcd_devfreq_scale(hba, true);
++	}
++	ufshcd_scsi_block_requests(hba);
++	if (ufshcd_wait_for_doorbell_clr(hba, 1000 * 1000))
++		pr_err("ferros: UFS doorbells did not drain; handing off anyway\n");
++	b = hba->mmio_base;
++	pr_info("ferros: RUNTIME UFS IS=%#x HCS=%#x DBR=%#x RSR=%#x AHIT=%#x gear=%u\n",
++		readl(b + 0x20), readl(b + 0x30), readl(b + 0x58), readl(b + 0x60),
++		readl(b + 0x18), hba->pwr_info.gear_rx);
++	ferros_handoff_now();
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block ufshcd_ferros_reboot_nb = {
++	.notifier_call = ufshcd_ferros_reboot,
++	.priority = INT_MAX,
++};
++
+ /**
+  * ufshcd_async_scan - asynchronous execution for probing hba
+  * @data: data pointer to pass to this function
+@@ -8924,6 +8971,39 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
+ 	/* Probe and add UFS logical units  */
+ 	ret = ufshcd_add_lus(hba);
+ 
++	/* FERROS M1 handoff: the UFS device is now fully initialized, at its working
++	 * gear, and its logical units are scanned in — i.e. the link is live and the
++	 * device is serving I/O. Jump into ferros so it adopts THIS link instead of
++	 * running its own (device-silent) link startup. ferros_handoff() is builtin
++	 * (same vmlinux, no module symbol export needed); it freezes all CPUs and
++	 * branches to ferros, returning only if disarmed (no /ferros.bin staged). */
++	if (!ret && !ferros_hba) {
++		ferros_hba = hba;
++		register_reboot_notifier(&ufshcd_ferros_reboot_nb);
++	}
++	if (!ret) {
++		static bool ferros_fired;
++		void ferros_handoff(void);
++
++		if (!ferros_fired) {
++			void __iomem *b = hba->mmio_base;
++
++			ferros_fired = true;
++			/* Dump Linux's LIVE, working controller state so ferros's
++			 * post-adoption state can be diffed against it. Same offsets
++			 * ferros captures. Runs on the disarmed boot too. */
++			pr_info("ferros: LINUX-LIVE UFS IS=%#x IE=%#x HCS=%#x UTRLBA=%#x DBR=%#x RSR=%#x IACR=%#x\n",
++				readl(b + 0x20), readl(b + 0x24), readl(b + 0x30),
++				readl(b + 0x50), readl(b + 0x58), readl(b + 0x60),
++				readl(b + 0x4C));
++			pr_info("ferros: LINUX-LIVE vs_FSM=%#x vs_DMA_state=%#x vs_DMA_dbell=%#x vs_AXI_ctrl=%#x vs_VENDOR_IS=%#x\n",
++				readl(b + 0xC0), readl(b + 0xC8), readl(b + 0xD8),
++				readl(b + 0xF8), readl(b + 0x38));
++			pr_info("ferros: UFS LUs added, link live — handing off\n");
++			ferros_handoff();
++		}
++	}
++
+ out:
+ 	pm_runtime_put_sync(hba->dev);
+ 
+diff --git a/include/ufs/ufshcd.h b/include/ufs/ufshcd.h
+index 56dd850ea..ca6a0551d 100644
+--- a/include/ufs/ufshcd.h
++++ b/include/ufs/ufshcd.h
+@@ -1268,10 +1268,36 @@ static inline bool ufshcd_enable_wb_if_scaling_up(struct ufs_hba *hba)
+ #define ufsmcq_readlx(hba, reg)	\
+ 	readl_relaxed((hba)->mcq_base + (reg))
+ 
++/* FERROS: trace core-layer register accesses (the exynos glue traces its own).
++ * Self-contained static inline — per-module budget and dedup state, no exported
++ * symbol, so it links against both source-built and prebuilt GKI kernels.
++ * NOTE: only takes effect in code recompiled with this header; the prebuilt GKI
++ * Image's builtin ufshcd stays untraced unless the kernel is built from source. */
++static inline void ferros_core_trace(int is_read, u32 reg, u32 val)
++{
++	static int budget = 4096;
++	static u32 last_key = ~0u, last_val;
++
++	if (budget <= 0)
++		return;
++	if (is_read) {
++		if (last_key == reg && last_val == val)
++			return;
++		last_key = reg;
++		last_val = val;
++	} else {
++		last_key = ~0u;
++	}
++	budget--;
++	printk(KERN_INFO "FCORE %c %04x = %08x\n", is_read ? 'R' : 'W', reg, val);
++}
++
+ #define ufshcd_writel(hba, val, reg)	\
+-	writel((val), (hba)->mmio_base + (reg))
++	({ ferros_core_trace(0, (reg), (val)); \
++	   writel((val), (hba)->mmio_base + (reg)); })
+ #define ufshcd_readl(hba, reg)	\
+-	readl((hba)->mmio_base + (reg))
++	({ u32 __fcv = readl((hba)->mmio_base + (reg)); \
++	   ferros_core_trace(1, (reg), __fcv); __fcv; })
+ 
+ /**
+  * ufshcd_rmwl - perform read/modify/write for a controller register

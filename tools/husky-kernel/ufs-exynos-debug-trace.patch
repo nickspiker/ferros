@@ -1,0 +1,265 @@
+diff --git a/drivers/ufs/ufs-exynos.c b/drivers/ufs/ufs-exynos.c
+index ef1a0a3..7f9b435 100644
+--- a/drivers/ufs/ufs-exynos.c
++++ b/drivers/ufs/ufs-exynos.c
+@@ -10,10 +10,12 @@
+ // (at your option) any later version.
+ 
+ #include <linux/module.h>
++#include <linux/reboot.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/clk.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/smc.h>
+ #include <ufs/ufshcd.h>
+ #include <host/ufshcd-pltfrm.h>
+@@ -722,12 +724,77 @@ static void exynos_ufs_update_clkgate_delay_ms(struct ufs_hba *hba)
+ 		hba->clk_gating.delay_ms = timer << 1;
+ }
+ 
++/* FERROS DEBUG: gates the FWTRACE MMIO-write logging in ufs-vs-mmio.h. Set
++ * across the whole HCE-enable + link-startup window so we capture the exact
++ * vendor register sequence of a WORKING bring-up. */
++int ferros_trace;
++static int ferros_link_up; /* set on link_startup POST success; read by the bisect probe-watchdog */
++EXPORT_SYMBOL(ferros_trace);
++
++/* FERROS DEBUG: dump the invisible state ferros can't see from the UFS MMIO
++ * block — clock rates, CMU_HSI2 registers, the PMU PHY-isolation reg, and the
++ * vcc/vccq/vccq2 regulators. ferros's MMIO now matches Linux byte-for-byte yet
++ * the device stays silent, so the difference must live here. */
++static void ferros_dump_invisible(struct exynos_ufs *ufs, const char *tag)
++{
++	struct ufs_hba *hba = ufs->hba;
++	struct ufs_vreg_info *vi = &hba->vreg_info;
++
++	/* Only kernel-framework calls here — no raw ioremap/readl of guessed CMU/PMU
++	 * offsets: reading an unclocked/protected register bus-errors and panics the
++	 * kernel during UFS probe (that bootlooped the previous build). clk_get_rate
++	 * gives us the UFS clock rates safely, which is the load-bearing datum. */
++	printk(KERN_INFO "FINVIS[%s] clk_unipro=%lu clk_hci=%lu\n", tag,
++	       ufs->clk_unipro ? clk_get_rate(ufs->clk_unipro) : 0UL,
++	       ufs->clk_hci ? clk_get_rate(ufs->clk_hci) : 0UL);
++
++	if (vi->vcc)
++		printk(KERN_INFO "FINVIS[%s] vcc en=%d uV=%d\n", tag, vi->vcc->enabled,
++		       vi->vcc->reg ? regulator_get_voltage(vi->vcc->reg) : -1);
++	if (vi->vccq)
++		printk(KERN_INFO "FINVIS[%s] vccq en=%d uV=%d\n", tag, vi->vccq->enabled,
++		       vi->vccq->reg ? regulator_get_voltage(vi->vccq->reg) : -1);
++	if (vi->vccq2)
++		printk(KERN_INFO "FINVIS[%s] vccq2 en=%d uV=%d\n", tag, vi->vccq2->enabled,
++		       vi->vccq2->reg ? regulator_get_voltage(vi->vccq2->reg) : -1);
++
++	/* mclk clock tree, same ten registers ferros reads pristine.
++	 * These offsets come from the zuma cmucal SFR tables (not guessed): the
++	 * cal-if clock driver reads/writes these exact registers constantly, so
++	 * unlike the previous raw-CMU attempt they are safe to read at ls_pre
++	 * with UFS clocks enabled.
++	 * PLL rate = 24.576MHz*M/(P*2^S), CON3 M=[25:16] P=[13:8] S=[2:0].
++	 * TOP mux SELECT=[1:0] (0=OSC 1=SHARED0_D4 2=SHARED2_D2 3=SPARE_D1),
++	 * TOP div DIVRATIO=[3:0], gates CG_VAL=[21] MANUAL=[20], user mux MUX_SEL=[4]. */
++	{
++		void __iomem *top = ioremap(0x26040000, 0x3000);
++		void __iomem *hsi2 = ioremap(0x13000000, 0x3000);
++
++		if (top) {
++			printk(KERN_INFO "FINVIS[%s] cmu_top sh0=%08x sh2=%08x spare=%08x mux=%08x div=%08x gate=%08x\n",
++			       tag, readl(top + 0x14c), readl(top + 0x1cc),
++			       readl(top + 0x24c), readl(top + 0x10b8),
++			       readl(top + 0x18b0), readl(top + 0x20e0));
++			iounmap(top);
++		}
++		if (hsi2) {
++			printk(KERN_INFO "FINVIS[%s] cmu_hsi2 umux=%08x aclk=%08x unipro=%08x fmp=%08x\n",
++			       tag, readl(hsi2 + 0x630), readl(hsi2 + 0x210c),
++			       readl(hsi2 + 0x2110), readl(hsi2 + 0x2114));
++			iounmap(hsi2);
++		}
++	}
++}
++
+ static int exynos_ufs_hce_enable_notify(struct ufs_hba *hba,
+ 					enum ufs_notify_change_status notify)
+ {
+ 	struct exynos_ufs *ufs = to_exynos_ufs(hba);
+ 	int ret = 0;
+ 
++	if (notify == PRE_CHANGE)
++		ferros_trace = 1; /* start tracing the working init */
++
+ 	if (!IS_C_STATE_ON(ufs) ||
+ 	    (ufs->h_state != H_DISABLED &&
+ 	     ufs->h_state != H_SUSPEND))
+@@ -811,6 +878,7 @@ static int exynos_ufs_link_startup_notify(struct ufs_hba *hba,
+ 		/* cal */
+ 		p->mclk_rate = ufs->mclk_rate;
+ 		p->available_lane = ufs->num_lanes;
++		ferros_dump_invisible(ufs, "ls_pre");
+ 		ret = ufs_call_cal(ufs, 0, ufs_cal_pre_link);
+ 		break;
+ 	case POST_CHANGE:
+@@ -829,6 +897,21 @@ static int exynos_ufs_link_startup_notify(struct ufs_hba *hba,
+ 				 (!ret) ? res_token[0] : res_token[1]);
+ 
+ 		ufs->h_state = H_LINK_UP;
++		WRITE_ONCE(ferros_link_up, 1);
++		/* FERROS analog capture: dump the M-PHY (PMA) block on the working
++		 * link at PWM-G1 — the exact equivalent point to ferros's failed
++		 * linkstartup. Diff vs ferros's PMA isolates any analog cal delta
++		 * that the (identical) cal WRITES didn't produce. pma_readl gates
++		 * the APB clock per-read. COMN 0x000-0x1FC, TRSV0 0x800-0x9FC. */
++		{
++			u32 o;
++			for (o = 0x000; o <= 0x1FC; o += 4)
++				printk(KERN_INFO "FPMA C %04x = %08x\n", o,
++				       pma_readl(&ufs->handle, o));
++			for (o = 0x800; o <= 0xBFC; o += 4)
++				printk(KERN_INFO "FPMA T %04x = %08x\n", o,
++				       pma_readl(&ufs->handle, o));
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -870,9 +953,24 @@ static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
+ 		/* update active lanes after pmc */
+ 		exynos_ufs_update_active_lanes(hba);
+ 
++		/* FERROS DEBUG: capture the working-UFS protector-security + descriptor
++		 * DMA addresses so a non-secure OS can see whether descriptors must live
++		 * in secure memory. Printed once at boot after the link reaches HS gear. */
++		dev_info(ufs->dev,
++			"FERROS_UFSP RSECURITY=%08x WSECURITY=%08x SBEGIN0=%08x SEND0=%08x SLUN0=%08x SCTRL0=%08x\n",
++			readl(ufs->reg_ufsp + 0x10), readl(ufs->reg_ufsp + 0x110),
++			readl(ufs->reg_ufsp + 0x200), readl(ufs->reg_ufsp + 0x204),
++			readl(ufs->reg_ufsp + 0x208), readl(ufs->reg_ufsp + 0x20C));
++		dev_info(ufs->dev,
++			"FERROS_DESC UTRLBA=%08x UTRLBAU=%08x utrdl_dma=%pad ucdl_dma=%pad utmrdl_dma=%pad\n",
++			std_readl(&ufs->handle, 0x50), std_readl(&ufs->handle, 0x54),
++			&hba->utrdl_dma_addr, &hba->ucdl_dma_addr, &hba->utmrdl_dma_addr);
++
+ 		/* cal */
+ 		ret = ufs_call_cal(ufs, 0, ufs_cal_post_pmc);
+ 
++		ferros_trace = 0; /* stop tracing: full working bring-up captured */
++
+ 		if (!hba->clk_gating.is_suspended)
+ 			dev_info(ufs->dev,
+ 				 "Power mode change(%d): M(%d)G(%d)L(%d)"
+@@ -1798,7 +1896,17 @@ static struct platform_driver exynos_ufs_driver = {
+ 	.shutdown = exynos_ufs_shutdown,
+ };
+ 
+-module_platform_driver(exynos_ufs_driver);
++static int __init exynos_ufs_driver_init(void)
++{
++	return platform_driver_register(&exynos_ufs_driver);
++}
++module_init(exynos_ufs_driver_init);
++
++static void __exit exynos_ufs_driver_exit(void)
++{
++	platform_driver_unregister(&exynos_ufs_driver);
++}
++module_exit(exynos_ufs_driver_exit);
+ MODULE_DESCRIPTION("Exynos Specific UFSHCI driver");
+ MODULE_AUTHOR("Seungwon Jeon <tgih.jun@samsung.com>");
+ MODULE_AUTHOR("Kiwoong Kim <kwmad.kim@samsung.com>");
+diff --git a/drivers/ufs/zuma/ufs-vs-mmio.h b/drivers/ufs/zuma/ufs-vs-mmio.h
+index b66c99c..73e6665 100644
+--- a/drivers/ufs/zuma/ufs-vs-mmio.h
++++ b/drivers/ufs/zuma/ufs-vs-mmio.h
+@@ -16,34 +16,70 @@ struct ufs_vs_handle {
+ 	void *private;
+ };
+ 
++/* FERROS DEBUG: when set (around UFS init), every vendor MMIO write is logged
++ * as "FWTRACE <region> <ofs> = <val>" so the exact working init sequence can
++ * be diffed against ferros's full_init. Defined in ufs-exynos.c. */
++extern int ferros_trace;
++
+ static inline void std_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
+ {
++	if (ferros_trace)
++		printk(KERN_INFO "FWTRACE std    %04x = %08x\n", ofs, val);
+ 	writel(val, handle->std + ofs);
+ }
+ 
++/* FERROS DEBUG: read-trace with consecutive-dedup. A hot poll loop reads the
++ * same reg thousands of times; logging every one floods the log and printk is
++ * slow enough to distort bring-up timing. Dedup on (ofs,val) per region so a
++ * poll collapses to the lines where the value actually transitions. */
++static inline void ferros_rtrace(const char *reg, u32 ofs, u32 val,
++				 u32 *last_ofs, u32 *last_val)
++{
++	if (!ferros_trace)
++		return;
++	if (ofs == *last_ofs && val == *last_val)
++		return;
++	*last_ofs = ofs;
++	*last_val = val;
++	printk(KERN_INFO "FRTRACE %s %04x = %08x\n", reg, ofs, val);
++}
++
+ static inline u32 std_readl(struct ufs_vs_handle *handle, u32 ofs)
+ {
+-	return readl(handle->std + ofs);
++	static u32 lo = 0xffffffff, lv;
++	u32 val = readl(handle->std + ofs);
++	ferros_rtrace("std   ", ofs, val, &lo, &lv);
++	return val;
+ }
+ 
+ static inline void hci_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
+ {
++	if (ferros_trace)
++		printk(KERN_INFO "FWTRACE hci    %04x = %08x\n", ofs, val);
+ 	writel(val, handle->hci + ofs);
+ }
+ 
+ static inline u32 hci_readl(struct ufs_vs_handle *handle, u32 ofs)
+ {
+-	return readl(handle->hci + ofs);
++	static u32 lo = 0xffffffff, lv;
++	u32 val = readl(handle->hci + ofs);
++	ferros_rtrace("hci   ", ofs, val, &lo, &lv);
++	return val;
+ }
+ 
+ static inline void unipro_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
+ {
++	if (ferros_trace)
++		printk(KERN_INFO "FWTRACE unipro %04x = %08x\n", ofs, val);
+ 	writel(val, handle->unipro + ofs);
+ }
+ 
+ static inline u32 unipro_readl(struct ufs_vs_handle *handle, u32 ofs)
+ {
+-	return readl(handle->unipro + ofs);
++	static u32 lo = 0xffffffff, lv;
++	u32 val = readl(handle->unipro + ofs);
++	ferros_rtrace("unipro", ofs, val, &lo, &lv);
++	return val;
+ }
+ 
+ static inline void cport_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
+@@ -83,11 +119,17 @@ static inline u32 pma_readl(struct ufs_vs_handle *handle, u32 ofs)
+ 	val = readl(handle->pma + ofs);
+ 	DSB;
+ 	writel(clkstop_ctrl | MPHY_APBCLK_CAL, handle->hci + MISC_CAL);
++	{
++		static u32 lo = 0xffffffff, lv;
++		ferros_rtrace("pma   ", ofs, val, &lo, &lv);
++	}
+ 	return val;
+ }
+ #else
+ static inline void pma_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
+ {
++	if (ferros_trace)
++		printk(KERN_INFO "FWTRACE pma    %04x = %08x\n", ofs, val);
+ 	writel(val, handle->pma + ofs);
+ }
+ 

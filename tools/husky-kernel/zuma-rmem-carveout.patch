@@ -1,0 +1,28 @@
+diff --git a/dts/zuma-rmem.dtsi b/dts/zuma-rmem.dtsi
+index 65be646..d905536 100644
+--- a/dts/zuma-rmem.dtsi
++++ b/dts/zuma-rmem.dtsi
+@@ -69,6 +69,23 @@
+ 			no-map;
+ 		};
+ 
++		/*
++		 * ferros handoff carveout. 12 MB hole between gxp_mcu_fw and tpu_fw.
++		 * The shim kernel loads /ferros.bin here and jumps to it via
++		 * cpu_soft_restart after UFS link-up, so ferros adopts the live link
++		 * instead of running its own (device-silent) link startup.
++		 * ferros is relinked to base 0x92400000; its image + stack + static
++		 * UFS DMA buffers all live inside this region, so the UFS master DMAs
++		 * only to reserved DRAM the running kernel never touched.
++		 * no-map: no kernel linear mapping; handoff code memremaps to load.
++		 * Last 1 MB (0x92F00000) is the result scratch ferros writes and the
++		 * next Linux boot reads back.
++		 */
++		ferros_handoff_reserved: ferros_handoff@92400000 {
++			reg = <0x0 0x92400000 0x00C00000>;
++			no-map;
++		};
++
+ 		tpu_fw_reserved: tpu_fw@93000000 {
+ 			reg = <0x0 0x93000000 0x01000000>;
+ 			no-map;
