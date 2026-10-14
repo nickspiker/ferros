@@ -1594,9 +1594,11 @@ impl Dwc3Dev {
                 DEPEVT_XFERNOTREADY => {
                     self.ep0_xfer_notready += 1;
 
-                    // Bulk OUT XferNotReady — arm receive if configured
-                    if ep_phys == 2 && self.configured {
-                        self.bulk_out_arm();
+                    // Bulk OUT XferNotReady — arm receive only if no transfer is started (Linux dwc3 does the same: kick on NotReady only without DWC3_EP_TRANSFER_STARTED). These events queue while the main loop processes a packet; by the time they are polled the loop has usually re-armed already, and re-arming an armed endpoint ENDTRANSFERs the live TRB (drops the packet in flight, fails STARTTRANSFER with "no resource", raises more NotReady). On hardware that storm filled the event buffer mid-RELOAD: 437 failed STARTTRANSFERs, GEVNTCOUNT pinned at the full 1 KiB.
+                    if ep_phys == 2 {
+                        if self.configured && !self.bulk_out_armed {
+                            self.bulk_out_arm();
+                        }
                         return UsbEvent::None;
                     }
                     // Bulk IN XferNotReady — host polling, NAK until we send
