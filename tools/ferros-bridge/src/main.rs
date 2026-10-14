@@ -58,7 +58,7 @@ fn usage() {
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
-    eprintln!("  display [text]    Render text on the panel (shim after a --live handoff; '\\n' = newline)");
+    eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until both volume keys)");
 }
 
 #[tokio::main]
@@ -94,8 +94,11 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "display" => {
-            let text = args.get(2).cloned().unwrap_or_else(|| "ferros".to_string()).replace("\\n", "\n");
-            cmd_display(&text).await;
+            // --hold: keep the message up (the device's 512 s idle exit is disabled until both volume keys or a REBOOT).
+            let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);
+            let idx = if hold { 3 } else { 2 };
+            let text = args.get(idx).cloned().unwrap_or_else(|| "ferros".to_string()).replace("\\n", "\n");
+            cmd_display(&text, hold).await;
         }
         "echo" => cmd_echo().await,
         "send" => {
@@ -597,12 +600,17 @@ async fn cmd_diag() {
 }
 
 /// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
-async fn cmd_display(text: &str) {
+async fn cmd_display(text: &str, hold: bool) {
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
-    let cmd = build_cmd(ferros_pt::command::caps::DISPLAY, ferros_pt::Op::Write, text.as_bytes());
+    let mut params = Vec::with_capacity(text.len() + 1);
+    if hold {
+        params.push(1u8);
+    }
+    params.extend_from_slice(text.as_bytes());
+    let cmd = build_cmd(ferros_pt::command::caps::DISPLAY, ferros_pt::Op::Write, &params);
     if let Err(e) = pt_send(&link, &cmd).await {
         eprintln!("Command send failed: {e}");
         std::process::exit(1);

@@ -191,6 +191,29 @@ fn leave(p: &VaultProbe, exit: u8, attempts: u32, configured_ever: bool, usb: Op
     shim::psci_reset()
 }
 
+/// The boot screen: generation, vault state + root, and how to get out.
+fn status_text(generation: u64, p: &VaultProbe) -> alloc::vec::Vec<u8> {
+    let mut t = alloc::vec::Vec::new();
+    let hex = b"0123456789ABCDEF";
+    t.extend_from_slice(b"ferros\n\nchainloaded from Linux, generation G#");
+    for i in (0..4).rev() {
+        t.push(hex[((generation >> (i * 4)) & 0xF) as usize]);
+    }
+    t.extend_from_slice(b"\n\nufs: ");
+    t.extend_from_slice(if p.link_up { b"adopted, link up" } else { b"LINK DOWN" });
+    t.extend_from_slice(b"\nvault: ");
+    t.extend_from_slice(if p.verified == 1 { b"opened + verified".as_slice() } else if p.sealed == 1 { b"genesis sealed" } else if p.opened == 1 { b"opened, NOT verified" } else { b"NOT OPENED" });
+    t.extend_from_slice(b"\nroot: ");
+    for &b in &p.root16[..8] {
+        t.push(hex[(b >> 4) as usize]);
+        t.push(hex[(b & 0xF) as usize]);
+    }
+    t.extend_from_slice(b"\nwairua: ");
+    t.extend_from_slice(if p.wairua_ok == 1 { b"live" } else { b"NO TRNG" });
+    t.extend_from_slice(b"\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nto return to Android\n");
+    t
+}
+
 /// Shim entry with the USB service: adopt UFS, arm the safety nets, probe the vault, then serve PT over USB until told to leave.
 pub fn entry_usb(x0: u64) -> ! {
     let link_up = shim::adopt_ufs();
@@ -201,6 +224,9 @@ pub fn entry_usb(x0: u64) -> ! {
     let generation = if x0 & 1 == 1 { x0 >> 1 } else { 0 };
     let t_boot = cntpct();
     let exc_start = crate::exception_count();
+
+    // Boot screen: after a --live handoff DECON is still running, so show where this generation stands before USB even comes up (show() touches nothing when the DPU is powered down).
+    let _ = crate::shim_display::show(&status_text(generation, &probe), cntfrq());
 
     let dma = open_usb_dma_path();
     shim::crumb(0xA1);
@@ -230,6 +256,8 @@ pub fn entry_usb(x0: u64) -> ! {
     // A PT transfer that stops moving for 16 s is a wedged endpoint: report it and leave rather than idling for 512 s.
     let stall_giveup = freq * 16;
     let mut t_pt = t_init;
+    // `display --hold` keeps a message on the panel: the idle exit is off until both volume keys (or a host REBOOT) end the session.
+    let mut hold = false;
 
     let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut pt_bitmap_buf: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -265,7 +293,7 @@ pub fn entry_usb(x0: u64) -> ! {
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&probe, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
         }
-        if configured_ever && now.wrapping_sub(t_command) > idle_giveup {
+        if configured_ever && !hold && now.wrapping_sub(t_command) > idle_giveup {
             leave(&probe, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
         }
         if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
@@ -408,7 +436,13 @@ pub fn entry_usb(x0: u64) -> ! {
                                         resp.extend_from_slice(b"END\n");
                                         queue_pt_response(&mut pt_out_data, &resp);
                                     } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
-                                        let rep = crate::shim_display::show(cmd.params, freq);
+                                        // A leading G#01 byte = hold (bridge `display --hold`).
+                                        let (text, h) = match cmd.params.split_first() {
+                                            Some((1, rest)) => (rest, true),
+                                            _ => (cmd.params, false),
+                                        };
+                                        hold |= h;
+                                        let rep = crate::shim_display::show(text, freq);
                                         queue_pt_response(&mut pt_out_data, &rep);
                                     } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
