@@ -10,7 +10,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [ira entropy = unforgeability](ira_entropy_is_unforgeability.md) — ira entropy is about forgery-resistance not confidentiality; forgeable+unlocked ira = unevictable rekeyed fleet member; PUF core + vendor breadth
 - [ira entropy sources (husky)](ira_entropy_sources_husky.md) — grounded per-die source catalog + register addresses; chipid trim extras, UFS serial, MCT ring-osc; TMU/DRAM blocked; full doc ferros/IRA-ENTROPY-SOURCES.md
 - [Pixel 8 Boot Findings](pixel8_boot_findings.md) — ABL behavior, entry code crash, display pipeline, what works/doesn't
-- [UFS husky wall](ufs_husky_wall.md) — UFS driver proven correct but device silent at link-startup; blocks vault; next step is a Linux MMIO trace (see ferros/UFS.md)
+- [UFS husky wall — SOLVED](ufs_husky_wall.md) — cold UFS wall was ABL switching the flash VCC (gpp0-1) OFF before the kernel jump; drive it high + per-command nexus → cold link + LBA0 read work (2026-10-14). History kept.
 - [UFS Linux handoff](ufs_linux_handoff.md) — chainload ferros from running Linux to inherit its live UFS link; WORKS once pKVM disabled (fastboot oem pkvm disable); DRAM scratch doesn't survive reset
 - [Pixel is a dedicated ferros dev device](pixel8_dedicated_dev_device.md) — no banking/daily-driver constraint; graphene.md is dead scaffolding; free to unlock/wipe
 - [Feedback: don't SSH](feedback_no_ssh.md) — never SSH into another machine unless explicitly told to

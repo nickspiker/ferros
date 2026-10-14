@@ -1,11 +1,16 @@
 ---
 name: ufs-husky-wall
-description: "UFS storage on Pixel 8 (husky) is blocked — driver proven correct, device silent at link-startup; next step is a Linux MMIO trace"
+description: "SOLVED 2026-10-14: the husky cold UFS wall was ABL powering the flash OFF (gpp0-1 VCC low, reset asserted, refclk pin repurposed) right before the kernel jump; turn VCC back on and full_init links. History of the wall kept below."
 metadata: 
   node_type: memory
   type: project
   originSessionId: 873bc7fe-6da9-4b85-b1db-5d51c15b7843
 ---
+
+**SOLVED (2026-10-14) by reverse-engineering ABL.** ABL's UFS shutdown (`0x2cdbc`) runs on the kernel-boot path. It hibernates, then calls vendor hook stage 10: `HCI_GPIO_OUT=0`, gph5-0 re-purposed, and **gpp0-1 = 0, i.e. UFS VCC OFF**. ferros must drive gpp0-1 high (`cold_ufs::power_on_device`) before `full_init`, and set the per-command nexus bit (SCSI set, NOP/query clear). Cold result: LS_RES 0, MXGR 4, NOP OK, HS-G4, LBA0 = `AA55` (2nd read; the 1st gets UNIT ATTENTION).
+
+The August "VCC ruled out on spec grounds" reasoning below was WRONG: it assumed ABL wouldn't cut power after reading the device. Lesson: when the registers match but the device is silent, look at what the *previous stage* does on its way out. See [[husky_cold_slot_b]].
+
 
 ferros's UFS driver for Pixel 8 (husky/zuma/Tensor G3) is **proven correct but the device won't link**. This blocks the vault/manifestus storage path. Full trail is in the repo at `ferros/UFS.md`; this is the one-line state + the non-obvious conclusion.
 

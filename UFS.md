@@ -1,6 +1,29 @@
 # UFS on Pixel 8 (Zuma) — status and findings — Zil (0)
 
 ---
+## SOLVED (2026-10-14): ABL powers the flash OFF before handing over — turn VCC back on
+
+The August conclusion below ("difference is off-chip, needs a scope") was right that no UFS register differed, and wrong about why. Reverse-engineering Google's ABL (`ripcurrent-16.4-14540574`, extracted from the factory image's FBPK container) shows its UFS shutdown routine runs on the kernel-boot path, right after ABL reads the boot image.
+- **The routine:** at `0x2cdbc` it hibernates the link, then calls the zuma vendor hook with **stage 10** (`0x7777c`).
+- **What stage 10 does:**
+  - asserts the device reset: `HCI_GPIO_OUT = 0`;
+  - re-purposes the refclk pin gph5-0 (that's why GPH5CON always read `G#21` at handoff);
+  - drives **gpp0-1 LOW**, the UFS `vcc-supply` fixed regulator (`zuma-ufs.dtsi ufs_fixed_vcc`, enable-active-high).
+
+So ferros always started with an **unpowered flash device**. Linux re-enables the regulator at probe, which is why its register-identical bring-up worked.
+
+**Fix (`ferros_kernel/src/cold_ufs.rs`):**
+1. `power_on_device` sets gpp0-1 as an output (gpp0 CON `G#2010`, DAT `G#0` at handoff; the bank is accessible), drives it high, and waits 4 ms.
+2. The HAL sets the Exynos per-command nexus bit before every doorbell: set for SCSI, clear for NOP and query.
+
+**Result on a cold boot from ABL (slot b, no Linux):**
+- link startup succeeds first try (LS_RES 0, MXGR 4, 2 lanes);
+- NOP OCS 0, fDeviceInit done, HS-G4;
+- READ(10) LBA 0 returns the protective MBR signature `G#AA55`. The first read after power-on gets UNIT ATTENTION; the second returns data.
+
+Everything below is the history of how we got here.
+
+---
 ## DEFINITIVE CONCLUSION (2026-08-18): host proven byte-identical to Linux, digital AND analog — the difference is off-chip
 
 After an exhaustive campaign (custom instrumented Linux kernels built from source, root dmesg capture, ferros-side read+write+analog tracing, machine-diffed against Linux's working bring-up), **every register-level dimension of ferros's UFS bring-up is now PROVEN identical to Linux's, yet the flash device answers Linux and stays silent for ferros.** The blocker is not in any host register.
