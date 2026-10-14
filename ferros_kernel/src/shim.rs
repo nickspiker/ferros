@@ -573,13 +573,50 @@ pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
 pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
 pub const REBOOT_MODE_BOOTLOADER: u32 = 0xFC;
 
-/// Reset straight into the bootloader (fastboot): stamp the reboot mode through the EL3 monitor, then PSCI SYSTEM_RESET. Returns only if the monitor refused the write (nonzero), so the caller can report it.
-pub fn reboot_to_bootloader() -> u64 {
-    let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
-    if r == 0 {
-        psci_reset();
+/// Debug-snapshot (DSS) header, reserved-memory `header` node (G#D810_0000, 64 KiB, no-map). Offsets from debug-snapshot-def.h. The bootloader reads it to classify the last reset: Linux's clean-reboot path (dbg_snapshot_restart_handler) stamps EMERGENCY_REASON = DSS_SIGN_NORMAL_REBOOT, clears SCRATCH and every core's PANIC_STAT. Without that stamp the bootloader logs an unexpected "PIN Reset" (reason G#CECA) and boots normally with the reboot mode ignored — measured on hardware: mode G#FC written via EL3, bootloader read "Reboot mode: 0x0".
+pub const DSS_HEADER: usize = 0xD810_0000;
+pub const DSS_OFFSET_SCRATCH: usize = 0x100;
+pub const DSS_OFFSET_EMERGENCY_REASON: usize = 0x300;
+const DSS_OFFSET_PANIC_STAT: usize = 0x500;
+const DSS_SIGN_NORMAL_REBOOT: u32 = 0xCAFE;
+const NR_CPUS: usize = 9;
+
+/// Mark the coming reset as a clean reboot in the DSS header, exactly as Linux's restart handler does.
+pub fn dss_mark_clean_reboot() {
+    unsafe {
+        write_volatile((DSS_HEADER + DSS_OFFSET_EMERGENCY_REASON) as *mut u32, DSS_SIGN_NORMAL_REBOOT);
+        write_volatile((DSS_HEADER + DSS_OFFSET_SCRATCH) as *mut u32, 0);
+        for cpu in 0..NR_CPUS {
+            write_volatile((DSS_HEADER + DSS_OFFSET_PANIC_STAT + cpu * 4) as *mut u32, 0);
+        }
+        ferros_hal::mmio::cache_clean(DSS_HEADER, 0x600);
+        core::arch::asm!("dsb sy");
     }
-    r
+}
+
+/// Reset straight into the bootloader (fastboot): mark the reset clean in the DSS header, stamp the reboot mode through the EL3 monitor, then fire the cluster watchdog with a count of 1.
+/// Why the watchdog and not PSCI: measured on husky, a PSCI SYSTEM_RESET issued by ferros comes back as RST_STAT PIN_RESET (reason G#CECA) and the bootloader reads "Reboot mode: 0x0" even though the EL3 readback showed G#FC just before; an APC watchdog reset (RST_STAT CLUSTER0_NONCPU_WDTRESET) with the same mode stamped boots into fastboot ("Reboot mode: 0xfc - Bootloader"). Linux's own PSCI reset comes back as PIN_RESET|PO_RESET with the mode intact, so EL3 treats the two differently; the watchdog sidesteps whatever that is.
+/// Returns only if the monitor refused the write (nonzero) or the watchdog never fired, so the caller can report it.
+pub fn reboot_to_bootloader() -> u64 {
+    dss_mark_clean_reboot();
+    let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
+    if r != 0 {
+        return r;
+    }
+    // WTCON: RSTEN b0 + EN b5, prescaler 0, DIV16 (0 << 3); WTDAT = WTCNT = 1 → reset on the next watchdog tick.
+    for &wdt in &WATCHDOGS {
+        unsafe {
+            write_volatile(wdt as *mut u32, 0);
+            write_volatile((wdt + 0x04) as *mut u32, 1);
+            write_volatile((wdt + 0x08) as *mut u32, 1);
+            write_volatile(wdt as *mut u32, (1 << 5) | (1 << 0));
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    for _ in 0..(1u32 << 28) {
+        core::hint::spin_loop();
+    }
+    u64::MAX
 }
 
 /// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.

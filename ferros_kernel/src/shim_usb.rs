@@ -241,6 +241,7 @@ pub fn entry_usb(x0: u64) -> ! {
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
     let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
+    let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
     // RELOAD and RUN share STAGE; at most one of these is set, so a payload can never be jumped to as a kernel or vice versa.
     let mut reload_ok = false;
     let mut reload_size = 0usize;
@@ -389,6 +390,8 @@ pub fn entry_usb(x0: u64) -> ! {
                                         append_hex(&mut resp, b"WAIRUA_OK=", probe.wairua_ok as u32);
                                         // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
                                         append_hex(&mut resp, b"PMU_REBOOT_CMD=", shim::priv_reg(shim::PMU_REBOOT_CMD, false, 0) as u32);
+                                        append_hex(&mut resp, b"DSS_REASON=", r(shim::DSS_HEADER + shim::DSS_OFFSET_EMERGENCY_REASON));
+                                        append_hex(&mut resp, b"DSS_SCRATCH=", r(shim::DSS_HEADER + shim::DSS_OFFSET_SCRATCH));
                                         append_hex(&mut resp, b"S2MPU_HSI0_CTRL_LINUX=", dma.s2mpu_ctrl);
                                         append_hex(&mut resp, b"SYSMMU_NUM_VM=", dma.num_vm as u32);
                                         for vm in 0..dma.num_vm {
@@ -403,6 +406,46 @@ pub fn entry_usb(x0: u64) -> ! {
                                         }
                                         resp.extend_from_slice(b"END\n");
                                         queue_pt_response(&mut pt_out_data, &resp);
+                                    } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
+                                        // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
+                                        let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
+                                        let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
+                                        let addr = raw & !(1 << 63);
+                                        let (ret, back) = if raw >> 63 == 1 {
+                                            let ret = shim::priv_reg(addr, true, val);
+                                            (ret, shim::priv_reg(addr, false, 0) as u32)
+                                        } else {
+                                            unsafe {
+                                                write_volatile(addr as usize as *mut u32, val);
+                                                core::arch::asm!("dsb sy");
+                                                (0, read_volatile(addr as usize as *const u32))
+                                            }
+                                        };
+                                        let mut resp = [0u8; 12];
+                                        resp[..8].copy_from_slice(&ret.to_le_bytes());
+                                        resp[8..].copy_from_slice(&back.to_le_bytes());
+                                        queue_pt_response(&mut pt_out_data, &resp);
+                                    } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
+                                        // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
+                                        let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
+                                        let addr = (raw & !(1 << 63)) as usize;
+                                        let len = (u32::from_be_bytes(cmd.params[8..12].try_into().unwrap()) as usize).min(64 << 10);
+                                        let mut out = alloc::vec![0u8; len];
+                                        if raw >> 63 == 1 {
+                                            for (i, c) in out.chunks_mut(4).enumerate() {
+                                                let v = shim::priv_reg((addr + i * 4) as u64, false, 0) as u32;
+                                                c.copy_from_slice(&v.to_le_bytes()[..c.len()]);
+                                            }
+                                        } else if addr % 4 == 0 && len % 4 == 0 {
+                                            for (i, c) in out.chunks_mut(4).enumerate() {
+                                                c.copy_from_slice(&unsafe { read_volatile((addr + i * 4) as *const u32) }.to_le_bytes());
+                                            }
+                                        } else {
+                                            for (i, b) in out.iter_mut().enumerate() {
+                                                *b = unsafe { read_volatile((addr + i) as *const u8) };
+                                            }
+                                        }
+                                        queue_pt_response(&mut pt_out_data, &out);
                                     } else if (cmd.cap == cap_reload || cmd.cap == cap_run) && cmd.op == ferros_pt::Op::Write {
                                         // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
                                         let params = cmd.params;

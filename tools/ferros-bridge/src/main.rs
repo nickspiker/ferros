@@ -75,14 +75,21 @@ async fn main() {
         "diag" => cmd_diag().await,
         "read" => {
             if args.len() < 3 {
-                eprintln!("Usage: ferros-bridge read <hex-addr> [len]");
+                eprintln!("Usage: ferros-bridge read <hex-addr> [hex-len] [out-file]  (out-file gets the raw bytes instead of a hexdump; 'priv:<addr>' reads through the EL3 monitor — use it for the PMU, whose direct reads hang the bus on husky)");
                 std::process::exit(1);
             }
             let len = args
                 .get(3)
                 .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(4);
-            cmd_read(&args[2], len).await;
+            cmd_read(&args[2], len, args.get(4).map(|s| s.as_str())).await;
+        }
+        "poke" => {
+            if args.len() < 4 {
+                eprintln!("Usage: ferros-bridge poke <hex-addr> <hex-u32>  (addr bit 63 / prefix 'priv:' = write through the EL3 monitor)");
+                std::process::exit(1);
+            }
+            cmd_poke(&args[2], &args[3]).await;
         }
         "echo" => cmd_echo().await,
         "send" => {
@@ -581,7 +588,49 @@ async fn cmd_diag() {
     }
 }
 
-async fn cmd_read(addr_str: &str, len: usize) {
+/// Parse a hex address; a `priv:` prefix sets bit 63, which the shim routes through the EL3 monitor (SMC_CMD_PRIV_REG).
+fn parse_addr(s: &str) -> u64 {
+    let (privileged, hex) = match s.strip_prefix("priv:") {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let a = u64::from_str_radix(hex.trim_start_matches("G#").trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+        eprintln!("Invalid hex address: {s}");
+        std::process::exit(1);
+    });
+    if privileged { a | 1 << 63 } else { a }
+}
+
+async fn cmd_poke(addr_str: &str, val_str: &str) {
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let addr = parse_addr(addr_str);
+    let val = u32::from_str_radix(val_str.trim_start_matches("G#").trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+        eprintln!("Invalid hex value: {val_str}");
+        std::process::exit(1);
+    });
+    let mut params = [0u8; 12];
+    params[0..8].copy_from_slice(&addr.to_be_bytes());
+    params[8..12].copy_from_slice(&val.to_be_bytes());
+    let cmd = build_cmd(ferros_pt::command::caps::MEM, ferros_pt::Op::Write, &params);
+    if let Err(e) = pt_send(&link, &cmd).await {
+        eprintln!("Command send failed: {e}");
+        std::process::exit(1);
+    }
+    match pt_recv(&link).await {
+        Ok(r) if r.len() >= 12 => {
+            let ret = u64::from_le_bytes(r[0..8].try_into().unwrap());
+            let back = u32::from_le_bytes(r[8..12].try_into().unwrap());
+            println!("wrote G#{val:08X} -> G#{:X}{}: smc_ret=G#{ret:X} readback=G#{back:08X}", addr & !(1 << 63), if addr >> 63 == 1 { " (via EL3)" } else { "" });
+        }
+        Ok(r) => eprintln!("Short response: {} bytes", r.len()),
+        Err(e) => eprintln!("Response receive failed: {e}"),
+    }
+}
+
+async fn cmd_read(addr_str: &str, len: usize, out_file: Option<&str>) {
     let link = match usb::UsbLink::open() {
         Ok(l) => l,
         Err(e) => {
@@ -590,10 +639,7 @@ async fn cmd_read(addr_str: &str, len: usize) {
         }
     };
 
-    let addr = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
-        eprintln!("Invalid hex address: {addr_str}");
-        std::process::exit(1);
-    });
+    let addr = parse_addr(addr_str);
 
     // Build MEM Read command: params = [addr:8][len:4]
     let mut params = [0u8; 12];
@@ -617,6 +663,14 @@ async fn cmd_read(addr_str: &str, len: usize) {
     }
 
     match pt_recv(&link).await {
+        Ok(data) if out_file.is_some() => {
+            let path = out_file.unwrap();
+            std::fs::write(path, &data).unwrap_or_else(|e| {
+                eprintln!("Failed to write {path}: {e}");
+                std::process::exit(1);
+            });
+            eprintln!("Wrote {} bytes to {path}", data.len());
+        }
         Ok(data) => {
             // Hex dump
             for (i, chunk) in data.chunks(16).enumerate() {
