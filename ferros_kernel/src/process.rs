@@ -8,6 +8,7 @@
 //! - 2 `recv(cap, buf, buf_cap, reply_token)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes).
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
+//! - 6 `entropy(cap, buf, len)` — present a token holding the entropy right; `len` bytes (at most 4096) of fresh randomness are written at `buf`, x0 = `len`. The stream is BLAKE3 keyed from this session's wairua (KOHI) over a kernel counter, so no two calls in a power session see the same bytes and nothing from a previous session repeats. ERR without a wairua: a driver that needs randomness (the WiFi firmware's RNG seed) gets none rather than a predictable one.
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
 //!
 //! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through.
@@ -116,6 +117,8 @@ pub enum Object {
     Reply(usize),
     /// A hardware grant: an arc of device registers (index into the grant table). ASID.md: "process gets arcs, hardware gets a grant".
     Hardware(usize),
+    /// Served by the kernel: randomness from the session's wairua.
+    Entropy,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -144,6 +147,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Console => (0u8, 0u64),
         Object::Endpoint(i) => (1, i as u64),
         Object::Reply(i) => (2, i as u64),
+        Object::Entropy => (4, 0),
         Object::Hardware(i) => (3, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -268,6 +272,10 @@ const SYS_REPLY: u64 = 3;
 /// mmio_read(grant, offset) → x0 = the 32-bit register; mmio_write(grant, offset, value).
 const SYS_MMIO_READ: u64 = 4;
 const SYS_MMIO_WRITE: u64 = 5;
+/// entropy(cap, buf, len) → x0 = len.
+const SYS_ENTROPY: u64 = 6;
+const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
+static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// A named block of device registers a spawn can grant (`bridge spawn --hw NAME`). The spawner's authority stands in for a hardware-granting capability until there is one. `via_el3`: only the EL3 monitor can reach it (husky's PMU), so accesses go through SMC_CMD_PRIV_REG and only whitelisted offsets answer.
 pub struct Hw {
@@ -438,6 +446,23 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_ENTROPY => {
+            let token = p.read(f.x[0], 32);
+            let len = f.x[2] as usize;
+            f.x[0] = match (p.lookup(&token).map(|i| p.cspace[i].object), crate::wairua::draw()) {
+                (Some(Object::Entropy), Some(w)) if len <= 4096 => {
+                    let n = ENTROPY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let mut h = blake3::Hasher::new_keyed(&blake3::derive_key(ENTROPY_CONTEXT, &w));
+                    h.update(&n.to_le_bytes());
+                    let mut out = alloc::vec![0u8; len];
+                    h.finalize_xof().fill(&mut out);
+                    p.write(f.x[1], &out);
+                    len as u64
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_REPLY => {
             let token = p.read(f.x[0], 32);
             match p.lookup(&token) {
@@ -562,6 +587,8 @@ pub enum Grant<'a> {
     Use(&'a [u8]),
     /// A hardware grant from the registry, by name.
     Hardware(&'a [u8]),
+    /// The entropy right (syscall 6).
+    Entropy,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -591,6 +618,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such hardware block"),
             },
+            Grant::Entropy => (Object::Entropy, RIGHT_SEND),
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }

@@ -765,7 +765,7 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                         }
                                     } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
-                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use, len, name)*][input].
+                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy, len, name)*][input].
                                         if run_ok && run_size > 0 {
                                             let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                                             let pr = cmd.params;
@@ -782,6 +782,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 grants.push(match kind {
                                                     1 => crate::process::Grant::Serve(g),
                                                     3 => crate::process::Grant::Hardware(g),
+                                                    4 => crate::process::Grant::Entropy,
                                                     _ => crate::process::Grant::Use(g),
                                                 });
                                             }

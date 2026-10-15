@@ -21,6 +21,8 @@ const MEM: u64 = 8;
 const GPIO: u64 = 9;
 const CMU: u64 = 11;
 const PMU: u64 = 12;
+/// The entropy right (`--entropy`, after the hardware grants).
+const ENTROPY: u64 = 13;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -33,6 +35,8 @@ struct Drv {
     log: [u8; 3000],
     n: usize,
     failed: bool,
+    /// The backplane window BAR1 shows now (cfg G#84), so a run of accesses in one window costs one config write.
+    win: u32,
 }
 
 fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -124,13 +128,41 @@ impl Drv {
         self.kv(k, v);
     }
     /// One word of dongle memory (backplane address) through BAR1, moving the window first (dhdpcie_bus_membytes with bar1 switching).
+    fn window(&mut self, addr: u32) {
+        let w = addr & !(BAR1_SIZE - 1);
+        if w != self.win {
+            self.wr(CFG, 0x84, w);
+            self.win = w;
+        }
+    }
     fn tcm_rd(&mut self, addr: u32) -> u32 {
-        self.wr(CFG, 0x84, addr & !(BAR1_SIZE - 1));
+        self.window(addr);
         self.rd(MEM, BAR1 + (addr & (BAR1_SIZE - 1)) as u64)
     }
     fn tcm_wr(&mut self, addr: u32, v: u32) {
-        self.wr(CFG, 0x84, addr & !(BAR1_SIZE - 1));
+        self.window(addr);
         self.wr(MEM, BAR1 + (addr & (BAR1_SIZE - 1)) as u64, v);
+    }
+    /// Write bytes to dongle memory as little-endian words, the last one zero-padded; returns how many words read back different.
+    fn tcm_write_verify(&mut self, addr: u32, bytes: &[u8]) -> u32 {
+        let words = bytes.len().div_ceil(4);
+        let word = |i: usize| {
+            let mut w = [0u8; 4];
+            for (j, b) in w.iter_mut().enumerate() {
+                *b = bytes.get(i * 4 + j).copied().unwrap_or(0);
+            }
+            u32::from_le_bytes(w)
+        };
+        for i in 0..words {
+            self.tcm_wr(addr + 4 * i as u32, word(i));
+        }
+        let mut bad = 0;
+        for i in 0..words {
+            if self.tcm_rd(addr + 4 * i as u32) != word(i) {
+                bad += 1;
+            }
+        }
+        bad
     }
     fn flush(&mut self) {
         if self.n > 0 {
@@ -154,13 +186,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         asm!("mrs {}, cntfrq_el0", out(reg) freq);
     }
     let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else { 0 };
-    let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false };
-    run(&mut d, stage);
+    let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false, win: u32::MAX };
+    let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
+    run(&mut d, stage, rest);
     d.flush();
     unsafe { asm!("svc #0", in("x0") d.failed as u64, in("x8") 0u64, options(noreturn, nostack)) }
 }
 
-fn run(d: &mut Drv, stage: u8) {
+fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     // ---- stage 0: survey (WIFI.md §2, §3, §9 status registers) ----
     d.put(b"pcie1 stage ");
     d.hex(stage as u32);
@@ -490,6 +523,23 @@ fn run(d: &mut Drv, stage: u8) {
         d.show(b"ca7.amni.reset_status", MEM, 0x1144);
     }
     d.flush();
+    // The module's CIS tuples in OTP (dhd_custom_cis.c: 4398 range G#1801_115C..G#1801_11B3; tag G#80 start, G#81 vendor → the VID that names the module NVRAM, vid_naming_table_4398). Read-only, first read timed like the ROM dump.
+    d.wr(CFG, 0x80, 0x1801_1000);
+    let t0 = d.now();
+    let first = d.rd(MEM, 0x15C);
+    d.kv(b"otp.cis.first_read_us", (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32);
+    d.flush();
+    if first != 0xFFFF_FFFF {
+        d.put(b"otp.cis:");
+        for off in (0x15Cu64..0x1B4).step_by(4) {
+            let v = d.rd(MEM, off);
+            d.put(b" ");
+            d.hex(v);
+        }
+        d.put(b"\n");
+    }
+    d.wr(CFG, 0x80, 0x1800_0000);
+    d.flush();
     if stage < 6 {
         return;
     }
@@ -537,6 +587,171 @@ fn run(d: &mut Drv, stage: u8) {
     d.kv(b"ram[top] zeroed", v);
     d.show(b"cfg.bar1win", CFG, 0x84);
     d.flush();
+    if stage < 7 {
+        return;
+    }
+
+    // ---- stage 7: download and start the firmware (dhd_pcie.c _dhdpcie_download_firmware with the CA7 path of __dhdpcie_bus_download_state). Input after the stage byte: [u32 LE len][firmware .bin][u32 LE len][NVRAM text]. ----
+    let Some((fw, nv)) = split_files(files) else {
+        d.put(b"stage 7 wants --input-file firmware --input-file nvram\n");
+        d.failed = true;
+        return;
+    };
+    d.kv(b"fw.len", fw.len() as u32);
+    d.kv(b"nvram.raw_len", nv.len() as u32);
+    if fw.len() < 4 || fw.len() as u32 > ramsize {
+        d.put(b"firmware does not fit\n");
+        d.failed = true;
+        return;
+    }
+    // Enter: the CA7 must be out of reset and halted (stage 5 found it so after WL_REG_ON; dhd resets it into that state only when it isn't, which this driver doesn't do yet).
+    d.wr(CFG, 0x80, oobr);
+    let dmp = d.rd(MEM, 0x248);
+    d.wr(CFG, 0x80, 0x1800_0000);
+    d.wr(CFG, 0x70, 0x1850_4000);
+    let in_reset = d.rd(MEM, 0x1140) & 1;
+    if dmp & 0x20 == 0 || in_reset != 0 {
+        d.kv(b"ca7 not halted+up, dmpctrl", dmp);
+        d.failed = true;
+        return;
+    }
+    let ramtop = RAM_BASE + ramsize;
+    d.tcm_wr(ramtop - 4, 0);
+    // The image at the RAM base; its first word is the reset instruction, written to address 0 last.
+    let resetinstr = u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]);
+    let t0 = d.now();
+    let bad = d.tcm_write_verify(RAM_BASE, fw);
+    d.kv(b"fw.write_verify_ms", ((d.now().wrapping_sub(t0) * 1000) / d.freq) as u32);
+    d.kv(b"fw.bad_words", bad);
+    d.flush();
+    if bad != 0 {
+        d.failed = true;
+        return;
+    }
+    // NVRAM: text → NUL-separated vars (process_nvram_vars), zero-padded to 4 bytes, plus the terminating NUL dhd counts (varsz = len + 1, then ROUNDUP 4) — at the top of RAM below the length token.
+    let n = process_nvram_vars(nv);
+    let vlen = n.div_ceil(4) * 4;
+    let varsize = (vlen + 1).div_ceil(4) * 4;
+    let varaddr = ramtop - 4 - varsize as u32;
+    let bad = d.tcm_write_verify(varaddr, &nv[..vlen.min(nv.len())]);
+    for a in ((varaddr + vlen as u32)..(ramtop - 4)).step_by(4) {
+        d.tcm_wr(a, 0);
+    }
+    let w = (varsize / 4) as u32;
+    let token = (!w << 16) | (w & 0xFFFF);
+    d.tcm_wr(ramtop - 4, token);
+    d.kv(b"nvram.vars_len", n as u32);
+    d.kv(b"nvram.addr", varaddr);
+    d.kv(b"nvram.bad_words", bad);
+    d.kv(b"nvram.token", token);
+    // Random seed for the firmware's RNG (dhdpcie_wrt_rnd → a reverse TLV under the vars: 128 bytes, then length (no checksum on this TLV, the firmware crashes on one), then type G#FEEDC0DE). From the session's wairua through the entropy right — never from the host.
+    let mut seed = [0u8; 128];
+    let off = seed.as_mut_ptr() as u64 - d.base;
+    if svc(6, d.cap(ENTROPY), off, 128, 0, 0) != 128 {
+        d.put(b"no entropy right or no wairua: refusing to start the firmware without a seed\n");
+        d.failed = true;
+        return;
+    }
+    let rnd = varaddr - 8 - 128;
+    let bad = d.tcm_write_verify(rnd, &seed);
+    d.tcm_wr(rnd + 128, 128);
+    d.tcm_wr(rnd + 132, 0xFEED_C0DE);
+    d.kv(b"rnd.addr", rnd);
+    d.kv(b"rnd.bad_words", bad);
+    // Exit: reset instruction at 0, then clear CPUHALT in the CA7's DMP control ("for ARM CA7 it is enough if we clear bit5 in IO DMP ctrl") and wait for it to read back.
+    d.tcm_wr(0, resetinstr);
+    d.kv(b"resetinstr", resetinstr);
+    let v = d.tcm_rd(0);
+    d.kv(b"ram[0]", v);
+    d.flush();
+    d.wr(CFG, 0x80, oobr);
+    let v = d.rd(MEM, 0x248) & !0x20;
+    d.wr(MEM, 0x248, v);
+    let rel = d.poll(MEM, 0x248, 0xFFFF_FFFF, v, 5000);
+    d.kv(b"ca7.released_us", rel.map(|u| u as u32).unwrap_or(u32::MAX));
+    d.wr(CFG, 0x80, 0x1800_0000);
+    d.flush();
+    // The firmware boots and replaces the length token in the last RAM word with the address of its shared area (dhdpcie_readshared). Watch it for up to 4 s.
+    let t0 = d.now();
+    let mut last = token;
+    let shared = loop {
+        let v = d.tcm_rd(ramtop - 4);
+        if v != last {
+            d.kv(b"ramtop changed", v);
+            d.kv(b"  at_ms", ((d.now().wrapping_sub(t0) * 1000) / d.freq) as u32);
+            last = v;
+        }
+        if v != token && v != 0 && v >= RAM_BASE && v < ramtop {
+            break Some(v);
+        }
+        if d.now().wrapping_sub(t0) > 4 * d.freq {
+            break None;
+        }
+        d.us(1000);
+    };
+    d.flush();
+    let Some(sh) = shared else {
+        d.kv(b"no shared area; ramtop word", last);
+        d.wr(CFG, 0x80, oobr);
+        d.show(b"ca7.dmpctrl", MEM, 0x248);
+        d.wr(CFG, 0x80, 0x1800_0000);
+        d.flush();
+        return;
+    };
+    d.kv(b"FIRMWARE UP, shared", sh);
+    d.put(b"shared:");
+    for i in 0..24 {
+        let v = d.tcm_rd(sh + 4 * i);
+        d.put(b" ");
+        d.hex(v);
+    }
+    d.put(b"\n");
+    d.flush();
+}
+
+/// [u32 LE len][bytes] twice.
+fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8])> {
+    let take = |b: &[u8]| -> Option<usize> { Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize) };
+    let a = take(b)?;
+    if b.len() < 4 + a + 4 {
+        return None;
+    }
+    let (first, rest) = b[4..].split_at_mut(a);
+    let n = take(rest)?;
+    let second = rest.get_mut(4..4 + n)?;
+    Some((first, second))
+}
+
+/// bcmutils.c process_nvram_vars, in place: drop '\r', '#' comments to end of line and empty lines; each line ends in a NUL. Returns the length used (the rest is zeroed).
+fn process_nvram_vars(v: &mut [u8]) -> usize {
+    let (mut dp, mut find_newline, mut column) = (0usize, false, 0usize);
+    for n in 0..v.len() {
+        let c = v[n];
+        if c == b'\r' || (find_newline && c != b'\n') {
+            continue;
+        }
+        find_newline = false;
+        if c == b'#' {
+            find_newline = true;
+            continue;
+        }
+        if c == b'\n' {
+            if column == 0 {
+                continue;
+            }
+            v[dp] = 0;
+            dp += 1;
+            column = 0;
+            continue;
+        }
+        v[dp] = c;
+        dp += 1;
+        column += 1;
+    }
+    for b in &mut v[dp..] {
+        *b = 0;
+    }
+    dp
 }
 
 #[panic_handler]

@@ -174,6 +174,8 @@ async fn main() {
                     "--serve" => { grants.push((1, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--use" => { grants.push((2, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--hw" => { grants.push((3, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    // --entropy: the right to draw randomness from the session's wairua (syscall 6).
+                    "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
