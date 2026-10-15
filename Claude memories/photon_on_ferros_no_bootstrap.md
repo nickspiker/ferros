@@ -15,3 +15,4 @@ Decided with the owner 2026-10-15: a ferros device running Photon does NOT use t
 - If a cold-start seed is ever wanted: a DNS seed (seed.fgtw.org kept by the Worker, opted-in always-on peers), never an HTTP endpoint.
 
 Related: [[ira_network_owns_assignment]], [[threat_model_harm_not_observation]].
+- **Enrolment (owner, 2026-10-15):** the ferros device's Photon device key is derived from the ira; the owner's desktop Photon sponsors it into the fleet chain (Add op with ferros's consent signature, consent within 1 h → clock from peer pongs; PQ consent sigs if the fleet's floor is raised); pairing over USB/LAN from the host; the ferros phone holds the identity seed like any fleet device. Per-contact lane state (lane_root, era tag, conversation token) is provisioned at pairing and refreshed on era change. Chat ≤1 KB = one signed VSF datagram on UDP 4383 (no CLUTCH, no PT stream); body text needs vsf's `x` codec (ASCII Huffman subset planned).
