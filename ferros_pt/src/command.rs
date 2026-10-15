@@ -100,6 +100,8 @@ pub mod caps {
     pub const RUN: &[u8] = b"ferros.dev.run";
     /// Spawn — exec runs the payload staged through RUN as a process: EL0, in its own arc, holding only a console capability (ferros_kernel process.rs). Exec params become the process's input; the response is [exit: 8 LE][what it sent its console].
     pub const SPAWN: &[u8] = b"ferros.dev.spawn";
+    /// Seal (install) a masked capsule: exec runs the capsule staged through RUN through the gate and the sandbox checker once, and its seal (a keyed hash under the OS-only key) joins the vault's `sealed` list; spawn then requires that seal and does not re-check (SANDBOX.md). Response [0][seal: 32] or ERR:….
+    pub const SEAL: &[u8] = b"ferros.dev.seal";
     /// Beam — read ring entries by generation offset. Params: [ring_id:1][mode:1][offset:4 BE][count:4 BE] ring_id: 0=kernel, 1=vault_root, 2=ledger, 3=state mode: 0=latest (~N offset), 1=absolute generation, 2=all
     pub const BEAM: &[u8] = b"ferros.dev.beam";
     /// Display — write renders the params (text, '\n'-separated) on the panel through the adopted DECON pipeline; the response is a register report.

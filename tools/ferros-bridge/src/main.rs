@@ -158,6 +158,14 @@ async fn main() {
             });
             println!("signed capsule: {} bytes of code -> {} ({} bytes)", code.len(), args[3], c.len());
         }
+        "seal" => {
+            // seal <masked.bin> --text-len N: install a masked capsule — the device runs the gate and the sandbox checker once and adds its seal to the vault's `sealed` list; spawn then requires the seal (SANDBOX.md).
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge seal <masked.bin> --text-len N");
+                std::process::exit(1);
+            }
+            cmd_run_with_tail(&args[2], None, ferros_pt::command::caps::SEAL, Vec::new(), Vec::new(), true, text_len_arg(&args)).await;
+        }
         "spawn" => {
             // spawn <payload.bin> [hex-input] [--name N] [--serve E]... [--use E]...
             if args.len() < 3 {
@@ -494,7 +502,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         std::process::exit(1);
     });
     // spawn: the kernel only spawns signed capsules (the gate); run stays raw (dev payloads at EL2).
-    let blob = if exec_cap == ferros_pt::command::caps::SPAWN && std::env::var("FERROS_RAW_SPAWN").is_err() {
+    let blob = if (exec_cap == ferros_pt::command::caps::SPAWN || exec_cap == ferros_pt::command::caps::SEAL) && std::env::var("FERROS_RAW_SPAWN").is_err() {
         let mut c = signed_capsule(&blob, masked, text_len);
         // Test switch: flip one byte of the code after signing — the kernel's gate must refuse it.
         if std::env::var("FERROS_TAMPER_CAPSULE").is_ok() {
@@ -576,6 +584,9 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
             if resp.starts_with(b"ERR") {
                 eprintln!("Device refused: {}", String::from_utf8_lossy(&resp));
                 std::process::exit(1);
+            } else if exec_cap == ferros_pt::command::caps::SEAL && resp.len() == 33 && resp[0] == 0 {
+                let hex: String = resp[1..].iter().map(|b| format!("{b:02x}")).collect();
+                println!("sealed: G#{hex}");
             } else if resp.len() >= 8 {
                 let ret = u64::from_le_bytes(resp[..8].try_into().unwrap());
                 let out = &resp[8..];

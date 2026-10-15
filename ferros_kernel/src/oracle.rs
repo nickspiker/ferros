@@ -94,6 +94,23 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
     Ok(Gated { code, developer_pubkey, hp, masked, text_len })
 }
 
+/// The OS-only key that seals installed images (SANDBOX.md): derived from the system persistent secret, so nothing outside this OS on this device can produce a seal.
+pub fn seal_key() -> Option<[u8; 32]> {
+    let secret = unsafe { (*SECRET.0.get())? };
+    Some(blake3::derive_key("ferros.seal.v1", &secret))
+}
+
+/// The seal of a gated capsule: keyed BLAKE3 over who signed it, its provenance, whether it is masked, its instruction span and the exact image.
+pub fn seal(g: &Gated) -> Option<[u8; 32]> {
+    let mut h = blake3::Hasher::new_keyed(&seal_key()?);
+    h.update(&g.developer_pubkey);
+    h.update(&g.hp);
+    h.update(&[g.masked as u8]);
+    h.update(&(g.text_len as u64).to_le_bytes());
+    h.update(&g.code);
+    Some(*h.finalize().as_bytes())
+}
+
 /// The oracle. None until the system persistent secret exists (no ira, no ihi).
 pub fn ihi(developer_pubkey: &[u8; 32], option: &[u8]) -> Option<[u8; 32]> {
     let secret = unsafe { (*SECRET.0.get())? };

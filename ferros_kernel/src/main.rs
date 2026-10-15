@@ -1572,7 +1572,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The first process: the vault's `init` capsule (put there with `bridge capsule` + `store put init @file`), through the gate and the oracle like any other. No capsule is built into the kernel and no key is near its build. Spawning it is the first thing that needs the wairua (its capabilities are minted under it), so KOHI runs here.
     let mut init_exit = 0u32;
     if let Some(Ok(Some(capsule))) = store.as_ref().map(|s| s.get_by_key("init")) {
-        match process::spawn_capsule(b"init", &capsule, b"", &[]) {
+        match process::spawn_capsule(b"init", &capsule, b"", &[], &[]) {
             Ok(o) => {
                 init_exit = (o.exit >> 32) as u32 | 1;
                 checklist::mark(checklist::Item::Arcs);

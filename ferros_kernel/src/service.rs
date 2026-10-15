@@ -310,6 +310,7 @@ pub fn run(mut b: Boot) -> ! {
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
     let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
     let cap_spawn = ferros_pt::command::dev_cap(ferros_pt::command::caps::SPAWN);
+    let cap_seal = ferros_pt::command::dev_cap(ferros_pt::command::caps::SEAL);
     let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
     let cap_display = ferros_pt::command::dev_cap(ferros_pt::command::caps::DISPLAY);
     let cap_store = ferros_pt::command::dev_cap(ferros_pt::command::caps::STORE);
@@ -821,7 +822,8 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                             let input = &pr[at.min(pr.len())..];
                                             // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
-                                            match crate::process::spawn_capsule(if name.is_empty() { b"proc" } else { name }, code, input, &grants) {
+                                            let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+                                            match crate::process::spawn_capsule(if name.is_empty() { b"proc" } else { name }, code, input, &grants, &sealed) {
                                                 Ok(o) => {
                                                     use crate::checklist::{mark, Item};
                                                     mark(Item::Arcs);
@@ -847,6 +849,36 @@ pub fn run(mut b: Boot) -> ! {
                                                     queue_pt_response(&mut pt_out_data, &resp);
                                                 }
                                             }
+                                        } else {
+                                            queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                                        }
+                                    } else if cmd.cap == cap_seal && cmd.op == ferros_pt::Op::Exec {
+                                        // Install the staged masked capsule: gate + checker once, then its seal joins the vault's `sealed` list (idempotent). Reply [0][seal] or ERR.
+                                        if run_ok && run_size > 0 {
+                                            let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                                            let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
+                                                (Ok(seal), Some(store)) => {
+                                                    let mut list = store.get_by_key("sealed").ok().flatten().unwrap_or_default();
+                                                    if !list.chunks_exact(32).any(|e| e == seal) {
+                                                        list.extend_from_slice(&seal);
+                                                    }
+                                                    match store.set("sealed", list) {
+                                                        Ok(_) => {
+                                                            let mut r = alloc::vec![0u8];
+                                                            r.extend_from_slice(&seal);
+                                                            r
+                                                        }
+                                                        Err(_) => alloc::vec::Vec::from(&b"ERR:install: vault write failed"[..]),
+                                                    }
+                                                }
+                                                (Ok(_), None) => alloc::vec::Vec::from(&b"ERR:install: no vault"[..]),
+                                                (Err(e), _) => {
+                                                    let mut r = alloc::vec::Vec::from(&b"ERR:"[..]);
+                                                    r.extend_from_slice(e.as_bytes());
+                                                    r
+                                                }
+                                            };
+                                            queue_pt_response(&mut pt_out_data, &resp);
                                         } else {
                                             queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
                                         }

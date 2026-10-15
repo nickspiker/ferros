@@ -691,16 +691,29 @@ pub enum Grant<'a> {
 pub const IHI: usize = 0xFE0;
 
 /// Spawn a signed capsule: it must pass the gate (oracle.rs); the oracle's ihi is written into the process's arc at `IHI` and the kernel keeps no copy. Then as `spawn`.
-pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
+pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant], sealed: &[u8]) -> Result<Outcome, &'static str> {
     let g = crate::oracle::gate(capsule)?;
-    // Masked (sandboxed) code must pass the checker, every instruction (SANDBOX.md); native dev code spawns unchecked here but a production build refuses it entirely.
+    // Masked (sandboxed) code runs only if it was installed — its seal is in the vault's `sealed` list (`sealed`: 32-byte entries) — and then without re-checking: the checker ran once at install (SANDBOX.md, run and gun). Native dev code spawns unchecked here; a production build refuses it entirely.
     if g.masked {
-        ferros_sandbox::check_image(&g.code[..g.text_len]).map_err(|_| "gate: masked code failed the sandbox checker")?;
+        let s = crate::oracle::seal(&g).ok_or("no system secret: cannot check a seal")?;
+        if !sealed.chunks_exact(32).any(|e| e == s) {
+            return Err("gate: masked capsule not installed (no seal)");
+        }
     } else if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
     spawn(name, &g.code, input, grants, Some(ihi))
+}
+
+/// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
+pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
+    let g = crate::oracle::gate(capsule)?;
+    if !g.masked {
+        return Err("install: only masked capsules are installed");
+    }
+    ferros_sandbox::check_image(&g.code[..g.text_len]).map_err(|_| "install: masked code failed the sandbox checker")?;
+    crate::oracle::seal(&g).ok_or("no system secret: cannot seal")
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.

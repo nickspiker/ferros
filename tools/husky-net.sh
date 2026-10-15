@@ -37,6 +37,11 @@ for _ in $(seq 90); do
 done
 grep -q "serving wlan" "$LOG" || { echo "=== driver never served"; tail -20 "$LOG"; exit 1; }
 grep -E "joining|KEYED|join failed|allmulti|offload|flags2" "$LOG"
+if [ "${MASKED:-0}" = 1 ]; then
+    echo "=== seal ip + nettest (gate + sandbox checker once; seals join the vault's list)"
+    "$B" seal "$IPB" --text-len $(cat $REPO/target/masked/ip/ip.textlen) 2>/dev/null | grep sealed
+    "$B" seal "$NTB" --text-len $(cat $REPO/target/masked/nettest/nettest.textlen) 2>/dev/null | grep sealed
+fi
 echo "=== ip"
 timeout 60 "$B" spawn "$IPB" --name ip --use wlan --serve udp --entropy $IPFLAG >/dev/null 2>&1
 echo "=== nettest (UDP echo on 7777)"
