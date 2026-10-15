@@ -399,12 +399,19 @@ No NULL. No MAX. No boundaries to overflow. The address space wraps by construct
 ### Per-Process State
 
 ```rust
-struct RingRegion {
+// One base-limit pair: a contiguous piece of the wrapping address space.
+struct Arc {
     base_offset: usize,    // cryptographically random, continuously rotating
-    limit: usize,          // maximum addressable span
+    limit: usize,          // span in bytes, any size, any alignment
 }
 
-// Bounds check: 2 instructions
+// A process holds one or more arcs (ISOMEM: one or more base-limit pairs per process).
+// Fragments are just more arcs; a hardware grant is an arc of registers.
+struct ProcessMemory {
+    arcs: Vec<Arc>,
+}
+
+// Bounds check, per arc: 2 instructions
 // (ptr - offset) < limit
 // No TLB required
 // No page tables
@@ -430,7 +437,7 @@ Capabilities:   authorization mechanism (communication)
 Relationship:   orthogonal — they do not interfere
 
 Cap addresses kernel objects, not memory addresses
-Ring offset rotation cannot invalidate a cap
+Arc offset rotation cannot invalidate a cap
 This separation is architecturally load-bearing
 ```
 
@@ -700,7 +707,7 @@ If copy-back interrupted by kill:
 ```rust
 struct Header {
     generation:       u64,            // monotonic, total ordering
-    ring_state:       RingSnapshot,   // all process arc offsets
+    arc_state:        ArcSnapshot,    // all process arc offsets
     capability_state: CSpaceSnapshot, // all valid caps at this instant
     entry_points:     Vec<VirtAddr>,  // per-process resume addresses
     storage_map:      RingFSMap,      // current block allocation state
@@ -888,7 +895,7 @@ ferros/
 │   │   │   └── revocation.rs        # Epoch-based revocation
 │   │   ├── ring_memory/
 │   │   │   ├── mod.rs               # Ring memory manager
-│   │   │   ├── region.rs            # RingRegion, bounds check
+│   │   │   ├── arc.rs               # Arc, bounds check
 │   │   │   └── rotation.rs          # Continuous offset rotation
 │   │   ├── ipc/
 │   │   │   ├── mod.rs               # IPC primitive
@@ -896,7 +903,7 @@ ferros/
 │   │   │   └── reply.rs             # Single-use reply capabilities
 │   │   ├── scheduler/
 │   │   │   ├── mod.rs               # Thread scheduler
-│   │   │   └── thread.rs            # Thread = CSpace + RingRegion
+│   │   │   └── thread.rs            # Thread = CSpace + arcs
 │   │   ├── security/
 │   │   │   ├── mod.rs               # Branchless security path
 │   │   │   ├── checks.rs            # Mask-based capability validation
