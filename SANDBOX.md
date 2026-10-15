@@ -36,11 +36,29 @@ Indirect branches (`br`, `blr`, `ret`) are allowed: the invariant does not depen
 
 The scan only speaks for code it saw, so the process may execute nothing else. At spawn the kernel sets the arc's pages in the one static translation table (no per-process tables): the sealed code pages **EL0 read + execute, not writable**; every other page of the arc (read-only data, data, stack) **EL0 read/write, never executable**; guards and everything outside the arc not accessible at EL0. The pool is mapped with 4 KiB entries for this, and the kernel invalidates the TLB after changing them. Code and read-only data stay in the same arc, so PC-relative addressing (`adrp`) keeps working, and loads of read-only data go through the masked forms like any other access; a store into the code pages is a permission fault that ends the process. (Today's static map gives EL0 the whole pool as read/write/execute — the reason nothing can be called sandboxed until this lands.)
 
-## Guards
+## Placement and guards
 
-Immediate offsets reach up to G bytes past a masked address. Each arc is placed with **G bytes of unused guard memory before and after it** (kernel-reserved, never allocated to anyone), so an access at `x25 + imm` or `sp + imm` lands in the process's own arc or in its own guard — never in another arc or the kernel. G = 64 KiB covers every AArch64 scaled 12-bit immediate (up to 65520 for 16-byte accesses).
+Immediate offsets reach up to G = 64 KiB past a masked address (every AArch64 scaled 12-bit immediate, up to 65520 for 16-byte accesses; unscaled ones reach 256 below). So every arc needs at least G of memory nobody else owns on both sides.
 
-Arcs need not be size-aligned: offsets are computed relative to x28 (`sub`, then `and` with x27), so placement is free.
+- An arc of size S (a power of two, at least 64 KiB) is placed at an **S-aligned base inside a 2S block whose upper half is left unused**. The half above is its guard; the half below belongs to the previous block's guard (the pool starts with an unused G). So each arc has at least S ≥ G of guard on both sides.
+- Because the base is S-aligned, masking an absolute pointer gives its offset directly: `and x26, xN, x27` — an address inside the arc maps to itself, one outside wraps inside (still safe). One instruction.
+- Cost: an arc takes twice its size in the pool (the pool grows accordingly; DRAM is not the constraint).
+
+## What the emitter rewrites (measured on today's payloads: ~15% of instructions)
+
+x24 is the emitter's scratch register (reserved in codegen alongside x25–x28).
+
+| rustc emits | becomes |
+|---|---|
+| `ldr x0, [x1, #8]` (any base other than sp) | `and x26, x1, x27` · `add x25, x28, x26` · `ldr x0, [x25, #8]` |
+| `ldr x0, [x1]` | `and x26, x1, x27` · `ldr x0, [x28, x26]` |
+| `ldr x0, [x1, x2, lsl #3]` | `add x24, x1, x2, lsl #3` · `and x26, x24, x27` · `ldr x0, [x28, x26]` |
+| `ldr x0, [x1, #8]!` / `[x1], #8` | the base update as an `add`, then the masked access |
+| `sub sp, sp, #n` (any sp write) | `sub x24, sp, #n` · `and x26, x24, x27` · `add sp, x28, x26, uxtx` |
+| `stp x29, x30, [sp, #-16]!` | the sp adjustment above · `stp x29, x30, [sp]` |
+| `ldp x29, x30, [sp], #16` | `ldp x29, x30, [sp]` · the sp adjustment |
+
+Consecutive accesses through the same unchanged base can share one masked x25 (a later peephole).
 
 ## The stack (option a)
 
