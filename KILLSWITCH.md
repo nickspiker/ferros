@@ -10,6 +10,8 @@ On husky (since 2026-10-14, `ferros_kernel/src/killswitch.rs`) the key presses A
 - If SYSTEM_OFF ever returned, it sits with IRQs masked until the unpetted watchdog resets the SoC.
 - RELOAD masks IRQs before its copy stub overwrites the vector table; the new image re-arms first thing.
 - DIAG: `KILL_GICR_FRAME`, `KILL_GICD_CTLR`, `KILL_KEYS_IDLE` (both keys read released after becoming EINTs), `KILL_IRQS` (non-kill interrupts taken), `DAIF`.
+- Every path back into the kernel from an exception must leave IRQs unmasked. Until 2026-10-15 returning from a process (EL0) didn't, so the killswitch died the moment the boot spawned `init` (DAIF G#3C0, 7 IRQs per boot); `.Lel0_leave` now unmasks and the service loop re-asserts it every pass. DAIF must read G#340 with KILL_IRQS climbing.
+- Owner hardware test 2026-10-15: Vol Up + Vol Down powers the phone off from the running system (after `init`, service loop idle) — PASS.
 
 ## Why This Works
 
