@@ -68,6 +68,11 @@ fn both_held() -> bool {
     rd(GPA4_DAT) & (1 << VOL_DOWN_PIN) == 0 && rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
 }
 
+/// Either volume key down right now (DAT bit 0 = pressed). The "Ready?" gate's dev timer reads it.
+pub fn volume_key_down() -> bool {
+    rd(GPA4_DAT) & (1 << VOL_DOWN_PIN) == 0 || rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
+}
+
 fn system_off() -> ! {
     unsafe {
         core::arch::asm!("smc #0", in("x0") PSCI_SYSTEM_OFF, options(noreturn));

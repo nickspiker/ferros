@@ -4,7 +4,7 @@
 //!
 //! The screen: black, "Ready?" in thin Oxanium (rasterised at build time, build.rs) in the top third, and a green triangle on the right edge pointing at the power button. The press — not the release — is the power key's falling-edge interrupt (killswitch.rs `arm_power_key`, `.Lirq_power`).
 //!
-//! Dev builds proceed as if pressed after two seconds, so unattended loops keep working and every line after the gate is the same code; a production build (FERROS_PRODUCTION set at build time) waits for the key. There is no remote press: USB does not exist before the press.
+//! Dev builds proceed as if pressed after one second, so unattended loops keep working and every line after the gate is the same code — unless a volume key goes down during that second, which cancels the timer: the gate then waits for the power key like a production build (FERROS_PRODUCTION set at build time), which always waits. There is no remote press: USB does not exist before the press.
 
 static READY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ready.bin"));
 
@@ -82,12 +82,15 @@ pub fn wait() -> u64 {
     let t0 = crate::platform::cntpct();
     // The wairua's KOHI while the human decides (it is lazy everywhere else).
     let _ = crate::wairua::draw();
+    // Dev: a volume key cancels the one-second auto-press for good (the keys' edge interrupts wake the WFI below, so a tap is seen at once).
+    let mut held = false;
     loop {
         crate::platform::pet_watchdogs();
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
             break;
         }
-        if cfg!(not(ferros_production)) && crate::platform::cntpct().wrapping_sub(t0) > 2 * freq {
+        held |= crate::killswitch::volume_key_down();
+        if cfg!(not(ferros_production)) && !held && crate::platform::cntpct().wrapping_sub(t0) > freq {
             break;
         }
         // Sleep until the next interrupt: the press, or a 100 ms timer wake to pet the watchdogs.

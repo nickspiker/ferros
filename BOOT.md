@@ -53,7 +53,8 @@ The disk and the identity are never touched without a human present.
 - **The killswitch.** Vol Up + Vol Down works before, during and after the gate.
 
 ### Dev builds: auto-press
-Dev builds show "Ready?" and proceed as if the key were pressed; production builds compile that out and wait for the key.
+Dev builds show "Ready?" and proceed as if the key were pressed after one second; production builds compile that out and wait for the key.
+In a dev build, a volume key (up or down) during that second cancels the timer: the gate then waits for the power key indefinitely, as production does.
 Every line after the gate is identical in both, and nothing new listens on any interface: flashing a dev build is itself the developer's consent.
 There is deliberately no remote "press" (no USB bypass): USB data does not exist before the press.
 
