@@ -9,7 +9,7 @@
 //!
 //! The window is ferros's image, stack, heap and staging slot: 36 MiB from the cold link base, or the whole 12 MiB handoff carveout (0x9240_0000..0x9300_0000, tpu_fw_reserved after it).
 //!
-//! VHE (HCR_EL2.E2H + TGE, where the cores have it): the kernel runs as an EL2 host and processes run at EL0 under this same table, so a process gets cached memory and working atomics. The table then also carries one static split, never changed per process: EL0 may touch only the arc pool (the window's top 2 MiB) and may execute only there; EL2 may not execute pool code (and architecturally can't anyway: privileged execution of EL0-writable memory is always a permission fault in the EL2&0 regime); the kernel, MMIO, DMA pages and the staging slot are EL2-only, so dev RUN payloads still execute at EL2 from the slot. Spawning a process copies its staged code into its arc in the pool. Isolation between processes stays compiled masking (KERNEL.md, Execution Model).
+//! VHE (HCR_EL2.E2H + TGE, where the cores have it): the kernel runs as an EL2 host and processes run at EL0 under this same table, so a process gets cached memory and working atomics. The table then also carries one static split, never changed per process: EL0 may touch only the arc pool (POOL) and may execute only there; EL2 may not execute pool code (and architecturally can't anyway: privileged execution of EL0-writable memory is always a permission fault in the EL2&0 regime); the kernel, MMIO, DMA pages and the staging slot are EL2-only, so dev RUN payloads still execute at EL2 from the slot. Spawning a process copies its staged code into its arc in the pool. Isolation between processes stays compiled masking (KERNEL.md, Execution Model).
 //! Switching E2H changes the layout of several EL2 registers — CPTR_EL2 then reads in CPACR form, where an unset FPEN traps FP/SIMD at EL2 and the kernel's own memcpy would fault — so the switch sets FPEN explicitly, and RELOAD restores the boot HCR_EL2/CPTR_EL2 before handing over.
 
 use core::arch::asm;
@@ -30,9 +30,9 @@ unsafe extern "C" {
 const WINDOW: (usize, usize) = (0x8000_0000, 0x8240_0000);
 #[cfg(shim_handoff)]
 const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
-/// The arc pool: EL0-accessible, 2 MiB aligned, clear of the staging slot (cold: slot G#8208_0000, pool G#8220_0000; handoff: slot G#92A0_0000, stub G#92E8_0000, pool G#92C0_0000).
+/// The arc pool: EL0-accessible, a power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
 #[cfg(not(shim_handoff))]
-pub const POOL: (usize, usize) = (0x8220_0000, 0x8240_0000);
+pub const POOL: (usize, usize) = (0x8100_0000, 0x8180_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 

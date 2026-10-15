@@ -287,7 +287,7 @@ What runs today (cold boot, slot b), against the modules below:
 |---|---|
 | 1 Cryptographic address space | not started |
 | 2 Capabilities | tokens = BLAKE3 keyed with a per-session key (derived from the wairua) over domain, object, rights, nonce, epoch; a CSpace per process; each spawn a new epoch, so a dead process's tokens match nothing; lookup compares every entry without early exit. Not yet: processes minting/deriving caps, the derivation tree, TTLs |
-| 3 Arcs | power-of-two buddy allocator over the arc pool (2 MiB, top of the kernel window), zeroed on allocation; the static map lets EL0 touch only the pool. Not yet: compiled masking (processes are hand-written native code; the toka backend is what will mask) |
+| 3 Arcs | power-of-two buddy allocator over the arc pool (cold boot: 8 MiB at G#8100_0000, inside the kernel window), zeroed on allocation; the static map lets EL0 touch only the pool. Not yet: compiled masking (processes are hand-written native code; the toka backend is what will mask) |
 | 4 IPC | call / recv / reply, synchronous rendezvous, messages copied arc to arc, reply tokens single-use; named dev endpoints granted at spawn |
 | 5 Branchless security path | only the token lookup is branch-free |
 | 6 Encrypted kernel memory | not started |

@@ -165,6 +165,7 @@ async fn main() {
             }
             let mut name = String::new();
             let mut grants: Vec<(u8, String)> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
             let mut hex = None;
             let mut i = 3;
             while i < args.len() {
@@ -173,6 +174,8 @@ async fn main() {
                     "--serve" => { grants.push((1, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--use" => { grants.push((2, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--hw" => { grants.push((3, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
+                    "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
                 }
             }
@@ -184,7 +187,16 @@ async fn main() {
                 prefix.push(g.len() as u8);
                 prefix.extend_from_slice(g.as_bytes());
             }
-            cmd_run(&args[2], hex.as_deref(), ferros_pt::command::caps::SPAWN, prefix).await;
+            let mut tail = Vec::new();
+            for f in &files {
+                let b = std::fs::read(f).unwrap_or_else(|e| {
+                    eprintln!("Failed to read {f}: {e}");
+                    std::process::exit(1);
+                });
+                tail.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                tail.extend_from_slice(&b);
+            }
+            cmd_run_with_tail(&args[2], hex.as_deref(), ferros_pt::command::caps::SPAWN, prefix, tail).await;
         }
         "ping" => {
             let count = args
@@ -456,6 +468,11 @@ fn signed_capsule(code: &[u8]) -> Vec<u8> {
 
 /// `prefix` goes in front of the Exec params (spawn's name + grants header; empty for run).
 async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>) {
+    cmd_run_with_tail(path, hex_input, exec_cap, prefix, Vec::new()).await
+}
+
+/// As `cmd_run`; `tail` goes after the hex input (spawn's --input-file frames).
+async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>, tail: Vec<u8>) {
     let blob = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
@@ -528,6 +545,7 @@ async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: V
     let input = {
         let mut v = prefix;
         v.extend_from_slice(&input);
+        v.extend_from_slice(&tail);
         v
     };
     let cmd = build_cmd(exec_cap, ferros_pt::Op::Exec, &input);

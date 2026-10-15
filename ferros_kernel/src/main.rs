@@ -79,6 +79,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + 64KB stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
+// Cold boot: 8 MiB (room for multi-MiB PT transfers such as WiFi firmware; image + stack + heap end below G#8100_0000, where the arc pool starts). The handoff carveout is 12 MiB with its staging slot 6 MiB in, so it keeps 4 MiB.
+#[cfg(not(shim_handoff))]
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
+#[cfg(shim_handoff)]
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[cfg_attr(feature = "pixel8", allow(dead_code))]
