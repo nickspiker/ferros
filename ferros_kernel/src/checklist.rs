@@ -51,9 +51,10 @@ const GROUPS: [(&str, &[(Item, &str)]); 3] = [
     ]),
 ];
 
-const WHITE: u32 = 0x00FF_FFFF;
-const RED: u32 = 0x00FF_3030;
-const GREEN: u32 = 0x0030_FF60;
+const TITLE: u32 = 0x00FF_8000;
+const HEADER: u32 = 0x00FF_FF00;
+const RED: u32 = 0x00FF_0000;
+const GREEN: u32 = 0x0000_FF00;
 const SCALE: usize = 3;
 // Console geometry at SCALE (console margins: 160 top, 48 left; 8x16 font).
 const TOP: usize = 160;
@@ -131,13 +132,13 @@ pub fn start(cntfrq: u64, done: &[Item]) {
         c.done |= 1 << d as u8;
     }
     unsafe {
-        let mut con = c.panel.console(WHITE);
+        let mut con = c.panel.console(TITLE);
         con.set_scale(SCALE);
         con.goto(0, 0);
         con.puts("ferros");
         let mut row = 2;
         for (name, items) in GROUPS.iter() {
-            con.set_fg(WHITE);
+            con.set_fg(HEADER);
             con.goto(0, row);
             con.puts(name);
             row += items.len() + 2;

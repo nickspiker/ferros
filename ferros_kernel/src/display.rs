@@ -6,7 +6,7 @@
 //!
 //! What Linux leaves (measured on husky): DECON v7.6 and a screen-dependent stack of windows (seen: win2 on DPP0 + win3 on DPP8; win0..3,5..7 with win0 on DPP8), 1008x2244 (the default FHD+ render size, scaled by the DPU to the 1344x2992 panel), RGBA8888 with AFBC compression, at DPU-SYSMMU IOVA G#F700_0000. The SYSMMU (dpuf0, v9, VM0) maps that IOVA as 1 MiB sections onto contiguous DRAM from G#9F40_0000 for the first 8 MiB, the tail through a level-2 table.
 //!
-//! Recipe: keep the base window's IOVA and its mapping, switch the layer to linear XRGB8888 (AFBC off), write pixels through the mapping (MMU is off, so CPU stores land in DRAM directly), disable every other window, request the window + global shadow update, unmask the hardware (TE) trigger for one frame, wait for FRAME_COUNT to move, mask the trigger again (cal_9865 decon_reg_start / decon_reg_set_trigger).
+//! Recipe: keep the base window's IOVA and its mapping, switch the layer to linear 0x00RRGGBB pixels (Samsung BGRX8888, AFBC off), write pixels through the mapping (MMU is off, so CPU stores land in DRAM directly), disable every other window, request the window + global shadow update, unmask the hardware (TE) trigger for one frame, wait for FRAME_COUNT to move, mask the trigger again (cal_9865 decon_reg_start / decon_reg_set_trigger).
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -38,7 +38,8 @@ const DECON_INT_PEND: usize = 0x0070;
 // DPP RDMA (cal_9865 regs-dpp.h)
 const RDMA_IN_CTRL_0: usize = 0x0008;
 const IDMA_IMG_FORMAT_MASK: u32 = 0x3F << 8;
-const IDMA_IMG_FORMAT_XRGB8888: u32 = 7 << 8;
+// Samsung names RDMA formats by memory byte order (cal_9865 regs-dpp.h): our pixels are u32 0x00RRGGBB, i.e. bytes B, G, R, X — their BGRX8888 (4). Their "XRGB8888" (7) is bytes X, R, G, B: with it white came out yellow and red/green swapped (measured on husky 2026-10-14).
+const IDMA_IMG_FORMAT_BGRX8888: u32 = 4 << 8;
 const IDMA_ROT_MASK: u32 = 0x7 << 4;
 const IDMA_COMP_MASK: u32 = (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0); // AFBC, SBWC, SAJC, BLOCK
 const RDMA_SRC_WIDTH: usize = 0x0010;
@@ -91,7 +92,7 @@ fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
 }
 
 /// Paint `text` (lines separated by '\n') on the panel. Returns a register report (one LABEL=G#value per line) whatever happens, so each step can be checked without seeing the screen.
-/// The adopted base layer: a physically contiguous XRGB8888 surface the CPU writes directly, and what it takes to push a frame.
+/// The adopted base layer: a physically contiguous surface of u32 0x00RRGGBB pixels the CPU writes directly, and what it takes to push a frame.
 pub struct Panel {
     /// Physical address of the first pixel.
     pub fb: usize,
@@ -120,7 +121,7 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
-/// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear XRGB8888, turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.
+/// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear 0x00RRGGBB pixels (BGRX8888), turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.
 pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     // Never touch a powered-down DPU: on husky a CPU read of DECON with the DPU domain off returns 0 but leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever (measured: the boot screen's single DECON_VERSION read in the reboot path made DIAG's PMU readback hang). The domain state is read through the EL3 monitor, which is safe: word 0 of each PMU power-domain block is 1 when on (pd-dpub G#1546_1D00, pd-dpuf0 G#1546_1D80, pd-dpuf1 G#1546_1E00; other offsets are not whitelisted and return -EINVAL).
     let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::platform::priv_reg(a, false, 0));
@@ -248,8 +249,8 @@ pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     }
     unsafe { core::arch::asm!("dsb sy") };
 
-    // Linear XRGB8888 on the base layer; every other window off.
-    let new_ctrl = (in_ctrl & !(IDMA_IMG_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | IDMA_IMG_FORMAT_XRGB8888;
+    // Linear 0x00RRGGBB (BGRX8888) on the base layer; every other window off.
+    let new_ctrl = (in_ctrl & !(IDMA_IMG_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | IDMA_IMG_FORMAT_BGRX8888;
     wr(dpp_base + RDMA_IN_CTRL_0, new_ctrl);
     let mut up = SHD_REG_UP_REQ_GLOBAL | SHD_REG_UP_REQ_CMP | (1 << win);
     for w in 0..8 {
