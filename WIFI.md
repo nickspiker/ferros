@@ -1,6 +1,13 @@
 # WIFI — BCM4398 on PCIe ch1 (husky / zuma): bare-metal bring-up recipe
 
-**Status (2026-10-14):** recipe distilled from Google's Linux sources (citations below); not yet run on hardware. The bring-up is written as a driver *process* holding hardware grants (`payloads/pcie1`, ferros_kernel process.rs `--hw`), not as kernel code. Goal 1: PCIe link up (Gen1 or better). Goal 2: the endpoint's vendor/device ID over config space. Goal 3: dhd's first BAR0 chip-id read. Firmware download, msgbuf rings, 802.11 and an IP stack come after.
+**Status (2026-10-15): goals 1-3 reached on husky, cold boot, from a driver process.** `tools/husky-wifi.sh` runs `payloads/pcie1` (EL0, hardware grants only) through the recipe below:
+- survey: every PCIe ch1 CMU gate already on (G#0020_0000: CG_VAL=1, MANUAL=0, no auto-gating), PMU PHY control G#C0 (isolated), DBI answers G#A5A5_144D;
+- PHY: external PLL lock 1 µs, PHY PLL lock 97 µs, CDR lock 29 µs, offset calibration 6.7 ms;
+- link: LTSSM Polling.Active → **L0 in 81 µs**, link status G#3011_0000 = **Gen1 ×1** (Gen1 forced), RC id G#ECED_144D;
+- config space: **G#14E4 : G#4444** (BCM4398 D11AX); BAR0 → chipcommon ChipID **G#6003_4398 = chip G#4398 rev 3**.
+Next: TCM/firmware download, NVRAM + CLM, the msgbuf rings (DMA through S2MPU G#131F_0000), then 802.11 and an IP stack — each as processes.
+
+**Recipe source:** The bring-up is written as a driver *process* holding hardware grants (`payloads/pcie1`, ferros_kernel process.rs `--hw`), not as kernel code. Goal 1: PCIe link up (Gen1 or better). Goal 2: the endpoint's vendor/device ID over config space. Goal 3: dhd's first BAR0 chip-id read. Firmware download, msgbuf rings, 802.11 and an IP stack come after.
 
 Numbers use the project's `G#` notation. **[AMBIGUOUS]** / **[INFERENCE]** mark what the sources don't settle; the open questions are collected in §13.
 

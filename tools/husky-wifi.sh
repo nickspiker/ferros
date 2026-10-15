@@ -13,6 +13,13 @@ HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy
 for s in 00 01 02 03; do
     echo "=== stage $s"
     timeout 120 "$B" spawn "$R/pcie1.bin" "$s" --name pcie1 $HW 2>&1 | grep -vE "DATA|SPEC|recv\[|recv:|send|Staging|Staged|COMPLETE|Connected|Signed"
-    lsusb -d 1209:4665 >/dev/null || { echo "=== ferros dropped off USB during stage $s"; exit 1; }
+    # Long waits (WL_REG_ON's 200 ms) span many time slices: the spawn returns after the first one and the driver finishes in the background. Drain its console until it exits.
+    for _ in $(seq 60); do
+        lsusb -d 1209:4665 >/dev/null || { echo "=== ferros dropped off USB during stage $s"; exit 1; }
+        out=$("$B" diag console 2>/dev/null)
+        printf '%s\n' "$out" | grep -v '^ALIVE=' | grep -v '^$'
+        printf '%s\n' "$out" | grep -q '^ALIVE=00000000' && break
+        sleep 1
+    done
     [ "$s" = "$LAST" ] && break
 done

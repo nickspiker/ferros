@@ -17,6 +17,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: don't SSH](feedback_no_ssh.md) — never SSH into another machine unless explicitly told to
 - [Feedback: no manual line wraps](feedback_no_line_wraps.md) — write each sentence on one line in doc/block comments; editor handles wrapping
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) — commit AND push at every verified step without asking; stage only your own hunks
+- [Feedback: USB port wedge](feedback_usb_port_wedge.md) — phone silent after a -71 storm = HOST port gave up; ask for a replug before blaming the phone
 - [Feedback: measure before fixing](feedback_measure_before_fixing.md) — surface diagnostics FIRST when a system fails intermittently; don't write fixes from theories
 - [PIPE: slow is the security property](pipe_slow_is_security.md) — bounded throughput hard-caps attacker sample rate; pick slowest clock that meets usability, not fastest that closes timing
 - [PIPE TRNG silicon primitives](pipe_trng_silicon_primitives.md) — four physics sources (metastability, TERO, subthreshold inverter, shot-noise diode) for on-die TRNG; FPGA can't validate metastability/subthreshold

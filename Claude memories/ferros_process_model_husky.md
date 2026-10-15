@@ -13,4 +13,6 @@ Built and hardware-verified on the cold boot (slot b), all in ferros_kernel/src,
 - Boot spawns vault object `init` (signed hello_el0) as the first process.
 - Tools: `bridge capsule`, `bridge spawn [--serve E --use E]`, `bridge diag console|bench|devinfo|ready`.
 
+- **First driver process (2026-10-15):** payloads/pcie1 (hardware grants via mmio syscalls) brought PCIe ch1 to L0 Gen1 ×1 and read the BCM4398 (14E4:4444, chip 4398 rev 3) — WIFI.md.
+
 Open: toka VM as a process — needs a no_std core split of the owner's toka crate (review first); toka also doesn't build since VSF 0.10 (pins vsf ^0.9.3). See [[husky_cold_slot_b]], [[ferros_wake_policy_prox_gate]].
