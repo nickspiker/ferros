@@ -288,7 +288,7 @@ attack. Cold boot, power analysis, bus interception, memory forensics.
 
 ferros oracle has none of these surfaces because the secret has no
 address. The ihi is computed transiently and handed to the
-process. After spawn, it exists only in the process's arc — which
+process. After spawn, it exists only in the process's arcs — which
 is itself isolated by ISOMEM. The computation is gone. The input is
 gone. What remains is what was always going to be recognized.
 

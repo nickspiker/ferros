@@ -8,7 +8,7 @@ Linux:   demand paging, swapping, copy-on-write fork,
          page reclaim, OOM killer,
          thousands of lines, dozens of CVEs
 
-ferros:  process gets an arc, hardware gets a grant
+ferros:  process gets arcs, hardware gets a grant
          that's the entire page table story
          no swapping (killswitch ready, no swap partition)
          no demand paging (arc is always valid)
