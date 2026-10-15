@@ -48,6 +48,9 @@ mod cold_ufs;
 // Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod slot;
+// The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
+#[cfg(feature = "pixel8")]
+mod cachemap;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
 mod checklist;
@@ -1169,8 +1172,9 @@ pub(crate) fn pixel8_eusb_phy_init() {
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
-    // Killswitch before anything else.
+    // Killswitch before anything else, then the cache map.
     killswitch::arm();
+    cachemap::enable();
     // Init the DRAM bump heap (same as cold boot; __stack_top is inside the carveout for the shim link, so this stays in reserved DRAM).
     unsafe extern "C" { static __stack_top: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
@@ -1189,8 +1193,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
-    // Killswitch before anything else.
+    // Killswitch before anything else, then the cache map.
     killswitch::arm();
+    let cached = cachemap::enable();
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
@@ -1236,6 +1241,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+    if cached {
+        checklist::mark(checklist::Item::CacheMap);
+    }
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();

@@ -379,7 +379,9 @@ impl Trb {
     }
 }
 
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut EVT_BUF: EventBuffer = EventBuffer { buf: [0; 256] };
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut EP0_TRBS: Ep0Trbs = Ep0Trbs {
     setup: Trb::zero(),
     data: Trb::zero(),
@@ -392,6 +394,7 @@ static mut EP0_TRBS: Ep0Trbs = Ep0Trbs {
 struct SetupPacket {
     data: [u8; 8],
 }
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut EP0_SETUP_BUF: SetupPacket = SetupPacket { data: [0; 8] };
 
 /// EP0 data buffer for control transfers. Cache-line aligned (64B) to isolate from other DMA buffers.
@@ -399,6 +402,7 @@ static mut EP0_SETUP_BUF: SetupPacket = SetupPacket { data: [0; 8] };
 struct Ep0DataBuf {
     data: [u8; 512],
 }
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut EP0_DATA_BUF: Ep0DataBuf = Ep0DataBuf { data: [0; 512] };
 
 /// Bulk endpoint TRBs — one per direction, cache-line aligned.
@@ -407,7 +411,9 @@ struct BulkOutTrb { trb: Trb, _pad: [Trb; 3] }
 #[repr(C, align(64))]
 struct BulkInTrb { trb: Trb, _pad: [Trb; 3] }
 
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut BULK_OUT_TRB: BulkOutTrb = BulkOutTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut BULK_IN_TRB: BulkInTrb = BulkInTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
 
 /// Bulk OUT data buffer (host→device). 512B for HS bulk MPS.
@@ -417,7 +423,9 @@ struct BulkOutBuf { data: [u8; 512] }
 #[repr(C, align(64))]
 struct BulkInBuf { data: [u8; 4096] }
 
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut BULK_OUT_BUF: BulkOutBuf = BulkOutBuf { data: [0; 512] };
+#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
 static mut BULK_IN_BUF: BulkInBuf = BulkInBuf { data: [0; 4096] };
 
 // ---------------------------------------------------------------------------

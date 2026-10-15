@@ -33,6 +33,12 @@ SECTIONS
 
     .bss : ALIGN(4096) {
         __bss_start = .;
+        /* Device DMA buffers (ferros_hal: UFS descriptors + data, DWC3 events, TRBs, EP0 and bulk buffers), page-aligned so the static cache map can keep them uncached (cachemap.rs). Zeroed with the rest of .bss. */
+        . = ALIGN(4096);
+        __dma_start = .;
+        *(.bss.dma .bss.dma.*)
+        . = ALIGN(4096);
+        __dma_end = .;
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;

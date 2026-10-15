@@ -286,7 +286,15 @@ future front ends  (an RPN / AI-tailored Rust fork, ...)          → toka ┘
 3. The toka → aarch64 backend, sealing, go.
 4. wasm → toka lowering and the WASI-shaped host calls; then Photon, then Lumis.
 
-**Open:** data caches. With the MMU fully off every data access is uncached Device memory; see the decision record when it lands.
+### Data caches: one static map at boot (decided and built 2026-10-14)
+
+On ARM, with the MMU off every data access is Device memory: no data cache, exclusives (the atomics behind every `Arc`, mutex, tokio and rayon) not architecturally guaranteed, and unaligned accesses fault. There is no back door at EL2 (HCR_EL2.DC only covers the lower levels and forces stage-2 tables on). So ferros writes **one identity table at boot and never touches it again** (`ferros_kernel/src/cachemap.rs`):
+- virtual = physical; every 1 GiB block is Device, exactly the MMU-off world, except ferros's own window (image, stack, heap, staging), which is Normal write-back;
+- device DMA buffers live in `.bss.dma` and are mapped non-cacheable, so DMA needs no cache maintenance;
+- no per-process tables, no switching, no flushes; nothing in it isolates anything — it is the cache switch, not a protection mechanism;
+- RELOAD writes the window back and turns the MMU off before its copy stub; RUN cleans the payload to the point of unification.
+
+Measured on husky: a 4 MiB copy 157 ms → 0.78 ms (~200×), BLAKE3 1.6 → 215 MB/s (~135×), cold vault open 84 → 10 ms. On Glyph silicon even this table goes away.
 
 ---
 

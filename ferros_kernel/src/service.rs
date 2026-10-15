@@ -470,6 +470,30 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"bench" {
+                                            // Memory speed, for the cache map's before/after: 8 copies of 512 KiB (4 MiB moved) and BLAKE3 over 512 KiB, timed in microseconds, plus SCTLR_EL2 (M b0, C b2, I b12).
+                                            let n = 512 * 1024;
+                                            let src = alloc::vec![0x5Au8; n];
+                                            let mut dst = alloc::vec![0u8; n];
+                                            let us = |t: u64| (t * 1_000_000 / freq) as u32;
+                                            let t0 = cntpct();
+                                            for _ in 0..8 {
+                                                dst.copy_from_slice(&src);
+                                                core::hint::black_box(&mut dst);
+                                            }
+                                            let t1 = cntpct();
+                                            let h = blake3::hash(core::hint::black_box(&src));
+                                            let t2 = cntpct();
+                                            let sctlr: u64;
+                                            unsafe { core::arch::asm!("mrs {}, sctlr_el2", out(reg) sctlr) };
+                                            append_hex(&mut resp, b"BENCH_COPY_4MIB_US=", us(t1 - t0));
+                                            append_hex(&mut resp, b"BENCH_BLAKE3_512KIB_US=", us(t2 - t1));
+                                            append_hex(&mut resp, b"BENCH_HASH0=", h.as_bytes()[0] as u32);
+                                            append_hex(&mut resp, b"SCTLR_EL2=", sctlr as u32);
+                                            resp.extend_from_slice(b"END\n");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"devinfo" {
                                             // The bootloader's A/B slot record: devinfo is UFS LUN 3 (sdd1), starting at 512-byte sector 48 = 4 KiB LBA 6. Only the 128-byte header goes out ("DEVINFO_xx=" one 32-bit word per line): the rest of the partition is factory identity data (serials, MACs, IMEIs) that has no business on the wire. Needs the disk up (any boot that opened the vault).
                                             if store.is_none() {
@@ -681,11 +705,13 @@ pub fn run(mut b: Boot) -> ! {
                                             unsafe {
                                                 // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.
                                                 core::arch::asm!("msr daifset, #2");
+                                                // Copy the stub (cacheable) first, then hand over with every dirty line written back and the MMU off: the stub and the next image run MMU-off, as from ABL.
                                                 let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                                                 write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
                                                 let stub = &raw const ferros_reload_stub as usize;
                                                 let stub_len = &raw const ferros_reload_stub_end as usize - stub;
                                                 core::ptr::copy_nonoverlapping(stub as *const u8, b.stub as *mut u8, stub_len);
+                                                crate::cachemap::off_for_handover();
                                                 let len = (reload_size + 7) & !7;
                                                 let next_x0 = ((generation + 1) << 1) | 1;
                                                 core::arch::asm!(
@@ -706,7 +732,7 @@ pub fn run(mut b: Boot) -> ! {
                                     } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
                                         // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.
                                         if run_ok && run_size > 0 {
-                                            unsafe { core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb") };
+                                            crate::cachemap::sync_code(b.stage, run_size);
                                             let mut out = alloc::vec![0u8; 4096];
                                             let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(b.stage) };
                                             let ret = entry(cmd.params.as_ptr(), cmd.params.len(), out.as_mut_ptr(), out.len());
