@@ -19,6 +19,8 @@ members = [
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",
+    "payloads/ip",
+    "payloads/nettest",
     "payloads/wdtfire",
     "payloads/usbprobe",
     "payloads/pmuprobe",

@@ -888,7 +888,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0, serving: false, rxq: [(0, 0, 0); 64], rxq_head: 0, rxq_len: 0 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -929,8 +929,11 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         if stage >= 12 {
             join(d, &mut m, cred);
         }
-        if stage >= 13 && m.keyed {
+        if stage == 13 && m.keyed {
             dhcp(d, &mut m);
+        }
+        if stage >= 14 && m.keyed {
+            serve(d, &mut m, sh);
         }
     }
     let f = d.tcm_rd(sh);
@@ -989,6 +992,11 @@ struct Msgbuf {
     nak: bool,
     lease: [[u8; 4]; 3],
     lease_s: u32,
+    /// Server mode (stage 14): received frames wait in their rx buffers until a client takes one (buffer index, frame offset, length); the buffer is re-posted only then — backpressure without a copy.
+    serving: bool,
+    rxq: [(u8, u16, u16); 64],
+    rxq_head: usize,
+    rxq_len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1060,6 +1068,18 @@ impl Msgbuf {
             self.rx_frames += 1;
             if i < 64 {
                 let p = self.dma + 0x4_0000 + 0x800 * i + off;
+                if self.serving {
+                    // Hold the buffer for a client (re-posted when taken). The completion flags don't separate Ethernet from 802.11 frames here (an EAPOL frame came flagged G#02 too), so everything goes to the client, which ignores what it can't parse. data_len counts the frame from the offset on: subtracting the offset clipped 8 bytes off every frame (DHCP options and router advertisement prefixes lost).
+                    if self.rxq_len < self.rxq.len() && len > 0 {
+                        let at = (self.rxq_head + self.rxq_len) % self.rxq.len();
+                        self.rxq[at] = (i as u8, off as u16, len.min(0x800 - off) as u16);
+                        self.rxq_len += 1;
+                    } else {
+                        self.post_rx(i);
+                        self.ring_rx(d);
+                    }
+                    continue;
+                }
                 if be16(p + 12) == 0x0800 {
                     self.ipv4(d, p + 14, len.saturating_sub(off).saturating_sub(14));
                 }
@@ -1484,6 +1504,71 @@ fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
 }
 
 /// A#192.168.1.1 — one base prefix for the dotted quad.
+/// The `wlan` endpoint (grant slot after the DMA region): Ethernet frames for other processes. Requests (first byte): 1 SEND frame → [0] sent / [1] too short; 2 RECV → the oldest received frame, or nothing (length 0); 3 INFO → our MAC (6 bytes) + link up (1). Between requests the driver keeps its rings moving; `recv` polls (flag 1) so it never blocks.
+const WLAN: u64 = 15;
+
+fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
+    if !flowring(d, m) {
+        return;
+    }
+    // All multicast in: IPv6 neighbour discovery lives on 33:33:… groups.
+    let r = m.set_int(d, b"allmulti", 1);
+    d.kv(b"allmulti", r);
+    // Checksum offload: the firmware fills transmit checksums only with extended (56-byte) tx items, offered by pcie_shared flags2 bit G#40_0000 (TXPOST_EXT); receive completions flag G#800 when it verified a checksum.
+    let f2 = d.tcm_rd(sh + 80);
+    d.kv(b"shared flags2", f2);
+    d.put(if f2 & 0x0040_0000 != 0 { b"tx checksum offload offered (TXPOST_EXT)\n" } else { b"no tx checksum offload (no TXPOST_EXT)\n" });
+    m.serving = true;
+    m.verbose = false;
+    d.put(b"serving wlan\n");
+    d.flush();
+    let mut msg = [0u8; 2048];
+    let mut out = [0u8; 2048];
+    let mut tok = [0u8; 32];
+    loop {
+        let _ = m.pump(d);
+        m.pump_rx(d);
+        m.pump_tx(d);
+        let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
+        if n == u64::MAX - 1 || n == ERR {
+            continue;
+        }
+        let msg = unsafe { core::ptr::read_volatile(&msg) };
+        let n = n as usize;
+        let len = match msg.first() {
+            Some(1) if n > 14 => {
+                m.send(d, &msg[1..n]);
+                out[0] = 0;
+                1
+            }
+            Some(2) if m.rxq_len > 0 => {
+                let (i, off, l) = m.rxq[m.rxq_head];
+                m.rxq_head = (m.rxq_head + 1) % m.rxq.len();
+                m.rxq_len -= 1;
+                let p = m.dma + 0x4_0000 + 0x800 * i as u32 + off as u32;
+                let l = (l as usize).min(out.len());
+                for (k, o) in out[..l].iter_mut().enumerate() {
+                    *o = dbr(p + k as u32);
+                }
+                m.post_rx(i as u32);
+                m.ring_rx(d);
+                l
+            }
+            Some(3) => {
+                out[..6].copy_from_slice(&m.mac);
+                out[6] = m.linked as u8;
+                7
+            }
+            Some(1) => {
+                out[0] = 1;
+                1
+            }
+            _ => 0,
+        };
+        svc(3, tok.as_ptr() as u64 - d.base, out.as_ptr() as u64 - d.base, len as u64, 0, 0);
+    }
+}
+
 fn ip_put(d: &mut Drv, a: [u8; 4]) {
     d.put(b"A#");
     for (k, b) in a.iter().enumerate() {
@@ -1507,6 +1592,14 @@ fn ip_put(d: &mut Drv, a: [u8; 4]) {
 
 /// Stage 13: one transmit flowring, then DHCP — DISCOVER (broadcast), OFFER, REQUEST, ACK — from the EL0 driver. Flowring 2 (dhd's first flow id) is created on the control ring with its DMA ring (512 × 48 B at +G#6_0000), DA broadcast and SA our MAC, as dhd does for a STA's first packet; a STA has one flowring per priority, whatever the destination.
 fn dhcp(d: &mut Drv, m: &mut Msgbuf) {
+    if !flowring(d, m) {
+        return;
+    }
+    dhcp_run(d, m);
+}
+
+/// Create transmit flowring 2 (see `dhcp`); true when the firmware answered status 0.
+fn flowring(d: &mut Drv, m: &mut Msgbuf) -> bool {
     let req = m.dma + 0x1_3000;
     if let Some((0, b, _)) = m.get_var(d, b"cur_etheraddr", req) {
         m.mac = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
@@ -1529,10 +1622,11 @@ fn dhcp(d: &mut Drv, m: &mut Msgbuf) {
         d.us(1000);
     }
     d.kv(b"flowring create status", m.flow_status.unwrap_or(u32::MAX));
-    if m.flow_status != Some(0) {
-        d.flush();
-        return;
-    }
+    d.flush();
+    m.flow_status == Some(0)
+}
+
+fn dhcp_run(d: &mut Drv, m: &mut Msgbuf) {
     m.xid = 0xF3A0_0000 | (d.now() as u32 & 0xFFFF);
     for attempt in 0..3u32 {
         let frame = dhcp_frame(&m.mac, m.xid, 1, None);

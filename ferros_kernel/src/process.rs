@@ -5,7 +5,7 @@
 //! The syscall boundary is `svc #0` with the call number in x8 (all offsets are arc offsets, masked by the kernel; ERR = all ones):
 //! - 0 `exit(code)` — the process ends; its arc and capabilities cease to exist.
 //! - 1 `call(cap, msg, msg_len, reply, reply_cap)` — present a 32-byte token (at arc offset `cap`) holding the send right and send `msg`; the caller blocks until the reply is written at `reply` (at most `reply_cap` bytes); x0 = its length.
-//! - 2 `recv(cap, buf, buf_cap, reply_token)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes).
+//! - 2 `recv(cap, buf, buf_cap, reply_token, flags)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes). Flags bit 0 = poll: if nothing is queued, x0 = NOTHING (all ones but one) at once — for a server that also polls hardware.
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
 //! - 6 `entropy(cap, buf, len)` — present a token holding the entropy right; `len` bytes (at most 4096) of fresh randomness are written at `buf`, x0 = `len`. The stream is BLAKE3 keyed from this session's wairua (KOHI) over a kernel counter, so no two calls in a power session see the same bytes and nothing from a previous session repeats. ERR without a wairua: a driver that needs randomness (the WiFi firmware's RNG seed) gets none rather than a predictable one.
@@ -316,6 +316,8 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "pmu", base: 0x1546_0000, size: 0x1_0000, via_el3: true },
 ];
 const ERR: u64 = u64::MAX;
+/// What a polling `recv` returns when no message is waiting.
+pub const NOTHING: u64 = u64::MAX - 1;
 /// What `spawn` reports for a process still running when its slice ended (it continues in later slices).
 pub const PREEMPTED: u64 = 0x5110 << 48;
 /// Time slice, in generic-timer ticks per millisecond multiples.
@@ -432,6 +434,11 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         SYS_RECV => {
             let token = p.read(f.x[0], 32);
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                // x4 bit 0 = poll: with nothing queued, return NOTHING at once instead of blocking — for a server that must also keep polling its hardware (the WiFi driver's rings).
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && f.x[4] & 1 != 0 && kk.endpoints[ep].queue.is_empty() => {
+                    f.x[0] = NOTHING;
+                    0
+                }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 => {
                     p.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
                     p.frame = *f;
