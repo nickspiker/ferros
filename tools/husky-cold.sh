@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Boot ferros straight from the bootloader on slot b (pure cold boot, no Linux) and drive it over USB.
 #
-# Slot a stays Android + the handoff kernel (dev host and escape hatch); slot b's boot partition holds ferros. ABL loads the boot.img kernel at G#8008_0000 (the cold link base, ferros_kernel/aarch64-pixel8.ld) with the MMU off and jumps to it; ferros arms its fault sink + watchdogs, tunes the eUSB repeater and serves Photon Transport on USB (ferros_kernel/src/service.rs). There is no disk on a cold boot yet (UFS.md), so every exit except a plain `bridge reboot` goes to fastboot, where this script (or you) decides what boots next.
+# Slot a stays Android + the handoff kernel (dev host and escape hatch); slot b's boot partition holds ferros. ABL loads the boot.img kernel at G#8008_0000 (the cold link base, ferros_kernel/aarch64-pixel8.ld) with the MMU off and jumps to it; ferros arms its fault sink + watchdogs, tunes the eUSB repeater and serves Photon Transport on USB (ferros_kernel/src/service.rs). It brings up the disk itself (cold_ufs.rs) and marks slot b successful in devinfo (slot.rs), so a plain reset or power cycle boots ferros again; every exit except a plain `bridge reboot` goes to fastboot, where this script (or you) decides what boots next.
 #
-# No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). Slot b is never marked successful (that needs the devinfo partition, i.e. a disk), so ABL also falls back to slot a by itself after its retry count runs out.
+# No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). `--android` is the only way back to slot a: slot b no longer falls back on its own.
 #
 # Usage:
 #   tools/husky-cold.sh            build, flash boot_b, make b active, boot, wait for ferros on USB, print DIAG

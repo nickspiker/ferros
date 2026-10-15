@@ -592,6 +592,11 @@ impl UfsController {
 
     /// Read one 4KB block from UFS LUN 0. Returns OCS (0 = success). Data is in the internal buffer.
     pub fn read_block(&self, lba: u32) -> u8 {
+        self.read_block_lun(0, lba)
+    }
+
+    /// Read one 4KB block from the given UFS LUN (husky: LUN 0 = sda, the main disk; LUN 3 = sdd, devinfo). Returns OCS (0 = success). Data is in the internal buffer.
+    pub fn read_block_lun(&self, lun: u8, lba: u32) -> u8 {
         // SCSI READ(10) CDB: opcode=0x28, LBA (big-endian), transfer length=1 block
         let cdb = [
             scsi::READ_10,
@@ -605,7 +610,7 @@ impl UfsController {
             0x00,                        // control
         ];
 
-        self.build_scsi_upiu(0, 0, upiu::FLAG_READ, 4096, &cdb);
+        self.build_scsi_upiu(lun, 0, upiu::FLAG_READ, 4096, &cdb);
         self.setup_prdt(4096);
 
         // direction=2 (device→host), cmd_type=0 (SCSI), 1 PRDT entry
@@ -614,6 +619,11 @@ impl UfsController {
 
     /// Write one 4KB block to UFS LUN 0. Caller must fill data buffer first via `data_buffer_mut()`. Returns OCS (0 = success).
     pub fn write_block(&self, lba: u32) -> u8 {
+        self.write_block_lun(0, lba)
+    }
+
+    /// Write one 4KB block to the given UFS LUN. Caller must fill data buffer first via `data_buffer_mut()`. Returns OCS (0 = success).
+    pub fn write_block_lun(&self, lun: u8, lba: u32) -> u8 {
         // SCSI WRITE(10) CDB
         let cdb = [
             scsi::WRITE_10,
@@ -627,7 +637,7 @@ impl UfsController {
             0x00,
         ];
 
-        self.build_scsi_upiu(0, 0, upiu::FLAG_WRITE, 4096, &cdb);
+        self.build_scsi_upiu(lun, 0, upiu::FLAG_WRITE, 4096, &cdb);
         self.setup_prdt(4096);
 
         // direction=1 (host→device), cmd_type=0 (SCSI), 1 PRDT entry

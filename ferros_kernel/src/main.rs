@@ -42,6 +42,9 @@ mod shim;
 // Cold boot from ABL: the UFS link-startup probe behind `bridge diag ufs`.
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod cold_ufs;
+// Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod slot;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;
@@ -1169,6 +1172,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let (probe, store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
 
+    // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
+    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
+        slot::mark_booted_slot(dtb_addr)
+    } else {
+        slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
+    };
+
     let own_base = &raw const _start as usize;
     let extras = alloc::vec![
         (b"COLD_UFS_MS=".as_slice(), ufs_ms),
@@ -1184,6 +1194,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (b"REP_T79=".as_slice(), rep_snap[8]),
         (b"REP_TUNED=".as_slice(), rep_tuned),
         (b"DTB=".as_slice(), dtb_addr as u32),
+        (b"SLOT=".as_slice(), mark.slot),
+        (b"SLOT_WORD_BEFORE=".as_slice(), mark.before),
+        (b"SLOT_WORD_AFTER=".as_slice(), mark.after),
+        (b"SLOT_MARK=".as_slice(), mark.result),
     ];
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
     service::run(service::Boot {

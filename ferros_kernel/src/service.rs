@@ -478,6 +478,45 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"devinfo" {
+                                            // The bootloader's A/B slot record: devinfo is UFS LUN 3 (sdd1), starting at 512-byte sector 48 = 4 KiB LBA 6. Only the 128-byte header goes out ("DEVINFO_xx=" one 32-bit word per line): the rest of the partition is factory identity data (serials, MACs, IMEIs) that has no business on the wire. Needs the disk up (any boot that opened the vault).
+                                            if store.is_none() {
+                                                resp.extend_from_slice(b"no disk on this boot\n");
+                                            } else {
+                                                let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                                // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
+                                                let mut ocs = 0xFF;
+                                                for _ in 0..4 {
+                                                    ocs = ufs.read_block_lun(3, 6);
+                                                    if ocs == 0 && ufs.last_response_status() == 0 {
+                                                        break;
+                                                    }
+                                                }
+                                                append_hex(&mut resp, b"DEVINFO_OCS=", ocs as u32 | (ufs.last_response_status() as u32) << 8);
+                                                let d = ufs.data_buffer();
+                                                let hx = b"0123456789ABCDEF";
+                                                for i in 0..32 {
+                                                    let w = u32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
+                                                    let key = [b'D', b'E', b'V', b'I', b'N', b'F', b'O', b'_', hx[i * 4 >> 4], hx[i * 4 & 15], b'='];
+                                                    append_hex(&mut resp, &key, w);
+                                                }
+                                                // Fingerprint of everything past the header (rest of LBA 6 + all of LBA 7): tells whether a slot change touched anything else (a checksum, a mirror) without sending the identity data itself.
+                                                let mut h = blake3::Hasher::new();
+                                                h.update(&d[0x80..]);
+                                                let mut ocs7 = ufs.read_block_lun(3, 7);
+                                                if ocs7 != 0 || ufs.last_response_status() != 0 {
+                                                    ocs7 = ufs.read_block_lun(3, 7);
+                                                }
+                                                h.update(ufs.data_buffer());
+                                                let f = h.finalize();
+                                                let fb = f.as_bytes();
+                                                append_hex(&mut resp, b"DEVINFO_REST_OCS=", ocs7 as u32);
+                                                append_hex(&mut resp, b"DEVINFO_REST_B3=", u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
+                                            }
+                                            resp.extend_from_slice(b"END\n");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ufs" {
                                             match b.ufs_probe {
                                                 Some(f) => resp = f(),

@@ -24,5 +24,5 @@ metadata:
 **Disk works cold (2026-10-14):**
 - ABL powers the flash off on its way out. `cold_ufs::bring_up` turns VCC (gpp0-1) back on and runs full_init with the per-command nexus. Link + first read take 44 ms; the vault opens and verifies in 84 ms.
 - It is the same ira-rooted vault as the handoff path: the `note` written via the handoff reads back on the cold boot.
-- Not yet done: devinfo slot marking, so ABL's retry counter for b still decrements per cold boot and resets on `--set-active=b`.
+- **Slot b marks itself successful** (slot.rs, 2026-10-14): devinfo = UFS LUN 3 LBA 6, word per slot at G#30 (retries, flags b1 successful b2 active b3 fastboot-ok). ABL confirms `slot-successful:b:yes`; 5 plain reboots stayed in ferros. devinfo ALSO holds serials/MACs/IMEIs: never alter beyond the flag bit; full backup in keys/husky-devinfo-2026-10-14.bin. Details in BOOT.md.
 - See [[ufs_husky_wall]].

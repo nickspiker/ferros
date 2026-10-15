@@ -56,12 +56,15 @@ Pixel 8 / Tensor G3 (primary):
 - **Slot a = Android + the handoff kernel.** This is the dev host and the escape hatch: `tools/husky-hotload.sh` chainloads ferros from it with the disk live.
 - **Back to Android:** `tools/husky-cold.sh --android` (fastboot, `--set-active=a`, reboot, about 40 s, no buttons).
 - **Exits from cold ferros:**
-  - Slot marking isn't implemented yet (the devinfo format is still unknown), and a plain reset would just boot ferros again. So every exit except a plain host `bridge reboot` goes to fastboot: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
+  - A plain reset just boots ferros again (slot b is marked successful), so every exit except a plain host `bridge reboot` goes to fastboot, where the host decides what boots next: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
   - The report block at G#FD60_0000 survives warm resets and the trip through fastboot. The next cold boot shows it as `PREV_*` in DIAG, and Android's handoff kernel prints it as `ferros: r[..]`.
 - **Fastboot from ferros:** stamp PMU SYSIP_DAT0 = G#FC through the EL3 monitor, then fire the cluster watchdogs (count = reload = 1).
   - **The reset is not immediate:** these watchdogs reset the SoC about 15-20 s after they start expiring, so ferros waits up to 64 s by the clock.
   - A PSCI SYSTEM_RESET from ferros loses the reboot mode (ABL sees a PIN reset).
-- **Slot b is never marked successful.** That needs writing the proprietary `devinfo` partition. The disk works cold now (`cold_ufs.rs`: ABL powers the flash off, ferros turns VCC back on; 44 ms link + 84 ms vault), so this is just the format work left. ABL's retry counter for b decrements on every cold boot and is reset by each `--set-active=b`; when it runs out, ABL falls back to slot a by itself.
+- **Slot b marks itself successful** (`ferros_kernel/src/slot.rs`, since 2026-10-14), so ABL stops counting down its retries and a power cycle lands in ferros again. This is what Android's boot-control HAL does once boot completes.
+  - The record is `devinfo`: UFS LUN 3 (`sdd1`), 4 KiB LBA 6. It holds magic "DEVI", u16 major = 3, then at G#30 one word per slot (a, b): byte 0 = retries left, byte 1 = flags (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok). Measured on hardware: `--set-active` sets retries to 3, each ABL boot of an unmarked slot takes one, and a marked slot keeps its count. Nothing else in the partition changes (no checksum, no mirror).
+  - **The rest of devinfo is factory identity data:** serials, WiFi/BT MACs, both IMEIs. ferros rewrites the block byte-identical apart from the one flag bit and verifies it by read-back. `bridge diag devinfo` returns only the 128-byte header plus a BLAKE3 fingerprint of the rest. A pre-experiment backup of the whole 8 KiB partition is in `keys/husky-devinfo-2026-10-14.bin` (sha256 c0735a11…; rest-of-partition BLAKE3 starts 7034e633).
+  - The booted slot must agree in two sources: the last `androidboot.slot_suffix` in ABL's bootconfig (end of the initrd; it carries `_a` and then the real one) and devinfo's active bit. Marking happens only on a real ABL boot with the vault verified, so a build that dies earlier still falls back. `--set-active=b` clears the mark; the next ferros boot sets it again. DIAG: `SLOT`, `SLOT_WORD_BEFORE/AFTER`, `SLOT_MARK` (0 marked now, 1 already marked, G#1x/2x/3x refusals, see slot.rs).
 
 ### Entry teardown hazard (the 2026-03 crash, root-caused)
 
