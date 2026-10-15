@@ -51,6 +51,9 @@ mod slot;
 // The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
 #[cfg(feature = "pixel8")]
 mod cachemap;
+// KOHI: PIPE's entropy gathering + health stack in software (the wairua's source).
+#[cfg(feature = "pixel8")]
+mod kohi;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
 mod checklist;

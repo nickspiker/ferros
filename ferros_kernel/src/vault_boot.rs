@@ -11,6 +11,9 @@ const UFS_BASE: usize = 0x1320_0000;
 const IRA_FP_CONTEXT: &str = "ferros husky 2026-10-14 ira display fingerprint v1";
 const WAIRUA_FP_CONTEXT: &str = "ferros husky 2026-10-14 wairua display fingerprint v1";
 
+/// How long this boot's KOHI took, for DIAG.
+pub static KOHI_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn fingerprint(context: &str, secret: &[u8; 32]) -> [u8; 8] {
     let mut fp = [0u8; 8];
     fp.copy_from_slice(&blake3::derive_key(context, secret)[..8]);
@@ -51,7 +54,9 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
     crumb(0xC1); // anchor_key (chipid trims + BLAKE3 ira) returned
 
-    let wairua = crate::wairua::draw(); // TRNG (SMC then RNDR fallback)
+    let t_kohi = crate::platform::cntpct();
+    let wairua = crate::wairua::draw(); // this session's KOHI (run on first use)
+    KOHI_MS.store(((crate::platform::cntpct() - t_kohi) / (crate::platform::cntfrq() / 1000)) as u32, core::sync::atomic::Ordering::Relaxed);
     crumb(0xC2);
     let (wairua_ok, wairua_fp) = match wairua {
         Some(w) => (1u8, fingerprint(WAIRUA_FP_CONTEXT, &w)),

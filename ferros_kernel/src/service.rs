@@ -560,6 +560,18 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"KILL_GICD_CTLR=", k[1].load(Relaxed));
                                             append_hex(&mut resp, b"KILL_HCR_BEFORE=", k[2].load(Relaxed));
                                             append_hex(&mut resp, b"KILL_KEYS_IDLE=", k[3].load(Relaxed));
+                                            for (name, h) in crate::kohi::SOURCES.iter().zip(crate::wairua::source_health().iter()) {
+                                                // present b0, rct_fail b1, apt_fail b2, level_fail b8..15, level-0 ones/2 b16..31
+                                                let mut key = alloc::vec::Vec::from(&b"KOHI_"[..]);
+                                                key.extend_from_slice(name.to_ascii_uppercase().as_bytes());
+                                                key.push(b'=');
+                                                append_hex(&mut resp, &key, h.packed());
+                                                key.pop();
+                                                key.extend_from_slice(b"_US=");
+                                                append_hex(&mut resp, &key, h.us);
+                                            }
+                                            append_hex(&mut resp, b"KOHI_OK=", crate::wairua::draw().is_some() as u32);
+                                            append_hex(&mut resp, b"KOHI_MS=", crate::vault_boot::KOHI_MS.load(core::sync::atomic::Ordering::Relaxed));
                                             append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
                                             let daif: u64;
                                             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
