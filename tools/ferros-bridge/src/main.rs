@@ -160,7 +160,7 @@ async fn main() {
         "spawn" => {
             // spawn <payload.bin> [hex-input] [--name N] [--serve E]... [--use E]...
             if args.len() < 3 {
-                eprintln!("Usage: ferros-bridge spawn <payload.bin> [hex-input] [--name N] [--serve ENDPOINT]... [--use ENDPOINT]...  (runs it as a process: EL0, own arc, a console capability plus the endpoint grants)");
+                eprintln!("Usage: ferros-bridge spawn <payload.bin> [hex-input] [--name N] [--serve ENDPOINT]... [--use ENDPOINT]... [--hw BLOCK]...  (runs it as a process: EL0, own arc, a console capability plus endpoint and hardware grants)");
                 std::process::exit(1);
             }
             let mut name = String::new();
@@ -172,6 +172,7 @@ async fn main() {
                     "--name" => { name = args.get(i + 1).cloned().unwrap_or_default(); i += 2; }
                     "--serve" => { grants.push((1, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--use" => { grants.push((2, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    "--hw" => { grants.push((3, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
                 }
             }

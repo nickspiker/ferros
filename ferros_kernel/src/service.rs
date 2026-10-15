@@ -779,7 +779,11 @@ pub fn run(mut b: Boot) -> ! {
                                                 let kind = take(1).first().copied().unwrap_or(0);
                                                 let l = take(1).first().copied().unwrap_or(0) as usize;
                                                 let g = take(l);
-                                                grants.push(if kind == 1 { crate::process::Grant::Serve(g) } else { crate::process::Grant::Use(g) });
+                                                grants.push(match kind {
+                                                    1 => crate::process::Grant::Serve(g),
+                                                    3 => crate::process::Grant::Hardware(g),
+                                                    _ => crate::process::Grant::Use(g),
+                                                });
                                             }
                                             let input = &pr[at.min(pr.len())..];
                                             // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.

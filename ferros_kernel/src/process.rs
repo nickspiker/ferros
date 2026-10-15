@@ -7,6 +7,7 @@
 //! - 1 `call(cap, msg, msg_len, reply, reply_cap)` — present a 32-byte token (at arc offset `cap`) holding the send right and send `msg`; the caller blocks until the reply is written at `reply` (at most `reply_cap` bytes); x0 = its length.
 //! - 2 `recv(cap, buf, buf_cap, reply_token)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes).
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
+//! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
 //!
 //! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through.
@@ -113,6 +114,8 @@ pub enum Object {
     Endpoint(usize),
     /// A single-use reply to the process that called (index into the process table).
     Reply(usize),
+    /// A hardware grant: an arc of device registers (index into the grant table). ASID.md: "process gets arcs, hardware gets a grant".
+    Hardware(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -141,6 +144,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Console => (0u8, 0u64),
         Object::Endpoint(i) => (1, i as u64),
         Object::Reply(i) => (2, i as u64),
+        Object::Hardware(i) => (3, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -261,6 +265,31 @@ const SYS_EXIT: u64 = 0;
 const SYS_CALL: u64 = 1;
 const SYS_RECV: u64 = 2;
 const SYS_REPLY: u64 = 3;
+/// mmio_read(grant, offset) → x0 = the 32-bit register; mmio_write(grant, offset, value).
+const SYS_MMIO_READ: u64 = 4;
+const SYS_MMIO_WRITE: u64 = 5;
+
+/// A named block of device registers a spawn can grant (`bridge spawn --hw NAME`). The spawner's authority stands in for a hardware-granting capability until there is one. `via_el3`: only the EL3 monitor can reach it (husky's PMU), so accesses go through SMC_CMD_PRIV_REG and only whitelisted offsets answer.
+pub struct Hw {
+    pub name: &'static str,
+    pub base: usize,
+    pub size: usize,
+    pub via_el3: bool,
+}
+
+/// The dev hardware registry: blocks a process may be granted by name (sizes from ABL's DTB / the cmucal tables).
+pub static HARDWARE: &[Hw] = &[
+    Hw { name: "pcie1-elbi", base: 0x1312_0000, size: 0x2000, via_el3: false },
+    Hw { name: "pcie1-soc", base: 0x1313_0000, size: 0x5000, via_el3: false },
+    Hw { name: "pcie1-pcs", base: 0x1314_0000, size: 0x1000, via_el3: false },
+    Hw { name: "pcie1-udbg", base: 0x1315_0000, size: 0xD000, via_el3: false },
+    Hw { name: "pcie1-phy", base: 0x1316_0000, size: 0x3000, via_el3: false },
+    Hw { name: "hsi1-sysreg", base: 0x1302_0000, size: 0x2000, via_el3: false },
+    Hw { name: "pcie1-dbi", base: 0x1340_0000, size: 0x38_1000, via_el3: false },
+    Hw { name: "gpio-hsi1", base: 0x1304_0000, size: 0x1000, via_el3: false },
+    Hw { name: "cmu-hsi1", base: 0x1300_0000, size: 0x8000, via_el3: false },
+    Hw { name: "pmu", base: 0x1546_0000, size: 0x1_0000, via_el3: true },
+];
 const ERR: u64 = u64::MAX;
 /// What `spawn` reports for a process still running when its slice ended (it continues in later slices).
 pub const PREEMPTED: u64 = 0x5110 << 48;
@@ -381,6 +410,30 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
             }
+        }
+        SYS_MMIO_READ | SYS_MMIO_WRITE => {
+            // A hardware grant: offset (x1) must be 4-byte aligned and inside the grant; the access goes straight to the register, or through the EL3 monitor for blocks only it can reach (the PMU).
+            let token = p.read(f.x[0], 32);
+            f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Hardware(g)) => {
+                    let hw = &HARDWARE[g];
+                    let off = f.x[1] as usize;
+                    if off % 4 != 0 || off >= hw.size {
+                        ERR
+                    } else if f.x[8] == SYS_MMIO_READ {
+                        if hw.via_el3 { crate::platform::priv_reg((hw.base + off) as u64, false, 0) & 0xFFFF_FFFF } else { unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 } }
+                    } else {
+                        if hw.via_el3 {
+                            crate::platform::priv_reg((hw.base + off) as u64, true, f.x[2] as u32);
+                        } else {
+                            unsafe { core::ptr::write_volatile((hw.base + off) as *mut u32, f.x[2] as u32) };
+                        }
+                        0
+                    }
+                }
+                _ => ERR,
+            };
+            0
         }
         SYS_REPLY => {
             let token = p.read(f.x[0], 32);
@@ -504,6 +557,8 @@ const STACK: usize = 64 * 1024;
 pub enum Grant<'a> {
     Serve(&'a [u8]),
     Use(&'a [u8]),
+    /// A hardware grant from the registry, by name.
+    Hardware(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -526,11 +581,15 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for g in grants {
-        let (ep, rights) = match g {
-            Grant::Serve(n) => (endpoint(n), RIGHT_RECV),
-            Grant::Use(n) => (endpoint(n), RIGHT_SEND),
+        let (object, rights) = match g {
+            Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
+            Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
+            Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
+                Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
+                None => return Err("no such hardware block"),
+            },
         };
-        cspace.push(CapEntry { token: mint(Object::Endpoint(ep), rights, epoch), object: Object::Endpoint(ep), rights });
+        cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0 };
     let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true };
