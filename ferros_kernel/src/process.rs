@@ -470,6 +470,11 @@ pub fn run_slice() -> bool {
     true
 }
 
+/// Append to the kernel's process console (e.g. a boot-time spawn's output, kept for `diag console`).
+pub fn push_console(bytes: &[u8]) {
+    k().console.extend_from_slice(bytes);
+}
+
 /// Drain what processes have sent their consoles since the last drain.
 pub fn take_console() -> Vec<u8> {
     core::mem::take(&mut k().console)

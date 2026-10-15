@@ -1529,6 +1529,35 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };
 
+    // The first process: the vault's `init` capsule (put there with `bridge capsule` + `store put init @file`), through the gate and the oracle like any other. No capsule is built into the kernel and no key is near its build. Spawning it is the first thing that needs the wairua (its capabilities are minted under it), so KOHI runs here.
+    let mut init_exit = 0u32;
+    if let Some(Ok(Some(capsule))) = store.as_ref().map(|s| s.get_by_key("init")) {
+        match process::spawn_capsule(b"init", &capsule, b"", &[]) {
+            Ok(o) => {
+                init_exit = (o.exit >> 32) as u32 | 1;
+                checklist::mark(checklist::Item::Arcs);
+                checklist::mark(checklist::Item::Spawn);
+                if o.exit >> 56 != 0xFA {
+                    checklist::mark(checklist::Item::El0);
+                }
+                if !o.console.is_empty() {
+                    checklist::mark(checklist::Item::Syscall);
+                    checklist::mark(checklist::Item::Caps);
+                    checklist::mark(checklist::Item::FirstProcess);
+                    // On the panel: the first bytes of the ihi the oracle gave it, as it reported them ("my ihi: XXXXXXXX").
+                    if let Some(i) = o.console.windows(8).position(|w| w == b"my ihi: ") {
+                        let hex = &o.console[i + 8..(i + 16).min(o.console.len())];
+                        let mut sfx = alloc::vec::Vec::from(&b"ihi "[..]);
+                        sfx.extend_from_slice(hex);
+                        checklist::suffix(checklist::Item::FirstProcess, &sfx);
+                    }
+                }
+                process::push_console(&o.console);
+            }
+            Err(_) => init_exit = 0xE,
+        }
+    }
+
     let own_base = &raw const _start as usize;
     let extras = alloc::vec![
         (b"COLD_UFS_MS=".as_slice(), ufs_ms),
@@ -1548,6 +1577,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (b"SLOT_WORD_BEFORE=".as_slice(), mark.before),
         (b"SLOT_WORD_AFTER=".as_slice(), mark.after),
         (b"SLOT_MARK=".as_slice(), mark.result),
+        (b"INIT=".as_slice(), init_exit),
     ];
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
     service::run(service::Boot {

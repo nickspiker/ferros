@@ -140,6 +140,23 @@ async fn main() {
             }
             cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::RUN, Vec::new()).await;
         }
+        "capsule" => {
+            // capsule <code.bin> <out.vsf>: write a signed capsule (e.g. for `store put init @out.vsf`, which the cold boot spawns as its first process).
+            if args.len() < 4 {
+                eprintln!("Usage: ferros-bridge capsule <code.bin> <out.vsf>");
+                std::process::exit(1);
+            }
+            let code = std::fs::read(&args[2]).unwrap_or_else(|e| {
+                eprintln!("Failed to read {}: {e}", args[2]);
+                std::process::exit(1);
+            });
+            let c = signed_capsule(&code);
+            std::fs::write(&args[3], &c).unwrap_or_else(|e| {
+                eprintln!("Failed to write {}: {e}", args[3]);
+                std::process::exit(1);
+            });
+            println!("signed capsule: {} bytes of code -> {} ({} bytes)", code.len(), args[3], c.len());
+        }
         "spawn" => {
             // spawn <payload.bin> [hex-input] [--name N] [--serve E]... [--use E]...
             if args.len() < 3 {
