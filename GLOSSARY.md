@@ -70,6 +70,18 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 
 ---
 
+## The kernel
+
+- **kernel** — the one privileged program: it owns the hardware, allocates regions and enforces grants (on ARM it runs at EL2).
+- **app** / **process** — an app is the installed unit, a process is one running instance of it. Everything outside the kernel is a process; there is no "userspace", since the device has one identity and what differs between processes is only their grants.
+- **region** — a process's memory: an offset and extent in the wrapping ISOMEM address space, isolated from every other region. Never called a ring.
+- **ring** — only for things that are literally circular: the vault's on-disk layout, and the two's-complement address space ISOMEM wraps (ring memory). A region is an arc of that ring, not a ring.
+- **grant** — a permission held by a process; a process's grants are its capability space.
+- **capsule** — the signed binary ([ORACLE.md](ORACLE.md)); what a process is recognised to be is its *ihi*, not an "identity" of its own.
+- **levels** — numbered from 0 = most fundamental, as in PT where L0 is the medium. ARM's exception levels count the other way (EL0 least privileged), so EL names appear only where code touches the hardware.
+
+---
+
 ## Crate roster
 
 | crate | is | name |

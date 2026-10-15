@@ -127,18 +127,18 @@ spaghettify. There are ~10^80 atoms in the observable universe.
 
 **Spawn** is the moment the kernel instantiates a process.
 
-In ISOMEM terms: the kernel allocates a ring — an offset and extent
+In ISOMEM terms: the kernel allocates a region — an offset and extent
 in the continuous two's complement address space, randomly positioned,
-cryptographically isolated from every other ring. The process receives
-this ring at spawn. It is that ring, for this instance, until it dies.
+cryptographically isolated from every other region. The process receives
+this region at spawn. It is that region, for this instance, until it dies.
 
 Spawn is not exec. Exec replaces a process image. Spawn creates a new
-ring, a new capability space, a new identity. Nothing is inherited by
+region, a new capability space, a new *ihi*. Nothing is inherited by
 default. Everything must be explicitly granted.
 
 At spawn, the oracle runs. The ihi is computed and handed to the
 process. This is the only moment it can be computed — after signature
-verification passes, after the ring is allocated, before the first
+verification passes, after the region is allocated, before the first
 instruction executes.
 
 ---
@@ -213,7 +213,7 @@ capsule loads
   → either fails → oracle never called, spawn never completes
 ```
 
-You cannot feed the oracle a developer_pubkey directly. Userspace
+You cannot feed the oracle a developer_pubkey directly. A process
 cannot construct oracle inputs. The developer_pubkey only reaches
 the oracle after the private key behind it has proven this exact
 binary — meaning the person who holds the private key signed off on
@@ -288,7 +288,7 @@ attack. Cold boot, power analysis, bus interception, memory forensics.
 
 ferros oracle has none of these surfaces because the secret has no
 address. The ihi is computed transiently and handed to the
-process. After spawn, it exists only in the process's ring — which
+process. After spawn, it exists only in the process's region — which
 is itself isolated by ISOMEM. The computation is gone. The input is
 gone. What remains is what was always going to be recognized.
 
@@ -305,11 +305,11 @@ strong.
 
 ```
 0. Oracle:      hardware-bound process identity — ihi
-1. Memory:      ring allocation, grants, bounds enforcement (ISOMEM)
+1. Memory:      region allocation, grants, bounds enforcement (ISOMEM)
 2. Scheduling:  time slicing, IPC dispatch
 3. IPC:         capability-gated message passing
 4. Boot:        seed verification, vault root scan, state restore
-5. Hardware:    interrupt routing to userspace drivers
+5. Hardware:    interrupt routing to driver processes
 ```
 
 Oracle is #0 because without it, nothing above it is meaningful.
@@ -379,7 +379,7 @@ oracle(system_persistent_secret || developer_pubkey || option)
 
 Where developer_pubkey is provided exclusively by the kernel following
 successful capsule signature verification — it cannot be supplied
-by userspace under any condition — and option is a developer-controlled
+by any process under any condition — and option is a developer-controlled
 semantic slot determining identity granularity: version-stable via
 provenance hash, version-locked via signature, or ecosystem-wide via
 omission.

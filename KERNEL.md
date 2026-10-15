@@ -205,7 +205,7 @@ H5: Kill Circuit Atomicity
 └───────────────────────┬────────────────────────────────┘
                         │ capability-gated IPC only
 ┌───────────────────────▼────────────────────────────────┐
-│                 USERSPACE SERVERS                      │
+│                 SERVER PROCESSES                       │
 │                                                        │
 │  ┌──────────┐ ┌──────────┐ ┌───────┐ ┌────────────┐   │
 │  │ Ring FS  │ │ Drivers  │ │ TOKEN │ │    VSF     │   │
@@ -236,7 +236,7 @@ H5: Kill Circuit Atomicity
 × Device drivers
 × Authentication
 × Display
-× Anything that belongs in userspace
+× Anything that belongs in a process
 ```
 
 ---
@@ -700,7 +700,7 @@ If copy-back interrupted by kill:
 ```rust
 struct Header {
     generation:       u64,            // monotonic, total ordering
-    ring_state:       RingSnapshot,   // all process ring offsets
+    ring_state:       RingSnapshot,   // all process region offsets
     capability_state: CSpaceSnapshot, // all valid caps at this instant
     entry_points:     Vec<VirtAddr>,  // per-process resume addresses
     storage_map:      RingFSMap,      // current block allocation state
@@ -774,7 +774,7 @@ mod hardware {
 
     // Interrupt delivery
     // Interrupts converted to capability notifications
-    // Never delivered raw to userspace
+    // Never delivered raw to a process
     unsafe fn deliver_interrupt_as_notification(irq: IrqNumber, cap: Cap<NotifyRight, E>);
 }
 ```
@@ -790,7 +790,7 @@ ABL → Seed (verify self, verify kernel, jump)     <1s
   → Kernel Boot Stage 0-8 (see BOOT.md)           <500ms
     → Running system with restored state
 
-Total: <1.5s from power-on to userspace
+Total: <1.5s from power-on to the first process
        (excludes ABL nag screen — eliminated when locked)
 ```
 
@@ -928,7 +928,7 @@ ferros/
 │       ├── kill_circuit.sail        # Relay formal specification
 │       └── coprocessor.sail         # Crypto coprocessor formal specification
 │
-├── userspace/
+├── processes/
 │   ├── ring_fs/                     # Ring filesystem server
 │   ├── token_auth/                  # TOKEN identity server
 │   ├── vsf_compositor/              # VSF display compositor

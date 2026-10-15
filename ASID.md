@@ -8,11 +8,11 @@ Linux:   demand paging, swapping, copy-on-write fork,
          page reclaim, OOM killer,
          thousands of lines, dozens of CVEs
 
-ferros:  process gets a ring, hardware gets a grant
+ferros:  process gets a region, hardware gets a grant
          that's the entire page table story
          no swapping (killswitch ready, no swap partition)
-         no demand paging (ring is always valid)
-         no OOM killer (ring bounded at spawn)
+         no demand paging (region is always valid)
+         no OOM killer (region bounded at spawn)
 ```
 
 **Fork:**
@@ -22,7 +22,7 @@ Linux:   fork() copies entire process address space
          Spectre/Meltdown: fundamentally about fork + shared memory
 
 ferros:  no fork()
-         new process: new ring, new CSpace, new keys
+         new process: new region, new CSpace, new keys
          no shared state by default
          no fork-related vulnerability class
 ```
@@ -47,7 +47,7 @@ Linux:   ~70% of kernel code is drivers
          driver CVE: kernel privilege
          binary blobs: unauditable, unprovable
 
-ferros:  all drivers userspace
+ferros:  all drivers are processes
          driver bug: process crash, restart
          driver CVE: capability bounded
          no binary blobs: pure Rust
@@ -63,7 +63,7 @@ Linux:   Virtual Filesystem Switch
          all in kernel, all kernel privilege
 
 ferros:  one filesystem: Ring FS + HAMT + Vault
-         entirely userspace
+         entirely in processes
          kernel knows nothing about filesystems
          VSF is the format, period
 ```
