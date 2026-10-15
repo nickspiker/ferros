@@ -32,6 +32,8 @@ pub struct VaultProbe {
     pub wairua_ok: u8,
     /// One-way fingerprints for display (`fingerprint`): the ira's is the same every boot, the wairua's differs every boot. Never the secrets themselves.
     pub ira_fp: [u8; 8],
+    /// 0 = ira derived; else why not (`ira::derive_ira`: G#100 + source = reads disagreed, G#200 + source = degenerate, G#300 = devinfo records missing).
+    pub ira_fail: u32,
     pub wairua_fp: [u8; 8],
     pub ap_tune: [u8; 32],
     pub asv_nz: bool,
@@ -49,10 +51,10 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     use ferros_vault::anchor::AnchorKey;
     use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
 
-    let ira = crate::ira::derive_ira(); // chipid trims folded through the KDF (derive_ira v1)
-    let ira_fp = fingerprint(IRA_FP_CONTEXT, &ira);
-    let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
-    crumb(0xC1); // anchor_key (chipid trims + BLAKE3 ira) returned
+    let ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
+    let ira_fail = ira.err().unwrap_or(0);
+    let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
+    crumb(0xC1); // ira derived (or refused)
 
     let t_kohi = crate::platform::cntpct();
     let wairua = crate::wairua::draw(); // this session's KOHI (run on first use)
@@ -78,7 +80,14 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         asv_nz: nz(&crate::ira::read_asv_tbl()),
         hpm_nz: nz(&crate::ira::read_hpm_asv()),
         dvfs: crate::ira::read_dvfs_version(),
+        ira_fail,
     };
+
+    // No valid ira, no vault (PIPE: refuse to operate). The probe reports why.
+    let Ok(ira) = ira else {
+        return (p, None);
+    };
+    let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
 
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";

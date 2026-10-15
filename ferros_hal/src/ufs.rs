@@ -51,7 +51,7 @@ mod regs {
 
 /// UPIU Transaction Codes
 #[allow(dead_code)]
-mod upiu {
+pub mod upiu {
     pub const NOP_OUT: u8 = 0x00;
     pub const COMMAND: u8 = 0x01;
     pub const QUERY_REQ: u8 = 0x16;
@@ -73,6 +73,7 @@ mod upiu {
     pub const DESC_DEVICE: u8 = 0x00;
     pub const DESC_UNIT: u8 = 0x02;
     pub const DESC_GEOMETRY: u8 = 0x07;
+    pub const DESC_STRING: u8 = 0x05;
 }
 
 /// SCSI opcodes
@@ -355,6 +356,11 @@ impl UfsController {
     }
 
     /// Send a Query Request to read a descriptor. Returns the descriptor bytes (up to 255) or empty on failure.
+    /// Read a descriptor (QUERY READ DESCRIPTOR): (bytes, length, OCS).
+    pub fn read_descriptor(&self, idn: u8, index: u8) -> ([u8; 256], usize, u8) {
+        self.query_read_descriptor(idn, index)
+    }
+
     fn query_read_descriptor(&self, idn: u8, index: u8) -> ([u8; 256], usize, u8) {
         let mut desc = [0u8; 256];
         unsafe {

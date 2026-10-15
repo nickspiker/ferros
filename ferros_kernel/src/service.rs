@@ -596,6 +596,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
                                             }
                                             append_hex(&mut resp, b"WAIRUA_OK=", probe.wairua_ok as u32);
+                                            append_hex(&mut resp, b"IRA_FAIL=", probe.ira_fail);
                                         }
                                         if let Some(prev) = &b.prev {
                                             // Why the previous session ended (crumb byte G#Bx = exit reason, G#EExx = panic; a nonzero fault ELR = the fault sink fired).

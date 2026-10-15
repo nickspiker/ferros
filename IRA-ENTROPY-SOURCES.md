@@ -91,6 +91,17 @@ The probe's report is laid out to land in those printed slots (see [[husky_ferro
 
 **Conclusion: these fuses are temperature-stable (cold AND hot) and keyable DIRECTLY — no fuzzy extraction needed for the bytes measured. Remaining unknown is per-die ENTROPY (variance across the fleet), which one device cannot measure — needs a second Pixel 8 or fuse-semantics analysis; the tail-zeros in ap_hw_tune[0..16] hint width > entropy.**
 
+## In use: ira v2 (2026-10-14, `ferros_kernel/src/ira.rs`)
+
+`derive_ira` folds seven sources, each framed as name + length + bytes, through BLAKE3 under `ferros.ira.husky.v2`:
+hwid (16 B), ap_hw_tune (32 B), asv_tbl (64 B), hpm_asv (64 B), dvfs_version (1 B), devinfo's identity records (psn, dsn, imei1, imei2, wlan_mac1, bt_addr, pcbcfg, devcfg, sku, psku, coo, dpc — UFS LUN 3), and the UFS device serial string.
+The devinfo records and UFS serial are public-ish (printed on the box) but most people don't have them; they add breadth on top of the per-die calibration, which stays the unforgeable core.
+
+PIPE-style checks (the software stand-in for inverted-pair OTP + KOHI health): every source is read twice and the reads must agree; multi-byte sources must not be all G#00 or all G#FF; devinfo must yield psn, dsn and imei1. Any failure → no ira → no vault (DIAG `IRA_FAIL`: G#100 + source = reads disagreed, G#200 + source = degenerate, G#300 = devinfo records missing).
+
+Verified on husky: v2 re-genesised the vault once (expected: new key), then reopened and verified it across reloads and a real cold power-on (root G#FFF2DE2F).
+Caveat: a board swap or a repair that rewrites devinfo changes the ira, and the vault no longer opens.
+
 ## Next step
 
 1. ~~Temperature-cycle stability~~ — DONE (cold-soak, byte-identical, above).

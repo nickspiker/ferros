@@ -40,7 +40,7 @@ const HPM_ASV_LEN: usize = 64;
 const OFF_DVFS_VERSION: usize = 0x900C;
 
 /// BLAKE3 KDF context for the interim husky ira. Versioned: bump on any change to the material set below, since that re-keys every vault derived from it.
-const IRA_CONTEXT: &str = "ferros.ira.husky.v1";
+const IRA_CONTEXT: &str = "ferros.ira.husky.v2";
 
 /// Read husky's 16-byte hardware identity: `[product_id, unique_id0, unique_id1, revision]`, each u32 little-endian.
 ///
@@ -92,23 +92,118 @@ pub fn read_dvfs_version() -> u8 {
     unsafe { ferros_hal::mmio::read8(CHIPID_BASE + OFF_DVFS_VERSION) }
 }
 
-/// Derive the husky *ira* from the per-die chip-ID material proven stable on hardware.
+/// Derive the husky *ira*: every stable per-device value the AP can reach, mashed through the KDF, with PIPE-style checks (PIPE IRA.md: no valid source set, no ira — refuse to operate).
 ///
-/// Keyed material (all validated 2026-08-21 — populated AND byte-identical across four boots spanning a freezer cold-soak and a toaster heat-soak; see IRA-ENTROPY-SOURCES.md):
-/// `read_hw_identity()` (16B: die-unique serial + SoC model/stepping) ‖ `ap_hw_tune` (32B analog per-die trim — the unforgeable core) ‖ `asv_tbl` (64B) ‖ `hpm_asv` (64B) ‖ `dvfs_version` (1B speed bin) = 177 bytes folded through the KDF.
-/// Context bumped v0 -> v1 to mark this material set: a vault sealed under v0's identity-only key won't reopen (open-or-genesis re-genesises — correct for the bring-up transition).
-/// Still EXCLUDED until their read paths + stability are validated: UFS serial, MCT ring-osc, and the vendor-dispersion sources — each further addition re-keys and must be a deliberate, tested step. NOTE: these fields are proven STABLE (won't brick the vault), not yet proven HIGH-ENTROPY — per-die fleet variance is unmeasured from one device (ap_hw_tune's tail-zeros hint width > entropy).
-pub fn derive_ira() -> [u8; 32] {
-    let hwid = read_hw_identity();
-    let ap = read_ap_hw_tune();
-    let asv = read_asv_tbl();
-    let hpm = read_hpm_asv();
-    let dvfs = read_dvfs_version();
-    let mut m = [0u8; 16 + 32 + 64 + 64 + 1];
-    m[0..16].copy_from_slice(&hwid);
-    m[16..48].copy_from_slice(&ap);
-    m[48..112].copy_from_slice(&asv);
-    m[112..176].copy_from_slice(&hpm);
-    m[176] = dvfs;
-    AnchorKey::derive(IRA_CONTEXT, &m)
+/// Material, in this fixed order (each framed as name, u32 length, bytes):
+/// 0. `hwid` — die-unique serial + SoC model/stepping (16 B)
+/// 1. `ap_hw_tune` — analog per-die trim, the unforgeable core (32 B)
+/// 2. `asv_tbl` (64 B) and 3. `hpm_asv` (64 B) — per-die voltage/speed calibration
+/// 4. `dvfs_version` — speed bin (1 B)
+/// 5. `devinfo` — the factory identity records (serials, IMEIs, MACs, board/device config, SKU, origin), UFS LUN 3; public but most people don't have them, and they never change short of a board swap
+/// 6. `ufs_serial` — the flash device's serial-number string descriptor
+///
+/// Checks, the software stand-in for PIPE's inverted-pair OTP and KOHI health:
+/// - every source is read twice and the reads must agree (a flaky read never becomes an identity);
+/// - multi-byte sources must not be degenerate (all G#00 or all G#FF = a read that silently failed);
+/// - devinfo must yield psn, dsn and imei1.
+/// Any failure returns the failing source's bit (G#100 + index = reads disagreed, G#200 + index = degenerate, G#300 = devinfo missing records) and there is no ira, so the vault stays shut.
+/// Proven STABLE across boots and temperature (sources 0-4, IRA-ENTROPY-SOURCES.md; 5-6 are factory data), not proven high-entropy fleet-wide. Context v2 = this material set: a vault sealed under v1 won't reopen (open-or-genesis re-genesises).
+pub fn derive_ira() -> Result<[u8; 32], u32> {
+    let reads = || -> Result<[alloc::vec::Vec<u8>; 7], u32> {
+        Ok([
+            read_hw_identity().to_vec(),
+            read_ap_hw_tune().to_vec(),
+            read_asv_tbl().to_vec(),
+            read_hpm_asv().to_vec(),
+            alloc::vec![read_dvfs_version()],
+            read_devinfo_identity().ok_or(0x300u32)?,
+            read_ufs_serial().unwrap_or_default(),
+        ])
+    };
+    let a = reads()?;
+    let b = reads()?;
+    const NAMES: [&str; 7] = ["hwid", "ap_hw_tune", "asv_tbl", "hpm_asv", "dvfs_version", "devinfo", "ufs_serial"];
+    let mut m = alloc::vec::Vec::new();
+    for i in 0..7 {
+        if a[i] != b[i] {
+            return Err(0x100 + i as u32);
+        }
+        if a[i].len() > 1 && (a[i].iter().all(|&x| x == 0) || a[i].iter().all(|&x| x == 0xFF)) {
+            return Err(0x200 + i as u32);
+        }
+        m.extend_from_slice(NAMES[i].as_bytes());
+        m.extend_from_slice(&(a[i].len() as u32).to_le_bytes());
+        m.extend_from_slice(&a[i]);
+    }
+    Ok(AnchorKey::derive(IRA_CONTEXT, &m))
+}
+
+/// devinfo's identity records (UFS LUN 3, 4 KiB LBA 6, after the 128-byte slot header): "DIUS" records of [total u32][key length u32][key NUL][value NUL], total = key length + value length. Returns "key=value\n" lines for the keys below, in this order, each that is present; None unless psn, dsn and imei1 all are.
+fn read_devinfo_identity() -> Option<alloc::vec::Vec<u8>> {
+    const KEYS: [&[u8]; 12] = [b"psn", b"dsn", b"imei1", b"imei2", b"wlan_mac1", b"bt_addr", b"pcbcfg", b"devcfg", b"sku", b"psku", b"coo", b"dpc"];
+    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+    let mut ok = false;
+    for _ in 0..4 {
+        if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        return None;
+    }
+    let d = ufs.data_buffer();
+    if &d[0..4] != b"DEVI" {
+        return None;
+    }
+    let mut found: [Option<&[u8]>; 12] = [None; 12];
+    let mut p = 0x80;
+    while p + 12 <= d.len() {
+        if &d[p..p + 4] != b"DIUS" {
+            p += 1;
+            continue;
+        }
+        let total = u32::from_le_bytes([d[p + 4], d[p + 5], d[p + 6], d[p + 7]]) as usize;
+        let klen = u32::from_le_bytes([d[p + 8], d[p + 9], d[p + 10], d[p + 11]]) as usize;
+        if klen == 0 || klen > total || p + 12 + total > d.len() {
+            p += 1;
+            continue;
+        }
+        let key = &d[p + 12..p + 12 + klen - 1];
+        let val = &d[p + 12 + klen..p + 12 + total];
+        let val = &val[..val.iter().position(|&c| c == 0).unwrap_or(val.len())];
+        if let Some(i) = KEYS.iter().position(|k| *k == key) {
+            found[i] = Some(val);
+        }
+        p += 12 + total;
+    }
+    if found[0].is_none() || found[1].is_none() || found[2].is_none() {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::new();
+    for (k, v) in KEYS.iter().zip(found.iter()) {
+        if let Some(v) = v {
+            out.extend_from_slice(k);
+            out.push(b'=');
+            out.extend_from_slice(v);
+            out.push(b'\n');
+        }
+    }
+    Some(out)
+}
+
+/// The UFS device's serial-number string (device descriptor iSerialNumber at G#16 → string descriptor, UTF-16), raw bytes after the 2-byte header.
+fn read_ufs_serial() -> Option<alloc::vec::Vec<u8>> {
+    use ferros_hal::ufs::{upiu, UfsController};
+    let ufs = UfsController::new(0x1320_0000);
+    let (dev, dev_len, ocs) = ufs.read_descriptor(upiu::DESC_DEVICE, 0);
+    if ocs != 0 || dev_len <= 0x16 {
+        return None;
+    }
+    let (s, s_len, ocs) = ufs.read_descriptor(upiu::DESC_STRING, dev[0x16]);
+    if ocs != 0 || s_len < 2 || s[1] != upiu::DESC_STRING {
+        return None;
+    }
+    let n = (s[0] as usize).min(s_len);
+    Some(s[2..n].to_vec())
 }
