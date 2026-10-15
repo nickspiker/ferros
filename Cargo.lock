@@ -763,6 +763,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros_sandbox"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_seed"
 version = "0.1.0"
 dependencies = [

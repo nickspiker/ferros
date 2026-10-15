@@ -30,7 +30,11 @@ Memory access forms allowed:
 
 Everything else is refused: any other base register, writeback (pre/post-index) on any base, register offsets other than x26, any write to x27/x28, writes to x25/x26/sp outside the forms above, and system instructions — except `svc #0`, reading the EL0 timer (`mrs` of `cntvct_el0` / `cntfrq_el0`) and the barriers `isb` / `dsb` / `dmb` (a driver orders writes to its DMA region). The rules cover every load and store, integer and SIMD/FP alike.
 
-Indirect branches (`br`, `blr`, `ret`) are allowed: the invariant does not depend on control flow. Code is not writable by the process (the arc's code region is EL0 read/execute only once sealed — a later step; until then the scan plus no self-modification in emitted code).
+Indirect branches (`br`, `blr`, `ret`) are allowed: the invariant does not depend on control flow — **provided execution can only ever reach checked code.** That is the W^X rule below, and it is part of the invariant from day 0, not an add-on.
+
+## W^X (day 0)
+
+The scan only speaks for code it saw, so the process may execute nothing else. At spawn the kernel sets the arc's pages in the one static translation table (no per-process tables): the sealed code pages **EL0 read + execute, not writable**; every other page of the arc (read-only data, data, stack) **EL0 read/write, never executable**; guards and everything outside the arc not accessible at EL0. The pool is mapped with 4 KiB entries for this, and the kernel invalidates the TLB after changing them. Code and read-only data stay in the same arc, so PC-relative addressing (`adrp`) keeps working, and loads of read-only data go through the masked forms like any other access; a store into the code pages is a permission fault that ends the process. (Today's static map gives EL0 the whole pool as read/write/execute — the reason nothing can be called sandboxed until this lands.)
 
 ## Guards
 
@@ -46,8 +50,8 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 
 - **Checker** (`ferros_sandbox`, no_std, in the kernel's install path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`.
 - **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at install time.
-- **Kernel**: install (check + seal + store), spawn only sealed images, arcs placed with guards.
+- **Kernel**: install (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
 
 ## Status
 
-Spec only (2026-10-15). Order: checker → emitter → kernel install/seal/spawn → rebuild the drivers through the emitter and re-verify the network stack.
+Checker written (`ferros_sandbox`, 2026-10-15). Order: checker tests → emitter → kernel (W^X pages, guards, install/seal/spawn) → rebuild the drivers through the emitter and re-verify the network stack.

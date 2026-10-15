@@ -1,0 +1,9 @@
+[package]
+name = "ferros_sandbox"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The install-time checker for ferros's masking invariant (SANDBOX.md): a capsule's native code is accepted only if no instruction can reach outside its arc."
+
+[lib]
+path = "src/lib.rs"
