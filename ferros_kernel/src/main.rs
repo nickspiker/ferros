@@ -60,6 +60,9 @@ mod oracle;
 // Processes: EL0 in an arc, capabilities, the syscall boundary.
 #[cfg(feature = "pixel8")]
 mod process;
+// The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md).
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod ready;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
 mod checklist;
@@ -448,6 +451,8 @@ _m1_entry:
     b.hs    .Lirq_ret
     cmp     x0, #26
     b.eq    .Lirq_tick
+    cmp     x0, #60
+    b.eq    .Lirq_power
     cmp     x0, #61
     b.eq    .Lirq_key
     cmp     x0, #64
@@ -461,6 +466,18 @@ _m1_entry:
     movz    x3, #0x0180
     movk    x3, #0x1040, lsl #16
     str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>
+    b       .Lirq_eoi
+// The power key was pressed (gpa4-0 falling edge, killswitch.rs arm_power_key): record it for the "Ready?" gate and clear its pending bit.
+.Lirq_power:
+    adrp    x1, __power_pressed
+    add     x1, x1, :lo12:__power_pressed
+    mov     x2, #1
+    str     x2, [x1]
+    movz    x1, #0x0A10
+    movk    x1, #0x154D, lsl #16
+    mov     w2, #1
+    str     w2, [x1]               // EINT_PEND gpa4: power
+    dsb     sy
     b       .Lirq_eoi
 // The EL2 timer (PPI 26): a process's time slice is up. Stop the timer and EOI; from EL2 there is nothing to preempt, from EL0 park the process (.Lel0_preempt) and give the CPU back to the kernel.
 .Lirq_tick:
@@ -799,6 +816,9 @@ pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
     1
 }
 
+/// Set by `.Lirq_power` when the power key is pressed.
+#[unsafe(no_mangle)]
+pub static mut __power_pressed: u64 = 0;
 /// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
 #[unsafe(no_mangle)]
 pub static mut __el0_kctx: [u64; 13] = [0; 13];
@@ -1456,6 +1476,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::arm_safety();
     platform::crumb(0xC0);
 
+    // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
+    let pressed_at = if dtb_addr != 0 && dtb_addr & 1 == 0 { ready::wait() } else { 0 };
+    let _ = pressed_at;
+
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
     let rep_snap: [u32; 9] = {
         let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
@@ -1491,6 +1515,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
     if cached {
         checklist::mark(checklist::Item::CacheMap);
+    }
+    // KOHI ran during the "Ready?" wait: light the wairua line now that the checklist exists.
+    if let Some((Some(w), _)) = wairua::peek() {
+        let fp = wairua::fingerprint(w);
+        let hex = b"0123456789ABCDEF";
+        checklist::mark_interim(checklist::Item::Wairua);
+        checklist::suffix(checklist::Item::Wairua, &[hex[(fp[0] >> 4) as usize], hex[(fp[0] & 15) as usize], hex[(fp[1] >> 4) as usize], hex[(fp[1] & 15) as usize]]);
     }
 
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.

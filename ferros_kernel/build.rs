@@ -17,9 +17,54 @@ fn main() {
         println!("cargo:rustc-cfg=shim_handoff");
     }
     println!("cargo:rustc-check-cfg=cfg(shim_handoff)");
+    // FERROS_PRODUCTION: the "Ready?" gate waits for the power key (dev builds auto-press after two seconds).
+    if std::env::var("FERROS_PRODUCTION").is_ok() {
+        println!("cargo:rustc-cfg=ferros_production");
+    }
+    println!("cargo:rustc-check-cfg=cfg(ferros_production)");
+    println!("cargo:rerun-if-env-changed=FERROS_PRODUCTION");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64.ld");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64-shim.ld");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64-pixel8.ld");
     println!("cargo:rerun-if-env-changed=FERROS_SHIM_HANDOFF");
     println!("cargo:rerun-if-env-changed=FERROS_SHIM_ENTRY");
+    ready_text();
+}
+
+/// The "Ready?" gate text (BOOT.md), rasterised once on the host: Oxanium ExtraLight at 200 px into OUT_DIR/ready.bin = [width u32 LE][height u32 LE][one alpha byte per pixel, row-major]. The kernel only blits it.
+fn ready_text() {
+    let font_path = format!("{}/../assets/fonts/Oxanium-ExtraLight.ttf", std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed={font_path}");
+    let bytes = std::fs::read(&font_path).expect("Oxanium-ExtraLight.ttf");
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("font");
+    let px = 200.0;
+    let text = "Ready?";
+    let glyphs: Vec<_> = text.chars().map(|c| font.rasterize(c, px)).collect();
+    let line = font.horizontal_line_metrics(px).expect("line metrics");
+    let ascent = line.ascent.ceil() as i32;
+    let height = (line.ascent - line.descent).ceil() as usize;
+    let width: usize = glyphs.iter().map(|(m, _)| m.advance_width.round() as usize).sum::<usize>() + 4;
+    let mut img = vec![0u8; width * height];
+    let mut pen = 0i32;
+    for (m, bmp) in &glyphs {
+        let x0 = pen + m.xmin;
+        let y0 = ascent - m.height as i32 - m.ymin;
+        for y in 0..m.height {
+            for x in 0..m.width {
+                let (ix, iy) = (x0 + x as i32, y0 + y as i32);
+                if ix >= 0 && iy >= 0 && (ix as usize) < width && (iy as usize) < height {
+                    let a = bmp[y * m.width + x];
+                    let d = &mut img[iy as usize * width + ix as usize];
+                    *d = (*d).max(a);
+                }
+            }
+        }
+        pen += m.advance_width.round() as i32;
+    }
+    let mut out = Vec::with_capacity(8 + img.len());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&img);
+    let dir = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(std::path::Path::new(&dir).join("ready.bin"), out).unwrap();
 }

@@ -74,6 +74,28 @@ fn system_off() -> ! {
     }
 }
 
+/// The power key: gpa4-0 on the always-on bank (SPI 28, INTID 60), active low. `.Lirq` sets `__power_pressed` on its falling edge — the press, not the release (BOOT.md "Ready?" gate).
+pub const POWER_INTID: u32 = 32 + 28;
+const POWER_PIN: u32 = 0;
+const EINT_FALLING: u32 = 2;
+
+/// Arm the power key's press interrupt (after `arm`, which brought the GIC up).
+pub fn arm_power_key() {
+    set_nibble(GPA4_CON, POWER_PIN, PIN_FUNC_EINT);
+    set_nibble(EINT_CON + GPA4_EINT, POWER_PIN, EINT_FALLING);
+    wr(EINT_PEND + GPA4_EINT, 1 << POWER_PIN);
+    wr(EINT_MASK + GPA4_EINT, rd(EINT_MASK + GPA4_EINT) & !(1 << POWER_PIN));
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let n = POWER_INTID as usize;
+    unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, (mpidr & 0xFF_FFFF) | (mpidr & 0xFF_0000_0000)) };
+    let pr = GICD + 0x400 + (n & !3);
+    wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
+    let cfg = GICD + 0xC00 + (n / 16) * 4;
+    wr(cfg, rd(cfg) & !(2 << ((n % 16) * 2)));
+    wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
+}
+
 /// Enable one private interrupt (PPI, INTID 16..31) on this CPU's redistributor at middle priority — e.g. the EL2 timer (26) that ends a process's time slice. No-op if `arm` found no redistributor.
 pub fn enable_ppi(intid: u32) {
     let frame = REPORT[0].load(core::sync::atomic::Ordering::Relaxed);

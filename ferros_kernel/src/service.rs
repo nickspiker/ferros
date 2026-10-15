@@ -473,6 +473,15 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        #[cfg(not(shim_handoff))]
+                                        if cmd.params == b"ready" && b.kind == BootKind::Cold {
+                                            // Redraw the "Ready?" screen (dev check; the checklist comes back on the next boot) and count what landed.
+                                            let (text, tri) = crate::ready::show();
+                                            append_hex(&mut resp, b"READY_TEXT_PX=", text);
+                                            append_hex(&mut resp, b"READY_TRIANGLE_PX=", tri);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"console" {
                                             // What processes have sent their consoles since the last read (background slices included), and how many are alive.
                                             append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);

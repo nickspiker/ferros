@@ -21,3 +21,7 @@ ferros_pt = { path = "../ferros_pt", features = ["alloc"] }
 ferros_heap = { path = "../ferros_heap" }
 ihi = { path = "../../ihi", default-features = false }
 vsf = { path = "../../vsf", default-features = false, features = ["crypto-verify"] }
+
+[build-dependencies]
+# Rasterises the "Ready?" gate text at build time (no font engine in the kernel).
+fontdue = "0.9"

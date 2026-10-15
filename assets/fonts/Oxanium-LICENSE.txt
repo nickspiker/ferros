@@ -1,0 +1,5 @@
+Oxanium-ExtraLight.ttf — rasterised at build time (ferros_kernel/build.rs) for the "Ready?" gate screen. Copied from photon (assets/Oxanium).
+
+Copyright 2019 The Oxanium Project Authors (https://github.com/sevmeyer/oxanium)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL
