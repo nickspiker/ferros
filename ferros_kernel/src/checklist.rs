@@ -51,6 +51,7 @@ const GROUPS: [(&str, &[(Item, &str)]); 3] = [
     ]),
 ];
 
+const DETAIL: u32 = 0x00A0_A0A0;
 const TITLE: u32 = 0x00FF_8000;
 const HEADER: u32 = 0x00FF_FF00;
 const RED: u32 = 0x00FF_0000;
@@ -74,8 +75,20 @@ struct Global(UnsafeCell<Option<Checklist>>);
 unsafe impl Sync for Global {}
 static CHECKLIST: Global = Global(UnsafeCell::new(None));
 
+/// Lines reserved under an item for its details (the ira and wairua fingerprints).
+fn detail_rows(item: Item) -> usize {
+    match item {
+        Item::Ira => 2,
+        _ => 0,
+    }
+}
+
+fn group_rows(items: &[(Item, &str)]) -> usize {
+    items.iter().map(|&(it, _)| 1 + detail_rows(it)).sum()
+}
+
 fn row_of(item: Item) -> usize {
-    // Title row 0, blank, then per group: header row, its items, blank.
+    // Title row 0, blank, then per group: header row, its items (each followed by its detail lines), blank.
     let mut row = 2;
     for (_, items) in GROUPS.iter() {
         row += 1;
@@ -83,7 +96,7 @@ fn row_of(item: Item) -> usize {
             if it as u8 == item as u8 {
                 return row;
             }
-            row += 1;
+            row += 1 + detail_rows(it);
         }
         row += 1;
     }
@@ -141,7 +154,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
             con.set_fg(HEADER);
             con.goto(0, row);
             con.puts(name);
-            row += items.len() + 2;
+            row += group_rows(items) + 2;
         }
     }
     for (_, items) in GROUPS.iter() {
@@ -166,6 +179,26 @@ pub fn mark(item: Item) {
         for &(it, label) in items.iter() {
             if it as u8 == item as u8 {
                 draw_item(c, it, label);
+            }
+        }
+    }
+    let mut rep = alloc::vec::Vec::new();
+    c.panel.present(&mut rep);
+}
+
+/// Write an item's detail lines (indented, grey) and push a frame. Extra lines beyond the item's reserved rows are dropped.
+pub fn details(item: Item, lines: &[&[u8]]) {
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_ref() }) else {
+        return;
+    };
+    let base = row_of(item) + 1;
+    for (i, line) in lines.iter().take(detail_rows(item)).enumerate() {
+        unsafe {
+            let mut con = c.panel.console(DETAIL);
+            con.set_scale(SCALE);
+            con.goto(LABEL_COL + 1, base + i);
+            for &b in line.iter() {
+                con.putc(b);
             }
         }
     }

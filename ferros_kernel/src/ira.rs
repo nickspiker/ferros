@@ -112,10 +112,3 @@ pub fn derive_ira() -> [u8; 32] {
     m[176] = dvfs;
     AnchorKey::derive(IRA_CONTEXT, &m)
 }
-
-/// The vault AnchorKey for this husky device: `from_ira(derive_ira())`.
-///
-/// Replaces the `[0x5A; 32]` bring-up constant. Same value every boot on the same phone; a different phone yields a different key; survives factory reset because the chip-ID does. Any vault sealed under the old constant will not open under this key — the open-or-genesis path simply re-genesises, which is correct for the bring-up transition.
-pub fn anchor_key() -> AnchorKey {
-    AnchorKey::from_ira(&derive_ira())
-}

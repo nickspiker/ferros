@@ -1254,6 +1254,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if probe.opened == 1 && probe.wairua_ok == 1 {
         checklist::mark(checklist::Item::Ira);
     }
+    {
+        // The first two bytes of each one-way fingerprint, for the eye: the ira's is the same every boot, the wairua's changes every boot. Both secrets are 256-bit, so plain BLAKE3 is already one-way (a memory-hard KDF like spaghettify only matters for guessable inputs such as handles).
+        let fp_line = |label: &[u8], fp: &[u8; 8]| {
+            let hex = b"0123456789ABCDEF";
+            let mut l = alloc::vec::Vec::from(label);
+            for b in &fp[..2] {
+                l.push(hex[(b >> 4) as usize]);
+                l.push(hex[(b & 15) as usize]);
+            }
+            l
+        };
+        let ira = fp_line(b"ira    ", &probe.ira_fp);
+        let wairua = if probe.wairua_ok == 1 { fp_line(b"wairua ", &probe.wairua_fp) } else { alloc::vec::Vec::from(&b"wairua no TRNG"[..]) };
+        checklist::details(checklist::Item::Ira, &[&ira, &wairua]);
+    }
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
