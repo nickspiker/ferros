@@ -39,8 +39,8 @@ pub fn power_on_device() {
 
 /// Cold boot UFS bring-up for real use: DMA path open, VCC on, full_init, then one read to consume the power-on UNIT ATTENTION. Returns whether the device answers block reads (link up, NOP and LBA 0 read OK).
 pub fn bring_up() -> bool {
-    wr(S2MPU_HSI2 + 0x54, 0xFF);
-    wr(S2MPU_HSI2, 0);
+    // UFS DMAs only into ferros's own buffers (`.bss.dma`, inside the window the fence allows).
+    crate::s2mpu::fence();
     wr(0x1302_0710, rd(0x1302_0710) & !0x3); // non-coherent DMA (ferros does explicit cache maintenance)
     unsafe { core::arch::asm!("dsb sy") };
     power_on_device();
@@ -67,10 +67,8 @@ pub fn probe() -> Vec<u8> {
     let gpp0_dat_before = rd(GPP0 + 4);
     power_on_device();
 
-    // UFS DMA straight to physical addresses (zuma UFS has no stage-1 SYSMMU; the S2MPU is the only gate).
-    wr(S2MPU_HSI2 + 0x54, 0xFF);
-    wr(S2MPU_HSI2, 0);
-    unsafe { core::arch::asm!("dsb sy") };
+    // UFS DMA straight to physical addresses (zuma UFS has no stage-1 SYSMMU; the S2MPU is the only gate): the fence, which allows ferros's window.
+    crate::s2mpu::fence();
 
     // External-block state as ABL left it, read before any UFS touch (Linux's probe-time values: IOCC 3, PHY-ISO 1, UFSP RSECURITY G#FFFA6492, WSECURITY 0).
     let iocc = rd(0x1302_0710); // sysreg_ufs iocc

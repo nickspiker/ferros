@@ -9,6 +9,7 @@
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
 //! - 6 `entropy(cap, buf, len)` — present a token holding the entropy right; `len` bytes (at most 4096) of fresh randomness are written at `buf`, x0 = `len`. The stream is BLAKE3 keyed from this session's wairua (KOHI) over a kernel counter, so no two calls in a power session see the same bytes and nothing from a previous session repeats. ERR without a wairua: a driver that needs randomness (the WiFi firmware's RNG seed) gets none rather than a predictable one.
+//! - 7 `dma(cap)` — present a token holding a DMA grant; x0 = the physical base of that DMA region (its size is in the registry, `DMA`). DMA regions are 2 MiB blocks of non-cacheable memory the process reads and writes directly (its device's rings and buffers); the device's DMA window covers exactly that block (BOOT.md/WIFI.md: S2MPU fence).
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
 //!
 //! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through.
@@ -119,6 +120,8 @@ pub enum Object {
     Hardware(usize),
     /// Served by the kernel: randomness from the session's wairua.
     Entropy,
+    /// A DMA region (index into `DMA`).
+    Dma(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -148,6 +151,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Endpoint(i) => (1, i as u64),
         Object::Reply(i) => (2, i as u64),
         Object::Entropy => (4, 0),
+        Object::Dma(i) => (5, i as u64),
         Object::Hardware(i) => (3, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -274,6 +278,16 @@ const SYS_MMIO_READ: u64 = 4;
 const SYS_MMIO_WRITE: u64 = 5;
 /// entropy(cap, buf, len) → x0 = len.
 const SYS_ENTROPY: u64 = 6;
+/// dma(cap) → x0 = the region's physical base.
+const SYS_DMA: u64 = 7;
+
+/// A named DMA region a spawn can grant (`bridge spawn --dma NAME`): memory a device DMAs into, mapped non-cacheable and EL0 read/write (cachemap DMA_POOL). One per device, held for the boot: a driver that dies may leave its device still pointing into it, so it is never handed to anything else.
+pub struct Dma {
+    pub name: &'static str,
+    pub base: usize,
+    pub size: usize,
+}
+pub static DMA: &[Dma] = &[Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 }];
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
 static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -446,6 +460,14 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_DMA => {
+            let token = p.read(f.x[0], 32);
+            f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Dma(i)) if DMA[i].size > 0 => DMA[i].base as u64,
+                _ => ERR,
+            };
+            0
+        }
         SYS_ENTROPY => {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
@@ -589,6 +611,8 @@ pub enum Grant<'a> {
     Hardware(&'a [u8]),
     /// The entropy right (syscall 6).
     Entropy,
+    /// A DMA region from the registry, by name (syscall 7).
+    Dma(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -619,6 +643,10 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
                 None => return Err("no such hardware block"),
             },
             Grant::Entropy => (Object::Entropy, RIGHT_SEND),
+            Grant::Dma(n) => match DMA.iter().position(|r| r.name.as_bytes() == *n) {
+                Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
+                None => return Err("no such DMA region"),
+            },
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }

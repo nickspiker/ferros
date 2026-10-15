@@ -6,6 +6,7 @@
 //! - Every 1 GiB block is Device-nGnRnE, exactly what the MMU-off world was, so nothing outside the window changes and nothing there is ever speculatively touched (secure carveouts stay safe).
 //! - The GiB holding the window gets a level-2 table: the window's 2 MiB blocks are Normal write-back; the rest stay Device.
 //! - The 2 MiB blocks holding the device DMA buffers (`.bss.dma`) get level-3 tables: those 4 KiB pages are Normal non-cacheable, so DMA never needs cache maintenance.
+//! - DMA_POOL (cold only): 2 MiB of Normal non-cacheable memory a driver process reaches directly (EL0 read/write, never executable at any level) — the memory its device DMAs into (rings, buffers). It is granted like hardware (process.rs `DMA`), and the device's IOMMU/S2MPU window is meant to cover exactly it, so the device reaches nothing else.
 //!
 //! The window is ferros's image, stack, heap and staging slot: 36 MiB from the cold link base, or the whole 12 MiB handoff carveout (0x9240_0000..0x9300_0000, tpu_fw_reserved after it).
 //!
@@ -35,6 +36,12 @@ const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
 pub const POOL: (usize, usize) = (0x8100_0000, 0x8180_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
+
+/// Device DMA memory for driver processes (see the module doc): cold G#8180_0000, the 2 MiB above the pool, below the reload stub (G#8207_0000). None on the handoff path.
+#[cfg(not(shim_handoff))]
+pub const DMA_POOL: (usize, usize) = (0x8180_0000, 0x81A0_0000);
+#[cfg(shim_handoff)]
+pub const DMA_POOL: (usize, usize) = (0, 0);
 
 /// HCR_EL2 / CPTR_EL2 as the loader left them, restored before RELOAD hands over.
 static mut BOOT_HCR: u64 = 0;
@@ -72,6 +79,9 @@ fn normal(vhe: bool, addr: usize, kind: u64) -> u64 {
 fn pool(vhe: bool, addr: usize, kind: u64) -> u64 {
     if vhe { addr as u64 | kind | ATTR_NORMAL | SH_INNER | AF | AP_EL0 | PXN } else { normal(false, addr, kind) }
 }
+fn dma_pool(vhe: bool, addr: usize, kind: u64) -> u64 {
+    addr as u64 | kind | ATTR_NC | SH_INNER | AF | if vhe { AP_EL0 | UXN | PXN } else { AP_EL2 | XN }
+}
 fn uncached(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_NC | SH_INNER | AF | if vhe { UXN | PXN } else { AP_EL2 | XN }
 }
@@ -97,7 +107,9 @@ pub fn enable() -> bool {
     let (w0, w1) = WINDOW;
     let (d0, d1) = dma_range();
     let (p0, p1) = POOL;
-    if w0 / GIB != (w1 - 1) / GIB || d0 < w0 || d1 > w1 || (d1 - 1) / MIB2 - d0 / MIB2 >= 2 || p0 < w0 || p1 > w1 || (d0 < p1 && p0 < d1) {
+    let (q0, q1) = DMA_POOL;
+    let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
+    if w0 / GIB != (w1 - 1) / GIB || d0 < w0 || d1 > w1 || (d1 - 1) / MIB2 - d0 / MIB2 >= 2 || p0 < w0 || p1 > w1 || (d0 < p1 && p0 < d1) || !dma_ok {
         return false;
     }
     let vhe = has_vhe();
@@ -117,6 +129,8 @@ pub fn enable() -> bool {
                 device(vhe, a, BLOCK)
             } else if a >= p0 && a + MIB2 <= p1 {
                 pool(vhe, a, BLOCK)
+            } else if a >= q0 && a + MIB2 <= q1 {
+                dma_pool(vhe, a, BLOCK)
             } else if a + MIB2 > d0 && a < d1 {
                 let t = &mut l3[next_l3];
                 for (k, p) in t.0.iter_mut().enumerate() {

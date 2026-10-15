@@ -176,6 +176,8 @@ async fn main() {
                     "--hw" => { grants.push((3, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     // --entropy: the right to draw randomness from the session's wairua (syscall 6).
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
+                    // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).
+                    "--dma" => { grants.push((5, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }

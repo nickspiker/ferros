@@ -48,6 +48,9 @@ mod cold_ufs;
 // Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod slot;
+// Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into).
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod s2mpu;
 // The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
 #[cfg(feature = "pixel8")]
 mod cachemap;

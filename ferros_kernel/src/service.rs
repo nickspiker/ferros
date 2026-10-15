@@ -594,6 +594,8 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"KOHI_OK=", kohi.map(|k| k.0.is_some()).unwrap_or(false) as u32);
                                             append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
                                             append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
+                                            #[cfg(all(feature = "pixel8", not(shim_handoff)))]
+                                            crate::s2mpu::report(&mut resp);
                                             append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
                                             let daif: u64;
                                             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
@@ -765,7 +767,7 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                         }
                                     } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
-                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy, len, name)*][input].
+                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
                                         if run_ok && run_size > 0 {
                                             let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                                             let pr = cmd.params;
@@ -783,6 +785,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     1 => crate::process::Grant::Serve(g),
                                                     3 => crate::process::Grant::Hardware(g),
                                                     4 => crate::process::Grant::Entropy,
+                                                    5 => crate::process::Grant::Dma(g),
                                                     _ => crate::process::Grant::Use(g),
                                                 });
                                             }
