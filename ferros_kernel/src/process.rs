@@ -9,7 +9,9 @@
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
 //!
-//! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through; there is no timer scheduler yet, so a process runs until it blocks or exits (a process that spins forever stops the watchdog pets and the SoC resets).
+//! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through.
+//!
+//! Time slices: while a process runs, the EL2 timer (PPI 26) is armed for 10 ms. When it fires at EL0 the process is parked runnable and the kernel gets the CPU back, so a process that never blocks can't starve the USB service loop (which resumes runnable processes one slice at a time, `run_slice`) or stop the watchdog pets.
 //!
 //! Tokens are BLAKE3 keyed with a per-session kernel key (derived from the wairua) over domain, object, rights, nonce and the process's epoch; every spawn gets a new epoch, so a dead process's tokens match nothing.
 //!
@@ -260,6 +262,10 @@ const SYS_CALL: u64 = 1;
 const SYS_RECV: u64 = 2;
 const SYS_REPLY: u64 = 3;
 const ERR: u64 = u64::MAX;
+/// What `spawn` reports for a process still running when its slice ended (it continues in later slices).
+pub const PREEMPTED: u64 = 0x5110 << 48;
+/// Time slice, in generic-timer ticks per millisecond multiples.
+const SLICE_MS: u64 = 10;
 /// Exit value marking a fault: FAULT | EC << 40 | faulting PC (arc offset) << 16 | fault address (arc offset, low 16 bits).
 pub const FAULT: u64 = 0xFA << 56;
 /// What `spawn` reports for a process that is still alive, blocked in recv or call.
@@ -410,9 +416,68 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     }
 }
 
+/// The slice ran out while the current process was at EL0: park it runnable (back of the queue) and leave to the kernel.
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
+    let kk = k();
+    if let Some(cur) = kk.current {
+        if let Some(p) = kk.procs[cur].as_mut() {
+            p.frame = *f;
+            p.state = State::Runnable;
+            kk.runnable.push_back(cur);
+        }
+    }
+    kk.current = None;
+    f.x[0] = PREEMPTED;
+    1
+}
+
 unsafe extern "C" {
-    /// main.rs: enter EL0 at `entry` with SP_EL0 = `sp`, x28 = arc base, x27 = arc mask, x0..x2 = args; returns when no process is left to run (the value of the last to leave, or PARKED).
+    /// main.rs: enter EL0 at `entry` with SP_EL0 = `sp`, x28 = arc base, x27 = arc mask, x0..x2 = args; returns when no process is left to run (the value of the last to leave, PARKED or PREEMPTED).
     fn ferros_el0_enter(entry: usize, sp: usize, base: usize, mask: usize, a0: u64, a1: u64, a2: u64) -> u64;
+    /// main.rs: resume a parked process from its saved frame; returns like `ferros_el0_enter`.
+    fn ferros_el0_resume(frame: *const Frame) -> u64;
+}
+
+fn arm_slice() {
+    static PPI: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !PPI.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::killswitch::enable_ppi(26);
+    }
+    let ticks = crate::platform::cntfrq() / 1000 * SLICE_MS;
+    unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
+}
+
+fn disarm_slice() {
+    unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
+}
+
+/// Give the next runnable process one time slice (called from the service loop). Returns false if nothing was runnable. Its console output collects until `take_console`.
+pub fn run_slice() -> bool {
+    let kk = k();
+    let Some(next) = kk.runnable.pop_front() else { return false };
+    let Some(p) = kk.procs[next].as_mut() else { return true };
+    if p.state != State::Runnable {
+        return true;
+    }
+    p.state = State::Running;
+    let frame = p.frame;
+    kk.current = Some(next);
+    arm_slice();
+    unsafe { ferros_el0_resume(&frame) };
+    disarm_slice();
+    k().current = None;
+    true
+}
+
+/// Drain what processes have sent their consoles since the last drain.
+pub fn take_console() -> Vec<u8> {
+    core::mem::take(&mut k().console)
+}
+
+/// How many processes are alive (running, runnable or blocked).
+pub fn alive() -> usize {
+    k().procs.iter().filter(|p| p.is_some()).count()
 }
 
 /// What a spawn left behind.
@@ -477,7 +542,6 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code.len());
     let kk = k();
-    kk.console.clear();
     kk.exited.clear();
     let trips0 = kk.ipc_round_trips;
     let me = match kk.procs.iter().position(|q| q.is_none()) {
@@ -491,9 +555,15 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
         }
     };
     kk.current = Some(me);
+    arm_slice();
     unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
+    disarm_slice();
     let kk = k();
     kk.current = None;
-    let exit = kk.exited.iter().find(|&&(i, _)| i == me).map(|&(_, v)| v).unwrap_or(PARKED);
+    let exit = match kk.exited.iter().find(|&&(i, _)| i == me) {
+        Some(&(_, v)) => v,
+        None if matches!(kk.procs[me].as_ref().map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
+        None => PARKED,
+    };
     Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
 }

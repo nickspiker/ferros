@@ -617,6 +617,10 @@ name = "ferros-payload-slot1nop"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-spinner"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-ufsdme"
 version = "0.1.0"
 dependencies = [

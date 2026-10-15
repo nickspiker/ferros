@@ -74,6 +74,19 @@ fn system_off() -> ! {
     }
 }
 
+/// Enable one private interrupt (PPI, INTID 16..31) on this CPU's redistributor at middle priority — e.g. the EL2 timer (26) that ends a process's time slice. No-op if `arm` found no redistributor.
+pub fn enable_ppi(intid: u32) {
+    let frame = REPORT[0].load(core::sync::atomic::Ordering::Relaxed);
+    if frame == 0xFF || !(16..32).contains(&intid) {
+        return;
+    }
+    let sgi = GICR + frame as usize * GICR_STRIDE + GICR_SGI;
+    let pr = sgi + 0x400 + (intid as usize & !3);
+    let sh = (intid as usize & 3) * 8;
+    wr(pr, (rd(pr) & !(0xFF << sh)) | (0x80 << sh));
+    wr(sgi + 0x100, 1 << intid);
+}
+
 /// Arm the killswitch. Safe to call again (RELOAD re-runs it).
 pub fn arm() -> Armed {
     // Held at boot: die before anything else runs.

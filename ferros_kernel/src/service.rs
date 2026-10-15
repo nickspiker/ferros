@@ -339,6 +339,8 @@ pub fn run(mut b: Boot) -> ! {
 
         match usb.poll_event() {
             UsbEvent::None => {
+                // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires).
+                crate::process::run_slice();
                 if !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
                     if init_history.len() < 32 {
                         unsafe {
@@ -468,6 +470,13 @@ pub fn run(mut b: Boot) -> ! {
                                                 let label = [b'R', b'E', b'P', b'_', hex[(reg >> 4) as usize], hex[(reg & 0xF) as usize], b'='];
                                                 append_hex(&mut resp, &label, v);
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"console" {
+                                            // What processes have sent their consoles since the last read (background slices included), and how many are alive.
+                                            append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
+                                            resp.extend_from_slice(&crate::process::take_console());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

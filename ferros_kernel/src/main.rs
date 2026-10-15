@@ -446,6 +446,8 @@ _m1_entry:
     str     x2, [x1]
     cmp     x0, #1020
     b.hs    .Lirq_ret
+    cmp     x0, #26
+    b.eq    .Lirq_tick
     cmp     x0, #61
     b.eq    .Lirq_key
     cmp     x0, #64
@@ -460,6 +462,17 @@ _m1_entry:
     movk    x3, #0x1040, lsl #16
     str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>
     b       .Lirq_eoi
+// The EL2 timer (PPI 26): a process's time slice is up. Stop the timer and EOI; from EL2 there is nothing to preempt, from EL0 park the process (.Lel0_preempt) and give the CPU back to the kernel.
+.Lirq_tick:
+    msr     cnthp_ctl_el2, xzr
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
 .Lirq_key:
     movz    x1, #0x0A10
     movk    x1, #0x154D, lsl #16
@@ -559,6 +572,29 @@ ferros_el0_enter:
     eret
 
 .balign 16
+// Resume a parked process (process.rs `run_slice`): x0 = its saved frame (288 bytes, the .Lel0_sync layout). Saves the kernel context like ferros_el0_enter, copies the frame onto the stack and erets through the common restore path.
+.global ferros_el0_resume
+ferros_el0_resume:
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    stp     x19, x20, [x9, #0]
+    stp     x21, x22, [x9, #16]
+    stp     x23, x24, [x9, #32]
+    stp     x25, x26, [x9, #48]
+    stp     x27, x28, [x9, #64]
+    stp     x29, x30, [x9, #80]
+    mov     x10, sp
+    str     x10, [x9, #96]
+    sub     sp, sp, #288
+    mov     x10, #0
+1:  ldr     x11, [x0, x10]
+    str     x11, [sp, x10]
+    add     x10, x10, #8
+    cmp     x10, #288
+    b.lo    1b
+    b       .Lel0_restore
+
+.balign 16
 // Synchronous exception from EL0 (a syscall or a fault): save the process's registers in a frame on SP_EL2, let process.rs decide (ferros_el0_trap: 0 = resume, 1 = the process ends).
 .Lel0_sync:
     sub     sp, sp, #288
@@ -590,7 +626,41 @@ ferros_el0_enter:
     str     x9, [sp, #280]
     mov     x0, sp
     bl      ferros_el0_trap
+    b       .Lel0_tail
+// The time slice ran out while a process was at EL0 (the timer tick in .Lirq, scratch registers already restored): save its frame the same way and let process.rs park it runnable.
+.Lel0_preempt:
+    sub     sp, sp, #288
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30, [sp, #240]
+    mrs     x9, sp_el0
+    str     x9, [sp, #248]
+    mrs     x9, elr_el2
+    str     x9, [sp, #256]
+    mrs     x9, spsr_el2
+    str     x9, [sp, #264]
+    mrs     x9, esr_el2
+    str     x9, [sp, #272]
+    mrs     x9, far_el2
+    str     x9, [sp, #280]
+    mov     x0, sp
+    bl      ferros_el0_preempt
+.Lel0_tail:
     cbnz    x0, .Lel0_leave
+.Lel0_restore:
     ldr     x9, [sp, #256]
     msr     elr_el2, x9
     ldr     x9, [sp, #264]
@@ -721,6 +791,11 @@ static mut __exception_count: u64 = 0;
 #[cfg(not(feature = "pixel8"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_trap(_frame: *mut u64) -> u64 {
+    1
+}
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
     1
 }
 

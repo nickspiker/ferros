@@ -17,6 +17,7 @@ members = [
     "payloads/hello_el0",
     "payloads/echo_server",
     "payloads/echo_client",
+    "payloads/spinner",
     "payloads/wdtfire",
     "payloads/usbprobe",
     "payloads/pmuprobe",
