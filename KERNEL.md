@@ -241,6 +241,55 @@ H5: Kill Circuit Atomicity
 
 ---
 
+## Execution Model: one compiler, arcs, go (decided 2026-10-14)
+
+ferros runs only native code that its own compiler produced.
+Isolation is a property of that compiler's output, not of page tables: no per-process translation tables, no TLB-based isolation, no address-space switch.
+
+### Ingress: one backend
+
+```
+toka bytecode      (ferros-native capsules: handles, no pointers) ──────┐
+wasm32             (real-world Rust: Photon, Lumis, their C deps) → toka ┼→ toka → aarch64 → sealed in vault → go
+future front ends  (an RPN / AI-tailored Rust fork, ...)          → toka ┘
+```
+
+- toka is the only thing the backend compiles. A wasm module's flat memory becomes one toka handle to a byte arc; its loads and stores are accesses through that handle, so "no pointers" still holds.
+- One compiler, one trust boundary: what has to be proven (Verus) is the toka → aarch64 backend plus the kernel, not every app.
+- Real-world apps stay 100% Rust. They build to wasm32 with their usual toolchains; their ferros platform shim (the counterpart of their Kotlin/Android shim) talks to ferros through WASI-shaped host calls, which become capability handles to servers (network, display, camera, storage).
+- Threads of one app share its arcs, each with its own stack, so tokio and rayon get real threads.
+- SIMD is 128-bit (wasm simd128 / toka), which is NEON width.
+
+### Install, compile, seal, go
+
+1. **Install:** verify the capsule — the developer's ed25519 signature over its BLAKE3 hash ([ORACLE.md](ORACLE.md)).
+2. **Compile once, on device:** toka → aarch64. Accesses the compiler proves in range carry no check (a row is carved once; the loop inside it is proven). The rest are masked, `base + (addr & mask)`: one AND, no branch, and no speculative out-of-bounds read.
+3. **Seal:** the native code is stored in the vault, authenticated by a keyed BLAKE3 MAC under an ira-derived key, bound to (bytecode hash, compiler hash). Only this device ever verifies it, so a public-key signature buys nothing; a compiler update invalidates every seal and code is recompiled. The seal is not an identity: the process's *ihi* still comes from the developer's capsule.
+4. **Go:** load the arc base and mask registers, set the entry point, `eret` to EL0. Switching processes is switching those registers: no table switch, no TLB, no flush.
+
+### Registers and EL0
+
+- Arc base and mask live in two registers the backend reserves and never lets program code write.
+- Processes still run at EL0. Bounds come from the compiled code; EL0 only takes away the system controls. Code at EL2 could mask IRQs (silencing the killswitch), issue SMCs or rewrite system registers; at EL0 it physically cannot, so a backend bug can't become a dead killswitch. It costs one `eret` and no page tables.
+
+### Arcs under masking
+
+- A masked arc is a power of two in size and aligned to it. The requested size is rounded up; the slack is zeroed at allocation and belongs to that arc alone, never shared with a neighbour, which closes the uninitialised-neighbour leak ISOMEM describes for pages.
+- An out-of-range offset wraps inside the process's own arc: ring memory at the instruction level.
+- Glyph silicon does base–limit in the load/store unit, in parallel (ISOMEM proper: exact size, zero instructions). Compiled masking is the stock-silicon embodiment.
+- Hardware grants (MMIO arcs) reach a process only as handles; a driver's register accesses go through them like any other arc.
+
+### Bring-up order
+
+1. EL0 entry and the base/mask register ABI: the existing RUN payload path becomes a real process.
+2. The toka VM as ferros's first process (safe by construction) while the backend is written.
+3. The toka → aarch64 backend, sealing, go.
+4. wasm → toka lowering and the WASI-shaped host calls; then Photon, then Lumis.
+
+**Open:** data caches. With the MMU fully off every data access is uncached Device memory; see the decision record when it lands.
+
+---
+
 ## Module 1: Cryptographic Address Space
 
 ### Principle
@@ -402,7 +451,7 @@ No NULL. No MAX. No boundaries to overflow. The address space wraps by construct
 // One base-limit pair: a contiguous piece of the wrapping address space.
 struct Arc {
     base_offset: usize,    // cryptographically random, continuously rotating
-    limit: usize,          // span in bytes, any size, any alignment
+    limit: usize,          // span in bytes: a power of two under compiled masking (stock silicon), any size in Glyph silicon
 }
 
 // A process holds one or more arcs (ISOMEM: one or more base-limit pairs per process).
@@ -411,8 +460,9 @@ struct ProcessMemory {
     arcs: Vec<Arc>,
 }
 
-// Bounds check, per arc: 2 instructions
-// (ptr - offset) < limit
+// Bounds, per arc, compiled into the code (Execution Model): proven accesses carry no check,
+// the rest are masked: base + (addr & mask), one AND, no branch.
+// Glyph silicon: (ptr - offset) < limit in the load/store unit, zero instructions.
 // No TLB required
 // No page tables
 // 5-10x faster context switch

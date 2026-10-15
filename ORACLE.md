@@ -132,6 +132,12 @@ in the continuous two's complement address space, randomly positioned,
 cryptographically isolated from every other arc. The process receives
 this arc at spawn. It is that arc, for this instance, until it dies.
 
+The code a process runs is never the developer's bytes directly. The
+capsule's toka bytecode (or wasm, lowered to toka) is compiled once by
+ferros's own backend and sealed in the vault under a device MAC (KERNEL.md,
+Execution Model). Spawn verifies that seal, allocates the arcs, runs the
+oracle, then goes: arc base and mask registers set, eret to EL0.
+
 Spawn is not exec. Exec replaces a process image. Spawn creates a new
 arc, a new capability space, a new *ihi*. Nothing is inherited by
 default. Everything must be explicitly granted.
