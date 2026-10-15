@@ -23,6 +23,8 @@ const CMU: u64 = 11;
 const PMU: u64 = 12;
 /// The entropy right (`--entropy`, after the hardware grants).
 const ENTROPY: u64 = 13;
+/// The DMA region (`--dma pcie1-dma`, after the entropy right).
+const DMA: u64 = 14;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -794,6 +796,174 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     // Unwrapped start (idx is where the next byte goes): oldest first when the ring has wrapped, i.e. the byte after idx is non-zero.
     let wrapped = d.tcm_rd(buf + (idx & !3) + 4) != 0 && idx + 8 < size;
     let (start, len) = if wrapped { (idx, size) } else { (0, idx) };
+    console_dump(d, buf, size, start, len);
+    if stage < 9 {
+        return;
+    }
+
+    // ---- stage 9: the msgbuf rings and the first ioctl (dhd_msgbuf.c dhd_prot_init order; WIFI.md §14). Read/write indices stay in TCM (no DMA'd index arrays), so every completion item is checked by epoch and XOR (D2H_SYNC_XORCSUM). Everything the chip may DMA lives in the pcie1-dma region, inside the S2MPU fence. ----
+    let dma = svc(7, d.cap(DMA), 0, 0, 0, 0);
+    if dma == ERR {
+        d.put(b"no DMA region (--dma pcie1-dma)\n");
+        d.failed = true;
+        return;
+    }
+    let dma = dma as u32;
+    d.kv(b"dma.base", dma);
+    // DMA region layout: the five common rings, the 8-byte scratch, the ioctl request buffer, 8 ioctl response buffers (8 KiB), 8 event buffers (2 KiB).
+    const RINGS: [(u32, u16, u16); 5] = [(0x0_0000, 64, 40), (0x0_1000, 512, 32), (0x0_5000, 64, 24), (0x0_6000, 1024, 24), (0x0_C000, 512, 40)];
+    const SCRATCH: u32 = 0x1_1000;
+    const IOCTL_REQ: u32 = 0x1_3000;
+    const IOCTL_RESP: u32 = 0x2_0000;
+    const EVENT_BUF: u32 = 0x3_0000;
+    for off in (0..0x4_0000u32).step_by(4) {
+        dw(dma + off, 0);
+    }
+    let ri = d.tcm_rd(sh + 48);
+    let ringmem = d.tcm_rd(ri);
+    let (h2d_w, h2d_r, d2h_w, d2h_r) = (d.tcm_rd(ri + 4), d.tcm_rd(ri + 8), d.tcm_rd(ri + 12), d.tcm_rd(ri + 16));
+    d.kv(b"ri.ringmem", ringmem);
+    d.kv(b"ri.h2d_w", h2d_w);
+    d.kv(b"ri.d2h_w", d2h_w);
+    let v = d.tcm_rd(ri + 52);
+    d.kv(b"ri.max_flowrings|max_subq", v);
+    let v = d.tcm_rd(ri + 56);
+    d.kv(b"ri.max_cplrings|max_vdevs", v);
+    // host_cap: IPC 9, HOSTRDY, deep sleep off (NO_OOB_DW without INBAND_DW), no trap on a PCIe Unsupported Request.
+    d.tcm_wr(sh + 84, 0x0080_1409);
+    d.tcm_wr(sh + 112, 0);
+    for (i, &(off, items, len)) in RINGS.iter().enumerate() {
+        let m = ringmem + 16 * i as u32;
+        let id = d.tcm_rd(m);
+        d.put(b"ring ");
+        d.hex(i as u32);
+        d.kv(b" idx|type", id);
+        d.tcm_wr(m + 4, items as u32 | (len as u32) << 16);
+        d.tcm_wr(m + 8, dma + off);
+        d.tcm_wr(m + 12, 0);
+    }
+    for i in 0..2u32 {
+        d.tcm_wr(h2d_w + 4 * i, 0);
+        d.tcm_wr(h2d_r + 4 * i, 0);
+    }
+    for i in 0..3u32 {
+        d.tcm_wr(d2h_w + 4 * i, 0);
+        d.tcm_wr(d2h_r + 4 * i, 0);
+    }
+    d.tcm_wr(sh + 56, dma + SCRATCH);
+    d.tcm_wr(sh + 60, 0);
+    d.tcm_wr(sh + 52, 8);
+    d.flush();
+    // Hostready: H2D doorbell 1 (PCIe core registers at BAR0 + G#2000; DB0 G#140, DB1 G#144).
+    unsafe { core::arch::asm!("dsb sy") };
+    d.wr(MEM, 0x2144, 0x1234_5678);
+    let cons_before = d.tcm_rd(cons + 16);
+    // Control submit ring: 8 ioctl response buffers, 8 event buffers, then the ioctl. Each item: cmn_msg_hdr (type, if, flags = phase G#80 on the first lap, epoch = seq % 253 with seq from 254, request id).
+    let mut seq = 254u32;
+    let mut w = 0u32;
+    let mut item = |d: &mut Drv, words: [u32; 10]| {
+        let a = dma + RINGS[0].0 + 40 * w;
+        for (k, v) in words.iter().enumerate() {
+            dw(a + 4 * k as u32, *v);
+        }
+        w += 1;
+        let _ = d;
+    };
+    for b in 0..8u32 {
+        let e = seq % 253;
+        seq += 1;
+        item(d, [0x0B | 0x80 << 16 | e << 24, 1 + b, 8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
+    }
+    for b in 0..8u32 {
+        let e = seq % 253;
+        seq += 1;
+        item(d, [0x0D | 0x80 << 16 | e << 24, 0x101 + b, 2048, 0, dma + EVENT_BUF + 0x800 * b, 0, 0, 0, 0, 0]);
+    }
+    // WLC_GET_VAR (262) "ver": the iovar name with its NUL in the request buffer; dhd passes the whole buffer length as input and output length.
+    for (k, c) in b"ver\0".iter().enumerate() {
+        db(dma + IOCTL_REQ + k as u32, *c);
+    }
+    let e = seq % 253;
+    item(d, [0x09 | 0x80 << 16 | e << 24, 0xFFFE, 262, 1 | 256 << 16, 256, 0, dma + IOCTL_REQ, 0, 0, 0]);
+    let posted = w;
+    unsafe { core::arch::asm!("dsb sy") };
+    d.tcm_wr(h2d_w, posted);
+    d.wr(MEM, 0x2140, 0xFF00_0000 | posted);
+    d.kv(b"h2d.ctrl posted", posted);
+    d.flush();
+    // Control complete ring (D2H slot 0): items of 24 bytes; a new one is valid once epoch == seq % 253 (seq from 254) and its six words XOR to zero.
+    let mut rd_i = 0u32;
+    let mut dseq = 254u32;
+    let mut got_cmplt = false;
+    let t0 = d.now();
+    while !got_cmplt && d.now().wrapping_sub(t0) < 3 * d.freq {
+        let wi = d.tcm_rd(d2h_w);
+        while rd_i != wi {
+            let a = dma + RINGS[2].0 + 24 * (rd_i % 64);
+            let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
+            let epoch = words[0] >> 24;
+            let xor = words.iter().fold(0, |x, v| x ^ v);
+            if epoch != dseq % 253 || xor != 0 {
+                break; // the index ran ahead of the item's DMA: look again
+            }
+            dseq += 1;
+            rd_i = (rd_i + 1) % 64;
+            d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
+            d.put(b"us d2h ctrl:");
+            for v in words {
+                d.put(b" ");
+                d.hex(v);
+            }
+            d.put(b"\n");
+            if words[0] & 0xFF == 0x0C {
+                got_cmplt = true;
+                let buf = words[1].wrapping_sub(1);
+                let len = (words[3] & 0xFFFF).min(512);
+                d.kv(b"ioctl status", words[2] & 0xFFFF);
+                if buf < 8 {
+                    d.put(b"ver: ");
+                    for k in 0..len {
+                        let c = dbr(dma + IOCTL_RESP + 0x2000 * buf + k);
+                        if c == 0 {
+                            break;
+                        }
+                        if (0x20..0x7F).contains(&c) || c == b'\n' {
+                            d.put(&[c]);
+                        }
+                    }
+                    d.put(b"\n");
+                }
+            }
+            d.tcm_wr(d2h_r, rd_i);
+            d.flush();
+        }
+        d.us(1000);
+    }
+    if !got_cmplt {
+        d.put(b"no ioctl completion\n");
+    }
+    let f = d.tcm_rd(sh);
+    d.kv(b"sh.flags", f);
+    let idx = d.tcm_rd(cons + 16);
+    console_dump(d, buf, size, cons_before, (idx + size - cons_before) % size);
+}
+
+/// Physical (= identity-mapped) access to the DMA region: Normal non-cacheable, EL0 read/write.
+fn dw(a: u32, v: u32) {
+    unsafe { core::ptr::write_volatile(a as u64 as *mut u32, v) }
+}
+fn dr(a: u32) -> u32 {
+    unsafe { core::ptr::read_volatile(a as u64 as *const u32) }
+}
+fn db(a: u32, v: u8) {
+    unsafe { core::ptr::write_volatile(a as u64 as *mut u8, v) }
+}
+fn dbr(a: u32) -> u8 {
+    unsafe { core::ptr::read_volatile(a as u64 as *const u8) }
+}
+
+/// The firmware's console ring (hnd_cons log) from `start`, `len` bytes, printable text only.
+fn console_dump(d: &mut Drv, buf: u32, size: u32, start: u32, len: u32) {
     d.put(b"---- firmware console\n");
     let mut i = 0;
     while i < len {
