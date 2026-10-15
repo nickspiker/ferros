@@ -707,6 +707,77 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
     d.put(b"\n");
     d.flush();
+    if stage < 8 {
+        return;
+    }
+
+    // ---- stage 8: what the running firmware says about itself. The settled shared area (bcmpcie.h pciedev_shared_t: flags, trap_addr, assert_exp/file, assert_line, console_addr at +G#14, fwid, ..., rings_info_ptr at +G#30) once its pointers are filled in; trap_addr non-zero means the firmware trapped. Then its console: hnd_cons_t at console_addr, log ring at +8 (buf, buf_size, idx) — the firmware's own boot log, printed as text. ----
+    // Timeline first (stage 8's first run saw the shared flags and fwid go to zero within 2 s, console never set): every 5 ms for 3 s, log any change in shared flags / console_addr, the ramtop word, ram[0] and the CA7's DMP control.
+    let t0 = d.now();
+    let mut prev = [u32::MAX; 5];
+    while d.now().wrapping_sub(t0) < 3 * d.freq {
+        let mut cur = [d.tcm_rd(sh), d.tcm_rd(sh + 0x14), d.tcm_rd(ramtop - 4), d.tcm_rd(0), 0];
+        d.wr(CFG, 0x80, oobr);
+        cur[4] = d.rd(MEM, 0x248);
+        d.wr(CFG, 0x80, 0x1800_0000);
+        if cur != prev {
+            d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
+            d.put(b"us flags/console/ramtop/ram0/dmp:");
+            for v in cur {
+                d.put(b" ");
+                d.hex(v);
+            }
+            d.put(b"\n");
+            prev = cur;
+            if d.n > 2400 {
+                d.flush();
+            }
+        }
+        d.us(5000);
+    }
+    // The first ramtop value is an early, temporary one: around 430 ms in, the firmware publishes the real shared area there (dhd never sees the first — it reads after the firmware-boot interrupt, dhdpcie_wait_readshared_area_addr).
+    let sh = d.tcm_rd(ramtop - 4);
+    d.kv(b"shared (settled)", sh);
+    if sh < RAM_BASE || sh >= ramtop {
+        d.flush();
+        return;
+    }
+    for (k, off) in [(&b"sh.flags"[..], 0u32), (b"sh.trap_addr", 4), (b"sh.assert_line", 0x10), (b"sh.console_addr", 0x14), (b"sh.fwid", 0x1C), (b"sh.h2d_mb", 0x28), (b"sh.d2h_mb", 0x2C), (b"sh.rings_info", 0x30)] {
+        let v = d.tcm_rd(sh + off);
+        d.kv(k, v);
+    }
+    d.flush();
+    let cons = d.tcm_rd(sh + 0x14);
+    if cons < RAM_BASE || cons >= ramtop {
+        return;
+    }
+    let (buf, size, idx) = (d.tcm_rd(cons + 8), d.tcm_rd(cons + 12), d.tcm_rd(cons + 16));
+    d.kv(b"cons.buf", buf);
+    d.kv(b"cons.size", size);
+    d.kv(b"cons.idx", idx);
+    d.flush();
+    if buf < RAM_BASE || size == 0 || size > 0x1_0000 || buf + size > ramtop || idx > size {
+        return;
+    }
+    // Unwrapped start (idx is where the next byte goes): oldest first when the ring has wrapped, i.e. the byte after idx is non-zero.
+    let wrapped = d.tcm_rd(buf + (idx & !3) + 4) != 0 && idx + 8 < size;
+    let (start, len) = if wrapped { (idx, size) } else { (0, idx) };
+    d.put(b"---- firmware console\n");
+    let mut i = 0;
+    while i < len {
+        let pos = (start + i) % size;
+        let w = d.tcm_rd(buf + (pos & !3));
+        let c = (w >> (8 * (pos & 3))) as u8;
+        if c == b'\n' || (0x20..0x7F).contains(&c) {
+            d.put(&[c]);
+        }
+        if d.n > 2400 && c == b'\n' {
+            d.flush();
+        }
+        i += 1;
+    }
+    d.put(b"\n---- end\n");
+    d.flush();
 }
 
 /// [u32 LE len][bytes] twice.
