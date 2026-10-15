@@ -55,3 +55,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Photon on ferros: no bootstrap](photon_on_ferros_no_bootstrap.md) — peers from physical pairing + LAN broadcast, no seed, no FGTW/TCP/HTTP/TLS; net stack = ARP/IPv4 + IPv6 (NDP/SLAAC) + UDP
 - [Display driver: design first](display_driver_design_first.md) — before coding the husky display driver, show the owner a knobs inventory + ideal design
 - [toka pipeline + trust model A](toka_pipeline_trust_model_a.md) — device compiles everything (no precompiled trust); toka = WASM fork extended with i128/64-bit/Scalar/Circle at both pipe ends; native capsules dev-only
+- [Photon vocabulary](photon_terminology.md) — message = photon (send a photon), video call = beam (beam someone)
