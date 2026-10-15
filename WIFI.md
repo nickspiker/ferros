@@ -5,6 +5,7 @@
 - PHY: external PLL lock 1 µs, PHY PLL lock 97 µs, CDR lock 29 µs, offset calibration 6.7 ms;
 - link: LTSSM Polling.Active → **L0 in 81 µs**, link status G#3011_0000 = **Gen1 ×1** (Gen1 forced), RC id G#ECED_144D;
 - config space: **G#14E4 : G#4444** (BCM4398 D11AX); BAR0 → chipcommon ChipID **G#6003_4398 = chip G#4398 rev 3**.
+- NCI enumeration (stage 04 + `tools/nci-parse.py`, following nciutils.c nci_scan): EROM pointer G#1800_7118 (EROM1 G#1800_7000, OOBR G#1800_6000). Cores: chipcommon G#800 rev 76 @ G#1800_0000; PCIe2 G#83C rev 130 @ G#1800_1000; **ARM CA7 G#847 rev 13 @ G#1808_0000** (OOBR +G#240, DMP control at +8); **sysmem G#849 rev 14 @ G#1808_8000 with RAM at backplane 0..G#29_FFFF and G#2A_0000 + 4 MiB**; D11 G#812 ×3 @ G#1808_2000/4000/6000; all interfaces Booker. (The download path: hold the CA7 in reset with CPUHALT, write the image, NVRAM vars + random seed, the reset instruction, release — dhd_pcie.c `_dhdpcie_download_firmware` / `__dhdpcie_bus_download_state`; no FW_SIGNATURE on this board.)
 Next: TCM/firmware download, NVRAM + CLM, the msgbuf rings (DMA through S2MPU G#131F_0000), then 802.11 and an IP stack — each as processes.
 
 **Recipe source:** The bring-up is written as a driver *process* holding hardware grants (`payloads/pcie1`, ferros_kernel process.rs `--hw`), not as kernel code. Goal 1: PCIe link up (Gen1 or better). Goal 2: the endpoint's vendor/device ID over config space. Goal 3: dhd's first BAR0 chip-id read. Firmware download, msgbuf rings, 802.11 and an IP stack come after.

@@ -2,7 +2,7 @@
 //!
 //! Spawn (grant order matters — slots 1..12):
 //!   ferros-bridge spawn pcie1.bin <stage> --name pcie1 --hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu
-//! Stage (input byte, hex): 00 read-only survey (CMU gates, PMU PHY control, GPIO, ELBI/LTSSM, DBI ID) · 01 + PHY bring-up (WIFI.md §5-8) · 02 + link training (§9) · 03 + config space and the chip id (§10-11).
+//! Stage (input byte, hex): 00 read-only survey (CMU gates, PMU PHY control, GPIO, ELBI/LTSSM, DBI ID) · 01 + PHY bring-up (WIFI.md §5-8) · 02 + link training (§9) · 03 + config space and the chip id (§10-11) · 04 + dump the chip's NCI enumeration ROM (read-only).
 //! Each stage only goes further than the last, so a hang (bus stall → watchdog reset) points at the stage that caused it.
 
 #![no_std]
@@ -393,6 +393,50 @@ fn run(d: &mut Drv, stage: u8) {
     d.kv(b"chipcommon.chipid", chip);
     d.kv(b"chip", chip & 0xFFFF);
     d.kv(b"rev", (chip >> 16) & 0xF);
+    d.flush();
+    if stage < 4 {
+        return;
+    }
+
+    // ---- stage 4: dump the NCI enumeration ROM (read-only) — the chip describes its own cores there (nciutils.c nci_init: ChipCommon EromPtrOffset G#FC → EROM2 base; EROM1/OOBR sit below it). The host parses the dump before any core reset is attempted. ----
+    let erom2 = d.rd(MEM, 0xFC);
+    d.kv(b"cc.eromptr", erom2);
+    let erom1 = erom2 & !0xFFF;
+    let oobr = erom2 & !0x1FFF;
+    d.kv(b"erom1_base", erom1);
+    d.kv(b"oobr_base", oobr);
+    d.flush();
+    for &(name, base) in &[(&b"oobr"[..], oobr), (b"erom", erom1)] {
+        d.wr(CFG, 0x80, base);
+        d.put(b"dump ");
+        d.put(name);
+        d.put(b" ");
+        d.hex(base);
+        d.put(b"\n");
+        // Measure first: time the first reads (a window the chip doesn't decode costs a PCIe completion timeout per read and starves everything else); dump further only if they come back fast.
+        let t0 = d.now();
+        let probe = d.rd(MEM, 0);
+        let us = (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32;
+        d.kv(b"first_read", probe);
+        d.kv(b"first_read_us", us);
+        d.flush();
+        let words = if us > 100 || probe == 0xFFFF_FFFF { 0u64 } else { 512 };
+        for i in 0..words {
+            if i % 8 == 0 {
+                d.flush();
+                d.hex((i * 4) as u32);
+                d.put(b":");
+            }
+            let v = d.rd(MEM, i * 4);
+            d.put(b" ");
+            d.hex(v);
+            if i % 8 == 7 {
+                d.put(b"\n");
+            }
+        }
+        d.flush();
+    }
+    d.wr(CFG, 0x80, 0x1800_0000);
 }
 
 #[panic_handler]
