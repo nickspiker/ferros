@@ -326,6 +326,8 @@ pub fn run(mut b: Boot) -> ! {
 
     loop {
         platform::pet_watchdogs();
+        // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
+        unsafe { core::arch::asm!("msr daifclr, #2") };
         let now = cntpct();
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);

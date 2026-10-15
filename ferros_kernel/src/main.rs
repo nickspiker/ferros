@@ -722,6 +722,8 @@ ferros_el0_resume:
     ldp     x29, x30, [x9, #80]
     ldr     x10, [x9, #96]
     mov     sp, x10
+    // Back in the kernel from exception context: taking the EL0 exception masked IRQs (PSTATE.I), and `ret` doesn't restore them. Left masked, the killswitch's key interrupts are never taken again — every boot lost it the moment `init` ran (seen 2026-10-15: DAIF G#3C0 in the service loop).
+    msr     daifclr, #2
     ret
 
 .balign 16
