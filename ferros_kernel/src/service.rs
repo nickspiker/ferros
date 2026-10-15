@@ -574,6 +574,7 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                             append_hex(&mut resp, b"KOHI_OK=", kohi.map(|k| k.0.is_some()).unwrap_or(false) as u32);
                                             append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
+                                            append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
                                             append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
                                             let daif: u64;
                                             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
