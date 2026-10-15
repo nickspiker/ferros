@@ -212,7 +212,9 @@ Assign EP BARs inside G#6000_0000..G#60FE_FFFF: BAR0 (64-bit, cfg G#10/G#14; dhd
 
 ## 12. S2MPU / SysMMU
 
-SysMMU `sysmmu_hsi2` G#131C_0000 is disabled; S2MPU `s2mpu_s0_hsi2` G#131F_0000 (always-on; pKVM module not in tree, state as ABL/EL3 left it — **[AMBIGUOUS]**). Neither affects goals 1–3 (CPU→EP accesses); both matter for EP→DRAM DMA later.
+SysMMU `sysmmu_hsi2` G#131C_0000 sits in front of PCIe ch1 only (port PCIe_CH1) and is disabled (DT `status = "disabled"`, `pcie_1` `use-sysmmu = "disabled"`); Linux never programs it. S2MPU `s2mpu_s0_hsi2` G#131F_0000 (v9, always-on) gates every HSI2 master (UFS, PCIe ch1). Register model, from pkvm-s2mpu kvm_s2mpu.h / hyp s2mpu.c: CTRL_PROT_EN_PER_VID_SET G#50 / CLR G#54 (cold_ufs used to write CLR = G#FF: protection off for all 8 VIDs), DECERR-on-deny G#70, contexts G#100/G#104 (context i → VID i, before any L1 write), L1 per VID per GiB at G#4000 + vid·G#200 + gb·8 (table address = PA >> 4) / +4 (attr: bit 0 table, bits 2:1 R/W for a 1 GiB block), 4 KiB tables of 4 bits per page (bit 2 R, bit 3 W, 128 KiB per GiB, aligned to their size), GiB 4..33 fixed no-access, invalidation G#1000 + sync G#102C/G#1030, faults G#2000 (bit per VID) and per VID PA/info (VID [26:24])/info2 (stream ID [23:0]).
+
+**The fence (ferros_kernel/src/s2mpu.rs, 2026-10-15):** every VID may reach only the cold window G#8000_0000..G#8240_0000 (kernel buffers for UFS, the DMA pool for the WiFi driver); every other GiB is no-access. Verified: UFS link, vault open/verified and the devinfo write work, the firmware boots, no faults. **Open:** which VID PCIe ch1 uses (zuma's DT doesn't say; gs101 put PCIe on VID 1, UFS on 0) — the first ring DMA pointed just outside the window will latch it in the fault registers; then that VID gets a table allowing only `pcie1-dma`. The dongle's PCIe core also has host-memory protection windows (HMAP, pcie_core.h `hmapwindow*` G#580.., violations at G#600..), a second, device-side layer.
 
 ## 13. What silently breaks the link / open questions
 

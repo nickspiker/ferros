@@ -298,7 +298,8 @@ What runs today (cold boot, slot b), against the modules below:
 The process ABI (`ferros_kernel/src/process.rs`):
 - **Entry:** EL0 (VHE: EL2 host, EL2&0 regime) at arc offset G#1000, x0 = grants offset, x1 = input offset, x2 = input length, **x28 = arc base, x27 = arc mask**, every other register (general and SIMD) zero, interrupts unmasked.
 - **Arc layout:** G#0 grants page — u32 count, then 32-byte tokens (slot 0 = console, then the endpoint grants in order); the *ihi* at G#FE0 (32 bytes); code at G#1000; input after the code; stack at the top.
-- **Syscalls** (`svc #0`, number in x8, every offset an arc offset the kernel masks, ERR = all ones): 0 `exit(code)`; 1 `call(cap, msg, len, reply, reply_cap)`; 2 `recv(cap, buf, buf_cap, reply_token)`; 3 `reply(reply_token, msg, len)`.
+- **Syscalls** (`svc #0`, number in x8, every offset an arc offset the kernel masks, ERR = all ones): 0 `exit(code)`; 1 `call(cap, msg, len, reply, reply_cap)`; 2 `recv(cap, buf, buf_cap, reply_token)`; 3 `reply(reply_token, msg, len)`; 4 `mmio_read(grant, off)` / 5 `mmio_write(grant, off, value)` on a hardware grant; 6 `entropy(cap, buf, len)` — up to 4096 bytes BLAKE3-keyed from the session's wairua over a kernel counter (no wairua, no bytes); 7 `dma(cap)` → the physical base of a DMA region grant.
+- **Grants** are capabilities like any other (`bridge spawn --serve/--use E`, `--hw BLOCK`, `--entropy`, `--dma REGION`). A DMA region is a 2 MiB block of non-cacheable memory (cachemap DMA_POOL) the driver reads and writes directly; its device can DMA only there and into ferros's window (`s2mpu.rs`, the HSI2 S2MPU fence), never anywhere else in DRAM.
 - **Faults** end the process (exit value FAULT | EC | PC | FAR), never the kernel.
 - **Time slices:** 10 ms on the EL2 timer; a preempted process continues in later slices from the service loop.
 - **Boot:** after the vault opens, the kernel spawns the vault's `init` capsule — ferros's first process.
