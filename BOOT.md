@@ -56,7 +56,7 @@ Pixel 8 / Tensor G3 (primary):
 - **Slot a = Android + the handoff kernel.** This is the dev host and the escape hatch: `tools/husky-hotload.sh` chainloads ferros from it with the disk live.
 - **Back to Android:** `tools/husky-cold.sh --android` (fastboot, `--set-active=a`, reboot, about 40 s, no buttons).
 - **Exits from cold ferros:**
-  - A plain reset just boots ferros again (slot b is marked successful), so every exit except a plain host `bridge reboot` goes to fastboot, where the host decides what boots next: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, both volume keys, or `bridge reboot fastboot`.
+  - A plain reset just boots ferros again (slot b is marked successful), so every exit except a plain host `bridge reboot` goes to fastboot, where the host decides what boots next: idle 512 s, a 64 s enumeration timeout, a 16 s PT stall, or `bridge reboot fastboot`. Both volume keys are the killswitch (KILLSWITCH.md): power off, no exit path, no report.
   - The report block at G#FD60_0000 survives warm resets and the trip through fastboot. The next cold boot shows it as `PREV_*` in DIAG, and Android's handoff kernel prints it as `ferros: r[..]`.
 - **Fastboot from ferros:** stamp PMU SYSIP_DAT0 = G#FC through the EL3 monitor, then fire the cluster watchdogs (count = reload = 1).
   - **The reset is not immediate:** these watchdogs reset the SoC about 15-20 s after they start expiring, so ferros waits up to 64 s by the clock.

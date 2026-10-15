@@ -62,7 +62,6 @@ const EXIT_NO_ENUM: u8 = 0xB1;
 const EXIT_IDLE: u8 = 0xB2;
 const EXIT_FASTBOOT: u8 = 0xB3;
 const EXIT_NO_USB: u8 = 0xB4;
-const EXIT_BUTTONS: u8 = 0xB5;
 const EXIT_PT_STALL: u8 = 0xB6;
 
 /// PT-level counters for the exit report.
@@ -76,11 +75,6 @@ struct PtStats {
     not_ready: u32,
 }
 
-/// Volume buttons (pinctrl@G#154D0000), active low. Both held = leave ferros.
-const GPA4_DAT: usize = 0x154D_0084;
-const GPA6_DAT: usize = 0x154D_00A4;
-const VOL_DOWN_BIT: u32 = 1 << 1;
-const VOL_UP_BIT: u32 = 1 << 2;
 
 // Reload copy stub. Position-independent; runs from `Boot::stub` after being copied there, so it can overwrite the image that called it.
 // x0 = source (`Boot::stage`), x1 = destination (`Boot::link_base`), x2 = byte count (multiple of 8, nonzero), x3 = x0 for the new image.
@@ -238,7 +232,7 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
     let p = match probe {
         Some(p) => p,
         None => {
-            t.extend_from_slice(b"\n\nufs: no vault probe\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nfor fastboot\n");
+            t.extend_from_slice(b"\n\nufs: no vault probe\n\nusb: serving Photon Transport\n     1209:4665\n\nboth volume keys\n= power off\n");
             return t;
         }
     };
@@ -253,7 +247,7 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
     }
     t.extend_from_slice(b"\nwairua: ");
     t.extend_from_slice(if p.wairua_ok == 1 { b"live" } else { b"NO TRNG" });
-    t.extend_from_slice(b"\n\nusb: serving Photon Transport\n     1209:4665\n\nhold both volume keys\nto return to Android\n");
+    t.extend_from_slice(b"\n\nusb: serving Photon Transport\n     1209:4665\n\nboth volume keys\n= power off\n");
     t
 }
 
@@ -299,7 +293,7 @@ pub fn run(mut b: Boot) -> ! {
     // A PT transfer that stops moving for 16 s is a wedged endpoint: report it and leave rather than idling for 512 s.
     let stall_giveup = freq * 16;
     let mut t_pt = t_init;
-    // `display --hold` keeps a message on the panel: the idle exit is off until both volume keys (or a host REBOOT) end the session.
+    // `display --hold` keeps a message on the panel: the idle exit is off until a host REBOOT ends the session (both volume keys still kill it: killswitch.rs).
     let mut hold = false;
 
     // Backing storage for the open inbound transfer (it holds raw slices into these); assigned on every SPEC.
@@ -329,11 +323,6 @@ pub fn run(mut b: Boot) -> ! {
 
     loop {
         platform::pet_watchdogs();
-        let gpa4 = unsafe { read_volatile(GPA4_DAT as *const u32) };
-        let gpa6 = unsafe { read_volatile(GPA6_DAT as *const u32) };
-        if (gpa4 & VOL_DOWN_BIT) == 0 && (gpa6 & VOL_UP_BIT) == 0 {
-            leave(&b, EXIT_BUTTONS, attempts, configured_ever, Some(&usb), &st);
-        }
         let now = cntpct();
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
@@ -537,6 +526,18 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
                                         append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
                                         append_hex(&mut resp, b"USB_ATTEMPTS=", attempts);
+                                        {
+                                            use core::sync::atomic::Ordering::Relaxed;
+                                            let k = &crate::killswitch::REPORT;
+                                            append_hex(&mut resp, b"KILL_GICR_FRAME=", k[0].load(Relaxed));
+                                            append_hex(&mut resp, b"KILL_GICD_CTLR=", k[1].load(Relaxed));
+                                            append_hex(&mut resp, b"KILL_HCR_BEFORE=", k[2].load(Relaxed));
+                                            append_hex(&mut resp, b"KILL_KEYS_IDLE=", k[3].load(Relaxed));
+                                            append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
+                                            let daif: u64;
+                                            unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
+                                            append_hex(&mut resp, b"DAIF=", daif as u32);
+                                        }
                                         unsafe extern "C" {
                                             static _start: u8;
                                         }
@@ -675,6 +676,8 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                             platform::crumb(0xA6);
                                             unsafe {
+                                                // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.
+                                                core::arch::asm!("msr daifset, #2");
                                                 let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
                                                 write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
                                                 let stub = &raw const ferros_reload_stub as usize;

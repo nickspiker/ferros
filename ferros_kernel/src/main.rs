@@ -25,6 +25,9 @@ use core::panic::PanicInfo;
 // Pixel 8 Pro (husky) modules shared by both boot paths: platform services, the USB/PT service, display adoption, the ira/wairua sources and the vault probe.
 #[cfg(feature = "pixel8")]
 mod platform;
+// Vol Up + Vol Down → power off, as the key-press interrupt itself (KILLSWITCH.md).
+#[cfg(feature = "pixel8")]
+mod killswitch;
 #[cfg(feature = "pixel8")]
 mod service;
 #[cfg(feature = "pixel8")]
@@ -367,7 +370,7 @@ _m1_entry:
 .Lvectors:
     b       .Lexc_recover          // EL1t sync
     .balign 0x80
-    b .Lhalt                       // EL1t IRQ
+    b       .Lirq                  // EL1t IRQ
     .balign 0x80
     b .Lhalt                       // EL1t FIQ
     .balign 0x80
@@ -376,7 +379,7 @@ _m1_entry:
     .balign 0x80
     b       .Lexc_recover          // EL1h sync
     .balign 0x80
-    b .Lhalt                       // EL1h IRQ
+    b       .Lirq                  // EL1h IRQ (at EL2: current EL, SP_EL2)
     .balign 0x80
     b .Lhalt                       // EL1h FIQ
     .balign 0x80
@@ -399,6 +402,64 @@ _m1_entry:
     b .Lhalt
     .balign 0x80
     b .Lhalt
+
+.balign 16
+// IRQ = the killswitch (ferros_kernel/src/killswitch.rs). Whatever fired, both volume keys held (gpa4-1 and gpa6-2 low, G#154D_0084 / G#154D_00A4) → PSCI SYSTEM_OFF at once: no zeroing, no cleanup (KILLSWITCH.md). Otherwise a key edge clears its EINT pending bits; any other interrupt is switched off at the distributor (ferros polls everything else); then EOI and return. Spurious (INTID >= 1020) returns without EOI. If SYSTEM_OFF ever returns, sit with IRQs masked until the unpetted watchdog resets the SoC.
+.Lirq:
+    stp     x0, x1, [sp, #-32]!
+    stp     x2, x3, [sp, #16]
+    mrs     x0, S3_0_C12_C12_0     // ICC_IAR1_EL1
+    movz    x1, #0x0084
+    movk    x1, #0x154D, lsl #16
+    ldr     w2, [x1]
+    ldr     w3, [x1, #0x20]
+    tst     w2, #2
+    b.ne    .Lirq_live
+    tst     w3, #4
+    b.ne    .Lirq_live
+    movz    x0, #0x0008
+    movk    x0, #0x8400, lsl #16
+    smc     #0
+.Lirq_dead:
+    wfi
+    b       .Lirq_dead
+.Lirq_live:
+    adrp    x1, __irq_count
+    add     x1, x1, :lo12:__irq_count
+    ldr     x2, [x1]
+    add     x2, x2, #1
+    str     x2, [x1]
+    cmp     x0, #1020
+    b.hs    .Lirq_ret
+    cmp     x0, #61
+    b.eq    .Lirq_key
+    cmp     x0, #64
+    b.eq    .Lirq_key
+    cmp     x0, #32
+    b.lo    .Lirq_eoi
+    lsr     x2, x0, #5
+    and     x3, x0, #31
+    mov     w1, #1
+    lsl     w1, w1, w3
+    movz    x3, #0x0180
+    movk    x3, #0x1040, lsl #16
+    str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>
+    b       .Lirq_eoi
+.Lirq_key:
+    movz    x1, #0x0A10
+    movk    x1, #0x154D, lsl #16
+    mov     w2, #2
+    str     w2, [x1]               // EINT_PEND gpa4: vol-down
+    mov     w2, #4
+    str     w2, [x1, #4]           // EINT_PEND gpa6: vol-up
+    dsb     sy
+.Lirq_eoi:
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+.Lirq_ret:
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    eret
 
 .balign 16
 // Synchronous abort: increment count, advance ELR past faulting instruction, eret.
@@ -487,6 +548,9 @@ _m1_entry:
 
 #[unsafe(no_mangle)]
 static mut __exception_count: u64 = 0;
+/// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
+#[unsafe(no_mangle)]
+pub static mut __irq_count: u64 = 0;
 #[unsafe(no_mangle)]
 static mut __boot_el: u64 = 0;
 /// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).
@@ -1102,6 +1166,8 @@ pub(crate) fn pixel8_eusb_phy_init() {
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Killswitch before anything else.
+    killswitch::arm();
     // Init the DRAM bump heap (same as cold boot; __stack_top is inside the carveout for the shim link, so this stays in reserved DRAM).
     unsafe extern "C" { static __stack_top: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
@@ -1120,6 +1186,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Killswitch before anything else.
+    killswitch::arm();
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };

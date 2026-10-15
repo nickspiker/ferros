@@ -1,7 +1,15 @@
 # Killswitch Architecture
 
 ## Mechanism
-Vol Up + Vol Down (held simultaneously) → GPIO poll → PSCI SYSTEM_OFF → PMIC power cut.
+Vol Up + Vol Down (held simultaneously) → key-edge interrupt → PSCI SYSTEM_OFF → PMIC power cut.
+
+On husky (since 2026-10-14, `ferros_kernel/src/killswitch.rs`) the key presses ARE the interrupt; nothing polls:
+- Both keys are always-on GPIOs that can each raise their own GIC SPI (Exynos wakeup EINT): vol-down = gpa4-1 → SPI 29 (INTID 61), vol-up = gpa6-2 → SPI 32 (INTID 64). They interrupt on both edges.
+- `killswitch::arm()` is the first line of `kernel_main` on both boot paths. It powers off at once if both keys are already held. Otherwise it brings up the GIC (distributor group 1, this CPU's redistributor, system-register CPU interface), switches every other interrupt off (ferros polls everything else), routes physical IRQs to EL2 (HCR_EL2.IMO) and unmasks.
+- The handler (`.Lirq` in main.rs) is a few instructions of assembly with no Rust state. Whatever fired, if both keys read held it issues SYSTEM_OFF on the spot, preempting whatever was running: UFS bring-up, the vault, a RUN payload, a wedged loop. Otherwise it clears the key's pending bit (or switches a stray interrupt off) and returns.
+- If SYSTEM_OFF ever returned, it sits with IRQs masked until the unpetted watchdog resets the SoC.
+- RELOAD masks IRQs before its copy stub overwrites the vector table; the new image re-arms first thing.
+- DIAG: `KILL_GICR_FRAME`, `KILL_GICD_CTLR`, `KILL_KEYS_IDLE` (both keys read released after becoming EINTs), `KILL_IRQS` (non-kill interrupts taken), `DAIF`.
 
 ## Why This Works
 
@@ -27,8 +35,10 @@ the SMC. This is unnecessary because:
    accessible from any lower EL (hardware-enforced).
 2. TF-A's SYSTEM_OFF handler runs at EL3. It commands the PMIC over SPMI/I2C
    (~1-10ms for the PMIC to actually cut rails).
-3. Between the SMC and rail collapse, only EL3 code executes. EL3 is ROM-signed
-   firmware — no attack surface.
+3. Between the SMC and rail collapse, only EL3 code executes. EL3 *can* read EL2's
+   registers, but the EL3 code we inspected never does: by whole-system logic it cannot,
+   within the radius of our disassembly and tracing, unless Google ships a different EL3
+   (Google-signed firmware, not ROM).
 4. Once VCORE drops, flip-flop state is physically destroyed. Not zeroed — destroyed.
    The distinction matters: zeroed memory has a known state (all 0). Destroyed
    flip-flops have no state — the output is determined by thermal noise, process
@@ -72,8 +82,6 @@ that no longer hold a defined state. The ciphertext decays naturally as DRAM cap
 discharge (1-4 seconds at room temperature).
 
 ## Future Enhancements
-- **GPIO interrupt (GIC)**: Replace polling with edge-triggered interrupt. Near-zero
-  CPU usage, same response time. Wake from WFI.
 - **NFC dead man's switch**: BLE/NFC tag proximity keepalive. Tag leaves range → kill.
 - **PMIC watchdog**: Program S2MPG PMIC to hard-cut power if not periodically petted
   by the kernel. Defense against kernel hang/compromise.
@@ -81,8 +89,13 @@ discharge (1-4 seconds at room temperature).
   all cores to halt before the SMC, preventing any core from racing to read keys.
 
 ## Hardware Confirmed On
-- Google Pixel 8 (Tensor G3 / Zuma), EL2, PSCI via Samsung TF-A
-- Kill confirmed: phone powers off immediately, requires manual power-on to restart
+- Google Pixel 8 Pro (husky, Tensor G3 / Zuma), EL2, PSCI via Samsung TF-A
+- Kill confirmed: phone powers off immediately.
+- Interrupt-driven killswitch confirmed 2026-10-14, cold boot (slot b) and Linux handoff:
+  - One key alone = two interrupts (press and release edges), nothing else happens.
+  - Both keys = power cut. It was a true rail drop, not a reset: the next boot found the DRAM report block gone, which every warm or watchdog reset preserves.
+  - Delivery to EL2 was also proven by software-pending each key's SPI (GICD_ISPENDR): handled, counted, cleared, no exception.
+- **With USB power attached the phone powers straight back on:** the BootROM ("Pixel ROM Recovery", 18d1:4f00) enumerated within the same second as the kill. That's the PMIC's power-on-on-VBUS, not the kill failing. Unplugged it stays off until the power button.
 
 ## M1 MacBook Air — Killswitch Plan
 

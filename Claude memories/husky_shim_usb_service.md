@@ -12,7 +12,7 @@ metadata:
 
 **Loop:** `tools/husky-hotload.sh` (push + /sys/kernel/ferros/stage + `adb reboot ferros`) → ferros on USB as 1209:4665 in ~35 s → `ferros-bridge diag | run <payload.bin> [hex] | reload <flat.bin> | read <addr> [len] [file] | poke <addr> <val> | reboot [fastboot]`. Disk (UFS) stays live, vault opens from the ira. Built by `shim_usb.rs` (default shim entry; `FERROS_SHIM_ENTRY=vault` = old one-shot probe). See [[husky_ferros_probe_boot]], [[ufs_linux_handoff]].
 
-**Never needs hands:** every exit lands in Android with a ramoops report (crumb byte: G#B0 reboot, B1 no enumeration in 64 s, B2 512 s idle, B3 fastboot, B5 both volume keys, B6 16 s mid-transfer PT stall); faults → fault sink; hangs → cluster watchdog. Nothing armed at boot. Kernel prints the whole result block as `ferros: r[00..31]` (layout documented on `leave()` in shim_usb.rs).
+**Never needs hands:** every exit lands in Android with a ramoops report (crumb byte: G#B0 reboot, B1 no enumeration in 64 s, B2 512 s idle, B3 fastboot, (B5 both volume keys — retired 2026-10-14: the keys are now the killswitch, power off, no report), B6 16 s mid-transfer PT stall); faults → fault sink; hangs → cluster watchdog. Nothing armed at boot. Kernel prints the whole result block as `ferros: r[00..31]` (layout documented on `leave()` in shim_usb.rs).
 
 **Facts measured on hardware (don't re-derive):**
 - Enumeration is first-try in the handoff (cold boot needed a retry watchdog) — Linux already applied the eUSB repeater tune.

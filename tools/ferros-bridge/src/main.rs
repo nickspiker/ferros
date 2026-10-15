@@ -59,7 +59,7 @@ fn usage() {
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
     eprintln!("  store put <key> <text|@file> | get <key> [out] | ls | rm <key>   Vault by logical key (shim)");
-    eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until both volume keys)");
+    eprintln!("  display [--hold] [text]  Render text on the panel (shim after a --live handoff; '\\n' = newline; --hold keeps it up until a REBOOT; both volume keys = killswitch power-off)");
 }
 
 #[tokio::main]
@@ -97,7 +97,7 @@ async fn main() {
         }
         "store" => cmd_store(&args[2..]).await,
         "display" => {
-            // --hold: keep the message up (the device's 512 s idle exit is disabled until both volume keys or a REBOOT).
+            // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);
             let idx = if hold { 3 } else { 2 };
             let text = args.get(idx).cloned().unwrap_or_else(|| "ferros".to_string()).replace("\\n", "\n");
