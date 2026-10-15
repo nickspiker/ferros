@@ -8,11 +8,66 @@
 ## Overview
 
 The kernel boot sequence is the second stage after the seed verifies and jumps.
-It transforms raw hardware into a running system by scanning the vault root ring, restoring state, and launching userspace.
+It transforms raw hardware into a running system by scanning the vault root ring, restoring state, and launching the first process.
+On husky it is split by the "Ready?" gate below: plumbing before the owner's press, the boot proper after it.
 The boot sequence is deterministic: given the same vault root state, it produces the same running system.
 
 Targets: **M1 MacBook Air** (active, boots via m1n1 proxy) and **Pixel 8 / Tensor G3** (primary, bring-up in progress).
 The Fairphone 5 (QCM6490) is dropped; FP5-specific steps below are marked legacy and are not built.
+
+---
+
+## The "Ready?" Gate (decided 2026-10-14)
+
+Everything before the gate is vendor plumbing we tolerate; ferros's own boot starts when a human presses the power button.
+
+```
+power on → BootROM → … → ABL (unlocked-bootloader nag) → ferros plumbing → "Ready?"
+                                                                       │
+                                            power key PRESSED (not released)
+                                                                       ▼
+                                                       boot, officially: the <1 s budget starts here
+```
+
+### The screen
+- Black, a green triangle on the right edge pointing at the power button, and white "Ready?" in the top third, thin (Oxanium ExtraLight).
+- The text is rasterised at build time on the host into an alpha bitmap; the kernel only blits it (no font engine in the kernel). The triangle's height is calibrated by eye against the physical button.
+- The press is an interrupt, like the killswitch: the power key is gpa4-0 on the always-on bank (SPI 28, INTID 60), armed on its falling edge (the key is active low); the release is ignored.
+
+### Before the press: only what it takes to ask
+1. Integrity of the code about to draw the screen (see Boot integrity below; on husky that is ABL's job).
+2. The killswitch (armed first, as always).
+3. The static cache map (KERNEL.md, Execution Model: identity, written once).
+4. The panel and the "Ready?" screen.
+5. The buttons, with the power key armed.
+
+Nothing that talks to the outside world or holds the self runs before the owner says go.
+The USB controller is held halted and its PHY in reset, so nothing ABL left behind can answer either.
+
+### After the press: the boot
+UFS power-on and link, the vault and the *ira*, slot marking, USB data, radios, services, the first process.
+The disk and the identity are never touched without a human present.
+
+### What is not affected
+- **Charging.** Power is not data: the charger and USB-C controller chips negotiate and charge on their own, without the main CPU, so a phone at "Ready?" charges normally. Only the AP's USB data path stays dark.
+- **The killswitch.** Vol Up + Vol Down works before, during and after the gate.
+
+### Dev builds: auto-press
+Dev builds show "Ready?" and proceed as if the key were pressed; production builds compile that out and wait for the key.
+Every line after the gate is identical in both, and nothing new listens on any interface: flashing a dev build is itself the developer's consent.
+There is deliberately no remote "press" (no USB bypass): USB data does not exist before the press.
+
+### Hot reload skips the gate
+A RELOAD swaps code on a device that has already booted; it is not a boot.
+
+### Boot integrity: no runtime hashing by ferros, ever
+- **Data at rest is not the reason to check.** The data is bound to PIPE: separate or damage PIPE and it is gone, whatever code boots.
+- **Corruption is one reason:** a flipped bit in code that writes the vault could damage data quietly.
+- **The evil maid is the other:** with the bootloader unlocked, anyone holding the phone for a minute can flash a modified ferros. It draws a perfect "Ready?", the owner presses and unlocks, and from then on it has full use of PIPE — PIPE answers whatever host asks and cannot see which code is asking. The check protects **who gets to ask PIPE**, not the data.
+- **ferros cannot check itself**: a replaced ferros simply skips the check. The anchor must be something the attacker cannot reflash. On husky that is Google's chain: relock the bootloader with **the owner's own key** (`avb_custom_key`, see Locked-bootloader endgame). ABL then verifies our image on every boot, in the vendor phase before "Ready?", so it costs nothing in our budget; it catches corruption for free, and flashing anything else requires an unlock, which wipes the device.
+- **The first lock is trust-on-first-use**, the same bootstrap problem as HTTPS: whoever locks first picks the key. The backstop is the human: ABL's warning screen shows the ID of the key it verified on every boot, and the owner compares it with what they recorded when *they* generated the key. Like SSH and better than HTTPS, there is no CA to compromise: the owner is the CA. Each owner generates their own key; there is no single ferros-project key.
+- **On Glyph silicon** the bootstrap becomes PIPE's genesis ceremony (*whakaira*): the trust anchor is born in the owner's hands instead of inherited from a vendor's lock. The first-trust moment cannot be removed, only made a ceremony the owner performs.
+- **Not now:** we stay unlocked while we are flashing constantly. Until we relock, an evil maid with a minute and a cable wins, PIPE or not.
 
 ---
 
@@ -202,6 +257,7 @@ ABL (Google's, immovable)
 - Pixel supports one `avb_custom_key` — a re-locked dual boot requires ferros seed and the Android build signed by the **same** key.
   Stock GrapheneOS (their key) cannot share a locked device with ferros (our key); a self-signed Graphene build can.
 - Dev stays unlocked (orange state). **Never lock until the signed chain is proven** — and macOS/stock recovery escape hatches stay per the M1 rules.
+- Why lock at all, and why with the owner's own key: see Boot integrity under the "Ready?" gate (evil maid, trust-on-first-use, the on-screen key ID).
 
 ---
 
@@ -279,9 +335,10 @@ Stage 4: GIC + Interrupts   <10ms    (register config)
 Stage 5: USB Init           <100ms   (PHY + enumeration)
 Stage 6: Capability Restore <50ms    (deserialize + verify)
 Stage 7: Process Restore    <100ms   (depends on snapshot size)
-Stage 8: Userspace Launch   <100ms   (server spawning)
+Stage 8: Process Launch     <100ms   (server spawning)
 
-Total target: <500ms from seed jump to userspace running
+Total target: <500ms from seed jump to the first process running
+              (husky: measured from the "Ready?" press; the plumbing stages before it are not counted)
               <1s including ABL + seed
               (excludes 10s unlocked-bootloader nag — eliminated when locked with our key)
 
