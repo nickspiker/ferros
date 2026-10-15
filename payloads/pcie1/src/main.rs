@@ -888,7 +888,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -965,6 +965,12 @@ struct Msgbuf {
     linked: bool,
     keyed: bool,
     join_failed: bool,
+    /// H2D rxpost (ring 1, 512 × 32 B at +G#1000, index slot 1) write index and sequence; D2H rx complete (ring 4, 512 × 40 B at +G#C000, index slot 2) read index and sequence; frames seen.
+    rxp_w: u32,
+    rxp_seq: u32,
+    rx_rd: u32,
+    rx_dseq: u32,
+    rx_frames: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -975,6 +981,9 @@ struct Target {
     /// The AP's RSN group cipher suite (OUI + type) and whether it can do management frame protection (RSN capabilities bit 7).
     group: [u8; 4],
     mfpc: bool,
+    /// Control channel (bss_info +88) and whether it is 5 GHz.
+    ctl: u8,
+    five: bool,
 }
 
 impl Msgbuf {
@@ -995,6 +1004,52 @@ impl Msgbuf {
         unsafe { core::arch::asm!("dsb sy") };
         d.tcm_wr(self.h2d_w, self.w % 64);
         d.wr(MEM, 0x2140, 0xFF00_0000 | (self.w % 64));
+    }
+    /// Post receive buffer `i` (2 KiB at +G#4_0000 + i × G#800) on the rxpost ring: host_rxbuf_post_t — header (type G#11, request id = G#1000 + i), u16 metadata length 0, u16 data length, rsvd, metadata address 0, data address.
+    fn post_rx(&mut self, i: u32) {
+        let phase = if (self.rxp_w / 512) % 2 == 0 { 0x80 } else { 0 };
+        let a = self.dma + 0x1000 + 32 * (self.rxp_w % 512);
+        let buf = self.dma + 0x4_0000 + 0x800 * i;
+        let words = [0x11 | phase << 16 | (self.rxp_seq % 253) << 24, 0x1000 + i, 2048 << 16, 0, 0, 0, buf, 0];
+        for (k, v) in words.iter().enumerate() {
+            dw(a + 4 * k as u32, *v);
+        }
+        self.rxp_seq += 1;
+        self.rxp_w += 1;
+    }
+    /// Publish posted rx buffers: rxpost write index (H2D slot 1), doorbell 0 for ring 1.
+    fn ring_rx(&mut self, d: &mut Drv) {
+        unsafe { core::arch::asm!("dsb sy") };
+        d.tcm_wr(self.h2d_w + 4, self.rxp_w % 512);
+        d.wr(MEM, 0x2140, 0xFF00_0000 | 1 << 16 | (self.rxp_w % 512));
+    }
+    /// Consume rx completions (host_rxbuf_cmpl_t, type G#12: request id = buffer, data_len +14, data_offset +16): log length and EtherType, re-post the buffer.
+    fn pump_rx(&mut self, d: &mut Drv) {
+        let wi = d.tcm_rd(self.d2h_w + 8);
+        while self.rx_rd != wi {
+            let a = self.dma + 0xC000 + 40 * self.rx_rd;
+            let words: [u32; 10] = core::array::from_fn(|k| dr(a + 4 * k as u32));
+            if words[0] >> 24 != self.rx_dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+                break;
+            }
+            self.rx_dseq += 1;
+            self.rx_rd = (self.rx_rd + 1) % 512;
+            d.tcm_wr(self.d2h_r + 8, self.rx_rd);
+            let i = words[1].wrapping_sub(0x1000);
+            let len = words[3] >> 16;
+            let off = words[4] & 0xFFFF;
+            self.rx_frames += 1;
+            if i < 64 {
+                let p = self.dma + 0x4_0000 + 0x800 * i + off;
+                d.put(b"rx frame len ");
+                d.dec(len);
+                d.put(b" ethertype ");
+                d.hex(be16(p + 12));
+                d.put(b"\n");
+                self.post_rx(i);
+                self.ring_rx(d);
+            }
+        }
     }
     /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length), its buffer re-posted.
     fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32)> {
@@ -1158,11 +1213,14 @@ impl Msgbuf {
             return;
         }
         let rssi = (dr32u(bi + 76) >> 16) as u16 as i16;
-        if self.target.map(|t| t.rssi >= rssi).unwrap_or(false) {
+        let five = cs & 0xC000 == 0xC000;
+        // Prefer 5 GHz (a first 2.4 GHz join associated, then lost the link waiting for the first beacon — WLC_E_LINK reason 8; 2.4 GHz shares the antenna with the chip's still-uninitialised Bluetooth), then signal: 5 GHz wins unless more than 15 dB weaker.
+        let score = |five: bool, rssi: i16| rssi as i32 + if five { 15 } else { 0 };
+        if self.target.map(|t| score(t.five, t.rssi) >= score(five, rssi)).unwrap_or(false) {
             return;
         }
         let bssid: [u8; 6] = core::array::from_fn(|k| dbr(bi + 8 + k as u32));
-        self.target = Some(Target { bssid, chanspec: cs, rssi, group, mfpc });
+        self.target = Some(Target { bssid, chanspec: cs, rssi, group, mfpc, ctl: dbr(bi + 88), five });
     }
     /// One ioctl: `in_len` bytes at the request buffer go to the firmware, up to `out_len` come back in a posted response buffer. Waits for the completion (3 s), handling events meanwhile.
     fn ioctl(&mut self, d: &mut Drv, cmd: u32, req_buf: u32, in_len: u32, out_len: u32) -> Option<(u32, u32, u32)> {
@@ -1329,11 +1387,16 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
         d.flush();
         return;
     };
-    d.put(b"joining: ch ");
-    d.dec(t.chanspec & 0xFF);
+    d.put(if t.five { b"joining: 5G ch " } else { b"joining: 2G ch " });
+    d.dec(t.ctl as u32);
     d.put(b" rssi -");
     d.dec((-(t.rssi as i32)).max(0) as u32);
     d.put(if t.mfpc { b" (AP can do MFP)\n" } else { b"\n" });
+    // Receive buffers first: the firmware runs split RX (SPLITRX_MODE 4), so data frames — the AP's EAPOL handshake messages among them — land in host buffers from the rxpost ring; with none posted the handshake never starts (seen: associated, no PSK_SUP, beacon loss after 15 s).
+    for i in 0..64 {
+        m.post_rx(i);
+    }
+    m.ring_rx(d);
     let r = m.set_int(d, b"sup_wpa", 1);
     d.kv(b"sup_wpa", r);
     let r = m.set_int(d, b"roam_off", 1);
@@ -1406,12 +1469,14 @@ fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
     let ts = d.now();
     while !m.keyed && !m.join_failed && d.now().wrapping_sub(ts) < 15 * d.freq {
         let _ = m.pump(d);
+        m.pump_rx(d);
         if d.n > 2000 {
             d.flush();
         }
         d.us(2000);
     }
     d.kv(b"join_ms", ((d.now().wrapping_sub(ts) * 1000) / d.freq) as u32);
+    d.kv(b"rx frames", m.rx_frames);
     if m.keyed {
         d.put(b"ASSOCIATED AND KEYED (WPA2-PSK, firmware supplicant)\n");
         // scb_val_t: i32 val, u8 ea[6], pad — WLC_GET_RSSI (127).
