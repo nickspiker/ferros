@@ -3,4 +3,5 @@
 
 [target.aarch64-unknown-none]
 # The process ABI (KERNEL.md): x28 = the process's arc base, x27 = its arc mask — set by the kernel at entry and never written by compiled code. Reserve both so rustc never allocates them (seen 2026-10-15: without this, compiled code used x28 as a scratch register and a process reading its arc base mid-call got garbage). The precompiled core/compiler_builtins treat them as callee-saved (restored before returning).
-rustflags = ["-C", "target-feature=+reserve-x27,+reserve-x28"]
+# The CPU's measured features (CPU-FEATURES.md): everything the sandbox checker already understands. Not yet: sve2 (no SVE masking rules), mte, pauth (emits retaa/braa), rand (RNDR is absent on these cores).
+rustflags = ["-C", "target-feature=+reserve-x24,+reserve-x25,+reserve-x26,+reserve-x27,+reserve-x28,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fp16,+fhm,+i8mm,+bf16,+rcpc,+jsconv,+fcma,+flagm,+sb,+ssbs,+frintts,+dit"]

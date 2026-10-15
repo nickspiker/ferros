@@ -7,6 +7,7 @@ metadata:
 
 Decided with the owner 2026-10-15:
 - **Trust model A**: ferros compiles every program it runs (code arrives as bytecode; the on-device toka compiler emits masked native code). "No reason to trust pre-compiled capsules." So no off-device LLVM masking pass and no NaCl-style verifier — masking lives in the on-device compiler.
+- **Priority (owner, 2026-10-15): cover the real hardware 1:1 first** — the crypto/NEON/wide/SVE2 instructions these cores implement (CPU-FEATURES.md, read from the ID registers: AES+PMULL, SHA1/2-512/3, SM3/4, CRC32, LSE incl. 128-bit CASP, DotProd, I8MM, FP16/BF16, SVE2+crypto, MTE3, PAuth2/BTI; no RNDR). spirix Scalar/Circle instructions wait until hardware runs them natively.
 - **toka bytecode = WASM forked and extended**: fork LLVM's WebAssembly backend + rustc's wasm target into a toka target and grow both ends together — native i128/u128, 64-bit addresses (from memory64), then spirix Scalar / Circle as first-class value types with their ops. Plain WASM stays a valid subset (other languages' ingress).
 - **Native `aarch64` capsule sections are dev-only** (hardware bring-up); a production build should refuse them. A cheap `aarch64-unknown-ferros` target spec (ABI: x27/x28 reserved, no rodata pointer tables) is still useful for the kernel and bring-up drivers.
 - Order agreed earlier stands: native bring-up through the first Photon beam, then the toka pipeline; drivers stay behind `ferros_sys` so the move is a recompile.

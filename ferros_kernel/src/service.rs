@@ -491,6 +491,34 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cpu" {
+                                            // The CPU's own feature registers (this core): what the instruction set offers, read rather than assumed — the 1:1 target for codegen, the checker and toka. 64-bit values as HI/LO pairs.
+                                            macro_rules! id {
+                                                ($name:literal, $reg:literal) => {{
+                                                    let v: u64;
+                                                    unsafe { core::arch::asm!(concat!("mrs {}, ", $reg), out(reg) v) };
+                                                    append_hex(&mut resp, concat!($name, "_HI=").as_bytes(), (v >> 32) as u32);
+                                                    append_hex(&mut resp, concat!($name, "_LO=").as_bytes(), v as u32);
+                                                }};
+                                            }
+                                            id!("MIDR", "midr_el1");
+                                            id!("MPIDR", "mpidr_el1");
+                                            id!("ISAR0", "id_aa64isar0_el1");
+                                            id!("ISAR1", "id_aa64isar1_el1");
+                                            id!("ISAR2", "s3_0_c0_c6_2");
+                                            id!("PFR0", "id_aa64pfr0_el1");
+                                            id!("PFR1", "id_aa64pfr1_el1");
+                                            id!("ZFR0", "s3_0_c0_c4_4");
+                                            id!("SMFR0", "s3_0_c0_c4_5");
+                                            id!("MMFR0", "id_aa64mmfr0_el1");
+                                            id!("MMFR1", "id_aa64mmfr1_el1");
+                                            id!("MMFR2", "id_aa64mmfr2_el1");
+                                            id!("DFR0", "id_aa64dfr0_el1");
+                                            id!("CTR", "ctr_el0");
+                                            id!("DCZID", "dczid_el0");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"bench" {
                                             // Memory speed, for the cache map's before/after: 8 copies of 512 KiB (4 MiB moved) and BLAKE3 over 512 KiB, timed in microseconds, plus SCTLR_EL2 (M b0, C b2, I b12).
                                             let n = 512 * 1024;
