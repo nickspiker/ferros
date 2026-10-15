@@ -127,18 +127,18 @@ spaghettify. There are ~10^80 atoms in the observable universe.
 
 **Spawn** is the moment the kernel instantiates a process.
 
-In ISOMEM terms: the kernel allocates a region — an offset and extent
+In ISOMEM terms: the kernel allocates an arc — an offset and extent
 in the continuous two's complement address space, randomly positioned,
-cryptographically isolated from every other region. The process receives
-this region at spawn. It is that region, for this instance, until it dies.
+cryptographically isolated from every other arc. The process receives
+this arc at spawn. It is that arc, for this instance, until it dies.
 
 Spawn is not exec. Exec replaces a process image. Spawn creates a new
-region, a new capability space, a new *ihi*. Nothing is inherited by
+arc, a new capability space, a new *ihi*. Nothing is inherited by
 default. Everything must be explicitly granted.
 
 At spawn, the oracle runs. The ihi is computed and handed to the
 process. This is the only moment it can be computed — after signature
-verification passes, after the region is allocated, before the first
+verification passes, after the arc is allocated, before the first
 instruction executes.
 
 ---
@@ -288,7 +288,7 @@ attack. Cold boot, power analysis, bus interception, memory forensics.
 
 ferros oracle has none of these surfaces because the secret has no
 address. The ihi is computed transiently and handed to the
-process. After spawn, it exists only in the process's region — which
+process. After spawn, it exists only in the process's arc — which
 is itself isolated by ISOMEM. The computation is gone. The input is
 gone. What remains is what was always going to be recognized.
 
@@ -305,7 +305,7 @@ strong.
 
 ```
 0. Oracle:      hardware-bound process identity — ihi
-1. Memory:      region allocation, grants, bounds enforcement (ISOMEM)
+1. Memory:      arc allocation, grants, bounds enforcement (ISOMEM)
 2. Scheduling:  time slicing, IPC dispatch
 3. IPC:         capability-gated message passing
 4. Boot:        seed verification, vault root scan, state restore

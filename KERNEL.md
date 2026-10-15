@@ -700,7 +700,7 @@ If copy-back interrupted by kill:
 ```rust
 struct Header {
     generation:       u64,            // monotonic, total ordering
-    ring_state:       RingSnapshot,   // all process region offsets
+    ring_state:       RingSnapshot,   // all process arc offsets
     capability_state: CSpaceSnapshot, // all valid caps at this instant
     entry_points:     Vec<VirtAddr>,  // per-process resume addresses
     storage_map:      RingFSMap,      // current block allocation state

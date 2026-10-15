@@ -8,11 +8,11 @@ Linux:   demand paging, swapping, copy-on-write fork,
          page reclaim, OOM killer,
          thousands of lines, dozens of CVEs
 
-ferros:  process gets a region, hardware gets a grant
+ferros:  process gets an arc, hardware gets a grant
          that's the entire page table story
          no swapping (killswitch ready, no swap partition)
-         no demand paging (region is always valid)
-         no OOM killer (region bounded at spawn)
+         no demand paging (arc is always valid)
+         no OOM killer (arc bounded at spawn)
 ```
 
 **Fork:**
@@ -22,7 +22,7 @@ Linux:   fork() copies entire process address space
          Spectre/Meltdown: fundamentally about fork + shared memory
 
 ferros:  no fork()
-         new process: new region, new CSpace, new keys
+         new process: new arc, new CSpace, new keys
          no shared state by default
          no fork-related vulnerability class
 ```
