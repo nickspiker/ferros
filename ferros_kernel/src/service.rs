@@ -261,7 +261,9 @@ pub fn run(mut b: Boot) -> ! {
     let exc_start = crate::exception_count();
 
     // Boot screen: after a --live handoff DECON is still running, so show where this generation stands before USB even comes up (show() touches nothing when the DPU is powered down).
-    let _ = crate::display::show(&status_text(b.kind, generation, b.probe.as_ref()), cntfrq());
+    if !crate::checklist::active() {
+        let _ = crate::display::show(&status_text(b.kind, generation, b.probe.as_ref()), cntfrq());
+    }
 
     let dma = open_usb_dma_path();
     platform::crumb(0xA1);
@@ -414,6 +416,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
                 if usb.is_configured() && !configured_ever {
                     configured_ever = true;
+                    crate::checklist::mark(crate::checklist::Item::Usb);
                     t_command = cntpct();
                     platform::crumb(0xA4);
                 }

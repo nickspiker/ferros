@@ -217,6 +217,7 @@ pub struct Console {
     rows: usize,   // max rows (within margins)
     fg: u32,       // foreground color (XRGB)
     bg: u32,       // background color (XRGB)
+    scale: usize,  // glyph magnification (each font pixel becomes scale x scale)
 }
 
 impl Console {
@@ -249,7 +250,27 @@ impl Console {
             rows: text_h / (GLYPH_H * Self::SCALE),
             fg,
             bg,
+            scale: Self::SCALE,
         }
+    }
+
+    /// Change the glyph magnification; the cursor is kept and the text grid recomputed.
+    pub fn set_scale(&mut self, scale: usize) {
+        let scale = scale.max(1);
+        self.cols = self.cols * GLYPH_W * self.scale / (GLYPH_W * scale);
+        self.rows = self.rows * GLYPH_H * self.scale / (GLYPH_H * scale);
+        self.scale = scale;
+    }
+
+    /// Change the foreground color for the text that follows.
+    pub fn set_fg(&mut self, fg: u32) {
+        self.fg = fg;
+    }
+
+    /// Move the cursor to a text position.
+    pub fn goto(&mut self, col: usize, row: usize) {
+        self.col = col.min(self.cols);
+        self.row = row.min(self.rows.saturating_sub(1));
     }
 
     /// Clear the entire screen with the background color.
@@ -265,8 +286,10 @@ impl Console {
         self.row = 0;
     }
 
-    /// Draw a single character at text position (col, row) within the margin area. Scale factor 2 = double size.
+    /// Default glyph magnification (2 = double size); `set_scale` changes it per console.
     const SCALE: usize = 2;
+
+    /// Draw a single character at text position (col, row) within the margin area.
 
     fn draw_char(&self, ch: u8, col: usize, row: usize) {
         let glyph = if ch >= FONT_FIRST && ch <= FONT_LAST {
@@ -275,7 +298,7 @@ impl Console {
             &FONT[0]
         };
 
-        let s = Self::SCALE;
+        let s = self.scale;
         let px = self.x_off + col * GLYPH_W * s;
         let py = self.y_off + row * GLYPH_H * s;
 
@@ -298,9 +321,9 @@ impl Console {
 
     /// Scroll the text area up by one text row (within margins).
     fn scroll_up(&mut self) {
-        let line_h = GLYPH_H * Self::SCALE;
-        let text_h = self.rows * GLYPH_H * Self::SCALE;
-        let x_end = self.x_off + self.cols * GLYPH_W * Self::SCALE;
+        let line_h = GLYPH_H * self.scale;
+        let text_h = self.rows * GLYPH_H * self.scale;
+        let x_end = self.x_off + self.cols * GLYPH_W * self.scale;
         // Move rows 1..rows up to 0..rows-1
         for y in 0..(text_h - line_h) {
             let src_y = self.y_off + y + line_h;

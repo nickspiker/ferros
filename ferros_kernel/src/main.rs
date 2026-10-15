@@ -48,6 +48,9 @@ mod cold_ufs;
 // Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 mod slot;
+// Bring-up checklist on the panel: red until done, green once done.
+#[cfg(feature = "pixel8")]
+mod checklist;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;
@@ -1231,18 +1234,34 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     platform::crumb(0xC1);
 
+    // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
+    checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+
     // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
     let t_ufs = platform::cntpct();
     let link_up = cold_ufs::bring_up();
     let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
+    if link_up {
+        checklist::mark(checklist::Item::Disk);
+    }
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
     let (probe, store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
+    if probe.verified == 1 {
+        checklist::mark(checklist::Item::Vault);
+    }
+    if probe.opened == 1 && probe.wairua_ok == 1 {
+        checklist::mark(checklist::Item::Ira);
+    }
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
-        slot::mark_booted_slot(dtb_addr)
+        let m = slot::mark_booted_slot(dtb_addr);
+        if m.result == slot::MARKED || m.result == slot::ALREADY {
+            checklist::mark(checklist::Item::Slot);
+        }
+        m
     } else {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };

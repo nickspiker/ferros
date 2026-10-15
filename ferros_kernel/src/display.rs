@@ -91,25 +91,54 @@ fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
 }
 
 /// Paint `text` (lines separated by '\n') on the panel. Returns a register report (one LABEL=G#value per line) whatever happens, so each step can be checked without seeing the screen.
+/// The adopted base layer: a physically contiguous XRGB8888 surface the CPU writes directly, and what it takes to push a frame.
+pub struct Panel {
+    /// Physical address of the first pixel.
+    pub fb: usize,
+    pub width: usize,
+    /// Rows reachable through `fb` (the physically contiguous prefix of the surface).
+    pub rows: usize,
+    /// Row pitch in pixels.
+    pub stride: usize,
+    up: u32,
+    cntfrq: u64,
+}
+
+/// Put `text` on the panel (bridge DISPLAY): adopt, amber console, one frame. Returns the adoption report.
 pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     let mut rep = alloc::vec::Vec::new();
+    let Some(panel) = adopt(cntfrq, &mut rep) else {
+        return rep;
+    };
+    unsafe {
+        let mut con = panel.console(0x00FF_B000);
+        for &b in text {
+            con.putc(b);
+        }
+    }
+    panel.present(&mut rep);
+    rep
+}
+
+/// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear XRGB8888, turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.
+pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     // Never touch a powered-down DPU: on husky a CPU read of DECON with the DPU domain off returns 0 but leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever (measured: the boot screen's single DECON_VERSION read in the reboot path made DIAG's PMU readback hang). The domain state is read through the EL3 monitor, which is safe: word 0 of each PMU power-domain block is 1 when on (pd-dpub G#1546_1D00, pd-dpuf0 G#1546_1D80, pd-dpuf1 G#1546_1E00; other offsets are not whitelisted and return -EINVAL).
     let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::platform::priv_reg(a, false, 0));
-    append_hex(&mut rep, b"PD_DPUB=", pd[0] as u32);
-    append_hex(&mut rep, b"PD_DPUF0=", pd[1] as u32);
-    append_hex(&mut rep, b"PD_DPUF1=", pd[2] as u32);
+    append_hex(rep, b"PD_DPUB=", pd[0] as u32);
+    append_hex(rep, b"PD_DPUF0=", pd[1] as u32);
+    append_hex(rep, b"PD_DPUF1=", pd[2] as u32);
     if pd.iter().any(|&v| v != 1) {
         rep.extend_from_slice(b"DPU powered down (hand off with --live so DECON is still running)\n");
-        return rep;
+        return None;
     }
     let version = rd(DECON0 + DECON_VERSION);
-    append_hex(&mut rep, b"DECON_VERSION=", version);
+    append_hex(rep, b"DECON_VERSION=", version);
     if version != DECON_V7_6 {
         rep.extend_from_slice(b"DPU not powered (hand off with --live so DECON is still running)\n");
-        return rep;
+        return None;
     }
-    append_hex(&mut rep, b"GLOBAL_CON=", rd(DECON0 + GLOBAL_CON));
-    append_hex(&mut rep, b"TRIG_CON_BEFORE=", rd(DECON0 + TRIG_CON));
+    append_hex(rep, b"GLOBAL_CON=", rd(DECON0 + GLOBAL_CON));
+    append_hex(rep, b"TRIG_CON_BEFORE=", rd(DECON0 + TRIG_CON));
 
     // Base window = the first enabled window that covers the whole screen with an unscaled layer (DPP image size == window size), on a channel ferros can drive; every other window is switched off. Android's stack varies with what is on screen (e.g. a full-screen window can be a 209x466 wallpaper scaled up by the DPP), so this is chosen per call. The screen size is the largest window end seen.
     let mut enabled_mask = 0u32;
@@ -140,21 +169,21 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
             }
         }
     }
-    append_hex(&mut rep, b"WINDOWS_ENABLED=", enabled_mask);
+    append_hex(rep, b"WINDOWS_ENABLED=", enabled_mask);
     let (win, ch) = match base_win {
         Some(b) => b,
         None => {
             rep.extend_from_slice(b"no full-screen unscaled layer on a drivable channel\n");
-            return rep;
+            return None;
         }
     };
-    append_hex(&mut rep, b"BASE_WIN=", win as u32);
-    append_hex(&mut rep, b"BASE_CHANNEL=", ch);
+    append_hex(rep, b"BASE_WIN=", win as u32);
+    append_hex(rep, b"BASE_CHANNEL=", ch);
     let (dpp_base, sysmmu) = match dpp(ch) {
         Some(d) => d,
         None => {
             rep.extend_from_slice(b"base window is on a channel ferros does not drive\n");
-            return rep;
+            return None;
         }
     };
     let img = rd(dpp_base + RDMA_IMG_SIZE);
@@ -165,15 +194,15 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     let first_px = ((src_off >> 16) as usize) * stride + (src_off & 0xFFFF) as usize;
     let iova = rd(dpp_base + RDMA_BASEADDR_P0) as u64 + first_px as u64 * 4;
     let in_ctrl = rd(dpp_base + RDMA_IN_CTRL_0);
-    append_hex(&mut rep, b"WIDTH=", width as u32);
-    append_hex(&mut rep, b"HEIGHT=", height as u32);
-    append_hex(&mut rep, b"STRIDE=", stride as u32);
-    append_hex(&mut rep, b"SRC_OFFSET=", src_off);
-    append_hex(&mut rep, b"FB_IOVA=", iova as u32);
-    append_hex(&mut rep, b"IN_CTRL_0_BEFORE=", in_ctrl);
+    append_hex(rep, b"WIDTH=", width as u32);
+    append_hex(rep, b"HEIGHT=", height as u32);
+    append_hex(rep, b"STRIDE=", stride as u32);
+    append_hex(rep, b"SRC_OFFSET=", src_off);
+    append_hex(rep, b"FB_IOVA=", iova as u32);
+    append_hex(rep, b"IN_CTRL_0_BEFORE=", in_ctrl);
     if stride < width || width == 0 || height == 0 {
         rep.extend_from_slice(b"implausible geometry\n");
-        return rep;
+        return None;
     }
 
     // Physically contiguous prefix of the surface (whole 1 MiB sections that follow on from the first).
@@ -182,7 +211,7 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
         Some(p) => p,
         None => {
             rep.extend_from_slice(b"FB IOVA not mapped\n");
-            return rep;
+            return None;
         }
     };
     let mut contig = 0usize;
@@ -194,20 +223,15 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
         }
     }
     let contig = contig.min(fb_bytes);
-    append_hex(&mut rep, b"FB_PHYS=", phys0 as u32);
-    append_hex(&mut rep, b"FB_PHYS_HI=", (phys0 >> 32) as u32);
-    append_hex(&mut rep, b"FB_CONTIG_BYTES=", contig as u32);
+    append_hex(rep, b"FB_PHYS=", phys0 as u32);
+    append_hex(rep, b"FB_PHYS_HI=", (phys0 >> 32) as u32);
+    append_hex(rep, b"FB_CONTIG_BYTES=", contig as u32);
 
-    // Pixels: the console over the contiguous rows, background through the mapping for the rest.
+    // Pixels: the whole surface to black — the contiguous prefix directly, the rest through the mapping.
     const BG: u32 = 0x0000_0000;
-    const FG: u32 = 0x00FF_B000; // amber
     let contig_rows = contig / (stride * 4);
-    unsafe {
-        let mut con = ferros_hal::console::Console::new(phys0 as usize as *mut u32, width, contig_rows, stride, FG, BG, (160, 48, 48, 48));
-        con.clear();
-        for &b in text {
-            con.putc(b);
-        }
+    for i in 0..contig_rows * stride {
+        wr(phys0 as usize + i * 4, BG);
     }
     let mut off = contig_rows * stride * 4;
     while off < fb_bytes {
@@ -235,28 +259,43 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
             up |= 1 << w;
         }
     }
-    append_hex(&mut rep, b"IN_CTRL_0_AFTER=", rd(dpp_base + RDMA_IN_CTRL_0));
+    append_hex(rep, b"IN_CTRL_0_AFTER=", rd(dpp_base + RDMA_IN_CTRL_0));
 
-    // One frame: shadow update, unmask the TE trigger, wait for FRAME_COUNT to move (or 1/4 s), mask it again.
-    let f0 = rd(DECON0 + FRAME_COUNT);
-    append_hex(&mut rep, b"FRAME_COUNT_BEFORE=", f0);
-    wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | up);
-    let t = rd(DECON0 + TRIG_CON);
-    wr(DECON0 + TRIG_CON, (t & !HW_TRIG_MASK_DECON) | HW_TRIG_EN);
-    let start: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start) };
-    loop {
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
-        if rd(DECON0 + FRAME_COUNT) != f0 || now.wrapping_sub(start) > cntfrq / 4 {
-            break;
-        }
+    Some(Panel { fb: phys0 as usize, width, rows: contig_rows, stride, up, cntfrq })
+}
+
+impl Panel {
+    /// A console over the panel's contiguous rows (margins clear the rounded corners and the camera hole).
+    ///
+    /// # Safety
+    /// The panel must still be the adopted, live surface.
+    pub unsafe fn console(&self, fg: u32) -> ferros_hal::console::Console {
+        unsafe { ferros_hal::console::Console::new(self.fb as *mut u32, self.width, self.rows, self.stride, fg, 0, (160, 48, 48, 48)) }
     }
-    let t = rd(DECON0 + TRIG_CON);
-    wr(DECON0 + TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
-    append_hex(&mut rep, b"FRAME_COUNT_AFTER=", rd(DECON0 + FRAME_COUNT));
-    append_hex(&mut rep, b"SHD_REG_UP_REQ_AFTER=", rd(DECON0 + SHD_REG_UP_REQ));
-    append_hex(&mut rep, b"DECON_INT_PEND=", rd(DECON0 + DECON_INT_PEND));
-    append_hex(&mut rep, b"TRIG_CON_AFTER=", rd(DECON0 + TRIG_CON));
-    rep
+
+    /// Push one frame: shadow update, unmask the TE trigger, wait for FRAME_COUNT to move (or 1/4 s), mask it again.
+    pub fn present(&self, rep: &mut alloc::vec::Vec<u8>) {
+        let cntfrq = self.cntfrq;
+        let up = self.up;
+        let f0 = rd(DECON0 + FRAME_COUNT);
+        append_hex(rep, b"FRAME_COUNT_BEFORE=", f0);
+        wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | up);
+        let t = rd(DECON0 + TRIG_CON);
+        wr(DECON0 + TRIG_CON, (t & !HW_TRIG_MASK_DECON) | HW_TRIG_EN);
+        let start: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start) };
+        loop {
+            let now: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+            if rd(DECON0 + FRAME_COUNT) != f0 || now.wrapping_sub(start) > cntfrq / 4 {
+                break;
+            }
+        }
+        let t = rd(DECON0 + TRIG_CON);
+        wr(DECON0 + TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+        append_hex(rep, b"FRAME_COUNT_AFTER=", rd(DECON0 + FRAME_COUNT));
+        append_hex(rep, b"SHD_REG_UP_REQ_AFTER=", rd(DECON0 + SHD_REG_UP_REQ));
+        append_hex(rep, b"DECON_INT_PEND=", rd(DECON0 + DECON_INT_PEND));
+        append_hex(rep, b"TRIG_CON_AFTER=", rd(DECON0 + TRIG_CON));
+    }
 }
