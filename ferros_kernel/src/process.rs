@@ -2,10 +2,14 @@
 //!
 //! A process is one arc — a power-of-two, aligned span of the arc pool, zeroed when allocated — and a capability space. The kernel enters it with `eret` to EL0 holding the arc in two registers the code may not write (x28 = base, x27 = mask); compiled code reaches memory only as `base + (offset & mask)`. EL0 itself takes away the system controls: a process can't mask the killswitch, issue SMCs or touch MMIO, DMA or kernel memory (the static map gives EL0 the pool only).
 //!
-//! The syscall boundary is `svc #0` with the call number in x8:
+//! The syscall boundary is `svc #0` with the call number in x8 (all offsets are arc offsets, masked by the kernel; ERR = all ones):
 //! - 0 `exit(code)` — the process ends; its arc and capabilities cease to exist.
-//! - 1 `call(cap, msg, msg_len, reply, reply_cap)` — present a 32-byte capability token (at arc offset `cap`) and send `msg`; the reply is written at `reply` (at most `reply_cap` bytes) and its length returned in x0. All offsets are arc offsets, masked by the kernel.
+//! - 1 `call(cap, msg, msg_len, reply, reply_cap)` — present a 32-byte token (at arc offset `cap`) holding the send right and send `msg`; the caller blocks until the reply is written at `reply` (at most `reply_cap` bytes); x0 = its length.
+//! - 2 `recv(cap, buf, buf_cap, reply_token)` — wait on an endpoint the token holds the receive right for; x0 = the message length, and a single-use reply token is written at `reply_token` (32 bytes).
+//! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
+//!
+//! IPC is synchronous rendezvous (Module 4): a call to an endpoint whose server waits in recv switches straight to the server with the message copied arc to arc (no shared memory); otherwise the call queues and the caller blocks. Switching processes is swapping the saved register frame the trap path returns through; there is no timer scheduler yet, so a process runs until it blocks or exits (a process that spins forever stops the watchdog pets and the SoC resets).
 //!
 //! Tokens are BLAKE3 keyed with a per-session kernel key (derived from the wairua) over domain, object, rights, nonce and the process's epoch; every spawn gets a new epoch, so a dead process's tokens match nothing.
 //!
@@ -98,13 +102,19 @@ pub fn arc_free(arc: Arc) {
 
 // ---------------------------------------------------------------- capabilities
 
-/// Kernel objects a capability can name. The console is served by the kernel itself: what a process sends it is collected for whoever spawned the process.
+/// Kernel objects a capability can name.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Object {
+    /// Served by the kernel: what a process sends is returned to whoever spawned it.
     Console,
+    /// An IPC endpoint (index into the endpoint table).
+    Endpoint(usize),
+    /// A single-use reply to the process that called (index into the process table).
+    Reply(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
+pub const RIGHT_RECV: u32 = 2;
 
 struct CapEntry {
     token: [u8; 32],
@@ -116,34 +126,96 @@ const CAP_DOMAIN: &[u8] = b"ferros.cap.v1";
 const CAP_KEY_CONTEXT: &str = "ferros.cap-key.v1";
 
 static EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static NONCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The per-session key every token is MACed under (derived from the wairua, so spawning is the first thing that needs KOHI). None = no wairua: refuse to spawn.
 fn cap_key() -> Option<[u8; 32]> {
     crate::wairua::draw().map(|w| blake3::derive_key(CAP_KEY_CONTEXT, &w))
 }
 
-fn mint(key: &[u8; 32], object: Object, rights: u32, nonce: u64, epoch: u64) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_keyed(key);
+fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
+    let key = cap_key().unwrap_or([0u8; 32]);
+    let (tag, id) = match object {
+        Object::Console => (0u8, 0u64),
+        Object::Endpoint(i) => (1, i as u64),
+        Object::Reply(i) => (2, i as u64),
+    };
+    let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mut h = blake3::Hasher::new_keyed(&key);
     h.update(CAP_DOMAIN);
-    h.update(&[object as u8]);
+    h.update(&[tag]);
+    h.update(&id.to_le_bytes());
     h.update(&rights.to_le_bytes());
     h.update(&nonce.to_le_bytes());
     h.update(&epoch.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
-// ---------------------------------------------------------------- processes
+// ---------------------------------------------------------------- processes and endpoints
+
+/// Saved process registers (built by `.Lel0_sync` on exception entry; the same layout is kept per blocked process).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Frame {
+    pub x: [u64; 31],
+    pub sp_el0: u64,
+    pub elr: u64,
+    pub spsr: u64,
+    pub esr: u64,
+    pub far: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Running,
+    Runnable,
+    /// In recv: (endpoint, buf, buf_cap, reply-token offset).
+    Receiving(usize, u64, u64, u64),
+    /// Called and waiting for the reply: (reply offset, reply cap).
+    Calling(u64, u64),
+}
 
 struct Process {
     arc: Arc,
     cspace: Vec<CapEntry>,
-    console: Vec<u8>,
+    frame: Frame,
+    state: State,
+    epoch: u64,
+    name: Vec<u8>,
+    /// The process's console output is at the start of a line (so the next byte gets the name tag).
+    line_start: bool,
 }
 
-static CURRENT: Global<Option<Process>> = Global(UnsafeCell::new(None));
+struct Endpoint {
+    name: Vec<u8>,
+    /// Calls waiting for the server: (caller, message).
+    queue: alloc::collections::VecDeque<(usize, Vec<u8>)>,
+}
 
-fn current() -> Option<&'static mut Process> {
-    unsafe { (*CURRENT.0.get()).as_mut() }
+struct Kernel {
+    procs: Vec<Option<Process>>,
+    endpoints: Vec<Endpoint>,
+    runnable: alloc::collections::VecDeque<usize>,
+    current: Option<usize>,
+    /// Everything any process sent its console during the current kernel entry, each line tagged with the sender's name.
+    console: Vec<u8>,
+    /// Processes that ended during the current entry: (process, exit value).
+    exited: Vec<(usize, u64)>,
+    ipc_round_trips: u32,
+}
+
+static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
+    procs: Vec::new(),
+    endpoints: Vec::new(),
+    runnable: alloc::collections::VecDeque::new(),
+    current: None,
+    console: Vec::new(),
+    exited: Vec::new(),
+    ipc_round_trips: 0,
+}));
+
+fn k() -> &'static mut Kernel {
+    unsafe { &mut *KERNEL.0.get() }
 }
 
 impl Process {
@@ -157,66 +229,179 @@ impl Process {
             unsafe { core::ptr::write_volatile((self.arc.base + ((off as usize + i) & m)) as *mut u8, b) };
         }
     }
-    /// Find the capability for a presented token: compare against every entry without an early exit, so the time taken says nothing about which (if any) matched.
-    fn lookup(&self, token: &[u8]) -> Option<(Object, u32)> {
-        let mut hit: Option<(Object, u32)> = None;
-        for e in &self.cspace {
+    /// Find the capability for a presented token: compare against every entry without an early exit, so the time taken says nothing about which (if any) matched. Returns the entry index.
+    fn lookup(&self, token: &[u8]) -> Option<usize> {
+        let mut hit = None;
+        for (i, e) in self.cspace.iter().enumerate() {
             let mut diff = 0u8;
             for (a, b) in e.token.iter().zip(token.iter()) {
                 diff |= a ^ b;
             }
             if diff == 0 && token.len() == 32 {
-                hit = Some((e.object, e.rights));
+                hit = Some(i);
             }
         }
         hit
     }
 }
 
-/// Saved process registers on exception entry from EL0 (built by `.Lel0_sync`).
-#[repr(C)]
-pub struct Frame {
-    pub x: [u64; 31],
-    pub sp_el0: u64,
-    pub elr: u64,
-    pub spsr: u64,
-    pub esr: u64,
-    pub far: u64,
+/// The endpoint registry for dev spawns: named endpoints created on first mention (`bridge spawn --serve NAME` / `--use NAME`). The spawner's authority stands in for an endpoint-creating capability until there is one.
+fn endpoint(name: &[u8]) -> usize {
+    let kk = k();
+    if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
+        return i;
+    }
+    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new() });
+    kk.endpoints.len() - 1
 }
 
 const SYS_EXIT: u64 = 0;
 const SYS_CALL: u64 = 1;
+const SYS_RECV: u64 = 2;
+const SYS_REPLY: u64 = 3;
 const ERR: u64 = u64::MAX;
+/// Exit value marking a fault: FAULT | EC << 40 | faulting PC (arc offset) << 16 | fault address (arc offset, low 16 bits).
+pub const FAULT: u64 = 0xFA << 56;
+/// What `spawn` reports for a process that is still alive, blocked in recv or call.
+pub const PARKED: u64 = 0xB10C << 48;
 
-/// Called from `.Lel0_sync` for every synchronous exception taken from EL0. Returns 0 to resume the process, 1 to end it (the exit value is then in x0).
+/// Copy the head of an endpoint's queue into a server waiting in recv: message into its buffer, a fresh single-use reply token into its arc and cspace, x0 = message length. The server becomes runnable.
+fn deliver(server: usize, ep: usize) {
+    let kk = k();
+    let Some((caller, msg)) = kk.endpoints[ep].queue.pop_front() else { return };
+    let Some(sp) = kk.procs[server].as_mut() else { return };
+    let State::Receiving(_, buf, cap, tok_off) = sp.state else { return };
+    let n = msg.len().min(cap as usize);
+    sp.write(buf, &msg[..n]);
+    let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
+    sp.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
+    sp.write(tok_off, &token);
+    sp.frame.x[0] = n as u64;
+    sp.state = State::Runnable;
+    kk.runnable.push_back(server);
+}
+
+/// Take the next runnable process (if any) and make it the one the trap returns into.
+fn switch_to_next(f: &mut Frame) -> bool {
+    let kk = k();
+    while let Some(next) = kk.runnable.pop_front() {
+        if let Some(np) = kk.procs[next].as_mut() {
+            if np.state == State::Runnable {
+                np.state = State::Running;
+                *f = np.frame;
+                kk.current = Some(next);
+                return true;
+            }
+        }
+    }
+    kk.current = None;
+    false
+}
+
+/// Called from `.Lel0_sync` for every synchronous exception taken from EL0, with the running process's live frame. Returns 0 to eret through `f` (which may now be another process's frame), 1 to leave EL0 (value in f.x[0]).
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
-    let ec = (f.esr >> 26) & 0x3F;
-    let Some(p) = current() else {
+    let kk = k();
+    let Some(cur) = kk.current else {
         f.x[0] = ERR;
         return 1;
     };
+    let ec = (f.esr >> 26) & 0x3F;
+    let base = kk.procs[cur].as_ref().map(|p| p.arc.base as u64).unwrap_or(0);
+    let end = |f: &mut Frame, value: u64| -> u64 {
+        let kk = k();
+        if let Some(p) = kk.procs[cur].take() {
+            arc_free(p.arc);
+        }
+        kk.exited.push((cur, value));
+        if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+    };
     if ec != 0x15 {
         // Not a syscall: the process faulted. It ends; the kernel carries on.
-        f.x[0] = FAULT | ec << 40 | (f.elr.wrapping_sub(p.arc.base as u64) & 0xFF_FFFF) << 16 | (f.far.wrapping_sub(p.arc.base as u64) & 0xFFFF);
-        return 1;
+        let v = FAULT | ec << 40 | (f.elr.wrapping_sub(base) & 0xFF_FFFF) << 16 | (f.far.wrapping_sub(base) & 0xFFFF);
+        return end(f, v);
     }
+    let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
-        SYS_EXIT => 1,
+        SYS_EXIT => end(f, f.x[0]),
         SYS_CALL => {
             let token = p.read(f.x[0], 32);
-            f.x[0] = match p.lookup(&token) {
+            match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    p.console.extend_from_slice(&msg);
-                    let reply = b"ok";
-                    let n = reply.len().min(f.x[4] as usize);
-                    p.write(f.x[3], &reply[..n]);
-                    n as u64
+                    for &c in &msg {
+                        if p.line_start {
+                            kk.console.extend_from_slice(&p.name);
+                            kk.console.extend_from_slice(b": ");
+                        }
+                        kk.console.push(c);
+                        p.line_start = c == b'\n';
+                    }
+                    let n = 2usize.min(f.x[4] as usize);
+                    p.write(f.x[3], &b"ok"[..n]);
+                    f.x[0] = n as u64;
+                    0
                 }
-                _ => ERR,
-            };
-            0
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
+                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    p.state = State::Calling(f.x[3], f.x[4]);
+                    p.frame = *f;
+                    kk.endpoints[ep].queue.push_back((cur, msg));
+                    // A server already waiting on this endpoint takes it now.
+                    if let Some(server) = kk.procs.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
+                        deliver(server, ep);
+                    }
+                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                }
+                _ => {
+                    f.x[0] = ERR;
+                    0
+                }
+            }
+        }
+        SYS_RECV => {
+            let token = p.read(f.x[0], 32);
+            match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 => {
+                    p.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
+                    p.frame = *f;
+                    if !kk.endpoints[ep].queue.is_empty() {
+                        deliver(cur, ep);
+                    }
+                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                }
+                _ => {
+                    f.x[0] = ERR;
+                    0
+                }
+            }
+        }
+        SYS_REPLY => {
+            let token = p.read(f.x[0], 32);
+            match p.lookup(&token) {
+                Some(i) if matches!(p.cspace[i].object, Object::Reply(_)) => {
+                    let Object::Reply(caller) = p.cspace[i].object else { unreachable!() };
+                    // Single use: the token leaves the cspace before anything else happens.
+                    p.cspace.swap_remove(i);
+                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    if let Some(cp) = kk.procs[caller].as_mut() {
+                        if let State::Calling(roff, rcap) = cp.state {
+                            let n = msg.len().min(rcap as usize);
+                            cp.write(roff, &msg[..n]);
+                            cp.frame.x[0] = n as u64;
+                            cp.state = State::Runnable;
+                            kk.runnable.push_back(caller);
+                            kk.ipc_round_trips += 1;
+                        }
+                    }
+                    f.x[0] = 0;
+                    0
+                }
+                _ => {
+                    f.x[0] = ERR;
+                    0
+                }
+            }
         }
         _ => {
             f.x[0] = ERR;
@@ -225,19 +410,19 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     }
 }
 
-/// Exit value marking a fault: FAULT | EC << 40 | faulting PC (arc offset) << 16 | fault address (arc offset, low 16 bits).
-pub const FAULT: u64 = 0xFA << 56;
-
 unsafe extern "C" {
-    /// main.rs: enter EL0 at `entry` with SP_EL0 = `sp`, x28 = arc base, x27 = arc mask, x0..x2 = args; returns the exit value when the process ends.
+    /// main.rs: enter EL0 at `entry` with SP_EL0 = `sp`, x28 = arc base, x27 = arc mask, x0..x2 = args; returns when no process is left to run (the value of the last to leave, or PARKED).
     fn ferros_el0_enter(entry: usize, sp: usize, base: usize, mask: usize, a0: u64, a1: u64, a2: u64) -> u64;
 }
 
-/// What a finished process left behind.
+/// What a spawn left behind.
 pub struct Outcome {
+    /// The spawned process's exit value, or PARKED if it is still alive (blocked in recv or call).
     pub exit: u64,
+    /// Everything any process sent its console while this spawn ran, tagged with the sender's name.
     pub console: Vec<u8>,
-    pub arc: Arc,
+    /// Completed IPC call/reply round trips during this spawn.
+    pub round_trips: u32,
 }
 
 /// Arc layout: grants page, then code.
@@ -245,27 +430,57 @@ const GRANTS: usize = 0;
 const CODE: usize = 0x1000;
 const STACK: usize = 64 * 1024;
 
-/// Spawn `code` (position-independent, entry at its offset 0) as a process with a console capability, run it to exit, and return what it left. `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(code: &[u8], input: &[u8]) -> Result<Outcome, &'static str> {
+/// A capability to grant at spawn: a dev endpoint by name, to serve (receive) or to use (send).
+pub enum Grant<'a> {
+    Serve(&'a [u8]),
+    Use(&'a [u8]),
+}
+
+/// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
-    let key = cap_key().ok_or("no wairua: refusing to mint capabilities")?;
+    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let arc = arc_alloc(CODE + code.len() + input.len() + STACK).ok_or("arc pool exhausted")?;
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    let console = mint(&key, Object::Console, RIGHT_SEND, 0, epoch);
-    let p = Process { arc, cspace: alloc::vec![CapEntry { token: console, object: Object::Console, rights: RIGHT_SEND }], console: Vec::new() };
-    // Grants page: count, then the tokens (slot 0 = console). Then the code, then the input.
-    p.write(GRANTS as u64, &1u32.to_le_bytes());
-    p.write((GRANTS + 4) as u64, &console);
+    let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
+    for g in grants {
+        let (ep, rights) = match g {
+            Grant::Serve(n) => (endpoint(n), RIGHT_RECV),
+            Grant::Use(n) => (endpoint(n), RIGHT_SEND),
+        };
+        cspace.push(CapEntry { token: mint(Object::Endpoint(ep), rights, epoch), object: Object::Endpoint(ep), rights });
+    }
+    let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0 };
+    let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true };
+    // Grants page: count, then the tokens in slot order. Then the code, then the input.
+    p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
+    for (i, c) in p.cspace.iter().enumerate() {
+        p.write((GRANTS + 4 + 32 * i) as u64, &c.token);
+    }
     p.write(CODE as u64, code);
     let in_off = CODE + code.len();
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code.len());
-    unsafe { *CURRENT.0.get() = Some(p) };
-    let exit = unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
-    let p = unsafe { (*CURRENT.0.get()).take() }.ok_or("process vanished")?;
-    // Its tokens die with its epoch; its arc goes back to the pool (zeroed again on the next allocation).
-    arc_free(p.arc);
-    Ok(Outcome { exit, console: p.console, arc: p.arc })
+    let kk = k();
+    kk.console.clear();
+    kk.exited.clear();
+    let trips0 = kk.ipc_round_trips;
+    let me = match kk.procs.iter().position(|q| q.is_none()) {
+        Some(i) => {
+            kk.procs[i] = Some(p);
+            i
+        }
+        None => {
+            kk.procs.push(Some(p));
+            kk.procs.len() - 1
+        }
+    };
+    kk.current = Some(me);
+    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
+    let kk = k();
+    kk.current = None;
+    let exit = kk.exited.iter().find(|&&(i, _)| i == me).map(|&(_, v)| v).unwrap_or(PARKED);
+    Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
 }

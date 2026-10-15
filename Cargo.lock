@@ -561,6 +561,14 @@ name = "ferros-payload-dispprobe"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-echo-client"
+version = "0.1.0"
+
+[[package]]
+name = "ferros-payload-echo-server"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-hangtest"
 version = "0.1.0"
 

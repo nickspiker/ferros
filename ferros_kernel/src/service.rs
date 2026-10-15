@@ -747,10 +747,24 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                         }
                                     } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
-                                        // Run the staged payload as a process (EL0, own arc, a console capability only); reply [exit][console].
+                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use, len, name)*][input].
                                         if run_ok && run_size > 0 {
                                             let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
-                                            match crate::process::spawn(code, cmd.params) {
+                                            let pr = cmd.params;
+                                            let mut at = 0usize;
+                                            let mut take = |n: usize| { let s = &pr[at.min(pr.len())..(at + n).min(pr.len())]; at += n; s };
+                                            let nl = take(1).first().copied().unwrap_or(0) as usize;
+                                            let name = take(nl);
+                                            let ng = take(1).first().copied().unwrap_or(0) as usize;
+                                            let mut grants = alloc::vec::Vec::new();
+                                            for _ in 0..ng {
+                                                let kind = take(1).first().copied().unwrap_or(0);
+                                                let l = take(1).first().copied().unwrap_or(0) as usize;
+                                                let g = take(l);
+                                                grants.push(if kind == 1 { crate::process::Grant::Serve(g) } else { crate::process::Grant::Use(g) });
+                                            }
+                                            let input = &pr[at.min(pr.len())..];
+                                            match crate::process::spawn(if name.is_empty() { b"proc" } else { name }, code, input, &grants) {
                                                 Ok(o) => {
                                                     use crate::checklist::{mark, Item};
                                                     mark(Item::Arcs);
@@ -760,6 +774,9 @@ pub fn run(mut b: Boot) -> ! {
                                                     if !o.console.is_empty() {
                                                         mark(Item::Syscall);
                                                         mark(Item::Caps);
+                                                    }
+                                                    if o.round_trips > 0 {
+                                                        mark(Item::Ipc);
                                                     }
                                                     let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + o.console.len());
                                                     resp.extend_from_slice(&o.exit.to_le_bytes());

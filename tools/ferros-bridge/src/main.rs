@@ -138,14 +138,35 @@ async fn main() {
                 eprintln!("Usage: ferros-bridge run <payload.bin> [hex-input]");
                 std::process::exit(1);
             }
-            cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::RUN).await;
+            cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::RUN, Vec::new()).await;
         }
         "spawn" => {
+            // spawn <payload.bin> [hex-input] [--name N] [--serve E]... [--use E]...
             if args.len() < 3 {
-                eprintln!("Usage: ferros-bridge spawn <payload.bin> [hex-input]  (runs it as a process: EL0, own arc, console capability only)");
+                eprintln!("Usage: ferros-bridge spawn <payload.bin> [hex-input] [--name N] [--serve ENDPOINT]... [--use ENDPOINT]...  (runs it as a process: EL0, own arc, a console capability plus the endpoint grants)");
                 std::process::exit(1);
             }
-            cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::SPAWN).await;
+            let mut name = String::new();
+            let mut grants: Vec<(u8, String)> = Vec::new();
+            let mut hex = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--name" => { name = args.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+                    "--serve" => { grants.push((1, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    "--use" => { grants.push((2, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    other => { hex = Some(other.to_string()); i += 1; }
+                }
+            }
+            let mut prefix = vec![name.len() as u8];
+            prefix.extend_from_slice(name.as_bytes());
+            prefix.push(grants.len() as u8);
+            for (kind, g) in &grants {
+                prefix.push(*kind);
+                prefix.push(g.len() as u8);
+                prefix.extend_from_slice(g.as_bytes());
+            }
+            cmd_run(&args[2], hex.as_deref(), ferros_pt::command::caps::SPAWN, prefix).await;
         }
         "ping" => {
             let count = args
@@ -384,7 +405,8 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8]) {
+/// `prefix` goes in front of the Exec params (spawn's name + grants header; empty for run).
+async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>) {
     let blob = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
@@ -441,6 +463,11 @@ async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8]) {
     }
 
     // Execute — Exec params become the payload's input
+    let input = {
+        let mut v = prefix;
+        v.extend_from_slice(&input);
+        v
+    };
     let cmd = build_cmd(exec_cap, ferros_pt::Op::Exec, &input);
     if let Err(e) = pt_send(&link, &cmd).await {
         eprintln!("Exec failed: {e}");
