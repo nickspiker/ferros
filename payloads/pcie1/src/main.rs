@@ -166,6 +166,19 @@ impl Drv {
         }
         bad
     }
+    /// Printable bytes of a NUL-terminated string in the DMA region (at most `len`, 512).
+    fn text(&mut self, a: u32, len: u32) {
+        for k in 0..len.min(512) {
+            let c = dbr(a + k);
+            if c == 0 {
+                break;
+            }
+            if (0x20..0x7F).contains(&c) {
+                self.put(&[c]);
+            }
+        }
+        self.put(b"\n");
+    }
     fn flush(&mut self) {
         if self.n > 0 {
             svc(1, self.grants + 4, self.log.as_ptr() as u64 - self.base, self.n as u64, 0xA00, 16);
@@ -858,94 +871,120 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     unsafe { core::arch::asm!("dsb sy") };
     d.wr(MEM, 0x2144, 0x1234_5678);
     let cons_before = d.tcm_rd(cons + 16);
-    // Control submit ring: 8 ioctl response buffers, 8 event buffers, then the ioctl. Each item: cmn_msg_hdr (type, if, flags = phase G#80 on the first lap, epoch = seq % 253 with seq from 254, request id).
-    let mut seq = 254u32;
-    let mut w = 0u32;
-    let mut item = |d: &mut Drv, words: [u32; 10]| {
-        let a = dma + RINGS[0].0 + 40 * w;
-        for (k, v) in words.iter().enumerate() {
-            dw(a + 4 * k as u32, *v);
-        }
-        w += 1;
-        let _ = d;
-    };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0 };
+    // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
-        let e = seq % 253;
-        seq += 1;
-        item(d, [0x0B | 0x80 << 16 | e << 24, 1 + b, 8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
+        m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
     }
     for b in 0..8u32 {
-        let e = seq % 253;
-        seq += 1;
-        item(d, [0x0D | 0x80 << 16 | e << 24, 0x101 + b, 2048, 0, dma + EVENT_BUF + 0x800 * b, 0, 0, 0, 0, 0]);
+        m.post(d, 0x0D, 0x101 + b, [2048, 0, dma + EVENT_BUF + 0x800 * b, 0, 0, 0, 0, 0]);
     }
-    // WLC_GET_VAR (262) "ver": the iovar name with its NUL in the request buffer; dhd passes the whole buffer length as input and output length.
-    for (k, c) in b"ver\0".iter().enumerate() {
-        db(dma + IOCTL_REQ + k as u32, *c);
-    }
-    let e = seq % 253;
-    item(d, [0x09 | 0x80 << 16 | e << 24, 0xFFFE, 262, 1 | 256 << 16, 256, 0, dma + IOCTL_REQ, 0, 0, 0]);
-    let posted = w;
-    unsafe { core::arch::asm!("dsb sy") };
-    d.tcm_wr(h2d_w, posted);
-    d.wr(MEM, 0x2140, 0xFF00_0000 | posted);
-    d.kv(b"h2d.ctrl posted", posted);
-    d.flush();
-    // Control complete ring (D2H slot 0): items of 24 bytes; a new one is valid once epoch == seq % 253 (seq from 254) and its six words XOR to zero.
-    let mut rd_i = 0u32;
-    let mut dseq = 254u32;
-    let mut got_cmplt = false;
+    m.ring(d);
     let t0 = d.now();
-    while !got_cmplt && d.now().wrapping_sub(t0) < 3 * d.freq {
-        let wi = d.tcm_rd(d2h_w);
-        while rd_i != wi {
-            let a = dma + RINGS[2].0 + 24 * (rd_i % 64);
-            let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
-            let epoch = words[0] >> 24;
-            let xor = words.iter().fold(0, |x, v| x ^ v);
-            if epoch != dseq % 253 || xor != 0 {
-                break; // the index ran ahead of the item's DMA: look again
-            }
-            dseq += 1;
-            rd_i = (rd_i + 1) % 64;
-            d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
-            d.put(b"us d2h ctrl:");
-            for v in words {
-                d.put(b" ");
-                d.hex(v);
-            }
-            d.put(b"\n");
-            if words[0] & 0xFF == 0x0C {
-                got_cmplt = true;
-                let buf = words[1].wrapping_sub(1);
-                let len = (words[3] & 0xFFFF).min(512);
-                d.kv(b"ioctl status", words[2] & 0xFFFF);
-                if buf < 8 {
-                    d.put(b"ver: ");
-                    for k in 0..len {
-                        let c = dbr(dma + IOCTL_RESP + 0x2000 * buf + k);
-                        if c == 0 {
-                            break;
-                        }
-                        if (0x20..0x7F).contains(&c) || c == b'\n' {
-                            d.put(&[c]);
-                        }
-                    }
-                    d.put(b"\n");
-                }
-            }
-            d.tcm_wr(d2h_r, rd_i);
-            d.flush();
+    match m.get_var(d, b"ver", dma + IOCTL_REQ, t0) {
+        Some((0, b, len)) => {
+            d.put(b"ver: ");
+            d.text(dma + IOCTL_RESP + 0x2000 * b, len);
         }
-        d.us(1000);
+        r => d.kv(b"ver failed, status", r.map(|r| r.0).unwrap_or(u32::MAX)),
     }
-    if !got_cmplt {
-        d.put(b"no ioctl completion\n");
+    d.flush();
+    if stage >= 10 {
+        // ---- stage 10: a second query the normal way, then the WiFi chip's S2MPU VID, measured: an ioctl whose request buffer sits outside the fence (G#8008_0000: the kernel image, inside the window the first fence allowed). The firmware's DMA read of it is denied (DECERR) and the S2MPU latches the fault with the VID, which `bridge diag` reports (S2MPU_FAULT_INFO bits 26:24). A denied read can't touch memory; the firmware may trap. ----
+        match m.get_var(d, b"cur_etheraddr", dma + IOCTL_REQ, t0) {
+            Some((0, _, len)) => d.kv(b"cur_etheraddr len", len),
+            r => d.kv(b"cur_etheraddr failed, status", r.map(|r| r.0).unwrap_or(u32::MAX)),
+        }
+        d.put(b"probe: ioctl request buffer at G#80080000 (the kernel image, outside the fence)\n");
+        d.flush();
+        let r = m.get_var(d, b"ver", 0x8008_0000, t0);
+        d.kv(b"probe result status", r.map(|r| r.0).unwrap_or(u32::MAX));
+        let f = d.tcm_rd(sh);
+        d.kv(b"sh.flags (G#400 = trapped)", f);
     }
     let f = d.tcm_rd(sh);
     d.kv(b"sh.flags", f);
     let idx = d.tcm_rd(cons + 16);
     console_dump(d, buf, size, cons_before, (idx + size - cons_before) % size);
+}
+
+/// The control path of msgbuf (dhd_msgbuf.c): H2D control submit (ring 0, 64 × 40 B) and D2H control complete (ring 2, 64 × 24 B) in the DMA region, indices in TCM.
+struct Msgbuf {
+    dma: u32,
+    h2d_w: u32,
+    d2h_w: u32,
+    d2h_r: u32,
+    /// H2D control submit write index and sequence (epoch = seq % 253, seq from 254; flags = phase G#80 on the first lap).
+    w: u32,
+    seq: u32,
+    /// D2H control complete read index and expected sequence.
+    rd: u32,
+    dseq: u32,
+    trans: u32,
+}
+
+impl Msgbuf {
+    /// Write one control submit item (cmn_msg_hdr + 32 bytes of body); `ring` publishes.
+    fn post(&mut self, _d: &mut Drv, ty: u32, req: u32, body: [u32; 8]) {
+        let phase = if (self.w / 64) % 2 == 0 { 0x80 } else { 0 };
+        let a = self.dma + 40 * (self.w % 64);
+        dw(a, ty | phase << 16 | (self.seq % 253) << 24);
+        dw(a + 4, req);
+        for (k, v) in body.iter().enumerate() {
+            dw(a + 8 + 4 * k as u32, *v);
+        }
+        self.seq += 1;
+        self.w += 1;
+    }
+    /// Publish posted items: the TCM write index, then doorbell 0 (BAR0 + G#2140).
+    fn ring(&mut self, d: &mut Drv) {
+        unsafe { core::arch::asm!("dsb sy") };
+        d.tcm_wr(self.h2d_w, self.w % 64);
+        d.wr(MEM, 0x2140, 0xFF00_0000 | (self.w % 64));
+    }
+    /// WLC_GET_VAR (262): the iovar name and its NUL at `req_buf` (dhd passes the whole buffer length both ways). Waits for the completion (3 s); Some((status, response buffer index, length)). Every completion item is printed; each consumed response buffer is re-posted.
+    fn get_var(&mut self, d: &mut Drv, name: &[u8], req_buf: u32, t0: u64) -> Option<(u32, u32, u32)> {
+        if req_buf >= self.dma && req_buf < self.dma + 0x20_0000 {
+            for (k, c) in name.iter().chain(&[0u8]).enumerate() {
+                db(req_buf + k as u32, *c);
+            }
+        }
+        self.trans += 1;
+        self.post(d, 0x09, 0xFFFE, [262, self.trans | 256 << 16, 256, 0, req_buf, 0, 0, 0]);
+        self.ring(d);
+        let ts = d.now();
+        while d.now().wrapping_sub(ts) < 3 * d.freq {
+            let wi = d.tcm_rd(self.d2h_w);
+            while self.rd != wi {
+                let a = self.dma + 0x5000 + 24 * self.rd;
+                let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
+                if words[0] >> 24 != self.dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+                    break; // the index ran ahead of the item's DMA: look again
+                }
+                self.dseq += 1;
+                self.rd = (self.rd + 1) % 64;
+                d.tcm_wr(self.d2h_r, self.rd);
+                d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
+                d.put(b"us d2h ctrl:");
+                for v in words {
+                    d.put(b" ");
+                    d.hex(v);
+                }
+                d.put(b"\n");
+                if words[0] & 0xFF == 0x0C {
+                    let b = words[1].wrapping_sub(1);
+                    if b < 8 {
+                        self.post(d, 0x0B, 1 + b, [8192, 0, self.dma + 0x2_0000 + 0x2000 * b, 0, 0, 0, 0, 0]);
+                        self.ring(d);
+                    }
+                    return Some((words[2] & 0xFFFF, b, words[3] & 0xFFFF));
+                }
+            }
+            d.us(1000);
+        }
+        d.put(b"no ioctl completion\n");
+        None
+    }
 }
 
 /// Physical (= identity-mapped) access to the DMA region: Normal non-cacheable, EL0 read/write.

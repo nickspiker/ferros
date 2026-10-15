@@ -197,10 +197,10 @@ struct UtmrlBuf {
     utmrd: [u32; 32],
 }
 
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
+#[unsafe(link_section = ".bss.dma.ufs")] // device DMA: kept uncached by the kernel's cache map; its own pages so the HSI2 S2MPU can allow UFS exactly these
 static mut UTMRL_BUF: UtmrlBuf = UtmrlBuf { utmrd: [0; 32] };
 
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
+#[unsafe(link_section = ".bss.dma.ufs")] // device DMA: kept uncached by the kernel's cache map; its own pages so the HSI2 S2MPU can allow UFS exactly these
 static mut UFS_BUF: UfsBuffers = UfsBuffers {
     utrd: Utrd { dw: [0; 8] },
     _pad: [0; 992],

@@ -46,6 +46,11 @@ SECTIONS
         /* Device DMA buffers (ferros_hal: UFS descriptors + data, DWC3 events, TRBs, EP0 and bulk buffers), page-aligned so the static cache map can keep them uncached (cachemap.rs). Zeroed with the rest of .bss. */
         . = ALIGN(4096);
         __dma_start = .;
+        /* UFS's own buffers first, on their own pages: the HSI2 S2MPU lets VID 0 (UFS and the WiFi chip share it) reach exactly these, not the USB/PT buffers beside them (s2mpu.rs). */
+        __dma_ufs_start = .;
+        *(.bss.dma.ufs)
+        . = ALIGN(4096);
+        __dma_ufs_end = .;
         *(.bss.dma .bss.dma.*)
         . = ALIGN(4096);
         __dma_end = .;
