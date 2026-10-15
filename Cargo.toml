@@ -20,6 +20,7 @@ members = [
     "payloads/spinner",
     "payloads/pcie1",
     "ferros_sys",
+    "photon_core",
     "payloads/ip",
     "payloads/nettest",
     "payloads/wdtfire",
