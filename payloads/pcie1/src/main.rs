@@ -622,8 +622,8 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
 
     // ---- stage 7: download and start the firmware (dhd_pcie.c _dhdpcie_download_firmware with the CA7 path of __dhdpcie_bus_download_state). Input after the stage byte: [u32 LE len][firmware .bin][u32 LE len][NVRAM text]. ----
-    let Some((fw, nv, clm)) = split_files(files) else {
-        d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob]\n");
+    let Some((fw, nv, clm, cred)) = split_files(files) else {
+        d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob [--input-file wifi_credential]]\n");
         d.failed = true;
         return;
     };
@@ -888,7 +888,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -921,7 +921,14 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.kv(b"sh.flags (G#400 = trapped)", f);
     }
     if stage >= 11 {
+        if let Some((ssid, _)) = credential(cred) {
+            m.want[..ssid.len()].copy_from_slice(ssid);
+            m.want_len = ssid.len();
+        }
         scan(d, &mut m, clm);
+        if stage >= 12 {
+            join(d, &mut m, cred);
+        }
     }
     let f = d.tcm_rd(sh);
     d.kv(b"sh.flags", f);
@@ -950,6 +957,24 @@ struct Msgbuf {
     scan_done: bool,
     seen: [[u8; 6]; 96],
     nseen: usize,
+    /// The network to join (stage 12): its SSID from the credential file, and the best matching BSS the scan found (WPA2-PSK, not 6 GHz).
+    want: [u8; 32],
+    want_len: usize,
+    target: Option<Target>,
+    /// Join progress from events: link up (16), keyed (46 with status 6 or 10, reason 0), or a failure.
+    linked: bool,
+    keyed: bool,
+    join_failed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Target {
+    bssid: [u8; 6],
+    chanspec: u32,
+    rssi: i16,
+    /// The AP's RSN group cipher suite (OUI + type) and whether it can do management frame protection (RSN capabilities bit 7).
+    group: [u8; 4],
+    mfpc: bool,
 }
 
 impl Msgbuf {
@@ -1023,8 +1048,24 @@ impl Msgbuf {
         }
         let (ty, status, dlen) = (be32(p + 28), be32(p + 32), be32(p + 44));
         if ty != 69 {
-            if self.verbose {
-                d.kv(b"event", ty);
+            // Join progress (stage 12): SET_SSID 0, AUTH 3, DEAUTH 5/6, ASSOC 7, DISASSOC 11/12, LINK 16 (flags bit 0 = up), PSK_SUP 46 (status 6 KEYED / 10 WAIT_G1 with reason 0 = authorized), AUTHORIZED 136.
+            let (reason, flags) = (be32(p + 36), be16(p + 26));
+            d.put(b"event ");
+            d.dec(ty);
+            d.put(b" status ");
+            d.dec(status);
+            d.put(b" reason ");
+            d.dec(reason);
+            d.put(b" flags ");
+            d.hex(flags);
+            d.put(b"\n");
+            match ty {
+                16 => self.linked = flags & 1 != 0,
+                46 if (status == 6 || status == 10) && reason == 0 => self.keyed = true,
+                46 if status < 10 && reason != 0 && reason != 21 => self.join_failed = true,
+                0 | 3 | 7 if status != 0 => self.join_failed = true,
+                5 | 6 | 11 | 12 => self.join_failed = true,
+                _ => {}
             }
             return;
         }
@@ -1066,6 +1107,7 @@ impl Msgbuf {
             let (id, l) = (dbr(q), dbr(q + 1) as u32);
             if id == 48 {
                 sec = b"RSN";
+                self.consider(bi, q + 2, l, cs);
             } else if id == 221 && l >= 4 && sec != b"RSN" && dbr(q + 2) == 0x00 && dbr(q + 3) == 0x50 && dbr(q + 4) == 0xF2 && dbr(q + 5) == 1 {
                 sec = b"WPA";
             }
@@ -1089,6 +1131,38 @@ impl Msgbuf {
         if d.n > 2400 {
             d.flush();
         }
+    }
+    /// A BSS whose SSID is the one to join and whose RSN IE (version 2, group 4, pairwise count + list, AKM count + list, capabilities) offers PSK (00-0F-AC:2), outside 6 GHz (which needs WPA3-SAE): keep the strongest.
+    fn consider(&mut self, bi: u32, rsn: u32, l: u32, cs: u32) {
+        let n = dbr(bi + 18) as usize;
+        if self.want_len == 0 || n != self.want_len || cs & 0xC000 == 0x4000 || l < 8 {
+            return;
+        }
+        if (0..n).any(|k| dbr(bi + 19 + k as u32) != self.want[k]) {
+            return;
+        }
+        let group: [u8; 4] = core::array::from_fn(|k| dbr(rsn + 2 + k as u32));
+        let np = (dbr(rsn + 6) as u32) | (dbr(rsn + 7) as u32) << 8;
+        let a = rsn + 8 + 4 * np;
+        if a + 2 > rsn + l {
+            return;
+        }
+        let na = (dbr(a) as u32) | (dbr(a + 1) as u32) << 8;
+        let psk = (0..na).any(|k| {
+            let s = a + 2 + 4 * k;
+            dbr(s) == 0x00 && dbr(s + 1) == 0x0F && dbr(s + 2) == 0xAC && dbr(s + 3) == 2
+        });
+        let caps = a + 2 + 4 * na;
+        let mfpc = caps + 1 < rsn + l && dbr(caps) & 0x80 != 0;
+        if !psk {
+            return;
+        }
+        let rssi = (dr32u(bi + 76) >> 16) as u16 as i16;
+        if self.target.map(|t| t.rssi >= rssi).unwrap_or(false) {
+            return;
+        }
+        let bssid: [u8; 6] = core::array::from_fn(|k| dbr(bi + 8 + k as u32));
+        self.target = Some(Target { bssid, chanspec: cs, rssi, group, mfpc });
     }
     /// One ioctl: `in_len` bytes at the request buffer go to the firmware, up to `out_len` come back in a posted response buffer. Waits for the completion (3 s), handling events meanwhile.
     fn ioctl(&mut self, d: &mut Drv, cmd: u32, req_buf: u32, in_len: u32, out_len: u32) -> Option<(u32, u32, u32)> {
@@ -1126,6 +1200,17 @@ impl Msgbuf {
             k += 1;
         }
         self.ioctl(d, 263, req, k, k).map(|r| r.0).unwrap_or(u32::MAX)
+    }
+    fn set_int(&mut self, d: &mut Drv, name: &[u8], v: u32) -> u32 {
+        self.set_var(d, name, &v.to_le_bytes())
+    }
+    /// A plain ioctl carrying one int (WLC_SET_INFRA, WLC_SET_PM, ...).
+    fn ioctl_int(&mut self, d: &mut Drv, cmd: u32, v: u32) -> u32 {
+        let req = self.dma + 0x1_3000;
+        for (k, b) in v.to_le_bytes().iter().enumerate() {
+            db(req + k as u32, *b);
+        }
+        self.ioctl(d, cmd, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX)
     }
     /// The response buffer holding an ioctl's answer.
     fn resp(&self, b: u32) -> u32 {
@@ -1194,8 +1279,8 @@ fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
     None
 }
 
-/// [u32 LE len][bytes] twice (firmware, NVRAM), then optionally a third (the CLM blob; empty if absent).
-fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8], &[u8])> {
+/// [u32 LE len][bytes] twice (firmware, NVRAM), then optionally the CLM blob and the WiFi credential (empty if absent).
+fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8], &[u8], &[u8])> {
     let take = |b: &[u8]| -> Option<usize> { Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize) };
     let a = take(b)?;
     if b.len() < 4 + a + 4 {
@@ -1207,11 +1292,142 @@ fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8], &[u8])> {
         return None;
     }
     let (second, rest) = rest[4..].split_at_mut(n);
-    let third: &[u8] = match take(rest) {
+    let (third, rest): (&[u8], &[u8]) = match take(rest) {
+        Some(c) if rest.len() >= 4 + c => (&rest[4..4 + c], &rest[4 + c..]),
+        _ => (&[], &[]),
+    };
+    let fourth: &[u8] = match take(rest) {
         Some(c) if rest.len() >= 4 + c => &rest[4..4 + c],
         _ => &[],
     };
-    Some((first, second, third))
+    Some((first, second, third, fourth))
+}
+
+/// The WiFi credential file (keys/wifi.txt): the SSID on the first line, the passphrase on the second. Never printed.
+fn credential(c: &[u8]) -> Option<(&[u8], &[u8])> {
+    let trim = |s: &[u8]| -> usize { s.iter().rposition(|&b| b != b'\r' && b != b' ').map(|i| i + 1).unwrap_or(0) };
+    let nl = c.iter().position(|&b| b == b'\n')?;
+    let ssid = &c[..trim(&c[..nl])];
+    let rest = &c[nl + 1..];
+    let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+    let pass = &rest[..trim(&rest[..end])];
+    if ssid.is_empty() || ssid.len() > 32 || pass.len() < 8 || pass.len() > 63 {
+        return None;
+    }
+    Some((ssid, pass))
+}
+
+/// Stage 12: join the best scanned BSS of the credential's network with WPA2-PSK, the firmware doing the 4-way handshake (dhd's wl_cfg80211_connect order: sup_wpa, STA defaults, infra, security cleared, wpa_auth provisional → auth → wsec → mfp → wpa_auth final, the passphrase as WLC_SET_WSEC_PMK, our RSN IE as "wpaie", then "join" with the BSSID and chanspec). Done when the firmware's supplicant reports keyed.
+fn join(d: &mut Drv, m: &mut Msgbuf, cred: &[u8]) {
+    let Some((ssid, pass)) = credential(cred) else {
+        d.put(b"stage 12 wants --input-file keys/wifi.txt (SSID line, passphrase line, 8..63 chars)\n");
+        d.flush();
+        return;
+    };
+    let Some(t) = m.target else {
+        d.put(b"no WPA2-PSK BSS of that SSID in the scan (outside 6 GHz)\n");
+        d.flush();
+        return;
+    };
+    d.put(b"joining: ch ");
+    d.dec(t.chanspec & 0xFF);
+    d.put(b" rssi -");
+    d.dec((-(t.rssi as i32)).max(0) as u32);
+    d.put(if t.mfpc { b" (AP can do MFP)\n" } else { b"\n" });
+    let r = m.set_int(d, b"sup_wpa", 1);
+    d.kv(b"sup_wpa", r);
+    let r = m.set_int(d, b"roam_off", 1);
+    d.kv(b"roam_off", r);
+    let r = m.set_int(d, b"buf_key_b4_m4", 1);
+    d.kv(b"buf_key_b4_m4", r);
+    let r = m.ioctl_int(d, 86, 0);
+    d.kv(b"PM off", r);
+    let r = m.ioctl_int(d, 20, 1);
+    d.kv(b"infra", r);
+    for name in [&b"wsec"[..], b"auth", b"wpa_auth"] {
+        let _ = m.set_int(d, name, 0);
+    }
+    let r = [m.set_int(d, b"wpa_auth", 0xC0), m.set_int(d, b"auth", 0), m.set_int(d, b"wsec", 4), m.set_int(d, b"mfp", t.mfpc as u32), m.set_int(d, b"wpa_auth", 0x80)];
+    d.put(b"security wpa_auth/auth/wsec/mfp/wpa_auth:");
+    for v in r {
+        d.put(b" ");
+        d.hex(v);
+    }
+    d.put(b"\n");
+    // wsec_pmk_t: u16 key_len, u16 flags (1 = passphrase), u8 key[256], u16 opt_len — 263 bytes as dhd sends it.
+    let req = m.dma + 0x1_3000;
+    for k in 0..263 {
+        db(req + k, 0);
+    }
+    for (k, b) in (pass.len() as u16).to_le_bytes().iter().chain(&1u16.to_le_bytes()).chain(pass).enumerate() {
+        db(req + k as u32, *b);
+    }
+    let r = m.ioctl(d, 268, req, 263, 263).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WSEC_PMK", r);
+    for k in 0..263 {
+        db(req + k, 0);
+    }
+    // Our RSN IE: version 1, the AP's group cipher, pairwise CCMP, AKM PSK, capabilities (MFPC if we set mfp 1).
+    let mut ie = [0u8; 22];
+    ie[..4].copy_from_slice(&[48, 20, 1, 0]);
+    ie[4..8].copy_from_slice(&t.group);
+    ie[8..20].copy_from_slice(&[1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 2]);
+    ie[20] = if t.mfpc { 0x80 } else { 0 };
+    let r = m.set_var(d, b"wpaie", &ie);
+    d.kv(b"wpaie", r);
+    // join: v0 (wl_extjoin_params_t) unless join_ver says otherwise; ssid (u32 len + 32), scan params (scan_type u8, pad, nprobes, active, passive, home = -1), then the assoc params: BSSID, bssid_cnt 0, one chanspec.
+    let jv = match m.get_var(d, b"join_ver", req) {
+        Some((0, b, _)) => dr32u(m.resp(b) + 4) & 0xFFFF,
+        _ => 0,
+    };
+    d.kv(b"join_ver", jv);
+    let mut j = [0u8; 84];
+    let (o_ssid, o_scan, o_bssid, o_cnt, o_num, o_list) = match jv {
+        0 => (0usize, 36usize, 56usize, 62usize, 64usize, 68usize),
+        1 => (4, 40, 64, 70, 72, 76),
+        _ => (4, 40, 64, 70, 76, 80),
+    };
+    j[o_ssid..o_ssid + 4].copy_from_slice(&(ssid.len() as u32).to_le_bytes());
+    j[o_ssid + 4..o_ssid + 4 + ssid.len()].copy_from_slice(ssid);
+    for k in 0..4 {
+        let at = o_scan + 4 + 4 * k;
+        j[at..at + 4].copy_from_slice(&(-1i32).to_le_bytes());
+    }
+    j[o_bssid..o_bssid + 6].copy_from_slice(&t.bssid);
+    j[o_cnt..o_cnt + 2].copy_from_slice(&0u16.to_le_bytes());
+    j[o_num..o_num + 4].copy_from_slice(&1u32.to_le_bytes());
+    j[o_list..o_list + 2].copy_from_slice(&(t.chanspec as u16).to_le_bytes());
+    m.linked = false;
+    m.keyed = false;
+    m.join_failed = false;
+    let r = m.set_var(d, b"join", &j[..o_list + 2]);
+    d.kv(b"join", r);
+    d.flush();
+    let ts = d.now();
+    while !m.keyed && !m.join_failed && d.now().wrapping_sub(ts) < 15 * d.freq {
+        let _ = m.pump(d);
+        if d.n > 2000 {
+            d.flush();
+        }
+        d.us(2000);
+    }
+    d.kv(b"join_ms", ((d.now().wrapping_sub(ts) * 1000) / d.freq) as u32);
+    if m.keyed {
+        d.put(b"ASSOCIATED AND KEYED (WPA2-PSK, firmware supplicant)\n");
+        // scb_val_t: i32 val, u8 ea[6], pad — WLC_GET_RSSI (127).
+        for k in 0..12 {
+            db(req + k, 0);
+        }
+        if let Some((0, b, _)) = m.ioctl(d, 127, req, 12, 12) {
+            let v = dr32u(m.resp(b)) as i32;
+            d.put(b"link rssi -");
+            d.dec((-v).max(0) as u32);
+            d.put(b"\n");
+        }
+    } else {
+        d.put(if m.join_failed { b"join failed (see events)\n" } else { b"join timed out\n" });
+    }
+    d.flush();
 }
 
 /// Stage 11: a scan, the way dhd's up path and wl_run_escan do it. The regulatory table first (`country` reads "#n" when the firmware has no CLM: then the CLM blob goes in through `clmload` in 1408-byte chunks), the escan-result event (69) enabled in `event_msgs_ext`, WLC_UP (2), `scan_ver` to pick the request layout, then `escan` over every channel; results arrive as events, one BSS each, until a final status.
@@ -1264,7 +1480,9 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
             *v = dbr(m.resp(b) + 4 + k as u32);
         }
     }
-    mask[69 >> 3] |= 1 << (69 & 7);
+    for e in [69u32, 0, 3, 5, 6, 7, 11, 12, 16, 46, 136] {
+        mask[(e >> 3) as usize] |= 1 << (e & 7);
+    }
     let mut ev = [0u8; 31];
     ev[..4].copy_from_slice(&[1, 3, 27, 0]);
     ev[4..].copy_from_slice(&mask);
