@@ -569,6 +569,10 @@ name = "ferros-payload-hello"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-hello-el0"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-memprobe"
 version = "0.1.0"
 
@@ -652,7 +656,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.9.3",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -709,7 +713,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi",
- "vsf 0.9.3",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1737,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "bitvec",
  "blake3",

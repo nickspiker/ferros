@@ -14,6 +14,7 @@ members = [
     "tools/ferros-bridge",
     "tools/install",
     "payloads/hello",
+    "payloads/hello_el0",
     "payloads/wdtfire",
     "payloads/usbprobe",
     "payloads/pmuprobe",

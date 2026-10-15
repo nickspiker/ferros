@@ -309,6 +309,7 @@ pub fn run(mut b: Boot) -> ! {
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
     let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
     let cap_run = ferros_pt::command::dev_cap(ferros_pt::command::caps::RUN);
+    let cap_spawn = ferros_pt::command::dev_cap(ferros_pt::command::caps::SPAWN);
     let cap_mem = ferros_pt::command::dev_cap(ferros_pt::command::caps::MEM);
     let cap_display = ferros_pt::command::dev_cap(ferros_pt::command::caps::DISPLAY);
     let cap_store = ferros_pt::command::dev_cap(ferros_pt::command::caps::STORE);
@@ -744,6 +745,35 @@ pub fn run(mut b: Boot) -> ! {
                                                     options(noreturn)
                                                 );
                                             }
+                                        }
+                                    } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
+                                        // Run the staged payload as a process (EL0, own arc, a console capability only); reply [exit][console].
+                                        if run_ok && run_size > 0 {
+                                            let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                                            match crate::process::spawn(code, cmd.params) {
+                                                Ok(o) => {
+                                                    use crate::checklist::{mark, Item};
+                                                    mark(Item::Arcs);
+                                                    if o.exit >> 56 != 0xFA {
+                                                        mark(Item::El0);
+                                                    }
+                                                    if !o.console.is_empty() {
+                                                        mark(Item::Syscall);
+                                                        mark(Item::Caps);
+                                                    }
+                                                    let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + o.console.len());
+                                                    resp.extend_from_slice(&o.exit.to_le_bytes());
+                                                    resp.extend_from_slice(&o.console);
+                                                    queue_pt_response(&mut pt_out_data, &resp);
+                                                }
+                                                Err(e) => {
+                                                    let mut resp = alloc::vec::Vec::from(&b"ERR:"[..]);
+                                                    resp.extend_from_slice(e.as_bytes());
+                                                    queue_pt_response(&mut pt_out_data, &resp);
+                                                }
+                                            }
+                                        } else {
+                                            queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
                                         }
                                     } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
                                         // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.

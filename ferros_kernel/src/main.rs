@@ -54,6 +54,9 @@ mod cachemap;
 // KOHI: PIPE's entropy gathering + health stack in software (the wairua's source).
 #[cfg(feature = "pixel8")]
 mod kohi;
+// Processes: EL0 in an arc, capabilities, the syscall boundary.
+#[cfg(feature = "pixel8")]
+mod process;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
 mod checklist;
@@ -395,9 +398,9 @@ _m1_entry:
     b       .Lexc_serror           // EL1h SError
 
     .balign 0x80
-    b       .Lexc_recover          // Lower AArch64 sync
+    b       .Lel0_sync             // Lower AArch64 sync (a process: syscall or fault)
     .balign 0x80
-    b .Lhalt                       // Lower AArch64 IRQ
+    b       .Lirq                  // Lower AArch64 IRQ (the killswitch preempts processes too)
     .balign 0x80
     b .Lhalt                       // Lower AArch64 FIQ
     .balign 0x80
@@ -469,6 +472,160 @@ _m1_entry:
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp], #32
     eret
+
+.balign 16
+// Enter a process at EL0 (process.rs `spawn`): x0 = entry, x1 = SP_EL0, x2 = arc base → x28, x3 = arc mask → x27, x4..x6 = the process's x0..x2. Saves the kernel's callee-saved registers and SP in __el0_kctx; `.Lel0_leave` returns from this call with the exit value. Every other register — general and SIMD — is cleared so no kernel value leaks into the process. SPSR = EL0t with interrupts unmasked: the killswitch keeps preempting.
+.global ferros_el0_enter
+ferros_el0_enter:
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    stp     x19, x20, [x9, #0]
+    stp     x21, x22, [x9, #16]
+    stp     x23, x24, [x9, #32]
+    stp     x25, x26, [x9, #48]
+    stp     x27, x28, [x9, #64]
+    stp     x29, x30, [x9, #80]
+    mov     x10, sp
+    str     x10, [x9, #96]
+    msr     elr_el2, x0
+    msr     sp_el0, x1
+    msr     spsr_el2, xzr
+    mov     x28, x2
+    mov     x27, x3
+    mov     x0, x4
+    mov     x1, x5
+    mov     x2, x6
+    mov     x3, xzr
+    mov     x4, xzr
+    mov     x5, xzr
+    mov     x6, xzr
+    mov     x7, xzr
+    mov     x8, xzr
+    mov     x9, xzr
+    mov     x10, xzr
+    mov     x11, xzr
+    mov     x12, xzr
+    mov     x13, xzr
+    mov     x14, xzr
+    mov     x15, xzr
+    mov     x16, xzr
+    mov     x17, xzr
+    mov     x18, xzr
+    mov     x19, xzr
+    mov     x20, xzr
+    mov     x21, xzr
+    mov     x22, xzr
+    mov     x23, xzr
+    mov     x24, xzr
+    mov     x25, xzr
+    mov     x26, xzr
+    mov     x29, xzr
+    mov     x30, xzr
+    movi    v0.16b, #0
+    movi    v1.16b, #0
+    movi    v2.16b, #0
+    movi    v3.16b, #0
+    movi    v4.16b, #0
+    movi    v5.16b, #0
+    movi    v6.16b, #0
+    movi    v7.16b, #0
+    movi    v8.16b, #0
+    movi    v9.16b, #0
+    movi    v10.16b, #0
+    movi    v11.16b, #0
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    movi    v20.16b, #0
+    movi    v21.16b, #0
+    movi    v22.16b, #0
+    movi    v23.16b, #0
+    movi    v24.16b, #0
+    movi    v25.16b, #0
+    movi    v26.16b, #0
+    movi    v27.16b, #0
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    movi    v30.16b, #0
+    movi    v31.16b, #0
+    eret
+
+.balign 16
+// Synchronous exception from EL0 (a syscall or a fault): save the process's registers in a frame on SP_EL2, let process.rs decide (ferros_el0_trap: 0 = resume, 1 = the process ends).
+.Lel0_sync:
+    sub     sp, sp, #288
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30, [sp, #240]
+    mrs     x9, sp_el0
+    str     x9, [sp, #248]
+    mrs     x9, elr_el2
+    str     x9, [sp, #256]
+    mrs     x9, spsr_el2
+    str     x9, [sp, #264]
+    mrs     x9, esr_el2
+    str     x9, [sp, #272]
+    mrs     x9, far_el2
+    str     x9, [sp, #280]
+    mov     x0, sp
+    bl      ferros_el0_trap
+    cbnz    x0, .Lel0_leave
+    ldr     x9, [sp, #256]
+    msr     elr_el2, x9
+    ldr     x9, [sp, #264]
+    msr     spsr_el2, x9
+    ldr     x9, [sp, #248]
+    msr     sp_el0, x9
+    ldp     x0, x1, [sp, #0]
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldp     x6, x7, [sp, #48]
+    ldp     x8, x9, [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x12, x13, [sp, #96]
+    ldp     x14, x15, [sp, #112]
+    ldp     x16, x17, [sp, #128]
+    ldp     x18, x19, [sp, #144]
+    ldp     x20, x21, [sp, #160]
+    ldp     x22, x23, [sp, #176]
+    ldp     x24, x25, [sp, #192]
+    ldp     x26, x27, [sp, #208]
+    ldp     x28, x29, [sp, #224]
+    ldr     x30, [sp, #240]
+    add     sp, sp, #288
+    eret
+// The process ended: return from ferros_el0_enter with its x0 (the exit value), kernel registers and SP restored.
+.Lel0_leave:
+    ldr     x0, [sp, #0]
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    ldp     x19, x20, [x9, #0]
+    ldp     x21, x22, [x9, #16]
+    ldp     x23, x24, [x9, #32]
+    ldp     x25, x26, [x9, #48]
+    ldp     x27, x28, [x9, #64]
+    ldp     x29, x30, [x9, #80]
+    ldr     x10, [x9, #96]
+    mov     sp, x10
+    ret
 
 .balign 16
 // Synchronous abort: increment count, advance ELR past faulting instruction, eret.
@@ -557,6 +714,16 @@ _m1_entry:
 
 #[unsafe(no_mangle)]
 static mut __exception_count: u64 = 0;
+/// M1 has no processes yet; the shared vector table still names the EL0 trap handler, so a stand-in ends anything that could ever reach it.
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_el0_trap(_frame: *mut u64) -> u64 {
+    1
+}
+
+/// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
+#[unsafe(no_mangle)]
+pub static mut __el0_kctx: [u64; 13] = [0; 13];
 /// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
 #[unsafe(no_mangle)]
 pub static mut __irq_count: u64 = 0;

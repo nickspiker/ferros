@@ -138,7 +138,14 @@ async fn main() {
                 eprintln!("Usage: ferros-bridge run <payload.bin> [hex-input]");
                 std::process::exit(1);
             }
-            cmd_run(&args[2], args.get(3).map(|s| s.as_str())).await;
+            cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::RUN).await;
+        }
+        "spawn" => {
+            if args.len() < 3 {
+                eprintln!("Usage: ferros-bridge spawn <payload.bin> [hex-input]  (runs it as a process: EL0, own arc, console capability only)");
+                std::process::exit(1);
+            }
+            cmd_run(&args[2], args.get(3).map(|s| s.as_str()), ferros_pt::command::caps::SPAWN).await;
         }
         "ping" => {
             let count = args
@@ -377,7 +384,7 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_run(path: &str, hex_input: Option<&str>) {
+async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8]) {
     let blob = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
@@ -434,7 +441,7 @@ async fn cmd_run(path: &str, hex_input: Option<&str>) {
     }
 
     // Execute — Exec params become the payload's input
-    let cmd = build_cmd(ferros_pt::command::caps::RUN, ferros_pt::Op::Exec, &input);
+    let cmd = build_cmd(exec_cap, ferros_pt::Op::Exec, &input);
     if let Err(e) = pt_send(&link, &cmd).await {
         eprintln!("Exec failed: {e}");
         std::process::exit(1);
