@@ -371,6 +371,16 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let end = |f: &mut Frame, value: u64| -> u64 {
         let kk = k();
         if let Some(p) = kk.procs[cur].take() {
+            // Say how it ended on the console: a process that outlives its first slice (spawn already returned) has no one else to hear its exit value — a fault or a panic would otherwise vanish.
+            if !p.line_start {
+                kk.console.push(b'\n');
+            }
+            kk.console.extend_from_slice(&p.name);
+            kk.console.extend_from_slice(b": exit G#");
+            for i in (0..16).rev() {
+                kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
+            }
+            kk.console.push(b'\n');
             arc_free(p.arc);
         }
         kk.exited.push((cur, value));

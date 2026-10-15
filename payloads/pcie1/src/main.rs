@@ -888,7 +888,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
     let rx_off = d.tcm_rd(sh + 36);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0 };
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0, want: [0; 32], want_len: 0, target: None, linked: false, keyed: false, join_failed: false, rxp_w: 0, rxp_seq: 254, rx_rd: 0, rx_dseq: 254, rx_frames: 0, flow_status: None, tx_w: 0, tx_rd: 0, tx_dseq: 254, tx_done: 0, tx_status: 0, mac: [0; 6], xid: 0, offer: None, acked: false, nak: false, lease: [[0; 4]; 3], lease_s: 0 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -928,6 +928,9 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         scan(d, &mut m, clm);
         if stage >= 12 {
             join(d, &mut m, cred);
+        }
+        if stage >= 13 && m.keyed {
+            dhcp(d, &mut m);
         }
     }
     let f = d.tcm_rd(sh);
@@ -971,6 +974,21 @@ struct Msgbuf {
     rx_rd: u32,
     rx_dseq: u32,
     rx_frames: u32,
+    /// Transmit (stage 13): flowring create status (MSG_TYPE_FLOW_RING_CREATE_CMPLT G#04), flowring write index and packets, D2H tx complete (ring 3, 1024 × 24 B at +G#6000, index slot 1) read index, sequence, count and last status.
+    flow_status: Option<u32>,
+    tx_w: u32,
+    tx_rd: u32,
+    tx_dseq: u32,
+    tx_done: u32,
+    tx_status: u32,
+    mac: [u8; 6],
+    /// DHCP: transaction id, the offer (address, server), the ack and what it carried (subnet, router, DNS, lease seconds).
+    xid: u32,
+    offer: Option<([u8; 4], [u8; 4])>,
+    acked: bool,
+    nak: bool,
+    lease: [[u8; 4]; 3],
+    lease_s: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1037,19 +1055,143 @@ impl Msgbuf {
             d.tcm_wr(self.d2h_r + 8, self.rx_rd);
             let i = words[1].wrapping_sub(0x1000);
             let len = words[3] >> 16;
-            let off = words[4] & 0xFFFF;
+            // dhd: the frame starts at data_offset if non-zero, otherwise at pcie_shared dma_rxoffset (8 here), measured from the posted buffer; it is a plain Ethernet frame.
+            let off = if words[4] & 0xFFFF != 0 { words[4] & 0xFFFF } else { self.rx_off };
             self.rx_frames += 1;
             if i < 64 {
                 let p = self.dma + 0x4_0000 + 0x800 * i + off;
+                if be16(p + 12) == 0x0800 {
+                    self.ipv4(d, p + 14, len.saturating_sub(off).saturating_sub(14));
+                }
                 d.put(b"rx frame len ");
                 d.dec(len);
                 d.put(b" ethertype ");
                 d.hex(be16(p + 12));
                 d.put(b"\n");
+                if false {
+                    d.put(b"  cmpl:");
+                    for v in words {
+                        d.put(b" ");
+                        d.hex(v);
+                    }
+                    d.put(b"\n  buf:");
+                    let b0 = self.dma + 0x4_0000 + 0x800 * i;
+                    for k in 0..8 {
+                        d.put(b" ");
+                        d.hex(dr(b0 + 4 * k));
+                    }
+                    d.put(b"\n");
+                }
                 self.post_rx(i);
                 self.ring_rx(d);
             }
         }
+    }
+    /// An IPv4 packet: if it is UDP to port 68 carrying a BOOTP reply with our transaction id, take the DHCP message (options after the 240-byte BOOTP header + magic cookie): 53 type (2 OFFER, 5 ACK, 6 NAK), 54 server, 1 subnet, 3 router, 6 DNS, 51 lease.
+    fn ipv4(&mut self, d: &mut Drv, ip: u32, len: u32) {
+        let ihl = (dbr(ip) & 0xF) as u32 * 4;
+        if dbr(ip) >> 4 != 4 || dbr(ip + 9) != 17 || len < ihl + 8 + 240 {
+            return;
+        }
+        let udp = ip + ihl;
+        if be16(udp + 2) != 68 {
+            return;
+        }
+        let b = udp + 8;
+        if dbr(b) != 2 || be32(b + 4) != self.xid {
+            return;
+        }
+        let yiaddr: [u8; 4] = core::array::from_fn(|k| dbr(b + 16 + k as u32));
+        let (mut ty, mut server) = (0u8, [0u8; 4]);
+        let mut o = b + 240;
+        // Bounded by the IP header's total length (the rx completion's length doesn't cover the whole packet the way it was read here: the options walk stopped early).
+        let end = ip + (be16(ip + 2)).min(len.max(be16(ip + 2)));
+        while o < end {
+            let code = dbr(o);
+            if code == 255 {
+                break;
+            }
+            if code == 0 {
+                o += 1;
+                continue;
+            }
+            let l = dbr(o + 1) as u32;
+            let v4: [u8; 4] = core::array::from_fn(|k| dbr(o + 2 + k as u32));
+            match code {
+                53 => ty = dbr(o + 2),
+                54 => server = v4,
+                1 => self.lease[0] = v4,
+                3 => self.lease[1] = v4,
+                6 => self.lease[2] = v4,
+                51 => self.lease_s = u32::from_be_bytes(v4),
+                _ => {}
+            }
+            o += 2 + l;
+        }
+        // One put per arm: a `match` yielding string slices compiles to a table of absolute pointers in .rodata, which a payload loaded at its arc base (no relocation) can't follow (seen: data abort in pump_rx, FAR G#…9927).
+        d.put(b"dhcp ");
+        if ty == 2 {
+            d.put(b"OFFER");
+        } else if ty == 5 {
+            d.put(b"ACK");
+        } else if ty == 6 {
+            d.put(b"NAK");
+        } else {
+            d.put(b"other");
+        }
+        d.put(b" ");
+        ip_put(d, yiaddr);
+        d.put(b" from ");
+        ip_put(d, server);
+        d.put(b"\n");
+        match ty {
+            2 if self.offer.is_none() => self.offer = Some((yiaddr, server)),
+            5 => self.acked = true,
+            6 => self.nak = true,
+            _ => {}
+        }
+    }
+    /// Consume tx completions (host_txbuf_cmpl_t, type G#10, 24 B: request id = packet, status & G#F 0 = sent).
+    fn pump_tx(&mut self, d: &mut Drv) {
+        let wi = d.tcm_rd(self.d2h_w + 4);
+        while self.tx_rd != wi {
+            let a = self.dma + 0x6000 + 24 * self.tx_rd;
+            let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
+            if words[0] >> 24 != self.tx_dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+                break;
+            }
+            self.tx_dseq += 1;
+            self.tx_rd = (self.tx_rd + 1) % 1024;
+            d.tcm_wr(self.d2h_r + 4, self.tx_rd);
+            self.tx_done += 1;
+            self.tx_status = words[2] & 0xF;
+        }
+    }
+    /// Send one Ethernet frame on flowring 2 (msgbuf ring 5, H2D index slot 2): copy it to a tx buffer (2 KiB at +G#7_0000), then host_txbuf_post_t v1 (48 B): header (type G#0F, request id), the 14-byte Ethernet header, flags G#01 (802.3), seg_cnt 1, data address = the payload after the header, data_len = length − 14.
+    fn send(&mut self, d: &mut Drv, frame: &[u8]) {
+        let k = self.tx_w % 8;
+        let buf = self.dma + 0x7_0000 + 0x800 * k;
+        for (j, b) in frame.iter().enumerate() {
+            db(buf + j as u32, *b);
+        }
+        let phase = if (self.tx_w / 512) % 2 == 0 { 0x80 } else { 0 };
+        let a = self.dma + 0x6_0000 + 48 * (self.tx_w % 512);
+        let mut item = [0u8; 48];
+        item[0] = 0x0F;
+        item[2] = phase as u8;
+        item[4..8].copy_from_slice(&(0x2000 + self.tx_w).to_le_bytes());
+        item[8..22].copy_from_slice(&frame[..14]);
+        item[22] = 0x01;
+        item[23] = 1;
+        item[32..36].copy_from_slice(&(buf + 14).to_le_bytes());
+        item[42..44].copy_from_slice(&((frame.len() - 14) as u16).to_le_bytes());
+        for j in 0..12 {
+            dw(a + 4 * j, u32::from_le_bytes(item[4 * j as usize..4 * j as usize + 4].try_into().unwrap()));
+        }
+        self.tx_w += 1;
+        unsafe { core::arch::asm!("dsb sy") };
+        d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
+        d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
     }
     /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length), its buffer re-posted.
     fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32)> {
@@ -1081,6 +1223,8 @@ impl Msgbuf {
                     }
                     return Some((words[2] & 0xFFFF, b, words[3] & 0xFFFF));
                 }
+                // MSG_TYPE_FLOW_RING_CREATE_CMPLT: status +8, flow ring id +10.
+                0x04 => self.flow_status = Some(words[2] & 0xFFFF),
                 // MSG_TYPE_WL_EVENT: request id = the event buffer, event_data_len at +12; the packet starts rx_dataoffset into the buffer.
                 0x0E => {
                     let b = words[1].wrapping_sub(0x101);
@@ -1147,10 +1291,12 @@ impl Msgbuf {
             self.nseen += 1;
         }
         let cs = dr32u(bi + 72) & 0xFFFF;
-        let band = match cs & 0xC000 {
-            0 => b"2G",
-            0x4000 => b"6G",
-            _ => b"5G",
+        let band: &[u8] = if cs & 0xC000 == 0 {
+            b"2G"
+        } else if cs & 0xC000 == 0x4000 {
+            b"6G"
+        } else {
+            b"5G"
         };
         let ch = if cs & 0x3800 == 0x1000 { cs & 0xFF } else { dbr(bi + 88) as u32 };
         let rssi = (dr32u(bi + 78 - 2) >> 16) as u16 as i16;
@@ -1335,6 +1481,153 @@ fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
         p = ((h >> 8) & 0xFC) as u64;
     }
     None
+}
+
+/// A#192.168.1.1 — one base prefix for the dotted quad.
+fn ip_put(d: &mut Drv, a: [u8; 4]) {
+    d.put(b"A#");
+    for (k, b) in a.iter().enumerate() {
+        if k > 0 {
+            d.put(b".");
+        }
+        let mut v = *b as u32;
+        let mut digits = [0u8; 3];
+        let mut n = 0;
+        loop {
+            digits[2 - n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        d.put(&digits[3 - n..]);
+    }
+}
+
+/// Stage 13: one transmit flowring, then DHCP — DISCOVER (broadcast), OFFER, REQUEST, ACK — from the EL0 driver. Flowring 2 (dhd's first flow id) is created on the control ring with its DMA ring (512 × 48 B at +G#6_0000), DA broadcast and SA our MAC, as dhd does for a STA's first packet; a STA has one flowring per priority, whatever the destination.
+fn dhcp(d: &mut Drv, m: &mut Msgbuf) {
+    let req = m.dma + 0x1_3000;
+    if let Some((0, b, _)) = m.get_var(d, b"cur_etheraddr", req) {
+        m.mac = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
+    }
+    d.tcm_wr(m.h2d_w + 8, 0);
+    let mut c = [0u8; 32];
+    c[0..6].copy_from_slice(&[0xFF; 6]);
+    c[6..12].copy_from_slice(&m.mac);
+    c[14..16].copy_from_slice(&2u16.to_le_bytes());
+    c[20..22].copy_from_slice(&512u16.to_le_bytes());
+    c[22..24].copy_from_slice(&48u16.to_le_bytes());
+    c[24..28].copy_from_slice(&(m.dma + 0x6_0000).to_le_bytes());
+    let body: [u32; 8] = core::array::from_fn(|k| u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().unwrap()));
+    m.flow_status = None;
+    m.post(d, 0x03, 0, body);
+    m.ring(d);
+    let ts = d.now();
+    while m.flow_status.is_none() && d.now().wrapping_sub(ts) < 2 * d.freq {
+        let _ = m.pump(d);
+        d.us(1000);
+    }
+    d.kv(b"flowring create status", m.flow_status.unwrap_or(u32::MAX));
+    if m.flow_status != Some(0) {
+        d.flush();
+        return;
+    }
+    m.xid = 0xF3A0_0000 | (d.now() as u32 & 0xFFFF);
+    for attempt in 0..3u32 {
+        let frame = dhcp_frame(&m.mac, m.xid, 1, None);
+        m.send(d, &frame[..342]);
+        d.kv(b"DISCOVER sent, attempt", attempt);
+        d.flush();
+        let ts = d.now();
+        while m.offer.is_none() && d.now().wrapping_sub(ts) < 3 * d.freq {
+            let _ = m.pump(d);
+            m.pump_rx(d);
+            m.pump_tx(d);
+            d.us(1000);
+        }
+        if m.offer.is_some() {
+            break;
+        }
+    }
+    d.kv(b"tx completions", m.tx_done);
+    d.kv(b"last tx status", m.tx_status);
+    let Some((ip, server)) = m.offer else {
+        d.put(b"no DHCP offer\n");
+        d.flush();
+        return;
+    };
+    let frame = dhcp_frame(&m.mac, m.xid, 3, Some((ip, server)));
+    m.send(d, &frame[..342]);
+    d.flush();
+    let ts = d.now();
+    while !m.acked && !m.nak && d.now().wrapping_sub(ts) < 4 * d.freq {
+        let _ = m.pump(d);
+        m.pump_rx(d);
+        m.pump_tx(d);
+        d.us(1000);
+    }
+    if m.acked {
+        d.put(b"LEASED ");
+        ip_put(d, ip);
+        d.put(b" mask ");
+        ip_put(d, m.lease[0]);
+        d.put(b" router ");
+        ip_put(d, m.lease[1]);
+        d.put(b" dns ");
+        ip_put(d, m.lease[2]);
+        d.put(b" lease ");
+        d.dec(m.lease_s);
+        d.put(b" s\n");
+        d.kv(b"rx frames", m.rx_frames);
+    } else {
+        d.put(if m.nak { b"DHCP NAK\n" } else { b"no DHCP ACK\n" });
+    }
+    d.flush();
+}
+
+/// A broadcast DHCP message from 0.0.0.0:68 to 255.255.255.255:67 (342 bytes): Ethernet, IPv4 (header checksum, UDP checksum 0 as IPv4 allows), BOOTP (op 1, broadcast flag so replies come broadcast, our MAC as chaddr), the magic cookie, options 53 (1 DISCOVER / 3 REQUEST), 50 + 54 on a REQUEST, 55 (subnet, router, DNS, lease), end.
+fn dhcp_frame(mac: &[u8; 6], xid: u32, ty: u8, req: Option<([u8; 4], [u8; 4])>) -> [u8; 342] {
+    let mut f = [0u8; 342];
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(mac);
+    f[12..14].copy_from_slice(&[0x08, 0x00]);
+    let ip = 14;
+    let ip_len = (342 - 14) as u16;
+    f[ip..ip + 12].copy_from_slice(&[0x45, 0, (ip_len >> 8) as u8, ip_len as u8, 0, 0, 0, 0, 64, 17, 0, 0]);
+    f[ip + 16..ip + 20].copy_from_slice(&[255; 4]);
+    let mut sum = 0u32;
+    for k in (0..20).step_by(2) {
+        sum += u16::from_be_bytes([f[ip + k], f[ip + k + 1]]) as u32;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    f[ip + 10..ip + 12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    let udp = ip + 20;
+    let udp_len = ip_len - 20;
+    f[udp..udp + 8].copy_from_slice(&[0, 68, 0, 67, (udp_len >> 8) as u8, udp_len as u8, 0, 0]);
+    let b = udp + 8;
+    f[b..b + 4].copy_from_slice(&[1, 1, 6, 0]);
+    f[b + 4..b + 8].copy_from_slice(&xid.to_be_bytes());
+    f[b + 10] = 0x80;
+    f[b + 28..b + 34].copy_from_slice(mac);
+    f[b + 236..b + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+    let mut o = b + 240;
+    for chunk in [&[53u8, 1, ty][..]] {
+        f[o..o + chunk.len()].copy_from_slice(chunk);
+        o += chunk.len();
+    }
+    if let Some((ip_req, server)) = req {
+        f[o..o + 2].copy_from_slice(&[50, 4]);
+        f[o + 2..o + 6].copy_from_slice(&ip_req);
+        f[o + 6..o + 8].copy_from_slice(&[54, 4]);
+        f[o + 8..o + 12].copy_from_slice(&server);
+        o += 12;
+    }
+    f[o..o + 6].copy_from_slice(&[55, 4, 1, 3, 6, 51]);
+    f[o + 6] = 255;
+    f
 }
 
 /// [u32 LE len][bytes] twice (firmware, NVRAM), then optionally the CLM blob and the WiFi credential (empty if absent).
