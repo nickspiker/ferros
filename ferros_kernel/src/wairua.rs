@@ -2,6 +2,8 @@
 //!
 //! Distinct from the *ira* (see [`crate::ira`] and VAULT-KEY.md / GLOSSARY.md): the ira is permanent and identity-bearing; the wairua is a volatile per-power-session secret that dies at power interruption and is never persisted. Session working keys derive from it, so when the session ends — or power drops — a wairua-derived key is unrecoverable by construction (freeze IS the destruct, see KEY_REGISTERS.md).
 //!
+//! Lazy: nothing at boot needs it (opening and reading the vault don't; only encrypting does), so KOHI runs the first time something asks — by then more entropy sources can be up to feed it. The checklist's wairua line turns yellow at that moment.
+//!
 //! It comes from one KOHI per session ([`crate::kohi`]: PIPE's health stack and byzantine threshold over the firmware TRNG, RNDR where present, and CPU timing jitter). No healthy majority, no wairua: callers must refuse to proceed (NGARO), never fall back to a counter or timestamp.
 //!
 //! Not yet to spec: the value lives in RAM. Holding it in the V-register file under the inverted-pair guard, and clearing it at session end, is KEY_REGISTERS.md's concern and lands separately.
@@ -18,14 +20,44 @@ struct Session(UnsafeCell<Option<(Option<[u8; 32]>, [crate::kohi::Health; 3])>>)
 unsafe impl Sync for Session {}
 static SESSION: Session = Session(UnsafeCell::new(None));
 
+/// How long this session's KOHI took (ms); 0 until it has run.
+static KOHI_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn session_state() -> &'static (Option<[u8; 32]>, [crate::kohi::Health; 3]) {
     unsafe {
         let s = &mut *SESSION.0.get();
         if s.is_none() {
-            *s = Some(crate::kohi::gather(WAIRUA_CONTEXT));
+            let t0 = crate::platform::cntpct();
+            let st = crate::kohi::gather(WAIRUA_CONTEXT);
+            KOHI_MS.store(((crate::platform::cntpct() - t0) / (crate::platform::cntfrq() / 1000)) as u32, core::sync::atomic::Ordering::Relaxed);
+            if let Some(w) = st.0 {
+                // Yellow: up, but a stand-in until PIPE (and held in RAM, not on-die registers). The first two bytes of its one-way fingerprint follow the label.
+                let fp = fingerprint(&w);
+                let hex = b"0123456789ABCDEF";
+                let s4 = [hex[(fp[0] >> 4) as usize], hex[(fp[0] & 15) as usize], hex[(fp[1] >> 4) as usize], hex[(fp[1] & 15) as usize]];
+                crate::checklist::mark_interim(crate::checklist::Item::Wairua);
+                crate::checklist::suffix(crate::checklist::Item::Wairua, &s4);
+            }
+            *s = Some(st);
         }
         s.as_ref().unwrap()
     }
+}
+
+/// One-way display fingerprint of the wairua (BLAKE3 derive_key under its own context, first 64 bits).
+pub fn fingerprint(w: &[u8; 32]) -> [u8; 8] {
+    let mut fp = [0u8; 8];
+    fp.copy_from_slice(&blake3::derive_key("ferros husky 2026-10-14 wairua display fingerprint v1", w)[..8]);
+    fp
+}
+
+/// This session's KOHI result if it has run, without running it.
+pub fn peek() -> Option<&'static (Option<[u8; 32]>, [crate::kohi::Health; 3])> {
+    unsafe { (*SESSION.0.get()).as_ref() }
+}
+
+pub fn kohi_ms() -> u32 {
+    KOHI_MS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// This session's wairua: the first call runs KOHI, later calls return the same value. `None` = KOHI failed (NGARO).
@@ -33,29 +65,26 @@ pub fn draw() -> Option<[u8; 32]> {
     session_state().0
 }
 
-/// Each KOHI source's health from this session's gather (order: [`crate::kohi::SOURCES`]).
-pub fn source_health() -> [crate::kohi::Health; 3] {
-    session_state().1
-}
-
 /// A [`NonceSource`](ferros_vault::crypto::NonceSource) for the vault store.
 ///
 /// `nonce_i = BLAKE3-keyed(seed, i)`, seed = a key derived from this session's wairua, i a monotonic counter: unique (distinct counter) and unpredictable (secret seed), and never repeating across boots because the wairua is fresh each power session.
 /// Without a wairua there is no safe seed — a zero seed would make nonces a bare counter that restarts every boot, repeating nonces across boots under the same key — so the source refuses: reads still work, the first encryption panics (reported through the fault sink) instead of writing with a reused nonce.
 pub struct TrngNonce {
-    seed: Option<[u8; 32]>,
+    /// Derived from the wairua at the first encryption (that is what runs KOHI if nothing has yet).
+    seed: Option<Option<[u8; 32]>>,
     counter: u64,
 }
 
 impl TrngNonce {
     pub fn new() -> Self {
-        Self { seed: draw().map(|w| blake3::derive_key(NONCE_SEED_CONTEXT, &w)), counter: 0 }
+        Self { seed: None, counter: 0 }
     }
 }
 
 impl ferros_vault::crypto::NonceSource for TrngNonce {
     fn next_nonce(&mut self) -> [u8; 24] {
-        let Some(seed) = self.seed else {
+        let seed = *self.seed.get_or_insert_with(|| draw().map(|w| blake3::derive_key(NONCE_SEED_CONTEXT, &w)));
+        let Some(seed) = seed else {
             panic!("no wairua (KOHI failed): refusing to encrypt with a reused nonce");
         };
         let mut hasher = blake3::Hasher::new_keyed(&seed);

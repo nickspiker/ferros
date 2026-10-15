@@ -1265,26 +1265,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if probe.verified == 1 {
         checklist::mark(checklist::Item::VaultVerified);
     }
-    // ira and wairua: yellow once there is a value — up, but stand-ins until PIPE: SoC-sourced (the ira from readable chip-ID trims rather than GLOSSARY's interim HUK root, the wairua from the SoC TRNG) and passing through RAM instead of being held in on-die registers (KEY_REGISTERS.md). The first two bytes of each one-way fingerprint follow the label.
-    if probe.ira_fp != [0u8; 8] {
+    // ira: yellow once derived — up, but a stand-in until PIPE (SoC-sourced and held in RAM, not on-die registers, KEY_REGISTERS.md) — with the first two bytes of its one-way fingerprint after the label (256-bit secret, so plain BLAKE3 is already one-way; spaghettify only matters for guessable inputs like handles). The wairua line is lit by wairua.rs when KOHI first runs: it is lazy, nothing at boot needs it.
+    if probe.ira_fail == 0 {
         checklist::mark_interim(checklist::Item::Ira);
-    }
-    if probe.wairua_ok == 1 {
-        checklist::mark_interim(checklist::Item::Wairua);
-    }
-    {
-        // The first two bytes of each one-way fingerprint, for the eye: the ira's is the same every boot, the wairua's changes every boot. Both secrets are 256-bit, so plain BLAKE3 is already one-way (a memory-hard KDF like spaghettify only matters for guessable inputs such as handles).
-        let fp_line = |label: &[u8], fp: &[u8; 8]| {
-            let hex = b"0123456789ABCDEF";
-            let mut l = alloc::vec::Vec::from(label);
-            for b in &fp[..2] {
-                l.push(hex[(b >> 4) as usize]);
-                l.push(hex[(b & 15) as usize]);
-            }
-            l
-        };
-        checklist::suffix(checklist::Item::Ira, &fp_line(b"", &probe.ira_fp));
-        checklist::suffix(checklist::Item::Wairua, &if probe.wairua_ok == 1 { fp_line(b"", &probe.wairua_fp) } else { alloc::vec::Vec::from(&b"no TRNG"[..]) });
+        let hex = b"0123456789ABCDEF";
+        let f = &probe.ira_fp;
+        checklist::suffix(checklist::Item::Ira, &[hex[(f[0] >> 4) as usize], hex[(f[0] & 15) as usize], hex[(f[1] >> 4) as usize], hex[(f[1] & 15) as usize]]);
     }
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.

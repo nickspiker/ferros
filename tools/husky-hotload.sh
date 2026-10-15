@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# REGISTER ORACLE ONLY (2026-10-14): ferros runs from the cold boot on slot b (tools/husky-cold.sh). This handoff path is kept to boot Linux, let it set hardware up, then hand off and dump/diff what it left — a guide for new bring-ups (WiFi/PCIe, modem), not a way to run ferros. New features are not ported to it.
+#
 # Hot-load a ferros shim build onto husky (Pixel 8 Pro) with no flashing: push, stage, `adb reboot ferros`, read the report.
 #
 # Needs the runtime-trigger husky kernel (husky-kernel aosp: ferros_handoff.c /sys/kernel/ferros/stage + the ufshcd.c reboot notifier) flashed once, plus root (Magisk) and pKVM disabled.

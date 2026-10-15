@@ -1,12 +1,15 @@
 ---
 name: husky_shim_usb_service
-description: "The husky dev loop since 2026-10-13 — runtime handoff into the shim USB service (PT diag/reload/run/mem/poke with UFS live), button-free fastboot via EL3 + watchdog, and the hard-won hardware facts behind it"
+description: "Linux-handoff shim USB service — since 2026-10-14 a REGISTER ORACLE ONLY, not a boot option (ferros runs from cold slot b); still holds the hard-won hardware facts (SYSMMU, XferNotReady, EL3 poison rule, fastboot via EL3 + watchdog)"
 metadata:
   node_type: memory
   type: project
   originSessionId: 75576678-89a2-4635-8c20-1eba33babf4a
   modified: 2026-10-14T05:39:48.285Z
 ---
+
+**Status 2026-10-14: oracle and guide, not a boot option.** ferros runs from the cold boot on slot b ([[husky_cold_slot_b]]). Use this path only to boot Linux, let it set hardware up, hand off and dump/diff what it left (how the cold-USB fix was found) — for WiFi/PCIe and modem bring-up. Don't port new features to it; delete it after WiFi bring-up.
+
 
 **Also:** `bridge store put|get|ls|rm` (vault by logical key, persists), `bridge display [--hold] "text"` + automatic boot status screen after a `--live` handoff (DECON adoption, see ferros DISPLAY.md; text on the panel visually confirmed by the owner 2026-10-14), `--live` = /sys/kernel/ferros/go from running Android (screen on, DECON hibernation off).
 

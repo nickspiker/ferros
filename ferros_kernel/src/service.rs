@@ -246,7 +246,7 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
         t.push(hex[(b & 0xF) as usize]);
     }
     t.extend_from_slice(b"\nwairua: ");
-    t.extend_from_slice(if p.wairua_ok == 1 { b"live" } else { b"NO TRNG" });
+    t.extend_from_slice(match crate::wairua::peek() { None => b"not drawn yet".as_slice(), Some((Some(_), _)) => b"live", Some((None, _)) => b"KOHI FAILED" });
     t.extend_from_slice(b"\n\nusb: serving Photon Transport\n     1209:4665\n\nboth volume keys\n= power off\n");
     t
 }
@@ -560,7 +560,9 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"KILL_GICD_CTLR=", k[1].load(Relaxed));
                                             append_hex(&mut resp, b"KILL_HCR_BEFORE=", k[2].load(Relaxed));
                                             append_hex(&mut resp, b"KILL_KEYS_IDLE=", k[3].load(Relaxed));
-                                            for (name, h) in crate::kohi::SOURCES.iter().zip(crate::wairua::source_health().iter()) {
+                                            let kohi = crate::wairua::peek();
+                                            append_hex(&mut resp, b"KOHI_DONE=", kohi.is_some() as u32);
+                                            for (name, h) in crate::kohi::SOURCES.iter().zip(kohi.map(|k| k.1).unwrap_or_default().iter()) {
                                                 // present b0, rct_fail b1, apt_fail b2, level_fail b8..15, level-0 ones/2 b16..31
                                                 let mut key = alloc::vec::Vec::from(&b"KOHI_"[..]);
                                                 key.extend_from_slice(name.to_ascii_uppercase().as_bytes());
@@ -570,8 +572,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 key.extend_from_slice(b"_US=");
                                                 append_hex(&mut resp, &key, h.us);
                                             }
-                                            append_hex(&mut resp, b"KOHI_OK=", crate::wairua::draw().is_some() as u32);
-                                            append_hex(&mut resp, b"KOHI_MS=", crate::vault_boot::KOHI_MS.load(core::sync::atomic::Ordering::Relaxed));
+                                            append_hex(&mut resp, b"KOHI_OK=", kohi.map(|k| k.0.is_some()).unwrap_or(false) as u32);
+                                            append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
                                             append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
                                             let daif: u64;
                                             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
@@ -595,7 +597,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
                                                 append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
                                             }
-                                            append_hex(&mut resp, b"WAIRUA_OK=", probe.wairua_ok as u32);
+                                            append_hex(&mut resp, b"WAIRUA_OK=", crate::wairua::peek().map(|k| k.0.is_some()).unwrap_or(false) as u32);
                                             append_hex(&mut resp, b"IRA_FAIL=", probe.ira_fail);
                                         }
                                         if let Some(prev) = &b.prev {

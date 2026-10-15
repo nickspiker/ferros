@@ -9,10 +9,6 @@ const UFS_BASE: usize = 0x1320_0000;
 
 /// Display fingerprints: the first 64 bits of BLAKE3 derive_key under a context of their own, so a fingerprint is one-way and matches no other hash of the same secret anywhere.
 const IRA_FP_CONTEXT: &str = "ferros husky 2026-10-14 ira display fingerprint v1";
-const WAIRUA_FP_CONTEXT: &str = "ferros husky 2026-10-14 wairua display fingerprint v1";
-
-/// How long this boot's KOHI took, for DIAG.
-pub static KOHI_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn fingerprint(context: &str, secret: &[u8; 32]) -> [u8; 8] {
     let mut fp = [0u8; 8];
@@ -29,12 +25,10 @@ pub struct VaultProbe {
     /// 0 ok; 1 format, 2 set, 3 read failed.
     pub stage: u8,
     pub root16: [u8; 16],
-    pub wairua_ok: u8,
-    /// One-way fingerprints for display (`fingerprint`): the ira's is the same every boot, the wairua's differs every boot. Never the secrets themselves.
+    /// One-way display fingerprint of the ira (`fingerprint`): the same every boot. Never the secret itself.
     pub ira_fp: [u8; 8],
     /// 0 = ira derived; else why not (`ira::derive_ira`: G#100 + source = reads disagreed, G#200 + source = degenerate, G#300 = devinfo records missing).
     pub ira_fail: u32,
-    pub wairua_fp: [u8; 8],
     pub ap_tune: [u8; 32],
     pub asv_nz: bool,
     pub hpm_nz: bool,
@@ -56,14 +50,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
     crumb(0xC1); // ira derived (or refused)
 
-    let t_kohi = crate::platform::cntpct();
-    let wairua = crate::wairua::draw(); // this session's KOHI (run on first use)
-    KOHI_MS.store(((crate::platform::cntpct() - t_kohi) / (crate::platform::cntfrq() / 1000)) as u32, core::sync::atomic::Ordering::Relaxed);
     crumb(0xC2);
-    let (wairua_ok, wairua_fp) = match wairua {
-        Some(w) => (1u8, fingerprint(WAIRUA_FP_CONTEXT, &w)),
-        None => (0u8, [0u8; 8]),
-    };
 
     let nz = |b: &[u8]| b.iter().any(|&x| x != 0);
     let mut p = VaultProbe {
@@ -73,9 +60,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         sealed: 0,
         stage: 0,
         root16: [0u8; 16],
-        wairua_ok,
         ira_fp,
-        wairua_fp,
         ap_tune: crate::ira::read_ap_hw_tune(),
         asv_nz: nz(&crate::ira::read_asv_tbl()),
         hpm_nz: nz(&crate::ira::read_hpm_asv()),
@@ -137,16 +122,17 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
 }
 
 /// Write the vault probe into the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory).
-/// r[1]/0x08 `link_up=` := the wairua's fingerprint (differs each boot; never the wairua itself — this block is printed by Android's kernel); r[2]/0x10 bytes := opened|verified<<1|sealed<<2|wairua_ok<<3|link_up<<4, then stage, then ap_nz|asv_nz<<1|hpm_nz<<2; r[3]/0x18 `mbr_sig` := exit | dvfs<<8 (exit 0 = vault run done, G#Bx = USB service exit reason); r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — non-zero + stable across boots == the vault booted from the ira.
+/// r[1]/0x08 `link_up=` := the wairua's fingerprint if KOHI has run, else 0 (differs each boot; never the wairua itself — this block is printed by Android's kernel); r[2]/0x10 bytes := opened|verified<<1|sealed<<2|wairua drawn<<3|link_up<<4, then stage, then ap_nz|asv_nz<<1|hpm_nz<<2; r[3]/0x18 `mbr_sig` := exit | dvfs<<8 (exit 0 = vault run done, G#Bx = USB service exit reason); r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — non-zero + stable across boots == the vault booted from the ira.
 pub fn report_vault(p: &VaultProbe, exit: u8) {
-    let f_open = (p.opened as u64) | ((p.verified as u64) << 1) | ((p.sealed as u64) << 2) | ((p.wairua_ok as u64) << 3) | ((p.link_up as u64) << 4);
+    let wairua = crate::wairua::peek().and_then(|s| s.0);
+    let f_open = (p.opened as u64) | ((p.verified as u64) << 1) | ((p.sealed as u64) << 2) | ((wairua.is_some() as u64) << 3) | ((p.link_up as u64) << 4);
     let ap_nz = p.ap_tune.iter().any(|&x| x != 0) as u64;
     let flags = f_open | ((p.stage as u64) << 8) | ((ap_nz | ((p.asv_nz as u64) << 1) | ((p.hpm_nz as u64) << 2)) << 16);
     LAST_CRUMB.store(exit as u64, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
-        w(0x08, u64::from_le_bytes(p.wairua_fp));
+        w(0x08, wairua.map(|w| u64::from_le_bytes(crate::wairua::fingerprint(&w))).unwrap_or(0));
         w(0x10, flags);
         w(0x18, (exit as u64) | ((p.dvfs as u64) << 8));
         core::ptr::copy_nonoverlapping(p.ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);
