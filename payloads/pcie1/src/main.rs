@@ -22,6 +22,9 @@ const GPIO: u64 = 9;
 const CMU: u64 = 11;
 const PMU: u64 = 12;
 const ERR: u64 = u64::MAX;
+/// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
+const BAR1: u64 = 0x40_0000;
+const BAR1_SIZE: u32 = 0x40_0000;
 
 struct Drv {
     grants: u64,
@@ -115,6 +118,19 @@ impl Drv {
         self.put(b"=");
         self.hex(v);
         self.put(b"\n");
+    }
+    fn show(&mut self, k: &[u8], g: u64, off: u64) {
+        let v = self.rd(g, off);
+        self.kv(k, v);
+    }
+    /// One word of dongle memory (backplane address) through BAR1, moving the window first (dhdpcie_bus_membytes with bar1 switching).
+    fn tcm_rd(&mut self, addr: u32) -> u32 {
+        self.wr(CFG, 0x84, addr & !(BAR1_SIZE - 1));
+        self.rd(MEM, BAR1 + (addr & (BAR1_SIZE - 1)) as u64)
+    }
+    fn tcm_wr(&mut self, addr: u32, v: u32) {
+        self.wr(CFG, 0x84, addr & !(BAR1_SIZE - 1));
+        self.wr(MEM, BAR1 + (addr & (BAR1_SIZE - 1)) as u64, v);
     }
     fn flush(&mut self) {
         if self.n > 0 {
@@ -437,6 +453,90 @@ fn run(d: &mut Drv, stage: u8) {
         d.flush();
     }
     d.wr(CFG, 0x80, 0x1800_0000);
+    if stage < 5 {
+        return;
+    }
+
+    // ---- stage 5: measure before the firmware download touches anything (read-only on the chip). BAR sizes; the DAR security status (pcie_core.h: secure boot means a signature file is required); the CA7's NCI state: core info and DMP control in the OOBR (nci_core_cflags: OOBR + core offset + 8, bit 5 CPUHALT), reset control in its AMNI wrapper (nci_iscoreup: wrapper + G#140 bit 0 = in reset), the wrapper reached through BAR0's second 4 KiB window (cfg G#70). ----
+    d.clr(CFG, 0x04, 0x2);
+    for (name, off, restore) in [(&b"bar0"[..], 0x10u64, 0x6000_0000u32), (b"bar1", 0x18, 0)] {
+        d.wr(CFG, off, 0xFFFF_FFFF);
+        let raw = d.rd(CFG, off);
+        d.wr(CFG, off, restore);
+        d.put(name);
+        d.kv(b".raw", raw);
+        d.put(name);
+        d.kv(b".size", (!(raw & !0xF)).wrapping_add(1));
+    }
+    d.set(CFG, 0x04, 0x2);
+    d.show(b"cfg.bar1win", CFG, 0x84);
+    d.show(b"cfg.bar0win2", CFG, 0x70);
+    d.wr(CFG, 0x80, 0x1800_1000);
+    d.show(b"pcie.dar_security_status", MEM, 0xA74);
+    d.wr(CFG, 0x80, oobr);
+    d.show(b"ca7.coreinfo", MEM, 0x240);
+    d.show(b"ca7.dmpctrl", MEM, 0x248);
+    d.show(b"ca7.dmp+c", MEM, 0x24C);
+    d.wr(CFG, 0x80, 0x1800_0000);
+    d.flush();
+    d.wr(CFG, 0x70, 0x1850_4000);
+    let t0 = d.now();
+    let id = d.rd(MEM, 0x1100);
+    d.kv(b"ca7.amni.first_read_us", (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32);
+    d.kv(b"ca7.amni.idm_device_id", id);
+    d.flush();
+    if id != 0xFFFF_FFFF {
+        d.show(b"ca7.amni.reset_control", MEM, 0x1140);
+        d.show(b"ca7.amni.reset_status", MEM, 0x1144);
+    }
+    d.flush();
+    if stage < 6 {
+        return;
+    }
+
+    // ---- stage 6: the dongle's RAM through BAR1, ARM still halted. RAM size the way si_sysmem_size counts it (sysmem rev 14 ≥ 12: coreinfo ROM banks [31:24], SRAM banks [23:16]; per bank, bankidx G#10 ← index, bankinfo G#40 size = 8 KiB × ([6:0] + 1)); the RAM base is the sysmem's second slave port (G#2A_0000, dhd_pcie.c NCI default). BAR1 (4 MiB) sits above BAR0 (64 KiB) at G#6040_0000; cfg G#84 picks which 4 MiB of the backplane it shows (dhdpcie_setbar1win). Then a pattern round trip in both windows, and the shared-area word at the top of RAM zeroed (dhdpcie_init_shared_addr). ----
+    d.wr(CFG, 0x80, 0x1808_8000);
+    let ci = d.rd(MEM, 0x0);
+    d.kv(b"sysmem.coreinfo", ci);
+    let (nrb, nb) = ((ci >> 24) & 0xFF, (ci >> 16) & 0xFF);
+    let mut ramsize = 0u32;
+    for i in nrb..nrb + nb {
+        d.wr(MEM, 0x10, i);
+        let bi = d.rd(MEM, 0x40);
+        ramsize += 8192 * ((bi & 0x7F) + 1);
+    }
+    d.wr(CFG, 0x80, 0x1800_0000);
+    d.kv(b"ramsize", ramsize);
+    const RAM_BASE: u32 = 0x2A_0000;
+    d.wr(CFG, 0x18, 0x6040_0000);
+    d.wr(CFG, 0x1C, 0);
+    d.flush();
+    let t0 = d.now();
+    let w0 = d.tcm_rd(RAM_BASE);
+    d.kv(b"bar1.first_read_us", (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32);
+    d.kv(b"ram[base]", w0);
+    d.flush();
+    if w0 == 0xFFFF_FFFF {
+        d.put(b"BAR1 does not decode\n");
+        return;
+    }
+    let top = RAM_BASE + ramsize - 4;
+    let v = d.tcm_rd(top);
+    d.kv(b"ram[top]", v);
+    for (addr, pat) in [(RAM_BASE, 0xA5C3_3C5Au32), (top - 4, 0x5A3C_C3A5)] {
+        d.tcm_wr(addr, pat);
+        let back = d.tcm_rd(addr);
+        d.put(if back == pat { b"roundtrip ok " } else { b"roundtrip BAD " });
+        d.hex(addr);
+        d.put(b" ");
+        d.hex(back);
+        d.put(b"\n");
+    }
+    d.tcm_wr(top, 0);
+    let v = d.tcm_rd(top);
+    d.kv(b"ram[top] zeroed", v);
+    d.show(b"cfg.bar1win", CFG, 0x84);
+    d.flush();
 }
 
 #[panic_handler]
