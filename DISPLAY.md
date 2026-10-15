@@ -6,7 +6,7 @@ Boot-time breadcrumbs on the physical screen — so a hang during a risky MMIO e
 
 ## The panel
 
-- **google-shoreline**, 1080x2400, **command mode**, **DSC** (Display Stream Compression). Command mode = the panel has its own GRAM and self-refreshes; DECON only pushes a frame when triggered. This is NOT a video-mode linear framebuffer that scans out continuously.
+- husky (Pixel 8 Pro): **Samsung S6E3HC3** (DT `zuma-shusky-display.dtsi`: `samsung,s6e3hc3` / `-c10` by revision), **1344x2992**, **command mode**, **DSC** (Display Stream Compression). (The google-shoreline 1080x2400 noted here first is the Pixel 8 / shiba panel, from the original purchase note.) Command mode = the panel has its own GRAM and self-refreshes; DECON only pushes a frame when triggered. This is NOT a video-mode linear framebuffer that scans out continuously.
 - Zuma DPU driver = **cal_9865** in the google display module (cloned to `/mnt/Harbor/ferros-ref/display-gs`, branch android-gs-shusky-5.15-android15-qpr1). Register maps: `samsung/cal_9865/regs-decon.h`, `regs-dpp.h`; sequences: `decon_reg.c`, `dpp_reg.c`, `dsim_reg.c`.
 
 ## Block addresses (zuma-drm-dpu.dtsi)
@@ -80,6 +80,8 @@ On a cold boot ABL leaves:
 `display::show` treats "translation off" as an identity mapping and otherwise runs exactly as after a handoff. FRAME_COUNT 4 -> 5, and the owner saw the text. Each cold boot also paints its status screen automatically. Text is smaller than after a handoff because nothing scales it: the console draws 8x16 glyphs at 2x straight onto the native grid.
 
 ## Status
+
+Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, write ABL's surface, shadow update + trigger); it owns no power-up from off, no DSI command path (brightness G#51, display off/on G#28/G#29, sleep in/out G#10/G#11), no framebuffer of its own, no tear-effect sync, and it lives in the kernel rather than as a process. On cold boot the SYSMMU/S2MPU items below are moot (ABL leaves translation off). **Before the display driver work starts: a knobs inventory (everything DECON/DPP/DSIM/DSC/panel lets us set) and the ideal design, for the owner to review — no code first.**
 
 - [x] Identify panel/DPU (command mode + DSC, cal_9865)
 - [x] Clone the display driver (Harbor `display-gs`)
