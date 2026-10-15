@@ -55,7 +55,7 @@ Nothing hard-baked traps us. USB is the lowest rung of a ladder that is explicit
 
 ## Module map
 
-The FPGA implementation lives at `/mnt/Octopus/Code/pipe/` (separate repo from ferros). RTL modules:
+The FPGA implementation lives at `/mnt/Harbor/Code/pipe/` (separate repo from ferros). RTL modules:
 
 | Module | Role |
 |---|---|
@@ -136,7 +136,7 @@ PIPE on ECP5 is the FPGA prototype of the same write-once-key anchor that [Glyph
 
 ## Repository
 
-Implementation: `/mnt/Octopus/Code/pipe/` — standalone repo, peer to ferros. Not a member of the ferros Cargo workspace.
+Implementation: `/mnt/Harbor/Code/pipe/` — standalone repo, peer to ferros. Not a member of the ferros Cargo workspace.
 
 Status (as of 2026-05-08): Phase A scaffold complete; module bodies and Phase B/C measurements pending.
 

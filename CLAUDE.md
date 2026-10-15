@@ -93,7 +93,7 @@ ferros boots on the M1 MacBook Air via m1n1 proxy. Framebuffer console output co
 
 ### Setup (already done)
 - **MacBook:** Asahi m1n1 replaced with BRINGUP build (see below) on the ESP.
-- **Fedora:** m1n1 cloned at `/mnt/Octopus/Code/m1n1`, pyserial + construct installed.
+- **Fedora:** m1n1 cloned at `/mnt/Harbor/Code/m1n1`, pyserial + construct installed.
 - **udev rule:** `/etc/udev/rules.d/99-m1n1.rules` auto-loads `cdc_acm` and sets `dialout` group.
 
 ### MacBook Claude: Install patched m1n1 (DO THIS — replaces broken BRINGUP build)
@@ -207,7 +207,7 @@ All code written, never run on hardware. Next step is boot + validate.
 ### Test plan (Phase 4a: validate boot-to-USB)
 ```bash
 # Fedora box:
-cd /mnt/Octopus/Code/ferros
+cd /mnt/Harbor/Code/ferros
 git pull
 cargo build -p ferros_kernel --target aarch64-unknown-none --release --no-default-features --features m1
 aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel \
