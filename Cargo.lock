@@ -532,10 +532,12 @@ name = "ferros-bridge"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "ed25519-dalek",
  "ferros_pt",
  "nunc-time",
  "nusb",
  "tokio",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -690,7 +692,8 @@ dependencies = [
  "ferros_ledger",
  "ferros_pt",
  "ferros_vault",
- "ihi",
+ "ihi 0.0.48",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -720,7 +723,7 @@ dependencies = [
  "ed25519-compact",
  "ferros_hal",
  "ferros_layout",
- "ihi",
+ "ihi 0.0.3",
  "vsf 0.10.0",
 ]
 
@@ -956,6 +959,16 @@ dependencies = [
  "sha2",
  "sha3",
  "spirix",
+]
+
+[[package]]
+name = "ihi"
+version = "0.0.48"
+dependencies = [
+ "blake3",
+ "i256",
+ "sha2",
+ "sha3",
 ]
 
 [[package]]
@@ -1509,6 +1522,9 @@ name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -1531,6 +1547,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spirix"
@@ -1751,14 +1773,20 @@ dependencies = [
 name = "vsf"
 version = "0.10.0"
 dependencies = [
+ "aes-gcm",
  "bitvec",
  "blake3",
+ "chacha20poly1305",
  "chrono",
+ "ed25519-dalek",
  "hex",
  "i256",
  "libm",
  "num-complex",
  "num-traits",
+ "rand",
+ "spin",
+ "x25519-dalek",
 ]
 
 [[package]]

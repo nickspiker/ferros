@@ -54,6 +54,9 @@ mod cachemap;
 // KOHI: PIPE's entropy gathering + health stack in software (the wairua's source).
 #[cfg(feature = "pixel8")]
 mod kohi;
+// The gate and the oracle: signed capsules, ihi at spawn (ORACLE.md).
+#[cfg(feature = "pixel8")]
+mod oracle;
 // Processes: EL0 in an arc, capabilities, the syscall boundary.
 #[cfg(feature = "pixel8")]
 mod process;

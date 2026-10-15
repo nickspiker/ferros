@@ -436,8 +436,18 @@ pub enum Grant<'a> {
     Use(&'a [u8]),
 }
 
+/// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
+pub const IHI: usize = 0xFE0;
+
+/// Spawn a signed capsule: it must pass the gate (oracle.rs); the oracle's ihi is written into the process's arc at `IHI` and the kernel keeps no copy. Then as `spawn`.
+pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
+    let g = crate::oracle::gate(capsule)?;
+    let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+    spawn(name, &g.code, input, grants, Some(ihi))
+}
+
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
@@ -458,6 +468,9 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant]) -> Result
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
         p.write((GRANTS + 4 + 32 * i) as u64, &c.token);
+    }
+    if let Some(i) = ihi {
+        p.write(IHI as u64, &i);
     }
     p.write(CODE as u64, code);
     let in_off = CODE + code.len();

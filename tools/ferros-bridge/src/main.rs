@@ -405,12 +405,56 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process.
+fn signed_capsule(code: &[u8]) -> Vec<u8> {
+    use ed25519_dalek::SigningKey;
+    use vsf::types::VsfType;
+    let key_path = std::env::var("FERROS_DEV_KEY").unwrap_or_else(|_| "/mnt/Harbor/Code/keys/ferros.secret".to_string());
+    let key = std::fs::read(&key_path).unwrap_or_else(|e| {
+        eprintln!("No developer key at {key_path}: {e}");
+        std::process::exit(1);
+    });
+    if key.len() < 32 {
+        eprintln!("Developer key at {key_path} is too short");
+        std::process::exit(1);
+    }
+    let seed: [u8; 32] = key[..32].try_into().unwrap();
+    let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let mut section = vsf::file_format::VsfSection::new("aarch64");
+    section.add_field("code", VsfType::v(b'b', code.to_vec()));
+    let unsigned = vsf::VsfBuilder::new()
+        .add_section_direct(section)
+        .signature_ed25519(pubkey, [0u8; 64])
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Capsule build failed: {e}");
+            std::process::exit(1);
+        });
+    vsf::verification::sign_file(unsigned, &seed).unwrap_or_else(|e| {
+        eprintln!("Capsule signing failed: {e}");
+        std::process::exit(1);
+    })
+}
+
 /// `prefix` goes in front of the Exec params (spawn's name + grants header; empty for run).
 async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>) {
     let blob = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
     });
+    // spawn: the kernel only spawns signed capsules (the gate); run stays raw (dev payloads at EL2).
+    let blob = if exec_cap == ferros_pt::command::caps::SPAWN && std::env::var("FERROS_RAW_SPAWN").is_err() {
+        let mut c = signed_capsule(&blob);
+        // Test switch: flip one byte of the code after signing — the kernel's gate must refuse it.
+        if std::env::var("FERROS_TAMPER_CAPSULE").is_ok() {
+            let n = c.len();
+            c[n - 1] ^= 0x01;
+        }
+        eprintln!("Signed capsule: {} bytes of code -> {} bytes", blob.len(), c.len());
+        c
+    } else {
+        blob
+    };
     let input: Vec<u8> = match hex_input {
         Some(h) => {
             let h = h.trim_start_matches("0x");
@@ -477,7 +521,10 @@ async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: V
     // Response: [ret: 8 LE][out bytes]
     match tokio::time::timeout(std::time::Duration::from_secs(30), pt_recv(&link)).await {
         Ok(Ok(resp)) => {
-            if resp.len() >= 8 {
+            if resp.starts_with(b"ERR") {
+                eprintln!("Device refused: {}", String::from_utf8_lossy(&resp));
+                std::process::exit(1);
+            } else if resp.len() >= 8 {
                 let ret = u64::from_le_bytes(resp[..8].try_into().unwrap());
                 let out = &resp[8..];
                 eprintln!("Payload returned A#{ret} ({} output bytes):", out.len());

@@ -73,6 +73,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         return (p, None);
     };
     let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
+    crate::oracle::set_system_secret(&ira);
 
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";

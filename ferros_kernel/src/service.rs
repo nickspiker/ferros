@@ -764,10 +764,12 @@ pub fn run(mut b: Boot) -> ! {
                                                 grants.push(if kind == 1 { crate::process::Grant::Serve(g) } else { crate::process::Grant::Use(g) });
                                             }
                                             let input = &pr[at.min(pr.len())..];
-                                            match crate::process::spawn(if name.is_empty() { b"proc" } else { name }, code, input, &grants) {
+                                            // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
+                                            match crate::process::spawn_capsule(if name.is_empty() { b"proc" } else { name }, code, input, &grants) {
                                                 Ok(o) => {
                                                     use crate::checklist::{mark, Item};
                                                     mark(Item::Arcs);
+                                                    mark(Item::Spawn);
                                                     if o.exit >> 56 != 0xFA {
                                                         mark(Item::El0);
                                                     }
