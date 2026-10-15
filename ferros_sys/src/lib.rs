@@ -24,6 +24,7 @@ pub mod nr {
     pub const MMIO_WRITE: u64 = 5;
     pub const ENTROPY: u64 = 6;
     pub const DMA: u64 = 7;
+    pub const INPUT: u64 = 8;
 }
 
 /// The raw trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer named by the arguments, so nothing is assumed cached across it.
@@ -128,6 +129,11 @@ pub fn entropy(cap: u64, buf: &mut [u8]) -> u64 {
 /// The physical base of a DMA region grant (non-cacheable memory the process reads and writes directly, its device's only DMA window).
 pub fn dma(cap: u64) -> u64 {
     svc(nr::DMA, cap, 0, 0, 0, 0)
+}
+
+/// Copy spawn input into `buf`, starting at byte `off`; returns how many bytes (0 at the end). Large one-shot input (firmware) is streamed this way so the arc stays small.
+pub fn input(start: u64, buf: &mut [u8]) -> usize {
+    svc(nr::INPUT, start, off(buf.as_mut_ptr() as *const u8), buf.len() as u64, 0, 0) as usize
 }
 
 /// Say something on the console (grant slot 0).

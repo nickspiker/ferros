@@ -9,6 +9,7 @@
 //! - 3 `reply(reply_token, msg, msg_len)` — answer a call; the reply token ceases to exist (it cannot be used twice), the caller becomes runnable, the server carries on.
 //! - 4 `mmio_read(grant, offset)` / 5 `mmio_write(grant, offset, value)` — a hardware grant (an arc of device registers, ASID.md) checked by the kernel on every access: 4-byte aligned, inside the grant, else ERR. Blocks only the EL3 monitor can reach (the PMU) go through it. Drivers are processes holding these; when toka-compiled drivers exist, masked direct access replaces the syscall. Husky hazard: reading a block whose power domain is off makes the next EL3 call hang (BOOT.md EL3 poison rule), so a driver checks power state first.
 //! - 6 `entropy(cap, buf, len)` — present a token holding the entropy right; `len` bytes (at most 4096) of fresh randomness are written at `buf`, x0 = `len`. The stream is BLAKE3 keyed from this session's wairua (KOHI) over a kernel counter, so no two calls in a power session see the same bytes and nothing from a previous session repeats. ERR without a wairua: a driver that needs randomness (the WiFi firmware's RNG seed) gets none rather than a predictable one.
+//! - 8 `input(off, buf, len)` — copy `len` bytes (≤ 4096) of the spawn input at `off` into the arc at `buf`; x0 = bytes copied (0 past the end). Large one-shot input (a driver's firmware) streams through a small arc buffer this way instead of bloating the arc; small input is also inlined at `x1` on entry.
 //! - 7 `dma(cap)` — present a token holding a DMA grant; x0 = the physical base of that DMA region (its size is in the registry, `DMA`). DMA regions are 2 MiB blocks of non-cacheable memory the process reads and writes directly (its device's rings and buffers); the device's DMA window covers exactly that block (BOOT.md/WIFI.md: S2MPU fence).
 //! There is no "print", no PID and no ambient authority: what a process may reach is exactly the tokens it was granted at spawn (written at arc offset 0: u32 count, then the 32-byte tokens). An object you hold no token for does not exist for you — an unknown token gets the same answer as a wrong one.
 //!
@@ -198,6 +199,8 @@ struct Process {
     name: Vec<u8>,
     /// The process's console output is at the start of a line (so the next byte gets the name tag).
     line_start: bool,
+    /// The spawn input, kept in kernel memory and pulled in by the `input` syscall (so a driver's arc stays small while large one-shot data — firmware — streams through a chunk buffer). Inlined into the arc too only when it is small.
+    input: Vec<u8>,
 }
 
 struct Endpoint {
@@ -280,6 +283,11 @@ const SYS_MMIO_WRITE: u64 = 5;
 const SYS_ENTROPY: u64 = 6;
 /// dma(cap) → x0 = the region's physical base.
 const SYS_DMA: u64 = 7;
+/// input(off, buf, len) → bytes of the spawn input copied into the arc at `buf`.
+const SYS_INPUT: u64 = 8;
+/// Once pcie1 streams its firmware via SYS_INPUT, input above this is streamed only and the arc stays small; today the full input is still inlined as a bridge (see spawn).
+#[allow(dead_code)]
+const INLINE_INPUT: usize = 4096;
 
 /// A named DMA region a spawn can grant (`bridge spawn --dma NAME`): memory a device DMAs into, mapped non-cacheable and EL0 read/write (cachemap DMA_POOL). One per device, held for the boot: a driver that dies may leave its device still pointing into it, so it is never handed to anything else.
 pub struct Dma {
@@ -476,6 +484,14 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 }
                 _ => ERR,
             };
+            0
+        }
+        SYS_INPUT => {
+            let off = f.x[0] as usize;
+            let len = (f.x[2] as usize).min(4096);
+            let slice: Vec<u8> = p.input.get(off..).map(|t| t[..len.min(t.len())].to_vec()).unwrap_or_default();
+            p.write(f.x[1], &slice);
+            f.x[0] = slice.len() as u64;
             0
         }
         SYS_DMA => {
@@ -687,7 +703,8 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
         return Err("no VHE: processes need the EL2&0 regime");
     }
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
-    let arc = arc_alloc(CODE + code.len() + input.len() + STACK).ok_or("arc pool exhausted")?;
+    let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
+    let arc = arc_alloc(CODE + code.len() + inline + STACK).ok_or("arc pool exhausted")?;
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for g in grants {
@@ -707,7 +724,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0 };
-    let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true };
+    let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true, input: input.to_vec() };
     // Grants page: count, then the tokens in slot order. Then the code, then the input.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
