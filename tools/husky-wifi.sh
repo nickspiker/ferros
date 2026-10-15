@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the pcie1 driver process (payloads/pcie1, WIFI.md) through its stages on cold ferros, stopping at the first stage that does not come back.
-#   00 read-only survey · 01 + PHY bring-up · 02 + link training (Gen1) · 03 + config space and the chip id  · 04 + NCI ROM dump · 05 + BAR sizes, security status, CA7 state (read-only)  · 06 + RAM size, BAR1, write/read round trip in dongle RAM · 07 + firmware download and start · 08 + shared area and firmware console · 09 + msgbuf rings and the first ioctl · 10 + a second query, then the S2MPU VID probe (outside-fence DMA)
+#   00 read-only survey · 01 + PHY bring-up · 02 + link training (Gen1) · 03 + config space and the chip id  · 04 + NCI ROM dump · 05 + BAR sizes, security status, CA7 state (read-only)  · 06 + RAM size, BAR1, write/read round trip in dongle RAM · 07 + firmware download and start · 08 + shared area and firmware console · 09 + msgbuf rings and the first ioctl · 10 + a second query, then the S2MPU VID probe (outside-fence DMA; stage 10 only) · 11 + CLM, events, WLC_UP and a scan
 # A stage that stalls the bus ends in a watchdog reset (ferros reboots); the last printed stage is the culprit.
 # Usage: tools/husky-wifi.sh [last-stage] [first-stage]   (default 03; each stage redoes every earlier one, so a first-stage skips only the earlier runs' output)
 set -uo pipefail
@@ -13,13 +13,15 @@ FIRST=${2:-00}
 FWDIR=${FWDIR:-/mnt/Harbor/firmware/husky}
 FW=${FW:-$FWDIR/fw_bcmdhd.bin_4398_d0}
 NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}
+# The regulatory (CLM) blob, loaded only if the firmware reports none (`country` = "#n"); d0 = ROW byte for byte.
+CLM=${CLM:-$FWDIR/bcmdhd_clm.blob_4398_d0}
 ( cd "$REPO" && cargo build -q -p ferros-payload-pcie1 --target aarch64-unknown-none --release && aarch64-linux-gnu-objcopy -O binary "$R/pcie1" "$R/pcie1.bin" ) || exit 1
 HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu"
-for s in 00 01 02 03 04 05 06 07 08 09 10; do
+for s in 00 01 02 03 04 05 06 07 08 09 10 11; do
     [[ "$s" < "$FIRST" ]] && continue
     echo "=== stage $s"
     EXTRA=()
-    [[ "$s" > 06 ]] && EXTRA=(--entropy --dma pcie1-dma --input-file "$FW" --input-file "$NVRAM")
+    [[ "$s" > 06 ]] && EXTRA=(--entropy --dma pcie1-dma --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM")
     timeout 120 "$B" spawn "$R/pcie1.bin" "$s" --name pcie1 $HW "${EXTRA[@]}" 2>&1 | grep -vE "DATA|SPEC|recv\[|recv:|send|Staging|Staged|COMPLETE|Connected|Signed"
     # Long waits (WL_REG_ON's 200 ms) span many time slices: the spawn returns after the first one and the driver finishes in the background. Drain its console until it exits.
     for _ in $(seq 60); do

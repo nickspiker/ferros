@@ -119,6 +119,21 @@ impl Drv {
             self.put(&[c]);
         }
     }
+    fn dec(&mut self, mut v: u32) {
+        let mut b = [0u8; 10];
+        let mut i = b.len();
+        loop {
+            i -= 1;
+            b[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.put(b"A#");
+        let digits = b;
+        self.put(&digits[i..]);
+    }
     fn kv(&mut self, k: &[u8], v: u32) {
         self.put(k);
         self.put(b"=");
@@ -607,8 +622,8 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
 
     // ---- stage 7: download and start the firmware (dhd_pcie.c _dhdpcie_download_firmware with the CA7 path of __dhdpcie_bus_download_state). Input after the stage byte: [u32 LE len][firmware .bin][u32 LE len][NVRAM text]. ----
-    let Some((fw, nv)) = split_files(files) else {
-        d.put(b"stage 7 wants --input-file firmware --input-file nvram\n");
+    let Some((fw, nv, clm)) = split_files(files) else {
+        d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob]\n");
         d.failed = true;
         return;
     };
@@ -871,7 +886,9 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     unsafe { core::arch::asm!("dsb sy") };
     d.wr(MEM, 0x2144, 0x1234_5678);
     let cons_before = d.tcm_rd(cons + 16);
-    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0 };
+    let t0 = d.now();
+    let rx_off = d.tcm_rd(sh + 36);
+    let mut m = Msgbuf { dma, h2d_w, d2h_w, d2h_r, w: 0, seq: 254, rd: 0, dseq: 254, trans: 0, verbose: stage < 11, t0, rx_off, scan_done: false, seen: [[0; 6]; 96], nseen: 0 };
     // Control submit ring: 8 ioctl response buffers and 8 event buffers first (the firmware DMAs ioctl results into a posted response buffer, named by its request id in the completion).
     for b in 0..8u32 {
         m.post(d, 0x0B, 1 + b, [8192, 0, dma + IOCTL_RESP + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -880,8 +897,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         m.post(d, 0x0D, 0x101 + b, [2048, 0, dma + EVENT_BUF + 0x800 * b, 0, 0, 0, 0, 0]);
     }
     m.ring(d);
-    let t0 = d.now();
-    match m.get_var(d, b"ver", dma + IOCTL_REQ, t0) {
+    match m.get_var(d, b"ver", dma + IOCTL_REQ) {
         Some((0, b, len)) => {
             d.put(b"ver: ");
             d.text(dma + IOCTL_RESP + 0x2000 * b, len);
@@ -891,16 +907,21 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.flush();
     if stage >= 10 {
         // ---- stage 10: a second query the normal way, then the WiFi chip's S2MPU VID, measured: an ioctl whose request buffer sits outside the fence (G#8008_0000: the kernel image, inside the window the first fence allowed). The firmware's DMA read of it is denied (DECERR) and the S2MPU latches the fault with the VID, which `bridge diag` reports (S2MPU_FAULT_INFO bits 26:24). A denied read can't touch memory; the firmware may trap. ----
-        match m.get_var(d, b"cur_etheraddr", dma + IOCTL_REQ, t0) {
+        match m.get_var(d, b"cur_etheraddr", dma + IOCTL_REQ) {
             Some((0, _, len)) => d.kv(b"cur_etheraddr len", len),
             r => d.kv(b"cur_etheraddr failed, status", r.map(|r| r.0).unwrap_or(u32::MAX)),
         }
+    }
+    if stage == 10 {
         d.put(b"probe: ioctl request buffer at G#80080000 (the kernel image, outside the fence)\n");
         d.flush();
-        let r = m.get_var(d, b"ver", 0x8008_0000, t0);
+        let r = m.get_var(d, b"ver", 0x8008_0000);
         d.kv(b"probe result status", r.map(|r| r.0).unwrap_or(u32::MAX));
         let f = d.tcm_rd(sh);
         d.kv(b"sh.flags (G#400 = trapped)", f);
+    }
+    if stage >= 11 {
+        scan(d, &mut m, clm);
     }
     let f = d.tcm_rd(sh);
     d.kv(b"sh.flags", f);
@@ -921,6 +942,14 @@ struct Msgbuf {
     rd: u32,
     dseq: u32,
     trans: u32,
+    /// Print every completion item (bring-up stages) or only what matters (the scan).
+    verbose: bool,
+    t0: u64,
+    /// pcie_shared dma_rxoffset: where a packet starts inside a posted buffer.
+    rx_off: u32,
+    scan_done: bool,
+    seen: [[u8; 6]; 96],
+    nseen: usize,
 }
 
 impl Msgbuf {
@@ -942,36 +971,29 @@ impl Msgbuf {
         d.tcm_wr(self.h2d_w, self.w % 64);
         d.wr(MEM, 0x2140, 0xFF00_0000 | (self.w % 64));
     }
-    /// WLC_GET_VAR (262): the iovar name and its NUL at `req_buf` (dhd passes the whole buffer length both ways). Waits for the completion (3 s); Some((status, response buffer index, length)). Every completion item is printed; each consumed response buffer is re-posted.
-    fn get_var(&mut self, d: &mut Drv, name: &[u8], req_buf: u32, t0: u64) -> Option<(u32, u32, u32)> {
-        if req_buf >= self.dma && req_buf < self.dma + 0x20_0000 {
-            for (k, c) in name.iter().chain(&[0u8]).enumerate() {
-                db(req_buf + k as u32, *c);
+    /// Consume every valid D2H control completion: events are handled (and their buffers re-posted) here; an ioctl completion is returned as (status, response buffer index, length), its buffer re-posted.
+    fn pump(&mut self, d: &mut Drv) -> Option<(u32, u32, u32)> {
+        let wi = d.tcm_rd(self.d2h_w);
+        while self.rd != wi {
+            let a = self.dma + 0x5000 + 24 * self.rd;
+            let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
+            if words[0] >> 24 != self.dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
+                break; // the index ran ahead of the item's DMA: look again
             }
-        }
-        self.trans += 1;
-        self.post(d, 0x09, 0xFFFE, [262, self.trans | 256 << 16, 256, 0, req_buf, 0, 0, 0]);
-        self.ring(d);
-        let ts = d.now();
-        while d.now().wrapping_sub(ts) < 3 * d.freq {
-            let wi = d.tcm_rd(self.d2h_w);
-            while self.rd != wi {
-                let a = self.dma + 0x5000 + 24 * self.rd;
-                let words: [u32; 6] = core::array::from_fn(|k| dr(a + 4 * k as u32));
-                if words[0] >> 24 != self.dseq % 253 || words.iter().fold(0, |x, v| x ^ v) != 0 {
-                    break; // the index ran ahead of the item's DMA: look again
-                }
-                self.dseq += 1;
-                self.rd = (self.rd + 1) % 64;
-                d.tcm_wr(self.d2h_r, self.rd);
-                d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
+            self.dseq += 1;
+            self.rd = (self.rd + 1) % 64;
+            d.tcm_wr(self.d2h_r, self.rd);
+            if self.verbose {
+                d.hex(((d.now().wrapping_sub(self.t0) * 1_000_000) / d.freq) as u32);
                 d.put(b"us d2h ctrl:");
                 for v in words {
                     d.put(b" ");
                     d.hex(v);
                 }
                 d.put(b"\n");
-                if words[0] & 0xFF == 0x0C {
+            }
+            match words[0] & 0xFF {
+                0x0C => {
                     let b = words[1].wrapping_sub(1);
                     if b < 8 {
                         self.post(d, 0x0B, 1 + b, [8192, 0, self.dma + 0x2_0000 + 0x2000 * b, 0, 0, 0, 0, 0]);
@@ -979,12 +1001,147 @@ impl Msgbuf {
                     }
                     return Some((words[2] & 0xFFFF, b, words[3] & 0xFFFF));
                 }
+                // MSG_TYPE_WL_EVENT: request id = the event buffer, event_data_len at +12; the packet starts rx_dataoffset into the buffer.
+                0x0E => {
+                    let b = words[1].wrapping_sub(0x101);
+                    if b < 8 {
+                        let at = self.dma + 0x3_0000 + 0x800 * b;
+                        self.event(d, at + self.rx_off, words[3] & 0xFFFF);
+                        self.post(d, 0x0D, 0x101 + b, [2048, 0, at, 0, 0, 0, 0, 0]);
+                        self.ring(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    /// A firmware event (bcm_event_t: Ethernet header, ether type G#886C, BRCM header, then wl_event_msg_t with big-endian fields: type +28, status +32, datalen +44, data at +72).
+    fn event(&mut self, d: &mut Drv, p: u32, len: u32) {
+        if len < 72 || be16(p + 12) != 0x886C {
+            return;
+        }
+        let (ty, status, dlen) = (be32(p + 28), be32(p + 32), be32(p + 44));
+        if ty != 69 {
+            if self.verbose {
+                d.kv(b"event", ty);
+            }
+            return;
+        }
+        // WLC_E_ESCAN_RESULT: status 8 = a partial result carrying one BSS, 0 = the scan finished, anything else = it ended otherwise.
+        if status != 8 {
+            self.scan_done = true;
+            d.kv(b"escan finished, status", status);
+            return;
+        }
+        let r = p + 72;
+        if dlen < 12 || dr32u(r + 10) & 0xFFFF == 0 {
+            return;
+        }
+        self.bss(d, r + 12);
+    }
+    /// One wl_bss_info (the version-independent prefix): BSSID +8, capability +16, SSID +18/+19, chanspec +72, RSSI +78, ctl_ch +88, IEs at ie_offset +116 / ie_length +120. Printed once per BSSID.
+    fn bss(&mut self, d: &mut Drv, bi: u32) {
+        let bssid: [u8; 6] = core::array::from_fn(|k| dbr(bi + 8 + k as u32));
+        if self.seen[..self.nseen].contains(&bssid) {
+            return;
+        }
+        if self.nseen < self.seen.len() {
+            self.seen[self.nseen] = bssid;
+            self.nseen += 1;
+        }
+        let cs = dr32u(bi + 72) & 0xFFFF;
+        let band = match cs & 0xC000 {
+            0 => b"2G",
+            0x4000 => b"6G",
+            _ => b"5G",
+        };
+        let ch = if cs & 0x3800 == 0x1000 { cs & 0xFF } else { dbr(bi + 88) as u32 };
+        let rssi = (dr32u(bi + 78 - 2) >> 16) as u16 as i16;
+        let (ie_off, ie_len) = (dr32u(bi + 116) & 0xFFFF, dr32u(bi + 120));
+        let mut sec: &[u8] = if dr32u(bi + 16) & 0x10 != 0 { b"WEP" } else { b"open" };
+        let mut q = bi + ie_off;
+        let end = q + ie_len.min(2048);
+        while q + 2 <= end {
+            let (id, l) = (dbr(q), dbr(q + 1) as u32);
+            if id == 48 {
+                sec = b"RSN";
+            } else if id == 221 && l >= 4 && sec != b"RSN" && dbr(q + 2) == 0x00 && dbr(q + 3) == 0x50 && dbr(q + 4) == 0xF2 && dbr(q + 5) == 1 {
+                sec = b"WPA";
+            }
+            q += 2 + l;
+        }
+        d.put(band);
+        d.put(b" ch ");
+        d.dec(ch);
+        d.put(b" rssi -");
+        d.dec((-(rssi as i32)).max(0) as u32);
+        d.put(b" ");
+        d.put(sec);
+        d.put(b" \"");
+        let n = (dbr(bi + 18) as u32).min(32);
+        for k in 0..n {
+            let c = dbr(bi + 19 + k);
+            let c = if (0x20..0x7F).contains(&c) { c } else { b'?' };
+            d.put(&[c]);
+        }
+        d.put(b"\"\n");
+        if d.n > 2400 {
+            d.flush();
+        }
+    }
+    /// One ioctl: `in_len` bytes at the request buffer go to the firmware, up to `out_len` come back in a posted response buffer. Waits for the completion (3 s), handling events meanwhile.
+    fn ioctl(&mut self, d: &mut Drv, cmd: u32, req_buf: u32, in_len: u32, out_len: u32) -> Option<(u32, u32, u32)> {
+        self.trans += 1;
+        self.post(d, 0x09, 0xFFFE, [cmd, self.trans | in_len << 16, out_len, 0, req_buf, 0, 0, 0]);
+        self.ring(d);
+        let ts = d.now();
+        while d.now().wrapping_sub(ts) < 3 * d.freq {
+            if let Some(r) = self.pump(d) {
+                return Some(r);
             }
             d.us(1000);
         }
         d.put(b"no ioctl completion\n");
         None
     }
+    /// WLC_GET_VAR (262): the iovar name and its NUL (then `arg`) at the request buffer; dhd passes the whole buffer length both ways. The value comes back at offset 0 of the response buffer.
+    fn get_var(&mut self, d: &mut Drv, name: &[u8], req_buf: u32) -> Option<(u32, u32, u32)> {
+        self.get_var_arg(d, name, &[], req_buf)
+    }
+    fn get_var_arg(&mut self, d: &mut Drv, name: &[u8], arg: &[u8], req_buf: u32) -> Option<(u32, u32, u32)> {
+        if req_buf >= self.dma && req_buf < self.dma + 0x20_0000 {
+            for (k, c) in name.iter().chain(&[0u8]).chain(arg).enumerate() {
+                db(req_buf + k as u32, *c);
+            }
+        }
+        self.ioctl(d, 262, req_buf, 256, 256)
+    }
+    /// WLC_SET_VAR (263): name, NUL, value, no padding (bcm_mkiovar); the length is exactly that.
+    fn set_var(&mut self, d: &mut Drv, name: &[u8], value: &[u8]) -> u32 {
+        let req = self.dma + 0x1_3000;
+        let mut k = 0;
+        for c in name.iter().chain(&[0u8]).chain(value) {
+            db(req + k, *c);
+            k += 1;
+        }
+        self.ioctl(d, 263, req, k, k).map(|r| r.0).unwrap_or(u32::MAX)
+    }
+    /// The response buffer holding an ioctl's answer.
+    fn resp(&self, b: u32) -> u32 {
+        self.dma + 0x2_0000 + 0x2000 * b
+    }
+}
+
+fn be16(a: u32) -> u32 {
+    (dbr(a) as u32) << 8 | dbr(a + 1) as u32
+}
+fn be32(a: u32) -> u32 {
+    be16(a) << 16 | be16(a + 2)
+}
+/// A little-endian u32 at any byte address.
+fn dr32u(a: u32) -> u32 {
+    u32::from_le_bytes([dbr(a), dbr(a + 1), dbr(a + 2), dbr(a + 3)])
 }
 
 /// Physical (= identity-mapped) access to the DMA region: Normal non-cacheable, EL0 read/write.
@@ -1037,8 +1194,8 @@ fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
     None
 }
 
-/// [u32 LE len][bytes] twice.
-fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8])> {
+/// [u32 LE len][bytes] twice (firmware, NVRAM), then optionally a third (the CLM blob; empty if absent).
+fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8], &[u8])> {
     let take = |b: &[u8]| -> Option<usize> { Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize) };
     let a = take(b)?;
     if b.len() < 4 + a + 4 {
@@ -1046,8 +1203,117 @@ fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8])> {
     }
     let (first, rest) = b[4..].split_at_mut(a);
     let n = take(rest)?;
-    let second = rest.get_mut(4..4 + n)?;
-    Some((first, second))
+    if rest.len() < 4 + n {
+        return None;
+    }
+    let (second, rest) = rest[4..].split_at_mut(n);
+    let third: &[u8] = match take(rest) {
+        Some(c) if rest.len() >= 4 + c => &rest[4..4 + c],
+        _ => &[],
+    };
+    Some((first, second, third))
+}
+
+/// Stage 11: a scan, the way dhd's up path and wl_run_escan do it. The regulatory table first (`country` reads "#n" when the firmware has no CLM: then the CLM blob goes in through `clmload` in 1408-byte chunks), the escan-result event (69) enabled in `event_msgs_ext`, WLC_UP (2), `scan_ver` to pick the request layout, then `escan` over every channel; results arrive as events, one BSS each, until a final status.
+fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
+    let req = m.dma + 0x1_3000;
+    if let Some((0, b, _)) = m.get_var(d, b"country", req) {
+        let cc: [u8; 4] = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
+        d.put(b"country before CLM: ");
+        d.put(&cc[..2]);
+        d.put(b"\n");
+        if &cc[..2] == b"#n" {
+            if clm.is_empty() {
+                d.put(b"no CLM in firmware and none given (--input-file clm_blob)\n");
+                return;
+            }
+            // wl_dload_data_t per chunk: u16 flag (handler version 1 << 12 | DL_BEGIN 2 on the first | DL_END 4 on the last), u16 type 2 (CLM), u32 len, u32 crc 0, data; the chunk padded to 8.
+            let mut off = 0;
+            let mut status = 0;
+            while off < clm.len() && status == 0 {
+                let n = (clm.len() - off).min(1408);
+                let mut flag = 1u16 << 12;
+                if off == 0 {
+                    flag |= 2;
+                }
+                if off + n == clm.len() {
+                    flag |= 4;
+                }
+                let mut chunk = [0u8; 1424];
+                chunk[0..2].copy_from_slice(&flag.to_le_bytes());
+                chunk[2..4].copy_from_slice(&2u16.to_le_bytes());
+                chunk[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+                chunk[12..12 + n].copy_from_slice(&clm[off..off + n]);
+                let total = (12 + n).div_ceil(8) * 8;
+                status = m.set_var(d, b"clmload", &chunk[..total]);
+                off += n;
+            }
+            d.kv(b"clmload status", status);
+            if let Some((0, b, _)) = m.get_var(d, b"country", req) {
+                let cc: [u8; 4] = core::array::from_fn(|k| dbr(m.resp(b) + k as u32));
+                d.put(b"country after CLM: ");
+                d.put(&cc[..2]);
+                d.put(b"\n");
+            }
+        }
+    }
+    // event_msgs_ext: GET the mask (ver 1, command 0, len 27, maxgetsize 27), set bit 69, SET it back (command 3).
+    let mut mask = [0u8; 27];
+    if let Some((0, b, _)) = m.get_var_arg(d, b"event_msgs_ext", &[1, 0, 27, 27], req) {
+        for (k, v) in mask.iter_mut().enumerate() {
+            *v = dbr(m.resp(b) + 4 + k as u32);
+        }
+    }
+    mask[69 >> 3] |= 1 << (69 & 7);
+    let mut ev = [0u8; 31];
+    ev[..4].copy_from_slice(&[1, 3, 27, 0]);
+    ev[4..].copy_from_slice(&mask);
+    let r = m.set_var(d, b"event_msgs_ext", &ev);
+    d.kv(b"event_msgs_ext set", r);
+    for (k, v) in 0u32.to_le_bytes().iter().enumerate() {
+        db(req + k as u32, *v);
+    }
+    let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
+    d.kv(b"WLC_UP", r);
+    let ver = match m.get_var(d, b"scan_ver", req) {
+        Some((0, b, _)) => dr32u(m.resp(b) + 4) & 0xFFFF,
+        _ => 1,
+    };
+    d.kv(b"scan_ver", ver);
+    // escan: u32 version, u16 action 1 (start), u16 sync id, then the scan params — v1 without the version/length prefix; v2/v3 72 bytes, v4 76 (scan_type_ext). Broadcast SSID, BSSID ff…ff, any BSS type, active, firmware-default times, every channel.
+    let mut p = [0u8; 84];
+    let (hdr_ver, plen): (u32, usize) = match ver {
+        2 | 3 => (ver, 72),
+        4 => (4, 76),
+        _ => (1, 64),
+    };
+    p[0..4].copy_from_slice(&hdr_ver.to_le_bytes());
+    p[4..6].copy_from_slice(&1u16.to_le_bytes());
+    p[6..8].copy_from_slice(&0x4F31u16.to_le_bytes());
+    let s = 8;
+    let o = if hdr_ver == 1 { 0 } else { 4 };
+    if hdr_ver != 1 {
+        p[s..s + 2].copy_from_slice(&(hdr_ver as u16).to_le_bytes());
+        p[s + 2..s + 4].copy_from_slice(&(plen as u16).to_le_bytes());
+    }
+    p[s + o + 36..s + o + 42].copy_from_slice(&[0xFF; 6]);
+    p[s + o + 42] = 2;
+    let t = s + if hdr_ver == 1 { 44 } else if hdr_ver == 4 { 56 } else { 52 };
+    for k in 0..4 {
+        p[t + 4 * k..t + 4 * k + 4].copy_from_slice(&(-1i32).to_le_bytes());
+    }
+    m.scan_done = false;
+    let r = m.set_var(d, b"escan", &p[..8 + plen]);
+    d.kv(b"escan", r);
+    d.flush();
+    let ts = d.now();
+    while !m.scan_done && d.now().wrapping_sub(ts) < 12 * d.freq {
+        let _ = m.pump(d);
+        d.us(2000);
+    }
+    d.kv(b"BSSes", m.nseen as u32);
+    d.kv(b"scan_ms", ((d.now().wrapping_sub(ts) * 1000) / d.freq) as u32);
+    d.flush();
 }
 
 /// bcmutils.c process_nvram_vars, in place: drop '\r', '#' comments to end of line and empty lines; each line ends in a NUL. Returns the length used (the rest is zeroed).
