@@ -88,7 +88,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     loop {
         // Addresses as they appear (INFO flags: bit 0 IPv4 bound, bit 1 IPv6 global).
         let n = a.udp(&[3], &mut out);
-        let o = unsafe { core::ptr::read_volatile(&out) };
+        let o = &out;
         if n == 51 && o[50] != shown {
             shown = o[50];
             a.put(b"addresses: v4 ");
@@ -104,7 +104,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let req = [2u8, (PORT >> 8) as u8, PORT as u8];
         let n = a.udp(&req, &mut out);
         if n != 0 && n != ERR && n >= 21 {
-            let o = unsafe { core::ptr::read_volatile(&out) };
+            let o = &out;
             let n = (n as usize).min(o.len());
             let fam = o[0];
             let sport = u16::from_be_bytes([o[17], o[18]]);
@@ -131,7 +131,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             // A first send may only resolve the next hop (status 1): try a few times.
             for _ in 0..50 {
                 let st = a.udp(&s[..22 + pl], &mut r);
-                let rr = unsafe { core::ptr::read_volatile(&r) };
+                let rr = &r;
                 if st == 1 && rr[0] != 1 {
                     break;
                 }

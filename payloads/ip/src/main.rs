@@ -716,7 +716,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut info = [0u8; 16];
     let q = [3u8];
     svc(CALL, ip.cap(S_WLAN), ip.off(q.as_ptr()), 1, ip.off(info.as_mut_ptr()), 16);
-    let info = unsafe { core::ptr::read_volatile(&info) };
+    let info = &info;
     ip.mac.copy_from_slice(&info[..6]);
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
@@ -724,7 +724,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         ip.put(b"no entropy right: needs --entropy\n");
         ip.flush();
     }
-    let r = unsafe { core::ptr::read_volatile(&r) };
+    let r = &r;
     ip.xid = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
     ip.iid.copy_from_slice(&r[8..16]);
     ip.ll[0] = 0xFE;
@@ -750,7 +750,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if n == 0 || n == ERR || n < 14 {
                 break;
             }
-            let f = unsafe { core::ptr::read_volatile(&frame) };
+            let f = &frame;
             let n = (n as usize).min(f.len());
             ip.frames += 1;
             let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
@@ -766,7 +766,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // Applications: a polling recv on `udp`.
         let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
         if n != NOTHING && n != ERR {
-            let m = unsafe { core::ptr::read_volatile(&msg) };
+            let m = &msg;
             let l = ip.serve(&m[..(n as usize).min(m.len())], &mut out);
             svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
         }

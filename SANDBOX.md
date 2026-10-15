@@ -72,4 +72,6 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 
 ## Status
 
-Checker written (`ferros_sandbox`, 2026-10-15). Order: checker tests → emitter → kernel (W^X pages, guards, install/seal/spawn) → rebuild the drivers through the emitter and re-verify the network stack.
+- **Checker** (`ferros_sandbox`): written, tested against GNU-assembled encodings.
+- **Emitter** (`tools/ferros-mask` + `tools/ferros-masked-build.sh`): every crate (payload, core, alloc, compiler_builtins) built from source to assembly with nightly `-Z build-std`, rewritten, assembled with `llvm-mc`, linked with `ld.lld`; the build fails unless the checker accepts every instruction. 2026-10-15: `ip` (5,078 instructions, +46% code) and `nettest` (742, +10%) pass with zero refusals and **run correctly on husky** — DHCP + SLAAC, ping and UDP echo over IPv4 and IPv6 (`MASKED=1 tools/husky-net.sh`).
+- **Next:** the kernel side — size-aligned arcs in 2S blocks (guards), W^X page attributes per arc, install (check + seal) and spawn-only-sealed. Then the WiFi driver: its DMA region must become part of its arc (non-cacheable pages inside the arc, the S2MPU window over them), since masked accesses only reach the arc.

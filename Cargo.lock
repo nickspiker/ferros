@@ -570,6 +570,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-mask"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-mkimg"
 version = "0.1.0"
 dependencies = [
