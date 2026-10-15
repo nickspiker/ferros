@@ -153,6 +153,8 @@ pub fn enable() -> bool {
                 c = in(reg) 3u64 << 20,
             );
             VHE = true;
+            // EL0 may read the counters (CNTHCTL_EL2 in its E2H layout: EL0PCTEN b0, EL0VCTEN b1), so processes can time their own delays.
+            asm!("mrs {t}, cnthctl_el2", "orr {t}, {t}, #3", "msr cnthctl_el2, {t}", "isb", t = out(reg) _);
         }
         // TCR_EL2. Non-VHE: T0SZ 25, inner/outer write-back walks, inner shareable, 4 KiB granule, 40-bit PA, RES1 bits 23 and 31. VHE (TCR_EL1 layout): the same for TTBR0, TTBR1 walks disabled (EPD1, TG1 = 4 KiB), IPS 40-bit.
         let tcr: u64 = if vhe {

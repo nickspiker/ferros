@@ -1,0 +1,401 @@
+//! The WiFi PCIe driver, as a process: brings up PCIe channel 1 to the BCM4398 following WIFI.md, touching hardware only through the hardware grants it was spawned with (ferros_kernel process.rs, syscalls 4/5), and reports every step through its console.
+//!
+//! Spawn (grant order matters — slots 1..12):
+//!   ferros-bridge spawn pcie1.bin <stage> --name pcie1 --hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu
+//! Stage (input byte, hex): 00 read-only survey (CMU gates, PMU PHY control, GPIO, ELBI/LTSSM, DBI ID) · 01 + PHY bring-up (WIFI.md §5-8) · 02 + link training (§9) · 03 + config space and the chip id (§10-11).
+//! Each stage only goes further than the last, so a hang (bus stall → watchdog reset) points at the stage that caused it.
+
+#![no_std]
+#![no_main]
+
+use core::arch::asm;
+
+const ELBI: u64 = 1;
+const SOC: u64 = 2;
+const PCS: u64 = 3;
+const UDBG: u64 = 4;
+const PHY: u64 = 5;
+const DBI: u64 = 6;
+const CFG: u64 = 7;
+const MEM: u64 = 8;
+const GPIO: u64 = 9;
+const CMU: u64 = 11;
+const PMU: u64 = 12;
+const ERR: u64 = u64::MAX;
+
+struct Drv {
+    grants: u64,
+    base: u64,
+    freq: u64,
+    log: [u8; 3000],
+    n: usize,
+    failed: bool,
+}
+
+fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let r: u64;
+    unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
+    r
+}
+
+impl Drv {
+    fn cap(&self, slot: u64) -> u64 {
+        self.grants + 4 + 32 * slot
+    }
+    fn rd(&mut self, g: u64, off: u64) -> u32 {
+        let v = svc(4, self.cap(g), off, 0, 0, 0);
+        if v == ERR {
+            self.failed = true;
+            self.put(b"!rd ");
+            self.hex(g as u32);
+            self.put(b"+");
+            self.hex(off as u32);
+            self.put(b"\n");
+        }
+        v as u32
+    }
+    fn wr(&mut self, g: u64, off: u64, v: u32) {
+        if svc(5, self.cap(g), off, v as u64, 0, 0) == ERR {
+            self.failed = true;
+            self.put(b"!wr ");
+            self.hex(g as u32);
+            self.put(b"+");
+            self.hex(off as u32);
+            self.put(b"\n");
+        }
+    }
+    fn set(&mut self, g: u64, off: u64, bits: u32) {
+        let v = self.rd(g, off);
+        self.wr(g, off, v | bits);
+    }
+    fn clr(&mut self, g: u64, off: u64, bits: u32) {
+        let v = self.rd(g, off);
+        self.wr(g, off, v & !bits);
+    }
+    fn now(&self) -> u64 {
+        let t: u64;
+        unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t) };
+        t
+    }
+    fn us(&self, n: u64) {
+        let t0 = self.now();
+        while self.now().wrapping_sub(t0) < n * self.freq / 1_000_000 {}
+    }
+    /// Poll until (reg & mask) == want or `max_us` passes; returns the elapsed microseconds, or None on timeout (logged, not fatal: WIFI.md §13.10).
+    fn poll(&mut self, g: u64, off: u64, mask: u32, want: u32, max_us: u64) -> Option<u64> {
+        let t0 = self.now();
+        loop {
+            if self.rd(g, off) & mask == want {
+                return Some(self.now().wrapping_sub(t0) * 1_000_000 / self.freq);
+            }
+            if self.now().wrapping_sub(t0) > max_us * self.freq / 1_000_000 {
+                return None;
+            }
+            self.us(10);
+        }
+    }
+    fn put(&mut self, s: &[u8]) {
+        for &c in s {
+            if self.n < self.log.len() {
+                self.log[self.n] = c;
+                self.n += 1;
+            }
+        }
+    }
+    fn hex(&mut self, v: u32) {
+        let h = b"0123456789ABCDEF";
+        self.put(b"G#");
+        for i in (0..8).rev() {
+            let c = h[((v >> (i * 4)) & 15) as usize];
+            self.put(&[c]);
+        }
+    }
+    fn kv(&mut self, k: &[u8], v: u32) {
+        self.put(k);
+        self.put(b"=");
+        self.hex(v);
+        self.put(b"\n");
+    }
+    fn flush(&mut self) {
+        if self.n > 0 {
+            svc(1, self.grants + 4, self.log.as_ptr() as u64 - self.base, self.n as u64, 0xA00, 16);
+            self.n = 0;
+        }
+    }
+    fn pmu_rmw(&mut self, off: u64, mask: u32, val: u32) {
+        let v = self.rd(PMU, off);
+        self.wr(PMU, off, (v & !mask) | (val & mask));
+    }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.entry")]
+pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+    let base: u64;
+    let freq: u64;
+    unsafe {
+        asm!("mov {}, x28", out(reg) base);
+        asm!("mrs {}, cntfrq_el0", out(reg) freq);
+    }
+    let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else { 0 };
+    let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false };
+    run(&mut d, stage);
+    d.flush();
+    unsafe { asm!("svc #0", in("x0") d.failed as u64, in("x8") 0u64, options(noreturn, nostack)) }
+}
+
+fn run(d: &mut Drv, stage: u8) {
+    // ---- stage 0: survey (WIFI.md §2, §3, §9 status registers) ----
+    d.put(b"pcie1 stage ");
+    d.hex(stage as u32);
+    d.put(b"\n");
+    for &(name, off) in &[
+        (&b"cmu.phy_refclk"[..], 0x201Cu64),
+        (b"cmu.dbi_aclk", 0x2088),
+        (b"cmu.mstr_aclk", 0x208C),
+        (b"cmu.slv_aclk", 0x2090),
+        (b"cmu.subctrl_apb", 0x2094),
+        (b"cmu.phy_udbg_apb", 0x2098),
+        (b"cmu.uasc_dbi_aclk", 0x20EC),
+        (b"cmu.uasc_slv_aclk", 0x20F4),
+        (b"cmu.qch_apb", 0x3058),
+        (b"cmu.qch_axi", 0x3060),
+        (b"cmu.pcie_user_mux", 0x0620),
+    ] {
+        let v = d.rd(CMU, off);
+        d.kv(name, v);
+    }
+    let pmu = d.rd(PMU, 0x3EC8);
+    d.kv(b"pmu.phy_ch1", pmu);
+    let gcon = d.rd(GPIO, 0x0);
+    let gdat = d.rd(GPIO, 0x4);
+    d.kv(b"gph3.con", gcon);
+    d.kv(b"gph3.dat", gdat);
+    let lt = d.rd(ELBI, 0x2C8);
+    d.kv(b"elbi.ltssm", lt);
+    let id = d.rd(DBI, 0x0);
+    d.kv(b"dbi.id", id);
+    d.flush();
+    if stage < 1 {
+        return;
+    }
+
+    // ---- stage 1: PHY into a known state, WL_REG_ON, PHY calibration (WIFI.md §5-8) ----
+    for off in [0x10u64, 0x14, 0x18] {
+        d.wr(ELBI, off, 0); // A1
+    }
+    d.pmu_rmw(0x3EC8, 1, 1); // A2: PHY isolation release
+    d.clr(PHY, 0x204, 0xC); // A3
+    for (off, v) in [(0x1044u64, 0x2A), (0x1048, 0xAA), (0x104C, 0xA8), (0x1050, 0x80), (0x185C, 0x0A)] {
+        d.wr(PHY, off, v); // A4
+    }
+    d.us(1);
+    d.wr(PHY, 0x208, 0xFF); // A5
+    d.us(1);
+    d.wr(PHY, 0x580, 0x0A); // A6
+    d.wr(PHY, 0x928, 0xAA);
+    d.wr(PHY, 0x00C, 0x0A); // A7
+    d.us(50);
+    d.clr(UDBG, 0xC700, 1); // A8
+    d.us(10);
+    // B: pins. PERST (gph3-0) output low, WL_REG_ON (gph3-4) output low then high, CLKREQ (gph3-1) function 2 pull-up, dev_wake (gph3-5) input pull-down.
+    let mut con = d.rd(GPIO, 0x0);
+    con = (con & !0xF) | 0x1;
+    con = (con & !(0xF << 4)) | (0x2 << 4);
+    con = (con & !(0xF << 16)) | (0x1 << 16);
+    con &= !(0xF << 20);
+    d.clr(GPIO, 0x4, (1 << 0) | (1 << 4)); // B1: both low before switching to outputs
+    d.wr(GPIO, 0x0, con);
+    let pud = d.rd(GPIO, 0x8);
+    d.wr(GPIO, 0x8, (pud & !((0xF << 4) | (0xF << 16) | (0xF << 20))) | (3 << 4) | (1 << 20));
+    let drv = d.rd(GPIO, 0xC);
+    d.wr(GPIO, 0xC, (drv & !(0xF | (0xF << 4) | (0xF << 16))) | 3 | (3 << 4));
+    d.us(20_000); // WL_REG_ON low ≥ 20 ms (§4)
+    d.set(GPIO, 0x4, 1 << 4); // B2: WL_REG_ON high
+    d.us(200_000); // B3
+    d.wr(SOC, 0x4000, 0x15); // B5
+    // C: PHY power-down clear.
+    d.set(UDBG, 0xC700, 1);
+    d.us(100);
+    d.wr(PHY, 0x00C, 0);
+    d.wr(PHY, 0x928, 0x55);
+    d.wr(PHY, 0x580, 0x02);
+    d.wr(PHY, 0x208, 0);
+    for off in [0x1044u64, 0x1048, 0x104C, 0x1050, 0x185C] {
+        d.wr(PHY, off, 0);
+    }
+    d.us(10);
+    // D: zuma PHY configuration, ch1.
+    d.wr(PHY, 0x32C, 0x3); // D1
+    d.set(UDBG, 0xC700, 1 << 0); // D2
+    d.clr(UDBG, 0xC700, 1 << 1); // D3
+    match d.poll(UDBG, 0xC734, 1 << 2, 1 << 2, 100_000) {
+        Some(t) => d.kv(b"ext_pll_lock_us", t as u32),
+        None => d.put(b"ext_pll_lock TIMEOUT\n"),
+    }
+    d.clr(SOC, 0x4004, 1 << 2); // D5
+    d.set(SOC, 0x4004, 0x30); // D6
+    d.wr(ELBI, 0x080, 0x4); // D7
+    d.wr(ELBI, 0x3A4, 0xF); // D8
+    d.wr(ELBI, 0x3A4, 0xD);
+    d.us(10);
+    d.wr(ELBI, 0x3A4, 0xF); // D9
+    d.us(10);
+    for v in [1u32, 0] {
+        d.wr(ELBI, 0x1404, v); // D10
+        d.wr(ELBI, 0x1408, v);
+        d.wr(ELBI, 0x1400, v);
+    }
+    d.wr(ELBI, 0x3D8, 1); // D11
+    const PHYCFG: &[(u64, u32)] = &[
+        // D12
+        (0x0000, 0x88), (0x001C, 0x66), (0x01F4, 0x00), (0x0514, 0x59), (0x051C, 0x11), (0x062C, 0x0E), (0x0644, 0x22), (0x0688, 0x03), (0x06D4, 0x28), (0x0788, 0x64), (0x078C, 0x64), (0x0790, 0x50), (0x0794, 0x50), (0x0944, 0x05), (0x0948, 0x05), (0x094C, 0x05), (0x0950, 0x05),
+        // D13-D16
+        (0x0590, 0x02), (0x07F8, 0xB0), (0x0730, 0x08), (0x0344, 0xC0), (0x0040, 0x04), (0x0204, 0x03), (0x02D4, 0x1F), (0x0358, 0x10), (0x0018, 0x01),
+        // D17-D18
+        (0x0514, 0x5B), (0x0608, 0x0C), (0x060C, 0x0F), (0x0610, 0x0F), (0x0614, 0x0F), (0x0618, 0x0F), (0x0510, 0x80), (0x0688, 0x03), (0x0644, 0x23), (0x0624, 0x11), (0x0630, 0x0F), (0x06D0, 0x53),
+        // D19 (lane)
+        (0x1140, 0x04), (0x1144, 0x04), (0x1148, 0x04), (0x114C, 0x02), (0x1150, 0), (0x1154, 0), (0x1158, 0), (0x115C, 0), (0x12CC, 0x1C), (0x12DC, 0x6C), (0x130C, 0x29), (0x13B4, 0x2F), (0x1A64, 0x05), (0x1A68, 0x05), (0x1A84, 0x05), (0x1A88, 0x05), (0x1A98, 0), (0x1A9C, 0), (0x1AA8, 0x07), (0x1AB8, 0), (0x1ABC, 0), (0x1AF8, 0x90), (0x1B34, 0x03), (0x1BB0, 0x03), (0x1BB4, 0x03), (0x1BC0, 0x06), (0x1BC4, 0x06), (0x1BE8, 0x01), (0x1BF8, 0x04), (0x1C98, 0), (0x1CA4, 0x81),
+        // D20 (BCM)
+        (0x1B20, 0x02), (0x1340, 0x23), (0x002C, 0x3C),
+    ];
+    for &(off, v) in PHYCFG {
+        d.wr(PHY, off, v);
+    }
+    d.set(PHY, 0x1350, 1); // D21
+    const PCSCFG: &[(u64, u32)] = &[(0x190, 0x100B_0604), (0x154, 0x0007_00D5), (0x100, 0x1640_0000), (0x104, 0x0860_0000), (0x114, 0x1850_0000), (0x124, 0x6070_0000), (0x174, 0x7), (0x178, 0x100), (0x17C, 0x700), (0x110, 0x0160_0202)];
+    for &(off, v) in PCSCFG {
+        d.wr(PCS, off, v); // D22-D24
+    }
+    d.wr(ELBI, 0x1404, 1); // D25
+    d.us(10);
+    d.wr(ELBI, 0x1408, 1); // D26
+    d.wr(ELBI, 0x1400, 1);
+    for &(name, off, bit) in &[(&b"pll_lock_us"[..], 0xA80u64, 0u32), (b"cdr_lock_us", 0x15C0, 4), (b"ofs_cal_us", 0x140C, 7)] {
+        match d.poll(PHY, off, 1 << bit, 1 << bit, 100_000) {
+            Some(t) => d.kv(name, t as u32),
+            None => {
+                d.put(name);
+                d.put(b" TIMEOUT\n");
+            }
+        }
+    }
+    d.wr(PHY, 0x32C, 0); // D30
+    d.wr(ELBI, 0x1078, 1); // D31
+    d.flush();
+    if stage < 2 {
+        return;
+    }
+
+    // ---- stage 2: RC setup, PERST, LTSSM (WIFI.md §9), Gen1 forced (no Gen3 insistence) ----
+    d.pmu_rmw(0x3EC8, 0x400, 0x400); // E1
+    d.wr(UDBG, 0xC800, 0x421); // E2
+    d.wr(PHY, 0x32C, 0); // E3
+    d.wr(DBI, 0x890, 0x1_2000); // E4
+    d.set(GPIO, 0x4, 1 << 0); // E5: PERST# high
+    d.us(16_000); // E6
+    d.set(ELBI, 0x3BC, 0x11); // E7
+    d.wr(ELBI, 0x3A0, 0x2); // E8
+    d.wr(ELBI, 0x074, 1); // E9
+    d.clr(ELBI, 0x3A8, 0xFFF); // E10
+    d.wr(ELBI, 0x474, 1); // E11
+    d.wr(ELBI, 0x1078, 1); // E12
+    // E13 dw_pcie_setup_rc, with link speed capped at Gen1.
+    d.set(DBI, 0x8BC, 1);
+    let v = d.rd(DBI, 0xA0);
+    d.wr(DBI, 0xA0, (v & !0xF) | 1);
+    let v = d.rd(DBI, 0x7C);
+    d.wr(DBI, 0x7C, (v & !0xF) | 1);
+    let v = d.rd(DBI, 0x710);
+    d.wr(DBI, 0x710, (v & !((1 << 7) | (0x3F << 16))) | (1 << 5) | (1 << 16));
+    let v = d.rd(DBI, 0x80C);
+    d.wr(DBI, 0x80C, (v & !(0x1F << 8)) | (1 << 8));
+    d.wr(DBI, 0x10, 4);
+    d.wr(DBI, 0x14, 0);
+    let v = d.rd(DBI, 0x3C);
+    d.wr(DBI, 0x3C, (v & !(0xFF << 8)) | (1 << 8));
+    let v = d.rd(DBI, 0x18);
+    d.wr(DBI, 0x18, (v & 0xFF00_0000) | 0x00FF_0100);
+    let v = d.rd(DBI, 0x4);
+    d.wr(DBI, 0x4, (v & !0xFFFF) | 0x107);
+    d.wr(DBI, 0x10, 0);
+    let v = d.rd(DBI, 0x8);
+    d.wr(DBI, 0x8, (v & 0xFFFF) | (0x0604 << 16)); // class code (16-bit at G#0A)
+    d.clr(DBI, 0x8BC, 1);
+    // E14 exynos_pcie_setup_rc (Gen1 cap kept).
+    d.wr(DBI, 0x8BC, 1);
+    d.wr(DBI, 0x0, 0xECED_144D);
+    let v = d.rd(DBI, 0x7C);
+    d.wr(DBI, 0x7C, (v & !((7 << 15) | 0xF)) | 0x3_8000 | 1);
+    d.wr(DBI, 0xB40, 0x1A);
+    d.wr(DBI, 0xB44, 0xEA);
+    d.wr(DBI, 0x44, 0);
+    let v = d.rd(DBI, 0x98);
+    d.wr(DBI, 0x98, (v & !0xF) | 5);
+    // E15 history buffer.
+    d.clr(ELBI, 0xC00, 1 << 2);
+    d.wr(ELBI, 0xC04, 0xFFFF_FFFF);
+    d.wr(ELBI, 0xC08, 0xFFFF_FFFF);
+    d.set(ELBI, 0xC00, 3);
+    let id = d.rd(DBI, 0x0);
+    d.kv(b"dbi.id", id);
+    d.wr(ELBI, 0x054, 1); // E17: LTSSM enable
+    let t0 = d.now();
+    let mut last = 0xFFu32;
+    let mut l0 = false;
+    for _ in 0..6000 {
+        let s = d.rd(ELBI, 0x2C8) & 0x3F;
+        if s != last {
+            d.put(b"ltssm ");
+            d.hex(s);
+            d.put(b"\n");
+            last = s;
+        }
+        if s == 0x11 {
+            l0 = true;
+            break;
+        }
+        d.us(10);
+    }
+    let dt = (d.now().wrapping_sub(t0) * 1_000_000 / d.freq) as u32;
+    d.kv(b"ltssm_us", dt);
+    let ls = d.rd(DBI, 0x80);
+    d.kv(b"dbi.lnkctl_sta", ls);
+    d.put(if l0 { b"LINK UP (L0)\n" } else { b"no L0\n" });
+    d.flush();
+    if !l0 || stage < 3 {
+        return;
+    }
+
+    // ---- stage 3: iATU, config space, BAR0, chip id (WIFI.md §10-11) ----
+    let atu = 0x30_0000u64;
+    for (off, v) in [(0x08u64, 0x60FF_E000u32), (0x0C, 0), (0x10, 0x60FF_FFFF), (0x14, 0x0100_0000), (0x18, 0), (0x00, 0x4), (0x04, 0x8000_0000)] {
+        d.wr(DBI, atu + off, v);
+    }
+    for (off, v) in [(0x200u64, 0u32), (0x208, 0x6000_0000), (0x20C, 0), (0x210, 0x60FE_FFFF), (0x214, 0x6000_0000), (0x218, 0), (0x204, 0x8000_0000)] {
+        d.wr(DBI, atu + off, v);
+    }
+    d.wr(ELBI, 0x074, 1);
+    let vid = d.rd(CFG, 0x0);
+    d.wr(ELBI, 0x074, 0);
+    d.kv(b"ep.vendor_device", vid);
+    if vid & 0xFFFF != 0x14E4 {
+        d.put(b"not Broadcom\n");
+        return;
+    }
+    // BAR0 at the bottom of the window (64-bit), the bridge window around it, memory + bus master on.
+    d.wr(CFG, 0x10, 0x6000_0000);
+    d.wr(CFG, 0x14, 0);
+    d.wr(DBI, 0x20, 0x60F0_6000);
+    d.set(CFG, 0x04, 0x6);
+    d.wr(CFG, 0x80, 0x1800_0000); // PCI_BAR0_WIN = SI_ENUM_BASE: chipcommon
+    let chip = d.rd(MEM, 0x0);
+    d.kv(b"chipcommon.chipid", chip);
+    d.kv(b"chip", chip & 0xFFFF);
+    d.kv(b"rev", (chip >> 16) & 0xF);
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    unsafe { asm!("svc #0", in("x0") 0xDEADu64, in("x8") 0u64, options(noreturn, nostack)) }
+}

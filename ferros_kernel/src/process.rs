@@ -277,17 +277,20 @@ pub struct Hw {
     pub via_el3: bool,
 }
 
-/// The dev hardware registry: blocks a process may be granted by name (sizes from ABL's DTB / the cmucal tables).
+/// The dev hardware registry: blocks a process may be granted by name (WIFI.md §0: PCIe ch1 sits in HSI2).
 pub static HARDWARE: &[Hw] = &[
     Hw { name: "pcie1-elbi", base: 0x1312_0000, size: 0x2000, via_el3: false },
     Hw { name: "pcie1-soc", base: 0x1313_0000, size: 0x5000, via_el3: false },
-    Hw { name: "pcie1-pcs", base: 0x1314_0000, size: 0x1000, via_el3: false },
+    Hw { name: "pcie1-pcs", base: 0x1314_0000, size: 0x5000, via_el3: false },
     Hw { name: "pcie1-udbg", base: 0x1315_0000, size: 0xD000, via_el3: false },
     Hw { name: "pcie1-phy", base: 0x1316_0000, size: 0x3000, via_el3: false },
-    Hw { name: "hsi1-sysreg", base: 0x1302_0000, size: 0x2000, via_el3: false },
     Hw { name: "pcie1-dbi", base: 0x1340_0000, size: 0x38_1000, via_el3: false },
-    Hw { name: "gpio-hsi1", base: 0x1304_0000, size: 0x1000, via_el3: false },
-    Hw { name: "cmu-hsi1", base: 0x1300_0000, size: 0x8000, via_el3: false },
+    Hw { name: "pcie1-cfg", base: 0x60FF_E000, size: 0x2000, via_el3: false },
+    Hw { name: "pcie1-mem", base: 0x6000_0000, size: 0xFF_0000, via_el3: false },
+    Hw { name: "hsi2-sysreg", base: 0x1302_0000, size: 0x2000, via_el3: false },
+    Hw { name: "gpio-hsi2", base: 0x1304_0000, size: 0x1000, via_el3: false },
+    Hw { name: "gpio-far-alive", base: 0x154E_0000, size: 0x1000, via_el3: false },
+    Hw { name: "cmu-hsi2", base: 0x1300_0000, size: 0x8000, via_el3: false },
     Hw { name: "pmu", base: 0x1546_0000, size: 0x1_0000, via_el3: true },
 ];
 const ERR: u64 = u64::MAX;

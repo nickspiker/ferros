@@ -615,6 +615,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-pcie1"
+version = "0.1.0"
+
+[[package]]
 name = "ferros-payload-pmupoke"
 version = "0.1.0"
 
