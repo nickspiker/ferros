@@ -150,7 +150,8 @@ async fn main() {
                 eprintln!("Failed to read {}: {e}", args[2]);
                 std::process::exit(1);
             });
-            let c = signed_capsule(&code);
+            let masked = args.iter().any(|a| a == "--masked");
+            let c = signed_capsule(&code, masked, text_len_arg(&args));
             std::fs::write(&args[3], &c).unwrap_or_else(|e| {
                 eprintln!("Failed to write {}: {e}", args[3]);
                 std::process::exit(1);
@@ -167,6 +168,7 @@ async fn main() {
             let mut grants: Vec<(u8, String)> = Vec::new();
             let mut files: Vec<String> = Vec::new();
             let mut hex = None;
+            let masked = args.iter().any(|a| a == "--masked");
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
@@ -178,6 +180,8 @@ async fn main() {
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).
                     "--dma" => { grants.push((5, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    "--masked" => { i += 1; }
+                    "--text-len" => { i += 2; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -200,7 +204,7 @@ async fn main() {
                 tail.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 tail.extend_from_slice(&b);
             }
-            cmd_run_with_tail(&args[2], hex.as_deref(), ferros_pt::command::caps::SPAWN, prefix, tail).await;
+            cmd_run_with_tail(&args[2], hex.as_deref(), ferros_pt::command::caps::SPAWN, prefix, tail, masked, text_len_arg(&args)).await;
         }
         "ping" => {
             let count = args
@@ -440,7 +444,12 @@ fn build_cmd(cap_name: &[u8], op: ferros_pt::Op, params: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Wrap position-independent native code in a signed capsule (toka's capsule format: a VSF file, section `aarch64` field `code`, signed with Ed25519 over the whole file). The developer key is the 64-byte keypair at $FERROS_DEV_KEY (default: the ferros key in the keys dir); only its 32-byte seed is used, and it never leaves this process.
-fn signed_capsule(code: &[u8]) -> Vec<u8> {
+/// `--text-len N`: for a masked capsule, how many bytes of the image are instructions (the rest is read-only data).
+fn text_len_arg(args: &[String]) -> Option<usize> {
+    args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
+}
+
+fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
     use vsf::types::VsfType;
     let key_path = std::env::var("FERROS_DEV_KEY").unwrap_or_else(|_| "/mnt/Harbor/Code/keys/ferros.secret".to_string());
@@ -454,8 +463,11 @@ fn signed_capsule(code: &[u8]) -> Vec<u8> {
     }
     let seed: [u8; 32] = key[..32].try_into().unwrap();
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-    let mut section = vsf::file_format::VsfSection::new("aarch64");
+    let mut section = vsf::file_format::VsfSection::new(if masked { "masked" } else { "aarch64" });
     section.add_field("code", VsfType::v(b'b', code.to_vec()));
+    if let Some(t) = text_len {
+        section.add_field("text", VsfType::u(t, false));
+    }
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(section)
         .signature_ed25519(pubkey, [0u8; 64])
@@ -472,18 +484,18 @@ fn signed_capsule(code: &[u8]) -> Vec<u8> {
 
 /// `prefix` goes in front of the Exec params (spawn's name + grants header; empty for run).
 async fn cmd_run(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>) {
-    cmd_run_with_tail(path, hex_input, exec_cap, prefix, Vec::new()).await
+    cmd_run_with_tail(path, hex_input, exec_cap, prefix, Vec::new(), false, None).await
 }
 
 /// As `cmd_run`; `tail` goes after the hex input (spawn's --input-file frames).
-async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>, tail: Vec<u8>) {
+async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8], prefix: Vec<u8>, tail: Vec<u8>, masked: bool, text_len: Option<usize>) {
     let blob = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
     });
     // spawn: the kernel only spawns signed capsules (the gate); run stays raw (dev payloads at EL2).
     let blob = if exec_cap == ferros_pt::command::caps::SPAWN && std::env::var("FERROS_RAW_SPAWN").is_err() {
-        let mut c = signed_capsule(&blob);
+        let mut c = signed_capsule(&blob, masked, text_len);
         // Test switch: flip one byte of the code after signing — the kernel's gate must refuse it.
         if std::env::var("FERROS_TAMPER_CAPSULE").is_ok() {
             let n = c.len();

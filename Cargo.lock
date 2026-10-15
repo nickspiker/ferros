@@ -741,6 +741,7 @@ dependencies = [
  "ferros_layout",
  "ferros_ledger",
  "ferros_pt",
+ "ferros_sandbox",
  "ferros_vault",
  "fontdue",
  "ihi 0.0.48",

@@ -26,6 +26,8 @@ done
 ld.lld -T "$REPO/payloads/$P/payload.ld" --gc-sections -e _entry -o "$OUT/$BIN.elf" "${OBJS[@]}"
 aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
+# The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
+stat -c %s "$OUT/$BIN.text" > "$OUT/$BIN.textlen"
 ( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ) | tee "$OUT/scan.txt"
 grep -q " 0 refused" "$OUT/scan.txt" || { echo "REFUSED: $BIN does not pass the sandbox checker"; exit 1; }
 echo "$BIN: sandboxed image $(stat -c %s "$OUT/$BIN.bin") bytes → $OUT/$BIN.bin"

@@ -28,6 +28,10 @@ pub struct Gated {
     pub code: Vec<u8>,
     pub developer_pubkey: [u8; 32],
     pub hp: [u8; 32],
+    /// True if the code came from a `masked` section (sandboxed, SANDBOX.md): the kernel runs the checker on it. A plain `aarch64` section is native dev code, spawned unchecked (a production build refuses it).
+    pub masked: bool,
+    /// For masked code: how many bytes from the start are instructions (`.text`); the rest is read-only data. The checker covers exactly this span, and W^X makes everything after it non-executable.
+    pub text_len: usize,
 }
 
 /// The gate. Ok only if the capsule's Ed25519 signature verifies over this exact file.
@@ -49,17 +53,45 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
         _ => return Err("gate: no provenance hash"),
     };
     let sections = header.sections(capsule, header_end).map_err(|_| "gate: bad sections")?;
-    let code = sections
-        .iter()
-        .find(|s| s.name == "aarch64")
-        .and_then(|s| s.get_field("code"))
-        .and_then(|f| f.values.first())
-        .and_then(|v| match v {
-            VsfType::v(b'b', bytes) => Some(bytes.clone()),
-            _ => None,
-        })
-        .ok_or("gate: no aarch64 code section")?;
-    Ok(Gated { code, developer_pubkey, hp })
+    let find = |name: &str| {
+        sections
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.get_field("code"))
+            .and_then(|f| f.values.first())
+            .and_then(|v| match v {
+                VsfType::v(b'b', bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+    };
+    let (code, masked) = match find("masked") {
+        Some(c) => (c, true),
+        None => (find("aarch64").ok_or("gate: no code section")?, false),
+    };
+    let text_len = if masked {
+        let t = sections
+            .iter()
+            .find(|s| s.name == "masked")
+            .and_then(|s| s.get_field("text"))
+            .and_then(|f| f.values.first())
+            .and_then(|v| match v {
+                // VSF integers are auto-sized: whatever width the encoder picked comes back.
+                VsfType::u(n, _) => Some(*n),
+                VsfType::u3(n) => Some(*n as usize),
+                VsfType::u4(n) => Some(*n as usize),
+                VsfType::u5(n) => Some(*n as usize),
+                VsfType::u6(n) => Some(*n as usize),
+                _ => None,
+            })
+            .ok_or("gate: masked code without a text length")?;
+        if t == 0 || t > code.len() || t % 4 != 0 {
+            return Err("gate: bad text length");
+        }
+        t
+    } else {
+        code.len()
+    };
+    Ok(Gated { code, developer_pubkey, hp, masked, text_len })
 }
 
 /// The oracle. None until the system persistent secret exists (no ira, no ihi).

@@ -17,10 +17,12 @@ CRED=${CRED:-/mnt/Harbor/Code/keys/wifi.txt}
 ( cd "$REPO" && cargo build -q -p ferros-payload-pcie1 -p ferros-payload-ip -p ferros-payload-nettest --target aarch64-unknown-none --release ) || exit 1
 for b in pcie1 ip nettest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
 # MASKED=1: run ip and nettest as sandboxed images (tools/ferros-masked-build.sh; the checker accepted every instruction).
-IPB=$R/ip.bin; NTB=$R/nettest.bin
+IPB=$R/ip.bin; NTB=$R/nettest.bin; IPFLAG=; NTFLAG=
 if [ "${MASKED:-0}" = 1 ]; then
     for p in ip nettest; do "$REPO/tools/ferros-masked-build.sh" $p >/dev/null || exit 1; done
     IPB=$REPO/target/masked/ip/ip.bin; NTB=$REPO/target/masked/nettest/nettest.bin
+    IPFLAG="--masked --text-len $(cat $REPO/target/masked/ip/ip.textlen)"
+    NTFLAG="--masked --text-len $(cat $REPO/target/masked/nettest/nettest.textlen)"
 fi
 : > "$LOG"
 drain() { "$B" diag console 2>/dev/null | grep -v '^ALIVE=' | grep -v '^$' | tee -a "$LOG"; }
@@ -36,9 +38,9 @@ done
 grep -q "serving wlan" "$LOG" || { echo "=== driver never served"; tail -20 "$LOG"; exit 1; }
 grep -E "joining|KEYED|join failed|allmulti|offload|flags2" "$LOG"
 echo "=== ip"
-timeout 60 "$B" spawn "$IPB" --name ip --use wlan --serve udp --entropy >/dev/null 2>&1
+timeout 60 "$B" spawn "$IPB" --name ip --use wlan --serve udp --entropy $IPFLAG >/dev/null 2>&1
 echo "=== nettest (UDP echo on 7777)"
-timeout 60 "$B" spawn "$NTB" --name nettest --use udp >/dev/null 2>&1
+timeout 60 "$B" spawn "$NTB" --name nettest --use udp $NTFLAG >/dev/null 2>&1
 end=$((SECONDS + KEEP))
 while [ $SECONDS -lt $end ]; do
     lsusb -d 1209:4665 >/dev/null || { echo "=== ferros dropped off USB"; exit 1; }
