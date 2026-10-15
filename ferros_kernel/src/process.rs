@@ -389,8 +389,9 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
     };
     if ec != 0x15 {
-        // Not a syscall: the process faulted. It ends; the kernel carries on.
+        // Not a syscall: the process faulted. It ends; the kernel carries on. Its full state goes to the console first (ESR, ELR/FAR/SP as arc offsets, every register), so a fault is debuggable from the console alone.
         let v = FAULT | ec << 40 | (f.elr.wrapping_sub(base) & 0xFF_FFFF) << 16 | (f.far.wrapping_sub(base) & 0xFFFF);
+        fault_report(f, base);
         return end(f, v);
     }
     let p = kk.procs[cur].as_mut().unwrap();
@@ -534,6 +535,44 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             0
         }
     }
+}
+
+/// A faulting process's state on the console: `name: FAULT esr … elr+… far+… sp+…` then x0..x30, eight per line (G# hex; the three addresses as offsets into its arc).
+fn fault_report(f: &Frame, base: u64) {
+    let kk = k();
+    let Some(cur) = kk.current else { return };
+    let name = kk.procs[cur].as_ref().map(|p| p.name.clone()).unwrap_or_default();
+    let hex = |out: &mut Vec<u8>, v: u64| {
+        out.extend_from_slice(b"G#");
+        for i in (0..16).rev() {
+            out.push(b"0123456789ABCDEF"[((v >> (4 * i)) & 0xF) as usize]);
+        }
+    };
+    let mut o = Vec::new();
+    o.extend_from_slice(&name);
+    o.extend_from_slice(b": FAULT esr ");
+    hex(&mut o, f.esr);
+    o.extend_from_slice(b" elr+");
+    hex(&mut o, f.elr.wrapping_sub(base));
+    o.extend_from_slice(b" far ");
+    hex(&mut o, f.far);
+    o.extend_from_slice(b" sp+");
+    hex(&mut o, f.sp_el0.wrapping_sub(base));
+    o.push(b'\n');
+    for (i, r) in f.x.iter().enumerate() {
+        if i % 8 == 0 {
+            o.extend_from_slice(&name);
+            o.extend_from_slice(b":  x");
+            o.push(b'0' + (i / 10) as u8);
+            o.push(b'0' + (i % 10) as u8);
+        }
+        o.push(b' ');
+        hex(&mut o, *r);
+        if i % 8 == 7 || i == 30 {
+            o.push(b'\n');
+        }
+    }
+    kk.console.extend_from_slice(&o);
 }
 
 /// The slice ran out while the current process was at EL0: park it runnable (back of the queue) and leave to the kernel.

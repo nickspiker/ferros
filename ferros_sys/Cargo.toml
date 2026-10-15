@@ -1,0 +1,9 @@
+[package]
+name = "ferros_sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The one place a ferros process touches the machine: syscalls, the timer, its arc base."
+
+[lib]
+path = "src/lib.rs"

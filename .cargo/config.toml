@@ -2,3 +2,5 @@
 # Linker scripts are passed per-crate via build.rs, not here.
 
 [target.aarch64-unknown-none]
+# The process ABI (KERNEL.md): x28 = the process's arc base, x27 = its arc mask — set by the kernel at entry and never written by compiled code. Reserve both so rustc never allocates them (seen 2026-10-15: without this, compiled code used x28 as a scratch register and a process reading its arc base mid-call got garbage). The precompiled core/compiler_builtins treat them as callee-saved (restored before returning).
+rustflags = ["-C", "target-feature=+reserve-x27,+reserve-x28"]

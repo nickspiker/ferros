@@ -1,0 +1,142 @@
+//! The one place a ferros process touches the machine (KERNEL.md, process ABI): the `svc` syscalls, the generic timer and the process's arc base.
+//!
+//! Everything else in a driver or stack is plain no_std Rust. Today processes are native aarch64 capsules; when the one backend exists (Rust → WASM → toka → native with compiled masking), this crate becomes WASM imports and the code above it is recompiled, not rewritten (KERNEL.md "Build order").
+//!
+//! Memory passed to the kernel is named by arc offset (pointer − arc base): every buffer handed to a syscall must live in the process's own arc — its stack or its image — which is all a process has.
+
+#![no_std]
+
+use core::arch::asm;
+use core::sync::atomic::{compiler_fence, Ordering};
+
+/// A syscall failed: unknown or wrong token, out-of-range offset, no such object.
+pub const ERR: u64 = u64::MAX;
+/// A polling `recv` found no message waiting.
+pub const NOTHING: u64 = u64::MAX - 1;
+
+/// Syscall numbers (x8).
+pub mod nr {
+    pub const EXIT: u64 = 0;
+    pub const CALL: u64 = 1;
+    pub const RECV: u64 = 2;
+    pub const REPLY: u64 = 3;
+    pub const MMIO_READ: u64 = 4;
+    pub const MMIO_WRITE: u64 = 5;
+    pub const ENTROPY: u64 = 6;
+    pub const DMA: u64 = 7;
+}
+
+/// The raw trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer named by the arguments, so nothing is assumed cached across it.
+#[inline(always)]
+pub fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let r: u64;
+    compiler_fence(Ordering::SeqCst);
+    unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
+    compiler_fence(Ordering::SeqCst);
+    r
+}
+
+/// The process's arc base (x28, set by the kernel at entry and never written by compiled code).
+#[inline(always)]
+pub fn arc_base() -> u64 {
+    let b: u64;
+    unsafe { asm!("mov {}, x28", out(reg) b, options(nomem, nostack, preserves_flags)) };
+    b
+}
+
+/// The generic timer count (EL0 may read it: CNTHCTL_EL2.EL0VCTEN).
+#[inline(always)]
+pub fn now() -> u64 {
+    let t: u64;
+    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+    t
+}
+
+/// Timer ticks per second.
+#[inline(always)]
+pub fn freq() -> u64 {
+    let f: u64;
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+    f
+}
+
+/// Busy-wait `us` microseconds on the timer.
+pub fn delay_us(us: u64) {
+    let (t0, f) = (now(), freq());
+    while now().wrapping_sub(t0) < us * f / 1_000_000 {}
+}
+
+/// Microseconds since `t0` (a `now()` value).
+pub fn us_since(t0: u64) -> u64 {
+    now().wrapping_sub(t0) * 1_000_000 / freq()
+}
+
+/// Order this process's writes to device-visible memory (its DMA region) before what follows — typically a doorbell write telling the device to look (`dsb sy`).
+#[inline(always)]
+pub fn dma_barrier() {
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+/// Arc offset of something in this process's arc.
+#[inline(always)]
+pub fn off<T: ?Sized>(p: *const T) -> u64 {
+    p as *const u8 as u64 - arc_base()
+}
+
+/// The token for grant `slot`, given the grants offset the kernel passed at entry (x0): a u32 count, then 32-byte tokens; slot 0 is the console.
+#[inline(always)]
+pub fn cap(grants: u64, slot: u64) -> u64 {
+    grants + 4 + 32 * slot
+}
+
+/// End this process; its arc and capabilities cease to exist.
+pub fn exit(code: u64) -> ! {
+    svc(nr::EXIT, code, 0, 0, 0, 0);
+    loop {}
+}
+
+/// Call an endpoint (or the console): `msg` goes to the server, its reply lands in `reply`; returns the reply length (ERR on a bad token).
+pub fn call(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
+    svc(nr::CALL, cap, off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
+}
+
+/// Receive on an endpoint: the message lands in `buf`, a single-use reply token in `token`; returns the message length. With `poll`, returns NOTHING at once when no message waits.
+pub fn recv(cap: u64, buf: &mut [u8], token: &mut [u8; 32], poll: bool) -> u64 {
+    svc(nr::RECV, cap, off(buf.as_mut_ptr()), buf.len() as u64, off(token.as_mut_ptr()), poll as u64)
+}
+
+/// Answer a call; the token stops existing.
+pub fn reply(token: &[u8; 32], msg: &[u8]) -> u64 {
+    svc(nr::REPLY, off(token.as_ptr()), off(msg.as_ptr()), msg.len() as u64, 0, 0)
+}
+
+/// Read a 32-bit register of a hardware grant (ERR if the offset is unaligned or outside it).
+pub fn mmio_read(cap: u64, offset: u64) -> u64 {
+    svc(nr::MMIO_READ, cap, offset, 0, 0, 0)
+}
+
+/// Write a 32-bit register of a hardware grant.
+pub fn mmio_write(cap: u64, offset: u64, value: u32) -> u64 {
+    svc(nr::MMIO_WRITE, cap, offset, value as u64, 0, 0)
+}
+
+/// Fill `buf` (≤ 4096 bytes) with randomness from the session's wairua; returns its length, or ERR without the entropy right or a wairua.
+pub fn entropy(cap: u64, buf: &mut [u8]) -> u64 {
+    svc(nr::ENTROPY, cap, off(buf.as_mut_ptr()), buf.len() as u64, 0, 0)
+}
+
+/// The physical base of a DMA region grant (non-cacheable memory the process reads and writes directly, its device's only DMA window).
+pub fn dma(cap: u64) -> u64 {
+    svc(nr::DMA, cap, 0, 0, 0, 0)
+}
+
+/// Say something on the console (grant slot 0).
+pub fn console(grants: u64, text: &[u8]) {
+    let mut r = [0u8; 16];
+    call(cap(grants, 0), text, &mut r);
+}
+
+/// What a payload's panic handler calls: exit with G#DEAD (the kernel prints `name: exit G#…DEAD`).
+pub fn panic_exit() -> ! {
+    exit(0xDEAD)
+}

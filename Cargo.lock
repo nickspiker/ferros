@@ -606,6 +606,9 @@ version = "0.1.0"
 [[package]]
 name = "ferros-payload-ip"
 version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros-payload-memprobe"
@@ -621,10 +624,16 @@ dependencies = [
 [[package]]
 name = "ferros-payload-nettest"
 version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros-payload-pcie1"
 version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros-payload-pmupoke"
@@ -764,6 +773,10 @@ dependencies = [
  "ihi 0.0.3",
  "vsf 0.10.0",
 ]
+
+[[package]]
+name = "ferros_sys"
+version = "0.1.0"
 
 [[package]]
 name = "ferros_vault"

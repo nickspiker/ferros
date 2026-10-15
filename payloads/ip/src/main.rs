@@ -15,31 +15,13 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
-
-const CALL: u64 = 1;
-const RECV: u64 = 2;
-const REPLY: u64 = 3;
-const ENTROPY_SYS: u64 = 6;
-const NOTHING: u64 = u64::MAX - 1;
-const ERR: u64 = u64::MAX;
+use ferros_sys::nr::{CALL, ENTROPY as ENTROPY_SYS, RECV, REPLY};
+use ferros_sys::{now, svc, ERR, NOTHING};
 
 const S_CONSOLE: u64 = 0;
 const S_WLAN: u64 = 1;
 const S_UDP: u64 = 2;
 const S_ENTROPY: u64 = 3;
-
-fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let r: u64;
-    unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
-    r
-}
-
-fn now() -> u64 {
-    let t: u64;
-    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t) };
-    t
-}
 
 const QN: usize = 8;
 
@@ -696,12 +678,7 @@ fn csum(data: &[u8], init: u32) -> u16 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
-    let base: u64;
-    let freq: u64;
-    unsafe {
-        asm!("mov {}, x28", out(reg) base);
-        asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    }
+    let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, data: [0; 1472] };
     let mut ip = Ip {
         grants,
@@ -808,5 +785,5 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    unsafe { asm!("svc #0", in("x0") 0xDEADu64, in("x8") 0u64, options(noreturn, nostack)) }
+    ferros_sys::panic_exit()
 }

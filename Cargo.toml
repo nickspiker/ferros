@@ -19,6 +19,7 @@ members = [
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",
+    "ferros_sys",
     "payloads/ip",
     "payloads/nettest",
     "payloads/wdtfire",

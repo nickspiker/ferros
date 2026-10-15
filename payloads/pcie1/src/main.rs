@@ -8,7 +8,7 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
+use ferros_sys::svc;
 
 const ELBI: u64 = 1;
 const SOC: u64 = 2;
@@ -39,12 +39,6 @@ struct Drv {
     failed: bool,
     /// The backplane window BAR1 shows now (cfg G#84), so a run of accesses in one window costs one config write.
     win: u32,
-}
-
-fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let r: u64;
-    unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
-    r
 }
 
 impl Drv {
@@ -82,9 +76,7 @@ impl Drv {
         self.wr(g, off, v & !bits);
     }
     fn now(&self) -> u64 {
-        let t: u64;
-        unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t) };
-        t
+        ferros_sys::now()
     }
     fn us(&self, n: u64) {
         let t0 = self.now();
@@ -209,18 +201,13 @@ impl Drv {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
-    let base: u64;
-    let freq: u64;
-    unsafe {
-        asm!("mov {}, x28", out(reg) base);
-        asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    }
+    let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else { 0 };
     let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false, win: u32::MAX };
     let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
     run(&mut d, stage, rest);
     d.flush();
-    unsafe { asm!("svc #0", in("x0") d.failed as u64, in("x8") 0u64, options(noreturn, nostack)) }
+    ferros_sys::exit(d.failed as u64)
 }
 
 fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
@@ -883,7 +870,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     d.tcm_wr(sh + 52, 8);
     d.flush();
     // Hostready: H2D doorbell 1 (PCIe core registers at BAR0 + G#2000; DB0 G#140, DB1 G#144).
-    unsafe { core::arch::asm!("dsb sy") };
+    ferros_sys::dma_barrier();
     d.wr(MEM, 0x2144, 0x1234_5678);
     let cons_before = d.tcm_rd(cons + 16);
     let t0 = d.now();
@@ -1027,7 +1014,7 @@ impl Msgbuf {
     }
     /// Publish posted items: the TCM write index, then doorbell 0 (BAR0 + G#2140).
     fn ring(&mut self, d: &mut Drv) {
-        unsafe { core::arch::asm!("dsb sy") };
+        ferros_sys::dma_barrier();
         d.tcm_wr(self.h2d_w, self.w % 64);
         d.wr(MEM, 0x2140, 0xFF00_0000 | (self.w % 64));
     }
@@ -1045,7 +1032,7 @@ impl Msgbuf {
     }
     /// Publish posted rx buffers: rxpost write index (H2D slot 1), doorbell 0 for ring 1.
     fn ring_rx(&mut self, d: &mut Drv) {
-        unsafe { core::arch::asm!("dsb sy") };
+        ferros_sys::dma_barrier();
         d.tcm_wr(self.h2d_w + 4, self.rxp_w % 512);
         d.wr(MEM, 0x2140, 0xFF00_0000 | 1 << 16 | (self.rxp_w % 512));
     }
@@ -1209,7 +1196,7 @@ impl Msgbuf {
             dw(a + 4 * j, u32::from_le_bytes(item[4 * j as usize..4 * j as usize + 4].try_into().unwrap()));
         }
         self.tx_w += 1;
-        unsafe { core::arch::asm!("dsb sy") };
+        ferros_sys::dma_barrier();
         d.tcm_wr(self.h2d_w + 8, self.tx_w % 512);
         d.wr(MEM, 0x2140, 0xFF00_0000 | 5 << 16 | (self.tx_w % 512));
     }
@@ -2020,5 +2007,5 @@ fn process_nvram_vars(v: &mut [u8]) -> usize {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    unsafe { asm!("svc #0", in("x0") 0xDEADu64, in("x8") 0u64, options(noreturn, nostack)) }
+    ferros_sys::panic_exit()
 }

@@ -7,3 +7,6 @@ license.workspace = true
 [[bin]]
 name = "ip"
 path = "src/main.rs"
+
+[dependencies]
+ferros_sys = { path = "../../ferros_sys" }
