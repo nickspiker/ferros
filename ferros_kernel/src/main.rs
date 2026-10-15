@@ -1248,11 +1248,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let t_vault = platform::cntpct();
     let (probe, store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
-    if probe.verified == 1 {
-        checklist::mark(checklist::Item::Vault);
+    if probe.opened == 1 {
+        checklist::mark(checklist::Item::VaultOpen);
     }
-    if probe.opened == 1 && probe.wairua_ok == 1 {
-        checklist::mark(checklist::Item::Ira);
+    if probe.verified == 1 {
+        checklist::mark(checklist::Item::VaultVerified);
+    }
+    // ira and wairua: yellow once there is a value — up, but stand-ins until PIPE: SoC-sourced (the ira from readable chip-ID trims rather than GLOSSARY's interim HUK root, the wairua from the SoC TRNG) and passing through RAM instead of being held in on-die registers (KEY_REGISTERS.md). The first two bytes of each one-way fingerprint follow the label.
+    if probe.ira_fp != [0u8; 8] {
+        checklist::mark_interim(checklist::Item::Ira);
+    }
+    if probe.wairua_ok == 1 {
+        checklist::mark_interim(checklist::Item::Wairua);
     }
     {
         // The first two bytes of each one-way fingerprint, for the eye: the ira's is the same every boot, the wairua's changes every boot. Both secrets are 256-bit, so plain BLAKE3 is already one-way (a memory-hard KDF like spaghettify only matters for guessable inputs such as handles).
@@ -1265,9 +1272,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             }
             l
         };
-        let ira = fp_line(b"ira    ", &probe.ira_fp);
-        let wairua = if probe.wairua_ok == 1 { fp_line(b"wairua ", &probe.wairua_fp) } else { alloc::vec::Vec::from(&b"wairua no TRNG"[..]) };
-        checklist::details(checklist::Item::Ira, &[&ira, &wairua]);
+        checklist::suffix(checklist::Item::Ira, &fp_line(b"", &probe.ira_fp));
+        checklist::suffix(checklist::Item::Wairua, &if probe.wairua_ok == 1 { fp_line(b"", &probe.wairua_fp) } else { alloc::vec::Vec::from(&b"no TRNG"[..]) });
     }
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.

@@ -1,6 +1,6 @@
 //! The bring-up checklist on the panel: every step from power-on to ferros's first process, red until it happens on this boot, green once it has (BOOT.md, "Ready?" gate).
 //!
-//! Steps that do not exist yet stay red — the screen is the road map. Cold boot only: the handoff path has no live panel unless it came up with `--live`.
+//! Steps that do not exist yet stay red — the screen is the road map. Three states: green filled = up and the real thing; yellow filled = up through a stand-in (the ira and wairua until PIPE); red open = not up yet. Cold boot only: the handoff path has no live panel unless it came up with `--live`.
 
 use crate::display::Panel;
 use core::cell::UnsafeCell;
@@ -12,8 +12,10 @@ pub enum Item {
     CacheMap,
     Panel,
     Disk,
-    Vault,
+    VaultOpen,
+    VaultVerified,
     Ira,
+    Wairua,
     Slot,
     Usb,
     El0,
@@ -34,8 +36,10 @@ const GROUPS: [(&str, &[(Item, &str)]); 3] = [
     ]),
     ("boot", &[
         (Item::Disk, "disk: UFS link"),
-        (Item::Vault, "vault opened + verified"),
-        (Item::Ira, "ira + wairua"),
+        (Item::VaultOpen, "vault opened"),
+        (Item::VaultVerified, "vault verified"),
+        (Item::Ira, "ira"),
+        (Item::Wairua, "wairua"),
         (Item::Slot, "slot marked"),
         (Item::Usb, "usb: PT link"),
     ]),
@@ -51,10 +55,10 @@ const GROUPS: [(&str, &[(Item, &str)]); 3] = [
     ]),
 ];
 
-const DETAIL: u32 = 0x00A0_A0A0;
 const TITLE: u32 = 0x00FF_8000;
 const HEADER: u32 = 0x00FF_FF00;
 const RED: u32 = 0x00FF_0000;
+const YELLOW: u32 = 0x00FF_FF00;
 const GREEN: u32 = 0x0000_FF00;
 const SCALE: usize = 3;
 // Console geometry at SCALE (console margins: 160 top, 48 left; 8x16 font).
@@ -65,9 +69,15 @@ const LINE_H: usize = 16 * SCALE;
 /// The label starts after the circle.
 const LABEL_COL: usize = 3;
 
+/// Text shown after an item's label (a fingerprint); same color as the item.
+const SUFFIX_MAX: usize = 16;
+
 struct Checklist {
     panel: Panel,
     done: u32,
+    /// Up through a stand-in (subset of `done`): drawn yellow.
+    interim: u32,
+    suffix: [([u8; SUFFIX_MAX], usize); 32],
 }
 
 struct Global(UnsafeCell<Option<Checklist>>);
@@ -75,20 +85,8 @@ struct Global(UnsafeCell<Option<Checklist>>);
 unsafe impl Sync for Global {}
 static CHECKLIST: Global = Global(UnsafeCell::new(None));
 
-/// Lines reserved under an item for its details (the ira and wairua fingerprints).
-fn detail_rows(item: Item) -> usize {
-    match item {
-        Item::Ira => 2,
-        _ => 0,
-    }
-}
-
-fn group_rows(items: &[(Item, &str)]) -> usize {
-    items.iter().map(|&(it, _)| 1 + detail_rows(it)).sum()
-}
-
 fn row_of(item: Item) -> usize {
-    // Title row 0, blank, then per group: header row, its items (each followed by its detail lines), blank.
+    // Title row 0, blank, then per group: header row, its items, blank.
     let mut row = 2;
     for (_, items) in GROUPS.iter() {
         row += 1;
@@ -96,7 +94,7 @@ fn row_of(item: Item) -> usize {
             if it as u8 == item as u8 {
                 return row;
             }
-            row += 1 + detail_rows(it);
+            row += 1;
         }
         row += 1;
     }
@@ -123,7 +121,7 @@ fn draw_circle(panel: &Panel, row: usize, filled: bool, color: u32) {
 
 fn draw_item(c: &Checklist, item: Item, label: &str) {
     let done = c.done & (1 << item as u8) != 0;
-    let color = if done { GREEN } else { RED };
+    let color = if !done { RED } else if c.interim & (1 << item as u8) != 0 { YELLOW } else { GREEN };
     let row = row_of(item);
     draw_circle(&c.panel, row, done, color);
     unsafe {
@@ -131,7 +129,26 @@ fn draw_item(c: &Checklist, item: Item, label: &str) {
         con.set_scale(SCALE);
         con.goto(LABEL_COL, row);
         con.puts(label);
+        let (text, len) = &c.suffix[item as usize];
+        if *len > 0 {
+            con.putc(b' ');
+            for &b in &text[..*len] {
+                con.putc(b);
+            }
+        }
     }
+}
+
+fn redraw(c: &Checklist, item: Item) {
+    for (_, items) in GROUPS.iter() {
+        for &(it, label) in items.iter() {
+            if it as u8 == item as u8 {
+                draw_item(c, it, label);
+            }
+        }
+    }
+    let mut rep = alloc::vec::Vec::new();
+    c.panel.present(&mut rep);
 }
 
 /// Adopt the panel and draw the whole list; `done` items start green. No-op (and every later `mark` too) if there is no panel to drive.
@@ -140,7 +157,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
     let Some(panel) = crate::display::adopt(cntfrq, &mut rep) else {
         return;
     };
-    let mut c = Checklist { panel, done: 1 << Item::Panel as u8 };
+    let mut c = Checklist { panel, done: 1 << Item::Panel as u8, interim: 0, suffix: [([0u8; SUFFIX_MAX], 0); 32] };
     for &d in done {
         c.done |= 1 << d as u8;
     }
@@ -154,7 +171,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
             con.set_fg(HEADER);
             con.goto(0, row);
             con.puts(name);
-            row += group_rows(items) + 2;
+            row += items.len() + 2;
         }
     }
     for (_, items) in GROUPS.iter() {
@@ -175,35 +192,28 @@ pub fn mark(item: Item) {
         return;
     }
     c.done |= 1 << item as u8;
-    for (_, items) in GROUPS.iter() {
-        for &(it, label) in items.iter() {
-            if it as u8 == item as u8 {
-                draw_item(c, it, label);
-            }
-        }
-    }
-    let mut rep = alloc::vec::Vec::new();
-    c.panel.present(&mut rep);
+    redraw(c, item);
 }
 
-/// Write an item's detail lines (indented, grey) and push a frame. Extra lines beyond the item's reserved rows are dropped.
-pub fn details(item: Item, lines: &[&[u8]]) {
-    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_ref() }) else {
+/// Mark an item up through a stand-in (yellow) and redraw it.
+pub fn mark_interim(item: Item) {
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };
-    let base = row_of(item) + 1;
-    for (i, line) in lines.iter().take(detail_rows(item)).enumerate() {
-        unsafe {
-            let mut con = c.panel.console(DETAIL);
-            con.set_scale(SCALE);
-            con.goto(LABEL_COL + 1, base + i);
-            for &b in line.iter() {
-                con.putc(b);
-            }
-        }
-    }
-    let mut rep = alloc::vec::Vec::new();
-    c.panel.present(&mut rep);
+    c.done |= 1 << item as u8;
+    c.interim |= 1 << item as u8;
+    redraw(c, item);
+}
+
+/// Put `text` after an item's label (truncated to 16 bytes) and redraw it.
+pub fn suffix(item: Item, text: &[u8]) {
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
+        return;
+    };
+    let n = text.len().min(SUFFIX_MAX);
+    c.suffix[item as usize].0[..n].copy_from_slice(&text[..n]);
+    c.suffix[item as usize].1 = n;
+    redraw(c, item);
 }
 
 /// Whether the checklist owns the panel on this boot (then nothing else should draw over it).
