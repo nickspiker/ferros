@@ -279,6 +279,31 @@ future front ends  (an RPN / AI-tailored Rust fork, ...)          → toka ┘
 - Glyph silicon does base–limit in the load/store unit, in parallel (ISOMEM proper: exact size, zero instructions). Compiled masking is the stock-silicon embodiment.
 - Hardware grants (MMIO arcs) reach a process only as handles; a driver's register accesses go through them like any other arc.
 
+### Built on husky (2026-10-14) — the process ABI as it stands
+
+What runs today (cold boot, slot b), against the modules below:
+
+| Module | Status |
+|---|---|
+| 1 Cryptographic address space | not started |
+| 2 Capabilities | tokens = BLAKE3 keyed with a per-session key (derived from the wairua) over domain, object, rights, nonce, epoch; a CSpace per process; each spawn a new epoch, so a dead process's tokens match nothing; lookup compares every entry without early exit. Not yet: processes minting/deriving caps, the derivation tree, TTLs |
+| 3 Arcs | power-of-two buddy allocator over the arc pool (2 MiB, top of the kernel window), zeroed on allocation; the static map lets EL0 touch only the pool. Not yet: compiled masking (processes are hand-written native code; the toka backend is what will mask) |
+| 4 IPC | call / recv / reply, synchronous rendezvous, messages copied arc to arc, reply tokens single-use; named dev endpoints granted at spawn |
+| 5 Branchless security path | only the token lookup is branch-free |
+| 6 Encrypted kernel memory | not started |
+| 7 Killswitch | the key presses are the interrupt (KILLSWITCH.md) |
+| 8 Storage | the ira-rooted vault (VAULT.md) |
+| Oracle / spawn (ORACLE.md) | signed VSF capsules through the gate (Ed25519 over the whole file, vsf crypto-verify), ihi = spaghettify(system secret ‖ developer key ‖ hp) written into the arc; the system secret is an ira-derived RAM stand-in for the write-only CSR |
+
+The process ABI (`ferros_kernel/src/process.rs`):
+- **Entry:** EL0 (VHE: EL2 host, EL2&0 regime) at arc offset G#1000, x0 = grants offset, x1 = input offset, x2 = input length, **x28 = arc base, x27 = arc mask**, every other register (general and SIMD) zero, interrupts unmasked.
+- **Arc layout:** G#0 grants page — u32 count, then 32-byte tokens (slot 0 = console, then the endpoint grants in order); the *ihi* at G#FE0 (32 bytes); code at G#1000; input after the code; stack at the top.
+- **Syscalls** (`svc #0`, number in x8, every offset an arc offset the kernel masks, ERR = all ones): 0 `exit(code)`; 1 `call(cap, msg, len, reply, reply_cap)`; 2 `recv(cap, buf, buf_cap, reply_token)`; 3 `reply(reply_token, msg, len)`.
+- **Faults** end the process (exit value FAULT | EC | PC | FAR), never the kernel.
+- **Time slices:** 10 ms on the EL2 timer; a preempted process continues in later slices from the service loop.
+- **Boot:** after the vault opens, the kernel spawns the vault's `init` capsule — ferros's first process.
+- **Dev:** `bridge capsule` signs a binary with the developer key, `bridge spawn` runs one (with `--serve` / `--use` endpoint grants), `bridge diag console` reads what processes said.
+
 ### Bring-up order
 
 1. EL0 entry and the base/mask register ABI: the existing RUN payload path becomes a real process.
