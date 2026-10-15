@@ -604,6 +604,31 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.failed = true;
         return;
     }
+    // MSI before the firmware runs: it signals boot-complete with an MSI, and with none programmed the write goes to address 0 and the firmware traps (stage 08's first console). The RC's DesignWare MSI receiver (DBI port logic: MSI_ADDR_LO/HI G#820/G#824, vector enable G#828, mask G#82C, status G#830) terminates writes to MSI_ADDR inside the controller; the EP's MSI capability points at the same address. MSI_TARGET is in the boot ROM region, never DRAM, so a write that ever escaped interception would land nowhere.
+    const MSI_TARGET: u32 = 0xF000;
+    d.wr(DBI, 0x820, MSI_TARGET);
+    d.wr(DBI, 0x824, 0);
+    d.wr(DBI, 0x828, 0xFFFF_FFFF);
+    d.wr(DBI, 0x82C, 0);
+    d.wr(DBI, 0x830, 0xFFFF_FFFF);
+    let msi = find_cap(d, 0x05);
+    d.kv(b"ep.msi_cap", msi.unwrap_or(0) as u32);
+    if let Some(c) = msi {
+        let ctl = d.rd(CFG, c) >> 16;
+        let is64 = ctl & 0x80 != 0;
+        d.wr(CFG, c + 4, MSI_TARGET);
+        if is64 {
+            d.wr(CFG, c + 8, 0);
+        }
+        let data_off = if is64 { c + 0xC } else { c + 8 };
+        let dv = d.rd(CFG, data_off & !3);
+        d.wr(CFG, data_off & !3, dv & 0xFFFF_0000);
+        // Message control: enable, one vector (multiple-message enable [6:4] = 0).
+        let w = d.rd(CFG, c);
+        d.wr(CFG, c, (w & !(0x71 << 16)) | (1 << 16));
+        d.show(b"ep.msi_ctl", CFG, c);
+    }
+    d.flush();
     // Enter: the CA7 must be out of reset and halted (stage 5 found it so after WL_REG_ON; dhd resets it into that state only when it isn't, which this driver doesn't do yet).
     d.wr(CFG, 0x80, oobr);
     let dmp = d.rd(MEM, 0x248);
@@ -699,6 +724,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         return;
     };
     d.kv(b"FIRMWARE UP, shared", sh);
+    d.show(b"rc.msi_status", DBI, 0x830);
     d.put(b"shared:");
     for i in 0..24 {
         let v = d.tcm_rd(sh + 4 * i);
@@ -712,17 +738,17 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
 
     // ---- stage 8: what the running firmware says about itself. The settled shared area (bcmpcie.h pciedev_shared_t: flags, trap_addr, assert_exp/file, assert_line, console_addr at +G#14, fwid, ..., rings_info_ptr at +G#30) once its pointers are filled in; trap_addr non-zero means the firmware trapped. Then its console: hnd_cons_t at console_addr, log ring at +8 (buf, buf_size, idx) — the firmware's own boot log, printed as text. ----
-    // Timeline first (stage 8's first run saw the shared flags and fwid go to zero within 2 s, console never set): every 5 ms for 3 s, log any change in shared flags / console_addr, the ramtop word, ram[0] and the CA7's DMP control.
+    // Timeline first (stage 8's first run saw the shared flags and fwid go to zero within 2 s, console never set): every 5 ms for 3 s, log any change in shared flags / console_addr, the ramtop word and the CA7's DMP control. Not backplane G#0: once booted the firmware disables that region, and a host read there through BAR1 is an AXI slave error the firmware traps on (seen: "AXI Slave Err on s_pcie ... addr 0", then a FIQ trap).
     let t0 = d.now();
-    let mut prev = [u32::MAX; 5];
+    let mut prev = [u32::MAX; 4];
     while d.now().wrapping_sub(t0) < 3 * d.freq {
-        let mut cur = [d.tcm_rd(sh), d.tcm_rd(sh + 0x14), d.tcm_rd(ramtop - 4), d.tcm_rd(0), 0];
+        let mut cur = [d.tcm_rd(sh), d.tcm_rd(sh + 0x14), d.tcm_rd(ramtop - 4), 0];
         d.wr(CFG, 0x80, oobr);
-        cur[4] = d.rd(MEM, 0x248);
+        cur[3] = d.rd(MEM, 0x248);
         d.wr(CFG, 0x80, 0x1800_0000);
         if cur != prev {
             d.hex(((d.now().wrapping_sub(t0) * 1_000_000) / d.freq) as u32);
-            d.put(b"us flags/console/ramtop/ram0/dmp:");
+            d.put(b"us flags/console/ramtop/dmp:");
             for v in cur {
                 d.put(b" ");
                 d.hex(v);
@@ -738,6 +764,12 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     // The first ramtop value is an early, temporary one: around 430 ms in, the firmware publishes the real shared area there (dhd never sees the first — it reads after the firmware-boot interrupt, dhdpcie_wait_readshared_area_addr).
     let sh = d.tcm_rd(ramtop - 4);
     d.kv(b"shared (settled)", sh);
+    d.show(b"rc.msi_status", DBI, 0x830);
+    if sh >= RAM_BASE && sh < ramtop {
+        // bcmpcie.h: PCIE_SHARED_ASSERT G#200, PCIE_SHARED_TRAP G#400.
+        let f = d.tcm_rd(sh);
+        d.put(if f & 0x600 != 0 { b"FIRMWARE TRAPPED/ASSERTED\n" } else { b"firmware running, no trap\n" });
+    }
     if sh < RAM_BASE || sh >= ramtop {
         d.flush();
         return;
@@ -778,6 +810,22 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
     d.put(b"\n---- end\n");
     d.flush();
+}
+
+/// Walk the endpoint's capability list (cfg G#34) for `id`; returns the capability's config offset.
+fn find_cap(d: &mut Drv, id: u32) -> Option<u64> {
+    let mut p = (d.rd(CFG, 0x34) & 0xFC) as u64;
+    for _ in 0..48 {
+        if p == 0 {
+            return None;
+        }
+        let h = d.rd(CFG, p);
+        if h & 0xFF == id {
+            return Some(p);
+        }
+        p = ((h >> 8) & 0xFC) as u64;
+    }
+    None
 }
 
 /// [u32 LE len][bytes] twice.
