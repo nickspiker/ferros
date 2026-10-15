@@ -1021,10 +1021,16 @@ pub(crate) fn pixel8_eusb_phy_init() {
             reg &= !(1 << 0);
             core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
 
-            // UTMI_CTRL(G#10): force VBUS/BVALID valid (device mode, no VBUS-detect HW path).
+            // UTMI_CTRL(G#10): force B-valid (b0), VBUS-valid (b1) and UTMI TX bit-stuff enable (b2), the live value under Linux (7). The link's own session detection is disabled above (dis_bvalid), so b0|b1 ARE the session the controller sees (exynos-usb-blkcon.c); this used to set b1|b2 and so never forced B-valid. Register parity with Linux, from diffing USBCON cold vs handoff — it was not the cause of the flaky cold enumeration (that was the EP0 status stage, ferros_hal usb.rs StatusInWait).
             reg = core::ptr::read_volatile((USBCON + 0x0010) as *const u32);
-            reg |= (1 << 1) | (1 << 2);
+            reg |= (1 << 0) | (1 << 1) | (1 << 2);
             core::ptr::write_volatile((USBCON + 0x0010) as *mut u32, reg);
+
+            // HSP_MISC(G#114): resistance-tune calibration chain = eUSB PHY only (sel_res_tune_mux b1:0 = 2, set_req_in2 b4 = 1, set_ack_in2/req_in1/ack_in1 b5/b6/b7 = 0), as exynos_usbcon_disable_pipe3_phy does when the USB3/DP combo PHY is down, which it always is here. ABL leaves 0 (Phy2 → Phy1); Linux, with the combo PHY up, uses 1.
+            reg = core::ptr::read_volatile((USBCON + 0x0114) as *const u32);
+            reg &= !(0x3 | (0xF << 4));
+            reg |= 2 | (1 << 4);
+            core::ptr::write_volatile((USBCON + 0x0114) as *mut u32, reg);
 
             // --- PHY init (phy_exynos_eusb_initiate) ---
             // 1. Hold PHY + UTMI port in reset, override-enabled. RST_CTRL(G#00): phy_reset b0, phy_reset_ovrd_en b1, utmi_port_reset b4, utmi_port_reset_ovrd_en b5.
@@ -1049,6 +1055,11 @@ pub(crate) fn pixel8_eusb_phy_init() {
             reg = core::ptr::read_volatile((EUSB_PHY + 0x000C) as *const u32);
             reg &= !(0xF << 8);
             core::ptr::write_volatile((EUSB_PHY + 0x000C) as *mut u32, reg);
+
+            // TXTUNE(G#14): fsls_vref_tune (b2:1) = 0, as phy_exynos_eusb_initiate does right before releasing IDDQ (it then applies the DT tune table; on husky the rest of TXTUNE already matches Linux's tuned value G#9030 — cold ABL leaves G#9034).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0014) as *const u32);
+            reg &= !(0x3 << 1);
+            core::ptr::write_volatile((EUSB_PHY + 0x0014) as *mut u32, reg);
 
             // 3. Clear analog IDDQ — TESTSE(G#20) test_iddq b6 = 0 — powers the PHY analog UP. (The step the old port missed.)
             reg = core::ptr::read_volatile((EUSB_PHY + 0x0020) as *const u32);

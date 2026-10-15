@@ -15,7 +15,7 @@ metadata:
 
 **Facts measured (don't re-derive):**
 - **Link base:** ABL loads the kernel at G#8008_0000, so the cold image links there (`aarch64-pixel8.ld`). The old 0x80000 link only worked because nothing used absolute addresses.
-- **USB enumeration:** cold takes 2-7 attempts (the handoff's is first-try).
+- **USB enumeration is first-try** (13/13 cold boots, about 23 s from `fastboot reboot`) since the 2026-10-14 EP0 fix. The long-standing "coin flip" was SET_ADDRESS's status ZLP being started before XferNotReady(Status) (the race is in ferros_hal usb.rs `StatusInWait`), not the repeater or PHY. `bridge diag` FAIL_ATT blocks dump per-attempt DWC3 event rings if it ever regresses.
 - **Display:** ABL leaves DECON on with both DPU SYSMMUs in translation-off, so the splash buffer G#FAC0_0000 (1344x2992 linear XRGB8888) is physical and `display::show` draws on it.
 - **Exits:** every cold exit except a plain `bridge reboot` goes to fastboot. The report block survives fastboot (Android dmesg `ferros: r[..]`, next cold boot `PREV_*`).
 - **Watchdog-triggered reset is DELAYED:** about 15-20 s after the cluster watchdogs start expiring (about 1 min for a single expiry). `reboot_to_bootloader` waits up to 64 s. Measured with `payloads/wdtfire`, a RUN payload that owns the CPU so nothing pets. The earlier "fastboot works" test only passed because the bridge waited 60 s.

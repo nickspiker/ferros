@@ -1,6 +1,19 @@
 # eUSB2 Repeater Bring-Up (Pixel 8 / Tensor G3) — Zila (1)
 
-## Why this matters
+## SOLVED (2026-10-14): the coin flip was the EP0 status stage, not the analog path
+
+The enumeration coin flip was never the repeater or the PHY. Per-attempt DWC3 event rings (`bridge diag`, `FAIL_ATT` blocks) showed every failed attempt doing the same thing:
+- GET_DESCRIPTOR(64) completes, then bus reset, then SET_ADDRESS arrives.
+- The status-stage ZLP had been started at SETUP time, before the core asked for it. The core then raised XferNotReady(Status) with "transfer active" set, and that status transfer never completed.
+- The host's next request, to the new address, failed with EPROTO (-71). Host journal: `device descriptor read/all, error -71` / `read/8, error -71`.
+
+The fix is in `ferros_hal/src/usb.rs` (`Ep0State::StatusInWait`). SET_ADDRESS and SET_CONFIGURATION now start their status IN only on XferNotReady(Status), the DWC3 control programming model that Linux dwc3 follows too.
+
+Cold boots of slot b went from 1-16 attempts (sometimes none in 64 s) to **first-try on 13 of 13 boots** (9 of them on the committed build: flash boot plus 8 cycled boots, about 23 s from `fastboot reboot` to enumerated).
+
+This explains "failed inits look identical to healthy ones at the link controller" below: the link was fine every time. The history below is kept for the record. The repeater tune and the register-parity fixes it led to (UTMI_CTRL = 7, HSP_MISC eUSB-only calibration chain, TXTUNE fsls_vref_tune = 0) are correct to keep, but none of them moved the attempt counts.
+
+## Why this matters (history: the analog-path theory, wrong)
 
 Enumeration on the Pixel is a coin flip: some boots the analog path never lights up and USB stays silent for 30–240s while the watchdog re-inits the PHY. The forensics (2026-08-15, [pixel8_boot_findings]) showed failed inits look *identical* to healthy ones at the link controller — LTSTATE `G#FFFF4`, LINKDBG `G#115` both ways. The failure is the **analog path**, and the analog path in front of the eUSB2 PHY is the **repeater**.
 

@@ -757,6 +757,7 @@ enum Ep0State {
     DataIn,     // Sending data to host
     DataOut,    // Receiving data from host
     Status,     // Status stage
+    StatusInWait, // No-data request handled; status IN starts on the core's XferNotReady(Status)
 }
 
 /// Event types returned from poll.
@@ -1635,6 +1636,11 @@ impl Dwc3Dev {
                         }
                         return UsbEvent::None;
                     }
+                    // No-data request (SET_ADDRESS, SET_CONFIGURATION): the core asks for the status stage → start the status IN ZLP now. Starting it at SETUP time instead (before this event) is outside the DWC3 control programming model (Linux dwc3 waits for DEPEVT_STATUS_CONTROL_STATUS too) and races the core: on husky cold boots the early SET_ADDRESS status transfer sat "active" and never completed in about half the attempts, so the host's next request to the new address failed with EPROTO (-71).
+                    if ep_phys == 1 && self.ep0_state == Ep0State::StatusInWait {
+                        self.ep0_status_in();
+                        return UsbEvent::None;
+                    }
                     if ep_phys == 1 && self.ep0_state == Ep0State::DataOut {
                         self.ep0_status_in();
                         return UsbEvent::None;
@@ -1852,7 +1858,7 @@ impl Dwc3Dev {
                         (dcfg & !DCFG_DEVADDR_MASK)
                         | ((self.address as u32) << DCFG_DEVADDR_SHIFT));
                 }
-                self.ep0_status_in();
+                self.ep0_state = Ep0State::StatusInWait;
                 true
             }
             USB_REQ_GET_DESCRIPTOR => {
@@ -1866,7 +1872,7 @@ impl Dwc3Dev {
                     self.bulk_out_arm();
                     self.bulk_in_idle = true;
                 }
-                self.ep0_status_in();
+                self.ep0_state = Ep0State::StatusInWait;
                 true
             }
             USB_REQ_GET_STATUS => {

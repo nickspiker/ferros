@@ -292,7 +292,9 @@ pub fn run(mut b: Boot) -> ! {
     let mut t_command = t_init;
     let mut attempts: u32 = 1;
     let mut configured_ever = false;
-    let mut init_history: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
+    let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
+    // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
+    let mut att_ev = [0u32; 3];
     let mut st = PtStats::default();
     // A PT transfer that stops moving for 16 s is a wedged endpoint: report it and leave rather than idling for 512 s.
     let stall_giveup = freq * 16;
@@ -348,11 +350,29 @@ pub fn run(mut b: Boot) -> ! {
                 if !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
                     if init_history.len() < 32 {
                         unsafe {
-                            init_history.push((
+                            let n = usb.evt_ring_n as usize;
+                            let mut h = [0u32; 24];
+                            h[..12].copy_from_slice(&[
                                 read_volatile((USBCON + 0x80) as *const u32),  // LTSTATE_HIS
                                 read_volatile((USBCON + 0x84) as *const u32),  // LINK_DEBUG_L
                                 read_volatile((DWC3 + 0xC70C) as *const u32), // DSTS
-                            ));
+                                att_ev[0],
+                                att_ev[1],
+                                att_ev[2],
+                                usb.ep0_setup_arm_ok | usb.ep0_setup_arm_fail << 16,
+                                usb.ep0_xfer_notready,
+                                usb.cmd_status_fail,
+                                usb.evt_ring_n,
+                                usb.last_setup_brequest as u32 | (usb.last_setup_wvalue as u32) << 16,
+                                usb.status_in_count | usb.status_out_count << 16,
+                            ]);
+                            // The event ring, oldest first.
+                            for k in 0..12 {
+                                if n >= 12 - k {
+                                    h[12 + k] = usb.evt_ring[(n + k) % 12];
+                                }
+                            }
+                            init_history.push(h);
                         }
                     }
                     crate::pixel8_eusb_phy_init();
@@ -360,6 +380,7 @@ pub fn run(mut b: Boot) -> ! {
                         usb = nu;
                     }
                     attempts += 1;
+                    att_ev = [0; 3];
                     pt_inbound = None;
                     pt_seq_width = 0;
                     pt_out_data.clear();
@@ -376,6 +397,7 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             UsbEvent::Reset => {
+                att_ev[0] += 1;
                 t_progress = cntpct();
                 usb.handle_reset();
                 pt_inbound = None;
@@ -383,6 +405,7 @@ pub fn run(mut b: Boot) -> ! {
                 pt_out_data.clear();
             }
             UsbEvent::ConnectDone { .. } => {
+                att_ev[1] += 1;
                 t_progress = cntpct();
                 usb.handle_connect_done();
                 usb.ep0_start_setup();
@@ -395,6 +418,7 @@ pub fn run(mut b: Boot) -> ! {
                 pt_out_data.clear();
             }
             UsbEvent::Ep0Setup { request } => {
+                att_ev[2] += 1;
                 t_progress = cntpct();
                 if !usb.handle_setup(&request) {
                     usb.ep0_stall();
@@ -438,6 +462,22 @@ pub fn run(mut b: Boot) -> ! {
                                 if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                        if cmd.params == b"rep" {
+                                            // The eUSB2 repeater's whole 8-bit register map over I2C (HSI2C11, address from the DT), one "REP_xx=" line per register; G#8000_xxxx = the read failed (TRANS_STATUS low bits). For diffing cold vs handoff state.
+                                            let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+                                            i2c.init();
+                                            let hex = b"0123456789ABCDEF";
+                                            for reg in 0..=255u8 {
+                                                let v = match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
+                                                    Ok(v) => v as u32,
+                                                    Err(t) => 0x8000_0000 | (t & 0xFFFF),
+                                                };
+                                                let label = [b'R', b'E', b'P', b'_', hex[(reg >> 4) as usize], hex[(reg & 0xF) as usize], b'='];
+                                                append_hex(&mut resp, &label, v);
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ufs" {
                                             match b.ufs_probe {
                                                 Some(f) => resp = f(),
@@ -498,11 +538,12 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"SYSMMU_VM_CTRL_LINUX=", dma.vm_ctrl_before[vm]);
                                             append_hex(&mut resp, b"SYSMMU_VM_CTRL_NOW=", dma.vm_ctrl_after[vm]);
                                         }
-                                        for (i, &(lt, dbg, dsts)) in init_history.iter().enumerate() {
+                                        const ATT_KEYS: [&[u8]; 24] = [b"  LTSTATE=", b"  LINKDBG=", b"  DSTS=", b"  RESETS=", b"  CONNDONES=", b"  SETUPS=", b"  SETUP_ARM_OK_FAIL=", b"  XFERNOTREADY=", b"  CMD_FAIL=", b"  EVENTS=", b"  LAST_SETUP=", b"  STATUS_IN_OUT=", b"  E0=", b"  E1=", b"  E2=", b"  E3=", b"  E4=", b"  E5=", b"  E6=", b"  E7=", b"  E8=", b"  E9=", b"  EA=", b"  EB="];
+                                        for (i, h) in init_history.iter().enumerate() {
                                             append_hex(&mut resp, b"FAIL_ATT=", i as u32);
-                                            append_hex(&mut resp, b"  LTSTATE=", lt);
-                                            append_hex(&mut resp, b"  LINKDBG=", dbg);
-                                            append_hex(&mut resp, b"  DSTS=", dsts);
+                                            for (k, &v) in ATT_KEYS.iter().zip(h.iter()) {
+                                                append_hex(&mut resp, k, v);
+                                            }
                                         }
                                         resp.extend_from_slice(b"END\n");
                                         queue_pt_response(&mut pt_out_data, &resp);
