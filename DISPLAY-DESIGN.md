@@ -53,7 +53,7 @@ Why a process, not kernel: the panel bring-up is long and full of delays and DCS
 
 1. **Refresh strategy:** fixed 120 Hz for simplicity first, or wire variable-refresh (10–120 Hz) early because it's the big battery lever? LP/AOD ties into the wake policy.
 2. **Wake policy coupling:** should the display server own the proximity-gated power-button policy (screen lights only if power pressed AND prox far), or is that a separate policy process that calls the display server? (The wake-policy memory says it's native ferros display-policy, not kernel.)
-3. **Bit depth:** 8 bpc is what the panel's DSC is configured for; the 10-bit path exists. Start 8, revisit for Lumis/photo?
+3. **Bit depth:** 8 bpc is what the panel's DSC is configured for; the 10-bit path exists. Start 8, revisit for Lumis/photo? HDR is decided separately and doesn't need 10 bits on the link: content arrives as VSF `gamma2tanh` (vsf colour.md, "HDR: Gamma 2, Then tanh": `tanh(√linear)` per channel, diffuse white at code 194, 3.3 stops of headroom at 8 bits and 5.1 at 16). The display server puts diffuse white at a chosen brightness and maps the tanh tail into HBM headroom by raising `0x51` and scaling the SDR part down in pixel values. Ten bits or DECON dither then earns its place as precision for the SDR part under that reserved headroom, not as range.
 4. **Cold power-up priority:** worth building now, or lean on ABL leaving the panel up and only build full power-up when deep-idle/off actually matters?
 5. **Kernel painter vs server:** keep the Ready/checklist painter in the kernel permanently (it must run pre-process), with the server taking over only after first process — agree?
 
