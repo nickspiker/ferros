@@ -58,3 +58,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Photon vocabulary](photon_terminology.md) — message = photon (send a photon), video call = beam (beam someone)
 - [Feedback: single egg rule](feedback_single_egg_rule.md) — never one basket: critical inputs (entropy) from several independent sources; KOHI target = four
 - [Feedback: no attribution](feedback_no_attribution.md) — rule is honesty, not a word filter: no false authorship/ownership claims (Co-Authored-By is a lie), factual tool notes fine; guard in ferros scripts/hooks
+- [Dev box network for phone tests](devbox_network_for_phone_tests.md) — wired NIC is DMX (use WiFi .156), firewall drops unsolicited UDP (receiver pings phone first), router throttles repeated WiFi joins (~10 min), never cut the bridge mid-transfer
