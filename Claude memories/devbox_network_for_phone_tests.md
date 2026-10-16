@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Learned the hard way on 2026-10-15 night getting the first beam from husky to the dev box (BEAM.md, [[photon_on_ferros_no_bootstrap]]):
+Learned the hard way on 2026-10-15 night sending a beam-format test stream (not a beam) from husky to the dev box (BEAM.md, [[photon_on_ferros_no_bootstrap]]):
 
 - **Wired `enp5s0` (192.168.1.100) is "dmx-eth", a separate DMX lighting network** on the same /24: the phone on WiFi cannot ARP it. Target the box's WiFi address, `wlp4s0` = 192.168.1.156.
 - **The box's firewall drops unsolicited inbound UDP from the phone** (Photon's own 4383 works only because its peers' pings open the flow). A receiver must send a datagram to the phone from its listening port first, so the phone's stream arrives as replies on an established flow (`tools/photon-interop` `beam-recv … <phone address>`). Reading firewalld config needs root; `firewall-cmd` hangs on an auth prompt here.
