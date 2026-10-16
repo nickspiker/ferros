@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# ferros commit-msg hook. Refuses commit messages that claim authorship, co-authorship, ownership or tool-generation (attribution-guard.sh) — nobody owns this codebase and no tool authors it.
+# ferros commit-msg hook. Refuses commit messages that claim an AI authored, co-authored or owns the work (attribution-guard.sh); "Built with Claude <version>" is fine. ferros sets its own hooks path, so the global commit-msg hook does not run here and this one calls the same canonical guard.
 set -euo pipefail
 exec "$(git rev-parse --show-toplevel)/scripts/attribution-guard.sh" "$1"

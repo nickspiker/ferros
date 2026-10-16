@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# ferros pre-push hook. This repo sets its own hooks path, which replaces the global one, so the global pre-push (the handle guard's backstop over every pushed commit) would never run here; run it wherever it is installed.
+set -euo pipefail
+g="$(git config --global --get core.hooksPath || true)"; g="${g/#\~/$HOME}"
+if [ -n "$g" ] && [ -x "$g/pre-push" ]; then exec "$g/pre-push" "$@"; fi

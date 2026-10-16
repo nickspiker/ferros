@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
-# ferros pre-commit hook. Blocks commits that introduce hard-wrapped comment prose.
+# ferros pre-commit hook. This repo sets its own hooks path, which replaces the global one, so the global pre-commit (the handle guard) runs here first wherever it is installed; then the comment gate blocks commits that introduce hard-wrapped comment prose.
 set -euo pipefail
+g="$(git config --global --get core.hooksPath || true)"; g="${g/#\~/$HOME}"
+if [ -n "$g" ] && [ -x "$g/pre-commit" ]; then "$g/pre-commit"; fi
 exec "$(git rev-parse --show-toplevel)/scripts/comment-gate.sh"
