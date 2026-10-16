@@ -167,8 +167,13 @@ pub fn parse(bytes: &[u8]) -> Option<Frame> {
                 VsfType::hp(b) => arr::<32>(&b)?,
                 _ => return None,
             };
+            // VSF auto-sizes integers on decode, so era can come back in any unsigned width.
             let era = match one("era") {
                 Some(VsfType::u(e, _)) => Some(e as u64),
+                Some(VsfType::u3(e)) => Some(e as u64),
+                Some(VsfType::u4(e)) => Some(e as u64),
+                Some(VsfType::u5(e)) => Some(e as u64),
+                Some(VsfType::u6(e)) => Some(e),
                 _ => None,
             };
             let data = match one("data")? {
