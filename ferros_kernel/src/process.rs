@@ -52,11 +52,12 @@ fn arcs() -> &'static mut Arcs {
     a
 }
 
-/// An arc: `size` bytes at `base`, both powers of two, base aligned to size.
+/// An arc: `size` usable bytes at `base` (a power of two, base aligned to `size`), carved from a `block`-byte buddy block (= `size`, or `2 * size` for a guarded arc, whose upper half is unused guard so an in-arc immediate offset can't reach another arc — SANDBOX.md).
 #[derive(Clone, Copy)]
 pub struct Arc {
     pub base: usize,
     pub size: usize,
+    pub block: usize,
 }
 
 impl Arc {
@@ -65,10 +66,11 @@ impl Arc {
     }
 }
 
-/// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed: the slack beyond what was asked for is zero and belongs to this arc alone.
-pub fn arc_alloc(bytes: usize) -> Option<Arc> {
+/// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed. `guard` reserves a guard of the arc's own size on each side (a 2S block, SANDBOX.md): the base is 2S-aligned, hence S-aligned, so masking stays a single `and`, and the usable arc never abuts another.
+pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
     let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
-    let k = want.trailing_zeros() as usize;
+    let block = if guard { want * 2 } else { want };
+    let k = block.trailing_zeros() as usize;
     let a = arcs();
     let mut j = k;
     while j < 32 && a.free[j].is_empty() {
@@ -83,7 +85,7 @@ pub fn arc_alloc(bytes: usize) -> Option<Arc> {
         a.free[j].push(base + (1 << j));
     }
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, want) };
-    Some(Arc { base, size: want })
+    Some(Arc { base, size: want, block })
 }
 
 /// Return an arc to the pool, merging buddies.
@@ -91,7 +93,7 @@ pub fn arc_free(arc: Arc) {
     let a = arcs();
     let (p0, p1) = crate::cachemap::POOL;
     let mut base = arc.base;
-    let mut k = arc.size.trailing_zeros() as usize;
+    let mut k = arc.block.trailing_zeros() as usize;
     while (1usize << k) < p1 - p0 {
         let buddy = p0 + ((base - p0) ^ (1 << k));
         match a.free[k].iter().position(|&b| b == buddy) {
@@ -703,7 +705,7 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi))
+    spawn(name, &g.code, input, grants, Some(ihi), g.masked)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -717,13 +719,13 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>) -> Result<Outcome, &'static str> {
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, guard: bool) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
-    let arc = arc_alloc(CODE + code.len() + inline + STACK).ok_or("arc pool exhausted")?;
+    let arc = arc_alloc(CODE + code.len() + inline + STACK, guard).ok_or("arc pool exhausted")?;
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for g in grants {
