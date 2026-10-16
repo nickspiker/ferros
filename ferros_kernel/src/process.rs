@@ -90,6 +90,7 @@ pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
 
 /// Return an arc to the pool, merging buddies.
 pub fn arc_free(arc: Arc) {
+    crate::cachemap::arc_reset(arc.base, arc.block);
     let a = arcs();
     let (p0, p1) = crate::cachemap::POOL;
     let mut base = arc.base;
@@ -705,7 +706,7 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi), g.masked)
+    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -719,7 +720,7 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, guard: bool) -> Result<Outcome, &'static str> {
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
@@ -758,6 +759,8 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     let in_off = CODE + code.len();
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code.len());
+    // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
+    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
     let kk = k();
     kk.exited.clear();
     let trips0 = kk.ipc_round_trips;

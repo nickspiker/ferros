@@ -21,6 +21,8 @@ struct Table([u64; 512]);
 static mut L1: Table = Table([0; 512]);
 static mut L2: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
+/// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 8 MiB = 4 blocks, the shim pool 2 MiB = 1.
+static mut POOL_L3: [Table; 4] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
 
 unsafe extern "C" {
     static __dma_start: u8;
@@ -62,6 +64,8 @@ const ATTR_NC: u64 = 2 << 2;
 // Descriptor bits. Non-VHE EL2 regime: AP[1] (bit 6) is RES1, one XN (bit 54). VHE (EL2&0 regime): AP[1] = EL0 access, UXN (bit 54) / PXN (bit 53). SH inner shareable (bits 9:8), AF (bit 10).
 const AP_EL2: u64 = 1 << 6;
 const AP_EL0: u64 = 1 << 6;
+/// AP[2]: read-only (for either EL in the VHE regime).
+const AP_RO: u64 = 1 << 7;
 const SH_INNER: u64 = 3 << 8;
 const AF: u64 = 1 << 10;
 const XN: u64 = 1 << 54;
@@ -81,6 +85,20 @@ fn pool(vhe: bool, addr: usize, kind: u64) -> u64 {
 }
 fn dma_pool(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_NC | SH_INNER | AF | if vhe { AP_EL0 | UXN | PXN } else { AP_EL2 | XN }
+}
+/// A pool page (VHE EL0): Normal cacheable, EL0-accessible, never executable at EL2 (PXN). `writable` clears AP[2]; `exec` clears UXN so EL0 may execute it. Default (the state a freed/fresh arc page is left in) is writable, non-executable — data.
+fn pool_page(vhe: bool, addr: usize, writable: bool, exec: bool) -> u64 {
+    if !vhe {
+        return normal(false, addr, TABLE_OR_PAGE);
+    }
+    let mut d = addr as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | AP_EL0 | PXN;
+    if !writable {
+        d |= AP_RO;
+    }
+    if !exec {
+        d |= UXN;
+    }
+    d
 }
 fn uncached(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_NC | SH_INNER | AF | if vhe { UXN | PXN } else { AP_EL2 | XN }
@@ -117,6 +135,7 @@ pub fn enable() -> bool {
         let l1 = &mut *(&raw mut L1);
         let l2 = &mut *(&raw mut L2);
         let l3 = &mut *(&raw mut L3);
+        let pool_l3 = &mut *(&raw mut POOL_L3);
         for (i, e) in l1.0.iter_mut().enumerate() {
             *e = device(vhe, i * GIB, BLOCK);
         }
@@ -128,7 +147,12 @@ pub fn enable() -> bool {
             *e = if a + MIB2 <= w0 || a >= w1 {
                 device(vhe, a, BLOCK)
             } else if a >= p0 && a + MIB2 <= p1 {
-                pool(vhe, a, BLOCK)
+                // The pool at 4 KiB granularity (per-arc W^X). A fresh/freed page is data: writable, non-executable; spawn flips a process's code pages to read-only + executable.
+                let t = &mut pool_l3[(a - p0) / MIB2];
+                for (k, pg) in t.0.iter_mut().enumerate() {
+                    *pg = pool_page(vhe, a + k * PAGE, true, false);
+                }
+                &raw const t.0 as u64 | TABLE_OR_PAGE
             } else if a >= q0 && a + MIB2 <= q1 {
                 dma_pool(vhe, a, BLOCK)
             } else if a + MIB2 > d0 && a < d1 {
@@ -251,6 +275,40 @@ pub fn off_for_handover() {
 }
 
 /// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
+/// Set the W^X attributes of an arc's pool pages (SANDBOX.md), then invalidate the TLB for them. A masked process marks `[exec_start, exec_end)` read-only + executable (its checked `.text`) and leaves every other page writable + non-executable (grants, read-only data, input, stack). A native dev process (`native`) gets the whole arc RWX. Call after writing the code, before entering; `arc_reset` returns every page to data on free.
+pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, native: bool) {
+    if !vhe() {
+        return;
+    }
+    let (p0, p1) = POOL;
+    if base < p0 || base + size > p1 {
+        return;
+    }
+    unsafe {
+        let pool_l3 = &mut *(&raw mut POOL_L3);
+        let mut a = base;
+        while a < base + size {
+            let idx = (a - p0) / PAGE;
+            let exec = native || (a >= exec_start && a < exec_end);
+            let writable = native || !exec;
+            pool_l3[idx / 512].0[idx % 512] = pool_page(true, a, writable, exec);
+            a += PAGE;
+        }
+        asm!("dsb ish");
+        let mut a = base;
+        while a < base + size {
+            asm!("tlbi vae1, {x}", x = in(reg) (a as u64) >> 12);
+            a += PAGE;
+        }
+        asm!("dsb ish", "isb");
+    }
+}
+
+/// Return an arc's pages to the default (writable data, non-executable) when it is freed.
+pub fn arc_reset(base: usize, size: usize) {
+    set_arc_wx(base, size, 0, 0, false);
+}
+
 pub fn sync_code(addr: usize, len: usize) {
     unsafe {
         let mut a = addr & !63;
