@@ -1,0 +1,15 @@
+[package]
+name = "photon-interop"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Host-only check that photon_core speaks the stock Photon app's wire and braid byte for byte, by linking Photon's own library."
+
+# Standalone: Photon is a large std crate, kept out of the ferros workspace build.
+[workspace]
+
+[dependencies]
+photon = { package = "photon-messenger", path = "../../../photon" }
+photon_core = { path = "../../photon_core" }
+vsf = { path = "../../../vsf" }
+ed25519-dalek = "2"
