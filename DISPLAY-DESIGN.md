@@ -47,6 +47,7 @@ Why a process, not kernel: the panel bring-up is long and full of delays and DCS
 - **Expose early:** brightness (12-bit), display on/off, one refresh mode (start at whatever ABL left, likely 120 Hz), the framebuffer.
 - **Expose for the wake policy:** display on/off + brightness ramp + AOD/LP entry (10/30 Hz, `0x53` low-nit), since the prox-gated wake policy is a named goal.
 - **Defer:** HBM (sun-readable), HDR, 10-bit path, multi-window compositing, SBWC/AFBC, per-DPP scaling, local-HBM. All real, none needed for a first UI.
+- **Local-HBM is the under-display fingerprint spot** (fixed centre x=G#2D0 y=G#939, 6 mm radius), not a general per-region highlight tool. Highlight "pop" goes through global brightness (`0x51`, HBM) with the SDR part of the image scaled down in pixel values. On OLED that only brightens the highlight pixels, since there's no backlight.
 
 ## 5. Decisions for the owner
 
