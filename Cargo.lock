@@ -584,6 +584,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-beamtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "photon_core",
+]
+
+[[package]]
 name = "ferros-payload-dispprobe"
 version = "0.1.0"
 
