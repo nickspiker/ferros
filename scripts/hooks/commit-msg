@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# ferros commit-msg hook. Refuses commit messages that claim authorship, co-authorship, ownership or tool-generation (attribution-guard.sh) — nobody owns this codebase and no tool authors it.
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/attribution-guard.sh" "$1"
