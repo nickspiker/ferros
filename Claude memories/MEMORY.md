@@ -57,3 +57,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [toka pipeline + trust model A](toka_pipeline_trust_model_a.md) — device compiles everything (no precompiled trust); toka = WASM fork extended at both pipe ends — real hardware 1:1 first (CPU-FEATURES.md), spirix types later; native capsules dev-only
 - [Photon vocabulary](photon_terminology.md) — message = photon (send a photon), video call = beam (beam someone)
 - [Feedback: single egg rule](feedback_single_egg_rule.md) — never one basket: critical inputs (entropy) from several independent sources; KOHI target = four
+- [Feedback: no attribution](feedback_no_attribution.md) — never add authorship/co-authorship/ownership/tool-generation lines anywhere; nobody owns this codebase, no tool authors it; fail-closed guard in ferros scripts/hooks
