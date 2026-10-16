@@ -1,6 +1,6 @@
 //! beamtest: a test-card beam from the phone, to prove the whole send path on hardware (BEAM.md step 4).
 //!
-//! Each frame is an animated 4:2:0 test card, encoded as H.264 (photon_core::h264), cut into RaptorQ-coded beam datagrams (photon_core::beam) and sealed under a fixed TEST wave secret, with a plaid audio window of silence beside it (photon_core::wave). Everything goes out through the `udp` service to a receiver built on Photon's own library (tools/photon-interop, `beam-recv`), which holds the same test secret. Not a real wave: there is no friendship and no signalling yet.
+//! Each frame is an animated 4:2:0 test card, encoded as compressed H.264 (photon_core::h264, I_16x16 + CAVLC), cut into RaptorQ-coded beam datagrams (photon_core::beam) and sealed under a fixed TEST wave secret, with a plaid audio window of silence beside it (photon_core::wave). Everything goes out through the `udp` service to a receiver built on Photon's own library (tools/photon-interop, `beam-recv`), which holds the same test secret. Not a real wave: there is no friendship and no signalling yet.
 //!
 //! Spawn after `ip`: ferros-bridge spawn beamtest.bin <input hex> --name beamtest --use udp
 //! Grant slots: 0 console, 1 udp. Input: destination IPv4 (4 bytes), port (u16 BE), frame count (u16 BE), frames per second (u8).
@@ -16,8 +16,8 @@ use core::cell::UnsafeCell;
 use ferros_sys::{arc_base, cap, console, input, now, us_since, ERR};
 use photon_core::{beam, h264, wave};
 
-/// The heap lives in `.data`, not `.bss`: the kernel sizes an arc from the flat image, which carries no `.bss`, so a `.bss` heap would overlap the stack.
-const HEAP_BYTES: usize = 1536 * 1024;
+/// The heap lives in `.data`, not `.bss`: the kernel sizes an arc from the flat image, which carries no `.bss`, so a `.bss` heap would overlap the stack. Measured on husky at 176x144: 307 KB at most.
+const HEAP_BYTES: usize = 512 * 1024;
 
 #[repr(C, align(16))]
 struct Heap(UnsafeCell<[u8; HEAP_BYTES]>);
@@ -37,9 +37,11 @@ unsafe impl GlobalAlloc for Bump {
         let base = HEAP.0.get() as usize;
         let start = (base + *self.next.get() + l.align() - 1) & !(l.align() - 1);
         if start + l.size() > base + HEAP_BYTES {
+            FAILED_SIZE = l.size();
             return core::ptr::null_mut();
         }
         *self.next.get() = start + l.size() - base;
+        HIGH = HIGH.max(*self.next.get());
         *self.live.get() += 1;
         start as *mut u8
     }
@@ -62,6 +64,8 @@ fn test_secret() -> [u8; 32] {
 const W: usize = 176;
 const H: usize = 144;
 const SRC_PORT: u16 = 4393;
+/// The encoder's quantiser: about 50 dB on smooth content, a few KB per frame at this size.
+const QP: u8 = 26;
 
 struct Out {
     grants: u64,
@@ -82,7 +86,7 @@ impl Out {
         req.extend_from_slice(&SRC_PORT.to_be_bytes());
         req.extend_from_slice(payload);
         let mut r = [0u8; 16];
-        for _ in 0..64 {
+        for _ in 0..8 {
             let n = ferros_sys::call(cap(self.grants, 1), &req, &mut r);
             if n != ERR && n >= 1 && r[0] == 0 {
                 self.sent += 1;
@@ -132,6 +136,7 @@ fn card(f: u32, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
     let _ = arc_base();
+    unsafe { GRANTS = grants };
     let mut cfg = [0u8; 9];
     let got = input(0, &mut cfg);
     if got < 9 {
@@ -147,6 +152,7 @@ pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
     let info = beam::Info { width: W as u16, height: H as u16, fps: fps as u8, codec: beam::CODEC_H264, colour: Vec::new() };
     let (mut y, mut u, mut v) = ([0u8; W * H], [0u8; W * H / 4], [0u8; W * H / 4]);
     let silence = [0i16; wave::FRAME_SAMPLES];
+    console(grants, b"beamtest: started\n");
     let t0 = now();
     for f in 0..frames {
         if f % beam::INFO_EVERY_FRAMES == 0 {
@@ -156,14 +162,14 @@ pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
             out.send(&p);
         }
         card(f, &mut y, &mut u, &mut v);
-        let au = h264::encode_pcm_idr(&h264::Picture { width: W, height: H, y: &y, u: &u, v: &v }, f % 2);
+        let au = h264::encode_intra_idr(&h264::Picture { width: W, height: H, y: &y, u: &u, v: &v }, f % 2, QP);
         for p in tx.frame(f, beam::Gains::NONE, &au) {
             out.send(&p);
         }
         drop(au);
         let p = audio.plaid(f, &silence, None);
         out.send(&p);
-        if f % 16 == 15 {
+        if f < 8 || f % 16 == 15 {
             let mut m = Vec::new();
             m.extend_from_slice(b"beamtest: frame ");
             dec(f + 1, &mut m);
@@ -171,6 +177,10 @@ pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
             dec(out.sent, &mut m);
             m.extend_from_slice(b", failed ");
             dec(out.failed, &mut m);
+            m.extend_from_slice(b", ms ");
+            dec((us_since(t0) / 1000) as u32, &mut m);
+            m.extend_from_slice(b", heap high ");
+            dec(unsafe { HIGH } as u32, &mut m);
             m.push(b'\n');
             console(grants, &m);
         }
@@ -190,7 +200,49 @@ pub extern "C" fn _entry(grants: u64, _in: u64, _inlen: u64) -> ! {
     ferros_sys::exit(0)
 }
 
+/// The grants pointer, for the panic report.
+static mut GRANTS: u64 = 0;
+/// The largest heap offset reached, and the size of an allocation that didn't fit.
+static mut HIGH: usize = 0;
+static mut FAILED_SIZE: usize = 0;
+
+/// Report where it panicked by line and column only: the location's file name is an absolute pointer this unrelocated image can't follow.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut m = [0u8; 160];
+    let mut n = 0;
+    let mut put = |b: &[u8]| {
+        for &c in b {
+            if n < m.len() {
+                m[n] = c;
+                n += 1;
+            }
+        }
+    };
+    let num = |v: usize, put: &mut dyn FnMut(&[u8])| {
+        let mut d = [0u8; 20];
+        let mut i = d.len();
+        let mut v = v;
+        loop {
+            i -= 1;
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        put(&d[i..]);
+    };
+    put(b"beamtest: panic at line ");
+    let (line, col) = info.location().map_or((0, 0), |l| (l.line() as usize, l.column() as usize));
+    num(line, &mut put);
+    put(b" col ");
+    num(col, &mut put);
+    put(b"; heap high ");
+    num(unsafe { HIGH }, &mut put);
+    put(b", failed alloc ");
+    num(unsafe { FAILED_SIZE }, &mut put);
+    put(b"\n");
+    console(unsafe { GRANTS }, &m[..n]);
     ferros_sys::panic_exit()
 }
