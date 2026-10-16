@@ -1321,7 +1321,9 @@ name = "photon_core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chacha20",
  "ed25519-dalek",
+ "ihi 0.0.48",
  "vsf 0.10.0",
 ]
 

@@ -12,6 +12,8 @@ path = "src/lib.rs"
 vsf = { path = "../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }
+ihi = { path = "../../ihi", default-features = false }
+chacha20 = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }

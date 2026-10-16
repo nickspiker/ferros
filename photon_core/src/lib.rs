@@ -6,4 +6,5 @@
 
 extern crate alloc;
 
+pub mod chain;
 pub mod wire;
