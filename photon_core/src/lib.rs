@@ -7,5 +7,6 @@
 extern crate alloc;
 
 pub mod chain;
+pub mod beam;
 pub mod wave;
 pub mod wire;
