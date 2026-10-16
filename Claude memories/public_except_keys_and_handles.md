@@ -14,8 +14,9 @@ The disclosure policy, stated by the user emphatically 2026-08-20 after handles 
 
 **Enforcement (machinery, because "be careful" has failed repeatedly):** a fail-closed guard now BLOCKS any commit/push containing a handle, on EVERY repo:
 - `keys/handle-guard.sh` reads the handle list (LEFT column) from the map and scans stdin; exit 1 = handle found, exit 2 = map unreadable (fail-closed).
-- Global hooks at `~/.config/git/hooks/{pre-commit,pre-push}` invoke it (`git config --global core.hooksPath ~/.config/git/hooks`); pre-commit chains to each repo's own hook. Tested: `zeno`/`esme`/`Carmen Sandiego` blocked, `Nick` passes, missing map blocks.
+- Global hooks at `~/.config/git/hooks/{pre-commit,pre-push}` invoke it (`git config --global core.hooksPath ~/.config/git/hooks`); pre-commit chains to each repo's own hook. Tested: three handles from the map blocked, a petname passes, missing map blocks. (This line itself once named those three handles: published before the guard covered ferros, replaced with this wording 2026-10-15.)
 - **The one hole:** ungateable handles (1-2 chars or numeric, e.g. the handle `1`) match everything and are skipped — those people MUST rotate to a distinctive handle to be gateable. Handle-choice policy: distinctive handles only.
 - Per machine (MacBook/desktop): guard + map ride in `keys/` (Chiton/MEGA mirrored); just set `core.hooksPath` there too.
+- **Repos with their own hooks path bypass the global hooks entirely** (a local `core.hooksPath` replaces the global one). Until 2026-10-15 that left ferros, photon and auscultatio unguarded, and handles were published from ferros and photon. Their own pre-commit/pre-push now chain the global hooks wherever they are installed. Any new repo that sets its own hooks path must do the same.
 
 **How to apply:** publish freely — memories, code, patents. Refer to people by PETNAME (right column). Never write a handle or key into anything git-tracked; the guard enforces it. See [[secrets_canonical_keys_dir]].

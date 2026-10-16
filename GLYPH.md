@@ -207,7 +207,7 @@ The only case material with metal-class heat spreading AND zero electromagnetic 
 
 ## Recovery
 
-- Locked device: call wife / daughter / dad — social attestation per user-set preferences. No vendor, no account, no email. FGTW enrollment path, already proven.
+- Locked device: call wife / daughter / Scott — social attestation per user-set preferences. No vendor, no account, no email. FGTW enrollment path, already proven.
 - Post-kill (keys zeroed): resurrection via fleet re-enrollment + social attestation. The one ceremony in the system, and it's earned: the keys are GONE, that was the point.
 - TODO: spec "time from kill to restored trust."
 
