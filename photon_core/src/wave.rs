@@ -324,3 +324,67 @@ fn read_express_payload(payload: &[u8]) -> Option<(i64, Option<[u8; 32]>, WaveSi
     };
     Some((ts, lane_key, sig, beam))
 }
+
+// ---- audio: the plaid rung (wave/engine.rs) ----
+//
+// Every wave carries audio, and Photon's liveness and its send-address learning key only on authenticated audio, so a beam needs it too. Plaid is the raw rung: i16 LE PCM, one 5 ms frame per datagram, no FEC, and the receiver accepts it on any link, so sending needs no Opus.
+
+/// Samples per 5 ms frame at 48 kHz.
+pub const FRAME_SAMPLES: usize = 240;
+/// The plaid rung's tier (ctrl's low 3 bits; no repair flag).
+pub const PLAID_TIER: u8 = 4;
+/// A plaid slot: `[len u16 LE = 480][480 bytes of PCM]`, zero-padded to 2 + 486.
+const PLAID_SLOT: usize = 2 + 486;
+
+/// A frame number: the 48 kHz sample index of the window's first sample over 240, low 32 bits.
+pub fn frame_no(sample_index: i64) -> u32 {
+    sample_index.div_euclid(FRAME_SAMPLES as i64) as u32
+}
+
+/// The frame number for an eagle time (oscillations): the receiver schedules playout against its own clock from this, so the sender needs real time.
+pub fn eagle_frame_no(eagle_osc: i64) -> u32 {
+    frame_no(vsf::grid::eagle_to_sample(eagle_osc))
+}
+
+/// The link tail: our wrapping µs stamp, the peer's newest stamp echoed, how long we held it, and how many of our windows were lost over the last second. The receiver also accepts a window with no tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTail {
+    pub stamp_us: u32,
+    pub echo: u32,
+    pub hold_us: u16,
+    pub peer_loss: u8,
+}
+
+/// The audio sender at the plaid rung: one window per datagram, seq = the window counter from 0, on the wave secret's own step chain.
+pub struct AudioTx {
+    chain: StepChain,
+    window: u32,
+}
+
+impl AudioTx {
+    pub fn new(wave_secret: &[u8; 32], dir: Direction) -> Self {
+        Self { chain: StepChain::new(wave_secret, dir), window: 0 }
+    }
+
+    /// One 5 ms frame of PCM as a sealed audio datagram: `[ctrl = 4][fno u32 LE][slot][tail?]`.
+    pub fn plaid(&mut self, fno: u32, pcm: &[i16; FRAME_SAMPLES], tail: Option<&LinkTail>) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + 4 + PLAID_SLOT + 11);
+        p.push(PLAID_TIER);
+        p.extend_from_slice(&fno.to_le_bytes());
+        p.extend_from_slice(&((FRAME_SAMPLES * 2) as u16).to_le_bytes());
+        for s in pcm {
+            p.extend_from_slice(&s.to_le_bytes());
+        }
+        p.resize(1 + 4 + PLAID_SLOT, 0);
+        if let Some(t) = tail {
+            p.extend_from_slice(&t.stamp_us.to_le_bytes());
+            p.extend_from_slice(&t.echo.to_le_bytes());
+            p.extend_from_slice(&t.hold_us.to_le_bytes());
+            p.push(t.peer_loss);
+        }
+        let seq = self.window;
+        self.window = self.window.wrapping_add(1);
+        self.chain.advance_to(StepChain::step_for_seq(seq));
+        seal(&self.chain, seq, &p, MEDIA_MAGIC)
+    }
+}
