@@ -711,6 +711,13 @@ name = "ferros-payload-wdtfire"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-wxtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [

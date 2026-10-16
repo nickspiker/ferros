@@ -25,6 +25,7 @@ members = [
     "photon_core",
     "payloads/ip",
     "payloads/nettest",
+    "payloads/wxtest",
     "payloads/wdtfire",
     "payloads/usbprobe",
     "payloads/pmuprobe",
