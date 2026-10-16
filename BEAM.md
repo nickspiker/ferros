@@ -63,4 +63,17 @@ Proven against Photon's own library in `tools/photon-interop` (host tests, `carg
 - **Plaid audio** (`photon_core::wave::AudioTx`): Photon opens every window; the payload shape matches engine.rs (restated, since the receive loop has no callable entry point).
 - **H.264** (`photon_core::h264`): an I_PCM encoder whose frames Photon's OpenH264 decoder returns pixel-exact. Lossless and large (~1.5 bytes/pixel); compression is next.
 
-All of it builds no_std for aarch64. Still missing: compression in the encoder, a pure-Rust H.264 decoder and an Opus decoder (receiving), the camera, and — with the owner — pairing + CLUTCH.
+- **H.264 compression** (`photon_core::h264::encode_intra_idr`): I_16x16 + CAVLC; Photon's decoder output equals our reconstruction exactly; 640x480 at QP 26 is 3–45 KB per frame against 463 KB raw.
+- **Receive side** (`photon_core::beam::BeamRx`): differentially identical to Photon's over a hostile 1,000-packet stream.
+
+All of it builds no_std for aarch64.
+
+**First beam from the phone (2026-10-15 night):** `payloads/beamtest` on husky, under ferros (EL0 process over the `udp` service, WiFi from our own driver), sent 100 frames of an animated 176x144 test card (compressed H.264, QP 26) plus 100 plaid audio windows, 858 datagrams, under a fixed TEST wave secret. On the dev box `tools/photon-interop` `beam-recv`, built only on Photon's library (BeamRx, packet layer, OpenH264), received all 858: 100/100 frames, 0 lost, 0 bad, 100 decoded with 0 errors, 100 audio windows authenticated; the decoded frames show the card exactly as drawn. Not yet a real wave: no friendship, no signalling, a test secret.
+
+Lessons from the run:
+- The dev box's firewall drops unsolicited inbound UDP: `beam-recv <port> <dir> <idle> <phone address>` sends a datagram to the phone first so the stream returns on an established flow. A real Photon peer is in the same position: its pings open the path.
+- The dev box's wired interface is a separate DMX network; reach it over WiFi (192.168.1.156).
+- Effective rate ~2.3 frames/s: each datagram is one call into `ip`, which serves one request per loop after polling the WiFi driver. Batching sends in `ip` is the next throughput step.
+- The beam image (code + 512 KB heap in `.data`) stages over PT in ~30 s.
+- Repeated WiFi joins in a short time fail (association succeeds, the WPA2 handshake doesn't); after ~10 minutes it joins again. Suspect the router throttling, or the firmware's slow passphrase-to-PMK conversion racing the handshake; precomputing the PMK on the host side of the driver would remove the second.
+- One unexplained PT-stall exit (PREV_EXIT G#B6) between bring-up and spawn, with no bridge command in flight that we know of. Still missing: compression in the encoder, a pure-Rust H.264 decoder and an Opus decoder (receiving), the camera, and — with the owner — pairing + CLUTCH.
