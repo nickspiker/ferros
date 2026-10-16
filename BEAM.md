@@ -53,4 +53,14 @@ Photon's liveness and its TX-address learning key **only on authenticated audio*
 4. **A beam from husky to a receiver on the dev box** built on Photon's library, under a test wave secret — the whole send path on hardware.
 5. With the owner: pairing + CLUTCH, then a real wave with the stock app; then receive (H.264 decoder, Opus decoder), the camera, and the display.
 
-Missing entirely today: a pure-Rust H.264 decoder and encoder, an Opus decoder, the camera.
+## Status (2026-10-15 night)
+
+Proven against Photon's own library in `tools/photon-interop` (host tests, `cargo test` there):
+
+- **Wire + braid:** ping, pong, photon and ack frames byte-identical; the braid (salt, scratch, ciphertext, advance) identical.
+- **Wave crypto** (`photon_core::wave`): wave secret hits Photon's known-answer vector; step chains, beam/audio packets byte-identical; express signals open both ways with identical plaintexts.
+- **Beam packetizer** (`photon_core::beam`): Photon's `BeamRx` reassembles our frames bit for bit, and recovers lost packets from the repair symbols.
+- **Plaid audio** (`photon_core::wave::AudioTx`): Photon opens every window; the payload shape matches engine.rs (restated, since the receive loop has no callable entry point).
+- **H.264** (`photon_core::h264`): an I_PCM encoder whose frames Photon's OpenH264 decoder returns pixel-exact. Lossless and large (~1.5 bytes/pixel); compression is next.
+
+All of it builds no_std for aarch64. Still missing: compression in the encoder, a pure-Rust H.264 decoder and an Opus decoder (receiving), the camera, and — with the owner — pairing + CLUTCH.
