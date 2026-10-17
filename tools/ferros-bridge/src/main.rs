@@ -105,14 +105,20 @@ async fn main() {
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" if args.get(2).map(String::as_str) == Some("modeset") => {
-            // display modeset fhd|wqhd [1368|1346] — the link rate: ABL's 1368 Mbps, Android's 1346; omitted keeps the current one.
+            // display modeset fhd|wqhd [1368|1346] [8|10] — the link rate (ABL's 1368 Mbps, Android's 1346) and the blend depth (8 bpc as ABL, 10 bpc with the DQE dither as Android), in either order; omitted keeps the current one.
             let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
-            let rate = match args.get(4).map(String::as_str) {
-                Some("1368") => 1,
-                Some("1346") => 2,
-                _ => 0,
-            };
-            cmd_display_raw(&[10, fhd, rate]).await;
+            let mut rate = 0;
+            let mut bpc = 0;
+            for a in &args[4..] {
+                match a.as_str() {
+                    "1368" => rate = 1,
+                    "1346" => rate = 2,
+                    "8" => bpc = 1,
+                    "10" => bpc = 2,
+                    _ => {}
+                }
+            }
+            cmd_display_raw(&[10, fhd, rate, bpc]).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("idle") => {
             let floor: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(10);

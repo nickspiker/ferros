@@ -180,7 +180,7 @@ pub fn te_profile(cntfrq: u64) -> ((u32, u32), u32) {
 
 /// DECON0's state as Android runs it at WQHD 120 Hz, where ABL leaves it unset (the live diff against oracle/display/husky-hk3/W120_noidle, 2026-10-16): SRAM for every window Android allocates, the out-FIFO QoS, the interrupt enables. The main registers are shadowed: the next present's global shadow update applies them.
 ///
-/// NOT set here, measured to wedge DECON (2026-10-16): `GLOBAL_CON.TEN_BPC_MODE` with the enhance-path dither. The first frame after it completed, the next timed out (INT_PEND_EXTRA TIME_OUT) and the shadow request never cleared again; only a reboot into ABL's init recovered the panel. Android pairs 10 bpc with a different DSC_CONTROL1 (G#55: dual slice, flatness 5, against ABL's G#44) and a configured dither in the DQE block, whose registers are not in the oracle yet. 10 bpc waits for that capture.
+/// NOT set here: `GLOBAL_CON.TEN_BPC_MODE` with the enhance-path dither alone wedges DECON (2026-10-16: the next frame timed out and the shadow request never cleared). The dither bit on DECON0 means "the DQE output is dithered", so the DQE must be in the path and sized first; dpu::modeset's 10 bpc option does that and works.
 const OF_URGENT_EN: usize = 0x02C0;
 const OF_RD_URGENT_0: usize = 0x02C4;
 const OF_RD_URGENT_1: usize = 0x02C8;

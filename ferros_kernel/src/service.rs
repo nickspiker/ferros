@@ -787,10 +787,10 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
-                                            // G#0A [1 = FHD, 0 = WQHD] [link rate: 0 keep, 1 = 1368 Mbps, 2 = 1346 Mbps] = the full modeset (dpu::modeset: DECON and DSIM stopped, re-initialised, started; bridge `display modeset fhd|wqhd [1368|1346]`).
+                                            // G#0A [1 = FHD, 0 = WQHD] [link rate: 0 keep, 1 = 1368 Mbps, 2 = 1346 Mbps] [blend depth: 0 keep, 1 = 8 bpc, 2 = 10 bpc] = the full modeset (dpu::modeset: DECON and DSIM stopped, re-initialised, started; bridge `display modeset fhd|wqhd [1368|1346] [8|10]`).
                                             Some((10, args)) if !args.is_empty() => {
                                                 let mut rep = alloc::vec::Vec::new();
-                                                crate::dpu::modeset(args[0] == 1, args.get(1).copied().unwrap_or(0), freq, &mut rep);
+                                                crate::dpu::modeset(args[0] == 1, args.get(1).copied().unwrap_or(0), args.get(2).copied().unwrap_or(0), freq, &mut rep);
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
                                             // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).

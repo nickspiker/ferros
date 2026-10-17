@@ -202,11 +202,31 @@ pub fn read(cmd: u8, len: usize, cntfrq: u64) -> Result<Vec<u8>, u32> {
 
 const DSIM_CMD_TE_CTRL0: usize = 0x0084;
 const DSIM_CMD_TE_CTRL1: usize = 0x0088;
-/// The HS bit rate the link runs at, Mbps: 1368 as ABL brings it up, 1346 as Android runs it (DISPLAY-HK3.md §7); dpu::modeset changes it.
-static HS_CLK_MBPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1368);
+/// The HS bit rate the link runs at, Mbps: 1368 as ABL brings it up, 1346 as Android runs it (DISPLAY-HK3.md §7). Read from the DPHY PLL the first time it is asked for (a reload must not assume), set by dpu::modeset when it changes the rate.
+static HS_CLK_MBPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn hs_clk() -> u32 {
-    HS_CLK_MBPS.load(core::sync::atomic::Ordering::Relaxed)
+    let v = HS_CLK_MBPS.load(core::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let v = pll_hs_clk();
+    HS_CLK_MBPS.store(v, core::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+/// The link rate the DPHY PLL is programmed for: hs = (M + K / 2¹⁶) × 24.576 MHz / P / 2^S × 2, from PLL_CON0 (P [5:0], S [10:8]), PLL_CON1 (K, two's complement) and PLL_CON2 (M), rounded to the Mbps the driver's tables use.
+pub fn pll_hs_clk() -> u32 {
+    const PHY: usize = 0x1946_0100;
+    let con0 = unsafe { core::ptr::read_volatile(PHY as *const u32) };
+    let k = unsafe { core::ptr::read_volatile((PHY + 4) as *const u32) } & 0xFFFF;
+    let m = unsafe { core::ptr::read_volatile((PHY + 8) as *const u32) } & 0x3FF;
+    let p = (con0 & 0x3F).max(1);
+    let s = (con0 >> 8) & 0x7;
+    let k = if k & 0x8000 != 0 { k as i64 - 0x1_0000 } else { k as i64 };
+    // In kHz with the fraction kept: ((M << 16) + K) × 24576 × 2 / P / 2^S / 2^16.
+    let khz = (((m as i64) << 16) + k) * 24_576 * 2 / p as i64 / (1i64 << s) >> 16;
+    ((khz + 500) / 1000) as u32
 }
 
 pub fn set_hs_clk(mbps: u32) {

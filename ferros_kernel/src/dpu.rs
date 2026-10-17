@@ -17,6 +17,8 @@ const DMA0: usize = 0x1990_0000;
 const DPP0: usize = 0x1993_0000;
 const SRAMC0: usize = 0x1995_0000;
 const HDRCOMM0: usize = 0x1996_0000;
+const DQE0: usize = 0x194D_0000;
+const DQE_CGC0: usize = 0x194F_0000;
 /// The base window ABL uses, on layer 0.
 const WIN: usize = 5;
 
@@ -26,6 +28,26 @@ const GLOBAL_CON_SRESET: u32 = 1 << 28;
 const GLOBAL_CON_RUN_STATUS: u32 = 1 << 4;
 const GLOBAL_CON_DECON_EN: u32 = 1 << 1;
 const GLOBAL_CON_DECON_EN_F: u32 = 1 << 0;
+/// DECON blends at 10 bits per component (decon_reg_set_bpc). Needs the DQE in the enhance path with its display dither on, or the first frame times out and DECON never recovers (measured 2026-10-16).
+const GLOBAL_CON_TEN_BPC: u32 = 1 << 20;
+const DATA_PATH_CON_0: usize = 0x0200;
+const ENHANCE_PATH_MASK: u32 = 0xF << 12;
+const ENHANCE_DITHER_ON: u32 = 1 << 12;
+const ENHANCE_DQE_ON: u32 = 2 << 12;
+const SHD_REG_UP_REQ_DQE: u32 = 1 << 24;
+// DQE (regs-dqe.h): the top block's sizes, the display dither, the ATC and CGC enables.
+const DQE_TOP_IMG_SIZE: usize = 0x0004;
+const DQE_TOP_FRM_SIZE: usize = 0x0008;
+const DQE_TOP_FRM_PXL_NUM: usize = 0x000C;
+const DQE_ATC_CONTROL: usize = 0x0400;
+const DQE_CGC_DITHER: usize = 0x2400;
+const DQE_DISP_DITHER: usize = 0x2800;
+const DITHER_EN: u32 = 1 << 0;
+const DQE_CGC_CON: usize = 0x0000;
+// The layer's 10 bpc mode bits (dpp_reg_set_bpc, hdrc_reg_set_bpc_mode).
+const DPP_COM_IO_CON: usize = 0x0038;
+const LSI_COMM_IO_CON: usize = 0x000C;
+const BPC_MODE_10: u32 = 1 << 6;
 const TRIG_CON: usize = 0x0030;
 const HW_TRIG_EN: u32 = 1 << 0;
 const HW_TRIG_MASK_DECON: u32 = 1 << 4;
@@ -297,9 +319,22 @@ fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], rate: Option<&
 }
 
 /// DECON init for a raster (decon_reg_init) on top of the restored snapshot: geometry, the DSC encoders, the DSIM interface select, the out-FIFO.
-fn decon_init(r: &Raster, main: &[u32], sub0: &[u32], sub1: &[u32], win: &[u32], wincon: u32) {
+fn decon_init(r: &Raster, main: &[u32], sub0: &[u32], sub1: &[u32], win: &[u32], wincon: u32, ten_bpc: bool) {
     restore(DECON0, 0, main, &[0x0004, GLOBAL_CON, 0x0038, 0x003C, SHD_REG_UP_REQ, DECON_INT_PEND, DECON_INT_PEND_EXTRA, 0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0114, 0x0118, 0x011C, 0x0120, 0x0124]);
-    wr(DECON0 + GLOBAL_CON, 1 << 8);
+    wr(DECON0 + GLOBAL_CON, 1 << 8 | if ten_bpc { GLOBAL_CON_TEN_BPC } else { 0 });
+    // 10 bpc the way Android runs it (decon_reg_set_bpc_and_dither_path, __exynos_dqe_update): the DQE in the enhance path, sized for the raster, its display dither taking the blend down to the link's 8 bits; no CGC, no ATC. The layer's DPP and HDR-common blocks take the same bit. 8 bpc is ABL's path: no enhance path at all.
+    let enhance = if ten_bpc { ENHANCE_DQE_ON | ENHANCE_DITHER_ON } else { 0 };
+    wr(DECON0 + DATA_PATH_CON_0, (rd(DECON0 + DATA_PATH_CON_0) & !ENHANCE_PATH_MASK) | enhance);
+    wr(DQE0 + DQE_TOP_IMG_SIZE, r.h << 16 | r.w);
+    wr(DQE0 + DQE_TOP_FRM_SIZE, r.h << 16 | r.w);
+    wr(DQE0 + DQE_TOP_FRM_PXL_NUM, r.w * r.h);
+    wr(DQE0 + DQE_ATC_CONTROL, 0);
+    wr(DQE0 + DQE_CGC_DITHER, 0);
+    wr(DQE0 + DQE_DISP_DITHER, if ten_bpc { DITHER_EN } else { 0 });
+    wr(DQE_CGC0 + DQE_CGC_CON, 0);
+    let bpc = if ten_bpc { BPC_MODE_10 } else { 0 };
+    wr(DPP0 + DPP_COM_IO_CON, (rd(DPP0 + DPP_COM_IO_CON) & !BPC_MODE_10) | bpc);
+    wr(HDRCOMM0 + LSI_COMM_IO_CON, (rd(HDRCOMM0 + LSI_COMM_IO_CON) & !BPC_MODE_10) | bpc);
     // Android's SRAM allocation, out-FIFO QoS and interrupt enables (display::configure_like_android), so a modeset lands in its state.
     wr(DECON0 + 0x0300, 0x1111_1111);
     wr(DECON0 + 0x0304, 0x111);
@@ -359,8 +394,8 @@ fn after_te(cntfrq: u64) {
 }
 
 /// The whole modeset to `fhd` or WQHD, then one frame. Reports every step that misbehaved, the panel's raster register and the TE rate afterwards.
-/// `rate`: 0 keeps the link rate, 1 = 1368 Mbps, 2 = 1346 Mbps (bridge `display modeset fhd|wqhd [1368|1346]`).
-pub fn modeset(fhd: bool, rate: u8, cntfrq: u64, rep: &mut Vec<u8>) {
+/// `rate`: 0 keeps the link rate, 1 = 1368 Mbps, 2 = 1346 Mbps. `bpc`: 0 keeps the blend depth, 1 = 8 bpc, 2 = 10 bpc (bridge `display modeset fhd|wqhd [1368|1346] [8|10]`).
+pub fn modeset(fhd: bool, rate: u8, bpc: u8, cntfrq: u64, rep: &mut Vec<u8>) {
     if !dpu_on() || !crate::dsim::alive() {
         rep.extend_from_slice(b"display not running\n");
         return;
@@ -383,11 +418,16 @@ pub fn modeset(fhd: bool, rate: u8, cntfrq: u64, rep: &mut Vec<u8>) {
     let link = snapshot(DSIM0, 0, 0x0128);
     let bias = snapshot(DPHY_BIAS, 0, 0x0014);
     let phy = snapshot(DPHY, 0, 0x0700);
+    let ten_bpc = match bpc {
+        1 => false,
+        2 => true,
+        _ => main[GLOBAL_CON / 4] & GLOBAL_CON_TEN_BPC != 0,
+    };
 
     decon_stop(cntfrq, rep);
     dsim_stop(cntfrq, rep);
     dsim_init(&r, &link, &bias, &phy, rate, cntfrq, rep);
-    decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+    decon_init(&r, &main, &sub0, &sub1, &win, wincon, ten_bpc);
 
     // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
     after_te(cntfrq);
@@ -409,7 +449,7 @@ pub fn modeset(fhd: bool, rate: u8, cntfrq: u64, rep: &mut Vec<u8>) {
     // Start: every window's shadow, DECON on, running, and the painter's masked trigger.
     wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | SHD_ALL_WINDOWS);
     wr(DECON0 + GLOBAL_CON, rd(DECON0 + GLOBAL_CON) | GLOBAL_CON_DECON_EN | GLOBAL_CON_DECON_EN_F);
-    wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | SHD_GLOBAL | SHD_CMP);
+    wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | SHD_GLOBAL | SHD_CMP | if ten_bpc { SHD_REG_UP_REQ_DQE } else { 0 });
     wr(DECON0 + DECON_INT_PEND, INT_PEND_FRAME_START);
     if !poll(DECON0 + GLOBAL_CON, GLOBAL_CON_RUN_STATUS, GLOBAL_CON_RUN_STATUS, 2_000, cntfrq) {
         rep.extend_from_slice(b"decon: not running after start\n");
@@ -429,4 +469,6 @@ pub fn modeset(fhd: bool, rate: u8, cntfrq: u64, rep: &mut Vec<u8>) {
     crate::display::append_hex(rep, b"TE_HZ=", te);
     crate::display::append_hex(rep, b"TE_US=", width);
     crate::display::append_hex(rep, b"HS_MBPS=", crate::dsim::hs_clk());
+    crate::display::append_hex(rep, b"BPC=", if rd(DECON0 + GLOBAL_CON) & GLOBAL_CON_TEN_BPC != 0 { 10 } else { 8 });
+    crate::display::append_hex(rep, b"FRAMES=", rd(DECON0 + 0x0004));
 }
