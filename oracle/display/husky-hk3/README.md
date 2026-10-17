@@ -4,7 +4,7 @@ Captured 2026-10-16 from the phone running Android (Magisk root), by `tools/swee
 
 Each state directory holds:
 - `dsi-commands.txt` — every DSI packet of the transition into that state (ftrace `dsi_tx`: payload bytes, packet type when not a long write, the driver's wait after it) with the time in ms from the first packet; `-- pps begin/end`, `-- init_cmd begin/end` and TE2 notes are the driver's own labels.
-- `dpu-regdump.txt` — the DPU register dump after the transition (DECON0 main + shadow, WIN/WINCON 0–13, DPP 0–9 + DMA, HDR/HDRCOMM, SRAMC, DSIM, DSIM DPHY, DSIM LINK), from debugfs `crtc-0/reg_dump`.
+- `dpu-regdump.txt` — the DPU register dump after the transition (complete for the eight mode states and `ON`, recaptured with DPU hibernation disabled; in the other states DECON had hibernated between frames and the dump says so — to be recaptured with a wake lock held) (DECON0 main + shadow, WIN/WINCON 0–13, DPP 0–9 + DMA, HDR/HDRCOMM, SRAMC, DSIM, DSIM DPHY, DSIM LINK), from debugfs `crtc-0/reg_dump`.
 - `panel.txt` — the panel's sysfs after the transition (refresh_rate, op_hz, power_state, panel_idle, min_vrefresh, te2_timing, backlight level, hbm_mode, dimming).
 - `mode.txt` — SurfaceFlinger's active mode. `rates.txt` — DECON TE and frame-done interrupt counts over 2 s (these count DPU activity, not the panel's own TE: with the DPU hibernating on a still screen they fall to zero).
 
