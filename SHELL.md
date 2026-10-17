@@ -1,6 +1,6 @@
 # SHELL — what the owner sees when ferros wakes
 
-Decided with the owner 2026-10-16: the basics on one line, people as the home, the app list secondary. The mock is `tools/shell-mock` (fluor, headless, the panel's real geometry; `cargo run --release -- <out dir>` writes PPM frames). The display driver that will paint it is DISPLAY-DESIGN.md.
+Decided with the owner 2026-10-16: the basics on one line, people as the home, the app list secondary. The mock is `tools/shell-mock` (fluor, headless, the panel's real geometry; `cargo run --release -- <out dir>` writes PPM frames). The display driver that paints it is DISPLAY-DESIGN.md; since 2026-10-16 night the home screen also runs on the phone, drawn by `payloads/shelltest` through the display server's `display` endpoint (DISPLAY.md), in Oxanium — the owner's face for ferros.
 
 ## The principle
 

@@ -102,10 +102,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     bad += c.rect(margin, h - (span * 0.09) as u16, w - 2 * margin, 0, RULE) as u32;
     bad += c.text(margin, h - (span * 0.05) as u16, (span * 0.019) as u16, DIM, 0, "apps") as u32;
     bad += c.text(w - margin, h - (span * 0.05) as u16, (span * 0.019) as u16, GREY, 2, "slot b \u{2022} ferros") as u32;
-    let shown = c.present();
-    let mut line = *b"shelltest: home screen drawn, bad ops 0, present 0\n";
-    line[37] = b'0' + (bad % 10) as u8;
-    line[48] = b'0' + shown;
+    let status = c.present();
+    let mut line = *b"shelltest: home screen drawn, bad ops 0, present status 0\n";
+    let n = line.len();
+    line[n - 20] = b'0' + (bad % 10) as u8;
+    line[n - 2] = b'0' + status.min(9);
     console(grants, &line);
     ferros_sys::exit(0)
 }
