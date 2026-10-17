@@ -333,7 +333,8 @@ pub fn run(mut b: Boot) -> ! {
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
         }
-        if configured_ever && !hold && now.wrapping_sub(t_command) > idle_giveup {
+        // The idle exit is a dev safety net for a kernel nobody is talking to; a live process (the display server, a driver) is the session itself, so it holds the kernel up like `display --hold` does. The killswitch and `bridge reboot` still end it.
+        if configured_ever && !hold && crate::process::alive() == 0 && now.wrapping_sub(t_command) > idle_giveup {
             leave(&b, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
         }
         if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
