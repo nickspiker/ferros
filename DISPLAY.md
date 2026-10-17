@@ -100,5 +100,5 @@ Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, w
 - [x] DSI command path: DCS writes to the panel from ferros (2026-10-16; brightness, dimming, off/on)
 - [x] DCS reads (2026-10-16): power mode G#9F, extinfo 0a 80 20 (= Android's), pixel format, TE on, and brightness readback G#52 returning exactly the DBV written — the writes are proven by the panel itself
 - [x] Refresh-rate switches W120 ⇄ W60 from the oracle's packets, measured on the TE pin (gpp0-3): ABL leaves the panel at 60 Hz; the W120 transition gives 120 Hz, W60 gives 60 (`bridge display terate`)
-- [ ] After a switch, also set DSIM's command-mode TE timers (CMD_TE_CTRL0/1: ABL's are the 60 Hz values, Android's at 120 Hz are G#1A / G#1A03_1E1F)
+- [x] `bridge display mode 60|120`: the hk3 command set for the rate (hk3.rs, from the oracle), then DSIM's command-TE timers for it, then the TE pin measured
 - [ ] FHD modes (C3 0D, F2 81, the FHD PPS — not in the traces, must be packed from the DSC config) and the DECON reconfiguration they need
