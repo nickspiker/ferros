@@ -740,6 +740,44 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#0B [samples] [interval, 1/16 s units] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths]`): voltage, current, the average of the samples.
+                                            Some((11, args)) => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                let n = args.first().copied().unwrap_or(1).max(1) as u32;
+                                                let gap = args.get(1).copied().unwrap_or(8) as u64 * freq / 16;
+                                                let mut sum_ua: i64 = 0;
+                                                let mut got = 0u32;
+                                                for i in 0..n {
+                                                    if i > 0 {
+                                                        let t0: u64;
+                                                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
+                                                        loop {
+                                                            let t: u64;
+                                                            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+                                                            if t.wrapping_sub(t0) >= gap {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    match crate::hsi2c::gauge::sample() {
+                                                        Ok(g) => {
+                                                            sum_ua += g.current_ua as i64;
+                                                            got += 1;
+                                                            rep.extend_from_slice(alloc::format!("soc {}% temp {}.{:02} C vcell {} mV current {} mA (avg {} mA, avg vcell {} mV)\n", g.soc, g.temp_cc / 100, (g.temp_cc % 100).unsigned_abs(), g.vcell_uv / 1000, g.current_ua / 1000, g.avg_current_ua / 1000, g.avg_vcell_uv / 1000).as_bytes());
+                                                        }
+                                                        Err(e) => rep.extend_from_slice(alloc::format!("gauge read failed: G#{e:X} (1 controller not up, 2 busy, 4 no device, 8 bus error, 10 timeout, 20 empty)\n").as_bytes()),
+                                                    }
+                                                }
+                                                if got > 1 {
+                                                    rep.extend_from_slice(alloc::format!("mean current over {got} samples: {} mA (negative = discharging)\n", sum_ua / got as i64 / 1000).as_bytes());
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
+                                            Some((12, args)) if args.len() >= 3 => {
+                                                let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#07 = set DECON0 to Android's state (10 bpc, dither, SRAM, QoS, interrupts), then paint a frame to apply it (bridge `display tune`).
                                             Some((7, _)) => {
                                                 let mut rep = alloc::vec::Vec::new();

@@ -38,6 +38,8 @@ mod dsim;
 mod hk3;
 #[cfg(feature = "pixel8")]
 mod dpu;
+#[cfg(feature = "pixel8")]
+mod hsi2c;
 // The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
 mod vault_boot;

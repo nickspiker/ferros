@@ -101,6 +101,17 @@ async fn main() {
             let script = args[3..].join(" ");
             cmd_display_dcs(&script).await;
         }
+        "display" if args.get(2).map(String::as_str) == Some("power") => {
+            // display power [samples = 1] [interval in 1/16 s = 8] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene.
+            let n: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(1);
+            let gap: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(8);
+            cmd_display_raw(&[11, n, gap]).await;
+        }
+        "display" if args.get(2).map(String::as_str) == Some("fill") => {
+            // display fill <rrggbb> — a solid colour over the whole panel.
+            let rgb = args.get(3).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);
+            cmd_display_raw(&[12, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,

@@ -121,6 +121,23 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
+/// A solid G#00RRGGBB over the whole surface, one frame: the controlled scene power profiling needs (bridge `display fill`).
+pub fn fill(rgb: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
+    let mut rep = alloc::vec::Vec::new();
+    let Some(panel) = adopt(cntfrq, &mut rep) else {
+        return rep;
+    };
+    for y in 0..panel.rows {
+        let row = panel.fb + y * panel.stride * 4;
+        for x in 0..panel.width {
+            unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, rgb) };
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    panel.present(&mut rep);
+    rep
+}
+
 const DECON_INT_EN: usize = 0x0060;
 const INT_EN_EXTRA: u32 = 1 << 4;
 const DECON_INT_EN_EXTRA: usize = 0x0064;
