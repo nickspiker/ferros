@@ -489,6 +489,70 @@ pub fn run(mut b: Boot) -> ! {
                                     st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                        if cmd.params == b"ufsdesc" {
+                                            // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
+                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                            let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
+                                            resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
+                                            // The provisioning lock and the write-protect flags (JEDEC UFS: attribute bConfigDescrLock G#1B is one-time — once 1 the LU layout is permanent; flags fPermanentWPEn G#02 and fPowerOnWPEn G#03; attribute bBootLunEn G#00).
+                                            let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("{x}"), None => alloc::string::String::from("?") };
+                                            let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
+                                            resp.extend_from_slice(alloc::format!("bConfigDescrLock {} bBootLunEn {} bCurrentPowerMode {} fPermanentWPEn {} fPowerOnWPEn {} fDeviceInit {}\n", fmt(ufs.read_attribute(0x1B, 0)), fmt(ufs.read_attribute(0x00, 0)), fmt(ufs.read_attribute(0x02, 0)), fmtb(ufs.read_flag(0x02)), fmtb(ufs.read_flag(0x03)), fmtb(ufs.read_flag(0x01))).as_bytes());
+                                            let (c, cn, cocs) = ufs.read_descriptor(0x01, 0);
+                                            resp.extend_from_slice(alloc::format!("CONFIG_DESC len {cn} ocs {cocs}: bootEnable {} descrAccessEn {} initPowerMode {} highPriorityLUN {}\n", c.get(0x03).copied().unwrap_or(0), c.get(0x04).copied().unwrap_or(0), c.get(0x05).copied().unwrap_or(0), c.get(0x06).copied().unwrap_or(0)).as_bytes());
+                                            for lu in 0..8u8 {
+                                                let (u, n, ocs) = ufs.read_descriptor(0x02, lu);
+                                                if n < 0x13 || ocs != 0 {
+                                                    resp.extend_from_slice(alloc::format!("LU{lu}: no descriptor (len {n}, ocs {ocs})\n").as_bytes());
+                                                    continue;
+                                                }
+                                                let blocks = u64::from_be_bytes([u[0x0B], u[0x0C], u[0x0D], u[0x0E], u[0x0F], u[0x10], u[0x11], u[0x12]]);
+                                                let bs = 1u64 << u[0x0A];
+                                                let wp = match u[0x05] { 0 => "none", 1 => "POWER-ON", 2 => "PERMANENT", _ => "?" };
+                                                resp.extend_from_slice(alloc::format!("LU{lu}: enable {} bootLunId {} writeProtect {} memType {} blockSize {bs} blocks {blocks} = {} MiB\n", u[0x03], u[0x04], wp, u[0x08], blocks * bs >> 20).as_bytes());
+                                                if u[0x03] == 0 {
+                                                    continue;
+                                                }
+                                                // GPT: header at LBA 1, the entry array where it says (usually LBA 2), 128-byte entries, UTF-16LE names at +56.
+                                                if ufs.read_block_lun(lu, 1) != 0 || ufs.last_response_status() != 0 {
+                                                    resp.extend_from_slice(b"    (LBA 1 unreadable)\n");
+                                                    continue;
+                                                }
+                                                let h = *ufs.data_buffer();
+                                                if &h[0..8] != b"EFI PART" {
+                                                    resp.extend_from_slice(b"    (no GPT)\n");
+                                                    continue;
+                                                }
+                                                let entry_lba = u64::from_le_bytes(h[0x48..0x50].try_into().unwrap());
+                                                let count = u32::from_le_bytes(h[0x50..0x54].try_into().unwrap()).min(256) as usize;
+                                                let esize = u32::from_le_bytes(h[0x54..0x58].try_into().unwrap()) as usize;
+                                                let per_block = if esize > 0 { 4096 / esize } else { 0 };
+                                                let mut names = alloc::string::String::new();
+                                                let mut i = 0usize;
+                                                while i < count && per_block > 0 {
+                                                    if ufs.read_block_lun(lu, (entry_lba as usize + i / per_block) as u32) != 0 {
+                                                        break;
+                                                    }
+                                                    let blk = *ufs.data_buffer();
+                                                    for e in 0..per_block {
+                                                        if i >= count {
+                                                            break;
+                                                        }
+                                                        let ent = &blk[e * esize..(e + 1) * esize];
+                                                        if ent[..16].iter().any(|&b| b != 0) {
+                                                            let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
+                                                            let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
+                                                            let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
+                                                            names.push_str(&alloc::format!(" {name}({}K)", (last + 1 - first) * bs >> 10));
+                                                        }
+                                                        i += 1;
+                                                    }
+                                                }
+                                                resp.extend_from_slice(alloc::format!("    GPT:{names}\n").as_bytes());
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"rep" {
                                             // The eUSB2 repeater's whole 8-bit register map over I2C (HSI2C11, address from the DT), one "REP_xx=" line per register; G#8000_xxxx = the read failed (TRANS_STATUS low bits). For diffing cold vs handoff state.
                                             let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
@@ -782,7 +846,9 @@ pub fn run(mut b: Boot) -> ! {
                                                 let mut rep = alloc::vec::Vec::new();
                                                 let n = args.first().copied().unwrap_or(1).max(1) as u32;
                                                 let gap = args.get(1).copied().unwrap_or(8) as u64 * freq / 16;
-                                                let battery = args.get(2).copied().unwrap_or(0) == 1;
+                                                let battery = args.get(2).copied().unwrap_or(0) >= 1;
+                                                // 2 = also open the CHGIN input (CHG_CNFG_12 CHGINSEL) for the window, the stronger isolation.
+                                                let open_input = args.get(2).copied().unwrap_or(0) == 2;
                                                 let wait = |ticks: u64| {
                                                     let t0: u64;
                                                     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
@@ -794,10 +860,20 @@ pub fn run(mut b: Boot) -> ! {
                                                         }
                                                     }
                                                 };
+                                                let mut input_prev: Option<u8> = None;
                                                 let charger = if battery {
                                                     match crate::hsi2c::charger::set_mode(0) {
                                                         Ok(prev) => {
                                                             rep.extend_from_slice(alloc::format!("charger mode G#{:X} -> buck off\n", prev & 0xF).as_bytes());
+                                                            if open_input {
+                                                                match crate::hsi2c::charger::input_select(false) {
+                                                                    Ok(p) => {
+                                                                        input_prev = Some(p);
+                                                                        rep.extend_from_slice(alloc::format!("charger input CHG_CNFG_12 G#{p:02X} -> CHGIN deselected\n").as_bytes());
+                                                                    }
+                                                                    Err(e) => rep.extend_from_slice(alloc::format!("charger input write failed: G#{e:X}\n").as_bytes()),
+                                                                }
+                                                            }
                                                             wait(freq / 2);
                                                             Some(prev)
                                                         }
@@ -824,6 +900,12 @@ pub fn run(mut b: Boot) -> ! {
                                                             rep.extend_from_slice(alloc::format!("soc {}% temp {}.{:02} C vcell {} mV current {} mA (avg {} mA, avg vcell {} mV)\n", g.soc, g.temp_cc / 100, (g.temp_cc % 100).unsigned_abs(), g.vcell_uv / 1000, g.current_ua / 1000, g.avg_current_ua / 1000, g.avg_vcell_uv / 1000).as_bytes());
                                                         }
                                                         Err(e) => rep.extend_from_slice(alloc::format!("gauge read failed: G#{e:X} (1 controller not up, 2 busy, 4 no device, 8 bus error, 10 timeout, 20 empty)\n").as_bytes()),
+                                                    }
+                                                }
+                                                if let Some(p) = input_prev {
+                                                    match crate::hsi2c::charger::restore_input(p) {
+                                                        Ok(()) => rep.extend_from_slice(alloc::format!("charger input G#{p:02X} restored\n").as_bytes()),
+                                                        Err(e) => rep.extend_from_slice(alloc::format!("CHARGER INPUT RESTORE FAILED: G#{e:X} — write G#69[G#C5] = G#{p:02X} by hand\n").as_bytes()),
                                                     }
                                                 }
                                                 if let Some(prev) = charger {

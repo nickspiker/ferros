@@ -262,6 +262,34 @@ ABL (Google's, immovable)
 
 ---
 
+### Can Android be kept from writing the boot chain? Measured 2026-10-17
+
+The question behind dual boot: once both slots are signed with the owner's key and the bootloader locked, Android (its OTA engine as a matter of routine, or anything with root) can still *write* the inactive slot and `devinfo` — the lock only governs what ABL will boot. On a locked bootloader that turns "re-flash ferros" into "unlock and wipe". The hardware answer would be UFS power-on write protection: a per-LU provisioning type, armed by one device flag (`fPowerOnWPEn`) that only a reset clears. ferros read the flash's own descriptors (`bridge diag ufsdesc`):
+
+```
+DEVICE_DESC len 89 ocs 0: numLU 1 bootEnable 0 descrAccessEn 4 features G#B300
+bConfigDescrLock 0 bBootLunEn 2 bCurrentPowerMode 17 fPermanentWPEn 0 fPowerOnWPEn 0 fDeviceInit 0
+CONFIG_DESC len 230 ocs 0: bootEnable 1 descrAccessEn 1 initPowerMode 1 highPriorityLUN 127
+LU0: enable 1 bootLunId 0 writeProtect none memType 0 blockSize 4096 blocks 62436352 = 243892 MiB
+    GPT: persist(131072K) klog(16384K) misc(1024K) frp(512K) efs(65536K) efs_backup(65536K) modem_userdata(65536K) trusty_persist(65536K) trusty_userdata(131072K) metadata(65536K) fips(2048K) ufs_internal(4096K) boot_a(65536K) init_boot_a(8192K) vendor_boot_a(65536K) vendor_kernel_boot_a(65536K) dtbo_a(16384K) vbmeta_a(64K) vbmeta_system_a(64K) vbmeta_vendor_a(64K) pvmfw_a(1024K) modem_a(204800K) boot_b(65536K) init_boot_b(8192K) vendor_boot_b(65536K) vendor_kernel_boot_b(65536K) dtbo_b(16384K) vbmeta_b(64K) vbmeta_system_b(64K) vbmeta_vendor_b(64K) pvmfw_b(1024K) modem_b(204800K) super(8331264K) userdata(105728104K) ferros(134217708K)
+LU1: enable 1 bootLunId 1 writeProtect POWER-ON memType 3 blockSize 4096 blocks 8192 = 32 MiB
+    GPT: bl1_a(16K) pbl_a(80K) bl2_a(540K) dram_train_a(100K) abl_a(4096K) bl31_a(256K) tzsw_a(20480K) gsa_a(1024K) gsa_bl1_a(96K) ldfw_a(4096K) dpm_a(36K) gcf_a(352K)
+LU2: enable 1 bootLunId 2 writeProtect POWER-ON memType 3 blockSize 4096 blocks 8192 = 32 MiB
+    GPT: bl1_b(16K) pbl_b(80K) bl2_b(540K) dram_train_b(100K) abl_b(4096K) bl31_b(256K) tzsw_b(20480K) gsa_b(1024K) gsa_bl1_b(96K) ldfw_b(4096K) dpm_b(36K) gcf_b(352K)
+LU3: enable 1 bootLunId 0 writeProtect none memType 0 blockSize 4096 blocks 1024 = 4 MiB
+    GPT: devinfo(8K) pinfo(8K) blenv(8K) mfg_data(3280K)
+LU4: enable 0 bootLunId 0 writeProtect none memType 0 blockSize 1 blocks 0 = 0 MiB
+LU5: enable 0 bootLunId 0 writeProtect none memType 0 blockSize 1 blocks 0 = 0 MiB
+LU6: enable 0 bootLunId 0 writeProtect none memType 0 blockSize 1 blocks 0 = 0 MiB
+LU7: enable 0 bootLunId 0 writeProtect none memType 0 blockSize 1 blocks 0 = 0 MiB
+```
+
+- **LU1 and LU2 (the bootloader's two 32 MiB boot LUs) are the only power-on-protectable LUs.** Google provisioned the protection for their chain. Ours — `boot_b`, `vbmeta_b`, `dtbo_b`, the `ferros` partition — sits on LU0 beside `userdata`, and `devinfo` on LU3 with no protection type; protecting either LU would freeze Android's own data. **No hardware barrier for our slot on this phone.**
+- **`bConfigDescrLock = 0`**: the LU layout is *not* locked, so the flash would accept a re-provisioning (a new power-on-protected LU for our chain) — but writing the Configuration Descriptor erases every LU, the bootloader's two included, and with ABL gone there is no fastboot and no public ROM recovery on Tensor. That is a brick, not a factory reset. Not a path.
+- **`fPowerOnWPEn = 0` under ferros**: ABL does not arm the protection before jumping to us; even LU1/LU2 are writable from this kernel. Whether ABL arms it when booting Android: to read from Android's sysfs. ferros should arm it at boot regardless (one SET FLAG; the next reset clears it, and fastboot runs before anything sets it) — pending the owner's yes.
+
+What remains, in order of cost: (1) **signed and unlocked** — images signed with the owner's key so ABL *reports* tampering (orange/yellow), ferros re-flashed from fastboot when Android stomps on it; integrity by detection and recovery, never by prevention; the posture today minus the signing. (2) **A UFS command firewall at EL2** — ferros stays hypervisor, Android runs at EL1 with the hardware passed through, but the UFS doorbell is trapped and the 32-slot command list shadowed: every SCSI WRITE's LUN/LBA is checked against the protected set before the real doorbell rings. No virtual disk, one trap per command batch, the S2MPU fence already keeps the device's DMA out of ferros's memory. The only sandbox that holds against root inside Android; a bounded project, not pKVM. (3) **No Android.** Locking the bootloader before (2) exists is the one thing not to do.
+
 ## Genesis Boot (First Boot Ever)
 
 ```

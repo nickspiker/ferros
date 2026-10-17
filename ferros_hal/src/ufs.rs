@@ -437,6 +437,69 @@ impl UfsController {
         }
     }
 
+    /// A Query Request with no data segment (READ ATTRIBUTE, READ FLAG): the response UPIU's transaction-specific fields (bytes 12..32) and the OCS.
+    fn query_tsf(&self, opcode: u8, idn: u8, index: u8) -> ([u8; 20], u8) {
+        let mut tsf = [0u8; 20];
+        unsafe {
+            let buf = &raw mut UFS_BUF;
+            core::ptr::write_bytes(&raw mut (*buf).ucd as *mut u8, 0, core::mem::size_of::<Ucd>());
+            (*buf).ucd.cmd_upiu[0] = upiu::QUERY_REQ;
+            (*buf).ucd.cmd_upiu[3] = 0;
+            (*buf).ucd.cmd_upiu[5] = upiu::QUERY_FN_READ;
+            (*buf).ucd.cmd_upiu[12] = opcode;
+            (*buf).ucd.cmd_upiu[13] = idn;
+            (*buf).ucd.cmd_upiu[14] = index;
+            (*buf).ucd.cmd_upiu[15] = 0;
+            let ucd_addr = &raw const (*buf).ucd as usize as u64;
+            (*buf).utrd.dw[0] = (1 << 24) | (1 << 28);
+            (*buf).utrd.dw[1] = 0;
+            (*buf).utrd.dw[2] = 0x0000_000F;
+            (*buf).utrd.dw[3] = 0;
+            (*buf).utrd.dw[4] = ucd_addr as u32;
+            (*buf).utrd.dw[5] = (ucd_addr >> 32) as u32;
+            (*buf).utrd.dw[6] = (0x0080 << 16) | 0x0080;
+            (*buf).utrd.dw[7] = (0x0100 << 16) | 0x0000;
+            let utrd_phys = &raw const (*buf).utrd as usize;
+            let ucd_phys = &raw const (*buf).ucd as usize;
+            crate::mmio::cache_clean(utrd_phys, 32);
+            crate::mmio::cache_clean(ucd_phys, 1024);
+            core::arch::asm!("dsb sy");
+            self.nexus(false);
+            self.write_reg(regs::UTRLDBR, 1);
+            for _ in 0..1_000_000u32 {
+                let is = self.read_reg(regs::IS);
+                if is & regs::IS_UTRCS != 0 {
+                    self.write_reg(regs::IS, regs::IS_UTRCS);
+                    break;
+                }
+            }
+            crate::mmio::cache_invalidate(utrd_phys, 32);
+            crate::mmio::cache_invalidate(ucd_phys, 1024);
+            let ocs = ((*buf).utrd.dw[2] & 0xFF) as u8;
+            tsf.copy_from_slice(&(&(*buf).ucd.rsp_upiu)[12..32]);
+            (tsf, ocs)
+        }
+    }
+
+    /// QUERY READ ATTRIBUTE: the attribute's value (big-endian in the response's VALUE field), or None on a failed query / query-response error.
+    pub fn read_attribute(&self, idn: u8, index: u8) -> Option<u32> {
+        let (tsf, ocs) = self.query_tsf(0x03, idn, index);
+        // Response TSF: byte 3 (UPIU byte 15) carries the query response code; 0 = success.
+        if ocs != ocs::SUCCESS || tsf[3] != 0 {
+            return None;
+        }
+        Some(u32::from_be_bytes([tsf[8], tsf[9], tsf[10], tsf[11]]))
+    }
+
+    /// QUERY READ FLAG: the flag's value (the low byte of the VALUE field), or None.
+    pub fn read_flag(&self, idn: u8) -> Option<bool> {
+        let (tsf, ocs) = self.query_tsf(0x05, idn, 0);
+        if ocs != ocs::SUCCESS || tsf[3] != 0 {
+            return None;
+        }
+        Some(tsf[11] & 1 == 1)
+    }
+
     /// Probe the UFS controller and device.
     pub fn probe(&self) -> UfsProbe {
         let mut p = UfsProbe::default();
