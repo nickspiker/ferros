@@ -131,19 +131,23 @@ async fn main() {
         "display" if args.get(2).map(String::as_str) == Some("modeset") => {
             // display modeset fhd|wqhd [1368|1346] [8|10|keep] — the link rate (ABL's 1368 Mbps, Android's 1346; omitted keeps the current one) and the blend depth: 10 bpc with the DQE dither is the default (two bits of gradation on the 8 bpc link for no measurable power, DISPLAY-POWER.md), `8` is ABL's path, `keep` leaves it.
             let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
+            // `link10`: the 10 bpc DSC stream experiment (DISPLAY-DESIGN.md step 5), with `f2=XX` the panel's F2 byte to try; needs eyes on the panel.
             let mut rate = 0;
             let mut bpc = 2;
+            let mut f2 = 0u8;
             for a in &args[4..] {
                 match a.as_str() {
                     "1368" => rate = 1,
                     "1346" => rate = 2,
                     "8" => bpc = 1,
                     "10" => bpc = 2,
+                    "link10" => bpc = 3,
                     "keep" => bpc = 0,
+                    s if s.starts_with("f2=") => f2 = u8::from_str_radix(&s[3..], 16).unwrap_or(0),
                     _ => {}
                 }
             }
-            cmd_display_raw(&[10, fhd, rate, bpc]).await;
+            cmd_display_raw(&[10, fhd, rate, bpc, f2]).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("idle") => {
             let floor: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(10);

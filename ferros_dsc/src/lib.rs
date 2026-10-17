@@ -80,6 +80,19 @@ const fn husky(pic_width: u16, pic_height: u16, slice_width: u16, initial_dec_de
     }
 }
 
+/// The same raster with a 10 bits-per-component stream at the same 8 bpp (DSC 1.1 Annex E, the 8 bpp column at 10 bpc: QP ranges four higher, flatness 7..16, quant limits 15, an 11-bit line buffer). An experiment: whether the hk3 panel decodes it is UNCONFIRMED (DISPLAY-DESIGN.md plan step 5).
+pub const fn ten_bpc(c: Config) -> Config {
+    let mut c = c;
+    c.bits_per_component = 10;
+    c.line_buf_depth = 11;
+    c.flatness_min_qp = 7;
+    c.flatness_max_qp = 16;
+    c.rc_quant_incr_limit0 = 15;
+    c.rc_quant_incr_limit1 = 15;
+    c.rc_range_params = [(0, 8, 2), (4, 8, 0), (5, 9, 0), (5, 10, 62), (7, 11, 60), (7, 11, 58), (7, 11, 56), (7, 12, 56), (7, 13, 56), (7, 14, 54), (9, 15, 54), (9, 16, 52), (9, 17, 52), (11, 17, 52), (17, 19, 52)];
+    c
+}
+
 /// husky WQHD: 1344×2992, two 672×187 slices per line.
 pub const HUSKY_WQHD: Config = husky(1344, 2992, 672, 592, 5177, 9, 112);
 /// husky FHD: 1008×2244, two 504×187 slices per line, scaled up in the panel.
