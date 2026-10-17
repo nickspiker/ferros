@@ -1,12 +1,7 @@
 //! The google-hk3 panel's command sets as ferros sends them (DISPLAY-HK3.md), in dsim::sequence's script form: `[type][len][bytes…][wait ms]` per packet. Taken from the oracle (oracle/display/husky-hk3/<state>/dsi-commands.txt): what Android sends for the same transition, byte for byte.
 
-/// WQHD, 120 Hz, HS op mode, manual rate (early exit off), changeable TE; then the TE2 update. Oracle W120_noidle.
+/// 120 Hz, HS op mode, manual rate (early exit off), changeable TE; then the TE2 update. The oracle's W120_noidle transition with its raster-select packets removed (that capture was a resolution change: C3 0C and the F2 offset-1 bracket re-select WQHD, which a modeset must not do).
 pub const REFRESH_120: &[u8] = &[
-    0x39, 0x03, 0xF0, 0x5A, 0x5A, 0x00,
-    0x15, 0x02, 0xC3, 0x0C, 0x00,
-    0x39, 0x04, 0xB0, 0x00, 0x01, 0xF2, 0x00,
-    0x15, 0x02, 0xF2, 0x01, 0x00,
-    0x39, 0x03, 0xF0, 0xA5, 0xA5, 0x00,
     0x39, 0x03, 0xF0, 0x5A, 0x5A, 0x00,
     0x15, 0x02, 0xB9, 0x04, 0x00,
     0x39, 0x04, 0xB0, 0x00, 0x04, 0xB9, 0x00,
