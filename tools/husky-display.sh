@@ -13,6 +13,8 @@ for b in ferros_kernel display shelltest; do aarch64-linux-gnu-objcopy -O binary
 if lsusb -d 18d1:4ee0 >/dev/null 2>&1; then echo "phone in fastboot: rebooting into ferros"; timeout 30 fastboot reboot >/dev/null 2>&1; fi
 for _ in $(seq 60); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 lsusb -d 1209:4665 >/dev/null 2>&1 || { echo "ferros is not on USB"; exit 1; }
+# Before the reload: the kernel found running says why the previous one left (the flashed kernel only knows PREV_EXIT; the reloaded one also prints the PT record).
+echo "found: $("$B" diag 2>/dev/null | grep -E "^GEN|^PREV_EXIT|^PREV_PT_CMD_CAP|^PREV_ALIVE" | tr '\n' ' ')"
 if [ $RELOAD = 1 ]; then
     timeout 300 "$B" reload "$R/ferros_kernel.bin" >/dev/null 2>&1
     sleep 4

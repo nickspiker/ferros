@@ -433,10 +433,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.dec(hs_mbps as u64);
     log.s(b" Mbps\n");
     log.flush();
-    // Nothing moves between presents, so the panel may rest: the 10 Hz auto-rate floor (its own engine drops the refresh when frames stop and comes back for the next one; DISPLAY-POWER.md: 150–190 mW under 120 Hz). A client can change it (op 8).
+    // Nothing moves between presents, so the panel may rest: the 10 Hz auto-rate floor (its own engine drops the refresh when frames stop and comes back for the next one; DISPLAY-POWER.md: 150–190 mW under 120 Hz) — with the TE kept fixed at 120 Hz, as Android runs it: DECON triggers on TE, so a changeable TE at the floor would make every present wait for the next 100 ms tick (measured 10 Hz on the pin, 2026-10-16 night). Fixed, the panel inserts the frame at once and the saving stays. A client can change the floor (op 8).
     if dsi.alive() {
-        let (_, fail) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
-        log.s(if fail.is_none() { b"display: panel idle floor 10 Hz\n" } else { b"display: idle floor command stuck\n" });
+        let (_, f1) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
+        let (_, f2) = dsi.sequence(ferros_dsi::hk3::TE_FIXED);
+        log.s(if f1.is_none() && f2.is_none() { b"display: panel idle floor 10 Hz, TE fixed 120\n" } else { b"display: idle floor / TE command stuck\n" });
         log.flush();
     }
 
