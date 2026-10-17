@@ -4,6 +4,8 @@ How: the phone on USB to the dev box, running ferros from slot b. For each row t
 
 The number is the **whole phone**: SoC with one core spinning in the EL2 service loop, DRAM, the USB link, the panel. Differences between rows are the display; the absolute is not a display figure. Run-to-run spread on the same state is about ±50 mW (the 120 Hz black row came out at 3.21–3.26 W across six visits; one earlier visit read 2.83 W, before the sweep set the brightness explicitly — see the brightness finding).
 
+**Caveat (2026-10-17):** the panel rows below were taken in a state that no longer reproduces — white at DBV 1353 cost +2.44 W over black that day and +0.35 W the next, with the i1 Pro confirming 133 nits at that DBV on the second day. The AOD cycle at the end of the day reset whatever drive state the panel was in. Treat the white/grey/HBM deltas as an upper bound until the sweep is redone in nits (DISPLAY-CALIB.md has the table).
+
 ## 2026-10-16, battery 98 %, 37 °C
 
 | state | TE | mean draw |
