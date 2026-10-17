@@ -762,6 +762,31 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#09 [floor: 30, 10, 1, or 0 = exit to manual 120] = the panel's auto-rate idle floor, then 1.5 s of stillness and the TE pin (bridge `display idle N`).
+                                            Some((9, args)) if !args.is_empty() => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                let script = match args[0] { 30 => Some(crate::hk3::IDLE_30), 10 => Some(crate::hk3::IDLE_10), 1 => Some(crate::hk3::IDLE_1), 0 => Some(crate::hk3::IDLE_EXIT), _ => None };
+                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
+                                                    rep.extend_from_slice(b"display not running\n");
+                                                } else if let Some(script) = script {
+                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
+                                                    // A second byte of 1 asks for changeable TE during the measurement, so the pin shows the panel's real rate; fixed TE is restored after.
+                                                    let changeable = args.get(1) == Some(&1);
+                                                    if changeable {
+                                                        let _ = crate::dsim::sequence(crate::hk3::TE_CHANGEABLE, freq);
+                                                    }
+                                                    let t0 = cntpct();
+                                                    while cntpct().wrapping_sub(t0) < freq * 3 / 2 {}
+                                                    let ((pin_hz, _), width_us) = crate::display::te_profile(freq);
+                                                    if changeable {
+                                                        let _ = crate::dsim::sequence(crate::hk3::TE_FIXED, freq);
+                                                    }
+                                                    rep.extend_from_slice(alloc::format!("idle floor {}: {sent} packets{}; after 1.5 s still, TE {pin_hz} Hz ({width_us} us high){}\n", args[0], if fail.is_some() { " (FIFO stuck)" } else { "" }, if changeable { " [changeable TE]" } else { "" }).as_bytes());
+                                                } else {
+                                                    rep.extend_from_slice(b"idle: 30, 10, 1 or 0\n");
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
                                             Some((5, _)) => {
                                                 let mut rep = alloc::vec::Vec::new();

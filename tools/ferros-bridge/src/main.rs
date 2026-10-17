@@ -104,6 +104,11 @@ async fn main() {
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
+        "display" if args.get(2).map(String::as_str) == Some("idle") => {
+            let floor: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(10);
+            let changeable = args.get(4).map(|a| a == "changeable").unwrap_or(false) as u8;
+            cmd_display_raw(&[9, floor, changeable]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("res") => {
             // display res fhd|wqhd [steps mask: 1 panel, 2 DECON+DSC+layer, 4 DSIM; default 7]
             let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
