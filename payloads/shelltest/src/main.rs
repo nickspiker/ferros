@@ -108,6 +108,21 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     line[n - 20] = b'0' + (bad % 10) as u8;
     line[n - 2] = b'0' + status.min(9);
     console(grants, &line);
+    // The panel through the server: 140 nits (DBV 1353), then the DBV read back (DCS 52) — the display server's own DSIM path, verified by the panel.
+    let b = c.op(&[6, (1353u16 & 0xFF) as u8, (1353u16 >> 8) as u8]);
+    let mut r = [0u8; 16];
+    let k = call(cap(grants, S_DISPLAY), &[10, 0x52, 2], &mut r);
+    let mut line = *b"shelltest: brightness op status 0, DBV readback xx xx\n";
+    let n = line.len();
+    line[n - 22] = b'0' + b.min(9);
+    let hex = b"0123456789ABCDEF";
+    if k >= 3 && r[0] == 0 {
+        line[n - 6] = hex[(r[1] >> 4) as usize];
+        line[n - 5] = hex[(r[1] & 15) as usize];
+        line[n - 3] = hex[(r[2] >> 4) as usize];
+        line[n - 2] = hex[(r[2] & 15) as usize];
+    }
+    console(grants, &line);
     ferros_sys::exit(0)
 }
 

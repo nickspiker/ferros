@@ -2,8 +2,8 @@
 //!
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads, plus this process's heap above it), DECON0's main/win/wincon blocks, layer 0's DMA and DPP blocks, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (DPP0's image size) and the modeset ABL or the kernel left — the panel, DSIM and DECON's geometry stay as they are; this process only re-points the layer and pushes frames.
 //!
-//! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow).
+//! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -11,6 +11,10 @@
 //! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
 //! - 4 `present`: black under everything, then the frame goes to the panel. Reply byte 1 = whether DECON advanced.
 //! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32]`.
+//! - 6 `brightness [dbv u16]`: the panel's DBV (196 = 2 nits … 3307 = 1000 nits; DISPLAY-HK3.md §4), through DSIM from this process.
+//! - 7 `refresh [hz u8]`: 60 or 120, the panel's own command set plus DSIM's command-TE timers.
+//! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
+//! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
 //! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass. What is not a convention is fluor's order: it composites **front to back**, a paint goes *under* what is already there and an opaque pixel is left alone, so a frame starts from transparent (α = 0), the text goes down first and the background last. (The first cut filled black over raw DRAM: every word that happened to carry α = FF survived, a random-colour matrix at 1 in 256 — the owner's "green speckle wallpaper", 2026-10-16.)
@@ -36,6 +40,28 @@ const S_DPP0: u64 = 6;
 const S_GPP0: u64 = 7;
 const S_FB: u64 = 8;
 const S_HEAP: u64 = 9;
+const S_DSIM: u64 = 10;
+const S_DPHY: u64 = 11;
+
+/// DSIM0 through its grant: one syscall per register access, the generic timer for the waits.
+struct DsiGrant {
+    grants: u64,
+}
+
+impl ferros_dsi::Link for DsiGrant {
+    fn rd(&self, off: usize) -> u32 {
+        mmio_read(cap(self.grants, S_DSIM), off as u64) as u32
+    }
+    fn wr(&self, off: usize, v: u32) {
+        mmio_write(cap(self.grants, S_DSIM), off as u64, v);
+    }
+    fn now(&self) -> u64 {
+        now()
+    }
+    fn freq(&self) -> u64 {
+        freq()
+    }
+}
 
 // DECON main (cal_9865 regs-decon.h).
 const FRAME_COUNT: u64 = 0x0004;
@@ -382,6 +408,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     ALLOC.reset();
     let strip = (status_y + span * 0.02) as usize;
 
+    // The panel's command path, and the link rate its TE timers are figured from (the DPHY PLL at +G#100 of the dphy0 grant).
+    let dsi = ferros_dsi::Dsim(DsiGrant { grants });
+    let hs_mbps = ferros_dsi::pll_hs_clk(|off| mmio_read(cap(grants, S_DPHY), 0x100 + off as u64) as u32);
+    log.s(b"display: dsim ");
+    log.s(if dsi.alive() { b"alive, link " } else { b"NOT alive, link " });
+    log.dec(hs_mbps as u64);
+    log.s(b" Mbps\n");
+    log.flush();
+
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
@@ -453,6 +488,51 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     out[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
                     out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
                     len = 12;
+                }
+                // The panel, through DSIM: every write bracketed by the hk3 level-2 unlock/lock as the stock driver does.
+                Some(6) if m.len() >= 3 => {
+                    let dbv = u16::from_le_bytes([m[1], m[2]]).min(4095);
+                    let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
+                    out[0] = r.is_err() as u8 * 3;
+                }
+                Some(7) if m.len() >= 2 => {
+                    let (script, fps) = match m[1] {
+                        60 => (ferros_dsi::hk3::REFRESH_60, 60),
+                        120 => (ferros_dsi::hk3::REFRESH_120, 120),
+                        _ => (&[][..], 0),
+                    };
+                    if fps == 0 {
+                        out[0] = 1;
+                    } else {
+                        let (_, fail) = dsi.sequence(script);
+                        dsi.set_cmd_te(fps, hs_mbps, width as u32);
+                        out[0] = fail.is_some() as u8 * 3;
+                    }
+                }
+                Some(8) if m.len() >= 2 => {
+                    let script = match m[1] {
+                        30 => Some(ferros_dsi::hk3::IDLE_30),
+                        10 => Some(ferros_dsi::hk3::IDLE_10),
+                        1 => Some(ferros_dsi::hk3::IDLE_1),
+                        0 => Some(ferros_dsi::hk3::IDLE_EXIT),
+                        _ => None,
+                    };
+                    match script {
+                        Some(sc) => out[0] = dsi.sequence(sc).1.is_some() as u8 * 3,
+                        None => out[0] = 1,
+                    }
+                }
+                Some(9) if m.len() >= 2 => {
+                    out[0] = dsi.dcs(&m[1..]).is_err() as u8 * 3;
+                }
+                Some(10) if m.len() >= 3 => {
+                    let n = (m[2] as usize).clamp(1, 15);
+                    let _ = dsi.dcs(&[0xF0, 0x5A, 0x5A]);
+                    match dsi.read(m[1], &mut out[1..1 + n]) {
+                        Ok(k) => len = 1 + k,
+                        Err(_) => out[0] = 3,
+                    }
+                    let _ = dsi.dcs(&[0xF0, 0xA5, 0xA5]);
                 }
                 _ => out[0] = 1,
             }

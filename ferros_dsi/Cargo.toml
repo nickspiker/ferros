@@ -1,0 +1,8 @@
+[package]
+name = "ferros_dsi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The Exynos DSIM command path (DCS writes, reads, scripted sequences, the command-TE timers) over any register access, and the google-hk3 panel's command sets; no_std, shared by the kernel's bench and the display server"
+
+[dependencies]
