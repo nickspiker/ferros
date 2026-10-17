@@ -202,13 +202,22 @@ pub fn read(cmd: u8, len: usize, cntfrq: u64) -> Result<Vec<u8>, u32> {
 
 const DSIM_CMD_TE_CTRL0: usize = 0x0084;
 const DSIM_CMD_TE_CTRL1: usize = 0x0088;
-/// The HS bit rate the link runs at, Mbps (DISPLAY-HK3.md §7).
-const HS_CLK_MBPS: u32 = 1368;
+/// The HS bit rate the link runs at, Mbps: 1368 as ABL brings it up, 1346 as Android runs it (DISPLAY-HK3.md §7); dpu::modeset changes it.
+static HS_CLK_MBPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1368);
 
-/// The command-mode TE timers for a refresh rate, the stock driver's formula (dsim_reg_set_cmd_ctrl: stable VFP = hactive × 2 / 100 with DSC; TE protect = hs × 95 × 100 / fps / 16; TE timeout = hs × 110 × 100 / fps / 16). ABL leaves the 60 Hz values; Android's at 120 Hz come out a few percent lower than this formula at 1368 Mbps.
+pub fn hs_clk() -> u32 {
+    HS_CLK_MBPS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_hs_clk(mbps: u32) {
+    HS_CLK_MBPS.store(mbps, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The command-mode TE timers for a refresh rate, the stock driver's formula (dsim_reg_get_cmd_timer: TE protect = hs × 95 × 100 / fps / 16; TE timeout = hs × 110 × 100 / fps / 16, integer division in that order; stable VFP = hactive × 2 / 100 with DSC). Reproduces Android's G#1A03_1E1F at 120 Hz with its 1346 Mbps link.
 pub fn set_cmd_te(fps: u32) {
-    let protect = HS_CLK_MBPS * 95 * 100 / fps / 16;
-    let timeout = HS_CLK_MBPS * 110 * 100 / fps / 16;
+    let hs = hs_clk();
+    let protect = hs * 95 * 100 / fps / 16;
+    let timeout = hs * 110 * 100 / fps / 16;
     wr(DSIM_CMD_TE_CTRL0, 1344 * 2 / 100);
     wr(DSIM_CMD_TE_CTRL1, (protect & 0xFFFF) << 16 | (timeout & 0xFFFF));
 }

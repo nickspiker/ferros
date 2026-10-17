@@ -92,6 +92,25 @@ const fn md_gnr_con0(lane: usize) -> usize {
 }
 const PHY_ENABLE: u32 = 1 << 0;
 const PHY_READY: u32 = 1 << 1;
+/// A link rate: the DPHY words that differ between the two rates the stock stack knows (DISPLAY-HK3.md §7) and the panel's FFC table for it. The PLL's PMSK and lock count, MC_ANA_CON2, and the clock and data lanes' timing words for the rate's row of the driver's table; 1346 from Android's live dump, 1368 from the state ABL leaves.
+pub struct LinkRate {
+    pub mbps: u32,
+    phy: &'static [(usize, u32)],
+    ffc: &'static [u8],
+}
+
+pub const LINK_1368: LinkRate = LinkRate {
+    mbps: 1368,
+    phy: &[(0x0000, 0x1201), (0x0004, 0x5400), (0x0008, 0x006F), (0x001C, 0x01F4), (0x0210, 2), (0x0230, 0x1290), (0x0234, 0x1536), (0x0238, 0x0842), (0x0240, 0x01A9), (0x0330, 0x1290), (0x0334, 0x0836), (0x0338, 0x0843), (0x0340, 0x01A9), (0x0430, 0x1290), (0x0434, 0x0836), (0x0438, 0x0843), (0x0440, 0x01A9), (0x0530, 0x1290), (0x0534, 0x0836), (0x0538, 0x0843), (0x0540, 0x01A9), (0x0630, 0x1290), (0x0634, 0x0836), (0x0638, 0x0843), (0x0640, 0x01A9)],
+    ffc: crate::hk3::FFC_1368,
+};
+
+pub const LINK_1346: LinkRate = LinkRate {
+    mbps: 1346,
+    phy: &[(0x0000, 0x1202), (0x0004, 0x1355), (0x0008, 0x00DB), (0x001C, 0x03E8), (0x0210, 2), (0x0230, 0x1280), (0x0234, 0x1535), (0x0238, 0x0841), (0x0240, 0x0190), (0x0330, 0x1280), (0x0334, 0x0835), (0x0338, 0x0842), (0x0340, 0x0190), (0x0430, 0x1280), (0x0434, 0x0835), (0x0438, 0x0842), (0x0440, 0x0190), (0x0530, 0x1280), (0x0534, 0x0835), (0x0538, 0x0842), (0x0540, 0x0190), (0x0630, 0x1280), (0x0634, 0x0835), (0x0638, 0x0842), (0x0640, 0x0190)],
+    ffc: crate::hk3::FFC_1346,
+};
+
 // DPU sysreg
 const DISP_DPU_MIPI_PHY_CON: usize = 0x0008;
 const M_RESETN_M0: u32 = 1 << 0;
@@ -207,7 +226,7 @@ fn dsim_stop(cntfrq: u64, rep: &mut Vec<u8>) {
 }
 
 /// DSIM init + start (dsim_reg_init, dsim_reg_start) for a raster, the DPHY's proven words restored around the PLL re-lock.
-fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], cntfrq: u64, rep: &mut Vec<u8>) {
+fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], rate: Option<&LinkRate>, cntfrq: u64, rep: &mut Vec<u8>) {
     // DPHY reset under sysreg control, OSC clock, software reset.
     wr(DPU_SYSREG + DISP_DPU_MIPI_PHY_CON, rd(DPU_SYSREG + DISP_DPU_MIPI_PHY_CON) & !SEL_RESET_DPHY0);
     wr(DSIM0 + DSIM_CLK_CTRL, rd(DSIM0 + DSIM_CLK_CTRL) & !CLK_CLOCK_SEL);
@@ -220,6 +239,13 @@ fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], cntfrq: u64, r
     // DPHY reset asserted while the PLL and lanes come up.
     wr(DPU_SYSREG + DISP_DPU_MIPI_PHY_CON, rd(DPU_SYSREG + DISP_DPU_MIPI_PHY_CON) & !M_RESETN_M0);
     restore(DPHY_BIAS, 0, bias, &[]);
+    let mut phy = Vec::from(phy);
+    if let Some(lr) = rate {
+        for &(off, w) in lr.phy {
+            phy[off / 4] = w;
+        }
+        crate::dsim::set_hs_clk(lr.mbps);
+    }
     for (i, &w) in phy.iter().enumerate() {
         let off = 4 * i;
         let w = match off {
@@ -262,7 +288,8 @@ fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], cntfrq: u64, r
     wr(DSIM0 + DSIM_SLICE01, sw << 16 | sw);
     wr(DSIM0 + DSIM_CMD_CONFIG, 0);
     wr(DSIM0 + DSIM_CMD_TE_CTRL0, r.w * 2 / 100);
-    wr(DSIM0 + DSIM_CMD_TE_CTRL1, (1368 * 95 * 100 / 120 / 16) << 16 | (1368 * 110 * 100 / 120 / 16));
+    let hs = crate::dsim::hs_clk();
+    wr(DSIM0 + DSIM_CMD_TE_CTRL1, (hs * 95 * 100 / 120 / 16) << 16 | (hs * 110 * 100 / 120 / 16));
     // Start: request the HS clock, interrupts as they were, status clear.
     wr(DSIM0 + DSIM_CLK_CTRL, rd(DSIM0 + DSIM_CLK_CTRL) | CLK_TX_REQUEST_HSCLK);
     wr(DSIM0 + DSIM_INTMSK, link[DSIM_INTMSK / 4]);
@@ -332,10 +359,20 @@ fn after_te(cntfrq: u64) {
 }
 
 /// The whole modeset to `fhd` or WQHD, then one frame. Reports every step that misbehaved, the panel's raster register and the TE rate afterwards.
-pub fn modeset(fhd: bool, cntfrq: u64, rep: &mut Vec<u8>) {
+/// `rate`: 0 keeps the link rate, 1 = 1368 Mbps, 2 = 1346 Mbps (bridge `display modeset fhd|wqhd [1368|1346]`).
+pub fn modeset(fhd: bool, rate: u8, cntfrq: u64, rep: &mut Vec<u8>) {
     if !dpu_on() || !crate::dsim::alive() {
         rep.extend_from_slice(b"display not running\n");
         return;
+    }
+    let rate = match rate {
+        1 => Some(&LINK_1368),
+        2 => Some(&LINK_1346),
+        _ => None,
+    };
+    // The panel's FFC off before its link clock changes (pre_update_ffc), as the stock stack does.
+    if rate.map(|lr| lr.mbps != crate::dsim::hs_clk()).unwrap_or(false) {
+        let _ = crate::dsim::sequence(crate::hk3::FFC_OFF, cntfrq);
     }
     let r = raster(fhd);
     let main = snapshot(DECON0, 0, 0x0344);
@@ -349,7 +386,7 @@ pub fn modeset(fhd: bool, cntfrq: u64, rep: &mut Vec<u8>) {
 
     decon_stop(cntfrq, rep);
     dsim_stop(cntfrq, rep);
-    dsim_init(&r, &link, &bias, &phy, cntfrq, rep);
+    dsim_init(&r, &link, &bias, &phy, rate, cntfrq, rep);
     decon_init(&r, &main, &sub0, &sub1, &win, wincon);
 
     // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
@@ -361,6 +398,9 @@ pub fn modeset(fhd: bool, cntfrq: u64, rep: &mut Vec<u8>) {
     let (_, f1) = crate::dsim::sequence(if fhd { crate::hk3::RES_FHD } else { crate::hk3::RES_WQHD }, cntfrq);
     let (_, f2) = crate::dsim::sequence(crate::hk3::REFRESH_120, cntfrq);
     let f3 = crate::dsim::dcs(&[0x53, 0x20], cntfrq).err();
+    if let Some(lr) = rate {
+        let _ = crate::dsim::sequence(lr.ffc, cntfrq);
+    }
     let (_, f4) = crate::dsim::sequence(crate::hk3::FFC_ON, cntfrq);
     if f1.is_some() || f2.is_some() || f3.is_some() || f4.is_some() {
         rep.extend_from_slice(b"panel: a command set stuck\n");
@@ -388,4 +428,5 @@ pub fn modeset(fhd: bool, cntfrq: u64, rep: &mut Vec<u8>) {
     let ((te, _), width) = crate::display::te_profile(cntfrq);
     crate::display::append_hex(rep, b"TE_HZ=", te);
     crate::display::append_hex(rep, b"TE_US=", width);
+    crate::display::append_hex(rep, b"HS_MBPS=", crate::dsim::hs_clk());
 }
