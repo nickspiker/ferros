@@ -37,6 +37,33 @@ pub fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     r
 }
 
+/// Apply the image's own relocations, for a payload linked `-pie` (see payloads/display/payload.ld + build.rs): native payloads run unrelocated at their arc base (KERNEL.md), so any absolute address the linker baked into data — a `dyn` vtable, a function-pointer table, a `&'static str` table — points into nowhere. With `-pie` the linker leaves those words as R_AARCH64_RELATIVE entries in `.rela.dyn` instead, and this adds the load address to each. Call it first in `_entry`, before anything that could touch such data; the loop itself uses only PC-relative addressing. No-op for an image linked without `.rela.dyn`.
+///
+/// # Safety
+/// Must run exactly once, before any other code of the image, from the image this crate was linked into.
+#[inline(never)]
+pub unsafe fn relocate() {
+    unsafe extern "C" {
+        static __image_start: u8;
+        static __rela_start: u8;
+        static __rela_end: u8;
+    }
+    const R_AARCH64_RELATIVE: u64 = 1027;
+    unsafe {
+        let base = &raw const __image_start as u64;
+        let mut p = &raw const __rela_start as *const u64;
+        let end = &raw const __rela_end as *const u64;
+        while p < end {
+            let (offset, info, addend) = (p.read(), p.add(1).read(), p.add(2).read());
+            if info & 0xFFFF_FFFF == R_AARCH64_RELATIVE {
+                ((base + offset) as *mut u64).write(base.wrapping_add(addend));
+            }
+            p = p.add(3);
+        }
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
 /// The process's arc base (x28, set by the kernel at entry and never written by compiled code).
 #[inline(always)]
 pub fn arc_base() -> u64 {

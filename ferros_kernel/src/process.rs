@@ -301,6 +301,8 @@ pub struct Dma {
 pub static DMA: &[Dma] = &[
     Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
+    // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
+    Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
 ];
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
 static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -328,6 +330,22 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "gpio-far-alive", base: 0x154E_0000, size: 0x1000, via_el3: false },
     Hw { name: "cmu-hsi2", base: 0x1300_0000, size: 0x8000, via_el3: false },
     Hw { name: "pmu", base: 0x1546_0000, size: 0x1_0000, via_el3: true },
+    // The display pipe (DISPLAY-DESIGN.md §3; sizes from zuma-drm-dpu.dtsi): DECON0's four blocks and its DQE, layer 0's DMA / DPP / SRAMC / HDR blocks, DSIM0 with its PHY and the DPU sysreg, and the GPIO bank with the panel's TE pin.
+    Hw { name: "decon0-main", base: 0x1947_0000, size: 0x6000, via_el3: false },
+    Hw { name: "decon0-win", base: 0x1948_0000, size: 0xE000, via_el3: false },
+    Hw { name: "decon0-sub", base: 0x1949_0000, size: 0x1_0000, via_el3: false },
+    Hw { name: "decon0-wincon", base: 0x194A_0000, size: 0xE000, via_el3: false },
+    Hw { name: "dqe0", base: 0x194D_0000, size: 0xF000, via_el3: false },
+    Hw { name: "dqe0-cgc", base: 0x194F_0000, size: 0x1_0000, via_el3: false },
+    Hw { name: "dpu-dma0", base: 0x1990_0000, size: 0x1000, via_el3: false },
+    Hw { name: "dpp0", base: 0x1993_0000, size: 0x1000, via_el3: false },
+    Hw { name: "sramc0", base: 0x1995_0000, size: 0x1000, via_el3: false },
+    Hw { name: "hdrcomm0", base: 0x1996_0000, size: 0x1000, via_el3: false },
+    Hw { name: "hdr0", base: 0x1998_0000, size: 0x1000, via_el3: false },
+    Hw { name: "dsim0", base: 0x1944_0000, size: 0x1000, via_el3: false },
+    Hw { name: "dphy0", base: 0x1946_0000, size: 0x1000, via_el3: false },
+    Hw { name: "dpu-sysreg", base: 0x1942_1000, size: 0x1000, via_el3: false },
+    Hw { name: "gpio-gpp0", base: 0x1084_0000, size: 0x1000, via_el3: false },
 ];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.

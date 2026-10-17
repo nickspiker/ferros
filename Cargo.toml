@@ -16,6 +16,7 @@ members = [
     "tools/ferros-mask",
     "tools/install",
     "payloads/hello",
+    "payloads/display",
     "payloads/hello_el0",
     "payloads/echo_server",
     "payloads/echo_client",
