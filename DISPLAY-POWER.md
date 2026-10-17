@@ -37,7 +37,7 @@ The number is the **whole phone**: SoC with one core spinning in the EL2 service
 - **White at 1000 nits is 8.3 W, HBM 1600 nits is 12.9 W** (3.1 A from the cell, 4.11 V under load). HBM is for sunlight, briefly; the battery says so.
 - **10 bpc blend + DQE dither costs nothing measurable** (5.70 vs 5.67 W white, 3.21 vs 3.23 W black). The 1346 vs 1368 Mbps link: nothing measurable either. FHD vs WQHD: nothing measurable (the panel scales; the link carries the same DSC stream rate).
 - **Refresh rate is worth 100–200 mW.** 60 Hz saves 100–160 mW on black, 150 mW on white; the auto-rate floors save 120–190 mW (black) and 140–220 mW (white) against 120 Hz, with 10 Hz and 1 Hz no better than each other at this resolution of measurement. Small next to content and brightness, but it is free when nothing moves.
-- **Open:** in this sweep the TE pin stayed at 120 Hz at the idle floors even with changeable TE and a 3 s settle, while the power dropped as it should; on 2026-10-16 morning (ABL's fresh init, no modeset) the pin showed 30 / 10 / 1 Hz. Something in the modeset's panel sequence (REFRESH_120 re-sends the TE set) likely puts TE back to fixed after `idle … changeable` — check the order, measure again.
+- **The TE pin at the idle floors read 120 Hz in this sweep because the TE was fixed**: `display idle … changeable` switches the panel to changeable TE only for its own measurement (it saw 28 / 8 Hz at the 30 / 10 Hz floors) and puts fixed TE back, as Android runs; the panel keeps idling underneath, which is what the power shows. Not a hardware question.
 
 ## Still to measure
 
