@@ -911,6 +911,10 @@ pub static mut __power_pressed: u64 = 0;
 /// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
 #[unsafe(no_mangle)]
 pub static mut __el0_kctx: [u64; 21] = [0; 21];
+/// Whether the cold boot armed the UFS power-on write protect: 0 not attempted, 1 armed, 2 the device refused (DIAG UFS_POWER_ON_WP).
+pub static UFS_WP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The flag as the boot found it (DIAG UFS_POWER_ON_WP_BEFORE): 0 clear, 1 set — it survived the reset — 2 unreadable.
+pub static UFS_WP_BEFORE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
 #[unsafe(no_mangle)]
 pub static mut __irq_count: u64 = 0;
@@ -1566,7 +1570,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::crumb(0xC0);
 
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
-    let pressed_at = if dtb_addr != 0 && dtb_addr & 1 == 0 { ready::wait() } else { 0 };
+    let (pressed_at, gate_choice) = if dtb_addr != 0 && dtb_addr & 1 == 0 { ready::wait() } else { (0, ready::Choice::Ferros) };
     let _ = pressed_at;
 
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
@@ -1638,6 +1642,33 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         checklist::suffix(checklist::Item::Ira, &[hex[(f[0] >> 4) as usize], hex[(f[0] & 15) as usize], hex[(f[1] >> 4) as usize], hex[(f[1] & 15) as usize]]);
     }
 
+    // The flash's power-on write protect, armed now that the link is up (BOOT.md "Dual Boot", owner's yes 2026-10-17): the bootloader's own LUs become read-only until the next reset. The bootloader does not arm it itself; fastboot runs before anything could, so flashing is untouched. Reported in DIAG as UFS_POWER_ON_WP (1 armed, 2 refused, 0 no link).
+    let ufs_wp = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
+        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+        // As the boot found it: whether the flag survived the reset that brought us here (a warm reset may keep it; DIAG UFS_POWER_ON_WP_BEFORE: 0/1, 2 unreadable).
+        UFS_WP_BEFORE.store(match ufs.read_flag(0x03) { Some(true) => 1, Some(false) => 0, None => 2 }, core::sync::atomic::Ordering::Relaxed);
+        if cfg!(ferros_no_ufs_wp) {
+            3
+        } else if ufs.set_flag(0x03) {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+    UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
+
+    // The gate chose Android: slot a active in devinfo (its retries at 3, our active bit cleared), then a plain reset — the bootloader boots Android. The way back is the gate on slot b, which Android reaches with `bootctl set-active-boot-slot 1` + reboot (root), or fastboot.
+    if gate_choice == ready::Choice::Android && store.is_some() {
+        let r = slot::set_active(0);
+        if r == slot::MARKED {
+            platform::crumb(0xC7);
+            platform::reboot();
+        }
+        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
+    }
+
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
         let m = slot::mark_booted_slot(dtb_addr);
@@ -1681,6 +1712,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let own_base = &raw const _start as usize;
     let extras = alloc::vec![
         (b"COLD_UFS_MS=".as_slice(), ufs_ms),
+        (b"UFS_POWER_ON_WP=".as_slice(), UFS_WP.load(core::sync::atomic::Ordering::Relaxed)),
+        (b"UFS_POWER_ON_WP_BEFORE=".as_slice(), UFS_WP_BEFORE.load(core::sync::atomic::Ordering::Relaxed)),
         (b"COLD_VAULT_MS=".as_slice(), vault_ms),
         (b"REP_REV=".as_slice(), rep_snap[0]),
         (b"REP_CFG=".as_slice(), rep_snap[1]),

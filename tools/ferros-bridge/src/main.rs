@@ -105,7 +105,8 @@ async fn main() {
             // display power [samples = 1] [interval in 1/16 s = 8] [battery] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene. `battery`: the charger's buck is off for the run so the reading is the system's draw, not the charger's leftovers.
             let n: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(1);
             let gap: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(8);
-            let battery = args.iter().skip(3).any(|a| a == "battery") as u8;
+            // `battery2`: also deselects the CHGIN input for the window (the charger's buck off alone left USB feeding the system on 2026-10-17).
+            let battery = if args.iter().skip(3).any(|a| a == "battery2") { 2 } else { args.iter().skip(3).any(|a| a == "battery") as u8 };
             cmd_display_raw(&[11, n, gap, battery]).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("i2c") => {

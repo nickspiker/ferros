@@ -489,6 +489,96 @@ pub fn run(mut b: Boot) -> ! {
                                     st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                        if cmd.params.starts_with(b"lun ") {
+                                            // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
+                                            let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
+                                            let (lun, first, count) = (it.next().unwrap_or(3).min(7) as u8, it.next().unwrap_or(6), it.next().unwrap_or(1).min(8));
+                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                            let hex = b"0123456789ABCDEF";
+                                            for lba in first..first + count {
+                                                let mut ok = false;
+                                                for _ in 0..4 {
+                                                    if ufs.read_block_lun(lun, lba) == 0 && ufs.last_response_status() == 0 {
+                                                        ok = true;
+                                                        break;
+                                                    }
+                                                }
+                                                resp.extend_from_slice(alloc::format!("LBA {lba}{}\n", if ok { "" } else { " unreadable" }).as_bytes());
+                                                if !ok {
+                                                    continue;
+                                                }
+                                                let b = ufs.data_buffer();
+                                                for (i, row) in b.chunks(16).enumerate() {
+                                                    if row.iter().any(|&x| x != 0) {
+                                                        resp.extend_from_slice(alloc::format!("  {:04X}:", i * 16).as_bytes());
+                                                        for &x in row {
+                                                            resp.push(b' ');
+                                                            resp.push(hex[(x >> 4) as usize]);
+                                                            resp.push(hex[(x & 15) as usize]);
+                                                        }
+                                                        resp.push(b'\n');
+                                                    }
+                                                }
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params.starts_with(b"bootlun ") {
+                                            // `diag bootlun <1|2>`: write the UFS device's bBootLunEn attribute (1 = Boot LU A, 2 = Boot LU B) and read it back. The ROM boots the bootloader chain from that LU, and the bootloader's "boot slot" follows the LU's letter before devinfo is read (its log: "ufshc: bBootLunEn 0x2" then "boot slot: b"; devinfo's active flag gets re-synced to it). Only 1 or 2 are accepted: 0 disables boot.
+                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                            let before = ufs.read_attribute(0x00, 0);
+                                            let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
+                                            let line = match want {
+                                                Some(v @ 1..=2) => {
+                                                    let ok = ufs.write_attribute(0x00, 0, v);
+                                                    alloc::format!("bBootLunEn before {before:?}, write {v}: {}, after {:?}\n", if ok { "accepted" } else { "REFUSED" }, ufs.read_attribute(0x00, 0))
+                                                }
+                                                _ => alloc::format!("bBootLunEn {before:?}; only 1 or 2 may be written\n"),
+                                            };
+                                            resp.extend_from_slice(line.as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"android" {
+                                            // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot.
+                                            let r = crate::slot::set_active(0);
+                                            resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            if r == crate::slot::MARKED {
+                                                let t0 = cntpct();
+                                                while cntpct().wrapping_sub(t0) < freq / 2 {
+                                                    if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                                                        let len = pt_out_data.len().min(512);
+                                                        let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
+                                                        usb.bulk_in_send(&chunk);
+                                                    }
+                                                    let _ = usb.poll_event();
+                                                }
+                                                platform::crumb(0xC7);
+                                                platform::reboot();
+                                            }
+                                            continue;
+                                        }
+                                        if cmd.params == b"devinfo" {
+                                            // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
+                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                                            let mut ok = false;
+                                            for _ in 0..4 {
+                                                if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
+                                                    ok = true;
+                                                    break;
+                                                }
+                                            }
+                                            if ok {
+                                                let b = ufs.data_buffer();
+                                                let w = |s: usize| u32::from_le_bytes([b[0x30 + 4 * s], b[0x31 + 4 * s], b[0x32 + 4 * s], b[0x33 + 4 * s]]);
+                                                resp.extend_from_slice(alloc::format!("DEVINFO magic {}{}{}{} major {}: slot a word G#{:08X} (retries {}, flags G#{:02X}), slot b word G#{:08X} (retries {}, flags G#{:02X})\n", b[0] as char, b[1] as char, b[2] as char, b[3] as char, u16::from_le_bytes([b[4], b[5]]), w(0), w(0) & 0xFF, (w(0) >> 8) & 0xFF, w(1), w(1) & 0xFF, (w(1) >> 8) & 0xFF).as_bytes());
+                                            } else {
+                                                resp.extend_from_slice(b"DEVINFO unreadable\n");
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ufsdesc" {
                                             // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
                                             let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
@@ -543,7 +633,12 @@ pub fn run(mut b: Boot) -> ! {
                                                             let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
                                                             let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
                                                             let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
-                                                            names.push_str(&alloc::format!(" {name}({}K)", (last + 1 - first) * bs >> 10));
+                                                            let attr = u64::from_le_bytes(ent[48..56].try_into().unwrap());
+                                                            names.push_str(&alloc::format!(" {name}@{first}({}K)", (last + 1 - first) * bs >> 10));
+                                                            if attr != 0 {
+                                                                // GPT attribute bits (Android's A/B HALs keep slot state in bits 48+ on some SoCs); printed only when set, to see whether husky's bootloader uses them.
+                                                                names.push_str(&alloc::format!("[attr G#{attr:X}]"));
+                                                            }
                                                         }
                                                         i += 1;
                                                     }

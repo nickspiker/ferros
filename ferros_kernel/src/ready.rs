@@ -10,6 +10,14 @@ static READY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ready.bin"));
 
 /// Panel row the power button sits beside (the triangle's tip points here). Calibrated by eye on husky.
 const POWER_Y: usize = 1050;
+/// Panel row beside the volume-down key (the Android mark points here; the rocker sits below the power button on husky). To calibrate by eye.
+const VOL_DOWN_Y: usize = 1700;
+/// The gate's answer: power = ferros; volume down = Android (slot a made active, then a reset; BOOT.md "Dual Boot"). Volume up only holds (the dev auto-press is cancelled; a production build waits for power anyway).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    Ferros,
+    Android,
+}
 const WHITE: u32 = 0x00FF_FFFF;
 const GREEN: u32 = 0x0000_FF00;
 const DWC3_DCTL: usize = 0x1121_C704;
@@ -45,6 +53,17 @@ fn draw(p: &crate::display::Panel) {
             px(p, tip - dx, POWER_Y + dy, GREEN);
         }
     }
+    // The Android choice at the volume-down key: a smaller chevron in Google's four colours, blue at the tip, so the key that leaves ferros is unmistakable.
+    const GOOGLE: [u32; 4] = [0x004285F4, 0x00EA4335, 0x00FBBC05, 0x0034A853];
+    let (tip, half, len) = (p.width - 28, 48usize, 80usize);
+    for dx in 0..len {
+        let reach = half * dx / len;
+        let c = GOOGLE[(dx * 4 / len).min(3)];
+        for dy in 0..=reach {
+            px(p, tip - dx, VOL_DOWN_Y - dy, c);
+            px(p, tip - dx, VOL_DOWN_Y + dy, c);
+        }
+    }
 }
 
 /// Draw the screen without waiting (dev: `bridge diag ready`). Returns (text pixels, triangle pixels) as found in the surface afterwards, so it can be checked without eyes on the panel.
@@ -67,8 +86,8 @@ pub fn show() -> (u32, u32) {
     (text, tri)
 }
 
-/// Show the screen and wait for the press. Returns the generic-timer count at the press.
-pub fn wait() -> u64 {
+/// Show the screen and wait for the press. Returns the generic-timer count at the press and what was chosen.
+pub fn wait() -> (u64, Choice) {
     // Nothing answers on USB before the press: stop the controller ABL may have left running.
     unsafe { core::ptr::write_volatile(DWC3_DCTL as *mut u32, core::ptr::read_volatile(DWC3_DCTL as *const u32) & !(1 << 31)) };
     let freq = crate::platform::cntfrq();
@@ -84,9 +103,15 @@ pub fn wait() -> u64 {
     let _ = crate::wairua::draw();
     // Dev: a volume key cancels the one-second auto-press for good (the keys' edge interrupts wake the WFI below, so a tap is seen at once).
     let mut held = false;
+    let mut choice = Choice::Ferros;
     loop {
         crate::platform::pet_watchdogs();
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
+            break;
+        }
+        // Volume down alone chooses Android (both keys together is the killswitch and never reaches here); volume up holds.
+        if crate::killswitch::vol_down_held() && !crate::killswitch::vol_up_held() {
+            choice = Choice::Android;
             break;
         }
         held |= crate::killswitch::volume_key_down();
@@ -97,5 +122,5 @@ pub fn wait() -> u64 {
         unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", t = in(reg) freq / 10, c = out(reg) _) };
     }
     unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
-    crate::platform::cntpct()
+    (crate::platform::cntpct(), choice)
 }

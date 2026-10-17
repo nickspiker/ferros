@@ -175,6 +175,20 @@ pub mod charger {
     pub fn restore(raw: u8) -> Result<(), u32> {
         super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_00, raw)
     }
+
+    /// CHG_CNFG_12: CHGINSEL (bit 5) selects the wired input at all; cleared, the CHGIN path is open regardless of MODE. The stronger "battery only" for a measurement (2026-10-17: MODE 0 alone read 40 % less system current than the day before at the same screen, so something still fed the system from USB).
+    pub const CHG_CNFG_12: u8 = 0xC5;
+    pub const CHGINSEL: u8 = 1 << 5;
+
+    pub fn input_select(sel: bool) -> Result<u8, u32> {
+        let prev = super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_12)?;
+        super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_12, if sel { prev | CHGINSEL } else { prev & !CHGINSEL })?;
+        Ok(prev)
+    }
+
+    pub fn restore_input(raw: u8) -> Result<(), u32> {
+        super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_12, raw)
+    }
 }
 
 /// The MAX77759 fuel gauge (PMIC.md): one sample of what matters for power profiling.

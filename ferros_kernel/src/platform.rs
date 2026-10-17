@@ -164,6 +164,12 @@ pub fn dss_mark_clean_reboot() {
 /// `reboot_to_bootloader` result when the watchdog never reset the SoC. Distinct from every EL3 return: the monitor reports errors as negative values (e.g. -1 = G#FFFF_FFFF_FFFF_FFFF), which an earlier u64::MAX sentinel could not be told apart from.
 pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
 
+/// A plain reset through EL3 (PSCI SYSTEM_RESET). Measured on husky: the bootloader reads it as "Reboot mode: 0x0", a normal boot of the active slot — which is what the gate's Android choice wants after `slot::set_active(0)`.
+pub fn reboot() -> ! {
+    dss_mark_clean_reboot();
+    unsafe { core::arch::asm!("smc #0", in("x0") 0x8400_0009u64, options(noreturn)) }
+}
+
 pub fn reboot_to_bootloader() -> u64 {
     dss_mark_clean_reboot();
     let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);

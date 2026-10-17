@@ -1,6 +1,6 @@
 //! A/B slot marking on husky: tell the bootloader that the slot ferros booted from is good, so ABL stops counting down its retries and the slot stays ferros across power cycles — what Android's boot-control HAL does once boot completes.
 //!
-//! The record is the `devinfo` partition (UFS LUN 3, 4 KiB LBA 6), measured on hardware (2026-10-14): magic "DEVI", u16 major = 3, then at G#30 one 4-byte word per slot (a, b): byte 0 = retries left, byte 1 = flags (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok). `fastboot --set-active` sets retries to 3, every ABL boot of an unmarked slot takes one, a marked slot keeps its count. Nothing else in the partition changed across slot switches and boots (no checksum, no mirror). The rest of the block is factory identity data (serials, MACs, IMEIs): it is rewritten byte-identical and verified, never altered.
+//! The record is the `devinfo` partition (UFS LUN 3, 4 KiB LBA 6), measured on hardware (2026-10-14): magic "DEVI", u16 major = 3, then at G#30 one 4-byte word per slot (a, b): byte 0 = retries left, byte 1 = flags (b0 unbootable, b1 successful, b2 active, b3 de-activated by a switch — not booted). `fastboot --set-active` sets retries to 3, every ABL boot of an unmarked slot takes one, a marked slot keeps its count. Nothing else in the partition changed across slot switches and boots (no checksum, no mirror). The rest of the block is factory identity data (serials, MACs, IMEIs): it is rewritten byte-identical and verified, never altered.
 //!
 //! Which slot booted is taken from two independent sources that must agree: the last `androidboot.slot_suffix` in the bootconfig ABL appends to the initrd (it carries two, `_a` then the real one — `:=` overrides, last wins), and devinfo's active bit. Any disagreement, unknown version or unknown flag bit → nothing is written.
 
@@ -12,6 +12,8 @@ const DEVINFO_LBA: u32 = 6;
 const SLOT_WORDS: usize = 0x30;
 const FLAG_SUCCESSFUL: u8 = 1 << 1;
 const FLAG_ACTIVE: u8 = 1 << 2;
+/// Bit 3: set on the slot that was de-activated by a switch (`fastboot --set-active` leaves it on the old slot and clears it on the new; measured 2026-10-17). A slot carrying it is not booted. Earlier guessed as "fastboot-ok".
+const FLAG_DEACTIVATED: u8 = 1 << 3;
 const FLAG_KNOWN: u8 = 0x0F;
 
 /// Outcome of `mark_booted_slot`, reported in DIAG as SLOT_MARK.
@@ -26,6 +28,8 @@ pub const UNKNOWN_FLAGS: u32 = 0x22;
 pub const NOT_ACTIVE: u32 = 0x23;
 pub const WRITE_FAILED: u32 = 0x30;
 pub const VERIFY_FAILED: u32 = 0x31;
+/// The devinfo write took but the UFS bBootLunEn attribute could not be switched (or did not read back): the bootloader would boot the old slot and re-sync devinfo to it.
+pub const BOOTLUN_FAILED: u32 = 0x32;
 
 pub struct SlotMark {
     /// 0 = a, 1 = b, G#FF = unknown.
@@ -125,4 +129,38 @@ pub fn mark_booted_slot(dtb_addr: u64) -> SlotMark {
     m.after = word(&back, slot);
     m.result = if back == want { MARKED } else { VERIFY_FAILED };
     m
+}
+
+/// Make `slot` (0 = a, 1 = b) the one ABL boots next: its active flag set with 3 retries (what `fastboot --set-active` writes), the other slot's active flag cleared, everything else byte for byte; verified by reading back. The gate's Android choice (ready.rs) uses it for slot a before a reset. Returns a result code as `mark_booted_slot` does.
+pub fn set_active(slot: usize) -> u32 {
+    if slot > 1 {
+        return BAD_FORMAT;
+    }
+    let ufs = UfsController::new(UFS_BASE);
+    let Some(block) = read_devinfo(&ufs) else { return READ_FAILED };
+    if &block[0..4] != b"DEVI" || u16::from_le_bytes([block[4], block[5]]) != 3 {
+        return BAD_FORMAT;
+    }
+    let flags = [block[SLOT_WORDS + 1], block[SLOT_WORDS + 5]];
+    if flags.iter().any(|f| f & !FLAG_KNOWN != 0) {
+        return UNKNOWN_FLAGS;
+    }
+    // Exactly what `fastboot --set-active` leaves (measured 2026-10-17 from Android after a switch to a: a = retries 2/3, flags G#06; b = flags G#0A): the new slot gets 3 retries, the active bit, and bit 3 CLEARED; the old slot loses the active bit and GAINS bit 3. Bit 3 marks the de-activated slot; ABL would not boot a slot still carrying it (our first write left it on a: ABL moved active back to b without even trying a).
+    let mut want = block.clone();
+    want[SLOT_WORDS + 4 * slot] = 3;
+    want[SLOT_WORDS + 4 * slot + 1] = (want[SLOT_WORDS + 4 * slot + 1] | FLAG_ACTIVE) & !FLAG_DEACTIVATED;
+    want[SLOT_WORDS + 4 * (1 - slot) + 1] = (want[SLOT_WORDS + 4 * (1 - slot) + 1] & !FLAG_ACTIVE) | FLAG_DEACTIVATED;
+    ufs.data_buffer_mut().copy_from_slice(&want);
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
+        return WRITE_FAILED;
+    }
+    if !matches!(read_devinfo(&ufs), Some(back) if back == want) {
+        return VERIFY_FAILED;
+    }
+    // The part devinfo alone cannot do (measured 2026-10-17, bootloader log): the ROM boots the bootloader chain from the Boot LU named by the UFS attribute bBootLunEn (1 = A, 2 = B), and the bootloader boots the Android slot of that letter — its log prints "boot slot: b" before it reads devinfo, and then writes the active flag back onto that slot ("AB Decision: active slot boot ok"). Three devinfo-only writes were undone that way. So the hand-off switches the Boot LU as well, as `fastboot --set-active` does.
+    let lun_en = slot as u32 + 1;
+    if ufs.read_attribute(0x00, 0) != Some(lun_en) && (!ufs.write_attribute(0x00, 0, lun_en) || ufs.read_attribute(0x00, 0) != Some(lun_en)) {
+        return BOOTLUN_FAILED;
+    }
+    MARKED
 }

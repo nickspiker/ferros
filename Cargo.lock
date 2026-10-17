@@ -710,6 +710,7 @@ dependencies = [
  "ferros_sys",
  "fluor",
  "fontdue",
+ "libm",
 ]
 
 [[package]]
@@ -723,6 +724,13 @@ version = "0.1.0"
 [[package]]
 name = "ferros-payload-echo-server"
 version = "0.1.0"
+
+[[package]]
+name = "ferros-payload-fptest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros-payload-hangtest"

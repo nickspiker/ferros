@@ -439,17 +439,29 @@ impl UfsController {
 
     /// A Query Request with no data segment (READ ATTRIBUTE, READ FLAG): the response UPIU's transaction-specific fields (bytes 12..32) and the OCS.
     fn query_tsf(&self, opcode: u8, idn: u8, index: u8) -> ([u8; 20], u8) {
+        self.query_tsf_fn(upiu::QUERY_FN_READ, opcode, idn, index)
+    }
+
+    fn query_tsf_fn(&self, function: u8, opcode: u8, idn: u8, index: u8) -> ([u8; 20], u8) {
+        self.query_tsf_fn_value(function, opcode, idn, index, 0)
+    }
+
+    /// The query with a VALUE field (TSF bytes 8..12, big-endian): WRITE ATTRIBUTE carries the new value there; every other query ignores it.
+    fn query_tsf_fn_value(&self, function: u8, opcode: u8, idn: u8, index: u8, value: u32) -> ([u8; 20], u8) {
         let mut tsf = [0u8; 20];
         unsafe {
             let buf = &raw mut UFS_BUF;
             core::ptr::write_bytes(&raw mut (*buf).ucd as *mut u8, 0, core::mem::size_of::<Ucd>());
             (*buf).ucd.cmd_upiu[0] = upiu::QUERY_REQ;
             (*buf).ucd.cmd_upiu[3] = 0;
-            (*buf).ucd.cmd_upiu[5] = upiu::QUERY_FN_READ;
+            (*buf).ucd.cmd_upiu[5] = function;
             (*buf).ucd.cmd_upiu[12] = opcode;
             (*buf).ucd.cmd_upiu[13] = idn;
             (*buf).ucd.cmd_upiu[14] = index;
             (*buf).ucd.cmd_upiu[15] = 0;
+            for (k, b) in value.to_be_bytes().iter().enumerate() {
+                (*buf).ucd.cmd_upiu[20 + k] = *b;
+            }
             let ucd_addr = &raw const (*buf).ucd as usize as u64;
             (*buf).utrd.dw[0] = (1 << 24) | (1 << 28);
             (*buf).utrd.dw[1] = 0;
@@ -489,6 +501,18 @@ impl UfsController {
             return None;
         }
         Some(u32::from_be_bytes([tsf[8], tsf[9], tsf[10], tsf[11]]))
+    }
+
+    /// QUERY WRITE ATTRIBUTE (write function): true when the device accepted it. `bBootLunEn` (G#00) is the one that matters: 1 = boot from Boot LU A, 2 = Boot LU B; the ROM reads it to pick the bootloader chain, and the bootloader boots the Android slot of the same letter (its "boot slot" is decided before it reads devinfo). Persistent. Never write 0 (boot disabled).
+    pub fn write_attribute(&self, idn: u8, index: u8, value: u32) -> bool {
+        let (tsf, ocs) = self.query_tsf_fn_value(0x81, 0x04, idn, index, value);
+        ocs == ocs::SUCCESS && tsf[3] == 0
+    }
+
+    /// QUERY SET FLAG (write function): true when the device accepted it. `fPowerOnWPEn` (G#03) makes every power-on-protected LU read-only until the next reset.
+    pub fn set_flag(&self, idn: u8) -> bool {
+        let (tsf, ocs) = self.query_tsf_fn(0x81, 0x06, idn, 0);
+        ocs == ocs::SUCCESS && tsf[3] == 0
     }
 
     /// QUERY READ FLAG: the flag's value (the low byte of the VALUE field), or None.

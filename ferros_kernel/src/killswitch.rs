@@ -70,7 +70,17 @@ fn both_held() -> bool {
 
 /// Either volume key down right now (DAT bit 0 = pressed). The "Ready?" gate's dev timer reads it.
 pub fn volume_key_down() -> bool {
-    rd(GPA4_DAT) & (1 << VOL_DOWN_PIN) == 0 || rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
+    vol_down_held() || vol_up_held()
+}
+
+/// Volume down held (active low). At the "Ready?" gate it chooses Android (BOOT.md).
+pub fn vol_down_held() -> bool {
+    rd(GPA4_DAT) & (1 << VOL_DOWN_PIN) == 0
+}
+
+/// Volume up held (active low). At the gate it holds: the dev auto-press is off for good.
+pub fn vol_up_held() -> bool {
+    rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
 }
 
 fn system_off() -> ! {

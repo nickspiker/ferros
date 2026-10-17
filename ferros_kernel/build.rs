@@ -22,6 +22,12 @@ fn main() {
         println!("cargo:rustc-cfg=ferros_production");
     }
     println!("cargo:rustc-check-cfg=cfg(ferros_production)");
+    // FERROS_NO_UFS_WP=1: a control build that does not arm the UFS power-on write protect at boot (bisecting the gate's Android path, 2026-10-17).
+    println!("cargo:rustc-check-cfg=cfg(ferros_no_ufs_wp)");
+    println!("cargo:rerun-if-env-changed=FERROS_NO_UFS_WP");
+    if std::env::var("FERROS_NO_UFS_WP").map(|v| v == "1").unwrap_or(false) {
+        println!("cargo:rustc-cfg=ferros_no_ufs_wp");
+    }
     println!("cargo:rerun-if-env-changed=FERROS_PRODUCTION");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64.ld");
     println!("cargo:rerun-if-changed=ferros_kernel/aarch64-shim.ld");
