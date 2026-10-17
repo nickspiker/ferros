@@ -715,6 +715,29 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#06 [hz] = switch the panel's refresh rate with its own command set, set the DSIM's command-TE timers, and measure the result (bridge `display mode 60|120`).
+                                            Some((6, args)) if !args.is_empty() => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                let hz = args[0] as u32;
+                                                let script = match hz {
+                                                    60 => Some(crate::hk3::REFRESH_60),
+                                                    120 => Some(crate::hk3::REFRESH_120),
+                                                    _ => None,
+                                                };
+                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
+                                                    rep.extend_from_slice(b"display not running\n");
+                                                } else if let Some(script) = script {
+                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
+                                                    if fail.is_none() {
+                                                        crate::dsim::set_cmd_te(hz);
+                                                    }
+                                                    let (pin_hz, _) = crate::display::te_rate(freq);
+                                                    rep.extend_from_slice(alloc::format!("mode {hz} Hz: {sent} packets{}; TE now {pin_hz} Hz\n", if fail.is_some() { " (FIFO stuck)" } else { "" }).as_bytes());
+                                                } else {
+                                                    rep.extend_from_slice(b"mode: 60 or 120\n");
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
                                             Some((5, _)) => {
                                                 let mut rep = alloc::vec::Vec::new();

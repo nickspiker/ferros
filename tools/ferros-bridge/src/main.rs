@@ -103,6 +103,10 @@ async fn main() {
         }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
+        "display" if args.get(2).map(String::as_str) == Some("mode") => {
+            let hz: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(120);
+            cmd_display_raw(&[6, hz]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("read") => {
             // display read <reg hex> [len = 1] — a DCS read from the panel.
             let reg = u8::from_str_radix(args.get(3).map(String::as_str).unwrap_or("0a"), 16).unwrap_or_else(|_| { eprintln!("bad register"); std::process::exit(1) });
