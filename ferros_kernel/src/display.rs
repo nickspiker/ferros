@@ -103,6 +103,23 @@ pub struct Panel {
     pub stride: usize,
     up: u32,
     cntfrq: u64,
+    /// The layer's DMA block, for its IRQ status after a present (read errors show there).
+    dpp: usize,
+}
+
+/// Where the painter's pixels live: 0 = ABL's splash surface (the layer's own base, through the SYSMMU if it translates); otherwise the physical base of ferros's own framebuffer (cachemap DISPLAY_FB), which `adopt` points the layer at. The layer's original base, stride and offset are kept for the way back.
+static FB_OVERRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ABL_LAYER: [core::sync::atomic::AtomicU32; 3] = [core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0)];
+
+/// Paint on ferros's own framebuffer (true) or ABL's surface (false). Takes effect at the next `adopt` (every show/fill).
+pub fn use_own_fb(own: bool) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (f0, f1) = crate::cachemap::DISPLAY_FB;
+    if own && f0 == f1 {
+        return false;
+    }
+    FB_OVERRIDE.store(if own { f0 } else { 0 }, Relaxed);
+    true
 }
 
 /// Put `text` on the panel (bridge DISPLAY): adopt, amber console, one frame. Returns the adoption report.
@@ -375,6 +392,34 @@ pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
         return None;
     }
 
+    // ferros's own framebuffer: the layer re-pointed at it (translation is off on a cold boot, so the DMA address is the physical one), stride = width, no offset; ABL's words kept the first time so `use_own_fb(false)` can put them back.
+    use core::sync::atomic::Ordering::Relaxed;
+    let own = FB_OVERRIDE.load(Relaxed);
+    let (stride, iova) = if own != 0 {
+        if ABL_LAYER[0].load(Relaxed) == 0 {
+            ABL_LAYER[0].store(rd(dpp_base + RDMA_BASEADDR_P0), Relaxed);
+            ABL_LAYER[1].store(rd(dpp_base + RDMA_SRC_WIDTH), Relaxed);
+            ABL_LAYER[2].store(rd(dpp_base + RDMA_SRC_OFFSET), Relaxed);
+        }
+        wr(dpp_base + RDMA_BASEADDR_P0, own as u32);
+        wr(dpp_base + RDMA_SRC_WIDTH, width as u32);
+        wr(dpp_base + RDMA_SRC_OFFSET, 0);
+        append_hex(rep, b"OWN_FB=", own as u32);
+        (width, own as u64)
+    } else {
+        if ABL_LAYER[0].load(Relaxed) != 0 && rd(dpp_base + RDMA_BASEADDR_P0) == crate::cachemap::DISPLAY_FB.0 as u32 {
+            wr(dpp_base + RDMA_BASEADDR_P0, ABL_LAYER[0].load(Relaxed));
+            wr(dpp_base + RDMA_SRC_WIDTH, ABL_LAYER[1].load(Relaxed));
+            wr(dpp_base + RDMA_SRC_OFFSET, ABL_LAYER[2].load(Relaxed));
+            let stride = ABL_LAYER[1].load(Relaxed) as usize;
+            let src_off = ABL_LAYER[2].load(Relaxed);
+            let first_px = ((src_off >> 16) as usize) * stride + (src_off & 0xFFFF) as usize;
+            (stride, ABL_LAYER[0].load(Relaxed) as u64 + first_px as u64 * 4)
+        } else {
+            (stride, iova)
+        }
+    };
+
     // Physically contiguous prefix of the surface (whole 1 MiB sections that follow on from the first).
     let fb_bytes = stride * height * 4;
     let phys0 = match iova_to_phys(sysmmu, iova) {
@@ -431,7 +476,7 @@ pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     }
     append_hex(rep, b"IN_CTRL_0_AFTER=", rd(dpp_base + RDMA_IN_CTRL_0));
 
-    Some(Panel { fb: phys0 as usize, width, rows: contig_rows, stride, up, cntfrq })
+    Some(Panel { fb: phys0 as usize, width, rows: contig_rows, stride, up, cntfrq, dpp: dpp_base })
 }
 
 impl Panel {
@@ -467,5 +512,9 @@ impl Panel {
         append_hex(rep, b"SHD_REG_UP_REQ_AFTER=", rd(DECON0 + SHD_REG_UP_REQ));
         append_hex(rep, b"DECON_INT_PEND=", rd(DECON0 + DECON_INT_PEND));
         append_hex(rep, b"TRIG_CON_AFTER=", rd(DECON0 + TRIG_CON));
+        // The layer DMA's IRQ status (regs-dpp.h RDMA_IRQ): FRAME_DONE bit 16; READ_SLAVE_ERR bit 19 or AXI_ADDR_ERR bit 26 would mean the fence or the bus refused the surface. Cleared for the next present.
+        let irq = rd(self.dpp + 0x0004);
+        append_hex(rep, b"RDMA_IRQ=", irq);
+        wr(self.dpp + 0x0004, irq & (0xDFB << 16));
     }
 }

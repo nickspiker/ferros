@@ -45,6 +45,12 @@ pub const DMA_POOL: (usize, usize) = (0x8180_0000, 0x81A0_0000);
 #[cfg(shim_handoff)]
 pub const DMA_POOL: (usize, usize) = (0, 0);
 
+/// The display's framebuffers (cold only): 32 MiB of Normal non-cacheable, EL0 read/write memory above the window (two WQHD BGRX8888 surfaces of 15.3 MiB), the DPU's DMA target once ferros stops painting on ABL's splash surface. Granted as the DMA region `display-fb`. Free DRAM on a cold boot: Linux's image would be here, and the first reserved carveout (zuma-rmem.dtsi) is at G#9000_0000.
+#[cfg(not(shim_handoff))]
+pub const DISPLAY_FB: (usize, usize) = (0x8400_0000, 0x8600_0000);
+#[cfg(shim_handoff)]
+pub const DISPLAY_FB: (usize, usize) = (0, 0);
+
 /// HCR_EL2 / CPTR_EL2 as the loader left them, restored before RELOAD hands over.
 static mut BOOT_HCR: u64 = 0;
 static mut BOOT_CPTR: u64 = 0;
@@ -126,8 +132,11 @@ pub fn enable() -> bool {
     let (d0, d1) = dma_range();
     let (p0, p1) = POOL;
     let (q0, q1) = DMA_POOL;
+    let (f0, f1) = DISPLAY_FB;
     let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
-    if w0 / GIB != (w1 - 1) / GIB || d0 < w0 || d1 > w1 || (d1 - 1) / MIB2 - d0 / MIB2 >= 2 || p0 < w0 || p1 > w1 || (d0 < p1 && p0 < d1) || !dma_ok {
+    // The framebuffers sit outside the window but in its GiB (so the level-2 table covers them), 2 MiB aligned.
+    let fb_ok = f0 == f1 || (f0 % MIB2 == 0 && f1 % MIB2 == 0 && f0 / GIB == w0 / GIB && (f1 - 1) / GIB == w0 / GIB && (f1 <= w0 || f0 >= w1));
+    if w0 / GIB != (w1 - 1) / GIB || d0 < w0 || d1 > w1 || (d1 - 1) / MIB2 - d0 / MIB2 >= 2 || p0 < w0 || p1 > w1 || (d0 < p1 && p0 < d1) || !dma_ok || !fb_ok {
         return false;
     }
     let vhe = has_vhe();
@@ -144,7 +153,9 @@ pub fn enable() -> bool {
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if a + MIB2 <= w0 || a >= w1 {
+            *e = if f0 != f1 && a >= f0 && a + MIB2 <= f1 {
+                dma_pool(vhe, a, BLOCK)
+            } else if a + MIB2 <= w0 || a >= w1 {
                 device(vhe, a, BLOCK)
             } else if a >= p0 && a + MIB2 <= p1 {
                 // The pool at 4 KiB granularity (per-arc W^X). A fresh/freed page is data: writable, non-executable; spawn flips a process's code pages to read-only + executable.

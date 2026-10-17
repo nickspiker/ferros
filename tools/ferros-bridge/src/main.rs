@@ -120,6 +120,11 @@ async fn main() {
                 }
             }
         }
+        "display" if args.get(2).map(String::as_str) == Some("fb") => {
+            // display fb own|abl — paint on ferros's own framebuffer (the display-fb DMA region) or ABL's splash surface.
+            let own = args.get(3).map(|a| a == "own").unwrap_or(true) as u8;
+            cmd_display_raw(&[15, own]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("fill") => {
             // display fill <rrggbb> — a solid colour over the whole panel.
             let rgb = args.get(3).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);

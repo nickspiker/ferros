@@ -819,6 +819,17 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#0F [1 = ferros's own framebuffer (cachemap DISPLAY_FB), 0 = ABL's surface] = where the painter draws and the layer reads (bridge `display fb own|abl`), then a frame to prove it.
+                                            Some((15, args)) if !args.is_empty() => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::use_own_fb(args[0] == 1) {
+                                                    rep.extend_from_slice(b"no framebuffer region on this boot path\n");
+                                                } else {
+                                                    let r = crate::display::show(if args[0] == 1 { b"ferros: own framebuffer" } else { b"ferros: ABL's surface" }, freq);
+                                                    rep.extend_from_slice(&r);
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
                                             Some((12, args)) if args.len() >= 3 => {
                                                 let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);

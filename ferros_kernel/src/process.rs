@@ -298,7 +298,10 @@ pub struct Dma {
     pub base: usize,
     pub size: usize,
 }
-pub static DMA: &[Dma] = &[Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 }];
+pub static DMA: &[Dma] = &[
+    Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 },
+    Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
+];
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
 static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
