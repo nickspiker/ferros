@@ -371,14 +371,15 @@ fn knee(l: f32, white: f32, k: f32) -> f32 {
     white * (1.0 + (h - 1.0) * tanh(k * (l - 1.0)) / top)
 }
 
-/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the knee curve with white at 57 % of peak — linear to 1×, the 3.3 stops above rolled into the remaining 0.8 stop. Bottom half: linear at the same white, clipped at the peak. The halves are identical up to the 1× tick by construction. Ticks (dark lines) at L = 1, 2, 4, 8.
+/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the display curve, Y/peak = tanh(L/H) with H = 1.75 — slope 1 at black, white at 52 % of peak, everything above rolled toward the peak, nothing clipped. Bottom half: linear with white at 57 %, clipped at the peak. A 12-pixel line of code 255 between them is the peak itself. Ticks (dark lines) at L = 1, 2, 4, 8.
 fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     let stops_lo = -6.0f32;
     let stops_hi = libm::log2f(9.6);
     for x in 0..width {
         let stops = stops_lo + (stops_hi - stops_lo) * x as f32 / (width - 1) as f32;
         let l = libm::exp2f(stops);
-        let top = panel_code(knee(l, 0.574, 0.35));
+        // The owner's curve (2026-10-17): Y/peak = tanh(L/H), H = peak ÷ white — smooth everywhere, never clips, white at tanh(1/H) of the peak (52 % at H = 1.75 against 57 % linear).
+        let top = panel_code(tanh(l / 1.75));
         let bottom = panel_code(l * 0.574);
         let tick = [0.0f32, 1.0, 2.0, 3.0].iter().any(|t| libm::fabsf(stops - t) < 0.004);
         for y in 0..height {
@@ -386,6 +387,8 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
             let c = if y < height / 2 { top } else { bottom };
             // A hairline tick where L is a power of two from white, in the two middle bands only.
             let c = if tick && (band == 3 || band == 4) { 0 } else { c };
+            // The panel's peak, code 255, as a 12-pixel line between the halves: the reference both ramps' tops are judged against.
+            let c = if y >= height / 2 - 6 && y < height / 2 + 6 { 255 } else { c };
             pixels[y * width + x] = 0xFF00_0000 | c << 16 | c << 8 | c;
         }
     }
