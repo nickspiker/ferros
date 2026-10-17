@@ -5,7 +5,7 @@
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap
 //! Grant slots, in that order: 0 console, 1 DECON main, 2 DECON win, 3 DECON wincon, 4 DMA0, 5 DPP0, 6 GPP0, 7 the framebuffer region, 8 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow).
 //!
-//! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass.
+//! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass. What is not a convention is fluor's order: it composites **front to back**, a paint goes *under* what is already there and an opaque pixel is left alone, so a frame starts from transparent (α = 0), the text goes down first and the background last. (The first cut filled black over raw DRAM: every word that happened to carry α = FF survived, a random-colour matrix at 1 in 256 — the owner's "green speckle wallpaper", 2026-10-16.)
 
 #![no_std]
 #![no_main]
@@ -103,8 +103,8 @@ impl Bump {
 #[global_allocator]
 static ALLOC: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1) };
 
-/// Open Sans (OFL), the shell's face until the owner picks one.
-static FONT: &[u8] = include_bytes!("../../../../fluor/assets/Open_Sans/static/OpenSans-Regular.ttf");
+/// Oxanium (OFL, assets/fonts), the owner's choice for ferros's face — the same family as the "Ready?" screen.
+static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular.ttf");
 
 /// An opaque colour in the layer's own byte order, which fluor blends linearly like any other word.
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -355,33 +355,36 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 
     pipe.take_layer(fb, width as u32);
 
-    // The first-boot screen (SHELL.md 3): the status line, the one thing a sovereign device needs first, the foot.
+    // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules, and the black last, under everything.
     let mut damage = Damage::new();
+    pixels.fill(0);
     {
         let mut c = Canvas::new(pixels, width, height, &mut damage);
-        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
-        paint::fill_rect(&mut c, margin as isize, (status_y + span * 0.03) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
         text_center(&mut c, &font, "ferros", h * 0.40, span * 0.11, WHITE);
         text_center(&mut c, &font, "No one yet.", h * 0.47, span * 0.032, GREY);
         text_center(&mut c, &font, "Pair with a device you trust.", h * 0.51, span * 0.032, GREY);
-        paint::fill_rect(&mut c, (w * 0.5 - span * 0.004) as isize, (h * 0.56) as isize, (span * 0.008) as isize, (span * 0.008) as isize, AMBER, None, None);
-        paint::fill_rect(&mut c, margin as isize, (h - span * 0.09) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
         text(&mut c, &font, "apps", margin, h - span * 0.05, span * 0.019, DIM);
         text_right(&mut c, &font, "slot b \u{2022} ferros", w - margin, h - span * 0.05, span * 0.019, GREY);
+        paint::fill_rect(&mut c, (w * 0.5 - span * 0.004) as isize, (h * 0.56) as isize, (span * 0.008) as isize, (span * 0.008) as isize, AMBER, None, None);
+        paint::fill_rect(&mut c, margin as isize, (status_y + span * 0.03) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
+        paint::fill_rect(&mut c, margin as isize, (h - span * 0.09) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
+        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
     }
     ALLOC.reset();
+    let strip = (status_y + span * 0.02) as usize;
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
     loop {
-        // The status line: uptime left, the link and the layer's state right; repainted every second.
+        // The status line: uptime left, the link and the layer's state right; repainted every second — the strip cleared to transparent, text, then black under it.
         let secs = now() / freq();
+        pixels[..strip * width].fill(0);
         {
             let mut c = Canvas::new(pixels, width, height, &mut damage);
-            paint::fill_rect(&mut c, 0, 0, width as isize, (status_y + span * 0.02) as isize, BLACK, None, None);
             let t = uptime(&mut clock, secs);
             text(&mut c, &font, t, margin, status_y, status_px, GREY);
             text_right(&mut c, &font, "USB \u{2022} slot b", w - margin, status_y, status_px, DIM);
+            paint::fill_rect(&mut c, 0, 0, width as isize, strip as isize, BLACK, None, None);
         }
         ALLOC.reset();
         ferros_sys::dma_barrier();

@@ -120,6 +120,11 @@ async fn main() {
                 }
             }
         }
+        "display" if args.get(2).map(String::as_str) == Some("dither") => {
+            // display dither <hex> — the DQE display dither word (1 = on, 0 = off, 5 = on + temporal frame control, 3 = shift mode); applied at the next present.
+            let v = args.get(3).and_then(|a| u8::from_str_radix(a.trim_start_matches("0x"), 16).ok()).unwrap_or(1);
+            cmd_display_raw(&[16, v]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("fb") => {
             // display fb own|abl — paint on ferros's own framebuffer (the display-fb DMA region) or ABL's splash surface.
             let own = args.get(3).map(|a| a == "own").unwrap_or(true) as u8;

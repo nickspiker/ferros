@@ -832,6 +832,21 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#10 [dither word] = the DQE's display dither register (DQE_DISP_DITHER: EN b0, MODE b1 = shift, FRAME_CON b2 = temporal, FRAME_OFFSET [4:3], TABLE_SEL R/G/B b5..b7) with the DQE shadow update requested; the next present applies it (bridge `display dither <hex>`). For finding the setting that doesn't speckle black at 10 bpc.
+                                            Some((16, args)) if !args.is_empty() => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                let dqe = 0x194D_0000usize;
+                                                unsafe {
+                                                    write_volatile((dqe + 0x2800) as *mut u32, args[0] as u32);
+                                                    let shd = 0x1947_0050usize;
+                                                    write_volatile(shd as *mut u32, read_volatile(shd as *const u32) | 1 << 24);
+                                                }
+                                                crate::display::append_hex(&mut rep, b"DQE_DISP_DITHER=", unsafe { read_volatile((dqe + 0x2800) as *const u32) });
+                                                crate::display::append_hex(&mut rep, b"DQE_CGC_DITHER=", unsafe { read_volatile((dqe + 0x2400) as *const u32) });
+                                                crate::display::append_hex(&mut rep, b"DECON_GLOBAL_CON=", unsafe { read_volatile(0x1947_0020usize as *const u32) });
+                                                crate::display::append_hex(&mut rep, b"DATA_PATH_CON_0=", unsafe { read_volatile(0x1947_0200usize as *const u32) });
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
                                             Some((12, args)) if args.len() >= 3 => {
                                                 let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);
