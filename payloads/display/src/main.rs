@@ -416,6 +416,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.dec(hs_mbps as u64);
     log.s(b" Mbps\n");
     log.flush();
+    // Nothing moves between presents, so the panel may rest: the 10 Hz auto-rate floor (its own engine drops the refresh when frames stop and comes back for the next one; DISPLAY-POWER.md: 150–190 mW under 120 Hz). A client can change it (op 8).
+    if dsi.alive() {
+        let (_, fail) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
+        log.s(if fail.is_none() { b"display: panel idle floor 10 Hz\n" } else { b"display: idle floor command stuck\n" });
+        log.flush();
+    }
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
