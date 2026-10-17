@@ -102,6 +102,13 @@ async fn main() {
             cmd_display_dcs(&script).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
+        "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
+        "display" if args.get(2).map(String::as_str) == Some("read") => {
+            // display read <reg hex> [len = 1] — a DCS read from the panel.
+            let reg = u8::from_str_radix(args.get(3).map(String::as_str).unwrap_or("0a"), 16).unwrap_or_else(|_| { eprintln!("bad register"); std::process::exit(1) });
+            let len: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(1);
+            cmd_display_raw(&[4, reg, len]).await;
+        }
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);

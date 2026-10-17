@@ -17,6 +17,22 @@ const FIFOCTRL_FULL_PH_SFR: u32 = 1 << 11;
 const FIFOCTRL_FULL_PL_SFR: u32 = 1 << 9;
 const INTSRC_SFR_PH_FIFO_EMPTY: u32 = 1 << 28;
 const INTSRC_SFR_PL_FIFO_EMPTY: u32 = 1 << 29;
+const INTSRC_BTA_TOUT: u32 = 1 << 20;
+const INTSRC_RX_DATA_DONE: u32 = 1 << 18;
+const DSIM_RXFIFO: usize = 0x0060;
+const FIFOCTRL_EMPTY_RX: u32 = 1 << 12;
+const PKTHDR_BTA: u32 = 1 << 24;
+/// DSI data types of the read request and the responses (MIPI DSI 1.3 §8.7, §8.10).
+const SET_MAXIMUM_RETURN_PACKET_SIZE: u8 = 0x37;
+pub const DCS_READ: u8 = 0x06;
+const RX_ACK_AND_ERROR: u8 = 0x02;
+const RX_END_OF_TRANSMISSION: u8 = 0x08;
+const RX_GENERIC_SHORT_1: u8 = 0x11;
+const RX_GENERIC_SHORT_2: u8 = 0x12;
+const RX_GENERIC_LONG: u8 = 0x1A;
+const RX_DCS_LONG: u8 = 0x1C;
+const RX_DCS_SHORT_1: u8 = 0x21;
+const RX_DCS_SHORT_2: u8 = 0x22;
 
 /// DSI data types (MIPI DSI 1.3 §8.7).
 pub const DCS_SHORT_WRITE_0: u8 = 0x05;
@@ -129,6 +145,61 @@ pub fn sequence(script: &[u8], cntfrq: u64) -> (usize, Option<u32>) {
     (sent, None)
 }
 
+/// A DCS read of `len` bytes (at most 64) from register `cmd`: the maximum-return-size packet, then the read request with bus turn-around, then the response out of the RX FIFO, the way the stock driver does it. Err carries INTSRC on a timeout or the unexpected RX header.
+pub fn read(cmd: u8, len: usize, cntfrq: u64) -> Result<Vec<u8>, u32> {
+    let len = len.clamp(1, 64);
+    if !wait_fifo(FIFOCTRL_EMPTY_PH_SFR | FIFOCTRL_EMPTY_PL_SFR, cntfrq) {
+        return Err(rd(DSIM_FIFOCTRL));
+    }
+    // Drain anything stale, then clear the done and timeout flags.
+    while rd(DSIM_FIFOCTRL) & FIFOCTRL_EMPTY_RX == 0 {
+        let _ = rd(DSIM_RXFIFO);
+    }
+    wr(DSIM_INTSRC, INTSRC_RX_DATA_DONE | INTSRC_BTA_TOUT | INTSRC_SFR_PH_FIFO_EMPTY);
+    wr(DSIM_PKTHDR, SET_MAXIMUM_RETURN_PACKET_SIZE as u32 | (len as u32) << 8);
+    wr(DSIM_PKTHDR, DCS_READ as u32 | (cmd as u32) << 8 | PKTHDR_BTA);
+    if !wait_fifo(FIFOCTRL_EMPTY_PH_SFR, cntfrq) {
+        return Err(rd(DSIM_FIFOCTRL));
+    }
+    // Wait for the response. The BTA timeout flag comes up early on this link while the turn-around and the data still follow (measured), so only the data's absence after 100 ms is a failure.
+    let start = now();
+    loop {
+        let i = rd(DSIM_INTSRC);
+        if i & INTSRC_RX_DATA_DONE != 0 {
+            break;
+        }
+        if now().wrapping_sub(start) > cntfrq / 10 {
+            return Err(i);
+        }
+    }
+    let head = rd(DSIM_RXFIFO);
+    let mut out = Vec::with_capacity(len);
+    match (head & 0xFF) as u8 {
+        RX_DCS_SHORT_2 | RX_GENERIC_SHORT_2 => {
+            out.push((head >> 8) as u8);
+            out.push((head >> 16) as u8);
+        }
+        RX_DCS_SHORT_1 | RX_GENERIC_SHORT_1 => out.push((head >> 8) as u8),
+        RX_DCS_LONG | RX_GENERIC_LONG => {
+            let n = ((head >> 8) & 0xFFFF) as usize;
+            while out.len() < n.min(len) {
+                let w = rd(DSIM_RXFIFO);
+                for k in 0..4 {
+                    if out.len() < n.min(len) {
+                        out.push((w >> (8 * k)) as u8);
+                    }
+                }
+            }
+        }
+        RX_ACK_AND_ERROR | RX_END_OF_TRANSMISSION => return Err(head),
+        _ => return Err(head),
+    }
+    while rd(DSIM_FIFOCTRL) & FIFOCTRL_EMPTY_RX == 0 {
+        let _ = rd(DSIM_RXFIFO);
+    }
+    Ok(out)
+}
+
 /// The DSIM's link registers, G#00..G#124, as the oracle's `DSIM 0 LINK SFR DUMP` lays them out, for diffing against it.
 pub fn dump(out: &mut Vec<u8>) {
     for row in (0..0x128).step_by(0x20) {
@@ -144,6 +215,39 @@ pub fn dump(out: &mut Vec<u8>) {
         }
         out.push(b'\n');
     }
+}
+
+/// The DPHY registers in the stock dump's layout (dsim_reg.c __dphy_dump): BIAS at G#1946_0000, then PLL, clock lane (MC) and data lanes (MD0..3) at G#1946_0100 + the offsets shown.
+pub fn dump_phy(out: &mut Vec<u8>) {
+    const BIAS: usize = 0x1946_0000;
+    const PHY: usize = 0x1946_0100;
+    let mut block = |label: &[u8], base: usize, from: usize, len: usize| {
+        out.extend_from_slice(label);
+        out.push(b'\n');
+        for row in (from..from + len).step_by(0x20) {
+            out.extend_from_slice(b"[");
+            hex(out, row as u32);
+            out.extend_from_slice(b"]");
+            for col in (0..0x20).step_by(4) {
+                if row + col >= from + len {
+                    break;
+                }
+                out.push(b' ');
+                hex(out, unsafe { core::ptr::read_volatile((base + row + col) as *const u32) });
+            }
+            out.push(b'\n');
+        }
+    };
+    block(b"-[BIAS]-", BIAS, 0, 0x14);
+    block(b"-[PLL]-", PHY, 0, 0x44);
+    block(b"-[MC]-", PHY, 0x200, 0x48);
+    block(b"-[MC]-", PHY, 0x2E0, 0x10);
+    for (i, lane) in [(0usize, &b"-[MD0]-"[..]), (1, b"-[MD1]-"), (2, b"-[MD2]-")].iter().map(|(i, l)| (*i, *l)) {
+        block(lane, PHY, 0x300 + i * 0x100, 0x70);
+        block(lane, PHY, 0x3E0 + i * 0xE0, 0x40);
+    }
+    block(b"-[MD3]-", PHY, 0x600, 0x48);
+    block(b"-[MD3]-", PHY, 0x6C0, 0x20);
 }
 
 fn hex(out: &mut Vec<u8>, v: u32) {

@@ -121,6 +121,42 @@ pub fn show(text: &[u8], cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
+const DECON_INT_EN: usize = 0x0060;
+const INT_EN_EXTRA: u32 = 1 << 4;
+const DECON_INT_EN_EXTRA: usize = 0x0064;
+const INT_EN_TE_RISE: u32 = 1 << 16;
+const DECON_INT_PEND_EXTRA: usize = 0x0074;
+const INT_PEND_TE_RISE: u32 = 1 << 16;
+const HW_TE_CNT: usize = 0x0038;
+
+/// The panel's refresh rate as DECON sees it: TE rising edges counted over half a second (the TE-rise interrupt pend bit, polled and cleared) and the hardware TE counter's delta, reported as Hz. Ground truth for mode switches, no eyes needed.
+pub fn te_rate(cntfrq: u64) -> (u32, u32) {
+    let en = rd(DECON0 + DECON_INT_EN);
+    let en_x = rd(DECON0 + DECON_INT_EN_EXTRA);
+    wr(DECON0 + DECON_INT_EN_EXTRA, en_x | INT_EN_TE_RISE);
+    wr(DECON0 + DECON_INT_EN, en | INT_EN_EXTRA);
+    wr(DECON0 + DECON_INT_PEND_EXTRA, INT_PEND_TE_RISE);
+    let hw0 = rd(DECON0 + HW_TE_CNT);
+    let start: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start) };
+    let mut rises = 0u32;
+    loop {
+        let now: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+        if now.wrapping_sub(start) >= cntfrq / 2 {
+            break;
+        }
+        if rd(DECON0 + DECON_INT_PEND_EXTRA) & INT_PEND_TE_RISE != 0 {
+            wr(DECON0 + DECON_INT_PEND_EXTRA, INT_PEND_TE_RISE);
+            rises += 1;
+        }
+    }
+    let hw1 = rd(DECON0 + HW_TE_CNT);
+    wr(DECON0 + DECON_INT_EN_EXTRA, en_x);
+    wr(DECON0 + DECON_INT_EN, en);
+    (rises * 2, hw1.wrapping_sub(hw0).wrapping_mul(2))
+}
+
 /// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).
 pub fn dpu_on() -> bool {
     [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) == 1)

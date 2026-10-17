@@ -711,6 +711,37 @@ pub fn run(mut b: Boot) -> ! {
                                                     rep.extend_from_slice(b"DPU powered down\n");
                                                 } else {
                                                     crate::dsim::dump(&mut rep);
+                                                    crate::dsim::dump_phy(&mut rep);
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
+                                            Some((5, _)) => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() {
+                                                    rep.extend_from_slice(b"DPU powered down\n");
+                                                } else {
+                                                    let (irq_hz, hw_hz) = crate::display::te_rate(freq);
+                                                    rep.extend_from_slice(alloc::format!("TE: {irq_hz} Hz by interrupt, {hw_hz} Hz by HW_TE_CNT\n").as_bytes());
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#04 [cmd][len] = a DCS read from the panel (bridge `display read`).
+                                            Some((4, args)) if args.len() >= 2 => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() {
+                                                    rep.extend_from_slice(b"DPU powered down\n");
+                                                } else {
+                                                    match crate::dsim::read(args[0], args[1] as usize, freq) {
+                                                        Ok(bytes) => {
+                                                            rep.extend_from_slice(alloc::format!("read G#{:02x}:", args[0]).as_bytes());
+                                                            for b in bytes {
+                                                                rep.extend_from_slice(alloc::format!(" {b:02x}").as_bytes());
+                                                            }
+                                                            rep.push(b'\n');
+                                                        }
+                                                        Err(e) => rep.extend_from_slice(alloc::format!("read G#{:02x} failed: G#{e:08x}\n", args[0]).as_bytes()),
+                                                    }
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
