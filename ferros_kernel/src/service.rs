@@ -730,6 +730,8 @@ pub fn run(mut b: Boot) -> ! {
                                                     let (sent, fail) = crate::dsim::sequence(script, freq);
                                                     if fail.is_none() {
                                                         crate::dsim::set_cmd_te(hz);
+                                                        // The DSIM's registers are shadowed: a frame applies the timers.
+                                                        let _ = crate::display::show(if hz == 60 { b"ferros 60 Hz" } else { b"ferros 120 Hz" }, freq);
                                                     }
                                                     let (pin_hz, _) = crate::display::te_rate(freq);
                                                     rep.extend_from_slice(alloc::format!("mode {hz} Hz: {sent} packets{}; TE now {pin_hz} Hz\n", if fail.is_some() { " (FIFO stuck)" } else { "" }).as_bytes());
@@ -756,7 +758,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 if !crate::display::dpu_on() || !crate::dsim::alive() {
                                                     rep.extend_from_slice(b"display not running\n");
                                                 } else {
-                                                    crate::display::resolution(args[0] == 1, freq, &mut rep);
+                                                    crate::display::resolution(args[0] == 1, args.get(1).copied().unwrap_or(7), freq, &mut rep);
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }

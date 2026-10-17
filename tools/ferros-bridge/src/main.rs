@@ -105,8 +105,10 @@ async fn main() {
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" if args.get(2).map(String::as_str) == Some("res") => {
+            // display res fhd|wqhd [steps mask: 1 panel, 2 DECON+DSC+layer, 4 DSIM; default 7]
             let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
-            cmd_display_raw(&[8, fhd]).await;
+            let steps: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(7);
+            cmd_display_raw(&[8, fhd, steps]).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("mode") => {
             let hz: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(120);
