@@ -13,7 +13,7 @@ use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 
 /// 64 MiB in the LOW DRAM bank, just under the secure carveout at G#B620_0000 and clear of where ABL stages the boot images (G#A000_0000..G#AA00_0000) and keeps its heap (G#F8B3_C000). It was the last 64 MiB of DRAM (G#A_FC00_0000) first: the high bank reads as decayed cells after every reset, and Android under the hv lost cores to silent hangs after a minute of idling with nothing in the hv's log — consistent with that bank, or the hv's part of it, not being kept refreshed under deep idle either (2026-10-17).
-const HV_BASE: u64 = 0xB200_0000;
+const HV_BASE: u64 = 0xA_FC00_0000;
 const HV_SIZE: u64 = 0x400_0000;
 /// Where the patched DTB goes: the megabyte below the reserved region, ordinary RAM that Linux reserves itself once it has read the tree from there.
 const DTB_COPY: u64 = HV_BASE - 0x10_0000;
@@ -41,6 +41,11 @@ global_asm!(
 _entry:
     msr     daifset, #0xF
     mov     x19, x0                     // DTB from ABL
+    // Band in splash slot 3 (rows 288..384, grey A0) before anything else: ABL jumped into the hv. PC-relative, no stack, no memory of ours.
+    mov     x9, #3
+    movz    x10, #0xA0A0
+    movk    x10, #0xFFA0, lsl #16
+    bl      asm_band
     // Copy [_start, __hv_copy_end) to HV_BASE. PC-relative source, absolute destination; the MMU is off so these are plain DRAM writes.
     adrp    x1, _start
     add     x1, x1, :lo12:_start
@@ -58,6 +63,11 @@ _entry:
     ldr     x4, =.Lrelocated
     br      x4
 .Lrelocated:
+    // Band in slot 2 (rows 192..288, grey 60): the copy landed and the jump into it worked.
+    mov     x9, #2
+    movz    x10, #0x6060
+    movk    x10, #0xFF60, lsl #16
+    bl      asm_band
     // Zero bss, take the primary stack, enter Rust.
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end
@@ -161,6 +171,42 @@ unexpected:
 6:  wfe
     b       6b
 
+// Leaf, no stack: paint 88 rows of colour x10 across the layer DMA0 scans, at slot x9 (96 rows each). Clobbers x11-x16. Same registers and guards as splash::band.
+.global asm_band
+asm_band:
+    movz    x11, #0x1990, lsl #16       // DMA0
+    ldr     w12, [x11, #0x40]           // base (physical: translation off)
+    ldr     w13, [x11, #0x10]           // stride, pixels
+    ldr     w14, [x11, #0x1C]           // height:16 | width:16
+    and     x15, x14, #0xFFFF           // width
+    lsr     x14, x14, #16               // height
+    lsr     x16, x12, #31               // base below G#8000_0000 is not DRAM
+    cbz     x16, 9f
+    cbz     x13, 9f
+    cmp     x13, #8192
+    b.hi    9f
+    cbz     x15, 9f
+    add     x16, x9, #1
+    lsl     x16, x16, #5
+    add     x16, x16, x16, lsl #1       // (slot+1)*96
+    cmp     x14, x16
+    b.lo    9f
+    lsl     x16, x9, #5
+    add     x16, x16, x16, lsl #1       // slot*96 = first row
+    lsl     x13, x13, #2                // stride in bytes
+    madd    x12, x16, x13, x12          // row address
+    mov     x14, #88
+7:  mov     x16, x15                    // x pixels left
+    mov     x11, x12
+8:  str     w10, [x11], #4
+    subs    x16, x16, #1
+    b.ne    8b
+    add     x12, x12, x13
+    subs    x14, x14, #1
+    b.ne    7b
+    dsb     sy
+9:  ret
+
 // Leaf: x1 = MPIDR → x0 = index into the per-core tables (Aff1 is the core number on this SoC: cluster-level affinity sits in Aff2 and the nine cores are numbered 0-8 in Aff1).
 .global core_index
 core_index:
@@ -200,6 +246,14 @@ fn bump(off: usize) {
 
 /// Where each core should go after the hv brings it up: the entry and context Linux passed to PSCI, by core index.
 static mut RESUME: [[u64; 2]; 16] = [[0; 2]; 16];
+/// Per-core counts: resumes through `_secondary`, SMCs trapped. Written by one core each, read for the log.
+static mut RESUMES: [u64; 16] = [0; 16];
+static mut SMCS: [u64; 16] = [0; 16];
+/// The distinct SMC function IDs seen (first occurrence logged with its arguments), 32 slots.
+static mut FIDS: [u64; 32] = [0; 32];
+/// Per core: the guest's DBGBVR0_EL1, DBGBCR0_EL1 and MDSCR_EL1 while the hv runs it natively over an SMC, and a count of such runs.
+static mut STEP_SAVED: [u64; 48] = [0; 48];
+static mut STEPS: [u64; 16] = [0; 16];
 
 /// EL2 as the guest should find it. Called on every core before its first eret.
 unsafe fn configure_el2() {
@@ -244,6 +298,8 @@ unsafe fn configure_el2() {
     asm!("mrs {a}, midr_el1", "mrs {b}, mpidr_el1", a = out(reg) midr, b = out(reg) mpidr);
     asm!("msr vpidr_el2, {a}", "msr vmpidr_el2, {b}", a = in(reg) midr, b = in(reg) mpidr);
     asm!("msr hstr_el2, {v}", v = in(reg) 0u64);
+    // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
+    asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1is", "dsb ish", "isb", v = in(reg) 0u64, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
     report(0x70, 0xB8);
     // ACTLR_EL2 gates EL1 access to the core's implementation-defined registers (CPUECTLR_EL1, CPUACTLR_EL1, CPUPWRCTLR_EL1 and friends on Cortex-A/X cores); a kernel that ran at EL2 never met the gate. All permission bits on (RES0 bits ignore the write); the value found is kept at +G#78 for the record.
     let actlr: u64;
@@ -337,6 +393,16 @@ extern "C" fn hv_secondary(ctx: u64) -> ! {
     let (entry, saved_ctx) = unsafe { (RESUME[idx][0], RESUME[idx][1]) };
     unsafe {
         configure_el2();
+        if entry == 0 {
+            // A wake with nothing to resume to: EL3 started this core at the hv without a CPU_ON / CPU_SUSPEND having passed through (or the record was lost). Say so and park rather than eret to 0.
+            let mut h = [0u8; 16];
+            pstore::log(&[b"\nferros hv: core ", &[b'0' + idx as u8], b" woke with NO resume entry, ctx ", pstore::hex(ctx, &mut h), b" -- parked\n"]);
+            stage(STAGE_UNEXPECTED_TRAP);
+            loop {
+                asm!("wfe");
+            }
+        }
+        write_volatile(&raw mut RESUMES[idx], read_volatile(&raw const RESUMES[idx]) + 1);
         // First time through for this core after Linux is up: one line, so the log shows resume reaching the hv at all.
         let seen = (REPORT + 0x200 + idx * 8) as *mut u64;
         if read_volatile(seen) < 2 {
@@ -371,40 +437,73 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                 asm!("mrs {v}, mpidr_el1", v = out(reg) m);
                 m
             };
-            match fid {
-                PSCI_CPU_ON | PSCI_CPU_ON_32 => {
-                    bump(0x50);
-                    let idx = ((frame[1] >> 8) & 0xF) as usize;
-                    unsafe {
-                        RESUME[idx] = [frame[2], frame[3]];
-                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
-                    }
-                    frame[2] = _secondary as *const () as u64;
-                    // Context still travels through EL3 in x3 and arrives in x0 on the new core.
-                }
-                PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 => {
-                    let idx = ((me >> 8) & 0xF) as usize;
-                    unsafe {
-                        RESUME[idx] = [frame[2], frame[3]];
-                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
-                    }
-                    frame[2] = _secondary as *const () as u64;
-                }
-                PSCI_SYSTEM_SUSPEND => {
-                    let idx = ((me >> 8) & 0xF) as usize;
-                    unsafe {
-                        RESUME[idx] = [frame[1], frame[2]];
-                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
-                    }
-                    frame[1] = _secondary as *const () as u64;
-                }
-                _ => {}
-            }
-            forward_smc(frame);
+            let core = ((me >> 8) & 0xF) as usize;
             unsafe {
-                let elr: u64;
-                asm!("mrs {v}, elr_el2", v = out(reg) elr);
-                asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                write_volatile(&raw mut SMCS[core], read_volatile(&raw const SMCS[core]) + 1);
+            }
+            let entry_call = matches!(fid, PSCI_CPU_ON | PSCI_CPU_ON_32 | PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 | PSCI_SYSTEM_SUSPEND);
+            if entry_call {
+                // The three PSCI calls that name where a core comes back: the entry becomes `_secondary`, the call is issued from here, the guest resumes past its SMC.
+                match fid {
+                    PSCI_CPU_ON | PSCI_CPU_ON_32 => {
+                        bump(0x50);
+                        let idx = ((frame[1] >> 8) & 0xF) as usize;
+                        unsafe {
+                            RESUME[idx] = [frame[2], frame[3]];
+                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
+                        }
+                        frame[2] = _secondary as *const () as u64;
+                    }
+                    PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 => {
+                        unsafe {
+                            RESUME[core] = [frame[2], frame[3]];
+                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
+                        }
+                        frame[2] = _secondary as *const () as u64;
+                    }
+                    _ => {
+                        unsafe {
+                            RESUME[core] = [frame[1], frame[2]];
+                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
+                        }
+                        frame[1] = _secondary as *const () as u64;
+                    }
+                }
+                forward_smc(frame);
+                unsafe {
+                    let elr: u64;
+                    asm!("mrs {v}, elr_el2", v = out(reg) elr);
+                    asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                }
+            } else {
+                // Every other SMC runs natively from EL1, so EL3 sees the caller it expects (the hv re-issuing them from EL2 is the suspect behind the power-domain hangs, 2026-10-17). The SMC trap is dropped and a hardware breakpoint (BRP 0, EL1 only, address match) is planted on the instruction after the SMC, routed to EL2 by MDCR_EL2.TDE; its handler (EC G#30) re-arms the trap and puts the guest's debug registers back. A software step would not do: a stepped instruction that takes an exception completes the step on entry to EL3, and no step exception follows the return (the quirk Linux fakes around for stepped SVCs). ELR stays on the SMC so it executes.
+                unsafe {
+                    let (elr, bvr, bcr, mdscr, mdcr, hcr): (u64, u64, u64, u64, u64, u64);
+                    asm!("mrs {e}, elr_el2", "mrs {a}, dbgbvr0_el1", "mrs {b}, dbgbcr0_el1", "mrs {m}, mdscr_el1", "mrs {c}, mdcr_el2", "mrs {d}, hcr_el2",
+                        e = out(reg) elr, a = out(reg) bvr, b = out(reg) bcr, m = out(reg) mdscr, c = out(reg) mdcr, d = out(reg) hcr);
+                    write_volatile(&raw mut STEP_SAVED[core * 3], bvr);
+                    write_volatile(&raw mut STEP_SAVED[core * 3 + 1], bcr);
+                    write_volatile(&raw mut STEP_SAVED[core * 3 + 2], mdscr);
+                    // The OS Lock is set at reset and disables every debug event until Linux clears it (debug_monitors_init, a postcore initcall — long after the first PSCI calls). Clear it here, or the breakpoint never fires and the trap stays off (measured 2026-10-17: the first two native builds never reached adb).
+                    asm!("msr oslar_el1, {z}", "isb", z = in(reg) 0u64);
+                    // DBGBCR0: E | PMC = 0b01 (EL1 only) | BAS = all bytes; HMC = 0, SSC = 0 (non-secure EL1), unlinked address match.
+                    asm!("msr dbgbvr0_el1, {v}", "msr dbgbcr0_el1, {c}", "msr mdscr_el1, {m}", "msr mdcr_el2, {d}", "msr hcr_el2, {h}", "isb",
+                        v = in(reg) elr + 4, c = in(reg) 0x1E3u64, m = in(reg) mdscr | (1 << 15), d = in(reg) mdcr | (1 << 8), h = in(reg) hcr & !(1 << 19));
+                }
+            }
+        }
+        0x30 => {
+            // Breakpoint from EL1: the natively re-executed SMC is done and the guest is at the instruction after it (ELR). Guest debug registers back, SMC trap re-armed.
+            let me: u64;
+            unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) me) };
+            let core = ((me >> 8) & 0xF) as usize;
+            unsafe {
+                let (mdcr, hcr): (u64, u64);
+                asm!("mrs {c}, mdcr_el2", "mrs {d}, hcr_el2", c = out(reg) mdcr, d = out(reg) hcr);
+                asm!("msr dbgbcr0_el1, {b}", "msr dbgbvr0_el1, {a}", "msr mdscr_el1, {m}", "msr mdcr_el2, {c}", "msr hcr_el2, {d}", "isb",
+                    a = in(reg) read_volatile(&raw const STEP_SAVED[core * 3]), b = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 1]), m = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 2]),
+                    c = in(reg) mdcr & !(1 << 8), d = in(reg) hcr | (1 << 19));
+                write_volatile(&raw mut STEPS[core], read_volatile(&raw const STEPS[core]) + 1);
             }
         }
         0x16 => {
@@ -666,7 +765,7 @@ mod fdt {
         let head = insert_at - src;
         copy(dst, src, head);
         let mut q = dst + head;
-        for (name, base, size) in [(b"hv@b2000000\0\0\0\0\0", super::HV_BASE, super::HV_SIZE), (b"hvrep@b6100000\0\0", super::REPORT as u64, super::REPORT_RESERVE)] {
+        for (name, base, size) in [(b"hv@afc000000\0\0\0\0", super::HV_BASE, super::HV_SIZE), (b"hvrep@b6100000\0\0", super::REPORT as u64, super::REPORT_RESERVE)] {
             wr32(q, BEGIN_NODE);
             q += 4;
             for (k, &c) in name.iter().enumerate() {
