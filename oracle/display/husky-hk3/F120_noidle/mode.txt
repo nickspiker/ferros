@@ -1,0 +1,1 @@
+mActiveSfDisplayMode=DisplayMode{id=2, width=1008, height=2244, xDpi=365.76, yDpi=367.726, peakRefreshRate=120.00001

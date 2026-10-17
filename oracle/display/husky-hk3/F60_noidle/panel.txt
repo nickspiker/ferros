@@ -1,0 +1,9 @@
+refresh_rate = 60|
+op_hz = 120|
+power_state = On|
+panel_idle = 0|
+min_vrefresh = 1|
+te2_timing = 1344x2992@60 rising 16 falling 48|1344x2992@120 rising 16 falling 48|1008x2244@60 rising 16 falling 48|1008x2244@120 rising 16 falling 48|
+idle_delay_ms = 80|
+time_in_state = 0 1344 2992 1 1640|0 1344 2992 60 14767|0 1344 2992 120 16405|0 1008 2244 1 4957793|0 1008 2244 10 3063|0 1008 2244 30 30132|0 1008 2244 60 2971128|0 1008 2244 120 3148215|2 1008 2244 1 521|2 1008 2244 30 1587|3 0 0 0 23754399|
+backlight = 1354 actual = 1354 hbm_mode = 0 dimming_on = 0 state = On: 1008x2244@60

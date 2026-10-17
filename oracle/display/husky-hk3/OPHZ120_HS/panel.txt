@@ -1,0 +1,7 @@
+refresh_rate = 60|
+op_hz = 120|
+power_state = On|
+panel_idle = 0|
+min_vrefresh = 1|
+te2_timing = 1344x2992@60 rising 16 falling 48|1344x2992@120 rising 16 falling 48|1008x2244@60 rising 16 falling 48|1008x2244@120 rising 16 falling 48|
+backlight = 1354 actual = 1354 hbm_mode = 0 lp_state =  state = On: 1344x2992@60

@@ -1,0 +1,76 @@
+# 75 DSI packets; times in ms from the first event; bytes are the packet payload (the first byte is the DCS command); type shown when not a long write (39)
+   41.334  tx f0 5a 5a
+   41.454  tx bd 21 01 83 03 03
+   41.508  tx b0 00 10 bd
+   41.556  tx bd 22 type 15
+   41.593  tx b0 00 82 bd
+   41.640  tx bd 22 22 22 22
+   41.696  tx b0 00 1e bd
+   41.745  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+   41.805  tx bd 21 type 15
+   41.977  tx 60 00 type 15
+   42.016  tx f7 0f type 15
+   42.052  tx f0 a5 a5  last
+  522.923  tx f0 5a 5a
+  522.975  tx bd 21 01 83 03 03
+  523.007  tx b0 00 10 bd
+  523.034  tx bd 22 type 15
+  523.057  tx b0 00 82 bd
+  523.086  tx bd 22 22 22 22
+  523.112  tx b0 00 1e bd
+  523.139  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  523.168  tx b0 00 92 bd
+  523.192  tx bd 00 00
+  523.218  tx b0 00 12 bd
+  523.244  tx bd 00 00 ee
+  523.269  tx b0 00 9e bd
+  523.297  tx bd 00 02 00 06 00 16
+  523.323  tx b0 00 ae bd
+  523.350  tx bd 00 01 03
+  523.375  tx bd a3 type 15
+  523.400  tx f7 0f type 15
+  523.425  tx f0 a5 a5  last
+  523.466  tx f0 5a 5a
+  523.493  tx b0 00 42 f2
+  523.519  tx f2 0d type 15
+  523.545  tx b0 00 01 b9
+  523.570  tx b9 51 type 15
+  523.594  tx b0 00 22 b9
+  523.619  tx b9 00 10 00 30 00 10 00 30
+  523.646  tx f0 a5 a5  last
+  533.242  tx f0 5a 5a
+  533.281  tx b9 04 type 15
+  533.304  tx b0 00 04 b9
+  533.323  tx b9 0b bb 00 2f
+  533.348  tx b0 00 42 f2
+  533.370  tx f2 0d type 15
+  533.387  tx b0 00 01 b9
+  533.404  tx b9 51 type 15
+  533.421  tx b0 00 22 b9
+  533.439  tx b9 00 10 00 30 00 10 00 30
+  533.460  tx b0 02 00 92
+  533.478  tx 92 00 00
+  533.495  tx b0 02 f3 68
+  533.513  tx 68 77 81 23 8c 99 3c
+  533.531  tx f2 01 type 15
+  533.548  tx 60 00 type 15
+  533.565  tx bd 21 81 83 03 03
+  533.583  tx b0 00 10 bd
+  533.600  tx bd 00 type 15
+  533.618  tx b0 00 82 bd
+  533.636  tx bd 00 00 00 00
+  533.654  tx b0 00 1e bd
+  533.671  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  533.691  tx bd 21 type 15
+  533.709  tx 60 01 type 15
+  533.725  tx f7 0f type 15
+  533.742  tx f0 a5 a5  last
+  548.564  tx 28 type 05  last
+  548.637  tx f0 5a 5a  last
+  548.676  tx e4 00 2c 2c a2 00 00  last
+  548.705  tx b0 00 4f f4  last
+  548.731  tx f4 50 type 15  last
+  548.756  tx b0 00 31 f4  last
+  548.780  tx f4 00 00 00 00 00  last
+  548.804  tx e4 00 2c 2c 82 00 00  last
+  548.825  tx f0 a5 a5  last

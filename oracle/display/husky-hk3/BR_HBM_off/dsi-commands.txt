@@ -1,0 +1,99 @@
+# 98 DSI packets; times in ms from the first event; bytes are the packet payload (the first byte is the DCS command); type shown when not a long write (39)
+    0.000  tx 53 20 type 15  last
+    2.649  tx f0 5a 5a
+    2.693  tx bd 21 01 83 03 03
+    2.724  tx b0 00 10 bd
+    2.752  tx bd 22 type 15
+    2.778  tx b0 00 82 bd
+    2.806  tx bd 22 22 22 22
+    2.834  tx b0 00 1e bd
+    2.863  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+    2.902  tx b0 00 92 bd
+    2.930  tx bd 00 00
+    2.956  tx b0 00 12 bd
+    2.983  tx bd 00 00 ee
+    3.009  tx b0 00 9e bd
+    3.036  tx bd 00 02 00 06 00 16
+    3.064  tx b0 00 ae bd
+    3.092  tx bd 00 01 03
+    3.119  tx bd a3 type 15
+    3.147  tx f7 0f type 15
+    3.173  tx f0 a5 a5  last
+   66.052  tx f0 5a 5a
+   66.147  tx bd 21 01 83 03 03
+   66.185  tx b0 00 10 bd
+   66.224  tx bd 22 type 15
+   66.261  tx b0 00 82 bd
+   66.298  tx bd 22 22 22 22
+   66.340  tx b0 00 1e bd
+   66.384  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+   66.424  tx bd 21 type 15
+   66.540  tx 60 00 type 15
+   66.577  tx f7 0f type 15
+   66.613  tx f0 a5 a5  last
+  186.848  tx f0 5a 5a
+  186.903  tx bd 21 01 83 03 03
+  186.921  tx b0 00 10 bd
+  186.940  tx bd 22 type 15
+  186.952  tx b0 00 82 bd
+  186.967  tx bd 22 22 22 22
+  186.982  tx b0 00 1e bd
+  187.002  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  187.023  tx b0 00 92 bd
+  187.039  tx bd 00 00
+  187.051  tx b0 00 12 bd
+  187.067  tx bd 00 00 ee
+  187.080  tx b0 00 9e bd
+  187.095  tx bd 00 02 00 06 00 16
+  187.109  tx b0 00 ae bd
+  187.125  tx bd 00 01 03
+  187.144  tx bd a3 type 15
+  187.159  tx f7 0f type 15
+  187.174  tx f0 a5 a5  last
+  187.230  tx f0 5a 5a
+  187.250  tx b0 00 42 f2
+  187.263  tx f2 0d type 15
+  187.278  tx b0 00 01 b9
+  187.293  tx b9 51 type 15
+  187.306  tx b0 00 22 b9
+  187.328  tx b9 00 10 00 30 00 10 00 30
+  187.344  tx f0 a5 a5  last
+  520.553  tx f0 5a 5a
+  520.680  tx bd 21 01 83 03 03
+  520.765  tx b0 00 10 bd
+  520.833  tx bd 22 type 15
+  520.884  tx b0 00 82 bd
+  520.945  tx bd 22 22 22 22
+  521.005  tx b0 00 1e bd
+  521.085  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  521.159  tx bd 21 type 15
+  521.208  tx 60 00 type 15
+  521.254  tx f7 0f type 15
+  521.306  tx f0 a5 a5  last
+  638.878  tx f0 5a 5a
+  638.950  tx bd 21 01 83 03 03
+  638.983  tx b0 00 10 bd
+  639.011  tx bd 22 type 15
+  639.041  tx b0 00 82 bd
+  639.072  tx bd 22 22 22 22
+  639.107  tx b0 00 1e bd
+  639.140  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  639.174  tx b0 00 92 bd
+  639.206  tx bd 00 00
+  639.236  tx b0 00 12 bd
+  639.267  tx bd 00 00 ee
+  639.297  tx b0 00 9e bd
+  639.327  tx bd 00 02 00 06 00 16
+  639.359  tx b0 00 ae bd
+  639.391  tx bd 00 01 03
+  639.421  tx bd a3 type 15
+  639.449  tx f7 0f type 15
+  639.477  tx f0 a5 a5  last
+  639.560  tx f0 5a 5a
+  639.594  tx b0 00 42 f2
+  639.625  tx f2 0d type 15
+  639.656  tx b0 00 01 b9
+  639.688  tx b9 51 type 15
+  639.717  tx b0 00 22 b9
+  639.747  tx b9 00 10 00 30 00 10 00 30
+  639.777  tx f0 a5 a5  last

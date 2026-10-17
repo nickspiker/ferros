@@ -1,0 +1,24 @@
+# 23 DSI packets; times in ms from the first event; bytes are the packet payload (the first byte is the DCS command); type shown when not a long write (39)
+  168.903  tx f0 5a 5a
+  168.964  tx b9 04 type 15
+  168.993  tx b0 00 04 b9
+  169.030  tx b9 0b bb 00 2f
+  169.066  tx bd 21 81 83 03 03
+  169.101  tx b0 00 10 bd
+  169.137  tx bd 00 type 15
+  169.164  tx b0 00 82 bd
+  169.197  tx bd 00 00 00 00
+  169.232  tx b0 00 1e bd
+  169.266  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+  169.301  tx bd 21 type 15
+  169.328  tx 60 01 type 15
+  169.355  tx f7 0f type 15
+  169.381  tx f0 a5 a5  last
+  174.574  tx f0 5a 5a
+  174.629  tx b0 00 42 f2
+  174.664  tx f2 0d type 15
+  174.692  tx b0 00 01 b9
+  174.726  tx b9 04 type 15
+  174.772  tx b0 00 1e b9
+  174.811  tx b9 00 10 00 30
+  174.864  tx f0 a5 a5  last

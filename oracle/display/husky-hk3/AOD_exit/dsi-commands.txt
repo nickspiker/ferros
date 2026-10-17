@@ -1,0 +1,253 @@
+# 251 DSI packets; times in ms from the first event; bytes are the packet payload (the first byte is the DCS command); type shown when not a long write (39)
+   33.329  tx f0 5a 5a
+   33.359  tx bd 21 type 15
+   33.368  tx b9 04 type 15
+   33.376  tx b0 00 04 b9
+   33.382  tx b9 0b e0 00 2f
+   33.390  tx b0 00 01 60
+   33.398  tx 60 00 type 15
+   33.405  tx f7 0f type 15
+   33.412  tx f0 a5 a5  last
+   44.601  tx 28 type 05  last
+   44.654  tx f0 5a 5a  last
+   44.665  tx e4 00 2c 2c a2 00 00  last
+   44.675  tx b0 00 4f f4  last
+   44.684  tx f4 50 type 15  last
+   44.691  tx b0 00 31 f4  last
+   44.699  tx f4 00 00 00 00 00  last
+   44.710  tx e4 00 2c 2c 82 00 00  last
+   44.720  tx f0 a5 a5  last
+   77.955  tx f0 5a 5a
+   77.979  tx b0 00 52 94
+   77.986  tx 94 00 type 15
+   77.994  tx f0 a5 a5
+   78.002  tx 53 20 type 15  last
+   78.016  tx f0 5a 5a
+   78.028  tx b9 51 type 15
+   78.034  tx b0 00 02 b9
+   78.042  tx b9 00 type 15
+   78.048  tx b0 00 08 b9
+   78.056  tx b9 0b bb 00 2f 0b bb 00 2f
+   78.077  tx b0 02 00 92
+   78.087  tx 92 00 00
+   78.095  tx b0 02 f3 68
+   78.102  tx 68 77 81 23 8c 99 3c
+   78.111  tx f2 01 type 15
+   78.119  tx 60 00 type 15
+   78.127  tx bd 21 01 83 03 03
+   78.136  tx b0 00 10 bd
+   78.146  tx bd 22 type 15
+   78.154  tx b0 00 82 bd
+   78.162  tx bd 22 22 22 22
+   78.173  tx b0 00 1e bd
+   78.182  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+   78.192  tx b0 00 92 bd
+   78.201  tx bd 00 00
+   78.209  tx b0 00 12 bd
+   78.217  tx bd 00 00 16
+   78.226  tx b0 00 9e bd
+   78.234  tx bd 00 02 00 06 00 16
+   78.243  tx b0 00 ae bd
+   78.251  tx bd 00 03 00
+   78.260  tx bd a3 type 15
+   78.268  tx f7 0f type 15
+   78.276  tx f0 a5 a5  last
+   78.289  tx 53 20 type 15  last
+   78.299  tx f0 5a 5a
+   78.307  tx bd 21 01 83 03 03
+   78.316  tx b0 00 10 bd
+   78.324  tx bd 22 type 15
+   78.333  tx b0 00 82 bd
+   78.341  tx bd 22 22 22 22
+   78.350  tx b0 00 1e bd
+   78.357  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+   78.365  tx b0 00 92 bd
+   78.373  tx bd 00 00
+   78.379  tx b0 00 12 bd
+   78.386  tx bd 00 00 06
+   78.392  tx b0 00 9e bd
+   78.400  tx bd 00 02 00 06 00 16
+   78.408  tx b0 00 ae bd
+   78.417  tx bd 00 00 00
+   78.425  tx bd a3 type 15
+   78.432  tx f7 0f type 15
+   78.440  tx f0 a5 a5  last
+   78.465  tx f0 5a 5a  last
+   78.475  tx e4 00 2c 2c a2 00 00  last
+   78.485  tx b0 00 4f f4  last
+   78.496  tx f4 70 type 15  last
+   78.505  tx b0 00 31 f4  last
+   78.515  tx f4 1a 1a 1a 1a 1a  last
+   78.523  tx e4 00 2c 2c 82 00 00  last
+   78.532  tx f0 a5 a5  last
+   78.540  tx 29 type 05  last
+   78.559  tx f0 5a 5a
+   78.568  tx b0 00 42 f2
+   78.576  tx f2 0d type 15
+   78.583  tx b0 00 01 b9
+   78.591  tx b9 04 type 15
+   78.597  tx b0 00 1e b9
+   78.605  tx b9 00 10 00 30
+   78.611  tx f0 a5 a5  last
+   78.715  tx f0 5a 5a
+   78.724  tx bd 21 01 83 03 03
+   78.733  tx b0 00 10 bd
+   78.739  tx bd 22 type 15
+   78.745  tx b0 00 82 bd
+   78.761  tx bd 22 22 22 22
+   78.770  tx b0 00 1e bd
+   78.776  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+   78.786  tx bd 21 type 15
+   78.793  tx 60 00 type 15
+   78.801  tx f7 0f type 15
+   78.808  tx f0 a5 a5  last
+ 1043.414  tx f0 5a 5a
+ 1043.527  tx b0 00 31 f4  last
+ 1043.603  tx 05 type 37  last
+ 1043.606  tx f4 type 06  last
+ 1043.780  rx cmd=0xf4 length=5 rx=[1a 1a 1a 1a 1a]
+ 1043.787  tx f0 a5 a5  last
+ 1043.863  tx f0 5a 5a
+ 1043.908  tx bd 21 01 83 03 03
+ 1043.949  tx b0 00 10 bd
+ 1043.989  tx bd 22 type 15
+ 1044.028  tx b0 00 82 bd
+ 1044.068  tx bd 22 22 22 22
+ 1044.113  tx b0 00 1e bd
+ 1044.154  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 1044.197  tx b0 00 92 bd
+ 1044.237  tx bd 00 00
+ 1044.276  tx b0 00 12 bd
+ 1044.316  tx bd 00 00 ee
+ 1044.353  tx b0 00 9e bd
+ 1044.391  tx bd 00 02 00 06 00 16
+ 1044.430  tx b0 00 ae bd
+ 1044.472  tx bd 00 01 03
+ 1044.510  tx bd a3 type 15
+ 1044.547  tx f7 0f type 15
+ 1044.587  tx f0 a5 a5  last
+ 1044.680  tx f0 5a 5a
+ 1044.728  tx b0 00 42 f2
+ 1044.769  tx f2 0d type 15
+ 1044.805  tx b0 00 01 b9
+ 1044.846  tx b9 51 type 15
+ 1044.884  tx b0 00 22 b9
+ 1044.924  tx b9 00 10 00 30 00 10 00 30
+ 1044.965  tx f0 a5 a5  last
+ 1092.678  tx f0 5a 5a
+ 1092.885  tx bd 21 01 83 03 03
+ 1092.937  tx b0 00 10 bd
+ 1092.985  tx bd 22 type 15
+ 1093.031  tx b0 00 82 bd
+ 1093.079  tx bd 22 22 22 22
+ 1093.128  tx b0 00 1e bd
+ 1093.178  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 1093.231  tx bd 21 type 15
+ 1093.288  tx 60 00 type 15
+ 1093.337  tx f7 0f type 15
+ 1093.385  tx f0 a5 a5  last
+ 1179.143  tx f0 5a 5a
+ 1181.125  tx bd 21 01 83 03 03
+ 1181.178  tx b0 00 10 bd
+ 1181.229  tx bd 22 type 15
+ 1181.278  tx b0 00 82 bd
+ 1181.329  tx bd 22 22 22 22
+ 1181.385  tx b0 00 1e bd
+ 1181.438  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 1181.492  tx b0 00 92 bd
+ 1181.543  tx bd 00 00
+ 1181.594  tx b0 00 12 bd
+ 1181.646  tx bd 00 00 ee
+ 1181.696  tx b0 00 9e bd
+ 1181.746  tx bd 00 02 00 06 00 16
+ 1181.801  tx b0 00 ae bd
+ 1181.859  tx bd 00 01 03
+ 1181.909  tx bd a3 type 15
+ 1181.961  tx f7 0f type 15
+ 1182.010  tx f0 a5 a5  last
+ 1182.143  tx f0 5a 5a
+ 1182.202  tx b0 00 42 f2
+ 1182.253  tx f2 0d type 15
+ 1182.304  tx b0 00 01 b9
+ 1182.355  tx b9 51 type 15
+ 1182.412  tx b0 00 22 b9
+ 1182.463  tx b9 00 10 00 30 00 10 00 30
+ 1182.516  tx f0 a5 a5  last
+ 1362.142  tx f0 5a 5a
+ 1362.293  tx bd 21 01 83 03 03
+ 1362.402  tx b0 00 10 bd
+ 1362.513  tx bd 22 type 15
+ 1362.597  tx b0 00 82 bd
+ 1362.706  tx bd 22 22 22 22
+ 1362.807  tx b0 00 1e bd
+ 1362.912  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 1363.218  tx bd 21 type 15
+ 1363.300  tx 60 00 type 15
+ 1363.381  tx f7 0f type 15
+ 1363.460  tx f0 a5 a5  last
+ 1479.485  tx f0 5a 5a
+ 1479.616  tx bd 21 01 83 03 03
+ 1479.706  tx b0 00 10 bd
+ 1479.791  tx bd 22 type 15
+ 1479.873  tx b0 00 82 bd
+ 1479.956  tx bd 22 22 22 22
+ 1480.041  tx b0 00 1e bd
+ 1480.125  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 1480.212  tx b0 00 92 bd
+ 1480.300  tx bd 00 00
+ 1480.385  tx b0 00 12 bd
+ 1480.462  tx bd 00 00 ee
+ 1480.519  tx b0 00 9e bd
+ 1480.566  tx bd 00 02 00 06 00 16
+ 1480.616  tx b0 00 ae bd
+ 1480.663  tx bd 00 01 03
+ 1480.711  tx bd a3 type 15
+ 1480.756  tx f7 0f type 15
+ 1480.804  tx f0 a5 a5  last
+ 1480.904  tx f0 5a 5a
+ 1480.964  tx b0 00 42 f2
+ 1481.011  tx f2 0d type 15
+ 1481.058  tx b0 00 01 b9
+ 1481.105  tx b9 51 type 15
+ 1481.152  tx b0 00 22 b9
+ 1481.199  tx b9 00 10 00 30 00 10 00 30
+ 1481.252  tx f0 a5 a5  last
+ 3055.885  tx f0 5a 5a
+ 3055.980  tx bd 21 01 83 03 03
+ 3056.031  tx b0 00 10 bd
+ 3056.080  tx bd 22 type 15
+ 3056.130  tx b0 00 82 bd
+ 3056.179  tx bd 22 22 22 22
+ 3056.229  tx b0 00 1e bd
+ 3056.280  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 3056.333  tx bd 21 type 15
+ 3056.389  tx 60 00 type 15
+ 3056.435  tx f7 0f type 15
+ 3056.485  tx f0 a5 a5  last
+ 3167.589  tx f0 5a 5a
+ 3167.722  tx bd 21 01 83 03 03
+ 3167.822  tx b0 00 10 bd
+ 3167.928  tx bd 22 type 15
+ 3168.019  tx b0 00 82 bd
+ 3168.115  tx bd 22 22 22 22
+ 3168.212  tx b0 00 1e bd
+ 3168.307  tx bd 00 00 00 02 00 06 00 16 00 2e 00 ee
+ 3168.407  tx b0 00 92 bd
+ 3168.505  tx bd 00 00
+ 3168.598  tx b0 00 12 bd
+ 3168.700  tx bd 00 00 ee
+ 3168.793  tx b0 00 9e bd
+ 3168.883  tx bd 00 02 00 06 00 16
+ 3168.973  tx b0 00 ae bd
+ 3169.066  tx bd 00 01 03
+ 3169.161  tx bd a3 type 15
+ 3169.251  tx f7 0f type 15
+ 3169.339  tx f0 a5 a5  last
+ 3169.537  tx f0 5a 5a
+ 3169.645  tx b0 00 42 f2
+ 3169.744  tx f2 0d type 15
+ 3169.833  tx b0 00 01 b9
+ 3169.922  tx b9 51 type 15
+ 3170.012  tx b0 00 22 b9
+ 3170.108  tx b9 00 10 00 30 00 10 00 30
+ 3170.201  tx f0 a5 a5  last

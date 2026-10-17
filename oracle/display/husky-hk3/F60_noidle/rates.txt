@@ -1,0 +1,1 @@
+te_per_2s = 30 frames_per_2s = 9

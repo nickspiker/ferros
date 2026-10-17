@@ -1,0 +1,1 @@
+exynos-decon[0]: DECON disabled(2)
