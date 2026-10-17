@@ -1,5 +1,5 @@
-/* ferros hv (HV.md). ABL loads the blob [hv | Linux Image] at G#8008_0000 and jumps to its first instruction with the MMU off; the hv copies itself to HV_BASE, the last 64 MiB of DRAM, which it also reserves in the DTB it hands Linux. Everything is linked at HV_BASE; the few instructions that run before the copy are PC-relative. */
-HV_BASE = 0xAFC000000;
+/* ferros hv (HV.md). ABL loads the blob [hv | Linux Image] at G#8008_0000 and jumps to its first instruction with the MMU off; the hv copies itself to HV_BASE, 64 MiB of the LOW DRAM bank at G#B200_0000 (the high bank, G#8_8000_0000 up, is not kept refreshed across resets and is suspected of the same under deep idle), which it also reserves in the DTB it hands Linux. Everything is linked at HV_BASE; the few instructions that run before the copy are PC-relative. */
+HV_BASE = 0xB2000000;
 ENTRY(_start)
 SECTIONS
 {

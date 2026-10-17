@@ -1,9 +1,9 @@
 //! ferros hv — the thin EL2 layer under Android on husky (HV.md).
 //!
-//! Milestone 0, what this file does: ABL loads `boot_a`'s "kernel", which is this binary padded to G#18_0000 with the stock Linux Image appended, at G#8008_0000 and jumps here at EL2 with the MMU off and the DTB in x0. The hv copies itself to the last 64 MiB of DRAM (HV_BASE), zeroes its bss, copies the DTB next to itself with one node added (`/reserved-memory/hv@afc000000`, no-map, so Linux never allocates over it), programs EL2 so that EL1 sees a plain machine (timers, GIC system registers, pointer authentication, SVE, PMU, MTE all through; only SMC traps), and erets into the Linux Image at G#8020_0000 as EL1h.
+//! Milestone 0, what this file does: ABL loads `boot_a`'s "kernel", which is this binary padded to G#18_0000 with the stock Linux Image appended, at G#8008_0000 and jumps here at EL2 with the MMU off and the DTB in x0. The hv copies itself to 64 MiB of the low DRAM bank (HV_BASE), zeroes its bss, copies the DTB next to itself with one node added (`/reserved-memory/hv@b2000000`, no-map, so Linux never allocates over it), programs EL2 so that EL1 sees a plain machine (timers, GIC system registers, pointer authentication, SVE, PMU, MTE all through; only SMC traps), and erets into the Linux Image at G#8020_0000 as EL1h.
 //! From then on the hv runs only when Linux issues an SMC: PSCI calls that name a resume address (CPU_ON, CPU_SUSPEND, SYSTEM_SUSPEND) get that address swapped for `_secondary`, which brings the new or woken core up through the same EL2 setup and erets to where Linux wanted it; every other SMC is forwarded to EL3 unchanged.
 //! There is no stage 2 yet (HCR_EL2.VM = 0): milestone 0 is Android booting, running and sleeping under a dormant hv. Stage 2 and the UFS command firewall come next.
-//! Crumbs go to the ramoops result block at G#FD60_0000 from offset G#40 (ferros's own words are below it), where the next ferros boot reads them: +G#40 stage, +G#48 SMC traps, +G#50 CPU_ON count, +G#58 ESR of the last unexpected trap, +G#60 its ELR, +G#68 its FAR.
+//! Crumbs go to the ramoops result block at G#FD60_0000 from offset G#40 (ferros's own words are below it), where the next ferros boot reads them: +G#40 stage, +G#48 SMC traps, +G#50 CPU_ON count, +G#58 ESR of the last unexpected trap, +G#60 its ELR, +G#68 its FAR, +G#70 EL2 setup sub-stage, +G#78 ACTLR_EL2 as found, +G#80 trapped system-register accesses, +G#100 + core*16 the first such trap per core (ESR, ELR).
 
 #![no_std]
 #![no_main]
@@ -12,14 +12,17 @@
 use core::arch::{asm, global_asm};
 use core::ptr::{read_volatile, write_volatile};
 
-const HV_BASE: u64 = 0xA_FC00_0000;
+/// 64 MiB in the LOW DRAM bank, just under the secure carveout at G#B620_0000 and clear of where ABL stages the boot images (G#A000_0000..G#AA00_0000) and keeps its heap (G#F8B3_C000). It was the last 64 MiB of DRAM (G#A_FC00_0000) first: the high bank reads as decayed cells after every reset, and Android under the hv lost cores to silent hangs after a minute of idling with nothing in the hv's log — consistent with that bank, or the hv's part of it, not being kept refreshed under deep idle either (2026-10-17).
+const HV_BASE: u64 = 0xB200_0000;
 const HV_SIZE: u64 = 0x400_0000;
 /// Where the patched DTB goes: the megabyte below the reserved region, ordinary RAM that Linux reserves itself once it has read the tree from there.
 const DTB_COPY: u64 = HV_BASE - 0x10_0000;
 const DTB_COPY_MAX: usize = 0x10_0000;
 /// The Linux Image: right after the hv's pad in the blob ABL loaded, 2 MiB aligned as its header demands (its flags say "place anywhere").
 const LINUX_ENTRY: u64 = 0x8020_0000;
-const REPORT: usize = 0xFD60_0000;
+/// The hv's report page, in a reserved megabyte of the LOW DRAM bank (no-map in the DTB the hv hands Linux), read by the next ferros boot with `bridge read B6100000 200`. Measured 2026-10-17: the high bank (G#8_8000_0000..) does not keep its contents across any reset, the low 2 GiB does; and G#FD60_0000, ferros's block, is inside stock Android's pstore ramoops region, which rewrites it while Android runs.
+const REPORT: usize = 0xB610_0000;
+const REPORT_RESERVE: u64 = 0x10_0000;
 
 const STAGE_ENTERED: u64 = 0xA1;
 const STAGE_DTB_DONE: u64 = 0xA2;
@@ -175,6 +178,17 @@ fn report(off: usize, v: u64) {
 
 fn stage(s: u64) {
     report(0x40, s);
+    // Slot 0 of the splash: a grey that climbs with the stage (A1 dark … A4 white); errors in slot 1 (magenta: DTB rebuild failed; green: an unexpected trap parked a core; yellow: panic).
+    match s {
+        STAGE_ENTERED => splash::band(0, 0xFF40_4040),
+        STAGE_DTB_DONE => splash::band(0, 0xFF80_8080),
+        STAGE_EL2_DONE => splash::band(0, 0xFFC0_C0C0),
+        STAGE_ERET => splash::band(0, 0xFFFF_FFFF),
+        STAGE_DTB_FAILED => splash::band(1, 0xFFFF_00FF),
+        STAGE_UNEXPECTED_TRAP => splash::band(1, 0xFF00_FF00),
+        STAGE_PANIC => splash::band(1, 0xFFFF_FF00),
+        _ => {}
+    }
 }
 
 fn bump(off: usize) {
@@ -189,40 +203,57 @@ static mut RESUME: [[u64; 2]; 16] = [[0; 2]; 16];
 
 /// EL2 as the guest should find it. Called on every core before its first eret.
 unsafe fn configure_el2() {
+    // Vectors first, so anything below that traps lands in `unexpected` with its ESR instead of in whatever VBAR_EL2 held. Sub-stage crumbs at +G#70 name the register being written (the first flash, 2026-10-17, stopped between A2 and A3 with no vector installed).
+    let vbar = hv_vectors as *const () as u64;
+    asm!("msr vbar_el2, {v}", "isb", v = in(reg) vbar);
+    report(0x70, 0xB0);
     // RW (EL1 is AArch64) | TSC (SMC traps here) | APK + API (pointer authentication keys and instructions untrapped) | ATA (MTE tag accesses untrapped where implemented). VM = 0: no stage 2 yet. IMO/FMO/AMO = 0: interrupts go to EL1 directly. E2H = 0, TGE = 0.
     let hcr: u64 = (1 << 31) | (1 << 19) | (1 << 40) | (1 << 41) | (1 << 56);
-    asm!("msr hcr_el2, {h}", h = in(reg) hcr);
+    // The ISB matters: without it the CPTR_EL2 write below used the E2H = 1 register layout the core was still in (measured 2026-10-17: ZEN read as 0, the ZCR_EL2 write trapped with EC G#19).
+    asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr);
+    report(0x70, 0xB1);
     // CPTR_EL2 (E2H = 0 layout): RES1 bits with TFP (10) and TZ (8) clear, so FP/SIMD and SVE run at EL1 untrapped; TAM (30) clear for the activity monitors.
-    asm!("msr cptr_el2, {v}", v = in(reg) 0x32FFu64);
+    asm!("msr cptr_el2, {v}", "isb", v = in(reg) 0x32FFu64);
+    report(0x70, 0xB2);
     // SVE present: let EL1 use the full vector length.
     let pfr0: u64;
     asm!("mrs {v}, id_aa64pfr0_el1", v = out(reg) pfr0);
     if (pfr0 >> 32) & 0xF != 0 {
         asm!("msr s3_4_c1_c2_0, {v}", v = in(reg) 0xFu64); // ZCR_EL2
     }
+    report(0x70, 0xB3);
     // MDCR_EL2: every PMU counter visible to EL1 (HPMN = PMCR_EL0.N), the SPE buffer (E2PB) and trace buffer (E2TB) owned by EL1, no debug traps.
     let pmcr: u64;
     asm!("mrs {v}, pmcr_el0", v = out(reg) pmcr);
     let mdcr: u64 = ((pmcr >> 11) & 0x1F) | (3 << 12) | (3 << 24);
     asm!("msr mdcr_el2, {v}", v = in(reg) mdcr);
+    report(0x70, 0xB4);
     // Timers: EL1 reads the physical counter and owns the physical timer; no virtual offset.
     asm!("msr cnthctl_el2, {v}", v = in(reg) 3u64);
     asm!("msr cntvoff_el2, {v}", v = in(reg) 0u64);
+    report(0x70, 0xB5);
     // GICv3: system-register interface at EL2, and EL1 allowed to enable its own (ICC_SRE_EL2.Enable); no virtual CPU interface.
     asm!("msr s3_4_c12_c9_5, {v}", v = in(reg) 0xFu64); // ICC_SRE_EL2
     asm!("isb");
+    report(0x70, 0xB6);
     asm!("msr s3_4_c12_c11_0, {v}", v = in(reg) 0u64); // ICH_HCR_EL2
+    report(0x70, 0xB7);
     // The guest sees the real core.
     let midr: u64;
     let mpidr: u64;
     asm!("mrs {a}, midr_el1", "mrs {b}, mpidr_el1", a = out(reg) midr, b = out(reg) mpidr);
     asm!("msr vpidr_el2, {a}", "msr vmpidr_el2, {b}", a = in(reg) midr, b = in(reg) mpidr);
     asm!("msr hstr_el2, {v}", v = in(reg) 0u64);
+    report(0x70, 0xB8);
+    // ACTLR_EL2 gates EL1 access to the core's implementation-defined registers (CPUECTLR_EL1, CPUACTLR_EL1, CPUPWRCTLR_EL1 and friends on Cortex-A/X cores); a kernel that ran at EL2 never met the gate. All permission bits on (RES0 bits ignore the write); the value found is kept at +G#78 for the record.
+    let actlr: u64;
+    asm!("mrs {v}, actlr_el2", v = out(reg) actlr);
+    report(0x78, actlr);
+    asm!("msr actlr_el2, {v}", "isb", v = in(reg) 0xFFFF_FFFFu64);
     // EL1 starts with its MMU off, little-endian, as a kernel entry requires.
     asm!("msr sctlr_el1, {v}", v = in(reg) 0x30D0_0800u64);
-    let vbar = hv_vectors as *const () as u64;
-    asm!("msr vbar_el2, {v}", v = in(reg) vbar);
     asm!("isb");
+    report(0x70, 0xB9);
 }
 
 unsafe extern "C" {
@@ -233,8 +264,10 @@ unsafe extern "C" {
 /// EL1h with every interrupt masked, as a kernel expects at entry.
 const SPSR_EL1H_MASKED: u64 = 0x3C5;
 
-unsafe fn eret_to(entry: u64, x0: u64) -> ! {
-    stage(STAGE_ERET);
+unsafe fn eret_to(entry: u64, x0: u64, paint: bool) -> ! {
+    if paint {
+        stage(STAGE_ERET);
+    }
     asm!(
         "msr elr_el2, {e}",
         "msr spsr_el2, {s}",
@@ -254,11 +287,17 @@ unsafe fn eret_to(entry: u64, x0: u64) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn hv_primary(dtb: u64) -> ! {
     unsafe {
-        write_volatile(REPORT as *mut u64, 0x4645_5252_4F53_5F48); // "FERROS_H": the block is ours too
+        write_volatile(REPORT as *mut u64, 0x4645_5252_4F53_5F48); // "FERROS_H"
     }
     stage(STAGE_ENTERED);
     report(0x48, 0);
     report(0x50, 0);
+    report(0x80, 0);
+    for core in 0..16 {
+        report(0x100 + core * 16, 0);
+        report(0x108 + core * 16, 0);
+        report(0x200 + core * 8, 0);
+    }
     let new_dtb = match fdt::patch(dtb as usize, DTB_COPY as usize, DTB_COPY_MAX) {
         Some(len) => {
             unsafe {
@@ -283,7 +322,10 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     unsafe {
         configure_el2();
         stage(STAGE_EL2_DONE);
-        eret_to(LINUX_ENTRY, new_dtb);
+        let mut h = [0u8; 16];
+        let actlr = read_volatile((REPORT + 0x78) as *const u64);
+        pstore::log(&[b"\nferros hv: EL2 up, Linux at EL1; ACTLR_EL2 was ", pstore::hex(actlr, &mut h), b"\n"]);
+        eret_to(LINUX_ENTRY, new_dtb, true);
     }
 }
 
@@ -295,8 +337,15 @@ extern "C" fn hv_secondary(ctx: u64) -> ! {
     let (entry, saved_ctx) = unsafe { (RESUME[idx][0], RESUME[idx][1]) };
     unsafe {
         configure_el2();
+        // First time through for this core after Linux is up: one line, so the log shows resume reaching the hv at all.
+        let seen = (REPORT + 0x200 + idx * 8) as *mut u64;
+        if read_volatile(seen) < 2 {
+            write_volatile(seen, read_volatile(seen) + 1);
+            let (mut h1, mut h2) = ([0u8; 16], [0u8; 16]);
+            pstore::log(&[b"\nferros hv: core ", &[b'0' + idx as u8], b" up via hv, entry ", pstore::hex(entry, &mut h1), b" ctx ", pstore::hex(ctx, &mut h2), b"\n"]);
+        }
         // CPU_ON hands the context in x0; a resume from CPU_SUSPEND / SYSTEM_SUSPEND does too. Prefer what EL3 gave us, fall back to the recorded one.
-        eret_to(entry, if ctx != 0 { ctx } else { saved_ctx });
+        eret_to(entry, if ctx != 0 { ctx } else { saved_ctx }, false);
     }
 }
 
@@ -362,6 +411,35 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
             // HVC from EL1: nothing at EL2 answers calls yet. SMCCC NOT_SUPPORTED; ELR already points past the HVC.
             frame[0] = u64::MAX;
         }
+        0x18 => {
+            // A system register access EL2 traps (one the gates above did not open). Recorded once per core (+G#100 + core*16: ESR, ELR) and counted (+G#80), then skipped: a write is dropped, a read returns 0. Milestone 0 survives it; the record names the register for the gate to open.
+            let (me, elr): (u64, u64);
+            unsafe { asm!("mrs {a}, mpidr_el1", "mrs {b}, elr_el2", a = out(reg) me, b = out(reg) elr) };
+            let core = ((me >> 8) & 0xF) as usize;
+            unsafe {
+                let slot = (REPORT + 0x100 + core * 16) as *mut u64;
+                if read_volatile(slot) == 0 {
+                    write_volatile(slot, esr);
+                    write_volatile(slot.add(1), elr);
+                    asm!("dc civac, {a}", "dsb sy", a = in(reg) slot as u64);
+                    let (mut h1, mut h2) = ([0u8; 16], [0u8; 16]);
+                    pstore::log(&[b"\nferros hv: sysreg trap, core ", &[b'0' + core as u8], b" ESR ", pstore::hex(esr, &mut h1), b" ELR ", pstore::hex(elr, &mut h2), b" -- skipped\n"]);
+                }
+            }
+            bump(0x80);
+            if esr & 1 != 0 {
+                // Direction bit set: a read. Rt is ISS[9:5]; the frame holds x0..x17 then x18, x30.
+                let rt = ((esr >> 5) & 0x1F) as usize;
+                if rt < 18 {
+                    frame[rt] = 0;
+                } else if rt == 18 {
+                    frame[18] = 0;
+                } else if rt == 30 {
+                    frame[19] = 0;
+                }
+            }
+            unsafe { asm!("msr elr_el2, {v}", v = in(reg) elr + 4) };
+        }
         _ => {
             let elr: u64;
             let far: u64;
@@ -395,6 +473,10 @@ extern "C" fn hv_unexpected(esr: u64, elr: u64, far: u64) {
     report(0x60, elr);
     report(0x68, far);
     stage(STAGE_UNEXPECTED_TRAP);
+    let (me, spsr): (u64, u64);
+    unsafe { asm!("mrs {a}, mpidr_el1", "mrs {b}, spsr_el2", a = out(reg) me, b = out(reg) spsr) };
+    let (mut h1, mut h2, mut h3, mut h4) = ([0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16]);
+    pstore::log(&[b"\nferros hv: UNEXPECTED trap, core ", &[b'0' + ((me >> 8) & 0xF) as u8], b" ESR ", pstore::hex(esr, &mut h1), b" ELR ", pstore::hex(elr, &mut h2), b" FAR ", pstore::hex(far, &mut h3), b" SPSR ", pstore::hex(spsr, &mut h4), b" -- core parked\n"]);
 }
 
 #[panic_handler]
@@ -405,7 +487,73 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
-/// The one DTB edit milestone 0 needs: a `hv@afc000000 { reg = <0xa 0xfc000000 0x0 0x4000000>; no-map; };` child under `/reserved-memory`, written as a fresh copy of the tree at `dst`. Big-endian flattened tree, standard token stream; the strings "reg" and "no-map" are taken from the existing strings block (every reserved-memory tree has them).
+/// The stage painted onto ABL's splash, which is still on the panel when the hv runs: a band across the top of the layer DMA0 is scanning (base, stride and size read from its registers, translation off on this path so the base is physical). Needs no memory that survives a reset and no host: the owner reads it off the glass. Greys are the same whichever byte order the surface has; magenta and green survive a red/blue swap too.
+mod splash {
+    use core::ptr::{read_volatile, write_volatile};
+    const DMA0: usize = 0x1990_0000;
+    pub const BAND_ROWS: usize = 96;
+
+    pub fn band(slot: usize, argb: u32) {
+        unsafe {
+            let base = read_volatile((DMA0 + 0x40) as *const u32) as usize;
+            let stride = read_volatile((DMA0 + 0x10) as *const u32) as usize;
+            let img = read_volatile((DMA0 + 0x1C) as *const u32);
+            let (w, h) = ((img & 0xFFFF) as usize, (img >> 16) as usize);
+            if base < 0x8000_0000 || stride == 0 || stride > 8192 || w == 0 || h < BAND_ROWS * (slot + 1) {
+                return;
+            }
+            let top = slot * BAND_ROWS;
+            for y in top..top + BAND_ROWS - 8 {
+                let row = base + y * stride * 4;
+                for x in 0..w {
+                    write_volatile((row + x * 4) as *mut u32, argb);
+                }
+            }
+            core::arch::asm!("dsb sy");
+        }
+    }
+}
+
+/// Lines into Android's pstore console ring (ramoops at G#FD3F_F000, 2 MiB, `persistent_ram_buffer`: u32 sig "DBGC", u32 start, u32 size, then data). pstore saves the ring to /sys/fs/pstore/console-ramoops-0 on the next Android boot, so the hv's words land in the kernel log timeline — the only RAM measured to survive this phone's resets (2026-10-17: everything outside the bootloader's preserved regions reads as decayed cells after any reset, and the pmsg half of ramoops too). The kernel appends to the same ring with atomics; the hv's plain read-modify-write from EL2 can clip a kernel line now and then, which is acceptable for a few lines per boot.
+mod pstore {
+    use core::ptr::{read_volatile, write_volatile};
+    const ZONE: usize = 0xFD3F_F000;
+    const ZONE_SIZE: usize = 0x20_0000;
+    const DATA: usize = ZONE + 12;
+    const BUF: u32 = (ZONE_SIZE - 12) as u32;
+
+    pub fn log(parts: &[&[u8]]) {
+        unsafe {
+            if read_volatile(ZONE as *const u32) != 0x4347_4244 {
+                return;
+            }
+            let mut start = read_volatile((ZONE + 4) as *const u32);
+            let mut size = read_volatile((ZONE + 8) as *const u32);
+            for part in parts {
+                for &b in part.iter() {
+                    write_volatile((DATA + start as usize) as *mut u8, b);
+                    start = if start + 1 >= BUF { 0 } else { start + 1 };
+                    if size < BUF {
+                        size += 1;
+                    }
+                }
+            }
+            write_volatile((ZONE + 4) as *mut u32, start);
+            write_volatile((ZONE + 8) as *mut u32, size);
+            core::arch::asm!("dsb sy");
+        }
+    }
+
+    /// 16 hex digits.
+    pub fn hex(v: u64, out: &mut [u8; 16]) -> &[u8] {
+        for (k, c) in out.iter_mut().enumerate() {
+            *c = b"0123456789ABCDEF"[((v >> (60 - 4 * k)) & 0xF) as usize];
+        }
+        out
+    }
+}
+
+/// The one DTB edit milestone 0 needs: a `hv@b2000000 { reg = <0x0 0xb2000000 0x0 0x4000000>; no-map; };` child under `/reserved-memory`, written as a fresh copy of the tree at `dst`. Big-endian flattened tree, standard token stream; the strings "reg" and "no-map" are taken from the existing strings block (every reserved-memory tree has them).
 mod fdt {
     use core::ptr::{read_volatile, write_volatile};
 
@@ -508,8 +656,8 @@ mod fdt {
             }
         }
         let insert_at = insert_at?;
-        // The node: BEGIN_NODE "hv@afc000000" (13 bytes + pad to 16), PROP reg (len 16, 4 cells), PROP no-map (len 0), END_NODE.
-        let node_len = 4 + 16 + 12 + 16 + 12 + 4;
+        // Two nodes, each: BEGIN_NODE + 16-byte name PROP reg (len 16, 4 cells), PROP no-map (len 0), END_NODE = 64 bytes: the hv's RAM, and its report megabyte in the low bank.
+        let node_len = 2 * (4 + 16 + 12 + 16 + 12 + 4);
         let new_total = total + node_len;
         if new_total > dst_max {
             return None;
@@ -518,26 +666,28 @@ mod fdt {
         let head = insert_at - src;
         copy(dst, src, head);
         let mut q = dst + head;
-        wr32(q, BEGIN_NODE);
-        q += 4;
-        for (k, &c) in b"hv@afc000000\0\0\0\0".iter().enumerate() {
-            wr8(q + k, c);
+        for (name, base, size) in [(b"hv@b2000000\0\0\0\0\0", super::HV_BASE, super::HV_SIZE), (b"hvrep@b6100000\0\0", super::REPORT as u64, super::REPORT_RESERVE)] {
+            wr32(q, BEGIN_NODE);
+            q += 4;
+            for (k, &c) in name.iter().enumerate() {
+                wr8(q + k, c);
+            }
+            q += 16;
+            wr32(q, PROP);
+            wr32(q + 4, 16);
+            wr32(q + 8, reg_off);
+            wr32(q + 12, (base >> 32) as u32);
+            wr32(q + 16, base as u32);
+            wr32(q + 20, (size >> 32) as u32);
+            wr32(q + 24, size as u32);
+            q += 28;
+            wr32(q, PROP);
+            wr32(q + 4, 0);
+            wr32(q + 8, nomap_off);
+            q += 12;
+            wr32(q, END_NODE);
+            q += 4;
         }
-        q += 16;
-        wr32(q, PROP);
-        wr32(q + 4, 16);
-        wr32(q + 8, reg_off);
-        wr32(q + 12, (super::HV_BASE >> 32) as u32);
-        wr32(q + 16, super::HV_BASE as u32);
-        wr32(q + 20, (super::HV_SIZE >> 32) as u32);
-        wr32(q + 24, super::HV_SIZE as u32);
-        q += 28;
-        wr32(q, PROP);
-        wr32(q + 4, 0);
-        wr32(q + 8, nomap_off);
-        q += 12;
-        wr32(q, END_NODE);
-        q += 4;
         // The rest of the structure block and the strings block that follows it.
         copy(q, insert_at, total - head);
         wr32(dst + 4, new_total as u32);

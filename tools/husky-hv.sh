@@ -26,8 +26,8 @@ PY
   fi
   IMAGE=$W/Image
 fi
-cargo build -q -p ferros_hv --target aarch64-unknown-none --release
-aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_hv $W/hv.bin
+cargo build -q -p ferros_hv --target aarch64-unknown-none-softfloat --release
+aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none-softfloat/release/ferros_hv $W/hv.bin
 HV=$(stat -c %s $W/hv.bin); PAD=$((0x180000))
 [ $HV -le $PAD ] || { echo "hv.bin is $HV bytes, over the G#18_0000 pad"; exit 1; }
 python3 - $W/hv.bin $IMAGE $W/kernel.lz4 $PAD <<'PY'
