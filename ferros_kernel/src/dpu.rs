@@ -255,6 +255,8 @@ fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], cntfrq: u64, r
     wr(DSIM0 + DSIM_NUM_OF_TRANSFER, r.h);
     wr(DSIM0 + DSIM_CONFIG, CONFIG_RUNNING);
     wr(DSIM0 + DSIM_SFR_CTRL, SFR_SHADOW_READ_EN | SFR_SHADOW_EN);
+    // The stock driver sets command mode and compression after the shadow is on; written before it, the compression bit did not reach the applied register (measured: CONFIG read back G#0480_7CFF).
+    wr(DSIM0 + DSIM_CONFIG, CONFIG_RUNNING);
     wr(DSIM0 + DSIM_CPRS_CTRL, 0xA);
     let sw = r.cfg.slice_width as u32;
     wr(DSIM0 + DSIM_SLICE01, sw << 16 | sw);
@@ -271,6 +273,17 @@ fn dsim_init(r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], cntfrq: u64, r
 fn decon_init(r: &Raster, main: &[u32], sub0: &[u32], sub1: &[u32], win: &[u32], wincon: u32) {
     restore(DECON0, 0, main, &[0x0004, GLOBAL_CON, 0x0038, 0x003C, SHD_REG_UP_REQ, DECON_INT_PEND, DECON_INT_PEND_EXTRA, 0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0114, 0x0118, 0x011C, 0x0120, 0x0124]);
     wr(DECON0 + GLOBAL_CON, 1 << 8);
+    // Android's SRAM allocation, out-FIFO QoS and interrupt enables (display::configure_like_android), so a modeset lands in its state.
+    wr(DECON0 + 0x0300, 0x1111_1111);
+    wr(DECON0 + 0x0304, 0x111);
+    wr(DECON0 + 0x0320, 0);
+    wr(DECON0 + 0x02C0, 1);
+    wr(DECON0 + 0x02C4, 0x0800_0400);
+    wr(DECON0 + 0x02C8, 0x10);
+    wr(DECON0 + 0x02D0, 1);
+    wr(DECON0 + 0x02D4, 0x3200_0600);
+    wr(DECON0 + 0x0060, 0x0030_3011);
+    wr(DECON0 + 0x0064, 0x11);
     wr(DECON0 + BLD_BG_IMG_SIZE_PRI, r.h << 16 | r.w);
     wr(DECON_SUB + DSIMIF_SEL0, 0);
     let pps = ferros_dsc::pps(&r.cfg);
