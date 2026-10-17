@@ -40,23 +40,24 @@ A **display server process** (EL0, masked/sealed) holding grants for DECON0, the
 - **Colour** — MEASURED 2026-10-17 with the owner's i1 Pro (DISPLAY-CALIB.md): native γ 2.185 with no toe, white 6750 K (not E), primaries wider than P3, DBV table within 5 %; the VSF→panel transfer table and the 3×3 follow from it.
 - **10 bit**: whether it exists on the link (plan step 5), and if so, measured banding versus 8 bit + dither.
 
-## 6. HDR rendering: gamma2tanh to the panel
+## 6. Rendering: gamma2tanh to the panel — decided 2026-10-17
 
-Content arrives as VSF `gamma2tanh` (vsf colour.md "HDR: Gamma 2, Then tanh": `tanh(√L)` per channel, diffuse white at code 194/256, 3.3 stops of headroom at 8 bits, 5.1 at 16). The display server renders it as follows.
+Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel, white at code 194/256, 3.3 stops above white at 8 bits, 5.1 at 16). The display curve was chosen on the glass with the owner (the display server's test card, `shelltest 02`, against a code-255 peak line), the panel numbers are DISPLAY-CALIB.md. The order, per pixel, per channel:
 
-1. **Pick diffuse white in nits**, W: from ambient light when a sensor is read, else a setting (140 nits is the panel's default level; a dim room wants less).
-2. **Headroom** H = P / W, where P is the peak the panel can give right now: 1000 nits normal, 1600 in HBM (HBM is a budget — Android caps it to 5 minutes per 30 — so H is a function of the HBM timer, not a constant).
-3. **Drive the panel at P**: `51` to the DBV for P (and `53 E0` for HBM), so the brightest code is P nits.
-4. **Map codes**: decode L = atanh(v)². SDR content (L ≤ 1) is scaled by W/P in linear light so it sits at W nits; the tail (L > 1) is placed between W and P. If the content's headroom exceeds H, squash the tail with the same tanh at the display's scale: `v' = tanh(√(L / L_max) · k)` with k chosen so L = 1 lands at W/P — the display's tone map is the decoder with a different scale, never a clip.
-5. **Precision**: scaling SDR down by W/P costs √(W/P) of the panel's codes (at W/P = ¼, half of them); dither in DECON — or 10 bit on the link if step 5 of the plan delivers it — keeps gradients clean. This is where 10 bit earns its place: precision under headroom, not range.
-6. **OLED makes this cheap**: only the highlight pixels emit more; the SDR part costs what it did. Sustained bright area is bounded by the panel's power and the HBM timer, which is physics, not the encoding.
-7. **Calibration input**: the measured code-to-nits curve per brightness level (§5), applied as a per-level LUT before DSC. Until it is measured, the mapping is approximate.
+1. **Decode once**: `L = atanh(v)²` — scene light in VSF RGB, white = 1. The encoding's tanh is storage; it is never re-applied.
+2. **Matrix**: 3×3 VSF RGB → panel RGB in linear light, the white adaptation inside it: VSF's Illuminant E renders as the panel's native white (6750 K measured) at full luminance — display white = media white, the owner's choice (a). Negatives clamp to 0. The matrix comes from the panel primaries placed under the observer VSF uses (Stockman–Sharpe 10°, from the i1 Pro's saved spectra), not through 1931 xy.
+3. **Expose**: one scalar — white's share of the panel's peak, 1/H (the brightness setting), times any per-image exposure. Linear, so it commutes with the matrix.
+4. **Roll off**: `Y/peak = tanh(L/H)` (owner's curve): slope 1 at black, smooth everywhere, never clips, asymptote at the peak. White lands at tanh(1/H) of the peak: 24.5 % at H = 4 (0.03 stop under linear), 46 % at H = 2, 76 % at H = 1 — so the brightness setting may run all the way to the peak with no cap; "max" means white at 76 % of peak with the highlights in the last 0.4 stop. A piecewise knee (linear to white, tanh above) was tried and rejected: indistinguishable below 25 %, and it needs a cap. The encoding's own `tanh(√L)²` as a display curve lifts the midtones 1.74× and was rejected on sight.
+5. **Panel encode**: `code = Y^(1/2.185)` — the measured EOTF (a plain power law, no toe) — at 10 bits, then the DQE's dither to the 8 bpc DSC link.
+6. **Brightness**: the setting is diffuse white in nits (the measured DBV table, 1353 = 133 nits on this unit), the panel runs at the DBV for the peak the headroom needs, HBM only when ambient asks (its timer makes H a function of time). OLED makes headroom cheap: only the highlight pixels pay.
 
-Untagged content is regular VSF RGB and renders at W with no tail.
+**Where it runs: the DQE.** Steps 1, 2 and 4+5 are the DQE's three blocks — a **degamma LUT** (33 points, 13-bit, with programmable x positions, so the steep top third-stop of `atanh²` gets its own points), a **3×3 gamma matrix** (14-bit coefficients and offsets), and a **regamma LUT** (33 points per channel, programmable x) carrying `tanh(L/H)` and the 2.185 encode — at 10 bits on every pixel, in hardware (`dqe_reg.c`: set_degamma_lut / set_gamma_matrix / set_regamma_lut, registers G#1000 / G#0C00 / regamma base). The compositor writes gamma2tanh codes straight into the framebuffer and never touches a pixel for colour; a brightness change is a new regamma table and a DQE shadow update. The display server owns the tables. Untagged (plain VSF RGB) content is the same path with nothing above white.
+
+**Precision**: scaling white down to 1/H costs codes (at H = 4 white sits at 10-bit code 346); the 10 bpc blend and the dither are what keep 8-bit content clean there — the reason 10 bpc is the default even though the link is 8 (DISPLAY.md).
 
 ## 7. Open
 
 - The regulator path from EL2 to S2MPG14/15 (ACPM/SPMI), needed for cold power-up and for reading the panel's rails.
-- Whether the panel accepts a 10 bpc PPS (plan step 5).
-- The photometer measurement (needs the owner and an instrument).
+- Whether the panel accepts a 10 bpc PPS (plan step 5; `modeset … link10`, eyes).
+- The gamut matrix under VSF's observer from the i1 Pro's spectra, and the EOTF at a second brightness (DISPLAY-CALIB.md).
 - Touch input (SPI, `spitouch`), which the shell needs and nothing covers yet.
