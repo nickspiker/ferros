@@ -36,7 +36,7 @@ A **display server process** (EL0, masked/sealed) holding grants for DECON0, the
 ## 5. Profiling: what "profiled" means here
 
 - **Timing**: per mode, TE period and width (the panel's TE constants: 273 µs at 120, 8500 µs at 60 HS, 1223 at 60 NS, 693 in AOD), frame transfer time against the underrun budget, mode-switch latency (the oracle has the transition timings: a W120→W60 switch is 23 packets in ~6 ms plus the vsync waits).
-- **Power**: per mode and brightness, measured — not estimated. Android baseline first (a fixed full-screen pattern, panel idle off, 20 s averages of battery current; the sweep's current samples were taken over uncontrolled content and are not a profile), then the same scenes under ferros. Idle/auto floors and AOD are where the wins are.
+- **Power**: per mode and brightness, measured — not estimated. **Done under ferros 2026-10-16: DISPLAY-POWER.md** (the gauge read over hsi2c_11 with the charger's buck off so the battery carries the system; solid-fill scenes; every mode, 8/10 bpc, both link rates, three brightnesses, HBM). Headline: content (+2.4 W white over black at 140 nits) and brightness (black alone moves 0.8 W between 2 and 140 nits) dwarf refresh rate (100–200 mW) and everything in the pipe (10 bpc, link rate, FHD: nothing measurable). Still to do: AOD, the Android baseline for the same scenes, 20 s averages.
 - **Colour**: the panel's code-to-nits curve at several brightness levels, measured with a photometer — the one input the HDR mapping below cannot get from any register. Samsung DDICs calibrate gamma per brightness level, and HBM differs again.
 - **10 bit**: whether it exists on the link (plan step 5), and if so, measured banding versus 8 bit + dither.
 

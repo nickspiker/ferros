@@ -51,7 +51,7 @@ Not on ACPM. I²C address G#36 (charger G#69, PMIC G#66) on `hsi2c_11` = G#10CB_
 
 ## For ferros
 
-1. **Battery current from ferros** (power profiling): a polled hsi2c master for hsi2c_11, a 16-bit read at G#36/G#0A and G#09. Smallest step, biggest payoff: every display mode's power becomes measurable under ferros with a controlled scene.
+1. **Battery current from ferros** (power profiling) — DONE 2026-10-16: `ferros_kernel/src/hsi2c.rs`, a polled master on hsi2c_11 reusing the bootloader's bring-up (confirmed: sysreg mode 4, mux/gates on, DIV /1 so the controller runs at 400 MHz with FS3 divider G#3E for 400 kHz, AUTO_MODE set); `bridge display power [n] [sixteenths] [battery]` reads SOC, temperature, VCell and current, `display i2c <target> <reg> [val]` any 8-bit register. On USB the battery current reads 0 ± 5 mA — the charger carries the load — so `battery` switches the MAX77759 charger's MODE (CHG_CNFG_00 G#B9 [3:0], 5 = charger + buck on) to 0 for the run and restores it in the kernel; the system then draws from the cell (662 mA at 4.28 V idle) and the gauge is a power meter. Results: DISPLAY-POWER.md.
 2. **ACPM channel 2 client**: read the descriptors, probe the chip id, then the display rails' control registers; turning VCI/VDDD off and on is the cold power-up's first half (DISPLAY-HK3.md §6 has the order and delays).
 
 ## hsi2c_11, the controller in front of the gauge (`soc/gs/drivers/i2c/busses/i2c-exynos5.c`)
