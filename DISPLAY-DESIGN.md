@@ -55,6 +55,8 @@ Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel
 
 **Precision**: scaling white down to 1/H costs codes (at H = 4 white sits at 10-bit code 346); the 10 bpc blend and the dither are what keep 8-bit content clean there — the reason 10 bpc is the default even though the link is 8 (DISPLAY.md).
 
+**Pinned (owner, 2026-10-17):** this pipeline is the reference colour profile for everything the owner's projects show or store. Mahere today stores imagery as √(tanh(x)) (tanh in linear light, then gamma 2) and displays through Opsin's cubic rail — a sibling; once the panel pipeline is final it ports to Mahere's imagery and to VSF's gamma2tanh definition, and the two are not allowed to drift meanwhile.
+
 ## 7. Open
 
 - The regulator path from EL2 to S2MPG14/15 (ACPM/SPMI), needed for cold power-up and for reading the panel's rails.
