@@ -314,6 +314,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut pt_bitmap_buf: alloc::vec::Vec<u64>;
     let mut pt_inbound: Option<InboundTransfer<'_>> = None;
     let mut pt_seq_width: usize = 0;
+    // A finished transfer is closed at the top of the next pass, not at the end of the arm that finished it: the DIAG handlers leave their arm with `continue`, which skipped the close and left every finished `diag` transfer "open" — then a 16 s pause tripped the stall exit (every PT-stall exit of 2026-10-16 followed a `diag` with a pause; the record named it).
+    let mut pt_done = false;
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 
     let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
@@ -340,6 +342,11 @@ pub fn run(mut b: Boot) -> ! {
         platform::pet_watchdogs();
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
+        if pt_done {
+            pt_done = false;
+            pt_inbound = None;
+            pt_seq_width = 0;
+        }
         let now = cntpct();
         if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
@@ -477,6 +484,7 @@ pub fn run(mut b: Boot) -> ! {
                                 }
                                 t_command = cntpct();
                                 done = true;
+                                pt_done = true;
                                 if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
                                     st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
