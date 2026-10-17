@@ -1,0 +1,12 @@
+[package]
+name = "ferros-shell-mock"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "What the owner sees when ferros wakes: a fluor mock of the shell at the panel's real geometry, rendered headless to PPM frames."
+
+# Standalone: fluor's host build (cosmic-text, rayon) stays out of the ferros workspace lock.
+[workspace]
+
+[dependencies]
+fluor = { path = "../../../fluor" }
