@@ -29,6 +29,10 @@ The number is the **whole phone**: SoC with one core spinning in the EL2 service
 | FHD 120, 10 bpc, white, 140 nits | 120 Hz | 1350 mA = 5.71 W |
 | WQHD 120, black, 2 nits | 120 Hz | 566 mA = **2.42 W** |
 | WQHD 120, black, 1000 nits | 120 Hz | 791 mA = **3.37 W** |
+| **AOD** (LP, 30 Hz, DBV 853), black | 30 Hz, 691 µs | 494 mA at 4285 mV = **2.12 W** |
+| AOD, grey 25 % (code 64) | 30 Hz, 689 µs | 548 mA = 2.35 W |
+| AOD, white | 30 Hz, 688 µs | 608 mA = 2.60 W |
+| after AOD exit, black, DBV still 853 (the exit set leaves brightness; Android sets it after) | 120 Hz, 273 µs | 613 mA = 2.62 W |
 
 ## What it says
 
@@ -37,11 +41,11 @@ The number is the **whole phone**: SoC with one core spinning in the EL2 service
 - **White at 1000 nits is 8.3 W, HBM 1600 nits is 12.9 W** (3.1 A from the cell, 4.11 V under load). HBM is for sunlight, briefly; the battery says so.
 - **10 bpc blend + DQE dither costs nothing measurable** (5.70 vs 5.67 W white, 3.21 vs 3.23 W black). The 1346 vs 1368 Mbps link: nothing measurable either. FHD vs WQHD: nothing measurable (the panel scales; the link carries the same DSC stream rate).
 - **Refresh rate is worth 100–200 mW.** 60 Hz saves 100–160 mW on black, 150 mW on white; the auto-rate floors save 120–190 mW (black) and 140–220 mW (white) against 120 Hz, with 10 Hz and 1 Hz no better than each other at this resolution of measurement. Small next to content and brightness, but it is free when nothing moves.
+- **AOD is the floor of the display: 2.12 W whole-phone on black** — 1.1 W under 120 Hz black at 140 nits, and 0.3 W under black at 2 nits. With the SoC still spinning a core, that 2.12 W is almost all SoC + USB; the AOD panel itself is in the low hundreds of milliwatts, and white AOD content costs 0.5 W over black (at its 853-DBV brightness). The AOD figure that matters for battery life needs the core asleep — see below.
 - **The TE pin at the idle floors read 120 Hz in this sweep because the TE was fixed**: `display idle … changeable` switches the panel to changeable TE only for its own measurement (it saw 28 / 8 Hz at the 30 / 10 Hz floors) and puts fixed TE back, as Android runs; the panel keeps idling underneath, which is what the power shows. Not a hardware question.
 
 ## Still to measure
 
-- AOD (30 Hz LP, DBV 853) — the state a phone spends most of its life in.
 - The SoC's own floor: the same rows with the core in WFI instead of spinning, once the service loop sleeps between PT packets; then the absolute numbers mean something as battery life.
 - Android's numbers for the same scenes, for the comparison the design asked for (DISPLAY-DESIGN.md §5): a fixed full-screen pattern, hibernation off, the gauge read from `sysfs`.
 - Longer averages (20 s) for the small differences — the 2 s averages here resolve ~50 mW.
