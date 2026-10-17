@@ -4,6 +4,7 @@ members = [
     "ferros_layout",
     "ferros_kernel",
     "ferros_hal",
+    "ferros_dsc",
     "ferros_hal_m1",
     "vault",
     "ferros_ledger",

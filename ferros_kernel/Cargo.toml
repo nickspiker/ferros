@@ -11,6 +11,7 @@ pixel8 = []
 m1 = ["dep:ferros_hal_m1"]
 
 [dependencies]
+ferros_dsc = { path = "../ferros_dsc" }
 ferros_sandbox = { path = "../ferros_sandbox" }
 ferros_hal = { path = "../ferros_hal", default-features = false, features = ["alloc"] }
 ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }

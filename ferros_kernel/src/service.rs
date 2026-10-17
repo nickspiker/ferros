@@ -750,6 +750,16 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#08 [1 = FHD, 0 = WQHD] = switch the whole pipe's raster (bridge `display res fhd|wqhd`).
+                                            Some((8, args)) if !args.is_empty() => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
+                                                    rep.extend_from_slice(b"display not running\n");
+                                                } else {
+                                                    crate::display::resolution(args[0] == 1, freq, &mut rep);
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
                                             Some((5, _)) => {
                                                 let mut rep = alloc::vec::Vec::new();

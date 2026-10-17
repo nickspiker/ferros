@@ -191,6 +191,71 @@ pub fn configure_like_android(rep: &mut alloc::vec::Vec<u8>) {
     append_hex(rep, b"GLOBAL_CON=", rd(DECON0 + GLOBAL_CON));
 }
 
+const DECON_SUB: usize = 0x1949_0000;
+const DMA0: usize = 0x1990_0000;
+const DPP0: usize = 0x1993_0000;
+const SRAMC0: usize = 0x1995_0000;
+const HDRCOMM0: usize = 0x1996_0000;
+const DSIM0: usize = 0x1944_0000;
+
+/// Switch the whole pipe between the panel's WQHD raster and its FHD raster (DISPLAY-HK3.md §1: the panel scales FHD up itself). The registers and values are the oracle's W120_noidle ⇄ F120_noidle diff (2026-10-16): DECON's image/out-FIFO sizes, both DSC encoders' group count and PPS words, DMA0/DPP0/SRAMC0/HDRCOMM0 geometry, window 5, and DSIM0's resolution, compressed width, slice widths and stable-VFP timer. Panel side first (DSC on, the PPS, the raster select), then every shadowed register, then one present to apply it all in one frame. Reports what the panel says afterwards.
+pub fn resolution(fhd: bool, cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) {
+    let cfg = if fhd { ferros_dsc::HUSKY_FHD } else { ferros_dsc::HUSKY_WQHD };
+    let (w, h) = (cfg.pic_width as u32, cfg.pic_height as u32);
+    let comp = cfg.slice_width as u32 / 3;
+    // Panel: DSC on, the PPS as a DSI type G#0A long packet, then the raster.
+    let pps = ferros_dsc::pps(&cfg);
+    if crate::dsim::send(crate::dsim::DCS_SHORT_WRITE_1, &[0x9D, 0x01], cntfrq).is_err() || crate::dsim::send(crate::dsim::PPS_LONG_WRITE, &pps, cntfrq).is_err() {
+        rep.extend_from_slice(b"PPS: FIFO stuck\n");
+        return;
+    }
+    let (sent, fail) = crate::dsim::sequence(if fhd { crate::hk3::RES_FHD } else { crate::hk3::RES_WQHD }, cntfrq);
+    if fail.is_some() {
+        append_hex(rep, b"raster select stuck after ", sent as u32);
+        return;
+    }
+    // DECON main: image size, out-FIFO / DSIM interface sizes.
+    wr(DECON0 + 0x0220, h << 16 | w);
+    wr(DECON0 + 0x0290, h << 16 | comp);
+    wr(DECON0 + 0x0294, comp);
+    wr(DECON0 + 0x0298, (cfg.slice_height as u32) << 16 | comp);
+    // Both DSC encoders: group count per line, and the PPS words 0..71 as DECON holds them.
+    for dsc in [DECON_SUB, DECON_SUB + 0x1000] {
+        wr(dsc + 0x000C, 3 << 12 | comp);
+        for i in 0..18 {
+            wr(dsc + 0x0040 + 4 * i, u32::from_be_bytes([pps[4 * i], pps[4 * i + 1], pps[4 * i + 2], pps[4 * i + 3]]));
+        }
+    }
+    // The layer: DMA source and image size, DPP, SRAM controller, HDR common.
+    wr(DMA0 + 0x0010, w);
+    wr(DMA0 + 0x0014, h);
+    wr(DMA0 + 0x001C, h << 16 | w);
+    wr(DPP0 + 0x003C, h << 16 | w);
+    wr(SRAMC0 + 0x0014, (h - 1) << 16);
+    wr(HDRCOMM0 + 0x0020, h << 16 | w);
+    // Window 5 (the base window ABL uses): start 0, end at the last pixel.
+    wr(DECON_WIN + 5 * 0x1000 + 0x000C, 0);
+    wr(DECON_WIN + 5 * 0x1000 + 0x0010, (h - 1) << 16 | (w - 1));
+    // DSIM0: resolution, compressed line width, slice widths, stable-VFP timer (hactive × 2 / 100).
+    let dsim = |off: usize, v: u32| unsafe { core::ptr::write_volatile((DSIM0 + off) as *mut u32, v) };
+    dsim(0x0030, h);
+    dsim(0x0034, if fhd { 0x0ED8 } else { 0x063A });
+    dsim(0x0038, comp);
+    dsim(0x003C, h << 16 | comp);
+    dsim(0x0078, (cfg.slice_width as u32) << 16 | cfg.slice_width as u32);
+    dsim(0x0084, w * 2 / 100);
+    // One frame applies every shadow register, then the panel reports its raster.
+    let r = show(if fhd { b"ferros FHD 1008x2244" } else { b"ferros WQHD 1344x2992" }, cntfrq);
+    rep.extend_from_slice(&r);
+    let _ = crate::dsim::dcs(&[0xF0, 0x5A, 0x5A], cntfrq);
+    if let Ok(v) = crate::dsim::read(0xC3, 1, cntfrq) {
+        append_hex(rep, b"PANEL_C3=", v[0] as u32);
+    }
+    let _ = crate::dsim::dcs(&[0xF0, 0xA5, 0xA5], cntfrq);
+    let (te, _) = te_rate(cntfrq);
+    append_hex(rep, b"TE_HZ=", te);
+}
+
 /// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).
 pub fn dpu_on() -> bool {
     [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) == 1)
