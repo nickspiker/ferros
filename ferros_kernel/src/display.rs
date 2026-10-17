@@ -127,34 +127,43 @@ const DECON_INT_EN_EXTRA: usize = 0x0064;
 const INT_EN_TE_RISE: u32 = 1 << 16;
 const DECON_INT_PEND_EXTRA: usize = 0x0074;
 const INT_PEND_TE_RISE: u32 = 1 << 16;
-const HW_TE_CNT: usize = 0x0038;
 
-/// The panel's refresh rate as DECON sees it: TE rising edges counted over half a second (the TE-rise interrupt pend bit, polled and cleared) and the hardware TE counter's delta, reported as Hz. Ground truth for mode switches, no eyes needed.
+/// The panel's TE pin (gpp0-3, pinctrl@1084_0000 bank 0: DAT at +4, bit 3): the TE pulse itself, before any DPU logic.
+const GPP0_DAT: usize = 0x1084_0004;
+
+/// The panel's refresh rate, two ways over half a second: rising edges on the TE pin, polled, and DECON's TE-rise interrupt with the hardware trigger armed but masked (TE reaches DECON, no frame starts). Hz each. Ground truth for mode switches, no eyes needed.
 pub fn te_rate(cntfrq: u64) -> (u32, u32) {
     let en = rd(DECON0 + DECON_INT_EN);
     let en_x = rd(DECON0 + DECON_INT_EN_EXTRA);
+    let trig = rd(DECON0 + TRIG_CON);
     wr(DECON0 + DECON_INT_EN_EXTRA, en_x | INT_EN_TE_RISE);
     wr(DECON0 + DECON_INT_EN, en | INT_EN_EXTRA);
     wr(DECON0 + DECON_INT_PEND_EXTRA, INT_PEND_TE_RISE);
-    let hw0 = rd(DECON0 + HW_TE_CNT);
+    wr(DECON0 + TRIG_CON, trig | HW_TRIG_EN | HW_TRIG_MASK_DECON);
     let start: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start) };
-    let mut rises = 0u32;
+    let (mut pin_rises, mut irq_rises) = (0u32, 0u32);
+    let mut last = unsafe { core::ptr::read_volatile(GPP0_DAT as *const u32) } >> 3 & 1;
     loop {
         let now: u64;
         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
         if now.wrapping_sub(start) >= cntfrq / 2 {
             break;
         }
+        let pin = unsafe { core::ptr::read_volatile(GPP0_DAT as *const u32) } >> 3 & 1;
+        if pin == 1 && last == 0 {
+            pin_rises += 1;
+        }
+        last = pin;
         if rd(DECON0 + DECON_INT_PEND_EXTRA) & INT_PEND_TE_RISE != 0 {
             wr(DECON0 + DECON_INT_PEND_EXTRA, INT_PEND_TE_RISE);
-            rises += 1;
+            irq_rises += 1;
         }
     }
-    let hw1 = rd(DECON0 + HW_TE_CNT);
+    wr(DECON0 + TRIG_CON, trig);
     wr(DECON0 + DECON_INT_EN_EXTRA, en_x);
     wr(DECON0 + DECON_INT_EN, en);
-    (rises * 2, hw1.wrapping_sub(hw0).wrapping_mul(2))
+    (pin_rises * 2, irq_rises * 2)
 }
 
 /// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).

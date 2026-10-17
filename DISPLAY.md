@@ -81,7 +81,7 @@ On a cold boot ABL leaves:
 
 ## DSI command path (2026-10-16) — ferros speaks to the panel
 
-The panel is google-hk3 on DSIM0 (DISPLAY-HK3.md; the oracle of every transition is `oracle/display/husky-hk3/`). `dsim.rs` sends DCS packets through DSIM0's SFR packet FIFOs between presents (the link is idle while the painter masks the TE trigger). First run on a cold boot: brightness `51 00 C4` / `51 0C EB` / `51 05 49`, dimming `53 28` / `53 20`, display off `28` and on `29` — every packet accepted and drained by the FIFO. ABL leaves the DSIM link configured as Android runs it (lanes, format, PLL identical; only interrupt masks and the command-mode TE timers differ). `bridge display dcs '<hex> / <hex> wNN / ...'` plays any oracle line; `bridge display dsim` dumps the link registers. Readback (DCS read, for self-verifying tests) is next.
+The panel is google-hk3 on DSIM0 (DISPLAY-HK3.md; the oracle of every transition is `oracle/display/husky-hk3/`). `dsim.rs` sends DCS packets through DSIM0's SFR packet FIFOs between presents (the link is idle while the painter masks the TE trigger). First run on a cold boot: brightness `51 00 C4` / `51 0C EB` / `51 05 49`, dimming `53 28` / `53 20`, display off `28` and on `29` — every packet accepted and drained by the FIFO. ABL leaves the DSIM link configured as Android runs it (lanes, format, PLL identical; only interrupt masks and the command-mode TE timers differ). `bridge display dcs '<hex> / <hex> wNN / ...'` plays any oracle line; `bridge display dsim` dumps the link registers. Reads work too (`bridge display read <reg> [len]`): the panel reports power mode G#9F, its extinfo, and a brightness readback equal to the DBV written. `bridge display terate` counts TE pulses on gpp0-3 for half a second: ABL leaves the panel at 60 Hz, and replaying the oracle's W120 / W60 transitions switches it to 120 and back, measured.
 
 ## Status
 
@@ -97,6 +97,8 @@ Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, w
 - [x] Re-point a DPP layer at linear pixels (adoption: keep its IOVA + mapping, switch AFBC off)
 - [x] Write pixels + trigger one frame (registers confirm, visually confirmed 2026-10-14)
 - [x] Minimal text glyph writer (`ferros_hal::console`, `bridge display "text"`)
-- [x] DSI command path: DCS writes to the panel from ferros (2026-10-16; brightness, dimming, off/on accepted by the FIFO; visual confirmation by the owner pending)
-- [ ] DCS read (power mode, brightness readback, DDIC ID) so tests verify themselves
-- [ ] Mode switches from the oracle (W120 ⇄ W60 ⇄ FHD), diffed against its register dumps
+- [x] DSI command path: DCS writes to the panel from ferros (2026-10-16; brightness, dimming, off/on)
+- [x] DCS reads (2026-10-16): power mode G#9F, extinfo 0a 80 20 (= Android's), pixel format, TE on, and brightness readback G#52 returning exactly the DBV written — the writes are proven by the panel itself
+- [x] Refresh-rate switches W120 ⇄ W60 from the oracle's packets, measured on the TE pin (gpp0-3): ABL leaves the panel at 60 Hz; the W120 transition gives 120 Hz, W60 gives 60 (`bridge display terate`)
+- [ ] After a switch, also set DSIM's command-mode TE timers (CMD_TE_CTRL0/1: ABL's are the 60 Hz values, Android's at 120 Hz are G#1A / G#1A03_1E1F)
+- [ ] FHD modes (C3 0D, F2 81, the FHD PPS — not in the traces, must be packed from the DSC config) and the DECON reconfiguration they need

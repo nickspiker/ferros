@@ -721,8 +721,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 if !crate::display::dpu_on() {
                                                     rep.extend_from_slice(b"DPU powered down\n");
                                                 } else {
-                                                    let (irq_hz, hw_hz) = crate::display::te_rate(freq);
-                                                    rep.extend_from_slice(alloc::format!("TE: {irq_hz} Hz by interrupt, {hw_hz} Hz by HW_TE_CNT\n").as_bytes());
+                                                    let (pin_hz, irq_hz) = crate::display::te_rate(freq);
+                                                    rep.extend_from_slice(alloc::format!("TE: {pin_hz} Hz on the pin, {irq_hz} Hz by DECON interrupt\n").as_bytes());
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
