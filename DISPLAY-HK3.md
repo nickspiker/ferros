@@ -99,7 +99,7 @@ Self-refresh and idle: `set_self_refresh` (1057-1125) on entry sets auto mode at
 
 ## 5. TE / TE2
 
-- TE width (HK3:323-327): AOD 693, 120 Hz 273, 60 Hz HS **8500**, 60 Hz NS 1223 µs. `get_te_usec` returns the HS/NS value at 60 Hz, else the mode's (1430-1440).
+- TE width (HK3:323-327): AOD 693, 120 Hz 273, 60 Hz HS **8500**, 60 Hz NS 1223 µs. **Measured on the pin from ferros (2026-10-16, `bridge display terate`): 120 Hz 272 µs, 60 Hz HS 8.3–8.6 ms** — the constants hold. `get_te_usec` returns the HS/NS value at 60 Hz, else the mode's (1430-1440).
 - TE width registers: HS `0B BB 00 2F`, NS `0B 43 00 2F`, AOD `0B E0 00 2F` (reading them as line positions is UNCONFIRMED).
 - TE2 option `B9`: changeable `04` / fixed `51` (414-427); fixed in LP, or with EE on and auto rate < 30. Offsets rising 0x10, falling 0x30 (HS) / 0x25 (NS). `update_te2` (429-490): `U @F2+42: F2 0D; @B9+01: B9 opt; @B9+(fixed 22 / changeable 1E): B9 rH rL fH fL` (twice when fixed) `L` — seen in the oracle after every mode switch.
 - Wait helpers (1453-1495): one vblank, then te_us × 1.05, + 1 ms; the changeable variant measures two vblanks and accepts |Δ − period| < 2 ms.

@@ -131,8 +131,12 @@ const INT_PEND_TE_RISE: u32 = 1 << 16;
 /// The panel's TE pin (gpp0-3, pinctrl@1084_0000 bank 0: DAT at +4, bit 3): the TE pulse itself, before any DPU logic.
 const GPP0_DAT: usize = 0x1084_0004;
 
-/// The panel's refresh rate, two ways over half a second: rising edges on the TE pin, polled, and DECON's TE-rise interrupt with the hardware trigger armed but masked (TE reaches DECON, no frame starts). Hz each. Ground truth for mode switches, no eyes needed.
+/// The panel's refresh rate and TE pulse width over half a second: rising edges on the TE pin (Hz), DECON's TE-rise interrupt with the hardware trigger armed but masked (Hz), and the mean high time of the pulse in µs. Ground truth for mode switches and the TE timing profile, no eyes needed.
 pub fn te_rate(cntfrq: u64) -> (u32, u32) {
+    te_profile(cntfrq).0
+}
+
+pub fn te_profile(cntfrq: u64) -> ((u32, u32), u32) {
     let en = rd(DECON0 + DECON_INT_EN);
     let en_x = rd(DECON0 + DECON_INT_EN_EXTRA);
     let trig = rd(DECON0 + TRIG_CON);
@@ -140,19 +144,26 @@ pub fn te_rate(cntfrq: u64) -> (u32, u32) {
     wr(DECON0 + DECON_INT_EN, en | INT_EN_EXTRA);
     wr(DECON0 + DECON_INT_PEND_EXTRA, INT_PEND_TE_RISE);
     wr(DECON0 + TRIG_CON, trig | HW_TRIG_EN | HW_TRIG_MASK_DECON);
-    let start: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) start) };
+    let tick = || {
+        let t: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+        t
+    };
+    let start = tick();
     let (mut pin_rises, mut irq_rises) = (0u32, 0u32);
+    let (mut high_ticks, mut rose_at) = (0u64, 0u64);
     let mut last = unsafe { core::ptr::read_volatile(GPP0_DAT as *const u32) } >> 3 & 1;
     loop {
-        let now: u64;
-        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+        let now = tick();
         if now.wrapping_sub(start) >= cntfrq / 2 {
             break;
         }
         let pin = unsafe { core::ptr::read_volatile(GPP0_DAT as *const u32) } >> 3 & 1;
         if pin == 1 && last == 0 {
             pin_rises += 1;
+            rose_at = now;
+        } else if pin == 0 && last == 1 && rose_at != 0 {
+            high_ticks += now.wrapping_sub(rose_at);
         }
         last = pin;
         if rd(DECON0 + DECON_INT_PEND_EXTRA) & INT_PEND_TE_RISE != 0 {
@@ -163,7 +174,8 @@ pub fn te_rate(cntfrq: u64) -> (u32, u32) {
     wr(DECON0 + TRIG_CON, trig);
     wr(DECON0 + DECON_INT_EN_EXTRA, en_x);
     wr(DECON0 + DECON_INT_EN, en);
-    (pin_rises * 2, irq_rises * 2)
+    let width_us = if pin_rises > 0 { (high_ticks * 1_000_000 / cntfrq / pin_rises as u64) as u32 } else { 0 };
+    ((pin_rises * 2, irq_rises * 2), width_us)
 }
 
 /// DECON0's state as Android runs it at WQHD 120 Hz, where ABL leaves it unset (the live diff against oracle/display/husky-hk3/W120_noidle, 2026-10-16): SRAM for every window Android allocates, the out-FIFO QoS, the interrupt enables. The main registers are shadowed: the next present's global shadow update applies them.
