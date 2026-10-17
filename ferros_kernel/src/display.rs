@@ -82,7 +82,7 @@ fn iova_to_phys(sysmmu: usize, iova: u64) -> Option<u64> {
     }
 }
 
-fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
+pub fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
     out.extend_from_slice(label);
     let hex = b"0123456789ABCDEF";
     for i in (0..8).rev() {
@@ -129,7 +129,7 @@ const DECON_INT_PEND_EXTRA: usize = 0x0074;
 const INT_PEND_TE_RISE: u32 = 1 << 16;
 
 /// The panel's TE pin (gpp0-3, pinctrl@1084_0000 bank 0: DAT at +4, bit 3): the TE pulse itself, before any DPU logic.
-const GPP0_DAT: usize = 0x1084_0004;
+pub const GPP0_DAT: usize = 0x1084_0004;
 
 /// The panel's refresh rate and TE pulse width over half a second: rising edges on the TE pin (Hz), DECON's TE-rise interrupt with the hardware trigger armed but masked (Hz), and the mean high time of the pulse in µs. Ground truth for mode switches and the TE timing profile, no eyes needed.
 pub fn te_rate(cntfrq: u64) -> (u32, u32) {
