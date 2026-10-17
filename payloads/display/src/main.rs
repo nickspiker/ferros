@@ -371,7 +371,7 @@ fn knee(l: f32, white: f32, k: f32) -> f32 {
     white * (1.0 + (h - 1.0) * tanh(k * (l - 1.0)) / top)
 }
 
-/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the display curve, Y/peak = tanh(L/H) with H = 1.75 — slope 1 at black, white at 52 % of peak, everything above rolled toward the peak, nothing clipped. Bottom half: linear with white at 57 %, clipped at the peak. A 12-pixel line of code 255 between them is the peak itself. Ticks (dark lines) at L = 1, 2, 4, 8.
+/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the display curve, Y/peak = tanh²(√(L/H)) with H = 1.75 — slope 1 at black, white at 41 % of the peak, the stops above rolled smoothly, nothing clipped. Bottom half: linear at the same white, clipped at the peak. A 12-pixel line of code 255 between them is the peak itself. Ticks (dark lines) at L = 1, 2, 4, 8.
 fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     let stops_lo = -6.0f32;
     let stops_hi = libm::log2f(9.6);
@@ -379,8 +379,11 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
         let stops = stops_lo + (stops_hi - stops_lo) * x as f32 / (width - 1) as f32;
         let l = libm::exp2f(stops);
         // The owner's curve (2026-10-17): Y/peak = tanh(L/H), H = peak ÷ white — smooth everywhere, never clips, white at tanh(1/H) of the peak (52 % at H = 1.75 against 57 % linear).
-        let top = panel_code(tanh(l / 1.75));
-        let bottom = panel_code(l * 0.574);
+        // Top: the display curve (DISPLAY-DESIGN.md §6), tanh in gamma-2 space, Y/peak = tanh²(√(L/H)). Bottom: linear at the same white, clipped at the peak — the reference the roll-off is judged against.
+        let b = tanh(sqrt(l / 1.75));
+        let white = tanh(sqrt(1.0 / 1.75));
+        let top = panel_code(b * b);
+        let bottom = panel_code(l * white * white);
         let tick = [0.0f32, 1.0, 2.0, 3.0].iter().any(|t| libm::fabsf(stops - t) < 0.004);
         for y in 0..height {
             let band = y * 8 / height;
