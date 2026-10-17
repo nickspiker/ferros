@@ -129,16 +129,17 @@ async fn main() {
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" if args.get(2).map(String::as_str) == Some("modeset") => {
-            // display modeset fhd|wqhd [1368|1346] [8|10] — the link rate (ABL's 1368 Mbps, Android's 1346) and the blend depth (8 bpc as ABL, 10 bpc with the DQE dither as Android), in either order; omitted keeps the current one.
+            // display modeset fhd|wqhd [1368|1346] [8|10|keep] — the link rate (ABL's 1368 Mbps, Android's 1346; omitted keeps the current one) and the blend depth: 10 bpc with the DQE dither is the default (two bits of gradation on the 8 bpc link for no measurable power, DISPLAY-POWER.md), `8` is ABL's path, `keep` leaves it.
             let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
             let mut rate = 0;
-            let mut bpc = 0;
+            let mut bpc = 2;
             for a in &args[4..] {
                 match a.as_str() {
                     "1368" => rate = 1,
                     "1346" => rate = 2,
                     "8" => bpc = 1,
                     "10" => bpc = 2,
+                    "keep" => bpc = 0,
                     _ => {}
                 }
             }
