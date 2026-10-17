@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "ferros_layout",
     "ferros_kernel",
+    "ferros_hv",
     "ferros_hal",
     "ferros_dsc",
     "ferros_dsi",

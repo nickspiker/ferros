@@ -890,6 +890,10 @@ name = "ferros_heap"
 version = "0.0.0"
 
 [[package]]
+name = "ferros_hv"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_kernel"
 version = "0.1.0"
 dependencies = [
