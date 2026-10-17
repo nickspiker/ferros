@@ -1,9 +1,9 @@
 //! The display server, first cut (DISPLAY-DESIGN.md §3, SHELL.md): an EL0 process that owns the framebuffer and the base layer, paints the shell's first-boot screen with fluor and a real typeface, and presents it on the panel's TE through DECON's trigger — the frame loop that was the kernel's `display::show` until now, as a process.
 //!
-//! What it owns: the `display-fb` DMA region (the surface the layer DMA reads, plus this process's heap above it), DECON0's main/win/wincon blocks, layer 0's DMA and DPP blocks, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (DPP0's image size) and the modeset ABL or the kernel left — the panel, DSIM and DECON's geometry stay as they are; this process only re-points the layer and pushes frames.
+//! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
-//! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers).
+//! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -42,6 +42,8 @@ const S_FB: u64 = 8;
 const S_HEAP: u64 = 9;
 const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
+const S_SRAMC0: u64 = 12;
+const S_HDRCOMM0: u64 = 13;
 
 /// DSIM0 through its grant: one syscall per register access, the generic timer for the waits.
 struct DsiGrant {
@@ -206,13 +208,28 @@ impl Pipe {
     fn wr(&self, slot: u64, off: u64, v: u32) {
         mmio_write(cap(self.grants, slot), off, v);
     }
-    /// Point the base layer at `fb` (translation is off, so the DMA address is the physical one), linear BGRX8888, stride = width.
-    fn take_layer(&self, fb: usize, width: u32) {
+    /// The whole layer, every word, as the kernel's modeset programs it from the oracle (dpu::decon_init) — nothing inherited: window `win` non-secure, ABL's blend function for an opaque base layer (FUNC_CON_0 G#102: function 1, alpha-multiply source 2; proven on this pipe), the full raster from (0,0), no colour map; WINCON enable on channel 0 (DMA0/DPP0); the DMA linear BGRX8888 at `fb` (translation is off, so the DMA address is the physical one), stride = width, no offset, image = raster; DPP0, SRAMC0 and HDRCOMM0 told the same size.
+    fn program_layer(&self, win: u32, fb: usize, width: u32, height: u32) {
+        let w = (win * 0x1000) as u64;
+        self.wr(S_WIN, w + 0x00, 1);
+        self.wr(S_WIN, w + 0x04, 0x0102);
+        self.wr(S_WIN, w + 0x08, 0);
+        self.wr(S_WIN, w + 0x0C, 0);
+        self.wr(S_WIN, w + 0x10, (height - 1) << 16 | (width - 1));
+        self.wr(S_WIN, w + 0x14, 0);
+        self.wr(S_WIN, w + 0x18, 0);
+        self.wr(S_WIN, w + 0x1C, 0);
+        self.wr(S_WINCON, w, 1);
         let ctrl = self.rd(S_DMA0, RDMA_IN_CTRL_0);
         self.wr(S_DMA0, RDMA_IN_CTRL_0, (ctrl & !(IDMA_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | IDMA_BGRX8888);
-        self.wr(S_DMA0, RDMA_BASEADDR_P0, fb as u32);
         self.wr(S_DMA0, RDMA_SRC_WIDTH, width);
+        self.wr(S_DMA0, 0x0014, height);
         self.wr(S_DMA0, RDMA_SRC_OFFSET, 0);
+        self.wr(S_DMA0, RDMA_IMG_SIZE, height << 16 | width);
+        self.wr(S_DMA0, RDMA_BASEADDR_P0, fb as u32);
+        self.wr(S_DPP0, 0x003C, height << 16 | width);
+        self.wr(S_SRAMC0, 0x0014, (height - 1) << 16);
+        self.wr(S_HDRCOMM0, 0x0020, height << 16 | width);
     }
     /// One frame: the window's and the global shadow update, the TE trigger unmasked until FRAME_COUNT moves (or a quarter second), then masked again. Returns (frames advanced, RDMA_IRQ).
     fn present(&self, win: u32) -> (bool, u32) {
@@ -388,7 +405,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let status_y = span * 0.05;
     let status_px = span * 0.021;
 
-    pipe.take_layer(fb, width as u32);
+    pipe.program_layer(win, fb, width as u32, height as u32);
 
     // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules, and the black last, under everything.
     let mut damage = Damage::new();
@@ -482,7 +499,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
                     }
                     ferros_sys::dma_barrier();
-                    pipe.take_layer(fb, width as u32);
+                    pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     frames += 1;
                     out[1] = moved as u8;
@@ -562,7 +579,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 ALLOC.reset();
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
-                pipe.take_layer(fb, width as u32);
+                pipe.program_layer(win, fb, width as u32, height as u32);
                 let (moved, irq) = pipe.present(win);
                 frames += 1;
                 if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {

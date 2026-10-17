@@ -19,8 +19,8 @@ if [ $RELOAD = 1 ]; then
     for _ in $(seq 20); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 fi
 "$B" diag 2>/dev/null | grep -E "^GEN|^PREV_EXIT"
-# Grant slots are positional (payloads/display/src/main.rs header): console, endpoint, DECON main/win/wincon, DMA0, DPP0, GPP0, framebuffer, heap, DSIM0, DPHY0.
-timeout 120 "$B" spawn "$R/display.bin" 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 2>&1 | grep -E "^display|rror"
+# Grant slots are positional (payloads/display/src/main.rs header): console, endpoint, DECON main/win/wincon, DMA0, DPP0, GPP0, framebuffer, heap, DSIM0, DPHY0, SRAMC0, HDRCOMM0.
+timeout 120 "$B" spawn "$R/display.bin" 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0 2>&1 | grep -E "^display|rror"
 sleep 3
 if [ $SHELL_CLIENT = 1 ]; then
     timeout 120 "$B" spawn "$R/shelltest.bin" 00 --name shelltest --use display >/dev/null 2>&1
