@@ -686,14 +686,44 @@ pub fn run(mut b: Boot) -> ! {
                                         let resp = store_command(store.as_mut(), cmd.op, cmd.params);
                                         queue_pt_response(&mut pt_out_data, &resp);
                                     } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
-                                        // A leading G#01 byte = hold (bridge `display --hold`).
-                                        let (text, h) = match cmd.params.split_first() {
-                                            Some((1, rest)) => (rest, true),
-                                            _ => (cmd.params, false),
-                                        };
-                                        hold |= h;
-                                        let rep = crate::display::show(text, freq);
-                                        queue_pt_response(&mut pt_out_data, &rep);
+                                        // A leading G#01 byte = hold (bridge `display --hold`); G#02 = a DSI packet script for the panel (dsim::sequence, bridge `display dcs`); G#03 = dump the DSIM link registers (bridge `display dsim`). Anything else is text for the painter.
+                                        match cmd.params.split_first() {
+                                            Some((2, script)) => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() {
+                                                    rep.extend_from_slice(b"DPU powered down\n");
+                                                } else if !crate::dsim::alive() {
+                                                    rep.extend_from_slice(b"DSIM0 not running\n");
+                                                } else {
+                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
+                                                    rep.extend_from_slice(b"DSI packets sent: ");
+                                                    rep.extend_from_slice(alloc::format!("{sent}").as_bytes());
+                                                    match fail {
+                                                        Some(f) => rep.extend_from_slice(alloc::format!(", then FIFO stuck (FIFOCTRL G#{f:08x})\n").as_bytes()),
+                                                        None => rep.extend_from_slice(b", all went\n"),
+                                                    }
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            Some((3, _)) => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() {
+                                                    rep.extend_from_slice(b"DPU powered down\n");
+                                                } else {
+                                                    crate::dsim::dump(&mut rep);
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            _ => {
+                                                let (text, h) = match cmd.params.split_first() {
+                                                    Some((1, rest)) => (rest, true),
+                                                    _ => (cmd.params, false),
+                                                };
+                                                hold |= h;
+                                                let rep = crate::display::show(text, freq);
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                        }
                                     } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
                                         let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());

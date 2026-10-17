@@ -96,6 +96,12 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
+        "display" if args.get(2).map(String::as_str) == Some("dcs") => {
+            // display dcs "<packet> / <packet> / ..." — each packet is hex bytes (the DCS command first), optionally followed by wNN (wait NN ms after it); a leading tNN picks the DSI data type (default: G#05 / G#15 / G#39 by length). Example: 'f0 5a 5a / 51 05 49 / f0 a5 a5' sets brightness 1353.
+            let script = args[3..].join(" ");
+            cmd_display_dcs(&script).await;
+        }
+        "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);
@@ -823,6 +829,54 @@ async fn cmd_store(args: &[String]) {
 }
 
 /// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
+/// Encode a DCS script into the kernel's `[type][len][bytes…][wait_ms]` packets and send it as DISPLAY op G#02.
+async fn cmd_display_dcs(script: &str) {
+    let mut params = vec![2u8];
+    let mut n = 0;
+    for pkt in script.split('/') {
+        let mut bytes = Vec::new();
+        let mut wait = 0u8;
+        let mut kind: Option<u8> = None;
+        for tok in pkt.split_whitespace() {
+            if let Some(w) = tok.strip_prefix('w') {
+                wait = w.parse().unwrap_or_else(|_| { eprintln!("bad wait: {tok}"); std::process::exit(1) });
+            } else if let Some(t) = tok.strip_prefix('t') {
+                kind = Some(u8::from_str_radix(t, 16).unwrap_or_else(|_| { eprintln!("bad type: {tok}"); std::process::exit(1) }));
+            } else {
+                bytes.push(u8::from_str_radix(tok, 16).unwrap_or_else(|_| { eprintln!("bad byte: {tok}"); std::process::exit(1) }));
+            }
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        let kind = kind.unwrap_or(match bytes.len() { 1 => 0x05, 2 => 0x15, _ => 0x39 });
+        params.push(kind);
+        params.push(bytes.len() as u8);
+        params.extend_from_slice(&bytes);
+        params.push(wait);
+        n += 1;
+    }
+    println!("{n} packets");
+    cmd_display_raw(&params).await;
+}
+
+/// Send raw DISPLAY params and print the reply.
+async fn cmd_display_raw(params: &[u8]) {
+    let link = usb::UsbLink::open().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let cmd = build_cmd(ferros_pt::command::caps::DISPLAY, ferros_pt::Op::Write, params);
+    if let Err(e) = pt_send(&link, &cmd).await {
+        eprintln!("Command send failed: {e}");
+        std::process::exit(1);
+    }
+    match pt_recv(&link).await {
+        Ok(r) => print!("{}", String::from_utf8_lossy(&r)),
+        Err(e) => eprintln!("Response receive failed: {e}"),
+    }
+}
+
 async fn cmd_display(text: &str, hold: bool) {
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
         eprintln!("{e}");
