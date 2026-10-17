@@ -361,15 +361,24 @@ fn panel_code(y: f32) -> u32 {
     if c.is_nan() { 0 } else if c > 255.0 { 255 } else { c as u32 }
 }
 
-/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the max-brightness curve, Y/peak = tanh(√L)² — white (L = 1) lands at 57 % of peak, the 3.3 stops above it roll into the remaining 0.8 stop. Bottom half: linear at the same white, clipped at the peak. Ticks (dark lines) at L = 1, 2, 4, 8.
+/// The display curve with a knee (DISPLAY-DESIGN.md §6): linear up to white, the tanh shoulder only above it, reaching the peak at gamma2tanh's top (9.6× white). `white` = white's share of the peak (1/H); `k` sets how gently the shoulder begins (0.35: half-way to the peak near 4× white). Below white this is exactly the linear curve — same black, same slope — so SDR is untouched; the encoding's own tanh(√L)² curve was tried first and lifts the midtones by up to 1.74× (the owner saw it on the card, 2026-10-17).
+fn knee(l: f32, white: f32, k: f32) -> f32 {
+    if l <= 1.0 {
+        return white * l;
+    }
+    let h = 1.0 / white;
+    let top = tanh(k * (9.6 - 1.0));
+    white * (1.0 + (h - 1.0) * tanh(k * (l - 1.0)) / top)
+}
+
+/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the knee curve with white at 57 % of peak — linear to 1×, the 3.3 stops above rolled into the remaining 0.8 stop. Bottom half: linear at the same white, clipped at the peak. The halves are identical up to the 1× tick by construction. Ticks (dark lines) at L = 1, 2, 4, 8.
 fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     let stops_lo = -6.0f32;
     let stops_hi = libm::log2f(9.6);
     for x in 0..width {
         let stops = stops_lo + (stops_hi - stops_lo) * x as f32 / (width - 1) as f32;
         let l = libm::exp2f(stops);
-        let v = tanh(sqrt(l));
-        let top = panel_code(v * v);
+        let top = panel_code(knee(l, 0.574, 0.35));
         let bottom = panel_code(l * 0.574);
         let tick = [0.0f32, 1.0, 2.0, 3.0].iter().any(|t| libm::fabsf(stops - t) < 0.004);
         for y in 0..height {
