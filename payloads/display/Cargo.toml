@@ -13,3 +13,4 @@ ferros_sys = { path = "../../ferros_sys" }
 ferros_dsi = { path = "../../ferros_dsi" }
 fluor = { path = "../../../fluor", default-features = false, features = ["host-bare"] }
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+libm = "0.2"

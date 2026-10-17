@@ -15,6 +15,7 @@
 //! - 7 `refresh [hz u8]`: 60 or 120, the panel's own command set plus DSIM's command-TE timers.
 //! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
 //! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
+//! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
 //! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass. What is not a convention is fluor's order: it composites **front to back**, a paint goes *under* what is already there and an opaque pixel is left alone, so a frame starts from transparent (α = 0), the text goes down first and the background last. (The first cut filled black over raw DRAM: every word that happened to carry α = FF survived, a random-colour matrix at 1 in 256 — the owner's "green speckle wallpaper", 2026-10-16.)
@@ -318,6 +319,69 @@ fn text_right(c: &mut Canvas, font: &fontdue::Font, s: &str, right: f32, baselin
     text(c, font, s, right - w, baseline, px, colour);
 }
 
+/// Square root by Newton on plain multiplies and divides. On husky, 2026-10-17, both `libm::sqrtf` and an inline `fsqrt` returned 0 for every input in this process while `libm::tanhf`/`exp2f`/`log2f` and fontdue's arithmetic were right — unexplained; `fsqrt_probe` records it per boot.
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut r = if x > 1.0 { x } else { 1.0 };
+    for _ in 0..24 {
+        r = 0.5 * (r + x / r);
+    }
+    r
+}
+
+fn fsqrt_probe(x: f32) -> f32 {
+    let r: f32;
+    unsafe { core::arch::asm!("fsqrt {0:s}, {1:s}", out(vreg) r, in(vreg) x, options(pure, nomem, nostack)) };
+    r
+}
+
+/// tanh from the exp2 that works: tanh(x) = (e^{2x} − 1) / (e^{2x} + 1).
+fn tanh(x: f32) -> f32 {
+    if x > 10.0 {
+        return 1.0;
+    }
+    let e = libm::exp2f(2.0 * x * core::f32::consts::LOG2_E);
+    (e - 1.0) / (e + 1.0)
+}
+
+/// x^p for x > 0, through exp2/log2.
+fn pow(x: f32, p: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    libm::exp2f(p * libm::log2f(x))
+}
+
+/// The panel's measured transfer (DISPLAY-CALIB.md): relative luminance → 8-bit code, γ 2.185.
+fn panel_code(y: f32) -> u32 {
+    let y = if y.is_nan() || y < 0.0 { 0.0 } else if y > 1.0 { 1.0 } else { y };
+    let c = pow(y, 1.0 / 2.185) * 255.0 + 0.5;
+    if c.is_nan() { 0 } else if c > 255.0 { 255 } else { c as u32 }
+}
+
+/// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the max-brightness curve, Y/peak = tanh(√L)² — white (L = 1) lands at 57 % of peak, the 3.3 stops above it roll into the remaining 0.8 stop. Bottom half: linear at the same white, clipped at the peak. Ticks (dark lines) at L = 1, 2, 4, 8.
+fn testcard(pixels: &mut [u32], width: usize, height: usize) {
+    let stops_lo = -6.0f32;
+    let stops_hi = libm::log2f(9.6);
+    for x in 0..width {
+        let stops = stops_lo + (stops_hi - stops_lo) * x as f32 / (width - 1) as f32;
+        let l = libm::exp2f(stops);
+        let v = tanh(sqrt(l));
+        let top = panel_code(v * v);
+        let bottom = panel_code(l * 0.574);
+        let tick = [0.0f32, 1.0, 2.0, 3.0].iter().any(|t| libm::fabsf(stops - t) < 0.004);
+        for y in 0..height {
+            let band = y * 8 / height;
+            let c = if y < height / 2 { top } else { bottom };
+            // A hairline tick where L is a power of two from white, in the two middle bands only.
+            let c = if tick && (band == 3 || band == 4) { 0 } else { c };
+            pixels[y * width + x] = 0xFF00_0000 | c << 16 | c << 8 | c;
+        }
+    }
+}
+
 /// hh:mm:ss since boot — the only clock this process has until a time source is granted.
 fn uptime(buf: &mut [u8; 8], secs: u64) -> &str {
     let (h, m, s) = ((secs / 3600) % 100, (secs / 60) % 60, secs % 60);
@@ -548,6 +612,44 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(9) if m.len() >= 2 => {
                     out[0] = dsi.dcs(&m[1..]).is_err() as u8 * 3;
+                }
+                Some(11) => {
+                    // The arithmetic the card is built from, logged (2026-10-17: a card came out all code 0 once; a NaN cast is 0).
+                    let probe = |l: f32| {
+                        let v = tanh(sqrt(l));
+                        (v, panel_code(v * v))
+                    };
+                    let (v0, c0) = probe(1.0 / 64.0);
+                    let (v1, c1) = probe(1.0);
+                    let (v2, c2) = probe(9.6);
+                    log.s(b"display: testcard tanh(sqrt L) at L=1/64,1,9.6: ");
+                    for v in [v0, v1, v2] {
+                        log.dec((v * 1000.0) as u64);
+                        log.s(b"/1000 ");
+                    }
+                    log.s(b"codes ");
+                    for c in [c0, c1, c2] {
+                        log.dec(c as u64);
+                        log.s(b" ");
+                    }
+                    log.s(b"libm sqrtf(4)*1000=");
+                    log.dec((libm::sqrtf(4.0) * 1000.0) as u64);
+                    log.s(b" fsqrt(4)*1000=");
+                    log.dec((fsqrt_probe(4.0) * 1000.0) as u64);
+                    log.s(b" newton sqrt(4)*1000=");
+                    log.dec((sqrt(4.0) * 1000.0) as u64);
+                    log.s(b" libm tanhf(1)*1000=");
+                    log.dec((libm::tanhf(1.0) * 1000.0) as u64);
+                    log.s(b"\n");
+                    log.flush();
+                    testcard(pixels, width, height);
+                    ferros_sys::dma_barrier();
+                    pipe.program_layer(win, fb, width as u32, height as u32);
+                    let (moved, _) = pipe.present(win);
+                    frames += 1;
+                    client_owned = true;
+                    out[1] = moved as u8;
+                    len = 2;
                 }
                 Some(10) if m.len() >= 3 => {
                     let n = (m[2] as usize).clamp(1, 15);

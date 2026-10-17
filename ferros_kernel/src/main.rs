@@ -535,6 +535,10 @@ ferros_el0_enter:
     stp     x29, x30, [x9, #80]
     mov     x10, sp
     str     x10, [x9, #96]
+    stp     d8, d9, [x9, #104]
+    stp     d10, d11, [x9, #120]
+    stp     d12, d13, [x9, #136]
+    stp     d14, d15, [x9, #152]
     msr     elr_el2, x0
     msr     sp_el0, x1
     msr     spsr_el2, xzr
@@ -604,7 +608,7 @@ ferros_el0_enter:
     eret
 
 .balign 16
-// Resume a parked process (process.rs `run_slice`): x0 = its saved frame (288 bytes, the .Lel0_sync layout). Saves the kernel context like ferros_el0_enter, copies the frame onto the stack and erets through the common restore path.
+// Resume a parked process (process.rs `run_slice`): x0 = its saved frame (816 bytes, the .Lel0_sync layout: x0–x30, SP_EL0, ELR, SPSR, ESR, FAR, then v0–v31, FPCR, FPSR). Saves the kernel context like ferros_el0_enter, copies the frame onto the stack and erets through the common restore path.
 .global ferros_el0_resume
 ferros_el0_resume:
     adrp    x9, __el0_kctx
@@ -617,19 +621,23 @@ ferros_el0_resume:
     stp     x29, x30, [x9, #80]
     mov     x10, sp
     str     x10, [x9, #96]
-    sub     sp, sp, #288
+    stp     d8, d9, [x9, #104]
+    stp     d10, d11, [x9, #120]
+    stp     d12, d13, [x9, #136]
+    stp     d14, d15, [x9, #152]
+    sub     sp, sp, #816
     mov     x10, #0
 1:  ldr     x11, [x0, x10]
     str     x11, [sp, x10]
     add     x10, x10, #8
-    cmp     x10, #288
+    cmp     x10, #816
     b.lo    1b
     b       .Lel0_restore
 
 .balign 16
 // Synchronous exception from EL0 (a syscall or a fault): save the process's registers in a frame on SP_EL2, let process.rs decide (ferros_el0_trap: 0 = resume, 1 = the process ends).
 .Lel0_sync:
-    sub     sp, sp, #288
+    sub     sp, sp, #816
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -656,12 +664,32 @@ ferros_el0_resume:
     str     x9, [sp, #272]
     mrs     x9, far_el2
     str     x9, [sp, #280]
+    stp     q0, q1, [sp, #288]
+    stp     q2, q3, [sp, #320]
+    stp     q4, q5, [sp, #352]
+    stp     q6, q7, [sp, #384]
+    stp     q8, q9, [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x9, fpcr
+    str     x9, [sp, #800]
+    mrs     x9, fpsr
+    str     x9, [sp, #808]
     mov     x0, sp
     bl      ferros_el0_trap
     b       .Lel0_tail
 // The time slice ran out while a process was at EL0 (the timer tick in .Lirq, scratch registers already restored): save its frame the same way and let process.rs park it runnable.
 .Lel0_preempt:
-    sub     sp, sp, #288
+    sub     sp, sp, #816
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -688,6 +716,26 @@ ferros_el0_resume:
     str     x9, [sp, #272]
     mrs     x9, far_el2
     str     x9, [sp, #280]
+    stp     q0, q1, [sp, #288]
+    stp     q2, q3, [sp, #320]
+    stp     q4, q5, [sp, #352]
+    stp     q6, q7, [sp, #384]
+    stp     q8, q9, [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x9, fpcr
+    str     x9, [sp, #800]
+    mrs     x9, fpsr
+    str     x9, [sp, #808]
     mov     x0, sp
     bl      ferros_el0_preempt
 .Lel0_tail:
@@ -699,6 +747,26 @@ ferros_el0_resume:
     msr     spsr_el2, x9
     ldr     x9, [sp, #248]
     msr     sp_el0, x9
+    ldr     x9, [sp, #800]
+    msr     fpcr, x9
+    ldr     x9, [sp, #808]
+    msr     fpsr, x9
+    ldp     q0, q1, [sp, #288]
+    ldp     q2, q3, [sp, #320]
+    ldp     q4, q5, [sp, #352]
+    ldp     q6, q7, [sp, #384]
+    ldp     q8, q9, [sp, #416]
+    ldp     q10, q11, [sp, #448]
+    ldp     q12, q13, [sp, #480]
+    ldp     q14, q15, [sp, #512]
+    ldp     q16, q17, [sp, #544]
+    ldp     q18, q19, [sp, #576]
+    ldp     q20, q21, [sp, #608]
+    ldp     q22, q23, [sp, #640]
+    ldp     q24, q25, [sp, #672]
+    ldp     q26, q27, [sp, #704]
+    ldp     q28, q29, [sp, #736]
+    ldp     q30, q31, [sp, #768]
     ldp     x0, x1, [sp, #0]
     ldp     x2, x3, [sp, #16]
     ldp     x4, x5, [sp, #32]
@@ -715,7 +783,7 @@ ferros_el0_resume:
     ldp     x26, x27, [sp, #208]
     ldp     x28, x29, [sp, #224]
     ldr     x30, [sp, #240]
-    add     sp, sp, #288
+    add     sp, sp, #816
     eret
 // The process ended: return from ferros_el0_enter with its x0 (the exit value), kernel registers and SP restored.
 .Lel0_leave:
@@ -730,6 +798,10 @@ ferros_el0_resume:
     ldp     x29, x30, [x9, #80]
     ldr     x10, [x9, #96]
     mov     sp, x10
+    ldp     d8, d9, [x9, #104]
+    ldp     d10, d11, [x9, #120]
+    ldp     d12, d13, [x9, #136]
+    ldp     d14, d15, [x9, #152]
     // Back in the kernel from exception context: taking the EL0 exception masked IRQs (PSTATE.I), and `ret` doesn't restore them. Left masked, the killswitch's key interrupts are never taken again — every boot lost it the moment `init` ran (seen 2026-10-15: DAIF G#3C0 in the service loop).
     msr     daifclr, #2
     ret
@@ -838,7 +910,7 @@ pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
 pub static mut __power_pressed: u64 = 0;
 /// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
 #[unsafe(no_mangle)]
-pub static mut __el0_kctx: [u64; 13] = [0; 13];
+pub static mut __el0_kctx: [u64; 21] = [0; 21];
 /// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
 #[unsafe(no_mangle)]
 pub static mut __irq_count: u64 = 0;

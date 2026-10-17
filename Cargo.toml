@@ -19,6 +19,7 @@ members = [
     "payloads/hello",
     "payloads/display",
     "payloads/shelltest",
+    "payloads/fptest",
     "payloads/hello_el0",
     "payloads/echo_server",
     "payloads/echo_client",

@@ -181,6 +181,10 @@ pub struct Frame {
     pub spsr: u64,
     pub esr: u64,
     pub far: u64,
+    /// v0–v31 and the FP control/status registers: saved on every EL0 entry and restored on every eret since 2026-10-17 — before, a process's floating point lived only until its next syscall or slice tick (the kernel's own memcpy uses the vector registers), which zeroed every f32 the display server carried across one.
+    pub v: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -801,7 +805,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
         };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
-    let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0 };
+    let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
     let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true, input: input.to_vec() };
     // Grants page: count, then the tokens in slot order. Then the code, then the input.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
