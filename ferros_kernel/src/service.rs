@@ -740,36 +740,82 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
-                                            // G#0B [samples] [interval, 1/16 s units] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths]`): voltage, current, the average of the samples.
+                                            // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
                                             Some((11, args)) => {
                                                 let mut rep = alloc::vec::Vec::new();
                                                 let n = args.first().copied().unwrap_or(1).max(1) as u32;
                                                 let gap = args.get(1).copied().unwrap_or(8) as u64 * freq / 16;
+                                                let battery = args.get(2).copied().unwrap_or(0) == 1;
+                                                let wait = |ticks: u64| {
+                                                    let t0: u64;
+                                                    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
+                                                    loop {
+                                                        let t: u64;
+                                                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+                                                        if t.wrapping_sub(t0) >= ticks {
+                                                            break;
+                                                        }
+                                                    }
+                                                };
+                                                let charger = if battery {
+                                                    match crate::hsi2c::charger::set_mode(0) {
+                                                        Ok(prev) => {
+                                                            rep.extend_from_slice(alloc::format!("charger mode G#{:X} -> buck off\n", prev & 0xF).as_bytes());
+                                                            wait(freq / 2);
+                                                            Some(prev)
+                                                        }
+                                                        Err(e) => {
+                                                            rep.extend_from_slice(alloc::format!("charger mode write failed: G#{e:X}; sampling as is\n").as_bytes());
+                                                            None
+                                                        }
+                                                    }
+                                                } else {
+                                                    None
+                                                };
                                                 let mut sum_ua: i64 = 0;
+                                                let mut sum_uv: u64 = 0;
                                                 let mut got = 0u32;
                                                 for i in 0..n {
                                                     if i > 0 {
-                                                        let t0: u64;
-                                                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
-                                                        loop {
-                                                            let t: u64;
-                                                            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
-                                                            if t.wrapping_sub(t0) >= gap {
-                                                                break;
-                                                            }
-                                                        }
+                                                        wait(gap);
                                                     }
                                                     match crate::hsi2c::gauge::sample() {
                                                         Ok(g) => {
                                                             sum_ua += g.current_ua as i64;
+                                                            sum_uv += g.vcell_uv as u64;
                                                             got += 1;
                                                             rep.extend_from_slice(alloc::format!("soc {}% temp {}.{:02} C vcell {} mV current {} mA (avg {} mA, avg vcell {} mV)\n", g.soc, g.temp_cc / 100, (g.temp_cc % 100).unsigned_abs(), g.vcell_uv / 1000, g.current_ua / 1000, g.avg_current_ua / 1000, g.avg_vcell_uv / 1000).as_bytes());
                                                         }
                                                         Err(e) => rep.extend_from_slice(alloc::format!("gauge read failed: G#{e:X} (1 controller not up, 2 busy, 4 no device, 8 bus error, 10 timeout, 20 empty)\n").as_bytes()),
                                                     }
                                                 }
-                                                if got > 1 {
-                                                    rep.extend_from_slice(alloc::format!("mean current over {got} samples: {} mA (negative = discharging)\n", sum_ua / got as i64 / 1000).as_bytes());
+                                                if let Some(prev) = charger {
+                                                    match crate::hsi2c::charger::restore(prev) {
+                                                        Ok(()) => rep.extend_from_slice(alloc::format!("charger mode G#{:X} restored\n", prev & 0xF).as_bytes()),
+                                                        Err(e) => rep.extend_from_slice(alloc::format!("CHARGER RESTORE FAILED: G#{e:X} — write G#69[G#B9] = G#{prev:02X} by hand\n").as_bytes()),
+                                                    }
+                                                }
+                                                if got > 0 {
+                                                    let ma = sum_ua / got as i64 / 1000;
+                                                    let mv = sum_uv / got as u64 / 1000;
+                                                    rep.extend_from_slice(alloc::format!("MEAN over {got}: {ma} mA at {mv} mV = {} mW (negative = discharging)\n", ma * mv as i64 / 1000).as_bytes());
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#0D [target] [reg] = an 8-bit register read on hsi2c_11; G#0E [target] [reg] [val] = an 8-bit write, read back after (bridge `display i2c <target> <reg> [val]`). The PMIC-side chips: gauge G#36, charger G#69, PMIC G#66.
+                                            Some((13, args)) if args.len() >= 2 => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                match crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1]) {
+                                                    Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] = G#{v:02X}\n", args[0], args[1]).as_bytes()),
+                                                    Err(e) => rep.extend_from_slice(alloc::format!("i2c read failed: G#{e:X}\n").as_bytes()),
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            Some((14, args)) if args.len() >= 3 => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                match crate::hsi2c::write_byte(crate::hsi2c::HSI2C_11, args[0], args[1], args[2]).and_then(|_| crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1])) {
+                                                    Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] <- G#{:02X}, reads back G#{v:02X}\n", args[0], args[1], args[2]).as_bytes()),
+                                                    Err(e) => rep.extend_from_slice(alloc::format!("i2c write failed: G#{e:X}\n").as_bytes()),
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }

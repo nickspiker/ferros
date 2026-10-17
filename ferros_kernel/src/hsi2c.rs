@@ -132,6 +132,51 @@ pub fn read_word(base: usize, target: u8, reg: u8) -> Result<u16, u32> {
     Ok(u16::from_le_bytes(v))
 }
 
+/// An 8-bit register read: the register byte without STOP, then one byte.
+pub fn read_byte(base: usize, target: u8, reg: u8) -> Result<u8, u32> {
+    if !up(base) {
+        return Err(E_NOT_UP);
+    }
+    transfer(base, target, &[reg], &mut [], true)?;
+    let mut v = [0u8; 1];
+    transfer(base, target, &[], &mut v, false)?;
+    Ok(v[0])
+}
+
+/// An 8-bit register write: register byte and value in one transfer with STOP.
+pub fn write_byte(base: usize, target: u8, reg: u8, val: u8) -> Result<(), u32> {
+    if !up(base) {
+        return Err(E_NOT_UP);
+    }
+    transfer(base, target, &[reg, val], &mut [], false)
+}
+
+/// The MAX77759 charger, on the same bus at G#69: its MODE field (CHG_CNFG_00 [3:0]; 5 = charger + buck on, 4 = buck only, 0 = all off). With the buck off the system runs from the battery while USB data carries on, so the gauge's current is the system's draw: how display power gets measured on a tethered phone.
+pub mod charger {
+    pub const TARGET: u8 = 0x69;
+    pub const CHG_CNFG_00: u8 = 0xB9;
+    pub const MODE_MASK: u8 = 0x0F;
+
+    pub fn mode() -> Result<u8, u32> {
+        super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_00)
+    }
+
+    /// Writes MODE and leaves the other bits; returns the previous register value for the restore.
+    pub fn set_mode(mode: u8) -> Result<u8, u32> {
+        let prev = mode_raw()?;
+        super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_00, (prev & !MODE_MASK) | (mode & MODE_MASK))?;
+        Ok(prev)
+    }
+
+    fn mode_raw() -> Result<u8, u32> {
+        super::read_byte(super::HSI2C_11, TARGET, CHG_CNFG_00)
+    }
+
+    pub fn restore(raw: u8) -> Result<(), u32> {
+        super::write_byte(super::HSI2C_11, TARGET, CHG_CNFG_00, raw)
+    }
+}
+
 /// The MAX77759 fuel gauge (PMIC.md): one sample of what matters for power profiling.
 pub mod gauge {
     pub const TARGET: u8 = 0x36;

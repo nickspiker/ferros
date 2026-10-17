@@ -102,10 +102,23 @@ async fn main() {
             cmd_display_dcs(&script).await;
         }
         "display" if args.get(2).map(String::as_str) == Some("power") => {
-            // display power [samples = 1] [interval in 1/16 s = 8] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene.
+            // display power [samples = 1] [interval in 1/16 s = 8] [battery] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene. `battery`: the charger's buck is off for the run so the reading is the system's draw, not the charger's leftovers.
             let n: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(1);
             let gap: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(8);
-            cmd_display_raw(&[11, n, gap]).await;
+            let battery = args.iter().skip(3).any(|a| a == "battery") as u8;
+            cmd_display_raw(&[11, n, gap, battery]).await;
+        }
+        "display" if args.get(2).map(String::as_str) == Some("i2c") => {
+            // display i2c <target hex> <reg hex> [val hex] — an 8-bit register read, or write + read-back, on hsi2c_11 (gauge G#36, charger G#69, PMIC G#66).
+            let h = |i: usize| args.get(i).and_then(|a| u8::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+            match (h(3), h(4), h(5)) {
+                (Some(t), Some(r), Some(v)) => cmd_display_raw(&[14, t, r, v]).await,
+                (Some(t), Some(r), None) => cmd_display_raw(&[13, t, r]).await,
+                _ => {
+                    eprintln!("Usage: ferros-bridge display i2c <target> <reg> [val]  (hex)");
+                    std::process::exit(1);
+                }
+            }
         }
         "display" if args.get(2).map(String::as_str) == Some("fill") => {
             // display fill <rrggbb> — a solid colour over the whole panel.
