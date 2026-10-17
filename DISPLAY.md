@@ -79,6 +79,10 @@ On a cold boot ABL leaves:
 
 `display::show` treats "translation off" as an identity mapping and otherwise runs exactly as after a handoff. FRAME_COUNT 4 -> 5, and the owner saw the text. Each cold boot also paints its status screen automatically. Text is smaller than after a handoff because nothing scales it: the console draws 8x16 glyphs at 2x straight onto the native grid.
 
+## DSI command path (2026-10-16) — ferros speaks to the panel
+
+The panel is google-hk3 on DSIM0 (DISPLAY-HK3.md; the oracle of every transition is `oracle/display/husky-hk3/`). `dsim.rs` sends DCS packets through DSIM0's SFR packet FIFOs between presents (the link is idle while the painter masks the TE trigger). First run on a cold boot: brightness `51 00 C4` / `51 0C EB` / `51 05 49`, dimming `53 28` / `53 20`, display off `28` and on `29` — every packet accepted and drained by the FIFO. ABL leaves the DSIM link configured as Android runs it (lanes, format, PLL identical; only interrupt masks and the command-mode TE timers differ). `bridge display dcs '<hex> / <hex> wNN / ...'` plays any oracle line; `bridge display dsim` dumps the link registers. Readback (DCS read, for self-verifying tests) is next.
+
 ## Status
 
 Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, write ABL's surface, shadow update + trigger); it owns no power-up from off, no DSI command path (brightness G#51, display off/on G#28/G#29, sleep in/out G#10/G#11), no framebuffer of its own, no tear-effect sync, and it lives in the kernel rather than as a process. On cold boot the SYSMMU/S2MPU items below are moot (ABL leaves translation off). **Before the display driver work starts: a knobs inventory (everything DECON/DPP/DSIM/DSC/panel lets us set) and the ideal design, for the owner to review — no code first.**
@@ -93,3 +97,6 @@ Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, w
 - [x] Re-point a DPP layer at linear pixels (adoption: keep its IOVA + mapping, switch AFBC off)
 - [x] Write pixels + trigger one frame (registers confirm, visually confirmed 2026-10-14)
 - [x] Minimal text glyph writer (`ferros_hal::console`, `bridge display "text"`)
+- [x] DSI command path: DCS writes to the panel from ferros (2026-10-16; brightness, dimming, off/on accepted by the FIFO; visual confirmation by the owner pending)
+- [ ] DCS read (power mode, brightness readback, DDIC ID) so tests verify themselves
+- [ ] Mode switches from the oracle (W120 ⇄ W60 ⇄ FHD), diffed against its register dumps
