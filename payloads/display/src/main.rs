@@ -2,8 +2,16 @@
 //!
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads, plus this process's heap above it), DECON0's main/win/wincon blocks, layer 0's DMA and DPP blocks, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (DPP0's image size) and the modeset ABL or the kernel left — the panel, DSIM and DECON's geometry stay as they are; this process only re-points the layer and pushes frames.
 //!
-//! Spawn: ferros-bridge spawn display.bin 00 --name display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap
-//! Grant slots, in that order: 0 console, 1 DECON main, 2 DECON win, 3 DECON wincon, 4 DMA0, 5 DPP0, 6 GPP0, 7 the framebuffer region, 8 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow).
+//! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow).
+//!
+//! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
+//! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
+//! - 2 `text [x][y baseline][px][colour][align: 0 left, 1 centre at x, 2 right edge at x][utf-8…]`.
+//! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
+//! - 4 `present`: black under everything, then the frame goes to the panel. Reply byte 1 = whether DECON advanced.
+//! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32]`.
+//! fluor's order holds inside a frame: what a client sends first is on top.
 //!
 //! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass. What is not a convention is fluor's order: it composites **front to back**, a paint goes *under* what is already there and an opaque pixel is left alone, so a frame starts from transparent (α = 0), the text goes down first and the background last. (The first cut filled black over raw DRAM: every word that happened to carry α = FF survived, a random-colour matrix at 1 in 256 — the owner's "green speckle wallpaper", 2026-10-16.)
 
@@ -19,14 +27,15 @@ use fluor::canvas::{Canvas, Damage};
 use fluor::paint;
 
 const S_CONSOLE: u64 = 0;
-const S_DECON: u64 = 1;
-const S_WIN: u64 = 2;
-const S_WINCON: u64 = 3;
-const S_DMA0: u64 = 4;
-const S_DPP0: u64 = 5;
-const S_GPP0: u64 = 6;
-const S_FB: u64 = 7;
-const S_HEAP: u64 = 8;
+const S_DISPLAY: u64 = 1;
+const S_DECON: u64 = 2;
+const S_WIN: u64 = 3;
+const S_WINCON: u64 = 4;
+const S_DMA0: u64 = 5;
+const S_DPP0: u64 = 6;
+const S_GPP0: u64 = 7;
+const S_FB: u64 = 8;
+const S_HEAP: u64 = 9;
 
 // DECON main (cal_9865 regs-decon.h).
 const FRAME_COUNT: u64 = 0x0004;
@@ -375,37 +384,117 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
+    // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
+    let mut client_owned = false;
+    let mut next_tick = (now() / freq() + 1) * freq();
+    let mut msg = [0u8; 4096];
+    let mut tok = [0u8; 32];
     loop {
-        // The status line: uptime left, the link and the layer's state right; repainted every second — the strip cleared to transparent, text, then black under it.
-        let secs = now() / freq();
-        pixels[..strip * width].fill(0);
-        {
-            let mut c = Canvas::new(pixels, width, height, &mut damage);
-            let t = uptime(&mut clock, secs);
-            text(&mut c, &font, t, margin, status_y, status_px, GREY);
-            text_right(&mut c, &font, "USB \u{2022} slot b", w - margin, status_y, status_px, DIM);
-            paint::fill_rect(&mut c, 0, 0, width as isize, strip as isize, BLACK, None, None);
+        // Clients first: every call waiting on the endpoint.
+        loop {
+            let n = ferros_sys::recv(cap(grants, S_DISPLAY), &mut msg, &mut tok, true);
+            if n == ferros_sys::NOTHING || n == ferros_sys::ERR {
+                break;
+            }
+            let m = &msg[..(n as usize).min(msg.len())];
+            let mut out = [0u8; 16];
+            let mut len = 1usize;
+            out[0] = 0;
+            match m.first() {
+                Some(1) => {
+                    client_owned = true;
+                    pixels.fill(0);
+                }
+                Some(2) if m.len() >= 12 => {
+                    let x = u16::from_le_bytes([m[1], m[2]]) as f32;
+                    let y = u16::from_le_bytes([m[3], m[4]]) as f32;
+                    let px = u16::from_le_bytes([m[5], m[6]]) as f32;
+                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
+                    let align = m[11];
+                    match core::str::from_utf8(&m[12..]) {
+                        Ok(t) if px >= 4.0 && px <= 512.0 => {
+                            let mut c = Canvas::new(pixels, width, height, &mut damage);
+                            match align {
+                                1 => {
+                                    let tw = text_width(&font, t, px);
+                                    text(&mut c, &font, t, x - tw * 0.5, y, px, colour);
+                                }
+                                2 => text_right(&mut c, &font, t, x, y, px, colour),
+                                _ => {
+                                    text(&mut c, &font, t, x, y, px, colour);
+                                }
+                            }
+                            ALLOC.reset();
+                        }
+                        _ => out[0] = 1,
+                    }
+                }
+                Some(3) if m.len() >= 13 => {
+                    let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as isize;
+                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[9], m[10], m[11], m[12]]) & 0x00FF_FFFF;
+                    let mut c = Canvas::new(pixels, width, height, &mut damage);
+                    paint::fill_rect(&mut c, v(1), v(3), v(5), v(7), colour, None, None);
+                }
+                Some(4) => {
+                    {
+                        let mut c = Canvas::new(pixels, width, height, &mut damage);
+                        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
+                    }
+                    ferros_sys::dma_barrier();
+                    pipe.take_layer(fb, width as u32);
+                    let (moved, _) = pipe.present(win);
+                    frames += 1;
+                    out[1] = moved as u8;
+                    len = 2;
+                }
+                Some(5) => {
+                    out[0..2].copy_from_slice(&(width as u16).to_le_bytes());
+                    out[2..4].copy_from_slice(&(height as u16).to_le_bytes());
+                    out[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
+                    out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
+                    len = 12;
+                }
+                _ => out[0] = 1,
+            }
+            ferros_sys::reply(&tok, &out[..len]);
         }
-        ALLOC.reset();
-        ferros_sys::dma_barrier();
-        // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
-        pipe.take_layer(fb, width as u32);
-        let (moved, irq) = pipe.present(win);
-        frames += 1;
-        if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
-            log.s(b"display: frame ");
-            log.dec(frames);
-            log.s(if moved { b" ok, RDMA_IRQ " } else { b" NOT SHOWN, RDMA_IRQ " });
-            log.hex(irq);
-            log.s(b" INT_PEND ");
-            log.hex(pipe.rd(S_DECON, INT_PEND));
-            log.s(b"/");
-            log.hex(pipe.rd(S_DECON, INT_PEND_EXTRA));
-            log.s(if pipe.te() { b" TE high\n" } else { b" TE low\n" });
-            log.flush();
+
+        let t = now();
+        if t >= next_tick {
+            let secs = t / freq();
+            next_tick = (secs + 1) * freq();
+            if !client_owned {
+                // The status line: uptime left, the link right; repainted every second — the strip cleared to transparent, text, then black under it.
+                pixels[..strip * width].fill(0);
+                {
+                    let mut c = Canvas::new(pixels, width, height, &mut damage);
+                    let tt = uptime(&mut clock, secs);
+                    text(&mut c, &font, tt, margin, status_y, status_px, GREY);
+                    text_right(&mut c, &font, "USB \u{2022} slot b", w - margin, status_y, status_px, DIM);
+                    paint::fill_rect(&mut c, 0, 0, width as isize, strip as isize, BLACK, None, None);
+                }
+                ALLOC.reset();
+                ferros_sys::dma_barrier();
+                // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
+                pipe.take_layer(fb, width as u32);
+                let (moved, irq) = pipe.present(win);
+                frames += 1;
+                if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
+                    log.s(b"display: frame ");
+                    log.dec(frames);
+                    log.s(if moved { b" ok, RDMA_IRQ " } else { b" NOT SHOWN, RDMA_IRQ " });
+                    log.hex(irq);
+                    log.s(b" INT_PEND ");
+                    log.hex(pipe.rd(S_DECON, INT_PEND));
+                    log.s(b"/");
+                    log.hex(pipe.rd(S_DECON, INT_PEND_EXTRA));
+                    log.s(if pipe.te() { b" TE high\n" } else { b" TE low\n" });
+                    log.flush();
+                }
+            }
         }
-        // Once a second: asleep until then, so the kernel's service loop has the CPU.
-        ferros_sys::sleep_until((secs + 1) * freq());
+        // Asleep until the next poll (a sixteenth of a second: a client waits at most that long) or the next tick, whichever is first; the service loop has the CPU meanwhile.
+        ferros_sys::sleep_until(next_tick.min(now() + freq() / 16));
     }
 }
 

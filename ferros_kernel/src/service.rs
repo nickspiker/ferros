@@ -73,6 +73,13 @@ struct PtStats {
     data_accepted: u32,
     commands: u32,
     not_ready: u32,
+    /// The last command parsed: cap bytes 0..3 (LE) | op << 56 — so a stall exit says what the host was doing (DIAG PREV_PT_CMD).
+    last_cmd: u64,
+    /// The transfer open at a stall exit: stream id, chunks received, expected bytes, and how long since its last packet (DIAG PREV_PT_*).
+    open_sid: u32,
+    open_recv: u32,
+    open_total: u32,
+    pt_age_ms: u32,
 }
 
 
@@ -127,6 +134,10 @@ fn leave(b: &Boot, exit: u8, attempts: u32, configured_ever: bool, usb: Option<&
     w(19, st.data_decoded as u64 | (st.data_accepted as u64) << 32);
     w(22, st.commands as u64 | (st.not_ready as u64) << 32);
     w(23, FASTBOOT_FAIL.load(core::sync::atomic::Ordering::Relaxed));
+    w(24, st.last_cmd);
+    w(25, st.open_sid as u64 | (st.open_recv as u64) << 32);
+    w(26, st.open_total as u64 | (st.pt_age_ms as u64) << 32);
+    w(27, crate::process::alive() as u64);
     unsafe {
         core::ptr::copy_nonoverlapping(usb_b.as_ptr(), (0xFD60_0000usize + 0x20) as *mut u8, 5);
         ferros_hal::mmio::cache_clean(0xFD60_0000, 0x100);
@@ -338,6 +349,12 @@ pub fn run(mut b: Boot) -> ! {
             leave(&b, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
         }
         if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
+            if let Some(x) = &pt_inbound {
+                st.open_sid = x.sid.0 as u32;
+                st.open_recv = x.chunks_received as u32;
+                st.open_total = x.expected_total as u32;
+                st.pt_age_ms = (now.wrapping_sub(t_pt) * 1000 / freq) as u32;
+            }
             leave(&b, EXIT_PT_STALL, attempts, configured_ever, Some(&usb), &st);
         }
 
@@ -461,6 +478,7 @@ pub fn run(mut b: Boot) -> ! {
                                 t_command = cntpct();
                                 done = true;
                                 if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
+                                    st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                                         if cmd.params == b"rep" {
@@ -662,6 +680,14 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
                                             append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
                                             append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
+                                            // The PT record (leave(): words 24..27): the last command (cap bytes, op), and at a stall exit the open transfer and its age.
+                                            append_hex(&mut resp, b"PREV_PT_CMD_CAP=", prev[24] as u32);
+                                            append_hex(&mut resp, b"PREV_PT_CMD_OP=", (prev[24] >> 56) as u32);
+                                            append_hex(&mut resp, b"PREV_PT_OPEN_SID=", prev[25] as u32);
+                                            append_hex(&mut resp, b"PREV_PT_OPEN_RECV=", (prev[25] >> 32) as u32);
+                                            append_hex(&mut resp, b"PREV_PT_OPEN_TOTAL=", prev[26] as u32);
+                                            append_hex(&mut resp, b"PREV_PT_AGE_MS=", (prev[26] >> 32) as u32);
+                                            append_hex(&mut resp, b"PREV_ALIVE=", prev[27] as u32);
                                         }
                                         for (label, v) in &b.extras {
                                             append_hex(&mut resp, label, *v);
