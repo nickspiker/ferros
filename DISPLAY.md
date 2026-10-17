@@ -103,4 +103,5 @@ Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, w
 - [x] `bridge display mode 60|120`: the hk3 command set for the rate (hk3.rs, from the oracle), then DSIM's command-TE timers for it, then the TE pin measured
 - [x] DECON brought to Android's 120 Hz state where it is safe to (`bridge display tune`: SRAM allocation, out-FIFO QoS, interrupt enables), verified by a live register diff against the oracle
 - [ ] 10 bpc compose: `TEN_BPC_MODE` + enhance dither alone **wedges DECON** (frame timeout, shadow request stuck; 2026-10-16). Android pairs it with DSC_CONTROL1 G#55 (dual slice, flatness 5; ABL G#44) and a configured dither in the DQE block — capture `crtc-0/dqe` and the DQE registers from Android first
-- [ ] FHD modes (C3 0D, F2 81, the FHD PPS — not in the traces, must be packed from the DSC config) and the DECON reconfiguration they need
+- [x] The DSC PPS packed by ferros (`ferros_dsc`), word for word what Android's DECON holds for both rasters
+- [ ] FHD modes: a one-frame switch of panel raster + every geometry register (`display res fhd`) takes one frame and then the panel's TE stops and the link wedges (2026-10-16; reboot recovers). Android does a full modeset for a resolution change (DECON and DSIM stopped and restarted); reproducing that sequence is the open item
