@@ -166,6 +166,31 @@ pub fn te_rate(cntfrq: u64) -> (u32, u32) {
     (pin_rises * 2, irq_rises * 2)
 }
 
+/// DECON0's state as Android runs it at WQHD 120 Hz, where ABL leaves it unset (the live diff against oracle/display/husky-hk3/W120_noidle, 2026-10-16): SRAM for every window Android allocates, the out-FIFO QoS, the interrupt enables. The main registers are shadowed: the next present's global shadow update applies them.
+///
+/// NOT set here, measured to wedge DECON (2026-10-16): `GLOBAL_CON.TEN_BPC_MODE` with the enhance-path dither. The first frame after it completed, the next timed out (INT_PEND_EXTRA TIME_OUT) and the shadow request never cleared again; only a reboot into ABL's init recovered the panel. Android pairs 10 bpc with a different DSC_CONTROL1 (G#55: dual slice, flatness 5, against ABL's G#44) and a configured dither in the DQE block, whose registers are not in the oracle yet. 10 bpc waits for that capture.
+const OF_URGENT_EN: usize = 0x02C0;
+const OF_RD_URGENT_0: usize = 0x02C4;
+const OF_RD_URGENT_1: usize = 0x02C8;
+const OF_DTA_CONTROL: usize = 0x02D0;
+const OF_DTA_THRESHOLD: usize = 0x02D4;
+const SRAM_EN_OF_PRI_0: usize = 0x0300;
+const SRAM_EN_OF_PRI_1: usize = 0x0304;
+const SRAM_EN_OF_SEC_0: usize = 0x0320;
+
+pub fn configure_like_android(rep: &mut alloc::vec::Vec<u8>) {
+    wr(DECON0 + OF_URGENT_EN, 1);
+    wr(DECON0 + OF_RD_URGENT_0, 0x0800_0400);
+    wr(DECON0 + OF_RD_URGENT_1, 0x10);
+    wr(DECON0 + OF_DTA_CONTROL, 1);
+    wr(DECON0 + OF_DTA_THRESHOLD, 0x3200_0600);
+    wr(DECON0 + SRAM_EN_OF_PRI_0, 0x1111_1111);
+    wr(DECON0 + SRAM_EN_OF_PRI_1, 0x111);
+    wr(DECON0 + SRAM_EN_OF_SEC_0, 0);
+    wr(DECON0 + DECON_INT_EN, 0x0030_3011);
+    append_hex(rep, b"GLOBAL_CON=", rd(DECON0 + GLOBAL_CON));
+}
+
 /// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).
 pub fn dpu_on() -> bool {
     [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) == 1)

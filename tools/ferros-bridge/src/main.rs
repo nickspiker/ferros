@@ -103,6 +103,7 @@ async fn main() {
         }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
+        "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
         "display" if args.get(2).map(String::as_str) == Some("mode") => {
             let hz: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(120);
             cmd_display_raw(&[6, hz]).await;

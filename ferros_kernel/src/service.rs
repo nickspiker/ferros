@@ -738,6 +738,18 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#07 = set DECON0 to Android's state (10 bpc, dither, SRAM, QoS, interrupts), then paint a frame to apply it (bridge `display tune`).
+                                            Some((7, _)) => {
+                                                let mut rep = alloc::vec::Vec::new();
+                                                if !crate::display::dpu_on() {
+                                                    rep.extend_from_slice(b"DPU powered down\n");
+                                                } else {
+                                                    crate::display::configure_like_android(&mut rep);
+                                                    let r = crate::display::show(b"ferros: DECON as Android", freq);
+                                                    rep.extend_from_slice(&r);
+                                                }
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
                                             Some((5, _)) => {
                                                 let mut rep = alloc::vec::Vec::new();

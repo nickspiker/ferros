@@ -101,4 +101,6 @@ Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, w
 - [x] DCS reads (2026-10-16): power mode G#9F, extinfo 0a 80 20 (= Android's), pixel format, TE on, and brightness readback G#52 returning exactly the DBV written — the writes are proven by the panel itself
 - [x] Refresh-rate switches W120 ⇄ W60 from the oracle's packets, measured on the TE pin (gpp0-3): ABL leaves the panel at 60 Hz; the W120 transition gives 120 Hz, W60 gives 60 (`bridge display terate`)
 - [x] `bridge display mode 60|120`: the hk3 command set for the rate (hk3.rs, from the oracle), then DSIM's command-TE timers for it, then the TE pin measured
+- [x] DECON brought to Android's 120 Hz state where it is safe to (`bridge display tune`: SRAM allocation, out-FIFO QoS, interrupt enables), verified by a live register diff against the oracle
+- [ ] 10 bpc compose: `TEN_BPC_MODE` + enhance dither alone **wedges DECON** (frame timeout, shadow request stuck; 2026-10-16). Android pairs it with DSC_CONTROL1 G#55 (dual slice, flatness 5; ABL G#44) and a configured dither in the DQE block — capture `crtc-0/dqe` and the DQE registers from Android first
 - [ ] FHD modes (C3 0D, F2 81, the FHD PPS — not in the traces, must be packed from the DSC config) and the DECON reconfiguration they need
