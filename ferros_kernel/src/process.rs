@@ -191,6 +191,8 @@ enum State {
     Receiving(usize, u64, u64, u64),
     /// Called and waiting for the reply: (reply offset, reply cap).
     Calling(u64, u64),
+    /// Asleep until the generic timer count reaches the deadline (SYS_SLEEP); `wake_sleepers` makes it runnable again.
+    Sleeping(u64),
 }
 
 struct Process {
@@ -288,6 +290,8 @@ const SYS_ENTROPY: u64 = 6;
 const SYS_DMA: u64 = 7;
 /// input(off, buf, len) → bytes of the spawn input copied into the arc at `buf`.
 const SYS_INPUT: u64 = 8;
+/// 9 `sleep(deadline)`: park until CNTPCT reaches `deadline`, so a periodic process (the display server's frame clock) costs nothing between frames instead of spinning through every slice the service loop hands out.
+const SYS_SLEEP: u64 = 9;
 /// Once pcie1 streams its firmware via SYS_INPUT, input above this is streamed only and the arc stays small; today the full input is still inlined as a bridge (see spawn).
 #[allow(dead_code)]
 const INLINE_INPUT: usize = 4096;
@@ -429,6 +433,19 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_SLEEP => {
+            let now: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+            if f.x[0] <= now {
+                f.x[0] = 0;
+                0
+            } else {
+                p.state = State::Sleeping(f.x[0]);
+                p.frame = *f;
+                p.frame.x[0] = 0;
+                if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+            }
+        }
         SYS_CALL => {
             let token = p.read(f.x[0], 32);
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -652,7 +669,25 @@ fn disarm_slice() {
 }
 
 /// Give the next runnable process one time slice (called from the service loop). Returns false if nothing was runnable. Its console output collects until `take_console`.
+/// Sleepers whose deadline has passed become runnable (called before every slice).
+fn wake_sleepers() {
+    let kk = k();
+    let now: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+    for (i, p) in kk.procs.iter_mut().enumerate() {
+        if let Some(p) = p {
+            if let State::Sleeping(d) = p.state {
+                if d <= now {
+                    p.state = State::Runnable;
+                    kk.runnable.push_back(i);
+                }
+            }
+        }
+    }
+}
+
 pub fn run_slice() -> bool {
+    wake_sleepers();
     let kk = k();
     let Some(next) = kk.runnable.pop_front() else { return false };
     let Some(p) = kk.procs[next].as_mut() else { return true };

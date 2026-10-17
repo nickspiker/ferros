@@ -342,8 +342,10 @@ pub fn run(mut b: Boot) -> ! {
 
         match usb.poll_event() {
             UsbEvent::None => {
-                // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires).
-                crate::process::run_slice();
+                // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires) — but not while a PT transfer is open or a response is still going out: a 10 ms slice per idle pass crawls a transfer to the point where the host gives up, and the half-open transfer then trips the 16 s stall exit (measured 2026-10-16: every PT-stall exit of the day had a busy process running).
+                if pt_inbound.is_none() && pt_out_data.is_empty() {
+                    crate::process::run_slice();
+                }
                 if !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
                     if init_history.len() < 32 {
                         unsafe {

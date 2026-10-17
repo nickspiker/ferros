@@ -385,6 +385,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         ALLOC.reset();
         ferros_sys::dma_barrier();
+        // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
+        pipe.take_layer(fb, width as u32);
         let (moved, irq) = pipe.present(win);
         frames += 1;
         if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
@@ -399,9 +401,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             log.s(if pipe.te() { b" TE high\n" } else { b" TE low\n" });
             log.flush();
         }
-        // Once a second, by the counter (no timer interrupt reaches a process yet).
-        let next = (secs + 1) * freq();
-        while now() < next {}
+        // Once a second: asleep until then, so the kernel's service loop has the CPU.
+        ferros_sys::sleep_until((secs + 1) * freq());
     }
 }
 
