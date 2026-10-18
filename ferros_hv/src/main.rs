@@ -417,7 +417,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn hv_secondary(ctx: u64) -> ! {
     if chord::held() {
-        chord::to_fastboot();
+        chord::power_off();
     }
     let mpidr: u64;
     unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) mpidr) };
@@ -457,7 +457,7 @@ const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 #[unsafe(no_mangle)]
 extern "C" fn hv_sync(frame: &mut [u64; 20]) {
     if chord::held() {
-        chord::to_fastboot();
+        chord::power_off();
     }
     let esr: u64;
     unsafe { asm!("mrs {v}, esr_el2", v = out(reg) esr) };
@@ -591,7 +591,7 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
 #[unsafe(no_mangle)]
 extern "C" fn hv_window_close() {
     if chord::held() {
-        chord::to_fastboot();
+        chord::power_off();
     }
     let me: u64;
     unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) me) };
@@ -668,7 +668,7 @@ mod splash {
     }
 }
 
-/// The kill chord at EL2: Vol Up + Vol Down held together, read off the always-on GPIO banks on every trap the hv takes (thousands a second while Linux runs, and continuously in any early-boot livelock), so no GIC work is needed yet. Action, for the dev loop: stamp the fastboot reboot mode through EL3 and fire the cluster watchdogs — the path ferros measured to land in fastboot ("Reboot mode: 0xfc - Bootloader") where a PSCI reset loses the mode. The reset follows 15–60 s after the chord (the watchdogs expire slowly). Owner, 2026-10-17: "we really need to get that killswitch in the hv". The power-off variant comes with the GIC group split (HV.md M1).
+/// The kill chord at EL2: Vol Up + Vol Down held together, read off the always-on GPIO banks on every trap the hv takes (thousands a second while Linux runs, and continuously in any early-boot livelock), so no GIC work is needed yet; the GIC group-0 FIQ hook (HV.md M1) makes it instant to the microsecond. Action: power off, the kill switch proper. A fastboot variant (stamp the mode through EL3, fire the cluster watchdogs, ~20 s) was measured working on 2026-10-17 and dropped in favour of this; it lives in git history if the dev loop ever wants a gesture for it.
 mod chord {
     use core::arch::asm;
     use core::ptr::{read_volatile, write_volatile};
@@ -677,11 +677,6 @@ mod chord {
     const GPA6_DAT: usize = ALIVE + 0xA4;
     const VOL_DOWN_PIN: u32 = 1;
     const VOL_UP_PIN: u32 = 2;
-    const DSS_HEADER: usize = 0xD810_0000;
-    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
-    const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
-    const PMU_REBOOT_CMD: u64 = 0x1546_0810;
-    const REBOOT_MODE_BOOTLOADER: u64 = 0xFC;
 
     const GPA4_CON: usize = ALIVE + 0x80;
     const GPA6_CON: usize = ALIVE + 0xA0;
@@ -714,46 +709,13 @@ mod chord {
         }
     }
 
-    fn ms(n: u64) {
+    /// Never returns: PSCI SYSTEM_OFF, the PMIC cuts the rails. The owner's test (2026-10-17): "watch that second vol button go down and if the next frame ain't black cuz the power is gone, you did it wrong." No stamp, no watchdog, no fastboot; the dev's fastboot is adb's problem.
+    pub fn power_off() -> ! {
+        super::pstore::log(&[b"\nferros hv: kill chord -- SYSTEM_OFF\n"]);
         unsafe {
-            let (f, t0): (u64, u64);
-            asm!("mrs {f}, cntfrq_el0", "mrs {t}, cntpct_el0", f = out(reg) f, t = out(reg) t0);
-            loop {
-                let t: u64;
-                asm!("mrs {t}, cntpct_el0", t = out(reg) t);
-                if t.wrapping_sub(t0) >= f / 1000 * n {
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Never returns: the watchdogs reset the SoC into fastboot.
-    pub fn to_fastboot() -> ! {
-        super::pstore::log(&[b"\nferros hv: kill chord -- rebooting to fastboot\n"]);
-        unsafe {
-            // The DSS header stamp Linux's clean reboot makes, so ABL classifies the reset and reads the mode.
-            write_volatile((DSS_HEADER + 0x300) as *mut u32, 0xCAFE);
-            write_volatile((DSS_HEADER + 0x100) as *mut u32, 0);
-            for cpu in 0..9 {
-                write_volatile((DSS_HEADER + 0x500 + cpu * 4) as *mut u32, 0);
-            }
             asm!("dsb sy");
-            asm!("smc #0", inout("x0") SMC_CMD_PRIV_REG => _, inout("x1") PMU_REBOOT_CMD => _, inout("x2") 1u64 => _, inout("x3") REBOOT_MODE_BOOTLOADER => _,
-                out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
-            for &wdt in &WATCHDOGS {
-                write_volatile(wdt as *mut u32, 0);
-                ms(1);
-                write_volatile((wdt + 0x04) as *mut u32, 1);
-                ms(1);
-                write_volatile((wdt + 0x08) as *mut u32, 1);
-                ms(1);
-                write_volatile(wdt as *mut u32, (1 << 5) | (1 << 0));
-                ms(1);
-            }
+            asm!("smc #0", in("x0") 0x8400_0008u64);
         }
-        // No instant path yet: a direct PMU write of the mode followed by PSCI SYSTEM_RESET was tried (2026-10-17) and hung the core in EL3 until the watchdogs fired — ABL reads a Linux-style reboot's mode off the PMIC path (its log shows those as power-on resets), which the hv will reach once it speaks to the PMIC (M1).
-        super::splash::band(1, 0xFFFF_FFFF);
         loop {
             unsafe { asm!("wfe") };
         }
