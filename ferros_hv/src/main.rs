@@ -243,6 +243,9 @@ core_index:
 );
 
 fn report(off: usize, v: u64) {
+    if cfg!(hv_no_report) && off >= 0x48 {
+        return;
+    }
     unsafe {
         write_volatile((REPORT + off) as *mut u64, v);
         asm!("dc civac, {a}", "dsb sy", a = in(reg) (REPORT + off) as u64);
@@ -265,10 +268,27 @@ fn stage(s: u64) {
 }
 
 fn bump(off: usize) {
+    if cfg!(hv_no_report) && off != 0x50 {
+        return;
+    }
     unsafe {
         let p = (REPORT + off) as *mut u64;
         write_volatile(p, read_volatile(p).wrapping_add(1));
     }
+}
+
+/// Stage 2, identity: a 40-bit IPA space in 1 GiB blocks (level 1, two concatenated 4 KiB tables = 1024 entries), every block Normal write-back inner-shareable, read/write, access flag set; stage 1's attributes win for Device memory under the combining rules, so MMIO stays MMIO. What pKVM gives its host; the M1 firewall unmaps the UFS controller's pages from here.
+#[repr(C, align(8192))]
+struct Stage2([u64; 1024]);
+static mut STAGE2: Stage2 = Stage2([0; 1024]);
+
+unsafe fn stage2_build() -> u64 {
+    for (i, e) in (*(&raw mut STAGE2)).0.iter_mut().enumerate() {
+        // Block descriptor: [1:0] = 0b01, MemAttr[5:2] = 0b1111 (Normal WB in/out), S2AP[7:6] = 0b11 (RW), SH[9:8] = 0b11 (inner), AF[10] = 1; output address = i << 30.
+        write_volatile(e, ((i as u64) << 30) | 0b01 | (0b1111 << 2) | (0b11 << 6) | (0b11 << 8) | (1 << 10));
+    }
+    asm!("dsb sy");
+    (&raw const STAGE2) as u64
 }
 
 /// Where each core should go after the hv brings it up: the entry and context Linux passed to PSCI, by core index.
@@ -278,18 +298,63 @@ static mut RESUMES: [u64; 16] = [0; 16];
 static mut SMCS: [u64; 16] = [0; 16];
 /// The distinct SMC function IDs seen (first occurrence logged with its arguments), 32 slots.
 static mut FIDS: [u64; 32] = [0; 32];
+/// Per core: the last trapped SMC's function ID and the counter value at the last trap; the counter value of the last stats line (core-shared, racy, fine).
+static mut LAST_FID: [u64; 16] = [0; 16];
+static mut LAST_T: [u64; 16] = [0; 16];
+static mut STATS_T: u64 = 0;
+
+/// Once a second, from whichever core traps next: a line per core into the pstore ring — traps, resumes, last SMC, milliseconds since its last trap. The timeline a freeze leaves behind: the core that falls silent first and its last words.
+fn stats_tick(now: u64, freq: u64) {
+    unsafe {
+        let last = read_volatile(&raw const STATS_T);
+        if now.wrapping_sub(last) < freq {
+            return;
+        }
+        write_volatile(&raw mut STATS_T, now);
+        let mut line = [0u8; 9 * 44];
+        for c in 0..9 {
+            let (mut h1, mut h2, mut h3) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+            let smcs = read_volatile(&raw const SMCS[c]);
+            let res = read_volatile(&raw const RESUMES[c]);
+            let fid = read_volatile(&raw const LAST_FID[c]);
+            let lt = read_volatile(&raw const LAST_T[c]);
+            let ago_ms = if lt == 0 { 0xFFFF_FFFF } else { now.wrapping_sub(lt) / (freq / 1000) };
+            pstore::hex((smcs << 32) | (res & 0xFFFF_FFFF), &mut h1);
+            pstore::hex(fid, &mut h2);
+            pstore::hex(ago_ms, &mut h3);
+            let o = c * 44;
+            line[o] = b' ';
+            line[o + 1] = b'0' + c as u8;
+            line[o + 2] = b':';
+            line[o + 3..o + 19].copy_from_slice(&h1);
+            line[o + 19] = b'/';
+            line[o + 20..o + 28].copy_from_slice(&h2[8..16]);
+            line[o + 28] = b'/';
+            line[o + 29..o + 37].copy_from_slice(&h3[8..16]);
+            line[o + 37..o + 44].copy_from_slice(b"       ");
+        }
+        let mut hn = [0u8; 16];
+        pstore::hex(now / (freq / 1000), &mut hn);
+        pstore::log(&[b"\nferros hv stats t=", &hn[6..16], b" ms;", &line, b"\n"]);
+    }
+}
+
 /// Per core: the guest's DBGBVR0_EL1, DBGBCR0_EL1 and MDSCR_EL1 while the hv runs it natively over an SMC, and a count of such runs.
 static mut STEP_SAVED: [u64; 48] = [0; 48];
 static mut STEPS: [u64; 16] = [0; 16];
 
 /// EL2 as the guest should find it. Called on every core before its first eret.
 unsafe fn configure_el2() {
+    // The hv's own instruction fetches are cacheable with SCTLR_EL2.I set even with its MMU off (data stays Device); without it every trap executes a few hundred instructions straight from DRAM, tens of microseconds with interrupts masked under GPU memory traffic.
+    let sctlr2: u64;
+    asm!("mrs {v}, sctlr_el2", v = out(reg) sctlr2);
+    asm!("msr sctlr_el2, {v}", "ic iallu", "dsb sy", "isb", v = in(reg) sctlr2 | (1 << 12));
     // Vectors first, so anything below that traps lands in `unexpected` with its ESR instead of in whatever VBAR_EL2 held. Sub-stage crumbs at +G#70 name the register being written (the first flash, 2026-10-17, stopped between A2 and A3 with no vector installed).
     let vbar = hv_vectors as *const () as u64;
     asm!("msr vbar_el2, {v}", "isb", v = in(reg) vbar);
     report(0x70, 0xB0);
     // RW (EL1 is AArch64) | TSC (SMC traps here) | APK + API (pointer authentication keys and instructions untrapped) | ATA (MTE tag accesses untrapped where implemented). VM = 0: no stage 2 yet. IMO/FMO/AMO = 0: interrupts go to EL1 directly. E2H = 0, TGE = 0.
-    let hcr: u64 = (1 << 31) | (1 << 19) | (1 << 40) | (1 << 41) | (1 << 56);
+    let hcr: u64 = (1 << 31) | (1 << 19) | (1 << 40) | (1 << 41) | if cfg!(hv_no_ata) { 0 } else { 1 << 56 };
     // The ISB matters: without it the CPTR_EL2 write below used the E2H = 1 register layout the core was still in (measured 2026-10-17: ZEN read as 0, the ZCR_EL2 write trapped with EC G#19).
     asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr);
     report(0x70, 0xB1);
@@ -314,8 +379,11 @@ unsafe fn configure_el2() {
     asm!("msr cntvoff_el2, {v}", v = in(reg) 0u64);
     report(0x70, 0xB5);
     // GICv3: system-register interface at EL2, and EL1 allowed to enable its own (ICC_SRE_EL2.Enable); no virtual CPU interface.
-    asm!("msr s3_4_c12_c9_5, {v}", v = in(reg) 0xFu64); // ICC_SRE_EL2
+    // ICC_SRE_EL2 as Linux's init_el2 writes it: SRE | Enable, the bypass-disable bits left clear (an earlier 0xF set DIB/DFB too).
+    asm!("msr s3_4_c12_c9_5, {v}", v = in(reg) 0x9u64); // ICC_SRE_EL2
     asm!("isb");
+    // The EL2 physical timer is UNKNOWN at reset and after every power-down; nothing at EL2 uses it, so it is off (a kernel at EL2 would own it).
+    asm!("msr cnthp_ctl_el2, xzr", "isb");
     report(0x70, 0xB6);
     asm!("msr s3_4_c12_c11_0, {v}", v = in(reg) 0u64); // ICH_HCR_EL2
     report(0x70, 0xB7);
@@ -325,16 +393,50 @@ unsafe fn configure_el2() {
     asm!("mrs {a}, midr_el1", "mrs {b}, mpidr_el1", a = out(reg) midr, b = out(reg) mpidr);
     asm!("msr vpidr_el2, {a}", "msr vmpidr_el2, {b}", a = in(reg) midr, b = in(reg) mpidr);
     asm!("msr hstr_el2, {v}", v = in(reg) 0u64);
+    // What Linux's own init_el2 zeroes and the hv did not (2026-10-17): registers that are UNKNOWN at reset and again after every core power-down, each able to change EL1's behaviour per core — fine-grained traps (HFGRTR/HFGWTR/HFGITR/HDFGRTR/HDFGWTR/HAFGRTR_EL2), HCRX_EL2 (FEAT_HCX: instruction enables and extra traps), MPAM2_EL2 and MPAMHCR_EL2 (partition IDs and MPAM traps), PMSCR_EL2 (statistical profiling at EL2), TRFCR_EL2 (trace filter). Guarded by the ID registers.
+    let (mmfr0, mmfr1, pfr0, dfr0): (u64, u64, u64, u64);
+    asm!("mrs {a}, id_aa64mmfr0_el1", "mrs {b}, id_aa64mmfr1_el1", "mrs {c}, id_aa64pfr0_el1", "mrs {d}, id_aa64dfr0_el1", a = out(reg) mmfr0, b = out(reg) mmfr1, c = out(reg) pfr0, d = out(reg) dfr0);
+    if (mmfr0 >> 56) & 0xF != 0 {
+        asm!("msr s3_4_c1_c1_4, xzr", "msr s3_4_c1_c1_5, xzr", "msr s3_4_c1_c1_6, xzr", "msr s3_4_c3_c1_4, xzr", "msr s3_4_c3_c1_5, xzr");
+        if (pfr0 >> 44) & 0xF != 0 {
+            asm!("msr s3_4_c3_c1_6, xzr"); // HAFGRTR_EL2, AMU present
+        }
+    }
+    if (mmfr1 >> 40) & 0xF != 0 {
+        asm!("msr s3_4_c1_c2_2, xzr"); // HCRX_EL2
+    }
+    if (pfr0 >> 40) & 0xF != 0 {
+        asm!("msr s3_4_c10_c5_0, xzr", "msr s3_4_c10_c4_0, xzr"); // MPAM2_EL2, MPAMHCR_EL2
+    }
+    if (dfr0 >> 32) & 0xF != 0 {
+        asm!("msr s3_4_c9_c9_0, xzr"); // PMSCR_EL2
+    }
+    if (dfr0 >> 40) & 0xF != 0 {
+        asm!("msr s3_4_c1_c2_1, xzr"); // TRFCR_EL2
+    }
+    asm!("isb");
+    report(0x70, 0xBA);
     // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
-    asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1is", "dsb ish", "isb", v = in(reg) 0u64, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
+    // The flush is local: this core's EL1 TLB is empty on a first boot and after a power-down anyway, and a broadcast (ALLE1IS) on every resume of nine cores would be a DVM storm.
+    // VTCR_EL2: T0SZ 24 (40-bit IPA), SL0 1 (start at level 1), IRGN/ORGN write-back, SH inner, TG0 4 KiB, PS 40-bit, RES1 bit 31.
+    let vttbr = if cfg!(hv_stage2) { stage2_build() } else { 0 };
+    asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1", "dsb nsh", "isb", v = in(reg) vttbr, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
+    if cfg!(hv_stage2) {
+        let hcr: u64;
+        asm!("mrs {h}, hcr_el2", h = out(reg) hcr);
+        asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr | 1); // VM
+    }
     report(0x70, 0xB8);
     // ACTLR_EL2 gates EL1 access to the core's implementation-defined registers (CPUECTLR_EL1, CPUACTLR_EL1, CPUPWRCTLR_EL1 and friends on Cortex-A/X cores); a kernel that ran at EL2 never met the gate. All permission bits on (RES0 bits ignore the write); the value found is kept at +G#78 for the record.
     let actlr: u64;
     asm!("mrs {v}, actlr_el2", v = out(reg) actlr);
     report(0x78, actlr);
-    asm!("msr actlr_el2, {v}", "isb", v = in(reg) 0xFFFF_FFFFu64);
+    if !cfg!(hv_actlr_keep) {
+        asm!("msr actlr_el2, {v}", "isb", v = in(reg) 0xFFFF_FFFFu64);
+    }
     // EL1 starts with its MMU off, little-endian, as a kernel entry requires.
-    asm!("msr sctlr_el1, {v}", v = in(reg) 0x30D0_0800u64);
+    // SCTLR_EL1 as Linux's init_el2 hands it to EL1 (INIT_SCTLR_EL1_MMU_OFF): RES1 plus the pointer-authentication enables EnIA/EnIB/EnDA/EnDB.
+    asm!("msr sctlr_el1, {v}", v = in(reg) 0x30D0_0800u64 | (1 << 31) | (1 << 30) | (1 << 27) | (1 << 13));
     asm!("isb");
     report(0x70, 0xB9);
 }
@@ -374,6 +476,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     }
     stage(STAGE_ENTERED);
     chord::arm();
+    chord::early_to_fastboot_if_held();
     report(0x48, 0);
     report(0x50, 0);
     report(0x80, 0);
@@ -405,6 +508,14 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         }
     };
     unsafe {
+        if cfg!(hv_linux_at_el2) {
+            // The memory-map-only variant: Linux gets EL2 as from ABL (HCR_EL2 reset, SCTLR_EL2 off) and the hv is never entered again. Only the reservation and the DTB copy remain in effect.
+            pstore::log(&[b"\nferros hv: handing Linux EL2 (memory-map test variant)\n"]);
+            asm!("msr hcr_el2, {h}", "isb", h = in(reg) (1u64 << 31));
+            stage(STAGE_ERET);
+            asm!("msr elr_el2, {e}", "msr spsr_el2, {s}", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr", "dsb sy", "isb", "eret",
+                e = in(reg) LINUX_ENTRY, s = in(reg) 0x3C9u64, in("x0") new_dtb, options(noreturn));
+        }
         configure_el2();
         stage(STAGE_EL2_DONE);
         let mut h = [0u8; 16];
@@ -416,13 +527,38 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn hv_secondary(ctx: u64) -> ! {
-    if chord::held() {
-        chord::power_off();
-    }
     let mpidr: u64;
     unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) mpidr) };
     let idx = ((mpidr >> 8) & 0xF) as usize;
     let (entry, saved_ctx) = unsafe { (RESUME[idx][0], RESUME[idx][1]) };
+    if cfg!(hv_lean_resume) {
+        // The wake path stripped to what EL1 needs: no chord poll, no counters, no log, no ACTLR write, no TLB flush — the bisection variant for the resume path (2026-10-17).
+        unsafe {
+            let vbar = hv_vectors as *const () as u64;
+            asm!("msr vbar_el2, {v}", "isb", v = in(reg) vbar);
+            asm!("msr hcr_el2, {h}", "isb", h = in(reg) (1u64 << 31) | (1 << 19) | (1 << 40) | (1 << 41) | (1 << 56));
+            asm!("msr cptr_el2, {v}", "isb", v = in(reg) 0x32FFu64);
+            let pmcr: u64;
+            asm!("mrs {v}, pmcr_el0", v = out(reg) pmcr);
+            asm!("msr mdcr_el2, {v}", v = in(reg) ((pmcr >> 11) & 0x1F) | (3 << 12) | (3 << 24));
+            asm!("msr cnthctl_el2, {v}", "msr cntvoff_el2, xzr", v = in(reg) 3u64);
+            asm!("msr s3_4_c12_c9_5, {v}", "isb", "msr s3_4_c12_c11_0, xzr", v = in(reg) 0xFu64);
+            let (midr, mp): (u64, u64);
+            asm!("mrs {a}, midr_el1", "mrs {b}, mpidr_el1", a = out(reg) midr, b = out(reg) mp);
+            asm!("msr vpidr_el2, {a}", "msr vmpidr_el2, {b}", "msr hstr_el2, xzr", "msr vttbr_el2, xzr", a = in(reg) midr, b = in(reg) mp);
+            asm!("msr sctlr_el1, {v}", "isb", v = in(reg) 0x30D0_0800u64);
+            if entry == 0 {
+                loop {
+                    asm!("wfe");
+                }
+            }
+            asm!("msr elr_el2, {e}", "msr spsr_el2, {s}", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr", "dsb sy", "isb", "eret",
+                e = in(reg) entry, s = in(reg) SPSR_EL1H_MASKED, in("x0") if ctx != 0 { ctx } else { saved_ctx }, options(noreturn));
+        }
+    }
+    if chord::held() {
+        chord::power_off();
+    }
     unsafe {
         configure_el2();
         if entry == 0 {
@@ -451,6 +587,8 @@ const PSCI_CPU_SUSPEND: u64 = 0xC400_0001;
 const PSCI_CPU_ON: u64 = 0xC400_0003;
 const PSCI_SYSTEM_SUSPEND: u64 = 0xC400_000E;
 const PSCI_CPU_SUSPEND_32: u64 = 0x8400_0001;
+/// Exynos EL3: save / restore a power domain's TrustZone state (TZPC group, S2MPU) around its power cycle (exynos-pd_el3.c).
+const SMC_CMD_PREPARE_PD_ONOFF: u64 = 0x8200_0410;
 const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 
 /// The trapped synchronous exception from EL1. `frame` holds x0..x17 (then x18, x30) as the guest left them; results go back through it.
@@ -462,6 +600,23 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
     let esr: u64;
     unsafe { asm!("mrs {v}, esr_el2", v = out(reg) esr) };
     let ec = (esr >> 26) & 0x3F;
+    // The inert-hv experiment: with all secondaries up, this core stops trapping SMCs for good (Android must keep deep idle off: a power-down wake would land in Linux at EL2).
+    if cfg!(hv_tsc_off_after_boot) && ec == 0x17 && unsafe { read_volatile((REPORT + 0x50) as *const u64) } >= 8 {
+        unsafe {
+            let hcr: u64;
+            asm!("mrs {h}, hcr_el2", h = out(reg) hcr);
+            asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr & !(1 << 19));
+        }
+        bump(0x98);
+        // This SMC still has to happen: forward it as the trapped one it is.
+        forward_smc(frame);
+        unsafe {
+            let elr: u64;
+            asm!("mrs {v}, elr_el2", v = out(reg) elr);
+            asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+        }
+        return;
+    }
     match ec {
         0x17 => {
             // SMC from AArch64 EL1. ELR points at the SMC itself for this class; step over it.
@@ -475,11 +630,20 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
             let core = ((me >> 8) & 0xF) as usize;
             unsafe {
                 write_volatile(&raw mut SMCS[core], read_volatile(&raw const SMCS[core]) + 1);
+                let (now, freq): (u64, u64);
+                asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
+                write_volatile(&raw mut LAST_FID[core], fid);
+                write_volatile(&raw mut LAST_T[core], now);
+                stats_tick(now, freq);
             }
             let entry_call = matches!(fid, PSCI_CPU_ON | PSCI_CPU_ON_32 | PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 | PSCI_SYSTEM_SUSPEND);
-            if entry_call {
+            // Experiment (2026-10-17 evening): the power-domain prepare call issued from EL2, as a kernel running at EL2 would — EL3 may do the S2MPU save/restore for a domain only for an EL2 caller and leave it to pKVM for an EL1 one. Mahere's GPU work froze the phone with deep idle disabled, so the wake path is not it.
+            if entry_call || fid == SMC_CMD_PREPARE_PD_ONOFF || cfg!(hv_no_window) {
                 // The three PSCI calls that name where a core comes back: the entry becomes `_secondary`, the call is issued from here, the guest resumes past its SMC.
                 match fid {
+                    SMC_CMD_PREPARE_PD_ONOFF => {
+                        bump(0x90);
+                    }
                     PSCI_CPU_ON | PSCI_CPU_ON_32 => {
                         bump(0x50);
                         let idx = ((frame[1] >> 8) & 0xF) as usize;
@@ -496,13 +660,14 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                         }
                         frame[2] = _secondary as *const () as u64;
                     }
-                    _ => {
+                    PSCI_SYSTEM_SUSPEND => {
                         unsafe {
                             RESUME[core] = [frame[1], frame[2]];
                             asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
                         }
                         frame[1] = _secondary as *const () as u64;
                     }
+                    _ => {}
                 }
                 forward_smc(frame);
                 unsafe {
@@ -701,11 +866,73 @@ mod chord {
 
     /// Both keys down on two consecutive polls (the polls are traps, so a few microseconds to milliseconds apart).
     pub fn held() -> bool {
+        if cfg!(hv_no_chord_poll) {
+            return false;
+        }
         unsafe {
             let both = read_volatile(GPA4_DAT as *const u32) & (1 << VOL_DOWN_PIN) == 0 && read_volatile(GPA6_DAT as *const u32) & (1 << VOL_UP_PIN) == 0;
             let n = if both { read_volatile(&raw const HITS) + 1 } else { 0 };
             write_volatile(&raw mut HITS, n);
             n >= 2
+        }
+    }
+
+    const DSS_HEADER: usize = 0xD810_0000;
+    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+    const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
+    const PMU_REBOOT_CMD: u64 = 0x1546_0810;
+    const REBOOT_MODE_BOOTLOADER: u64 = 0xFC;
+
+    fn ms(n: u64) {
+        unsafe {
+            let (f, t0): (u64, u64);
+            asm!("mrs {f}, cntfrq_el0", "mrs {t}, cntpct_el0", f = out(reg) f, t = out(reg) t0);
+            loop {
+                let t: u64;
+                asm!("mrs {t}, cntpct_el0", t = out(reg) t);
+                if t.wrapping_sub(t0) >= f / 1000 * n {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The dev escape: both volume keys held while the hv starts (before Linux) send the phone to fastboot — the fastboot reboot mode stamped through EL3 and the cluster watchdogs fired, the path measured to land there (~20 s). A broken slot-a build otherwise retries forever (the slot is marked successful). Never returns.
+    pub fn early_to_fastboot_if_held() {
+        // A third of a second to be seen holding, polled.
+        let mut n = 0;
+        for _ in 0..32 {
+            if held() {
+                n += 1;
+            }
+            ms(10);
+        }
+        if n < 8 {
+            return;
+        }
+        super::pstore::log(&[b"\nferros hv: volume keys held at start -- fastboot\n"]);
+        unsafe {
+            write_volatile((DSS_HEADER + 0x300) as *mut u32, 0xCAFE);
+            write_volatile((DSS_HEADER + 0x100) as *mut u32, 0);
+            for cpu in 0..9 {
+                write_volatile((DSS_HEADER + 0x500 + cpu * 4) as *mut u32, 0);
+            }
+            asm!("dsb sy");
+            asm!("smc #0", inout("x0") SMC_CMD_PRIV_REG => _, inout("x1") PMU_REBOOT_CMD => _, inout("x2") 1u64 => _, inout("x3") REBOOT_MODE_BOOTLOADER => _,
+                out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
+            for &wdt in &WATCHDOGS {
+                write_volatile(wdt as *mut u32, 0);
+                ms(1);
+                write_volatile((wdt + 0x04) as *mut u32, 1);
+                ms(1);
+                write_volatile((wdt + 0x08) as *mut u32, 1);
+                ms(1);
+                write_volatile(wdt as *mut u32, (1 << 5) | (1 << 0));
+                ms(1);
+            }
+        }
+        loop {
+            unsafe { asm!("wfe") };
         }
     }
 
