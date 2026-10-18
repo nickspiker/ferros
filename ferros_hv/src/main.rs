@@ -752,6 +752,7 @@ mod chord {
                 ms(1);
             }
         }
+        // No instant path yet: a direct PMU write of the mode followed by PSCI SYSTEM_RESET was tried (2026-10-17) and hung the core in EL3 until the watchdogs fired — ABL reads a Linux-style reboot's mode off the PMIC path (its log shows those as power-on resets), which the hv will reach once it speaks to the PMIC (M1).
         super::splash::band(1, 0xFFFF_FFFF);
         loop {
             unsafe { asm!("wfe") };
