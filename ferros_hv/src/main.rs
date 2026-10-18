@@ -335,7 +335,24 @@ fn stats_tick(now: u64, freq: u64) {
         }
         let mut hn = [0u8; 16];
         pstore::hex(now / (freq / 1000), &mut hn);
-        pstore::log(&[b"\nferros hv stats t=", &hn[6..16], b" ms;", &line, b"\n"]);
+        // The display's two S2MPUs (always powered while the panel is on): CTRL0, the per-VID protection enable as it reads back, and FAULT_STATUS — a denied DMA in stall mode would hold DECON's frame forever, which is what the compositor's unreleased retire fence looked like (2026-10-17 21:20). Only these two: a powered-down block's registers would abort the read.
+        let mut s2 = [0u8; 2 * 40];
+        for (k, base) in [0x1987_0000usize, 0x19C7_0000].iter().enumerate() {
+            let (mut a, mut b, mut c) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+            pstore::hex(read_volatile(*base as *const u32) as u64, &mut a);
+            pstore::hex(read_volatile((*base + 0x50) as *const u32) as u64, &mut b);
+            pstore::hex(read_volatile((*base + 0x2000) as *const u32) as u64, &mut c);
+            let o = k * 40;
+            s2[o..o + 6].copy_from_slice(if k == 0 { b" dpuf0" } else { b" dpuf1" });
+            s2[o + 6] = b' ';
+            s2[o + 7..o + 15].copy_from_slice(&a[8..16]);
+            s2[o + 15] = b'/';
+            s2[o + 16..o + 24].copy_from_slice(&b[8..16]);
+            s2[o + 24] = b'/';
+            s2[o + 25..o + 33].copy_from_slice(&c[8..16]);
+            s2[o + 33..o + 40].copy_from_slice(b"       ");
+        }
+        pstore::log(&[b"\nferros hv stats t=", &hn[6..16], b" ms;", &line, b" s2mpu", &s2, b"\n"]);
     }
 }
 
@@ -520,7 +537,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         stage(STAGE_EL2_DONE);
         let mut h = [0u8; 16];
         let actlr = read_volatile((REPORT + 0x78) as *const u64);
-        pstore::log(&[b"\nferros hv: EL2 up, Linux at EL1; ACTLR_EL2 was ", pstore::hex(actlr, &mut h), b"\n"]);
+        pstore::log(&[b"\nferros hv: EL2 up, Linux at EL1; build ", env!("HV_BUILD_TAG").as_bytes(), b"; ACTLR_EL2 was ", pstore::hex(actlr, &mut h), b"\n"]);
         eret_to(LINUX_ENTRY, new_dtb, true);
     }
 }
