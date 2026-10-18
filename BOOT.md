@@ -52,6 +52,12 @@ The disk and the identity are never touched without a human present.
 - **Charging.** Power is not data: the charger and USB-C controller chips negotiate and charge on their own, without the main CPU, so a phone at "Ready?" charges normally. Only the AP's USB data path stays dark.
 - **The killswitch.** Vol Up + Vol Down works before, during and after the gate.
 
+### The gate's contract (owner, 2026-10-17)
+
+Dev builds never default to Android: the one-second auto-press goes to ferros, and Android takes an explicit volume-down during the second (or volume-up to hold, then down). Release builds do not auto-press; they stop on Ready? and wait for the power key (ferros) or volume down (Android). ferros_kernel/src/ready.rs is this today. Slot-a hypervisor tests bypass the gate by making slot a active, which is the owner-approved override for those tests only.
+
+**Planned: a USB handshake at the gate.** The host should be able to choose ferros or Android from the Ready? screen (a PT command while the gate waits), for the dev loop and for recovery without touching the phone. The gate currently stops the USB controller before the press on purpose ("nothing answers on USB before the press"); the handshake means bringing DWC3 and a minimal PT endpoint up while the screen waits, so it costs the gate its "only what it takes to ask" economy on release builds only when the cable is present.
+
 ### Dev builds: auto-press
 Dev builds show "Ready?" and proceed as if the key were pressed after one second; production builds compile that out and wait for the key.
 In a dev build, a volume key (up or down) during that second cancels the timer: the gate then waits for the power key indefinitely, as production does (owner hardware test 2026-10-15: PASS).
