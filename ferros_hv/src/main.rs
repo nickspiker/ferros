@@ -335,9 +335,15 @@ fn stats_tick(now: u64, freq: u64) {
         }
         let mut hn = [0u8; 16];
         pstore::hex(now / (freq / 1000), &mut hn);
-        // The display's two S2MPUs (always powered while the panel is on): CTRL0, the per-VID protection enable as it reads back, and FAULT_STATUS — a denied DMA in stall mode would hold DECON's frame forever, which is what the compositor's unreleased retire fence looked like (2026-10-17 21:20). Only these two: a powered-down block's registers would abort the read.
+        // The display's two S2MPUs: CTRL0, the per-VID protection enable as it reads back, and FAULT_STATUS — a denied DMA in stall mode would hold DECON's frame forever, which is what the compositor's unreleased retire fence looked like (2026-10-17 21:20). Read only when this core's last SMC was a DQE histogram call (the display driver is touching the DQE, so the domain is on): a read into a powered-down block hangs the core, and the first version of this, reading on every tick, did exactly that during early boot and burned slot a's retries (21:27–22:17).
         let mut s2 = [0u8; 2 * 40];
+        let dpu_on = matches!(read_volatile(&raw const LAST_FID[((me_core()) & 0xF) as usize]), 0x8200_2013 | 0x8200_2014);
         for (k, base) in [0x1987_0000usize, 0x19C7_0000].iter().enumerate() {
+            if !dpu_on {
+                let o = k * 40;
+                s2[o..o + 40].copy_from_slice(b" dpu?  --------/--------/--------       ");
+                continue;
+            }
             let (mut a, mut b, mut c) = ([0u8; 16], [0u8; 16], [0u8; 16]);
             pstore::hex(read_volatile(*base as *const u32) as u64, &mut a);
             pstore::hex(read_volatile((*base + 0x50) as *const u32) as u64, &mut b);
@@ -354,6 +360,12 @@ fn stats_tick(now: u64, freq: u64) {
         }
         pstore::log(&[b"\nferros hv stats t=", &hn[6..16], b" ms;", &line, b" s2mpu", &s2, b"\n"]);
     }
+}
+
+fn me_core() -> u64 {
+    let m: u64;
+    unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) m) };
+    m >> 8
 }
 
 /// Per core: the guest's DBGBVR0_EL1, DBGBCR0_EL1 and MDSCR_EL1 while the hv runs it natively over an SMC, and a count of such runs.
@@ -881,6 +893,11 @@ mod chord {
         }
     }
 
+    /// Both keys down right now.
+    pub fn held_now() -> bool {
+        unsafe { read_volatile(GPA4_DAT as *const u32) & (1 << VOL_DOWN_PIN) == 0 && read_volatile(GPA6_DAT as *const u32) & (1 << VOL_UP_PIN) == 0 }
+    }
+
     /// Both keys down on two consecutive polls (the polls are traps, so a few microseconds to milliseconds apart).
     pub fn held() -> bool {
         if cfg!(hv_no_chord_poll) {
@@ -916,16 +933,13 @@ mod chord {
 
     /// The dev escape: both volume keys held while the hv starts (before Linux) send the phone to fastboot — the fastboot reboot mode stamped through EL3 and the cluster watchdogs fired, the path measured to land there (~20 s). A broken slot-a build otherwise retries forever (the slot is marked successful). Never returns.
     pub fn early_to_fastboot_if_held() {
-        // A third of a second to be seen holding, polled.
-        let mut n = 0;
+        // The inputs can read "pressed" for a moment after a reset (watchdog reboots went to fastboot with nobody touching the phone, 2026-10-17 21:50): let the pull-ups settle, then demand both keys down on every one of 32 polls over a third of a second.
+        ms(100);
         for _ in 0..32 {
-            if held() {
-                n += 1;
+            if !held_now() {
+                return;
             }
             ms(10);
-        }
-        if n < 8 {
-            return;
         }
         super::pstore::log(&[b"\nferros hv: volume keys held at start -- fastboot\n"]);
         unsafe {
