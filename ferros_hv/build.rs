@@ -38,7 +38,13 @@ fn main() {
     pages.dedup();
     let list: Vec<String> = pages.iter().map(|p| format!("{p:#x}")).collect();
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("oracle_targets.rs");
-    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\n", pages.len(), list.join(", "))).unwrap();
+    // FERROS_HV_ORACLE_CAP: how many trapped accesses get a log line (default 2048); later ones are still emulated, only not logged. The console ring is ~2 MiB and a line ~52 bytes, so ~16k lines is the useful ceiling.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_CAP");
+    let cap: u64 = std::env::var("FERROS_HV_ORACLE_CAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2048);
+    // FERROS_HV_ORACLE_ARM_GAP: seconds the trapped pages must sit idle before logging starts (default 0 = log from the first access). With a gap, a boot-time burst (the camera service reading calibration at ~30 s) goes unlogged and the next burst after the quiet is logged from its first access.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_ARM_GAP");
+    let gap: u64 = std::env::var("FERROS_HV_ORACLE_ARM_GAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\n", pages.len(), list.join(", "), cap, gap)).unwrap();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=HV_BUILD_TAG={} {}", stamp % 100000, if tag.is_empty() { "base".to_string() } else { tag.trim_end().to_string() });
 }

@@ -362,9 +362,31 @@ unsafe fn stage2_base() -> u64 {
 }
 
 /// One compact line per trapped oracle access, capped so a touch burst cannot flood the ring. Read from the next boot's /sys/fs/pstore/console-ramoops-0, the way every other hv line is.
+static mut ORACLE_LAST_T: u64 = 0;
+static mut ORACLE_ARMED: bool = false;
+static mut ORACLE_LOGGED: u64 = 0;
+
 fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
-    if unsafe { read_volatile((REPORT + 0xB0) as *const u64) } > 2048 {
-        return;
+    unsafe {
+        let (now, freq): (u64, u64);
+        asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
+        let last = read_volatile(&raw const ORACLE_LAST_T);
+        write_volatile(&raw mut ORACLE_LAST_T, now);
+        if !read_volatile(&raw const ORACLE_ARMED) {
+            // Arm on the first access when there is no gap, or on the first access after the pages have been quiet for the gap.
+            if ORACLE_ARM_GAP_S == 0 || (last != 0 && now.wrapping_sub(last) > ORACLE_ARM_GAP_S * freq) {
+                write_volatile(&raw mut ORACLE_ARMED, true);
+                let mut ht = [0u8; 16];
+                pstore::log(&[b"\nferros hv: oracle armed at t=", pstore::hex(now / (freq / 1000), &mut ht), b" ms\n"]);
+            } else {
+                return;
+            }
+        }
+        let n = read_volatile(&raw const ORACLE_LOGGED);
+        if n >= ORACLE_CAP {
+            return;
+        }
+        write_volatile(&raw mut ORACLE_LOGGED, n + 1);
     }
     let (mut hp, mut hv) = ([0u8; 16], [0u8; 16]);
     pstore::log(&[
