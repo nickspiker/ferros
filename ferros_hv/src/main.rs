@@ -20,8 +20,8 @@ const DTB_COPY: u64 = HV_BASE - 0x10_0000;
 const DTB_COPY_MAX: usize = 0x10_0000;
 /// The Linux Image: right after the hv's pad in the blob ABL loaded, 2 MiB aligned as its header demands (its flags say "place anywhere").
 const LINUX_ENTRY: u64 = 0x8020_0000;
-/// The hv's report page, in a reserved megabyte of the LOW DRAM bank (no-map in the DTB the hv hands Linux), read by the next ferros boot with `bridge read B6100000 200`. Measured 2026-10-17: the high bank (G#8_8000_0000..) does not keep its contents across any reset, the low 2 GiB does; and G#FD60_0000, ferros's block, is inside stock Android's pstore ramoops region, which rewrites it while Android runs.
-const REPORT: usize = 0xB610_0000;
+/// The hv's report page: the last 64 KiB of its own reserved region. It sat at G#B610_0000 for a day, a page right under the secure DRAM carveout at G#B620_0000 — and the freezes under real use resolved into an asynchronous SError (bus error, syndrome G#BE000011) delivered to whichever core trapped next, which is what a write into a protected window looks like when the hv writes this page on every trap (2026-10-19). Nothing needs this page to survive a reset any more: the hv's words go into Android's pstore ring.
+const REPORT: usize = 0xA_FFFF_0000;
 const REPORT_RESERVE: u64 = 0x10_0000;
 
 const STAGE_ENTERED: u64 = 0xA1;
@@ -331,17 +331,32 @@ fn stats_tick(now: u64, freq: u64) {
             line[o + 20..o + 28].copy_from_slice(&h2[8..16]);
             line[o + 28] = b'/';
             line[o + 29..o + 37].copy_from_slice(&h3[8..16]);
-            line[o + 37..o + 44].copy_from_slice(b"       ");
+            // "w" + ms this core has been inside a natively re-executed SMC (0 = none open), then its FID's low 16 bits.
+            let wt = read_volatile(&raw const WIN_OPEN_T[c]);
+            let wms = if wt == 0 { 0 } else { now.wrapping_sub(wt) / (freq / 1000) };
+            let mut hw = [0u8; 16];
+            pstore::hex((wms.min(0xFFFF) << 16) | (read_volatile(&raw const WIN_FID[c]) & 0xFFFF), &mut hw);
+            line[o + 37] = b'w';
+            line[o + 38..o + 44].copy_from_slice(&hw[10..16]);
         }
         let mut hn = [0u8; 16];
         pstore::hex(now / (freq / 1000), &mut hn);
         // The display's two S2MPUs: CTRL0, the per-VID protection enable as it reads back, and FAULT_STATUS — a denied DMA in stall mode would hold DECON's frame forever, which is what the compositor's unreleased retire fence looked like (2026-10-17 21:20). Read only when this core's last SMC was a DQE histogram call (the display driver is touching the DQE, so the domain is on): a read into a powered-down block hangs the core, and the first version of this, reading on every tick, did exactly that during early boot and burned slot a's retries (21:27–22:17).
-        let mut s2 = [0u8; 2 * 40];
-        let dpu_on = matches!(read_volatile(&raw const LAST_FID[((me_core()) & 0xF) as usize]), 0x8200_2013 | 0x8200_2014);
-        for (k, base) in [0x1987_0000usize, 0x19C7_0000].iter().enumerate() {
-            if !dpu_on {
+        let mut s2 = [0u8; 3 * 40];
+        // The display domain is on when any core issued a DQE histogram call within the last second; the GPU domain is on when the PMU's G3D_STATUS (read through EL3, as ferros's kernel reads the PMU) says so — the GPU's S2MPU (G3D) is then read too: Mahere's first frames stop the whole SoC with nothing in the kernel log, the shape of a DMA master stalled by its S2MPU (2026-10-19).
+        // No S2MPU readback at all any more: the display domain is off more often than the histogram gate assumed (the display driver keeps issuing those calls and EL3 answers error 3 while the domain is down), and a read into the powered-down block came back as an asynchronous SError on whichever core trapped next — the bootloader decoded it as "BOOKER CPU8 to DPUF0" (2026-10-19). Every SError-class freeze dates from the build that added the readback.
+        let dpu_on = false;
+        let mut g3d_status: u64 = 0;
+        if !cfg!(hv_no_pmu_read) {
+        asm!("smc #0", inout("x0") 0x8200_0504u64 => g3d_status, inout("x1") 0x1546_1A84u64 => _, inout("x2") 0u64 => _, inout("x3") 0u64 => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
+        }
+        let g3d_on = g3d_status & 1 == 1 && g3d_status < 0x1_0000;
+        for (k, base) in [0x1987_0000usize, 0x19C7_0000, 0x1EE7_0000].iter().enumerate() {
+            let on = if k < 2 { dpu_on } else { g3d_on };
+            if !on {
                 let o = k * 40;
-                s2[o..o + 40].copy_from_slice(b" dpu?  --------/--------/--------       ");
+                s2[o..o + 40].copy_from_slice(if k < 2 { b" dpu?  --------/--------/--------       " } else { b" g3d?  --------/--------/--------       " });
                 continue;
             }
             let (mut a, mut b, mut c) = ([0u8; 16], [0u8; 16], [0u8; 16]);
@@ -349,7 +364,7 @@ fn stats_tick(now: u64, freq: u64) {
             pstore::hex(read_volatile((*base + 0x50) as *const u32) as u64, &mut b);
             pstore::hex(read_volatile((*base + 0x2000) as *const u32) as u64, &mut c);
             let o = k * 40;
-            s2[o..o + 6].copy_from_slice(if k == 0 { b" dpuf0" } else { b" dpuf1" });
+            s2[o..o + 6].copy_from_slice(match k { 0 => b" dpuf0", 1 => b" dpuf1", _ => b" g3d  " });
             s2[o + 6] = b' ';
             s2[o + 7..o + 15].copy_from_slice(&a[8..16]);
             s2[o + 15] = b'/';
@@ -370,6 +385,9 @@ fn me_core() -> u64 {
 
 /// Per core: the guest's DBGBVR0_EL1, DBGBCR0_EL1 and MDSCR_EL1 while the hv runs it natively over an SMC, and a count of such runs.
 static mut STEP_SAVED: [u64; 48] = [0; 48];
+/// Per core: the counter value when a native-SMC window was opened (0 when closed) and the FID inside it — the stats line turns it into "how long has this core been inside an SMC", the question the EHLD verdicts raise (2026-10-19).
+static mut WIN_OPEN_T: [u64; 16] = [0; 16];
+static mut WIN_FID: [u64; 16] = [0; 16];
 static mut STEPS: [u64; 16] = [0; 16];
 
 /// EL2 as the guest should find it. Called on every core before its first eret.
@@ -383,6 +401,7 @@ unsafe fn configure_el2() {
     asm!("msr vbar_el2, {v}", "isb", v = in(reg) vbar);
     report(0x70, 0xB0);
     // RW (EL1 is AArch64) | TSC (SMC traps here) | APK + API (pointer authentication keys and instructions untrapped) | ATA (MTE tag accesses untrapped where implemented). VM = 0: no stage 2 yet. IMO/FMO/AMO = 0: interrupts go to EL1 directly. E2H = 0, TGE = 0.
+    // (Bits 52..55 are TOCU / EnSCXT / TTLBIS / TTLBOS — setting them "for PBHA" on 2026-10-19 trapped the kernel's TLB invalidations into the skip path and slot a stopped booting. The page-table hardware-use bits are gated elsewhere; left alone.)
     let hcr: u64 = (1 << 31) | (1 << 19) | (1 << 40) | (1 << 41) | if cfg!(hv_no_ata) { 0 } else { 1 << 56 };
     // The ISB matters: without it the CPTR_EL2 write below used the E2H = 1 register layout the core was still in (measured 2026-10-17: ZEN read as 0, the ZCR_EL2 write trapped with EC G#19).
     asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr);
@@ -510,6 +529,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     report(0x50, 0);
     report(0x80, 0);
     report(0x88, 0);
+    report(0xA0, 0);
     for core in 0..16 {
         report(0x100 + core * 16, 0);
         report(0x108 + core * 16, 0);
@@ -712,6 +732,8 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                         e = out(reg) elr, a = out(reg) bvr, b = out(reg) bcr, m = out(reg) mdscr, c = out(reg) mdcr, d = out(reg) hcr, s = out(reg) spsr);
                     // Route an interrupt class to EL2 only if the guest has it unmasked: a masked guest cannot be preempted inside the window, and routing while masked livelocks (the pending interrupt traps here, the SMC re-traps, forever — the frozen-splash boots of 2026-10-17).
                     let route = (if spsr & (1 << 7) == 0 { 1 << 4 } else { 0 }) | (if spsr & (1 << 6) == 0 { 1 << 3 } else { 0 });
+                    write_volatile(&raw mut WIN_OPEN_T[core], read_volatile(&raw const LAST_T[core]));
+                    write_volatile(&raw mut WIN_FID[core], fid);
                     write_volatile(&raw mut STEP_SAVED[core * 3], bvr);
                     write_volatile(&raw mut STEP_SAVED[core * 3 + 1], bcr);
                     write_volatile(&raw mut STEP_SAVED[core * 3 + 2], mdscr);
@@ -725,7 +747,16 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
             }
         }
         0x30 => {
-            // Breakpoint from EL1: the natively re-executed SMC is done and the guest is at the instruction after it (ELR).
+            // Breakpoint from EL1: the natively re-executed SMC is done and the guest is at the instruction after it (ELR); frame[0] is what EL3 returned. Non-zero returns of the display's histogram calls are logged (first 24): in every captured freeze most cores are issuing them in the last seconds, the shape of a driver retrying a refused call (2026-10-19).
+            let core = (me_core() & 0xF) as usize;
+            let fid = unsafe { read_volatile(&raw const WIN_FID[core]) };
+            if (fid == 0x8200_2013 || fid == 0x8200_2014 || fid == 0x8200_2010 || fid == 0x8200_0410) && frame[0] != 0 {
+                bump(0xA0);
+                if unsafe { read_volatile((REPORT + 0xA0) as *const u64) } <= 24 {
+                    let (mut h0, mut h1, mut h2) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+                    pstore::log(&[b"\nferros hv: SMC ", pstore::hex(fid, &mut h0), b" returned ", pstore::hex(frame[0], &mut h1), b" x1 ", pstore::hex(frame[1], &mut h2), b" on core ", &[b'0' + core as u8], b"\n"]);
+                }
+            }
             hv_window_close();
         }
         0x16 => {
@@ -797,6 +828,7 @@ extern "C" fn hv_window_close() {
             a = in(reg) read_volatile(&raw const STEP_SAVED[core * 3]), b = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 1]), m = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 2]),
             c = in(reg) mdcr & !(1 << 8), d = in(reg) (hcr | (1 << 19)) & !((1 << 4) | (1 << 3)));
         write_volatile(&raw mut STEPS[core], read_volatile(&raw const STEPS[core]) + 1);
+        write_volatile(&raw mut WIN_OPEN_T[core], 0);
     }
 }
 
@@ -1123,7 +1155,7 @@ mod fdt {
         }
         let insert_at = insert_at?;
         // Two nodes, each: BEGIN_NODE + 16-byte name PROP reg (len 16, 4 cells), PROP no-map (len 0), END_NODE = 64 bytes: the hv's RAM, and its report megabyte in the low bank.
-        let node_len = 2 * (4 + 16 + 12 + 16 + 12 + 4);
+        let node_len = 1 * (4 + 16 + 12 + 16 + 12 + 4);
         let new_total = total + node_len;
         if new_total > dst_max {
             return None;
@@ -1132,7 +1164,7 @@ mod fdt {
         let head = insert_at - src;
         copy(dst, src, head);
         let mut q = dst + head;
-        for (name, base, size) in [(b"hv@afc000000\0\0\0\0", super::HV_BASE, super::HV_SIZE), (b"hvrep@b6100000\0\0", super::REPORT as u64, super::REPORT_RESERVE)] {
+        for (name, base, size) in [(b"hv@afc000000\0\0\0\0", super::HV_BASE, super::HV_SIZE)] {
             wr32(q, BEGIN_NODE);
             q += 4;
             for (k, &c) in name.iter().enumerate() {
