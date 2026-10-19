@@ -2,7 +2,7 @@
 //!
 //! Milestone 0, what this file does: ABL loads `boot_a`'s "kernel", which is this binary padded to G#18_0000 with the stock Linux Image appended, at G#8008_0000 and jumps here at EL2 with the MMU off and the DTB in x0. The hv copies itself to 64 MiB of the low DRAM bank (HV_BASE), zeroes its bss, copies the DTB next to itself with one node added (`/reserved-memory/hv@b2000000`, no-map, so Linux never allocates over it), programs EL2 so that EL1 sees a plain machine (timers, GIC system registers, pointer authentication, SVE, PMU, MTE all through; only SMC traps), and erets into the Linux Image at G#8020_0000 as EL1h.
 //! From then on the hv runs only when Linux issues an SMC: PSCI calls that name a resume address (CPU_ON, CPU_SUSPEND, SYSTEM_SUSPEND) get that address swapped for `_secondary`, which brings the new or woken core up through the same EL2 setup and erets to where Linux wanted it; every other SMC is forwarded to EL3 unchanged.
-//! Milestone 0: Android boots, runs and sleeps under a dormant hv (stage 2 off). Milestone 1 adds stage 2 behind the `hv_stage2` knob — a 40-bit IPA identity map, HCR_EL2.VM = 1 — proven transparent on hardware 2026-10-19; the UFS command firewall and the EL2 kill chord build on it next.
+//! Milestone 0: Android boots, runs and sleeps under a dormant hv (stage 2 off). Milestone 1 adds stage 2 behind the `hv_stage2` knob — a 40-bit IPA identity map, HCR_EL2.VM = 1 — proven transparent on hardware 2026-10-19; the register oracle (`hv_oracle`) unmaps a target's pages to trap and log them, proven on the touch SPI bus 2026-10-19; the UFS command firewall and the EL2 kill chord build on the same trap next.
 //! Crumbs go to the ramoops result block at G#FD60_0000 from offset G#40 (ferros's own words are below it), where the next ferros boot reads them: +G#40 stage, +G#48 SMC traps, +G#50 CPU_ON count, +G#58 ESR of the last unexpected trap, +G#60 its ELR, +G#68 its FAR, +G#70 EL2 setup sub-stage, +G#78 ACTLR_EL2 as found, +G#80 trapped system-register accesses, +G#100 + core*16 the first such trap per core (ESR, ELR).
 
 #![no_std]
@@ -137,7 +137,7 @@ hv_vectors:
 
 // x0..x17 are the SMC's arguments and results; the guest's x18..x30 are callee-saved by the Rust handler, sp_el1 and the system state are untouched.
 lower_sync:
-    sub     sp, sp, #0xA0
+    sub     sp, sp, #0x100
     stp     x0, x1, [sp, #0x00]
     stp     x2, x3, [sp, #0x10]
     stp     x4, x5, [sp, #0x20]
@@ -147,9 +147,15 @@ lower_sync:
     stp     x12, x13, [sp, #0x60]
     stp     x14, x15, [sp, #0x70]
     stp     x16, x17, [sp, #0x80]
-    stp     x18, x30, [sp, #0x90]
+    stp     x18, x19, [sp, #0x90]
+    stp     x20, x21, [sp, #0xA0]
+    stp     x22, x23, [sp, #0xB0]
+    stp     x24, x25, [sp, #0xC0]
+    stp     x26, x27, [sp, #0xD0]
+    stp     x28, x29, [sp, #0xE0]
+    str     x30, [sp, #0xF0]
     mov     x0, sp
-    bl      hv_sync                     // rewrites x0..x17 in the frame
+    bl      hv_sync                     // frame index = register number; may rewrite any of x0..x30
     ldp     x0, x1, [sp, #0x00]
     ldp     x2, x3, [sp, #0x10]
     ldp     x4, x5, [sp, #0x20]
@@ -159,8 +165,14 @@ lower_sync:
     ldp     x12, x13, [sp, #0x60]
     ldp     x14, x15, [sp, #0x70]
     ldp     x16, x17, [sp, #0x80]
-    ldp     x18, x30, [sp, #0x90]
-    add     sp, sp, #0xA0
+    ldp     x18, x19, [sp, #0x90]
+    ldp     x20, x21, [sp, #0xA0]
+    ldp     x22, x23, [sp, #0xB0]
+    ldp     x24, x25, [sp, #0xC0]
+    ldp     x26, x27, [sp, #0xD0]
+    ldp     x28, x29, [sp, #0xE0]
+    ldr     x30, [sp, #0xF0]
+    add     sp, sp, #0x100
     eret
 
 unexpected:
@@ -250,18 +262,107 @@ fn bump(off: usize) {
     }
 }
 
-/// Stage 2, identity: a 40-bit IPA space in 1 GiB blocks (level 1, two concatenated 4 KiB tables = 1024 entries), every block Normal write-back inner-shareable, read/write, access flag set; stage 1's attributes win for Device memory under the combining rules, so MMIO stays MMIO. What pKVM gives its host; the M1 firewall unmaps the UFS controller's pages from here.
+/// Stage 2, identity: a 40-bit IPA space in 1 GiB blocks (level 1, two concatenated 4 KiB tables = 1024 entries), every block Normal write-back inner-shareable, read/write, access flag set; stage 1's attributes win for Device memory under the combining rules, so MMIO stays MMIO. What pKVM gives its host; the oracle and the M1 firewall unmap a block's pages from here so every access traps.
 #[repr(C, align(8192))]
 struct Stage2([u64; 1024]);
 static mut STAGE2: Stage2 = Stage2([0; 1024]);
 
-unsafe fn stage2_build() -> u64 {
-    for (i, e) in (*(&raw mut STAGE2)).0.iter_mut().enumerate() {
-        // Block descriptor: [1:0] = 0b01, MemAttr[5:2] = 0b1111 (Normal WB in/out), S2AP[7:6] = 0b11 (RW), SH[9:8] = 0b11 (inner), AF[10] = 1; output address = i << 30.
-        write_volatile(e, ((i as u64) << 30) | 0b01 | (0b1111 << 2) | (0b11 << 6) | (0b11 << 8) | (1 << 10));
+/// Descriptor low bits. Block (L1/L2): [1:0] = 0b01. Page (L3): [1:0] = 0b11. Both carry MemAttr[5:2] = 0b1111 (Normal WB in/out), S2AP[7:6] = 0b11 (RW), SH[9:8] = 0b11 (inner), AF[10] = 1. A table pointer is next-level-address | 0b11.
+const S2_ATTR: u64 = (0b1111 << 2) | (0b11 << 6) | (0b11 << 8) | (1 << 10);
+const S2_BLOCK: u64 = 0b01 | S2_ATTR;
+const S2_PAGE: u64 = 0b11 | S2_ATTR;
+const S2_ADDR: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// A next-level page table (512 × 8 bytes, 4 KiB, naturally aligned). Pools for splitting blocks down to pages: four 1 GiB blocks and eight 2 MiB blocks can be refined, enough for the oracle's targets with room to spare.
+#[repr(C, align(4096))]
+struct Tbl([u64; 512]);
+static mut L2POOL: [Tbl; 4] = [const { Tbl([0; 512]) }; 4];
+static mut L3POOL: [Tbl; 8] = [const { Tbl([0; 512]) }; 8];
+static mut L2N: usize = 0;
+static mut L3N: usize = 0;
+static mut S2_READY: bool = false;
+
+/// The MMIO pages the oracle unmaps so their accesses trap and are logged. Touch first: the SPI controller the GTI touch IC hangs off (spi@111D0000). Speakers (cs35l41 on spi@111C0000) and the rest follow.
+const ORACLE_TARGETS: [u64; 1] = [0x111D_0000];
+
+unsafe fn take_l2() -> *mut u64 {
+    let n = read_volatile(&raw const L2N);
+    write_volatile(&raw mut L2N, n + 1);
+    (&raw mut L2POOL[n]) as *mut u64
+}
+unsafe fn take_l3() -> *mut u64 {
+    let n = read_volatile(&raw const L3N);
+    write_volatile(&raw mut L3N, n + 1);
+    (&raw mut L3POOL[n]) as *mut u64
+}
+
+/// Refine the map down to the 4 KiB page holding `ipa` and mark it invalid, so an EL1&0 access to it faults to EL2 (EC G#24). Splits the covering 1 GiB block into 2 MiB blocks and the covering 2 MiB block into 4 KiB pages, both identity, on the way down. Called once, on the primary, before any secondary starts.
+unsafe fn stage2_unmap(ipa: u64) {
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    let l1i = (ipa >> 30) as usize;
+    let e1 = read_volatile(s2.add(l1i));
+    let l2 = if e1 & 0b11 == 0b11 {
+        (e1 & S2_ADDR) as *mut u64
+    } else {
+        let t = take_l2();
+        for j in 0..512u64 {
+            write_volatile(t.add(j as usize), (((l1i as u64) << 30) | (j << 21)) | S2_BLOCK);
+        }
+        write_volatile(s2.add(l1i), (t as u64 & S2_ADDR) | 0b11);
+        t
+    };
+    let l2i = ((ipa >> 21) & 0x1FF) as usize;
+    let e2 = read_volatile(l2.add(l2i));
+    let l3 = if e2 & 0b11 == 0b11 {
+        (e2 & S2_ADDR) as *mut u64
+    } else {
+        let t = take_l3();
+        let base2 = (ipa >> 21) << 21;
+        for k in 0..512u64 {
+            write_volatile(t.add(k as usize), (base2 | (k << 12)) | S2_PAGE);
+        }
+        write_volatile(l2.add(l2i), (t as u64 & S2_ADDR) | 0b11);
+        t
+    };
+    let l3i = ((ipa >> 12) & 0x1FF) as usize;
+    write_volatile(l3.add(l3i), 0);
+}
+
+/// Build the shared stage-2 table once (the primary boots and enables it before any secondary is started, so the flag needs no lock), unmap the oracle's targets into it, and return its base for VTTBR_EL2. Secondaries call this too and get the finished table.
+unsafe fn stage2_base() -> u64 {
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    if !read_volatile(&raw const S2_READY) {
+        for i in 0..1024u64 {
+            write_volatile(s2.add(i as usize), (i << 30) | S2_BLOCK);
+        }
+        if cfg!(hv_oracle) {
+            let mut i = 0;
+            while i < ORACLE_TARGETS.len() {
+                stage2_unmap(ORACLE_TARGETS[i]);
+                i += 1;
+            }
+        }
+        asm!("dsb sy", "tlbi alle1", "dsb sy", "isb");
+        write_volatile(&raw mut S2_READY, true);
     }
-    asm!("dsb sy");
-    (&raw const STAGE2) as u64
+    s2 as u64
+}
+
+/// One compact line per trapped oracle access, capped so a touch burst cannot flood the ring. Read from the next boot's /sys/fs/pstore/console-ramoops-0, the way every other hv line is.
+fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
+    if unsafe { read_volatile((REPORT + 0xB0) as *const u64) } > 2048 {
+        return;
+    }
+    let (mut hp, mut hv) = ([0u8; 16], [0u8; 16]);
+    pstore::log(&[
+        b"\nferros hv: S2 ",
+        pstore::hex(pa, &mut hp),
+        if write { b" W" } else { b" R" },
+        &[b'0' + bytes],
+        b" ",
+        pstore::hex(val, &mut hv),
+        b"\n",
+    ]);
 }
 
 /// Where each core should go after the hv brings it up: the entry and context Linux passed to PSCI, by core index.
@@ -430,7 +531,7 @@ unsafe fn configure_el2() {
     // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
     // The flush is local: this core's EL1 TLB is empty on a first boot and after a power-down anyway, and a broadcast (ALLE1IS) on every resume of nine cores would be a DVM storm.
     // VTCR_EL2: T0SZ 24 (40-bit IPA), SL0 1 (start at level 1), IRGN/ORGN write-back, SH inner, TG0 4 KiB, PS 40-bit, RES1 bit 31.
-    let vttbr = if cfg!(hv_stage2) { stage2_build() } else { 0 };
+    let vttbr = if cfg!(hv_stage2) { stage2_base() } else { 0 };
     asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1", "dsb nsh", "isb", v = in(reg) vttbr, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
     if cfg!(hv_stage2) {
         let hcr: u64;
@@ -605,7 +706,7 @@ const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 
 /// The trapped synchronous exception from EL1. `frame` holds x0..x17 (then x18, x30) as the guest left them; results go back through it.
 #[unsafe(no_mangle)]
-extern "C" fn hv_sync(frame: &mut [u64; 20]) {
+extern "C" fn hv_sync(frame: &mut [u64; 32]) {
     if chord::held() {
         chord::power_off();
     }
@@ -685,6 +786,63 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                 asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
             }
         }
+        0x24 => {
+            // Stage-2 data abort from EL1&0: an access to a page the oracle unmapped. The hv runs at EL2, which is not under stage 2, so it performs the real access against the device register, hands the guest the result, logs it, and steps past the instruction. Only the single-register syndrome form (ISV = 1, what readl/writel compile to) is emulated; a pair or other ISV = 0 access is logged and skipped (the driver may miss it, but the hv does not guess).
+            let (far, hpfar): (u64, u64);
+            unsafe { asm!("mrs {a}, far_el2", "mrs {b}, hpfar_el2", a = out(reg) far, b = out(reg) hpfar) };
+            let pa = ((hpfar >> 4) << 12) | (far & 0xFFF); // identity map: IPA == PA
+            let isv = (esr >> 24) & 1;
+            let wnr = (esr >> 6) & 1;
+            let sas = ((esr >> 22) & 3) as u32;
+            let sse = (esr >> 21) & 1;
+            let srt = ((esr >> 16) & 0x1F) as usize;
+            let sf = (esr >> 15) & 1;
+            bump(0xB0);
+            if isv == 1 {
+                let bytes = 1u8 << sas;
+                let logval;
+                unsafe {
+                    if wnr == 1 {
+                        let v = if srt == 31 { 0 } else { frame[srt] };
+                        match sas {
+                            0 => write_volatile(pa as *mut u8, v as u8),
+                            1 => write_volatile(pa as *mut u16, v as u16),
+                            2 => write_volatile(pa as *mut u32, v as u32),
+                            _ => write_volatile(pa as *mut u64, v),
+                        }
+                        logval = v;
+                    } else {
+                        let raw = match sas {
+                            0 => read_volatile(pa as *const u8) as u64,
+                            1 => read_volatile(pa as *const u16) as u64,
+                            2 => read_volatile(pa as *const u32) as u64,
+                            _ => read_volatile(pa as *const u64),
+                        };
+                        let bits = 8u32 << sas;
+                        let mut v = raw;
+                        if sse == 1 && bits < 64 {
+                            let sh = 64 - bits;
+                            v = (((v << sh) as i64) >> sh) as u64;
+                        }
+                        if sf == 0 {
+                            v &= 0xFFFF_FFFF;
+                        }
+                        if srt != 31 {
+                            frame[srt] = v;
+                        }
+                        logval = v;
+                    }
+                }
+                oracle_log(pa, wnr == 1, bytes, logval);
+            } else {
+                oracle_log(pa, wnr == 1, 0, esr);
+            }
+            unsafe {
+                let elr: u64;
+                asm!("mrs {v}, elr_el2", v = out(reg) elr);
+                asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+            }
+        }
         0x16 => {
             // HVC from EL1: nothing at EL2 answers calls yet. SMCCC NOT_SUPPORTED; ELR already points past the HVC. The first eight are logged: a driver expecting pKVM would show up here.
             bump(0x88);
@@ -714,14 +872,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
             }
             bump(0x80);
             if esr & 1 != 0 {
-                // Direction bit set: a read. Rt is ISS[9:5]; the frame holds x0..x17 then x18, x30.
+                // Direction bit set: a read returns 0. Rt is ISS[9:5]; the frame is indexed by register number (x0..x30), 31 = XZR (discard).
                 let rt = ((esr >> 5) & 0x1F) as usize;
-                if rt < 18 {
+                if rt != 31 {
                     frame[rt] = 0;
-                } else if rt == 18 {
-                    frame[18] = 0;
-                } else if rt == 30 {
-                    frame[19] = 0;
                 }
             }
             unsafe { asm!("msr elr_el2, {v}", v = in(reg) elr + 4) };
@@ -739,7 +893,7 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
 }
 
 /// Issue the guest's SMC to EL3 with its arguments and bring every result register back.
-fn forward_smc(f: &mut [u64; 20]) {
+fn forward_smc(f: &mut [u64; 32]) {
     unsafe {
         asm!(
             "smc #0",
