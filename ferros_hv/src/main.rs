@@ -1154,8 +1154,10 @@ mod fdt {
             }
         }
         let insert_at = insert_at?;
-        // Two nodes, each: BEGIN_NODE + 16-byte name PROP reg (len 16, 4 cells), PROP no-map (len 0), END_NODE = 64 bytes: the hv's RAM, and its report megabyte in the low bank.
-        let node_len = 1 * (4 + 16 + 12 + 16 + 12 + 4);
+        // One node: BEGIN_NODE + 16-byte name, PROP reg (len 12: 2 address cells + 1 size cell), PROP no-map (len 0), END_NODE = 60 bytes.
+        // The size is ONE cell because husky's /reserved-memory carries #address-cells = 2 and #size-cells = 1 (every sibling node's reg is 12 bytes).
+        // Until 2026-10-19 this wrote four cells: Linux read the first size cell — 0 — and reserved nothing, so the hv's 64 MiB sat in the page allocator; Mahere's buffers and kernel structures landed in the hv's statics and stacks, and the hv's writes landed in theirs (HV.md, "the reservation that never was").
+        let node_len = 4 + 16 + (12 + 12) + 12 + 4;
         let new_total = total + node_len;
         if new_total > dst_max {
             return None;
@@ -1172,13 +1174,12 @@ mod fdt {
             }
             q += 16;
             wr32(q, PROP);
-            wr32(q + 4, 16);
+            wr32(q + 4, 12);
             wr32(q + 8, reg_off);
             wr32(q + 12, (base >> 32) as u32);
             wr32(q + 16, base as u32);
-            wr32(q + 20, (size >> 32) as u32);
-            wr32(q + 24, size as u32);
-            q += 28;
+            wr32(q + 20, size as u32);
+            q += 24;
             wr32(q, PROP);
             wr32(q + 4, 0);
             wr32(q + 8, nomap_off);

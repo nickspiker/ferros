@@ -13,13 +13,20 @@ for e in workqueue_queue_work workqueue_execute_start workqueue_execute_end; do 
 echo 1 > $T/events/power/cpu_idle/enable
 echo 1 > $T/tracing_on
 echo "trace on $(cat $T/buffer_size_kb) KB/cpu; events: $(grep -c 1 $T/events/block/*/enable | grep -c ':1')"
+# Second argument "noidle": every cpuidle state but WFI disabled first, so no core goes through CPU_SUSPEND (the hv's resume path) during the run.
+if [ "${2:-}" = noidle ]; then
+  for c in /sys/devices/system/cpu/cpu[0-8]; do for st in $c/cpuidle/state*; do [ "$(cat $st/name)" != WFI ] && echo 1 > $st/disable; done; done
+  echo "idle states off: $(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/disable | tr '\n' ' ')"
+fi
 monkey -p nz.mahere.app -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
-t0=$(date +%s); n=0; stuck=0
+t0=$(date +%s); n=0; stuck=0; lastsw=
 check() {
   p=$(pidof nz.mahere.app); [ -z "$p" ] && { echo "$(( $(date +%s)-t0 ))s: no mahere pid"; return 1; }
   for t in /proc/$p/task/*; do
     st=$(cut -d' ' -f3 /proc/$(basename $t)/stat 2>/dev/null); st=$(awk '{print $3}' $t/stat 2>/dev/null)
-    if [ "$st" = D ]; then w=$(cat $t/wchan); echo "$(( $(date +%s)-t0 ))s: tid $(basename $t) $(cat $t/comm) D in $w"; case "$w" in blk_io_schedule|*io_schedule*|*wait_on_bit*) return 2;; esac; fi
+    if [ "$st" = D ]; then w=$(cat $t/wchan); sw=$(grep nr_switches $t/sched | awk '{print $3}'); echo "$(( $(date +%s)-t0 ))s: tid $(basename $t) $(cat $t/comm) D in $w switches=$sw"
+      # Stuck means no progress: the same switch count as last poll. A healthy Mahere shows D in blk_io_schedule on most polls at thousands of switches a second (measured after the fix, 2026-10-19).
+      if [ "$w" = blk_io_schedule ] && [ "$sw" = "$lastsw" ]; then return 2; fi; lastsw=$sw; fi
   done
   return 0
 }
