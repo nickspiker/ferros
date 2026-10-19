@@ -14,6 +14,31 @@ fn main() {
             tag.push(' ');
         }
     }
+    // FERROS_HV_ORACLE_PAGES: the pages the oracle unmaps, as a comma-separated list of hex addresses ("G#" prefix or bare hex, underscores allowed); a range "start-end" takes every 4 KiB page in it. Defaults to the touch SPI controller. Generated into OUT_DIR/oracle_targets.rs.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_PAGES");
+    let spec = std::env::var("FERROS_HV_ORACLE_PAGES").unwrap_or_else(|_| "G#111D_0000".to_string());
+    let parse = |t: &str| -> u64 {
+        let t = t.trim().trim_start_matches("G#").trim_start_matches("g#").replace('_', "");
+        u64::from_str_radix(&t, 16).unwrap_or_else(|_| panic!("FERROS_HV_ORACLE_PAGES: bad address {t:?}"))
+    };
+    let mut pages: Vec<u64> = Vec::new();
+    for item in spec.split(',').filter(|i| !i.trim().is_empty()) {
+        if let Some((a, b)) = item.split_once('-') {
+            let (a, b) = (parse(a) & !0xFFF, parse(b));
+            let mut p = a;
+            while p < b {
+                pages.push(p);
+                p += 0x1000;
+            }
+        } else {
+            pages.push(parse(item) & !0xFFF);
+        }
+    }
+    pages.sort();
+    pages.dedup();
+    let list: Vec<String> = pages.iter().map(|p| format!("{p:#x}")).collect();
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("oracle_targets.rs");
+    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\n", pages.len(), list.join(", "))).unwrap();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=HV_BUILD_TAG={} {}", stamp % 100000, if tag.is_empty() { "base".to_string() } else { tag.trim_end().to_string() });
 }

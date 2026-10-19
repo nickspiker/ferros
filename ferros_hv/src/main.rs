@@ -273,25 +273,32 @@ const S2_BLOCK: u64 = 0b01 | S2_ATTR;
 const S2_PAGE: u64 = 0b11 | S2_ATTR;
 const S2_ADDR: u64 = 0x0000_FFFF_FFFF_F000;
 
-/// A next-level page table (512 × 8 bytes, 4 KiB, naturally aligned). Pools for splitting blocks down to pages: four 1 GiB blocks and eight 2 MiB blocks can be refined, enough for the oracle's targets with room to spare.
+/// A next-level page table (512 × 8 bytes, 4 KiB, naturally aligned). Pools for splitting blocks down to pages: eight 1 GiB blocks and 64 2 MiB blocks can be refined; a target list that needs more stops at the pool's end (stage2_unmap refuses rather than overrun).
 #[repr(C, align(4096))]
 struct Tbl([u64; 512]);
-static mut L2POOL: [Tbl; 4] = [const { Tbl([0; 512]) }; 4];
-static mut L3POOL: [Tbl; 8] = [const { Tbl([0; 512]) }; 8];
+static mut L2POOL: [Tbl; 8] = [const { Tbl([0; 512]) }; 8];
+static mut L3POOL: [Tbl; 64] = [const { Tbl([0; 512]) }; 64];
 static mut L2N: usize = 0;
 static mut L3N: usize = 0;
 static mut S2_READY: bool = false;
 
-/// The MMIO pages the oracle unmaps so their accesses trap and are logged. Touch first: the SPI controller the GTI touch IC hangs off (spi@111D0000). Speakers (cs35l41 on spi@111C0000) and the rest follow.
-const ORACLE_TARGETS: [u64; 1] = [0x111D_0000];
+// The MMIO pages the oracle unmaps so their accesses trap and are logged, from FERROS_HV_ORACLE_PAGES at build time (build.rs); the default is the touch SPI controller (spi@111D0000).
+include!(concat!(env!("OUT_DIR"), "/oracle_targets.rs"));
 
+/// Next free table from a pool, or null when it is used up (the caller leaves that target mapped).
 unsafe fn take_l2() -> *mut u64 {
     let n = read_volatile(&raw const L2N);
+    if n >= (*(&raw const L2POOL)).len() {
+        return core::ptr::null_mut();
+    }
     write_volatile(&raw mut L2N, n + 1);
     (&raw mut L2POOL[n]) as *mut u64
 }
 unsafe fn take_l3() -> *mut u64 {
     let n = read_volatile(&raw const L3N);
+    if n >= (*(&raw const L3POOL)).len() {
+        return core::ptr::null_mut();
+    }
     write_volatile(&raw mut L3N, n + 1);
     (&raw mut L3POOL[n]) as *mut u64
 }
@@ -305,6 +312,9 @@ unsafe fn stage2_unmap(ipa: u64) {
         (e1 & S2_ADDR) as *mut u64
     } else {
         let t = take_l2();
+        if t.is_null() {
+            return;
+        }
         for j in 0..512u64 {
             write_volatile(t.add(j as usize), (((l1i as u64) << 30) | (j << 21)) | S2_BLOCK);
         }
@@ -317,6 +327,9 @@ unsafe fn stage2_unmap(ipa: u64) {
         (e2 & S2_ADDR) as *mut u64
     } else {
         let t = take_l3();
+        if t.is_null() {
+            return;
+        }
         let base2 = (ipa >> 21) << 21;
         for k in 0..512u64 {
             write_volatile(t.add(k as usize), (base2 | (k << 12)) | S2_PAGE);
