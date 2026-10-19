@@ -44,7 +44,16 @@ fn main() {
     // FERROS_HV_ORACLE_ARM_GAP: seconds the trapped pages must sit idle before logging starts (default 0 = log from the first access). With a gap, a boot-time burst (the camera service reading calibration at ~30 s) goes unlogged and the next burst after the quiet is logged from its first access.
     println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_ARM_GAP");
     let gap: u64 = std::env::var("FERROS_HV_ORACLE_ARM_GAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\n", pages.len(), list.join(", "), cap, gap)).unwrap();
+    // FERROS_HV_ORACLE_QUIET: exact register addresses whose accesses are emulated but not logged — a known controller's setup and status registers, so only the content registers (target, start, data) fill the log. Same syntax as the page list, no ranges.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_QUIET");
+    let mut quiet: Vec<u64> = std::env::var("FERROS_HV_ORACLE_QUIET").unwrap_or_default().split(',').filter(|i| !i.trim().is_empty()).map(|i| parse(i)).collect();
+    quiet.sort();
+    quiet.dedup();
+    let qlist: Vec<String> = quiet.iter().map(|p| format!("{p:#x}")).collect();
+    // FERROS_HV_ORACLE_ARM_AFTER_MS: no logging before this counter time in ms (the hv's counter runs close to the kernel's printk clock, measured 2026-10-19), so boot-time bursts are skipped and logging starts at the first access after it.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_ARM_AFTER_MS");
+    let after: u64 = std::env::var("FERROS_HV_ORACLE_ARM_AFTER_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\npub const ORACLE_QUIET: [u64; {}] = [{}];\npub const ORACLE_ARM_AFTER_MS: u64 = {};\n", pages.len(), list.join(", "), cap, gap, quiet.len(), qlist.join(", "), after)).unwrap();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=HV_BUILD_TAG={} {}", stamp % 100000, if tag.is_empty() { "base".to_string() } else { tag.trim_end().to_string() });
 }

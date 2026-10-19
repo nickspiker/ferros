@@ -365,6 +365,9 @@ unsafe fn stage2_base() -> u64 {
 static mut ORACLE_LAST_T: u64 = 0;
 static mut ORACLE_ARMED: bool = false;
 static mut ORACLE_LOGGED: u64 = 0;
+/// The last logged access (pa, value, write<<8 | bytes) and how many identical ones followed it unlogged: a driver's status poll is the same read returning the same value thousands of times, and logging each one ate the whole cap on the camera bus (2026-10-19). A run is written as one `rep N` line when it ends; the decoder replays it.
+static mut ORACLE_PREV: [u64; 3] = [u64::MAX; 3];
+static mut ORACLE_REP: u64 = 0;
 
 fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
     unsafe {
@@ -372,9 +375,16 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
         asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
         let last = read_volatile(&raw const ORACLE_LAST_T);
         write_volatile(&raw mut ORACLE_LAST_T, now);
+        let mut q = 0;
+        while q < ORACLE_QUIET.len() {
+            if ORACLE_QUIET[q] == pa {
+                return;
+            }
+            q += 1;
+        }
         if !read_volatile(&raw const ORACLE_ARMED) {
-            // Arm on the first access when there is no gap, or on the first access after the pages have been quiet for the gap.
-            if ORACLE_ARM_GAP_S == 0 || (last != 0 && now.wrapping_sub(last) > ORACLE_ARM_GAP_S * freq) {
+            // Arm on the first access when there is no gap, or on the first access after the pages have been quiet for the gap; never before ORACLE_ARM_AFTER_MS.
+            if now / (freq / 1000) >= ORACLE_ARM_AFTER_MS && (ORACLE_ARM_GAP_S == 0 || (last != 0 && now.wrapping_sub(last) > ORACLE_ARM_GAP_S * freq)) {
                 write_volatile(&raw mut ORACLE_ARMED, true);
                 let mut ht = [0u8; 16];
                 pstore::log(&[b"\nferros hv: oracle armed at t=", pstore::hex(now / (freq / 1000), &mut ht), b" ms\n"]);
@@ -382,10 +392,23 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
                 return;
             }
         }
+        let meta = ((write as u64) << 8) | bytes as u64;
+        let prev = &raw mut ORACLE_PREV;
+        if (*prev)[0] == pa && (*prev)[1] == val && (*prev)[2] == meta {
+            write_volatile(&raw mut ORACLE_REP, read_volatile(&raw const ORACLE_REP) + 1);
+            return;
+        }
         let n = read_volatile(&raw const ORACLE_LOGGED);
         if n >= ORACLE_CAP {
             return;
         }
+        let rep = read_volatile(&raw const ORACLE_REP);
+        if rep > 0 {
+            let mut hr = [0u8; 16];
+            pstore::log(&[b"\nferros hv: S2 rep ", pstore::hex(rep, &mut hr), b"\n"]);
+            write_volatile(&raw mut ORACLE_REP, 0);
+        }
+        (*prev) = [pa, val, meta];
         write_volatile(&raw mut ORACLE_LOGGED, n + 1);
     }
     let (mut hp, mut hv) = ([0u8; 16], [0u8; 16]);
