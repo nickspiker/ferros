@@ -121,9 +121,9 @@ hv_vectors:
     .org hv_vectors + 0x400
     b       lower_sync
     .org hv_vectors + 0x480
-    b       window_irq
+    b       unexpected
     .org hv_vectors + 0x500
-    b       window_irq
+    b       unexpected
     .org hv_vectors + 0x580
     b       unexpected
     .org hv_vectors + 0x600
@@ -150,33 +150,6 @@ lower_sync:
     stp     x18, x30, [sp, #0x90]
     mov     x0, sp
     bl      hv_sync                     // rewrites x0..x17 in the frame
-    ldp     x0, x1, [sp, #0x00]
-    ldp     x2, x3, [sp, #0x10]
-    ldp     x4, x5, [sp, #0x20]
-    ldp     x6, x7, [sp, #0x30]
-    ldp     x8, x9, [sp, #0x40]
-    ldp     x10, x11, [sp, #0x50]
-    ldp     x12, x13, [sp, #0x60]
-    ldp     x14, x15, [sp, #0x70]
-    ldp     x16, x17, [sp, #0x80]
-    ldp     x18, x30, [sp, #0x90]
-    add     sp, sp, #0xA0
-    eret
-
-// A physical interrupt taken at EL2: only possible while a native-SMC window is open (IMO/FMO are set only then). Close the window and go back to the SMC; the interrupt stays pending and is taken by EL1 once IMO is clear, and the SMC traps again afterwards.
-window_irq:
-    sub     sp, sp, #0xA0
-    stp     x0, x1, [sp, #0x00]
-    stp     x2, x3, [sp, #0x10]
-    stp     x4, x5, [sp, #0x20]
-    stp     x6, x7, [sp, #0x30]
-    stp     x8, x9, [sp, #0x40]
-    stp     x10, x11, [sp, #0x50]
-    stp     x12, x13, [sp, #0x60]
-    stp     x14, x15, [sp, #0x70]
-    stp     x16, x17, [sp, #0x80]
-    stp     x18, x30, [sp, #0x90]
-    bl      hv_window_close
     ldp     x0, x1, [sp, #0x00]
     ldp     x2, x3, [sp, #0x10]
     ldp     x4, x5, [sp, #0x20]
@@ -331,13 +304,9 @@ fn stats_tick(now: u64, freq: u64) {
             line[o + 20..o + 28].copy_from_slice(&h2[8..16]);
             line[o + 28] = b'/';
             line[o + 29..o + 37].copy_from_slice(&h3[8..16]);
-            // "w" + ms this core has been inside a natively re-executed SMC (0 = none open), then its FID's low 16 bits.
-            let wt = read_volatile(&raw const WIN_OPEN_T[c]);
-            let wms = if wt == 0 { 0 } else { now.wrapping_sub(wt) / (freq / 1000) };
-            let mut hw = [0u8; 16];
-            pstore::hex((wms.min(0xFFFF) << 16) | (read_volatile(&raw const WIN_FID[c]) & 0xFFFF), &mut hw);
-            line[o + 37] = b'w';
-            line[o + 38..o + 44].copy_from_slice(&hw[10..16]);
+            // The window column went with the native-SMC window (removed 2026-10-19): the stride stays 44 bytes and these trailing bytes are a fixed marker, so the per-core record and the silent-core detector (ms-since-last-trap, above) are unchanged.
+            line[o + 37] = b'-';
+            line[o + 38..o + 44].copy_from_slice(b"------");
         }
         let mut hn = [0u8; 16];
         pstore::hex(now / (freq / 1000), &mut hn);
@@ -383,12 +352,6 @@ fn me_core() -> u64 {
     m >> 8
 }
 
-/// Per core: the guest's DBGBVR0_EL1, DBGBCR0_EL1 and MDSCR_EL1 while the hv runs it natively over an SMC, and a count of such runs.
-static mut STEP_SAVED: [u64; 48] = [0; 48];
-/// Per core: the counter value when a native-SMC window was opened (0 when closed) and the FID inside it — the stats line turns it into "how long has this core been inside an SMC", the question the EHLD verdicts raise (2026-10-19).
-static mut WIN_OPEN_T: [u64; 16] = [0; 16];
-static mut WIN_FID: [u64; 16] = [0; 16];
-static mut STEPS: [u64; 16] = [0; 16];
 
 /// EL2 as the guest should find it. Called on every core before its first eret.
 unsafe fn configure_el2() {
@@ -685,79 +648,42 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                 write_volatile(&raw mut LAST_T[core], now);
                 stats_tick(now, freq);
             }
-            let entry_call = matches!(fid, PSCI_CPU_ON | PSCI_CPU_ON_32 | PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 | PSCI_SYSTEM_SUSPEND);
-            // Experiment (2026-10-17 evening): the power-domain prepare call issued from EL2, as a kernel running at EL2 would — EL3 may do the S2MPU save/restore for a domain only for an EL2 caller and leave it to pKVM for an EL1 one. Mahere's GPU work froze the phone with deep idle disabled, so the wake path is not it.
-            if entry_call || fid == SMC_CMD_PREPARE_PD_ONOFF || cfg!(hv_no_window) {
-                // The three PSCI calls that name where a core comes back: the entry becomes `_secondary`, the call is issued from here, the guest resumes past its SMC.
-                match fid {
-                    SMC_CMD_PREPARE_PD_ONOFF => {
-                        bump(0x90);
-                    }
-                    PSCI_CPU_ON | PSCI_CPU_ON_32 => {
-                        bump(0x50);
-                        let idx = ((frame[1] >> 8) & 0xF) as usize;
-                        unsafe {
-                            RESUME[idx] = [frame[2], frame[3]];
-                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
-                        }
-                        frame[2] = _secondary as *const () as u64;
-                    }
-                    PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 => {
-                        unsafe {
-                            RESUME[core] = [frame[2], frame[3]];
-                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
-                        }
-                        frame[2] = _secondary as *const () as u64;
-                    }
-                    PSCI_SYSTEM_SUSPEND => {
-                        unsafe {
-                            RESUME[core] = [frame[1], frame[2]];
-                            asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
-                        }
-                        frame[1] = _secondary as *const () as u64;
-                    }
-                    _ => {}
+            // Every trapped SMC is forwarded to EL3 from here and the guest resumed past it. The three PSCI calls that carry a re-entry point have it rewritten to `_secondary`; everything else passes through untouched. (The native-SMC re-execution window, breakpoint-stepped from EL1, was removed 2026-10-19: it existed to chase a caller-EL theory that the memory-corruption root cause disproved, and plain forwarding from EL2 booted Android before the window was ever written.)
+            match fid {
+                SMC_CMD_PREPARE_PD_ONOFF => {
+                    bump(0x90);
                 }
-                forward_smc(frame);
-                unsafe {
-                    let elr: u64;
-                    asm!("mrs {v}, elr_el2", v = out(reg) elr);
-                    asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                PSCI_CPU_ON | PSCI_CPU_ON_32 => {
+                    bump(0x50);
+                    let idx = ((frame[1] >> 8) & 0xF) as usize;
+                    unsafe {
+                        RESUME[idx] = [frame[2], frame[3]];
+                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[idx]) as u64);
+                    }
+                    frame[2] = _secondary as *const () as u64;
                 }
-            } else {
-                // Every other SMC runs natively from EL1, so EL3 sees the caller it expects (the hv re-issuing them from EL2 is the suspect behind the power-domain hangs, 2026-10-17). The SMC trap is dropped and a hardware breakpoint (BRP 0, EL1 only, address match) is planted on the instruction after the SMC, routed to EL2 by MDCR_EL2.TDE; its handler (EC G#30) re-arms the trap and puts the guest's debug registers back. A software step would not do: a stepped instruction that takes an exception completes the step on entry to EL3, and no step exception follows the return (the quirk Linux fakes around for stepped SVCs). ELR stays on the SMC so it executes.
-                unsafe {
-                    let (elr, bvr, bcr, mdscr, mdcr, hcr, spsr): (u64, u64, u64, u64, u64, u64, u64);
-                    asm!("mrs {e}, elr_el2", "mrs {a}, dbgbvr0_el1", "mrs {b}, dbgbcr0_el1", "mrs {m}, mdscr_el1", "mrs {c}, mdcr_el2", "mrs {d}, hcr_el2", "mrs {s}, spsr_el2",
-                        e = out(reg) elr, a = out(reg) bvr, b = out(reg) bcr, m = out(reg) mdscr, c = out(reg) mdcr, d = out(reg) hcr, s = out(reg) spsr);
-                    // Route an interrupt class to EL2 only if the guest has it unmasked: a masked guest cannot be preempted inside the window, and routing while masked livelocks (the pending interrupt traps here, the SMC re-traps, forever — the frozen-splash boots of 2026-10-17).
-                    let route = (if spsr & (1 << 7) == 0 { 1 << 4 } else { 0 }) | (if spsr & (1 << 6) == 0 { 1 << 3 } else { 0 });
-                    write_volatile(&raw mut WIN_OPEN_T[core], read_volatile(&raw const LAST_T[core]));
-                    write_volatile(&raw mut WIN_FID[core], fid);
-                    write_volatile(&raw mut STEP_SAVED[core * 3], bvr);
-                    write_volatile(&raw mut STEP_SAVED[core * 3 + 1], bcr);
-                    write_volatile(&raw mut STEP_SAVED[core * 3 + 2], mdscr);
-                    // The OS Lock is set at reset and disables every debug event until Linux clears it (debug_monitors_init, a postcore initcall — long after the first PSCI calls). Clear it here, or the breakpoint never fires and the trap stays off (measured 2026-10-17: the first two native builds never reached adb).
-                    asm!("msr oslar_el1, {z}", "isb", z = in(reg) 0u64);
-                    // DBGBCR0: E | PMC = 0b01 (EL1 only) | BAS = all bytes; HMC = 0, SSC = 0 (non-secure EL1), unlinked address match.
-                    // IMO | FMO on for the window: an interrupt before the SMC executes would let the guest switch tasks with the trap off (the idle task's CPU_SUSPEND would then go to EL3 natively and the core would wake into Linux's resume code at EL2). Routed here instead, the window closes and the SMC re-traps later.
-                    asm!("msr dbgbvr0_el1, {v}", "msr dbgbcr0_el1, {c}", "msr mdscr_el1, {m}", "msr mdcr_el2, {d}", "msr hcr_el2, {h}", "isb",
-                        v = in(reg) elr + 4, c = in(reg) 0x1E3u64, m = in(reg) mdscr | (1 << 15), d = in(reg) mdcr | (1 << 8), h = in(reg) (hcr & !(1 << 19)) | route);
+                PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 => {
+                    unsafe {
+                        RESUME[core] = [frame[2], frame[3]];
+                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
+                    }
+                    frame[2] = _secondary as *const () as u64;
                 }
+                PSCI_SYSTEM_SUSPEND => {
+                    unsafe {
+                        RESUME[core] = [frame[1], frame[2]];
+                        asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
+                    }
+                    frame[1] = _secondary as *const () as u64;
+                }
+                _ => {}
             }
-        }
-        0x30 => {
-            // Breakpoint from EL1: the natively re-executed SMC is done and the guest is at the instruction after it (ELR); frame[0] is what EL3 returned. Non-zero returns of the display's histogram calls are logged (first 24): in every captured freeze most cores are issuing them in the last seconds, the shape of a driver retrying a refused call (2026-10-19).
-            let core = (me_core() & 0xF) as usize;
-            let fid = unsafe { read_volatile(&raw const WIN_FID[core]) };
-            if (fid == 0x8200_2013 || fid == 0x8200_2014 || fid == 0x8200_2010 || fid == 0x8200_0410) && frame[0] != 0 {
-                bump(0xA0);
-                if unsafe { read_volatile((REPORT + 0xA0) as *const u64) } <= 24 {
-                    let (mut h0, mut h1, mut h2) = ([0u8; 16], [0u8; 16], [0u8; 16]);
-                    pstore::log(&[b"\nferros hv: SMC ", pstore::hex(fid, &mut h0), b" returned ", pstore::hex(frame[0], &mut h1), b" x1 ", pstore::hex(frame[1], &mut h2), b" on core ", &[b'0' + core as u8], b"\n"]);
-                }
+            forward_smc(frame);
+            unsafe {
+                let elr: u64;
+                asm!("mrs {v}, elr_el2", v = out(reg) elr);
+                asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
             }
-            hv_window_close();
         }
         0x16 => {
             // HVC from EL1: nothing at EL2 answers calls yet. SMCCC NOT_SUPPORTED; ELR already points past the HVC. The first eight are logged: a driver expecting pKVM would show up here.
@@ -809,26 +735,6 @@ extern "C" fn hv_sync(frame: &mut [u64; 20]) {
                 unsafe { asm!("wfe") };
             }
         }
-    }
-}
-
-/// Close a native-SMC window on this core: guest debug registers back, breakpoint routing off, interrupts back to EL1, SMC trap re-armed. From the breakpoint handler (SMC done, ELR past it) and from an interrupt taken during the window (ELR still on the SMC).
-#[unsafe(no_mangle)]
-extern "C" fn hv_window_close() {
-    if chord::held() {
-        chord::power_off();
-    }
-    let me: u64;
-    unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) me) };
-    let core = ((me >> 8) & 0xF) as usize;
-    unsafe {
-        let (mdcr, hcr): (u64, u64);
-        asm!("mrs {c}, mdcr_el2", "mrs {d}, hcr_el2", c = out(reg) mdcr, d = out(reg) hcr);
-        asm!("msr dbgbcr0_el1, {b}", "msr dbgbvr0_el1, {a}", "msr mdscr_el1, {m}", "msr mdcr_el2, {c}", "msr hcr_el2, {d}", "isb",
-            a = in(reg) read_volatile(&raw const STEP_SAVED[core * 3]), b = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 1]), m = in(reg) read_volatile(&raw const STEP_SAVED[core * 3 + 2]),
-            c = in(reg) mdcr & !(1 << 8), d = in(reg) (hcr | (1 << 19)) & !((1 << 4) | (1 << 3)));
-        write_volatile(&raw mut STEPS[core], read_volatile(&raw const STEPS[core]) + 1);
-        write_volatile(&raw mut WIN_OPEN_T[core], 0);
     }
 }
 
