@@ -149,9 +149,38 @@ pub fn info(rep: &mut Vec<u8>) {
     let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
     let (tx, rx) = (b[84] as u32, b[85] as u32);
     line(rep, alloc::format!("grid: A#{tx} transmit x A#{rx} receive = A#{} nodes; largest coordinates A#{} and A#{}; key length A#{}, force length A#{}\n", tx * rx, u16at(80), u16at(82), b[86], b[87]));
-    line(rep, alloc::format!("mutual-sense frames: raw G#{:X} filtered G#{:X} strength G#{:X} baseline G#{:X}\n", u16at(136), u16at(138), u16at(140), u16at(142)));
-    line(rep, alloc::format!("self-sense transmit: raw G#{:X} strength G#{:X}; receive: raw G#{:X} strength G#{:X}\n", u16at(144), u16at(148), u16at(152), u16at(156)));
-    line(rep, alloc::format!("one mutual-sense frame is A#{} bytes\n", tx * rx * 2));
+    // Every frame the chip can hand over, in the order `readSysInfo` reads their addresses (ftsCore.c 736-800). A zero address means this panel does not carry that layer.
+    const FRAMES: [(usize, &str); 28] = [
+        (136, "mutual raw"), (138, "mutual filtered"), (140, "mutual strength"), (142, "mutual baseline"),
+        (144, "self tx raw"), (146, "self tx filtered"), (148, "self tx strength"), (150, "self tx baseline"),
+        (152, "self rx raw"), (154, "self rx filtered"), (156, "self rx strength"), (158, "self rx baseline"),
+        (160, "key raw"), (162, "key filtered"), (164, "key strength"), (166, "key baseline"),
+        (168, "force raw"), (170, "force filtered"), (172, "force strength"), (174, "force baseline"),
+        (176, "hover tx raw"), (178, "hover tx filtered"), (180, "hover tx strength"), (182, "hover tx baseline"),
+        (184, "hover rx raw"), (186, "hover rx filtered"), (188, "hover rx strength"), (190, "hover rx baseline"),
+    ];
+    let mut have = 0u32;
+    let mut s = alloc::string::String::new();
+    for (o, name) in FRAMES {
+        let a = u16at(o);
+        if a != 0 {
+            have += 1;
+            s.push_str(&alloc::format!("  {name}: G#{a:X}\n"));
+        }
+    }
+    // The last four groups (proximity transmit/receive, detect) finish the block.
+    for (o, name) in [(192usize, "proximity tx"), (200, "proximity rx"), (208, "detect")] {
+        for (i, kind) in ["raw", "filtered", "strength", "baseline"].iter().enumerate() {
+            let a = u16at(o + i * 2);
+            if a != 0 {
+                have += 1;
+                s.push_str(&alloc::format!("  {name} {kind}: G#{a:X}\n"));
+            }
+        }
+    }
+    line(rep, alloc::format!("A#{have} of A#40 frame layers carried by this panel:\n"));
+    line(rep, s);
+    line(rep, alloc::format!("a mutual frame is A#{} bytes, a self-sense one A#{} or A#{}\n", tx * rx * 2, tx * 2, rx * 2));
 }
 
 /// The touch resolution last read (X << 16 | Y), 0 until `up` reads it.

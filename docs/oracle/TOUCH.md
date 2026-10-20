@@ -107,3 +107,18 @@ strongest nodes: (tx A#12, rx A#12) = A#1562; (tx A#12, rx A#11) = A#1551; (tx A
 ```
 
 58 frames a second, of which 4 ms is the frame read over SPI and 13 ms the paint. A fingertip is a bump about four nodes across (around 15 mm at this pitch) peaking near 1560 against a quiet floor inside about plus or minus 200, so roughly eight times the noise. The screen mapping is transmit across the width and receive down the height; the first run came out the right way round.
+
+### The frame layers this panel carries (2026-10-20)
+
+The driver defines 40 frame addresses in the information block (ftsCore.c `readSysInfo`, offsets 136-215); a zero means the panel does not carry that layer. husky carries **16**, four measurement stages across four sensing modes:
+
+| Mode | Values per frame | raw | filtered | strength | baseline |
+|---|---|---|---|---|---|
+| Mutual (the 18 x 39 grid) | 702, 1404 bytes | G#BACC | G#7924 | G#86E4 | G#9678 |
+| Self, transmit lines | 18, 36 bytes | G#B948 | G#12D6 | G#1352 | G#AB18 |
+| Self, receive lines | 39, 78 bytes | G#B974 | G#1302 | G#137E | G#AB44 |
+| Detect (the low-power wake scan) | — | G#B858 | G#10EE | G#111A | G#1096 |
+
+Zero, so absent on this panel: the key, force, hover and proximity groups (24 addresses). Key length and force length both read 0 in the block, which agrees.
+
+`strength` is `raw` minus that mode's own `baseline`, and is the layer to look at; `filtered` is what the firmware's own detection runs on.
