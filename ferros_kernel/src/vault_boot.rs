@@ -36,14 +36,12 @@ pub struct VaultProbe {
 }
 
 /// The ira-keyed vault on the ferros partition, kept open by the USB service for `ferros.dev.store`.
-pub type ShimStore = ferros_vault::backend::Store<crate::ufs_device::UfsDevice>;
+/// The kernel's store: manifestus (kvault.rs) since 2026-10-20; ferros_vault's Phase-1 single-file store before.
+pub type ShimStore = crate::kvault::KVault;
 
 /// The real boot pattern on the adopted link: open the ferros vault keyed by the ira, else genesis + seal it. Crumbs bracket each first-on-hardware step so a stall pins it. Returns the open store too (None if open and genesis both failed).
 pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
-    use crate::ufs_device::UfsDevice;
-    use ferros_hal::ufs::UfsController;
     use ferros_vault::anchor::AnchorKey;
-    use ferros_vault::backend::{Store, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE};
 
     let ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
     let ira_fail = ira.err().unwrap_or(0);
@@ -74,61 +72,44 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     };
     let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
     crate::oracle::set_system_secret(&ira);
+    let _ = key;
 
     const LKEY: &str = "genesis";
     const MSG: &[u8] = b"FERROS-GENESIS-0";
-    let mut need_seal = false;
     let mut kept: Option<ShimStore> = None;
-    let fresh_dev = || UfsDevice::ferros(UfsController::new(UFS_BASE));
-
-    crumb(0xE4);
-    let dev0 = fresh_dev();
-    crumb(0xE5); // UfsDevice constructed
-    let nonce_src = crate::wairua::TrngNonce::new();
-    crumb(0xE6); // TRNG seed drawn (SMC)
-    let nonce0 = alloc::boxed::Box::new(nonce_src); // coerces to Box<dyn NonceSource> at the call
-    crumb(0xE0); // first heap allocation done; before Store::open (UFS prefix read -> bounded read -> decode -> anchor decrypt)
-    let anchor_text = |a: &ferros_vault::vault_anchor::VaultAnchor| alloc::format!("anchor seq {} ring {} capacity {} tail {} root {:02x}{:02x}{:02x}{:02x}", a.anchor_seq, a.ring_size, a.payload_capacity, a.object_tail, a.root_commit.0[0], a.root_commit.0[1], a.root_commit.0[2], a.root_commit.0[3]);
-    let opened = Store::open(dev0, key, nonce0);
-    match &opened {
-        Ok(store) => crate::flashlog::line(&alloc::format!("vault open ok: {}, keys {:?}", anchor_text(store.anchor()), store.keys().map(|k| k.len()))),
-        Err(e) => crate::flashlog::line(&alloc::format!("vault open FAILED: {e:?}")),
-    }
-    match opened {
-        Ok(store) => {
+    let t_open = crate::platform::cntpct();
+    crumb(0xE0); // before KVault::open (manifestus open ladder: bootstrap the spine, or genesis a blank pair of regions)
+    match crate::kvault::KVault::open(&ira) {
+        Ok(mut store) => {
             p.opened = 1;
-            p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
+            crate::flashlog::line(&alloc::format!("kvault open ok in {} ms: {}", (crate::platform::cntpct() - t_open) / (crate::platform::cntfrq() / 1000), store.describe()));
             match store.get_by_key(LKEY) {
                 Ok(Some(v)) if v.as_slice() == MSG => p.verified = 1,
-                Ok(_) => {
-                    crate::flashlog::line("vault open: genesis key absent or wrong, will FORMAT");
-                    need_seal = true // vault present but key absent/mismatched
+                Ok(other) => {
+                    // A fresh (genesised) vault, or the genesis value missing: write it. Never a format: manifestus refuses to genesis over sealed blocks it cannot bootstrap.
+                    crate::flashlog::line(&alloc::format!("kvault: genesis value {}, writing it", if other.is_some() { "wrong" } else { "absent" }));
+                    match store.set(LKEY, MSG.to_vec()) {
+                        Ok(_) => p.sealed = 1,
+                        Err(e) => {
+                            crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {e:?}"));
+                            p.stage = 2
+                        }
+                    }
                 }
                 Err(e) => {
-                    crate::flashlog::line(&alloc::format!("vault open: genesis read failed: {e:?}"));
+                    crate::flashlog::line(&alloc::format!("kvault: genesis read FAILED: {e:?}"));
                     p.stage = 3
                 }
             }
-            if !need_seal {
-                kept = Some(store);
+            if let Ok(Some(_)) = store.get_by_key(LKEY) {
+                let r = blake3::hash(store.describe().as_bytes());
+                p.root16.copy_from_slice(&r.as_bytes()[..16]);
             }
+            kept = Some(store);
         }
-        Err(_) => need_seal = true, // no vault (or wrong key) — genesis it
-    }
-    crumb(0xE1); // Store::open returned
-    if need_seal {
-        crumb(0xE2); // before Store::format (seal + UFS write)
-        crate::flashlog::line(&alloc::format!("vault FORMAT (wipes everything): capacity {DEFAULT_PAYLOAD_CAPACITY} ring {DEFAULT_RING_SIZE}"));
-        match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
-            Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
-                Ok(_) => {
-                    p.sealed = 1;
-                    p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
-                    kept = Some(store);
-                }
-                Err(_) => p.stage = 2,
-            },
-            Err(_) => p.stage = 1,
+        Err(e) => {
+            crate::flashlog::line(&alloc::format!("kvault open FAILED (nothing formatted): {e:?}"));
+            p.stage = 1
         }
     }
     crumb(0xE3); // vault path returned

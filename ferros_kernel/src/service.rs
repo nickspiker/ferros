@@ -182,14 +182,12 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 _ => return alloc::vec![3],
             };
             let len = params.len() - 2 - klen;
-            let a = store.anchor().clone();
-            crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes: before seq {} tail {} capacity {}", a.anchor_seq, a.object_tail, a.payload_capacity));
+            crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
             match store.set(&key, params[2 + klen..].to_vec()) {
                 Ok(h) => {
-                    let a = store.anchor();
-                    crate::flashlog::line(&alloc::format!("store set {key:?} ok: after seq {} tail {}", a.anchor_seq, a.object_tail));
+                    crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
-                    r.extend_from_slice(&h.0);
+                    r.extend_from_slice(&h);
                     r
                 }
                 Err(e) => {
@@ -226,7 +224,12 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     r
                 }
                 Ok(None) => alloc::vec![1],
-                Err(_) => alloc::vec![2],
+                Err(e) => {
+                    crate::flashlog::line(&alloc::format!("store get {key:?} FAILED: {e:?}"));
+                    let mut r = alloc::vec![2u8];
+                    r.extend_from_slice(alloc::format!("{e:?}").as_bytes());
+                    r
+                }
             }
         }
         ferros_pt::Op::Exec => match key_of(params) {
@@ -874,6 +877,15 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_digit() {
                                             // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot.
                                             crate::modem::stages(&mut resp, cmd.params[7] - b'0');
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"kv selftest" {
+                                            // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
+                                            match store.as_mut() {
+                                                Some(s) => resp.extend_from_slice(s.selftest().as_bytes()),
+                                                None => resp.extend_from_slice(b"no vault open\n"),
+                                            }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

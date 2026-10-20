@@ -20,6 +20,9 @@ ferros_layout = { path = "../ferros_layout" }
 ferros_ext4 = { path = "../ferros_ext4" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ferros_vault = { path = "../vault", default-features = false }
+# The storage engine (the owner's, shared with Photon and the rest of the stack): mirrored 4 KiB blocks, generation ring, plow-managed tract, COW HAMT. no_std core; the kernel backs its BlockDev with UFS (kvault.rs).
+manifestus = { path = "../../manifestus", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 ferros_ledger = { path = "../ferros_ledger" }
 ferros_pt = { path = "../ferros_pt", features = ["alloc"] }
 ferros_heap = { path = "../ferros_heap" }

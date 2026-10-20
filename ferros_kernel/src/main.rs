@@ -53,6 +53,8 @@ mod partfs;
 #[cfg(feature = "pixel8")]
 mod flashlog;
 #[cfg(feature = "pixel8")]
+mod kvault;
+#[cfg(feature = "pixel8")]
 mod modem;
 // The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
@@ -1644,7 +1646,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let ok = flashlog::init();
         flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
     }
-    let (probe, store) = vault_boot::vault_probe(link_up);
+    let (probe, mut store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {
         checklist::mark(checklist::Item::VaultOpen);
@@ -1700,7 +1702,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // The first process: the vault's `init` capsule (put there with `bridge capsule` + `store put init @file`), through the gate and the oracle like any other. No capsule is built into the kernel and no key is near its build. Spawning it is the first thing that needs the wairua (its capabilities are minted under it), so KOHI runs here.
     let mut init_exit = 0u32;
-    if let Some(Ok(Some(capsule))) = store.as_ref().map(|s| s.get_by_key("init")) {
+    if let Some(Ok(Some(capsule))) = store.as_mut().map(|s| s.get_by_key("init")) {
         match process::spawn_capsule(b"init", &capsule, b"", &[], &[]) {
             Ok(o) => {
                 init_exit = (o.exit >> 32) as u32 | 1;

@@ -27,6 +27,13 @@ State at the stop: on a cold boot the sensor streams and CSI link 1 counts frame
 Left to do: find what connects CSI link 1 to the ISPFE input (compare a full ISPFE + CSIS register snapshot from Linux while streaming against ferros's), then read a frame back.
 Also open: the cold vault accepts only the first write per boot and that write does not survive a reboot (store put returns "vault error" afterwards).
 
+## 2c. Kernel vault moved onto manifestus (stopped 2026-10-20 mid-verification)
+
+Done: ferros_kernel/src/kvault.rs (manifestus over two UFS mirror regions of the ferros partition, values sealed, a sealed name index for `store ls`); vault_boot/service switched to it, no silent format any more; flash log (flashlog.rs, `diag log`) and manifestus storage events logged; `diag kv selftest`; manifestus no_std fix and vsf 0.12 bump pushed.
+Verified on the phone: genesis once (17.6 s), later opens ~6 ms, small values and genesis survive reboots, a 30 KB value stored through `store put` reads back identical with the current build.
+Left: the earlier `Corrupt("furrow 0 unsealed")` reads came from values written by an older kernel build in the same regions (each such 30 KB set cost ~400 blocks); confirm with a reboot that new large values persist, decide whether to wipe the regions written by the old builds, re-provision `init` and `sealed`, then remove ferros_vault from the kernel (shim.rs entry_genesis, UfsDevice, ira.rs AnchorKey, wairua NonceSource).
+Also: kete, photon and other dependents of ../vsf still ask for vsf 0.11 and will not resolve against 0.12.
+
 ## 3. Attestation / Play Integrity discussion (2026-10-19)
 
 Conversation only, no code: what spoofing verified-boot / attestation state would expose for banking and Wallet apps. Nothing in the repo depends on it.
