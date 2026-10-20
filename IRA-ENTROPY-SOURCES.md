@@ -14,7 +14,9 @@ The ira secret must root in material that is high-entropy AND physically bound A
 ## Two layers
 
 - **Unforgeable physical core** — PUF-class, bound to this die, needs fuzzy extraction (secure sketch + ECC, public helper data) because it is noisy. This is the root of forgery-resistance.
-- **Vendor-issued uniqueness** — chip serial, UFS serial, IMEI, MACs, OTP. Knowable and technically forgeable, but Google guards extraction, so it raises the attacker's dossier cost. Breadth, never a sole root.
+- **Vendor-issued uniqueness** — chip serial, UFS serial, IMEI, MACs, OTP. Knowable and technically forgeable; raises an outside attacker's dossier cost. Breadth, never a sole root.
+
+**Against Google too (owner, 2026-10-19: "we don't want Google to have our entire fingerprint if possible").** Whoever holds every input can derive the ira, so no single party may hold the full source set — Google included. Stock Android with Google services ran on this phone from 2023, so anything Android could read is treated as already known to Google: the serials, IMEI and MACs above, the camera API's per-unit calibration (lens intrinsics, distortion, color matrices, shading maps — gated behind the camera permission since Android 10 for exactly this reason), motion-sensor calibration error, and the sensor noise in any photo backed up to Google. Those add breadth but no forgery resistance against Google. That part must come from sources Android never saw or could not read: measured by ferros at cold boot (SRAM power-on state, MCT clock ratios) or under conditions the Android camera stack never uses (dark frames at exposures and gains the HAL never sets). Google's boot chain runs first on every boot and could read power-on state, but it has no network; the exfiltration path was Android, which ferros removes. While Android still runs under the hv, the hv can *withhold* (not fake) raw sources Android does not need, by unmapping them from stage 2 — selectively, since some fuses (the ASV voltage tables) feed Android's own power management.
 
 ## Tiering (so a drifting bit never bricks the vault)
 
