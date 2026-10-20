@@ -2,14 +2,15 @@
 # ferros hv on husky (HV.md): build the EL2 layer, pack it in front of the slot-a Linux Image as one boot.img v4 kernel, and (with --flash) put it on boot_a and boot it.
 # Blob = [hv flat binary padded to G#18_0000][Linux Image], LZ4-legacy compressed as ABL expects; ABL loads it at G#8008_0000, so the Image lands 2 MiB aligned at G#8020_0000.
 # The Linux Image defaults to the one unpacked from the 2026-10-13 boot_a backup (the kernel Android runs today). Restore: `fastboot flash boot_a /mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img`.
-# Usage: tools/husky-hv.sh [--image <Linux Image>] [--flash]
+# The boot gate (ferros_hv/src/gate.rs): by default the blob also carries the cold ferros image, packed past Linux's image_size (rounded up to 2 MiB) behind a 4 KiB header {"FERROSGT", u64 length}; the hv then shows "Ready?" before Linux: power (or 1 s on dev builds) = ferros, volume down = Android, volume up = hold. --no-ferros leaves it out (the hv boots Android straight away, as before: oracle captures).
+# Usage: tools/husky-hv.sh [--image <Linux Image>] [--no-ferros] [--flash]
 set -eu
 cd "$(dirname "$0")/.."
 MKB=/mnt/Harbor/husky-kernel/tools/mkbootimg
 BACKUP=/mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img
 W=target/hv; mkdir -p $W
-IMAGE=""; FLASH=0
-while [ $# -gt 0 ]; do case $1 in --image) IMAGE=$2; shift 2;; --flash) FLASH=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
+IMAGE=""; FLASH=0; FERROS=1
+while [ $# -gt 0 ]; do case $1 in --image) IMAGE=$2; shift 2;; --flash) FLASH=1; shift;; --no-ferros) FERROS=0; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
 if [ -z "$IMAGE" ]; then
   if [ ! -f $W/Image ]; then
     python3 $MKB/unpack_bootimg.py --boot_img $BACKUP --out $W/unpacked >/dev/null
@@ -30,11 +31,26 @@ cargo build -q -p ferros_hv --target aarch64-unknown-none-softfloat --release
 aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none-softfloat/release/ferros_hv $W/hv.bin
 HV=$(stat -c %s $W/hv.bin); PAD=$((0x180000))
 [ $HV -le $PAD ] || { echo "hv.bin is $HV bytes, over the G#18_0000 pad"; exit 1; }
-python3 - $W/hv.bin $IMAGE $W/kernel.lz4 $PAD <<'PY'
+FERROS_BIN=""
+if [ $FERROS = 1 ]; then
+  # The cold ferros image (link base G#8008_0000), the same one slot b boots.
+  cargo build -q -p ferros_kernel --target aarch64-unknown-none --release
+  aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel $W/ferros.bin
+  FERROS_BIN=$W/ferros.bin
+fi
+python3 - $W/hv.bin $IMAGE $W/kernel.lz4 $PAD $FERROS_BIN <<'PY'
 import lz4.block, struct, sys
 hv=open(sys.argv[1],'rb').read(); img=open(sys.argv[2],'rb').read(); pad=int(sys.argv[4])
 to,isz,flags=struct.unpack_from('<QQQ',img,8); assert img[56:60]==b'ARMd' and to==0 and flags&8, "Image header"
 blob=hv+b'\0'*(pad-len(hv))+img
+if len(sys.argv) > 5 and sys.argv[5]:
+    fer=open(sys.argv[5],'rb').read()
+    # gate.rs finds it at Linux's entry + image_size rounded up to 2 MiB: past Linux's bss, below ABL's ramdisks at G#8600_0000.
+    at=pad+((isz+0x1FFFFF)&~0x1FFFFF)
+    assert 0x80080000+at+0x1000+len(fer) < 0x86000000, "ferros image would reach ABL's ramdisks"
+    blob+=b'\0'*(at-len(blob))
+    blob+=(b'FERROSGT'+struct.pack('<Q',len(fer))).ljust(0x1000,b'\0')+fer
+    print(f"ferros {len(fer)} B packed at G#{0x80080000+at:X}")
 out=bytearray(b'\x02\x21\x4c\x18')
 for i in range(0,len(blob),8<<20):
     c=lz4.block.compress(blob[i:i+(8<<20)],store_size=False,mode='high_compression')
@@ -53,6 +69,6 @@ lsusb -d 18d1:4ee0 >/dev/null 2>&1 || { echo "no fastboot device"; exit 1; }
 fastboot flash boot_a $W/boot_a_hv.img 2>&1 | tail -2
 fastboot --set-active=a 2>&1 | tail -1
 fastboot reboot >/dev/null 2>&1
-echo "== booting slot a under the hv; waiting for adb"
-for i in $(seq 80); do sleep 3; tools/usb-kick.sh --if-wedged; if adb devices 2>/dev/null | grep -qE "device$|unauthorized"; then echo "== ANDROID on adb after $((i*3)) s"; adb shell 'dmesg 2>/dev/null | grep -E "started at EL"; ls /sys/firmware/devicetree/base/reserved-memory/ | grep hv' 2>/dev/null; exit 0; fi; lsusb -d 18d1:4ee0 >/dev/null 2>&1 && { echo "== back in fastboot (slot a did not boot)"; exit 1; }; done
+echo "== booting slot a under the hv; waiting for adb (or ferros, if the gate chose it)"
+for i in $(seq 80); do sleep 3; tools/usb-kick.sh --if-wedged; if lsusb -d 1209:4665 >/dev/null 2>&1; then echo "== FERROS on USB after $((i*3)) s (the gate chose ferros)"; exit 0; fi; if adb devices 2>/dev/null | grep -qE "device$|unauthorized"; then echo "== ANDROID on adb after $((i*3)) s"; adb shell 'dmesg 2>/dev/null | grep -E "started at EL"; ls /sys/firmware/devicetree/base/reserved-memory/ | grep hv' 2>/dev/null; exit 0; fi; lsusb -d 18d1:4ee0 >/dev/null 2>&1 && { echo "== back in fastboot (slot a did not boot)"; exit 1; }; done
 echo "== nothing on USB after 240 s"

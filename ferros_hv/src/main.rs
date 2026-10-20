@@ -36,6 +36,8 @@ const STAGE_PANIC: u64 = 0xE3;
 
 global_asm!(include_str!("header.s"));
 
+mod gate;
+
 global_asm!(
     r#"
 .section .text.boot, "ax"
@@ -941,6 +943,11 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         report(0x100 + core * 16, 0);
         report(0x108 + core * 16, 0);
         report(0x200 + core * 8, 0);
+    }
+    // The boot gate (gate.rs): with a ferros image packed in this boot image, ask before Linux runs; ABL has already done everything Android needs, including the secure world's boot state.
+    if gate::ask() == gate::Choice::Ferros {
+        pstore::log(&[b"\nferros hv: gate -- ferros\n"]);
+        gate::start_ferros(dtb);
     }
     let new_dtb = match fdt::patch(dtb as usize, DTB_COPY as usize, DTB_COPY_MAX) {
         Some(len) => {

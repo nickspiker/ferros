@@ -10,3 +10,7 @@ name = "ferros_hv"
 path = "src/main.rs"
 
 [dependencies]
+
+[build-dependencies]
+# Rasterises the gate's "Ready?" at build time (as ferros_kernel does); the hv only blits it.
+fontdue = "0.9"

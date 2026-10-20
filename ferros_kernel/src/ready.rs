@@ -124,3 +124,19 @@ pub fn wait() -> (u64, Choice) {
     unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
     (crate::platform::cntpct(), choice)
 }
+
+/// The hv's boot gate (ferros_hv/src/gate.rs) leaves this word in its report page when it hands the machine to ferros: the human has already answered "ferros", so the gate is not shown twice. Read once and cleared, so a later boot that did not come through the hv never sees a stale answer.
+const HV_GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;
+const HV_GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
+
+pub fn answered_by_hv() -> bool {
+    unsafe {
+        let p = HV_GATE_MARK_ADDR as *mut u64;
+        let yes = core::ptr::read_volatile(p) == HV_GATE_MARK;
+        if yes {
+            core::ptr::write_volatile(p, 0);
+            core::arch::asm!("dsb sy");
+        }
+        yes
+    }
+}

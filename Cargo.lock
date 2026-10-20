@@ -896,6 +896,9 @@ version = "0.0.0"
 [[package]]
 name = "ferros_hv"
 version = "0.1.0"
+dependencies = [
+ "fontdue",
+]
 
 [[package]]
 name = "ferros_kernel"

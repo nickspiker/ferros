@@ -1586,7 +1586,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::crumb(0xC0);
 
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
-    let (pressed_at, gate_choice) = if dtb_addr != 0 && dtb_addr & 1 == 0 { ready::wait() } else { (0, ready::Choice::Ferros) };
+    // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
+    let (pressed_at, gate_choice) = if ready::answered_by_hv() {
+        (platform::cntpct(), ready::Choice::Ferros)
+    } else if dtb_addr != 0 && dtb_addr & 1 == 0 {
+        ready::wait()
+    } else {
+        (0, ready::Choice::Ferros)
+    };
     let _ = pressed_at;
 
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
