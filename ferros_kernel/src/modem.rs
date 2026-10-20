@@ -67,7 +67,19 @@ pub fn files(rep: &mut Vec<u8>) {
         },
     }
     match crate::partfs::mount("efs") {
-        Err(e) => line(rep, alloc::format!("{e}\n")),
+        Err(e) => {
+            // Not ext4 (f2fs has its magic G#F2F52010 at byte G#400): say which, and show the first bytes so the real format is identifiable.
+            line(rep, alloc::format!("efs: {e}\n"));
+            if let Some(p) = crate::partfs::find("efs") {
+                let mut d = crate::partfs::PartDisk::new(p);
+                let mut b = alloc::vec![0u8; 4096];
+                use ferros_ext4::Disk;
+                if d.read_blocks(0, &mut b).is_ok() {
+                    let w = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                    line(rep, alloc::format!("efs: LU A#{} LBA A#{}..A#{}; block 0 +0 G#{:X} +G#400 G#{:X} (f2fs is G#F2F52010), +G#438 G#{:X} (ext4 magic G#EF53 in the low half)\n", p.lun, p.first, p.last, w(0), w(0x400), w(0x438)));
+                }
+            }
+        }
         Ok(mut m) => {
             for f in ["/nv_normal.bin", "/nv_protected.bin"] {
                 match m.open(f) {
@@ -270,7 +282,8 @@ fn cp2ap(rep: &mut Vec<u8>, at: &str) {
 
 /// Stage 0: what the cold boot left, read only. Returns false when HSI1 is not powered or its gates are closed (nothing further is safe).
 fn survey(rep: &mut Vec<u8>) -> bool {
-    let pd = crate::platform::priv_reg(PD_HSI1_STATUS, false, 0) as u32;
+    // The PMU power-domain status word is a plain read: EL3's priv-reg read refuses it (-22, measured here and on pd_ispfe / pd_hsi1 in amp.rs).
+    let pd = rd(PD_HSI1_STATUS as usize);
     kv(rep, "pd_hsi1.status", pd);
     if pd & 1 == 0 {
         line(rep, alloc::format!("HSI1 not powered: stopping\n"));
@@ -285,7 +298,7 @@ fn survey(rep: &mut Vec<u8>) -> bool {
     }
     s.push('\n');
     line(rep, s);
-    kv(rep, "pmu.pcie0", crate::platform::priv_reg(PMU_PCIE0, false, 0) as u32);
+    kv(rep, "pmu.pcie0", rd(PMU_PCIE0 as usize));
     if !all {
         line(rep, alloc::format!("a gate on the ch0 path is closed: stopping before any HSI1 register is read\n"));
         return false;
@@ -332,9 +345,11 @@ fn power_on(rep: &mut Vec<u8>) {
     NRESET.out(true);
     ms(10);
     CP_WRST_N.out(true);
+    line(rep, alloc::format!("after the sequence: gph0 CON G#{:X} DAT G#{:X} | gph1 CON G#{:X} DAT G#{:X} | gpa0 CON G#{:X} DAT G#{:X}\n", rd(GPH0), rd(GPH0 + 4), rd(GPH1), rd(GPH1 + 4), rd(GPA0), rd(GPA0 + 4)));
+    line(rep, alloc::format!("AP2CP now: CP_PWR {} NRESET {} CP_WRST_N {} AP_ACTIVE {} PM_WRST_N {} WAKEUP {} DUMP_NOTI {}\n", CP_PWR.get() as u8, NRESET.get() as u8, CP_WRST_N.get() as u8, AP_ACTIVE.get() as u8, PM_WRST_N.get() as u8, AP2CP_WAKEUP.get() as u8, DUMP_NOTI.get() as u8));
     let t0 = now();
     let mut last = 0xFFu8;
-    while since_us(t0) < 1_000_000 {
+    while since_us(t0) < 3_000_000 {
         crate::platform::pet_watchdogs();
         let s = PS_HOLD.get() as u8 | (CP2AP_WRST_N.get() as u8) << 1 | (CP2AP_WAKEUP.get() as u8) << 2 | (PHONE_ACTIVE.get() as u8) << 3;
         if s != last {
