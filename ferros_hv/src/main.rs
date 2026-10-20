@@ -468,7 +468,8 @@ unsafe fn pdma_dump() {
         pstore::log(&[b"\nferros hv: PDMA dump step: contexts ", pstore::hex(nvm as u64, &mut h2), b"\n"]);
         for vid in 0..nvm {
             let ctrl = read_volatile((mmu + 0x8000 + vid * 0x1000) as *const u32);
-            let base = read_volatile((mmu + 0x800C + vid * 0x1000) as *const u32) as u64;
+            // REG_MMU_CONTEXT0_CFG_FLPT_BASE_VM (samsung-iommu-v9.h): G#8404 per VM (stride G#1000), the table address >> 12. The first try read G#800C and saw 0.
+            let base = (read_volatile((mmu + 0x8404 + vid * 0x1000) as *const u32) & 0xFF_FFFF) as u64;
             let flpt = base << 12;
             {
                 let e1 = if in_dram(flpt + (iova >> 20) * 4) { read_volatile((flpt + (iova >> 20) * 4) as *const u32) as u64 } else { 0xDEAD };
