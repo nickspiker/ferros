@@ -450,7 +450,7 @@ unsafe fn sysmmu_walk(flpt: u64, iova: u64) -> Option<u64> {
 }
 
 unsafe fn pdma_dump() {
-    if read_volatile(&raw const PDMA_DUMPS) >= 2 {
+    if read_volatile(&raw const PDMA_DUMPS) >= 4 {
         return;
     }
     write_volatile(&raw mut PDMA_DUMPS, read_volatile(&raw const PDMA_DUMPS) + 1);
@@ -496,7 +496,7 @@ unsafe fn pdma_dump() {
     while off < bytes {
         let Some(pa) = sysmmu_walk(flpt, iova + off) else {
             pstore::log(&[b"\nferros hv: PDMA unmapped at +", pstore::hex(off, &mut h0), b"\n"]);
-            return;
+            break;
         };
         // One line of 8 words.
         let mut words = [[0u8; 16]; 8];
@@ -504,6 +504,8 @@ unsafe fn pdma_dump() {
         line_parts[0] = b"\nferros hv: PDMA +";
         let mut ho = [0u8; 16];
         line_parts[1] = pstore::hex(off, &mut ho);
+        // The HAL writes the list through Linux's cacheable mapping and the hv reads with its MMU off (Device, uncached): push the line out to DRAM first, or the read sees stale memory (first working walk, 2026-10-20: almost all zeros). DC CIVAC with the MMU off takes the physical address.
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) pa & !63);
         let mut w = 0;
         while w < 8 {
             let v = read_volatile((pa + w as u64 * 4) as *const u32) as u64;
@@ -518,6 +520,41 @@ unsafe fn pdma_dump() {
         off += 32;
     }
     pstore::log(&[b"\n"]);
+    // The list turned out to be a ring of 16-byte descriptors {flags G#C003, buffer IOVA, 0, length} (2026-10-20). The first descriptor's buffer is the front end's register-write list (headers G#nnnn_0002 = n address/value pairs, G#nnnn_4001 = n values from one address): dump all of it.
+    let mut d = 0u64;
+    while d < bytes {
+        let Some(pa) = sysmmu_walk(flpt, iova + d) else { return };
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) pa & !63);
+        if read_volatile(pa as *const u32) == 0xC003 {
+            let buf = read_volatile((pa + 4) as *const u32) as u64;
+            let len = read_volatile((pa + 12) as *const u32) as u64;
+            pstore::log(&[b"\nferros hv: PDMA buffer ", pstore::hex(buf, &mut h0), b" length ", pstore::hex(len, &mut h1), b"\n"]);
+            let mut o = 0u64;
+            while o < len.min(8192) {
+                let Some(bp) = sysmmu_walk(flpt, buf + o) else {
+                    pstore::log(&[b"\nferros hv: PDMA buffer unmapped\n"]);
+                    return;
+                };
+                asm!("dc civac, {a}", "dsb sy", a = in(reg) bp & !63);
+                let mut ws = [[0u8; 16]; 8];
+                let mut parts: [&[u8]; 18] = [b""; 18];
+                parts[0] = b"\nferros hv: PDMA buf +";
+                let mut ho2 = [0u8; 16];
+                parts[1] = pstore::hex(o, &mut ho2);
+                for w in 0..8 {
+                    pstore::hex(read_volatile((bp + w as u64 * 4) as *const u32) as u64, &mut ws[w]);
+                }
+                for w in 0..8 {
+                    parts[2 + w * 2] = b" ";
+                    parts[3 + w * 2] = &ws[w][8..16];
+                }
+                pstore::log(&parts);
+                o += 32;
+            }
+            return;
+        }
+        d += 4;
+    }
 }
 
 /// Build the shared stage-2 table once (the primary boots and enables it before any secondary is started, so the flag needs no lock), unmap the oracle's targets into it, and return its base for VTTBR_EL2. Secondaries call this too and get the finished table.
@@ -1110,7 +1147,8 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 }
                 oracle_log(pa, wnr == 1, bytes, logval);
                 // Only once the oracle is armed: the camera service starts the PDMA during boot too, and a dump that hangs there boot-loops the phone (2026-10-19).
-                if cfg!(hv_pdma_dump) && wnr == 1 && pa == PDMA as u64 && logval & 1 == 1 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                // Dumped at start (bit 0 set) and again at stop (0): the walk works since 2026-10-20 but the buffer reads all zeros at start, so it may be the PDMA's output rather than its input; the stop dump shows what the engine left there.
+                if cfg!(hv_pdma_dump) && wnr == 1 && pa == PDMA as u64 && (logval & 1 == 1 || logval == 0) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { pdma_dump() };
                 }
                 unsafe {
