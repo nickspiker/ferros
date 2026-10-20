@@ -341,6 +341,58 @@ unsafe fn stage2_unmap(ipa: u64) {
     write_volatile(l3.add(l3i), 0);
 }
 
+/// Single-step support for the oracle (FERROS_HV_ORACLE_STEP): per core, the page being stepped over and the guest state the step borrowed (SPSR_EL2 I/F bits, MDSCR_EL1, MDCR_EL2).
+static mut STEP_PAGE: [u64; 16] = [0; 16];
+static mut STEP_SAVED: [[u64; 3]; 16] = [[0; 3]; 16];
+
+fn this_core() -> usize {
+    let m: u64;
+    unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) m) };
+    ((m >> 8) & 0xF) as usize
+}
+
+/// Arm a single step of the guest's current instruction: SPSR.SS so the step runs exactly one instruction, I and F masked so no interrupt handler runs in the step, MDSCR_EL1.SS to enable stepping, MDCR_EL2.TDE so the step exception comes to EL2.
+unsafe fn step_over(pa: u64) {
+    let c = this_core();
+    let (spsr, mdscr, mdcr): (u64, u64, u64);
+    asm!("mrs {a}, spsr_el2", "mrs {b}, mdscr_el1", "mrs {c}, mdcr_el2", a = out(reg) spsr, b = out(reg) mdscr, c = out(reg) mdcr);
+    write_volatile(&raw mut STEP_PAGE[c], pa & !0xFFF);
+    write_volatile(&raw mut STEP_SAVED[c], [spsr & 0xC0, mdscr, mdcr]);
+    asm!("msr spsr_el2, {a}", "msr mdscr_el1, {b}", "msr mdcr_el2, {c}", "isb", a = in(reg) spsr | 1 << 21 | 0xC0, b = in(reg) mdscr | 1, c = in(reg) mdcr | 1 << 8);
+}
+
+/// The step completed: trap the page again, give back the borrowed state.
+unsafe fn step_done() {
+    let c = this_core();
+    let page = read_volatile(&raw const STEP_PAGE[c]);
+    let [ifb, mdscr, mdcr] = read_volatile(&raw const STEP_SAVED[c]);
+    if page != 0 {
+        stage2_rearm(page);
+        write_volatile(&raw mut STEP_PAGE[c], 0);
+    }
+    let spsr: u64;
+    asm!("mrs {a}, spsr_el2", a = out(reg) spsr);
+    asm!("msr spsr_el2, {a}", "msr mdscr_el1, {b}", "msr mdcr_el2, {c}", "isb", a = in(reg) (spsr & !(1 << 21 | 0xC0)) | ifb, b = in(reg) mdscr, c = in(reg) mdcr);
+    bump(0xC0);
+}
+
+/// Unmap a page whose 4 KiB descriptor already exists (a page `stage2_unmap` split out earlier and `stage2_remap` put back), with the TLB maintenance a live map needs.
+unsafe fn stage2_rearm(ipa: u64) {
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    let e1 = read_volatile(s2.add((ipa >> 30) as usize));
+    if e1 & 0b11 != 0b11 {
+        return;
+    }
+    let l2 = (e1 & S2_ADDR) as *mut u64;
+    let e2 = read_volatile(l2.add(((ipa >> 21) & 0x1FF) as usize));
+    if e2 & 0b11 != 0b11 {
+        return;
+    }
+    let l3 = (e2 & S2_ADDR) as *mut u64;
+    write_volatile(l3.add(((ipa >> 12) & 0x1FF) as usize), 0);
+    asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
+}
+
 /// Put one previously unmapped page back into the identity map (a page descriptor again), so the guest's next access goes straight to the hardware. Used when a trapped access cannot be emulated from its syndrome.
 unsafe fn stage2_remap(ipa: u64) {
     let s2 = (&raw mut STAGE2) as *mut u64;
@@ -1013,6 +1065,7 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 unsafe {
                     if wnr == 1 {
                         let v = if srt == 31 { 0 } else { frame[srt] };
+                        let ring_old = if cfg!(hv_modem_ring) && sas == 2 && (pa == MODEM_IPC + 0x18 || pa == MODEM_IPC + 0x24) { Some(read_volatile(pa as *const u32)) } else { None };
                         match sas {
                             0 => write_volatile(pa as *mut u8, v as u8),
                             1 => write_volatile(pa as *mut u16, v as u16),
@@ -1020,6 +1073,9 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                             _ => write_volatile(pa as *mut u64, v),
                         }
                         logval = v;
+                        if let Some(o) = ring_old {
+                            modem_ring(pa == MODEM_IPC + 0x18, o, v as u32);
+                        }
                     } else {
                         let raw = match sas {
                             0 => read_volatile(pa as *const u8) as u64,
@@ -1053,9 +1109,12 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
                 }
             } else {
-                // No syndrome (a load/store pair, or one with base writeback such as memcpy_fromio's post-increment loop): skipping it would leave the guest's pointer unadvanced and its copy loop spinning until the watchdog (the boot hangs of 2026-10-19 with the ISP front end trapped). Hand the page back to the guest and let the instruction run natively; that page is no longer observed.
+                // No syndrome (a load/store pair, or one with base writeback such as memcpy_fromio's post-increment loop): skipping it would leave the guest's pointer unadvanced and its copy loop spinning until the watchdog (the boot hangs of 2026-10-19 with the ISP front end trapped). Hand the page back to the guest and let the instruction run natively. Without FERROS_HV_ORACLE_STEP that page is no longer observed; with it, the guest is single-stepped over that one instruction (debug exceptions routed to EL2, interrupts masked for the step) and the page is trapped again at the step exception (EC G#32).
                 unsafe {
                     stage2_remap(pa);
+                    if cfg!(hv_oracle_step) {
+                        step_over(pa);
+                    }
                     bump(0xB8);
                     if read_volatile((REPORT + 0xB8) as *const u64) <= 32 {
                         let (elr, mut h0, mut h1, mut h2) = { let e: u64; asm!("mrs {v}, elr_el2", v = out(reg) e); (e, [0u8; 16], [0u8; 16], [0u8; 16]) };
@@ -1063,6 +1122,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     }
                 }
             }
+        }
+        0x32 if cfg!(hv_oracle_step) => {
+            // Software step from EL1: the no-syndrome instruction `step_over` let run against the remapped page has completed.
+            unsafe { step_done() };
         }
         0x16 => {
             // HVC from EL1: nothing at EL2 answers calls yet. SMCCC NOT_SUPPORTED; ELR already points past the HVC. The first eight are logged: a driver expecting pKVM would show up here.
@@ -1114,6 +1177,34 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
 }
 
 /// Issue the guest's SMC to EL3 with its arguments and bring every result register back.
+/// Modem boot-channel trace (FERROS_HV_MODEM_RING, docs/oracle/MODEM-BOOT-RECON.md): with the IPC control page G#EA40_0000 trapped, the AP's write of the RAW TX head (IPC+G#18) brackets exactly one frame it just put in the TX ring (IPC+G#3000, G#1F_D000 bytes), and its write of the RAW RX tail (IPC+G#24) brackets the CP's frames it just consumed from the RX ring (IPC+G#20_0000, G#20_0000 bytes). Each is logged as `RING T|R <length> <old> <bytes>`: the first 48 bytes of a TX frame (its 12-byte header and the start of its payload, enough to find a chunk in an image file) and up to 128 bytes of RX. The shared memory is write-combine on Linux and Device to the hv, so both see the same bytes. Raw logs stay local: the boot channel can carry per-unit NV data.
+const MODEM_IPC: u64 = 0xEA40_0000;
+static mut MODEM_RING_LINES: u64 = 0;
+fn modem_ring(tx: bool, old: u32, new: u32) {
+    let (base, size, cap) = if tx { (MODEM_IPC + 0x3000, 0x1F_D000u32, 48u32) } else { (MODEM_IPC + 0x20_0000, 0x20_0000u32, 128u32) };
+    if old >= size || new >= size {
+        return;
+    }
+    unsafe {
+        let n = read_volatile(&raw const MODEM_RING_LINES);
+        if n >= 12000 {
+            return;
+        }
+        write_volatile(&raw mut MODEM_RING_LINES, n + 1);
+    }
+    let len = (new + size - old) % size;
+    let show = len.min(cap) as usize;
+    let mut text = [0u8; 256];
+    for i in 0..show {
+        let b = unsafe { read_volatile((base + ((old as u64 + i as u64) % size as u64)) as *const u8) };
+        let d = b"0123456789ABCDEF";
+        text[2 * i] = d[(b >> 4) as usize];
+        text[2 * i + 1] = d[(b & 15) as usize];
+    }
+    let (mut hl, mut ho) = ([0u8; 16], [0u8; 16]);
+    pstore::log(&[if tx { b"\nferros hv: RING T " } else { b"\nferros hv: RING R " }, pstore::hex(len as u64, &mut hl), b" ", pstore::hex(old as u64, &mut ho), b" ", &text[..2 * show], b"\n"]);
+}
+
 /// SMC oracle (FERROS_HV_ORACLE_SMC): one line per forwarded non-PSCI SMC after ORACLE_ARM_AFTER_MS, `SMC fid x1 x2 x3 = r0 r1`, capped at ORACLE_SMC_CAP.
 static mut ORACLE_SMCS: u64 = 0;
 fn oracle_smc(a: [u64; 4], r0: u64, r1: u64) {

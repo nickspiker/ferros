@@ -188,3 +188,53 @@ Oracle captures that close them: the MMIO trace of the ch0 PCIe and PMU G#1546_3
 - kdev-zuma/dts: zuma-cp-s5300-sit.dtsi 25-102, 478-540; zuma-board-cp-s5300-sit.dtsi 16-154; zuma-rmem.dtsi 109-131; zuma-pcie.dtsi 12-72; zuma-board-pcie.dtsi 10-29; zuma-s2mpu.dtsi 85-90; zuma.dtsi 464; zuma-board.dtsi 10-12.
 - kdev-shusky: shusky_defconfig 1-13; dts/zuma-shusky-pcie.dtsi 9-11; dts/zuma-shusky-cp-features.dtsi 10-12; dts/zuma-husky-common.dtsi 8-24.
 - device/google/zuma (gitiles, main): conf/fstab.modem.
+
+## Boot channel G#F1: captured (2026-10-19)
+
+Captured on Android under the hv with only the IPC control page G#EA40_0000 trapped (`FERROS_HV_MODEM_RING=1 FERROS_HV_ORACLE_STEP=1`, see below), decoded with `tools/oracle-decode-modem-ring.py`; the modem still came up ONLINE under the trap.
+The raw trace stays local (`/mnt/Harbor/tmp/modem-capture`): the NV images it carries are per-unit.
+
+Every frame is a 12-byte SIT header {G#ABCD, u16 frame seq, u16 cfg (G#C000 AP->CP, 0 CP->AP), u16 length incl. header, u8 channel G#F1, u8 channel seq, 2 spare}, then a payload whose first u16 is the command.
+AP commands are G#Axxx and the CP answers each with the same number in G#Cxxx; a data frame is {u16 G#AnnB, u16 chunk length + 8, u32 section size, u32 offset, data}, at most G#C000 data bytes, and each one is acked with G#CnnB before the next.
+The data is the raw section bytes, unmodified (first chunks match `modem.bin` at the TOC offsets).
+
+The whole conversation, in order (the ROM stage before it is the BOOT section at G#EA41_0000 + doorbell, section 3):
+
+| AP | CP | Meaning |
+|---|---|---|
+| G#A110 | G#C110 | hello |
+| | G#C11B | CP bootloader ready |
+| G#A11D | G#C11D | |
+| G#A120 / data G#A12B x1998 / G#A321 {u16 0, u32 CRC} / G#A12D | G#C120 / G#C12B each / G#C320 / G#C12D | MAIN, G#5DA_0C00 bytes; G#A321 carries MAIN's CRC from the TOC (G#BEB4_3318) |
+| G#A130 / G#A13B x96 / G#A13D | acks | VSS, G#47_CC0C bytes |
+| G#A140 / G#A14B x1 / G#A14D | acks | APM, G#B498 bytes |
+| G#A150 / G#A15B x11 / G#A15D | acks | NV_NORM, G#8_0000 bytes = `/mnt/vendor/efs/nv_normal.bin` |
+| G#A160 / G#A16B x11 / G#A16D | acks | NV_PROT, G#8_0000 bytes = `/mnt/vendor/efs/nv_protected.bin` |
+| G#A170 / G#A17B x11 / G#A17D | acks | REPLAY, G#8_0000 bytes = `/mnt/vendor/modem_userdata/replay_region.bin` |
+| G#A400 | G#C400 | start: the rings reset and the main firmware runs |
+
+Section n's begin/data/end are G#A1n0 / G#A1nB / G#A1nD with n = the TOC entry id.
+`modem.bin` (in the `modem` partition, `images/default/`) starts with a TOC of 32-byte entries {name[12], u32 file offset, u32 CP load address, u32 size, u32 CRC, u32 id}:
+
+| Name | File offset | Load | Size | CRC | Id |
+|---|---|---|---|---|---|
+| BOOT | G#410 | 0 | G#1_6800 | G#3842_82CC | 1 |
+| MAIN | G#1_6C10 | G#4001_0000 | G#5DA_0C00 | G#BEB4_3318 | 2 |
+| VSS | G#5DB_7810 | G#4F90_0000 | G#47_CC0C | G#CDB6_2B7F | 3 |
+| APM | G#623_441C | G#202_E000 | G#B498 | G#9413_0678 | 4 |
+| NV_NORM | not in file | G#4D60_0000 | G#8_0000 | | 5 |
+| NV_PROT | not in file | G#4D68_0000 | G#8_0000 | | 6 |
+| REPLAY | not in file | G#5A40_0000 | G#8_0000 | | 6 (sent as section 7) |
+| INFO | G#623_F8B4 | G#4000_9000 | G#D0 | G#FDA3_B5AD | 0 (not sent) |
+
+After G#C400 the CP opens channel G#29 (41), a remote-file service: it asks for paths such as `/vendor/firmware/carrierconfig/manifests/...` and the AP streams the files back (Android's `rfsd`).
+A cold ferros modem boot therefore needs, besides section 1-2: `modem.bin` (or its sections), the three per-unit NV files, and later a channel-41 file server.
+
+### Capture method
+
+`FERROS_HV_MODEM_RING=1` makes the hv log each frame the AP puts in the RAW TX ring (bracketed by its write of the TX head, IPC+G#18) and the CP frames it consumes from the RAW RX ring (bracketed by its write of the RX tail, IPC+G#24).
+`FERROS_HV_ORACLE_STEP=1` keeps a trapped page trapped through accesses without a syndrome (the driver's memcpy into IPC+G#82C returned the page to the guest on the first try): the hv remaps the page, single-steps the guest over that one instruction with debug exceptions routed to EL2 and interrupts masked, and unmaps the page again at the step exception.
+
+```bash
+FERROS_HV_NO_PMU_READ=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_MODEM_RING=1 FERROS_HV_ORACLE_STEP=1 FERROS_HV_ORACLE_CAP=6000 FERROS_HV_ORACLE_PAGES="G#EA40_0000" FERROS_HV_ORACLE_QUIET="G#EA40_0018,G#EA40_001C,G#EA40_0020,G#EA40_0024" HV_CMDLINE="loglevel=4" tools/husky-hv.sh --flash
+```
