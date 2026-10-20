@@ -53,3 +53,10 @@ adb shell 'su -c "echo \"<3>ferros-mark: camera open\" > /dev/kmsg"; am start -a
 adb shell 'su -c "grep -aE \"ferros hv|ferros-mark\" /sys/fs/pstore/console-ramoops-0"' > capture.log
 tools/oracle-decode-hsi2c.py capture.log --max-bytes 32
 ```
+
+## Power-up (captured 2026-10-19)
+
+Order, rails, voltages and delays come from the device tree (`module_power_seq@0`); register traffic from the oracle during a marked camera open:
+- `camera-main-powerup-pmic-transfers.txt`: the camera PMIC (G#75) and flash driver (G#63) on hsi2c@10980000, 108 transfers.
+- `camera-main-powerup-cmu.txt`: CMU_TOP accesses for the master clock CIS_CLK3 (mux G#2604_101C, divider G#2604_181C, gate G#2604_2044, clock-gating control G#2604_3010).
+- The sensor enable line is sub-PMIC GPIO2 over ACPM channel 2 (GPIO sub-block G#0C, register G#0A); LDO12 and LDO26 are sub-PMIC rails on the same channel.
