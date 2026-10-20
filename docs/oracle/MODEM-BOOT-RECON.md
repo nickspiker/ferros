@@ -238,3 +238,19 @@ A cold ferros modem boot therefore needs, besides section 1-2: `modem.bin` (or i
 ```bash
 FERROS_HV_NO_PMU_READ=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_MODEM_RING=1 FERROS_HV_ORACLE_STEP=1 FERROS_HV_ORACLE_CAP=6000 FERROS_HV_ORACLE_PAGES="G#EA40_0000" FERROS_HV_ORACLE_QUIET="G#EA40_0018,G#EA40_001C,G#EA40_0020,G#EA40_0024" HV_CMDLINE="loglevel=4" tools/husky-hv.sh --flash
 ```
+
+## ferros cold bring-up: `diag modem sN` (written 2026-10-19 night, not yet run)
+
+`ferros_kernel/src/modem.rs` runs stages 0..=N, each repeating the ones before it so a hang points at the stage that caused it (the payloads/pcie1 pattern, ported to ch0):
+
+| Stage | What | Pass looks like |
+|---|---|---|
+| s0 | read only: pd_hsi1 status (EL3 read), CMU_HSI1 gates on the ch0 path, PMU G#3EC4, GPIO, S2MPU/SysMMU HSI1, ELBI LTSSM, DBI id, boot_stage | HSI1 powered, every gate open |
+| s1 | power_on_cp by GPIO with Linux's delays, then a second of CP2AP pin changes | PS_HOLD rises (the CP is running its ROM) |
+| s2 | PERST low, CLKREQ, PMU isolation release, SOC+G#4000, ch0 power-down clear, ch0 PHY table, PLL/CDR/offset-cal polls | the three locks |
+| s3 | PMU bit 10, UDBG G#C800, RC setup (Gen1 x1), IOCC, PERST high + 18 ms, LTSSM | L0 (G#11) |
+| s4 | iATU (CFG0, MEM G#4000_0000 -> bus G#14E0_0000), CP config space, BAR0, doorbell address from its readback, bridge window, memory + bus master, MSI to G#F620_0000 | vendor G#144D (Linux reads device G#A5A5), doorbell G#4006_0000 |
+| s5 | HSI1 S2MPU protection off, BOOT section from `modem_a` into G#EA41_0000, control words, magic G#BDBD, image address/size in the MSI page, doorbell G#1_0000, poll boot_stage | G#3FFF |
+
+After s5, the next steps are the link cycle (drop the link, wait for CP2AP_WAKEUP, Gen3 x2, doorbell G#1_000E) and the channel-G#F1 download in the captured order.
+`diag modem files` and `diag modem readmain` check the flash path first (expected MAIN BLAKE3 prefix 14df88e07f8aad008ab8fff8a4256d12).

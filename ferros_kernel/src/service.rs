@@ -838,6 +838,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_digit() {
+                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot.
+                                            crate::modem::stages(&mut resp, cmd.params[7] - b'0');
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"modem files" {
                                             // `diag modem files`: the modem's images on the flash (modem.bin's TOC, NV file sizes), read only (modem.rs).
                                             crate::modem::files(&mut resp);
