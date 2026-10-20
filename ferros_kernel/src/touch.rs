@@ -7,36 +7,6 @@ use crate::acpm;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
-const SPI: usize = 0x111D_0000;
-const CH_CFG: usize = SPI;
-const MODE_CFG: usize = SPI + 0x08;
-const SLAVE_SEL: usize = SPI + 0x0C;
-const INT_EN: usize = SPI + 0x10;
-const STATUS: usize = SPI + 0x14;
-const TX_DATA: usize = SPI + 0x18;
-const RX_DATA: usize = SPI + 0x1C;
-const PACKET_CNT: usize = SPI + 0x20;
-const PENDING_CLR: usize = SPI + 0x24;
-const SWAP_CFG: usize = SPI + 0x28;
-const FB_CLK: usize = SPI + 0x2C;
-const USI_CON: usize = SPI + 0xC4;
-const CH_TX_ON: u32 = 1 << 0;
-const CH_RX_ON: u32 = 1 << 1;
-const CH_SW_RST: u32 = 1 << 5;
-const PACKET_CNT_EN: u32 = 1 << 16;
-/// MODE_CFG with byte transfers and the maximum trailing count, the value Android keeps there.
-const MODE_BYTE: u32 = 0x1FF8_0000;
-
-/// CMU_HSI0 (cmucal-sfr.c): USI2's source mux (bit 0: 1 = OSCCLK_HSI0, the 24.576 MHz oscillator), divider, and the gates on its path.
-const CMU_HSI0: usize = 0x1100_0000;
-const USI2_MUX: usize = CMU_HSI0 + 0x101C;
-const USI2_DIV: usize = CMU_HSI0 + 0x181C;
-const USI2_GATES: [(&str, usize); 4] = [("gate", CMU_HSI0 + 0x2120), ("ipclk", CMU_HSI0 + 0x20FC), ("pclk", CMU_HSI0 + 0x2100), ("rstnsync", CMU_HSI0 + 0x20BC)];
-const USI2_QCH: usize = CMU_HSI0 + 0x30CC;
-/// `samsung,usi-offset` on `sysreg_hsi0`: [2:0] = 2 selects SPI.
-const USI2_MODE: usize = 0x1102_101C;
-const USI_SPI: u32 = 2;
-
 /// Reset: gpp21-2 (`pinctrl@10C40000` bank G#40). Interrupt: gpn0-0 (`pinctrl@15060000` bank 0), active low.
 const GPP21: usize = 0x10C4_0040;
 const RESET_PIN: u32 = 2;
@@ -83,13 +53,16 @@ fn spin_us(us: u64) {
     while now() < t {}
 }
 
-/// A CMU gate is closed only when manual control is on (bit 20) and its value (bit 21) is off.
-fn gate_open(v: u32) -> bool {
-    !(v & (1 << 20) != 0 && v & (1 << 21) == 0)
+fn spi_clocked() -> bool {
+    crate::spi::TOUCH.clocked()
 }
 
-fn spi_clocked() -> bool {
-    USI2_GATES.iter().all(|&(_, a)| gate_open(rd(a)))
+fn spi_up() {
+    crate::spi::TOUCH.up()
+}
+
+fn transact(cmd: &[u8], out: &mut [u8]) -> Result<(), &'static str> {
+    crate::spi::TOUCH.transact(crate::spi::Cs::Native, cmd, out)
 }
 
 fn hex(r: Result<u8, u32>) -> alloc::string::String {
@@ -101,100 +74,11 @@ fn hex(r: Result<u8, u32>) -> alloc::string::String {
 
 /// Everything the bring-up depends on, read only. The SPI controller's own registers are read only when every gate on its path is open: a read into a gated block can hang the core.
 pub fn state(rep: &mut Vec<u8>) {
-    let mut s = alloc::format!("USI2: mode G#{:X} mux G#{:X} div G#{:X} qch G#{:X}", rd(USI2_MODE), rd(USI2_MUX), rd(USI2_DIV), rd(USI2_QCH));
-    for (name, a) in USI2_GATES {
-        s.push_str(&alloc::format!(" {name} G#{:X}", rd(a)));
-    }
-    s.push('\n');
-    line(rep, s);
-    if spi_clocked() {
-        line(rep, alloc::format!("  SPI: USI_CON G#{:X} CH_CFG G#{:X} MODE G#{:X} CS G#{:X} STATUS G#{:X}\n", rd(USI_CON), rd(CH_CFG), rd(MODE_CFG), rd(SLAVE_SEL), rd(STATUS)));
-    } else {
-        line(rep, alloc::format!("  SPI: not read, a gate is closed\n"));
-    }
+    line(rep, alloc::format!("USI2: {}\n", crate::spi::TOUCH.describe()));
     line(rep, alloc::format!("gpp21 (reset = pin 2): CON G#{:X} DAT G#{:X} PUD G#{:X}\n", rd(GPP21), rd(GPP21 + 4), rd(GPP21 + 8)));
     line(rep, alloc::format!("gpn0 (interrupt = pin 0): CON G#{:X} DAT G#{:X} PUD G#{:X}\n", rd(GPN0), rd(GPN0 + 4), rd(GPN0 + 8)));
     line(rep, alloc::format!("LDO25M (DVDD 1.8 V) G#{:X}: {}\n", L25M_CTRL, hex(acpm::read(acpm::MAIN, acpm::T_PMIC, L25M_CTRL))));
     line(rep, alloc::format!("LDO4M (AVDD 3.3 V) G#{:X}: {}\n", L4M_CTRL, hex(acpm::read(acpm::MAIN, acpm::T_PMIC, L4M_CTRL))));
-}
-
-/// Clock the controller from the oscillator (÷1, and ÷4 inside the controller: about 6.1 MHz on the wire, the touch IC takes 10 MHz), select SPI mode, release the USI reset, and set it up the way `s3c64xx_spi_hwinit` does (the capture's first 20 accesses).
-fn spi_up() {
-    wr(USI2_MUX, (rd(USI2_MUX) & !1) | 1);
-    wr(USI2_DIV, rd(USI2_DIV) & !0xF);
-    for (_, a) in USI2_GATES {
-        wr(a, rd(a) | 1 << 20 | 1 << 21);
-    }
-    wr(USI2_MODE, (rd(USI2_MODE) & !7) | USI_SPI);
-    wr(USI_CON, 0);
-    wr(SLAVE_SEL, 1);
-    wr(INT_EN, 0);
-    wr(MODE_CFG, 0);
-    wr(PACKET_CNT, 0);
-    wr(PENDING_CLR, 0x1E);
-    wr(PENDING_CLR, 0);
-    wr(SWAP_CFG, 0);
-    wr(MODE_CFG, MODE_BYTE);
-    wr(FB_CLK, 0);
-    flush();
-}
-
-/// Empty both FIFOs: channels off, packet count off, a software-reset pulse held until the FIFOs read empty.
-fn flush() {
-    wr(CH_CFG, rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON));
-    wr(PACKET_CNT, 0);
-    wr(CH_CFG, rd(CH_CFG) | CH_SW_RST);
-    let t = now() + ticks_us(1000);
-    while (rd(STATUS) >> 6) & 0x1FF != 0 || (rd(STATUS) >> 15) & 0x1FF != 0 {
-        if now() > t {
-            break;
-        }
-    }
-    wr(CH_CFG, rd(CH_CFG) & !CH_SW_RST);
-}
-
-/// Shift `len` bytes: TX from `tx` when given (what comes back is discarded, as Android does), otherwise RX into `rx`. Packet count makes the controller generate exactly `len` bytes of clock.
-fn segment(tx: Option<&[u8]>, rx: Option<&mut [u8]>, len: usize) -> Result<(), &'static str> {
-    if len == 0 || len > 64 {
-        return Err("segment longer than the FIFO");
-    }
-    wr(PACKET_CNT, 0);
-    wr(PACKET_CNT, len as u32);
-    wr(PACKET_CNT, len as u32 | PACKET_CNT_EN);
-    wr(MODE_CFG, MODE_BYTE);
-    let ch = rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON | 0xC);
-    if let Some(b) = tx {
-        wr(CH_CFG, ch | CH_RX_ON | CH_TX_ON);
-        for &x in b {
-            wr(TX_DATA, x as u32);
-        }
-    } else {
-        wr(CH_CFG, ch | CH_RX_ON);
-    }
-    let t = now() + ticks_us(10_000);
-    while ((rd(STATUS) >> 15) & 0x1FF) < len as u32 {
-        if now() > t {
-            flush();
-            return Err("SPI transfer timed out");
-        }
-    }
-    if let Some(out) = rx {
-        for o in out.iter_mut().take(len) {
-            *o = rd(RX_DATA) as u8;
-        }
-    }
-    flush();
-    Ok(())
-}
-
-/// One chip-select-wrapped transaction: write `cmd`, then read `out.len()` bytes when non-empty. CS rises 10 µs after the last byte (`SPI_DELAY_CS`).
-fn transact(cmd: &[u8], out: &mut [u8]) -> Result<(), &'static str> {
-    wr(FB_CLK, 0);
-    wr(SLAVE_SEL, 0);
-    let r = segment(Some(cmd), None, cmd.len()).and_then(|_| if out.is_empty() { Ok(()) } else { let n = out.len(); segment(None, Some(out), n) });
-    spin_us(10);
-    wr(SLAVE_SEL, 1);
-    r
 }
 
 /// Read one event from the controller's FIFO (the dummy byte stripped).
@@ -306,7 +190,7 @@ pub fn up(rep: &mut Vec<u8>) {
         state(rep);
         return;
     }
-    line(rep, alloc::format!("SPI up: USI_CON G#{:X} CH_CFG G#{:X} MODE G#{:X} STATUS G#{:X}\n", rd(USI_CON), rd(CH_CFG), rd(MODE_CFG), rd(STATUS)));
+    line(rep, alloc::format!("SPI up: {}\n", crate::spi::TOUCH.describe()));
     set_reset(false);
     let d = rail_on(L25M_CTRL, L25M_1V8);
     line(rep, alloc::format!("DVDD (LDO25M): {}\n", hex(d)));
