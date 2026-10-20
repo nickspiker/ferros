@@ -669,7 +669,7 @@ dependencies = [
  "nunc-time",
  "nusb",
  "tokio",
- "vsf 0.12.0",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -879,7 +879,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.12.0",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -917,7 +917,7 @@ dependencies = [
  "fontdue",
  "ihi 0.0.48",
  "manifestus",
- "vsf 0.12.0",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -952,7 +952,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi 0.0.3",
- "vsf 0.12.0",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1484,7 +1484,7 @@ dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.12.0",
+ "vsf 0.10.0",
 ]
 
 [[package]]
@@ -1900,7 +1900,7 @@ dependencies = [
  "poly1305",
  "raptorq",
  "subtle",
- "vsf 0.12.0",
+ "vsf 0.10.0",
  "zeroize",
 ]
 
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.12.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "bitvec",
