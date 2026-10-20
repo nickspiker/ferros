@@ -402,3 +402,63 @@ pub fn power_down(rep: &mut Vec<u8>) {
         acpm::read(acpm::SUB, acpm::T_GPIO, 0x0A).map(|v| alloc::format!("G#{v:02X}")).ok(),
         acpm::read(acpm::SUB, acpm::T_GPIO, 0x0B).map(|v| alloc::format!("G#{v:02X}")).ok()));
 }
+
+/// The ISP front end's power domain (zuma-pm-domains.dtsi pd_ispfe; flexpmu_cal_local_zuma.h ispfe_on): CONFIGURATION bit 0 on, wait for STATUS bit 0. As in Linux's CAL engine (pmucal_rae.c `pmucal_write_reg`), PMU writes go through EL3 (SMC G#82000504, option 1) and PMU reads are plain reads; EL3 refuses a read request for these registers (returned -22, measured 2026-10-19). Then the domain's prepare call exactly as Linux's exynos-pd makes it (exynos-pd_el3.c `exynos_pd_tz_restore`: SMC G#82000410, wake-up = 1, the domain's `need_smc` address, group 2).
+const PD_ISPFE_CONF: u64 = 0x1546_2480;
+const PD_ISPFE_STATUS: u64 = 0x1546_2484;
+const PD_ISPFE_NEED_SMC: u64 = 0x1C01_0204;
+const CMU_ISPFE: usize = 0x1C00_0000;
+const SYSREG_ISPFE: usize = 0x1C02_0000;
+/// CSI link 1 (the main camera's; G#1C05_0000 in the `csis-link-phy` space): its version register reads G#5000.
+pub const CSIS_LINK1: usize = 0x1C05_0000;
+
+fn pd_prepare(addr: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!("smc #0",
+            inout("x0") 0x8200_0410u64 => ret, inout("x1") 1u64 => _, inout("x2") addr => _, inout("x3") 2u64 => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
+    }
+    ret
+}
+
+/// Whether the ISP front end's power domain reports on.
+pub fn fe_powered() -> bool {
+    rd(PD_ISPFE_STATUS as usize) & 1 == 1
+}
+
+/// Power the ISP front end and restore its clocks the way a camera open does (oracle capture 2026-10-19): CMU_ISPFE dividers and bus-clock mux, its control word, every Q-channel requesting its clock, and SYSREG_ISPFE's two words. Reads CSI link 1's version only once the domain reports on: a read into a powered-down block can hang the core.
+pub fn fe_up(rep: &mut Vec<u8>) {
+    let before = rd(PD_ISPFE_STATUS as usize);
+    if before & 1 == 0 {
+        let conf = rd(PD_ISPFE_CONF as usize);
+        let w = crate::platform::priv_reg(PD_ISPFE_CONF, true, conf | 1);
+        line(rep, alloc::format!("PD ISPFE configuration G#{conf:X} -> write G#{:X} returned G#{w:X}\n", conf | 1));
+        let t = crate::platform::cntpct() + crate::platform::cntfrq() / 100;
+        while !fe_powered() && crate::platform::cntpct() < t {}
+    }
+    let after = rd(PD_ISPFE_STATUS as usize);
+    line(rep, alloc::format!("PD ISPFE status G#{before:X} -> G#{after:X}\n"));
+    if after & 1 == 0 {
+        line(rep, alloc::format!("domain did not come on; nothing else touched\n"));
+        return;
+    }
+    let r = pd_prepare(PD_ISPFE_NEED_SMC);
+    line(rep, alloc::format!("prepare call returned G#{r:X}\n"));
+    wr(CMU_ISPFE + 0x1800, 3);
+    wr(CMU_ISPFE + 0x1804, 1);
+    wr(CMU_ISPFE + 0x0600, 0x10);
+    wr(CMU_ISPFE + 0x0800, 0xF11F_F03F);
+    let mut q = 0x301C;
+    while q <= 0x30D0 {
+        if q != 0x30C8 {
+            wr(CMU_ISPFE + q, 2);
+        }
+        q += 4;
+    }
+    wr(SYSREG_ISPFE + 0x104, 0x3FF_FFFF);
+    wr(SYSREG_ISPFE + 0x108, 0);
+    line(rep, alloc::format!("CMU_ISPFE div G#{:X}/G#{:X} mux G#{:X} ctl G#{:X}; SYSREG_ISPFE G#{:X}; CSI link 1 version G#{:X}\n",
+        rd(CMU_ISPFE + 0x1800), rd(CMU_ISPFE + 0x1804), rd(CMU_ISPFE + 0x600), rd(CMU_ISPFE + 0x800), rd(SYSREG_ISPFE + 0x104), rd(CSIS_LINK1 + 4)));
+}
