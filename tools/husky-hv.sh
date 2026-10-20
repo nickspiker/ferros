@@ -43,7 +43,8 @@ open(sys.argv[3],'wb').write(out)
 print(f"hv {len(hv)} B, Image {len(img)} B (image_size G#{isz:X}), blob {len(blob)} B, lz4 {len(out)} B")
 PY
 : > $W/ramdisk.empty
-python3 $MKB/mkbootimg.py --header_version 4 --kernel $W/kernel.lz4 --ramdisk $W/ramdisk.empty --cmdline '' -o $W/boot_a_hv.img
+# HV_CMDLINE: extra kernel command line in the boot image header (ABL appends it). Oracle captures of boot-time drivers use HV_CMDLINE=loglevel=4 so the kernel's boot log stays out of the pstore console ring the captures travel through.
+python3 $MKB/mkbootimg.py --header_version 4 --kernel $W/kernel.lz4 --ramdisk $W/ramdisk.empty --cmdline "${HV_CMDLINE:-}" -o $W/boot_a_hv.img
 echo "== image: $W/boot_a_hv.img ($(stat -c %s $W/boot_a_hv.img) bytes)"
 [ $FLASH = 1 ] || { echo "not flashing (add --flash). Then: fastboot flash boot_a $W/boot_a_hv.img; fastboot --set-active=a; fastboot reboot"; exit 0; }
 if adb devices 2>/dev/null | grep -qE "device$"; then adb reboot bootloader; elif lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true; fi
