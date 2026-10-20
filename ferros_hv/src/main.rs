@@ -358,6 +358,113 @@ unsafe fn stage2_remap(ipa: u64) {
     asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
 }
 
+/// The ISP front end's PDMA is a command engine: the camera stack writes a list of register settings into memory and the PDMA applies them, buffer addresses included, so those settings never appear as CPU writes the oracle can trap. When the oracle sees the CPU start the PDMA (`FERROS_HV_PDMA_DUMP=1`), the hv reads the command list itself: base IOVA (PDMA G#04) and count (G#0C) from the PDMA's registers, translated through whichever ISP front-end SYSMMU context maps it (samsung-iommu: per-context CTRL G#8000 bit 0, page-table base G#800C as PA >> 12, stride G#1000; first level 4096 × 1 MiB, section type 2 or second-level pointer type 1, second level 256 × 4 KiB, large page type 1 or small type 2, physical addresses stored >> 4), dumped as hex lines. First two starts only.
+const PDMA: usize = 0x1C39_0000;
+// Only s0: reading s1's per-context registers hung the core during a camera open (2026-10-19), most likely an idle port with its clock gated; Linux reads a SYSMMU only while its master runs.
+const ISPFE_SYSMMUS: [usize; 1] = [0x1C11_0000];
+static mut PDMA_DUMPS: u32 = 0;
+
+/// Physical addresses the walk may read: husky's DRAM (G#8000_0000 upward, below G#C_0000_0000). A table or target outside it is refused: a read into a hole or a register block can hang the core (the first version of this dump did, reading context registers that do not exist).
+fn in_dram(pa: u64) -> bool {
+    (0x8000_0000..0xC_0000_0000).contains(&pa)
+}
+
+/// Translate one IOVA through a SYSMMU page table rooted at `flpt` (physical); None if unmapped or if any step leaves DRAM.
+unsafe fn sysmmu_walk(flpt: u64, iova: u64) -> Option<u64> {
+    let a1 = flpt + (iova >> 20) * 4;
+    if !in_dram(a1) {
+        return None;
+    }
+    let e1 = read_volatile(a1 as *const u32) as u64;
+    let pa = match e1 & 7 {
+        2 => ((e1 & !0xFFFF) << 4) | (iova & 0xF_FFFF),
+        1 => {
+            let a2 = ((e1 & !0x3F) << 4) + ((iova & 0xF_FFFF) >> 12) * 4;
+            if !in_dram(a2) {
+                return None;
+            }
+            let e2 = read_volatile(a2 as *const u32) as u64;
+            match e2 & 3 {
+                1 => ((e2 & !0xFFF) << 4) | (iova & 0xFFFF),
+                2 => ((e2 & !0xFF) << 4) | (iova & 0xFFF),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if in_dram(pa) { Some(pa) } else { None }
+}
+
+unsafe fn pdma_dump() {
+    if read_volatile(&raw const PDMA_DUMPS) >= 2 {
+        return;
+    }
+    write_volatile(&raw mut PDMA_DUMPS, read_volatile(&raw const PDMA_DUMPS) + 1);
+    let (mut h0, mut h1, mut h2) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+    pstore::log(&[b"\nferros hv: PDMA dump step: reading PDMA base/count\n"]);
+    let iova = read_volatile((PDMA + 0x04) as *const u32) as u64;
+    let count = read_volatile((PDMA + 0x0C) as *const u32) as u64;
+    pstore::log(&[b"\nferros hv: PDMA dump step: iova ", pstore::hex(iova, &mut h0), b" count ", pstore::hex(count, &mut h1), b"\n"]);
+    // Find a context that maps the first page.
+    let mut root = None;
+    'search: for &mmu in ISPFE_SYSMMUS.iter() {
+        // Only the contexts this SYSMMU has (NUM_CONTEXT G#100, low 5 bits; as ferros's USB path reads it).
+        pstore::log(&[b"\nferros hv: PDMA dump step: sysmmu ", pstore::hex(mmu as u64, &mut h2), b" NUM_CONTEXT\n"]);
+        let nvm = ((read_volatile((mmu + 0x100) as *const u32) & 0x1F) as usize).clamp(1, 8);
+        pstore::log(&[b"\nferros hv: PDMA dump step: contexts ", pstore::hex(nvm as u64, &mut h2), b"\n"]);
+        for vid in 0..nvm {
+            let ctrl = read_volatile((mmu + 0x8000 + vid * 0x1000) as *const u32);
+            let base = read_volatile((mmu + 0x800C + vid * 0x1000) as *const u32) as u64;
+            let flpt = base << 12;
+            {
+                let e1 = if in_dram(flpt + (iova >> 20) * 4) { read_volatile((flpt + (iova >> 20) * 4) as *const u32) as u64 } else { 0xDEAD };
+                let (mut a, mut b, mut c) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+                pstore::log(&[b"\nferros hv: PDMA dump step: vid ", &[b'0' + vid as u8], b" ctrl ", pstore::hex(ctrl as u64, &mut a), b" flpt ", pstore::hex(flpt, &mut b), b" lv1 ", pstore::hex(e1, &mut c), b"\n"]);
+            }
+            if ctrl & 1 == 0 || base == 0 || !in_dram(flpt) {
+                continue;
+            }
+            if sysmmu_walk(flpt, iova).is_some() {
+                root = Some((mmu, vid, flpt));
+                break 'search;
+            }
+        }
+    }
+    let Some((mmu, vid, flpt)) = root else {
+        pstore::log(&[b"\nferros hv: PDMA start, iova ", pstore::hex(iova, &mut h0), b" count ", pstore::hex(count, &mut h1), b" -- no ISPFE SYSMMU context maps it\n"]);
+        return;
+    };
+    pstore::log(&[b"\nferros hv: PDMA start, iova ", pstore::hex(iova, &mut h0), b" count ", pstore::hex(count, &mut h1), b" via sysmmu ", pstore::hex(((mmu as u64) << 4) | vid as u64, &mut h2), b"\n"]);
+    // count entries of 8 bytes (two words) assumed; at most 16 KiB.
+    let bytes = (count * 8).min(16 * 1024);
+    let mut off = 0u64;
+    while off < bytes {
+        let Some(pa) = sysmmu_walk(flpt, iova + off) else {
+            pstore::log(&[b"\nferros hv: PDMA unmapped at +", pstore::hex(off, &mut h0), b"\n"]);
+            return;
+        };
+        // One line of 8 words.
+        let mut words = [[0u8; 16]; 8];
+        let mut line_parts: [&[u8]; 18] = [b""; 18];
+        line_parts[0] = b"\nferros hv: PDMA +";
+        let mut ho = [0u8; 16];
+        line_parts[1] = pstore::hex(off, &mut ho);
+        let mut w = 0;
+        while w < 8 {
+            let v = read_volatile((pa + w as u64 * 4) as *const u32) as u64;
+            pstore::hex(v, &mut words[w]);
+            w += 1;
+        }
+        for w in 0..8 {
+            line_parts[2 + w * 2] = b" ";
+            line_parts[3 + w * 2] = &words[w][8..16];
+        }
+        pstore::log(&line_parts);
+        off += 32;
+    }
+    pstore::log(&[b"\n"]);
+}
+
 /// Build the shared stage-2 table once (the primary boots and enables it before any secondary is started, so the flag needs no lock), unmap the oracle's targets into it, and return its base for VTTBR_EL2. Secondaries call this too and get the finished table.
 unsafe fn stage2_base() -> u64 {
     let s2 = (&raw mut STAGE2) as *mut u64;
@@ -932,6 +1039,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     }
                 }
                 oracle_log(pa, wnr == 1, bytes, logval);
+                // Only once the oracle is armed: the camera service starts the PDMA during boot too, and a dump that hangs there boot-loops the phone (2026-10-19).
+                if cfg!(hv_pdma_dump) && wnr == 1 && pa == PDMA as u64 && logval & 1 == 1 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                    unsafe { pdma_dump() };
+                }
                 unsafe {
                     let elr: u64;
                     asm!("mrs {v}, elr_el2", v = out(reg) elr);
