@@ -75,3 +75,16 @@ Order, rails, voltages and delays come from the device tree (`module_power_seq@0
 `diag cam off` reverses the sequence and drops the supply enables; chip select stays high as Android leaves it.
 
 Next: the receive side (the CSI receiver and its DMA in the ISP front end, behind three S2MPUs), then the sensor's init sequence and a first raw frame.
+
+## The receive side, cold (2026-10-19)
+
+`diag cam fe`, `diag cam stream` (camera.rs, camera_rx.rs). Built from a census capture: a camera open touches 42 of the ISP front end's pages (`FERROS_HV_ORACLE_CENSUS=1` logs the first access to each). What works cold:
+
+- **ISP front-end power domain** (pd_ispfe): already on at cold boot. PMU status is a plain read (EL3 refuses a read request for it, returns -22); the config write and the domain prepare call (SMC G#82000410) go through EL3, as Linux's CAL engine does. CMU_ISPFE dividers, bus-clock mux, control word and every Q-channel request restored from the capture; SYSREG_ISPFE set. **CSI link 1 then reads version G#5000, its value under Linux.**
+- **Sensor init replayed from the vault** (`cam.boitata.init`, 744 writes incl. the 6.5 KB settings upload, generated from the capture, kept off the repo): the sensor latches stream-on, `mode_select` G#0100 reads back G#0103.
+- **The combo D-PHY's PMU isolation must be bypassed** (PMU G#3EBC bit 0, `__set_phy_isolation`): a PMU write the oracle never sees. Without it the PHY's per-lane registers read 0 after being written; with it the lane status words reach G#3 (Linux's ready value).
+- **Receiver configured** (camera_rx.rs: the D-PHY common/lane settings, CSI link 1's virtual-channel/data-type/lane setup and start G#205E01, the CSIS reset that releases link 1), all from the capture.
+
+**Open: no frames.** The sensor accepts stream-on but its frame counter (G#0005) does not advance and link 1's status registers stay 0. The master-clock pin is the suspect: gpp9-0 set to function 2 reads a steady low (sampled high 0/128), so the 26 MHz CIS_CLK3 is not reaching the sensor's XCLK even though the clock node runs. Next: confirm CIS_CLK3's gate/divider actually output (Android's clk_summary shows its real rate and enable count), and whether the sensor's XCLK is that pin or a PMIC clock-buffer output. Only once the sensor streams does the DMA (PDMA at G#1C39_0000, behind the three ISPFE S2MPUs) become worth wiring.
+
+**Note:** a camera open run *under the 42-page oracle hv* ended in an SError to the TPU power domain (`BOOKER CPU8 to TPU`), unrelated to the cold camera code; the camera stack reaches into the TPU/other domains in ways the ISP-only page list did not cover. Cold ferros touches only what it powers.
