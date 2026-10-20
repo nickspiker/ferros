@@ -450,7 +450,7 @@ unsafe fn sysmmu_walk(flpt: u64, iova: u64) -> Option<u64> {
 }
 
 unsafe fn pdma_dump() {
-    if read_volatile(&raw const PDMA_DUMPS) >= 4 {
+    if read_volatile(&raw const PDMA_DUMPS) >= 6 {
         return;
     }
     write_volatile(&raw mut PDMA_DUMPS, read_volatile(&raw const PDMA_DUMPS) + 1);
@@ -550,6 +550,45 @@ unsafe fn pdma_dump() {
                 }
                 pstore::log(&parts);
                 o += 32;
+            }
+            // Second pass over the list: each block-load record (opcode 9: {IOVA, 0, length, register}) gets its source dumped, as "PDMA load <register> +<off> words".
+            let word = |i: u64| -> Option<u32> {
+                let p = sysmmu_walk(flpt, buf + i * 4)?;
+                asm!("dc civac, {a}", "dsb sy", a = in(reg) p & !63);
+                Some(read_volatile(p as *const u32))
+            };
+            let mut i = 0u64;
+            while i * 4 < len {
+                let Some(h) = word(i) else { return };
+                let n = (h >> 14) as u64;
+                if h & 0x3FFF == 9 && n == 4 {
+                    let (Some(src), Some(sz), Some(reg)) = (word(i + 1), word(i + 3), word(i + 4)) else { return };
+                    let mut o = 0u64;
+                    while o < (sz as u64).min(0x2000) {
+                        let Some(sp) = sysmmu_walk(flpt, src as u64 + o) else { break };
+                        asm!("dc civac, {a}", "dsb sy", a = in(reg) sp & !63);
+                        let mut ws = [[0u8; 16]; 8];
+                        let mut parts: [&[u8]; 20] = [b""; 20];
+                        let (mut hr, mut ho3) = ([0u8; 16], [0u8; 16]);
+                        parts[0] = b"\nferros hv: PDMA load ";
+                        parts[1] = pstore::hex(reg as u64, &mut hr);
+                        parts[2] = b" +";
+                        parts[3] = pstore::hex(o, &mut ho3);
+                        for w in 0..8 {
+                            pstore::hex(read_volatile((sp + w as u64 * 4) as *const u32) as u64, &mut ws[w]);
+                        }
+                        for w in 0..8 {
+                            parts[4 + w * 2] = b" ";
+                            parts[5 + w * 2] = &ws[w][8..16];
+                        }
+                        pstore::log(&parts);
+                        o += 32;
+                    }
+                }
+                if n == 0 && h == 0 {
+                    break;
+                }
+                i += 1 + n;
             }
             return;
         }
@@ -1148,7 +1187,8 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 oracle_log(pa, wnr == 1, bytes, logval);
                 // Only once the oracle is armed: the camera service starts the PDMA during boot too, and a dump that hangs there boot-loops the phone (2026-10-19).
                 // Dumped at start (bit 0 set) and again at stop (0): the walk works since 2026-10-20 but the buffer reads all zeros at start, so it may be the PDMA's output rather than its input; the stop dump shows what the engine left there.
-                if cfg!(hv_pdma_dump) && wnr == 1 && pa == PDMA as u64 && (logval & 1 == 1 || logval == 0) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                // And mid-stream: the descriptor index (PDMA + G#10, +G#10 per frame) reaching G#100, while the lists are certainly still mapped (at stop the HAL had sometimes already unmapped them, 2026-10-20).
+                if cfg!(hv_pdma_dump) && wnr == 1 && ((pa == PDMA as u64 && (logval & 1 == 1 || logval == 0)) || (pa == PDMA as u64 + 0x10 && logval == 0x100)) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { pdma_dump() };
                 }
                 unsafe {
