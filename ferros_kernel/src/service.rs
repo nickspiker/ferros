@@ -777,6 +777,19 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam up" {
+                                            // `diag cam up`: power the main camera module (rails programmed and verified first), then read the sensor's model ID.
+                                            crate::camera::power_up(&mut resp);
+                                            crate::camera::sensor_id(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam off" {
+                                            // `diag cam off`: power the main camera module down.
+                                            crate::camera::power_down(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam scan" {
                                             // `diag cam scan`: which addresses acknowledge on the camera-PMIC bus.
                                             crate::camera::scan(&mut resp);

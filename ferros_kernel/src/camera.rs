@@ -179,9 +179,9 @@ fn spin_us(us: u64) {
     while crate::platform::cntpct() < t {}
 }
 
-/// Power the camera PMIC the way its driver does (`slg51002_power_on`): buck-boost enable (sub GPIO1) high, 2 ms, buck enable (sub GPIO3) high, 2 ms. Then read its pattern ID to see it answer. The tuning writes and chip select (sub GPIO0) that follow in the driver are left for the next step, once the chip is known to be alive.
+/// Power the camera PMIC. Its I2C interface needs chip select (sub GPIO0) high: Android keeps it high whenever the camera is closed and the chip does not acknowledge without it (measured 2026-10-19: debugfs gpio shows cs hi / bb lo / buck lo closed, all hi open; ferros cold had cs low and every address NACKed). Then the driver's `slg51002_power_on`: buck-boost enable (sub GPIO1) high, 2 ms, buck enable (sub GPIO3) high, 2 ms. Then read its pattern ID.
 pub fn pmic_power_on(rep: &mut Vec<u8>) {
-    for (n, label) in [(1, "GPIO1 buck-boost"), (3, "GPIO3 buck")] {
+    for (n, label) in [(0, "GPIO0 chip select"), (1, "GPIO1 buck-boost"), (3, "GPIO3 buck")] {
         let r = sub_gpio_high(n);
         let v = acpm::read(acpm::SUB, acpm::T_GPIO, 0x08 + n);
         line(rep, alloc::format!("{label}: set {:?}, reads {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), v.map(|x| alloc::format!("G#{x:X}")).map_err(|e| alloc::format!("G#{e:X}"))));
@@ -191,8 +191,9 @@ pub fn pmic_power_on(rep: &mut Vec<u8>) {
         line(rep, alloc::format!("PMIC bus not up: run `diag cam bus` first\n"));
         return;
     }
-    // A failed attempt on the unpowered chip leaves bytes in the TX FIFO: reset the controller before the first real transfer.
+    // A failed attempt on the unpowered chip leaves bytes in the TX FIFO: reset the controller before the first real transfer, and give the chip a few more milliseconds (the first read straight after the driver's 2 ms delays was not acknowledged).
     crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    spin_us(5000);
     let mut s = alloc::string::String::from("SLG51002 pattern ID:");
     for r in 0x1105u16..=0x1107 {
         match pmic_read(r) {
@@ -226,4 +227,178 @@ pub fn scan(rep: &mut Vec<u8>) {
         }
     }
     line(rep, alloc::format!("PMIC bus scan: acknowledged{}; non-NACK failures {other}\n", if found.is_empty() { " none".into() } else { found }));
+}
+
+/// Camera-PMIC regulator enables: one bit per LDO in SYSCTL_MATRIX_CONF_A (slg51002-regulator.c `enable_mask = BIT(id)`, LDO1 = bit 0 .. LDO8 = bit 7); the GPIO4 load switch is bit 0 of GPIO4_CTRL (= MUXARRAY_INPUT_SEL_19).
+const MATRIX_A: u16 = 0x110D;
+const GPIO4_CTRL: u16 = 0x1713;
+
+/// Voltage codes for the main camera's rails, V = base + code × step (slg51002-regulator.c: LDO1–5 base 1.2 V step 10 mV, LDO6–8 base 0.4 V step 5 mV), targets from the device tree's regulator nodes. The chip's cold defaults are different (LDO1 G#A5 = 2.85 V, LDO8 G#8C = 1.10 V): Linux sets these when it registers the regulators at boot, which is why a camera-open capture never shows them. Each entry: name, VSEL register, code, enable bit, and the range registers' address to check the code against.
+const RAILS: [(&str, u16, u8, u32, u16); 4] = [
+    ("LDO1 2.25 V", 0x2000, 0x69, 0, 0x2060),
+    ("LDO4 2.95 V", 0x2500, 0xAF, 3, 0x2560),
+    ("LDO5 2.90 V", 0x2700, 0xAA, 4, 0x2760),
+    ("LDO8 0.97 V", 0x3200, 0x72, 7, 0x3260),
+];
+
+fn pmic_write(reg: u16, val: u8) -> Result<(), u32> {
+    let r = reg.to_be_bytes();
+    crate::hsi2c::write_bytes(PMIC_BUS.base, PMIC_ADDR, &[r[0], r[1], val])
+}
+
+/// Set one LDO's enable bit and read the matrix back.
+fn ldo_on(bit: u32) -> Result<u8, u32> {
+    let m = pmic_read(MATRIX_A)?;
+    pmic_write(MATRIX_A, m | (1 << bit) as u8)?;
+    pmic_read(MATRIX_A)
+}
+
+/// Drive a PERIC0 pin as an output at `high`: level first, then direction, so it never glitches the other way.
+fn pin_out(bank: usize, pin: u32, high: bool) {
+    let a = GPIO_PERIC0 + bank;
+    let d = rd(a + 4);
+    wr(a + 4, if high { d | (1 << pin) } else { d & !(1 << pin) });
+    pin_field(a, pin, 1);
+}
+
+/// Power the main camera module in `module_power_seq@0` order with its delays, after programming and verifying the rail voltages. Refuses if any camera-PMIC rail is already on. On any failure it powers back down.
+pub fn power_up(rep: &mut Vec<u8>) {
+    pmic_power_on(rep);
+    let step = |rep: &mut Vec<u8>, label: &str, r: Result<alloc::string::String, alloc::string::String>| -> bool {
+        match r {
+            Ok(s) => {
+                line(rep, alloc::format!("  {label}: {s}\n"));
+                true
+            }
+            Err(s) => {
+                line(rep, alloc::format!("  {label}: FAILED {s}\n"));
+                false
+            }
+        }
+    };
+    let hex = |e: u32| alloc::format!("G#{e:X}");
+    match pmic_read(MATRIX_A) {
+        Ok(0) => {}
+        Ok(m) => {
+            line(rep, alloc::format!("refusing: camera-PMIC rails already on (MATRIX_CONF_A G#{m:02X})\n"));
+            return;
+        }
+        Err(e) => {
+            line(rep, alloc::format!("refusing: camera PMIC not answering (G#{e:X})\n"));
+            return;
+        }
+    }
+    // Voltages first, verified, while every rail is off.
+    for (name, vsel, code, _, range) in RAILS {
+        let r = (|| -> Result<alloc::string::String, alloc::string::String> {
+            let lo = pmic_read(range).map_err(hex)?;
+            let hi = pmic_read(range + 1).map_err(hex)?;
+            if code < lo || code > hi {
+                return Err(alloc::format!("code G#{code:02X} outside range G#{lo:02X}..G#{hi:02X}"));
+            }
+            let before = pmic_read(vsel).map_err(hex)?;
+            pmic_write(vsel, code).map_err(hex)?;
+            let after = pmic_read(vsel).map_err(hex)?;
+            if after != code {
+                return Err(alloc::format!("wrote G#{code:02X}, reads G#{after:02X}"));
+            }
+            Ok(alloc::format!("G#{before:02X} -> G#{after:02X}"))
+        })();
+        if !step(rep, name, r) {
+            power_down(rep);
+            return;
+        }
+    }
+    let ldo = |bit: u32| ldo_on(bit).map(|m| alloc::format!("matrix G#{m:02X}")).map_err(hex);
+    let sub = |n: u32| sub_gpio_high(n).map(|_| alloc::string::String::from("high")).map_err(hex);
+    let sub_ldo = |reg: u32| acpm::update(acpm::SUB, acpm::T_PMIC, reg, 0x80, 0x80).and_then(|_| acpm::read(acpm::SUB, acpm::T_PMIC, reg)).map(|v| alloc::format!("ctrl G#{v:02X}")).map_err(hex);
+    let seq: [(&str, u64); 6] = [("LDO1 on", 500), ("sensor enable (sub GPIO2)", 10), ("LDO8 on", 750), ("sub LDO26 on", 0), ("sub LDO12 on", 0), ("LDO4 on", 1000)];
+    for (i, (label, us)) in seq.iter().enumerate() {
+        let r = match i {
+            0 => ldo(0),
+            1 => sub(2),
+            2 => ldo(7),
+            3 => sub_ldo(0x48),
+            4 => sub_ldo(0x3A),
+            _ => ldo(3),
+        };
+        if !step(rep, label, r) {
+            power_down(rep);
+            return;
+        }
+        spin_us(*us);
+    }
+    // Master clock out on gpp9-0 (function 2, drive 2; CIS_CLK3 itself already runs cold), ToF reset high.
+    let g9 = GPIO_PERIC0 + 0x120;
+    pin_field(g9 + 0xC, 0, 2);
+    pin_field(g9, 0, 2);
+    line(rep, alloc::format!("  master clock pin: gpp9 CON G#{:X}\n", rd(g9)));
+    pin_out(0x1E0, 0, true);
+    line(rep, alloc::format!("  ToF reset high: gpp15 DAT G#{:X}\n", rd(GPIO_PERIC0 + 0x1E4)));
+    if !step(rep, "LDO5 on", ldo(4)) {
+        power_down(rep);
+        return;
+    }
+    spin_us(1000);
+    let g4 = (|| -> Result<alloc::string::String, alloc::string::String> {
+        let v = pmic_read(GPIO4_CTRL).map_err(hex)?;
+        pmic_write(GPIO4_CTRL, v | 1).map_err(hex)?;
+        Ok(alloc::format!("GPIO4_CTRL G#{:02X}", pmic_read(GPIO4_CTRL).map_err(hex)?))
+    })();
+    if !step(rep, "GPIO4 switch on", g4) {
+        power_down(rep);
+        return;
+    }
+    spin_us(1000);
+    // The sensor's reset released (its resume sequence), then 9 ms before the first I2C.
+    pin_out(0x40, 2, true);
+    spin_us(9000);
+    line(rep, alloc::format!("  sensor reset released: gpp2 DAT G#{:X}\n", rd(GPIO_PERIC0 + 0x44)));
+}
+
+/// Read the main sensor's model ID (register G#0000, two bytes; Linux reads G#08EF). The sensor bus is brought up again first: its pads only go high once the module's rails are on.
+pub fn sensor_id(rep: &mut Vec<u8>) {
+    crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, FS_DIV, 0x2_0000);
+    line(rep, alloc::format!("sensor bus: ready {} (gpp2 DAT G#{:X})\n", crate::hsi2c::ready(SENSOR_BUS.base, SENSOR_BUS.usi_mode), rd(GPIO_PERIC0 + 0x44)));
+    let mut id = [0u8; 2];
+    match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x00], &mut id) {
+        Ok(()) => line(rep, alloc::format!("main sensor (G#3D) model ID: G#{:02X}{:02X}{}\n", id[0], id[1], if id == [0x08, 0xEF] { " — matches Linux" } else { "" })),
+        Err(e) => line(rep, alloc::format!("main sensor (G#3D): error G#{e:X} (G#4 no acknowledge)\n")),
+    }
+}
+
+/// Power the module down in the reverse of `module_power_seq@0`, then the camera PMIC's supplies (chip select stays high, as Android leaves it). Best effort: every step runs even if one fails.
+pub fn power_down(rep: &mut Vec<u8>) {
+    pin_out(0x40, 2, false);
+    if let Ok(v) = pmic_read(GPIO4_CTRL) {
+        let _ = pmic_write(GPIO4_CTRL, v & !1);
+    }
+    for bit in [4u32] {
+        if let Ok(m) = pmic_read(MATRIX_A) {
+            let _ = pmic_write(MATRIX_A, m & !(1 << bit) as u8);
+        }
+    }
+    pin_out(0x1E0, 0, false);
+    pin_out(0x120, 0, false);
+    for bit in [3u32] {
+        if let Ok(m) = pmic_read(MATRIX_A) {
+            let _ = pmic_write(MATRIX_A, m & !(1 << bit) as u8);
+        }
+    }
+    let _ = acpm::update(acpm::SUB, acpm::T_PMIC, 0x3A, 0, 0x80);
+    let _ = acpm::update(acpm::SUB, acpm::T_PMIC, 0x48, 0, 0x80);
+    for bit in [7u32, 0] {
+        if let Ok(m) = pmic_read(MATRIX_A) {
+            let _ = pmic_write(MATRIX_A, m & !(1 << bit) as u8);
+        }
+    }
+    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x0A, 0x40, 0x60);
+    let m = pmic_read(MATRIX_A);
+    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x0B, 0x40, 0x60);
+    let _ = acpm::update(acpm::SUB, acpm::T_GPIO, 0x09, 0x40, 0x60);
+    line(rep, alloc::format!("powered down: MATRIX_CONF_A before supplies off {:?}; sub GPIO1/2/3 {:?} {:?} {:?}\n",
+        m.map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}")),
+        acpm::read(acpm::SUB, acpm::T_GPIO, 0x09).map(|v| alloc::format!("G#{v:02X}")).ok(),
+        acpm::read(acpm::SUB, acpm::T_GPIO, 0x0A).map(|v| alloc::format!("G#{v:02X}")).ok(),
+        acpm::read(acpm::SUB, acpm::T_GPIO, 0x0B).map(|v| alloc::format!("G#{v:02X}")).ok()));
 }

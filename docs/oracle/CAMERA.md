@@ -60,3 +60,18 @@ Order, rails, voltages and delays come from the device tree (`module_power_seq@0
 - `camera-main-powerup-pmic-transfers.txt`: the camera PMIC (G#75) and flash driver (G#63) on hsi2c@10980000, 108 transfers.
 - `camera-main-powerup-cmu.txt`: CMU_TOP accesses for the master clock CIS_CLK3 (mux G#2604_101C, divider G#2604_181C, gate G#2604_2044, clock-gating control G#2604_3010).
 - The sensor enable line is sub-PMIC GPIO2 over ACPM channel 2 (GPIO sub-block G#0C, register G#0A); LDO12 and LDO26 are sub-PMIC rails on the same channel.
+
+## ferros brings the main camera up cold (2026-10-19)
+
+`diag cam bus`, `diag cam up`, `diag cam off` (ferros_kernel/src/camera.rs, acpm.rs, hsi2c.rs), on slot b with no Linux: the main sensor answers with model ID G#08EF, the value Linux reads. What it took, in order:
+
+1. **ACPM client** for the sub-PMIC (acpm.rs): its GPIOs and LDOs are reached only through the power-management firmware's channel 2. Worked first try.
+2. **Both camera HS-I2C controllers from cold**: pins muxed (PMIC bus gpp16-0/1 function 2; sensor bus gpp2-0/1 function 3 with pull-ups), USI in I2C mode, controller reset and timed, on the 24.576 MHz oscillator. Two traps: the transfer **timeout enable comes out of reset on** (G#48 bit 31; the kernel clears it every message), and the **error interrupt sources must be enabled** or a no-acknowledge never shows and looks like a hang.
+3. **Camera PMIC chip select (sub GPIO0) high** — Android keeps it high whenever the camera is closed; without it the chip does not acknowledge. Then buck-boost (sub GPIO1) and buck (sub GPIO3) enables with 2 ms each. The driver's tuning step is empty on this chip revision (enter, then exit, nothing between).
+4. **Program the rail voltages before enabling anything** — the chip's cold defaults are not the camera's: LDO1 G#A5 = 2.85 V where the camera needs 2.25 V. Codes, V = base + code × step: LDO1 G#69 (2.25 V), LDO4 G#AF (2.95 V), LDO5 G#AA (2.90 V), LDO8 G#72 (0.97 V); each written and read back while every rail is off. Linux sets these at boot, which is why a camera-open capture never shows them.
+5. **The device tree's power sequence** (`module_power_seq@0`): LDO1, 500 µs; sensor enable (sub GPIO2); LDO8, 750 µs; sub LDO26 and LDO12 (bit 7 of their control registers; voltages already programmed); LDO4, 1 ms; master clock pin gpp9-0 function 2 (CIS_CLK3 already runs cold); ToF reset high; LDO5, 1 ms; the GPIO4 load switch (bit 0 of G#1713), 1 ms; then the sensor reset (gpp2-2) released and 9 ms. Camera-PMIC LDO enables are one bit each in G#110D (LDO1 bit 0 .. LDO8 bit 7).
+6. **Sensor bus up again, read G#0000** → G#08EF.
+
+`diag cam off` reverses the sequence and drops the supply enables; chip select stays high as Android leaves it.
+
+Next: the receive side (the CSI receiver and its DMA in the ISP front end, behind three S2MPUs), then the sensor's init sequence and a first raw frame.
