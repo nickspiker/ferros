@@ -23,6 +23,8 @@ const LINUX_ENTRY: u64 = 0x8020_0000;
 /// The hv's report page: the last 64 KiB of its own reserved region. It sat at G#B610_0000 for a day, a page right under the secure DRAM carveout at G#B620_0000 — and the freezes under real use resolved into an asynchronous SError (bus error, syndrome G#BE000011) delivered to whichever core trapped next, which is what a write into a protected window looks like when the hv writes this page on every trap (2026-10-19). Nothing needs this page to survive a reset any more: the hv's words go into Android's pstore ring.
 const REPORT: usize = 0xA_FFFF_0000;
 const REPORT_RESERVE: u64 = 0x10_0000;
+/// Marker at REPORT + G#FF00: the previous boot ran the oracle (see stage2_base).
+const ORACLE_ONESHOT: u64 = 0x4F52_4143_4C45_3131;
 
 const STAGE_ENTERED: u64 = 0xA1;
 const STAGE_DTB_DONE: u64 = 0xA2;
@@ -524,7 +526,14 @@ unsafe fn stage2_base() -> u64 {
         for i in 0..1024u64 {
             write_volatile(s2.add(i as usize), (i << 30) | S2_BLOCK);
         }
-        if cfg!(hv_oracle) {
+        // One shot per cold start: a capture is read back through a warm reset (sysrq crash) into the next boot, and with the PCIe ch0 pages trapped that next boot hung in the root-complex probe every time and overwrote the capture (2026-10-19). The capture boot leaves a marker in the hv's report page, which survives a warm reset as pstore does; the boot that finds it traps nothing and clears it.
+        let oneshot = (REPORT + 0xFF00) as *mut u64;
+        let skip = cfg!(hv_oracle) && read_volatile(oneshot) == ORACLE_ONESHOT;
+        write_volatile(oneshot, if cfg!(hv_oracle) && !skip { ORACLE_ONESHOT } else { 0 });
+        if skip {
+            pstore::log(&[b"\nferros hv: oracle skipped this boot (the previous boot was a capture)\n"]);
+        }
+        if cfg!(hv_oracle) && !skip {
             let mut i = 0;
             while i < ORACLE_TARGETS.len() {
                 stage2_unmap(ORACLE_TARGETS[i]);
@@ -1209,6 +1218,10 @@ fn modem_ring(tx: bool, old: u32, new: u32) {
 static mut ORACLE_SMCS: u64 = 0;
 fn oracle_smc(a: [u64; 4], r0: u64, r1: u64) {
     if a[0] & 0xFFFF_FFE0 == 0x8400_0000 || a[0] & 0xFFFF_FFE0 == 0xC400_0000 {
+        return;
+    }
+    // CPU idle reads the cluster power status through the priv-reg call thousands of times a boot (PMU G#1546_0860..G#1546_0880, measured 2026-10-19): not logged.
+    if a[0] == 0x8200_0504 && a[2] == 0 && a[1] & !0xFF == 0x1546_0800 {
         return;
     }
     unsafe {
