@@ -24,7 +24,7 @@ Stopped while writing a userspace tool to read the camera HAL's PDMA command lis
 
 Done and committed: the PDMA list format and the full decoded front-end program (docs/oracle/CAMERA.md, camera-ispfe-pdma-writes.txt, tools/oracle-decode-pdma.py); tools/camera-prog.py (builds a CPR2 program: CPU setup before the PDMA start, the PDMA program, CPU setup after, buffer IOVAs moved to PA G#8800_0000+); `diag cam frame` in camera.rs (FERROS_CAM_FRAME=<local bundle> embeds init + program at build time; the bundle stays in target/cam, never the repo).
 State at the stop: on a cold boot the sensor streams and CSI link 1 counts frames, the whole program applies with no hang, but nothing in the ISPFE pages changes and no output buffer is written. The link-to-front-end path is still not running.
-Left to do: find what connects CSI link 1 to the ISPFE input (compare a full ISPFE + CSIS register snapshot from Linux while streaming against ferros's), then read a frame back.
+**Narrowed 2026-10-20 (Opus 5):** `cam frame` now reads back everything it writes. Every ISPFE control page holds its values; the G#1C36_xxxx region holds none of 3048 writes and is not CPU-writable at all (constant values that ignore writes, and one address that changes by itself while streaming). That region is exactly where the PDMA program's twelve block-load records point, so a CPU replay can never be complete. Next step is to run the PDMA engine itself from a descriptor ring ferros builds — the format is fully decoded. See docs/oracle/CAMERA.md.
 Also open: the cold vault accepts only the first write per boot and that write does not survive a reboot (store put returns "vault error" afterwards).
 
 ## 2c. Kernel vault moved onto manifestus (stopped 2026-10-20 mid-verification)

@@ -702,7 +702,8 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
         let mut skipped = 0u32;
         for &(a, v) in pairs {
             // The ISPFE block, the CSI links and the PDMA wrapper; never the PDMA engine page (its descriptor ring is not used) or anything outside the front end.
-            if (0x1C04_0000..ISPFE + 0x10_0000).contains(&a) && !(0x1C39_0000..0x1C39_1000).contains(&a) {
+            // G#1C36_xxxx is not CPU-writable (2026-10-20): it ignores CPU writes and part of it changes on its own while the sensor streams, so the PDMA's block-load records target hardware the CPU cannot stand in for. Those writes are dropped rather than scattered.
+            if (0x1C04_0000..ISPFE + 0x10_0000).contains(&a) && !(0x1C39_0000..0x1C39_1000).contains(&a) && !(0x1C36_0000..0x1C37_0000).contains(&a) {
                 wr(a, v);
                 applied += 1;
             } else {
@@ -712,6 +713,31 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
         line(rep, alloc::format!("{name}: A#{applied} writes applied, A#{skipped} outside the front end skipped\n"));
     }
     line(rep, alloc::format!("A#{} output buffers patterned\n", bufs.len()));
+    // Which of the written registers actually hold their value: a whole page that does not is a block still gated or in reset, and that is the thing stopping the frame reaching memory.
+    let mut pages: Vec<(usize, u32, u32)> = Vec::new();
+    for pairs in sections.iter() {
+        for &(a, v) in pairs {
+            if !(0x1C04_0000..ISPFE + 0x10_0000).contains(&a) || (0x1C39_0000..0x1C39_1000).contains(&a) {
+                continue;
+            }
+            let page = a & !0xFFF;
+            let ok = rd(a) == v;
+            match pages.iter_mut().find(|p| p.0 == page) {
+                Some(p) => {
+                    p.1 += 1;
+                    p.2 += ok as u32;
+                }
+                None => pages.push((page, 1, ok as u32)),
+            }
+        }
+    }
+    pages.sort();
+    let mut s = alloc::string::String::from("written registers that read back (per page):");
+    for (page, n, ok) in pages {
+        s.push_str(&alloc::format!(" G#{page:X}: A#{ok}/A#{n}"));
+    }
+    s.push('\n');
+    line(rep, s);
     let snap = || ISPFE_STATUS.map(|a| rd(a));
     let before = snap();
     // Whole pages, to see what moves at all while streaming: the two output channels and CSI link 1.
@@ -754,6 +780,16 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
     }
     moved.push_str(&alloc::format!(" (A#{n} in all)\n"));
     line(rep, moved);
+    // The G#1C36_xxxx region (the front end's coefficient/LUT memory, which the HAL fills through the PDMA's block-load records, never with CPU writes) holds none of what the CPU puts there: probe it directly so the failure mode is named.
+    let mut probe = alloc::string::String::from("LUT region probe:");
+    for a in [0x1C36_1D48usize, 0x1C36_95FC, 0x1C36_A02C, 0x1C36_C8B8] {
+        let r1 = rd(a);
+        spin_us(20_000);
+        let r2 = rd(a);
+        probe.push_str(&alloc::format!(" G#{a:X}: G#{r1:X} then G#{r2:X} 20 ms later{};", if r1 == r2 { "" } else { " CHANGED BY ITSELF" }));
+    }
+    probe.push('\n');
+    line(rep, probe);
     let mut any = false;
     for &b in &bufs {
         let mut changed = 0usize;
