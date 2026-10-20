@@ -623,7 +623,8 @@ fn rom_boot(rep: &mut Vec<u8>) {
     for off in [0xA0, 0xA4, 0xA8, 0xAC] {
         wr(IPC + off, 0);
     }
-    wr(IPC + 0x808, 0x4000);
+    // ap2cp_united_status: zero, as the Android capture shows Linux writing it (the DS-detect field in bits [15:14] stays clear there).
+    wr(IPC + 0x808, 0);
     wr(IPC + 0x80C, 0);
     // `init_legacy_link` (link_device_memory_legacy.c:228): magic and mem_access to 0, every ring's head and tail to 0, then the magic and mem_access = 1, both read back. On a cold boot the cursors are whatever the DRAM held (measured G#FFFF_FFFF), and the first frame has nowhere to go.
     wr(IPC, 0);

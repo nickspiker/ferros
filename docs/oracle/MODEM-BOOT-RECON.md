@@ -280,4 +280,8 @@ Ruled out:
 
 G#A110 / G#A11B / G#A11D are section 1 (BOOT, TOC id 1) begin / data / end on this channel, not a handshake — the per-section pattern is G#A1n0 / G#A1nB / G#A1nD with n the TOC id, so the opening pair is BOOT's, which the ROM already has.
 
-**The capture to run next.** The current ring capture had the cursors in `FERROS_HV_ORACLE_QUIET`, and it shows the AP's tx head jumping from G#10 (after `A110`) to G#438 before `A11D` — G#428 bytes the decode does not account for. Re-take it with the cursors **not** quiet so every head write is logged, and the bytes the AP actually puts in the TX ring between those two frames become visible. That gap is the most likely home of whatever the CP is waiting for.
+**That capture was taken (cursors not quiet) and explains the gap: the CP moves the AP's tx cursors itself.** Between `C110` and `C11B`, with no write from the AP, both the tx head and the tx tail go from G#10 to G#438 — the CP repositions the ring from its side, and only then does the AP write `A11D` at G#438. The AP therefore has to re-read the head before every frame (ferros does) and, more importantly, **wait for `C11B` before sending the next frame**, because that is when the cursors move.
+
+The capture also corrects one control-message field: Linux writes `ap2cp_united_status` (IPC+G#808) as **zero**, not with a DS-detect value in bits [15:14]. ferros matches it now; it made no difference to the stall.
+
+So the single open question is narrow: **what makes the CP emit `C11B` and reposition the cursors.** It happens ~30 ms after `C110` under Linux and never here, and pushing on without it writes the next frame at an offset the CP has not moved to, which is why everything after is consumed in silence. Everything else about the channel is understood and matches.
