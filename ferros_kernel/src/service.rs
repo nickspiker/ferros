@@ -838,6 +838,35 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"touch state" {
+                                            // `diag touch state`: the touch controller's clocks, pins and rails, read only (touch.rs).
+                                            crate::touch::state(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"touch up" {
+                                            // `diag touch up`: SPI controller up, rails on, reset released, controller ready, scan mode active.
+                                            crate::touch::up(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"touch watch" {
+                                            // `diag touch watch`: report touches for 8 s.
+                                            crate::touch::watch(&mut resp, 8192);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"touch paint" {
+                                            // `diag touch paint`: draw finger strokes on the panel for 16 s, the by-eye test of touch.
+                                            crate::touch::paint(&mut resp, 16384);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"touch off" {
+                                            crate::touch::off(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam state" {
                                             // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
                                             crate::camera::state(&mut resp);

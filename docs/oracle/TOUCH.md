@@ -42,3 +42,35 @@ Touch events (8 bytes): `13` enter, `23` motion, `33` leave. `id = e[1]>>4`, `ty
 | AVDD 3.3 V | S2MPG14 LDO4M, ctrl G#2E, bit 7 enable, [5:0] = (uV-1800000)/25000 = G#3C |
 
 Power-up (`fts_chip_powercycle`): reset low, DVDD on, 1 ms, AVDD on, 5 ms, 10 ms, reset high.
+
+## Cold bring-up in ferros (2026-10-19): WORKS
+
+`ferros_kernel/src/touch.rs`, driven over PT:
+
+```bash
+ferros-bridge diag "touch state"   # clocks, pins, rails, read only
+ferros-bridge diag "touch up"      # SPI up, rails, reset, controller ready, scan mode on
+ferros-bridge diag "touch watch"   # 8 s of touch events as text
+ferros-bridge diag "touch paint"   # 16 s: draw finger strokes on the panel (by-eye test)
+ferros-bridge diag "touch off"
+```
+
+First cold run, slot b, no Linux anywhere:
+
+```
+SPI up: USI_CON G#0 CH_CFG G#0 MODE G#1FF80000 STATUS G#0
+DVDD (LDO25M): G#AC
+AVDD (LDO4M): G#BC
+controller ready after A#12 ms: G#0300000000000000
+GPIO6 register G#80 -> G#80
+touch system info: largest coordinates A#2991 and A#1343
+chip ID G#3640 (FTM5 parts: G#3648 ALIX, G#3640 SALIXP, G#3639), fw G#0083
+scan mode active: G#4305010000000000
+```
+
+Then `touch watch` saw the scan-mode echo `43 01 A0 00 FF` and nothing else (nobody touching), and `touch paint` adopted the panel at 1344 x 2992 and cleared it.
+Cold state before anything is written: the USI2 gates are in automatic mode (open), USI_CON = 1 (USI held in reset), both rails programmed to the right voltage but disabled (G#2C, G#3C), reset pin an input.
+The firmware in the controller's flash runs as is; no firmware download is needed.
+
+Still to verify with a finger: the coordinate axes (events should give x across the short side up to 1343, y up to 2991; `touch paint` reports the largest seen) and the paint strokes landing under the finger.
+The system-info block also holds a per-die identifier at offsets 32-47; ferros reads only the header and the coordinates.
