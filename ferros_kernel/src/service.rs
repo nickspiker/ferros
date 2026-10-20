@@ -777,6 +777,13 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam stream" {
+                                            // `diag cam stream`: replay the sensor init from the vault, configure CSI link 1, stream 300 ms, report what the link saw.
+                                            let init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                                            crate::camera::stream_probe(&mut resp, init);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam fe" {
                                             // `diag cam fe`: power the ISP front end, restore its clocks, read CSI link 1's version.
                                             crate::camera::fe_up(&mut resp);

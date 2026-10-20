@@ -88,7 +88,15 @@ fn wait_done(base: usize) -> Result<(), u32> {
 
 /// One auto-mode transfer: `tx` bytes written to `target`, or `rx.len()` bytes read from it (one or the other per call), with STOP after it unless `hold` keeps the bus for a following read.
 fn transfer(base: usize, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Result<(), u32> {
-    if rd(base + TRANS_STATUS) & TRANS_MASTER_BUSY != 0 {
+    // The previous transfer's STOP can still be on the wire when the next one is asked for (measured 2026-10-19 on the camera-PMIC bus: back-to-back reads failed busy with TRANS_STATUS G#A000D); wait it out rather than fail.
+    let mut idle = false;
+    for _ in 0..WAIT_POLLS {
+        if rd(base + TRANS_STATUS) & TRANS_MASTER_BUSY == 0 {
+            idle = true;
+            break;
+        }
+    }
+    if !idle {
         return Err(E_BUSY);
     }
     let read = !rx.is_empty();
@@ -113,7 +121,27 @@ fn transfer(base: usize, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Re
             *b = rd(base + RX_DATA) as u8;
         }
     } else {
+        // Feed the TX FIFO as it drains (64 deep; kept under 48), watching for a NACK or bus error, so a write of any length works — a camera sensor's settings upload is one 6.5 KB transfer. Short writes never wait.
         for &b in tx {
+            let mut room = false;
+            for _ in 0..WAIT_POLLS {
+                if rd(base + FIFO_STATUS) & 0x7F < 48 {
+                    room = true;
+                    break;
+                }
+                let st = rd(base + INT_STATUS);
+                if st & INT_NODEV != 0 {
+                    wr(base + INT_STATUS, st);
+                    return Err(E_NODEV);
+                }
+                if st & INT_ERRORS != 0 {
+                    wr(base + INT_STATUS, st);
+                    return Err(E_BUS);
+                }
+            }
+            if !room {
+                return Err(E_TIMEOUT);
+            }
             wr(base + TX_DATA, b as u32);
         }
         wait_done(base)?;
@@ -259,7 +287,7 @@ pub fn ready(base: usize, usi_mode: usize) -> bool {
         && rd(base + TRANS_STATUS) & TRANS_MASTER_BUSY == 0
 }
 
-/// Write `w` to `target` with STOP. The TX FIFO is not refilled during a transfer, so keep `w` within the FIFO (64 bytes on USI v2).
+/// Write `w` to `target` with STOP, any length (the FIFO is fed as it drains; the transfer length field is 16 bits).
 pub fn write_bytes(base: usize, target: u8, w: &[u8]) -> Result<(), u32> {
     transfer(base, target, w, &mut [], false)
 }

@@ -462,3 +462,134 @@ pub fn fe_up(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("CMU_ISPFE div G#{:X}/G#{:X} mux G#{:X} ctl G#{:X}; SYSREG_ISPFE G#{:X}; CSI link 1 version G#{:X}\n",
         rd(CMU_ISPFE + 0x1800), rd(CMU_ISPFE + 0x1804), rd(CMU_ISPFE + 0x600), rd(CMU_ISPFE + 0x800), rd(SYSREG_ISPFE + 0x104), rd(CSIS_LINK1 + 4)));
 }
+
+/// Replay a sensor init table: records `W` len(u16 BE) bytes (an I2C write), `R` n(u16) addr(2) (register read, value discarded), `D` microseconds (u32 BE). The table is generated from an oracle capture and kept in the vault (key `cam.boitata.init`), not in the source: it carries the sensor vendor's settings file. Returns (writes, reads, first failure as (record index, error)).
+fn replay_init(t: &[u8]) -> (u32, u32, Option<(u32, u32)>) {
+    let (mut i, mut n, mut w, mut r) = (0usize, 0u32, 0u32, 0u32);
+    while i < t.len() {
+        let k = t[i];
+        let res = match k {
+            b'W' if i + 3 <= t.len() => {
+                let len = u16::from_be_bytes([t[i + 1], t[i + 2]]) as usize;
+                let d = &t[i + 3..(i + 3 + len).min(t.len())];
+                i += 3 + len;
+                w += 1;
+                crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, d)
+            }
+            b'R' if i + 5 <= t.len() => {
+                let cnt = u16::from_be_bytes([t[i + 1], t[i + 2]]) as usize;
+                let a = [t[i + 3], t[i + 4]];
+                i += 5;
+                r += 1;
+                let mut buf = [0u8; 8];
+                crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &a, &mut buf[..cnt.min(8)])
+            }
+            b'D' if i + 5 <= t.len() => {
+                spin_us(u32::from_be_bytes([t[i + 1], t[i + 2], t[i + 3], t[i + 4]]) as u64);
+                i += 5;
+                Ok(())
+            }
+            _ => return (w, r, Some((n, 0xBAD))),
+        };
+        if let Err(e) = res {
+            return (w, r, Some((n, e)));
+        }
+        n += 1;
+    }
+    (w, r, None)
+}
+
+/// Link 1's register words at G#000..G#1FC and G#600..G#6FC (the ranges the camera stack touches), 192 words.
+fn link_off(i: usize) -> usize {
+    if i < 128 { i * 4 } else { 0x600 + (i - 128) * 4 }
+}
+fn link_snapshot() -> [u32; 192] {
+    let mut s = [0u32; 192];
+    for (i, v) in s.iter_mut().enumerate() {
+        *v = rd(CSIS_LINK1 + link_off(i));
+    }
+    s
+}
+
+/// The sensor's frame counter (CCS frame_count, register G#0005, one byte; the camera stack reads it): it counts while the sensor streams.
+fn sensor_frame_count() -> Option<u8> {
+    let mut b = [0u8; 1];
+    crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).ok().map(|_| b[0])
+}
+
+/// Stream the main sensor into CSI link 1 and see whether frames arrive: requires `cam up` (the sensor answering), brings the ISP front end up, replays the sensor init from the vault, configures the receiver (camera_rx.rs), snapshots link 1's registers, starts the sensor for 300 ms, snapshots again and reports every register that changed, then stops the sensor and the receiver. No DMA is set up: this only asks whether the link sees the stream.
+pub fn stream_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+        return;
+    }
+    let init = match init {
+        Some(t) => t,
+        None => {
+            line(rep, alloc::format!("refusing: no `cam.boitata.init` in the vault (bridge store put cam.boitata.init @table)\n"));
+            return;
+        }
+    };
+    fe_up(rep);
+    if !fe_powered() {
+        return;
+    }
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed{}\n", match fail { None => alloc::string::String::new(), Some((n, e)) => alloc::format!("; FAILED at record {n} with G#{e:X}") }));
+    if fail.is_some() {
+        return;
+    }
+    // The combo D-PHY sits behind a PMU isolation that its driver bypasses before use (phy-exynos-mipi.c `__set_phy_isolation`: PMU + the node's `isolation` offset G#3EBC, bit 0 = bypass). It is a PMU write, so the oracle never saw it; without it the PHY's lane registers do not hold what is written (measured 2026-10-19: they read 0 after the replay wrote 1).
+    let iso = 0x1546_3EBCusize;
+    let iso_before = rd(iso);
+    let iso_ret = crate::platform::priv_reg(iso as u64, true, iso_before | 1);
+    line(rep, alloc::format!("PHY isolation G#{iso_before:X} -> G#{:X} (EL3 write returned G#{iso_ret:X})\n", rd(iso)));
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
+    let before = link_snapshot();
+    let phy = |rep: &mut Vec<u8>, when: &str| line(rep, alloc::format!("{when}: PHY lanes G#{:X} G#{:X} G#{:X}; link 1 ctl G#{:X} +14 G#{:X} +1C G#{:X} +20 G#{:X}\n",
+        rd(0x1C10_1800), rd(0x1C10_1900), rd(0x1C10_1A00), rd(CSIS_LINK1 + 4), rd(CSIS_LINK1 + 0x14), rd(CSIS_LINK1 + 0x1C), rd(CSIS_LINK1 + 0x20)));
+    phy(rep, "receiver configured");
+    let fc0 = sensor_frame_count();
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    let mut series = alloc::string::String::new();
+    for _ in 0..20 {
+        spin_us(50_000);
+        let mut b = [0u8; 2];
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
+            Ok(()) => series.push_str(&alloc::format!(" {:02X}{:02X}", b[0], b[1])),
+            Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
+        }
+    }
+    line(rep, alloc::format!("sensor G#0005..6 every 50 ms after stream-on:{series}\n"));
+    let mut ms = [0u8; 2];
+    let msr = crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00], &mut ms);
+    // A running 26 MHz master clock on gpp9-0 reads back through the pad as a mix of 0s and 1s; a steady value means no clock on the pin.
+    let mut ones = 0u32;
+    for _ in 0..128 {
+        ones += rd(GPIO_PERIC0 + 0x124) & 1;
+    }
+    line(rep, alloc::format!("sensor mode_select G#0100..1 reads {:?}; master-clock pad sampled high {ones}/128 (gpp9 CON G#{:X})\n", msr.map(|_| alloc::format!("G#{:02X}{:02X}", ms[0], ms[1])).map_err(|e| alloc::format!("G#{e:X}")), rd(GPIO_PERIC0 + 0x120)));
+    phy(rep, "after 1 s streaming");
+    let (fc1, fc2) = (None::<u8>, None::<u8>);
+    let after = link_snapshot();
+    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    spin_us(50_000);
+    for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+        wr(a, v);
+    }
+    line(rep, alloc::format!("stream on {:?}, off {:?}; sensor frame count {:?} -> {:?} (100 ms) -> {:?} (300 ms)\n", son.map_err(|e| alloc::format!("G#{e:X}")), soff.map_err(|e| alloc::format!("G#{e:X}")), fc0, fc1, fc2));
+    line(rep, alloc::format!("link 1 registers that changed while streaming:\n"));
+    let mut any = false;
+    for i in 0..192 {
+        if before[i] != after[i] {
+            any = true;
+            line(rep, alloc::format!("  +G#{:03X}: G#{:X} -> G#{:X}\n", link_off(i), before[i], after[i]));
+        }
+    }
+    if !any {
+        line(rep, alloc::format!("  none\n"));
+    }
+}
