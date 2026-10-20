@@ -795,6 +795,30 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam pdma" {
+                                            // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
+                                            let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                                            if b2.is_none() && cfg!(cam_frame_blob) {
+                                                b2 = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                                            }
+                                            let init = match b2.as_deref() {
+                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                                    if 8 + n <= b.len() { Some(b[8..8 + n].to_vec()) } else { None }
+                                                }
+                                                _ => store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()),
+                                            };
+                                            let prog = match b2.as_deref() {
+                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                                    if 8 + n <= b.len() { Some(b[8 + n..].to_vec()) } else { None }
+                                                }
+                                                _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
+                                            };
+                                            crate::camera::pdma_probe(&mut resp, init, prog);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam frame" {
                                             // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
                                             // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).

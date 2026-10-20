@@ -20,6 +20,18 @@ fn main() {
     // FERROS_CAM_FRAME=<file>: embed a `cam.frame` bundle ('CFRM' + init length + sensor init + front-end program) so `diag cam frame` works without the vault. Dev only: the bundle carries the sensor vendor's settings, so it comes from a local file (never the repo) and only into a locally built image.
     println!("cargo:rustc-check-cfg=cfg(cam_frame_blob)");
     println!("cargo:rerun-if-env-changed=FERROS_CAM_FRAME");
+    // FERROS_CAM_PDMA=<file>: embed a `cam.pdma` job (tools/camera-pdma-image.py) so `diag cam pdma` can hand the front end's register program to the PDMA engine. Dev only, and from a local file like the frame bundle.
+    println!("cargo:rustc-check-cfg=cfg(cam_pdma_blob)");
+    println!("cargo:rerun-if-env-changed=FERROS_CAM_PDMA");
+    let pout = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_pdma.bin");
+    match std::env::var("FERROS_CAM_PDMA") {
+        Ok(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::copy(&path, &pout).unwrap_or_else(|e| panic!("FERROS_CAM_PDMA {path}: {e}"));
+            println!("cargo:rustc-cfg=cam_pdma_blob");
+        }
+        Err(_) => std::fs::write(&pout, b"").unwrap(),
+    }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_frame.bin");
     match std::env::var("FERROS_CAM_FRAME") {
         Ok(path) => {

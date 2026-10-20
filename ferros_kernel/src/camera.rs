@@ -810,3 +810,163 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
         line(rep, alloc::format!("no output buffer changed in its first A#{} KiB\n", PROBE_BYTES / 1024));
     }
 }
+
+/// The PDMA engine's registers (G#1C39_0000), in the order a camera open drives them (oracle capture 2026-10-19).
+const PDMA: usize = 0x1C39_0000;
+/// The descriptor ring and the rest of the job live at fixed physical addresses the builder and the kernel agree on (tools/camera-pdma-image.py).
+const PDMA_RING_PA: usize = 0x8800_0000;
+const PDMA_BUF_PA: usize = 0x8810_0000;
+const PDMA_BUF_SLICE: usize = 0x20_0000;
+const PDMA_BUFS: usize = 18;
+
+/// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
+pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>) {
+    let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
+    if job.len() < 8 || &job[..4] != b"CPR3" {
+        return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
+    }
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no sensor init table\n"));
+    };
+    fe_up(rep);
+    if !fe_powered() {
+        return;
+    }
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    let iso = 0x1546_3EBCusize;
+    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
+    ispfe_dma_open(rep);
+    // Lay the job out in DRAM. The SysMMUs are in bypass, so what the engine reads as a bus address is this physical address.
+    let w32 = |i: usize| u32::from_le_bytes([job[i], job[i + 1], job[i + 2], job[i + 3]]) as usize;
+    let n = w32(4);
+    let mut at = 8;
+    let mut placed = 0u32;
+    for _ in 0..n {
+        if at + 8 > job.len() {
+            return line(rep, alloc::format!("job truncated\n"));
+        }
+        let (pa, len) = (w32(at), w32(at + 4));
+        at += 8;
+        if at + len > job.len() || !(0x8800_0000..0x9000_0000).contains(&pa) {
+            return line(rep, alloc::format!("job piece at G#{pa:X} len G#{len:X} out of range\n"));
+        }
+        for i in 0..len {
+            unsafe { core::ptr::write_volatile((pa + i) as *mut u8, job[at + i]) };
+        }
+        at += (len + 3) & !3;
+        placed += 1;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    line(rep, alloc::format!("job placed: A#{placed} pieces, ring at G#{PDMA_RING_PA:X}\n"));
+    // The CPU's own setup writes, in the capture's order: the ones before the PDMA start now, the ones after it once the engine is running. Without them the engine applies the program but the frame writer stays idle (2026-10-20).
+    let cpu = prog.as_deref().and_then(parse_prog);
+    let apply = |rep: &mut Vec<u8>, what: &str, pairs: Option<&Vec<(usize, u32)>>| {
+        let Some(pairs) = pairs else { return };
+        let mut n = 0u32;
+        for &(a, v) in pairs {
+            if (0x1C04_0000..ISPFE + 0x10_0000).contains(&a) && !(0x1C39_0000..0x1C39_1000).contains(&a) && !(0x1C36_0000..0x1C37_0000).contains(&a) {
+                wr(a, v);
+                n += 1;
+            }
+        }
+        line(rep, alloc::format!("{what}: A#{n} CPU writes\n"));
+    };
+    apply(rep, "CPU setup before the start", cpu.as_ref().map(|c| &c.1[0]));
+    // Pattern the head of every output slice so a write anywhere in it shows.
+    for b in 0..PDMA_BUFS {
+        let base = PDMA_BUF_PA + b * PDMA_BUF_SLICE;
+        for o in (0..PROBE_BYTES).step_by(4) {
+            wr(base + o, PATTERN);
+        }
+        for o in (0..PDMA_BUF_SLICE).step_by(4096) {
+            wr(base + o, PATTERN);
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    // Start the engine exactly as the capture shows a camera open starting it.
+    wr(PDMA + 0x2C, 1);
+    wr(PDMA + 0x40, 0x1F);
+    wr(PDMA + 0x20, 0);
+    wr(PDMA + 0x04, PDMA_RING_PA as u32);
+    wr(PDMA + 0x08, 0);
+    wr(PDMA + 0x0C, 16);
+    wr(PDMA + 0x10, 0);
+    wr(PDMA + 0x00, 1);
+    wr(PDMA + 0x34, 0);
+    wr(PDMA + 0x28, 1);
+    apply(rep, "CPU setup after the start", cpu.as_ref().map(|c| &c.1[2]));
+    line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    // Advance the descriptor index per frame, as the HAL does (+G#10 steps by G#10).
+    let mut series = alloc::string::String::new();
+    for f in 1..=10u32 {
+        spin_us(50_000);
+        wr(PDMA + 0x10, f * 0x10);
+        let mut b = [0u8; 2];
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
+            Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
+            Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
+        }
+    }
+    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    spin_us(50_000);
+    line(rep, alloc::format!("stream on {:?} off {:?}; sensor frame counter:{series}\n", son.is_ok(), soff.is_ok()));
+    line(rep, alloc::format!("PDMA after: ctrl G#{:X} index G#{:X} +G#2C G#{:X} +G#30 G#{:X} +G#34 G#{:X} +G#38 G#{:X} +G#3C G#{:X} +G#44 G#{:X}\n", rd(PDMA), rd(PDMA + 0x10), rd(PDMA + 0x2C), rd(PDMA + 0x30), rd(PDMA + 0x34), rd(PDMA + 0x38), rd(PDMA + 0x3C), rd(PDMA + 0x44)));
+    wr(PDMA + 0x00, 0);
+    wr(PDMA + 0x2C, 0);
+    wr(PDMA + 0x40, 0);
+    for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+        wr(a, v);
+    }
+    // Did the engine execute the list? These registers are set only by the program, and their values would now be the remapped G#88xx_xxxx slices. Read only once the engine and the receiver are stopped: reading one while the engine was running stalled the bus until the watchdog (2026-10-20).
+    let mut ran = alloc::string::String::from("registers the program sets:");
+    // Only these are safe to read once the engine has stopped: G#1C34_xxxx and G#1C35_xxxx both stall the bus until the watchdog at that point (2026-10-20), so the proof that the engine ran comes from the two channel registers, which hold the buffer addresses only the engine could have written.
+    for a in [0x1C32_0510usize, 0x1C32_2110] {
+        // Each address is named in the flash log before it is read: a read that stalls the bus takes the whole report with it, and the log's last line is then the culprit.
+        crate::flashlog::line(&alloc::format!("cam pdma: reading G#{a:X}"));
+        let v = rd(a);
+        crate::flashlog::line(&alloc::format!("cam pdma: G#{a:X} = G#{v:X}"));
+        ran.push_str(&alloc::format!(" G#{:X}=G#{v:X}", a & 0xF_FFFF));
+    }
+    ran.push('\n');
+    line(rep, ran);
+    let mut any = false;
+    for b in 0..PDMA_BUFS {
+        let base = PDMA_BUF_PA + b * PDMA_BUF_SLICE;
+        // The pattern covers the head of the slice; a frame could land anywhere in it, so the whole 2 MiB is sampled every 4 KiB as well.
+        let mut changed = 0usize;
+        let mut first = None;
+        for o in (0..PROBE_BYTES).step_by(4) {
+            if rd(base + o) != PATTERN {
+                changed += 1;
+                first.get_or_insert(o);
+            }
+        }
+        let mut nonzero = 0usize;
+        for o in (0..PDMA_BUF_SLICE).step_by(4096) {
+            if rd(base + o) != PATTERN && rd(base + o) != 0 {
+                nonzero += 1;
+                first.get_or_insert(o);
+            }
+        }
+        if changed > 0 || nonzero > 0 {
+            any = true;
+            let f = first.unwrap();
+            line(rep, alloc::format!("buffer A#{b} at G#{base:X}: A#{changed} words in the head, A#{nonzero} of A#512 sampled pages non-pattern, first at +G#{f:X}: G#{:08X} G#{:08X} G#{:08X} G#{:08X}\n", rd(base + f), rd(base + f + 4), rd(base + f + 8), rd(base + f + 12)));
+        }
+    }
+    if !any {
+        line(rep, alloc::format!("no output slice changed in its first A#{} KiB\n", PROBE_BYTES / 1024));
+    }
+}
