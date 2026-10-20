@@ -64,3 +64,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Cellular TTL 63](cellular_ttl_63.md) — owner wants default IPv4 TTL 63 (not 64) on the cellular stack, 2026-10-19; may revert later; IPv6 hop limit + WiFi default still open
 - [husky factory partitions backup](husky_factory_partitions_backup.md) — persist (all factory calibration) + efs/efs_backup (modem per-unit incl. IMEIs) imaged + hash-verified 2026-10-19 to /mnt/Harbor/tmp/husky-backup-2026-10-19; local only
 - [husky camera bring-up](husky_camera_bringup.md) — ferros powers the main camera cold, sensor answers G#08EF (2026-10-19); traps: ACPM, HS-I2C timeout/error IRQs, camera-PMIC chip select high, program voltages before enables
+- [Feedback: oracle capture integrity](feedback_oracle_capture_integrity.md) — pstore captures lose lines (hv + kernel race the ring); quiet console to level 4, stats off, decoder checks each transfer vs AUTO_CONF length before any replay
