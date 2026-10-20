@@ -984,7 +984,11 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 }
                 _ => {}
             }
+            let args = [frame[0], frame[1], frame[2], frame[3]];
             forward_smc(frame);
+            if cfg!(hv_oracle_smc) {
+                oracle_smc(args, frame[0], frame[1]);
+            }
             unsafe {
                 let elr: u64;
                 asm!("mrs {v}, elr_el2", v = out(reg) elr);
@@ -1110,6 +1114,29 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
 }
 
 /// Issue the guest's SMC to EL3 with its arguments and bring every result register back.
+/// SMC oracle (FERROS_HV_ORACLE_SMC): one line per forwarded non-PSCI SMC after ORACLE_ARM_AFTER_MS, `SMC fid x1 x2 x3 = r0 r1`, capped at ORACLE_SMC_CAP.
+static mut ORACLE_SMCS: u64 = 0;
+fn oracle_smc(a: [u64; 4], r0: u64, r1: u64) {
+    if a[0] & 0xFFFF_FFE0 == 0x8400_0000 || a[0] & 0xFFFF_FFE0 == 0xC400_0000 {
+        return;
+    }
+    unsafe {
+        let (now, freq): (u64, u64);
+        asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
+        if now / (freq / 1000) < ORACLE_ARM_AFTER_MS {
+            return;
+        }
+        let n = read_volatile(&raw const ORACLE_SMCS);
+        if n >= ORACLE_SMC_CAP {
+            return;
+        }
+        write_volatile(&raw mut ORACLE_SMCS, n + 1);
+    }
+    let mut h = [[0u8; 16]; 6];
+    let [h0, h1, h2, h3, h4, h5] = &mut h;
+    pstore::log(&[b"\nferros hv: SMC ", pstore::hex(a[0], h0), b" ", pstore::hex(a[1], h1), b" ", pstore::hex(a[2], h2), b" ", pstore::hex(a[3], h3), b" = ", pstore::hex(r0, h4), b" ", pstore::hex(r1, h5), b"\n"]);
+}
+
 fn forward_smc(f: &mut [u64; 32]) {
     unsafe {
         asm!(
