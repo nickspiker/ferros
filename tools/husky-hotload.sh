@@ -82,5 +82,6 @@ while :; do
         exit 0
     fi
     [ $(( $(date +%s) - t0 )) -gt 900 ] && { echo "neither ferros on USB nor Android after 15 min — phone needs hands (Power+VolDown)" >&2; exit 1; }
+    "$REPO/tools/usb-kick.sh" --if-wedged
     sleep 1
 done

@@ -27,7 +27,7 @@ to_fastboot() {
         echo "== Android -> fastboot"
         adb reboot bootloader
     fi
-    for _ in $(seq 90); do fastboot devices | grep -q . && return; sleep 2; done
+    for _ in $(seq 90); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
     echo "no fastboot after 3 min — phone needs hands (Power+VolDown)" >&2
     exit 1
 }
@@ -90,5 +90,6 @@ while :; do
         exit 1
     fi
     [ $(( $(date +%s) - t0 )) -gt 600 ] && { echo "nothing on USB after 10 min — phone needs hands (Power+VolDown)" >&2; exit 1; }
+    "$REPO/tools/usb-kick.sh" --if-wedged
     sleep 1
 done
