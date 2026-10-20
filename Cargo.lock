@@ -904,6 +904,7 @@ dependencies = [
  "blake3",
  "ferros_dsc",
  "ferros_dsi",
+ "ferros_ext4",
  "ferros_hal",
  "ferros_hal_m1",
  "ferros_heap",

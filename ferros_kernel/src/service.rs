@@ -838,6 +838,18 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"modem files" {
+                                            // `diag modem files`: the modem's images on the flash (modem.bin's TOC, NV file sizes), read only (modem.rs).
+                                            crate::modem::files(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem readmain" {
+                                            // `diag modem readmain`: read MAIN off the flash, CRC it against the TOC, time it.
+                                            crate::modem::read_main(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"touch state" {
                                             // `diag touch state`: the touch controller's clocks, pins and rails, read only (touch.rs).
                                             crate::touch::state(&mut resp);

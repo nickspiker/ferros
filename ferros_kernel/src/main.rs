@@ -48,6 +48,10 @@ mod camera;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod touch;
+#[cfg(feature = "pixel8")]
+mod partfs;
+#[cfg(feature = "pixel8")]
+mod modem;
 // The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
 mod vault_boot;

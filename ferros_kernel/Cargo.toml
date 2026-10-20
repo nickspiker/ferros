@@ -17,6 +17,7 @@ ferros_sandbox = { path = "../ferros_sandbox" }
 ferros_hal = { path = "../ferros_hal", default-features = false, features = ["alloc"] }
 ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }
 ferros_layout = { path = "../ferros_layout" }
+ferros_ext4 = { path = "../ferros_ext4" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ferros_vault = { path = "../vault", default-features = false }
 ferros_ledger = { path = "../ferros_ledger" }
