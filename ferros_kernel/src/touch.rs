@@ -134,6 +134,26 @@ fn screen_resolution() -> Result<(u32, u32), &'static str> {
     Ok((x, y))
 }
 
+/// `diag touch info`: the chip's system-information block — the sensor grid and the addresses of its live capacitance frames (`readSysInfo`, ftsCore.c: resolution at 80, transmit/receive channel counts at 84/85, key and force lengths at 86/87, the mutual-sense frame addresses at 136 and the self-sense ones after them). Nothing per-die is read or printed.
+pub fn info(rep: &mut Vec<u8>) {
+    if !spi_clocked() {
+        return line(rep, alloc::format!("SPI not clocked: run `diag touch up` first\n"));
+    }
+    let mut b = [0u8; 216];
+    if let Err(e) = fb_read(0, &mut b) {
+        return line(rep, alloc::format!("system info: {e}\n"));
+    }
+    if b[0] != 0xA5 || b[1] != 0x01 {
+        return line(rep, alloc::format!("system info header missing (G#{:02X}{:02X})\n", b[0], b[1]));
+    }
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let (tx, rx) = (b[84] as u32, b[85] as u32);
+    line(rep, alloc::format!("grid: A#{tx} transmit x A#{rx} receive = A#{} nodes; largest coordinates A#{} and A#{}; key length A#{}, force length A#{}\n", tx * rx, u16at(80), u16at(82), b[86], b[87]));
+    line(rep, alloc::format!("mutual-sense frames: raw G#{:X} filtered G#{:X} strength G#{:X} baseline G#{:X}\n", u16at(136), u16at(138), u16at(140), u16at(142)));
+    line(rep, alloc::format!("self-sense transmit: raw G#{:X} strength G#{:X}; receive: raw G#{:X} strength G#{:X}\n", u16at(144), u16at(148), u16at(152), u16at(156)));
+    line(rep, alloc::format!("one mutual-sense frame is A#{} bytes\n", tx * rx * 2));
+}
+
 /// The touch resolution last read (X << 16 | Y), 0 until `up` reads it.
 static RES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

@@ -74,3 +74,20 @@ The firmware in the controller's flash runs as is; no firmware download is neede
 
 Still to verify with a finger: the coordinate axes (events should give x across the short side up to 1343, y up to 2991; `touch paint` reports the largest seen) and the paint strokes landing under the finger.
 The system-info block also holds a per-die identifier at offsets 32-47; ferros reads only the header and the coordinates.
+
+## The sensor grid and the raw capacitance frames (2026-10-20)
+
+`diag touch info` reads the chip's system-information block and reports the grid and the addresses of its live frames. Measured on husky:
+
+```
+grid: A#18 transmit x A#39 receive = A#702 nodes; largest coordinates A#2991 and A#1343
+mutual-sense frames: raw G#BACC filtered G#7924 strength G#86E4 baseline G#9678
+self-sense transmit: raw G#B948 strength G#1352; receive: raw G#B974 strength G#137E
+one mutual-sense frame is A#1404 bytes
+```
+
+So 702 crossings over a 1344 x 2992 panel: about 75 pixels, near 4 mm, per node either way. A mutual-sense frame is one 16-bit value per crossing; a self-sense frame is one per row or column (18 and 39 values).
+
+Each frame is read with the same framebuffer command as the system info (`A7`, 16-bit address, one dummy byte first), at the address the block gives, for `transmit x receive x 2` bytes. No command is needed to prepare them — they are live. Only the factory compensation data needs a load command first (`SYS_CMD_LOAD_DATA`, ftsCompensation.c).
+
+Block offsets, from `readSysInfo` (ftsCore.c): header `A5 01` at 0, largest coordinates at 80 and 82, transmit and receive channel counts at 84 and 85, key and force lengths at 86 and 87, the four mutual-sense addresses from 136, the self-sense ones from 144. The block also holds a per-die identifier at 32-47 which ferros does not read.
