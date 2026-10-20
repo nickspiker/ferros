@@ -17,7 +17,11 @@ const RX_DATA: usize = 0x38;
 const CONF: usize = 0x40;
 const AUTO_CONF: usize = 0x44;
 const TRANS_STATUS: usize = 0x50;
+const TIMING_FS1: usize = 0x60;
+const TIMING_FS2: usize = 0x64;
 const TIMING_FS3: usize = 0x68;
+const TRAILING_CTL: usize = 0x08;
+const TIMEOUT: usize = 0x48;
 const ADDR: usize = 0x70;
 const USI_CON: usize = 0xC4;
 
@@ -227,4 +231,40 @@ pub mod gauge {
             avg_vcell_uv: uv(r(AVG_VCELL)?),
         })
     }
+}
+
+/// Bring an HS-I2C controller up from a cold boot, in the order the kernel's exynos5 driver uses (`exynos_usi_init`, `exynos5_i2c_reset`, `exynos5_i2c_set_timing`, `exynos5_i2c_init`): USI in I2C mode through its sysreg word, USI reset released, controller software reset, the three timing fields, master, trailing count, auto mode. The driver only writes FS3 [23:16] (clock divider), FS2 [7:0] (SCL high) and FS1 [23:16] (start hold) and leaves every other field at its reset value; the high and hold values here are the ones measured on hsi2c_11 at 400 kHz (PMIC.md), so a larger `fs_div` slows the bus while keeping the ratios.
+pub fn bring_up(base: usize, usi_mode: usize, fs_div: u32, trailing: u32) {
+    wr(usi_mode, 4);
+    wr(base + USI_CON, 0);
+    wr(base + CTL, rd(base + CTL) | (1 << 31));
+    wr(base + CTL, rd(base + CTL) & !(1 << 31));
+    wr(base + TIMING_FS3, (rd(base + TIMING_FS3) & !0x00FF_0000) | (fs_div & 0xFF) << 16);
+    wr(base + TIMING_FS2, (rd(base + TIMING_FS2) & !0xFF) | 0xE0);
+    wr(base + TIMING_FS1, (rd(base + TIMING_FS1) & !0x00FF_0000) | 0xF0 << 16);
+    wr(base + CTL, CTL_MASTER);
+    wr(base + TRAILING_CTL, trailing);
+    // The transfer timeout comes out of reset enabled (TIMEOUT G#48 bit 31; reads G#800000FF cold); with it on, auto-mode transfers never complete. The kernel clears it before every message (`exynos5_i2c_xfer_msg`); hsi2c_11 worked in ferros only because the bootloader had already cleared it there (measured 2026-10-19 by diffing the two controllers' register files).
+    wr(base + TIMEOUT, rd(base + TIMEOUT) & !(1 << 31));
+    wr(base + CONF, rd(base + CONF) | CONF_AUTO_MODE);
+}
+
+/// `up` for any instance: the same signs, with the instance's own USI mode word.
+pub fn ready(base: usize, usi_mode: usize) -> bool {
+    rd(usi_mode) & 7 == 4
+        && rd(base + USI_CON) & 1 == 0
+        && rd(base + CONF) & CONF_AUTO_MODE != 0
+        && (rd(base + TIMING_FS3) >> 16) & 0xFF != 0
+        && rd(base + TRANS_STATUS) & TRANS_MASTER_BUSY == 0
+}
+
+/// Write `w` to `target` with STOP. The TX FIFO is not refilled during a transfer, so keep `w` within the FIFO (64 bytes on USI v2).
+pub fn write_bytes(base: usize, target: u8, w: &[u8]) -> Result<(), u32> {
+    transfer(base, target, w, &mut [], false)
+}
+
+/// Write `w` without STOP, then read `r.len()` bytes: a register read for devices with multi-byte register addresses.
+pub fn write_read(base: usize, target: u8, w: &[u8], r: &mut [u8]) -> Result<(), u32> {
+    transfer(base, target, w, &mut [], true)?;
+    transfer(base, target, &[], r, false)
 }

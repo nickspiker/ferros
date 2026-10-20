@@ -771,6 +771,18 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam bus" {
+                                            // `diag cam bus`: mux and bring up both camera HS-I2C controllers (no device addressed).
+                                            crate::camera::buses_up(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam pmic" {
+                                            // `diag cam pmic`: the camera PMIC's ID and the main camera's regulators, read only.
+                                            crate::camera::pmic_dump(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam state" {
                                             // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
                                             crate::camera::state(&mut resp);

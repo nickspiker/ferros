@@ -6,7 +6,7 @@
 
 use crate::acpm;
 use alloc::vec::Vec;
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 
 const CMU_PERIC0: usize = 0x1080_0000;
 const SYSREG_PERIC0: usize = 0x1082_1000;
@@ -32,6 +32,95 @@ const CIS_CLK3: [(&str, usize); 4] = [("mux", CMU_TOP + 0x101C), ("div", CMU_TOP
 
 fn rd(a: usize) -> u32 {
     unsafe { read_volatile(a as *const u32) }
+}
+fn wr(a: usize, v: u32) {
+    unsafe { write_volatile(a as *mut u32, v) }
+}
+
+/// The camera PMIC (SLG51002) and its 16-bit, big-endian register addresses (include/linux/mfd/slg51002.h).
+pub const PMIC_ADDR: u8 = 0x75;
+/// The main sensor.
+pub const SENSOR_ADDR: u8 = 0x3D;
+
+/// Each PERIC0 USI's clock-source mux (cmucal-sfr.c PLL_CON0_MUX_CLKCMU_PERIC0_USIx_USI_USER): bit 4 picks CMU_TOP's PERIC0 IP clock, clear picks the 24.576 MHz oscillator. Cold boot leaves bit 4 set, and the I2C engine then never leaves START (measured 2026-10-19: registers answer on the bus clock, TRANS_STATUS state 1, TX FIFO filling, lines idle high) — the IP clock's upstream is not running. The oscillator is always on.
+const USI14_MUX: usize = CMU_PERIC0 + 0x640;
+const USI1_MUX: usize = CMU_PERIC0 + 0x650;
+
+/// Clock divider on the 24.576 MHz oscillator: ÷8 gives a 325 ns timing unit and about 192 kHz SCL, twice the unit of the hsi2c_11 config the FS1/FS2 field values were measured on (160 ns at 200 MHz ÷32), so every timing ratio is kept and every interval is longer.
+const FS_DIV: u32 = 7;
+
+/// Set one pin's 4-bit field in a GPIO bank register.
+fn pin_field(reg: usize, pin: u32, val: u32) {
+    wr(reg, (rd(reg) & !(0xF << (pin * 4))) | (val & 0xF) << (pin * 4));
+}
+
+/// Mux both camera I2C buses and bring their controllers up from a cold boot. The pins follow the device tree: the PMIC bus (gpp16-0/1) to function 2 with no pull; the sensor bus (gpp2-0/1) to its "on_i2c" state, function 3 with pull-ups. No I2C device is addressed.
+pub fn buses_up(rep: &mut Vec<u8>) {
+    let gpp16 = GPIO_PERIC0 + 0x220;
+    let gpp2 = GPIO_PERIC0 + 0x40;
+    for pin in 0..2 {
+        pin_field(gpp16, pin, 2);
+        pin_field(gpp16 + 8, pin, 0);
+        pin_field(gpp2, pin, 3);
+        pin_field(gpp2 + 8, pin, 3);
+    }
+    for m in [USI14_MUX, USI1_MUX] {
+        wr(m, rd(m) & !(1 << 4));
+    }
+    for _ in 0..1000 {
+        unsafe { core::arch::asm!("nop") };
+    }
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    crate::hsi2c::bring_up(SENSOR_BUS.base, SENSOR_BUS.usi_mode, FS_DIV, 0x2_0000);
+    for b in [&PMIC_BUS, &SENSOR_BUS] {
+        line(rep, alloc::format!("{}: ready {} (USI mode G#{:X}, USI_CON G#{:X}, CTL G#{:X}, CONF G#{:X}, FS1 G#{:X} FS2 G#{:X} FS3 G#{:X})\n",
+            b.name, crate::hsi2c::ready(b.base, b.usi_mode), rd(b.usi_mode), rd(b.base + 0xC4), rd(b.base), rd(b.base + 0x40), rd(b.base + 0x60), rd(b.base + 0x64), rd(b.base + 0x68)));
+    }
+    line(rep, alloc::format!("gpp16 CON G#{:X} PUD G#{:X} DAT G#{:X}; gpp2 CON G#{:X} PUD G#{:X} DAT G#{:X}; USI muxes 14 G#{:X} 1 G#{:X}\n", rd(gpp16), rd(gpp16 + 8), rd(gpp16 + 4), rd(gpp2), rd(gpp2 + 8), rd(gpp2 + 4), rd(USI14_MUX), rd(USI1_MUX)));
+}
+
+/// Read one camera-PMIC register.
+pub fn pmic_read(reg: u16) -> Result<u8, u32> {
+    let mut v = [0u8; 1];
+    crate::hsi2c::write_read(PMIC_BUS.base, PMIC_ADDR, &reg.to_be_bytes(), &mut v)?;
+    Ok(v[0])
+}
+
+/// The camera PMIC's identity and the four regulators the main camera uses, read only: chip pattern ID, the power-sequencer resource enables, and each LDO's voltage select, range, configuration and actual select.
+pub fn pmic_dump(rep: &mut Vec<u8>) {
+    if !crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode) {
+        line(rep, alloc::format!("PMIC bus not up: run `diag cam bus` first\n"));
+        return;
+    }
+    let mut s = alloc::string::String::from("SLG51002 pattern ID:");
+    for r in 0x1105u16..=0x1107 {
+        match pmic_read(r) {
+            Ok(v) => s.push_str(&alloc::format!(" G#{v:02X}")),
+            Err(e) => {
+                let b = PMIC_BUS.base;
+                s.push_str(&alloc::format!(" error G#{e:X} (G#4 no acknowledge, G#10 never finished): TRANS_STATUS G#{:X} INT_STATUS G#{:X} FIFO_STATUS G#{:X}", rd(b + 0x50), rd(b + 0x24), rd(b + 0x30)));
+                s.push('\n');
+                line(rep, s);
+                return;
+            }
+        }
+    }
+    s.push('\n');
+    line(rep, s);
+    let mut s = alloc::string::String::from("resource enables G#1900..G#1905:");
+    for r in 0x1900u16..=0x1905 {
+        s.push_str(&match pmic_read(r) { Ok(v) => alloc::format!(" G#{v:02X}"), Err(e) => alloc::format!(" err G#{e:X}") });
+    }
+    s.push('\n');
+    line(rep, s);
+    for (name, regs) in [("LDO1", [0x2000u16, 0x2060, 0x2061, 0x2064, 0x2065, 0x2066]), ("LDO4", [0x2500, 0x2560, 0x2561, 0x2564, 0x2565, 0x2566]), ("LDO5", [0x2700, 0x2760, 0x2761, 0x2764, 0x2765, 0x2766]), ("LDO8", [0x3200, 0x3260, 0x3261, 0x3265, 0x3266, 0x3267])] {
+        let mut s = alloc::format!("{name} vsel/minv/maxv/conf1/conf2/actual:");
+        for r in regs {
+            s.push_str(&match pmic_read(r) { Ok(v) => alloc::format!(" G#{v:02X}"), Err(e) => alloc::format!(" err G#{e:X}") });
+        }
+        s.push('\n');
+        line(rep, s);
+    }
 }
 
 /// A CMU gate lets the clock through unless it is under manual control (bit 20) with its value (bit 21) clear; with manual off, hardware gating (bit 28) ungates on access (cal-if ra.c `ra_get_gate`).
