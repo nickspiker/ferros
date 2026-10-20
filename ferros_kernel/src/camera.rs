@@ -331,6 +331,7 @@ pub fn power_up(rep: &mut Vec<u8>) {
     // Master clock out on gpp9-0 (function 2, drive 2; CIS_CLK3 itself already runs cold), ToF reset high.
     let g9 = GPIO_PERIC0 + 0x120;
     pin_field(g9 + 0xC, 0, 2);
+    pin_field(g9 + 0x8, 0, 0); // no pull, as Linux runs it (pinconf-pins: PUD 0, DRV 2); cold boot leaves a pull-down
     pin_field(g9, 0, 2);
     line(rep, alloc::format!("  master clock pin: gpp9 CON G#{:X}\n", rd(g9)));
     pin_out(0x1E0, 0, true);

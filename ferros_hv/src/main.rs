@@ -473,6 +473,10 @@ static mut STATS_T: u64 = 0;
 
 /// Once a second, from whichever core traps next: a line per core into the pstore ring — traps, resumes, last SMC, milliseconds since its last trap. The timeline a freeze leaves behind: the core that falls silent first and its last words.
 fn stats_tick(now: u64, freq: u64) {
+    // An oracle capture owns the console ring: the stats line written from another core can land on top of a trapped access's line (both append with a plain read-modify-write), and captures must be byte-exact (2026-10-19: seven bytes of a 6528-byte sensor upload lost that way).
+    if cfg!(hv_oracle) {
+        return;
+    }
     unsafe {
         let last = read_volatile(&raw const STATS_T);
         if now.wrapping_sub(last) < freq {

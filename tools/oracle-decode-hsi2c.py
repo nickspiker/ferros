@@ -25,8 +25,9 @@ def g(v, w=2):
     return "G#" + format(v, "0%dX" % w)
 
 target, tx, rx, kind, out = None, [], [], None, []
+expect, bad = None, 0
 def flush():
-    global tx, rx, kind
+    global tx, rx, kind, expect, bad
     if kind is not None and target is not None:
         data = tx if kind == "W" else rx
         if maxb is not None and len(data) > maxb:
@@ -34,8 +35,12 @@ def flush():
             text = " ".join("%02X" % b for b in data[:4]) + " ...[%d bytes, blake2b-64 %s]" % (len(data), h)
         else:
             text = " ".join("%02X" % b for b in data)
-        out.append("%s %s %s" % (g(target), kind, text))
-    tx, rx, kind = [], [], None
+        line = "%s %s %s" % (g(target), kind, text)
+        if expect is not None and len(data) != expect:
+            bad += 1
+            line += "   # LENGTH MISMATCH: programmed %d, captured %d" % (expect, len(data))
+        out.append(line)
+    tx, rx, kind, expect = [], [], None, None
 
 def accesses():
     """Yield (pa, dir, val) in order with repeat runs expanded, and ("MARK", text, None) for markers."""
@@ -56,6 +61,7 @@ def accesses():
             prev = (int(m.group(1), 16), m.group(2), int(m.group(4), 16))
             yield prev
 
+# Integrity: every transfer's byte count must equal the length its AUTO_CONF run was programmed with. A mismatch means log lines were lost (the console ring is shared with the kernel) and that transfer must not be replayed.
 for pa, d, val in accesses():
     if pa == "MARK":
         flush()
@@ -71,6 +77,7 @@ for pa, d, val in accesses():
         if kind is not None:
             flush()
         kind = "R" if val & (1 << 16) else "W"
+        expect = val & 0xFFFF
     elif off == 0x34 and d == "W":
         tx.append(val & 0xFF)
     elif off == 0x38 and d == "R":
@@ -78,4 +85,5 @@ for pa, d, val in accesses():
 flush()
 print("\n".join(out))
 xfers = [l for l in out if not l.startswith("#")]
+print("# integrity: %d transfer(s) whose byte count differs from the programmed length%s" % (bad, "" if bad == 0 else " -- DO NOT REPLAY"), file=sys.stderr)
 print("# %d transfers; targets: %s" % (len(xfers), ", ".join(sorted({l.split()[0] for l in xfers}))), file=sys.stderr)
