@@ -45,11 +45,6 @@ global_asm!(
 _entry:
     msr     daifset, #0xF
     mov     x19, x0                     // DTB from ABL
-    // Band in splash slot 3 (rows 288..384, grey A0) before anything else: ABL jumped into the hv. PC-relative, no stack, no memory of ours.
-    mov     x9, #3
-    movz    x10, #0xA0A0
-    movk    x10, #0xFFA0, lsl #16
-    bl      asm_band
     // Copy [_start, __hv_copy_end) to HV_BASE. PC-relative source, absolute destination; the MMU is off so these are plain DRAM writes.
     adrp    x1, _start
     add     x1, x1, :lo12:_start
@@ -67,11 +62,6 @@ _entry:
     ldr     x4, =.Lrelocated
     br      x4
 .Lrelocated:
-    // Band in slot 2 (rows 192..288, grey 60): the copy landed and the jump into it worked.
-    mov     x9, #2
-    movz    x10, #0x6060
-    movk    x10, #0xFF60, lsl #16
-    bl      asm_band
     // Zero bss, take the primary stack, enter Rust.
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end
@@ -187,41 +177,6 @@ unexpected:
 6:  wfe
     b       6b
 
-// Leaf, no stack: paint 88 rows of colour x10 across the layer DMA0 scans, at slot x9 (96 rows each). Clobbers x11-x16. Same registers and guards as splash::band.
-.global asm_band
-asm_band:
-    movz    x11, #0x1990, lsl #16       // DMA0
-    ldr     w12, [x11, #0x40]           // base (physical: translation off)
-    ldr     w13, [x11, #0x10]           // stride, pixels
-    ldr     w14, [x11, #0x1C]           // height:16 | width:16
-    and     x15, x14, #0xFFFF           // width
-    lsr     x14, x14, #16               // height
-    lsr     x16, x12, #31               // base below G#8000_0000 is not DRAM
-    cbz     x16, 9f
-    cbz     x13, 9f
-    cmp     x13, #8192
-    b.hi    9f
-    cbz     x15, 9f
-    add     x16, x9, #1
-    lsl     x16, x16, #5
-    add     x16, x16, x16, lsl #1       // (slot+1)*96
-    cmp     x14, x16
-    b.lo    9f
-    lsl     x16, x9, #5
-    add     x16, x16, x16, lsl #1       // slot*96 = first row
-    lsl     x13, x13, #2                // stride in bytes
-    madd    x12, x16, x13, x12          // row address
-    mov     x14, #88
-7:  mov     x16, x15                    // x pixels left
-    mov     x11, x12
-8:  str     w10, [x11], #4
-    subs    x16, x16, #1
-    b.ne    8b
-    add     x12, x12, x13
-    subs    x14, x14, #1
-    b.ne    7b
-    dsb     sy
-9:  ret
 
 // Leaf: x1 = MPIDR → x0 = index into the per-core tables (Aff1 is the core number on this SoC: cluster-level affinity sits in Aff2 and the nine cores are numbered 0-8 in Aff1).
 .global core_index
@@ -243,12 +198,8 @@ fn report(off: usize, v: u64) {
 
 fn stage(s: u64) {
     report(0x40, s);
-    // Slot 0 of the splash: a grey that climbs with the stage (A1 dark … A4 white); errors in slot 1 (magenta: DTB rebuild failed; green: an unexpected trap parked a core; yellow: panic).
+    // Errors only, in slot 1 of the splash (magenta: DTB rebuild failed; green: an unexpected trap parked a core; yellow: panic). The progress greys (slots 0, 2, 3) were bring-up crumbs, invisible until the boot gate began pushing the restored splash as a frame (2026-10-20: grey bars above Google's logo) — removed.
     match s {
-        STAGE_ENTERED => splash::band(0, 0xFF40_4040),
-        STAGE_DTB_DONE => splash::band(0, 0xFF80_8080),
-        STAGE_EL2_DONE => splash::band(0, 0xFFC0_C0C0),
-        STAGE_ERET => splash::band(0, 0xFFFF_FFFF),
         STAGE_DTB_FAILED => splash::band(1, 0xFFFF_00FF),
         STAGE_UNEXPECTED_TRAP => splash::band(1, 0xFF00_FF00),
         STAGE_PANIC => splash::band(1, 0xFFFF_FF00),
