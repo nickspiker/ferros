@@ -98,7 +98,8 @@ fn transfer(base: usize, target: u8, tx: &[u8], rx: &mut [u8], hold: bool) -> Re
     wr(base + CTL, CTL_MASTER | if read { CTL_RXCHON } else { CTL_TXCHON });
     wr(base + INT_STATUS, rd(base + INT_STATUS));
     wr(base + ADDR, ADDR_MASTER_ID_7 | (target as u32) << 10);
-    wr(base + INT_ENABLE, INT_TRANSFER_DONE);
+    // Done plus the error sources: without them enabled their status bits never latch, and a NACK looks like a hang (measured 2026-10-19 on the camera-PMIC bus: INT_STATUS G#401 once G#F81 was enabled, i.e. no-device).
+    wr(base + INT_ENABLE, INT_TRANSFER_DONE | INT_ERRORS);
     let mut auto = len | if read { AUTO_READ } else { 0 } | if hold { 0 } else { AUTO_STOP_AFTER_TRANS };
     wr(base + AUTO_CONF, auto);
     auto |= AUTO_MASTER_RUN;
@@ -266,5 +267,10 @@ pub fn write_bytes(base: usize, target: u8, w: &[u8]) -> Result<(), u32> {
 /// Write `w` without STOP, then read `r.len()` bytes: a register read for devices with multi-byte register addresses.
 pub fn write_read(base: usize, target: u8, w: &[u8], r: &mut [u8]) -> Result<(), u32> {
     transfer(base, target, w, &mut [], true)?;
+    transfer(base, target, &[], r, false)
+}
+
+/// A bare read of `r.len()` bytes with STOP, no register address first: the probe a bus scan uses.
+pub fn read_one(base: usize, target: u8, r: &mut [u8]) -> Result<(), u32> {
     transfer(base, target, &[], r, false)
 }

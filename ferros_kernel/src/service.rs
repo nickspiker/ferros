@@ -777,6 +777,35 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam scan" {
+                                            // `diag cam scan`: which addresses acknowledge on the camera-PMIC bus.
+                                            crate::camera::scan(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params.starts_with(b"acpm ") {
+                                            // `diag acpm r <speedy> <type> <reg>` / `diag acpm u <speedy> <type> <reg> <val> <mask>` (hex): one PMIC transaction over the ACPM channel, for experiments without a rebuild.
+                                            let words: alloc::vec::Vec<&[u8]> = cmd.params[5..].split(|&c| c == b' ').filter(|w| !w.is_empty()).collect();
+                                            let hx = |w: &[u8]| -> Option<u32> { let w = w.strip_prefix(b"G#").or_else(|| w.strip_prefix(b"0x")).unwrap_or(w); u32::from_str_radix(core::str::from_utf8(w).ok()?, 16).ok() };
+                                            let nums: alloc::vec::Vec<u32> = words.iter().skip(1).filter_map(|w| hx(w)).collect();
+                                            let out = match (words.first().copied(), nums.as_slice()) {
+                                                (Some(b"r"), [sp, ty, rg]) => alloc::format!("read {sp:X}/{ty:X}/{rg:X}: {:?}\n", crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))),
+                                                (Some(b"u"), [sp, ty, rg, v, m]) => {
+                                                    let r = crate::acpm::update(*sp, *ty, *rg, *v as u8, *m as u8);
+                                                    alloc::format!("update {sp:X}/{ty:X}/{rg:X} val G#{v:X} mask G#{m:X}: {:?}; now {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}")))
+                                                }
+                                                _ => alloc::string::String::from("usage: acpm r <speedy> <type> <reg> | acpm u <speedy> <type> <reg> <val> <mask> (hex)\n"),
+                                            };
+                                            resp.extend_from_slice(out.as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam pmicon" {
+                                            // `diag cam pmicon`: raise the camera PMIC's supply enables (sub-PMIC GPIO1, GPIO3) and read its ID.
+                                            crate::camera::pmic_power_on(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam pmic" {
                                             // `diag cam pmic`: the camera PMIC's ID and the main camera's regulators, read only.
                                             crate::camera::pmic_dump(&mut resp);

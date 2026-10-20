@@ -160,7 +160,70 @@ pub fn state(rep: &mut Vec<u8>) {
     };
     show(rep, "main PMIC top G#0B", acpm::read(acpm::MAIN, acpm::T_TOP, 0x0B));
     show(rep, "sub PMIC top G#0B", acpm::read(acpm::SUB, acpm::T_TOP, 0x0B));
+    show(rep, "sub GPIO0_SET (camera PMIC chip select)", acpm::read(acpm::SUB, acpm::T_GPIO, 0x08));
+    show(rep, "sub GPIO1_SET (camera PMIC buck-boost enable)", acpm::read(acpm::SUB, acpm::T_GPIO, 0x09));
     show(rep, "sub GPIO2_SET (sensor enable)", acpm::read(acpm::SUB, acpm::T_GPIO, 0x0A));
+    show(rep, "sub GPIO3_SET (camera PMIC buck enable)", acpm::read(acpm::SUB, acpm::T_GPIO, 0x0B));
     show(rep, "sub L12S_CTRL (1.85 V rail)", acpm::read(acpm::SUB, acpm::T_PMIC, 0x3A));
     show(rep, "sub L26S_CTRL (3.3 V rail)", acpm::read(acpm::SUB, acpm::T_PMIC, 0x48));
+}
+
+/// Sub-PMIC GPIOx_SET is G#08 + x in its GPIO block (s2mpg15-register.h); bit 6 enables the output, bit 5 is the level (s2mpg1415-gpio.c).
+const GPIO_OEN_OUT: u8 = 0x60;
+fn sub_gpio_high(n: u32) -> Result<(), u32> {
+    acpm::update(acpm::SUB, acpm::T_GPIO, 0x08 + n, GPIO_OEN_OUT, GPIO_OEN_OUT)
+}
+
+fn spin_us(us: u64) {
+    let t = crate::platform::cntpct() + crate::platform::cntfrq() / 1_000_000 * us;
+    while crate::platform::cntpct() < t {}
+}
+
+/// Power the camera PMIC the way its driver does (`slg51002_power_on`): buck-boost enable (sub GPIO1) high, 2 ms, buck enable (sub GPIO3) high, 2 ms. Then read its pattern ID to see it answer. The tuning writes and chip select (sub GPIO0) that follow in the driver are left for the next step, once the chip is known to be alive.
+pub fn pmic_power_on(rep: &mut Vec<u8>) {
+    for (n, label) in [(1, "GPIO1 buck-boost"), (3, "GPIO3 buck")] {
+        let r = sub_gpio_high(n);
+        let v = acpm::read(acpm::SUB, acpm::T_GPIO, 0x08 + n);
+        line(rep, alloc::format!("{label}: set {:?}, reads {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), v.map(|x| alloc::format!("G#{x:X}")).map_err(|e| alloc::format!("G#{e:X}"))));
+        spin_us(2000);
+    }
+    if !crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode) {
+        line(rep, alloc::format!("PMIC bus not up: run `diag cam bus` first\n"));
+        return;
+    }
+    // A failed attempt on the unpowered chip leaves bytes in the TX FIFO: reset the controller before the first real transfer.
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    let mut s = alloc::string::String::from("SLG51002 pattern ID:");
+    for r in 0x1105u16..=0x1107 {
+        match pmic_read(r) {
+            Ok(v) => s.push_str(&alloc::format!(" G#{v:02X}")),
+            Err(e) => {
+                let b = PMIC_BUS.base;
+                s.push_str(&alloc::format!(" error G#{e:X}: TRANS_STATUS G#{:X} INT_STATUS G#{:X} FIFO_STATUS G#{:X}", rd(b + 0x50), rd(b + 0x24), rd(b + 0x30)));
+                break;
+            }
+        }
+    }
+    s.push('\n');
+    line(rep, s);
+}
+
+/// Probe every 7-bit address on the camera-PMIC bus with a one-byte read and list the ones that acknowledge. The flash driver (LM3644, G#63) shares the bus and is expected to answer whatever the camera PMIC's state; if nothing answers, the bus itself is at fault.
+pub fn scan(rep: &mut Vec<u8>) {
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    let mut found = alloc::string::String::new();
+    let mut other = 0u32;
+    for a in 0x08u8..0x78 {
+        let mut b = [0u8; 1];
+        match crate::hsi2c::read_one(PMIC_BUS.base, a, &mut b) {
+            Ok(()) => found.push_str(&alloc::format!(" G#{a:02X}")),
+            Err(e) => {
+                if e != crate::hsi2c::E_NODEV {
+                    other += 1;
+                }
+                crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+            }
+        }
+    }
+    line(rep, alloc::format!("PMIC bus scan: acknowledged{}; non-NACK failures {other}\n", if found.is_empty() { " none".into() } else { found }));
 }
