@@ -31,8 +31,8 @@ Also open: the cold vault accepts only the first write per boot and that write d
 
 Done: ferros_kernel/src/kvault.rs (manifestus over two UFS mirror regions of the ferros partition, values sealed, a sealed name index for `store ls`); vault_boot/service switched to it, no silent format any more; flash log (flashlog.rs, `diag log`) and manifestus storage events logged; `diag kv selftest`; manifestus no_std fix and vsf 0.12 bump pushed.
 Verified on the phone: genesis once (17.6 s), later opens ~6 ms, small values and genesis survive reboots, a 30 KB value stored through `store put` reads back identical with the current build.
-Left: the earlier `Corrupt("furrow 0 unsealed")` reads came from values written by an older kernel build in the same regions (each such 30 KB set cost ~400 blocks); confirm with a reboot that new large values persist, decide whether to wipe the regions written by the old builds, re-provision `init` and `sealed`, then remove ferros_vault from the kernel (shim.rs entry_genesis, UfsDevice, ira.rs AnchorKey, wairua NonceSource).
-Also: kete, photon and other dependents of ../vsf still ask for vsf 0.11 and will not resolve against 0.12.
+**Closed 2026-10-20 (Opus 5):** a 30 KB value written by the current build reads back identical after a reboot, and only the values written by the older builds were corrupt — all of those are now deleted, so the vault holds just `genesis`. Reserved names (leading NUL: the name index, selftest scratch) no longer show in `store ls`. The vsf version question closed itself: vsf went back to one unreleased 0.10.0 and manifestus with it.
+Left: re-provision `init` (a capsule, when one is wanted) and `sealed`; then remove ferros_vault from the kernel (shim.rs entry_genesis, UfsDevice, ira.rs AnchorKey, wairua NonceSource all still use it).
 
 ## 3. Attestation / Play Integrity discussion (2026-10-19)
 

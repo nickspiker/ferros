@@ -20,8 +20,11 @@ const MIRROR_B: u64 = MIRROR_A + REGION_BLOCKS;
 const RING_LOG2: u8 = manifestus::HOST_RING_LOG2;
 const ADDR_CONTEXT: &str = "ferros.kernel.store.addr.v0";
 const PAYLOAD_CONTEXT: &str = "ferros.kernel.store.payload.v0";
-/// The kernel's list of names ('\n'-separated), itself stored under this name.
+/// The kernel's list of names ('\n'-separated), itself stored under this name. Every name starting with NUL is the kernel's own (the list, the selftest's scratch): never listed, never indexed, so `store ls` shows only what a caller stored.
 const NAMES: &str = "\0names";
+fn reserved(name: &str) -> bool {
+    name.starts_with('\0')
+}
 
 /// Block I/O counters for `selftest`.
 static READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -156,6 +159,9 @@ impl KVault {
     /// Store `value` under `name`, durably (manifestus commits per put). Returns the value's vault address.
     pub fn set(&mut self, name: &str, value: Vec<u8>) -> Result<[u8; 32], KvError> {
         let a = self.raw_put(name, &value)?;
+        if reserved(name) {
+            return Ok(a);
+        }
         let mut names = self.keys()?;
         if !names.iter().any(|n| n == name) {
             names.push(String::from(name));
@@ -183,7 +189,7 @@ impl KVault {
             None => Ok(Vec::new()),
             Some(b) => {
                 let s = core::str::from_utf8(&b).map_err(|_| KvError::BadNames)?;
-                Ok(s.split('\n').filter(|n| !n.is_empty()).map(String::from).collect())
+                Ok(s.split('\n').filter(|n| !n.is_empty() && !reserved(n)).map(String::from).collect())
             }
         }
     }
@@ -224,7 +230,7 @@ impl KVault {
         out.push_str(&alloc::format!("keys: {:?}\n", names.as_ref().map(|n| n.len())));
         check(self, "after reading the names", &mut out);
         let mut n = names.unwrap_or_default();
-        n.push(alloc::string::String::from("\0selftest-marker"));
+        n.push(alloc::string::String::from("\0selftest-marker")); // reserved: dropped by `keys` on the way back
         let r = self.raw_put(NAMES, n.join("\n").as_bytes());
         out.push_str(&alloc::format!("names put: {:?}\n", r.map(|_| ())));
         check(self, "after the names put", &mut out);
