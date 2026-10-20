@@ -20,6 +20,13 @@ Left to do, in order:
 
 Stopped while writing a userspace tool to read the camera HAL's PDMA command lists out of its process memory on Android. Still open: getting the front end's DMA configuration (see docs/oracle/CAMERA.md "Next"). The hv route (`FERROS_HV_PDMA_DUMP`) is parked; the next idea there is trapping the ISPFE SYSMMU register pages to see where Linux writes the page-table base.
 
+## 2b. Camera first frame (stopped 2026-10-20 morning)
+
+Done and committed: the PDMA list format and the full decoded front-end program (docs/oracle/CAMERA.md, camera-ispfe-pdma-writes.txt, tools/oracle-decode-pdma.py); tools/camera-prog.py (builds a CPR2 program: CPU setup before the PDMA start, the PDMA program, CPU setup after, buffer IOVAs moved to PA G#8800_0000+); `diag cam frame` in camera.rs (FERROS_CAM_FRAME=<local bundle> embeds init + program at build time; the bundle stays in target/cam, never the repo).
+State at the stop: on a cold boot the sensor streams and CSI link 1 counts frames, the whole program applies with no hang, but nothing in the ISPFE pages changes and no output buffer is written. The link-to-front-end path is still not running.
+Left to do: find what connects CSI link 1 to the ISPFE input (compare a full ISPFE + CSIS register snapshot from Linux while streaming against ferros's), then read a frame back.
+Also open: the cold vault accepts only the first write per boot and that write does not survive a reboot (store put returns "vault error" afterwards).
+
 ## 3. Attestation / Play Integrity discussion (2026-10-19)
 
 Conversation only, no code: what spoofing verified-boot / attestation state would expose for banking and Wallet apps. Nothing in the repo depends on it.

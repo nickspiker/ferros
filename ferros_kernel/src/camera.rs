@@ -594,3 +594,183 @@ pub fn stream_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
         line(rep, alloc::format!("  none\n"));
     }
 }
+
+/// The front end's DMA path (zuma-isp.dtsi): three S2MPUs and three SYSMMUs in front of its masters, and the gates CMU_ISPFE keeps on them (cmucal-sfr.c).
+const ISPFE_S2MPUS: [usize; 3] = [0x1C14_0000, 0x1C18_0000, 0x1C1C_0000];
+const ISPFE_SYSMMUS: [(usize, usize); 3] = [(0x1C11_0000, 0x213C), (0x1C15_0000, 0x2094), (0x1C19_0000, 0x2098)];
+/// ISPFE core clock gate (CLK_CON_GAT_GOUT_BLK_ISPFE_UID_ISPFE_IPCLKPORT_CLK_ISPFE).
+const ISPFE_CORE_GATE: usize = CMU_ISPFE + 0x20B8;
+const ISPFE: usize = 0x1C30_0000;
+const PATTERN: u32 = 0xA5A5_A5A5;
+/// The front end's status words Linux's per-frame handler reads (ispfe-full capture, 2026-10-19), with their values under Linux: channel interrupt status G#1C32_0424 / G#1C32_2024 (1, 8, G#12, G#13), G#1C32_008C (G#81 / 1), a counter G#1C32_0124 (G#7_5000 / G#7_5800) and what looks like a data checksum G#1C32_013C.
+const ISPFE_STATUS: [usize; 15] = [0x1C32_003C, 0x1C32_008C, 0x1C32_0094, 0x1C32_0110, 0x1C32_011C, 0x1C32_0124, 0x1C32_013C, 0x1C32_0424, 0x1C32_0430, 0x1C32_0444, 0x1C32_2024, 0x1C32_2030, 0x1C32_2044, 0x1C33_0000, 0x1C35_0000];
+const PROBE_BYTES: usize = 16 * 1024;
+
+/// Let the front end's masters reach physical memory: S2MPU protection off for every VID, SYSMMU VM 0 translation off (bypass), the ISPFE core clock on.
+fn ispfe_dma_open(rep: &mut Vec<u8>) {
+    for s in ISPFE_S2MPUS {
+        let v = rd(s + 0x60);
+        if v & 0xFFFF_0000 == 0x9000_0000 {
+            wr(s + 0x54, 0xFF);
+            line(rep, alloc::format!("S2MPU G#{s:X}: protection off (G#{:X})\n", rd(s)));
+        } else {
+            line(rep, alloc::format!("S2MPU G#{s:X}: version G#{v:X}, left alone\n"));
+        }
+    }
+    for (m, gate) in ISPFE_SYSMMUS {
+        let g = rd(CMU_ISPFE + gate);
+        if !gate_open(g) {
+            line(rep, alloc::format!("SYSMMU G#{m:X}: clock gated (G#{g:X}), left alone\n"));
+            continue;
+        }
+        let (ctrl, vm) = (rd(m), rd(m + 0x8000));
+        if vm & 1 != 0 {
+            wr(m + 0x8000, vm & !1);
+        }
+        line(rep, alloc::format!("SYSMMU G#{m:X}: CTRL G#{ctrl:X} CTRL_VM0 G#{vm:X} -> G#{:X}\n", rd(m + 0x8000)));
+    }
+    let g = rd(ISPFE_CORE_GATE);
+    if !gate_open(g) {
+        wr(ISPFE_CORE_GATE, g | 1 << 20 | 1 << 21);
+    }
+    line(rep, alloc::format!("ISPFE core gate G#{g:X} -> G#{:X}\n", rd(ISPFE_CORE_GATE)));
+}
+
+/// Parse a `cam.ispfe.prog` (tools/camera-prog.py): 'CPRG', nbuf, buffer PAs, npairs, (register, value) pairs; or 'CPR2' with three such sections: the CPU's writes before the PDMA start, the PDMA program, the CPU's writes after it.
+fn parse_prog(p: &[u8]) -> Option<(Vec<usize>, [Vec<(usize, u32)>; 3])> {
+    let w = |i: usize| p.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let v2 = match p.get(..4)? {
+        b"CPRG" => false,
+        b"CPR2" => true,
+        _ => return None,
+    };
+    let nb = w(1)? as usize;
+    let bufs = (0..nb).map(|i| w(2 + i).map(|v| v as usize)).collect::<Option<Vec<_>>>()?;
+    let mut at = 2 + nb;
+    let mut section = || -> Option<Vec<(usize, u32)>> {
+        let n = w(at)? as usize;
+        let v = (0..n).map(|i| Some((w(at + 1 + 2 * i)? as usize, w(at + 2 + 2 * i)?))).collect::<Option<Vec<_>>>()?;
+        at += 1 + 2 * n;
+        Some(v)
+    };
+    if v2 {
+        let pre = section()?;
+        let main = section()?;
+        let post = section()?;
+        Some((bufs, [pre, main, post]))
+    } else {
+        Some((bufs, [Vec::new(), section()?, Vec::new()]))
+    }
+}
+
+/// `diag cam frame`: everything `cam stream` does up to the receiver, then the front end's DMA program (the HAL's PDMA list, decoded, its output buffers moved to physical memory filled with a pattern), stream for half a second, and report which output buffers the front end wrote.
+pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>) {
+    let Some((mut bufs, sections)) = prog.as_deref().and_then(parse_prog) else {
+        return line(rep, alloc::format!("refusing: no valid `cam.ispfe.prog` in the vault (tools/camera-prog.py, then bridge store put cam.ispfe.prog @file)\n"));
+    };
+    bufs.sort();
+    bufs.dedup();
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no `cam.boitata.init` in the vault\n"));
+    };
+    fe_up(rep);
+    if !fe_powered() {
+        return;
+    }
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    let iso = 0x1546_3EBCusize;
+    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
+    ispfe_dma_open(rep);
+    for &b in &bufs {
+        for o in (0..PROBE_BYTES).step_by(4) {
+            wr(b + o, PATTERN);
+        }
+    }
+    for (name, pairs) in ["CPU setup before the PDMA start", "PDMA program", "CPU setup after the PDMA start"].iter().zip(sections.iter()) {
+        let mut applied = 0u32;
+        let mut skipped = 0u32;
+        for &(a, v) in pairs {
+            // The ISPFE block, the CSI links and the PDMA wrapper; never the PDMA engine page (its descriptor ring is not used) or anything outside the front end.
+            if (0x1C04_0000..ISPFE + 0x10_0000).contains(&a) && !(0x1C39_0000..0x1C39_1000).contains(&a) {
+                wr(a, v);
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        line(rep, alloc::format!("{name}: A#{applied} writes applied, A#{skipped} outside the front end skipped\n"));
+    }
+    line(rep, alloc::format!("A#{} output buffers patterned\n", bufs.len()));
+    let snap = || ISPFE_STATUS.map(|a| rd(a));
+    let before = snap();
+    // Whole pages, to see what moves at all while streaming: the two output channels and CSI link 1.
+    const PAGES: [usize; 3] = [0x1C32_0000, 0x1C32_2000, CSIS_LINK1];
+    let page_snap = || -> Vec<u32> { PAGES.iter().flat_map(|&p| (0..1024).map(move |i| rd(p + i * 4))).collect() };
+    let pages_before = page_snap();
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    let mut series = alloc::string::String::new();
+    for _ in 0..10 {
+        spin_us(50_000);
+        let mut b = [0u8; 2];
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
+            Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
+            Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
+        }
+    }
+    let after = snap();
+    let pages_after = page_snap();
+    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    spin_us(50_000);
+    for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+        wr(a, v);
+    }
+    line(rep, alloc::format!("stream on {:?} off {:?}; sensor frame counter:{series}\n", son.is_ok(), soff.is_ok()));
+    let mut st = alloc::string::String::from("front-end status before -> while streaming:");
+    for (i, a) in ISPFE_STATUS.iter().enumerate() {
+        st.push_str(&alloc::format!(" G#{:X}: G#{:X}{}", a & 0xF_FFFF, before[i], if before[i] != after[i] { alloc::format!("->G#{:X}", after[i]) } else { alloc::string::String::new() }));
+    }
+    st.push('\n');
+    line(rep, st);
+    let mut moved = alloc::string::String::from("words that changed while streaming:");
+    let mut n = 0;
+    for (i, (b, a)) in pages_before.iter().zip(pages_after.iter()).enumerate() {
+        if b != a {
+            n += 1;
+            if n <= 48 {
+                moved.push_str(&alloc::format!(" G#{:X}: G#{b:X}->G#{a:X}", PAGES[i / 1024] + (i % 1024) * 4));
+            }
+        }
+    }
+    moved.push_str(&alloc::format!(" (A#{n} in all)\n"));
+    line(rep, moved);
+    let mut any = false;
+    for &b in &bufs {
+        let mut changed = 0usize;
+        let mut first = None;
+        for o in (0..PROBE_BYTES).step_by(4) {
+            if rd(b + o) != PATTERN {
+                changed += 1;
+                first.get_or_insert(o);
+            }
+        }
+        if changed > 0 {
+            any = true;
+            let f = first.unwrap();
+            line(rep, alloc::format!("buffer G#{b:X}: A#{changed} of A#{} words written, first at +G#{f:X}: G#{:08X} G#{:08X} G#{:08X} G#{:08X}\n", PROBE_BYTES / 4, rd(b + f), rd(b + f + 4), rd(b + f + 8), rd(b + f + 12)));
+        }
+    }
+    if !any {
+        line(rep, alloc::format!("no output buffer changed in its first A#{} KiB\n", PROBE_BYTES / 1024));
+    }
+}

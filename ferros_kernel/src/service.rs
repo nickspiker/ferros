@@ -777,6 +777,24 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam frame" {
+                                            // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
+                                            // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).
+                                            let mut bundle = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                                            if bundle.is_none() && cfg!(cam_frame_blob) {
+                                                bundle = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                                            }
+                                            let (init, prog) = match bundle.as_deref() {
+                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                                    if 8 + n <= b.len() { (Some(b[8..8 + n].to_vec()), Some(b[8 + n..].to_vec())) } else { (None, None) }
+                                                }
+                                                _ => (store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()), store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
+                                            };
+                                            crate::camera::frame_probe(&mut resp, init, prog);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam stream" {
                                             // `diag cam stream`: replay the sensor init from the vault, configure CSI link 1, stream 300 ms, report what the link saw.
                                             let init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());

@@ -17,6 +17,18 @@ fn main() {
         println!("cargo:rustc-cfg=shim_handoff");
     }
     println!("cargo:rustc-check-cfg=cfg(shim_handoff)");
+    // FERROS_CAM_FRAME=<file>: embed a `cam.frame` bundle ('CFRM' + init length + sensor init + front-end program) so `diag cam frame` works without the vault. Dev only: the bundle carries the sensor vendor's settings, so it comes from a local file (never the repo) and only into a locally built image.
+    println!("cargo:rustc-check-cfg=cfg(cam_frame_blob)");
+    println!("cargo:rerun-if-env-changed=FERROS_CAM_FRAME");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_frame.bin");
+    match std::env::var("FERROS_CAM_FRAME") {
+        Ok(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::copy(&path, &out).unwrap_or_else(|e| panic!("FERROS_CAM_FRAME {path}: {e}"));
+            println!("cargo:rustc-cfg=cam_frame_blob");
+        }
+        Err(_) => std::fs::write(&out, b"").unwrap(),
+    }
     // FERROS_PRODUCTION: the "Ready?" gate waits for the power key (dev builds auto-press after two seconds).
     if std::env::var("FERROS_PRODUCTION").is_ok() {
         println!("cargo:rustc-cfg=ferros_production");
