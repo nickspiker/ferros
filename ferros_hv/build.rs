@@ -53,7 +53,10 @@ fn main() {
     // FERROS_HV_ORACLE_ARM_AFTER_MS: no logging before this counter time in ms (the hv's counter runs close to the kernel's printk clock, measured 2026-10-19), so boot-time bursts are skipped and logging starts at the first access after it.
     println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_ARM_AFTER_MS");
     let after: u64 = std::env::var("FERROS_HV_ORACLE_ARM_AFTER_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\npub const ORACLE_QUIET: [u64; {}] = [{}];\npub const ORACLE_ARM_AFTER_MS: u64 = {};\n", pages.len(), list.join(", "), cap, gap, quiet.len(), qlist.join(", "), after)).unwrap();
+    // FERROS_HV_ORACLE_CENSUS=1: log only the first access to each target page — which pages a subsystem uses, before a full capture of just those.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_ORACLE_CENSUS");
+    let census = std::env::var("FERROS_HV_ORACLE_CENSUS").map(|v| v == "1").unwrap_or(false);
+    std::fs::write(&out, format!("pub const ORACLE_TARGETS: [u64; {}] = [{}];\npub const ORACLE_CAP: u64 = {};\npub const ORACLE_ARM_GAP_S: u64 = {};\npub const ORACLE_QUIET: [u64; {}] = [{}];\npub const ORACLE_ARM_AFTER_MS: u64 = {};\npub const ORACLE_CENSUS: bool = {};\n", pages.len(), list.join(", "), cap, gap, quiet.len(), qlist.join(", "), after, census)).unwrap();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=HV_BUILD_TAG={} {}", stamp % 100000, if tag.is_empty() { "base".to_string() } else { tag.trim_end().to_string() });
 }

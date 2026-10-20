@@ -341,6 +341,23 @@ unsafe fn stage2_unmap(ipa: u64) {
     write_volatile(l3.add(l3i), 0);
 }
 
+/// Put one previously unmapped page back into the identity map (a page descriptor again), so the guest's next access goes straight to the hardware. Used when a trapped access cannot be emulated from its syndrome.
+unsafe fn stage2_remap(ipa: u64) {
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    let e1 = read_volatile(s2.add((ipa >> 30) as usize));
+    if e1 & 0b11 != 0b11 {
+        return;
+    }
+    let l2 = (e1 & S2_ADDR) as *mut u64;
+    let e2 = read_volatile(l2.add(((ipa >> 21) & 0x1FF) as usize));
+    if e2 & 0b11 != 0b11 {
+        return;
+    }
+    let l3 = (e2 & S2_ADDR) as *mut u64;
+    write_volatile(l3.add(((ipa >> 12) & 0x1FF) as usize), (ipa & !0xFFF) | S2_PAGE);
+    asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
+}
+
 /// Build the shared stage-2 table once (the primary boots and enables it before any secondary is started, so the flag needs no lock), unmap the oracle's targets into it, and return its base for VTTBR_EL2. Secondaries call this too and get the finished table.
 unsafe fn stage2_base() -> u64 {
     let s2 = (&raw mut STAGE2) as *mut u64;
@@ -368,6 +385,8 @@ static mut ORACLE_LOGGED: u64 = 0;
 /// The last logged access (pa, value, write<<8 | bytes) and how many identical ones followed it unlogged: a driver's status poll is the same read returning the same value thousands of times, and logging each one ate the whole cap on the camera bus (2026-10-19). A run is written as one `rep N` line when it ends; the decoder replays it.
 static mut ORACLE_PREV: [u64; 3] = [u64::MAX; 3];
 static mut ORACLE_REP: u64 = 0;
+/// Census mode: one bit per oracle target page, set at its first logged access.
+static mut ORACLE_SEEN: [u64; 32] = [0; 32];
 
 fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
     unsafe {
@@ -390,6 +409,23 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
                 pstore::log(&[b"\nferros hv: oracle armed at t=", pstore::hex(now / (freq / 1000), &mut ht), b" ms\n"]);
             } else {
                 return;
+            }
+        }
+        if ORACLE_CENSUS {
+            // First access per page only: binary search the sorted target list, one bit per target.
+            let page = pa & !0xFFF;
+            let (mut lo, mut hi) = (0usize, ORACLE_TARGETS.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if ORACLE_TARGETS[mid] < page { lo = mid + 1 } else { hi = mid }
+            }
+            if lo < ORACLE_TARGETS.len() && ORACLE_TARGETS[lo] == page {
+                let seen = &raw mut ORACLE_SEEN;
+                let (w, b) = (lo / 64, lo % 64);
+                if (*seen)[w] & (1 << b) != 0 {
+                    return;
+                }
+                (*seen)[w] |= 1 << b;
             }
         }
         let meta = ((write as u64) << 8) | bytes as u64;
@@ -892,13 +928,21 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     }
                 }
                 oracle_log(pa, wnr == 1, bytes, logval);
+                unsafe {
+                    let elr: u64;
+                    asm!("mrs {v}, elr_el2", v = out(reg) elr);
+                    asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                }
             } else {
-                oracle_log(pa, wnr == 1, 0, esr);
-            }
-            unsafe {
-                let elr: u64;
-                asm!("mrs {v}, elr_el2", v = out(reg) elr);
-                asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                // No syndrome (a load/store pair, or one with base writeback such as memcpy_fromio's post-increment loop): skipping it would leave the guest's pointer unadvanced and its copy loop spinning until the watchdog (the boot hangs of 2026-10-19 with the ISP front end trapped). Hand the page back to the guest and let the instruction run natively; that page is no longer observed.
+                unsafe {
+                    stage2_remap(pa);
+                    bump(0xB8);
+                    if read_volatile((REPORT + 0xB8) as *const u64) <= 32 {
+                        let (elr, mut h0, mut h1, mut h2) = { let e: u64; asm!("mrs {v}, elr_el2", v = out(reg) e); (e, [0u8; 16], [0u8; 16], [0u8; 16]) };
+                        pstore::log(&[b"\nferros hv: S2 no-syndrome access at ", pstore::hex(pa, &mut h0), b" from ", pstore::hex(elr, &mut h1), b" ESR ", pstore::hex(esr, &mut h2), b" -- page returned to the guest\n"]);
+                    }
+                }
             }
         }
         0x16 => {
