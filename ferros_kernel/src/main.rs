@@ -51,6 +51,8 @@ mod touch;
 #[cfg(feature = "pixel8")]
 mod partfs;
 #[cfg(feature = "pixel8")]
+mod flashlog;
+#[cfg(feature = "pixel8")]
 mod modem;
 // The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
 #[cfg(feature = "pixel8")]
@@ -1638,6 +1640,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
+    if link_up {
+        let ok = flashlog::init();
+        flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
+    }
     let (probe, store) = vault_boot::vault_probe(link_up);
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {

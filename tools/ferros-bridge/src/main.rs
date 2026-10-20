@@ -879,6 +879,10 @@ async fn cmd_store(args: &[String]) {
         }
         Some(s) => {
             eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", _ => "unknown status" });
+            // Newer kernels follow status 2 with the vault's own error text.
+            if r.len() > 1 {
+                eprintln!("  {}", String::from_utf8_lossy(&r[1..]));
+            }
             std::process::exit(1);
         }
         None => {

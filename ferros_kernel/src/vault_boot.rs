@@ -88,14 +88,26 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     crumb(0xE6); // TRNG seed drawn (SMC)
     let nonce0 = alloc::boxed::Box::new(nonce_src); // coerces to Box<dyn NonceSource> at the call
     crumb(0xE0); // first heap allocation done; before Store::open (UFS prefix read -> bounded read -> decode -> anchor decrypt)
-    match Store::open(dev0, key, nonce0) {
+    let anchor_text = |a: &ferros_vault::vault_anchor::VaultAnchor| alloc::format!("anchor seq {} ring {} capacity {} tail {} root {:02x}{:02x}{:02x}{:02x}", a.anchor_seq, a.ring_size, a.payload_capacity, a.object_tail, a.root_commit.0[0], a.root_commit.0[1], a.root_commit.0[2], a.root_commit.0[3]);
+    let opened = Store::open(dev0, key, nonce0);
+    match &opened {
+        Ok(store) => crate::flashlog::line(&alloc::format!("vault open ok: {}, keys {:?}", anchor_text(store.anchor()), store.keys().map(|k| k.len()))),
+        Err(e) => crate::flashlog::line(&alloc::format!("vault open FAILED: {e:?}")),
+    }
+    match opened {
         Ok(store) => {
             p.opened = 1;
             p.root16.copy_from_slice(&store.root_commit_hash().0[..16]);
             match store.get_by_key(LKEY) {
                 Ok(Some(v)) if v.as_slice() == MSG => p.verified = 1,
-                Ok(_) => need_seal = true, // vault present but key absent/mismatched
-                Err(_) => p.stage = 3,
+                Ok(_) => {
+                    crate::flashlog::line("vault open: genesis key absent or wrong, will FORMAT");
+                    need_seal = true // vault present but key absent/mismatched
+                }
+                Err(e) => {
+                    crate::flashlog::line(&alloc::format!("vault open: genesis read failed: {e:?}"));
+                    p.stage = 3
+                }
             }
             if !need_seal {
                 kept = Some(store);
@@ -106,6 +118,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     crumb(0xE1); // Store::open returned
     if need_seal {
         crumb(0xE2); // before Store::format (seal + UFS write)
+        crate::flashlog::line(&alloc::format!("vault FORMAT (wipes everything): capacity {DEFAULT_PAYLOAD_CAPACITY} ring {DEFAULT_RING_SIZE}"));
         match Store::format(fresh_dev(), key, DEFAULT_PAYLOAD_CAPACITY, DEFAULT_RING_SIZE, alloc::boxed::Box::new(crate::wairua::TrngNonce::new())) {
             Ok(mut store) => match store.set(LKEY, MSG.to_vec()) {
                 Ok(_) => {

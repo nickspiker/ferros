@@ -181,13 +181,24 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 Some(k) if !k.is_empty() => k,
                 _ => return alloc::vec![3],
             };
+            let len = params.len() - 2 - klen;
+            let a = store.anchor().clone();
+            crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes: before seq {} tail {} capacity {}", a.anchor_seq, a.object_tail, a.payload_capacity));
             match store.set(&key, params[2 + klen..].to_vec()) {
                 Ok(h) => {
+                    let a = store.anchor();
+                    crate::flashlog::line(&alloc::format!("store set {key:?} ok: after seq {} tail {}", a.anchor_seq, a.object_tail));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h.0);
                     r
                 }
-                Err(_) => alloc::vec![2],
+                Err(e) => {
+                    crate::flashlog::line(&alloc::format!("store set {key:?} FAILED: {e:?}"));
+                    // Status 2 followed by the vault's own error text, so the bridge can show it.
+                    let mut r = alloc::vec![2u8];
+                    r.extend_from_slice(alloc::format!("{e:?}").as_bytes());
+                    r
+                }
             }
         }
         ferros_pt::Op::Read => {
@@ -219,11 +230,15 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             }
         }
         ferros_pt::Op::Exec => match key_of(params) {
-            Some(k) if !k.is_empty() => match store.remove_key(&k) {
-                Ok(true) => alloc::vec![0],
-                Ok(false) => alloc::vec![1],
-                Err(_) => alloc::vec![2],
-            },
+            Some(k) if !k.is_empty() => {
+                let r = store.remove_key(&k);
+                crate::flashlog::line(&alloc::format!("store remove {k:?}: {r:?}"));
+                match r {
+                    Ok(true) => alloc::vec![0],
+                    Ok(false) => alloc::vec![1],
+                    Err(_) => alloc::vec![2],
+                }
+            }
             _ => alloc::vec![3],
         },
     }
@@ -859,6 +874,12 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_digit() {
                                             // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot.
                                             crate::modem::stages(&mut resp, cmd.params[7] - b'0');
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"log" {
+                                            // `diag log`: the last 16 KiB of the flash text log (flashlog.rs).
+                                            resp.extend_from_slice(&crate::flashlog::tail(16 * 1024));
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
