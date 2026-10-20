@@ -41,8 +41,10 @@ pub fn toc(first: &[u8]) -> Vec<Section> {
     v
 }
 
+/// Every modem line goes to the flash log as well as the report: a stage that hangs the bus loses its PT response to the watchdog reset, and the flash log is on the flash before the call returns (2026-10-20, the link cycle).
 fn line(rep: &mut Vec<u8>, s: alloc::string::String) {
     rep.extend_from_slice(s.as_bytes());
+    crate::flashlog::line(s.trim_end());
 }
 
 /// `diag modem files`: find and list the modem's images on the flash, read only — modem.bin's TOC, and the sizes of the per-unit NV files.
@@ -445,6 +447,11 @@ fn phy(rep: &mut Vec<u8>) {
 
 /// Stage 3: root complex setup, PERST, LTSSM to L0 at Gen1 x1 (exynos_pcie_rc_establish_link; the ch1 port in payloads/pcie1 stage 2 with ch0's PMU and UDBG differences).
 fn link(rep: &mut Vec<u8>) -> bool {
+    link_at(rep, 1, 1)
+}
+
+/// `speed` = 1 or 3 (LNKCAP/LNKCTL2 target speed), `lanes` = 1 or 2. The ROM stage trains at Gen1 x1; after the CP jumps to the image it pulled, its endpoint comes back as Gen3 x2 and will not train at Gen1 x1 (measured 2026-10-20: eight attempts bounce POLL_ACTIVE <-> POLL_CONFIG, DL Link Active never sets).
+fn link_at(rep: &mut Vec<u8>, speed: u32, lanes: u32) -> bool {
     let r = crate::platform::priv_rmw(PMU_PCIE0, 0x400, 0x400);
     kv(rep, "pmu.pcie0 bit10 ret", r as u32);
     clr(UDBG + 0xC800, 3 << 5);
@@ -461,13 +468,15 @@ fn link(rep: &mut Vec<u8>) -> bool {
     // dw_pcie_setup_rc, Gen1 x1.
     set(DBI + 0x8BC, 1);
     let v = rd(DBI + 0xA0);
-    wr(DBI + 0xA0, (v & !0xF) | 1);
+    wr(DBI + 0xA0, (v & !0xF) | speed);
     let v = rd(DBI + 0x7C);
-    wr(DBI + 0x7C, (v & !0xF) | 1);
+    wr(DBI + 0x7C, (v & !0xF) | speed);
+    // PORT_LINK_CONTROL's link mode is a mask, not a count (dw_pcie_setup): 1 lane = 1, 2 lanes = 3.
+    let mode = if lanes >= 2 { 3 } else { 1 };
     let v = rd(DBI + 0x710);
-    wr(DBI + 0x710, (v & !((1 << 7) | (0x3F << 16))) | (1 << 5) | (1 << 16));
+    wr(DBI + 0x710, (v & !((1 << 7) | (0x3F << 16))) | (1 << 5) | (mode << 16));
     let v = rd(DBI + 0x80C);
-    wr(DBI + 0x80C, (v & !(0x1F << 8)) | (1 << 8));
+    wr(DBI + 0x80C, (v & !(0x1F << 8)) | (lanes << 8));
     wr(DBI + 0x10, 4);
     wr(DBI + 0x14, 0);
     let v = rd(DBI + 0x3C);
@@ -484,7 +493,7 @@ fn link(rep: &mut Vec<u8>) -> bool {
     wr(DBI + 0x8BC, 1);
     wr(DBI, 0xECED_144D);
     let v = rd(DBI + 0x7C);
-    wr(DBI + 0x7C, (v & !((7 << 15) | 0xF)) | 0x3_8000 | 1);
+    wr(DBI + 0x7C, (v & !((7 << 15) | 0xF)) | 0x3_8000 | speed);
     wr(DBI + 0xB40, 0x1A);
     wr(DBI + 0xB44, 0xEA);
     wr(DBI + 0x44, 0);
@@ -616,8 +625,16 @@ fn rom_boot(rep: &mut Vec<u8>) {
     }
     wr(IPC + 0x808, 0x4000);
     wr(IPC + 0x80C, 0);
+    // `init_legacy_link` (link_device_memory_legacy.c:228): magic and mem_access to 0, every ring's head and tail to 0, then the magic and mem_access = 1, both read back. On a cold boot the cursors are whatever the DRAM held (measured G#FFFF_FFFF), and the first frame has nowhere to go.
+    wr(IPC, 0);
+    wr(IPC + 0x4, 0);
+    for off in [0x8, 0xC, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24] {
+        wr(IPC + off, 0);
+    }
     wr(IPC, 0xBDBD);
-    kv(rep, "magic readback", rd(IPC));
+    wr(IPC + 0x4, 1);
+    unsafe { core::arch::asm!("dsb sy") };
+    line(rep, alloc::format!("magic G#{:X} mem_access G#{:X}; rings zeroed\n", rd(IPC), rd(IPC + 0x4)));
     wr(MSI_PAGE + 0x14, ROM_IMG as u32);
     wr(MSI_PAGE + 0x18, 0);
     wr(MSI_PAGE + 0x1C, n as u32);
@@ -660,4 +677,335 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         return;
     }
     rom_boot(rep);
+    if n < 6 || rd(BOOT_STAGE) != 0x3FFF || !link_cycle(rep) || n < 7 {
+        return;
+    }
+    download(rep);
+}
+
+// ---------------------------------------------------------------------------
+// Stages 6-7: the link cycle the CP's jump to its downloaded bootloader forces, then the boot-channel download (MODEM-BOOT-RECON.md "Boot channel G#F1").
+
+/// RAW ring cursors in the IPC region: the AP writes at the tx head and reads at the rx tail.
+const TXQ_HEAD: usize = IPC + 0x18;
+const TXQ_TAIL: usize = IPC + 0x1C;
+const RXQ_HEAD: usize = IPC + 0x20;
+const RXQ_TAIL: usize = IPC + 0x24;
+const TX_RING: usize = IPC + 0x3000;
+const TX_RING_LEN: u32 = 0x1F_D000;
+const RX_RING: usize = IPC + 0x20_0000;
+const RX_RING_LEN: u32 = 0x20_0000;
+/// The FMT ring pair, the other half of the legacy link: the CP answers our boot-channel frames on RAW but announces itself on FMT (its `cp2ap_msg` reads G#83 = INT_VALID | SEND_FMT | SEND_RAW).
+const FMT_RXQ_HEAD: usize = IPC + 0x10;
+const FMT_RXQ_TAIL: usize = IPC + 0x14;
+const FMT_RX_RING: usize = IPC + 0x2000;
+const FMT_RX_RING_LEN: u32 = 0x1000;
+const AP2CP_MSG: usize = IPC + 0x800;
+/// `mask2int(MASK_SEND_DATA)` (link_device_memory.h): data waiting in a ring.
+const INT_SEND_DATA: u32 = 0x0081;
+/// Doorbell values: `int_ap2cp_* | G#1_0000` — message 0, PCIe link ack G#E.
+const DB_MSG: u32 = 0x1_0000;
+const DB_LINK_ACK: u32 = 0x1_000E;
+/// The boot channel.
+const CH_BOOT: u8 = 0xF1;
+/// Largest data bytes in one frame, as the capture shows the daemon using.
+const CHUNK: usize = 0xC000;
+
+fn wr8(a: usize, v: u8) {
+    unsafe { core::ptr::write_volatile(a as *mut u8, v) }
+}
+fn rd8(a: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(a as *const u8) }
+}
+
+/// The ch0 PHY power-down (`exynos_pcie_rc_phy_all_pwrdn`, ch0 branch): what the RC does before PERST drops, so the PHY comes back cleanly on the next `phy()`.
+fn phy_pwrdn() {
+    clr(PHY + 0x204, 3 << 2);
+    wr(PCS + 0x150, 0x3_00D9);
+    us(5);
+    for (off, v) in [(0x1044, 0x2A), (0x1048, 0xAA), (0x104C, 0xA8), (0x1050, 0x80), (0x185C, 0x0A)] {
+        wr(PHY + off, v);
+    }
+    us(1);
+    for (off, v) in [(0x2044, 0x2A), (0x2048, 0xAA), (0x204C, 0xA8), (0x2050, 0x80), (0x285C, 0x0A)] {
+        wr(PHY + off, v);
+    }
+    us(1);
+    wr(PHY + 0x208, 0xFF);
+    wr(PHY + 0x228, 0xFF);
+    us(1);
+    wr(PHY + 0x580, 0x0A);
+    wr(PHY + 0x928, 0xAA);
+    wr(PHY + 0x00C, 0x0A);
+    let v = rd(PHY + 0x600);
+    wr(PHY + 0x600, v | 2 << 4);
+    wr(PCS + 0x150, 0x3_00DE);
+    us(5);
+    for _ in 0..100 {
+        if rd(PHY + 0x260) & 4 == 0 {
+            break;
+        }
+        us(1);
+    }
+    set(UDBG + 0xC700, 1 << 1);
+    us(10);
+}
+
+/// Drop the link the way `exynos_pcie_rc_poweroff` does (pcie-exynos-rc.c 4005-4050), which is more than PERST and the LTSSM: the PHY input clock goes back to the oscillator first, and a SOFT_PWR_RESET pulse (ELBI G#3A4 bit 1, 20 us low) runs before the PHY powers down. Without those two the CP's endpoint never retrains (2026-10-20).
+fn link_down() {
+    PERST.out(false);
+    clr(SOC + 0x4000, 0x3);
+    wr(ELBI + 0x054, 0);
+    let v = rd(ELBI + 0x3A4);
+    wr(ELBI + 0x3A4, v & !2);
+    us(20);
+    wr(ELBI + 0x3A4, v | 2);
+    phy_pwrdn();
+}
+
+/// The PHY and the link, up to `tries` attempts: Gen3 x2 as the driver asks for after the ROM stage, then Gen1 x1, alternating. Each attempt is a full PHY configuration with the link dropped in between, and a run that fails them all leaves the PHY up so the next ELBI read does not stall the core.
+fn link_tries(rep: &mut Vec<u8>, tries: u32) -> bool {
+    for attempt in 1..=tries {
+        let (speed, lanes) = if attempt % 2 == 1 { (3, 2) } else { (1, 1) };
+        phy(rep);
+        if link_at(rep, speed, lanes) {
+            line(rep, alloc::format!("link up on attempt A#{attempt} (Gen{speed} x{lanes}); status G#{:X}\n", rd(DBI + 0x80)));
+            return true;
+        }
+        link_down();
+        ms(10);
+    }
+    phy(rep);
+    PERST.out(true);
+    line(rep, alloc::format!("no link in A#{tries} attempts; PHY left up so the registers stay readable\n"));
+    false
+}
+
+/// Stage 6: the link between the ROM stage and the download (`start_normal_boot` steps f-h).
+///
+/// `s5100_poweroff_pcie` waits 30 ms and then refuses to drop the link if CP2AP_WAKEUP already reads 1 or a transmit is pending (`modem_ctrl_s5100.c:1661-1675`); otherwise it drops it, step (g) waits for the CP to raise CP2AP_WAKEUP (20 ms x 200), and step (h) brings it back at Gen3 x2 and rings the link acknowledgement.
+fn link_cycle(rep: &mut Vec<u8>) -> bool {
+    ms(30);
+    if CP2AP_WAKEUP.get() {
+        line(rep, alloc::format!("cycle: CP2AP_WAKEUP already high, link kept\n"));
+    } else {
+        link_down();
+        line(rep, alloc::format!("cycle: link dropped, waiting for the CP\n"));
+        let t0 = now();
+        let mut up = false;
+        while since_us(t0) < 4_000_000 {
+            crate::platform::pet_watchdogs();
+            if CP2AP_WAKEUP.get() {
+                up = true;
+                break;
+            }
+            ms(20);
+        }
+        line(rep, alloc::format!("cycle: CP2AP_WAKEUP {} after A#{} ms\n", if up { "high" } else { "still low" }, since_us(t0) / 1000));
+        if !up {
+            return false;
+        }
+        AP2CP_WAKEUP.out(true);
+        ms(5);
+        if !link_tries(rep, 6) || !endpoint(rep) {
+            return false;
+        }
+    }
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+    line(rep, alloc::format!("link ack rung (G#{DB_LINK_ACK:X})\n"));
+    true
+}
+
+/// Put one boot-channel frame in the TX ring: the 12-byte SIT header, the command word, and `body` (the rest of the payload). Then the head, the message mask and the doorbell.
+fn send_frame(seq: &mut u8, cmd: u16, body: &[u8], data: Option<&[u8]>) -> Result<(), alloc::string::String> {
+    let payload = 2 + body.len() + data.map(|d| d.len()).unwrap_or(0);
+    let total = 12 + payload;
+    let head = rd(TXQ_HEAD);
+    let tail = rd(TXQ_TAIL);
+    let free = (tail + TX_RING_LEN - head - 1) % TX_RING_LEN;
+    if head >= TX_RING_LEN || tail >= TX_RING_LEN || (free as usize) < total {
+        return Err(alloc::format!("tx ring full or bad: head {head} tail {tail} need {total}"));
+    }
+    *seq = seq.wrapping_add(1);
+    let hdr = [0xCD, 0xAB, *seq, 0, 0x00, 0xC0, total as u8, (total >> 8) as u8, CH_BOOT, *seq, 0, 0];
+    let mut pos = head;
+    let mut put = |b: &[u8]| {
+        for &x in b {
+            wr8(TX_RING + pos as usize, x);
+            pos = (pos + 1) % TX_RING_LEN;
+        }
+    };
+    put(&hdr);
+    put(&cmd.to_le_bytes());
+    put(body);
+    if let Some(d) = data {
+        put(d);
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(TXQ_HEAD, pos);
+    unsafe { core::arch::asm!("dsb sy") };
+    // No mask and no doorbell: on the boot channel the CP polls the ring. In the whole Android capture the AP writes `ap2cp_msg` exactly once (zero, at `init_legacy_link`) and never again, and rings no doorbell per frame. Writing G#81 and ringing per frame got the first frame answered and every later one consumed in silence (2026-10-20).
+    Ok(())
+}
+
+/// Wait for a frame on the boot channel and return its command word. Frames are consumed from the RX ring whatever they are.
+fn recv_frame(ms_wait: u64) -> Result<u16, alloc::string::String> {
+    let t0 = now();
+    loop {
+        crate::platform::pet_watchdogs();
+        for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
+            let head = rd(headr);
+            let mut tail = rd(tailr);
+            if head >= len_max || tail >= len_max {
+                return Err(alloc::format!("{name} rx ring bad: head {head} tail {tail}"));
+            }
+            if head == tail {
+                continue;
+            }
+            let at = |o: u32| rd8(base + ((tail + o) % len_max) as usize);
+            if at(0) != 0xCD || at(1) != 0xAB {
+                return Err(alloc::format!("no frame header at {name} rx tail {tail}: G#{:02X}{:02X}", at(1), at(0)));
+            }
+            let flen = at(6) as u32 | (at(7) as u32) << 8;
+            let cmd = at(12) as u16 | (at(13) as u16) << 8;
+            tail = (tail + flen.max(12)) % len_max;
+            wr(tailr, tail);
+            // The root complex's MSI status is write-1-to-clear (DBI G#830): left set, the CP's next interrupt is coalesced into the one already pending.
+            let msi = rd(DBI + 0x830);
+            if msi != 0 {
+                wr(DBI + 0x830, msi);
+            }
+            crate::flashlog::line(&alloc::format!("modem rx {name}: G#{cmd:04X} len {flen}, msi G#{msi:X}"));
+            return Ok(cmd);
+        }
+        if since_us(t0) > ms_wait * 1000 {
+            return Err(alloc::format!("no reply in A#{ms_wait} ms (raw head {} tail {}, fmt head {} tail {}, cp2ap_msg G#{:X})", rd(RXQ_HEAD), rd(RXQ_TAIL), rd(FMT_RXQ_HEAD), rd(FMT_RXQ_TAIL), rd(IPC + 0x804)));
+        }
+        us(200);
+    }
+}
+
+/// One command and its answer: the CP answers G#Axxx with the same number in G#Cxxx.
+fn command(seq: &mut u8, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), alloc::string::String> {
+    send_frame(seq, cmd, body, None)?;
+    // Whether the CP reads what we put in the ring at all: it consumes at the tx tail.
+    let t0 = now();
+    while since_us(t0) < 500_000 && rd(TXQ_TAIL) != rd(TXQ_HEAD) {
+        us(500);
+    }
+    crate::flashlog::line(&alloc::format!("modem tx G#{cmd:04X}: tx head {} tail {} after A#{} us, cp2ap_msg G#{:X}", rd(TXQ_HEAD), rd(TXQ_TAIL), since_us(t0), rd(IPC + 0x804)));
+    let got = recv_frame(ms_wait)?;
+    let want = (cmd & 0x0FFF) | 0xC000;
+    if got != want {
+        return Err(alloc::format!("sent G#{cmd:04X}, expected G#{want:04X}, got G#{got:04X}"));
+    }
+    Ok(())
+}
+
+/// Send one section over the boot channel: begin (G#A1n0), the data frames (G#A1nB, each acked), end (G#A1nD). `read` fills the chunk at an offset.
+fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(rep: &mut Vec<u8>, seq: &mut u8, id: u32, size: u32, mut read: F) -> Result<(), alloc::string::String> {
+    let n = ((id & 0xF) << 4) as u16;
+    let t0 = now();
+    command(seq, 0xA100 | n, &[0, 0], 2000)?;
+    let mut buf = alloc::vec![0u8; CHUNK];
+    let mut off = 0u32;
+    let mut frames = 0u32;
+    while off < size {
+        crate::platform::pet_watchdogs();
+        let want = (size - off).min(CHUNK as u32) as usize;
+        read(off as u64, &mut buf[..want])?;
+        let mut body = alloc::vec::Vec::with_capacity(10);
+        body.extend_from_slice(&((want + 8) as u16).to_le_bytes());
+        body.extend_from_slice(&size.to_le_bytes());
+        body.extend_from_slice(&off.to_le_bytes());
+        send_frame(seq, 0xA10B | n, &body, Some(&buf[..want]))?;
+        let got = recv_frame(4000)?;
+        if got != (0xC10B | n) {
+            return Err(alloc::format!("section A#{id} at G#{off:X}: expected G#{:04X}, got G#{got:04X}", 0xC10B | n));
+        }
+        off += want as u32;
+        frames += 1;
+    }
+    command(seq, 0xA10D | n, &[0, 0], 2000)?;
+    line(rep, alloc::format!("section A#{id}: G#{size:X} bytes in A#{frames} frames, A#{} ms\n", since_us(t0) / 1000));
+    Ok(())
+}
+
+/// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`; the three NV sections need the per-unit files on f2fs, which ferros cannot read yet, so they are skipped and the CP's answer to the start command says whether it minds.
+fn download(rep: &mut Vec<u8>) {
+    let mut m = match crate::partfs::mount(MODEM_PART) {
+        Ok(m) => m,
+        Err(e) => return line(rep, alloc::format!("{e}\n")),
+    };
+    let ino = match m.open(MODEM_BIN) {
+        Ok(i) => i,
+        Err(e) => return line(rep, alloc::format!("{e}\n")),
+    };
+    let mut first = alloc::vec![0u8; 4096];
+    if let Err(e) = m.read(&ino, 0, &mut first) {
+        return line(rep, alloc::format!("{e}\n"));
+    }
+    let toc = toc(&first);
+    // The daemon's first boot-channel write comes well after the link acknowledgement; give the CP's bootloader the same breathing room.
+    ms(500);
+    let mut seq = 0u8;
+    let mut step = |rep: &mut Vec<u8>, what: &str, r: Result<(), alloc::string::String>| -> bool {
+        match r {
+            Ok(()) => true,
+            Err(e) => {
+                line(rep, alloc::format!("{what}: {e}\n"));
+                false
+            }
+        }
+    };
+    // Hello, then the CP's "bootloader ready" (G#C11B), then G#A11D.
+    if !step(rep, "hello", command(&mut seq, 0xA110, &[0, 0], 2000)) {
+        return;
+    }
+    // The CP's own "bootloader ready" (G#C11B) follows G#C110 straight away in the capture of Linux; here it does not always come, so it is noted and not waited on.
+    match recv_frame(2000) {
+        Ok(c) => line(rep, alloc::format!("CP ready: G#{c:04X} (expect G#C11B)\n")),
+        Err(e) => line(rep, alloc::format!("no CP-ready frame ({e}); carrying on\n")),
+    }
+    // G#A110/G#A11B/G#A11D are section 1 (BOOT, TOC id 1) begin/data/end on this channel, not a handshake: the CP's ROM already has BOOT, and in the capture the CP answers the begin and then emits G#C11B unprompted before the daemon closes with G#A11D. Here the unprompted frame never comes and G#A11D is consumed without an answer, so section 1 is closed with whatever the CP offers and the sections that matter follow.
+    match command(&mut seq, 0xA11D, &[0, 0], 2000) {
+        Ok(()) => line(rep, alloc::format!("section 1 closed (G#C11D)\n")),
+        Err(e) => line(rep, alloc::format!("section 1 close unanswered ({e}); carrying on to section 2\n")),
+    }
+    for name in ["MAIN", "VSS", "APM"] {
+        let Some(s) = toc.iter().find(|s| s.name() == name) else {
+            line(rep, alloc::format!("{name}: not in the TOC\n"));
+            return;
+        };
+        let base = s.offset as u64;
+        let r = send_section(rep, &mut seq, s.id, s.size, |off, out| {
+            // The section starts mid-block: read the whole blocks around the wanted range and copy the middle out.
+            let want = out.len();
+            let start = base + off;
+            let lo = (start & !4095) as u64;
+            let span = ((start - lo) as usize + want + 4095) & !4095;
+            let mut tmp = alloc::vec![0u8; span];
+            m.read(&ino, lo, &mut tmp).map_err(|e| alloc::format!("{e}"))?;
+            out.copy_from_slice(&tmp[(start - lo) as usize..(start - lo) as usize + want]);
+            Ok(())
+        });
+        if !step(rep, name, r) {
+            return;
+        }
+        if name == "MAIN" {
+            // The TOC's CRC for MAIN, forwarded as the daemon does (G#A321).
+            let mut b = alloc::vec::Vec::new();
+            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&s.crc.to_le_bytes());
+            if !step(rep, "MAIN CRC", command(&mut seq, 0xA321, &b, 4000)) {
+                return;
+            }
+        }
+    }
+    line(rep, alloc::format!("NV_NORM / NV_PROT / REPLAY skipped: their files are on f2fs\n"));
+    match command(&mut seq, 0xA400, &[0, 0], 8000) {
+        Ok(()) => line(rep, alloc::format!("START acknowledged (G#C400) -- the CP is running its main firmware\n")),
+        Err(e) => line(rep, alloc::format!("START: {e}\n")),
+    }
+    line(rep, alloc::format!("cp2ap_msg G#{:X}, cp2ap_status G#{:X}, boot_stage G#{:X}\n", rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE)));
 }

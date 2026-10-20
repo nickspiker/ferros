@@ -254,3 +254,30 @@ FERROS_HV_NO_PMU_READ=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_MODEM_RI
 
 After s5, the next steps are the link cycle (drop the link, wait for CP2AP_WAKEUP, Gen3 x2, doorbell G#1_000E) and the channel-G#F1 download in the captured order.
 `diag modem files` and `diag modem readmain` check the flash path first (expected MAIN BLAKE3 prefix 14df88e07f8aad008ab8fff8a4256d12).
+
+## Stages 6-7: the link cycle works, the boot channel answers once (2026-10-20)
+
+**Stage 6, the link cycle, works.** After the ROM stage the CP jumps to the BOOT image it pulled and re-initialises its endpoint, so the link must be dropped and retrained. Two steps of `exynos_pcie_rc_poweroff` (pcie-exynos-rc.c 4005-4050) are easy to miss and the retrain fails without either: the PHY input clock goes back to the oscillator (`SOC + G#4000 &= ~3`) and a SOFT_PWR_RESET pulse runs (ELBI G#3A4 bit 1 cleared, 20 us, set) before `phy_all_pwrdn`. With them:
+
+```
+cycle: link dropped, waiting for the CP
+cycle: CP2AP_WAKEUP high after A#156 ms
+link up on attempt A#1 (Gen3 x2); status G#3021_0000   (DL Link Active, 2 lanes)
+link ack rung (G#1_000E)
+```
+
+Asking for Gen1 x1 on the second link never trains (eight attempts bounce POLL_ACTIVE <-> POLL_CONFIG); Gen3 x2 trains first try and negotiates down to 2.5 GT/s x2. `s5100_poweroff_pcie` refuses to drop the link when CP2AP_WAKEUP already reads 1 (`modem_ctrl_s5100.c:1661-1675`), and after the ROM stage it reads 0 for the first ~150 ms and 1 afterwards — so whether Linux cycles the link depends on when it looks.
+
+**Stage 7, the boot channel, answers the first frame and then nothing.** The rings have to be initialised exactly as `init_legacy_link` does (link_device_memory_legacy.c:228) or the first frame has nowhere to go: magic (IPC+0) and mem_access (IPC+4) to zero, all four cursors of both ring pairs (IPC+G#8..G#24) to zero, then magic G#BDBD and mem_access 1, both read back. On a cold boot those cursors hold G#FFFF_FFFF.
+
+With that, `A110` is answered with `C110` — the boot channel is alive both ways. Every frame after it is **consumed** (the CP advances the tx tail to the head within ~500 us) and **never answered**, whatever it is: `A11D`, `A120`, a data frame. The rx head stays at G#10.
+
+Ruled out:
+- The per-frame signal. In the whole Android capture the AP writes `ap2cp_msg` exactly once (zero, at `init_legacy_link`) and never again, and rings no doorbell per boot-channel frame: the CP polls the ring. Writing G#81 + doorbell per frame and not writing it behave identically — the first frame is answered either way.
+- The FMT ring: empty throughout (head 0, tail 0), so no reply is hiding there.
+- The root complex's MSI status left set (DBI G#830, write-1-to-clear): clearing it after each reply changes nothing.
+- The CP's unprompted `C11B` being a required gate: it never comes here, and skipping it does not unblock the next frame.
+
+G#A110 / G#A11B / G#A11D are section 1 (BOOT, TOC id 1) begin / data / end on this channel, not a handshake — the per-section pattern is G#A1n0 / G#A1nB / G#A1nD with n the TOC id, so the opening pair is BOOT's, which the ROM already has.
+
+**The capture to run next.** The current ring capture had the cursors in `FERROS_HV_ORACLE_QUIET`, and it shows the AP's tx head jumping from G#10 (after `A110`) to G#438 before `A11D` — G#428 bytes the decode does not account for. Re-take it with the cursors **not** quiet so every head write is logged, and the bytes the AP actually puts in the TX ring between those two frames become visible. That gap is the most likely home of whatever the CP is waiting for.
