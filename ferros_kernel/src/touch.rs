@@ -469,6 +469,16 @@ pub fn paint(rep: &mut Vec<u8>, ms: u64) {
 ///
 /// One 16-bit signed value per crossing, 18 transmit by 39 receive on husky. The screen mapping is transmit across the width and receive down the height, which matches the panel's aspect; if a finger shows up transposed, swap them here.
 pub fn map(rep: &mut Vec<u8>, ms: u64) {
+    frames(rep, ms, true)
+}
+
+/// `diag touch raw`: the same, on the **mutual raw** frame — the rawest live layer the chip exposes, absolute capacitance per crossing with no baseline taken off. Auto-ranged per frame, so the picture stays readable while the values wander, and run long enough to watch it behave.
+pub fn raw(rep: &mut Vec<u8>, ms: u64) {
+    frames(rep, ms, false)
+}
+
+/// `strength` takes the chip's own baseline off; `raw` is the absolute reading.
+fn frames(rep: &mut Vec<u8>, ms: u64, strength: bool) {
     if !spi_clocked() {
         return line(rep, alloc::format!("SPI not clocked: run `diag touch up` first\n"));
     }
@@ -477,11 +487,12 @@ pub fn map(rep: &mut Vec<u8>, ms: u64) {
         return line(rep, alloc::format!("could not read the system-information block\n"));
     }
     let (tx, rx) = (blk[84] as usize, blk[85] as usize);
-    let addr = u16::from_le_bytes([blk[140], blk[141]]);
+    let at = if strength { 140 } else { 136 };
+    let addr = u16::from_le_bytes([blk[at], blk[at + 1]]);
     if tx == 0 || rx == 0 || tx * rx > 4096 {
         return line(rep, alloc::format!("implausible grid A#{tx} x A#{rx}\n"));
     }
-    line(rep, alloc::format!("strength frame at G#{addr:X}, A#{tx} x A#{rx}, A#{} bytes\n", tx * rx * 2));
+    line(rep, alloc::format!("{} frame at G#{addr:X}, A#{tx} x A#{rx}, A#{} bytes\n", if strength { "strength" } else { "raw" }, tx * rx * 2));
     let freq = crate::platform::cntfrq();
     let _ = crate::display::use_own_fb(true);
     let mut scratch = Vec::new();
@@ -493,6 +504,8 @@ pub fn map(rep: &mut Vec<u8>, ms: u64) {
     let bh = panel.as_ref().map(|p| p.rows / rx).unwrap_or(0);
     let mut raw = alloc::vec![0u8; tx * rx * 2];
     let mut last = alloc::vec![0i32; tx * rx];
+    let mut nlo = alloc::vec![i32::MAX; tx * rx];
+    let mut nhi = alloc::vec![i32::MIN; tx * rx];
     let (mut lo, mut hi) = (i32::MAX, i32::MIN);
     let (mut frames, mut paint_us) = (0u32, 0u64);
     let t_end = now() + ticks_us(ms * 1000);
@@ -507,6 +520,8 @@ pub fn map(rep: &mut Vec<u8>, ms: u64) {
             last[i] = v;
             lo = lo.min(v);
             hi = hi.max(v);
+            nlo[i] = nlo[i].min(v);
+            nhi[i] = nhi[i].max(v);
         }
         frames += 1;
         let Some(p) = panel.as_ref() else { continue };
@@ -551,6 +566,19 @@ pub fn map(rep: &mut Vec<u8>, ms: u64) {
         for t in 0..tx {
             let s = ((last[t * rx + r] - flo) * 9 / span) as usize;
             row.push(ramp[s.min(9)] as char);
+        }
+        line(rep, alloc::format!("  {row}\n"));
+    }
+    // How much each node moved over the whole run: fixed pattern shows as a steady picture, drift and noise as a loud one.
+    let span_of: Vec<i32> = (0..tx * rx).map(|i| if nhi[i] > nlo[i] { nhi[i] - nlo[i] } else { 0 }).collect();
+    let (slo, shi) = span_of.iter().fold((i32::MAX, i32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let sspan = (shi - slo).max(1);
+    line(rep, alloc::format!("per-node spread over the run, A#{slo}..A#{shi}:\n"));
+    for r in 0..rx {
+        let mut row = alloc::string::String::new();
+        for t in 0..tx {
+            let v = ((span_of[t * rx + r] - slo) * 9 / sspan) as usize;
+            row.push(ramp[v.min(9)] as char);
         }
         line(rep, alloc::format!("  {row}\n"));
     }

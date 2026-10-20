@@ -943,6 +943,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"touch raw" {
+                                            // `diag touch raw`: the chip's rawest live layer (mutual raw, no baseline removed), auto-ranged on the panel for five minutes (touch.rs).
+                                            crate::touch::raw(&mut resp, 300_000);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"touch map" {
                                             // `diag touch map`: the touch chip's capacitance strength frame, live on the panel and as an ASCII map, for 12 s (touch.rs).
                                             crate::touch::map(&mut resp, 12_000);
