@@ -91,3 +91,19 @@ So 702 crossings over a 1344 x 2992 panel: about 75 pixels, near 4 mm, per node 
 Each frame is read with the same framebuffer command as the system info (`A7`, 16-bit address, one dummy byte first), at the address the block gives, for `transmit x receive x 2` bytes. No command is needed to prepare them — they are live. Only the factory compensation data needs a load command first (`SYS_CMD_LOAD_DATA`, ftsCompensation.c).
 
 Block offsets, from `readSysInfo` (ftsCore.c): header `A5 01` at 0, largest coordinates at 80 and 82, transmit and receive channel counts at 84 and 85, key and force lengths at 86 and 87, the four mutual-sense addresses from 136, the self-sense ones from 144. The block also holds a per-die identifier at 32-47 which ferros does not read.
+
+### `diag touch map` — the capacitance frame, live (2026-10-20)
+
+Reads the mutual-sense strength frame (raw minus the chip's own baseline) in a loop, paints it on the panel as nearest-neighbour blocks on ferros's own framebuffer, and prints the last frame as an ASCII map with the strongest nodes. First run, one finger on the glass:
+
+```
+strength frame at G#86E4, A#18 x A#39, A#1404 bytes
+A#703 frames in A#12000 ms; values A#-498..A#1656; A#13 ms per paint
+  ..........:**:....
+  ..........+%%+....
+  ..........*%@= ...
+  ......... -*+. ...
+strongest nodes: (tx A#12, rx A#12) = A#1562; (tx A#12, rx A#11) = A#1551; (tx A#11, rx A#12) = A#1491; ...
+```
+
+58 frames a second, of which 4 ms is the frame read over SPI and 13 ms the paint. A fingertip is a bump about four nodes across (around 15 mm at this pitch) peaking near 1560 against a quiet floor inside about plus or minus 200, so roughly eight times the noise. The screen mapping is transmit across the width and receive down the height; the first run came out the right way round.

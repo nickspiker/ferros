@@ -435,3 +435,94 @@ pub fn paint(rep: &mut Vec<u8>, ms: u64) {
     }
     line(rep, alloc::format!("paint: A#{events} events, A#{downs} touches, A#{frames} frames in A#{ms} ms; touch A#{rx} x A#{ry} on panel A#{} x A#{} (A#{} rows reachable); largest x A#{max_x} y A#{max_y}\n", panel.width, (ry as usize) * panel.width / (rx.max(1) as usize), panel.rows));
 }
+
+/// `diag touch map`: the chip's mutual-sense **strength** frame (raw minus its own baseline, so a finger shows as a positive bump) read live, painted on the panel as nearest-neighbour blocks and printed as an ASCII map.
+///
+/// One 16-bit signed value per crossing, 18 transmit by 39 receive on husky. The screen mapping is transmit across the width and receive down the height, which matches the panel's aspect; if a finger shows up transposed, swap them here.
+pub fn map(rep: &mut Vec<u8>, ms: u64) {
+    if !spi_clocked() {
+        return line(rep, alloc::format!("SPI not clocked: run `diag touch up` first\n"));
+    }
+    let mut blk = [0u8; 216];
+    if fb_read(0, &mut blk).is_err() || blk[0] != 0xA5 {
+        return line(rep, alloc::format!("could not read the system-information block\n"));
+    }
+    let (tx, rx) = (blk[84] as usize, blk[85] as usize);
+    let addr = u16::from_le_bytes([blk[140], blk[141]]);
+    if tx == 0 || rx == 0 || tx * rx > 4096 {
+        return line(rep, alloc::format!("implausible grid A#{tx} x A#{rx}\n"));
+    }
+    line(rep, alloc::format!("strength frame at G#{addr:X}, A#{tx} x A#{rx}, A#{} bytes\n", tx * rx * 2));
+    let freq = crate::platform::cntfrq();
+    let _ = crate::display::use_own_fb(true);
+    let mut scratch = Vec::new();
+    let panel = crate::display::adopt(freq, &mut scratch);
+    if panel.is_none() {
+        line(rep, alloc::format!("no panel: the ASCII map below only\n"));
+    }
+    let bw = panel.as_ref().map(|p| p.width / tx).unwrap_or(0);
+    let bh = panel.as_ref().map(|p| p.rows / rx).unwrap_or(0);
+    let mut raw = alloc::vec![0u8; tx * rx * 2];
+    let mut last = alloc::vec![0i32; tx * rx];
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    let (mut frames, mut paint_us) = (0u32, 0u64);
+    let t_end = now() + ticks_us(ms * 1000);
+    while now() < t_end {
+        crate::platform::pet_watchdogs();
+        if let Err(e) = fb_read(addr, &mut raw) {
+            line(rep, alloc::format!("frame read: {e}\n"));
+            break;
+        }
+        for i in 0..tx * rx {
+            let v = i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]) as i32;
+            last[i] = v;
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        frames += 1;
+        let Some(p) = panel.as_ref() else { continue };
+        // Scale this frame's own range so the picture is readable whatever the baseline sits at.
+        let (flo, fhi) = last.iter().fold((i32::MAX, i32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        let span = (fhi - flo).max(1);
+        let t0 = now();
+        for r in 0..rx {
+            for t in 0..tx {
+                let s = ((last[t * rx + r] - flo) * 255 / span) as u32;
+                // Black to red to yellow to white: a finger reads as the bright end.
+                let c = if s < 85 { s * 3 << 16 } else if s < 170 { (255 << 16) | ((s - 85) * 3 << 8) } else { (255 << 16) | (255 << 8) | (s - 170) * 3 };
+                for y in 0..bh {
+                    let row = p.fb + (r * bh + y) * p.stride * 4 + t * bw * 4;
+                    for x in 0..bw {
+                        unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, c) };
+                    }
+                }
+            }
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        scratch.clear();
+        p.present(&mut scratch);
+        paint_us += (now() - t0) / (crate::platform::cntfrq() / 1_000_000);
+    }
+    line(rep, alloc::format!("A#{frames} frames in A#{ms} ms; values A#{lo}..A#{hi}; A#{} ms per paint\n", if frames > 0 { paint_us / frames as u64 / 1000 } else { 0 }));
+    // The last frame as an ASCII map, scaled over its own range.
+    let (flo, fhi) = last.iter().fold((i32::MAX, i32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let span = (fhi - flo).max(1);
+    let ramp = b" .:-=+*#%@";
+    line(rep, alloc::format!("last frame, A#{flo}..A#{fhi} (each row is one receive channel, each column one transmit):\n"));
+    for r in 0..rx {
+        let mut row = alloc::string::String::new();
+        for t in 0..tx {
+            let s = ((last[t * rx + r] - flo) * 9 / span) as usize;
+            row.push(ramp[s.min(9)] as char);
+        }
+        line(rep, alloc::format!("  {row}\n"));
+    }
+    let mut top: Vec<(i32, usize)> = last.iter().copied().zip(0..).collect();
+    top.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut s = alloc::string::String::from("strongest nodes:");
+    for &(v, i) in top.iter().take(6) {
+        s.push_str(&alloc::format!(" (tx A#{}, rx A#{}) = A#{v};", i / rx, i % rx));
+    }
+    s.push('\n');
+    line(rep, s);
+}
