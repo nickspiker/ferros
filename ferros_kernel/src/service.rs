@@ -837,7 +837,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"cam stream" {
+                                        if cmd.params == b"cam stream" || cmd.params == b"cam raw" {
                                             // `diag cam stream`: replay the sensor init, configure CSI link 1, stream 300 ms, report what the link saw and dump its words.
                                             // The init comes from the same places `cam frame` takes it from: the vault's own key, the bundled `cam.frame` value, or the image's built-in bundle. The vault lost these keys in the move to manifestus, and the dump is the whole point of the command, so it should not depend on which of the three is present.
                                             let mut init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
@@ -855,7 +855,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     }
                                                 }
                                             }
-                                            crate::camera::stream_probe(&mut resp, init);
+                                            if cmd.params == b"cam raw" { crate::camera::raw_probe(&mut resp, init) } else { crate::camera::stream_probe(&mut resp, init) }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

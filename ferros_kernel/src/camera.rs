@@ -305,6 +305,163 @@ pub const MODULES: [Module; 4] = [
     Module { name: "kraken", role: "front", bus: 0x108B_0000, bus_bank: GPP8, addr: 0x2D, reset_bank: GPP6, reset_pin: 2, mclk_bank: GPP7, usi_off: 0xC, clock: "CIS_CLK2 24 MHz", wide_regs: true, rails: &[0, 2, 4, 6, 7], switch: 0x1710, sub_enable: None, sub_ldo26: false },
 ];
 
+/// The front end's own CSIS core, configured by ferros alone: every write Linux makes into G#1C32_xxxx, in its order, and nothing else.
+/// The raw frame path is the CSI link (G#1C05_xxxx) into this core and out through its write DMA, and both are CPU-writable — the core held 100% of what the readback test wrote. The PDMA engine and the region at G#1C36_xxxx that only it can reach serve the ISP's *processing* blocks downstream (bayer, statistics, LUTs). So a raw dump should not need the vendor's 4495-write program at all, and running without it says whether those downstream blocks were what held the frame up.
+/// Read out of the capture's CPU writes and the decoded PDMA list (tools/camera-prog.py's CPR2 sections), with the three buffer addresses moved to ferros's own 16 MiB slices. The words worth knowing: +G#474 = G#0C000FF0 sizes the image channel to 4080 x 3072, link channel 0; +G#2074 = G#03000FF0 sizes the PD channel to 4080 x 768, link channel 1; and +G#48C / +G#208C differ only in bit 12, which is which link channel each one takes.
+const CORE_ONLY: [(usize, u32); 64] = [
+    (0x1C320008, 0xF),
+    (0x1C320010, 0x1),
+    (0x1C320094, 0x3FFFFFFF),
+    (0x1C32011C, 0x1),
+    (0x1C322154, 0x1400),
+    (0x1C322150, 0x4),
+    (0x1C322140, 0x1),
+    (0x1C3221C0, 0x88100000),  // our buffer
+    (0x1C3221C4, 0x0),
+    (0x1C322108, 0x8F),
+    (0x1C32210C, 0x0),
+    (0x1C322110, 0x89100000),  // our buffer
+    (0x1C322114, 0x0),
+    (0x1C320554, 0x1400),
+    (0x1C320550, 0x4),
+    (0x1C320544, 0x0),
+    (0x1C320540, 0x1),
+    (0x1C3205C0, 0x2000000),
+    (0x1C3205C4, 0x0),
+    (0x1C320508, 0x8F),
+    (0x1C32050C, 0x0),
+    (0x1C320510, 0x8A100000),  // our buffer
+    (0x1C320514, 0x0),
+    (0x1C32041C, 0x1),
+    (0x1C32201C, 0x1),
+    (0x1C322010, 0x7),
+    (0x1C322030, 0x12),
+    (0x1C322044, 0x3FFF),
+    (0x1C322058, 0x3),
+    (0x1C320410, 0x7),
+    (0x1C320430, 0x12),
+    (0x1C320444, 0x3FFF),
+    (0x1C320458, 0x3),
+    (0x1C320418, 0x1),
+    (0x1C3200B0, 0x1),
+    (0x1C320478, 0x14C1E38),
+    (0x1C32047C, 0x180),
+    (0x1C320460, 0x1),
+    (0x1C320464, 0x1),
+    (0x1C32046C, 0x1),
+    (0x1C320470, 0x1),
+    (0x1C32048C, 0x1000200),
+    (0x1C320488, 0x0),
+    (0x1C320474, 0xC000FF0),
+    (0x1C32042C, 0x1B),
+    (0x1C322018, 0x1),
+    (0x1C3200B0, 0x80),
+    (0x1C322078, 0x14C1E38),
+    (0x1C32207C, 0x180),
+    (0x1C322060, 0x1),
+    (0x1C322064, 0x1),
+    (0x1C32206C, 0x1),
+    (0x1C322070, 0x1),
+    (0x1C32208C, 0x1001200),
+    (0x1C322088, 0x0),
+    (0x1C322074, 0x3000FF0),
+    (0x1C32202C, 0x1B),
+    (0x1C329004, 0x0),
+    (0x1C329000, 0x1),
+    (0x1C329008, 0x0),
+    (0x1C328804, 0x0),
+    (0x1C328800, 0x1),
+    (0x1C320430, 0x1A),
+    (0x1C322030, 0x1A),
+];
+
+/// `diag cam raw`: a raw frame dump built from the ground up — the CSI link and the front end's CSIS core, configured by ferros, and nothing else.
+/// No PDMA program, no G#1C33/G#1C35/G#1C36 processing blocks: only CORE_ONLY's 64 writes into the core, with RX_START for the link between them as Linux orders it, then the sensor streaming. If the core's local channel starts a frame here, the vendor pipeline downstream was what held it; if it does not, the core genuinely depends on the processing blocks. Either way it is the smallest configuration that has been tried, and it is ours.
+/// Per-frame reads stay on the link and core pages: a read into the front end's other pages mid-stream has hung the core before.
+pub fn raw_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no sensor init table\n"));
+    };
+    fe_up(rep);
+    if !fe_powered() {
+        return;
+    }
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    let iso = 0x1546_3EBCusize;
+    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    ispfe_dma_open(rep);
+    // Our three slices, patterned so a write anywhere shows.
+    const SLICES: [usize; 3] = [0x8810_0000, 0x8910_0000, 0x8A10_0000];
+    for &base in SLICES.iter() {
+        crate::platform::pet_watchdogs();
+        for o in (0..PDMA_BUF_SLICE).step_by(256) {
+            wr(base + o, PATTERN);
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    // The core in Linux's order: its setup, then the link, then the channel configuration that follows.
+    for &(a, v) in CORE_ONLY[..25].iter() {
+        wr(a, v);
+    }
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
+    for &(a, v) in CORE_ONLY[25..].iter() {
+        wr(a, v);
+    }
+    line(rep, alloc::format!("core configured by ferros alone: A#{} writes, no PDMA, no processing blocks\n", CORE_ONLY.len()));
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    // Only the core's own status words, read then written back as Linux acknowledges them.
+    const CORE_ACK: [usize; 10] = [0x1C32_008C, 0x1C32_2004, 0x1C32_2024, 0x1C32_2038, 0x1C32_204C, 0x1C32_0404, 0x1C32_0424, 0x1C32_0438, 0x1C32_044C, 0x1C32_0110];
+    let mut series = alloc::string::String::new();
+    for f in 1..=10u32 {
+        spin_us(50_000);
+        crate::platform::pet_watchdogs();
+        let (fs, fe, err) = (rd(CSIS_LINK1 + 0x24), rd(CSIS_LINK1 + 0x2C), rd(CSIS_LINK1 + 0x14));
+        let (cmn, img, pd) = (rd(0x1C32_008C), rd(0x1C32_0424), rd(0x1C32_2024));
+        series.push_str(&alloc::format!("  frame A#{f}: link start G#{fs:X} end G#{fe:X} err G#{err:X} | core cmn G#{cmn:X} img G#{img:X} pd G#{pd:X}\n"));
+        for &a in CORE_ACK.iter() {
+            let v = rd(a);
+            wr(a, v);
+        }
+    }
+    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    line(rep, series);
+    line(rep, alloc::format!("stream on {:?} off {:?}; image channel holds G#{:X}, PD channel G#{:X}\n", son.is_ok(), soff.is_ok(), rd(0x1C32_0510), rd(0x1C32_2110)));
+    for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+        wr(a, v);
+    }
+    let mut any = false;
+    for (n, &base) in SLICES.iter().enumerate() {
+        crate::platform::pet_watchdogs();
+        let (mut moved, mut zeroed, mut first, mut last) = (0usize, 0usize, None, 0usize);
+        for o in (0..PDMA_BUF_SLICE).step_by(256) {
+            let v = rd(base + o);
+            if v != PATTERN {
+                moved += 1;
+                last = o;
+                if v == 0 { zeroed += 1 }
+                first.get_or_insert(o);
+            }
+        }
+        if let Some(f) = first {
+            any = true;
+            line(rep, alloc::format!("slice A#{n} at G#{base:X}: A#{moved} probe points written (A#{zeroed} to zero), +G#{f:X} to +G#{last:X}; at +G#{f:X}: G#{:08X} G#{:08X} G#{:08X} G#{:08X}\n", rd(base + f), rd(base + f + 4), rd(base + f + 8), rd(base + f + 12)));
+        }
+    }
+    if !any {
+        line(rep, alloc::format!("nothing written to any slice\n"));
+    }
+}
+
 /// The four sensor master clocks as CMU_TOP has them, read only.
 /// All four read zero, and that is their correct state, not a misread: `camera-main-powerup-cmu.txt` shows Linux reading these same words as zero and writing zero back, so the mux selects source 0 and the divider divides by one. The only live traffic in that capture is at G#2604_3004, G#2604_300C and G#2604_3010, each written 2 and then 0 — a transient access request around the register reads, not a persistent enable.
 /// So the master clocks need nothing from us beyond muxing each module's pin, and the two modules that stay silent are not silent for want of a clock configured differently from the two that answer.
