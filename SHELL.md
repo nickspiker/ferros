@@ -45,7 +45,7 @@ Each channel carries one meaning:
 
 The device measures what you do; you declare what matters. When a circle lights, the colour goes on its fill, so the ring stays as its steady weight underneath.
 
-**Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera).
+**Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera), Opsin (recording).
 
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
