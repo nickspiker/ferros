@@ -546,6 +546,183 @@ pub fn lochs_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
     }
 }
 
+/// Translate one IOVA through the front end's SYSMMU page table rooted at `flpt`, as the hv's PDMA dump does (samsung-iommu v9): a first-level entry per MiB, type 2 a 1 MiB section, type 1 a pointer to a second level whose entries are 64 KiB (type 1) or 4 KiB (type 2) pages. Physical addresses are stored shifted right by four. Every step must stay in DRAM: a read into a hole or a register block can hang the core.
+fn sysmmu_translate(flpt: usize, iova: usize) -> Option<usize> {
+    let dram = |pa: usize| (0x8000_0000..0xC_0000_0000).contains(&pa);
+    let a1 = flpt + (iova >> 20) * 4;
+    if !dram(a1) {
+        return None;
+    }
+    let e1 = rd(a1) as usize;
+    let pa = match e1 & 7 {
+        2 => ((e1 & !0xFFFF) << 4) | (iova & 0xF_FFFF),
+        1 => {
+            let a2 = ((e1 & !0x3F) << 4) + ((iova & 0xF_FFFF) >> 12) * 4;
+            if !dram(a2) {
+                return None;
+            }
+            let e2 = rd(a2) as usize;
+            match e2 & 3 {
+                1 => ((e2 & !0xFFF) << 4) | (iova & 0xFFFF),
+                2 => ((e2 & !0xFF) << 4) | (iova & 0xFFF),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if dram(pa) { Some(pa) } else { None }
+}
+
+/// `diag cam inherit`: put a real camera frame on the panel, by taking over a pipeline Linux already has running.
+/// Run after a live handoff (tools/husky-hotload.sh --live) with the camera app open: Linux hands the CPUs over without shutting down, so the sensor, the link, the front end and its write DMA are all still configured the way the working HAL left them, and the last frames are still sitting in Linux's buffers.
+/// The front end's image channel holds its current buffer as an IOVA (+G#510 low, +G#514 high); the SYSMMU in front of it maps that to physical pages, which are not contiguous, so each 4 KiB page is translated as it is reached. The frame is RAW10 packed four pixels to five bytes, 4080 x 3072 at a G#1400 stride, so each pixel's eight most significant bits sit at byte `(x / 4) * 5 + x % 4` of its line.
+/// The preview averages each 2 x 2 Bayer quad into one grey level and takes every fourth quad, which gives a 1020 x 768 picture of the scene, painted centred at the top of the panel.
+pub fn inherit_probe(rep: &mut Vec<u8>) {
+    if !fe_powered() {
+        return line(rep, alloc::format!("ISP front end is not powered: hand off from Android with the camera app open\n"));
+    }
+    crate::flashlog::line("cam inherit: reading the image channel's buffer");
+    // The core holds three buffer addresses. The image channel's is not a frame: at a handoff it points at an 8 KiB structure of metadata (first words G#EA, G#01, G#E9, G#BB9597B2), which is what painted as garbage lines on the first try. The frame-sized one is whichever maps the most pages, so the preview takes that — on 2026-10-21 the PD side, 961 pages, 769 lines at the G#1400 stride: 4080 x 768 RAW10, link channel 1's geometry.
+    let stride = rd(0x1C32_0554) as usize;
+    let candidates = [("image channel", 0x1C32_0510usize), ("PD channel", 0x1C32_2110), ("PD side", 0x1C32_21C0)];
+    let mut iova = 0usize;
+    let mut chosen = "";
+    let mut best = 0usize;
+    let mmu_probe = 0x1C11_0000usize;
+    let probe_flpt = ((rd(mmu_probe + 0x8404) & 0xFF_FFFF) as usize) << 12;
+    for (name, lo) in candidates {
+        let v = (rd(lo) as usize) | ((rd(lo + 4) as usize) << 32);
+        let mut n = 0usize;
+        while v != 0 && probe_flpt != 0 && n < 8192 && sysmmu_translate(probe_flpt, (v & !0xFFF) + n * 0x1000).is_some() {
+            n += 1;
+        }
+        line(rep, alloc::format!("{name}: IOVA G#{v:X}, A#{n} pages mapped\n"));
+        if n > best {
+            best = n;
+            iova = v;
+            chosen = name;
+        }
+    }
+    line(rep, alloc::format!("taking the {chosen} buffer, the largest: G#{iova:X}, stride G#{stride:X}\n"));
+    if iova == 0 {
+        return line(rep, alloc::format!("no buffer programmed: the camera was not streaming at the handoff\n"));
+    }
+    // Find the SYSMMU context whose table maps it. Only s0 is safe to read; s1 hung the core once.
+    const MMU: usize = 0x1C11_0000;
+    crate::flashlog::line("cam inherit: reading the SYSMMU");
+    let nvm = ((rd(MMU + 0x100) & 0x1F) as usize).clamp(1, 8);
+    let mut flpt = 0usize;
+    for vid in 0..nvm {
+        let ctrl = rd(MMU + 0x8000 + vid * 0x1000);
+        let base = (rd(MMU + 0x8404 + vid * 0x1000) & 0xFF_FFFF) as usize;
+        let t = base << 12;
+        line(rep, alloc::format!("  SYSMMU context A#{vid}: ctrl G#{ctrl:X} table G#{t:X}\n"));
+        if ctrl & 1 == 1 && base != 0 && sysmmu_translate(t, iova).is_some() {
+            flpt = t;
+            break;
+        }
+    }
+    if flpt == 0 {
+        return line(rep, alloc::format!("no SYSMMU context maps the buffer\n"));
+    }
+    let stride = if stride == 0 { 0x1400 } else { stride };
+    // The first page translated on its own, so it can be reported before the cache below takes the table over.
+    let Some(first_pa) = sysmmu_translate(flpt, iova & !0xFFF) else {
+        return line(rep, alloc::format!("the buffer's first page does not translate\n"));
+    };
+    line(rep, alloc::format!("buffer's first page maps to physical G#{first_pa:X}\n"));
+    // How far the buffer is actually mapped. The core is configured for a 4080 x 3072 frame, but the first run read only the top ~380 rows before the translation ran out, so the real extent is measured rather than assumed: the first unmapped 4 KiB page, and the size it implies in lines.
+    let mut mapped = 0usize;
+    while mapped < 8192 && sysmmu_translate(flpt, (iova & !0xFFF) + mapped * 0x1000).is_some() {
+        mapped += 1;
+    }
+    let lines_mapped = mapped * 0x1000 / stride.max(1);
+    line(rep, alloc::format!("buffer mapped for A#{mapped} contiguous pages (A#{} KiB), A#{lines_mapped} lines at this stride\n", mapped * 4));
+    // The raw bytes, before any interpretation: the first 128, then 32 at the start of lines 1, 2, 16 and 64. Packed RAW10 shows a fifth-byte rhythm (every fifth byte holds four pixels' two low bits); a compressed buffer shows a header and no such period; a wrong stride shows the same content drifting between lines.
+    let hex_at = |off: usize, len: usize| -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for i in 0..len {
+            let va = (iova & !0xFFF) + off + i;
+            let b = sysmmu_translate(flpt, va).map(|pa| unsafe { core::ptr::read_volatile(pa as *const u8) });
+            out.push_str(&match b { Some(b) => alloc::format!("{b:02X}"), None => alloc::string::String::from("--") });
+            if i % 4 == 3 { out.push(' '); }
+        }
+        out
+    };
+    line(rep, alloc::format!("first 128 bytes:\n  {}\n  {}\n  {}\n  {}\n", hex_at(0, 32), hex_at(32, 32), hex_at(64, 32), hex_at(96, 32)));
+    for ln in [1usize, 2, 16, 64] {
+        line(rep, alloc::format!("line A#{ln} (+G#{:X}): {}\n", ln * stride, hex_at(ln * stride, 32)));
+    }
+    // A one-page translation cache: lines run along IOVA pages, so most reads reuse the last one.
+    let mut page = (iova & !0xFFF, first_pa);
+    let mut byte = |off: usize| -> Option<u8> {
+        let va = iova + off;
+        let vp = va & !0xFFF;
+        if page.0 != vp {
+            page = (vp, sysmmu_translate(flpt, vp)?);
+        }
+        let pa = page.1 + (va & 0xFFF);
+        Some(unsafe { core::ptr::read_volatile(pa as *const u8) })
+    };
+    // The preview: 1020 x 768 grey, each sample the mean of one Bayer quad's four MSBs.
+    const OW: usize = 1020;
+    // Every fourth source line, stopping at the last one the mapping holds.
+    let oh = (lines_mapped / 4).clamp(1, 768);
+    let mut grey = alloc::vec![0u8; OW * oh];
+    let (mut lo, mut hi, mut sum, mut missing) = (255u32, 0u32, 0u64, 0u32);
+    for oy in 0..oh {
+        if oy % 64 == 0 {
+            crate::platform::pet_watchdogs();
+        }
+        let sy = oy * 4;
+        for ox in 0..OW {
+            let sx = ox * 4;
+            let col = |x: usize| (x / 4) * 5 + x % 4;
+            let q = [byte(sy * stride + col(sx)), byte(sy * stride + col(sx + 1)), byte((sy + 1) * stride + col(sx)), byte((sy + 1) * stride + col(sx + 1))];
+            let mut t = 0u32;
+            let mut ok = true;
+            for v in q.iter() {
+                match v { Some(b) => t += *b as u32, None => ok = false }
+            }
+            if !ok {
+                missing += 1;
+                continue;
+            }
+            let g = t / 4;
+            grey[oy * OW + ox] = g as u8;
+            lo = lo.min(g);
+            hi = hi.max(g);
+            sum += g as u64;
+        }
+    }
+    let n = (OW * oh) as u64 - missing as u64;
+    line(rep, alloc::format!("frame read: A#{n} samples, grey A#{lo}..A#{hi}, mean A#{}, A#{missing} unmapped\n", if n > 0 { sum / n } else { 0 }));
+    // Stretch whatever range the scene has to the full scale, so a dim room still reads.
+    let span = (hi.saturating_sub(lo)).max(1);
+    let freq = crate::platform::cntfrq();
+    let mut scratch = Vec::new();
+    let Some(p) = crate::display::adopt(freq, &mut scratch) else {
+        return line(rep, alloc::format!("no panel to paint on\n"));
+    };
+    let (w, h, pstride, fb) = (p.width, p.rows, p.stride, p.fb);
+    let x0 = (w.saturating_sub(OW)) / 2;
+    for y in 0..h {
+        for x in 0..w {
+            unsafe { core::ptr::write_volatile((fb + (y * pstride + x) * 4) as *mut u32, 0) };
+        }
+    }
+    for oy in 0..oh.min(h) {
+        for ox in 0..OW.min(w) {
+            let g = ((grey[oy * OW + ox] as u32).saturating_sub(lo) * 255 / span).min(255);
+            let v = g << 16 | g << 8 | g;
+            unsafe { core::ptr::write_volatile((fb + (oy * pstride + x0 + ox) * 4) as *mut u32, v) };
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    p.present(&mut scratch);
+    line(rep, alloc::format!("painted 1020 x A#{oh} at the top of the panel, contrast stretched from A#{lo}..A#{hi}\n"));
+}
+
 /// The four sensor master clocks as CMU_TOP has them, read only.
 /// All four read zero, and that is their correct state, not a misread: `camera-main-powerup-cmu.txt` shows Linux reading these same words as zero and writing zero back, so the mux selects source 0 and the divider divides by one. The only live traffic in that capture is at G#2604_3004, G#2604_300C and G#2604_3010, each written 2 and then 0 — a transient access request around the register reads, not a persistent enable.
 /// So the master clocks need nothing from us beyond muxing each module's pin, and the two modules that stay silent are not silent for want of a clock configured differently from the two that answer.

@@ -557,6 +557,8 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        // The handoff build has no `slot`: marking an A/B slot is a cold-boot job, and a ferros chainloaded out of a running Android must not rewrite devinfo under it.
+                                        #[cfg(not(shim_handoff))]
                                         if cmd.params == b"android" {
                                             // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot.
                                             let r = crate::slot::set_active(0);
@@ -889,6 +891,12 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"cam probe" {
                                             // `diag cam probe`: whether an impossible capability read is the sensor's answer or this driver's (camera.rs).
                                             crate::camera::read_probe(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam inherit" {
+                                            // `diag cam inherit`: after a live handoff with the camera running, read the frame Linux's pipeline wrote and paint it (camera.rs).
+                                            crate::camera::inherit_probe(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
