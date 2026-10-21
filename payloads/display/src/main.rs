@@ -172,7 +172,7 @@ struct Circle {
 }
 const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16] };
 
-/// The apps' icons, bundled by tools/app-icons.py: b"ICN2", count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (luminance, computed in linear light on the host). Empty when the build had no bundle.
+/// The apps' icons, bundled by tools/app-icons: b"ICN2", count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.

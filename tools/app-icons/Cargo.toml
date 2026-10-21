@@ -1,6 +1,6 @@
 # A host tool, kept out of the ferros workspace on purpose: it needs fluor with std and its icon decoder, and inside the workspace that feature set could be unified into the no_std payload builds that also depend on fluor.
 [package]
-name = "vsficon"
+name = "app-icons"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,3 +8,5 @@ edition = "2024"
 
 [dependencies]
 fluor = { path = "../../../fluor", default-features = false, features = ["std", "text", "icon"] }
+vsf = { path = "../../../vsf" }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
