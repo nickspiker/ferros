@@ -23,7 +23,14 @@ What the spec retires: the unread *count* on the resting face (a count is a badg
 
 **Nothing ever moves** is a storage invariant, not a rendering choice. A circle's position is written to the vault once, when the circle first appears, and never rewritten. That is what makes navigation by memory possible, and it is enforced where positions live rather than hoped for where they are drawn.
 
-**A circle** is: an identity, a kind (person, thread, photo, app), a fixed position and radius, a label, and two times — when it last changed and when it was last seen.
+**A circle** is: an identity, a kind (person, thread, photo, app), a fixed position, a size, a label, and two times — when it last changed and when it was last seen.
+
+**Size is time** (owner, 2026-10-21). The whole map is one day. Each circle's area is the projected time a day spent on that thing, so the circles together cover the time spent on the phone and **the air between them is everything else** — sleep, a walk, the people in the room. The owner's layout rules, *more air is better* and *keep it simple*, stop being a preference and become literal: a life less taken by the phone draws a quieter, emptier map. It also shows the attention economy for what it is without a word of commentary — an app that takes three hours a day is a large circle, and you watch it shrink when you take the time back.
+
+- Radius goes as the square root of time, not as time: the eye reads area, and a linear radius would draw something used twice as much four times as big.
+- Size and position are separate. Position comes from what a circle relates to and is written once; size follows time and breathes. *Nothing moves* means a thing is always where you left it — its centre stays put while it grows or shrinks, as a tree does — so each circle is placed with air to grow into.
+- Projected time is slow: a rolling average over weeks, measured on the device from what the owner actually zooms into and how long they stay. The map changes like a season, not a feed. A new circle starts small and earns its size.
+- The time measurements never leave the device. They are the most personal data on it.
 
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
@@ -53,6 +60,8 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 
 ## Open
 
+- **Time is not importance.** Area-as-time measures attention, not love: someone called once a month is a speck beside an app scrolled for hours. People could take a floor size, the owner could pin a circle's size, or the map could simply show it honestly.
+- **Growth against neighbours.** A circle that grows a great deal over months can outgrow the air it was placed with. Whether that is resolved by placing generously enough that it never happens, by a rare settling the owner asks for, or by letting circles overlap is open.
 - **Placement.** Who decides where a new circle lands, given it can never move afterwards: the owner, placing it once by hand, or the system, deterministically — say, beside what it relates to, a new thread next to its person?
 - **What lit looks like** at the home scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
 - **The clock** (eagle time, dozenal) and whether the map shows it at all, or the agent answers when asked.
