@@ -20,13 +20,22 @@ Leave this build only as long as the capture takes: idling in Android with every
 
 - SPI mode 0, byte transfers, CS held across a command and its read. Every read returns one dummy byte first (the command echoed back).
 - `87` then read 1+8: one FIFO event. `00`/`FF` in byte 0 = nothing pending.
+  The queue is drained the way `fts_interrupt_handler` drains it: byte 7 of an event carries in its low five bits how many events are still queued, so one read is followed by bursts of the rest (seven events and the dummy byte fill one 64-byte SPI segment, so a full 32-event queue takes five transfers).
+  Reading one event at a time races the queue cursor: the same event comes back a second time with its tail bytes zeroed, which decodes as a contact jumping to the top of the screen at zero pressure.
 - `FB aa aa aa aa` then read 1+n: hardware register read (32-bit big-endian address). `FA aa aa aa aa dd..`: hardware register write.
 - `A7 00 00` then read: framebuffer read (the system-info block). Android runs this one with RX DMA, so the oracle saw only the command.
-- `A0 00 FF`: scan mode active, all sensing on. `C0 ..`: Google custom commands (grip suppression `C0 03 10 FF 03 ..`, `C0 0B 03`, `C0 0F 00`, `C0 0E 00`), each echoed as a `43 01 <cmd>` status event.
+- `A0 00 FF`: scan mode active, all sensing on — but `setScanMode` (ftsCore.c) is **two** writes, and the first is what makes it work: `FA 20 00 00 00 00 00`, a two-byte zero write to hw reg G#2000_0000, precedes the mode command every time.
+  Without it the mode command is accepted silently and the controller never reports a contact, while the capacitance frames still show a finger perfectly — the chip senses but never runs the reporting pipeline.
+  G#2000_0000 is the address the chip ID is read from, so in the capture the write reads like a mistake; it is not. `C0 ..`: Google custom commands (grip suppression `C0 03 10 FF 03 ..`, `C0 0B 03`, `C0 0F 00`, `C0 0E 00`), each echoed as a `43 01 <cmd>` status event.
 
 Probe order: poll `87` until `03 00 ..` (controller ready) after the reset pin rises; read hw reg G#2000_00DE and write it back with bit 7 set (`FTS_GPIO6_UNUSED`); read system info; custom commands; reset again; `A0 00 FF`; then the event stream.
 
-Touch events (8 bytes): `13` enter, `23` motion, `33` leave. `id = e[1]>>4`, `type = e[1]&F`, `x = (e[3]&F)<<8 | e[2]`, `y = e[4]<<4 | e[3]>>4`, `z = e[5]`.
+Touch events (8 bytes). The identifier is the **high nibble of byte 0 alone** (`eventId = evt_data[0] >> 4`): `1` enter, `2` motion, `3` leave, `4` status, `0` controller ready, `F` error.
+The low nibble is payload, not part of the identifier — it carries the top two bits of the major axis — so comparing the whole byte drops every contact wide enough to set them (108 of 704 in the first run that reported anything).
+Because nibble `0` is both controller-ready and an empty queue (`00`), nothing-pending has to be ruled out before identifiers are matched.
+
+`id = e[1]>>4`, `type = e[1]&F`, `x = (e[3]&F)<<8 | e[2]`, `y = e[4]<<4 | e[3]>>4`, `z = e[5]`,
+`major = (((e[0]&0x0C)<<2) | (e[6]>>4)) * 16`, `minor = (((e[7]&0xC0)>>2) | (e[6]&0x0F)) * 16` (`AREA_SCALE` is 16; byte 7's top two bits are the minor axis, its low five the queue depth).
 
 ## Hardware (cold)
 
@@ -68,11 +77,15 @@ chip ID G#3640 (FTM5 parts: G#3648 ALIX, G#3640 SALIXP, G#3639), fw G#0083
 scan mode active: G#4305010000000000
 ```
 
-Then `touch watch` saw the scan-mode echo `43 01 A0 00 FF` and nothing else (nobody touching), and `touch paint` adopted the panel at 1344 x 2992 and cleared it.
+Then `touch watch` reports contacts: measured 1344 events in 8192 ms, 1267 of them motion, coordinates tracking the finger.
+It also reports how often the controller's interrupt line (gpn0-0) was asserted, which is what tells an empty window apart from a broken read — the line is asserted only when the chip has something queued, so "0 events, line asserted 2 of 513 polls" means nobody was touching, not that the driver is broken.
 Cold state before anything is written: the USI2 gates are in automatic mode (open), USI_CON = 1 (USI held in reset), both rails programmed to the right voltage but disabled (G#2C, G#3C), reset pin an input.
 The firmware in the controller's flash runs as is; no firmware download is needed.
 
-Still to verify with a finger: the coordinate axes (events should give x across the short side up to 1343, y up to 2991; `touch paint` reports the largest seen) and the paint strokes landing under the finger.
+Finger-verified 2026-10-20: the axes are x across the short side (0-1343) and y the long side (0-2991), matching the system-info block.
+`diag touch decay` is the instrument that proved it — a 1:1 decay screen in 10-bit-per-channel colour (DPP base layer ARGB2101010, format 19) where every frame each channel of every pixel loses one and each reading stamps the contact's ellipse split across the channels: major axis in red, minor in blue, pressure in green, so a fading trail's red fringe is the eccentricity of the contact.
+Measured 2035 readings in 30 s over 586 frames, 29 ms a decay pass, pressure to A#123 and a largest contact of A#352 by A#224.
+The canvas lives in the cacheable DISPLAY_HEAP and is blitted write-only; a read-modify-write straight on the uncached framebuffer costs 1079 ms a frame against 29 ms this way.
 The system-info block also holds a per-die identifier at offsets 32-47; ferros reads only the header and the coordinates.
 
 ## The sensor grid and the raw capacitance frames (2026-10-20)
