@@ -813,10 +813,13 @@ pub fn gamma(rep: &mut Vec<u8>, ms: u64) {
         }
     };
     let (mut frames, mut stamps, mut decay_us, mut pmax) = (0u32, 0u32, 0u64, 0u32);
+    // What each contact is doing now, held until its leave event. The controller reports a contact entering, then only when something about it changes, then leaving: a finger held perfectly still produces no events at all, so a frame's own queue is not what is on the glass. Deriving the flood from the queue alone made a still finger read as no pressure and the screen fell to black under it.
+    let mut down = [(0i64, 0i64, 0u32); 16];
+    let mut held = 0u16;
     let t_end = now() + ticks_us(ms * 1000);
     while now() < t_end {
         crate::platform::pet_watchdogs();
-        // The readings first, because the flood level for this frame is the hardest press in them.
+        // The readings first, because they decide what is on the glass for this frame.
         let mut batch = [[0u8; EVT_SIZE]; 32];
         let n = match drain_events(&mut batch) {
             Ok(n) => n,
@@ -825,21 +828,26 @@ pub fn gamma(rep: &mut Vec<u8>, ms: u64) {
                 0
             }
         };
-        let mut flood = 0u32;
-        let mut contacts = [(0i64, 0i64); 32];
-        let mut held = 0;
         for e in batch[..n].iter().copied() {
-            if !matches!(e[0] >> 4, EVT_ENTER | EVT_MOTION) {
-                continue;
+            let tid = (e[1] >> 4) as usize & 15;
+            match e[0] >> 4 {
+                EVT_ENTER | EVT_MOTION => {
+                    let z = e[5] as u32;
+                    pmax = pmax.max(z);
+                    down[tid] = (((e[3] as i64 & 0xF) << 8) | e[2] as i64, ((e[4] as i64) << 4) | (e[3] as i64 >> 4), z);
+                    held |= 1 << tid;
+                    stamps += 1;
+                }
+                EVT_LEAVE => held &= !(1 << tid),
+                _ => {}
             }
-            let z = e[5] as u32;
-            pmax = pmax.max(z);
-            flood = flood.max(lvl(z));
-            if held < contacts.len() {
-                contacts[held] = (((e[3] as i64 & 0xF) << 8) | e[2] as i64, ((e[4] as i64) << 4) | (e[3] as i64 >> 4));
-                held += 1;
+        }
+        // The hardest press among the contacts actually on the glass, still or moving.
+        let mut flood = 0u32;
+        for tid in 0..16 {
+            if held >> tid & 1 == 1 {
+                flood = flood.max(lvl(down[tid].2));
             }
-            stamps += 1;
         }
         // Halve what is there, then lift the whole screen to the level the press asks for: a lifted finger floods nothing, so the screen falls away by halving on its own.
         let t0 = now();
@@ -851,9 +859,11 @@ pub fn gamma(rep: &mut Vec<u8>, ms: u64) {
             }
         }
         decay_us += (now() - t0) / (freq / 1_000_000);
-        for k in 0..held {
-            let (x, y) = contacts[k];
-            stamp(x, y, (flood * 255 / 1023) as i64);
+        for tid in 0..16 {
+            if held >> tid & 1 == 1 {
+                let (x, y, z) = down[tid];
+                stamp(x, y, z as i64);
+            }
         }
         for i in 0..stride * h {
             unsafe { core::ptr::write_volatile((fb + i * 4) as *mut u32, px(i)) };
