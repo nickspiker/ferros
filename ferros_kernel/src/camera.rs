@@ -529,13 +529,14 @@ pub fn events_dump(rep: &mut Vec<u8>, quiet_too: bool) {
     for src in crate::camera_events::SOURCES.iter() {
         crate::flashlog::line(&alloc::format!("cam events: {}", src.name));
         let v = rd(src.base + src.off);
-        if v == 0 && !quiet_too {
+        let m = if src.mask_off != 0 { rd(src.base + src.mask_off) } else { 0 };
+        // An armed mask is as telling as a live status: it says the program enabled this channel and expects events from it. A channel with a mask and no status is one that was set up and never fired.
+        if v == 0 && m == 0 && !quiet_too {
             continue;
         }
         if v != 0 {
             live += 1;
         }
-        let m = if src.mask_off != 0 { rd(src.base + src.mask_off) } else { 0 };
         let mut names = alloc::string::String::new();
         for &(b, n) in src.bits.iter() {
             if v >> b & 1 == 1 {
