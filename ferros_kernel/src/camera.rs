@@ -518,6 +518,257 @@ fn sensor_frame_count() -> Option<u8> {
     crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).ok().map(|_| b[0])
 }
 
+/// `diag cam slit`: set our own window and frame rate on the sensor, rather than replaying the captured mode.
+/// The sensor speaks MIPI CCS, so geometry and timing are standard registers: `y_addr_start`/`y_addr_end` choose the rows read off the array, `y_output_size` the rows sent, and `frame_length_lines` the total frame period. Shrink the window and the frame gets shorter, so the rate goes up — which is both the proof that we drive the sensor rather than echo it, and the shape slit-scan wants: a narrow band read as fast as the sensor will give it.
+/// Measured against the captured mode's 4080 x 3072 at about fourteen frames a second. The sensor's own frame counter (G#0005) is the clock: it steps once a frame regardless of what the receiver downstream does, so this stands on its own even while the front end's routing is unsolved.
+/// `lines` is the slit height in output rows, binned four to one off the array as the captured mode is.
+pub fn slit(rep: &mut Vec<u8>, init: Option<Vec<u8>>, lines: u32) {
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no sensor init table\n"));
+    };
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    // One write of a 16-bit CCS register, big-endian as the bus is.
+    let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
+    let rate = |rep: &mut Vec<u8>, what: &str| {
+        // Count the sensor's own frames over a quarter second.
+        let t0 = crate::platform::cntpct();
+        let window = crate::platform::cntfrq() / 4;
+        let first = sensor_frame_count();
+        let mut last = first;
+        let mut seen = 0u32;
+        while crate::platform::cntpct() - t0 < window {
+            let c = sensor_frame_count();
+            if c != last {
+                seen += 1;
+                last = c;
+            }
+        }
+        line(rep, alloc::format!("{what}: A#{seen} frames in 250 ms (counter {:?} to {:?})\n", first, last));
+        seen
+    };
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    line(rep, alloc::format!("stream on {:?}; the captured mode is 4080 x 3072\n", son.is_ok()));
+    spin_us(200_000);
+    let before = rate(rep, "captured mode");
+    // The slit. The array rows are binned four to one, so the window is four times the output height; the frame period needs a little more than the rows it carries, and the captured mode's line length is kept so the pixel clock does not move.
+    let rows = (lines * 4).min(12288);
+    let hold = w16(0x0104, 1);
+    let a = w16(0x0346, 0x0010);
+    let b = w16(0x034A, (0x0010 + rows - 1) as u16);
+    let c = w16(0x034E, lines as u16);
+    let d = w16(0x0340, (lines + 64) as u16);
+    let rel = w16(0x0104, 0);
+    line(rep, alloc::format!("slit of A#{lines} output rows from A#{rows} array rows: hold {:?} y_start {:?} y_end {:?} y_out {:?} frame_len {:?} release {:?}\n", hold.is_ok(), a.is_ok(), b.is_ok(), c.is_ok(), d.is_ok(), rel.is_ok()));
+    spin_us(200_000);
+    let after = rate(rep, "slit mode");
+    // What the sensor says it is doing now, read back from its own registers.
+    let mut g = [0u8; 2];
+    let rd16 = |a: u16, g: &mut [u8; 2]| -> alloc::string::String {
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8], g) {
+            Ok(()) => alloc::format!("G#{:X}", (g[0] as u32) << 8 | g[1] as u32),
+            Err(e) => alloc::format!("err G#{e:X}"),
+        }
+    };
+    line(rep, alloc::format!("sensor now: y_output_size {} frame_length_lines {} x_output_size {} mode_select {}\n",
+        rd16(0x034E, &mut g), rd16(0x0340, &mut g), rd16(0x034C, &mut g), rd16(0x0100, &mut g)));
+    let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    if after > before {
+        line(rep, alloc::format!("the window is ours: A#{before} frames became A#{after} in the same 250 ms\n"));
+    } else {
+        line(rep, alloc::format!("the rate did not rise (A#{before} then A#{after}); the sensor either refused the geometry or needs the mode set before stream-on\n"));
+    }
+}
+
+/// `diag cam preexist`: does the front end hold state that nothing in the replay sets up?
+/// The oracle was armed sixty seconds into a boot, on purpose, to skip the boot probe — so any one-time initialisation done before a camera app ever runs was never captured and is not in anything ferros replays. The capture still shows it indirectly: a register Linux **reads as non-zero before it ever writes it** was set up by something earlier.
+/// This reads those registers on a cold ferros and reports every one that disagrees. A mismatch is missing setup; a match means the value is either a reset default or something the replay does cover.
+/// The read-only version words (every block's +G#4 reads G#5000) and one free-running counter are left out.
+pub fn preexisting(rep: &mut Vec<u8>) {
+    const EXPECT: [(usize, u32); 45] = [
+        (0x1C00701C, 0x4),
+        (0x1C007020, 0x4),
+        (0x1C007024, 0x4),
+        (0x1C007028, 0x5),
+        (0x1C00702C, 0x4),
+        (0x1C007030, 0x4),
+        (0x1C007034, 0x4),
+        (0x1C007038, 0x4),
+        (0x1C00703C, 0x4),
+        (0x1C007040, 0x4),
+        (0x1C007044, 0x4),
+        (0x1C007078, 0x4),
+        (0x1C00707C, 0x4),
+        (0x1C007080, 0x4),
+        (0x1C007084, 0x4),
+        (0x1C007088, 0x4),
+        (0x1C00708C, 0x4),
+        (0x1C007090, 0x4),
+        (0x1C007094, 0x4),
+        (0x1C00709C, 0x4),
+        (0x1C0070A0, 0x4),
+        (0x1C0070A4, 0x4),
+        (0x1C0070A8, 0x4),
+        (0x1C0070AC, 0x4),
+        (0x1C0070B0, 0x4),
+        (0x1C0070B4, 0x4),
+        (0x1C0070B8, 0x4),
+        (0x1C0070BC, 0x4),
+        (0x1C0070C0, 0x4),
+        (0x1C0070C4, 0x4),
+        (0x1C0070CC, 0x4),
+        (0x1C0070D0, 0x4),
+        (0x1C040000, 0x8010000),
+        (0x1C32008C, 0x81),
+        (0x1C320124, 0x75800),
+        (0x1C320424, 0x8),
+        (0x1C322024, 0x8),
+        (0x1C330000, 0x3004005),
+        (0x1C337300, 0x4),
+        (0x1C350000, 0x1003AA),
+        (0x1C395180, 0x1),
+        (0x1C395280, 0x1),
+        (0x1C395380, 0x1),
+        (0x1C395480, 0x1),
+        (0x1C395580, 0x1),
+    ];
+    if !fe_powered() {
+        return line(rep, alloc::format!("ISP front end is not powered (run `diag cam fe`)\n"));
+    }
+    let (mut same, mut diff) = (0u32, 0u32);
+    for &(a, want) in EXPECT.iter() {
+        crate::flashlog::line(&alloc::format!("cam preexist: reading G#{a:X}"));
+        let got = rd(a);
+        if got == want {
+            same += 1;
+        } else {
+            diff += 1;
+            line(rep, alloc::format!("  G#{a:X}: Linux G#{want:X}, ferros G#{got:X}\n"));
+        }
+    }
+    line(rep, alloc::format!("A#{same} of A#{} match what Linux had before its capture began; A#{diff} differ\n", EXPECT.len()));
+}
+
+/// `diag cam probe`: is a capability read that disagrees with reality the sensor's answer or ours?
+/// Several words in the CCS limit block came back impossible — `max_line_length_pck` 511 against a working mode of 6320, `min_frame_length_lines` 16704 against a mode of 10584 — and a minimum cannot exceed the value in use. Either the sensor does not implement those addresses, or this driver's multi-byte read is returning something else.
+/// The test interleaves a register that reads correctly with one that does not, and repeats each: a value that follows whatever was read before it is stale data from the previous transfer, and a value that is the same no matter what preceded it is the sensor's own answer, implemented or not.
+pub fn read_probe(rep: &mut Vec<u8>) {
+    let r = |a: u16, w: usize| -> alloc::string::String {
+        let mut b = [0u8; 4];
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8], &mut b[..w]) {
+            Ok(()) => {
+                let mut v = 0u32;
+                for i in 0..w {
+                    v = v << 8 | b[i] as u32;
+                }
+                alloc::format!("G#{v:X}")
+            }
+            Err(e) => alloc::format!("err G#{e:X}"),
+        }
+    };
+    // G#0000 is known good (the model ID), G#1140 is one of the impossible ones, G#1104 is the four-byte word whose first half G#1140 appeared to echo.
+    line(rep, alloc::format!("interleaved, 2 bytes each: G#0000={} G#1140={} G#0000={} G#1140={}\n", r(0x0000, 2), r(0x1140, 2), r(0x0000, 2), r(0x1140, 2)));
+    line(rep, alloc::format!("after a different word:    G#1104(4)={} G#1140={} G#0080={} G#1140={}\n", r(0x1104, 4), r(0x1140, 2), r(0x0080, 2), r(0x1140, 2)));
+    line(rep, alloc::format!("widths on a known word:    G#0000(1)={} G#0000(2)={} G#0000(4)={}\n", r(0x0000, 1), r(0x0000, 2), r(0x0000, 4)));
+    line(rep, alloc::format!("a register the mode uses:  G#0340(2)={} G#0342(2)={} G#034C(2)={} G#0136(2)={}\n", r(0x0340, 2), r(0x0342, 2), r(0x034C, 2), r(0x0136, 2)));
+}
+
+/// `diag cam caps`: the sensor's own statement of what it can do, read from the MIPI CCS capability block.
+/// The sensor speaks CCS (SMIA++), a public standard: of the 1347 writes in the captured init only twenty define the mode, and those twenty are standard registers. The rest is vendor tuning. So rates, windows and modes are ours to compute rather than replay — and this block is where the silicon says what the vendor allows, instead of us inferring an envelope from one captured mode.
+/// Addresses from the mainline CCS driver's generated register map (drivers/media/i2c/ccs/ccs-regs.h). A sensor need not implement all of it; a zero here means "not implemented", which is itself worth knowing.
+/// Needs only `diag cam up` — no receiver, no ISP.
+pub fn caps_dump(rep: &mut Vec<u8>) {
+    // (address, width in bytes, name). Widths are CCS's: the block is big-endian throughout.
+    const CAPS: [(u16, u8, &str); 49] = [
+        (0x0000, 2, "module_model_id"),
+        (0x0002, 1, "module_revision_major"),
+        (0x000E, 2, "module_manufacturer_id"),
+        (0x0016, 2, "sensor_model_id"),
+        (0x0018, 1, "sensor_revision"),
+        (0x0040, 1, "frame_format_model_type"),
+        (0x0041, 1, "frame_format_model_subtype"),
+        (0x0080, 2, "analog_gain_capability"),
+        (0x00C0, 1, "data_format_model_type"),
+        (0x00C1, 1, "data_format_model_subtype"),
+        (0x1000, 2, "integration_time_capability"),
+        (0x1004, 2, "coarse_integration_time_min"),
+        (0x1006, 2, "coarse_integration_time_max_margin"),
+        (0x1008, 2, "fine_integration_time_min"),
+        (0x100A, 2, "fine_integration_time_max_margin"),
+        (0x1081, 1, "digital_gain_capability"),
+        (0x10F0, 1, "adc_capability"),
+        (0x10F4, 4, "adc_bit_depth_capability"),
+        // The clock tree's limits: what pixel clock, and so what lane rate, the sensor will accept.
+        (0x1100, 4, "min_ext_clk_freq_mhz"),
+        (0x1104, 4, "max_ext_clk_freq_mhz"),
+        (0x1108, 2, "min_pre_pll_clk_div"),
+        (0x110A, 2, "max_pre_pll_clk_div"),
+        (0x110C, 4, "min_pll_ip_clk_freq_mhz"),
+        (0x1110, 4, "max_pll_ip_clk_freq_mhz"),
+        (0x1114, 2, "min_pll_multiplier"),
+        (0x1116, 2, "max_pll_multiplier"),
+        (0x1118, 4, "min_pll_op_clk_freq_mhz"),
+        (0x111C, 4, "max_pll_op_clk_freq_mhz"),
+        (0x1120, 2, "min_vt_sys_clk_div"),
+        (0x1122, 2, "max_vt_sys_clk_div"),
+        (0x112C, 4, "min_vt_pix_clk_freq_mhz"),
+        (0x1130, 4, "max_vt_pix_clk_freq_mhz"),
+        (0x1134, 2, "min_vt_pix_clk_div"),
+        (0x1136, 2, "max_vt_pix_clk_div"),
+        // Frame timing: the slit-scan knobs. A narrow window is a short frame, and a short frame is a fast one.
+        (0x1140, 2, "min_frame_length_lines"),
+        (0x1142, 2, "max_frame_length_lines"),
+        (0x1144, 2, "min_line_length_pck"),
+        (0x1146, 2, "max_line_length_pck"),
+        (0x1148, 2, "min_line_blanking_pck"),
+        (0x114A, 2, "min_frame_blanking_lines"),
+        (0x114C, 1, "min_line_length_pck_step_size"),
+        (0x114D, 1, "timing_mode_capability"),
+        (0x1188, 2, "min_x_output_size"),
+        (0x118A, 2, "min_y_output_size"),
+        (0x118C, 2, "max_x_output_size"),
+        (0x118E, 2, "max_y_output_size"),
+        (0x11C0, 2, "min_even_inc"),
+        (0x11C4, 2, "max_even_inc"),
+        (0x11C6, 2, "max_odd_inc"),
+    ];
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let (mut ok, mut zero, mut err) = (0u32, 0u32, 0u32);
+    for &(a, w, name) in CAPS.iter() {
+        let mut b = [0u8; 4];
+        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8], &mut b[..w as usize]) {
+            Ok(()) => {
+                let mut v = 0u32;
+                for i in 0..w as usize {
+                    v = v << 8 | b[i] as u32;
+                }
+                if v == 0 {
+                    zero += 1;
+                } else {
+                    ok += 1;
+                }
+                line(rep, alloc::format!("  G#{a:04X} {name:34} = A#{v} (G#{v:X})\n"));
+            }
+            Err(e) => {
+                err += 1;
+                line(rep, alloc::format!("  G#{a:04X} {name:34} = read failed G#{e:X}\n"));
+            }
+        }
+    }
+    // The four clock-frequency limits are CCS_FL_FLOAT_IREAL: a 32-bit value is either a plain integer or an IEEE-754 single, chosen per sensor, so the raw word above is the honest thing to print.
+    line(rep, alloc::format!("A#{ok} registers answered non-zero, A#{zero} read zero (not implemented), A#{err} failed; the *_freq_mhz words are CCS float-or-integer, read them raw\n"));
+}
+
 /// Read every interrupt source in the ISP pipeline and report the ones that are not zero, with their set bits named (camera_events.rs, generated from the Pixel kernel's LWIS event tables by tools/gen-isp-events.py).
 /// This is the pipeline's stethoscope: 203 sources across the front end, the CSI link and PHY, and the PDMA engine, so one run says which stage is alive and where it falls silent — instead of diffing words whose meaning has to be guessed.
 /// Each node is named in the flash log before it is read: some front-end pages stall the bus in some states, and the log's last line then names the one that did it.

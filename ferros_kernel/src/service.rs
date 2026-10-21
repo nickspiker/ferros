@@ -859,6 +859,45 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam slit" {
+                                            // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
+                                            let mut t = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                                            if t.is_none() {
+                                                let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                                                if b.is_none() && cfg!(cam_frame_blob) {
+                                                    b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                                                }
+                                                if let Some(b) = b.as_deref() {
+                                                    if b.len() > 8 && &b[..4] == b"CFRM" {
+                                                        let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                                        if 8 + n <= b.len() {
+                                                            t = Some(b[8..8 + n].to_vec());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            crate::camera::slit(&mut resp, t, 64);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam preexist" {
+                                            // `diag cam preexist`: front-end state Linux had before the capture window, which nothing in the replay sets up (camera.rs).
+                                            crate::camera::preexisting(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam probe" {
+                                            // `diag cam probe`: whether an impossible capability read is the sensor's answer or this driver's (camera.rs).
+                                            crate::camera::read_probe(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam caps" {
+                                            // `diag cam caps`: the sensor's MIPI CCS capability block — what rates, windows and modes the silicon says it allows (camera.rs).
+                                            crate::camera::caps_dump(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam events" {
                                             // `diag cam events`: every ISP interrupt source that is reporting, with its bits named (camera.rs, camera_events.rs).
                                             crate::camera::events_dump(&mut resp, false);
