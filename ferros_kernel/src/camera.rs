@@ -233,13 +233,68 @@ pub fn scan(rep: &mut Vec<u8>) {
 const MATRIX_A: u16 = 0x110D;
 const GPIO4_CTRL: u16 = 0x1713;
 
-/// Voltage codes for the main camera's rails, V = base + code × step (slg51002-regulator.c: LDO1–5 base 1.2 V step 10 mV, LDO6–8 base 0.4 V step 5 mV), targets from the device tree's regulator nodes. The chip's cold defaults are different (LDO1 G#A5 = 2.85 V, LDO8 G#8C = 1.10 V): Linux sets these when it registers the regulators at boot, which is why a camera-open capture never shows them. Each entry: name, VSEL register, code, enable bit, and the range registers' address to check the code against.
-const RAILS: [(&str, u16, u8, u32, u16); 4] = [
-    ("LDO1 2.25 V", 0x2000, 0x69, 0, 0x2060),
-    ("LDO4 2.95 V", 0x2500, 0xAF, 3, 0x2560),
-    ("LDO5 2.90 V", 0x2700, 0xAA, 4, 0x2760),
-    ("LDO8 0.97 V", 0x3200, 0x72, 7, 0x3260),
+/// One camera-PMIC rail: V = `base_mv` + code × `step_mv` (slg51002-regulator.c: LDO1-5 base 1.2 V step 10 mV, LDO6-8 base 0.4 V step 5 mV).
+/// `target_mv` is what the module wants, from the device tree's consumer nodes, and it is the thing an overvoltage is measured against — not the regulator's own range, which is far wider than any rail's consumer can take.
+struct Rail {
+    name: &'static str,
+    vsel: u16,
+    code: u8,
+    bit: u32,
+    /// The chip's own min/max code for this rail, a register pair.
+    range: u16,
+    base_mv: u32,
+    step_mv: u32,
+    target_mv: u32,
+}
+
+/// The main camera's rails. The chip's cold defaults are not the camera's (LDO1 G#A5 = 2.85 V where the module wants 2.25 V, LDO8 G#8C = 1.10 V where it wants 0.97 V): Linux sets these when it registers the regulators at boot, which is why a camera-open capture never shows them, and why writing a wrong code here is an ordinary mistake rather than an exotic one.
+const RAILS: [Rail; 4] = [
+    Rail { name: "LDO1 2.25 V", vsel: 0x2000, code: 0x69, bit: 0, range: 0x2060, base_mv: 1200, step_mv: 10, target_mv: 2250 },
+    Rail { name: "LDO4 2.95 V", vsel: 0x2500, code: 0xAF, bit: 3, range: 0x2560, base_mv: 1200, step_mv: 10, target_mv: 2950 },
+    Rail { name: "LDO5 2.90 V", vsel: 0x2700, code: 0xAA, bit: 4, range: 0x2760, base_mv: 1200, step_mv: 10, target_mv: 2900 },
+    Rail { name: "LDO8 0.97 V", vsel: 0x3200, code: 0x72, bit: 7, range: 0x3260, base_mv: 400, step_mv: 5, target_mv: 970 },
 ];
+
+/// Refuse a voltage code that would put more than a tenth over target on a rail.
+///
+/// This is the only irreversible mistake in the camera path. The sensor's digital core runs at 0.97 V and its regulator will happily deliver 1.675 V — inside the chip's declared range, past anything the die survives, and gone for good with no recovery of any kind. The guard is deliberately asymmetric: undervoltage only means the part does not work, so anything at or below target passes, while overvoltage is capped at ten percent to leave room for a deliberate experiment and none for an encoding slip.
+/// Returns the code's millivolts, or the reason it was refused.
+fn check_rail(r: &Rail, code: u8) -> Result<u32, alloc::string::String> {
+    let mv = r.base_mv + code as u32 * r.step_mv;
+    let ceiling = r.target_mv + r.target_mv / 10;
+    if mv > ceiling {
+        return Err(alloc::format!("REFUSED: code G#{code:02X} is A#{mv} mV, over the A#{ceiling} mV ceiling for a A#{} mV rail", r.target_mv));
+    }
+    Ok(mv)
+}
+
+/// `diag cam clamp`: prove the overvoltage guard refuses what it is there to refuse, without touching the chip.
+/// Every code is checked through `check_rail` alone — no I2C, no writes — so this is safe to run at any time, and it is the only way to know the guard works: one that has never been seen to fire is not a guard.
+/// The dangerous cases are the real ones. The chip's own cold default for LDO1 is G#A5, which is 2.85 V on a rail the module wants at 2.25 V; LDO8's regulator reaches 1.675 V on a 0.97 V digital core, and the device tree permits it.
+pub fn clamp_test(rep: &mut Vec<u8>) {
+    line(rep, alloc::format!("the overvoltage guard, checked against the codes it must pass and refuse:\n"));
+    let (mut pass, mut fail) = (0u32, 0u32);
+    for rail in RAILS.iter() {
+        // The code ferros uses, the chip's cold default, the rail's own maximum, and a plainly wrong byte.
+        for (what, code, want_ok) in [
+            ("ferros's own code", rail.code, true),
+            ("a tenth under target", ((rail.target_mv - rail.target_mv / 10 - rail.base_mv) / rail.step_mv) as u8, true),
+            ("the chip's cold default G#A5", 0xA5, rail.base_mv + 0xA5 * rail.step_mv <= rail.target_mv + rail.target_mv / 10),
+            ("the rail's maximum code", 0xFF, false),
+            ("a tenth over target", ((rail.target_mv + rail.target_mv / 5 - rail.base_mv) / rail.step_mv) as u8, false),
+        ] {
+            let got = check_rail(rail, code);
+            let ok = got.is_ok() == want_ok;
+            if ok { pass += 1 } else { fail += 1 }
+            let verdict = match &got {
+                Ok(mv) => alloc::format!("allowed at A#{mv} mV"),
+                Err(_) => alloc::string::String::from("refused"),
+            };
+            line(rep, alloc::format!("  {} {:30} G#{code:02X}: {verdict}{}\n", if ok { "ok  " } else { "BAD " }, what, if ok { "" } else { " <- the guard disagrees with what it should do" }));
+        }
+    }
+    line(rep, alloc::format!("A#{pass} checks behaved, A#{fail} did not\n"));
+}
 
 fn pmic_write(reg: u16, val: u8) -> Result<(), u32> {
     let r = reg.to_be_bytes();
@@ -289,12 +344,15 @@ pub fn power_up(rep: &mut Vec<u8>) {
         }
     }
     // Voltages first, verified, while every rail is off.
-    for (name, vsel, code, _, range) in RAILS {
+    for rail in RAILS.iter() {
+        let (name, vsel, code, range) = (rail.name, rail.vsel, rail.code, rail.range);
         let r = (|| -> Result<alloc::string::String, alloc::string::String> {
+            // The overvoltage guard before anything else, so a bad code never reaches the chip.
+            let mv = check_rail(rail, code)?;
             let lo = pmic_read(range).map_err(hex)?;
             let hi = pmic_read(range + 1).map_err(hex)?;
             if code < lo || code > hi {
-                return Err(alloc::format!("code G#{code:02X} outside range G#{lo:02X}..G#{hi:02X}"));
+                return Err(alloc::format!("code G#{code:02X} outside the chip's range G#{lo:02X}..G#{hi:02X}"));
             }
             let before = pmic_read(vsel).map_err(hex)?;
             pmic_write(vsel, code).map_err(hex)?;
@@ -302,7 +360,7 @@ pub fn power_up(rep: &mut Vec<u8>) {
             if after != code {
                 return Err(alloc::format!("wrote G#{code:02X}, reads G#{after:02X}"));
             }
-            Ok(alloc::format!("G#{before:02X} -> G#{after:02X}"))
+            Ok(alloc::format!("G#{before:02X} -> G#{after:02X}, A#{mv} mV"))
         })();
         if !step(rep, name, r) {
             power_down(rep);

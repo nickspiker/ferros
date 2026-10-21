@@ -892,6 +892,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam clamp" {
+                                            // `diag cam clamp`: prove the camera-PMIC overvoltage guard refuses what it must, with no I2C at all (camera.rs).
+                                            crate::camera::clamp_test(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam caps" {
                                             // `diag cam caps`: the sensor's MIPI CCS capability block — what rates, windows and modes the silicon says it allows (camera.rs).
                                             crate::camera::caps_dump(&mut resp);
