@@ -892,6 +892,18 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam scan all" {
+                                            // `diag cam scan all`: power each camera module in turn and read its model ID (camera.rs).
+                                            crate::camera::scan_all(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam buses" {
+                                            // `diag cam buses`: all four camera I2C controllers up, nothing powered and no device addressed (camera.rs).
+                                            crate::camera::buses_all(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam clamp" {
                                             // `diag cam clamp`: prove the camera-PMIC overvoltage guard refuses what it must, with no I2C at all (camera.rs).
                                             crate::camera::clamp_test(&mut resp);

@@ -247,13 +247,226 @@ struct Rail {
     target_mv: u32,
 }
 
-/// The main camera's rails. The chip's cold defaults are not the camera's (LDO1 G#A5 = 2.85 V where the module wants 2.25 V, LDO8 G#8C = 1.10 V where it wants 0.97 V): Linux sets these when it registers the regulators at boot, which is why a camera-open capture never shows them, and why writing a wrong code here is an ordinary mistake rather than an exotic one.
-const RAILS: [Rail; 4] = [
+/// Every rail on the camera PMIC, with the voltage its consumer actually wants.
+/// The chip's cold defaults are not the camera's (LDO1 G#A5 = 2.85 V where the module wants 2.25 V, LDO8 G#8C = 1.10 V where it wants 0.97 V): Linux sets these when it registers the regulators at boot, which is why a camera-open capture never shows them, and why writing a wrong code here is an ordinary mistake rather than an exotic one.
+/// The targets are the vendor's own, read out of a running Android (2026-10-21): the slg51002 rails are registered with Linux's regulator framework, so every one of them publishes its voltage under /sys/class/regulator, which is a safer source than any capture and settles four rails no capture had ever shown. Register addresses from slg51002.h; LDO1-5 are the 1.2 V/10 mV group and LDO6-8 the 0.4 V/5 mV one.
+/// Enable bits are one per LDO in SYSCTL_MATRIX_CONF_A (`enable_mask = BIT(id)`), so LDO1 is bit 0 and LDO8 is bit 7.
+const RAILS: [Rail; 8] = [
     Rail { name: "LDO1 2.25 V", vsel: 0x2000, code: 0x69, bit: 0, range: 0x2060, base_mv: 1200, step_mv: 10, target_mv: 2250 },
+    Rail { name: "LDO2 2.95 V", vsel: 0x2200, code: 0xAF, bit: 1, range: 0x2260, base_mv: 1200, step_mv: 10, target_mv: 2950 },
+    Rail { name: "LDO3 2.25 V", vsel: 0x2300, code: 0x69, bit: 2, range: 0x2360, base_mv: 1200, step_mv: 10, target_mv: 2250 },
     Rail { name: "LDO4 2.95 V", vsel: 0x2500, code: 0xAF, bit: 3, range: 0x2560, base_mv: 1200, step_mv: 10, target_mv: 2950 },
     Rail { name: "LDO5 2.90 V", vsel: 0x2700, code: 0xAA, bit: 4, range: 0x2760, base_mv: 1200, step_mv: 10, target_mv: 2900 },
+    Rail { name: "LDO6 1.10 V", vsel: 0x2900, code: 0x8C, bit: 5, range: 0x2960, base_mv: 400, step_mv: 5, target_mv: 1100 },
+    Rail { name: "LDO7 1.06 V", vsel: 0x3100, code: 0x84, bit: 6, range: 0x3160, base_mv: 400, step_mv: 5, target_mv: 1060 },
     Rail { name: "LDO8 0.97 V", vsel: 0x3200, code: 0x72, bit: 7, range: 0x3260, base_mv: 400, step_mv: 5, target_mv: 970 },
 ];
+
+/// One camera module: which bus answers it, where its pins are, and which rails it needs.
+/// Everything here is from the device tree (`zuma-husky-camera.dtsi` for the module, `zuma-pinctrl` for the pins): the four HS-I2C controllers are the same IP at G#1088/1089/108A/108B_0000 with their buses on gpp2/4/6/8 pins 0 and 1 at function 3, and each module has its own reset pin, its own master-clock pin at function 2, and its own load switch on the PMIC.
+/// `wide_regs` is false for the one module that answers 8-bit register values where the others answer 16 — without it that sensor looks dead.
+pub struct Module {
+    pub name: &'static str,
+    pub role: &'static str,
+    pub bus: usize,
+    pub bus_bank: usize,
+    pub addr: u8,
+    pub reset_bank: usize,
+    pub reset_pin: u32,
+    pub mclk_bank: usize,
+    /// This bus's USI software-configuration register, an offset into SYSREG_PERIC0: hsi2c_1 to hsi2c_4 are +0, +4, +8 and +G#C (zuma-usi.dtsi `samsung,usi-offset`).
+    pub usi_off: usize,
+    pub clock: &'static str,
+    pub wide_regs: bool,
+    /// Which of RAILS this module needs, by index.
+    pub rails: &'static [usize],
+    /// Its load switch on the PMIC: the GPIO control register.
+    pub switch: u16,
+    /// Its enable line on the sub-PMIC, if it has one (GPIO number in the sub block).
+    pub sub_enable: Option<u8>,
+    /// Whether it takes the sub-PMIC's LDO26 as well as LDO12: the two rear modules do, the other two do not (their device-tree supply lists).
+    pub sub_ldo26: bool,
+}
+
+/// GPP bank offsets inside GPIO_PERIC0, as the pin names map to them.
+const GPP2: usize = 0x40;
+const GPP3: usize = 0x60;
+const GPP4: usize = 0x80;
+const GPP5: usize = 0xA0;
+const GPP6: usize = 0xC0;
+const GPP7: usize = 0xE0;
+const GPP8: usize = 0x100;
+const GPP9: usize = 0x120;
+
+pub const MODULES: [Module; 4] = [
+    Module { name: "boitata", role: "main wide", bus: 0x1088_0000, bus_bank: GPP2, addr: 0x3D, reset_bank: GPP2, reset_pin: 2, mclk_bank: GPP9, usi_off: 0x0, clock: "CIS_CLK3 26 MHz", wide_regs: true, rails: &[0, 3, 4, 7], switch: 0x1713, sub_enable: Some(2), sub_ldo26: true },
+    Module { name: "dokkaebi", role: "tele", bus: 0x1089_0000, bus_bank: GPP4, addr: 0x10, reset_bank: GPP4, reset_pin: 2, mclk_bank: GPP5, usi_off: 0x4, clock: "CIS_CLK1 24 MHz", wide_regs: true, rails: &[0, 7], switch: 0x1712, sub_enable: Some(4), sub_ldo26: true },
+    Module { name: "oksoko", role: "ultrawide", bus: 0x108A_0000, bus_bank: GPP6, addr: 0x1A, reset_bank: GPP6, reset_pin: 3, mclk_bank: GPP3, usi_off: 0x8, clock: "CIS_CLK0 24 MHz", wide_regs: false, rails: &[0, 1, 3, 5, 7], switch: 0x1711, sub_enable: None, sub_ldo26: false },
+    Module { name: "kraken", role: "front", bus: 0x108B_0000, bus_bank: GPP8, addr: 0x2D, reset_bank: GPP6, reset_pin: 2, mclk_bank: GPP7, usi_off: 0xC, clock: "CIS_CLK2 24 MHz", wide_regs: true, rails: &[0, 2, 4, 6, 7], switch: 0x1710, sub_enable: None, sub_ldo26: false },
+];
+
+/// The four sensor master clocks as CMU_TOP has them, read only.
+/// All four read zero, and that is their correct state, not a misread: `camera-main-powerup-cmu.txt` shows Linux reading these same words as zero and writing zero back, so the mux selects source 0 and the divider divides by one. The only live traffic in that capture is at G#2604_3004, G#2604_300C and G#2604_3010, each written 2 and then 0 — a transient access request around the register reads, not a persistent enable.
+/// So the master clocks need nothing from us beyond muxing each module's pin, and the two modules that stay silent are not silent for want of a clock configured differently from the two that answer.
+fn clocks_report(rep: &mut Vec<u8>) {
+    const CMU_TOP: usize = 0x2604_0000;
+    for n in 0..4usize {
+        let (mux, div) = (CMU_TOP + 0x1010 + n * 4, CMU_TOP + 0x1810 + n * 4);
+        line(rep, alloc::format!("CIS_CLK{n}: mux G#{:08X} divider G#{:08X}\n", rd(mux), rd(div)));
+    }
+}
+
+/// Power every camera module down, whichever one was up.
+/// `power_down` reverses the main camera's own sequence and knows only its four rails, so after a module that uses any of the others it leaves them enabled — which both spoils the next module's clean start and makes the next `cam up` refuse, since it checks that the matrix is clear (seen 2026-10-21: MATRIX_CONF_A read G#66, the ultrawide's and the front camera's rails still on).
+/// This clears all four reset lines, all four load switches, every rail in the enable matrix, both sub-PMIC rails and all four master-clock pins, so the chip is back to the state a cold boot leaves it in bar the programmed voltages.
+pub fn power_down_all(rep: &mut Vec<u8>) {
+    for m in MODULES.iter() {
+        pin_out(m.reset_bank, m.reset_pin, false);
+        if let Ok(v) = pmic_read(m.switch) {
+            let _ = pmic_write(m.switch, v & !1);
+        }
+    }
+    let _ = pmic_write(MATRIX_A, 0);
+    let _ = acpm::update(acpm::SUB, acpm::T_PMIC, 0x3A, 0, 0x80);
+    let _ = acpm::update(acpm::SUB, acpm::T_PMIC, 0x48, 0, 0x80);
+    for m in MODULES.iter() {
+        pin_out(m.mclk_bank, 0, false);
+    }
+    line(rep, alloc::format!("  all modules down: MATRIX_CONF_A G#{}\n", match pmic_read(MATRIX_A) { Ok(v) => alloc::format!("{v:02X}"), Err(e) => alloc::format!("read err G#{e:X}") }));
+}
+
+/// Power one camera module and read its chip identifier, then leave it powered.
+/// The sequence is the main camera's, from `module_power_seq@0`, generalised over the module table: its own rails programmed and verified while everything is off, then LDO1, its sub-PMIC enable line if it has one, LDO8, the sub-PMIC rails, its remaining rails, its master-clock pin, its load switch, and finally reset released with the 9 ms the sequence calls for.
+/// Only the three rear modules share a sequence; the front one declares none in the device tree, and neither do the two side modules, so LWIS brings those up by enabling their supply list — which is what this does.
+fn power_module(rep: &mut Vec<u8>, m: &Module) -> bool {
+    let hex = |e: u32| alloc::format!("G#{e:X}");
+    let step = |rep: &mut Vec<u8>, label: &str, r: Result<alloc::string::String, alloc::string::String>| -> bool {
+        match r {
+            Ok(s) => { line(rep, alloc::format!("    {label}: {s}\n")); true }
+            Err(s) => { line(rep, alloc::format!("    {label}: FAILED {s}\n")); false }
+        }
+    };
+    // Voltages first, each through the overvoltage guard, while every rail of this module is still off.
+    for &i in m.rails {
+        let rail = &RAILS[i];
+        let r = (|| -> Result<alloc::string::String, alloc::string::String> {
+            let mv = check_rail(rail, rail.code)?;
+            let before = pmic_read(rail.vsel).map_err(hex)?;
+            pmic_write(rail.vsel, rail.code).map_err(hex)?;
+            let after = pmic_read(rail.vsel).map_err(hex)?;
+            if after != rail.code {
+                return Err(alloc::format!("wrote G#{:02X}, reads G#{after:02X}", rail.code));
+            }
+            Ok(alloc::format!("G#{before:02X} -> G#{after:02X}, A#{mv} mV"))
+        })();
+        if !step(rep, rail.name, r) {
+            return false;
+        }
+    }
+    let ldo = |bit: u32| ldo_on(bit).map(|x| alloc::format!("matrix G#{x:02X}")).map_err(hex);
+    let sub_ldo = |reg: u32| acpm::update(acpm::SUB, acpm::T_PMIC, reg, 0x80, 0x80).and_then(|_| acpm::read(acpm::SUB, acpm::T_PMIC, reg)).map(|v| alloc::format!("ctrl G#{v:02X}")).map_err(hex);
+    // LDO1 (the shared analogue rail) and LDO8 (the shared core) bracket the module's enable line, as the captured sequence does.
+    if !step(rep, "LDO1 on", ldo(0)) { return false }
+    spin_us(500);
+    if let Some(g) = m.sub_enable {
+        if !step(rep, "module enable (sub GPIO)", sub_gpio_high(g as u32).map(|_| alloc::string::String::from("high")).map_err(hex)) { return false }
+        spin_us(10);
+    }
+    if !step(rep, "LDO8 on", ldo(7)) { return false }
+    spin_us(750);
+    if m.sub_ldo26 && !step(rep, "sub LDO26 on", sub_ldo(0x48)) { return false }
+    if !step(rep, "sub LDO12 on", sub_ldo(0x3A)) { return false }
+    for &i in m.rails {
+        if i != 0 && i != 7 {
+            if !step(rep, RAILS[i].name, ldo(RAILS[i].bit)) { return false }
+            spin_us(1000);
+        }
+    }
+    // The master clock out on this module's pin: drive and no pull as Linux runs it, then function 2. The CIS clocks themselves already run on a cold boot.
+    let mc = GPIO_PERIC0 + m.mclk_bank;
+    pin_field(mc + 0xC, 0, 2);
+    pin_field(mc + 0x8, 0, 0);
+    pin_field(mc, 0, 2);
+    line(rep, alloc::format!("    master clock pin: CON G#{:X} ({})\n", rd(mc), m.clock));
+    let sw = pmic_read(m.switch).and_then(|v| pmic_write(m.switch, v | 1).map(|_| v)).map_err(hex).map(|v| alloc::format!("G#{v:02X} -> on"));
+    if !step(rep, "load switch", sw) { return false }
+    spin_us(1000);
+    pin_out(m.reset_bank, m.reset_pin, true);
+    line(rep, alloc::format!("    reset released: DAT G#{:X}\n", rd(GPIO_PERIC0 + m.reset_bank + 4)));
+    spin_us(9000);
+    true
+}
+
+/// `diag cam scan`: bring every camera module up in turn and ask it who it is.
+/// Each module gets its bus muxed and clocked, its own rails programmed through the overvoltage guard, its power sequence run, and then a read of register G#0000 — the model identifier, which is the one answer that proves the whole chain to that sensor works. Everything is powered back down between modules so only one is ever live.
+/// The identifier is two bytes on three of the four; the ultrawide answers eight-bit register values, and without allowing for that it reads as a dead part.
+pub fn scan_all(rep: &mut Vec<u8>) {
+    // The camera PMIC is on its own bus, number fourteen, which the four sensor buses do not include and every rail write needs.
+    let gpp16 = GPIO_PERIC0 + 0x220;
+    for pin in 0..2 {
+        pin_field(gpp16, pin, 2);
+        pin_field(gpp16 + 8, pin, 0);
+    }
+    wr(USI14_MUX, rd(USI14_MUX) & !(1 << 4));
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    line(rep, alloc::format!("camera PMIC bus G#{:X}: ready {}\n", PMIC_BUS.base, crate::hsi2c::ready(PMIC_BUS.base, PMIC_BUS.usi_mode)));
+    buses_all(rep);
+    clocks_report(rep);
+    pmic_power_on(rep);
+    // Start from a clear matrix: a previous scan leaves its last module's rails on, and nothing else resets them.
+    power_down_all(rep);
+    for m in MODULES.iter() {
+        line(rep, alloc::format!("{} ({}), bus G#{:X} address G#{:02X}:\n", m.name, m.role, m.bus, m.addr));
+        if power_module(rep, m) {
+            // The controller has to be brought up again now the module is powered: it was configured against lines nothing was holding high, and `sensor_id` does the same before addressing the main camera.
+            let usi = SYSREG_PERIC0 + m.usi_off;
+            crate::hsi2c::bring_up(m.bus, usi, FS_DIV, 0x2_0000);
+            let mut id = [0u8; 2];
+            let r = crate::hsi2c::write_read(m.bus, m.addr, &[0, 0], &mut id);
+            let ready = crate::hsi2c::ready(m.bus, usi);
+            match r {
+                Ok(()) => line(rep, alloc::format!("  ANSWERS: model ID G#{:02X}{:02X} (bus ready {ready})\n", id[0], id[1])),
+                Err(e) => line(rep, alloc::format!("  silent: G#{e:X} (bus ready {ready})\n")),
+            }
+            // A part that acknowledges but reads zero, or does not acknowledge at G#0000 at all, may keep its identifier elsewhere: CCS puts a module identifier at G#0000 and a sensor one at G#0016, and the ultrawide answers eight-bit register values where the rest answer sixteen.
+            if r.is_err() || id == [0, 0] {
+                let mut probe = alloc::string::String::from("  identifier probe:");
+                for reg in [0x0000u16, 0x0002, 0x0016, 0x0018, 0x300A] {
+                    let mut b = [0u8; 2];
+                    let got = crate::hsi2c::write_read(m.bus, m.addr, &[(reg >> 8) as u8, reg as u8], &mut b);
+                    probe.push_str(&match got {
+                        Ok(()) => alloc::format!(" G#{reg:04X}=G#{:02X}{:02X}", b[0], b[1]),
+                        Err(e) => alloc::format!(" G#{reg:04X}=err{e:X}"),
+                    });
+                }
+                probe.push('\n');
+                line(rep, probe);
+            }
+        }
+        power_down_all(rep);
+        spin_us(20_000);
+    }
+}
+
+/// `diag cam buses`: mux and bring up all four camera I2C controllers and report what each says.
+/// They are the same IP as the one the main camera already uses, at G#1088/1089/108A/108B_0000, with their buses on gpp2/4/6/8 pins 0 and 1 at function 3 (zuma-pinctrl) and their USI software-configuration words at +0, +4, +8 and +G#C in SYSREG_PERIC0 (zuma-usi.dtsi).
+/// Nothing is powered and no device is addressed, so this cannot harm anything: a controller whose clock is not running simply reports not ready, which is the question being asked — whether the other three buses are clocked on a cold boot the way the first one is.
+pub fn buses_all(rep: &mut Vec<u8>) {
+    for m in MODULES.iter() {
+        let bank = GPIO_PERIC0 + m.bus_bank;
+        for pin in 0..2 {
+            pin_field(bank, pin, 3);
+            pin_field(bank + 8, pin, 3);
+        }
+        let usi = SYSREG_PERIC0 + m.usi_off;
+        // USI_CON out of reset, then the controller as the main camera's bus is brought up.
+        wr(m.bus + 0xC4, 0);
+        crate::hsi2c::bring_up(m.bus, usi, FS_DIV, 0x2_0000);
+        let ready = crate::hsi2c::ready(m.bus, usi);
+        line(rep, alloc::format!("{:9} {:10} bus G#{:X}: ready {ready:5} USI mode G#{:X} USI_CON G#{:X} CTL G#{:X} CONF G#{:X}; pins CON G#{:X} PUD G#{:X}\n",
+            m.name, m.role, m.bus, rd(usi), rd(m.bus + 0xC4), rd(m.bus), rd(m.bus + 0x40), rd(bank), rd(bank + 8)));
+    }
+}
 
 /// Refuse a voltage code that would put more than a tenth over target on a rail.
 ///
