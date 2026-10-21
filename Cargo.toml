@@ -24,6 +24,8 @@ members = [
     "payloads/fptest",
     "payloads/hello_el0",
     "payloads/echo_server",
+    "payloads/touch",
+    "payloads/touchtest",
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",
