@@ -758,6 +758,123 @@ pub fn decay(rep: &mut Vec<u8>, ms: u64) {
 }
 
 /// Integer square root, for the circle's half-width per row.
+/// `diag touch gamma`: the pressure value alone, in greyscale, to see how the panel's brightness maps to the controller's eight-bit pressure.
+/// Each frame halves the whole canvas as the decay screen does, then floods it to the level the current pressure asks for, then stamps a white disc of that same pressure as its radius at the contact.
+/// One scalar drives two readouts at once: the disc's radius, which is linear in pressure by construction, and the flood's brightness, which is whatever the panel's transfer curve makes it. Pressing slowly from nothing to hard and watching the two disagree is the gamma.
+pub fn gamma(rep: &mut Vec<u8>, ms: u64) {
+    if !spi_clocked() {
+        return line(rep, alloc::format!("SPI not clocked: run `diag touch up` first\n"));
+    }
+    let freq = crate::platform::cntfrq();
+    if !crate::display::use_own_fb(true) {
+        return line(rep, alloc::format!("no framebuffer region on this boot path\n"));
+    }
+    let mut scratch = Vec::new();
+    let Some(p) = crate::display::adopt(freq, &mut scratch) else {
+        let _ = crate::display::use_own_fb(false);
+        return line(rep, alloc::format!("no panel\n"));
+    };
+    p.set_10bit(true);
+    let (w, h, stride, fb) = (p.width, p.rows, p.stride, p.fb);
+    let (heap, heap_end) = crate::cachemap::DISPLAY_HEAP;
+    let need = stride * h * 4;
+    if heap == 0 || heap + need > heap_end {
+        p.set_10bit(false);
+        let _ = crate::display::use_own_fb(false);
+        return line(rep, alloc::format!("the display heap holds A#{} bytes, the canvas needs A#{need}\n", heap_end - heap));
+    }
+    let px = |i: usize| unsafe { core::ptr::read_volatile((heap + i * 4) as *const u32) };
+    let set = |i: usize, v: u32| unsafe { core::ptr::write_volatile((heap + i * 4) as *mut u32, v) };
+    for i in 0..stride * h {
+        set(i, 0xC000_0000);
+        unsafe { core::ptr::write_volatile((fb + i * 4) as *mut u32, 0xC000_0000) };
+    }
+    // Eight-bit pressure to a ten-bit channel level, full scale to full scale.
+    let lvl = |z: u32| (z * 1023 + 127) / 255;
+    line(rep, alloc::format!("pressure gamma screen A#{w} x A#{h} at 1:1, greyscale, 10 bits a channel; pressure A#0-255 maps to level A#0-1023\n"));
+    let stamp = |cx: i64, cy: i64, r: i64| {
+        if r <= 0 {
+            return;
+        }
+        let r = r.min(400);
+        for dy in -r..=r {
+            let y = cy + dy;
+            if y < 0 || y as usize >= h {
+                continue;
+            }
+            let half = isqrt(r * r - dy * dy);
+            for dx in -half..=half {
+                let x = cx + dx;
+                if x < 0 || x as usize >= w {
+                    continue;
+                }
+                set(y as usize * stride + x as usize, 0xFFFF_FFFF);
+            }
+        }
+    };
+    let (mut frames, mut stamps, mut decay_us, mut pmax) = (0u32, 0u32, 0u64, 0u32);
+    let t_end = now() + ticks_us(ms * 1000);
+    while now() < t_end {
+        crate::platform::pet_watchdogs();
+        // The readings first, because the flood level for this frame is the hardest press in them.
+        let mut batch = [[0u8; EVT_SIZE]; 32];
+        let n = match drain_events(&mut batch) {
+            Ok(n) => n,
+            Err(err) => {
+                line(rep, alloc::format!("SPI: {err}\n"));
+                0
+            }
+        };
+        let mut flood = 0u32;
+        let mut contacts = [(0i64, 0i64); 32];
+        let mut held = 0;
+        for e in batch[..n].iter().copied() {
+            if !matches!(e[0] >> 4, EVT_ENTER | EVT_MOTION) {
+                continue;
+            }
+            let z = e[5] as u32;
+            pmax = pmax.max(z);
+            flood = flood.max(lvl(z));
+            if held < contacts.len() {
+                contacts[held] = (((e[3] as i64 & 0xF) << 8) | e[2] as i64, ((e[4] as i64) << 4) | (e[3] as i64 >> 4));
+                held += 1;
+            }
+            stamps += 1;
+        }
+        // Halve what is there, then lift the whole screen to the level the press asks for: a lifted finger floods nothing, so the screen falls away by halving on its own.
+        let t0 = now();
+        for i in 0..stride * h {
+            let v = px(i) & 0x3FF;
+            let d = (v >> 1).max(flood);
+            if d != v {
+                set(i, 0xC000_0000 | d | d << 10 | d << 20);
+            }
+        }
+        decay_us += (now() - t0) / (freq / 1_000_000);
+        for k in 0..held {
+            let (x, y) = contacts[k];
+            stamp(x, y, (flood * 255 / 1023) as i64);
+        }
+        for i in 0..stride * h {
+            unsafe { core::ptr::write_volatile((fb + i * 4) as *mut u32, px(i)) };
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        scratch.clear();
+        p.present(&mut scratch);
+        frames += 1;
+        if frames % 16 == 0 {
+            crate::flashlog::line(&alloc::format!("touch gamma: A#{frames} frames, A#{stamps} readings"));
+        }
+    }
+    p.set_10bit(false);
+    let _ = crate::display::use_own_fb(false);
+    scratch.clear();
+    if let Some(q) = crate::display::adopt(freq, &mut scratch) {
+        q.present(&mut scratch);
+    }
+    line(rep, alloc::format!("A#{frames} frames in A#{ms} ms, A#{stamps} readings; A#{} ms a frame in the decay pass; largest pressure A#{pmax} of A#255, which floods to level A#{} of A#1023; panel restored\n", if frames > 0 { decay_us / frames as u64 / 1000 } else { 0 }, lvl(pmax)));
+}
+
 fn isqrt(v: i64) -> i64 {
     if v <= 0 {
         return 0;
