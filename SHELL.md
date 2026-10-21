@@ -32,6 +32,21 @@ What the spec retires: the unread *count* on the resting face (a count is a badg
 - Projected time is slow: a rolling average over weeks, measured on the device from what the owner actually zooms into and how long they stay. The map changes like a season, not a feed. A new circle starts small and earns its size.
 - The time measurements never leave the device. They are the most personal data on it.
 
+**Importance is the ring** (owner, 2026-10-21). Time measures attention, not love, so importance gets its own channel: the circle's outline weight, in a few discrete steps — none, thin, heavy — since nobody reads seven stroke widths apart. Someone called once a month becomes a small circle with a heavy ring: little time, much meaning, both shown and neither overwriting the other. Brightness was rejected for it: the map's one signal is that lit means changed, and permanently bright important circles would be a standing shout — and, on an OLED, a standing drain.
+
+Each channel carries one meaning:
+
+| channel | meaning | source |
+|---|---|---|
+| position | what it relates to | placed once, never moves |
+| area | time spent | measured by the device |
+| ring | importance | declared by the owner |
+| colour | changed since last seen | events |
+
+The device measures what you do; you declare what matters. When a circle lights, the colour goes on its fill, so the ring stays as its steady weight underneath.
+
+**Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera).
+
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
 **Apps lose the right to speak.** The only path that may update a circle's last-changed time is a message a human originated, arriving through Photon. An app has no channel to light its own circle; that is a property of the shell, not a permission an app could request.
@@ -60,7 +75,6 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 
 ## Open
 
-- **Time is not importance.** Area-as-time measures attention, not love: someone called once a month is a speck beside an app scrolled for hours. People could take a floor size, the owner could pin a circle's size, or the map could simply show it honestly.
 - **Growth against neighbours.** A circle that grows a great deal over months can outgrow the air it was placed with. Whether that is resolved by placing generously enough that it never happens, by a rare settling the owner asks for, or by letting circles overlap is open.
 - **Placement.** Who decides where a new circle lands, given it can never move afterwards: the owner, placing it once by hand, or the system, deterministically — say, beside what it relates to, a new thread next to its person?
 - **What lit looks like** at the home scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
