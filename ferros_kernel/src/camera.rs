@@ -415,7 +415,9 @@ pub fn scan_all(rep: &mut Vec<u8>) {
     pmic_power_on(rep);
     // Start from a clear matrix: a previous scan leaves its last module's rails on, and nothing else resets them.
     power_down_all(rep);
-    for m in MODULES.iter() {
+    // What each module answered, for the panel at the end.
+    let mut found: [alloc::string::String; 4] = [alloc::string::String::new(), alloc::string::String::new(), alloc::string::String::new(), alloc::string::String::new()];
+    for (slot, m) in MODULES.iter().enumerate() {
         line(rep, alloc::format!("{} ({}), bus G#{:X} address G#{:02X}:\n", m.name, m.role, m.bus, m.addr));
         if power_module(rep, m) {
             // The controller has to be brought up again now the module is powered: it was configured against lines nothing was holding high, and `sensor_id` does the same before addressing the main camera.
@@ -425,8 +427,14 @@ pub fn scan_all(rep: &mut Vec<u8>) {
             let r = crate::hsi2c::write_read(m.bus, m.addr, &[0, 0], &mut id);
             let ready = crate::hsi2c::ready(m.bus, usi);
             match r {
-                Ok(()) => line(rep, alloc::format!("  ANSWERS: model ID G#{:02X}{:02X} (bus ready {ready})\n", id[0], id[1])),
-                Err(e) => line(rep, alloc::format!("  silent: G#{e:X} (bus ready {ready})\n")),
+                Ok(()) => {
+                    line(rep, alloc::format!("  ANSWERS: model ID G#{:02X}{:02X} (bus ready {ready})\n", id[0], id[1]));
+                    found[slot] = alloc::format!("answers G#{:02X}{:02X}", id[0], id[1]);
+                }
+                Err(e) => {
+                    line(rep, alloc::format!("  silent: G#{e:X} (bus ready {ready})\n"));
+                    found[slot] = alloc::format!("silent, G#{e:X}");
+                }
             }
             // A part that acknowledges but reads zero, or does not acknowledge at G#0000 at all, may keep its identifier elsewhere: CCS puts a module identifier at G#0000 and a sensor one at G#0016, and the ultrawide answers eight-bit register values where the rest answer sixteen.
             if r.is_err() || id == [0, 0] {
@@ -441,11 +449,27 @@ pub fn scan_all(rep: &mut Vec<u8>) {
                 }
                 probe.push('\n');
                 line(rep, probe);
+                // A part whose identifier only lives at the CCS sensor register still counts as found.
+                let mut b = [0u8; 2];
+                if crate::hsi2c::write_read(m.bus, m.addr, &[0x00, 0x16], &mut b).is_ok() && b != [0, 0] {
+                    found[slot] = alloc::format!("answers G#{:02X}{:02X} at G#0016", b[0], b[1]);
+                }
             }
         }
         power_down_all(rep);
         spin_us(20_000);
     }
+    // The same answers on the panel, so the cluster can be read off the phone itself.
+    let mut screen = alloc::string::String::from("ferros camera cluster\n\n");
+    for (slot, m) in MODULES.iter().enumerate() {
+        screen.push_str(&alloc::format!("{:9} {:11} bus G#{:X} addr G#{:02X}\n            {}\n", m.name, m.role, m.bus, m.addr, if found[slot].is_empty() { "not reached" } else { found[slot].as_str() }));
+    }
+    screen.push_str("\nrails, the vendor's own targets:\n");
+    for r in RAILS.iter() {
+        screen.push_str(&alloc::format!("  {} code G#{:02X}, refused above A#{} mV\n", r.name, r.code, r.target_mv + r.target_mv / 10));
+    }
+    let shown = crate::display::show(screen.as_bytes(), crate::platform::cntfrq());
+    line(rep, alloc::format!("panel painted ({} bytes of adoption report)\n", shown.len()));
 }
 
 /// `diag cam buses`: mux and bring up all four camera I2C controllers and report what each says.
