@@ -17,7 +17,7 @@
 //! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
 //! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
 //! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the phone is a map of your life).
-//! - 13 `scene add [count u8][count x circle]`: append circles, each 29 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `len u8`, `label [16]`.
+//! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 0 = none), `len u8`, `label [16]`.
 //! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`: draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
@@ -166,10 +166,26 @@ struct Circle {
     r: u16,
     ring: u8,
     lit: u8,
+    icon: u8,
     len: u8,
     label: [u8; 16],
 }
-const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, len: 0, label: [0; 16] };
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16] };
+
+/// The apps' icons, bundled by tools/app-icons.py: b"ICN2", count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (luminance, computed in linear light on the host). Empty when the build had no bundle.
+static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
+
+/// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
+fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
+    if n == 0 || ICONS.len() < 7 || &ICONS[..4] != b"ICN2" || n > ICONS[4] {
+        return None;
+    }
+    let size = u16::from_le_bytes([ICONS[5], ICONS[6]]) as usize;
+    let at = 7 + (n as usize - 1) * size * size * 5;
+    let px = ICONS.get(at..at + size * size * 4)?;
+    let grey = ICONS.get(at + size * size * 4..at + size * size * 5)?;
+    Some((px, grey, size))
+}
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
@@ -620,19 +636,19 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let count = m[1] as usize;
                     let mut at = 2usize;
                     for _ in 0..count {
-                        if at + 29 > m.len() || unsafe { SCENE_N } >= 256 {
+                        if at + 30 > m.len() || unsafe { SCENE_N } >= 256 {
                             out[0] = 2;
                             break;
                         }
                         let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
                         let mut label = [0u8; 16];
-                        label.copy_from_slice(&m[at + 13..at + 29]);
-                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], len: m[at + 12].min(16), label };
+                        label.copy_from_slice(&m[at + 14..at + 30]);
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label };
                         unsafe {
                             SCENE[SCENE_N] = c;
                             SCENE_N += 1;
                         }
-                        at += 29;
+                        at += 30;
                     }
                 }
                 Some(14) if m.len() >= 13 => {
@@ -662,6 +678,32 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     let px = libm::fminf(libm::fmaxf(sr * 0.32, 12.0), 72.0);
                                     let tw = text_width(&font, t, px);
                                     text(&mut c, &font, t, sx - tw * 0.5, sy + px * 0.35, px, if lit { BLACK } else { WHITE });
+                                }
+                            }
+                            // The app's icon, inside the ring: grey at rest, identifying by shape, and in its own colours only while lit — so colour on the map still means exactly one thing, that this changed.
+                            if let Some((px, grey, size)) = icon(cir.icon) {
+                                let ri = sr - stroke;
+                                let (x0, y0) = ((sx - ri).max(0.0) as usize, (sy - ri).max(0.0) as usize);
+                                let (x1, y1) = (((sx + ri) as usize).min(width), ((sy + ri) as usize).min(height));
+                                let step = size as f32 / (2.0 * ri);
+                                for yy in y0..y1 {
+                                    let v = (((yy as f32 - (sy - ri)) * step) as usize).min(size - 1);
+                                    for xx in x0..x1 {
+                                        let u = (((xx as f32 - (sx - ri)) * step) as usize).min(size - 1);
+                                        let k = (v * size + u) * 4;
+                                        // Front to back: only where nothing is painted yet, and only the icon's solid part — its rim goes to the fill underneath, which carries the antialiased edge.
+                                        let dst = &mut c.pixels[yy * width + xx];
+                                        if px[k + 3] < 128 || *dst >> 24 != 0 {
+                                            continue;
+                                        }
+                                        let rgb = if lit {
+                                            (px[k] as u32) << 16 | (px[k + 1] as u32) << 8 | px[k + 2] as u32
+                                        } else {
+                                            let y = grey[k / 4] as u32;
+                                            y << 16 | y << 8 | y
+                                        };
+                                        *dst = 0xFF00_0000 | rgb;
+                                    }
                                 }
                             }
                             paint::circle_filled(&mut c, sx as isize, sy as isize, (sr - stroke) as isize, if lit { MAP_LIT } else { MAP_FILL }, None, None);

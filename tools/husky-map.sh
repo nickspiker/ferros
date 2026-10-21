@@ -11,6 +11,9 @@ R=$REPO/target/aarch64-unknown-none/release
 RELOAD=1
 for a in "$@"; do case $a in --no-reload) RELOAD=0;; esac; done
 cd "$REPO" || exit 1
+# The apps' icons, from each app's own codebase, bundled into the display server at build time (tools/app-icons.py).
+(cd tools/vsficon && cargo run -q --release -- /mnt/Harbor/Code/opsin/assets/opsin_orb.vsf "$REPO/target/icons/opsin.rgba") || exit 1
+python3 tools/app-icons.py >/dev/null || exit 1
 cargo build -q -p ferros_kernel -p ferros-payload-display -p ferros-payload-touch -p ferros-payload-map --target aarch64-unknown-none --release || exit 1
 cargo build -q --bin ferros-bridge || exit 1
 for b in ferros_kernel display touch map; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done

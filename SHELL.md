@@ -47,7 +47,9 @@ The device measures what you do; you declare what matters. When a circle lights,
 
 **Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera), Opsin (recording).
 
-**An app is its icon** (owner, 2026-10-21). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own assets — Photon's and Mahere's as PNG, Opsin's already as VSF — and fluor's `Icon` reads VSF and already renders an icon as a circle (`to_rgba_circular`). Lumis has no icon yet.
+**An app is its icon** (owner, 2026-10-21). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own codebase — Photon's and Mahere's PNG, Lumis's Android launcher WebP, Opsin's VSF (decoded by `tools/vsficon`, since only fluor reads VSF) — and `tools/app-icons.py` cuts them to one circle at one size and bundles them into the display server at build time, so the phone decodes nothing.
+
+**Grey at rest, colour when lit** (owner, 2026-10-21: "sure on colour"). Colour on the map means one thing, changed, so an icon is drawn in grey while its circle is quiet and in its own colours only while lit. The grey is the icon's luminance, computed on the host in linear light with the Rec. 709 weights (sRGB's own primaries), then encoded again. Weighting the encoded values, the usual video shortcut, would sink saturated colours toward black, and pure blue would come out as grey 18 instead of 77. Photon's and Opsin's blues are exactly where that would show.
 
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
@@ -79,7 +81,6 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 
 - **Growth against neighbours.** A circle that grows a great deal over months can outgrow the air it was placed with. Whether that is resolved by placing generously enough that it never happens, by a rare settling the owner asks for, or by letting circles overlap is open.
 - **Placement.** Who decides where a new circle lands, given it can never move afterwards: the owner, placing it once by hand, or the system, deterministically — say, beside what it relates to, a new thread next to its person?
-- **Icons and the one colour.** If lit is the only colour on the map, full-colour icons put colour everywhere and the signal is gone. One answer: icons drawn in grey at rest, identifying by shape, and in full colour only while lit — so colour still means exactly one thing.
 - **What lit looks like** at the home scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
 - **The clock** (eagle time, dozenal) and whether the map shows it at all, or the agent answers when asked.
 - **Capture.** The 2026-10-16 design put it on a hardware chord, never behind a list. Nothing in the spec contradicts that; Lumis would open from it.

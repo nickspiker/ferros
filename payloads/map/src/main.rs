@@ -108,20 +108,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 
     // Hand the scene to the display server: clear, then the circles in one call.
     call(display, &[12], &mut r);
-    let mut m = [0u8; 2 + 29 * 4];
+    let mut m = [0u8; 2 + 30 * 4];
     m[0] = 13;
     m[1] = APPS.len() as u8;
     for (i, a) in APPS.iter().enumerate() {
-        let at = 2 + i * 29;
+        let at = 2 + i * 30;
         m[at..at + 4].copy_from_slice(&(xs[i] as i32).to_le_bytes());
         m[at + 4..at + 8].copy_from_slice(&(ys[i] as i32).to_le_bytes());
         m[at + 8..at + 10].copy_from_slice(&(RADIUS as u16).to_le_bytes());
         m[at + 10] = a.ring;
         m[at + 11] = a.lit;
+        // Each app's icon, by its place in tools/app-icons.py's bundle, which follows this table's order.
+        m[at + 12] = i as u8 + 1;
         let label = a.label.as_bytes();
         let len = if SHOW_LABELS { label.len().min(16) } else { 0 };
-        m[at + 12] = len as u8;
-        m[at + 13..at + 13 + len].copy_from_slice(&label[..len]);
+        m[at + 13] = len as u8;
+        m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
     }
     call(display, &m, &mut r);
 
