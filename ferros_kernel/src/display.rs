@@ -488,6 +488,12 @@ impl Panel {
         unsafe { ferros_hal::console::Console::new(self.fb as *mut u32, self.width, self.rows, self.stride, fg, 0, (160, 48, 48, 48)) }
     }
 
+    /// Switch the base layer between 8-bit BGRX8888 and 10-bit-per-channel 2:10:10:10 (cal_9865 regs-dpp.h: BGRX8888 is 4, ARGB2101010 is 19). In the packed format a pixel is one u32 with alpha in bits [31:30] and three 10-bit channels; green sits in bits [19:10] in both the ARGB and ABGR orderings, so only red and blue can be the other way round.
+    pub fn set_10bit(&self, on: bool) {
+        let v = rd(self.dpp + RDMA_IN_CTRL_0) & !IDMA_IMG_FORMAT_MASK;
+        wr(self.dpp + RDMA_IN_CTRL_0, v | if on { 19 << 8 } else { IDMA_IMG_FORMAT_BGRX8888 });
+    }
+
     /// Push one frame: shadow update, unmask the TE trigger, wait for FRAME_COUNT to move (or 1/4 s), mask it again.
     pub fn present(&self, rep: &mut alloc::vec::Vec<u8>) {
         let cntfrq = self.cntfrq;

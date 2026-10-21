@@ -949,6 +949,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"touch decay" {
+                                            // `diag touch decay`: a 1:1 10-bit decay screen stamped with a circle per touch reading: the contact's major axis in red, its minor in blue, its pressure in green (touch.rs).
+                                            crate::touch::decay(&mut resp, 30_000);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"touch map" {
                                             // `diag touch map`: the touch chip's capacitance strength frame, live on the panel and as an ASCII map, for 12 s (touch.rs).
                                             crate::touch::map(&mut resp, 12_000);

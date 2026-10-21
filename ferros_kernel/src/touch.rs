@@ -26,12 +26,13 @@ const HW_REG_W: u8 = 0xFA;
 const SCAN_MODE: u8 = 0xA0;
 const FB_READ: u8 = 0xA7;
 const EVT_SIZE: usize = 8;
-const EVT_CONTROLLER_READY: u8 = 0x03;
-const EVT_ENTER: u8 = 0x13;
-const EVT_MOTION: u8 = 0x23;
-const EVT_LEAVE: u8 = 0x33;
-const EVT_STATUS: u8 = 0x43;
-const EVT_ERROR: u8 = 0xF3;
+// The controller puts an event's identifier in the high nibble of byte zero and uses the low nibble for payload — the top two bits of a contact's major axis, for one — so every identifier here is a nibble and every comparison is against `e[0] >> 4`, as `fts_event_handler` (fts.c) dispatches on.
+const EVT_CONTROLLER_READY: u8 = 0x0;
+const EVT_ENTER: u8 = 0x1;
+const EVT_MOTION: u8 = 0x2;
+const EVT_LEAVE: u8 = 0x3;
+const EVT_STATUS: u8 = 0x4;
+const EVT_ERROR: u8 = 0xF;
 
 fn rd(a: usize) -> u32 {
     unsafe { read_volatile(a as *const u32) }
@@ -90,6 +91,34 @@ fn read_event() -> Result<[u8; EVT_SIZE], &'static str> {
     Ok(e)
 }
 
+/// Drain the controller's event queue the way the vendor interrupt handler does: one read for the first event, whose byte seven carries in its low five bits how many are still queued, then bursts of the rest.
+/// Seven events and the dummy byte fill one sixty-four-byte SPI segment, so the drain takes at most five transfers for a full thirty-two-event queue.
+/// Reading events one at a time instead races the chip's queue cursor — the same event comes back a second time with its tail bytes zeroed, which reads as a contact jumping to the top of the screen at zero pressure.
+fn drain_events(buf: &mut [[u8; EVT_SIZE]; 32]) -> Result<usize, &'static str> {
+    let mut b = [0u8; 1 + EVT_SIZE * 7];
+    transact(&[FIFO_READ], &mut b[..1 + EVT_SIZE])?;
+    if b[1] == 0x00 || b[1] == 0xFF {
+        return Ok(0);
+    }
+    buf[0].copy_from_slice(&b[1..1 + EVT_SIZE]);
+    let mut n = 1;
+    let mut queued = (buf[0][7] & 0x1F) as usize;
+    while queued > 0 && n < buf.len() {
+        let k = queued.min(7).min(buf.len() - n);
+        transact(&[FIFO_READ], &mut b[..1 + EVT_SIZE * k])?;
+        for i in 0..k {
+            let e = &b[1 + i * EVT_SIZE..1 + (i + 1) * EVT_SIZE];
+            if e[0] == 0x00 || e[0] == 0xFF {
+                return Ok(n);
+            }
+            buf[n].copy_from_slice(e);
+            n += 1;
+        }
+        queued -= k;
+    }
+    Ok(n)
+}
+
 /// Read `n` bytes of a 32-bit-addressed hardware register.
 fn hw_read(addr: u32, out: &mut [u8]) -> Result<(), &'static str> {
     let a = addr.to_be_bytes();
@@ -103,6 +132,13 @@ fn hw_read(addr: u32, out: &mut [u8]) -> Result<(), &'static str> {
 fn hw_write(addr: u32, val: u8) -> Result<(), &'static str> {
     let a = addr.to_be_bytes();
     transact(&[HW_REG_W, a[0], a[1], a[2], a[3], val], &mut [])
+}
+
+/// Set the scanning mode, as `setScanMode` (ftsCore.c) does it: a two-byte zero write to G#2000_0000 first, then the mode command itself.
+/// That register is the chip ID when read, so the write is not an ID change but a side-effect the controller requires before it will take a mode change; without it the mode command is accepted silently and no touch is ever reported.
+fn scan_mode(mode: u8, settings: u8) -> Result<(), &'static str> {
+    transact(&[HW_REG_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], &mut [])?;
+    transact(&[SCAN_MODE, mode, settings], &mut [])
 }
 
 /// Read `out.len()` bytes of the controller's framebuffer from `addr` (16-bit address, `FTS_CMD_FRAMEBUFFER_R`), in FIFO-sized chunks.
@@ -194,14 +230,15 @@ fn evt_hex(e: &[u8; EVT_SIZE]) -> alloc::string::String {
     s
 }
 
-/// Poll the FIFO until an event whose first byte is `id` arrives or `ms` pass; every other event is reported.
+/// Poll the FIFO until an event whose identifier nibble is `id` arrives or `ms` pass; every other event is reported.
 fn wait_event(rep: &mut Vec<u8>, id: u8, ms: u64) -> Option<[u8; EVT_SIZE]> {
     let t = now() + ticks_us(ms * 1000);
     let mut shown = 0;
     while now() < t {
         match read_event() {
-            Ok(e) if e[0] == id => return Some(e),
+            // An empty FIFO reads as all zeroes or all ones, and zero shares its high nibble with EVT_CONTROLLER_READY, so nothing-pending has to be ruled out before the identifier is matched.
             Ok(e) if e[0] == 0x00 || e[0] == 0xFF => spin_us(4000),
+            Ok(e) if e[0] >> 4 == id => return Some(e),
             Ok(e) => {
                 if shown < 8 {
                     line(rep, alloc::format!("  event G#{}\n", evt_hex(&e)));
@@ -274,7 +311,7 @@ pub fn up(rep: &mut Vec<u8>) {
         Ok(()) => line(rep, alloc::format!("chip ID G#{:02X}{:02X} (FTM5 parts: G#3648 ALIX, G#3640 SALIXP, G#3639), fw G#{:02X}{:02X}\n", id[0], id[1], id[5], id[4])),
         Err(e) => line(rep, alloc::format!("chip ID: {e}\n")),
     }
-    match transact(&[SCAN_MODE, 0x00, 0xFF], &mut []) {
+    match scan_mode(0x00, 0xFF) {
         Ok(()) => match wait_event(rep, EVT_STATUS, 256) {
             Some(e) => line(rep, alloc::format!("scan mode active: G#{}\n", evt_hex(&e))),
             None => line(rep, alloc::format!("scan mode written, no echo seen\n")),
@@ -293,39 +330,44 @@ pub fn watch(rep: &mut Vec<u8>, ms: u64) {
     let t0 = now();
     let mut last = 0u64;
     let (mut lines, mut motion, mut events, mut other) = (0u32, 0u32, 0u32, 0u32);
+    // How often the controller's interrupt line was asserted, and how often the queue was polled: the line low with an empty queue would mean the reads are wrong, the line never low means the controller is reporting nothing at all.
+    let (mut irq_low, mut polls) = (0u32, 0u32);
     let mut last_xy = [(0u32, 0u32); 16];
     while now() < t_end {
         crate::platform::pet_watchdogs();
         let irq = rd(GPN0 + 4) & 1 == 0;
+        if irq {
+            irq_low += 1;
+        }
         if !irq && now() - last < ticks_us(16_000) {
             continue;
         }
         last = now();
-        loop {
-            let e = match read_event() {
-                Ok(e) => e,
-                Err(err) => {
-                    line(rep, alloc::format!("SPI: {err}\n"));
-                    return;
-                }
-            };
-            if e[0] == 0x00 || e[0] == 0xFF {
-                break;
+        polls += 1;
+        let mut batch = [[0u8; EVT_SIZE]; 32];
+        let n = match drain_events(&mut batch) {
+            Ok(n) => n,
+            Err(err) => {
+                line(rep, alloc::format!("SPI: {err}\n"));
+                return;
             }
+        };
+        for e in batch[..n].iter().copied() {
             events += 1;
             let tid = (e[1] >> 4) as usize;
             let x = ((e[3] as u32 & 0xF) << 8) | e[2] as u32;
             let y = ((e[4] as u32) << 4) | (e[3] as u32 >> 4);
             let ms_at = (now() - t0) / ticks_us(1000);
-            match e[0] {
+            match e[0] >> 4 {
                 EVT_ENTER | EVT_LEAVE => {
-                    if e[0] == EVT_ENTER {
+                    let enter = e[0] >> 4 == EVT_ENTER;
+                    if enter {
                         last_xy[tid & 15] = (x, y);
                     }
                     if lines < 64 {
-                        let what = if e[0] == EVT_ENTER { "down" } else { "up" };
+                        let what = if enter { "down" } else { "up" };
                         let (lx, ly) = last_xy[tid & 15];
-                        let (px, py) = if e[0] == EVT_ENTER { (x, y) } else { (lx, ly) };
+                        let (px, py) = if enter { (x, y) } else { (lx, ly) };
                         line(rep, alloc::format!("A#{ms_at} ms: finger A#{tid} {what} at x A#{px} y A#{py}, z A#{}\n", e[5]));
                         lines += 1;
                     }
@@ -336,7 +378,7 @@ pub fn watch(rep: &mut Vec<u8>, ms: u64) {
                 }
                 _ => {
                     other += 1;
-                    if lines < 64 && (e[0] == EVT_ERROR || e[0] == EVT_STATUS || e[0] == EVT_CONTROLLER_READY) {
+                    if lines < 64 && matches!(e[0] >> 4, EVT_ERROR | EVT_STATUS | EVT_CONTROLLER_READY) {
                         line(rep, alloc::format!("A#{ms_at} ms: event G#{}\n", evt_hex(&e)));
                         lines += 1;
                     }
@@ -344,7 +386,7 @@ pub fn watch(rep: &mut Vec<u8>, ms: u64) {
             }
         }
     }
-    line(rep, alloc::format!("A#{events} events in A#{ms} ms: A#{motion} motion, A#{other} other\n"));
+    line(rep, alloc::format!("A#{events} events in A#{ms} ms: A#{motion} motion, A#{other} other; the interrupt line was asserted on A#{irq_low} of A#{polls} polls\n"));
 }
 
 /// Power the touch controller down: reset low, AVDD off, DVDD off (the reverse of `up`).
@@ -411,24 +453,22 @@ pub fn paint(rep: &mut Vec<u8>, ms: u64) {
         let irq = rd(GPN0 + 4) & 1 == 0;
         if irq || now() - polled > ticks_us(16_000) {
             polled = now();
-            loop {
-                let e = match read_event() {
-                    Ok(e) => e,
-                    Err(err) => {
-                        line(rep, alloc::format!("SPI: {err}\n"));
-                        return;
-                    }
-                };
-                if e[0] == 0x00 || e[0] == 0xFF {
-                    break;
+            let mut batch = [[0u8; EVT_SIZE]; 32];
+            let n = match drain_events(&mut batch) {
+                Ok(n) => n,
+                Err(err) => {
+                    line(rep, alloc::format!("SPI: {err}\n"));
+                    return;
                 }
+            };
+            for e in batch[..n].iter().copied() {
                 events += 1;
                 let tid = (e[1] >> 4) as usize & 15;
                 let x = ((e[3] as u32 & 0xF) << 8) | e[2] as u32;
                 let y = ((e[4] as u32) << 4) | (e[3] as u32 >> 4);
-                match e[0] {
+                match e[0] >> 4 {
                     EVT_ENTER | EVT_MOTION => {
-                        if e[0] == EVT_ENTER {
+                        if e[0] >> 4 == EVT_ENTER {
                             downs += 1;
                             last[tid] = None;
                         }
@@ -590,4 +630,140 @@ fn frames(rep: &mut Vec<u8>, ms: u64, strength: bool) {
     }
     s.push('\n');
     line(rep, s);
+}
+
+/// `diag touch decay`: a decay screen at 1:1 in 10-bit-per-channel colour. Every frame each channel of every pixel loses one, and every touch reading stamps two filled circles at the contact: the contact's ellipse split across the channels: red sized by its major axis, blue by its minor, green by the reported pressure. So a finger leaves a fading trail whose red fringe outside the blue disc is the eccentricity of the contact, and whose green says how hard it pressed.
+///
+/// The surface is ferros's own framebuffer (`DISPLAY_FB`), one u32 per pixel with alpha in bits [31:30] and three 10-bit channels, so the fade has 1024 steps instead of 256. The layer's format and the panel go back as they were on the way out.
+pub fn decay(rep: &mut Vec<u8>, ms: u64) {
+    if !spi_clocked() {
+        return line(rep, alloc::format!("SPI not clocked: run `diag touch up` first\n"));
+    }
+    let freq = crate::platform::cntfrq();
+    if !crate::display::use_own_fb(true) {
+        return line(rep, alloc::format!("no framebuffer region on this boot path\n"));
+    }
+    let mut scratch = Vec::new();
+    let Some(p) = crate::display::adopt(freq, &mut scratch) else {
+        let _ = crate::display::use_own_fb(false);
+        return line(rep, alloc::format!("no panel\n"));
+    };
+    p.set_10bit(true);
+    let (w, h, stride, fb) = (p.width, p.rows, p.stride, p.fb);
+    // The canvas lives in the cacheable display heap, not in the framebuffer: the framebuffer is Normal non-cacheable, where every read is its own uncached transaction, and a read-modify-write of four million pixels there took 1079 ms a frame (2026-10-20). Cacheable read-modify-write plus one write-only blit is the same work at a usable rate.
+    let (heap, heap_end) = crate::cachemap::DISPLAY_HEAP;
+    let need = stride * h * 4;
+    if heap == 0 || heap + need > heap_end {
+        p.set_10bit(false);
+        let _ = crate::display::use_own_fb(false);
+        return line(rep, alloc::format!("the display heap holds A#{} bytes, the canvas needs A#{need}\n", heap_end - heap));
+    }
+    let px = |i: usize| unsafe { core::ptr::read_volatile((heap + i * 4) as *const u32) };
+    let set = |i: usize, v: u32| unsafe { core::ptr::write_volatile((heap + i * 4) as *mut u32, v) };
+    for i in 0..stride * h {
+        set(i, 0xC000_0000);
+    }
+    // Opaque alpha, every channel dark.
+    for i in 0..stride * h {
+        unsafe { core::ptr::write_volatile((fb + i * 4) as *mut u32, 0xC000_0000) };
+    }
+    line(rep, alloc::format!("decay screen A#{w} x A#{h} at 1:1, 10 bits a channel\n"));
+    let stamp = |cx: i64, cy: i64, r: i64, mask: u32| {
+        if r <= 0 {
+            return;
+        }
+        let r = r.min(400);
+        for dy in -r..=r {
+            let y = cy + dy;
+            if y < 0 || y as usize >= h {
+                continue;
+            }
+            let half = isqrt(r * r - dy * dy);
+            for dx in -half..=half {
+                let x = cx + dx;
+                if x < 0 || x as usize >= w {
+                    continue;
+                }
+                let i = y as usize * stride + x as usize;
+                set(i, px(i) | mask);
+            }
+        }
+    };
+    let (mut frames, mut stamps, mut decay_us) = (0u32, 0u32, 0u64);
+    let (mut pmax, mut mmax, mut nmax) = (0u32, 0u32, 0u32);
+    let t_end = now() + ticks_us(ms * 1000);
+    while now() < t_end {
+        crate::platform::pet_watchdogs();
+        // One off every channel, each saturating at zero; alpha untouched.
+        let t0 = now();
+        for i in 0..stride * h {
+            let v = px(i);
+            let (r, g, b) = (v & 0x3FF, (v >> 10) & 0x3FF, (v >> 20) & 0x3FF);
+            let d = r.saturating_sub(1) | g.saturating_sub(1) << 10 | b.saturating_sub(1) << 20;
+            if d != v & 0x3FFF_FFFF {
+                set(i, 0xC000_0000 | d);
+            }
+        }
+        decay_us += (now() - t0) / (freq / 1_000_000);
+        // Every reading waiting in the chip's queue.
+        let mut batch = [[0u8; EVT_SIZE]; 32];
+        let n = match drain_events(&mut batch) {
+            Ok(n) => n,
+            Err(err) => {
+                line(rep, alloc::format!("SPI: {err}\n"));
+                0
+            }
+        };
+        for e in batch[..n].iter().copied() {
+            if !matches!(e[0] >> 4, EVT_ENTER | EVT_MOTION) {
+                continue;
+            }
+            let x = ((e[3] as i64 & 0xF) << 8) | e[2] as i64;
+            let y = ((e[4] as i64) << 4) | (e[3] as i64 >> 4);
+            let pressure = e[5] as u32;
+            // The contact's two axes, each six bits spread over three bytes and scaled by AREA_SCALE, as the vendor driver assembles them.
+            let major = ((((e[0] as u32 & 0x0C) << 2) | ((e[6] as u32 & 0xF0) >> 4)) * 16).min(1023);
+            let minor = ((((e[7] as u32 & 0xC0) >> 2) | (e[6] as u32 & 0x0F)) * 16).min(1023);
+            pmax = pmax.max(pressure);
+            mmax = mmax.max(major);
+            nmax = nmax.max(minor);
+            // The ellipse split across red and blue: red is the major axis, blue the minor, so the width of the red fringe outside the blue disc is the eccentricity of the contact. Green is pressure.
+            stamp(x, y, major as i64 / 2, 0x3FF << 20);
+            stamp(x, y, minor as i64 / 2, 0x3FF);
+            stamp(x, y, pressure as i64, 0x3FF << 10);
+            stamps += 1;
+        }
+        // The canvas to the surface the layer reads, write-only.
+        for i in 0..stride * h {
+            unsafe { core::ptr::write_volatile((fb + i * 4) as *mut u32, px(i)) };
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        scratch.clear();
+        p.present(&mut scratch);
+        frames += 1;
+        if frames % 16 == 0 {
+            crate::flashlog::line(&alloc::format!("touch decay: A#{frames} frames, A#{stamps} readings"));
+        }
+    }
+    p.set_10bit(false);
+    let _ = crate::display::use_own_fb(false);
+    scratch.clear();
+    if let Some(q) = crate::display::adopt(freq, &mut scratch) {
+        q.present(&mut scratch);
+    }
+    line(rep, alloc::format!("A#{frames} frames in A#{ms} ms, A#{stamps} readings stamped; A#{} ms a frame in the decay pass; largest pressure A#{pmax}, largest axes A#{mmax} by A#{nmax}; panel restored\n", if frames > 0 { decay_us / frames as u64 / 1000 } else { 0 }));
+}
+
+/// Integer square root, for the circle's half-width per row.
+fn isqrt(v: i64) -> i64 {
+    if v <= 0 {
+        return 0;
+    }
+    let mut x = v;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
 }
