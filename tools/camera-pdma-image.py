@@ -18,8 +18,8 @@ import re, struct, sys
 
 RING_PA, LIST_PA, LOAD_PA, BUF_PA = 0x8800_0000, 0x8801_0000, 0x8802_0000, 0x8810_0000
 BUF_SLICE = 0x100_0000
-# Two slices, not the seven that fit between BUF_PA and the carveout at G#9000_0000: writing a pattern as far as G#8F10_0000 reset the phone twice, while G#8810_0000 to G#8AA0_0000 has been written for days without trouble, so something in between is not ours. Two 16 MiB slices end at G#8A10_0000, inside the proven range, and two is enough for the image channels that matter.
-BUF_SLOTS = 2
+# As many slices as fit between BUF_PA and the first carveout, which zuma-rmem.dtsi puts at G#9000_0000: seven. Patterning that whole range was briefly blamed for resetting the phone, but all three of those runs were built from list 1 and the only run with list 2 was the one that worked; retested with list 2, seven 16 MiB slices to G#8F10_0000 are fine.
+BUF_SLOTS = (0x9000_0000 - BUF_PA) // BUF_SLICE
 LOAD_SLICE = 0x1000
 IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 RING_ENTRIES = 16
