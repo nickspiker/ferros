@@ -1161,18 +1161,6 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     if fail.is_some() {
         return line(rep, alloc::format!("sensor init failed\n"));
     }
-    // Optionally narrow the sensor's window first. A full 4080 x 3072 RAW10 frame is 15 MiB and the output slices are 2 MiB, so the captured mode could never have landed in one; a slit of a few dozen rows fits with room to spare, and the front end is being asked for far less work per frame.
-    if slit_lines > 0 {
-        let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
-        let rows = (slit_lines * 4).min(12288);
-        let _ = w16(0x0104, 1);
-        let _ = w16(0x0346, 0x0010);
-        let _ = w16(0x034A, (0x0010 + rows - 1) as u16);
-        let _ = w16(0x034E, slit_lines as u16);
-        let _ = w16(0x0340, (slit_lines + 64) as u16);
-        let _ = w16(0x0104, 0);
-        line(rep, alloc::format!("sensor narrowed to 4080 x A#{slit_lines} (A#{} bytes a frame at RAW10) before the front end starts\n", 4080 * slit_lines * 10 / 8));
-    }
     let iso = 0x1546_3EBCusize;
     let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
     ispfe_dma_open(rep);
@@ -1247,6 +1235,20 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
     let link_before = link_snapshot();
     let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    // Narrow the window only once the sensor is streaming. Set before stream-on it simply does not start — the frame counter never leaves zero and nothing reaches the receiver — while changed mid-stream it takes it at once, which is how `diag cam slit` measured 4080 x 64 at about 1184 frames a second (2026-10-20).
+    // The front end has to be built for the same height or it is expecting 3072 lines where 64 arrive: tools/camera-pdma-image.py --height.
+    if slit_lines > 0 {
+        spin_us(100_000);
+        let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
+        let rows = (slit_lines * 4).min(12288);
+        let _ = w16(0x0104, 1);
+        let _ = w16(0x0346, 0x0010);
+        let _ = w16(0x034A, (0x0010 + rows - 1) as u16);
+        let _ = w16(0x034E, slit_lines as u16);
+        let _ = w16(0x0340, (slit_lines + 64) as u16);
+        let _ = w16(0x0104, 0);
+        line(rep, alloc::format!("sensor narrowed mid-stream to 4080 x A#{slit_lines}, A#{} bytes a frame at RAW10\n", 4080 * slit_lines * 10 / 8));
+    }
     // Advance the descriptor index per frame, as the HAL does (+G#10 steps by G#10).
     // The front end's own per-frame status words are sampled alongside. Under Linux these are read and written straight back every frame — an interrupt acknowledgement, not configuration, which is why the captured CPU program leaves them out — and the values it acknowledges are non-zero: G#1C32_008C reads G#81 and G#1 on alternate frames, +G#424 reads G#8/G#12/G#1A, +G#124 reads G#75000. If ferros reads zero in all of them while the sensor streams and the receiver counts, the front end is raising no frame events at all, and the idle writer is a symptom of its input, not of its output.
     // Only the G#1C32 page is sampled: G#1C34 and G#1C35 stall the bus in some states (2026-10-20).

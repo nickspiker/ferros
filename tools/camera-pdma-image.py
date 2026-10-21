@@ -29,6 +29,13 @@ args = [a for a in sys.argv[1:]]
 which = 1
 if '--list' in args:
     i = args.index('--list'); which = int(args[i + 1]); del args[i:i + 2]
+# --height N rewrites the captured program's frame geometry, so the front end is configured for our own window instead of the 4080 x 3072 the capture was taken at.
+# The mode's dimensions sit in the list in recognisable form: the width G#FF0 (4080) and the height G#C00 (3072) appear packed as (height << 16) | width at about a dozen registers across the pipeline, as (width << 16) | height at one, and the height alone appears halved (G#600) and quartered (G#300). The line stride at +G#20554 and +G#22154 is G#1400, which is 4080 pixels of RAW10 rounded up to a 256-byte boundary, so it does not move while the width is unchanged.
+# Only height-derived halves are touched; the width is left alone. A half that happens to hold 3072 for some other reason would be rewritten too, which is the risk this takes for being able to ask the front end for a slit at all.
+HEIGHT_FULL = 3072
+height = None
+if '--height' in args:
+    i = args.index('--height'); height = int(args[i + 1]); del args[i:i + 2]
 src, out = args[0], args[1]
 
 words, loads, limit, k = [], {}, None, 0
@@ -53,8 +60,23 @@ if limit:
     words = words[:limit]
 assert words, "no list words in the dump"
 
+def regeom(v):
+    """Rewrite a word's height-derived halves to the requested height."""
+    if height is None:
+        return v
+    lo, hi = v & 0xFFFF, v >> 16
+    def m(h):
+        if h == HEIGHT_FULL:
+            return height
+        if h == HEIGHT_FULL // 2:
+            return height // 2
+        if h == HEIGHT_FULL // 4:
+            return height // 4
+        return h
+    return (m(hi) << 16) | m(lo)
+
 # Walk the list: rewrite every page-aligned bus address in a (register, value) pair to a buffer slice, and every block-load source to its own slice.
-bufs, load_order = {}, []
+bufs, load_order, geom = {}, [], 0
 i = 0
 while i < len(words):
     h = words[i]; n = h >> 14; op = h & 0x3FFF
@@ -64,12 +86,22 @@ while i < len(words):
             v = words[k2]
             if IOVA_LO <= v < IOVA_HI and v & 0xFFF == 0:
                 words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
+            else:
+                g = regeom(v)
+                if g != v:
+                    words[k2] = g
+                    geom += 1
     elif op == 1 and n:
         # A burst writes consecutive registers from one start address; buffer addresses appear in these too.
         for k2 in range(i + 2, i + 1 + n):
             v = words[k2]
             if IOVA_LO <= v < IOVA_HI and v & 0xFFF == 0:
                 words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
+            else:
+                g = regeom(v)
+                if g != v:
+                    words[k2] = g
+                    geom += 1
     elif op == 9 and n == 4:
         reg, size = words[i + 4], words[i + 3]
         data = loads.get(reg, {})
@@ -89,5 +121,7 @@ ring = b''.join(struct.pack('<IIII', 0xC003, LIST_PA, 0, len(list_bytes)) for _ 
 blobs = [(RING_PA, ring), (LIST_PA, list_bytes)] + load_order
 body = b''.join(struct.pack('<II', pa, len(b)) + b + b'\0' * (-len(b) % 4) for pa, b in blobs)
 open(out, 'wb').write(struct.pack('<4sI', b'CPR3', len(blobs)) + body)
+if height is not None:
+    print(f"geometry rewritten from height {HEIGHT_FULL} to {height} in {geom} words")
 print(f"list {len(list_bytes)} B, {len(load_order)} block-load sources, {len(bufs)} output buffers remapped from G#{min(bufs):X}.. to G#{BUF_PA:X}.., G#{BUF_SLICE:X} a slice over {BUF_SLOTS} slices")
 print(f"ring {RING_ENTRIES} entries at G#{RING_PA:X}; total {8 + len(body)} bytes -> {out}")
