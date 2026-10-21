@@ -45,6 +45,7 @@ mod acpm;
 #[cfg(feature = "pixel8")]
 mod camera;
 #[cfg(feature = "pixel8")]
+mod camera_events;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod spi;

@@ -518,6 +518,38 @@ fn sensor_frame_count() -> Option<u8> {
     crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).ok().map(|_| b[0])
 }
 
+/// Read every interrupt source in the ISP pipeline and report the ones that are not zero, with their set bits named (camera_events.rs, generated from the Pixel kernel's LWIS event tables by tools/gen-isp-events.py).
+/// This is the pipeline's stethoscope: 203 sources across the front end, the CSI link and PHY, and the PDMA engine, so one run says which stage is alive and where it falls silent — instead of diffing words whose meaning has to be guessed.
+/// Each node is named in the flash log before it is read: some front-end pages stall the bus in some states, and the log's last line then names the one that did it.
+pub fn events_dump(rep: &mut Vec<u8>, quiet_too: bool) {
+    if !fe_powered() {
+        return line(rep, alloc::format!("ISP front end is not powered\n"));
+    }
+    let mut live = 0u32;
+    for src in crate::camera_events::SOURCES.iter() {
+        crate::flashlog::line(&alloc::format!("cam events: {}", src.name));
+        let v = rd(src.base + src.off);
+        if v == 0 && !quiet_too {
+            continue;
+        }
+        if v != 0 {
+            live += 1;
+        }
+        let m = if src.mask_off != 0 { rd(src.base + src.mask_off) } else { 0 };
+        let mut names = alloc::string::String::new();
+        for &(b, n) in src.bits.iter() {
+            if v >> b & 1 == 1 {
+                if !names.is_empty() {
+                    names.push('|');
+                }
+                names.push_str(n);
+            }
+        }
+        line(rep, alloc::format!("  {} ({}) +G#{:X} = G#{v:X} [{names}] mask G#{m:X}\n", src.name, src.kind, src.off));
+    }
+    line(rep, alloc::format!("A#{live} of A#{} interrupt sources are reporting\n", crate::camera_events::SOURCES.len()));
+}
+
 /// `diag cam link`: every word of CSI link 1 that the camera stack touches, as a flat dump.
 /// The point is a diff. Cold ferros gets the sensor streaming and the receiver counting frames, and the front end still writes nothing, so what differs has to be in how the receiver is told where to send those frames. Running this on a cold ferros and again on a ferros chainloaded out of a streaming Android (the Linux handoff register oracle, HV.md) puts the two side by side with nothing else changed.
 /// Only the receiver is read: the front end's own G#1C34_xxxx and G#1C35_xxxx pages stall the bus in some states (2026-10-20), and the question here is the input side.
@@ -877,9 +909,6 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     }
     let iso = 0x1546_3EBCusize;
     let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
-    for &(a, v) in crate::camera_rx::RX_START.iter() {
-        wr(a, v);
-    }
     ispfe_dma_open(rep);
     // Lay the job out in DRAM. The SysMMUs are in bypass, so what the engine reads as a bus address is this physical address.
     let w32 = |i: usize| u32::from_le_bytes([job[i], job[i + 1], job[i + 2], job[i + 3]]) as usize;
@@ -940,6 +969,11 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     wr(PDMA + 0x00, 1);
     wr(PDMA + 0x34, 0);
     wr(PDMA + 0x28, 1);
+    // The receiver last, as a camera open does it: the capture starts the PDMA at line 1421 and only enables the link (SYSREG_ISPFE + G#500 = 2, the end of RX_START) at 1573.
+    // Enabling the link first — which is what ferros did until now — left the front end latching its configuration and never seeing a frame start: the only event either channel ever raised was SHADOW_UPDATE, never SOF (zuma-isp-event-info.dtsi names the bits).
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
     apply(rep, "CPU setup after the start", cpu.as_ref().map(|c| &c.1[2]));
     line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
     // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
@@ -973,6 +1007,11 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         for &a in FRAME_ACK.iter() {
             let v = rd(a);
             wr(a, v);
+        }
+        // Once, a few frames in, read the whole pipeline by name while the engine is live — the state Linux reads these in.
+        if f == 3 {
+            line(rep, alloc::format!("every reporting interrupt source, three frames in:\n"));
+            events_dump(rep, false);
         }
         let mut b = [0u8; 2];
         match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
