@@ -813,6 +813,95 @@ fn sensor_frame_count() -> Option<u8> {
     crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).ok().map(|_| b[0])
 }
 
+/// `diag cam slitsweep`: find how narrow a slit this sensor will actually give, and how fast.
+/// Nothing states the floor. CCS keeps a minimum output height at G#118A, and on this part that register reads zero along with the rest of the limit block, so the only way to know is to ask the sensor and watch its own frame counter.
+/// Two sweeps. The first narrows the window with a generous frame period, to find the smallest height that still streams. The second then shortens the frame period at that height, to find the shortest frame — which is where the rate actually comes from: the pixel clock never moves, so the rate is about `pixel_clock / (frame_length_lines x line_length_pck)`, and at 4080 x 64 with a period of 128 lines that worked out to roughly 958 Mpix/s, the same clock the full mode runs.
+/// Only sensor registers are touched, all of them standard CCS geometry and timing, so no rail and no voltage is involved.
+pub fn slit_sweep(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no sensor init table\n"));
+    };
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
+    // Frames the sensor itself counted over a quarter second: its own counter, so nothing downstream can flatter the number.
+    let rate = || -> u32 {
+        let t0 = crate::platform::cntpct();
+        let window = crate::platform::cntfrq() / 4;
+        let mut last = sensor_frame_count();
+        let mut seen = 0u32;
+        while crate::platform::cntpct() - t0 < window {
+            let c = sensor_frame_count();
+            if c != last {
+                seen += 1;
+                last = c;
+            }
+        }
+        seen * 4
+    };
+    let set = |lines: u32, period: u32| {
+        let rows = (lines * 4).min(12288);
+        let _ = w16(0x0104, 1);
+        let _ = w16(0x0346, 0x0010);
+        let _ = w16(0x034A, (0x0010 + rows - 1) as u16);
+        let _ = w16(0x034E, lines as u16);
+        let _ = w16(0x0340, period as u16);
+        let _ = w16(0x0104, 0);
+    };
+    // The sensor takes exactly one geometry change per stream session: the first lands, every later one reads back correctly and leaves it not streaming (measured 2026-10-21). And geometry set before stream-on never starts at all. So each step gets its own session — captured geometry restored, stream off, stream on, then the one change that is allowed.
+    let session = |lines: u32, period: u32| {
+        let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+        spin_us(50_000);
+        let _ = w16(0x0104, 1);
+        let _ = w16(0x0346, 0x0010);
+        let _ = w16(0x034A, 0x300F);
+        let _ = w16(0x034E, 0x0C00);
+        let _ = w16(0x0340, 0x2958);
+        let _ = w16(0x0104, 0);
+        let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+        spin_us(200_000);
+        set(lines, period);
+        spin_us(150_000);
+    };
+    let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    spin_us(200_000);
+    line(rep, alloc::format!("captured mode 4080 x 3072: A#{} frames a second\n\nnarrowing the window, one stream session per step, frame period the height plus 64:\n", rate()));
+    let mut narrowest = 0u32;
+    for lines in [512u32, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
+        session(lines, lines + 64);
+        let fps = rate();
+        let mut back = [0u8; 2];
+        let read = crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x03, 0x4E], &mut back).is_ok();
+        let got = if read { (back[0] as u32) << 8 | back[1] as u32 } else { 0 };
+        line(rep, alloc::format!("  4080 x {:4}: A#{fps:6} a second, y_output_size reads back A#{got}{}\n", lines, if fps == 0 { "  <- stopped streaming" } else { "" }));
+        if fps > 0 && got == lines {
+            narrowest = lines;
+        }
+    }
+    if narrowest == 0 {
+        line(rep, alloc::format!("no window below the captured mode streamed; stopping\n"));
+    } else {
+        line(rep, alloc::format!("\nshortest window that streams: 4080 x A#{narrowest}. Now shortening the frame period at that height:\n"));
+        for period in [narrowest + 64, narrowest + 32, narrowest + 16, narrowest + 8, narrowest + 4, narrowest + 2, narrowest + 1, narrowest] {
+            session(narrowest, period);
+            let fps = rate();
+            let mut back = [0u8; 2];
+            let read = crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x03, 0x40], &mut back).is_ok();
+            let got = if read { (back[0] as u32) << 8 | back[1] as u32 } else { 0 };
+            line(rep, alloc::format!("  period A#{:4} lines: A#{fps:6} a second, frame_length_lines reads back A#{got}{}\n", period, if fps == 0 { "  <- stopped streaming" } else { "" }));
+        }
+    }
+    let _ = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    line(rep, alloc::format!("\nstream off. The sensor needs a cold boot before the next run: a geometry change mid-stream leaves it stuck (2026-10-20).\n"));
+}
+
 /// `diag cam slit`: set our own window and frame rate on the sensor, rather than replaying the captured mode.
 /// The sensor speaks MIPI CCS, so geometry and timing are standard registers: `y_addr_start`/`y_addr_end` choose the rows read off the array, `y_output_size` the rows sent, and `frame_length_lines` the total frame period. Shrink the window and the frame gets shorter, so the rate goes up — which is both the proof that we drive the sensor rather than echo it, and the shape slit-scan wants: a narrow band read as fast as the sensor will give it.
 /// Measured against the captured mode's 4080 x 3072 at about fourteen frames a second. The sensor's own frame counter (G#0005) is the clock: it steps once a frame regardless of what the receiver downstream does, so this stands on its own even while the front end's routing is unsolved.

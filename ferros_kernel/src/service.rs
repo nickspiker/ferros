@@ -859,7 +859,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"cam slit" {
+                                        if cmd.params == b"cam slit" || cmd.params == b"cam slitsweep" {
                                             // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
                                             let mut t = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
                                             if t.is_none() {
@@ -876,7 +876,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     }
                                                 }
                                             }
-                                            crate::camera::slit(&mut resp, t, 64);
+                                            if cmd.params == b"cam slitsweep" { crate::camera::slit_sweep(&mut resp, t) } else { crate::camera::slit(&mut resp, t, 64) }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
