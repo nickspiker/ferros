@@ -525,6 +525,11 @@ pub fn link_dump(rep: &mut Vec<u8>) {
     if !fe_powered() {
         return line(rep, alloc::format!("ISP front end is not powered\n"));
     }
+    dump_link_words(rep);
+}
+
+/// The dump itself, so the stream probe can take one while the sensor is actually streaming — the state a dump taken out of a live Android is in, and the only one worth diffing against it.
+fn dump_link_words(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("CSI link 1 at G#{CSIS_LINK1:X}, the G#000..G#1FC and G#600..G#6FC words:\n"));
     let s = link_snapshot();
     let mut row = alloc::string::String::new();
@@ -592,6 +597,8 @@ pub fn stream_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
         }
     }
     line(rep, alloc::format!("sensor G#0005..6 every 50 ms after stream-on:{series}\n"));
+    // The receiver as it stands with frames actually coming in, for the diff against a live Android's.
+    dump_link_words(rep);
     let mut ms = [0u8; 2];
     let msr = crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00], &mut ms);
     // A running 26 MHz master clock on gpp9-0 reads back through the pad as a mix of 0s and 1s; a steady value means no clock on the pin.
@@ -911,12 +918,13 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     };
     apply(rep, "CPU setup before the start", cpu.as_ref().map(|c| &c.1[0]));
     // Pattern the head of every output slice so a write anywhere in it shows.
+    // Every probe point is patterned first, so a point that later reads anything else — including zero — was written. Sampling every 256 bytes maps where a frame lands without writing the whole 36 MiB.
     for b in 0..PDMA_BUFS {
         let base = PDMA_BUF_PA + b * PDMA_BUF_SLICE;
         for o in (0..PROBE_BYTES).step_by(4) {
             wr(base + o, PATTERN);
         }
-        for o in (0..PDMA_BUF_SLICE).step_by(4096) {
+        for o in (0..PDMA_BUF_SLICE).step_by(256) {
             wr(base + o, PATTERN);
         }
     }
@@ -938,15 +946,47 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     let link_before = link_snapshot();
     let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
     // Advance the descriptor index per frame, as the HAL does (+G#10 steps by G#10).
+    // The front end's own per-frame status words are sampled alongside. Under Linux these are read and written straight back every frame — an interrupt acknowledgement, not configuration, which is why the captured CPU program leaves them out — and the values it acknowledges are non-zero: G#1C32_008C reads G#81 and G#1 on alternate frames, +G#424 reads G#8/G#12/G#1A, +G#124 reads G#75000. If ferros reads zero in all of them while the sensor streams and the receiver counts, the front end is raising no frame events at all, and the idle writer is a symptom of its input, not of its output.
+    // Only the G#1C32 page is sampled: G#1C34 and G#1C35 stall the bus in some states (2026-10-20).
+    const FRAME_STATUS: [usize; 6] = [0x1C32_008C, 0x1C32_0110, 0x1C32_0124, 0x1C32_0424, 0x1C32_2024, 0x1C32_049C];
+    // The front end's per-frame interrupt acknowledgement, in the order a camera open does it: read the word, write the same value straight back.
+    // Under Linux these look like bookkeeping, which is why the captured CPU program leaves them out — it stops deliberately "before the per-frame interrupt handling". They are not bookkeeping. Unacknowledged, the front end latches its first frame and never advances: G#1C32_008C stays at G#81 instead of alternating with G#1, the buffer index at +G#49C stays 0 instead of stepping 0-3, and the write pointer at +G#124 stays put instead of stepping by G#800 through four buffers. Nothing is ever written out (2026-10-20).
+    const FRAME_ACK: [usize; 28] = [
+        0x1C35_0160, 0x1C35_0178, 0x1C35_0190,
+        0x1C32_008C,
+        0x1C32_2004, 0x1C32_2024, 0x1C32_2038, 0x1C32_204C,
+        0x1C32_0404, 0x1C32_0424, 0x1C32_0438, 0x1C32_044C,
+        0x1C32_0110,
+        0x1C35_0058, 0x1C35_0088, 0x1C35_00B8, 0x1C35_00E8, 0x1C35_0118, 0x1C35_01AC,
+        0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
+    ];
+    crate::flashlog::line("cam pdma: sampling the G#1C32 per-frame status words while the engine runs");
     let mut series = alloc::string::String::new();
+    let mut status = [[0u32; FRAME_STATUS.len()]; 10];
     for f in 1..=10u32 {
         spin_us(50_000);
         wr(PDMA + 0x10, f * 0x10);
+        for (k, &a) in FRAME_STATUS.iter().enumerate() {
+            status[f as usize - 1][k] = rd(a);
+        }
+        // Acknowledge the frame so the front end moves on to the next buffer.
+        for &a in FRAME_ACK.iter() {
+            let v = rd(a);
+            wr(a, v);
+        }
         let mut b = [0u8; 2];
         match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
             Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
             Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
         }
+    }
+    for (k, &a) in FRAME_STATUS.iter().enumerate() {
+        let mut row = alloc::format!("front end G#{:05X} per frame:", a & 0xF_FFFF);
+        for f in 0..10 {
+            row.push_str(&alloc::format!(" G#{:X}", status[f][k]));
+        }
+        row.push('\n');
+        line(rep, row);
     }
     let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
     spin_us(50_000);
@@ -995,20 +1035,26 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
                 first.get_or_insert(o);
             }
         }
-        let mut nonzero = 0usize;
-        for o in (0..PDMA_BUF_SLICE).step_by(4096) {
-            if rd(base + o) != PATTERN && rd(base + o) != 0 {
-                nonzero += 1;
+        // Count every probe point that no longer holds the pattern, zeros included: a frame of a dark scene writes mostly zeroes, and excluding them hid exactly the result this test exists to find (2026-10-20).
+        let (mut moved, mut zeroed, mut last) = (0usize, 0usize, 0usize);
+        for o in (0..PDMA_BUF_SLICE).step_by(256) {
+            let v = rd(base + o);
+            if v != PATTERN {
+                moved += 1;
+                last = o;
+                if v == 0 {
+                    zeroed += 1;
+                }
                 first.get_or_insert(o);
             }
         }
-        if changed > 0 || nonzero > 0 {
+        if changed > 0 || moved > 0 {
             any = true;
             let f = first.unwrap();
-            line(rep, alloc::format!("buffer A#{b} at G#{base:X}: A#{changed} words in the head, A#{nonzero} of A#512 sampled pages non-pattern, first at +G#{f:X}: G#{:08X} G#{:08X} G#{:08X} G#{:08X}\n", rd(base + f), rd(base + f + 4), rd(base + f + 8), rd(base + f + 12)));
+            line(rep, alloc::format!("buffer A#{b} at G#{base:X}: A#{changed} words in the head; A#{moved} of A#{} probe points written (A#{zeroed} to zero), from +G#{f:X} to +G#{last:X}; at +G#{f:X}: G#{:08X} G#{:08X} G#{:08X} G#{:08X}\n", PDMA_BUF_SLICE / 256, rd(base + f), rd(base + f + 4), rd(base + f + 8), rd(base + f + 12)));
         }
     }
     if !any {
-        line(rep, alloc::format!("no output slice changed in its first A#{} KiB\n", PROBE_BYTES / 1024));
+        line(rep, alloc::format!("no output slice changed at any probe point\n"));
     }
 }
