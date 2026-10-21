@@ -18,6 +18,20 @@ A snapshot of what runs on the Pixel 8 Pro (husky) today and what's next. Area d
 - **The display server** (`payloads/display`, an EL0 process): owns a 32 MiB framebuffer region and the base layer, paints with fluor's no_std canvas in Oxanium, presents on TE, serves the `display` endpoint (draw ops, brightness, refresh, idle floor, DCS through `ferros_dsi`), asks the panel for the 10 Hz floor between frames. `payloads/shelltest` draws SHELL.md's home screen through it. `tools/husky-display.sh` brings it up.
 - **Kernel fixes along the way:** a `sleep` syscall and no slices during PT transfers; no idle exit while a process lives; PIE-linked payloads relocated at entry (`ferros_sys::relocate`); the stall exit named its culprit and the DIAG handlers' `continue` skipping the transfer close was fixed — every "unexplained" PT-stall exit.
 
+## Peripherals brought up from a cold boot (2026-10-17 → 20)
+
+- **Touch (docs/oracle/TOUCH.md) — reports contacts, finger-verified 2026-10-20.** The ST FTM5 on SPI, cold: rails over ACPM, reset, controller ready in 12 ms, chip G#3640 (SALIXP). Contacts arrive with position, an eight-bit pressure, and the contact ellipse's major and minor axes; 1344 events in 8192 ms tracking a finger. Three things each made the chip sense without reporting, and all three are easy to reintroduce, so they are written down: `setScanMode` is *two* writes (a zero write to G#2000_0000 precedes the mode command), an event's identifier is the high nibble of byte zero alone, and the queue must be drained in bursts off byte seven's depth. Sixteen of the forty capacitance frame layers the driver defines are live on this panel, readable raw. Diagnostics: `diag touch up/watch/info/map/raw/decay/gamma/off`.
+- **Audio — control side only.** Both CS35L41 speaker amplifiers answer from cold (DEVID G#35A40, rev B2) over the shared SPI. No sound has been played yet.
+- **Camera (docs/oracle/CAMERA.md) — powers and runs, no image out.** The main sensor answers G#08EF cold, and the ISP front end's PDMA engine executes ferros's own descriptor ring of register-write programs. The front end's channel registers hold our buffer addresses and the frame writer stays idle: no output slice is written anywhere in the 2 MiB. Next step is a diff of Linux's live ISPFE/CSIS registers through the handoff oracle. The CPU cannot stand in for the PDMA — G#1C36_xxxx takes none of the 3048 register writes.
+- **Modem (docs/oracle/MODEM-BOOT-RECON.md) — ROM boots, boot channel stalls after one frame.** PCIe ch0 trains to Gen3 x2 (the drop must also switch the PHY to the oscillator clock and pulse SOFT_PWR_RESET), the CP answers config and the ROM boots. It answers the *first* boot-channel frame (A110 → C110) and then consumes every later frame silently. Ruled out: the per-frame mask and doorbell, the FMT ring, RC MSI status, the unprompted C11B and the `ap2cp_united_status` value. The CP repositions the AP's tx cursors itself as part of emitting C11B; what makes it do so is the open question. The per-unit NV sections need an f2fs reader (efs and modem_userdata are f2fs, not ext4) and never get logged or committed.
+
+## Storage and the boot gate (2026-10-20)
+
+- **The kernel vault runs on manifestus** (`ferros_kernel/src/kvault.rs`), the owner's own store, rather than a kernel copy of it: two mirrored UFS regions, sealed values, a sealed name index, proven across reboots. Reserved names stay out of listings. The in-tree `ferros_vault` is still referenced by `shim.rs`, `ira.rs` and the wairua nonce source, and comes out next.
+- **An append-only text log on the flash** (`flashlog.rs`, `diag log`): a bus stall loses the PT response, so anything being bisected names each step on the flash before it takes it. This is what found the camera read that stalls the bus.
+- **The boot gate in the hv** (`ferros_hv/src/gate.rs`): one pre-assembled slot-a image, `[hv][Linux][ferros]`, showing "Ready?" before Linux — power (or 1 s on dev) boots ferros, volume down continues to Android, volume up holds. Android on slot a stays the escape hatch and the register oracle.
+- **The wedged USB port recovers itself** (`tools/usb-kick.sh`): the host port, not the phone, is what gives up after a -71 storm; the scripts kick it through its sysfs switch instead of asking for a replug.
+
 ## photon_core (no_std, host-tested)
 
 The reusable core of a ferros-native Photon client: `wire.rs` (ping/pong/photon/ack/pt_ack frames, byte-shaped like the stock app) and `chain.rs` (the braid — rolling-chain photon encryption, ported from photon/src/crypto/chain.rs with the same ihi primitives). Round-trip tested; byte-compatibility with the stock app is still to be confirmed on device.
@@ -30,7 +44,9 @@ The reusable core of a ferros-native Photon client: `wire.rs` (ping/pong/photon/
 
 ## Next, in rough order
 
-1. Migrate the WiFi driver to the sandbox (streamed firmware, its DMA region inside its arc, masked code) — retires the last native exception on husky. Touches the S2MPU/cache map; do it attended.
-2. Finish photon_core against the app; enroll a ferros device; send the first photon.
-3. Display: the owner's eyes on 10 bpc black and the 10 bpc link; the shell as a process with live rows; AOD as a server state; cold power-up via ACPM.
-4. Camera stack → the first beam.
+1. **The touch server:** an EL0 process taking the controller's interrupt (gpn0-0) instead of polling, serving a `touch` endpoint — raw eight-bit pressure straight through to the app, with mm/px and px/RU published. The display server is the pattern to copy. Then fluor grows the `Event::Touch` arm its event doc already reserves (pressure, the contact ellipse, touch id, contact kind), pressure threads through `PointerArbiter` into `Context`, and `theme`'s `HELD` becomes a ramp so a control brightens under a harder press. Mouse hosts report full pressure on press, so nothing on desktop changes. Then `shelltest` answers a real tap.
+2. Migrate the WiFi driver to the sandbox (streamed firmware, its DMA region inside its arc, masked code) — retires the last native exception on husky. Touches the S2MPU/cache map; do it attended.
+3. Finish photon_core against the app; enroll a ferros device; send the first photon.
+4. Display: the owner's eyes on 10 bpc black and the 10 bpc link; the shell as a process with live rows; AOD as a server state; cold power-up via ACPM.
+5. Camera: find why the front end's frame writer stays idle (oracle diff against Linux) → the first beam.
+6. Cellular: find what makes the CP take a second boot-channel frame; an f2fs reader for the NV sections.
