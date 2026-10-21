@@ -518,6 +518,33 @@ fn sensor_frame_count() -> Option<u8> {
     crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).ok().map(|_| b[0])
 }
 
+/// `diag cam link`: every word of CSI link 1 that the camera stack touches, as a flat dump.
+/// The point is a diff. Cold ferros gets the sensor streaming and the receiver counting frames, and the front end still writes nothing, so what differs has to be in how the receiver is told where to send those frames. Running this on a cold ferros and again on a ferros chainloaded out of a streaming Android (the Linux handoff register oracle, HV.md) puts the two side by side with nothing else changed.
+/// Only the receiver is read: the front end's own G#1C34_xxxx and G#1C35_xxxx pages stall the bus in some states (2026-10-20), and the question here is the input side.
+pub fn link_dump(rep: &mut Vec<u8>) {
+    if !fe_powered() {
+        return line(rep, alloc::format!("ISP front end is not powered\n"));
+    }
+    line(rep, alloc::format!("CSI link 1 at G#{CSIS_LINK1:X}, the G#000..G#1FC and G#600..G#6FC words:\n"));
+    let s = link_snapshot();
+    let mut row = alloc::string::String::new();
+    for (i, v) in s.iter().enumerate() {
+        if i % 8 == 0 {
+            row.push_str(&alloc::format!("+G#{:03X}:", link_off(i)));
+        }
+        row.push_str(&alloc::format!(" G#{v:08X}"));
+        if i % 8 == 7 {
+            row.push('\n');
+            line(rep, core::mem::take(&mut row));
+        }
+    }
+    if !row.is_empty() {
+        row.push('\n');
+        line(rep, row);
+    }
+    line(rep, alloc::format!("D-PHY lanes: G#{:X} G#{:X} G#{:X}; common G#{:X}\n", rd(0x1C10_1800), rd(0x1C10_1900), rd(0x1C10_1A00), rd(0x1C10_1000)));
+}
+
 /// Stream the main sensor into CSI link 1 and see whether frames arrive: requires `cam up` (the sensor answering), brings the ISP front end up, replays the sensor init from the vault, configures the receiver (camera_rx.rs), snapshots link 1's registers, starts the sensor for 300 ms, snapshots again and reports every register that changed, then stops the sensor and the receiver. No DMA is set up: this only asks whether the link sees the stream.
 pub fn stream_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
     let mut id = [0u8; 2];
@@ -907,6 +934,8 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     wr(PDMA + 0x28, 1);
     apply(rep, "CPU setup after the start", cpu.as_ref().map(|c| &c.1[2]));
     line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
+    // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
+    let link_before = link_snapshot();
     let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
     // Advance the descriptor index per frame, as the HAL does (+G#10 steps by G#10).
     let mut series = alloc::string::String::new();
@@ -926,6 +955,19 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     wr(PDMA + 0x00, 0);
     wr(PDMA + 0x2C, 0);
     wr(PDMA + 0x40, 0);
+    // Read the receiver with the engine stopped but the receiver still configured: once RX_STOP runs its counters are gone, and reading while the engine ran risks the bus stall that G#1C34/G#1C35 showed.
+    let link_after = link_snapshot();
+    let mut moved = 0u32;
+    let mut which = alloc::string::String::new();
+    for i in 0..link_before.len() {
+        if link_before[i] != link_after[i] {
+            moved += 1;
+            if moved <= 12 {
+                which.push_str(&alloc::format!(" +G#{:X}: G#{:X}->G#{:X}", link_off(i), link_before[i], link_after[i]));
+            }
+        }
+    }
+    line(rep, alloc::format!("link 1 over the run: A#{moved} of A#{} words moved;{}\n", link_before.len(), if moved == 0 { alloc::string::String::from(" nothing arrived at the receiver") } else { which }));
     for &(a, v) in crate::camera_rx::RX_STOP.iter() {
         wr(a, v);
     }

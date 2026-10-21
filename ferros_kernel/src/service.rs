@@ -844,6 +844,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam link" {
+                                            // `diag cam link`: every CSI link 1 word the camera stack touches, for diffing a cold ferros against a streaming Android through the handoff (camera.rs).
+                                            crate::camera::link_dump(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam fe" {
                                             // `diag cam fe`: power the ISP front end, restore its clocks, read CSI link 1's version.
                                             crate::camera::fe_up(&mut resp);
