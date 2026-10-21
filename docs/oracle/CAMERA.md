@@ -214,3 +214,18 @@ With the slit the link's own state tracks the new geometry (`+G#678` moves to G#
 They are interrupt masks, which gate delivery rather than data, so they are unlikely to be the routing — but they are the only configuration-class difference this method found, and they cost one run to rule out.
 
 **Reading the front end mid-stream is timing-dependent.** `live_compare` stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump reads without trouble moments earlier in the same run. It is left in camera.rs but not called from the frame loop. Treat any front-end read during streaming as able to hang the core, and name each one in the flash log first.
+
+## From the ground up: the link's output never reaches the core (2026-10-21)
+
+**ferros's own raw path, no vendor program.** `diag cam raw` configures only the link and the front end's CSIS core — the 64 writes Linux makes into G#1C32, in its order, with RX_START between — and skips the PDMA and every processing block. It behaves exactly as the full 4495-write program does: frame one the core latches our configuration (G#81 / G#8 / G#8, SHADOW_UPDATE), and every frame after the link reports frame start and end on all three channels while the core reports nothing. **The processing pipeline is exonerated.**
+
+The configuration is legible enough to say it is right. Link 1's channels: CH0 RAW10 4080 x 3072 (image), CH1 RAW10 4080 x 768 (phase-detect), CH2 embedded data 4080 x 4. The core sizes its image path to CH0 (+G#474 = G#0C000FF0) and its PD path to CH1 (+G#2074 = G#03000FF0), and +G#48C / +G#208C differ only in bit 12, which selects the link channel.
+
+**No local channel sees anything.** `diag cam lochs` arms all fourteen paths — image and PD for loch0 to loch6, G#400 apart from +G#20424 and +G#22024 — clears them, streams without acknowledging, and reads once after the stop. All fourteen read G#0, the aggregate reads G#0, while the link reported frame start and end throughout. The data is not landing on a channel we were not watching; it is not reaching the core. (The aggregate's long-standing G#81 is loch0's image path at bit 0 and its PD path at bit 7: image paths occupy bits 0-6 and PD paths start at 7.)
+
+**Closed along the way:**
+- **The skipped Q-channel.** `fe_up` requests every CMU_ISPFE Q-channel from G#301C to G#30D0 except G#30C8. So does Linux — the capture writes the same range with the same gap.
+- **A link-side DMA.** The link's interrupt words carry frame start and end for 32 channels, line end, lost-frame and resolution-mismatch errors, and lane errors. Nothing DMA-shaped. The core is the only write path.
+- **PDMA list 1 as one-time setup.** It writes the same 1447 registers as list 2, none unique to either; 51 values differ, 42 of them in G#1C35 — buffer addresses and per-frame 3A tables. Its resets are most likely a buffer address escaping the builder's remap, not a clue.
+
+**What that leaves.** Every CPU write Linux makes to the link and the core, ferros makes, in order; the pre-capture state matches; the PDMA's lists hold no extra setup. So the link-to-core connection is set by a write we have never seen. The census only logs pages in its target list, which covered the ISP front end — a write to a page outside it would be invisible, and a camera open has already been seen reaching into the TPU domain, outside that list. **Next: a wider census**, arming the whole ISP span (G#1C00_0000 to G#1D8F_FFFF) and the system controllers around it for one camera open, to find any CPU-written page that nothing ferros does touches.

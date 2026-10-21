@@ -462,6 +462,90 @@ pub fn raw_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
     }
 }
 
+/// `diag cam lochs`: is the link feeding a local channel other than the one we are watching?
+/// The core has seven local channels with image and phase-detect paths each — loch0 to loch6, both paths at a G#400 stride from +G#20424 and +G#22024 (camera_events.rs). The aggregate word's bits run image paths 0-6 then PD paths from 7, which is why it has always read G#81: loch0's image and PD paths, the two the replay configures.
+/// So this arms every path's mask, clears every status, streams without acknowledging anything — so a frame start on any channel stays latched — and reads all fourteen once the stream has stopped. Reading after the stop, not during, keeps clear of the timing-dependent hang a mid-stream read into this block has caused.
+pub fn lochs_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
+    let mut id = [0u8; 2];
+    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+        return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
+    }
+    let Some(init) = init else {
+        return line(rep, alloc::format!("refusing: no sensor init table\n"));
+    };
+    fe_up(rep);
+    if !fe_powered() {
+        return;
+    }
+    let (w, r, fail) = replay_init(&init);
+    line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
+    if fail.is_some() {
+        return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    let iso = 0x1546_3EBCusize;
+    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    ispfe_dma_open(rep);
+    for &(a, v) in CORE_ONLY[..25].iter() {
+        wr(a, v);
+    }
+    for &(a, v) in crate::camera_rx::RX_START.iter() {
+        wr(a, v);
+    }
+    for &(a, v) in CORE_ONLY[25..].iter() {
+        wr(a, v);
+    }
+    // Every path's status word: image paths from +G#20424, phase-detect paths from +G#22024, G#400 apart. Mask at +G#C.
+    let path = |n: usize, pd: bool| 0x1C30_0000 + if pd { 0x22024 } else { 0x20424 } + n * 0x400;
+    for n in 0..7 {
+        for pd in [false, true] {
+            let a = path(n, pd);
+            // Every event enabled — SOF, EOF, EOL, SHADOW_UPDATE, DMA_DONE, FRAME_DONE — then the status cleared, before anything streams.
+            wr(a + 0xC, 0x3F);
+            let v = rd(a);
+            wr(a, v);
+        }
+    }
+    let cmn = 0x1C32_008C;
+    let v = rd(cmn);
+    wr(cmn, v);
+    line(rep, alloc::format!("all fourteen paths armed and cleared; aggregate now G#{:X}\n", rd(cmn)));
+    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    // Ten frames' worth, touching nothing in the core.
+    for _ in 0..10 {
+        spin_us(50_000);
+        crate::platform::pet_watchdogs();
+    }
+    let link = (rd(CSIS_LINK1 + 0x24), rd(CSIS_LINK1 + 0x2C), rd(CSIS_LINK1 + 0x14));
+    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    spin_us(50_000);
+    line(rep, alloc::format!("streamed {:?}/{:?}; link saw frame start G#{:X}, end G#{:X}, errors G#{:X}\n", son.is_ok(), soff.is_ok(), link.0, link.1, link.2));
+    const NAMES: [&str; 6] = ["SOF", "EOF", "EOL", "SHADOW_UPDATE", "DMA_DONE", "FRAME_DONE"];
+    let mut any_frame = false;
+    for n in 0..7 {
+        for pd in [false, true] {
+            let a = path(n, pd);
+            crate::flashlog::line(&alloc::format!("cam lochs: reading G#{a:X}"));
+            let st = rd(a);
+            let mut bits = alloc::string::String::new();
+            for b in 0..6 {
+                if st >> b & 1 == 1 {
+                    if !bits.is_empty() { bits.push('|'); }
+                    bits.push_str(NAMES[b]);
+                }
+            }
+            if st & 0b110111 != 0 {
+                any_frame = true;
+            }
+            line(rep, alloc::format!("  loch{n} {:5} G#{a:X}: G#{st:X} {}\n", if pd { "pd" } else { "image" }, if bits.is_empty() { alloc::string::String::from("-") } else { bits }));
+        }
+    }
+    line(rep, alloc::format!("aggregate after the run: G#{:X}\n", rd(cmn)));
+    line(rep, alloc::format!("{}\n", if any_frame { "A FRAME EVENT LANDED on at least one path above" } else { "no path saw any frame event: the link's output is not reaching the core at all" }));
+    for &(a, v) in crate::camera_rx::RX_STOP.iter() {
+        wr(a, v);
+    }
+}
+
 /// The four sensor master clocks as CMU_TOP has them, read only.
 /// All four read zero, and that is their correct state, not a misread: `camera-main-powerup-cmu.txt` shows Linux reading these same words as zero and writing zero back, so the mux selects source 0 and the divider divides by one. The only live traffic in that capture is at G#2604_3004, G#2604_300C and G#2604_3010, each written 2 and then 0 — a transient access request around the register reads, not a persistent enable.
 /// So the master clocks need nothing from us beyond muxing each module's pin, and the two modules that stay silent are not silent for want of a clock configured differently from the two that answer.
