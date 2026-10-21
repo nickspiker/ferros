@@ -1134,9 +1134,10 @@ const PDMA: usize = 0x1C39_0000;
 /// The descriptor ring and the rest of the job live at fixed physical addresses the builder and the kernel agree on (tools/camera-pdma-image.py).
 const PDMA_RING_PA: usize = 0x8800_0000;
 const PDMA_BUF_PA: usize = 0x8810_0000;
-/// A slice has to hold a frame: the captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the 2 MiB slices this started with could never have held one. Free DRAM from PDMA_BUF_PA to the first carveout at G#9000_0000 is 126 MiB, which is seven of these; tools/camera-pdma-image.py wraps the list's twenty distinct addresses over the same seven and must agree with these two numbers.
+/// A slice has to hold a frame: the captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the 2 MiB slices this started with could never have held one.
+/// Two slices, not the seven that fit below the carveout at G#9000_0000: patterning as far as G#8F10_0000 reset the phone twice, while G#8810_0000 to G#8AA0_0000 has been written for days without trouble, so something in between is not ours. tools/camera-pdma-image.py wraps the list's distinct addresses over the same two and must agree with these numbers.
 const PDMA_BUF_SLICE: usize = 0x100_0000;
-const PDMA_BUFS: usize = 7;
+const PDMA_BUFS: usize = 2;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
 pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32) {
@@ -1214,6 +1215,8 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     // Pattern the head of every output slice so a write anywhere in it shows.
     // Every probe point is patterned first, so a point that later reads anything else — including zero — was written. Sampling every 256 bytes maps where a frame lands without writing the whole 36 MiB.
     for b in 0..PDMA_BUFS {
+        // Seven 16 MiB slices probed every 256 bytes is getting on for half a million accesses; without a pet in here the watchdog takes the phone before the engine ever starts (2026-10-20).
+        crate::platform::pet_watchdogs();
         let base = PDMA_BUF_PA + b * PDMA_BUF_SLICE;
         for o in (0..PROBE_BYTES).step_by(4) {
             wr(base + o, PATTERN);
@@ -1329,8 +1332,9 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     line(rep, ran);
     let mut any = false;
     for b in 0..PDMA_BUFS {
+        crate::platform::pet_watchdogs();
         let base = PDMA_BUF_PA + b * PDMA_BUF_SLICE;
-        // The pattern covers the head of the slice; a frame could land anywhere in it, so the whole 2 MiB is sampled every 4 KiB as well.
+        // The pattern covers the head of the slice; a frame could land anywhere in it, so the whole slice is sampled as well.
         let mut changed = 0usize;
         let mut first = None;
         for o in (0..PROBE_BYTES).step_by(4) {

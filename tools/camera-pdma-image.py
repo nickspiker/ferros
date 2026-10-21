@@ -18,12 +18,13 @@ import re, struct, sys
 
 RING_PA, LIST_PA, LOAD_PA, BUF_PA = 0x8800_0000, 0x8801_0000, 0x8802_0000, 0x8810_0000
 BUF_SLICE = 0x100_0000
-# Free DRAM from BUF_PA to the first carveout at G#9000_0000, divided by the slice.
-BUF_SLOTS = (0x9000_0000 - BUF_PA) // BUF_SLICE
+# Two slices, not the seven that fit between BUF_PA and the carveout at G#9000_0000: writing a pattern as far as G#8F10_0000 reset the phone twice, while G#8810_0000 to G#8AA0_0000 has been written for days without trouble, so something in between is not ours. Two 16 MiB slices end at G#8A10_0000, inside the proven range, and two is enough for the image channels that matter.
+BUF_SLOTS = 2
 LOAD_SLICE = 0x1000
 IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 RING_ENTRIES = 16
 
+# --list picks which of the session's rotating lists to build from, and it matters: list 2 is the one docs/oracle/CAMERA.md decoded and the one ferros has run, at G#19DC bytes with 18 output buffers, while the default list 1 is G#1A10 with 20. Handing the engine list 1 reset the phone twice before the difference was noticed (2026-10-20). Always pass `--list 2` until there is a reason not to.
 args = [a for a in sys.argv[1:]]
 which = 1
 if '--list' in args:
