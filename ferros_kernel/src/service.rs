@@ -894,6 +894,18 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam preview" {
+                                            // `diag cam preview`: the camera app's 1344 x 1008 NV12 preview, its luma painted 1:1 (camera.rs).
+                                            crate::camera::preview(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"cam iova" {
+                                            // `diag cam iova`: every buffer the camera IOMMU maps, by walking its page table in DRAM (camera.rs).
+                                            crate::camera::iova_scan(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam inherit" {
                                             // `diag cam inherit`: after a live handoff with the camera running, read the frame Linux's pipeline wrote and paint it (camera.rs).
                                             crate::camera::inherit_probe(&mut resp);

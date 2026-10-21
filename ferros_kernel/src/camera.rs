@@ -573,6 +573,162 @@ fn sysmmu_translate(flpt: usize, iova: usize) -> Option<usize> {
     if dram(pa) { Some(pa) } else { None }
 }
 
+/// `diag cam iova`: every buffer the camera's IOMMU maps, found by walking the page table itself.
+/// The core's three buffer registers turned out to hold metadata, and a 4080 x 768 frame sitting at the sensor's black level even with the camera aimed at a bright scene — link channel 1's geometry, the phase-detect stream, not the picture. The picture the camera app shows is a processed output, and the program writes a cluster of buffer addresses into G#1C35 that have never been read. Reading those registers mid-stream has hung the core, so this does not touch them: the page table is in DRAM, and walking it is only memory reads.
+/// It lists every contiguous mapped IOVA run of at least 256 KiB with its size and the mean and maximum of a sample of its bytes. A processed image is large and bright; metadata is small; a raw black-level stream is large and dark.
+pub fn iova_scan(rep: &mut Vec<u8>) {
+    const MMU: usize = 0x1C11_0000;
+    let flpt = ((rd(MMU + 0x8404) & 0xFF_FFFF) as usize) << 12;
+    if flpt == 0 {
+        return line(rep, alloc::format!("SYSMMU context 0 has no table\n"));
+    }
+    line(rep, alloc::format!("page table at G#{flpt:X}; IOVA runs of 256 KiB and up:\n"));
+    let dram = |pa: usize| (0x8000_0000..0xC_0000_0000).contains(&pa);
+    let mut run_start: Option<usize> = None;
+    let mut run_pages = 0usize;
+    let mut found = 0u32;
+    let mut report = |rep: &mut Vec<u8>, start: usize, pages: usize| {
+        if pages * 4 < 256 {
+            return;
+        }
+        // A sample of 256 bytes spread evenly across the run.
+        let (mut sum, mut max, mut n) = (0u64, 0u32, 0u64);
+        for k in 0..256usize {
+            let va = start + (pages * 0x1000 / 256) * k;
+            if let Some(pa) = sysmmu_translate(flpt, va) {
+                let b = unsafe { core::ptr::read_volatile(pa as *const u8) } as u32;
+                sum += b as u64;
+                max = max.max(b);
+                n += 1;
+            }
+        }
+        line(rep, alloc::format!("  IOVA G#{start:X}: A#{} KiB, sampled mean A#{} max A#{max}\n", pages * 4, if n > 0 { sum / n } else { 0 }));
+        found += 1;
+    };
+    for l1 in 0..4096usize {
+        if l1 % 256 == 0 {
+            crate::platform::pet_watchdogs();
+        }
+        let a1 = flpt + l1 * 4;
+        if !dram(a1) {
+            continue;
+        }
+        let e1 = rd(a1) as usize;
+        // Each first-level entry covers one MiB: 256 small pages. Count which of them map, in order.
+        let mapped: [bool; 256] = match e1 & 7 {
+            2 => [true; 256],
+            1 => {
+                let base = (e1 & !0x3F) << 4;
+                let mut m = [false; 256];
+                if dram(base) {
+                    for (i, slot) in m.iter_mut().enumerate() {
+                        let e2 = rd(base + i * 4) as usize;
+                        *slot = matches!(e2 & 3, 1 | 2);
+                    }
+                }
+                m
+            }
+            _ => [false; 256],
+        };
+        for (i, &on) in mapped.iter().enumerate() {
+            let va = (l1 << 20) + i * 0x1000;
+            if on {
+                if run_start.is_none() {
+                    run_start = Some(va);
+                    run_pages = 0;
+                }
+                run_pages += 1;
+            } else if let Some(st) = run_start.take() {
+                report(rep, st, run_pages);
+            }
+        }
+    }
+    if let Some(st) = run_start {
+        report(rep, st, run_pages);
+    }
+    line(rep, alloc::format!("A#{found} runs of 256 KiB or more\n"));
+}
+
+/// `diag cam preview`: the camera app's own preview frame, painted 1:1.
+/// Walking the IOMMU table after a live handoff finds a ring of buffers of exactly 497 pages — 1988 KiB — with a well-exposed sampled mean around 91. That size is 1344 x 1008 NV12 exactly: 1,354,752 bytes of luma and 677,376 of interleaved chroma, 2,032,128 bytes in all. 1344 is the panel's own width, so this is the preview the camera app renders for this display, and its luma plane is a finished greyscale picture that lands on the panel pixel for pixel, with nothing to demosaic or scale.
+/// The first such buffer in the table is painted; an 84 x 32 character rendering of it comes back in the report so the scene can be checked without looking at the phone.
+pub fn preview(rep: &mut Vec<u8>) {
+    const MMU: usize = 0x1C11_0000;
+    const W: usize = 1344;
+    const H: usize = 1008;
+    const PAGES: usize = 497;
+    let flpt = ((rd(MMU + 0x8404) & 0xFF_FFFF) as usize) << 12;
+    if flpt == 0 {
+        return line(rep, alloc::format!("SYSMMU context 0 has no table\n"));
+    }
+    // The first run of exactly PAGES mapped pages.
+    let mut iova = 0usize;
+    let mut run = 0usize;
+    let mut start = 0usize;
+    'scan: for va in (0..0x1_0000_0000usize).step_by(0x1000) {
+        if va % 0x400_0000 == 0 {
+            crate::platform::pet_watchdogs();
+        }
+        if sysmmu_translate(flpt, va).is_some() {
+            if run == 0 {
+                start = va;
+            }
+            run += 1;
+        } else {
+            if run == PAGES {
+                iova = start;
+                break 'scan;
+            }
+            run = 0;
+        }
+    }
+    if iova == 0 {
+        return line(rep, alloc::format!("no 497-page preview buffer mapped\n"));
+    }
+    line(rep, alloc::format!("preview buffer at IOVA G#{iova:X}, 1344 x 1008 NV12; painting its luma plane\n"));
+    let mut page = (usize::MAX, 0usize);
+    let mut luma = |x: usize, y: usize| -> u8 {
+        let va = iova + y * W + x;
+        let vp = va & !0xFFF;
+        if page.0 != vp {
+            page = (vp, sysmmu_translate(flpt, vp).unwrap_or(0));
+        }
+        if page.1 == 0 { 0 } else { unsafe { core::ptr::read_volatile((page.1 + (va & 0xFFF)) as *const u8) } }
+    };
+    // The 84 x 32 rendering first, so the scene is in the report even if the panel will not take it.
+    const RAMP: &[u8] = b" .:-=+*#%@";
+    let mut art = alloc::string::String::from("preview, 84 x 32:\n");
+    for ay in 0..32 {
+        art.push_str("  ");
+        for ax in 0..84 {
+            let v = luma(ax * W / 84, ay * H / 32) as usize;
+            art.push(RAMP[v * (RAMP.len() - 1) / 255] as char);
+        }
+        art.push('\n');
+    }
+    line(rep, art);
+    let freq = crate::platform::cntfrq();
+    let mut scratch = Vec::new();
+    let Some(p) = crate::display::adopt(freq, &mut scratch) else {
+        line(rep, alloc::format!("no panel to paint on; adoption said:\n"));
+        rep.extend_from_slice(&scratch);
+        return;
+    };
+    let (w, h, pstride, fb) = (p.width, p.rows, p.stride, p.fb);
+    for y in 0..h {
+        if y % 256 == 0 {
+            crate::platform::pet_watchdogs();
+        }
+        for x in 0..w {
+            let v = if x < W && y < H { luma(x, y) as u32 } else { 0 };
+            unsafe { core::ptr::write_volatile((fb + (y * pstride + x) * 4) as *mut u32, v << 16 | v << 8 | v) };
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    p.present(&mut scratch);
+    line(rep, alloc::format!("painted the preview's luma 1:1 at the top of the panel ({w} x {h})\n"));
+}
+
 /// `diag cam inherit`: put a real camera frame on the panel, by taking over a pipeline Linux already has running.
 /// Run after a live handoff (tools/husky-hotload.sh --live) with the camera app open: Linux hands the CPUs over without shutting down, so the sensor, the link, the front end and its write DMA are all still configured the way the working HAL left them, and the last frames are still sitting in Linux's buffers.
 /// The front end's image channel holds its current buffer as an IOVA (+G#510 low, +G#514 high); the SYSMMU in front of it maps that to physical pages, which are not contiguous, so each 4 KiB page is translated as it is reached. The frame is RAW10 packed four pixels to five bytes, 4080 x 3072 at a G#1400 stride, so each pixel's eight most significant bits sit at byte `(x / 4) * 5 + x % 4` of its line.
@@ -702,7 +858,9 @@ pub fn inherit_probe(rep: &mut Vec<u8>) {
     let freq = crate::platform::cntfrq();
     let mut scratch = Vec::new();
     let Some(p) = crate::display::adopt(freq, &mut scratch) else {
-        return line(rep, alloc::format!("no panel to paint on\n"));
+        line(rep, alloc::format!("no panel to paint on; adoption said:\n"));
+        rep.extend_from_slice(&scratch);
+        return;
     };
     let (w, h, pstride, fb) = (p.width, p.rows, p.stride, p.fb);
     let x0 = (w.saturating_sub(OW)) / 2;
