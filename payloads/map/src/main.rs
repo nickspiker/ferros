@@ -29,6 +29,9 @@ const APPS: [Spec; 4] = [
     Spec { label: "Opsin", ring: 1, lit: 0 },
 ];
 
+/// Names under the circles: off. An app's icon identifies it (owner, 2026-10-21: "icons identify just fine"), so words are an option for whoever wants them, not the default. Settings will own this switch once settings exist.
+const SHOW_LABELS: bool = false;
+
 /// Every circle starts the same size: no time has been measured yet, and a new circle earns its area.
 const RADIUS: f32 = 110.0;
 
@@ -116,7 +119,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         m[at + 10] = a.ring;
         m[at + 11] = a.lit;
         let label = a.label.as_bytes();
-        let len = label.len().min(16);
+        let len = if SHOW_LABELS { label.len().min(16) } else { 0 };
         m[at + 12] = len as u8;
         m[at + 13..at + 13 + len].copy_from_slice(&label[..len]);
     }

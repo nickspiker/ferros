@@ -47,6 +47,8 @@ The device measures what you do; you declare what matters. When a circle lights,
 
 **Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera), Opsin (recording).
 
+**An app is its icon** (owner, 2026-10-21). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own assets — Photon's and Mahere's as PNG, Opsin's already as VSF — and fluor's `Icon` reads VSF and already renders an icon as a circle (`to_rgba_circular`). Lumis has no icon yet.
+
 **Lit** means changed since last seen. Seeing a circle — zooming in until it can be read — updates its last-seen time. That is the only signal on the map: no counts, no badges, no motion.
 
 **Apps lose the right to speak.** The only path that may update a circle's last-changed time is a message a human originated, arriving through Photon. An app has no channel to light its own circle; that is a property of the shell, not a permission an app could request.
@@ -77,6 +79,7 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 
 - **Growth against neighbours.** A circle that grows a great deal over months can outgrow the air it was placed with. Whether that is resolved by placing generously enough that it never happens, by a rare settling the owner asks for, or by letting circles overlap is open.
 - **Placement.** Who decides where a new circle lands, given it can never move afterwards: the owner, placing it once by hand, or the system, deterministically — say, beside what it relates to, a new thread next to its person?
+- **Icons and the one colour.** If lit is the only colour on the map, full-colour icons put colour everywhere and the signal is gone. One answer: icons drawn in grey at rest, identifying by shape, and in full colour only while lit — so colour still means exactly one thing.
 - **What lit looks like** at the home scale: brightness, a glow, or the only colour on an otherwise grey map. It renders through the pinned gamma2tanh profile either way.
 - **The clock** (eagle time, dozenal) and whether the map shows it at all, or the agent answers when asked.
 - **Capture.** The 2026-10-16 design put it on a hardware chord, never behind a list. Nothing in the spec contradicts that; Lumis would open from it.
