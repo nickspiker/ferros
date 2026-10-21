@@ -1153,6 +1153,101 @@ pub fn caps_dump(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("A#{ok} registers answered non-zero, A#{zero} read zero (not implemented), A#{err} failed; the *_freq_mhz words are CCS float-or-integer, read them raw\n"));
 }
 
+/// Every front-end and link register Linux reads while its camera streams, with the values it saw (capture lines 1573-12920 of the full ISPFE oracle log). `n` is how many distinct values: one means configuration, more means a status word that moves per frame.
+/// Generated from target/hv/ispfe-full-raw.log; the D-PHY page is left out, since its words are set by camera_rx.rs and checked elsewhere.
+const LINUX_LIVE: [(usize, u8, [u32; 4]); 66] = [
+        (0x1C050004, 2, [0x5000, 0x205E01, 0x205E01, 0x205E01]),
+        (0x1C050010, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C050018, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32008C, 2, [0x1, 0x81, 0x81, 0x81]),
+        (0x1C320110, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320114, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320124, 4, [0x74000, 0x74800, 0x75000, 0x75800]),
+        (0x1C320404, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320408, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320424, 4, [0x1, 0x8, 0x12, 0x1A]),
+        (0x1C320428, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320430, 2, [0x12, 0x1A, 0x1A, 0x1A]),
+        (0x1C320438, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32043C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32044C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C320450, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32049C, 84, [0x0, 0x1, 0x2, 0x3]),
+        (0x1C322004, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C322008, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C322024, 3, [0x8, 0x13, 0x1B, 0x1B]),
+        (0x1C322028, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C322030, 1, [0x12, 0x12, 0x12, 0x12]),
+        (0x1C322038, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32203C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C32204C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C322050, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C331300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C331304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C333300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C333304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C335300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C335304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C337300, 1, [0x4, 0x4, 0x4, 0x4]),
+        (0x1C337304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33730C, 1, [0x7F8, 0x7F8, 0x7F8, 0x7F8]),
+        (0x1C339300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C339304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33B300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33B304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33C300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33C304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33D300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33D304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33E300, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C33E304, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350058, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C35005C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350088, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C35008C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C3500B8, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C3500BC, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C3500E8, 4, [0x1, 0x2, 0x3, 0x10]),
+        (0x1C3500EC, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C3500F0, 1, [0x103FFFFE, 0x103FFFFE, 0x103FFFFE, 0x103FFFFE]),
+        (0x1C350118, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C35011C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350148, 4, [0x2, 0x8, 0x10, 0x12]),
+        (0x1C35014C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350150, 1, [0x3EF, 0x3EF, 0x3EF, 0x3EF]),
+        (0x1C350160, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350164, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350178, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C35017C, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350190, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C350194, 1, [0x0, 0x0, 0x0, 0x0]),
+        (0x1C3501AC, 1, [0x0, 0x0, 0x0, 0x0]),
+];
+
+/// Compare the front end against Linux's own live state, register by register, while ferros's stream runs.
+/// The rest of the diffing so far compared writes, or registers read before they were ever written. This compares what Linux *reads back during streaming* — the state a running camera actually holds — against what ferros's running camera holds. A configuration word that differs is a candidate for the one hop that does not work; a status word that moves under Linux and sits still under ferros says which stage is idle.
+#[allow(dead_code)]
+fn live_compare(rep: &mut Vec<u8>) {
+    let (mut same, mut diff, mut idle) = (0u32, 0u32, 0u32);
+    for &(a, n, vals) in LINUX_LIVE.iter() {
+        crate::flashlog::line(&alloc::format!("cam live: reading G#{a:X}"));
+        let got = rd(a);
+        let seen = &vals[..n as usize];
+        if seen.contains(&got) {
+            same += 1;
+        } else if n == 1 {
+            diff += 1;
+            line(rep, alloc::format!("  CONFIG  G#{a:X}: Linux G#{:X}, ferros G#{got:X}  (differs by G#{:X})\n", vals[0], vals[0] ^ got));
+        } else {
+            idle += 1;
+            let mut v = alloc::string::String::new();
+            for x in seen { v.push_str(&alloc::format!(" G#{x:X}")); }
+            line(rep, alloc::format!("  STATUS  G#{a:X}: Linux moves through{v}, ferros G#{got:X}\n"));
+        }
+    }
+    line(rep, alloc::format!("live state against Linux: A#{same} agree, A#{diff} configuration words differ, A#{idle} status words sit where Linux's move\n"));
+}
+
 /// Read every interrupt source in the ISP pipeline and report the ones that are not zero, with their set bits named (camera_events.rs, generated from the Pixel kernel's LWIS event tables by tools/gen-isp-events.py).
 /// This is the pipeline's stethoscope: 203 sources across the front end, the CSI link and PHY, and the PDMA engine, so one run says which stage is alive and where it falls silent — instead of diffing words whose meaning has to be guessed.
 /// Each node is named in the flash log before it is read: some front-end pages stall the bus in some states, and the log's last line then names the one that did it.
@@ -1666,6 +1761,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         if f == 3 {
             line(rep, alloc::format!("every reporting interrupt source, three frames in:\n"));
             events_dump(rep, false);
+            // `live_compare` is not called here. It stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump above reads without trouble moments earlier in the same run — so front-end reads mid-stream are timing-dependent rather than simply safe or unsafe (2026-10-21). Its useful result was already in the event dump: see docs/oracle/CAMERA.md.
         }
         let mut b = [0u8; 2];
         match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {

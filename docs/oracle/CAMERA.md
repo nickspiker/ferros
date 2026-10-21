@@ -196,3 +196,21 @@ With the slit the link's own state tracks the new geometry (`+G#678` moves to G#
 1. **The front end's geometry.** Everything we can compare against Linux now matches, so the gap is a register whose meaning we do not have rather than a value we failed to copy. The remaining untried source is the PDMA's **first** list of a session — `camera-ispfe-pdma-writes.txt` is list 2 of a rotating three, and one-time setup would live in the first.
 2. **A frame at the captured geometry** now that a slice can hold one, which is the test the 2 MiB slices made impossible.
 3. **Our own pipeline from raw Bayer**, in the pinned gamma2tanh profile, once a frame lands. The vendor ISP is 4495 register writes whose meaning lives only in a closed HAL; reproducing its tuning is neither possible nor wanted.
+
+## Lead 1: the front end's live state against Linux's (2026-10-21)
+
+**The physical layer is clean.** The link's error word has 22 named bits and reads exactly G#100 — `ERR_DESKEW_OVER` alone. `ERR_CRC` (payload), `ERR_ECC` (header), `ERR_CRC_PH`, `MAL_CRC`, `ERR_SOT_HS` and `ERR_SOT_SYNC` on all four lanes, `RX_INVALID_CODE` on all four lanes, `PHY_TIMING_ERR` and `ERR_SKEW` are all clear. The receiver CRC-checks every long packet, so if deskew had failed the pixel payloads would fail CRC; they do not. Deskew is a calibration timer overflowing, not corruption, and it is not the blocker it was briefly taken for. (The slit run with mismatched geometry *did* add `ERR_CRC_PH`, which is what real damage looks like.)
+
+**The read-back diff has little reach.** Linux reads only 66 front-end and link registers while streaming; 57 hold one value, and only five of those are non-zero. A routing map written once at setup and never read back is invisible to this method, so a clean result here does not clear the front end's configuration — it only clears what Linux happened to look at.
+
+**Three interrupt masks run one bit lighter under Linux.** Written identically at setup by the program, then each with one bit cleared by the HAL at runtime:
+
+| mask | Linux | ferros | extra bit in ferros |
+|---|---|---|---|
+| G#1C32_2030, loch0 pd_proc | G#12 | G#1A | 3, SHADOW_UPDATE |
+| G#1C35_0150, ctx0 lmp_pdaf | G#3EF | G#3FF | 4 |
+| G#1C35_00F0, ctx3 lmp_bayer | G#103FFFFE | G#103FFFFF | 0 |
+
+They are interrupt masks, which gate delivery rather than data, so they are unlikely to be the routing — but they are the only configuration-class difference this method found, and they cost one run to rule out.
+
+**Reading the front end mid-stream is timing-dependent.** `live_compare` stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump reads without trouble moments earlier in the same run. It is left in camera.rs but not called from the frame loop. Treat any front-end read during streaming as able to hang the core, and name each one in the flash log first.
