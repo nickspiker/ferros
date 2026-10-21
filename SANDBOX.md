@@ -11,7 +11,7 @@ Decided with the owner 2026-10-15. Trust model A: ferros compiles everything it 
 
 ## The invariant
 
-Registers (reserved in codegen, `.cargo/config.toml`):
+Registers (reserved in codegen by the payload target, `targets/aarch64-ferros.json`, so the rebuilt `core` and `compiler_builtins` honour them too — see `targets/README.md`; `.cargo/config.toml` carries the same set for the kernel and plain builds):
 
 | Register | Meaning | May be written by |
 |---|---|---|

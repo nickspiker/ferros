@@ -9,12 +9,14 @@ CRATE=$(grep -m1 '^name' "$REPO/payloads/$P/Cargo.toml" | sed 's/.*"\(.*\)"/\1/'
 OUT=$REPO/target/masked/$BIN
 TD=$OUT/build
 mkdir -p "$OUT/s"
-# The same codegen rules as every other aarch64 build (reserved registers + CPU features), from .cargo/config.toml.
-FLAGS=$(grep -m1 '^rustflags' "$REPO/.cargo/config.toml" | sed 's/.*target-feature=\([^"]*\)".*/\1/')
-( cd "$REPO" && RUSTFLAGS="-C target-feature=$FLAGS -C codegen-units=1 --emit=asm,link" cargo +nightly build -q -p "$CRATE" --target aarch64-unknown-none --release -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
-DEPS=$TD/aarch64-unknown-none/release/deps
+# The codegen rules come from the target itself (targets/aarch64-ferros.json): the process ABI's reserved registers and the CPU's measured features are properties of the target, so core, alloc and compiler_builtins inherit them by being built for it.
+# They used to be scraped out of .cargo/config.toml with sed. That worked, but a change to the shape of that line would have silently produced a different feature set — and a core built without x27/x28 reserved breaks the masking invariant (KERNEL.md: the arc base and mask must hold at *every* instruction, which callee-saved does not give).
+TARGET=$REPO/targets/aarch64-ferros.json
+( cd "$REPO" && RUSTFLAGS="-C codegen-units=1 --emit=asm,link" cargo +nightly build -q -p "$CRATE" --target "$TARGET" --release -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem --target-dir "$TD" )
+DEPS=$TD/aarch64-ferros/release/deps
 # The payload's own (post-LTO) module holds everything it uses; compiler_builtins is never part of LTO.
 SRCS=$(ls -t "$DEPS"/${BIN}-*.s | head -1; ls -t "$DEPS"/compiler_builtins-*.s | head -1)
+# llvm-mc's own spellings of the same set: LLVM and rustc disagree on several names (+fullfp16 for +fp16, +fp16fml for +fhm, +complxnum for +fcma, +fptoint for +frintts), so this list cannot be shared with the target's and is kept beside it deliberately.
 ATTR="+neon,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fullfp16,+fp16fml,+i8mm,+bf16,+rcpc,+jsconv,+complxnum,+flagm,+sb,+ssbs,+fptoint,+dit"
 OBJS=()
 for s in $SRCS; do

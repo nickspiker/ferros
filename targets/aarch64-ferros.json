@@ -1,0 +1,37 @@
+{
+  "arch": "aarch64",
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "default-uwtable": true,
+  "disable-redzone": true,
+  "features": "+v8a,+strict-align,+neon,+reserve-x24,+reserve-x25,+reserve-x26,+reserve-x27,+reserve-x28,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fp16,+fhm,+i8mm,+bf16,+rcpc,+jsconv,+fcma,+flagm,+sb,+ssbs,+frintts,+dit",
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "aarch64-unknown-none",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "ferros EL0 payload: bare ARM64 with the process ABI's registers reserved and the CPU's measured feature set",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "panic-strategy": "abort",
+  "pre-link-args": {
+    "gnu": [
+      "--fix-cortex-a53-843419"
+    ],
+    "gnu-lld": [
+      "--fix-cortex-a53-843419"
+    ]
+  },
+  "relocation-model": "static",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "supported-sanitizers": [
+    "kcfi",
+    "kernel-address",
+    "kernel-hwaddress"
+  ],
+  "target-pointer-width": 64
+}
