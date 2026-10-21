@@ -356,6 +356,19 @@ pub fn run(mut b: Boot) -> ! {
     }
     let heap_end = ((&raw const __stack_top as usize + 0xFFF) & !0xFFF) + crate::HEAP_SIZE;
 
+    // The generic timer's event stream: an event on every 0 -> 1 transition of counter bit 12, every 8192 ticks — 333 us at 24.576 MHz. A core in `wfe` wakes on it without taking an interrupt, so the idle loop below can sleep instead of spinning and still answer USB well inside anything the host would notice.
+    // The period sets the split. Each wake runs one full loop pass, about 13 us of work, so bit 9 (41.7 us) left the core awake a third of the time — 68% asleep, measured — while bit 12 leaves it awake about 4%. Only the first packet of a new command can wait up to one period; a transfer in progress never sleeps.
+    // Without it the loop pinned one core at full speed for as long as ferros was up, and with nothing else running that core was most of the phone's heat (owner, 2026-10-21: "why's it so hot? 1 core, always on?").
+    unsafe {
+        let mut v: u64;
+        core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
+        v = (v & !(0xF << 4 | 1 << 3)) | 1 << 2 | 12 << 4;
+        core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
+    }
+    // Ticks spent asleep in the idle loop, and since when, for DIAG's IDLE_PCT.
+    let mut asleep: u64 = 0;
+    let t_awake_from = cntpct();
+
     loop {
         platform::pet_watchdogs();
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
@@ -434,8 +447,15 @@ pub fn run(mut b: Boot) -> ! {
                     let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
                     usb.bulk_in_send(&chunk);
                 }
-                for _ in 0..64u32 {
-                    core::hint::spin_loop();
+                // Truly idle — enumerated, no transfer half-received, nothing waiting to go out, no process to run — sleep until the next timer event. Anything else keeps the old short spin, so transfers and a live display server behave exactly as before.
+                if usb.is_configured() && pt_inbound.is_none() && pt_out_data.is_empty() && crate::process::alive() == 0 {
+                    let t = cntpct();
+                    unsafe { core::arch::asm!("wfe") };
+                    asleep += cntpct().wrapping_sub(t);
+                } else {
+                    for _ in 0..64u32 {
+                        core::hint::spin_loop();
+                    }
                 }
             }
             UsbEvent::Reset => {
@@ -1126,6 +1146,8 @@ pub fn run(mut b: Boot) -> ! {
                                         });
                                         let r = |a: usize| unsafe { read_volatile(a as *const u32) };
                                         append_hex(&mut resp, b"GEN=", generation as u32);
+                                        // Percent of time since the service loop started that the core spent asleep in `wfe`, rather than spinning.
+                                        append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
