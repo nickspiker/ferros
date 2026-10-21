@@ -1134,11 +1134,12 @@ const PDMA: usize = 0x1C39_0000;
 /// The descriptor ring and the rest of the job live at fixed physical addresses the builder and the kernel agree on (tools/camera-pdma-image.py).
 const PDMA_RING_PA: usize = 0x8800_0000;
 const PDMA_BUF_PA: usize = 0x8810_0000;
-const PDMA_BUF_SLICE: usize = 0x20_0000;
-const PDMA_BUFS: usize = 18;
+/// A slice has to hold a frame: the captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the 2 MiB slices this started with could never have held one. Free DRAM from PDMA_BUF_PA to the first carveout at G#9000_0000 is 126 MiB, which is seven of these; tools/camera-pdma-image.py wraps the list's twenty distinct addresses over the same seven and must agree with these two numbers.
+const PDMA_BUF_SLICE: usize = 0x100_0000;
+const PDMA_BUFS: usize = 7;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
-pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>) {
+pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32) {
     let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
     if job.len() < 8 || &job[..4] != b"CPR3" {
         return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
@@ -1158,6 +1159,18 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
     if fail.is_some() {
         return line(rep, alloc::format!("sensor init failed\n"));
+    }
+    // Optionally narrow the sensor's window first. A full 4080 x 3072 RAW10 frame is 15 MiB and the output slices are 2 MiB, so the captured mode could never have landed in one; a slit of a few dozen rows fits with room to spare, and the front end is being asked for far less work per frame.
+    if slit_lines > 0 {
+        let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
+        let rows = (slit_lines * 4).min(12288);
+        let _ = w16(0x0104, 1);
+        let _ = w16(0x0346, 0x0010);
+        let _ = w16(0x034A, (0x0010 + rows - 1) as u16);
+        let _ = w16(0x034E, slit_lines as u16);
+        let _ = w16(0x0340, (slit_lines + 64) as u16);
+        let _ = w16(0x0104, 0);
+        line(rep, alloc::format!("sensor narrowed to 4080 x A#{slit_lines} (A#{} bytes a frame at RAW10) before the front end starts\n", 4080 * slit_lines * 10 / 8));
     }
     let iso = 0x1546_3EBCusize;
     let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);

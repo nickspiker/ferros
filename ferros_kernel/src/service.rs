@@ -795,7 +795,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"cam pdma" {
+                                        if cmd.params == b"cam pdma" || cmd.params == b"cam pdma slit" {
                                             // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
                                             let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
                                             if b2.is_none() && cfg!(cam_frame_blob) {
@@ -815,7 +815,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
                                             };
-                                            crate::camera::pdma_probe(&mut resp, init, prog);
+                                            crate::camera::pdma_probe(&mut resp, init, prog, if cmd.params == b"cam pdma slit" { 64 } else { 0 });
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

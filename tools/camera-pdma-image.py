@@ -7,7 +7,9 @@ Layout (free DRAM on a cold boot: above ferros's window and the display regions,
   G#8800_0000  the descriptor ring, 16-byte entries {flags G#C003, list address, 0, length}
   G#8801_0000  the register-write list, as the engine reads it
   G#8802_0000  the sources of the list's block-load records, one 4 KiB-aligned slice each
-  G#8810_0000  the output buffers, one 2 MiB slice per distinct address in the list
+  G#8810_0000  the output buffers, BUF_SLICE each, one slice per distinct address in the list, wrapping over BUF_SLOTS slices
+
+A slice has to hold a frame. The captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the original 2 MiB slices could never have held one however correctly everything else was programmed; free DRAM here runs G#8810_0000 to G#9000_0000, which is 126 MiB, enough for seven 16 MiB slices. There are more distinct addresses than that in the list, so they wrap: the ones that matter are the image channels, and a collision between two of the rest only matters once a frame actually lands.
 
 Output: 'CPR3', u32 blob count, then per blob {u32 physical address, u32 length, bytes padded to 4}.
 Usage: tools/camera-pdma-image.py <hv dump> <out file> [--list N]
@@ -15,7 +17,9 @@ Usage: tools/camera-pdma-image.py <hv dump> <out file> [--list N]
 import re, struct, sys
 
 RING_PA, LIST_PA, LOAD_PA, BUF_PA = 0x8800_0000, 0x8801_0000, 0x8802_0000, 0x8810_0000
-BUF_SLICE = 0x20_0000
+BUF_SLICE = 0x100_0000
+# Free DRAM from BUF_PA to the first carveout at G#9000_0000, divided by the slice.
+BUF_SLOTS = (0x9000_0000 - BUF_PA) // BUF_SLICE
 LOAD_SLICE = 0x1000
 IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 RING_ENTRIES = 16
@@ -58,13 +62,13 @@ while i < len(words):
         for k2 in range(i + 2, i + 1 + n, 2):
             v = words[k2]
             if IOVA_LO <= v < IOVA_HI and v & 0xFFF == 0:
-                words[k2] = bufs.setdefault(v, BUF_PA + len(bufs) * BUF_SLICE)
+                words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
     elif op == 1 and n:
         # A burst writes consecutive registers from one start address; buffer addresses appear in these too.
         for k2 in range(i + 2, i + 1 + n):
             v = words[k2]
             if IOVA_LO <= v < IOVA_HI and v & 0xFFF == 0:
-                words[k2] = bufs.setdefault(v, BUF_PA + len(bufs) * BUF_SLICE)
+                words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
     elif op == 9 and n == 4:
         reg, size = words[i + 4], words[i + 3]
         data = loads.get(reg, {})
@@ -84,5 +88,5 @@ ring = b''.join(struct.pack('<IIII', 0xC003, LIST_PA, 0, len(list_bytes)) for _ 
 blobs = [(RING_PA, ring), (LIST_PA, list_bytes)] + load_order
 body = b''.join(struct.pack('<II', pa, len(b)) + b + b'\0' * (-len(b) % 4) for pa, b in blobs)
 open(out, 'wb').write(struct.pack('<4sI', b'CPR3', len(blobs)) + body)
-print(f"list {len(list_bytes)} B, {len(load_order)} block-load sources, {len(bufs)} output buffers remapped from G#{min(bufs):X}.. to G#{BUF_PA:X}..")
+print(f"list {len(list_bytes)} B, {len(load_order)} block-load sources, {len(bufs)} output buffers remapped from G#{min(bufs):X}.. to G#{BUF_PA:X}.., G#{BUF_SLICE:X} a slice over {BUF_SLOTS} slices")
 print(f"ring {RING_ENTRIES} entries at G#{RING_PA:X}; total {8 + len(body)} bytes -> {out}")

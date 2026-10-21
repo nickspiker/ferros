@@ -137,3 +137,60 @@ Three results, all from the existing capture: **the oracle traps reads as well a
 **What is left: the front end takes one frame and stops asking for another.** With the acknowledgement in, the status words fire once and go quiet. Linux, per frame, steps the buffer index `+G#49C` through 0, 1, 2, 3 and the write pointer `+G#124` through G#74000, G#74800, G#75000, G#75800 — four buffers rotating, G#800 apart. ferros holds `+G#49C` at 0 and `+G#124` at G#75800 forever, while CSI link 1 keeps counting and the sensor's counter runs to 06.
 
 Linux's descriptor ring is count G#3E8 and the HAL builds a **fresh list per frame**, each with new buffer addresses; ferros hands the engine 16 descriptors that all point at one list and advances `PDMA + G#10` by G#10 a frame. So the likely missing piece is not an enable bit but the re-arm itself: in Linux the front end does not rotate buffers on its own, the HAL re-programs it every frame through the PDMA. The ordering around a frame boundary is in the capture (one frame's block is lines 1596-1699 of the full log); what to compare is what Linux does between one frame's acknowledgement and the next frame's arrival.
+
+## The sensor is ours; the front end's routing is not (2026-10-20, night)
+
+### The register map was in the tree all along
+
+`zuma-isp-event-info.dtsi` (7847 lines) names every interrupt source, mask, overflow and reset register of every block in the ISP, and `dt-bindings/lwis/platform/zuma/*.h` names every bit. LWIS's *logic* is a passthrough, which is why it was written off — but its device tree is where the front end's register semantics are written down in the open. `tools/gen-isp-events.py` generates `ferros_kernel/src/camera_events.rs` from it: 203 sources with named bits. `diag cam events` reads them all and prints the ones reporting, counting a source as interesting when its status is live **or** its mask is armed — an armed mask with no status is a channel that was set up and never fired.
+
+That immediately re-read words this driver had been printing for days. `CSIS_LINK1 + G#14 = G#100`, recorded as the link "latching its interrupt sources", is **ERR_DESKEW_OVER** — a D-PHY lane deskew overflow. The rest of the snapshot decodes as `+G#1C` LINE_END, `+G#24` FRAME_START on channels 0-2, `+G#2C` FRAME_END on channels 0-2.
+
+### Where the chain actually stops
+
+Read three frames into a PDMA run:
+
+```
+isp_fe_ctx1_csis_fs_int          +G#10024 = G#7 FRAME_START_CH0|CH1|CH2   mask G#0
+isp_fe_ctx1_csis_fe_int          +G#1002C = G#7 FRAME_END_CH0|CH1|CH2     mask G#0
+isp_fe_loch0_csis_core_img_proc  +G#20424 = G#0                           mask G#1A
+isp_fe_ctx0_pdma_err             +G#34    = G#0                           mask G#1F
+```
+
+"ctx1" is CSI link 1 (the csis-link-phy space plus one times G#10000). So link 1 takes frames, three channels of them; the front end's local channel 0 is armed with Linux's own mask G#1A (EOF, SHADOW_UPDATE, DMA_DONE) and raises nothing but SHADOW_UPDATE, which only means "your configuration was latched"; the engine reports no errors. **Nothing carries frames from the link into the front end's channel.**
+
+### Ruled out, each cheaply and each worth not repeating
+
+- **Ordering.** Linux starts the PDMA before enabling the link (capture lines 1421 then 1573) where ferros did the reverse. Reordered to match: identical result.
+- **The per-frame interrupt acknowledgement.** `tools/camera-prog.py` stops extracting "before the per-frame interrupt handling", so 21 registers Linux reads and writes straight back each frame were in neither the replay nor the program. They are real — unacknowledged, G#1C32_008C sticks at G#81 instead of alternating with G#1 — and `FRAME_ACK` in camera.rs now does all 28 in captured order, which clears it. It did not produce a frame.
+- **Missing boot-time initialisation.** The oracle was armed sixty seconds in, on purpose, to skip the boot probe, so any one-time setup before a camera open was never captured. The capture exposes it anyway: a register Linux **reads as non-zero before ever writing it** was set up earlier. `diag cam preexist` compares all 45 such registers on a cold ferros — 36 match, and the nine that differ are all interrupt status from Linux's prior session. There is no missing boot init.
+- **A DMA on the link, to bypass the front end.** The csis-link-phy space has only `int0/int1/fs_int/fe_int` per context across all 12 contexts, no DMA. The front end's `csis_core` *is* the minimal DMA; there is nothing to route around.
+- **VOTF.** `lwis_votf` serves rgbp/yuvp/tnr/mcsc/gdc/gse — downstream blocks, not the CSIS-to-front-end path.
+
+### Two measurement bugs of ours, both of which could have hidden success
+
+- The output test counted a probe point only when it read neither the pattern nor zero. Every point is patterned first, so a point reading zero **was written**, and a frame of a dark scene is mostly zeroes — exactly the result the test exists to find. It now counts any departure from the pattern and samples every 256 bytes.
+- The slices were 2 MiB. A 4080 x 3072 RAW10 frame is 15 MiB, so no correctly-programmed frame could ever have landed in one. Linux's buffers were spread over about 100 MB; the builder had compressed them to 2 MiB apart. `tools/camera-pdma-image.py` and camera.rs now agree on 16 MiB slices over the seven that fit free DRAM.
+
+### The sensor, on the other hand, is fully ours
+
+It speaks MIPI CCS (SMIA++), a public standard, and of the 1347 writes in the captured init only **twenty** define the mode — the rest is vendor tuning. The captured mode decodes completely: RAW10, 4080 x 3072 output, the full 16320 x 12288 array binned four to one, `line_length_pck` 6320, `frame_length_lines` 10584, `pll_multiplier` 245, `extclk` 24.0 MHz, exposure 20 lines.
+
+**`diag cam slit` drives it instead of echoing it.** Four writes inside a grouped-parameter hold — `y_addr_start`, `y_addr_end`, `y_output_size`, `frame_length_lines` — and, with the sensor's own frame counter as the clock so nothing downstream can flatter the result:
+
+| mode | frames in 250 ms | rate |
+|---|---|---|
+| captured, 4080 x 3072 | 4 | about 16 a second |
+| ours, 4080 x 64 | 296 | **about 1184 a second** |
+
+Seventy-four times the rate, read back as `y_output_size G#40`, `frame_length_lines G#80`, `x_output_size G#FF0`, `mode_select G#103`. That is slit-scan's foundation and it stands clear of the front end entirely. A slit frame is also 319 KiB rather than 15 MiB.
+
+With the slit the link's own state tracks the new geometry (`+G#678` moves to G#954A, `+G#624` appears) and new error bits arrive in `+G#14` and `+G#1C` — the captured program hard-codes the full-frame geometry, so the front end is being handed 64 lines where it expects 3072. Matching the front end to our own window needs its configuration registers, which is the one map LWIS does not carry.
+
+**`diag cam caps`** reads the CCS capability block (addresses from the mainline driver's generated `ccs-regs.h`). Identity, gain, integration-time and ADC capability answer properly; the clock and frame limit block at G#1100 does not exist on this part — G#10F4, G#1104 and G#1140 all return the same G#41400000, which is address aliasing. `diag cam probe` establishes that this is the sensor's answer and not ours: G#1140 reads G#4140 whatever preceded it, and a four-byte read of G#0000 gives G#08EFA100, which is the model ID and revision exactly. So the envelope has to come from experiment, and the slit result is the first measurement in it.
+
+### What to try next
+
+1. **The front end's geometry.** Everything we can compare against Linux now matches, so the gap is a register whose meaning we do not have rather than a value we failed to copy. The remaining untried source is the PDMA's **first** list of a session — `camera-ispfe-pdma-writes.txt` is list 2 of a rotating three, and one-time setup would live in the first.
+2. **A frame at the captured geometry** now that a slice can hold one, which is the test the 2 MiB slices made impossible.
+3. **Our own pipeline from raw Bayer**, in the pinned gamma2tanh profile, once a frame lands. The vendor ISP is 4495 register writes whose meaning lives only in a closed HAL; reproducing its tuning is neither possible nor wanted.
