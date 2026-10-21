@@ -632,7 +632,10 @@ fn frames(rep: &mut Vec<u8>, ms: u64, strength: bool) {
     line(rep, s);
 }
 
-/// `diag touch decay`: a decay screen at 1:1 in 10-bit-per-channel colour. Every frame each channel of every pixel loses one, and every touch reading stamps two filled circles at the contact: the contact's ellipse split across the channels: red sized by its major axis, blue by its minor, green by the reported pressure. So a finger leaves a fading trail whose red fringe outside the blue disc is the eccentricity of the contact, and whose green says how hard it pressed.
+/// `diag touch decay`: a decay screen at 1:1 in 10-bit-per-channel colour.
+/// Every frame halves each channel of every pixel, so a channel stamped at full scale is gone in ten frames — about a third of a second — which keeps the trail as short as the hand that drew it.
+/// Every touch reading stamps the contact's ellipse split across the channels: red sized by its major axis, blue by its minor, green by the reported pressure.
+/// So a finger leaves a fading trail whose red fringe outside the blue disc is the eccentricity of the contact, and whose green says how hard it pressed.
 ///
 /// The surface is ferros's own framebuffer (`DISPLAY_FB`), one u32 per pixel with alpha in bits [31:30] and three 10-bit channels, so the fade has 1024 steps instead of 256. The layer's format and the panel go back as they were on the way out.
 pub fn decay(rep: &mut Vec<u8>, ms: u64) {
@@ -699,7 +702,7 @@ pub fn decay(rep: &mut Vec<u8>, ms: u64) {
         for i in 0..stride * h {
             let v = px(i);
             let (r, g, b) = (v & 0x3FF, (v >> 10) & 0x3FF, (v >> 20) & 0x3FF);
-            let d = r.saturating_sub(1) | g.saturating_sub(1) << 10 | b.saturating_sub(1) << 20;
+            let d = (r >> 1) | (g >> 1) << 10 | (b >> 1) << 20;
             if d != v & 0x3FFF_FFFF {
                 set(i, 0xC000_0000 | d);
             }
