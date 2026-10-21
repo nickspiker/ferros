@@ -16,6 +16,10 @@
 //! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
 //! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
 //! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
+//! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the phone is a map of your life).
+//! - 13 `scene add [count u8][count x circle]`: append circles, each 29 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `len u8`, `label [16]`.
+//! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`: draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
+//! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
 //! Pixels are BGRX8888 as the layer reads them (G#xxRRGGBB); fluor draws into the same words with colours packed as G#FF_RRGGBB — its α + darkness convention is only a convention, every blend it does is linear, and the X byte is ignored by the DMA — so there is no conversion pass. What is not a convention is fluor's order: it composites **front to back**, a paint goes *under* what is already there and an opaque pixel is left alone, so a frame starts from transparent (α = 0), the text goes down first and the background last. (The first cut filled black over raw DRAM: every word that happened to carry α = FF survived, a random-colour matrix at 1 in 256 — the owner's "green speckle wallpaper", 2026-10-16.)
@@ -153,6 +157,26 @@ const GREY: u32 = rgb(0x9A, 0x9A, 0x9A);
 const DIM: u32 = rgb(0x5C, 0x5C, 0x5C);
 const RULE: u32 = rgb(0x28, 0x28, 0x28);
 const AMBER: u32 = rgb(0xFF, 0xA0, 0x00);
+
+/// One circle of the map (SHELL.md), in world units.
+#[derive(Clone, Copy)]
+struct Circle {
+    x: i32,
+    y: i32,
+    r: u16,
+    ring: u8,
+    lit: u8,
+    len: u8,
+    label: [u8; 16],
+}
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, len: 0, label: [0; 16] };
+/// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
+static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
+static mut SCENE_N: usize = 0;
+/// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
+const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
+const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
+const MAP_LIT: u32 = AMBER;
 const BLACK: u32 = rgb(0, 0, 0);
 
 struct Log {
@@ -524,6 +548,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut clock = [0u8; 8];
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
     let mut client_owned = false;
+    // When the map last moved its camera: while someone is touching, poll the endpoint fast enough to follow a finger; at rest, slowly, so the core sleeps.
+    let mut last_interaction = 0u64;
     let mut next_tick = (now() / freq() + 1) * freq();
     let mut msg = [0u8; 4096];
     let mut tok = [0u8; 32];
@@ -578,6 +604,75 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let mut c = Canvas::new(pixels, width, height, &mut damage);
                         paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
                     }
+                    ferros_sys::dma_barrier();
+                    pipe.program_layer(win, fb, width as u32, height as u32);
+                    let (moved, _) = pipe.present(win);
+                    frames += 1;
+                    out[1] = moved as u8;
+                    len = 2;
+                }
+                Some(12) => {
+                    client_owned = true;
+                    unsafe { SCENE_N = 0 };
+                }
+                Some(13) if m.len() >= 2 => {
+                    client_owned = true;
+                    let count = m[1] as usize;
+                    let mut at = 2usize;
+                    for _ in 0..count {
+                        if at + 29 > m.len() || unsafe { SCENE_N } >= 256 {
+                            out[0] = 2;
+                            break;
+                        }
+                        let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+                        let mut label = [0u8; 16];
+                        label.copy_from_slice(&m[at + 13..at + 29]);
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], len: m[at + 12].min(16), label };
+                        unsafe {
+                            SCENE[SCENE_N] = c;
+                            SCENE_N += 1;
+                        }
+                        at += 29;
+                    }
+                }
+                Some(14) if m.len() >= 13 => {
+                    client_owned = true;
+                    last_interaction = now();
+                    let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as f32;
+                    let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as f32;
+                    let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as f32 / 65536.0;
+                    pixels.fill(0);
+                    {
+                        let mut c = Canvas::new(pixels, width, height, &mut damage);
+                        for i in 0..unsafe { SCENE_N } {
+                            let cir = unsafe { SCENE[i] };
+                            let sx = (cir.x as f32 - cx) * z + w * 0.5;
+                            let sy = (cir.y as f32 - cy) * z + h * 0.5;
+                            let sr = cir.r as f32 * z;
+                            if sr < 1.0 || sx + sr < 0.0 || sx - sr > w || sy + sr < 0.0 || sy - sr > h {
+                                continue;
+                            }
+                            // Importance is the ring's weight, in screen pixels so it stays legible at every zoom.
+                            let stroke = match cir.ring { 0 => 0.0, 1 => libm::fmaxf(1.0, sr * 0.04), _ => libm::fmaxf(2.0, sr * 0.12) };
+                            let lit = cir.lit != 0;
+                            // fluor composites front to back: the label first, then the fill, then the ring's larger disc, which lands only on the band the fill left open.
+                            // Zoom is semantic: a name appears only once the circle is big enough to read it.
+                            if sr >= 36.0 && cir.len > 0 {
+                                if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
+                                    let px = libm::fminf(libm::fmaxf(sr * 0.32, 12.0), 72.0);
+                                    let tw = text_width(&font, t, px);
+                                    text(&mut c, &font, t, sx - tw * 0.5, sy + px * 0.35, px, if lit { BLACK } else { WHITE });
+                                }
+                            }
+                            paint::circle_filled(&mut c, sx as isize, sy as isize, (sr - stroke) as isize, if lit { MAP_LIT } else { MAP_FILL }, None, None);
+                            if stroke > 0.0 {
+                                paint::circle_filled(&mut c, sx as isize, sy as isize, sr as isize, MAP_RING, None, None);
+                            }
+                        }
+                        // The air: black under everything.
+                        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
+                    }
+                    ALLOC.reset();
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -714,8 +809,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
             }
         }
-        // Asleep until the next poll (a sixteenth of a second: a client waits at most that long) or the next tick, whichever is first; the service loop has the CPU meanwhile.
-        ferros_sys::sleep_until(next_tick.min(now() + freq() / 16));
+        // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
+        let poll = if now().wrapping_sub(last_interaction) < 2 * freq() { freq() / 120 } else { freq() / 16 };
+        ferros_sys::sleep_until(next_tick.min(now() + poll));
     }
 }
 

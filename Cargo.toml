@@ -26,6 +26,7 @@ members = [
     "payloads/echo_server",
     "payloads/touch",
     "payloads/touchtest",
+    "payloads/map",
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",
