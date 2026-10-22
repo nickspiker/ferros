@@ -342,3 +342,19 @@ Sequence: `cam bus`, `cam up`, `cam pdma …`, then for each further run `cam of
 Avoid `bridge read priv:15463EBC` after a camera run: it hung ferros until the watchdog.
 
 **Exposure timing.** CCS from the init: EXTCLK 24 MHz, pre-PLL ÷3, ×245, vt_sys ÷1, vt_pix ÷8, line_length_pck 6320, frame_length 21362, integration 21342. Read literally that is a 551 ms frame; measured, the sensor runs about 14 to 15 frames a second. vt_pix_clk taken as 1960 MHz (the ÷8 not applied, or eight pixel pipes) gives 3.22 µs lines, a 68.9 ms frame and **68.8 ms integration**, consistent with the measured rate. Confirmed by a timed count (`cam pdma rate`): 30 frames in 2.034 s on both the core's buffer index and the sensor's own counter, a period of 67.8 ms ± 2.3 ms (one-frame resolution), against 68.9 ms predicted. Still open for an absolute comparison: how analogue gain G#0400 maps onto the ISO the IDT's `gain_ref` was measured at.
+
+## The other cameras: captures (2026-10-22, early)
+
+Driven from adb through the Pixel Camera app (`tools/husky-hv-camall.sh`): open the camera, then marked taps at measured screen positions (1008 × 2244). The positions are UW (396, 1437), T (615, 1437) and flip (780, 1683). The front-camera intent extras are ignored by the app.
+
+- **One bus per capture.** Two controllers trapped together (camera PMIC + ultrawide) gave length mismatches in the same place twice. The cause is the hv's repeat-collapsing state, shared across cores without a lock (memory: feedback_oracle_capture_integrity).
+- **Ultrawide ("oksoko", hsi2c@108A0000): replay-grade capture taken.** 3978 transfers, integrity 0 (`target/hv/uw1-i2c-raw.log`, decoded `uw1-108A.txt`; local only, it carries the vendor settings).
+  - The sensor at G#1A identifies as **G#0787 (Sony IMX787)** at G#0016/0017.
+  - Plain CCS writes, one 4034-byte settings burst at G#CC00, stream-on at transfer 255.
+  - Per-frame exposure inside the G#0104 hold.
+  - The lens actuator at G#0F takes the same protocol as the main camera's (02 ← G#40, 02 ← 0, target in 00/01).
+  - Its lens polling fills a 36000-line cap in about 8 s, after the init.
+- **Front ("kraken", G#2D on hsi2c@108B0000):** reached with the flip tap; capture in progress.
+- **Tele ("dokkaebi", hsi2c@10890000):** not reached. The T tap did not switch to it; it needs the zoom control at its current position.
+
+Still to capture for each: its CSI link and PHY lanes (an ISP front-end capture of that session) and its PDMA program (`FERROS_HV_PDMA_DUMP`). The power-up comes from each module's `module_power_seq` in the device tree, as for the main camera.
