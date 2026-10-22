@@ -10,6 +10,7 @@
 #   check     one reading of the target, to confirm the instrument sees the disc
 #   run [sections...]   the readings (default: all, in order): drift rolloff sustain apl ramps nearblack colours drift
 #   ten <control|dither|link10|restore>   is the link really 10 bits: grey 10-bit codes 512-520 at ~1000 nits, read twice each, in the 1 cm disc. control = 10 bpc compose on the 8 bpc link with the dither off (expect plateaus four codes wide), dither = the same dithered (the instrument averages it: an even ramp), link10 = the 10 bpc DSC stream, no dither (even steps only if all ten bits arrive), restore = the default (10 bpc compose, dithered)
+#   run ramps10   the tone curve in 10-bit codes in the mode ferros runs (10 bpc compose + DQE dither on the 8 bpc link; the panel keeps 8 bits of a 10 bpc stream, 2026-10-22)
 #   on        the shell back (remove `home.off`), reboot
 # Output: oracle/display/husky-hk3/profile-<date>/readings.csv (section, label, dbv, window px, rgb, surround, seconds since start, Y cd/m², x, y) and spotread.log (every reading's full output, spectra included).
 # Needs: the instrument readable (sudo chmod a+rw /dev/bus/usb/<bus>/<dev>, or the colord group), cold ferros on USB, a dark room.
@@ -52,6 +53,22 @@ m10() {
         [ -z "$r" ] && r="? ? ?"
         echo "$sec,g10-$c-$k,3307,$PX_PER_CM,g10=$c,0,$(( $(date +%s) - T0 )),${r// /,}" | tee -a "$CSV"
     done
+}
+# One 10-bit reading in the disc: section, label, dbv, r g b (0-1023).
+m10c() {
+    local sec=$1 label=$2 d=$3; shift 3
+    run display patch10 "$PX_PER_CM" "$1" "$2" "$3" 0; sleep 1.5
+    local r; r=$(read_one "$sec $label dbv=$d rgb10=$1,$2,$3")
+    [ -z "$r" ] && r="? ? ?"
+    echo "$sec,$label,$d,$PX_PER_CM,r$1g$2b$3,0,$(( $(date +%s) - T0 )),${r// /,}" | tee -a "$CSV"
+}
+# The tone curve in the mode we run (10 bpc compose, DQE dither, 8 bpc link): grey in 33 steps of 10-bit code at two brightnesses, each channel in 17 at 1353, and the shadows in 10-bit codes, where the dither's two extra bits matter most.
+sec_ramps10() {
+    run display modeset wqhd 10
+    for d in 1353 3307; do dbv $d; for i in $(seq 0 32); do c=$(( i * 32 )); [ $c -gt 1023 ] && c=1023; m10c ramps10 "grey$c" $d $c $c $c; done; done
+    dbv 1353
+    for i in $(seq 0 16); do c=$(( i * 64 )); [ $c -gt 1023 ] && c=1023; m10c ramps10 "red$c" 1353 $c 0 0; m10c ramps10 "green$c" 1353 0 $c 0; m10c ramps10 "blue$c" 1353 0 0 $c; done
+    for c in 2 4 6 8 12 16 24 32 48; do m10c nearblack10 "grey$c" 1353 $c $c $c; done
 }
 ten() {
     case "$1" in

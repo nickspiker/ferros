@@ -1648,6 +1648,20 @@ pub fn run(mut b: Boot) -> ! {
                                                 let rep = crate::display::patch10(diam, [v(2), v(4), v(6)], [v(8), v(10), v(12)], freq);
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#13 [r g b, 10-bit, hi lo each] = DECON's background colour with the base window off; G#13 alone = the window back on (bridge `display bg <r> <g> <b>` / `display bg off`).
+                                            Some((19, args)) => {
+                                                let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
+                                                let c = if args.len() >= 6 { Some([v(0), v(2), v(4)]) } else { None };
+                                                let rep = crate::display::bg10(c, freq);
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#14 [diameter hi lo] [word, 4 bytes BE] [surround word, 4 bytes BE] = the 10-bit layer's disc with raw words (bridge `display patchraw`).
+                                            Some((20, args)) if args.len() >= 10 => {
+                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
+                                                let w = |i: usize| u32::from_be_bytes([args[i], args[i + 1], args[i + 2], args[i + 3]]);
+                                                let rep = crate::display::patch_raw(diam, w(2), w(6), freq);
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
                                             Some((12, args)) if args.len() >= 3 => {
                                                 let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);

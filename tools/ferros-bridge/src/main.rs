@@ -143,6 +143,26 @@ async fn main() {
             let (rgb, sur) = (hex(4), hex(5));
             cmd_display_raw(&[17, (diam >> 8) as u8, diam as u8, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, (sur >> 16) as u8, (sur >> 8) as u8, sur as u8]).await;
         }
+        "display" if args.get(2).map(String::as_str) == Some("patchraw") => {
+            // display patchraw <diameter px> <hex word> [hex surround word] — the 10-bit layer's disc with raw 32-bit words.
+            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
+            let hex = |i: usize| args.get(i).and_then(|a| u32::from_str_radix(a.trim_start_matches("G#"), 16).ok()).unwrap_or(0);
+            let mut m = vec![20u8, (diam >> 8) as u8, diam as u8];
+            m.extend_from_slice(&hex(4).to_be_bytes());
+            m.extend_from_slice(&hex(5).to_be_bytes());
+            cmd_display_raw(&m).await;
+        }
+        "display" if args.get(2).map(String::as_str) == Some("bg") => {
+            // display bg <r> <g> <b> | off — DECON's background colour (decimal 0-1023 each) over the whole raster with the base window off; `off` turns the window back on.
+            let mut m = vec![19u8];
+            if args.get(3).map(String::as_str) != Some("off") {
+                for i in 3..6 {
+                    let v = args.get(i).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0).min(1023);
+                    m.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            cmd_display_raw(&m).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("patch10") => {
             // display patch10 <diameter px> <r> <g> <b> [surround grey] — the disc in 10 bits a channel (decimal 0-1023), the layer switched to 2:10:10:10.
             let n = |i: usize, d: u16| args.get(i).and_then(|a| a.parse::<u16>().ok()).unwrap_or(d).min(1023);

@@ -161,10 +161,50 @@ pub fn patch(diam: usize, rgb: u32, surround: u32, cntfrq: u64) -> alloc::vec::V
     patch_px(diam, rgb, surround, false, cntfrq)
 }
 
+/// The panel adopted when `bg10` turned the base window off, kept so it can be turned back on: with no window enabled, `adopt` finds nothing to adopt.
+static mut BG_PANEL: Option<Panel> = None;
+
+/// DECON's own background colour, 10 bits a channel, over the whole raster with the base window off (bridge `display bg <r> <g> <b>`, `display bg off`): the blender, DQE, DSC and link with no layer DMA or DPP in front of them, for telling where precision is lost. `None` turns the window back on.
+pub fn bg10(c: Option<[u32; 3]>, cntfrq: u64) -> alloc::vec::Vec<u8> {
+    let mut rep = alloc::vec::Vec::new();
+    let panel = match unsafe { BG_PANEL } {
+        Some(p) => p,
+        None => match adopt(cntfrq, &mut rep) {
+            Some(p) => p,
+            None => return rep,
+        },
+    };
+    let win = (panel.up & 0xFF).trailing_zeros() as usize;
+    let wincon = DECON_WINCON + win * 0x1000;
+    match c {
+        Some([r, g, b]) => {
+            unsafe { BG_PANEL = Some(panel) };
+            wr(DECON0 + 0x0224, 0xFF << 16 | (r & 0x3FF));
+            wr(DECON0 + 0x0228, (g & 0x3FF) << 16 | (b & 0x3FF));
+            wr(wincon, rd(wincon) & !1);
+        }
+        None => {
+            unsafe { BG_PANEL = None };
+            wr(DECON0 + 0x0224, 0);
+            wr(DECON0 + 0x0228, 0);
+            wr(wincon, rd(wincon) | 1);
+        }
+    }
+    panel.present(&mut rep);
+    rep.extend_from_slice(alloc::format!("bg: {c:?}, window A#{win} {}\n", if c.is_some() { "off" } else { "on" }).as_bytes());
+    rep
+}
+
 /// The same patch in 10 bits a channel: the layer switched to 2:10:10:10 and each value 0-1023 (bridge `display patch10`). For telling a true 10 bpc link from an 8 bpc one with an instrument: one code steps the light by ~0.4 % near the middle of the range only if all ten bits reach the panel.
 pub fn patch10(diam: usize, rgb: [u32; 3], surround: [u32; 3], cntfrq: u64) -> alloc::vec::Vec<u8> {
-    let pack = |c: [u32; 3]| 3 << 30 | (c[0] & 0x3FF) << 20 | (c[1] & 0x3FF) << 10 | (c[2] & 0x3FF);
+    // The layout the hardware takes (`Panel::set_10bit`): blue on top, alpha at the bottom.
+    let pack = |c: [u32; 3]| (c[2] & 0x3FF) << 22 | (c[1] & 0x3FF) << 12 | (c[0] & 0x3FF) << 2 | 3;
     patch_px(diam, pack(rgb), pack(surround), true, cntfrq)
+}
+
+/// The patch with raw 32-bit words in the 10-bit layer (bridge `display patchraw`): for finding which bits of a word the hardware takes as which channel.
+pub fn patch_raw(diam: usize, word: u32, surround: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
+    patch_px(diam, word, surround, true, cntfrq)
 }
 
 fn patch_px(diam: usize, rgb: u32, surround: u32, ten: bool, cntfrq: u64) -> alloc::vec::Vec<u8> {
@@ -543,9 +583,17 @@ impl Panel {
     }
 
     /// Switch the base layer between 8-bit BGRX8888 and 10-bit-per-channel 2:10:10:10 (cal_9865 regs-dpp.h: BGRX8888 is 4, ARGB2101010 is 19). In the packed format a pixel is one u32 with alpha in bits [31:30] and three 10-bit channels; green sits in bits [19:10] in both the ARGB and ABGR orderings, so only red and blue can be the other way round.
+    ///
+    /// Three blocks must agree (measured with the i1 Pro, 2026-10-22; the stock driver's `dma_dpp_reg_set_format` sets all three): the DMA's format (19), and the DPP's and HDR-common's image format (DPP_COM_IO_CON / LSI_COMM_IO_CON bits [2:0] = 1, ARGB8101010). With only the DMA switched, the DPP keeps 8 bits a channel and the two low bits never reach the blender (plateaus four codes wide). With all three, the word the hardware takes is **B[31:22] G[21:12] R[11:2] A[1:0]** (BGRA1010102 in the header's names) whatever format 19 is called; packed that way, a grey ramp steps 0.4 % per code through the 10 bpc blend and the DQE dither.
     pub fn set_10bit(&self, on: bool) {
         let v = rd(self.dpp + RDMA_IN_CTRL_0) & !IDMA_IMG_FORMAT_MASK;
         wr(self.dpp + RDMA_IN_CTRL_0, v | if on { 19 << 8 } else { IDMA_IMG_FORMAT_BGRX8888 });
+        // Channel 0's DPP and HDR-common blocks sit G#3_0000 and G#6_0000 above its DMA (DPP0 G#1993_0000, HDRCOMM0 G#1996_0000).
+        if self.dpp == DMA0 {
+            let fmt = on as u32;
+            wr(DPP0 + 0x38, (rd(DPP0 + 0x38) & !7) | fmt);
+            wr(HDRCOMM0 + 0x0C, (rd(HDRCOMM0 + 0x0C) & !7) | fmt);
+        }
     }
 
     /// Push one frame: shadow update, unmask the TE trigger, wait for FRAME_COUNT to move (or 1/4 s), mask it again.
