@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+ferros_ledger = { path = "../../ferros_ledger" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }

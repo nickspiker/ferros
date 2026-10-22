@@ -11,9 +11,9 @@
 //!
 //! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
 //!
-//! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic and an arrangement by hand lasts until the process ends: the map holds no vault capability yet.
+//! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic until the owner arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings.
+//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`.
 
 #![no_std]
 #![no_main]
@@ -25,6 +25,7 @@ use tatau::Style;
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SETTINGS: u64 = 3;
+const S_STORE: u64 = 4;
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
 struct Spec {
@@ -270,12 +271,68 @@ struct Map {
     /// The device back's rows, as laid out by the last frame: (top, bottom, what).
     rows: [(i64, i64, Choice); 8],
     nrows: usize,
+    /// Circles moved or sized by hand since arranging began, to keep when it ends.
+    arranged: [bool; N],
 }
 
 impl Map {
     /// The arrived circle's radius on the panel.
     fn arrived_r(&self) -> i64 {
         self.w * 15 / 32
+    }
+
+    /// A circle's vault key, relative to the map's scope: `place.<label>`, so a circle keeps its place however the table grows.
+    fn place_key(i: usize, key: &mut [u8; 32]) -> usize {
+        let l = CIRCLES[i].label.as_bytes();
+        key[..6].copy_from_slice(b"place.");
+        let n = l.len().min(26);
+        key[6..6 + n].copy_from_slice(&l[..n]);
+        6 + n
+    }
+
+    /// The arrangement made by hand, from the vault: each circle's place as three EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), then the radius.
+    fn load_places(&mut self) -> usize {
+        let mut loaded = 0;
+        for i in 0..N {
+            let mut key = [0u8; 32];
+            let kl = Map::place_key(i, &mut key);
+            let mut v = [0u8; 64];
+            let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), &key[..kl], &mut v) else { continue };
+            let v = &v[..n.min(64)];
+            let mut at = 0;
+            let mut vals = [0u64; 3];
+            let mut ok = true;
+            for slot in vals.iter_mut() {
+                match ferros_ledger::ewe::decode_u64(&v[at.min(v.len())..]) {
+                    Some((x, k)) => {
+                        *slot = x;
+                        at += k;
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok && vals[2] > 0 && vals[2] < 4096 {
+                let unzig = |u: u64| ((u >> 1) as i64) ^ -((u & 1) as i64);
+                self.xs[i] = unzig(vals[0]);
+                self.ys[i] = unzig(vals[1]);
+                self.rs[i] = vals[2] as i64;
+                loaded += 1;
+            }
+        }
+        loaded
+    }
+
+    /// Keep circle i's place in the vault.
+    fn save_place(&self, i: usize) -> bool {
+        let mut key = [0u8; 32];
+        let kl = Map::place_key(i, &mut key);
+        let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
+        let mut b = [0u8; 32];
+        let mut n = 0;
+        for v in [zig(self.xs[i]), zig(self.ys[i]), self.rs[i] as u64] {
+            n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
+        }
+        ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &b[..n])
     }
 
     /// The circle under a panel pixel, smallest first when they overlap (the smaller is drawn on top).
@@ -526,6 +583,15 @@ impl Map {
         if self.editing {
             if fingers == 1 && self.hit(sx, sy).is_none() {
                 self.editing = false;
+                // The arrangement is kept now, once, rather than on every frame of a drag.
+                for i in 0..N {
+                    if self.arranged[i] {
+                        self.arranged[i] = false;
+                        if !self.save_place(i) {
+                            console(self.grants, b"map: the vault did not take a place\n");
+                        }
+                    }
+                }
                 self.draw();
             }
             return;
@@ -640,7 +706,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         editing: false,
         rows: [(0, 0, Choice::Labels); 8],
         nrows: 0,
+        arranged: [false; N],
     };
+    let kept = map.load_places();
+    if kept > 0 {
+        let mut l = Line::new();
+        let _ = write!(l, "map: {kept} circle(s) where the owner put them\n");
+        console(grants, l.as_str().as_bytes());
+    }
     map.send_scene();
     map.cam = map.home();
     // A development build can start arrived somewhere, to see a front or a back without a finger: FERROS_MAP_START=f<n> or b<n> (circle n).
@@ -785,6 +858,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         map.rs[i] = (map.rs[i] * d1 / d0).clamp(24, 1200);
                     }
                     map.send_move(i);
+                    map.arranged[i] = true;
                     scene_moved = true;
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {
                     // Two fingers: zoom by how much they spread and turn by how much they twist, about the point between them, so what is under your fingers stays under your fingers.

@@ -301,6 +301,18 @@ fn store_pref(index: usize, value: u8) -> bool {
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, alloc::vec![value]).is_ok()).unwrap_or(false) }
 }
 
+/// `SYS_STORE`'s vault: the kernel has already checked the capability and prefixed the key with its scope.
+fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    match value {
+        Some(v) => {
+            crate::flashlog::line(&alloc::format!("store set {key:?} {} bytes (process)", v.len()));
+            st.set(key, v.to_vec()).map(|_| None).map_err(|_| ())
+        }
+        None => st.get_by_key(key).map_err(|_| ()),
+    }
+}
+
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k).ok().flatten() }
@@ -317,6 +329,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Serve(b"touch"), Hardware(b"usi2-spi"), Hardware(b"gpio-gpn0"),
         Use(b"display"), Use(b"touch"),
         Settings,
+        Store(b"map"),
     ]
 }
 
@@ -386,6 +399,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::CAPSULES = Some(read_capsule);
         crate::process::PREF_STORE = Some(store_pref);
         crate::process::FACTS = Some(facts);
+        crate::process::STORE = Some(store_scoped);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();

@@ -128,6 +128,8 @@ pub enum Object {
     Dma(usize),
     /// Served by the kernel: the right to change the device's preferences (`SYS_SET_PREF`, SETTINGS.md). Reading them needs no capability: every process finds them in its own grants page.
     Settings,
+    /// Served by the kernel: a scope of the device vault (index into `STORES`): get and set the keys under its prefix, named relative to it (`SYS_STORE`).
+    Store(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -160,6 +162,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Dma(i) => (5, i as u64),
         Object::Hardware(i) => (3, i as u64),
         Object::Settings => (6, 0),
+        Object::Store(i) => (7, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -309,6 +312,8 @@ const SYS_SET_PREF: u64 = 11;
 const SYS_FACTS: u64 = 12;
 pub const FACT_COUNT: usize = 16;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
+/// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
+const SYS_STORE: u64 = 13;
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
 pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 
@@ -365,6 +370,20 @@ pub static DMA: &[Dma] = &[
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
 ];
+/// A named scope of the device vault a spawn can grant: every key under `prefix`. A process names keys relative to its scope and cannot reach outside it (no `/`-style escapes exist: the kernel only ever prepends).
+pub struct StoreScope {
+    pub name: &'static str,
+    pub prefix: &'static str,
+}
+pub static STORES: &[StoreScope] = &[
+    // The map's own state: the arrangement the owner made by hand.
+    StoreScope { name: "map", prefix: "map." },
+];
+/// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
+pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
+/// The largest value `SYS_STORE` moves either way.
+pub const STORE_MAX: usize = 4096;
+
 const ENTROPY_CONTEXT: &str = "ferros husky 2026-10-15 entropy syscall v1";
 static ENTROPY_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -494,6 +513,36 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_STORE => {
+            let token = p.read(f.x[0], 32);
+            let scope = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i),
+                _ => None,
+            };
+            let (set, len) = (f.x[1] & 1 == 1, (f.x[1] >> 8) as usize);
+            let rel = p.read(f.x[2], (f.x[3] as usize).min(65));
+            f.x[0] = match (scope, unsafe { STORE }) {
+                (Some(sc), Some(store)) if !rel.is_empty() && rel.len() <= 64 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && len <= STORE_MAX => {
+                    let mut key = alloc::string::String::from(sc.prefix);
+                    key.push_str(core::str::from_utf8(&rel).unwrap_or(""));
+                    if set {
+                        let value = p.read(f.x[4], len);
+                        if store(&key, Some(&value)).is_ok() { 0 } else { ERR }
+                    } else {
+                        match store(&key, None) {
+                            Ok(Some(v)) => {
+                                p.write(f.x[4], &v[..v.len().min(len)]);
+                                v.len() as u64
+                            }
+                            Ok(None) => NOTHING,
+                            Err(()) => ERR,
+                        }
+                    }
+                }
+                _ => ERR,
+            };
+            0
+        }
         SYS_FACTS => {
             let facts = unsafe { FACTS }.map(|f| f()).unwrap_or([FACT_UNKNOWN; FACT_COUNT]);
             let mut b = [0u8; FACT_COUNT * 8];
@@ -871,6 +920,8 @@ pub enum Grant<'a> {
     Dma(&'a [u8]),
     /// The right to change device preferences (syscall 11).
     Settings,
+    /// A scope of the device vault, by name (syscall 13).
+    Store(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -946,6 +997,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 None => return Err("no such DMA region"),
             },
             Grant::Settings => (Object::Settings, RIGHT_SEND),
+            Grant::Store(n) => match STORES.iter().position(|r| r.name.as_bytes() == *n) {
+                Some(i) => (Object::Store(i), RIGHT_SEND),
+                None => return Err("no such store scope"),
+            },
         });
     }
     Ok(v)

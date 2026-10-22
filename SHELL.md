@@ -152,7 +152,7 @@ The proposal above, with the owner's gestures ("two finger scale/move for edits 
   
   Taps go through the Settings capability, which init now passes to the map.
 - **An app's front** is its icon filling the screen, with "not here yet". Its back is its share of your time, whether it is installed, what it waits for, and its capabilities (none yet).
-- **Arranging by hand:** two fingers that land on a circle move it with their midpoint and size it with their spread. A tap in the air ends it. The arrangement lasts until the map restarts, because the map holds no vault capability yet.
+- **Arranging by hand:** two fingers that land on a circle move it with their midpoint and size it with their spread. A tap in the air ends it, and every circle that moved is kept in the vault under `map.place.<name>`: x and y (world units ×256, zigzag) and the radius, as EWE integers. From then on a kept place wins over the seeded one. The map reaches the vault only through a Store capability scoped to `map.` (process.rs `STORES`, `SYS_STORE`). It names keys relative to that scope and cannot name anything outside it.
 
 Everything in the map is integer. The camera centre is in world units ×256 and the zoom is 16.16. Pinches use integer square roots.
 

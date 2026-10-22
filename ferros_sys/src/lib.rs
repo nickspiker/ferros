@@ -29,6 +29,7 @@ pub mod nr {
     pub const SPAWN: u64 = 10;
     pub const SET_PREF: u64 = 11;
     pub const FACTS: u64 = 12;
+    pub const STORE: u64 = 13;
 }
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
@@ -96,6 +97,17 @@ impl Facts {
     pub fn vault_keys(&self) -> Option<u64> {
         self.get(7)
     }
+}
+
+/// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.
+pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, (buf.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+/// Write `value` under `key` in a Store capability's vault scope; true when the vault took it.
+pub fn store_set(cap: u64, key: &[u8], value: &[u8]) -> bool {
+    svc(nr::STORE, cap, 1 | (value.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(value.as_ptr())) == 0
 }
 
 /// Read the facts now.
