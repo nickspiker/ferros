@@ -7,9 +7,9 @@ Captured with the hv oracle (HV.md): the camera's control buses unmapped from th
 | sensor | role | I2C controller | addr | lens | EEPROM |
 |---|---|---|---|---|---|
 | boitata | main (wide) | hsi2c@10880000 | G#3D | act-cornerfolk G#0C, ois-djinn G#24 | djinn G#24 |
-| dokkaebi | tele | hsi2c@10890000 | G#10 | G#0C | G#51 |
+| dokkaebi | **front** | hsi2c@10890000 (hsi2c_2) | G#10 | G#0C | G#51 |
 | oksoko | ultrawide | hsi2c@108A0000 | G#1A | G#0F | smaug G#50 |
-| kraken | front | hsi2c@108B0000 | G#2D | — | humbaba G#61 |
+| kraken | **tele** (folded) | hsi2c@108B0000 (hsi2c_4) | G#2D | — | humbaba G#61 |
 | tof-tarasque | depth | hsi2c@10880000 | G#29 | — | — |
 | flash-lm3644 | torch | hsi2c@10980000 | G#63 | — | — |
 
@@ -354,7 +354,8 @@ Driven from adb through the Pixel Camera app (`tools/husky-hv-camall.sh`): open 
   - Per-frame exposure inside the G#0104 hold.
   - The lens actuator at G#0F takes the same protocol as the main camera's (02 ← G#40, 02 ← 0, target in 00/01).
   - Its lens polling fills a 36000-line cap in about 8 s, after the init.
-- **Front ("kraken", G#2D on hsi2c@108B0000):** its ID reads **G#08D5**. Under a single-bus trap the open goes no further than that ID read, twice (once with the flip tap, once with the app already in front mode), while the four-bus run of the same night logged 2304 accesses on this bus. Not explained yet: the next step is to check whether the camera app reports an error under the trap (logcat), before assuming anything about the bus.
-- **Tele ("dokkaebi", hsi2c@10890000):** not reached. The T tap did not switch to it; it needs the zoom control at its current position.
+- **Roles corrected (2026-10-22):** the device tree's own comments (`zuma-husky-camera.dtsi`) name dokkaebi the FRONT camera (G#10, hsi2c_2) and kraken the REAR folded TELE (G#2D, hsi2c_4); this table had them swapped. So the "front" capture below trapped the tele's bus, and in the four-bus run the T tap did reach the tele (kraken traffic in the "tele" segment).
+- **Tele ("kraken", G#2D on hsi2c@108B0000):** its ID reads **G#08D5**. Those single-bus captures flipped to the front camera, so the tele only answered its boot-time ID probe; nothing was wrong with the trap.
+- **Front ("dokkaebi", G#10 on hsi2c@10890000):** not captured yet on its own bus; the flip tap reaches it.
 
 Still to capture for each: its CSI link and PHY lanes (an ISP front-end capture of that session) and its PDMA program (`FERROS_HV_PDMA_DUMP`). The power-up comes from each module's `module_power_seq` in the device tree, as for the main camera.
