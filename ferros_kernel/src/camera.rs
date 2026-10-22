@@ -2318,7 +2318,7 @@ fn viewfinder(rep: &mut Vec<u8>, panel: Option<&crate::display::Panel>, seconds:
     };
     let mut last = crate::platform::cntpct();
     let mut service = |idx: &mut u32, last: &mut u64| {
-        if crate::platform::cntpct().wrapping_sub(*last) > f / 25 {
+        if crate::platform::cntpct().wrapping_sub(*last) > f / 80 {
             *idx += 1;
             wr(PDMA + 0x10, *idx * 0x10);
             for &a in ack.iter() {
@@ -2546,7 +2546,16 @@ impl Shot {
 /// The main camera's lens actuator ("cornerfolk", G#0C on the sensor bus): the camera open's sequence (camera-main-open-transfers.txt) is 02 <- G#40, 02 <- 0, F1 <- 0, then the 16-bit target into 00/01; 84 reads the position back (two bytes), which settles on the target.
 const ACTUATOR: u8 = 0x0C;
 fn focus(rep: &mut Vec<u8>, pos: u32) {
-    let w = |r: u8, v: u8| crate::hsi2c::write_bytes(SENSOR_BUS.base, ACTUATOR, &[r, v]);
+    focus_on(rep, Cam::Main, pos)
+}
+
+/// Each camera's lens actuator on its own sensor bus: the main's at G#0C, the ultrawide's at G#0F, the same protocol (both captures).
+fn focus_on(rep: &mut Vec<u8>, cam: Cam, pos: u32) {
+    let (bus, act) = match cam {
+        Cam::Main => (SENSOR_BUS.base, ACTUATOR),
+        Cam::Ultrawide => (MODULES[2].bus, 0x0F),
+    };
+    let w = |r: u8, v: u8| crate::hsi2c::write_bytes(bus, act, &[r, v]);
     // The reset (02 <- G#40) needs time: Linux has OIS and ToF traffic between it and the next write, and straight after it every write came back unacknowledged (error 4).
     let reset = w(0x02, 0x40);
     spin_us(5_000);
@@ -2554,7 +2563,7 @@ fn focus(rep: &mut Vec<u8>, pos: u32) {
     let set = [w(0x00, (pos >> 8) as u8), w(0x01, pos as u8)];
     spin_us(30_000);
     let mut b = [0u8; 2];
-    let at = crate::hsi2c::write_read(SENSOR_BUS.base, ACTUATOR, &[0x84], &mut b).map(|_| u16::from_be_bytes(b));
+    let at = crate::hsi2c::write_read(bus, act, &[0x84], &mut b).map(|_| u16::from_be_bytes(b));
     line(rep, alloc::format!("lens actuator: init {init:X?} target G#{pos:04X} {set:X?}, position after 30 ms {at:X?}\n"));
 }
 
@@ -2670,8 +2679,8 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
     // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
     let link_before = link_snapshot();
-    if shot.af != 0 && shot.cam == Cam::Main {
-        focus(rep, shot.af);
+    if shot.af != 0 {
+        focus_on(rep, shot.cam, shot.af);
     }
     // Exposure and gain before stream-on, as Linux does (the block at transfers 771-778 precedes stream-on at 781). Written mid-stream instead, the sensor ran on but the core saw SOF with no EOF from then on (2026-10-21).
     // Linux's per-frame block, byte for byte (camera-main-open-transfers.txt 771-778): G#0104 is the one-byte grouped-parameter hold, so the hold is the four-byte write 01 04 01 01 and the release 01 04 00 01 (G#0105 stays 1); then G#0702/G#0704 = 0, digital gain G#020E = G#0100, analogue gain G#0204, integration G#0202, frame length G#0340 = G#2959. The HAL runs 2646 lines (G#0A56) at gain G#0400; the 20 lines in the captured init is overridden every frame and never meant to stand.
@@ -2753,16 +2762,29 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             series.push_str(&alloc::format!(" {:02X}", b[0]));
         }
     }
+    // The ultrawide's frame handler also acknowledges G#1C35_0148 (the PDAF statistics status, ctx0 lmp_pdaf): capture of its stream, 2026-10-22. Without it the core took one frame and stopped.
+    const FRAME_ACK_UW: [usize; 29] = [
+        0x1C35_0148, 0x1C35_0160, 0x1C35_0178, 0x1C35_0190,
+        0x1C32_008C,
+        0x1C32_2004, 0x1C32_2024, 0x1C32_2038, 0x1C32_204C,
+        0x1C32_0404, 0x1C32_0424, 0x1C32_0438, 0x1C32_044C,
+        0x1C32_0110,
+        0x1C35_0058, 0x1C35_0088, 0x1C35_00B8, 0x1C35_00E8, 0x1C35_0118, 0x1C35_01AC,
+        0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
+    ];
+    let ack: &[usize] = if shot.cam == Cam::Ultrawide { &FRAME_ACK_UW } else { &FRAME_ACK };
+    // How often the front end is answered: faster than the sensor's frame period, or frames arrive unanswered and it stops taking them. The main runs at ~14.5 fps (69 ms), so 50 ms is enough; the ultrawide runs at ~30 fps (33 ms), and at 50 ms it took one frame and stopped (2026-10-22).
+    let tick_us: u64 = if shot.cam == Cam::Ultrawide { 15_000 } else { 50_000 };
     crate::flashlog::line("cam pdma: sampling the G#1C32 per-frame status words while the engine runs");
     let mut status = [[0u32; FRAME_STATUS.len()]; 10];
     for f in 1..=(if fast { 0 } else { 10u32 }) {
-        spin_us(50_000);
+        spin_us(tick_us);
         wr(PDMA + 0x10, f * 0x10);
         for (k, &a) in FRAME_STATUS.iter().enumerate() {
             status[f as usize - 1][k] = rd(a);
         }
         // Acknowledge the frame so the front end moves on to the next buffer.
-        for &a in FRAME_ACK.iter() {
+        for &a in ack.iter() {
             let v = rd(a);
             wr(a, v);
         }
@@ -2795,7 +2817,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             spin_us(40_000);
             idx += 1;
             wr(PDMA + 0x10, idx * 0x10);
-            for &a in FRAME_ACK.iter() {
+            for &a in ack.iter() {
                 let v = rd(a);
                 wr(a, v);
             }
@@ -2808,7 +2830,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     }
     if shot.view > 0 {
         crate::flashlog::line("view: frame loop done");
-        viewfinder(rep, view_panel.as_ref(), shot.view, &mut idx_after_loop(), &FRAME_ACK);
+        viewfinder(rep, view_panel.as_ref(), shot.view, &mut idx_after_loop(),  ack);
     }
     if shot.sweep {
         // Focus sweep while the stream runs: for each lens position, keep answering frames (index advance + acknowledgement every 50 ms, as the loop above) for 400 ms so the lens settles and at least two whole frames land, then copy the image body (G#A200_0000, 15 MiB) to its own slot. The slots sit in DRAM nothing else uses (zuma-rmem.dtsi reserves nothing from G#9700_0000 up to G#E800_0000; the output slices start at G#A000_0000).
@@ -2816,13 +2838,13 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         let mut summary = alloc::string::String::new();
         for k in 0..8usize {
             let pos = shot.sweep_from + k as u32 * shot.sweep_step;
-            focus(rep, pos);
+            focus_on(rep, shot.cam, pos);
             let mut seen = alloc::string::String::new();
             for _ in 0..8 {
-                spin_us(50_000);
+                spin_us(tick_us);
                 idx += 1;
                 wr(PDMA + 0x10, idx * 0x10);
-                for &a in FRAME_ACK.iter() {
+                for &a in ack.iter() {
                     let v = rd(a);
                     wr(a, v);
                 }
@@ -2839,10 +2861,10 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
                 let n = (FRAME_BYTES - off).min(256 * 1024);
                 unsafe { core::ptr::copy_nonoverlapping((src + off) as *const u64, (dst + off) as *mut u64, n / 8) };
                 off += n;
-                if crate::platform::cntpct().wrapping_sub(last) > f / 20 {
+                if crate::platform::cntpct().wrapping_sub(last) > f * tick_us / 1_000_000 {
                     idx += 1;
                     wr(PDMA + 0x10, idx * 0x10);
-                    for &a in FRAME_ACK.iter() {
+                    for &a in ack.iter() {
                         let v = rd(a);
                         wr(a, v);
                     }
