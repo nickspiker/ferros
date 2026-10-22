@@ -1737,6 +1737,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             tatau::set_base(b);
         }
     }
+    process::set_pref(process::PREF_BASE, tatau::base().code());
 
     // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
     let init_exit = 0u32;

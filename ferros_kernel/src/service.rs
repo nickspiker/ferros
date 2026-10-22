@@ -185,6 +185,10 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
             match store.set(&key, params[2 + klen..].to_vec()) {
                 Ok(h) => {
+                    // A preference set from the bridge applies at once, as one set from the device does (SYS_SET_PREF): every live process sees it on its next frame.
+                    if key == "device.base" && len == 1 && tatau::Base::from_code(params[2 + klen]).is_some() {
+                        crate::process::set_pref(crate::process::PREF_BASE, params[2 + klen]);
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -284,6 +288,15 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
 /// The service loop's vault, lent to `SYS_SPAWN` (process.rs `CAPSULES`) for reading capsules by key: `run` never returns, so the pointer stays good for the rest of the boot.
 static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 
+/// `SYS_SET_PREF`'s persistence: a preference into the device vault under its key (SETTINGS.md).
+fn store_pref(index: usize, value: u8) -> bool {
+    let key = match index {
+        crate::process::PREF_BASE => "device.base",
+        _ => return false,
+    };
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, alloc::vec![value]).is_ok()).unwrap_or(false) }
+}
+
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k).ok().flatten() }
@@ -299,6 +312,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Hardware(b"dsim0"), Hardware(b"dphy0"), Hardware(b"sramc0"), Hardware(b"hdrcomm0"),
         Serve(b"touch"), Hardware(b"usi2-spi"), Hardware(b"gpio-gpn0"),
         Use(b"display"), Use(b"touch"),
+        Settings,
     ]
 }
 
@@ -331,6 +345,7 @@ pub fn run(mut b: Boot) -> ! {
     unsafe {
         SPAWN_STORE = &raw mut store;
         crate::process::CAPSULES = Some(read_capsule);
+        crate::process::PREF_STORE = Some(store_pref);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();

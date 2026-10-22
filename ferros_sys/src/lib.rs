@@ -27,6 +27,27 @@ pub mod nr {
     pub const INPUT: u64 = 8;
     pub const SLEEP: u64 = 9;
     pub const SPAWN: u64 = 10;
+    pub const SET_PREF: u64 = 11;
+}
+
+/// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
+pub const PREFS: u64 = 0xFC0;
+/// Preference 0: the number base, tatau's code.
+pub const PREF_BASE: u64 = 0;
+
+/// The device's number base right now (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS). Read it at draw time, not once: the person can change it while the app runs.
+pub fn device_base() -> u8 {
+    unsafe { core::ptr::read_volatile((arc_base() + PREFS + PREF_BASE) as *const u8) }
+}
+
+/// A number formatter in the device base, right now: `tatau::count(&mut out, ferros_sys::numbers(Style::Glyphs), n, 1)`. Glyphs where the app draws with the Oxanium +glyphs face, words elsewhere.
+pub fn numbers(style: tatau::Style) -> tatau::Fmt {
+    tatau::Fmt::new(tatau::Base::from_code(device_base()).unwrap_or(tatau::Base::Dms), style)
+}
+
+/// Change a device preference, given the Settings capability: the kernel keeps it in the vault and every app sees it on its next frame. Returns 0, or ERR (no capability, or a value the preference does not take).
+pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
+    svc(nr::SET_PREF, cap, index, value as u64, 0, 0)
 }
 
 /// The raw trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer named by the arguments, so nothing is assumed cached across it.

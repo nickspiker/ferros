@@ -94,6 +94,26 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
 }
 
 
+/// "map: numbers in <base>", with two seconds written in it, in words (the console is a terminal surface).
+fn say_base(grants: u64, code: u8) {
+    struct Buf([u8; 96], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let n = b.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut out = Buf([0; 96], 0);
+    let f = ferros_sys::numbers(tatau::Style::Words);
+    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("map: numbers in {:?} (G#{:02X}); two seconds reads ", f.base, code));
+    let _ = tatau::duration_ns(&mut out, f, 2_000_000_000, 1);
+    let _ = core::fmt::Write::write_str(&mut out, "\n");
+    console(grants, &out.0[..out.1]);
+}
+
 /// The distance between two touch points, for the pinch (still floating point, as the camera's zoom is; the layout above is integer). Written out because `f32::powi` and friends exist only with std.
 fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (ax - bx, ay - by);
@@ -158,10 +178,18 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut zoom = 1.0f32;
     camera(grants, cx, cy, zoom);
     console(grants, b"map: home drawn; one finger pans, two fingers pinch\n");
+    // The device's number base, as every app reads it (SETTINGS.md): logged now and whenever it changes, which is the proof the preference reaches a running process.
+    let mut base = ferros_sys::device_base();
+    say_base(grants, base);
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0f32, 0f32); 16];
     loop {
+        let b = ferros_sys::device_base();
+        if b != base {
+            base = b;
+            say_base(grants, base);
+        }
         let n = call(touch, &[1], &mut r) as usize;
         let mut cur = [(false, 0f32, 0f32); 16];
         let mut ids = [0usize; 16];

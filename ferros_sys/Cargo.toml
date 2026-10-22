@@ -7,3 +7,7 @@ description = "The one place a ferros process touches the machine: syscalls, the
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+# Numbers in the device base (SETTINGS.md): `numbers()` hands an app a ready tatau formatter.
+tatau = { path = "../../tatau" }

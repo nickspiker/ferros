@@ -764,6 +764,7 @@ version = "0.1.0"
 dependencies = [
  "ferros_sys",
  "libm",
+ "tatau",
 ]
 
 [[package]]
@@ -991,6 +992,9 @@ dependencies = [
 [[package]]
 name = "ferros_sys"
 version = "0.1.0"
+dependencies = [
+ "tatau",
+]
 
 [[package]]
 name = "ferros_vault"

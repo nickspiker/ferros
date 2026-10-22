@@ -126,6 +126,8 @@ pub enum Object {
     Entropy,
     /// A DMA region (index into `DMA`).
     Dma(usize),
+    /// Served by the kernel: the right to change the device's preferences (`SYS_SET_PREF`, SETTINGS.md). Reading them needs no capability: every process finds them in its own grants page.
+    Settings,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -157,6 +159,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Entropy => (4, 0),
         Object::Dma(i) => (5, i as u64),
         Object::Hardware(i) => (3, i as u64),
+        Object::Settings => (6, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -298,6 +301,40 @@ const SYS_INPUT: u64 = 8;
 const SYS_SLEEP: u64 = 9;
 /// Start a signed capsule from the vault as a new process, handing it copies of some of the caller's own capabilities (never more rights than the caller holds; reply capabilities do not pass). x0/x1: request offset and length in the caller's arc, [name len][name][vault key len][vault key][token count][tokens, 32 bytes each]. The child is queued, not entered: the caller carries on. Returns 0, or ERR with the reason on the console.
 const SYS_SPAWN: u64 = 10;
+/// Change a device preference: x0 the Settings capability's token offset, x1 which preference, x2 its new value. The kernel checks the value, keeps it in the vault through `PREF_STORE`, and rewrites it in every live process's preferences block at once. Returns 0 or ERR.
+const SYS_SET_PREF: u64 = 11;
+
+/// The device preferences block in every process's grants page (SETTINGS.md): byte 0 is the number base, tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS); the rest is reserved. Written at spawn and rewritten in every live process when a preference changes, so a process reads the current value from its own memory each time it draws.
+pub const PREFS: usize = 0xFC0;
+pub const PREF_BASE: usize = 0;
+static mut PREFS_NOW: [u8; 32] = [0; 32];
+
+/// Keeps a changed preference in the vault: (preference, value) -> stored. Registered by whoever owns the vault (service.rs).
+pub static mut PREF_STORE: Option<fn(usize, u8) -> bool> = None;
+
+/// Set a preference in kernel memory and in every live process (no persistence: the caller has done that, or the value came from the vault).
+pub fn set_pref(index: usize, value: u8) {
+    if index >= 32 {
+        return;
+    }
+    unsafe { (*(&raw mut PREFS_NOW))[index] = value };
+    if index == PREF_BASE {
+        if let Some(b) = tatau::Base::from_code(value) {
+            tatau::set_base(b);
+        }
+    }
+    for p in k().procs.iter().flatten() {
+        p.write((PREFS + index) as u64, &[value]);
+    }
+}
+
+/// Whether `value` is valid for preference `index`.
+fn pref_valid(index: usize, value: u8) -> bool {
+    match index {
+        PREF_BASE => tatau::Base::from_code(value).is_some(),
+        _ => false,
+    }
+}
 
 /// Where `SYS_SPAWN` finds capsules: whoever owns the vault registers a reader (vault key -> bytes) while it is alive. Kernel-side only; a process never reads the vault through it, it only names a capsule to start, and the gate still checks the capsule's signature.
 pub static mut CAPSULES: Option<fn(&[u8]) -> Option<Vec<u8>>> = None;
@@ -446,6 +483,18 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_SET_PREF => {
+            let token = p.read(f.x[0], 32);
+            let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
+            let (index, value) = (f.x[1] as usize, f.x[2] as u8);
+            f.x[0] = if held && pref_valid(index, value) && unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false) {
+                set_pref(index, value);
+                0
+            } else {
+                ERR
+            };
+            0
+        }
         SYS_SPAWN => {
             // Parse [name len][name][key len][key][n][n tokens] from the caller's arc and resolve each token in the caller's own table: a child gets only what its parent holds, at the same rights, and never a reply.
             let req = p.read(f.x[0], (f.x[1] as usize).min(4096));
@@ -789,6 +838,8 @@ pub enum Grant<'a> {
     Entropy,
     /// A DMA region from the registry, by name (syscall 7).
     Dma(&'a [u8]),
+    /// The right to change device preferences (syscall 11).
+    Settings,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -863,6 +914,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
             },
+            Grant::Settings => (Object::Settings, RIGHT_SEND),
         });
     }
     Ok(v)
@@ -888,6 +940,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     if let Some(i) = ihi {
         p.write(IHI as u64, &i);
     }
+    p.write(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
     p.write(CODE as u64, code);
     let in_off = CODE + code.len();
     p.write(in_off as u64, input);
