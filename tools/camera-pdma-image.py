@@ -26,7 +26,7 @@ IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 # Address registers whose captured value falls outside that window: list 2 hands them G#0200_0000, G#0158_0000, G#0D18_0000 and G#0FF0_0000, which the window left alone, so with the SYSMMUs in bypass the front end was pointed at physical addresses in the register space. Found by comparing list 2 with the hv's live snapshot of a Linux stream (tools/camera-snap-list.py, 2026-10-21): each holds a different page-aligned IOVA there. G#1C32_05C0 sits in loch0's image path, beside its buffer address at +G#510.
 ISPFE = 0x1C30_0000  # list addresses are offsets into the front end (tools/oracle-decode-pdma.py)
 ADDR_REGS = {0x1C32_05C0, 0x1C35_51A8, 0x1C35_51E8, 0x1C35_51F8}
-RING_ENTRIES = 16
+RING_ENTRIES = 1024  # camera.rs writes the same count; enough frames for a focus sweep without wrapping (Linux: 1000)
 
 # --list picks which of the session's rotating lists to build from, and it matters: list 2 is the one docs/oracle/CAMERA.md decoded and the one ferros has run, at G#19DC bytes with 18 output buffers, while the default list 1 is G#1A10 with 20. Handing the engine list 1 reset the phone twice before the difference was noticed (2026-10-20). Always pass `--list 2` until there is a reason not to.
 args = [a for a in sys.argv[1:]]

@@ -2257,10 +2257,76 @@ const PDMA_BUF_PA: usize = 0xA000_0000;
 /// A slice has to hold a frame: the captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the 2 MiB slices this started with could never have held one.
 /// Thirty-two of them, one per distinct output address (the list has 22), from G#A000_0000 to G#C000_0000: zuma-rmem.dtsi reserves nothing between G#9700_0000 and G#E800_0000, and on a cold boot nothing else lives there. Seven slices below G#9000_0000 made the 22 outputs share, and the first real frame (2026-10-21) came back with other channels written over its top half. tools/camera-pdma-image.py must agree with these numbers.
 const PDMA_BUF_SLICE: usize = 0x100_0000;
+/// One frame as the front end writes it: 3072 lines at the G#1400 stride.
+const FRAME_BYTES: usize = 3072 * 0x1400;
+/// Where a focus sweep keeps its eight frames (8 x 16 MiB below the output slices).
+const SWEEP_PA: usize = 0x9800_0000;
 const PDMA_BUFS: usize = 32;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
-pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool) {
+/// Picture settings for `cam pdma`, from `exp=<lines> gain=<code> af=<position>` after the command (all optional; 0 = leave as captured).
+#[derive(Clone, Copy, Default)]
+pub struct Shot {
+    /// CCS coarse_integration_time (G#0202), in lines. The captured mode uses 20, out of a frame of 10584.
+    pub exp: u32,
+    /// CCS analogue_gain_code_global (G#0204).
+    pub gain: u32,
+    /// The lens actuator's target (G#0C, registers 00/01), 16 bits; Linux focused at G#5D10 in the capture.
+    pub af: u32,
+    /// `sweep` or `sweep=<start>:<step>`: after the ten-frame run, step the lens through eight positions (default G#4000 by G#800) and copy one frame at each to its own slot at SWEEP_PA.
+    pub sweep: bool,
+    pub sweep_from: u32,
+    pub sweep_step: u32,
+    /// `snap`: read the 2914-register Linux snapshot three frames in (snap_compare). Off by default: it holds the loop for a long time mid-stream.
+    pub snap: bool,
+}
+
+impl Shot {
+    pub fn parse(params: &[u8]) -> Shot {
+        let mut s = Shot::default();
+        for tok in params.split(|&c| c == b' ') {
+            let Some(eq) = tok.iter().position(|&c| c == b'=') else { continue };
+            let (k, v) = (&tok[..eq], &tok[eq + 1..]);
+            let v = core::str::from_utf8(v).ok().and_then(|t| if let Some(h) = t.strip_prefix("G#") { u32::from_str_radix(h, 16).ok() } else { t.parse().ok() }).unwrap_or(0);
+            match k {
+                b"exp" => s.exp = v,
+                b"gain" => s.gain = v,
+                b"af" => s.af = v,
+                _ => {}
+            }
+        }
+        s.sweep = params.split(|&c| c == b' ').any(|t| t == b"sweep" || t.starts_with(b"sweep="));
+        (s.sweep_from, s.sweep_step) = (0x4000, 0x800);
+        if let Some(t) = params.split(|&c| c == b' ').find(|t| t.starts_with(b"sweep=")) {
+            let num = |x: &[u8]| core::str::from_utf8(x).ok().and_then(|t| if let Some(h) = t.strip_prefix("G#") { u32::from_str_radix(h, 16).ok() } else { t.parse().ok() });
+            let body = &t[6..];
+            if let Some(c) = body.iter().position(|&c| c == b':') {
+                if let (Some(a), Some(b)) = (num(&body[..c]), num(&body[c + 1..])) {
+                    (s.sweep_from, s.sweep_step) = (a, b);
+                }
+            }
+        }
+        s.snap = params.split(|&c| c == b' ').any(|t| t == b"snap");
+        s
+    }
+}
+
+/// The main camera's lens actuator ("cornerfolk", G#0C on the sensor bus): the camera open's sequence (camera-main-open-transfers.txt) is 02 <- G#40, 02 <- 0, F1 <- 0, then the 16-bit target into 00/01; 84 reads the position back (two bytes), which settles on the target.
+const ACTUATOR: u8 = 0x0C;
+fn focus(rep: &mut Vec<u8>, pos: u32) {
+    let w = |r: u8, v: u8| crate::hsi2c::write_bytes(SENSOR_BUS.base, ACTUATOR, &[r, v]);
+    // The reset (02 <- G#40) needs time: Linux has OIS and ToF traffic between it and the next write, and straight after it every write came back unacknowledged (error 4).
+    let reset = w(0x02, 0x40);
+    spin_us(5_000);
+    let init = [reset, w(0x02, 0x00), w(0xF1, 0x00)];
+    let set = [w(0x00, (pos >> 8) as u8), w(0x01, pos as u8)];
+    spin_us(30_000);
+    let mut b = [0u8; 2];
+    let at = crate::hsi2c::write_read(SENSOR_BUS.base, ACTUATOR, &[0x84], &mut b).map(|_| u16::from_be_bytes(b));
+    line(rep, alloc::format!("lens actuator: init {init:X?} target G#{pos:04X} {set:X?}, position after 30 ms {at:X?}\n"));
+}
+
+pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool, shot: Shot) {
     let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
     if job.len() < 8 || &job[..4] != b"CPR3" {
         return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
@@ -2340,7 +2406,8 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     wr(PDMA + 0x20, 0);
     wr(PDMA + 0x04, PDMA_RING_PA as u32);
     wr(PDMA + 0x08, 0);
-    wr(PDMA + 0x0C, 16);
+    // 1024 descriptors, all pointing at the one program (tools/camera-pdma-image.py RING_ENTRIES): enough for a focus sweep's worth of frames without wrapping (Linux runs a count of 1000).
+    wr(PDMA + 0x0C, 1024);
     wr(PDMA + 0x10, 0);
     wr(PDMA + 0x00, 1);
     wr(PDMA + 0x34, 0);
@@ -2354,6 +2421,26 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
     // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
     let link_before = link_snapshot();
+    if shot.af != 0 {
+        focus(rep, shot.af);
+    }
+    // Exposure and gain before stream-on, as Linux does (the block at transfers 771-778 precedes stream-on at 781). Written mid-stream instead, the sensor ran on but the core saw SOF with no EOF from then on (2026-10-21).
+    // Linux's per-frame block, byte for byte (camera-main-open-transfers.txt 771-778): G#0104 is the one-byte grouped-parameter hold, so the hold is the four-byte write 01 04 01 01 and the release 01 04 00 01 (G#0105 stays 1); then G#0702/G#0704 = 0, digital gain G#020E = G#0100, analogue gain G#0204, integration G#0202, frame length G#0340 = G#2959. The HAL runs 2646 lines (G#0A56) at gain G#0400; the 20 lines in the captured init is overridden every frame and never meant to stand.
+    if shot.exp != 0 || shot.gain != 0 {
+        let w = |b: &[u8]| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, b);
+        // Only what was asked, inside the hold. The init's own last block already sets integration G#535E (21342 lines) in a G#5372-line frame and gain G#0400; copying Linux's block wholesale (frame length G#2959) doubled the frame rate and stalled the core (2026-10-21).
+        let (e, g) = (shot.exp as u16, shot.gain as u16);
+        let mut r = alloc::vec![w(&[0x01, 0x04, 0x01, 0x01])];
+        if g != 0 {
+            r.push(w(&[0x02, 0x04, (g >> 8) as u8, g as u8]));
+        }
+        if e != 0 {
+            r.push(w(&[0x02, 0x02, (e >> 8) as u8, e as u8]));
+        }
+        r.push(w(&[0x01, 0x04, 0x00, 0x01]));
+        let ok = r.iter().filter(|x| x.is_ok()).count();
+        line(rep, alloc::format!("exposure A#{e} lines (0 = the init's 21342), gain code G#{g:04X} (0 = G#0400): A#{ok} of A#{} writes acknowledged\n", r.len()));
+    }
     let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
     // Narrow the window only once the sensor is streaming. Set before stream-on it simply does not start — the frame counter never leaves zero and nothing reaches the receiver — while changed mid-stream it takes it at once, which is how `diag cam slit` measured 4080 x 64 at about 1184 frames a second (2026-10-20).
     // The front end has to be built for the same height or it is expecting 3072 lines where 64 arrive: tools/camera-pdma-image.py --height.
@@ -2438,7 +2525,9 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         if f == 3 {
             line(rep, alloc::format!("every reporting interrupt source, three frames in:\n"));
             events_dump(rep, false);
-            snap_compare(rep);
+            if shot.snap {
+                snap_compare(rep);
+            }
             // `live_compare` is not called here. It stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump above reads without trouble moments earlier in the same run — so front-end reads mid-stream are timing-dependent rather than simply safe or unsafe (2026-10-21). Its useful result was already in the event dump: see docs/oracle/CAMERA.md.
         }
         let mut b = [0u8; 2];
@@ -2446,6 +2535,51 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
             Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
         }
+    }
+    if shot.sweep {
+        // Focus sweep while the stream runs: for each lens position, keep answering frames (index advance + acknowledgement every 50 ms, as the loop above) for 400 ms so the lens settles and at least two whole frames land, then copy the image body (G#A200_0000, 15 MiB) to its own slot. The slots sit in DRAM nothing else uses (zuma-rmem.dtsi reserves nothing from G#9700_0000 up to G#E800_0000; the output slices start at G#A000_0000).
+        let mut idx = 10u32;
+        let mut summary = alloc::string::String::new();
+        for k in 0..8usize {
+            let pos = shot.sweep_from + k as u32 * shot.sweep_step;
+            focus(rep, pos);
+            let mut seen = alloc::string::String::new();
+            for _ in 0..8 {
+                spin_us(50_000);
+                idx += 1;
+                wr(PDMA + 0x10, idx * 0x10);
+                for &a in FRAME_ACK.iter() {
+                    let v = rd(a);
+                    wr(a, v);
+                }
+                seen.push_str(&alloc::format!(" {:X}", rd(0x1C32_049C)));
+                crate::platform::pet_watchdogs();
+            }
+            line(rep, alloc::format!("  at G#{pos:04X}, buffer index per tick:{seen}\n"));
+            // Copy in 256 KiB pieces, answering the front end whenever 50 ms have passed: a single 15 MiB copy of uncached memory left it unanswered long enough that it stopped taking frames for good (2026-10-21, buffer index frozen at G#E). Frames keep landing during the copy; the lens does not move, so a mixed frame is still one focus position.
+            let (src, dst) = (PDMA_BUF_PA + 2 * PDMA_BUF_SLICE, SWEEP_PA + k * PDMA_BUF_SLICE);
+            let f = crate::platform::cntfrq();
+            let (t0, mut last) = (crate::platform::cntpct(), crate::platform::cntpct());
+            let mut off = 0;
+            while off < FRAME_BYTES {
+                let n = (FRAME_BYTES - off).min(256 * 1024);
+                unsafe { core::ptr::copy_nonoverlapping((src + off) as *const u64, (dst + off) as *mut u64, n / 8) };
+                off += n;
+                if crate::platform::cntpct().wrapping_sub(last) > f / 20 {
+                    idx += 1;
+                    wr(PDMA + 0x10, idx * 0x10);
+                    for &a in FRAME_ACK.iter() {
+                        let v = rd(a);
+                        wr(a, v);
+                    }
+                    crate::platform::pet_watchdogs();
+                    last = crate::platform::cntpct();
+                }
+            }
+            let ms = crate::platform::cntpct().wrapping_sub(t0) * 1000 / f;
+            summary.push_str(&alloc::format!(" G#{pos:04X}->G#{dst:X} (index G#{:X}, copy A#{ms} ms)", rd(0x1C32_049C)));
+        }
+        line(rep, alloc::format!("focus sweep:{summary}\n"));
     }
     for (k, &a) in FRAME_STATUS.iter().enumerate() {
         if fast {

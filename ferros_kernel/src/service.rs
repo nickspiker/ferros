@@ -834,7 +834,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"cam pdma" || cmd.params == b"cam pdma slit" || cmd.params == b"cam pdma fast" {
+                                        if cmd.params.starts_with(b"cam pdma") {
                                             // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
                                             let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
                                             if b2.is_none() && cfg!(cam_frame_blob) {
@@ -854,7 +854,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
                                             };
-                                            crate::camera::pdma_probe(&mut resp, init, prog, if cmd.params == b"cam pdma slit" { 64 } else { 0 }, cmd.params == b"cam pdma fast");
+                                            let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
+                                            crate::camera::pdma_probe(&mut resp, init, prog, if words.contains(&&b"slit"[..]) { 64 } else { 0 }, words.contains(&&b"fast"[..]), crate::camera::Shot::parse(&cmd.params));
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

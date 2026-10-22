@@ -283,3 +283,19 @@ Also ruled out tonight, worth not repeating:
 - **Response timing** (`cam pdma fast` answers the core within microseconds and sees no more than the 50 ms loop did). The single G#81 seen without the enable comes from the PDMA executing the program, not from a frame.
 - **VDD_CAM.** Linux raises S1S_VDD_CAM from 537.5 to 600 mV while streaming. Cold ferros has 575 mV, and ACPM refuses a direct write to that buck (error G#103).
 - **The hv transplant** (`FERROS_HV_XPLANT`). It works mechanically, but Linux's HAL restarts the whole session within 25 ms of any disturbance, so it cannot isolate a breaking write.
+
+## Focus, exposure, and keeping the stream alive (2026-10-21, night)
+
+**The lens actuator** ("cornerfolk", G#0C on the sensor bus) runs from ferros. The sequence:
+- 02 ← G#40 (reset);
+- **at least 5 ms** of quiet (straight after the reset every write NACKs);
+- 02 ← 0, F1 ← 0;
+- the 16-bit target into 00/01.
+
+84 reads the position back; it tracks the target within 30 ms across G#0800 to G#7800.
+
+`diag cam pdma sweep=<start>:<step>` steps eight positions while streaming and copies a frame at each to G#9800_0000 + k × 16 MiB. `tools/camera-pull.sh <prefix> <base>` and `tools/camera-raw10.py` fetch and decode. Over a floor about a metre away, sharpness on 8 × 8-binned frames peaks at G#3800 and falls off on both sides. The crop resolves cable braid and dust at half resolution.
+
+**Exposure is already long.** The captured init's last per-frame block sets integration G#535E (21342 lines) in a G#5372-line frame at analogue gain G#0400. The "20 lines" seen earlier is an intermediate value. Copying Linux's block from the older open capture (integration G#0A56, frame length G#2959) doubled the frame rate and stalled the core. So `exp=`/`gain=` now write only what is asked, inside the hold. The hold is the four-byte write `01 04 01 01` and its release `01 04 00 01`: G#0104 is one byte, G#0105 stays 1.
+
+**The front end has to be answered.** A single 15 MiB copy of uncached memory (about 600 ms) left it unacknowledged long enough to stop taking frames for good (buffer index frozen). With the copy cut into 256 KiB pieces and the index advance plus acknowledgement every 50 ms between them, it streams through a whole sweep (index G#7 to G#83). The descriptor ring is now 1024 entries, matching the count register.
