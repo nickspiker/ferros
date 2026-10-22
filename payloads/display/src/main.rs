@@ -18,7 +18,11 @@
 //! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
 //! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the phone is a map of your life).
 //! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 0 = none), `len u8`, `label [16]`.
-//! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`: draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
+//! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`, the centre in world units ×256 (24.8, so a pan at high zoom moves by a pixel, not a world unit): draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
+//!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15).
+//! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
+//! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
+//! - 17 `scene move [index u8][x i32][y i32][r u16]`: one circle of the scene moved and resized in place (the owner arranging by hand).
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -34,6 +38,7 @@ use core::cell::UnsafeCell;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
 use fluor::canvas::{Canvas, Damage};
 use fluor::paint;
+use fluor::pixel::{Blend, BlendMode};
 
 const S_CONSOLE: u64 = 0;
 const S_DISPLAY: u64 = 1;
@@ -95,14 +100,15 @@ const IDMA_IRQ_CLEAR: u32 = 0xDFB << 16;
 /// The TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
 
-/// The heap region (cachemap DISPLAY_HEAP): 16 MiB, cacheable. The typeface parse alone allocates 14.7 MiB in total (3.7 MiB live at the peak) and this allocator frees nothing until the frame arena resets, so the region has to hold the whole parse.
-const HEAP_BYTES: usize = 16 << 20;
+/// The heap region (cachemap DISPLAY_HEAP): 32 MiB, cacheable. Its top holds the back buffer (see `_entry`); the rest is the allocator's. The typeface parse alone allocates 14.7 MiB in total (3.7 MiB live at the peak) and this allocator frees nothing until the frame arena resets, so what is left under the back buffer has to hold the whole parse.
+const HEAP_REGION: usize = 32 << 20;
 
 /// A bump allocator over the heap in the framebuffer region, with a mark: everything allocated before `mark()` (the parsed typeface) lives for the process; everything after it is the frame's scratch (glyph bitmaps), thrown away by `reset()` after each frame.
 struct Bump {
     base: UnsafeCell<usize>,
     next: UnsafeCell<usize>,
     mark: UnsafeCell<usize>,
+    end: UnsafeCell<usize>,
 }
 unsafe impl Sync for Bump {}
 
@@ -113,7 +119,7 @@ unsafe impl GlobalAlloc for Bump {
             return core::ptr::null_mut();
         }
         let start = (*self.next.get() + l.align() - 1) & !(l.align() - 1);
-        if start + l.size() > base + HEAP_BYTES {
+        if start + l.size() > *self.end.get() {
             return core::ptr::null_mut();
         }
         *self.next.get() = start + l.size();
@@ -128,7 +134,12 @@ impl Bump {
             *self.base.get() = base;
             *self.next.get() = base;
             *self.mark.get() = base;
+            *self.end.get() = base + HEAP_REGION;
         }
+    }
+    /// Stop allocating at `end` (the back buffer starts there).
+    fn limit(&self, end: usize) {
+        unsafe { *self.end.get() = end };
     }
     fn mark(&self) {
         unsafe { *self.mark.get() = *self.next.get() };
@@ -143,10 +154,10 @@ impl Bump {
 
 /// Non-zero initialisers keep these in `.data`: the flat image carries no `.bss`, and whatever the kernel copies after the code (the input) would otherwise share their bytes. `init` sets the real values.
 #[global_allocator]
-static ALLOC: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1) };
+static ALLOC: Bump = Bump { base: UnsafeCell::new(1), next: UnsafeCell::new(1), mark: UnsafeCell::new(1), end: UnsafeCell::new(1) };
 
-/// Oxanium (OFL, assets/fonts), the owner's choice for ferros's face — the same family as the "Ready?" screen.
-static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular.ttf");
+/// Oxanium (OFL, assets/fonts), the owner's choice for ferros's face — the same family as the "Ready?" screen — in its +glyphs cut, which adds tatau's twelve dozenal digit glyphs at G#10–G#1B, so numbers draw in the device base as glyphs (SETTINGS.md).
+static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular+glyphs.ttf");
 
 /// An opaque colour in the layer's own byte order, which fluor blends linearly like any other word.
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -189,6 +200,8 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
+/// The camera op's last phases, microseconds: the scene, the black under it, the copy to the framebuffer, the present.
+static mut PHASE_US: [u64; 4] = [1; 4];
 /// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
 const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
 const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
@@ -437,6 +450,66 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     }
 }
 
+/// Black under everything, the last pass of every frame: written outright where nothing is painted, left alone where the paint is opaque, blended only on the antialiased edges between. fluor's full-surface `fill_rect` does the blend on every pixel: 41 ms a frame (2026-10-22), this a fraction of it.
+fn under_black(px: &mut [u32]) {
+    for p in px.iter_mut() {
+        let v = *p;
+        if v >= 0xFF00_0000 {
+            continue;
+        }
+        *p = if v == 0 { BLACK } else { v.under(BLACK, BlendMode::Normal) };
+    }
+}
+
+fn isqrt(v: i64) -> i64 {
+    if v <= 0 {
+        return 0;
+    }
+    let mut x = v;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
+}
+
+/// A filled circle under what is already there (fluor's order), antialiased at its rim, in integers: each row's whole span inside the circle is filled with plain writes and tests, and only the pixel or two at each end of a row gets a coverage from its distance to the centre. fluor's `circle_filled` blends every pixel: 18 ms for a screen-sized disc (2026-10-22).
+fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) {
+    if r <= 0 {
+        return;
+    }
+    let (w, h) = (width as i64, height as i64);
+    for y in (cy - r - 1).max(0)..=(cy + r + 1).min(h - 1) {
+        let dy = y - cy;
+        let outer = (r + 1) * (r + 1) - dy * dy;
+        if outer < 0 {
+            continue;
+        }
+        let inner = (r - 1) * (r - 1) - dy * dy;
+        let hi = if inner >= 0 { isqrt(inner) } else { -1 };
+        let ho = isqrt(outer);
+        let row = &mut px[y as usize * width..(y as usize + 1) * width];
+        for x in (cx - ho).max(0)..=(cx + ho).min(w - 1) {
+            let dx = x - cx;
+            let p = &mut row[x as usize];
+            if *p >= 0xFF00_0000 {
+                continue;
+            }
+            if dx.abs() <= hi {
+                *p = if *p == 0 { colour } else { (*p).under(colour, BlendMode::Normal) };
+            } else {
+                // Coverage = r − d + ½, in 256ths.
+                let d = isqrt((dx * dx + dy * dy) << 16);
+                let cov = ((r << 8) + 128 - d).clamp(0, 255);
+                if cov > 0 {
+                    *p = (*p).under((cov as u32) << 24 | colour & 0x00FF_FFFF, BlendMode::Normal);
+                }
+            }
+        }
+    }
+}
+
 /// hh:mm:ss since boot — the only clock this process has until a time source is granted.
 fn uptime(buf: &mut [u8; 8], secs: u64) -> &str {
     let (h, m, s) = ((secs / 3600) % 100, (secs / 60) % 60, secs % 60);
@@ -491,6 +564,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     if width == 0 || height == 0 || width > 4096 || height > 4096 {
         ferros_sys::exit(2);
     }
+    // The back buffer: every frame is composited here, in cacheable memory, and copied to the framebuffer only at present. fluor reads every pixel it blends onto, and a read from the non-cacheable framebuffer costs about 300 ns: drawing straight into it took 2.7 s for one dashboard frame (2026-10-22: a screen-sized disc 394 ms, the scene 2.3 s, while clearing all 16 MB took 1 ms — the writes are combined, the reads are not).
+    let back = (heap + HEAP_REGION - width * height * 4) & !0xFFF;
+    ALLOC.limit(back);
     // Input byte 0 = 1: a deliberate panic, to prove the panic handler's console line.
     let mut sel = [0u8; 1];
     let _ = input;
@@ -500,6 +576,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         panic!("deliberate, at frame zero");
     }
 
+    // The core's clock, measured: 2^20 dependent adds take 2^20 cycles (1.8 ms at the 576 MHz measured 2026-10-22), so cycles per microsecond is the MHz this process runs at.
+    let t_clk = now();
+    let mut acc = 0u64;
+    for _ in 0..(1u64 << 20) {
+        unsafe { core::arch::asm!("add {0}, {0}, #1", inout(reg) acc) };
+    }
+    let us = ferros_sys::us_since(t_clk).max(1);
+    log.s(b"display: core clock ~");
+    log.dec((1u64 << 20) / us + (acc & 0));
+    log.s(b" MHz\n");
+    log.flush();
     let t_font = now();
     let font = match fontdue::Font::from_bytes(FONT, fontdue::FontSettings::default()) {
         Ok(f) => f,
@@ -517,7 +604,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.s(b" KiB\n");
     log.flush();
 
-    let pixels: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
+    let pixels: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(back as *mut u32, width * height) };
+    let screen: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
     let span = width as f32;
     let (w, h) = (width as f32, height as f32);
     let margin = span * 0.04;
@@ -539,7 +627,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         paint::fill_rect(&mut c, (w * 0.5 - span * 0.004) as isize, (h * 0.56) as isize, (span * 0.008) as isize, (span * 0.008) as isize, AMBER, None, None);
         paint::fill_rect(&mut c, margin as isize, (status_y + span * 0.03) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
         paint::fill_rect(&mut c, margin as isize, (h - span * 0.09) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
-        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
+        under_black(c.pixels);
     }
     ALLOC.reset();
     let strip = (status_y + span * 0.02) as usize;
@@ -569,15 +657,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut next_tick = (now() / freq() + 1) * freq();
     let mut msg = [0u8; 4096];
     let mut tok = [0u8; 32];
+    let mut last_slow_log = 0u64;
+    // A second console writer: `log` is lent to the op handler for the whole pass.
+    let mut tlog = Log { grants, buf: [0; 256], n: 0 };
     loop {
-        // Clients first: every call waiting on the endpoint.
-        loop {
-            let n = ferros_sys::recv(cap(grants, S_DISPLAY), &mut msg, &mut tok, true);
-            if n == ferros_sys::NOTHING || n == ferros_sys::ERR {
-                break;
-            }
-            let m = &msg[..(n as usize).min(msg.len())];
-            let mut out = [0u8; 16];
+        // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
+        let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
             let mut len = 1usize;
             out[0] = 0;
             match m.first() {
@@ -618,8 +703,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 Some(4) => {
                     {
                         let mut c = Canvas::new(pixels, width, height, &mut damage);
-                        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
+                        under_black(c.pixels);
                     }
+                    // The finished frame to the framebuffer: reads from cache, writes combined.
+                    screen.copy_from_slice(pixels);
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -654,10 +741,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 Some(14) if m.len() >= 13 => {
                     client_owned = true;
                     last_interaction = now();
-                    let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as f32;
-                    let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as f32;
+                    let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as f32 / 256.0;
+                    let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as f32 / 256.0;
                     let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as f32 / 65536.0;
-                    pixels.fill(0);
+                    // Flag bit 0: keep what the frame already holds (a `begin` and the client's text and rects, sent first in the same batch), so the scene goes under an overlay; without it the frame starts empty.
+                    if m.get(13).copied().unwrap_or(0) & 1 == 0 {
+                        pixels.fill(0);
+                    }
+                    let mut t_phase = now();
                     {
                         let mut c = Canvas::new(pixels, width, height, &mut damage);
                         for i in 0..unsafe { SCENE_N } {
@@ -689,11 +780,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 for yy in y0..y1 {
                                     let v = (((yy as f32 - (sy - ri)) * step) as usize).min(size - 1);
                                     for xx in x0..x1 {
+                                        // Front to back: only where nothing is painted yet (tested first: under an arrived circle's overlay that is every pixel), and only the icon's solid part — its rim goes to the fill underneath, which carries the antialiased edge.
+                                        let dst = &mut c.pixels[yy * width + xx];
+                                        if *dst >> 24 != 0 {
+                                            continue;
+                                        }
                                         let u = (((xx as f32 - (sx - ri)) * step) as usize).min(size - 1);
                                         let k = (v * size + u) * 4;
-                                        // Front to back: only where nothing is painted yet, and only the icon's solid part — its rim goes to the fill underneath, which carries the antialiased edge.
-                                        let dst = &mut c.pixels[yy * width + xx];
-                                        if px[k + 3] < 128 || *dst >> 24 != 0 {
+                                        if px[k + 3] < 128 {
                                             continue;
                                         }
                                         let rgb = if lit {
@@ -706,21 +800,50 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     }
                                 }
                             }
-                            paint::circle_filled(&mut c, sx as isize, sy as isize, (sr - stroke) as isize, if lit { MAP_LIT } else { MAP_FILL }, None, None);
+                            disc(c.pixels, width, height, sx as i64, sy as i64, (sr - stroke) as i64, if lit { MAP_LIT } else { MAP_FILL });
                             if stroke > 0.0 {
-                                paint::circle_filled(&mut c, sx as isize, sy as isize, sr as isize, MAP_RING, None, None);
+                                disc(c.pixels, width, height, sx as i64, sy as i64, sr as i64, MAP_RING);
                             }
                         }
+                        unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
+                        t_phase = now();
                         // The air: black under everything.
-                        paint::fill_rect(&mut c, 0, 0, width as isize, height as isize, BLACK, None, None);
+                        under_black(c.pixels);
                     }
                     ALLOC.reset();
+                    unsafe { PHASE_US[1] = ferros_sys::us_since(t_phase) };
+                    t_phase = now();
+                    // The finished frame to the framebuffer: reads from cache, writes combined.
+                    screen.copy_from_slice(pixels);
                     ferros_sys::dma_barrier();
+                    unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
+                    t_phase = now();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
+                    unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
                     frames += 1;
                     out[1] = moved as u8;
                     len = 2;
+                }
+                Some(16) if m.len() >= 11 => {
+                    let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;
+                    let r = u16::from_le_bytes([m[5], m[6]]) as isize;
+                    let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
+                    let mut c = Canvas::new(pixels, width, height, &mut damage);
+                    disc(c.pixels, width, height, v(1) as i64, v(3) as i64, r as i64, colour);
+                }
+                Some(17) if m.len() >= 12 => {
+                    let i = m[1] as usize;
+                    if i < unsafe { SCENE_N } {
+                        let i32le = |k: usize| i32::from_le_bytes([m[k], m[k + 1], m[k + 2], m[k + 3]]);
+                        unsafe {
+                            SCENE[i].x = i32le(2);
+                            SCENE[i].y = i32le(6);
+                            SCENE[i].r = u16::from_le_bytes([m[10], m[11]]);
+                        }
+                    } else {
+                        out[0] = 1;
+                    }
                 }
                 Some(5) => {
                     out[0..2].copy_from_slice(&(width as u16).to_le_bytes());
@@ -795,6 +918,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.s(b"\n");
                     log.flush();
                     testcard(pixels, width, height);
+                    // The finished frame to the framebuffer: reads from cache, writes combined.
+                    screen.copy_from_slice(pixels);
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -814,6 +939,68 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 _ => out[0] = 1,
             }
+            len
+        };
+        // Clients first: every call waiting on the endpoint.
+        loop {
+            let n = ferros_sys::recv(cap(grants, S_DISPLAY), &mut msg, &mut tok, true);
+            if n == ferros_sys::NOTHING || n == ferros_sys::ERR {
+                break;
+            }
+            let m = &msg[..(n as usize).min(msg.len())];
+            let mut out = [0u8; 16];
+            let t_call = now();
+            let mut op_us = [0u64; 32];
+            let len = if m.first() == Some(&15) {
+                // A batch: [len u16][op…] after [len u16][op…], run in order; the reply is the last op's, with the first failure's status if any failed.
+                let (mut at, mut fail, mut len) = (1usize, 0u8, 1usize);
+                while at + 2 <= m.len() {
+                    let l = u16::from_le_bytes([m[at], m[at + 1]]) as usize;
+                    if at + 2 + l > m.len() || m.get(at + 2) == Some(&15) {
+                        fail = 1;
+                        break;
+                    }
+                    let t_op = now();
+                    len = handle(&m[at + 2..at + 2 + l], &mut out);
+                    let op = m.get(at + 2).copied().unwrap_or(0) as usize;
+                    op_us[op.min(31)] += ferros_sys::us_since(t_op);
+                    if fail == 0 {
+                        fail = out[0];
+                    }
+                    at += 2 + l;
+                }
+                out[0] = fail;
+                len
+            } else {
+                handle(m, &mut out)
+            };
+            // How long a call took, by its first op (a batch by its last), logged when slow and at most every two seconds: the frame budget is the thing to watch.
+            let took = ferros_sys::us_since(t_call);
+            if took > 20_000 && now().wrapping_sub(last_slow_log) > 2 * freq() {
+                last_slow_log = now();
+                tlog.s(b"display: call op ");
+                tlog.dec(m.first().copied().unwrap_or(0) as u64);
+                tlog.s(b" (");
+                tlog.dec(n);
+                tlog.s(b" bytes) took ");
+                tlog.dec(took / 1000);
+                tlog.s(b" ms;");
+                for (op, &us) in op_us.iter().enumerate() {
+                    if us >= 1000 {
+                        tlog.s(b" op ");
+                        tlog.dec(op as u64);
+                        tlog.s(b" ");
+                        tlog.dec(us / 1000);
+                        tlog.s(b" ms");
+                    }
+                }
+                tlog.s(b"; camera: scene ");
+                for (k, name) in [b" ms, black " as &[u8], b" ms, copy ", b" ms, present ", b" ms\n"].iter().enumerate() {
+                    tlog.dec(unsafe { PHASE_US[k] } / 1000);
+                    tlog.s(name);
+                }
+                tlog.flush();
+            }
             ferros_sys::reply(&tok, &out[..len]);
         }
 
@@ -832,6 +1019,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     paint::fill_rect(&mut c, 0, 0, width as isize, strip as isize, BLACK, None, None);
                 }
                 ALLOC.reset();
+                // The finished frame to the framebuffer: reads from cache, writes combined.
+                screen.copy_from_slice(pixels);
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, fb, width as u32, height as u32);

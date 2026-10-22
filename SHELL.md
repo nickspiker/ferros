@@ -134,3 +134,31 @@ The device circle never lights. Lit means a person sent you something, and the d
 - **What lit looks like:** the only colour on an otherwise grey map. Colour already means changed, and grey at rest is already true (icons are photopic grey). No glow and no motion.
 - **The clock:** not on the map. The time of day is the agent's to answer and the wake's to show for a moment, written as a share of the day in the device base.
 - **Time measured for size:** dwell, meaning how long a circle fills the screen. Kept on the device, averaged over weeks, never sent.
+
+## Built (2026-10-22)
+
+The proposal above, with the owner's gestures ("two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
+
+- **The device's circle** sits at the centre of the map with ferros's logo as its icon. It never lights.
+- **One-finger tap** on a circle arrives at it. The camera flies for sixteen frames, easing out, until the circle fills the width, and the circle's front shows. A tap in the air around it flies back to the whole map. Moving away (a drag or a pinch) also leaves.
+- **Two-finger tap** turns a circle over to its back. Another turns it back.
+- **The device's front** is the dashboard: battery, press to ready, since power on, USB, processes, keys in the vault, and the number base. It redraws once a second, every number in the device base, as glyphs. The facts come from the kernel's `SYS_FACTS` (process.rs), which needs no capability: none of them is a key, a handle or a serial.
+- **The device's back** is the settings:
+  - the four bases, each a row of two seconds and a mebibyte written in it, with the current one marked;
+  - names under circles, on or off;
+  - arrange by hand.
+  
+  Taps go through the Settings capability, which init now passes to the map.
+- **An app's front** is its icon filling the screen, with "not here yet". Its back is its share of your time, whether it is installed, what it waits for, and its capabilities (none yet).
+- **Arranging by hand:** two fingers that land on a circle move it with their midpoint and size it with their spread. A tap in the air ends it. The arrangement lasts until the map restarts, because the map holds no vault capability yet.
+
+Everything in the map is integer. The camera centre is in world units ×256 and the zoom is 16.16. Pinches use integer square roots.
+
+**The display server's cost, measured.** A dashboard frame took 2.7 s when it was composited straight into the framebuffer. That memory is non-cacheable, and every blend reads the pixel under it, at about 300 ns per read. Three changes brought it to 64 ms:
+- composite in a cacheable back buffer at the top of the display heap (grown to 32 MiB), then copy the finished frame out in 2 ms;
+- draw circles as integer spans, blending only at the rim;
+- write the black ground outright where nothing is painted.
+
+What is left is the core's clock: 576 MHz measured, the bootloader's setting, against roughly 2.9 GHz for the big cores. Raising it is CPU frequency control through ACPM, still to be brought up.
+
+Each frame is now one call (op 15, a batch): the overlay's text and discs, then the camera op with its keep flag. A call to an endpoint wakes a server that is asleep between polls, so the reply no longer waits for the server's next tick.

@@ -51,9 +51,9 @@ pub const DISPLAY_FB: (usize, usize) = (0x8400_0000, 0x8600_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_FB: (usize, usize) = (0, 0);
 
-/// A cacheable heap for the display server (cold only): 16 MiB of Normal write-back, EL0 read/write, never executable DRAM above the framebuffers — a process heap outside its arc, so the 8 MiB arc pool doesn't have to carry it and the non-cacheable framebuffer region doesn't slow it (a typeface parse over non-cacheable memory ran for minutes, 2026-10-16). Granted as the region `display-heap`; nothing DMAs into it.
+/// A cacheable heap for the display server (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable DRAM above the framebuffers — a process heap outside its arc, so the 8 MiB arc pool doesn't have to carry it and the non-cacheable framebuffer region doesn't slow it (a typeface parse over non-cacheable memory ran for minutes, 2026-10-16). Its top 16 MiB is the display server's back buffer, where frames are composited before one write-only copy to the framebuffer. It ends where the camera's buffers begin (G#8800_0000). Granted as the region `display-heap`; nothing DMAs into it.
 #[cfg(not(shim_handoff))]
-pub const DISPLAY_HEAP: (usize, usize) = (0x8600_0000, 0x8700_0000);
+pub const DISPLAY_HEAP: (usize, usize) = (0x8600_0000, 0x8800_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_HEAP: (usize, usize) = (0, 0);
 

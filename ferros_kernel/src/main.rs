@@ -1738,6 +1738,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
     process::set_pref(process::PREF_BASE, tatau::base().code());
+    // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
+    if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
+        if v <= 1 {
+            process::set_pref(process::PREF_LABELS, v);
+        }
+    }
 
     // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
     let init_exit = 0u32;

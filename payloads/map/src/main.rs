@@ -1,41 +1,66 @@
 //! The map (SHELL.md): the phone is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
-//! This is the first slice. The circles are the first apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time. One finger pans; two fingers pinch to zoom about the point between them. The display server keeps the scene, so a frame costs this process three numbers: the camera.
+//! The circles: the device itself first, at the centre (its front is the dashboard, its back the settings), then the apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time.
 //!
-//! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering (Photon, Mahere, Lumis, then Opsin) until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here to show all four channels; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic rather than written to the vault, which keeps them fixed across boots until the vault holds them.
+//! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
+//! - One finger drags the plane; two fingers pinch to zoom about the point between them.
+//! - A one-finger tap on a circle arrives at it: the camera flies until the circle fills the screen, and its front is shown. A tap in the air around an arrived circle leaves it.
+//! - A two-finger tap turns a circle over: its back, the facts about it and its few choices. Another two-finger tap turns it back.
+//! - Arranging by hand (from the device's back): two fingers that land on a circle move and size that circle instead of the view; a tap in the air ends it.
 //!
-//! Spawn after `display` and `touch`: ferros-bridge spawn map.bin 00 --name map --use display --use touch
-//! Grant slots: 0 console, 1 display (use), 2 touch (use).
+//! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
+//!
+//! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic and an arrangement by hand lasts until the process ends: the map holds no vault capability yet.
+//!
+//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings.
 
 #![no_std]
 #![no_main]
 
+use core::fmt::Write;
 use ferros_sys::{call, cap, console, freq, now, sleep_until};
+use tatau::Style;
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
+const S_SETTINGS: u64 = 3;
 
-/// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), and its share of the owner's time in thousandths — the circle's area is that share of the map.
+/// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
 struct Spec {
     label: &'static str,
     ring: u8,
     lit: u8,
     share: u32,
+    icon: u8,
+    needs: &'static str,
 }
 
-/// The shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis"): 40 %, 25 %, 20 %, 15 %.
-const APPS: [Spec; 4] = [
-    Spec { label: "Photon", ring: 2, lit: 1, share: 400 },
-    Spec { label: "Mahere", ring: 1, lit: 0, share: 250 },
-    Spec { label: "Lumis", ring: 1, lit: 0, share: 200 },
-    Spec { label: "Opsin", ring: 1, lit: 0, share: 150 },
+/// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
+const CIRCLES: [Spec; 5] = [
+    Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
+    Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
+    Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
+    Spec { label: "Lumis", ring: 1, lit: 0, share: 200, icon: 3, needs: "the camera as a process" },
+    Spec { label: "Opsin", ring: 1, lit: 0, share: 150, icon: 4, needs: "Lumis's frames" },
 ];
-
-/// Names under the circles: off. An app's icon identifies it (owner, 2026-10-21: "icons identify just fine"), so words are an option for whoever wants them, not the default. Settings will own this switch once settings exist.
-const SHOW_LABELS: bool = false;
+const N: usize = CIRCLES.len();
+const DEVICE: usize = 0;
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
 const BASE_RADIUS: i64 = 110;
+
+// Colours, as the display server takes them (G#00RRGGBB): the map's own greys, white for what is current.
+const WHITE: u32 = 0xF0F0F0;
+const GREY: u32 = 0x9A9A9A;
+const DIM: u32 = 0x5C5C5C;
+const FILL: u32 = 0x2A2A2A;
+
+/// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
+const SLOP: i64 = 24;
+/// A tap is down and up within a quarter second... and a half for two fingers, which rarely land together.
+const TAP_MS: u64 = 512;
+/// A flight is sixteen frames, ~133 ms at 120 Hz.
+const FLIGHT: i64 = 16;
 
 /// A circle's radius in world units: area = share x the map's total, so r = 110 x sqrt(4 x share). Integer square root, no floats.
 fn radius_of(share: u32) -> i64 {
@@ -70,11 +95,11 @@ impl Rng {
     }
 }
 
-/// Place the circles one at a time, biggest first, each at the first random spot that keeps clear of every circle already placed by at least the larger of the two radii again: more air is better, and no two ever overlap.
+/// The device at the centre; then the rest one at a time, in table order (biggest first), each at the first random spot that keeps clear of every circle already placed by at least the larger of the two radii again: more air is better, and no two ever overlap.
 fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
     let mut rng = Rng(0x6D61_7020_6C69_6665);
-    for i in 0..rs.len() {
-        let mut spread = rs[i];
+    for i in 1..rs.len() {
+        let mut spread = rs[i] + rs[0];
         loop {
             let (x, y) = (rng.signed(spread), rng.signed(spread * 8 / 5));
             let clear = (0..i).all(|j| {
@@ -93,41 +118,497 @@ fn place(rs: &[i64], xs: &mut [i64], ys: &mut [i64]) {
     }
 }
 
+/// A line of text being written, for tatau's formatters.
+struct Line {
+    b: [u8; 120],
+    n: usize,
+}
+impl Line {
+    fn new() -> Line {
+        Line { b: [0; 120], n: 0 }
+    }
+    fn s(&mut self, t: &str) -> &mut Line {
+        let _ = self.write_str(t);
+        self
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.b[..self.n]).unwrap_or("")
+    }
+}
+impl Write for Line {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let n = b.len().min(self.b.len() - self.n);
+        self.b[self.n..self.n + n].copy_from_slice(&b[..n]);
+        self.n += n;
+        Ok(())
+    }
+}
+
+/// The ops of one frame, sent to the display server as one batch (op 15): one call per frame however much is on it.
+struct Batch {
+    b: [u8; 4096],
+    n: usize,
+}
+impl Batch {
+    fn new() -> Batch {
+        let mut b = Batch { b: [0; 4096], n: 1 };
+        b.b[0] = 15;
+        b
+    }
+    fn op(&mut self, bytes: &[u8]) {
+        if self.n + 2 + bytes.len() > self.b.len() {
+            return;
+        }
+        self.b[self.n..self.n + 2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.b[self.n + 2..self.n + 2 + bytes.len()].copy_from_slice(bytes);
+        self.n += 2 + bytes.len();
+    }
+    /// Text with its baseline at y; align 0 left, 1 centred on x, 2 right edge at x.
+    fn text(&mut self, x: i64, y: i64, px: u16, colour: u32, align: u8, t: &str) {
+        let mut m = [0u8; 140];
+        m[0] = 2;
+        m[1..3].copy_from_slice(&(x.clamp(0, 65535) as u16).to_le_bytes());
+        m[3..5].copy_from_slice(&(y.clamp(0, 65535) as u16).to_le_bytes());
+        m[5..7].copy_from_slice(&px.to_le_bytes());
+        m[7..11].copy_from_slice(&colour.to_le_bytes());
+        m[11] = align;
+        let t = t.as_bytes();
+        let k = t.len().min(m.len() - 12);
+        m[12..12 + k].copy_from_slice(&t[..k]);
+        self.op(&m[..12 + k]);
+    }
+    fn disc(&mut self, x: i64, y: i64, r: i64, colour: u32) {
+        let mut m = [0u8; 11];
+        m[0] = 16;
+        m[1..3].copy_from_slice(&(x.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[3..5].copy_from_slice(&(y.clamp(-32768, 32767) as i16).to_le_bytes());
+        m[5..7].copy_from_slice(&(r.clamp(0, 65535) as u16).to_le_bytes());
+        m[7..11].copy_from_slice(&colour.to_le_bytes());
+        self.op(&m);
+    }
+    fn send(&self, display: u64) {
+        let mut r = [0u8; 4];
+        call(display, &self.b[..self.n], &mut r);
+    }
+}
+
+/// The camera: the centre in world units ×256, the zoom in panel pixels per world unit, 16.16.
+#[derive(Clone, Copy, PartialEq)]
+struct Cam {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+const Z_MIN: i64 = 9830; // 0.15
+const Z_MAX: i64 = 12 << 16;
+
+impl Cam {
+    /// A panel pixel to world units ×256.
+    fn world(&self, w: i64, h: i64, sx: i64, sy: i64) -> (i64, i64) {
+        (self.x + ((sx - w / 2) << 24) / self.z, self.y + ((sy - h / 2) << 24) / self.z)
+    }
+    fn op(&self, keep: bool) -> [u8; 14] {
+        let mut m = [0u8; 14];
+        m[0] = 14;
+        m[1..5].copy_from_slice(&(self.x as i32).to_le_bytes());
+        m[5..9].copy_from_slice(&(self.y as i32).to_le_bytes());
+        m[9..13].copy_from_slice(&(self.z as u32).to_le_bytes());
+        m[13] = keep as u8;
+        m
+    }
+}
+
+/// What the screen is showing: the plane, or one circle's front or back, arrived at.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Map,
+    Front(usize),
+    Back(usize),
+}
+
+/// The device's back: what each row does when tapped.
+#[derive(Clone, Copy)]
+enum Choice {
+    Base(u8),
+    Labels,
+    Arrange,
+}
+
+/// The four bases in the order the chooser shows them: the house base first.
+const BASES: [u8; 4] = [12, 0x8C, 10, 16];
+
+fn base_name(code: u8) -> &'static str {
+    match code {
+        10 => "arabic",
+        16 => "hexadecimal",
+        0x8C => "dozenal linear (DLS)",
+        _ => "dozenal magnitude (DMS)",
+    }
+}
+
+struct Map {
+    grants: u64,
+    display: u64,
+    w: i64,
+    h: i64,
+    /// Circles in world units ×256, and radii in world units.
+    xs: [i64; N],
+    ys: [i64; N],
+    rs: [i64; N],
+    cam: Cam,
+    view: View,
+    editing: bool,
+    /// The device back's rows, as laid out by the last frame: (top, bottom, what).
+    rows: [(i64, i64, Choice); 8],
+    nrows: usize,
+}
+
+impl Map {
+    /// The arrived circle's radius on the panel.
+    fn arrived_r(&self) -> i64 {
+        self.w * 15 / 32
+    }
+
+    /// The circle under a panel pixel, smallest first when they overlap (the smaller is drawn on top).
+    fn hit(&self, sx: i64, sy: i64) -> Option<usize> {
+        let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
+        let mut best: Option<usize> = None;
+        for i in 0..N {
+            let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
+            if dx * dx + dy * dy <= self.rs[i] * self.rs[i] && best.is_none_or(|b| self.rs[i] < self.rs[b]) {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    /// The whole scene to the display server: clear, then every circle in one call.
+    fn send_scene(&self) {
+        let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
+        let mut r = [0u8; 4];
+        call(self.display, &[12], &mut r);
+        let mut m = [0u8; 2 + 30 * N];
+        m[0] = 13;
+        m[1] = N as u8;
+        for (i, a) in CIRCLES.iter().enumerate() {
+            let at = 2 + i * 30;
+            m[at..at + 4].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
+            m[at + 4..at + 8].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
+            m[at + 8..at + 10].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
+            m[at + 10] = a.ring;
+            m[at + 11] = a.lit;
+            m[at + 12] = a.icon;
+            let label = a.label.as_bytes();
+            let len = if labels { label.len().min(16) } else { 0 };
+            m[at + 13] = len as u8;
+            m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
+        }
+        call(self.display, &m, &mut r);
+    }
+
+    /// One circle moved or resized in the display server's scene (op 17).
+    fn send_move(&self, i: usize) {
+        let mut m = [0u8; 12];
+        m[0] = 17;
+        m[1] = i as u8;
+        m[2..6].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
+        m[6..10].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
+        m[10..12].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
+        let mut r = [0u8; 4];
+        call(self.display, &m, &mut r);
+    }
+
+    /// The camera that shows every circle with air around them, never closer than one world unit to a pixel.
+    fn home(&self) -> Cam {
+        let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for i in 0..N {
+            let r = self.rs[i] << 8;
+            x0 = x0.min(self.xs[i] - r);
+            y0 = y0.min(self.ys[i] - r);
+            x1 = x1.max(self.xs[i] + r);
+            y1 = y1.max(self.ys[i] + r);
+        }
+        // Zoom so the bounds take seven eighths of the panel either way.
+        let (bw, bh) = (((x1 - x0) >> 8).max(1), ((y1 - y0) >> 8).max(1));
+        let z = ((self.w * 7 / 8) << 16) / bw;
+        let z = z.min(((self.h * 7 / 8) << 16) / bh).clamp(Z_MIN, 1 << 16);
+        Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z }
+    }
+
+    /// The camera that has arrived at circle i: it fills the panel's width, less a margin.
+    fn at(&self, i: usize) -> Cam {
+        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(Z_MIN, Z_MAX) }
+    }
+
+    /// Fly the camera to `to`: sixteen frames, easing out, the visible span (not the zoom) moving evenly so the approach feels like one motion.
+    fn fly(&mut self, to: Cam) {
+        let from = self.cam;
+        let (s0, s1) = ((1i64 << 32) / from.z, (1i64 << 32) / to.z);
+        let mut tick = now();
+        for k in 1..=FLIGHT {
+            let e = 256 - (FLIGHT - k) * (FLIGHT - k) * 256 / (FLIGHT * FLIGHT);
+            let span = s0 + (s1 - s0) * e / 256;
+            self.cam = Cam { x: from.x + (to.x - from.x) * e / 256, y: from.y + (to.y - from.y) * e / 256, z: ((1i64 << 32) / span.max(1)).clamp(Z_MIN, Z_MAX) };
+            let mut b = Batch::new();
+            b.op(&self.cam.op(false));
+            b.send(self.display);
+            tick += freq() / 120;
+            sleep_until(tick);
+        }
+        self.cam = to;
+    }
+
+    /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera.
+    fn draw(&mut self) {
+        let mut b = Batch::new();
+        b.op(&[1]);
+        self.nrows = 0;
+        match self.view {
+            View::Map => {
+                if self.editing {
+                    b.text(self.w / 2, self.h / 16, 34, GREY, 1, "arranging by hand");
+                    b.text(self.w / 2, self.h / 16 + 52, 28, DIM, 1, "two fingers on a circle move and size it \u{2022} tap the air to finish");
+                }
+            }
+            View::Front(DEVICE) => self.dashboard(&mut b),
+            View::Back(DEVICE) => self.settings(&mut b),
+            View::Front(i) => {
+                let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+                b.text(cx, cy + r + 96, 52, WHITE, 1, CIRCLES[i].label);
+                b.text(cx, cy + r + 160, 32, GREY, 1, "not here yet \u{2022} two fingers for its back");
+            }
+            View::Back(i) => self.app_back(&mut b, i),
+        }
+        b.op(&self.cam.op(true));
+        b.send(self.display);
+    }
+
+    /// Label and value on a row: the label right of centre's left, the value left of centre's right.
+    fn row(b: &mut Batch, cx: i64, y: i64, label: &str, value: &str) {
+        b.text(cx - 20, y, 36, GREY, 2, label);
+        b.text(cx + 20, y, 36, WHITE, 0, value);
+    }
+
+    /// The device's front: the state of the device in plain facts, every number in the device base.
+    fn dashboard(&self, b: &mut Batch) {
+        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+        let f = ferros_sys::numbers(Style::Glyphs);
+        let facts = ferros_sys::facts();
+        let mut y = cy - r * 9 / 16;
+        b.text(cx, y, 72, WHITE, 1, "ferros");
+        y += 120;
+        let mut v = Line::new();
+        match facts.battery_pct() {
+            Some(p) => {
+                let _ = tatau::share(&mut v, f, p, 100, 2);
+                if let Some(ua) = facts.battery_ua() {
+                    v.s(if ua > 0 { "  charging" } else { "  on battery" });
+                }
+            }
+            None => {
+                v.s("not read");
+            }
+        }
+        Map::row(b, cx, y, "battery", v.as_str());
+        y += 64;
+        let mut v = Line::new();
+        match facts.boot_us() {
+            Some(us) => {
+                let _ = tatau::duration_ns(&mut v, f, us * 1000, 1);
+            }
+            None => {
+                v.s("-");
+            }
+        }
+        Map::row(b, cx, y, "press to ready", v.as_str());
+        y += 64;
+        let mut v = Line::new();
+        // The counter runs from the SoC's reset: power on, near enough (the bootloader's seconds included).
+        let (t, hz) = (now(), freq());
+        let _ = tatau::duration_ns(&mut v, f, t / hz * 1_000_000_000 + t % hz * 1_000_000_000 / hz, 1);
+        Map::row(b, cx, y, "since power on", v.as_str());
+        y += 64;
+        Map::row(b, cx, y, "USB", match facts.usb_link() { Some(true) => "linked", Some(false) => "no link", None => "-" });
+        y += 64;
+        let mut v = Line::new();
+        if let Some(n) = facts.processes() {
+            let _ = tatau::count(&mut v, f, n, 1);
+        }
+        Map::row(b, cx, y, "processes", v.as_str());
+        y += 64;
+        let mut v = Line::new();
+        if let Some(n) = facts.vault_keys() {
+            let _ = tatau::count(&mut v, f, n, 1);
+        }
+        Map::row(b, cx, y, "in the vault", v.as_str());
+        y += 64;
+        Map::row(b, cx, y, "numbers", base_name(ferros_sys::device_base()));
+        b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "two fingers: settings");
+        b.disc(cx, cy, r - r / 25 - 1, FILL);
+    }
+
+    /// The device's back: its few choices. The number base is chosen by seeing — each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base — with its name small beneath.
+    fn settings(&mut self, b: &mut Batch) {
+        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+        let mut y = cy - r * 5 / 8;
+        b.text(cx, y, 56, WHITE, 1, "settings");
+        y += 96;
+        let now_base = ferros_sys::device_base();
+        for code in BASES {
+            let f = tatau::Fmt::new(tatau::Base::from_code(code).unwrap_or(tatau::Base::Dms), Style::Glyphs);
+            let mut v = Line::new();
+            let _ = tatau::duration_ns(&mut v, f, 2_000_000_000, 1);
+            v.s("   ");
+            let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
+            let current = code == now_base;
+            b.text(cx, y, 44, if current { WHITE } else { GREY }, 1, v.as_str());
+            b.text(cx, y + 38, 24, if current { GREY } else { DIM }, 1, base_name(code));
+            if current {
+                b.disc(cx - r * 5 / 8, y - 14, 10, WHITE);
+            }
+            self.push_row(y - 56, y + 52, Choice::Base(code));
+            y += 112;
+        }
+        y += 24;
+        let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
+        b.text(cx, y, 36, GREY, 1, if labels { "names under circles: on" } else { "names under circles: off" });
+        self.push_row(y - 44, y + 24, Choice::Labels);
+        y += 80;
+        b.text(cx, y, 36, GREY, 1, "arrange by hand");
+        self.push_row(y - 44, y + 24, Choice::Arrange);
+        b.disc(cx, cy, r - r / 25 - 1, FILL);
+    }
+
+    fn push_row(&mut self, top: i64, bottom: i64, what: Choice) {
+        if self.nrows < self.rows.len() {
+            self.rows[self.nrows] = (top, bottom, what);
+            self.nrows += 1;
+        }
+    }
+
+    /// An app's back: the facts about it, the same for every circle.
+    fn app_back(&self, b: &mut Batch, i: usize) {
+        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+        let f = ferros_sys::numbers(Style::Glyphs);
+        let a = &CIRCLES[i];
+        let mut y = cy - r / 2;
+        b.text(cx, y, 64, WHITE, 1, a.label);
+        y += 112;
+        let mut v = Line::new();
+        let _ = tatau::share(&mut v, f, a.share as u64, 1000, 2);
+        Map::row(b, cx, y, "your time", v.as_str());
+        y += 64;
+        Map::row(b, cx, y, "installed", "not yet");
+        y += 64;
+        Map::row(b, cx, y, "waits for", a.needs);
+        y += 64;
+        Map::row(b, cx, y, "capabilities", "none");
+        b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "time is set by hand until it is measured");
+        b.disc(cx, cy, r - r / 25 - 1, FILL);
+    }
+
+    /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
+    fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
+        let before = (self.view, self.editing);
+        self.tap_inner(fingers, sx, sy);
+        let mut l = Line::new();
+        let name = |v: View| match v {
+            View::Map => ("map", ""),
+            View::Front(i) => ("front of ", CIRCLES[i].label),
+            View::Back(i) => ("back of ", CIRCLES[i].label),
+        };
+        let (a, b) = name(self.view);
+        let _ = write!(l, "map: {fingers}-finger tap at {sx},{sy} -> {a}{b}{}{}\n", if self.editing { ", arranging" } else { "" }, if before == (self.view, self.editing) { " (no change)" } else { "" });
+        console(self.grants, l.as_str().as_bytes());
+    }
+
+    fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
+        let inside = {
+            let (dx, dy) = (sx - self.w / 2, sy - self.h / 2);
+            dx * dx + dy * dy <= self.arrived_r() * self.arrived_r()
+        };
+        if self.editing {
+            if fingers == 1 && self.hit(sx, sy).is_none() {
+                self.editing = false;
+                self.draw();
+            }
+            return;
+        }
+        match (fingers, self.view) {
+            (1, View::Map) => {
+                if let Some(i) = self.hit(sx, sy) {
+                    let to = self.at(i);
+                    self.fly(to);
+                    self.view = View::Front(i);
+                    self.draw();
+                }
+            }
+            (1, View::Front(_)) | (1, View::Back(_)) => {
+                if !inside {
+                    self.view = View::Map;
+                    let to = self.home();
+                    self.fly(to);
+                    self.draw();
+                } else if self.view == View::Back(DEVICE) {
+                    let row = self.rows[..self.nrows].iter().find(|r| sy >= r.0 && sy < r.1).map(|r| r.2);
+                    match row {
+                        Some(Choice::Base(code)) => {
+                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BASE, code);
+                            self.draw();
+                        }
+                        Some(Choice::Labels) => {
+                            let on = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
+                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_LABELS, (!on) as u8);
+                            self.send_scene();
+                            self.draw();
+                        }
+                        Some(Choice::Arrange) => {
+                            self.view = View::Map;
+                            self.editing = true;
+                            let to = self.home();
+                            self.fly(to);
+                            self.draw();
+                        }
+                        None => {}
+                    }
+                }
+            }
+            (2, View::Map) => {
+                if let Some(i) = self.hit(sx, sy) {
+                    let to = self.at(i);
+                    self.fly(to);
+                    self.view = View::Back(i);
+                    self.draw();
+                }
+            }
+            (2, View::Front(i)) => {
+                self.view = View::Back(i);
+                self.draw();
+            }
+            (2, View::Back(i)) => {
+                self.view = View::Front(i);
+                self.draw();
+            }
+            _ => {}
+        }
+    }
+}
 
 /// "map: numbers in <base>", with two seconds written in it, in words (the console is a terminal surface).
 fn say_base(grants: u64, code: u8) {
-    struct Buf([u8; 96], usize);
-    impl core::fmt::Write for Buf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let n = b.len().min(self.0.len() - self.1);
-            self.0[self.1..self.1 + n].copy_from_slice(&b[..n]);
-            self.1 += n;
-            Ok(())
-        }
-    }
-    let mut out = Buf([0; 96], 0);
-    let f = ferros_sys::numbers(tatau::Style::Words);
-    let _ = core::fmt::Write::write_fmt(&mut out, format_args!("map: numbers in {:?} (G#{:02X}); two seconds reads ", f.base, code));
+    let mut out = Line::new();
+    let f = ferros_sys::numbers(Style::Words);
+    let _ = write!(out, "map: numbers in {:?} (G#{:02X}); two seconds reads ", f.base, code);
     let _ = tatau::duration_ns(&mut out, f, 2_000_000_000, 1);
-    let _ = core::fmt::Write::write_str(&mut out, "\n");
-    console(grants, &out.0[..out.1]);
+    out.s("\n");
+    console(grants, out.as_str().as_bytes());
 }
 
-/// The distance between two touch points, for the pinch (still floating point, as the camera's zoom is; the layout above is integer). Written out because `f32::powi` and friends exist only with std.
-fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dx, dy) = (ax - bx, ay - by);
-    libm::sqrtf(dx * dx + dy * dy)
-}
-
-fn camera(grants: u64, cx: f32, cy: f32, zoom: f32) {
-    let mut m = [0u8; 13];
-    m[0] = 14;
-    m[1..5].copy_from_slice(&(cx as i32).to_le_bytes());
-    m[5..9].copy_from_slice(&(cy as i32).to_le_bytes());
-    m[9..13].copy_from_slice(&((zoom * 65536.0) as u32).to_le_bytes());
-    let mut r = [0u8; 4];
-    call(cap(grants, S_DISPLAY), &m, &mut r);
+/// The distance between two panel points in sixteenths of a pixel, for the pinch.
+fn dist16(a: (i64, i64), b: (i64, i64)) -> i64 {
+    let (dx, dy) = (a.0 - b.0, a.1 - b.1);
+    isqrt((dx * dx + dy * dy) << 8)
 }
 
 #[unsafe(no_mangle)]
@@ -144,102 +625,183 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"map: no display server\n");
         ferros_sys::exit(1);
     }
-    let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as f32, u16::from_le_bytes([r[2], r[3]]) as f32);
+    let (w, h) = (u16::from_le_bytes([r[0], r[1]]) as i64, u16::from_le_bytes([r[2], r[3]]) as i64);
 
-    // The circles, sized by share and placed once, biggest first.
-    let rs: [i64; 4] = core::array::from_fn(|i| radius_of(APPS[i].share));
-    let mut xs = [0i64; 4];
-    let mut ys = [0i64; 4];
+    // The circles, sized by share and placed once.
+    let rs: [i64; N] = core::array::from_fn(|i| radius_of(CIRCLES[i].share));
+    let mut xs = [0i64; N];
+    let mut ys = [0i64; N];
     place(&rs, &mut xs, &mut ys);
-
-    // Hand the scene to the display server: clear, then the circles in one call.
-    call(display, &[12], &mut r);
-    let mut m = [0u8; 2 + 30 * 4];
-    m[0] = 13;
-    m[1] = APPS.len() as u8;
-    for (i, a) in APPS.iter().enumerate() {
-        let at = 2 + i * 30;
-        m[at..at + 4].copy_from_slice(&(xs[i] as i32).to_le_bytes());
-        m[at + 4..at + 8].copy_from_slice(&(ys[i] as i32).to_le_bytes());
-        m[at + 8..at + 10].copy_from_slice(&(rs[i] as u16).to_le_bytes());
-        m[at + 10] = a.ring;
-        m[at + 11] = a.lit;
-        // Each app's icon, by its place in tools/app-icons.py's bundle, which follows this table's order.
-        m[at + 12] = i as u8 + 1;
-        let label = a.label.as_bytes();
-        let len = if SHOW_LABELS { label.len().min(16) } else { 0 };
-        m[at + 13] = len as u8;
-        m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
+    let mut map = Map {
+        grants,
+        display,
+        w,
+        h,
+        xs: xs.map(|x| x << 8),
+        ys: ys.map(|y| y << 8),
+        rs,
+        cam: Cam { x: 0, y: 0, z: 1 << 16 },
+        view: View::Map,
+        editing: false,
+        rows: [(0, 0, Choice::Labels); 8],
+        nrows: 0,
+    };
+    map.send_scene();
+    map.cam = map.home();
+    // A development build can start arrived somewhere, to see a front or a back without a finger: FERROS_MAP_START=f<n> or b<n> (circle n).
+    if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
+        if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < N {
+            let i = (v[1] - b'0') as usize;
+            map.cam = map.at(i);
+            map.view = if v[0] == b'b' { View::Back(i) } else { View::Front(i) };
+        }
     }
-    call(display, &m, &mut r);
-
-    // Home: the camera over the middle of the circles, one world unit to a pixel.
-    let (mut cx, mut cy) = (xs.iter().sum::<i64>() as f32 / 4.0, ys.iter().sum::<i64>() as f32 / 4.0);
-    let mut zoom = 1.0f32;
-    camera(grants, cx, cy, zoom);
-    console(grants, b"map: home drawn; one finger pans, two fingers pinch\n");
+    map.draw();
+    console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
     // The device's number base, as every app reads it (SETTINGS.md): logged now and whenever it changes, which is the proof the preference reaches a running process.
     let mut base = ferros_sys::device_base();
     say_base(grants, base);
+    let mut labels = ferros_sys::pref(ferros_sys::PREF_LABELS);
 
     // The previous frame's held contacts, by contact id: present, x, y.
-    let mut prev = [(false, 0f32, 0f32); 16];
+    let mut prev = [(false, 0i64, 0i64); 16];
+    // The touch session: from the first finger down to the last one up.
+    let mut down = false;
+    let mut t0 = 0u64;
+    let mut most = 0usize;
+    let mut moved = false;
+    let mut start = [(false, 0i64, 0i64); 16];
+    // Arranging: the circle two fingers took hold of this session (decided once, when the second finger moves), and whether it has been decided.
+    let mut grab: Option<usize> = None;
+    let mut grab_decided = false;
+    let mut last_dashboard = now();
     loop {
+        // A preference changed (here or from the bridge): redraw in it.
         let b = ferros_sys::device_base();
         if b != base {
             base = b;
             say_base(grants, base);
+            map.draw();
         }
+        let l = ferros_sys::pref(ferros_sys::PREF_LABELS);
+        if l != labels {
+            labels = l;
+            map.send_scene();
+            map.draw();
+        }
+        // The dashboard is live: once a second while it is showing.
+        if map.view == View::Front(DEVICE) && now().wrapping_sub(last_dashboard) > freq() {
+            last_dashboard = now();
+            map.draw();
+        }
+
         let n = call(touch, &[1], &mut r) as usize;
-        let mut cur = [(false, 0f32, 0f32); 16];
+        let mut cur = [(false, 0i64, 0i64); 16];
         let mut ids = [0usize; 16];
         let mut held = 0usize;
-        if n >= 1 {
+        if n >= 1 && n != ferros_sys::ERR as usize {
             let count = (r[0] as usize).min(16);
             for k in 0..count {
-                let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 if 1 + (k + 1) * 12 > n {
                     break;
                 }
+                let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 let id = (rec[0] as usize) & 15;
-                let x = u16::from_le_bytes([rec[4], rec[5]]) as f32;
-                let y = u16::from_le_bytes([rec[6], rec[7]]) as f32;
-                cur[id] = (true, x, y);
+                cur[id] = (true, u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
                 ids[held] = id;
                 held += 1;
             }
         }
-        // The contacts present both now and last frame are the ones that moved.
-        let mut both = [0usize; 2];
-        let mut nb = 0usize;
-        for &id in ids[..held].iter() {
-            if prev[id].0 && nb < 2 {
-                both[nb] = id;
-                nb += 1;
+
+        // The session: when it began, how many fingers it ever held, where each landed, and whether any went further than a resting finger does.
+        if held > 0 && !down {
+            down = true;
+            t0 = now();
+            most = 0;
+            moved = false;
+            start = [(false, 0, 0); 16];
+            grab = None;
+            grab_decided = false;
+        }
+        if down {
+            most = most.max(held);
+            for &id in ids[..held].iter() {
+                if !start[id].0 {
+                    start[id] = cur[id];
+                }
+                let (dx, dy) = (cur[id].1 - start[id].1, cur[id].2 - start[id].2);
+                if dx * dx + dy * dy > SLOP * SLOP {
+                    moved = true;
+                }
             }
         }
-        let (ocx, ocy, oz) = (cx, cy, zoom);
-        if nb == 1 {
-            // One finger: the plane follows it.
-            let id = both[0];
-            cx -= (cur[id].1 - prev[id].1) / zoom;
-            cy -= (cur[id].2 - prev[id].2) / zoom;
-        } else if nb == 2 {
-            // Two fingers: zoom by how much they spread, about the point between them, so what is under your fingers stays under your fingers.
-            let (a, b) = (both[0], both[1]);
-            let d0 = dist(prev[a].1, prev[a].2, prev[b].1, prev[b].2);
-            let d1 = dist(cur[a].1, cur[a].2, cur[b].1, cur[b].2);
-            if d0 > 8.0 {
-                let (m0x, m0y) = ((prev[a].1 + prev[b].1) * 0.5, (prev[a].2 + prev[b].2) * 0.5);
-                let (m1x, m1y) = ((cur[a].1 + cur[b].1) * 0.5, (cur[a].2 + cur[b].2) * 0.5);
-                let (wx, wy) = (cx + (m0x - w * 0.5) / zoom, cy + (m0y - h * 0.5) / zoom);
-                zoom = (zoom * d1 / d0).clamp(0.15, 12.0);
-                cx = wx - (m1x - w * 0.5) / zoom;
-                cy = wy - (m1y - h * 0.5) / zoom;
+        if held == 0 && down {
+            down = false;
+            if !moved && now().wrapping_sub(t0) < freq() * TAP_MS / 1000 && most <= 2 {
+                // Where the fingers landed, on average.
+                let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
+                for s in start.iter().filter(|s| s.0) {
+                    sx += s.1;
+                    sy += s.2;
+                    k += 1;
+                }
+                if k > 0 {
+                    map.tap(most, sx / k, sy / k);
+                }
             }
         }
-        if cx != ocx || cy != ocy || zoom != oz {
-            camera(grants, cx, cy, zoom);
+
+        // Drags and pinches, once the fingers have moved past the slop: the contacts present both now and last frame are the ones that moved.
+        if moved {
+            let mut both = [0usize; 2];
+            let mut nb = 0usize;
+            for &id in ids[..held].iter() {
+                if prev[id].0 && nb < 2 {
+                    both[nb] = id;
+                    nb += 1;
+                }
+            }
+            let before = map.cam;
+            let mut scene_moved = false;
+            if nb >= 1 && map.view != View::Map {
+                // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again.
+                map.view = View::Map;
+            }
+            if nb == 1 {
+                // One finger: the plane follows it.
+                let id = both[0];
+                map.cam.x -= ((cur[id].1 - prev[id].1) << 24) / map.cam.z;
+                map.cam.y -= ((cur[id].2 - prev[id].2) << 24) / map.cam.z;
+            } else if nb == 2 {
+                let (a, b) = (both[0], both[1]);
+                let (pa, pb, ca, cb) = ((prev[a].1, prev[a].2), (prev[b].1, prev[b].2), (cur[a].1, cur[a].2), (cur[b].1, cur[b].2));
+                let (d0, d1) = (dist16(pa, pb), dist16(ca, cb));
+                let (m0x, m0y) = ((pa.0 + pb.0) / 2, (pa.1 + pb.1) / 2);
+                let (m1x, m1y) = ((ca.0 + cb.0) / 2, (ca.1 + cb.1) / 2);
+                if map.editing && !grab_decided {
+                    grab_decided = true;
+                    grab = map.hit(m0x, m0y);
+                }
+                if let (true, Some(i)) = (map.editing, grab) {
+                    // Arranging: the circle follows the point between the fingers and grows or shrinks with their spread.
+                    map.xs[i] += ((m1x - m0x) << 24) / map.cam.z;
+                    map.ys[i] += ((m1y - m0y) << 24) / map.cam.z;
+                    if d0 > 8 * 16 {
+                        map.rs[i] = (map.rs[i] * d1 / d0).clamp(24, 1200);
+                    }
+                    map.send_move(i);
+                    scene_moved = true;
+                } else if d0 > 8 * 16 {
+                    // Two fingers: zoom by how much they spread, about the point between them, so what is under your fingers stays under your fingers.
+                    let (wx, wy) = map.cam.world(w, h, m0x, m0y);
+                    map.cam.z = (map.cam.z * d1 / d0).clamp(Z_MIN, Z_MAX);
+                    map.cam.x = wx - ((m1x - w / 2) << 24) / map.cam.z;
+                    map.cam.y = wy - ((m1y - h / 2) << 24) / map.cam.z;
+                }
+            }
+            if map.cam != before || scene_moved {
+                map.draw();
+            }
         }
         prev = cur;
         // A hundred-and-twentieth of a second while a finger is down, a thirtieth at rest.

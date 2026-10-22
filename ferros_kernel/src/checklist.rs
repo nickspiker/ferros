@@ -351,6 +351,8 @@ fn light(c: &Checklist, item: Item) {
 /// Boot timing: the counter when the cold kernel was entered (set right after the killswitch arms) and, per item, the counter when it was first marked. Kept apart from the drawn list so items marked before the panel is adopted still get a time. Read by `diag boot`.
 pub static ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static PRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// When the shell was started (the ring complete): press to here is the boot the owner waits for.
+pub static HOME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AT: [core::sync::atomic::AtomicU64; 18] = [const { core::sync::atomic::AtomicU64::new(0) }; 18];
 
 /// Named boot stamps between the checklist items (`at`), for finding where the time goes: up to 32, in order.

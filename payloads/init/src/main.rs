@@ -4,7 +4,7 @@
 //!
 //! Grant slots, as the kernel hands them to init (service.rs `start_home`, same order):
 //!   1 serve display, 2-7 decon0-main, decon0-win, decon0-wincon, dpu-dma0, dpp0, gpio-gpp0, 8-9 dma display-fb, display-heap, 10-13 dsim0, dphy0, sramc0, hdrcomm0,
-//!   14 serve touch, 15-16 usi2-spi, gpio-gpn0, 17 use display, 18 use touch.
+//!   14 serve touch, 15-16 usi2-spi, gpio-gpn0, 17 use display, 18 use touch, 19 settings (the map holds it: the device's settings are the back of the device's own circle).
 #![no_std]
 #![no_main]
 
@@ -14,7 +14,7 @@ use ferros_sys::{console, exit, spawn};
 const SHELL: [(&[u8], &[u8], &[u64]); 3] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
     (b"touch", b"touch", &[14, 15, 16]),
-    (b"map", b"map", &[17, 18]),
+    (b"map", b"map", &[17, 18, 19]),
 ];
 
 #[unsafe(no_mangle)]

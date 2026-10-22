@@ -219,6 +219,8 @@ struct Endpoint {
     name: Vec<u8>,
     /// Calls waiting for the server: (caller, message).
     queue: alloc::collections::VecDeque<(usize, Vec<u8>)>,
+    /// The process that last polled this endpoint (recv with poll): a call wakes it if it is asleep, so a server that sleeps between polls answers at once rather than at its next deadline.
+    poller: Option<usize>,
 }
 
 struct Kernel {
@@ -280,7 +282,7 @@ fn endpoint(name: &[u8]) -> usize {
     if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
         return i;
     }
-    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new() });
+    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None });
     kk.endpoints.len() - 1
 }
 
@@ -303,10 +305,18 @@ const SYS_SLEEP: u64 = 9;
 const SYS_SPAWN: u64 = 10;
 /// Change a device preference: x0 the Settings capability's token offset, x1 which preference, x2 its new value. The kernel checks the value, keeps it in the vault through `PREF_STORE`, and rewrites it in every live process's preferences block at once. Returns 0 or ERR.
 const SYS_SET_PREF: u64 = 11;
+/// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
+const SYS_FACTS: u64 = 12;
+pub const FACT_COUNT: usize = 16;
+pub const FACT_UNKNOWN: u64 = u64::MAX;
+/// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
+pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 
-/// The device preferences block in every process's grants page (SETTINGS.md): byte 0 is the number base, tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS); the rest is reserved. Written at spawn and rewritten in every live process when a preference changes, so a process reads the current value from its own memory each time it draws.
+/// The device preferences block in every process's grants page (SETTINGS.md): byte 0 is the number base, tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS); byte 1 names under the map's circles; the rest is reserved. Written at spawn and rewritten in every live process when a preference changes, so a process reads the current value from its own memory each time it draws.
 pub const PREFS: usize = 0xFC0;
 pub const PREF_BASE: usize = 0;
+/// Preference 1: names under the map's circles, 0 off (the default: icons identify) or 1 on.
+pub const PREF_LABELS: usize = 1;
 static mut PREFS_NOW: [u8; 32] = [0; 32];
 
 /// Keeps a changed preference in the vault: (preference, value) -> stored. Registered by whoever owns the vault (service.rs).
@@ -332,6 +342,7 @@ pub fn set_pref(index: usize, value: u8) {
 fn pref_valid(index: usize, value: u8) -> bool {
     match index {
         PREF_BASE => tatau::Base::from_code(value).is_some(),
+        PREF_LABELS => value <= 1,
         _ => false,
     }
 }
@@ -483,6 +494,17 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_FACTS => {
+            let facts = unsafe { FACTS }.map(|f| f()).unwrap_or([FACT_UNKNOWN; FACT_COUNT]);
+            let mut b = [0u8; FACT_COUNT * 8];
+            for (i, v) in facts.iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            let n = (f.x[1] as usize).min(b.len());
+            p.write(f.x[0], &b[..n]);
+            f.x[0] = n as u64;
+            0
+        }
         SYS_SET_PREF => {
             let token = p.read(f.x[0], 32);
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
@@ -566,6 +588,14 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     // A server already waiting on this endpoint takes it now.
                     if let Some(server) = kk.procs.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
                         deliver(server, ep);
+                    } else if let Some(s) = kk.endpoints[ep].poller {
+                        // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
+                        if let Some(q) = kk.procs[s].as_mut() {
+                            if matches!(q.state, State::Sleeping(_)) {
+                                q.state = State::Runnable;
+                                kk.runnable.push_back(s);
+                            }
+                        }
                     }
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
@@ -580,6 +610,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 // x4 bit 0 = poll: with nothing queued, return NOTHING at once instead of blocking — for a server that must also keep polling its hardware (the WiFi driver's rings).
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && f.x[4] & 1 != 0 && kk.endpoints[ep].queue.is_empty() => {
+                    kk.endpoints[ep].poller = Some(cur);
                     f.x[0] = NOTHING;
                     0
                 }

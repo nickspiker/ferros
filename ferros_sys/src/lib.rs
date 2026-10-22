@@ -28,12 +28,20 @@ pub mod nr {
     pub const SLEEP: u64 = 9;
     pub const SPAWN: u64 = 10;
     pub const SET_PREF: u64 = 11;
+    pub const FACTS: u64 = 12;
 }
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
 pub const PREFS: u64 = 0xFC0;
 /// Preference 0: the number base, tatau's code.
 pub const PREF_BASE: u64 = 0;
+/// Preference 1: names under the map's circles (0 off, 1 on).
+pub const PREF_LABELS: u64 = 1;
+
+/// A preference byte as this process's copy holds it now.
+pub fn pref(index: u64) -> u8 {
+    unsafe { core::ptr::read_volatile((arc_base() + PREFS + index.min(31)) as *const u8) }
+}
 
 /// The device's number base right now (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS). Read it at draw time, not once: the person can change it while the app runs.
 pub fn device_base() -> u8 {
@@ -48,6 +56,53 @@ pub fn numbers(style: tatau::Style) -> tatau::Fmt {
 /// Change a device preference, given the Settings capability: the kernel keeps it in the vault and every app sees it on its next frame. Returns 0, or ERR (no capability, or a value the preference does not take).
 pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
     svc(nr::SET_PREF, cap, index, value as u64, 0, 0)
+}
+
+/// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
+pub struct Facts(pub [u64; 16]);
+impl Facts {
+    fn get(&self, i: usize) -> Option<u64> {
+        Some(self.0[i]).filter(|&v| v != u64::MAX)
+    }
+    /// From the press at "Ready?" to the shell starting, microseconds.
+    pub fn boot_us(&self) -> Option<u64> {
+        self.get(0)
+    }
+    /// The battery's state of charge, per cent.
+    pub fn battery_pct(&self) -> Option<u64> {
+        self.get(1)
+    }
+    /// The battery's temperature, hundredths of a degree C.
+    pub fn battery_temp_cc(&self) -> Option<i64> {
+        self.get(2).map(|v| v as i64)
+    }
+    /// The cell voltage, microvolts.
+    pub fn cell_uv(&self) -> Option<u64> {
+        self.get(3)
+    }
+    /// The battery current, microamps, positive = charging.
+    pub fn battery_ua(&self) -> Option<i64> {
+        self.get(4).map(|v| v as i64)
+    }
+    /// Whether a host has the USB link.
+    pub fn usb_link(&self) -> Option<bool> {
+        self.get(5).map(|v| v != 0)
+    }
+    /// Processes alive.
+    pub fn processes(&self) -> Option<u64> {
+        self.get(6)
+    }
+    /// Keys in the vault.
+    pub fn vault_keys(&self) -> Option<u64> {
+        self.get(7)
+    }
+}
+
+/// Read the facts now.
+pub fn facts() -> Facts {
+    let mut b = [0u8; 128];
+    svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
+    Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }
 
 /// The raw trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer named by the arguments, so nothing is assumed cached across it.

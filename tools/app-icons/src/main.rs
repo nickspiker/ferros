@@ -23,11 +23,13 @@ const SIZE: usize = 128;
 const CODE: &str = "/mnt/Harbor/Code";
 
 /// The map's apps, in its order, and where each keeps its icon.
-const APPS: [(&str, &str); 4] = [
+const APPS: [(&str, &str); 5] = [
     ("Photon", "photon/assets/icon-128.png"),
     ("Mahere", "mahere/installers/icon-256.png"),
     ("Lumis", "lumis/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp"),
     ("Opsin", "opsin/assets/opsin_orb.vsf"),
+    // The device's own circle (SHELL.md): ferros's logo, the phase-diagram slices of iron.
+    ("ferros", "ferros/logo.svg"),
 ];
 
 /// An image in linear VSF RGB with premultiplied alpha: [r, g, b, a] per pixel.
@@ -43,7 +45,16 @@ fn fail(msg: String) -> ! {
 }
 
 fn load(path: &Path) -> Linear {
-    let bytes = fs::read(path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+    // SVG is drawn to a PNG by rsvg-convert first (it carries no profile, so it is sRGB like any other app asset), large enough that the area average does the scaling.
+    let bytes = if path.extension().is_some_and(|e| e == "svg") {
+        let out = process::Command::new("rsvg-convert").args(["-w", "1024", "-h", "1024"]).arg(path).output().unwrap_or_else(|e| fail(format!("rsvg-convert: {e}")));
+        if !out.status.success() {
+            fail(format!("{}: rsvg-convert failed", path.display()));
+        }
+        out.stdout
+    } else {
+        fs::read(path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())))
+    };
     if path.extension().is_some_and(|e| e == "vsf") {
         let icon = fluor::host::icon::Icon::from_vsf_bytes(&bytes).unwrap_or_else(|e| fail(format!("{}: not a VSF image ({e:?})", path.display())));
         // fluor packs a pixel as alpha over darkness, the RGB bytes being 255 minus the code, so one XOR gives back the VSF RGB gamma 2 codes; squaring a code gives its light.

@@ -19,7 +19,16 @@ Every number a person reads is drawn in one of four bases (`Code/tatau`): arabic
 
 - **Kept** in the device vault as `device.base`, one byte: tatau's code, 10 arabic, 12 DMS, 16 hex, G#8C DLS. Absent means DMS, the house base.
 - **Loaded** by the kernel right after the vault opens, into tatau's process-wide base, so everything drawn from then on reads in it (`ferros_kernel/src/main.rs`).
-- **Set** by the person on the device (the settings screen, to come; for now `bridge store put device.base @<one-byte file>`), or by an attesting identity's preference.
+- **Set** by the person on the device — the back of the device's own circle on the map (SHELL.md), where each base is a row showing two seconds and a mebibyte written in it, and a tap chooses — or `bridge store put device.base @<one-byte file>`, or by an attesting identity's preference.
 - **Drawn** as glyphs only where the font is ours (fluor with the Oxanium `+glyphs` face: the shell and the apps) and as words everywhere else. Terminals, bash and anything else without font control are not a supported surface for glyphs.
+
+## Names under circles (`device.labels`)
+
+Whether the map writes a circle's name under it: one byte, 0 off (the default: icons identify) or 1 on, preference 1 in every process's block. Set from the same back of the device's circle, kept and applied exactly as the base is.
+
+## How a process sees and changes them
+
+- Every process reads the current values from its own grants page (`ferros_sys::device_base`, `ferros_sys::pref`): the kernel rewrites that block in every live process the moment a value changes.
+- Changing one takes the Settings capability (`ferros_sys::set_pref`): init holds it and passes it to the map, whose device circle is where settings live.
 
 Developer output keeps its own convention (`G#` hexadecimal, `A#` decimal, CLAUDE.md): it is read by developers in terminals and logs, not by the person holding the device.

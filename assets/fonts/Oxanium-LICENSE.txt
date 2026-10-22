@@ -1,4 +1,5 @@
 Oxanium-ExtraLight.ttf — rasterised at build time (ferros_kernel/build.rs) for the "Ready?" gate screen. Copied from photon (assets/Oxanium).
+Oxanium-Regular+glyphs.ttf — the display server's face (payloads/display): Oxanium Regular with tatau's twelve dozenal digit glyphs at G#10–G#1B (copied from inksurf/assets/font), plus ↑ (U+2191) and ↓ (U+2193) drawn for ferros on 2026-10-22 in the face's own stem weight (84 units), for DLS's sign arrows.
 
 Copyright 2019 The Oxanium Project Authors (https://github.com/sevmeyer/oxanium)
 

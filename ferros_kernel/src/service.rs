@@ -189,6 +189,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.base" && len == 1 && tatau::Base::from_code(params[2 + klen]).is_some() {
                         crate::process::set_pref(crate::process::PREF_BASE, params[2 + klen]);
                     }
+                    if key == "device.labels" && len == 1 && params[2 + klen] <= 1 {
+                        crate::process::set_pref(crate::process::PREF_LABELS, params[2 + klen]);
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -292,6 +295,7 @@ static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 fn store_pref(index: usize, value: u8) -> bool {
     let key = match index {
         crate::process::PREF_BASE => "device.base",
+        crate::process::PREF_LABELS => "device.labels",
         _ => return false,
     };
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, alloc::vec![value]).is_ok()).unwrap_or(false) }
@@ -318,6 +322,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 
 /// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
 fn start_home(store: &mut Option<ShimStore>) {
+    crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
     let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten()) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return;
@@ -337,6 +342,40 @@ fn start_home(store: &mut Option<ShimStore>) {
     crate::checklist::at("home: init ran");
 }
 
+/// The USB link as of the service loop's last pass, for the facts.
+static USB_LINK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The last battery sample and when it was taken: the gauge is read at most every two seconds, however often a dashboard asks.
+static mut GAUGE: ([u64; 4], u64) = ([crate::process::FACT_UNKNOWN; 4], 0);
+
+/// SYS_FACTS (process.rs): 0 press to home µs; 1 battery %; 2 battery temperature, hundredths of a degree C (i64); 3 cell voltage µV; 4 battery current µA, positive = charging (i64); 5 USB link up (0/1); 6 processes alive; 7 keys in the vault; the rest unknown.
+fn facts() -> [u64; crate::process::FACT_COUNT] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut v = [crate::process::FACT_UNKNOWN; crate::process::FACT_COUNT];
+    let f = cntfrq();
+    let (press, home) = (crate::checklist::PRESS.load(Relaxed), crate::checklist::HOME.load(Relaxed));
+    if press != 0 && home > press {
+        v[0] = (home - press) * 1_000_000 / f;
+    }
+    let now = cntpct();
+    unsafe {
+        let g = &mut *(&raw mut GAUGE);
+        if g.1 == 0 || now.wrapping_sub(g.1) > 2 * f {
+            g.1 = now;
+            g.0 = match crate::hsi2c::gauge::sample() {
+                Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
+                Err(_) => [crate::process::FACT_UNKNOWN; 4],
+            };
+        }
+        v[1..5].copy_from_slice(&g.0);
+    }
+    v[5] = USB_LINK.load(Relaxed) as u64;
+    v[6] = crate::process::alive() as u64;
+    if let Some(keys) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).and_then(|s| s.keys().ok()) {
+        v[7] = keys.len() as u64;
+    }
+    v
+}
+
 pub fn run(mut b: Boot) -> ! {
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
     report(&b, 0xA0);
@@ -346,6 +385,7 @@ pub fn run(mut b: Boot) -> ! {
         SPAWN_STORE = &raw mut store;
         crate::process::CAPSULES = Some(read_capsule);
         crate::process::PREF_STORE = Some(store_pref);
+        crate::process::FACTS = Some(facts);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
@@ -438,6 +478,7 @@ pub fn run(mut b: Boot) -> ! {
         platform::pet_watchdogs();
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
+        USB_LINK.store(usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
         if pt_done {
             pt_done = false;
             pt_inbound = None;
