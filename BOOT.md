@@ -452,3 +452,19 @@ SECURITY_CHAIN.md: Trust model, key management, signature verification
 ```
 
 ---
+
+## Boot time: press to ready (2026-10-22)
+
+Only the time from the press at "Ready?" to ready is ferros's; everything before it (ABL, its unlocked-bootloader warning, the gate's wait) is vendor time or the human's. `bridge diag boot` prints the counter at kernel entry and every checklist item and named stamp (`checklist::at`) since then.
+
+**0.66 s** on a cold slot-b boot, down from 1.28 s:
+- The panel is adopted once per boot (`display::adopt_once`). The checklist used to adopt it again after the gate had, about 430 ms.
+- The eUSB PHY's delays run on the generic timer. A spin count calibrated for a faster core turned the 3.56 ms the PHY asks for into 230 ms.
+
+Where the 0.66 s goes: repeater tune + checklist draw 38 ms, UFS link 96 ms, vault + ira 38 ms, slot marking 117 ms, USB PHY + controller 4 ms, the host enumerating us 346 ms.
+
+**Held in reserve, for when a bring-up needs the room:**
+1. **Start USB right after the press** (PHY, controller, run), and do the disk, vault and slot while the host enumerates. The two overlap instead of adding up, about 0.4 s. The cost is that EP0 setup requests arrive during disk work, so the boot path has to service USB events between steps.
+2. **Mark the slot after ready** (117 ms). It is bookkeeping for the next boot, not something this one needs.
+
+Before the press (not counted, but it is how soon "Ready?" shows): the cache map 158 ms and adopting the panel 388 ms. Both are worth a look if the wait for "Ready?" ever matters.
