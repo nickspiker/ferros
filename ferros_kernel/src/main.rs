@@ -1731,6 +1731,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };
 
+    // The device's number base (SETTINGS.md): the person's own choice for this device, kept in the vault as one byte (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS) and loaded here so everything drawn from now on reads in it. An identity's preference replaces it when that identity attests; nothing here ever writes it back to an identity.
+    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.base").ok().flatten()) {
+        if let Some(b) = v.first().and_then(|&c| tatau::Base::from_code(c)) {
+            tatau::set_base(b);
+        }
+    }
+
     // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
     let init_exit = 0u32;
 

@@ -11,6 +11,8 @@ pixel8 = []
 m1 = ["dep:ferros_hal_m1"]
 
 [dependencies]
+# Every number a person reads, in the base they chose (Code/tatau): the device base is loaded from the vault at boot (SETTINGS.md).
+tatau = { path = "../../tatau" }
 ferros_dsc = { path = "../ferros_dsc" }
 ferros_dsi = { path = "../ferros_dsi" }
 ferros_sandbox = { path = "../ferros_sandbox" }
