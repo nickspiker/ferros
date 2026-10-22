@@ -189,6 +189,23 @@ pub static ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 pub static PRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static AT: [core::sync::atomic::AtomicU64; 18] = [const { core::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// Named boot stamps between the checklist items (`at`), for finding where the time goes: up to 32, in order.
+static NAMED: [core::sync::atomic::AtomicU64; 32] = [const { core::sync::atomic::AtomicU64::new(0) }; 32];
+static NAMES: [core::sync::atomic::AtomicPtr<u8>; 32] = [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; 32];
+static NAME_LEN: [core::sync::atomic::AtomicUsize; 32] = [const { core::sync::atomic::AtomicUsize::new(0) }; 32];
+static NAMED_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Stamp the counter under `name` (first boot only matters; later calls past 32 are dropped).
+pub fn at(name: &'static str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = NAMED_N.fetch_add(1, Relaxed);
+    if i < 32 {
+        NAMED[i].store(crate::platform::cntpct(), Relaxed);
+        NAMES[i].store(name.as_ptr() as *mut u8, Relaxed);
+        NAME_LEN[i].store(name.len(), Relaxed);
+    }
+}
+
 fn stamp(item: Item) {
     let _ = AT[item as usize].compare_exchange(0, crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
 }
@@ -204,7 +221,7 @@ pub fn boot_times() -> alloc::string::String {
     if p != 0 {
         s.push_str(&alloc::format!("  gate answered      +A#{} us\n", us(p.saturating_sub(e))));
     }
-    let mut v: alloc::vec::Vec<(u64, &str)> = alloc::vec::Vec::new();
+    let mut v: alloc::vec::Vec<(u64, &'static str)> = alloc::vec::Vec::new();
     for (_, items) in GROUPS.iter() {
         for &(item, label) in items.iter() {
             let t = AT[item as usize].load(Relaxed);
@@ -212,6 +229,11 @@ pub fn boot_times() -> alloc::string::String {
                 v.push((t, label));
             }
         }
+    }
+    let n = NAMED_N.load(Relaxed).min(32);
+    for i in 0..n {
+        let name = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(NAMES[i].load(Relaxed), NAME_LEN[i].load(Relaxed))) };
+        v.push((NAMED[i].load(Relaxed), name));
     }
     v.sort_by_key(|x| x.0);
     for (t, label) in v {

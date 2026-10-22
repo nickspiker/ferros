@@ -296,14 +296,17 @@ pub fn run(mut b: Boot) -> ! {
 
     let dma = open_usb_dma_path();
     platform::crumb(0xA1);
+    crate::checklist::at("usb: dma path open");
     crate::pixel8_eusb_phy_init();
     platform::crumb(0xA2);
+    crate::checklist::at("usb: phy up");
     ferros_hal::usb::set_dwc3_base(DWC3);
     let mut usb = match ferros_hal::usb::Dwc3Dev::init() {
         Some(u) => u,
         None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),
     };
     platform::crumb(0xA3);
+    crate::checklist::at("usb: controller up");
 
     let freq = cntfrq();
     // Enumeration watchdog (cold-boot values): 2 s of total silence = dead attempt; 4 s since init without SET_CONFIGURATION = wedged EP0. Either re-inits PHY + DWC3, which the host sees as a fresh attach.
@@ -490,6 +493,7 @@ pub fn run(mut b: Boot) -> ! {
                     crate::checklist::mark(crate::checklist::Item::Usb);
                     t_command = cntpct();
                     platform::crumb(0xA4);
+                    crate::checklist::at("usb: configured by host");
                 }
             }
             UsbEvent::TransferComplete { ep } => {

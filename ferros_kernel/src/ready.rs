@@ -92,15 +92,20 @@ pub fn wait() -> (u64, Choice) {
     unsafe { core::ptr::write_volatile(DWC3_DCTL as *mut u32, core::ptr::read_volatile(DWC3_DCTL as *const u32) & !(1 << 31)) };
     let freq = crate::platform::cntfrq();
     let mut rep = alloc::vec::Vec::new();
+    crate::checklist::at("gate: adopting panel");
     if let Some(panel) = crate::display::adopt(freq, &mut rep) {
+        crate::checklist::at("gate: panel adopted");
         draw(&panel);
+        crate::checklist::at("gate: Ready? drawn");
         panel.present(&mut rep);
+        crate::checklist::at("gate: Ready? on screen");
     }
     crate::killswitch::arm_power_key();
     crate::killswitch::enable_ppi(26);
     let t0 = crate::platform::cntpct();
     // The wairua's KOHI while the human decides (it is lazy everywhere else).
     let _ = crate::wairua::draw();
+    crate::checklist::at("gate: KOHI done");
     // Dev: a volume key cancels the one-second auto-press for good (the keys' edge interrupts wake the WFI below, so a tap is seen at once).
     let mut held = false;
     let mut choice = Choice::Ferros;

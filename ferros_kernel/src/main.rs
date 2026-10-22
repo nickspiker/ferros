@@ -1584,6 +1584,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Boot timing starts here: everything after this is ferros's own time (`diag boot`).
     checklist::ENTRY.store(platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
     let cached = cachemap::enable();
+    checklist::at("cache map on");
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
@@ -1595,6 +1596,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let prev = platform::read_report();
     platform::arm_safety();
     platform::crumb(0xC0);
+    checklist::at("safety armed");
 
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
     // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
@@ -1638,9 +1640,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
 
     platform::crumb(0xC1);
+    checklist::at("repeater read + tuned");
 
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+    checklist::at("checklist drawn");
     if cached {
         checklist::mark(checklist::Item::CacheMap);
     }
@@ -1772,6 +1776,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (b"INIT=".as_slice(), init_exit),
     ];
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
+    checklist::at("service start");
     service::run(service::Boot {
         kind: service::BootKind::Cold,
         link_base: own_base,
