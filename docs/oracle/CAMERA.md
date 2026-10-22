@@ -229,3 +229,39 @@ The configuration is legible enough to say it is right. Link 1's channels: CH0 R
 - **PDMA list 1 as one-time setup.** It writes the same 1447 registers as list 2, none unique to either; 51 values differ, 42 of them in G#1C35 — buffer addresses and per-frame 3A tables. Its resets are most likely a buffer address escaping the builder's remap, not a clue.
 
 **What that leaves.** Every CPU write Linux makes to the link and the core, ferros makes, in order; the pre-capture state matches; the PDMA's lists hold no extra setup. So the link-to-core connection is set by a write we have never seen. The census only logs pages in its target list, which covered the ISP front end — a write to a page outside it would be invisible, and a camera open has already been seen reaching into the TPU domain, outside that list. **Next: a wider census**, arming the whole ISP span (G#1C00_0000 to G#1D8F_FFFF) and the system controllers around it for one camera open, to find any CPU-written page that nothing ferros does touches.
+
+## The wide census, and a live snapshot that found the clock (2026-10-21, afternoon)
+
+**The wide census closes the "unseen page" lead.** `FERROS_HV_ORACLE_CENSUS=1` now logs each page's first read and first write separately and hands a page back to the guest after its first write, so the census can span thousands of pages without trapping a streaming camera. The bitmap is sized from the target list (it was fixed at 2048 pages). Armed over the whole ISP span G#1C00_0000-G#1D8F_FFFF plus CMU_TOP (G#2604_0000-G#2604_FFFF), plus every EL3 call (`FERROS_HV_ORACLE_SMC=1`), through boot and one marked camera open, it found 182 pages (`target/hv/isp-wide-census-raw.log`). Inside the front end, the only pages missing from the 42-page capture are its SYSMMUs and S2MPUs. Every other ISP block (G#1C40 to G#1D8F) gets its CMU control word, sysreg, S2MPU and SYSMMU set at boot, and during the open a handful of enables, none of them upstream of the front end. The open makes **no EL3 calls at all**. So no CPU write was being missed.
+
+**The hv can now snapshot Linux's live registers.** `FERROS_HV_SNAPSHOT=1` with `FERROS_HV_SNAP_LIST=<file>` reads a list of registers when the camera stack advances the PDMA's descriptor index to G#100, sixteen frames into a stream, and logs every value. The list comes from `tools/camera-snap-list.py`: 2914 registers known to exist, drawn from these sources:
+- every CMU_TOP and CMU_ISPFE register in cmucal-sfr.c;
+- every address in the front-end capture;
+- every register the PDMA program writes, minus the G#1C36 block-load region;
+- every LWIS event status and mask register;
+- CSI links 0 and 1.
+
+The same script turns the log into `ferros_kernel/src/camera_snap.rs`. `diag cam pdma` reads the same list three frames into its own stream (`snap_compare`) and reports every word that differs.
+
+Capture:
+```
+tools/camera-snap-list.py > target/hv/snap-list.txt
+FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_NO_PMU_READ=1 FERROS_HV_SNAPSHOT=1 FERROS_HV_SNAP_LIST=$PWD/target/hv/snap-list.txt \
+FERROS_HV_ORACLE_PAGES=G#1C39_0000 FERROS_HV_ORACLE_CAP=256 FERROS_HV_ORACLE_ARM_AFTER_MS=60000 HV_CMDLINE=loglevel=4 tools/husky-hv.sh --no-ferros --flash
+# past 62 s: mark, open the camera 10 s, close, mark, sysrq c; then pull "ferros hv|ferros-mark" from console-ramoops-0
+tools/camera-snap-list.py --rust target/hv/cam-snapshot-linux.log
+```
+
+**The front end's clock was a quarter of Linux's.** CMU_TOP's `MUX_CLKCMU_ISPFE_NOC` / `DIV_CLKCMU_ISPFE_NOC` (G#2604_10BC / G#2604_18B4) read 4 / 0 under Linux: PLL_SHARED1_D4 undivided, 465 MHz (SHARED1 = 24.576 MHz × 227 / 3). A cold ferros has 1 / 5: PLL_SHARED3_D1 ÷ 6, 111 MHz (SHARED3 = × 108 / 4). That clock feeds the front end's bus, the CSI links' ACLK and the D-PHY clock. Linux never writes it from the CPU: the camera's DVFS request goes to the ACPM firmware, which sets it, so no register capture could have shown it. `fe_up` now sets it, mux first so the clock only slows on the way.
+
+With it, the link behaves as under Linux:
+- ERR_DESKEW_OVER (`+G#14` = G#100) is gone, along with LINE_END in `+G#1C` and the `+G#634` / `+G#66C` words;
+- `+G#668` reads G#11, Linux's value, where it read G#7010011.
+
+The rest of CMU_TOP differs only in other domains' clocks (AUR, BW, DPU, G3D, MFC, MIF_NOCP, NOCL0) and in the CIS_CLK Q-channel requests ferros leaves at 2.
+
+**The core still reports nothing.** What the snapshot still shows in the front end looks like the core never seeing a frame start, not like a missing setting:
+- G#1C32_0508 / 2108, G#1C33_700C and G#1C34_0004 hold the program's G#8F where Linux reads G#10;
+- G#1C32_041C / 201C and G#1C33_7020 / B020 hold the program's 1 where Linux reads 0.
+
+Those are requests the hardware consumes when a frame arrives, and ours are still pending. The remaining differences are buffer addresses, counters and per-frame 3A values. CMU_ISPFE's Q-channel status words (G#1C00_7xxx: PPMU and SYSMMU channels) differ because ferros forces those clocks on.

@@ -1300,6 +1300,25 @@ pub fn fe_powered() -> bool {
     rd(PD_ISPFE_STATUS as usize) & 1 == 1
 }
 
+/// CMU_TOP's ISPFE_NOC clock, the source of the front end's bus, the CSI links' ACLK and the D-PHY clock (cmucal-node.c), set as Linux streams it: PLL_SHARED1_D4 undivided, 465 MHz.
+/// Cold boot leaves it at PLL_SHARED3_D1 divided by six, 111 MHz. Linux's camera open never writes these registers from the CPU — its DVFS asks the ACPM firmware, which does — so no register capture could show it; the hv's live snapshot of a Linux stream against a cold ferros run did (2026-10-21), with the link counting frames and the core silent at a quarter of the clock.
+/// The mux moves first, so the clock only ever slows on the way (SHARED1_D4 ÷ 6, 77 MHz) instead of passing through SHARED3_D1 undivided; each step waits for its busy bit (16).
+fn ispfe_noc_clock(rep: &mut Vec<u8>) {
+    const MUX: usize = CMU_TOP + 0x10BC;
+    const DIV: usize = CMU_TOP + 0x18B4;
+    let (m0, d0) = (rd(MUX), rd(DIV));
+    let settle = |a: usize| {
+        let t = crate::platform::cntpct() + crate::platform::cntfrq() / 1000;
+        while rd(a) >> 16 & 1 == 1 && crate::platform::cntpct() < t {}
+        rd(a) >> 16 & 1 == 0
+    };
+    wr(MUX, (m0 & !7) | 4);
+    let mok = settle(MUX);
+    wr(DIV, d0 & !0xF);
+    let dok = settle(DIV);
+    line(rep, alloc::format!("CMU_TOP ISPFE_NOC: mux G#{m0:X} -> G#{:X} ({}), divider G#{d0:X} -> G#{:X} ({}): PLL_SHARED1_D4 undivided, as Linux streams\n", rd(MUX), if mok { "settled" } else { "BUSY" }, rd(DIV), if dok { "settled" } else { "BUSY" }));
+}
+
 /// Power the ISP front end and restore its clocks the way a camera open does (oracle capture 2026-10-19): CMU_ISPFE dividers and bus-clock mux, its control word, every Q-channel requesting its clock, and SYSREG_ISPFE's two words. Reads CSI link 1's version only once the domain reports on: a read into a powered-down block can hang the core.
 pub fn fe_up(rep: &mut Vec<u8>) {
     let before = rd(PD_ISPFE_STATUS as usize);
@@ -1318,6 +1337,7 @@ pub fn fe_up(rep: &mut Vec<u8>) {
     }
     let r = pd_prepare(PD_ISPFE_NEED_SMC);
     line(rep, alloc::format!("prepare call returned G#{r:X}\n"));
+    ispfe_noc_clock(rep);
     wr(CMU_ISPFE + 0x1800, 3);
     wr(CMU_ISPFE + 0x1804, 1);
     wr(CMU_ISPFE + 0x0600, 0x10);
@@ -1822,6 +1842,34 @@ fn live_compare(rep: &mut Vec<u8>) {
         }
     }
     line(rep, alloc::format!("live state against Linux: A#{same} agree, A#{diff} configuration words differ, A#{idle} status words sit where Linux's move\n"));
+}
+
+/// Read every register of Linux's live snapshot (camera_snap.rs: 2914 registers the hv read sixteen frames into a Linux stream, all known to exist) and report each one ferros holds differently, then a per-page tally. The question it answers: with the link counting frames and the core silent, which configuration word does Linux's streaming front end hold that ours does not.
+/// The flash log names each 4 KiB page before its first read: a read that stalls the bus then leaves its page as the log's last line.
+fn snap_compare(rep: &mut Vec<u8>) {
+    let (mut page, mut same, mut diff) = (0u32, 0u32, 0u32);
+    let mut tally = alloc::string::String::new();
+    let mut out = alloc::string::String::new();
+    for &(a, linux) in crate::camera_snap::LINUX_SNAP.iter() {
+        if a & !0xFFF != page {
+            if page != 0 {
+                tally.push_str(&alloc::format!("  G#{page:X}: A#{same} agree, A#{diff} differ\n"));
+            }
+            page = a & !0xFFF;
+            (same, diff) = (0, 0);
+            crate::flashlog::line(&alloc::format!("cam snap: page G#{page:X}"));
+            crate::platform::pet_watchdogs();
+        }
+        let got = rd(a as usize);
+        if got == linux {
+            same += 1;
+        } else {
+            diff += 1;
+            out.push_str(&alloc::format!("  G#{a:X}: Linux G#{linux:X}, ferros G#{got:X}\n"));
+        }
+    }
+    tally.push_str(&alloc::format!("  G#{page:X}: A#{same} agree, A#{diff} differ\n"));
+    line(rep, alloc::format!("live snapshot against Linux, every word that differs:\n{out}per page:\n{tally}"));
 }
 
 /// Read every interrupt source in the ISP pipeline and report the ones that are not zero, with their set bits named (camera_events.rs, generated from the Pixel kernel's LWIS event tables by tools/gen-isp-events.py).
@@ -2337,6 +2385,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         if f == 3 {
             line(rep, alloc::format!("every reporting interrupt source, three frames in:\n"));
             events_dump(rep, false);
+            snap_compare(rep);
             // `live_compare` is not called here. It stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump above reads without trouble moments earlier in the same run — so front-end reads mid-stream are timing-dependent rather than simply safe or unsafe (2026-10-21). Its useful result was already in the event dump: see docs/oracle/CAMERA.md.
         }
         let mut b = [0u8; 2];

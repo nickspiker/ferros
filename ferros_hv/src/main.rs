@@ -365,6 +365,28 @@ unsafe fn stage2_remap(ipa: u64) {
     asm!("dsb ishst", "tlbi vmalls12e1is", "dsb ish", "isb");
 }
 
+include!(concat!(env!("OUT_DIR"), "/snap_list.rs"));
+static mut SNAPS: u32 = 0;
+
+/// Live-state snapshot (FERROS_HV_SNAPSHOT): when the camera stack advances the PDMA's descriptor index to G#100 (sixteen frames into a stream), read every register in SNAP_LIST and log it, `SN addr value`, zeros included so a missing line means a lost line. The list holds only registers known to exist (tools/camera-snap-list.py), since a read into a hole can stall the bus. First trigger only.
+unsafe fn snapshot() {
+    if read_volatile(&raw const SNAPS) != 0 {
+        return;
+    }
+    write_volatile(&raw mut SNAPS, 1);
+    let mut hn = [0u8; 16];
+    pstore::log(&[b"\nferros hv: snapshot begin, ", pstore::hex(SNAP_LIST.len() as u64, &mut hn), b" registers\n"]);
+    let mut i = 0;
+    while i < SNAP_LIST.len() {
+        let a = SNAP_LIST[i] as u64;
+        let v = read_volatile(a as *const u32) as u64;
+        let (mut ha, mut hv) = ([0u8; 16], [0u8; 16]);
+        pstore::log(&[b"\nferros hv: SN ", pstore::hex(a, &mut ha), b" ", pstore::hex(v, &mut hv), b"\n"]);
+        i += 1;
+    }
+    pstore::log(&[b"\nferros hv: snapshot end\n"]);
+}
+
 /// The ISP front end's PDMA is a command engine: the camera stack writes a list of register settings into memory and the PDMA applies them, buffer addresses included, so those settings never appear as CPU writes the oracle can trap. When the oracle sees the CPU start the PDMA (`FERROS_HV_PDMA_DUMP=1`), the hv reads the command list itself: base IOVA (PDMA G#04) and count (G#0C) from the PDMA's registers, translated through whichever ISP front-end SYSMMU context maps it (samsung-iommu: per-context CTRL G#8000 bit 0, page-table base G#800C as PA >> 12, stride G#1000; first level 4096 × 1 MiB, section type 2 or second-level pointer type 1, second level 256 × 4 KiB, large page type 1 or small type 2, physical addresses stored >> 4), dumped as hex lines. First two starts only.
 const PDMA: usize = 0x1C39_0000;
 // Only s0: reading s1's per-context registers hung the core during a camera open (2026-10-19), most likely an idle port with its clock gated; Linux reads a SYSMMU only while its master runs.
@@ -583,8 +605,8 @@ static mut ORACLE_LOGGED: u64 = 0;
 /// The last logged access (pa, value, write<<8 | bytes) and how many identical ones followed it unlogged: a driver's status poll is the same read returning the same value thousands of times, and logging each one ate the whole cap on the camera bus (2026-10-19). A run is written as one `rep N` line when it ends; the decoder replays it.
 static mut ORACLE_PREV: [u64; 3] = [u64::MAX; 3];
 static mut ORACLE_REP: u64 = 0;
-/// Census mode: one bit per oracle target page, set at its first logged access.
-static mut ORACLE_SEEN: [u64; 32] = [0; 32];
+/// Census mode: two bits per oracle target page (first read, first write), each set when that access is logged.
+static mut ORACLE_SEEN: [u64; (2 * ORACLE_TARGETS.len()).div_ceil(64)] = [0; (2 * ORACLE_TARGETS.len()).div_ceil(64)];
 
 fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
     unsafe {
@@ -610,7 +632,7 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
             }
         }
         if ORACLE_CENSUS {
-            // First access per page only: binary search the sorted target list, one bit per target.
+            // First read and first write per page only: binary search the sorted target list, two bits per target. Once a page's first write is logged the page goes back to the guest, so a census can span thousands of pages (the whole ISP, 2026-10-21) without trapping every access a streaming camera makes; a page only ever read stays trapped.
             let page = pa & !0xFFF;
             let (mut lo, mut hi) = (0usize, ORACLE_TARGETS.len());
             while lo < hi {
@@ -619,11 +641,15 @@ fn oracle_log(pa: u64, write: bool, bytes: u8, val: u64) {
             }
             if lo < ORACLE_TARGETS.len() && ORACLE_TARGETS[lo] == page {
                 let seen = &raw mut ORACLE_SEEN;
-                let (w, b) = (lo / 64, lo % 64);
+                let i = lo * 2 + write as usize;
+                let (w, b) = (i / 64, i % 64);
                 if (*seen)[w] & (1 << b) != 0 {
                     return;
                 }
                 (*seen)[w] |= 1 << b;
+                if write {
+                    stage2_remap(pa);
+                }
             }
         }
         let meta = ((write as u64) << 8) | bytes as u64;
@@ -1146,6 +1172,9 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 // Only once the oracle is armed: the camera service starts the PDMA during boot too, and a dump that hangs there boot-loops the phone (2026-10-19).
                 // Dumped at start (bit 0 set) and again at stop (0): the walk works since 2026-10-20 but the buffer reads all zeros at start, so it may be the PDMA's output rather than its input; the stop dump shows what the engine left there.
                 // And mid-stream: the descriptor index (PDMA + G#10, +G#10 per frame) reaching G#100, while the lists are certainly still mapped (at stop the HAL had sometimes already unmapped them, 2026-10-20).
+                if cfg!(hv_snapshot) && wnr == 1 && pa == PDMA as u64 + 0x10 && logval == 0x100 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                    unsafe { snapshot() };
+                }
                 if cfg!(hv_pdma_dump) && wnr == 1 && ((pa == PDMA as u64 && (logval & 1 == 1 || logval == 0)) || (pa == PDMA as u64 + 0x10 && logval == 0x100)) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { pdma_dump() };
                 }
