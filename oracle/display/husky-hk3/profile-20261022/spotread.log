@@ -2962,3 +2962,2325 @@ Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spec
 Peak value 6.023901 at (aprox.) 460.0 nm
 
  Result is XYZ: 130.530927 137.314180 153.167302, Yxy: 137.314180 0.310041 0.326152
+=== check t=12
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=512 #1 t=14
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=512 #2 t=24
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=513 #1 t=36
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=513 #2 t=46
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=514 #1 t=58
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=514 #2 t=68
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=515 #1 t=81
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=515 #2 t=91
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=516 #1 t=103
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=516 #2 t=113
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=517 #1 t=125
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=517 #2 t=135
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=518 #1 t=148
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=518 #2 t=158
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=519 #1 t=170
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=519 #2 t=180
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=520 #1 t=192
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== ten-control g10=520 #2 t=202
+
+Spot read needs a calibration before continuing
+
+Place cap on the instrument, or place on a dark surface,
+or place on the calibration reference,
+ and then hit any key to continue,
+ or hit Esc or Q to abort: Calibration failed with 'Measurement misread' (Sensor is saturated)
+
+Spot read got abort or error from calibration
+=== check t=9
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00122986, 0.000994142, 0.000967756, 0.0012095, 0.00410574, 0.0196041, 0.375649, 3.12776, 5.9391, 3.10698, 1.07423, 0.544795, 0.527599, 1.34095, 3.06316, 3.87635, 3.01901, 1.92583, 1.26462, 0.805683, 0.484184, 0.428825, 1.10428, 2.84383, 3.86346, 2.95344, 1.65425, 0.900655, 0.59109, 0.433916, 0.296262, 0.171854, 0.0912854, 0.0509323, 0.0314795, 0.0251664
+Peak value 5.939103 at (aprox.) 460.0 nm
+
+ Result is XYZ: 128.619302 135.071046 151.208286, Yxy: 135.071046 0.310002 0.325552
+=== ten-control g10=512 #1 t=10
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-1.1909e-05, 0.000524265, 0.000892139, 0.00153393, 0.00509916, 0.0257146, 0.492543, 4.0969, 7.76921, 4.0605, 1.39643, 0.673641, 0.522074, 1.12167, 2.50302, 3.1556, 2.45598, 1.56714, 1.02795, 0.649381, 0.36921, 0.204631, 0.14496, 0.163166, 0.177061, 0.132327, 0.0781246, 0.0454621, 0.03302, 0.028937, 0.0228747, 0.0154783, 0.0102999, 0.00972767, 0.00959408, 0.013709
+Peak value 7.769206 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.300139 87.962535 195.007056, Yxy: 87.962535 0.180439 0.254765
+=== ten-control g10=512 #2 t=16
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00132619, 0.0012722, 0.000772763, 0.00112004, 0.0046424, 0.0258766, 0.49267, 4.09395, 7.76559, 4.05763, 1.39568, 0.673602, 0.521733, 1.12006, 2.49987, 3.15215, 2.45276, 1.5654, 1.02751, 0.649646, 0.368691, 0.204607, 0.144854, 0.163437, 0.177338, 0.132404, 0.0783186, 0.0462715, 0.0320619, 0.027251, 0.0211767, 0.0145113, 0.00868542, 0.00766554, 0.00934058, 0.0108873
+Peak value 7.765587 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.263309 87.879640 194.895349, Yxy: 87.879640 0.180453 0.254695
+=== ten-control g10=513 #1 t=25
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00155468, 0.000491754, 0.000957772, 0.000903601, 0.0048245, 0.0260686, 0.492384, 4.09159, 7.76156, 4.05658, 1.39502, 0.673129, 0.521952, 1.12031, 2.49978, 3.15114, 2.45225, 1.56442, 1.02733, 0.648492, 0.369218, 0.205307, 0.144487, 0.163826, 0.177625, 0.132836, 0.0782807, 0.0444198, 0.0305587, 0.0274625, 0.0225937, 0.0155171, 0.011011, 0.0100741, 0.0119217, 0.0120819
+Peak value 7.761563 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.243384 87.858034 194.805390, Yxy: 87.858034 0.180464 0.254730
+=== ten-control g10=513 #2 t=32
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00386032, 0.00128222, 0.00157798, 0.00152076, 0.00510169, 0.0259269, 0.492706, 4.09242, 7.76296, 4.05754, 1.3955, 0.673339, 0.521866, 1.11992, 2.49931, 3.15107, 2.45349, 1.56556, 1.02772, 0.649977, 0.369554, 0.205101, 0.144599, 0.163568, 0.177824, 0.133495, 0.0794102, 0.0473467, 0.0338193, 0.0281697, 0.021968, 0.015874, 0.0129612, 0.0118496, 0.0122017, 0.0146838
+Peak value 7.762961 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.282742 87.891496 194.847770, Yxy: 87.891496 0.180518 0.254742
+=== ten-control g10=514 #1 t=41
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00243733, 0.000296463, 0.00133602, 0.00128423, 0.00473323, 0.0256279, 0.492474, 4.09326, 7.7656, 4.05882, 1.39549, 0.673781, 0.522027, 1.12077, 2.49929, 3.15121, 2.45278, 1.56539, 1.02701, 0.648963, 0.369388, 0.205206, 0.144963, 0.163828, 0.17806, 0.133063, 0.0792209, 0.046342, 0.0330495, 0.027775, 0.0217997, 0.0149132, 0.0115478, 0.0114365, 0.0121004, 0.0136841
+Peak value 7.765598 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.279820 87.881266 194.893859, Yxy: 87.881266 0.180492 0.254688
+=== ten-control g10=514 #2 t=47
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00118174, -0.000455605, -0.000449639, 0.000425241, 0.00368741, 0.0249287, 0.49178, 4.0949, 7.7691, 4.06071, 1.39602, 0.673575, 0.521346, 1.11937, 2.49981, 3.15288, 2.45438, 1.56584, 1.02744, 0.649056, 0.369244, 0.204614, 0.144323, 0.162423, 0.177012, 0.132656, 0.0775313, 0.0440123, 0.0298633, 0.026338, 0.0209786, 0.0121811, 0.00864032, 0.00739546, 0.0078711, 0.00793563
+Peak value 7.769096 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.255066 87.886512 194.949012, Yxy: 87.886512 0.180402 0.254677
+=== ten-control g10=515 #1 t=56
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00125959, 0.00120006, 0.00160531, 0.00167926, 0.00460642, 0.0254907, 0.491833, 4.09198, 7.76307, 4.05929, 1.39624, 0.674106, 0.521659, 1.1202, 2.49889, 3.15102, 2.45328, 1.56511, 1.02748, 0.649737, 0.369691, 0.204646, 0.144988, 0.164128, 0.17745, 0.133258, 0.0785043, 0.0454265, 0.0318218, 0.0287208, 0.0235067, 0.0146772, 0.00928503, 0.00964514, 0.011576, 0.012335
+Peak value 7.763069 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.269967 87.882089 194.848762, Yxy: 87.882089 0.180492 0.254730
+=== ten-control g10=515 #2 t=63
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00192194, 0.00108155, 0.00123667, 0.000832558, 0.00493247, 0.026038, 0.493243, 4.0938, 7.76712, 4.06127, 1.39617, 0.673931, 0.52265, 1.1211, 2.50054, 3.15423, 2.45505, 1.56659, 1.02845, 0.649674, 0.369994, 0.205029, 0.145844, 0.164172, 0.178346, 0.133985, 0.079211, 0.0465739, 0.0323956, 0.0296199, 0.0243406, 0.0179418, 0.0130709, 0.0120098, 0.0145111, 0.013278
+Peak value 7.767118 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.331374 87.959046 194.960420, Yxy: 87.959046 0.180539 0.254769
+=== ten-control g10=516 #1 t=72
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000484541, 0.000366914, 0.000746915, 0.00115064, 0.00442055, 0.0255786, 0.495622, 4.12011, 7.81812, 4.0867, 1.40681, 0.680534, 0.534591, 1.16282, 2.60101, 3.28303, 2.55573, 1.63066, 1.0715, 0.68021, 0.399536, 0.297385, 0.590682, 1.43334, 1.93671, 1.4865, 0.837503, 0.457603, 0.300487, 0.224591, 0.154562, 0.0903252, 0.0479561, 0.0267995, 0.0191723, 0.0167944
+Peak value 7.818115 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.991813 106.355327 196.373742, Yxy: 106.355327 0.240749 0.266741
+=== ten-control g10=516 #2 t=78
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000571939, 0.000432008, 0.00105464, 0.000831267, 0.00411185, 0.0262593, 0.495578, 4.12239, 7.82063, 4.08884, 1.407, 0.68074, 0.535275, 1.16443, 2.6019, 3.28315, 2.55593, 1.63095, 1.07156, 0.680489, 0.399263, 0.297405, 0.590496, 1.43239, 1.9375, 1.4861, 0.837609, 0.458541, 0.302455, 0.224718, 0.154808, 0.0918091, 0.0508883, 0.0301634, 0.0201695, 0.0199568
+Peak value 7.820628 at (aprox.) 460.0 nm
+
+ Result is XYZ: 96.008061 106.374002 196.458316, Yxy: 106.374002 0.240718 0.266708
+=== ten-control g10=517 #1 t=87
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00321556, 0.00202785, 0.00156645, 0.00192331, 0.00513612, 0.0267849, 0.495654, 4.11777, 7.81494, 4.08622, 1.4065, 0.680615, 0.53446, 1.16288, 2.59948, 3.28019, 2.55323, 1.62927, 1.07071, 0.679948, 0.398786, 0.296858, 0.590945, 1.43099, 1.93386, 1.48343, 0.836632, 0.457477, 0.300999, 0.225014, 0.154868, 0.092646, 0.0492543, 0.0289249, 0.020435, 0.0190482
+Peak value 7.814945 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.911150 106.268413 196.317970, Yxy: 106.268413 0.240682 0.266673
+=== ten-control g10=517 #2 t=94
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000471462, -0.000431963, 0.000436633, 0.000666471, 0.00514465, 0.0261897, 0.495033, 4.11537, 7.81126, 4.08514, 1.40563, 0.680788, 0.53432, 1.16186, 2.59814, 3.27924, 2.55384, 1.62968, 1.07148, 0.680119, 0.399083, 0.29707, 0.590587, 1.429, 1.93149, 1.48273, 0.835218, 0.457508, 0.301028, 0.222847, 0.154665, 0.0920302, 0.0513198, 0.0295941, 0.0204722, 0.0178291
+Peak value 7.811262 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.862514 106.246959 196.215237, Yxy: 106.246959 0.240664 0.266735
+=== ten-control g10=518 #1 t=103
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00054102, 0.00116092, 0.00158802, 0.00206468, 0.00485451, 0.0254832, 0.495442, 4.11845, 7.81689, 4.0878, 1.40605, 0.680467, 0.534361, 1.16294, 2.60016, 3.28098, 2.555, 1.62989, 1.07118, 0.680591, 0.398816, 0.296893, 0.590417, 1.43017, 1.93383, 1.48392, 0.836233, 0.457696, 0.30038, 0.223294, 0.155917, 0.0915717, 0.0497703, 0.0293228, 0.0193597, 0.0195776
+Peak value 7.816891 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.917453 106.295749 196.344063, Yxy: 106.295749 0.240662 0.266701
+=== ten-control g10=518 #2 t=109
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000984771, -0.000122567, 0.000602658, 0.00109462, 0.00481453, 0.0261191, 0.49417, 4.11447, 7.81004, 4.08422, 1.40523, 0.679811, 0.534103, 1.16187, 2.59749, 3.27773, 2.55272, 1.62872, 1.06996, 0.679879, 0.398027, 0.296801, 0.58918, 1.4284, 1.93159, 1.48247, 0.835688, 0.456824, 0.299907, 0.222086, 0.153239, 0.0897774, 0.0469078, 0.0267587, 0.017792, 0.0166566
+Peak value 7.810042 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.813217 106.188503 196.163699, Yxy: 106.188503 0.240637 0.266694
+=== ten-control g10=519 #1 t=118
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00121134, 0.00118191, 0.000780916, 0.00110344, 0.00425057, 0.0257366, 0.494838, 4.11663, 7.81596, 4.08829, 1.40649, 0.68058, 0.534773, 1.16245, 2.59825, 3.27896, 2.55492, 1.63034, 1.07094, 0.680738, 0.399409, 0.296633, 0.590043, 1.43025, 1.93422, 1.48389, 0.835859, 0.456965, 0.300822, 0.222685, 0.155699, 0.0911923, 0.0484531, 0.0276008, 0.020295, 0.0177269
+Peak value 7.815963 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.907530 106.276400 196.307916, Yxy: 106.276400 0.240676 0.266697
+=== ten-control g10=519 #2 t=125
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000661834, 0.00016412, 0.000669239, 0.000353315, 0.0041762, 0.0250689, 0.494902, 4.11501, 7.80967, 4.08424, 1.40526, 0.679935, 0.534133, 1.16167, 2.59799, 3.27839, 2.55251, 1.62973, 1.07046, 0.679895, 0.399214, 0.296501, 0.58955, 1.42755, 1.93146, 1.48217, 0.834931, 0.457012, 0.299098, 0.222317, 0.153674, 0.0904006, 0.0478561, 0.0270451, 0.0174253, 0.0154004
+Peak value 7.809666 at (aprox.) 460.0 nm
+
+ Result is XYZ: 95.815969 106.205673 196.162066, Yxy: 106.205673 0.240633 0.266725
+=== ten-control g10=520 #1 t=134
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00190072, 0.000764609, 0.000215703, 0.000814715, 0.00408346, 0.0264318, 0.49697, 4.13283, 7.84342, 4.10241, 1.41243, 0.687227, 0.555577, 1.23775, 2.77843, 3.50742, 2.73227, 1.74405, 1.14825, 0.736349, 0.458146, 0.494851, 1.55435, 4.15075, 5.65873, 4.32129, 2.41921, 1.31634, 0.864013, 0.634183, 0.430851, 0.248625, 0.131313, 0.0720217, 0.0421559, 0.030887
+Peak value 7.843417 at (aprox.) 460.0 nm
+
+ Result is XYZ: 166.739141 144.247136 197.362693, Yxy: 144.247136 0.328001 0.283756
+=== ten-control g10=520 #2 t=140
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00105065, 0.00116486, 0.000622294, 0.000883952, 0.00369149, 0.0256537, 0.496426, 4.13299, 7.84545, 4.10299, 1.41225, 0.687056, 0.555007, 1.23724, 2.77618, 3.50558, 2.73181, 1.74332, 1.14737, 0.73537, 0.45803, 0.494951, 1.55253, 4.14766, 5.65502, 4.31899, 2.41637, 1.3156, 0.862016, 0.633155, 0.43097, 0.246886, 0.130535, 0.0689816, 0.041193, 0.0298954
+Peak value 7.845455 at (aprox.) 460.0 nm
+
+ Result is XYZ: 166.646720 144.165228 197.372670, Yxy: 144.165228 0.327926 0.283687
+=== ten-dither g10=512 #1 t=9
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00288733, 0.00102786, 0.000672368, 0.00163508, 0.00586845, 0.0320001, 0.612562, 5.09565, 9.66491, 5.05624, 1.75008, 0.88808, 0.857863, 2.17545, 4.9676, 6.28539, 4.90144, 3.13037, 2.05845, 1.3117, 0.788967, 0.699141, 1.80076, 4.62745, 6.26908, 4.7812, 2.67841, 1.45963, 0.958022, 0.703858, 0.478007, 0.277078, 0.150625, 0.0818417, 0.0509086, 0.040545
+Peak value 9.664906 at (aprox.) 460.0 nm
+
+ Result is XYZ: 209.025769 219.389508 246.138396, Yxy: 219.389508 0.309873 0.325237
+=== ten-dither g10=512 #2 t=15
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0042452, 0.00223192, 0.00136463, 0.00218772, 0.00640067, 0.033178, 0.613785, 5.08779, 9.64928, 5.04966, 1.74707, 0.885636, 0.856056, 2.17139, 4.95845, 6.27506, 4.89181, 3.12435, 2.05434, 1.30947, 0.786263, 0.697584, 1.79691, 4.61663, 6.25409, 4.77093, 2.67329, 1.45813, 0.957046, 0.702373, 0.476214, 0.277223, 0.148024, 0.07979, 0.0500604, 0.0384003
+Peak value 9.649280 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.606314 218.958157 245.794271, Yxy: 218.958157 0.309800 0.325173
+=== ten-dither g10=513 #1 t=24
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00408803, 0.0026816, 0.00166897, 0.00212188, 0.00737852, 0.0336641, 0.613741, 5.08933, 9.65388, 5.0522, 1.74841, 0.887003, 0.856901, 2.17247, 4.96011, 6.27768, 4.89476, 3.12661, 2.05576, 1.31044, 0.788275, 0.698135, 1.79792, 4.61958, 6.2583, 4.77263, 2.67289, 1.45766, 0.958594, 0.703777, 0.479938, 0.279103, 0.149176, 0.0840668, 0.0515974, 0.0432335
+Peak value 9.653879 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.730800 219.088980 245.913045, Yxy: 219.088980 0.309812 0.325187
+=== ten-dither g10=513 #2 t=30
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00133443, 0.00110224, 0.000946251, 0.00158156, 0.00573571, 0.0314506, 0.613131, 5.09121, 9.65792, 5.05268, 1.74828, 0.886442, 0.856969, 2.17192, 4.9619, 6.27842, 4.89577, 3.12745, 2.05562, 1.30929, 0.786714, 0.698376, 1.79896, 4.62329, 6.26281, 4.77678, 2.6741, 1.45834, 0.957378, 0.702138, 0.477579, 0.275993, 0.146972, 0.0793772, 0.0489588, 0.038355
+Peak value 9.657924 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.805856 219.134203 245.947581, Yxy: 219.134203 0.309853 0.325179
+=== ten-dither g10=514 #1 t=39
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000734464, 0.000531229, 0.000359729, 0.00159766, 0.00555186, 0.0327898, 0.61415, 5.09424, 9.66172, 5.05422, 1.7484, 0.886342, 0.856886, 2.17464, 4.96487, 6.28421, 4.89953, 3.1296, 2.05699, 1.31098, 0.787948, 0.698038, 1.80044, 4.62498, 6.26389, 4.77831, 2.67634, 1.45897, 0.958081, 0.703491, 0.477248, 0.276539, 0.145634, 0.0784031, 0.0456899, 0.0376494
+Peak value 9.661721 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.913492 219.281725 246.071894, Yxy: 219.281725 0.309838 0.325215
+=== ten-dither g10=514 #2 t=45
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000500842, 0.000461355, 6.30136e-05, -0.000194728, 0.00458782, 0.031652, 0.611881, 5.08785, 9.65135, 5.04921, 1.74698, 0.885403, 0.856304, 2.17133, 4.95871, 6.27642, 4.89405, 3.12666, 2.05537, 1.30991, 0.78714, 0.697305, 1.79634, 4.61818, 6.25583, 4.77248, 2.67338, 1.45657, 0.956394, 0.700313, 0.47642, 0.277145, 0.145446, 0.0759977, 0.0466017, 0.0367709
+Peak value 9.651349 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.641045 219.019684 245.764997, Yxy: 219.019684 0.309820 0.325232
+=== ten-dither g10=515 #1 t=54
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000908772, 0.00180921, 0.000899245, 0.00210116, 0.00623805, 0.0327305, 0.612945, 5.08619, 9.64851, 5.04874, 1.74721, 0.885447, 0.855298, 2.17024, 4.95535, 6.27092, 4.88877, 3.12369, 2.05379, 1.30866, 0.786481, 0.696826, 1.79524, 4.61678, 6.25376, 4.77078, 2.6707, 1.45667, 0.956486, 0.701427, 0.477286, 0.278011, 0.146649, 0.0820247, 0.0518198, 0.0398678
+Peak value 9.648509 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.547254 218.863395 245.736527, Yxy: 218.863395 0.309809 0.325135
+=== ten-dither g10=515 #2 t=60
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0004974, 0.000394676, 0.00110025, 0.00266616, 0.00674505, 0.0317864, 0.612495, 5.08523, 9.6465, 5.04614, 1.7453, 0.884523, 0.855868, 2.16994, 4.95279, 6.26728, 4.88714, 3.12219, 2.05243, 1.30755, 0.785257, 0.697126, 1.79491, 4.6127, 6.25114, 4.76713, 2.66888, 1.45493, 0.955538, 0.699315, 0.474796, 0.276258, 0.143952, 0.077837, 0.0493908, 0.0367447
+Peak value 9.646499 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.429523 218.747081 245.652054, Yxy: 218.747081 0.309781 0.325116
+=== ten-dither g10=516 #1 t=69
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00150373, 0.00132116, 0.000819229, 0.00163512, 0.00646749, 0.0332406, 0.624203, 5.18196, 9.82903, 5.14159, 1.77891, 0.90209, 0.87119, 2.20893, 5.04306, 6.37955, 4.97463, 3.17755, 2.08997, 1.33252, 0.800351, 0.70983, 1.82963, 4.69986, 6.36684, 4.85476, 2.71902, 1.48223, 0.972489, 0.714704, 0.488597, 0.282715, 0.150821, 0.0817576, 0.051896, 0.0395295
+Peak value 9.829025 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.319633 222.750750 250.309674, Yxy: 222.750750 0.309784 0.325003
+=== ten-dither g10=516 #2 t=75
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00458547, 0.00207537, 0.000836475, 0.00254149, 0.00594141, 0.0330673, 0.624361, 5.18105, 9.82869, 5.14201, 1.78014, 0.902131, 0.87165, 2.20857, 5.04158, 6.37909, 4.97375, 3.17652, 2.08914, 1.33219, 0.801012, 0.710996, 1.82812, 4.69678, 6.36326, 4.85463, 2.72007, 1.48358, 0.973941, 0.716097, 0.488259, 0.283819, 0.150191, 0.083433, 0.0516983, 0.0414551
+Peak value 9.828693 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.274259 222.707697 250.304194, Yxy: 222.707697 0.309760 0.324985
+=== ten-dither g10=517 #1 t=84
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00254646, 0.000438487, 0.000412307, 0.00174791, 0.00580282, 0.0315341, 0.623992, 5.18337, 9.82885, 5.1431, 1.7799, 0.90201, 0.871967, 2.2094, 5.04286, 6.38322, 4.97707, 3.1801, 2.0916, 1.33182, 0.800614, 0.709397, 1.82759, 4.69904, 6.36652, 4.85614, 2.71972, 1.48322, 0.974144, 0.715692, 0.486641, 0.28247, 0.147897, 0.0835324, 0.0521011, 0.0389651
+Peak value 9.828848 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.328256 222.807837 250.325238, Yxy: 222.807837 0.309760 0.325048
+=== ten-dither g10=517 #2 t=90
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00165769, 0.000588186, 0.000605637, 0.00244331, 0.00664578, 0.0330102, 0.623888, 5.18272, 9.83024, 5.14391, 1.78008, 0.902504, 0.872042, 2.20943, 5.04482, 6.38391, 4.97729, 3.18037, 2.09163, 1.33284, 0.801427, 0.710767, 1.83027, 4.70116, 6.36705, 4.85417, 2.71985, 1.48358, 0.975347, 0.715901, 0.488699, 0.28297, 0.150894, 0.0836944, 0.0533183, 0.0417197
+Peak value 9.830244 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.389525 222.863624 250.361859, Yxy: 222.863624 0.309780 0.325057
+=== ten-dither g10=518 #1 t=99
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00136258, 0.00144284, 0.00172273, 0.00185015, 0.00666933, 0.03347, 0.623277, 5.18024, 9.82651, 5.14175, 1.77913, 0.901999, 0.870697, 2.20735, 5.0412, 6.38019, 4.97525, 3.17804, 2.08954, 1.33167, 0.800865, 0.709635, 1.8269, 4.69559, 6.36069, 4.8527, 2.71762, 1.48128, 0.974233, 0.716124, 0.487061, 0.283487, 0.151096, 0.0805993, 0.0511619, 0.0402325
+Peak value 9.826508 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.210050 222.690839 250.251820, Yxy: 222.690839 0.309727 0.325024
+=== ten-dither g10=518 #2 t=105
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000168299, 0.00131535, 0.000888834, 0.00073158, 0.00596224, 0.0330001, 0.624438, 5.18219, 9.83183, 5.14472, 1.78004, 0.901613, 0.871342, 2.20925, 5.04258, 6.38281, 4.97719, 3.18045, 2.09068, 1.33186, 0.800896, 0.709943, 1.82887, 4.70081, 6.36812, 4.85677, 2.71958, 1.4833, 0.974779, 0.714866, 0.484976, 0.282644, 0.151152, 0.0815745, 0.0503891, 0.0412457
+Peak value 9.831831 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.373328 222.822341 250.375624, Yxy: 222.822341 0.309776 0.325017
+=== ten-dither g10=519 #1 t=114
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00189817, 0.00136816, 0.000537454, 0.0013754, 0.00662333, 0.0329507, 0.624284, 5.18244, 9.83098, 5.14411, 1.77996, 0.902148, 0.871543, 2.21034, 5.0463, 6.38592, 4.98056, 3.18133, 2.09205, 1.33297, 0.801276, 0.709745, 1.82949, 4.70179, 6.37041, 4.8586, 2.72058, 1.4824, 0.974703, 0.715735, 0.486561, 0.283232, 0.150194, 0.0806994, 0.0488625, 0.0411953
+Peak value 9.830978 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.433395 222.924624 250.371496, Yxy: 222.924624 0.309792 0.325091
+=== ten-dither g10=519 #2 t=120
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00330718, 0.000495969, 0.000744568, 0.00210771, 0.00617474, 0.0332394, 0.624518, 5.18264, 9.82827, 5.14292, 1.77965, 0.902596, 0.871463, 2.20845, 5.03991, 6.37736, 4.97267, 3.17746, 2.08797, 1.33081, 0.799669, 0.710592, 1.82955, 4.6987, 6.36317, 4.85405, 2.71779, 1.48224, 0.975499, 0.717072, 0.486757, 0.281932, 0.151388, 0.0831837, 0.0525271, 0.0418224
+Peak value 9.828271 at (aprox.) 460.0 nm
+
+ Result is XYZ: 212.266182 222.670450 250.327125, Yxy: 222.670450 0.309758 0.324941
+=== ten-dither g10=520 #1 t=129
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00317092, 0.00110363, 0.000858916, 0.00127681, 0.00617734, 0.0340886, 0.635933, 5.27676, 10.0088, 5.23772, 1.81194, 0.917691, 0.887195, 2.24882, 5.13731, 6.50003, 5.06976, 3.23918, 2.12871, 1.35613, 0.815026, 0.723341, 1.86329, 4.7873, 6.48269, 4.94483, 2.76771, 1.51089, 0.992614, 0.727951, 0.494537, 0.288802, 0.154003, 0.08333, 0.0531264, 0.0402923
+Peak value 10.008791 at (aprox.) 460.0 nm
+
+ Result is XYZ: 216.247961 226.915617 254.912503, Yxy: 226.915617 0.309777 0.325059
+=== ten-dither g10=520 #2 t=135
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000382704, 0.00103519, 0.000834863, 0.001854, 0.0072384, 0.0338533, 0.635334, 5.27037, 9.99402, 5.23007, 1.80975, 0.917008, 0.885415, 2.24503, 5.12542, 6.4873, 5.05807, 3.23196, 2.12562, 1.35501, 0.814402, 0.722023, 1.85924, 4.77929, 6.4731, 4.93647, 2.76439, 1.5082, 0.992483, 0.727931, 0.496663, 0.286376, 0.150145, 0.0829996, 0.0518823, 0.0399965
+Peak value 9.994022 at (aprox.) 460.0 nm
+
+ Result is XYZ: 215.902927 226.495396 254.561500, Yxy: 226.495396 0.309778 0.324976
+=== check t=9
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000802858, 0.00155139, 0.00145033, 0.00116121, 0.00390949, 0.0203911, 0.379936, 3.14925, 5.99305, 3.15463, 1.09442, 0.555892, 0.53984, 1.35821, 3.09132, 3.92035, 3.06665, 1.95906, 1.28594, 0.819116, 0.492616, 0.433757, 1.10483, 2.84087, 3.87441, 2.97909, 1.67798, 0.916022, 0.599475, 0.439094, 0.300491, 0.17518, 0.0950364, 0.0509174, 0.0350202, 0.0282268
+Peak value 5.993049 at (aprox.) 460.0 nm
+
+ Result is XYZ: 129.644577 136.601879 152.787960, Yxy: 136.601879 0.309389 0.325992
+=== ramps10 grey0 dbv=1353 rgb10=0,0,0 t=13
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000125598, -3.74384e-05, 0.000355367, 0.000517415, 4.71388e-05, 0.000196749, 8.61493e-05, 0.000251415, 4.53034e-05, -0.00014152, -1.72102e-05, 0.000204072, 0.000186804, 6.04409e-05, 0.000156328, 0.000231136, 0.000257925, 4.9045e-06, 0.000153059, 0.000176505, 0.000229393, -1.1185e-05, -9.50178e-05, 0.000477364, 0.000363876, 0.000402947, -1.56315e-05, -0.00028207, -0.000486752, 4.0176e-05, 0.000400919, 0.000805813, 0.000199981, 0.000380517, 0.0018745, 0.000665978
+Peak value 0.001874 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.010774 0.010860 0.007437, Yxy: 0.010860 0.370615 0.373574
+=== ramps10 grey32 dbv=1353 rgb10=32,32,32 t=25
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000164198, -0.000282107, 0.000249837, -5.98252e-05, -0.000390599, -0.000211399, 0.000138987, 0.00149501, 0.00256632, 0.00129037, 0.000484572, 0.000308355, 0.000253437, 0.000848797, 0.00216504, 0.00255811, 0.00177329, 0.000988093, 0.000463385, 0.000455407, 0.000342499, 1.53056e-05, 0.000429731, 0.00173427, 0.00239101, 0.0020118, 0.00120806, 0.000900219, 5.64149e-06, 0.000680536, -0.000167802, -0.000405962, -5.69804e-05, 0.00018246, 0.00011105, -0.000802392
+Peak value 0.002566 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.070535 0.078513 0.063927, Yxy: 0.078513 0.331190 0.368647
+=== ramps10 grey64 dbv=1353 rgb10=64,64,64 t=37
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000427096, -3.2841e-05, 0.000232701, 7.9652e-05, -0.000188913, -9.22756e-05, 0.000697945, 0.00622541, 0.0118717, 0.00608121, 0.00210644, 0.00133154, 0.00133644, 0.00318522, 0.00726429, 0.00938776, 0.00730282, 0.00433186, 0.00276588, 0.00195246, 0.00114416, 0.000926244, 0.00245812, 0.00681639, 0.00913345, 0.00756146, 0.00424142, 0.00227987, 0.00123512, 0.00111974, 0.000478803, 0.00017536, -0.000404998, 0.000420988, 0.000623654, -7.21198e-05
+Peak value 0.011872 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.296024 0.317663 0.301122, Yxy: 0.317663 0.323591 0.347245
+=== ramps10 grey96 dbv=1353 rgb10=96,96,96 t=49
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00077552, -0.000650048, -0.00018598, 2.00488e-05, -0.00017902, -0.000116093, 0.00162492, 0.0150162, 0.0289866, 0.0153647, 0.00518343, 0.00274844, 0.00283534, 0.00746691, 0.0173801, 0.0220573, 0.0171926, 0.010768, 0.0067739, 0.00432907, 0.00268013, 0.0020231, 0.00570986, 0.0154555, 0.0216306, 0.0172184, 0.00964447, 0.00516418, 0.00274391, 0.00225727, 0.00142736, 0.0012652, 0.00026413, -0.000178725, 0.000671102, 0.000250161
+Peak value 0.028987 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.693757 0.748304 0.735254, Yxy: 0.748304 0.318630 0.343682
+=== ramps10 grey128 dbv=1353 rgb10=128,128,128 t=61
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000310203, 0.000453846, 0.000296807, 0.000215434, 0.000253494, 0.000364166, 0.00348991, 0.0289921, 0.0560435, 0.0296663, 0.010459, 0.00555009, 0.00557516, 0.0140877, 0.032122, 0.0406279, 0.0318976, 0.020045, 0.013099, 0.008443, 0.00541103, 0.0046186, 0.0110812, 0.0291769, 0.0405105, 0.0322098, 0.0182958, 0.0100562, 0.00662894, 0.00549096, 0.00349294, 0.00226423, 0.00125273, 0.000725065, 0.0016272, 0.00165012
+Peak value 0.056043 at (aprox.) 460.0 nm
+
+ Result is XYZ: 1.327756 1.412029 1.435357, Yxy: 1.412029 0.318015 0.338199
+=== ramps10 grey160 dbv=1353 rgb10=160,160,160 t=73
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000357438, -0.000223139, 0.00020806, 3.68283e-05, 1.62033e-05, 9.88733e-05, 0.00529883, 0.0466423, 0.0905303, 0.0479069, 0.016487, 0.00863631, 0.00870103, 0.0220777, 0.0503547, 0.0637554, 0.0498114, 0.031616, 0.0206599, 0.013326, 0.00808448, 0.00668942, 0.0175042, 0.0462832, 0.0644089, 0.0509783, 0.0291233, 0.0157442, 0.0103115, 0.00784288, 0.00545084, 0.00312117, 0.00153454, 0.00127986, 0.00153656, -0.000258262
+Peak value 0.090530 at (aprox.) 460.0 nm
+
+ Result is XYZ: 2.097155 2.218214 2.298725, Yxy: 2.218214 0.317074 0.335377
+=== ramps10 grey192 dbv=1353 rgb10=192,192,192 t=85
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000296033, -0.000248086, -0.000183858, 9.52963e-05, 0.000130236, 0.000373392, 0.00849007, 0.0717027, 0.138354, 0.0733748, 0.0254575, 0.0131133, 0.012955, 0.0330205, 0.0754712, 0.0959754, 0.0749485, 0.0476069, 0.0311213, 0.0199482, 0.0119818, 0.0102261, 0.0263645, 0.0689985, 0.0960455, 0.0757004, 0.0430402, 0.0235587, 0.0149053, 0.0112228, 0.00764393, 0.00438525, 0.00228942, 0.000790948, 0.00103213, 0.00114936
+Peak value 0.138354 at (aprox.) 460.0 nm
+
+ Result is XYZ: 3.149142 3.330338 3.525010, Yxy: 3.330338 0.314773 0.332884
+=== ramps10 grey224 dbv=1353 rgb10=224,224,224 t=97
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000138392, -0.00021473, 8.57355e-05, 0.000468758, 0.000167151, 0.000485972, 0.0118566, 0.101332, 0.195493, 0.103758, 0.0358262, 0.0185372, 0.0184273, 0.0464113, 0.105921, 0.134357, 0.10495, 0.0667469, 0.0438695, 0.0280196, 0.0170758, 0.0143948, 0.0367937, 0.0956039, 0.133237, 0.104844, 0.0598025, 0.0326233, 0.0204113, 0.0152259, 0.01082, 0.00687195, 0.0038824, 0.00195255, 0.00197544, 0.000633679
+Peak value 0.195493 at (aprox.) 460.0 nm
+
+ Result is XYZ: 4.398207 4.662456 4.978501, Yxy: 4.662456 0.313281 0.332104
+=== ramps10 grey256 dbv=1353 rgb10=256,256,256 t=109
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000668288, -0.00065785, -0.000386903, -3.6266e-05, 5.90362e-05, 0.000562819, 0.0157712, 0.135746, 0.262048, 0.138724, 0.048006, 0.0244652, 0.0242219, 0.0617314, 0.140946, 0.179263, 0.140235, 0.0893408, 0.0583013, 0.0373404, 0.0225273, 0.0190382, 0.0485925, 0.127259, 0.176895, 0.138672, 0.0789404, 0.0430605, 0.0275472, 0.0201843, 0.0136605, 0.00809147, 0.00379383, 0.00192699, 0.00147412, -9.57729e-05
+Peak value 0.262048 at (aprox.) 460.0 nm
+
+ Result is XYZ: 5.848869 6.208034 6.661338, Yxy: 6.208034 0.312469 0.331657
+=== ramps10 grey288 dbv=1353 rgb10=288,288,288 t=121
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000630312, -0.000158639, 6.4665e-05, 6.868e-05, 6.38392e-05, 0.00109288, 0.0208856, 0.176842, 0.340877, 0.18062, 0.0625057, 0.032057, 0.031665, 0.0801006, 0.182951, 0.232658, 0.181885, 0.115784, 0.0759732, 0.0486507, 0.029194, 0.0251817, 0.0633887, 0.165206, 0.229415, 0.179677, 0.102279, 0.0554959, 0.036015, 0.0267437, 0.0180242, 0.0107259, 0.0051875, 0.00244061, 0.00284343, 0.00181994
+Peak value 0.340877 at (aprox.) 460.0 nm
+
+ Result is XYZ: 7.601219 8.063203 8.678758, Yxy: 8.063203 0.312253 0.331230
+=== ramps10 grey320 dbv=1353 rgb10=320,320,320 t=132
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+9.47676e-05, 0.00034675, 0.000512246, 0.000569031, 0.000593458, 0.00134431, 0.0269663, 0.225064, 0.433541, 0.2298, 0.0796828, 0.0408119, 0.0403387, 0.101921, 0.23232, 0.295154, 0.230738, 0.147097, 0.0963945, 0.0617855, 0.0372982, 0.0321768, 0.081041, 0.210067, 0.291668, 0.22797, 0.129544, 0.0708432, 0.0460562, 0.0335105, 0.0241005, 0.0154137, 0.00742224, 0.00427249, 0.00353752, 0.00262468
+Peak value 0.433541 at (aprox.) 460.0 nm
+
+ Result is XYZ: 9.666979 10.244473 11.049060, Yxy: 10.244473 0.312236 0.330888
+=== ramps10 grey352 dbv=1353 rgb10=352,352,352 t=142
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.0002091, 0.000291111, 0.0006014, 0.000392543, 0.000545961, 0.00157074, 0.0333531, 0.282128, 0.543592, 0.287671, 0.0995614, 0.0510168, 0.0502748, 0.127485, 0.290771, 0.369538, 0.288888, 0.184065, 0.120609, 0.0769455, 0.0463374, 0.0403286, 0.101435, 0.263221, 0.365286, 0.285218, 0.162522, 0.0891803, 0.0581691, 0.0427362, 0.0290462, 0.0170636, 0.00930735, 0.0049725, 0.00375401, 0.00265216
+Peak value 0.543592 at (aprox.) 460.0 nm
+
+ Result is XYZ: 12.102354 12.820412 13.837063, Yxy: 12.820412 0.312240 0.330765
+=== ramps10 grey384 dbv=1353 rgb10=384,384,384 t=152
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000616679, 0.000503562, 0.000916028, 0.000579698, 0.000381786, 0.00224342, 0.0415178, 0.346968, 0.666786, 0.352689, 0.122081, 0.0624682, 0.0614607, 0.155747, 0.355499, 0.451948, 0.353159, 0.225071, 0.147839, 0.0945727, 0.0568581, 0.0494395, 0.12459, 0.323584, 0.447794, 0.3498, 0.198571, 0.109007, 0.0710865, 0.0523592, 0.0369072, 0.0227723, 0.0117537, 0.00653218, 0.00466615, 0.00445803
+Peak value 0.666786 at (aprox.) 460.0 nm
+
+ Result is XYZ: 14.844155 15.698906 16.988613, Yxy: 15.698906 0.312300 0.330283
+=== ramps10 grey416 dbv=1353 rgb10=416,416,416 t=162
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000332919, 0.000147184, 0.000856269, 0.000543745, 0.000475741, 0.00261006, 0.0500968, 0.419991, 0.806617, 0.426509, 0.147516, 0.0751801, 0.0742943, 0.188211, 0.428821, 0.544964, 0.426259, 0.27165, 0.17794, 0.113762, 0.0685304, 0.0595064, 0.150384, 0.390335, 0.539794, 0.420776, 0.238112, 0.130193, 0.084996, 0.0624704, 0.0433505, 0.0264685, 0.0138241, 0.00707348, 0.00390527, 0.00417185
+Peak value 0.806617 at (aprox.) 460.0 nm
+
+ Result is XYZ: 17.896178 18.930293 20.546466, Yxy: 18.930293 0.311927 0.329952
+=== ramps10 grey448 dbv=1353 rgb10=448,448,448 t=171
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000427043, 0.000410221, 0.000438918, 0.000705604, 0.000755435, 0.00290562, 0.0592184, 0.497347, 0.956277, 0.505328, 0.174607, 0.0889363, 0.0875851, 0.22163, 0.505922, 0.643049, 0.502856, 0.320409, 0.210194, 0.133916, 0.0807226, 0.0703303, 0.177677, 0.460861, 0.636843, 0.495531, 0.281072, 0.153299, 0.099889, 0.0728181, 0.0494699, 0.0293464, 0.0160738, 0.00860465, 0.00676347, 0.00631353
+Peak value 0.956277 at (aprox.) 460.0 nm
+
+ Result is XYZ: 21.128364 22.336303 24.338516, Yxy: 22.336303 0.311613 0.329429
+=== ramps10 grey480 dbv=1353 rgb10=480,480,480 t=181
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000861521, 0.000829418, 0.000819735, 0.000652701, 0.0017139, 0.00408103, 0.0698316, 0.582107, 1.11792, 0.591124, 0.204784, 0.104602, 0.102748, 0.259515, 0.590868, 0.750724, 0.58684, 0.374079, 0.245253, 0.156569, 0.0946211, 0.0825326, 0.208724, 0.539205, 0.743937, 0.578429, 0.327605, 0.178867, 0.116053, 0.08557, 0.0594525, 0.0364154, 0.0197658, 0.0106778, 0.00804447, 0.00755291
+Peak value 1.117923 at (aprox.) 460.0 nm
+
+ Result is XYZ: 24.703223 26.099191 28.487734, Yxy: 26.099191 0.311555 0.329161
+=== ramps10 grey512 dbv=1353 rgb10=512,512,512 t=191
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000467064, -5.21125e-05, -0.000385752, -7.10055e-05, 0.00028365, 0.00374246, 0.0806847, 0.675377, 1.29674, 0.685239, 0.237336, 0.120653, 0.118576, 0.298835, 0.681903, 0.866054, 0.676969, 0.431412, 0.282573, 0.180256, 0.108536, 0.0945129, 0.240518, 0.623757, 0.860284, 0.667634, 0.3785, 0.206027, 0.13368, 0.0978062, 0.0668401, 0.03918, 0.0212225, 0.0120072, 0.00792912, 0.00555475
+Peak value 1.296743 at (aprox.) 460.0 nm
+
+ Result is XYZ: 28.532643 30.112221 33.009039, Yxy: 30.112221 0.311309 0.328543
+=== ramps10 grey544 dbv=1353 rgb10=544,544,544 t=200
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-2.1055e-05, 0.000391638, 7.14063e-05, 0.000538562, 0.000888083, 0.00469886, 0.0924735, 0.774051, 1.48465, 0.783892, 0.271593, 0.13801, 0.135246, 0.341435, 0.778979, 0.989581, 0.773631, 0.493297, 0.323363, 0.20632, 0.123887, 0.108327, 0.276077, 0.714611, 0.983958, 0.763255, 0.432723, 0.236263, 0.153623, 0.111101, 0.0757229, 0.0455927, 0.0234175, 0.0135261, 0.00919414, 0.00529505
+Peak value 1.484650 at (aprox.) 460.0 nm
+
+ Result is XYZ: 32.656052 34.434583 37.800564, Yxy: 34.434583 0.311333 0.328289
+=== ramps10 grey576 dbv=1353 rgb10=576,576,576 t=210
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000140064, 0.000328697, 0.000331831, 0.000661727, 0.000946043, 0.00516659, 0.105198, 0.879966, 1.68629, 0.890547, 0.308372, 0.156619, 0.15282, 0.387005, 0.881778, 1.11994, 0.875237, 0.558429, 0.366065, 0.233123, 0.139869, 0.122815, 0.312765, 0.809523, 1.11533, 0.863873, 0.489564, 0.266465, 0.17357, 0.12669, 0.0865342, 0.0522715, 0.0277392, 0.0158154, 0.0122469, 0.0063318
+Peak value 1.686287 at (aprox.) 460.0 nm
+
+ Result is XYZ: 36.999761 38.984905 42.939147, Yxy: 38.984905 0.311122 0.327814
+=== ramps10 grey608 dbv=1353 rgb10=608,608,608 t=219
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000879424, 0.00105106, 0.000722298, 0.00113243, 0.00155233, 0.00597827, 0.119064, 0.99188, 1.9003, 1.00325, 0.347441, 0.17689, 0.17279, 0.43502, 0.991551, 1.26014, 0.985252, 0.628354, 0.411962, 0.262591, 0.15788, 0.138951, 0.353349, 0.912521, 1.25524, 0.972284, 0.550198, 0.300312, 0.196037, 0.143942, 0.099101, 0.0584156, 0.0311826, 0.0174937, 0.0124215, 0.00884227
+Peak value 1.900304 at (aprox.) 460.0 nm
+
+ Result is XYZ: 41.682698 43.892293 48.398250, Yxy: 43.892293 0.311127 0.327620
+=== ramps10 grey640 dbv=1353 rgb10=640,640,640 t=229
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00183955, 0.000700876, -6.31273e-05, 0.000373974, 0.00171032, 0.00711998, 0.133154, 1.10857, 2.12328, 1.12044, 0.387941, 0.197539, 0.192725, 0.485705, 1.10655, 1.40499, 1.09788, 0.699873, 0.458793, 0.292741, 0.176327, 0.154692, 0.3941, 1.01962, 1.40131, 1.08456, 0.613694, 0.33481, 0.218734, 0.159114, 0.108328, 0.0635593, 0.0333353, 0.018663, 0.0123486, 0.0101809
+Peak value 2.123279 at (aprox.) 460.0 nm
+
+ Result is XYZ: 46.516409 48.951182 54.074982, Yxy: 48.951182 0.311058 0.327339
+=== ramps10 grey672 dbv=1353 rgb10=672,672,672 t=238
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00272559, 0.000807755, 0.000256655, 0.000949712, 0.0024236, 0.00818656, 0.147476, 1.22982, 2.35436, 1.24277, 0.430478, 0.219116, 0.213287, 0.537963, 1.22625, 1.55756, 1.21744, 0.776543, 0.509208, 0.324422, 0.195572, 0.171537, 0.436722, 1.13116, 1.55308, 1.20167, 0.68, 0.371989, 0.242801, 0.177965, 0.122368, 0.0729026, 0.0402403, 0.0222522, 0.0145106, 0.0121159
+Peak value 2.354358 at (aprox.) 460.0 nm
+
+ Result is XYZ: 51.580426 54.275462 59.974970, Yxy: 54.275462 0.311042 0.327294
+=== ramps10 grey704 dbv=1353 rgb10=704,704,704 t=248
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000790973, -0.000219223, 0.000275144, 0.000414464, 0.00124498, 0.00856673, 0.162707, 1.35676, 2.59674, 1.36995, 0.474156, 0.241188, 0.23521, 0.592761, 1.35127, 1.7166, 1.34213, 0.855577, 0.56113, 0.357792, 0.215735, 0.189236, 0.48238, 1.24702, 1.71245, 1.32359, 0.748067, 0.40864, 0.267297, 0.195217, 0.133817, 0.0787963, 0.0421692, 0.0227782, 0.0161324, 0.0118323
+Peak value 2.596738 at (aprox.) 460.0 nm
+
+ Result is XYZ: 56.858596 59.824120 66.128189, Yxy: 59.824120 0.311024 0.327246
+=== ramps10 grey736 dbv=1353 rgb10=736,736,736 t=258
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0004037, 0.00076812, 0.000710107, 0.000662463, 0.00104535, 0.00884568, 0.1792, 1.4967, 2.86319, 1.51104, 0.523383, 0.265871, 0.2592, 0.652856, 1.48929, 1.89131, 1.47886, 0.94253, 0.617968, 0.393447, 0.236607, 0.208195, 0.53085, 1.37092, 1.8805, 1.45253, 0.82038, 0.447558, 0.292178, 0.213023, 0.145386, 0.0856472, 0.045807, 0.0243967, 0.0159472, 0.0118199
+Peak value 2.863189 at (aprox.) 460.0 nm
+
+ Result is XYZ: 62.532983 65.855170 72.919058, Yxy: 65.855170 0.310635 0.327138
+=== ramps10 grey768 dbv=1353 rgb10=768,768,768 t=267
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000239655, 0.000103639, -1.72244e-05, 0.000164646, 0.00223314, 0.0102317, 0.198072, 1.64956, 3.15385, 1.66353, 0.576376, 0.292816, 0.285374, 0.719106, 1.63898, 2.08111, 1.62693, 1.0378, 0.680777, 0.433824, 0.260881, 0.230108, 0.585076, 1.50876, 2.06836, 1.59668, 0.901766, 0.492174, 0.320543, 0.233678, 0.16079, 0.0941655, 0.0500545, 0.027211, 0.018527, 0.0135932
+Peak value 3.153846 at (aprox.) 460.0 nm
+
+ Result is XYZ: 68.838234 72.491704 80.338143, Yxy: 72.491704 0.310546 0.327028
+=== ramps10 grey800 dbv=1353 rgb10=800,800,800 t=277
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00092661, 0.000717888, 0.000497059, 0.000668719, 0.00232511, 0.0110183, 0.217494, 1.81084, 3.45953, 1.82391, 0.63178, 0.320934, 0.312671, 0.787423, 1.7949, 2.27825, 1.78174, 1.13634, 0.745547, 0.474676, 0.285192, 0.251228, 0.639719, 1.65081, 2.26242, 1.7456, 0.985269, 0.537653, 0.351919, 0.257258, 0.17553, 0.103271, 0.0534582, 0.031489, 0.0200323, 0.0154461
+Peak value 3.459535 at (aprox.) 460.0 nm
+
+ Result is XYZ: 75.346073 79.353008 88.126429, Yxy: 79.353008 0.310289 0.326790
+=== ramps10 grey832 dbv=1353 rgb10=832,832,832 t=286
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00131011, 0.000899406, 0.000893697, 0.00120219, 0.0025283, 0.0123373, 0.237635, 1.97759, 3.77707, 1.99197, 0.69032, 0.350537, 0.340897, 0.859925, 1.95911, 2.48617, 1.94474, 1.24064, 0.813713, 0.518352, 0.312027, 0.27399, 0.697345, 1.80085, 2.46514, 1.90037, 1.07177, 0.585068, 0.3826, 0.2795, 0.191079, 0.111638, 0.0606687, 0.0325261, 0.0214198, 0.0165146
+Peak value 3.777067 at (aprox.) 460.0 nm
+
+ Result is XYZ: 82.174905 86.586069 96.235401, Yxy: 86.586069 0.310098 0.326744
+=== ramps10 grey864 dbv=1353 rgb10=864,864,864 t=296
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00161505, 0.000570132, 0.000259917, 0.00119818, 0.0028211, 0.0135307, 0.25874, 2.15177, 4.10556, 2.16476, 0.750418, 0.381278, 0.371201, 0.934876, 2.13024, 2.70331, 2.11353, 1.34872, 0.885091, 0.564297, 0.339266, 0.298269, 0.760104, 1.95886, 2.68019, 2.06549, 1.16477, 0.635258, 0.415119, 0.303591, 0.206434, 0.121326, 0.0650602, 0.0360476, 0.0239346, 0.0189495
+Peak value 4.105562 at (aprox.) 460.0 nm
+
+ Result is XYZ: 89.363979 94.153979 104.637092, Yxy: 94.153979 0.310125 0.326748
+=== ramps10 grey896 dbv=1353 rgb10=896,896,896 t=306
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00238984, 0.000851593, 0.000146898, 0.000620985, 0.00293981, 0.0149136, 0.281846, 2.33951, 4.4613, 2.35128, 0.815134, 0.414062, 0.402925, 1.01428, 2.31028, 2.93074, 2.29216, 1.46293, 0.959624, 0.611914, 0.368094, 0.323988, 0.826412, 2.12974, 2.91212, 2.24188, 1.26398, 0.690176, 0.451681, 0.33043, 0.225595, 0.131423, 0.0704466, 0.038876, 0.0246454, 0.0179847
+Peak value 4.461298 at (aprox.) 460.0 nm
+
+ Result is XYZ: 97.057510 102.167193 113.708446, Yxy: 102.167193 0.310154 0.326482
+=== ramps10 grey928 dbv=1353 rgb10=928,928,928 t=315
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00124226, 0.000911153, 0.000867405, 0.000693205, 0.00290165, 0.0158562, 0.30489, 2.53281, 4.82604, 2.54169, 0.881357, 0.447696, 0.434624, 1.09566, 2.49583, 3.16541, 2.47527, 1.58072, 1.03751, 0.660922, 0.397488, 0.350132, 0.89275, 2.30005, 3.14455, 2.42034, 1.3644, 0.744562, 0.486938, 0.356718, 0.242826, 0.141812, 0.0762223, 0.0423233, 0.0280169, 0.023491
+Peak value 4.826045 at (aprox.) 460.0 nm
+
+ Result is XYZ: 104.853692 110.361037 122.998949, Yxy: 110.361037 0.310022 0.326306
+=== ramps10 grey960 dbv=1353 rgb10=960,960,960 t=325
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00210094, 0.00194589, 0.00105401, 0.00198385, 0.00395726, 0.0173699, 0.329587, 2.7353, 5.20957, 2.74403, 0.951533, 0.483321, 0.469097, 1.18146, 2.69092, 3.41252, 2.66827, 1.70429, 1.11891, 0.713343, 0.428685, 0.378415, 0.964499, 2.4826, 3.39058, 2.609, 1.47068, 0.802467, 0.525247, 0.384457, 0.262694, 0.152368, 0.0822472, 0.0464999, 0.0298364, 0.0225503
+Peak value 5.209574 at (aprox.) 460.0 nm
+
+ Result is XYZ: 113.124327 119.022152 132.800991, Yxy: 119.022152 0.309974 0.326135
+=== ramps10 grey992 dbv=1353 rgb10=992,992,992 t=334
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00117958, 0.000740782, 0.00097085, 0.00135548, 0.00315657, 0.0184799, 0.354998, 2.9477, 5.61067, 2.95428, 1.0242, 0.519927, 0.504818, 1.27185, 2.89609, 3.67293, 2.87208, 1.83473, 1.20405, 0.766605, 0.461328, 0.406892, 1.03972, 2.6746, 3.65044, 2.80648, 1.58103, 0.862192, 0.564677, 0.413759, 0.281321, 0.164269, 0.0871033, 0.0488437, 0.0306141, 0.0238367
+Peak value 5.610666 at (aprox.) 460.0 nm
+
+ Result is XYZ: 121.781942 128.110991 143.021603, Yxy: 128.110991 0.309945 0.326053
+=== ramps10 grey1023 dbv=1353 rgb10=1023,1023,1023 t=343
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00392633, 0.00179322, 0.00247892, 0.00265519, 0.00467367, 0.0198989, 0.378735, 3.13965, 5.97562, 3.14462, 1.09019, 0.553744, 0.537223, 1.35223, 3.07711, 3.90279, 3.05238, 1.94977, 1.28009, 0.81502, 0.491069, 0.432915, 1.10567, 2.8435, 3.87839, 2.9822, 1.6796, 0.917607, 0.600108, 0.439787, 0.300884, 0.175277, 0.0947162, 0.0518349, 0.0338088, 0.0284176
+Peak value 5.975624 at (aprox.) 460.0 nm
+
+ Result is XYZ: 129.496108 136.176585 152.314892, Yxy: 136.176585 0.309809 0.325791
+=== ramps10 grey0 dbv=3307 rgb10=0,0,0 t=355
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-9.12539e-05, 0.000100143, 8.8335e-05, 4.58154e-05, 5.66801e-05, -3.38668e-05, -0.000108384, -1.4931e-05, -0.000312111, -5.55262e-05, -4.26647e-05, 0.000150945, 5.08019e-05, -0.000127018, -0.000127885, -7.6748e-05, -4.38443e-05, -8.1241e-05, -0.000211628, -8.49549e-05, 0.000155528, 1.42584e-05, 3.79241e-05, 0.00032054, 9.35494e-05, 9.63882e-05, -0.000188669, -6.8392e-05, -0.000454478, -2.10333e-05, -0.000429378, 4.87986e-05, 0.000211416, -0.000621748, -2.66983e-05, 0.000317631
+Peak value 0.000321 at (aprox.) 610.0 nm
+
+ Result is XYZ: 0.000404 0.000000 0.000000, Yxy: 0.000000 1.000000 0.000000
+=== ramps10 grey32 dbv=3307 rgb10=32,32,32 t=367
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000470938, -0.0003195, -0.000149081, -0.000178489, -0.000275309, -0.000214043, 0.000969319, 0.00952337, 0.0182287, 0.00965521, 0.00323481, 0.00188234, 0.00193837, 0.00476481, 0.0110721, 0.0139865, 0.0109393, 0.00687731, 0.00429879, 0.00275339, 0.001643, 0.00111914, 0.00358603, 0.0101072, 0.014051, 0.0111818, 0.00625666, 0.00300797, 0.00154804, 0.00156142, 0.000733512, 0.00061601, 0.000261523, 0.000114343, 0.000838931, -0.000279923
+Peak value 0.018229 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.442348 0.476796 0.461182, Yxy: 0.476796 0.320466 0.345423
+=== ramps10 grey64 dbv=3307 rgb10=64,64,64 t=380
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000863471, -0.000370471, -0.00025204, 0.000129415, -8.98434e-05, 0.000176773, 0.00541665, 0.0474369, 0.0916687, 0.0484406, 0.0166584, 0.0086267, 0.00856464, 0.0221508, 0.0513475, 0.0652956, 0.0508819, 0.032304, 0.0210837, 0.0134367, 0.00816682, 0.00703139, 0.0178143, 0.0466088, 0.0650338, 0.0511163, 0.0290742, 0.0154053, 0.0090919, 0.00743376, 0.00434641, 0.00251098, 0.00160786, 0.000308377, 0.000424978, -0.000351825
+Peak value 0.091669 at (aprox.) 460.0 nm
+
+ Result is XYZ: 2.119713 2.253952 2.329524, Yxy: 2.253952 0.316225 0.336251
+=== ramps10 grey96 dbv=3307 rgb10=96,96,96 t=392
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000186062, -0.000176044, 0.000101186, 7.01603e-05, 3.91007e-05, 0.000629628, 0.0135008, 0.1153, 0.222565, 0.117917, 0.0409132, 0.0210663, 0.0210439, 0.0534932, 0.122246, 0.155071, 0.121094, 0.0771878, 0.0505357, 0.0323516, 0.0196489, 0.0166695, 0.0423559, 0.110027, 0.153294, 0.120464, 0.0685651, 0.0374348, 0.0237284, 0.0174071, 0.012003, 0.00794211, 0.00320495, 0.00185283, 0.00191631, 0.00167985
+Peak value 0.222565 at (aprox.) 460.0 nm
+
+ Result is XYZ: 5.052852 5.372325 5.667925, Yxy: 5.372325 0.313976 0.333828
+=== ramps10 grey128 dbv=3307 rgb10=128,128,128 t=403
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000923794, 1.49046e-05, 0.000276721, 0.000658775, 0.000362862, 0.00138047, 0.0263536, 0.222095, 0.428065, 0.226573, 0.0784955, 0.040021, 0.0396602, 0.100589, 0.228929, 0.290946, 0.227745, 0.145094, 0.0951923, 0.060918, 0.0367936, 0.0317651, 0.0797711, 0.207068, 0.287516, 0.224784, 0.128057, 0.070265, 0.045802, 0.0338935, 0.0231957, 0.0141486, 0.00773342, 0.0040537, 0.00329549, 0.00217309
+Peak value 0.428065 at (aprox.) 460.0 nm
+
+ Result is XYZ: 9.534597 10.103065 10.898705, Yxy: 10.103065 0.312237 0.330854
+=== ramps10 grey160 dbv=3307 rgb10=160,160,160 t=412
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000609593, -6.98479e-05, -0.000218476, 0.000232384, 0.000505631, 0.00193452, 0.0441759, 0.370505, 0.712467, 0.376974, 0.130521, 0.0664365, 0.0650496, 0.165118, 0.376492, 0.478843, 0.374518, 0.238487, 0.156618, 0.0998919, 0.0600126, 0.0521141, 0.131318, 0.341184, 0.47237, 0.368021, 0.209681, 0.115256, 0.0743122, 0.0546547, 0.0376334, 0.0219279, 0.0108927, 0.00765193, 0.00393325, 0.00277234
+Peak value 0.712467 at (aprox.) 460.0 nm
+
+ Result is XYZ: 15.701443 16.616065 18.136731, Yxy: 16.616065 0.311202 0.329329
+=== ramps10 grey192 dbv=3307 rgb10=192,192,192 t=422
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00012865, 0.000524551, 0.000138478, 0.000217677, 0.000675168, 0.00312377, 0.0671467, 0.558729, 1.07274, 0.56745, 0.196706, 0.100084, 0.0978417, 0.246301, 0.561259, 0.713263, 0.557797, 0.355553, 0.232919, 0.148807, 0.089661, 0.0776868, 0.198041, 0.512626, 0.707924, 0.549956, 0.312807, 0.170843, 0.111262, 0.081416, 0.0560553, 0.0337474, 0.0169068, 0.0111633, 0.00776952, 0.00591565
+Peak value 1.072743 at (aprox.) 460.0 nm
+
+ Result is XYZ: 23.523213 24.811681 27.318615, Yxy: 24.811681 0.310934 0.327965
+=== ramps10 grey224 dbv=3307 rgb10=224,224,224 t=432
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+5.25491e-05, -0.000588846, -0.000567819, -8.71813e-05, 0.000696754, 0.00420138, 0.0939023, 0.788413, 1.51287, 0.798436, 0.27646, 0.140399, 0.136801, 0.346363, 0.790618, 1.00447, 0.785147, 0.500664, 0.327848, 0.208748, 0.125443, 0.10989, 0.279684, 0.723011, 0.996456, 0.773086, 0.437105, 0.23834, 0.15562, 0.113898, 0.0787786, 0.0463634, 0.0230196, 0.0119403, 0.00907506, 0.00839101
+Peak value 1.512869 at (aprox.) 460.0 nm
+
+ Result is XYZ: 33.110870 34.923343 38.490511, Yxy: 34.923343 0.310828 0.327843
+=== ramps10 grey256 dbv=3307 rgb10=256,256,256 t=441
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000369088, 0.000403277, 0.000336943, 0.000254689, 0.00173175, 0.00669823, 0.128627, 1.07556, 2.06047, 1.08711, 0.37657, 0.191838, 0.186991, 0.471993, 1.07676, 1.36731, 1.06878, 0.681722, 0.446764, 0.285028, 0.171454, 0.149665, 0.380605, 0.984785, 1.35326, 1.0471, 0.59217, 0.323529, 0.211071, 0.154397, 0.105177, 0.0616427, 0.0333312, 0.018611, 0.0132608, 0.00950765
+Peak value 2.060466 at (aprox.) 460.0 nm
+
+ Result is XYZ: 45.046534 47.541704 52.467281, Yxy: 47.541704 0.310547 0.327748
+=== ramps10 grey288 dbv=3307 rgb10=288,288,288 t=451
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00131459, 0.0015898, 0.00141656, 0.00130648, 0.00244961, 0.00932447, 0.167926, 1.39738, 2.67294, 1.41007, 0.488356, 0.248399, 0.241964, 0.61043, 1.39226, 1.76829, 1.38228, 0.881368, 0.57779, 0.368203, 0.221861, 0.194186, 0.492605, 1.27154, 1.74515, 1.34896, 0.761677, 0.415334, 0.271917, 0.198272, 0.135935, 0.0802541, 0.0437511, 0.024252, 0.0158494, 0.0127502
+Peak value 2.672939 at (aprox.) 460.0 nm
+
+ Result is XYZ: 58.218725 61.456830 68.098501, Yxy: 61.456830 0.310047 0.327291
+=== ramps10 grey320 dbv=3307 rgb10=320,320,320 t=460
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000382222, 0.000454045, 0.00020416, 0.000585315, 0.0017786, 0.0107559, 0.212841, 1.77246, 3.38751, 1.78647, 0.61861, 0.314393, 0.306125, 0.773254, 1.76363, 2.23944, 1.75065, 1.11654, 0.732446, 0.467187, 0.280887, 0.246821, 0.626192, 1.61407, 2.21274, 1.70702, 0.96413, 0.526006, 0.342728, 0.249943, 0.169968, 0.0992682, 0.0532585, 0.0285019, 0.0188769, 0.0143373
+Peak value 3.387507 at (aprox.) 460.0 nm
+
+ Result is XYZ: 73.800194 77.877944 86.293365, Yxy: 77.877944 0.310122 0.327257
+=== ramps10 grey352 dbv=3307 rgb10=352,352,352 t=470
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00039454, -0.000329435, 8.69054e-05, 0.0010668, 0.0029041, 0.0135216, 0.263308, 2.19085, 4.1801, 2.20326, 0.763264, 0.387599, 0.377838, 0.954302, 2.17447, 2.75872, 2.15794, 1.37672, 0.903291, 0.575339, 0.345848, 0.303723, 0.77264, 1.9905, 2.72302, 2.09762, 1.18356, 0.645694, 0.422074, 0.307894, 0.209492, 0.122341, 0.0641738, 0.0344478, 0.0220459, 0.0152182
+Peak value 4.180097 at (aprox.) 460.0 nm
+
+ Result is XYZ: 90.926567 95.970911 106.527811, Yxy: 95.970911 0.309880 0.327071
+=== ramps10 grey384 dbv=3307 rgb10=384,384,384 t=479
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000605629, 0.00064699, 0.00112227, 0.00146334, 0.00319603, 0.0168575, 0.320726, 2.66321, 5.07316, 2.67093, 0.92597, 0.470363, 0.456818, 1.15129, 2.62179, 3.32473, 2.60039, 1.66026, 1.08994, 0.69433, 0.41772, 0.367433, 0.936045, 2.41021, 3.29178, 2.53328, 1.42649, 0.778475, 0.509355, 0.37185, 0.253358, 0.149098, 0.0797628, 0.0432333, 0.0271523, 0.0227426
+Peak value 5.073165 at (aprox.) 460.0 nm
+
+ Result is XYZ: 109.966575 115.845500 129.297349, Yxy: 115.845500 0.309670 0.326225
+=== ramps10 grey416 dbv=3307 rgb10=416,416,416 t=489
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00180364, 0.00138111, 0.00115335, 0.00200421, 0.00429785, 0.0205665, 0.385014, 3.19135, 6.07297, 3.1959, 1.10835, 0.562301, 0.544962, 1.37288, 3.12526, 3.96314, 3.09868, 1.98007, 1.29987, 0.828156, 0.498611, 0.439093, 1.12131, 2.88361, 3.93222, 3.02224, 1.70273, 0.928324, 0.60758, 0.445138, 0.303722, 0.177248, 0.0941669, 0.0517153, 0.0345758, 0.0262331
+Peak value 6.072968 at (aprox.) 460.0 nm
+
+ Result is XYZ: 131.399784 138.230248 154.798745, Yxy: 138.230248 0.309592 0.325685
+=== ramps10 grey448 dbv=3307 rgb10=448,448,448 t=498
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00151593, 0.001756, 0.00126325, 0.00193575, 0.00460355, 0.0244652, 0.453894, 3.75514, 7.13906, 3.75606, 1.30279, 0.661259, 0.641299, 1.61412, 3.67499, 4.6597, 3.64426, 2.32847, 1.52938, 0.974522, 0.586213, 0.518154, 1.32272, 3.39808, 4.62819, 3.55363, 2.00059, 1.09149, 0.714308, 0.52454, 0.357077, 0.207416, 0.111432, 0.0610001, 0.0391973, 0.029718
+Peak value 7.139059 at (aprox.) 460.0 nm
+
+ Result is XYZ: 154.632930 162.615153 182.026949, Yxy: 162.615153 0.309715 0.325703
+=== ramps10 grey480 dbv=3307 rgb10=480,480,480 t=507
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00444229, 0.00247743, 0.00162976, 0.00281767, 0.00641424, 0.0286082, 0.529155, 4.37681, 8.31401, 4.37075, 1.51703, 0.769894, 0.746413, 1.87964, 4.27699, 5.42212, 4.2401, 2.71049, 1.7808, 1.1349, 0.683353, 0.603373, 1.54002, 3.95488, 5.37994, 4.12821, 2.32243, 1.26841, 0.832741, 0.610262, 0.416369, 0.241929, 0.130181, 0.0728771, 0.0455171, 0.037787
+Peak value 8.314007 at (aprox.) 460.0 nm
+
+ Result is XYZ: 179.923901 189.238227 212.006284, Yxy: 189.238227 0.309590 0.325617
+=== ramps10 grey512 dbv=3307 rgb10=512,512,512 t=515
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00495542, 0.00322889, 0.00153755, 0.00223219, 0.0074199, 0.0339725, 0.615888, 5.07855, 9.63766, 5.06598, 1.75863, 0.892649, 0.864993, 2.17819, 4.95468, 6.27926, 4.9104, 3.14048, 2.06417, 1.31573, 0.791788, 0.702587, 1.79297, 4.59584, 6.24265, 4.78272, 2.69037, 1.46968, 0.964311, 0.706715, 0.48322, 0.282884, 0.151218, 0.0829158, 0.0537832, 0.0430885
+Peak value 9.637664 at (aprox.) 460.0 nm
+
+ Result is XYZ: 208.734448 219.366563 245.844811, Yxy: 219.366563 0.309720 0.325496
+=== ramps10 grey544 dbv=3307 rgb10=544,544,544 t=524
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00021051, 0.00160874, 0.00100463, 0.0031102, 0.00799699, 0.0378002, 0.703989, 5.80798, 11.0189, 5.78946, 2.00953, 1.01998, 0.988301, 2.49238, 5.66884, 7.18348, 5.61662, 3.59379, 2.36281, 1.50506, 0.905015, 0.803823, 2.05289, 5.26108, 7.14082, 5.46505, 3.073, 1.67897, 1.10089, 0.80599, 0.546571, 0.319944, 0.168825, 0.0946935, 0.0616319, 0.047427
+Peak value 11.018878 at (aprox.) 460.0 nm
+
+ Result is XYZ: 238.740714 250.948296 281.057779, Yxy: 250.948296 0.309752 0.325591
+=== ramps10 grey576 dbv=3307 rgb10=576,576,576 t=532
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00569903, 0.00273646, 0.0019703, 0.00308538, 0.010471, 0.0449235, 0.804167, 6.62285, 12.5535, 6.59227, 2.28774, 1.16207, 1.12842, 2.84605, 6.47468, 8.20324, 6.41366, 4.10381, 2.69954, 1.72078, 1.03579, 0.918409, 2.34432, 5.99803, 8.12987, 6.21693, 3.49474, 1.91099, 1.25549, 0.920495, 0.626021, 0.363057, 0.193704, 0.106988, 0.0681432, 0.0534309
+Peak value 12.553537 at (aprox.) 460.0 nm
+
+ Result is XYZ: 272.183919 286.411748 320.312397, Yxy: 286.411748 0.309684 0.325872
+=== ramps10 grey608 dbv=3307 rgb10=608,608,608 t=540
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000802116, 6.56211e-05, 6.73179e-05, 0.00316536, 0.00837472, 0.0479639, 0.902537, 7.43292, 14.0811, 7.39222, 2.56603, 1.30329, 1.26819, 3.20361, 7.28992, 9.23352, 7.2232, 4.6228, 3.04165, 1.93851, 1.16551, 1.03396, 2.64304, 6.75272, 9.13815, 6.98109, 3.92073, 2.14256, 1.40505, 1.03261, 0.699284, 0.40689, 0.214109, 0.113409, 0.0703769, 0.0577041
+Peak value 14.081144 at (aprox.) 460.0 nm
+
+ Result is XYZ: 306.024149 322.343988 359.332270, Yxy: 322.343988 0.309835 0.326358
+=== ramps10 grey640 dbv=3307 rgb10=640,640,640 t=549
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00489589, 0.00375948, 0.00323298, 0.0045613, 0.0119786, 0.0552828, 1.01324, 8.32354, 15.7486, 8.26716, 2.87223, 1.46066, 1.4236, 3.59667, 8.17407, 10.3479, 8.09239, 5.18315, 3.41215, 2.17649, 1.31047, 1.16246, 2.96334, 7.56172, 10.2272, 7.80987, 4.38619, 2.39877, 1.57731, 1.15747, 0.787255, 0.456959, 0.247019, 0.136885, 0.0874874, 0.0707287
+Peak value 15.748611 at (aprox.) 460.0 nm
+
+ Result is XYZ: 342.761934 361.276782 402.150811, Yxy: 361.276782 0.309858 0.326596
+=== ramps10 grey672 dbv=3307 rgb10=672,672,672 t=558
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00419436, 0.00362164, 0.00306577, 0.00453461, 0.0122733, 0.0624861, 1.12832, 9.25463, 17.5037, 9.18561, 3.19225, 1.62509, 1.58853, 4.01883, 9.1319, 11.56, 9.0401, 5.79374, 3.81431, 2.43225, 1.46452, 1.29976, 3.30994, 8.43237, 11.3867, 8.68718, 4.87747, 2.66829, 1.75662, 1.28907, 0.875287, 0.508511, 0.270874, 0.147387, 0.0942608, 0.0778646
+Peak value 17.503667 at (aprox.) 460.0 nm
+
+ Result is XYZ: 381.982371 403.283100 447.105299, Yxy: 403.283100 0.309957 0.327242
+=== ramps10 grey704 dbv=3307 rgb10=704,704,704 t=567
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00696413, 0.00380352, 0.00362675, 0.00551775, 0.0148001, 0.0688, 1.24578, 10.2001, 19.2747, 10.1132, 3.5155, 1.7914, 1.76037, 4.47195, 10.1653, 12.8621, 10.0588, 6.44794, 4.24698, 2.70808, 1.62963, 1.44661, 3.67972, 9.36221, 12.6336, 9.63067, 5.40524, 2.95504, 1.94788, 1.42929, 0.972818, 0.561797, 0.304113, 0.167607, 0.10427, 0.0886008
+Peak value 19.274668 at (aprox.) 460.0 nm
+
+ Result is XYZ: 423.601936 448.255402 492.679403, Yxy: 448.255402 0.310436 0.328504
+=== ramps10 grey736 dbv=3307 rgb10=736,736,736 t=575
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00819996, 0.0054856, 0.00385684, 0.0061554, 0.0174364, 0.0759155, 1.36197, 11.1498, 21.058, 11.0447, 3.84173, 1.95971, 1.93154, 4.91408, 11.1689, 14.1317, 11.0536, 7.08608, 4.6682, 2.97788, 1.79205, 1.59013, 4.0399, 10.2691, 13.842, 10.5464, 5.91895, 3.23922, 2.1335, 1.56633, 1.06472, 0.617874, 0.32922, 0.178822, 0.116344, 0.097042
+Peak value 21.058027 at (aprox.) 460.0 nm
+
+ Result is XYZ: 464.366447 492.158879 538.452432, Yxy: 492.158879 0.310618 0.329208
+=== ramps10 grey768 dbv=3307 rgb10=768,768,768 t=584
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00717818, 0.00232231, 0.00310745, 0.00733446, 0.0193553, 0.0844668, 1.49334, 12.21, 23.0491, 12.0849, 4.20346, 2.14534, 2.12337, 5.414, 12.306, 15.5681, 12.1752, 7.81044, 5.14471, 3.28156, 1.97475, 1.75025, 4.44397, 11.2826, 15.1924, 11.5652, 6.48963, 3.55447, 2.34392, 1.72275, 1.16851, 0.67682, 0.356242, 0.195851, 0.126826, 0.108883
+Peak value 23.049107 at (aprox.) 460.0 nm
+
+ Result is XYZ: 510.018029 541.609476 589.581056, Yxy: 541.609476 0.310758 0.330006
+=== ramps10 grey800 dbv=3307 rgb10=800,800,800 t=592
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0141261, 0.00486803, 0.00480783, 0.00909451, 0.0210902, 0.0923792, 1.62561, 13.2743, 25.0471, 13.1293, 4.56817, 2.33473, 2.31596, 5.91118, 13.4313, 16.9888, 13.2891, 8.52616, 5.62053, 3.5834, 2.15928, 1.91605, 4.8505, 12.2994, 16.5452, 12.5921, 7.0649, 3.87086, 2.55706, 1.87843, 1.27834, 0.741045, 0.40196, 0.228863, 0.142732, 0.127521
+Peak value 25.047096 at (aprox.) 460.0 nm
+
+ Result is XYZ: 555.791586 590.883555 640.896352, Yxy: 590.883555 0.310920 0.330551
+=== ramps10 grey832 dbv=3307 rgb10=832,832,832 t=601
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0175682, 0.00819895, 0.00419502, 0.00857985, 0.02248, 0.100091, 1.77052, 14.4245, 27.1964, 14.2536, 4.96213, 2.53777, 2.52524, 6.45721, 14.668, 18.5452, 14.506, 9.31031, 6.13871, 3.91623, 2.35833, 2.09132, 5.29343, 13.4132, 18.026, 13.704, 7.68831, 4.21156, 2.7803, 2.04038, 1.38706, 0.808674, 0.430858, 0.231895, 0.152914, 0.126555
+Peak value 27.196433 at (aprox.) 460.0 nm
+
+ Result is XYZ: 605.578349 644.701497 696.235486, Yxy: 644.701497 0.311109 0.331208
+=== ramps10 grey864 dbv=3307 rgb10=864,864,864 t=609
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00961443, 0.00804699, 0.00639464, 0.00929359, 0.0234165, 0.109344, 1.91989, 15.6391, 29.4687, 15.4401, 5.3753, 2.75188, 2.74518, 7.02342, 15.9552, 20.1685, 15.7734, 10.1265, 6.67875, 4.26182, 2.56626, 2.27375, 5.74597, 14.5409, 19.5236, 14.8391, 8.3226, 4.55962, 3.01355, 2.21489, 1.50256, 0.875816, 0.468787, 0.258085, 0.16231, 0.134847
+Peak value 29.468655 at (aprox.) 460.0 nm
+
+ Result is XYZ: 656.859096 700.459547 754.613275, Yxy: 700.459547 0.311023 0.331668
+=== ramps10 grey896 dbv=3307 rgb10=896,896,896 t=618
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0104469, 0.00385285, 0.00426191, 0.00712038, 0.0230283, 0.116732, 2.06657, 16.832, 31.7046, 16.6074, 5.7828, 2.96099, 2.95883, 7.58765, 17.2369, 21.7841, 17.0384, 10.9439, 7.21751, 4.60408, 2.77171, 2.45283, 6.20162, 15.6788, 21.0327, 15.9718, 8.95503, 4.91034, 3.24075, 2.3789, 1.6163, 0.937897, 0.498112, 0.276304, 0.171709, 0.139055
+Peak value 31.704642 at (aprox.) 460.0 nm
+
+ Result is XYZ: 708.032547 756.078063 812.015952, Yxy: 756.078063 0.311069 0.332178
+=== ramps10 grey928 dbv=3307 rgb10=928,928,928 t=626
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0135071, 0.0083489, 0.00818741, 0.011718, 0.0287793, 0.127422, 2.21956, 18.0477, 33.976, 17.7938, 6.19462, 3.17446, 3.17758, 8.15103, 18.5081, 23.3819, 18.2854, 11.7489, 7.75199, 4.94615, 2.98033, 2.64042, 6.6632, 16.8277, 22.5518, 17.1194, 9.59781, 5.26358, 3.48003, 2.55687, 1.74056, 1.01024, 0.543283, 0.304775, 0.199887, 0.161007
+Peak value 33.975987 at (aprox.) 460.0 nm
+
+ Result is XYZ: 759.661750 811.566350 870.448155, Yxy: 811.566350 0.311123 0.332381
+=== ramps10 grey960 dbv=3307 rgb10=960,960,960 t=635
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00835738, 0.00438143, 0.00450246, 0.00893448, 0.0293258, 0.1342, 2.37263, 19.2916, 36.2967, 19.0058, 6.62004, 3.39305, 3.40453, 8.74333, 19.8498, 25.0746, 19.6118, 12.6016, 8.31567, 5.30666, 3.1947, 2.82736, 7.13292, 17.9988, 24.1013, 18.2826, 10.2484, 5.62058, 3.71991, 2.7279, 1.84902, 1.07064, 0.569086, 0.31314, 0.197452, 0.166104
+Peak value 36.296742 at (aprox.) 460.0 nm
+
+ Result is XYZ: 812.640770 869.549859 930.153946, Yxy: 869.549859 0.311077 0.332862
+=== ramps10 grey992 dbv=3307 rgb10=992,992,992 t=644
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00932419, 0.00403207, 0.00421919, 0.00828828, 0.0290402, 0.142338, 2.52979, 20.5385, 38.6254, 20.2242, 7.04746, 3.61385, 3.63275, 9.34117, 21.2033, 26.7768, 20.9429, 13.4586, 8.8846, 5.67, 3.41291, 3.01625, 7.60048, 19.1516, 25.6278, 19.4313, 10.8922, 5.9731, 3.95199, 2.90321, 1.96734, 1.13634, 0.603228, 0.335931, 0.211267, 0.173596
+Peak value 38.625447 at (aprox.) 460.0 nm
+
+ Result is XYZ: 865.409771 927.660986 990.143173, Yxy: 927.660986 0.310939 0.333306
+=== ramps10 grey1023 dbv=3307 rgb10=1023,1023,1023 t=652
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.0157139, 0.00937762, 0.00743971, 0.011652, 0.0331374, 0.152824, 2.67308, 21.692, 40.7814, 21.3476, 7.44065, 3.81854, 3.85095, 9.91634, 22.5081, 28.4169, 22.2228, 14.2877, 9.4304, 6.01705, 3.62421, 3.19925, 8.04416, 20.2485, 27.0753, 20.5179, 11.5008, 6.31457, 4.1742, 3.06951, 2.08201, 1.20995, 0.646355, 0.360612, 0.231434, 0.189924
+Peak value 40.781446 at (aprox.) 460.0 nm
+
+ Result is XYZ: 915.469547 983.331706 1045.739275, Yxy: 983.331706 0.310904 0.333951
+=== ramps10 red0 dbv=1353 rgb10=0,0,0 t=665
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000703866, -0.000257854, -0.000121523, 7.13598e-05, -5.68363e-05, 0.000214888, -4.73222e-06, 3.69291e-05, -0.000431693, -0.000252473, -8.97918e-05, -1.08956e-05, -4.1466e-05, 4.51303e-05, 0.000180379, 3.43473e-05, 4.66833e-06, -0.000170197, -0.000312005, -4.80967e-05, -0.000103272, -0.000183174, 7.37097e-05, 0.000147289, 9.53617e-05, -3.4535e-05, -0.000279145, -0.000205174, -0.000464259, 3.99227e-06, -0.000246629, 0.000269266, -9.85744e-05, -5.94609e-05, 0.000603659, -0.000617861
+Peak value 0.000604 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.000000 0.000000 0.000000, Yxy: 0.000000 0.333333 0.333333
+=== ramps10 green0 dbv=1353 rgb10=0,0,0 t=677
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00023925, -0.000233803, 0.000197646, 0.00021494, 0.000168354, 3.94838e-06, -6.45858e-05, 2.78373e-05, -0.000354767, -0.000137552, 0.000153064, 0.000115221, 1.75795e-05, 6.5018e-05, 0.000253644, 1.41931e-05, -0.000150791, -4.01218e-05, -0.000101331, -0.000112737, 0.000163345, 0.00014887, 0.00011943, 0.000100901, 1.6135e-05, 0.000148951, -5.84991e-05, -4.19361e-05, -0.00020183, 0.000459499, 0.000157665, 1.00352e-05, 0.000781423, 0.000238465, 0.000250454, 0.000495423
+Peak value 0.000781 at (aprox.) 700.0 nm
+
+ Result is XYZ: 0.002399 0.001857 0.000000, Yxy: 0.001857 0.563649 0.436351
+=== ramps10 blue0 dbv=1353 rgb10=0,0,0 t=689
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00121955, -0.000802279, -0.000312907, -2.86353e-06, -7.69873e-05, -0.000171909, -0.000175522, -0.000222212, -0.000472036, -0.00037965, -0.000209329, -7.14574e-05, -4.60316e-05, -0.000163621, -0.00016768, -0.000326149, -0.000175829, -0.000179639, -0.000323049, -0.000193478, -0.000105811, -0.000332602, -0.000336559, 5.66114e-05, -0.000159063, -7.99823e-06, -0.000475708, -0.000862181, -0.00115501, -0.000671083, -0.000676714, -0.000692299, -0.000894876, -0.000994392, -8.67372e-05, -0.000827784
+Peak value 0.000057 at (aprox.) 610.0 nm
+
+ Result is XYZ: 0.000000 0.000000 0.000000, Yxy: 0.000000 0.333333 0.333333
+=== ramps10 red64 dbv=1353 rgb10=64,0,0 t=701
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000670825, -0.000513002, -0.000470861, -8.42829e-05, -0.000251852, -0.000139392, 2.81801e-05, -1.60126e-05, -0.000543909, -0.000498804, -0.000273728, -4.54067e-05, -0.000141351, -0.000110504, 7.92812e-06, -0.000108994, -0.000367801, -0.000412841, -0.000361333, -0.000219554, -5.514e-05, 1.07966e-05, 0.00179836, 0.00560221, 0.0077517, 0.00635289, 0.00350011, 0.00180388, 0.000889885, 0.000469691, -0.000480548, 2.77562e-06, -0.000503199, -0.000638007, 0.000247165, -0.000485569
+Peak value 0.007752 at (aprox.) 620.0 nm
+
+ Result is XYZ: 0.132329 0.053040 0.000000, Yxy: 0.053040 0.713870 0.286130
+=== ramps10 green64 dbv=1353 rgb10=0,64,0 t=713
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000436542, -0.00035127, 3.09435e-05, -6.21054e-05, -4.33154e-06, 1.68428e-05, -9.3395e-05, -1.40187e-05, -0.000339221, -0.000448367, -3.42358e-05, 0.000243258, 0.000578465, 0.0026331, 0.00652235, 0.00834605, 0.00641494, 0.00402261, 0.00247391, 0.00150254, 0.00081025, 5.98759e-06, 0.000109001, 0.00034585, 3.14619e-05, 0.000301675, -0.00019103, -0.000515338, -0.00035243, -7.02574e-06, -6.0395e-05, -3.70854e-05, -0.000307774, -0.00029967, 0.000260256, -0.000710356
+Peak value 0.008346 at (aprox.) 530.0 nm
+
+ Result is XYZ: 0.061162 0.192945 0.002504, Yxy: 0.192945 0.238344 0.751898
+=== ramps10 blue64 dbv=1353 rgb10=0,0,64 t=725
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00122757, -0.000291012, -6.54545e-05, 4.35237e-05, -0.000243833, -0.000217712, 0.000596189, 0.00595736, 0.011578, 0.00577099, 0.00208145, 0.000943487, 0.00041253, -4.19372e-06, -0.000423996, -0.000167344, -0.000140864, -0.00044591, -0.000416195, -0.000304046, -0.00033531, -0.000404983, -0.000120571, 0.000131703, -0.000382342, -0.00025282, -0.000377126, -0.000379688, -0.000382601, 0.000106464, -0.000481691, -0.000245113, -0.000275342, -8.45347e-05, 0.000643537, -0.000546122
+Peak value 0.011578 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.030802 0.000000 0.273995, Yxy: 0.000000 0.101058 0.000000
+=== ramps10 red128 dbv=1353 rgb10=128,0,0 t=737
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000314879, -0.000174801, 0.000140026, 0.000134041, 0.000141733, -3.39961e-05, -0.000111399, 6.71801e-05, -0.000327853, -0.000315431, -5.41323e-05, 8.70531e-05, -0.000130039, 1.61538e-05, -7.90391e-05, -0.000174652, -0.000243162, -0.000348973, -8.67379e-05, -8.93191e-05, 0.000222583, 0.00154753, 0.00926985, 0.0274233, 0.0386839, 0.0306593, 0.0173998, 0.00922737, 0.00577568, 0.00399579, 0.00281274, 0.00163425, 0.000193242, 0.000346228, -0.000150746, -0.000269193
+Peak value 0.038684 at (aprox.) 620.0 nm
+
+ Result is XYZ: 0.705075 0.323891 0.000000, Yxy: 0.323891 0.685227 0.314773
+=== ramps10 green128 dbv=1353 rgb10=0,128,0 t=749
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00026626, 4.09083e-05, 1.46702e-05, 9.74022e-05, 0.000115875, -0.000160497, -0.000152732, 1.32683e-05, -0.000287409, -0.000282719, 0.000145676, 0.000849108, 0.0034382, 0.0130935, 0.0310535, 0.0395964, 0.0309144, 0.0195972, 0.0126208, 0.00824409, 0.00467763, 0.00243391, 0.00141365, 0.000893395, 6.49633e-05, 0.000310826, 0.000107259, 1.33945e-05, -0.000575603, 5.87452e-05, 0.000135338, -0.000455331, -0.000481576, -0.000154535, 0.000721346, -6.33361e-05
+Peak value 0.039596 at (aprox.) 530.0 nm
+
+ Result is XYZ: 0.335552 0.961017 0.049748, Yxy: 0.961017 0.249237 0.713812
+=== ramps10 blue128 dbv=1353 rgb10=0,0,128 t=761
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000496749, -0.000192156, 7.02595e-05, 2.92771e-05, -6.02182e-05, 0.000116432, 0.00317713, 0.0285432, 0.0552996, 0.029265, 0.00995922, 0.00439754, 0.00173546, 0.000520374, 5.08972e-05, 6.13983e-07, -9.93588e-05, -0.000215069, -0.000213847, 4.12207e-05, 5.08879e-05, -0.000126781, -9.24591e-05, -4.87938e-05, -0.000128385, -0.000148924, -0.000510905, -0.000330043, -0.000188096, 0.000456651, -0.000175126, -0.00015492, -0.000596559, -0.00058237, 0.000437335, 1.74108e-05
+Peak value 0.055300 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.223258 0.064590 1.346455, Yxy: 0.064590 0.136608 0.039522
+=== ramps10 red192 dbv=1353 rgb10=192,0,0 t=773
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000476229, -0.000104678, 6.54286e-05, 0.0001685, -9.83815e-05, 1.13798e-05, 8.32153e-05, -7.1184e-05, -0.000385503, -0.00024697, 3.24759e-05, 7.82056e-05, 2.15375e-06, -0.000263116, 4.21013e-05, -1.59875e-05, -0.000177315, -0.000245797, -0.000194551, 3.32324e-05, 0.000712633, 0.00406475, 0.0222995, 0.0656211, 0.0935146, 0.0737514, 0.0418471, 0.0227956, 0.0143815, 0.0107126, 0.00698018, 0.00424593, 0.00184862, 0.000701173, 0.000160709, -0.00143577
+Peak value 0.093515 at (aprox.) 620.0 nm
+
+ Result is XYZ: 1.708479 0.794903 0.000000, Yxy: 0.794903 0.682468 0.317532
+=== ramps10 green192 dbv=1353 rgb10=0,192,0 t=785
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000802985, -0.00062862, -6.66338e-05, -5.97251e-05, -6.1672e-05, -0.000159023, -0.000162649, -0.000200944, -0.000316904, -0.000198836, 0.000357966, 0.00189609, 0.00842255, 0.031194, 0.0743145, 0.094946, 0.0741779, 0.0470204, 0.0306255, 0.0194, 0.0112894, 0.0058551, 0.00329523, 0.00199265, 0.000960704, 0.000801602, 0.000592525, -0.000211452, -0.000478122, 4.25282e-05, -0.000220357, -0.00043443, -0.000898867, -0.000317316, -9.64223e-05, -0.000515968
+Peak value 0.094946 at (aprox.) 530.0 nm
+
+ Result is XYZ: 0.810793 2.306536 0.126989, Yxy: 2.306536 0.249912 0.710946
+=== ramps10 blue192 dbv=1353 rgb10=0,0,192 t=797
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000320158, -2.37463e-05, 0.000342205, 0.000237436, 0.000224594, 0.00049353, 0.00845679, 0.0718374, 0.13843, 0.073427, 0.0250339, 0.0110766, 0.00457629, 0.00158409, 0.000659841, 0.000163405, -4.61893e-05, -0.000176151, -0.000160245, -7.25864e-05, 0.000275825, 4.9583e-05, 9.6297e-05, 0.00036313, 1.19128e-05, 8.23688e-05, 6.04094e-06, 9.11217e-06, -0.000502991, 0.000424509, 3.15413e-05, 0.000460407, 0.000335415, 0.000341453, 0.000434171, -0.000496172
+Peak value 0.138430 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.583317 0.182087 3.388670, Yxy: 0.182087 0.140420 0.043833
+=== ramps10 red256 dbv=1353 rgb10=256,0,0 t=809
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000112184, -5.48307e-05, 0.00010339, 9.41476e-05, -0.000156921, -2.71959e-05, 6.90724e-05, 4.07294e-05, -0.000249081, -0.000168876, 0.000169237, 0.000186038, 5.28736e-05, 9.16354e-05, 0.000284074, 4.31047e-05, -7.43306e-05, -0.000292627, -0.000154203, 0.000265959, 0.00150862, 0.00783656, 0.0418926, 0.122551, 0.173319, 0.136187, 0.0771426, 0.0421058, 0.0269312, 0.0197443, 0.0136629, 0.00790565, 0.00332804, 0.0018859, 0.00166537, 0.00111502
+Peak value 0.173319 at (aprox.) 620.0 nm
+
+ Result is XYZ: 3.181619 1.489854 0.000000, Yxy: 1.489854 0.681074 0.318926
+=== ramps10 green256 dbv=1353 rgb10=0,256,0 t=821
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000563346, 0.000196602, 0.000140019, 0.000137821, -0.000119144, -0.000122789, -3.98785e-05, -0.00015356, -0.000320134, -0.000343919, 0.000629631, 0.00379681, 0.0157939, 0.0587105, 0.139613, 0.178273, 0.13955, 0.0887456, 0.0579926, 0.0369047, 0.0209296, 0.0110946, 0.00629939, 0.00392572, 0.00242109, 0.00170806, 0.000759669, 0.000727688, 0.000226499, 0.000405774, 0.000225723, 0.000777948, 0.000386105, -0.000123502, 0.000287844, 0.000409555
+Peak value 0.178273 at (aprox.) 530.0 nm
+
+ Result is XYZ: 1.539849 4.346698 0.250812, Yxy: 4.346698 0.250898 0.708236
+=== ramps10 blue256 dbv=1353 rgb10=0,0,256 t=833
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000443924, -0.000259082, -8.43401e-05, 0.000177381, 6.17181e-05, 0.000694443, 0.0161117, 0.136255, 0.26279, 0.139183, 0.0474489, 0.0209203, 0.00850038, 0.00276955, 0.00123735, 0.000488843, 0.000224841, -3.09863e-05, -0.000323495, -0.000285587, 3.5408e-05, -0.00026688, -0.000179661, 9.93269e-05, -0.000298758, -3.05813e-05, 4.19944e-05, 1.21773e-05, -0.000203509, 0.000174782, 0.000295249, 0.000705277, -0.000118088, -0.000151107, 0.000725955, 0.000658934
+Peak value 0.262790 at (aprox.) 460.0 nm
+
+ Result is XYZ: 1.092325 0.338680 6.424414, Yxy: 0.338680 0.139054 0.043114
+=== ramps10 red320 dbv=1353 rgb10=320,0,0 t=845
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000509266, -0.000224667, -3.94582e-05, 0.000111467, -7.17835e-05, -0.000136804, -3.44762e-05, -6.13672e-05, -0.000316168, -0.000304552, -9.19803e-05, 1.6791e-05, -5.78469e-05, 4.18829e-05, -0.000202909, -0.000192367, -6.42275e-05, -0.000225222, -0.000130848, 0.000466256, 0.00244128, 0.0132121, 0.0696171, 0.202448, 0.285448, 0.223764, 0.126886, 0.0687534, 0.0440373, 0.0316454, 0.0215603, 0.0124809, 0.00634651, 0.00329831, 0.00147403, -0.000435701
+Peak value 0.285448 at (aprox.) 620.0 nm
+
+ Result is XYZ: 5.245393 2.454631 0.000000, Yxy: 2.454631 0.681218 0.318782
+=== ramps10 green320 dbv=1353 rgb10=0,320,0 t=857
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+3.23305e-05, -0.000268838, -6.93552e-05, 5.67952e-05, -0.000142594, 0.000165881, 4.12103e-05, -1.2019e-05, -0.000424872, -5.00506e-05, 0.00138207, 0.00616066, 0.026231, 0.0969976, 0.230489, 0.294401, 0.230155, 0.146389, 0.0957547, 0.0605615, 0.0343855, 0.0182886, 0.0105257, 0.00642355, 0.00411388, 0.0027684, 0.00163373, 0.0013028, 0.000490401, 0.000789491, 0.00040022, 0.000521671, 0.000693071, 0.000242465, 0.000964284, 0.000993111
+Peak value 0.294401 at (aprox.) 530.0 nm
+
+ Result is XYZ: 2.543408 7.173163 0.429230, Yxy: 7.173163 0.250686 0.707008
+=== ramps10 blue320 dbv=1353 rgb10=0,0,320 t=868
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000536249, 0.000174746, 0.000223461, 2.77368e-06, 0.000339221, 0.001498, 0.0270904, 0.226161, 0.435575, 0.230589, 0.0786356, 0.0348121, 0.0140376, 0.00469296, 0.00231058, 0.00119582, 0.000419646, 0.000331982, 0.000288102, 0.000429146, 0.0004759, 0.000307361, 0.000624876, 0.000572876, 0.000400453, 0.000510836, 0.00047338, 7.72849e-05, 0.000363964, 0.00100886, 0.000433827, 0.00153703, 0.000710796, 0.000548255, 0.00168083, 0.00192889
+Peak value 0.435575 at (aprox.) 460.0 nm
+
+ Result is XYZ: 1.850520 0.595914 10.660889, Yxy: 0.595914 0.141182 0.045464
+=== ramps10 red384 dbv=1353 rgb10=384,0,0 t=880
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000670158, -0.000607464, -0.00039846, -0.000382854, -0.000200097, -0.000167802, -7.9342e-05, -0.000195704, -0.000451336, -0.000423555, -0.000154541, -6.46754e-05, -0.000325171, -0.000399144, -0.000194818, -0.000307119, -0.000356854, -0.000224544, -5.32223e-05, 0.000756577, 0.00364791, 0.020358, 0.107586, 0.312573, 0.44018, 0.343905, 0.194401, 0.105475, 0.0680669, 0.0493558, 0.0329313, 0.0187271, 0.00996433, 0.00436165, 0.00244004, 0.000526765
+Peak value 0.440180 at (aprox.) 620.0 nm
+
+ Result is XYZ: 8.082809 3.781534 0.000000, Yxy: 3.781534 0.681269 0.318731
+=== ramps10 green384 dbv=1353 rgb10=0,384,0 t=891
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00043196, 6.38913e-05, -0.000134354, 3.2538e-05, 3.74145e-05, 0.000106852, -9.27952e-05, -3.54498e-05, -0.000139599, 0.000290282, 0.00202, 0.00937568, 0.0399736, 0.149105, 0.35377, 0.451907, 0.354076, 0.225489, 0.147431, 0.093187, 0.0528682, 0.0286115, 0.0160736, 0.00987775, 0.00639658, 0.00405299, 0.00274447, 0.00189174, 0.000928196, 0.000791524, 0.000561154, 0.00159869, 0.000276059, 0.000312379, 0.000292068, -0.000418868
+Peak value 0.451907 at (aprox.) 530.0 nm
+
+ Result is XYZ: 3.915849 11.028941 0.664647, Yxy: 11.028941 0.250864 0.706556
+=== ramps10 blue384 dbv=1353 rgb10=0,0,384 t=901
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000816685, 0.000203741, 0.000499507, 0.000354492, 0.000932449, 0.00240005, 0.0416375, 0.348523, 0.669703, 0.354102, 0.121048, 0.0534857, 0.0221061, 0.0077767, 0.00339792, 0.0015721, 0.000887692, 0.00078149, 0.000231969, 0.000158359, 0.000551824, 0.00074318, 0.000630809, 0.000361755, 0.000726827, 0.000816292, 0.000470473, 0.00140537, 0.000627792, 0.00185874, 0.00207116, 0.00250574, 0.00117439, 0.00168108, 0.00249696, 0.00224023
+Peak value 0.669703 at (aprox.) 460.0 nm
+
+ Result is XYZ: 2.842771 0.914149 16.402441, Yxy: 0.914149 0.141015 0.045346
+=== ramps10 red448 dbv=1353 rgb10=448,0,0 t=912
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000813496, -0.000300951, 0.00010291, 0.000375861, 5.77382e-05, -0.000179594, -0.000232401, -3.1509e-05, -0.000458536, -0.000488193, -0.000213548, 3.81153e-06, 0.000131885, -0.000101311, 5.26079e-05, -4.97485e-05, -0.000187839, -0.000103002, 0.000305711, 0.00150076, 0.00547254, 0.0296936, 0.15472, 0.447035, 0.627765, 0.489173, 0.276525, 0.150236, 0.0972362, 0.0702442, 0.047528, 0.0280734, 0.0144214, 0.00755849, 0.0043229, 0.0026246
+Peak value 0.627765 at (aprox.) 620.0 nm
+
+ Result is XYZ: 11.551248 5.420898 0.000000, Yxy: 5.420898 0.680600 0.319400
+=== ramps10 green448 dbv=1353 rgb10=0,448,0 t=922
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000587064, 0.000463008, -8.1686e-05, -0.000492624, 0.000181654, -0.000163131, 5.59858e-05, -1.47586e-05, 0.000276205, 0.000480863, 0.0027005, 0.0132625, 0.0569951, 0.211659, 0.502998, 0.642687, 0.502918, 0.320156, 0.209365, 0.131986, 0.0751551, 0.040185, 0.0223774, 0.0140956, 0.00921593, 0.00574018, 0.00352127, 0.00283277, 0.00197271, 0.000481823, -0.000603905, -0.00024451, -0.000503373, 0.000758416, 0.00072766, -0.000958985
+Peak value 0.642687 at (aprox.) 530.0 nm
+
+ Result is XYZ: 5.555075 15.665020 0.949346, Yxy: 15.665020 0.250574 0.706604
+=== ramps10 blue448 dbv=1353 rgb10=0,0,448 t=931
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000115503, -0.000687597, 0.00104563, 0.000480758, 0.000694376, 0.00320093, 0.0596429, 0.498761, 0.957548, 0.505949, 0.172578, 0.076082, 0.031055, 0.0108187, 0.00484762, 0.00257706, 0.00129704, 0.000375636, 2.67903e-06, 0.000495953, 0.000561672, 0.000650486, 0.00083795, 0.00095402, 0.000476858, 0.000983654, 0.0012426, 0.00055056, 0.000725923, 0.0022287, 0.00179931, 0.00156171, 0.000706763, 0.00200166, 0.003021, 0.0021718
+Peak value 0.957548 at (aprox.) 460.0 nm
+
+ Result is XYZ: 4.054007 1.295296 23.445510, Yxy: 1.295296 0.140789 0.044984
+=== ramps10 red512 dbv=1353 rgb10=512,0,0 t=942
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00027899, 8.74697e-05, 0.000237269, 0.000218071, 0.000221326, 3.95759e-05, 0.000138509, -5.9432e-06, -0.000181012, -0.000282726, -0.000120787, -0.000110149, 2.89845e-06, -0.000246326, -6.53256e-05, 0.000354943, -5.96988e-05, -2.63334e-05, 0.00044668, 0.00213531, 0.0078263, 0.04013, 0.209986, 0.604656, 0.847456, 0.659723, 0.372843, 0.202761, 0.131546, 0.0960589, 0.0652864, 0.0382066, 0.0192957, 0.00906655, 0.00543391, 0.00320218
+Peak value 0.847456 at (aprox.) 620.0 nm
+
+ Result is XYZ: 15.615100 7.333008 0.001989, Yxy: 7.333008 0.680394 0.319520
+=== ramps10 green512 dbv=1353 rgb10=0,512,0 t=951
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000508343, -0.000435557, -0.000437905, -0.000161835, -0.000146488, 0.00042367, -0.000149881, -0.000156345, -0.000108925, 0.00026474, 0.00350829, 0.0180016, 0.0766406, 0.284716, 0.675645, 0.863082, 0.675567, 0.430496, 0.281364, 0.177622, 0.100526, 0.0538158, 0.0303622, 0.0189715, 0.0119655, 0.00834992, 0.00513155, 0.00271171, 0.00140007, 0.00159361, 0.000125489, 0.000361008, 0.00157269, -0.00043804, 0.000990903, 0.00251942
+Peak value 0.863082 at (aprox.) 530.0 nm
+
+ Result is XYZ: 7.461806 21.046037 1.267191, Yxy: 21.046037 0.250606 0.706835
+=== ramps10 blue512 dbv=1353 rgb10=0,0,512 t=961
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000552399, 0.000285911, 0.000615367, 0.000775111, 0.00139781, 0.00450937, 0.0815144, 0.677456, 1.2994, 0.685723, 0.233874, 0.103253, 0.0419827, 0.0144678, 0.00621881, 0.00340873, 0.0018434, 0.00104257, 0.000701314, 0.000685362, 0.000498811, 0.0008176, 0.0016437, 0.00114803, 0.00100997, 0.000998115, 0.000817041, 0.00140018, 0.00127789, 0.00265893, 0.00218794, 0.00305518, 0.00227383, 0.00245476, 0.00226453, 0.00131525
+Peak value 1.299405 at (aprox.) 460.0 nm
+
+ Result is XYZ: 5.507948 1.762458 31.824131, Yxy: 1.762458 0.140888 0.045082
+=== ramps10 red576 dbv=1353 rgb10=576,0,0 t=970
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00150837, 0.000589753, 0.0006308, 0.00082278, 0.000754798, 0.000440216, 0.000452781, 0.000365145, 0.000374476, -4.16933e-05, 8.76081e-05, 0.000129871, 6.39992e-05, 0.00020118, 0.000633227, 0.000359315, 0.000321667, 0.000425199, 0.00114063, 0.00285704, 0.0100317, 0.0530222, 0.273832, 0.787101, 1.10149, 0.856608, 0.484239, 0.263641, 0.170644, 0.124209, 0.0846688, 0.0503127, 0.0258733, 0.012859, 0.00890225, 0.00537945
+Peak value 1.101486 at (aprox.) 620.0 nm
+
+ Result is XYZ: 20.320277 9.556714 0.030382, Yxy: 9.556714 0.679440 0.319544
+=== ramps10 green576 dbv=1353 rgb10=0,576,0 t=980
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00131615, 0.000492341, 0.000538183, 0.000337323, 0.000225213, 0.000928275, 0.000406998, 0.000192251, 0.000139611, 0.00131943, 0.00520374, 0.0235647, 0.0994344, 0.369545, 0.876348, 1.11903, 0.876179, 0.55863, 0.365423, 0.230824, 0.130933, 0.0704734, 0.0399664, 0.0246025, 0.0154407, 0.0104273, 0.00707101, 0.00516083, 0.00374267, 0.00300386, 0.00256316, 0.00414375, 0.0010774, 0.000984301, 0.00160589, 0.0026102
+Peak value 1.119026 at (aprox.) 530.0 nm
+
+ Result is XYZ: 9.707445 27.316950 1.678883, Yxy: 27.316950 0.250817 0.705805
+=== ramps10 blue576 dbv=1353 rgb10=0,0,576 t=990
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000429675, -6.05969e-05, -0.000554187, 0.000263011, 0.000628284, 0.00482041, 0.105204, 0.880606, 1.68878, 0.890637, 0.303074, 0.133577, 0.053764, 0.017918, 0.00703044, 0.00367623, 0.00161819, 0.000444395, -1.57821e-05, -3.933e-05, 0.000206951, 7.66705e-05, -8.88269e-05, 7.46961e-05, 4.65968e-05, 0.000391463, -0.000242615, -0.000236154, 0.00113243, 0.000566529, -6.51027e-05, 0.00145241, -0.000745487, -0.000424076, -0.000405696, -0.00148873
+Peak value 1.688778 at (aprox.) 460.0 nm
+
+ Result is XYZ: 7.078774 2.218670 41.321201, Yxy: 2.218670 0.139845 0.043831
+=== ramps10 red640 dbv=1353 rgb10=640,0,0 t=999
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00107829, 0.000630579, 0.000590195, 0.000744041, 0.00107093, 0.000537999, 0.000483063, 0.00051205, 0.000456592, -0.000249015, -9.42241e-05, 0.00019738, -7.12609e-06, 0.000268636, 0.000413458, 0.00010774, 0.000151264, 0.000275949, 0.001524, 0.00395035, 0.0126513, 0.0663217, 0.344129, 0.988361, 1.38055, 1.07035, 0.604869, 0.329005, 0.214096, 0.15689, 0.105874, 0.0625701, 0.0322443, 0.0172869, 0.0128514, 0.00949767
+Peak value 1.380552 at (aprox.) 620.0 nm
+
+ Result is XYZ: 25.464784 11.974309 0.034244, Yxy: 11.974309 0.679544 0.319542
+=== ramps10 green640 dbv=1353 rgb10=0,640,0 t=1009
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000571714, 0.000473932, -0.000102569, 0.000504637, 0.000346043, 1.30494e-07, 0.000165227, 0.000590722, 0.000296799, 0.00113107, 0.00631128, 0.0293668, 0.124778, 0.462927, 1.09872, 1.4021, 1.09743, 0.699499, 0.457659, 0.288658, 0.163315, 0.0879251, 0.0497666, 0.0301002, 0.0190452, 0.0122815, 0.00800939, 0.00598576, 0.00482161, 0.00376273, 0.00302603, 0.00219912, 0.00213031, 0.00298134, 0.00155696, 0.00281667
+Peak value 1.402103 at (aprox.) 530.0 nm
+
+ Result is XYZ: 12.131204 34.205405 2.088468, Yxy: 34.205405 0.250515 0.706357
+=== ramps10 blue640 dbv=1353 rgb10=0,0,640 t=1018
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000447675, -0.000132752, -4.88446e-06, 0.000170909, 0.00105728, 0.00645886, 0.132847, 1.11065, 2.12786, 1.12174, 0.382446, 0.168576, 0.0680044, 0.0225316, 0.00944316, 0.0048381, 0.00233677, 0.00102243, 0.00066567, 0.000362808, 0.000579642, 0.000271749, 0.000652157, 0.000303597, 0.000223386, 0.000774597, 0.000617936, 0.00147597, 0.000868515, 0.00296264, 0.00238816, 0.00227267, 0.000897112, 0.000183204, 0.0008938, 0.00148758
+Peak value 2.127860 at (aprox.) 460.0 nm
+
+ Result is XYZ: 8.951143 2.824231 52.087153, Yxy: 2.824231 0.140163 0.044224
+=== ramps10 red704 dbv=1353 rgb10=704,0,0 t=1028
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000167329, 0.000656804, -4.11067e-05, -8.65104e-05, 0.000369304, -0.000157707, -0.00023333, -0.000267458, 7.98375e-05, -0.000166489, 0.000183114, 0.000286137, -0.000123556, 7.55468e-06, 0.000299247, -2.82398e-05, -3.89916e-06, -3.29201e-06, 0.00127894, 0.00409405, 0.0149288, 0.0813681, 0.422413, 1.21112, 1.68946, 1.30918, 0.73767, 0.400407, 0.259671, 0.188822, 0.127847, 0.0751913, 0.0388926, 0.0199922, 0.0109042, 0.00715416
+Peak value 1.689462 at (aprox.) 620.0 nm
+
+ Result is XYZ: 31.145108 14.638696 0.004257, Yxy: 14.638696 0.680202 0.319706
+=== ramps10 green704 dbv=1353 rgb10=0,704,0 t=1038
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000218808, 0.00010617, 0.000888202, 0.000462924, 0.000274185, -2.36639e-05, 0.000507469, 0.000102193, 0.000320023, 0.00107543, 0.00743967, 0.0355665, 0.152377, 0.566922, 1.3451, 1.71791, 1.34381, 0.856911, 0.560536, 0.35383, 0.200373, 0.10762, 0.0605864, 0.0376434, 0.024212, 0.0153295, 0.00990493, 0.00636673, 0.00445103, 0.00294706, 0.00218474, 0.00222675, 0.00198369, 0.00166709, 0.00335349, 0.0027638
+Peak value 1.717911 at (aprox.) 530.0 nm
+
+ Result is XYZ: 14.864225 41.897655 2.546007, Yxy: 41.897655 0.250628 0.706443
+=== ramps10 blue704 dbv=1353 rgb10=0,0,704 t=1047
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000180813, -0.000464172, -0.000307828, 0.000670694, 0.00153145, 0.00823351, 0.163613, 1.3632, 2.60778, 1.37471, 0.468896, 0.206617, 0.0834433, 0.0277921, 0.0114487, 0.00595509, 0.00311647, 0.00169193, 0.000924058, 0.000692623, 0.000446795, 0.000544524, 0.00098993, 0.000928538, 0.000662908, 0.00065382, 0.000883474, 0.000928823, 0.00109107, 0.00288277, 0.0017272, 0.00247968, 0.00179049, 0.000602977, 0.00140351, 0.000746025
+Peak value 2.607780 at (aprox.) 460.0 nm
+
+ Result is XYZ: 10.985078 3.471422 63.875342, Yxy: 3.471422 0.140238 0.044317
+=== ramps10 red768 dbv=1353 rgb10=768,0,0 t=1057
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000362216, 7.78977e-05, 2.95223e-05, -0.000775846, 0.000171259, -5.75785e-05, -0.000103556, -9.85245e-05, -0.000144107, -0.000494109, -0.000256899, -3.06563e-05, -0.000534218, -0.00053552, -2.80708e-08, -0.000106203, -0.000105577, 0.000334617, 0.00171037, 0.00490657, 0.017193, 0.0978307, 0.511066, 1.4656, 2.04037, 1.57794, 0.888384, 0.483411, 0.314031, 0.227014, 0.153119, 0.0877499, 0.0469836, 0.0245438, 0.0135253, 0.00890844
+Peak value 2.040370 at (aprox.) 620.0 nm
+
+ Result is XYZ: 37.610024 17.673216 0.000000, Yxy: 17.673216 0.680315 0.319685
+=== ramps10 green768 dbv=1353 rgb10=0,768,0 t=1066
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000484513, 0.000684937, 0.000628579, 0.000755878, -0.00025207, -0.000456514, -0.000275852, -0.000397089, -0.000151619, 0.00122674, 0.00916152, 0.0430382, 0.184362, 0.687284, 1.63116, 2.08193, 1.62949, 1.03911, 0.679537, 0.428466, 0.24259, 0.130563, 0.0740676, 0.044791, 0.0288856, 0.0184141, 0.0113646, 0.0072797, 0.00536179, 0.00427857, 0.00294417, 0.00261994, 0.000445613, 0.00174924, 0.00343811, 0.00351995
+Peak value 2.081929 at (aprox.) 530.0 nm
+
+ Result is XYZ: 18.004006 50.786576 3.056269, Yxy: 50.786576 0.250589 0.706873
+=== ramps10 blue768 dbv=1353 rgb10=0,0,768 t=1076
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000582802, -7.35967e-05, 0.000126474, 0.000686791, 0.00195355, 0.0107148, 0.198645, 1.65408, 3.16172, 1.66578, 0.568392, 0.250919, 0.101406, 0.0335896, 0.0141326, 0.00699797, 0.00350677, 0.0018829, 0.00127309, 0.00107185, 0.00133225, 0.00105278, 0.00110507, 0.00140294, 0.00140662, 0.00113163, 0.00108179, 0.00146275, 0.00374445, 0.00462029, 0.00314178, 0.00408646, 0.00297653, 0.00285898, 0.00210533, -2.87472e-05
+Peak value 3.161722 at (aprox.) 460.0 nm
+
+ Result is XYZ: 13.341733 4.220055 77.462975, Yxy: 4.220055 0.140403 0.044410
+=== ramps10 red832 dbv=1353 rgb10=832,0,0 t=1085
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00154815, 3.62734e-06, -7.23665e-05, 0.000392132, 0.000430745, -7.64223e-05, 6.2909e-05, 0.000285956, 0.000203803, 0.000204899, -0.000144567, 3.05351e-05, 0.00013529, -3.43047e-05, -5.24808e-05, 4.17183e-07, 0.000157833, 0.000638318, 0.00200338, 0.00648786, 0.021964, 0.118962, 0.611707, 1.75216, 2.4376, 1.88303, 1.05944, 0.57614, 0.375475, 0.272193, 0.183656, 0.106772, 0.0546245, 0.0281365, 0.0179708, 0.0107967
+Peak value 2.437600 at (aprox.) 620.0 nm
+
+ Result is XYZ: 44.964365 21.148309 0.022527, Yxy: 21.148309 0.679886 0.319774
+=== ramps10 green832 dbv=1353 rgb10=0,832,0 t=1095
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+9.47704e-05, 0.000234958, 0.000700894, 0.00110508, 7.98494e-05, 0.000159787, -2.64428e-05, 0.000183794, -0.000117757, 0.00178429, 0.0111739, 0.0514092, 0.221292, 0.824112, 1.9539, 2.49232, 1.95106, 1.24452, 0.814528, 0.513727, 0.290801, 0.156386, 0.0883295, 0.0546456, 0.0349122, 0.0226953, 0.0144318, 0.00952311, 0.00587065, 0.00323133, 0.00345768, 0.00414959, 0.00113663, 0.00165875, 0.00303547, 0.00349172
+Peak value 2.492318 at (aprox.) 530.0 nm
+
+ Result is XYZ: 21.584006 60.836473 3.686491, Yxy: 60.836473 0.250665 0.706522
+=== ramps10 blue832 dbv=1353 rgb10=0,0,832 t=1105
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+3.38825e-06, 5.05968e-05, 9.1742e-06, 0.000544045, 0.00200056, 0.0119143, 0.238719, 1.98404, 3.78648, 1.9944, 0.6802, 0.299754, 0.121206, 0.0400266, 0.0165548, 0.0085244, 0.0041498, 0.00233717, 0.00133875, 0.00108001, 0.000881909, 0.000935692, 0.00129866, 0.00165048, 0.00116685, 0.000738572, 0.000855665, 0.00143531, 0.00148105, 0.00390408, 0.00439094, 0.00232704, 0.000552901, 0.000557842, 0.00161412, -0.000502293
+Peak value 3.786478 at (aprox.) 460.0 nm
+
+ Result is XYZ: 15.962385 5.037240 92.796051, Yxy: 5.037240 0.140272 0.044266
+=== ramps10 red896 dbv=1353 rgb10=896,0,0 t=1114
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-7.37588e-06, 0.000777487, 0.000302705, 0.00078189, 0.000420629, 6.86499e-05, 0.000126866, -0.000142744, 0.000136809, 0.000313674, 6.09851e-05, 0.000169195, 0.000302903, 0.000153938, 0.000280339, 0.000359935, 8.39383e-05, 0.000370086, 0.00254363, 0.00723473, 0.0253974, 0.139446, 0.723321, 2.06929, 2.87525, 2.21911, 1.24786, 0.678773, 0.441585, 0.321203, 0.21554, 0.124665, 0.065166, 0.0334283, 0.0184751, 0.010895
+Peak value 2.875251 at (aprox.) 620.0 nm
+
+ Result is XYZ: 53.037917 24.947468 0.024990, Yxy: 24.947468 0.679883 0.319797
+=== ramps10 green896 dbv=1353 rgb10=0,896,0 t=1124
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000550324, 0.000469873, 0.000805571, 0.000117811, 0.000563556, -3.42298e-05, -0.000132166, -0.000296947, -7.52327e-05, 0.00205626, 0.0129407, 0.0608219, 0.261316, 0.972019, 2.30426, 2.93787, 2.29983, 1.46792, 0.960902, 0.606668, 0.342686, 0.184006, 0.103753, 0.0637427, 0.0409818, 0.0263665, 0.0164995, 0.0111585, 0.00815025, 0.00487896, 0.00379033, 0.00387463, 0.00259217, 0.00234158, 0.00367893, 0.00414859
+Peak value 2.937870 at (aprox.) 530.0 nm
+
+ Result is XYZ: 25.440040 71.731366 4.338373, Yxy: 71.731366 0.250617 0.706645
+=== ramps10 blue896 dbv=1353 rgb10=0,0,896 t=1133
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+6.90794e-05, 0.000119091, 9.6875e-05, 0.000754988, 0.00263214, 0.0143104, 0.281597, 2.3426, 4.46645, 2.35049, 0.802492, 0.353673, 0.142838, 0.0474675, 0.0192539, 0.0101854, 0.00508315, 0.00269049, 0.00182904, 0.00141498, 0.00140674, 0.0010798, 0.00167664, 0.00170386, 0.00108165, 0.00191104, 0.00238848, 0.00204779, 0.00196945, 0.00381881, 0.00518564, 0.00513292, 0.00352966, 0.00135323, 0.00232574, 0.00228453
+Peak value 4.466449 at (aprox.) 460.0 nm
+
+ Result is XYZ: 18.843983 5.949858 109.474597, Yxy: 5.949858 0.140346 0.044313
+=== ramps10 red960 dbv=1353 rgb10=960,0,0 t=1143
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000405461, -0.000286224, 0.000121925, 0.000132377, 0.000215278, -0.000314968, -7.44314e-05, -9.52374e-05, -0.000619596, -0.000484051, -3.29559e-06, 1.28505e-05, -5.52849e-06, -0.000447197, -0.000422474, -0.000361629, -6.19078e-05, 0.00069158, 0.00282766, 0.00854368, 0.0297199, 0.162981, 0.842769, 2.40962, 3.34455, 2.5784, 1.44944, 0.787831, 0.512191, 0.371563, 0.250088, 0.144587, 0.074907, 0.0390817, 0.0218287, 0.0141046
+Peak value 3.344553 at (aprox.) 620.0 nm
+
+ Result is XYZ: 61.698113 29.017321 0.001679, Yxy: 29.017321 0.680115 0.319866
+=== ramps10 green960 dbv=1353 rgb10=0,960,0 t=1152
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00123989, 0.00120462, 0.00014165, 0.00097578, 0.000521468, 0.000425503, 6.84801e-05, 4.04003e-05, 7.74339e-05, 0.00252934, 0.015364, 0.0710395, 0.303871, 1.13143, 2.68148, 3.41826, 2.67477, 1.70825, 1.11872, 0.705894, 0.399121, 0.215121, 0.121267, 0.0743737, 0.0475595, 0.0304582, 0.0193503, 0.0128106, 0.00852992, 0.00622045, 0.00550871, 0.00495974, 0.00431102, 0.00334268, 0.00598864, 0.00636122
+Peak value 3.418264 at (aprox.) 530.0 nm
+
+ Result is XYZ: 29.618311 83.474615 5.065808, Yxy: 83.474615 0.250665 0.706462
+=== ramps10 blue960 dbv=1353 rgb10=0,0,960 t=1162
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000201928, 1.53285e-05, -2.13318e-05, 0.000756479, 0.00259294, 0.0169146, 0.329971, 2.74173, 5.22086, 2.7451, 0.937478, 0.413241, 0.166866, 0.0557942, 0.0230581, 0.0115341, 0.00565254, 0.00337658, 0.00201612, 0.00125885, 0.00143528, 0.00163895, 0.0011102, 0.00152742, 0.00187851, 0.00214937, 0.00124181, 0.00150671, 0.00288507, 0.0052982, 0.00648298, 0.0053546, 0.00304546, 0.00203045, 0.00103145, 0.00330947
+Peak value 5.220861 at (aprox.) 460.0 nm
+
+ Result is XYZ: 22.020175 6.946002 127.991875, Yxy: 6.946002 0.140293 0.044254
+=== ramps10 red1023 dbv=1353 rgb10=1023,0,0 t=1171
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00092713, 0.000404346, 0.000603322, 0.000462048, -9.03221e-05, -0.000121025, -5.55919e-05, 0.000230467, 0.000112048, -0.000317168, 0.000122517, 0.000318654, -2.47679e-06, -0.000532172, -0.000245703, 0.000211975, -4.40029e-05, 0.000850126, 0.0028151, 0.00945963, 0.0342213, 0.186861, 0.968185, 2.76419, 3.83142, 2.95199, 1.65773, 0.900818, 0.5872, 0.426763, 0.286488, 0.165496, 0.0867721, 0.0443458, 0.0256259, 0.0182009
+Peak value 3.831421 at (aprox.) 620.0 nm
+
+ Result is XYZ: 70.710427 33.262363 0.021304, Yxy: 33.262363 0.679947 0.319849
+=== ramps10 green1023 dbv=1353 rgb10=0,1023,0 t=1181
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.00116685, 0.000899685, 0.000534242, 0.000547414, 0.00065271, 3.32727e-05, 0.000301385, 0.000158356, 8.00326e-06, 0.00292345, 0.017361, 0.0807265, 0.34763, 1.29484, 3.07016, 3.91289, 3.06093, 1.95525, 1.28145, 0.807892, 0.45698, 0.245658, 0.139147, 0.0850813, 0.0548816, 0.0349074, 0.022274, 0.0136807, 0.00936855, 0.00699135, 0.00526094, 0.00553347, 0.00358866, 0.00287451, 0.00401597, 0.00542419
+Peak value 3.912886 at (aprox.) 530.0 nm
+
+ Result is XYZ: 33.902823 95.550952 5.793830, Yxy: 95.550952 0.250672 0.706489
+=== ramps10 blue1023 dbv=1353 rgb10=0,0,1023 t=1190
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000165788, 0.000122013, -0.000519507, 0.000832088, 0.00360562, 0.0201811, 0.378859, 3.14202, 5.97899, 3.14285, 1.0735, 0.473069, 0.190495, 0.0635329, 0.0263463, 0.0133493, 0.00679133, 0.00354778, 0.00219961, 0.00204746, 0.00211398, 0.00113049, 0.00164914, 0.00176764, 0.00174211, 0.00191841, 0.00281292, 0.00177668, 0.00254337, 0.00634682, 0.00656202, 0.00494214, 0.00279528, 0.00324022, 0.003099, 0.0010738
+Peak value 5.978991 at (aprox.) 460.0 nm
+
+ Result is XYZ: 25.227339 7.955430 146.615494, Yxy: 7.955430 0.140309 0.044246
+=== nearblack10 grey2 dbv=1353 rgb10=2,2,2 t=1202
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000401588, -0.000502953, -7.79343e-05, -3.1345e-05, -0.000360047, -3.85309e-05, -4.62945e-05, -1.7587e-05, -0.000149409, -0.000186234, -8.66004e-06, 5.43485e-05, -7.46611e-05, 4.98649e-05, 7.6056e-05, -6.96917e-07, -9.25198e-06, -0.00010266, -0.000122754, 7.86461e-05, 6.09701e-06, -0.000283327, -4.93631e-05, 0.000209511, 0.000152689, 0.000151772, -0.000206644, -0.000179817, -0.000606182, 0.000195853, 0.000195095, 0.000251572, 6.27907e-05, -0.000765731, 0.000343305, -0.000274099
+Peak value 0.000343 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.000000 0.000000 0.000000, Yxy: 0.000000 0.333333 0.333333
+=== nearblack10 grey4 dbv=1353 rgb10=4,4,4 t=1214
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000504435, -0.000243846, -0.000198196, -1.27712e-05, -0.000171829, 8.76071e-05, -1.74891e-05, 8.4103e-05, -0.000243096, -0.000278716, -4.07175e-05, 4.08069e-05, -0.000151376, -0.000101494, 0.000250166, 7.94295e-05, 0.000180731, -8.88579e-05, -0.000183605, -0.000129085, 2.12731e-05, -0.000157325, -5.28664e-05, 3.15479e-05, -0.000308702, -2.61151e-05, -0.000202601, -0.00037495, -0.000596722, -0.000204474, -0.000401117, -0.000323733, -0.000821789, -0.000576827, 0.000222523, -0.000417038
+Peak value 0.000250 at (aprox.) 520.0 nm
+
+ Result is XYZ: 0.000000 0.000000 0.000000, Yxy: 0.000000 0.333333 0.333333
+=== nearblack10 grey6 dbv=1353 rgb10=6,6,6 t=1226
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+0.000141822, -3.73281e-05, 8.16412e-05, 0.000214549, -9.13961e-05, 6.91345e-05, 4.97712e-05, 0.000300958, 3.75654e-05, 8.89576e-06, 8.65855e-05, 0.000177272, 0.000147935, 0.00029666, 0.000632856, 0.000410596, 0.000239746, 1.67006e-05, -0.00011509, 0.00022459, 0.000204897, 7.40799e-05, 0.000249991, 0.000467482, 0.000351449, 0.000583029, 0.000187614, 0.000346684, -6.49424e-05, 0.000643623, 0.00073407, 0.000888242, 0.000368919, 0.000387998, 0.00136636, 0.000424837
+Peak value 0.001366 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.016542 0.016636 0.007467, Yxy: 0.016636 0.406980 0.409311
+=== nearblack10 grey8 dbv=1353 rgb10=8,8,8 t=1238
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000806262, -0.000342014, 3.31825e-05, -4.43727e-05, -3.04231e-05, -0.000114795, -9.26044e-05, 0.000152922, -4.74353e-05, -0.000152078, 4.39794e-05, -7.57946e-05, -0.000169452, -1.24904e-05, 0.000473348, 0.000375148, 0.000146277, -2.103e-05, -0.000162768, 6.73655e-05, 1.36352e-05, -0.000236171, 0.000109411, 0.000489387, 0.000158584, 0.00032922, 9.24412e-05, 0.000106381, -0.000562805, -0.000521062, -0.000914695, -0.000492749, -0.000168908, -0.000292516, 0.000680638, 0.000218598
+Peak value 0.000681 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.004230 0.005781 0.000000, Yxy: 0.005781 0.422508 0.577492
+=== nearblack10 grey12 dbv=1353 rgb10=12,12,12 t=1250
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000117521, -5.72242e-05, 3.12642e-06, 0.000241683, 0.000134093, 5.44215e-05, 4.24158e-05, 0.000264075, 0.000342925, 8.91672e-05, 0.000142432, 6.6308e-05, 0.000213508, 0.000240862, 0.000428874, 0.000470592, 0.000369416, 0.000137969, -4.20751e-05, 0.000109108, 0.000270719, 0.000142867, 0.000220876, 0.000178726, 0.000157027, 0.000318865, 0.000172038, -0.000205323, -0.000364876, -0.000283727, -0.000241061, -0.000445885, -0.000176093, -0.000261429, 0.000522265, -0.000166412
+Peak value 0.000522 at (aprox.) 720.0 nm
+
+ Result is XYZ: 0.011422 0.015107 0.011946, Yxy: 0.015107 0.296876 0.392639
+=== nearblack10 grey16 dbv=1353 rgb10=16,16,16 t=1263
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00049231, -0.000401966, -8.53583e-06, -0.000161859, -8.61224e-05, -3.67796e-05, -7.27988e-05, 0.000185472, 0.000125424, 5.97429e-05, -0.000112152, 4.73207e-05, 6.23369e-05, 0.000210153, 0.00027481, 0.0003108, 0.000175775, 3.75073e-05, -9.18543e-05, -6.62028e-05, -0.000212312, -0.000374246, -1.79688e-05, 0.000185009, 8.5914e-05, 0.000157598, -0.000351701, -0.000306399, -0.0004823, 4.74067e-05, 0.00018244, -0.00043925, -0.000784005, -0.000765504, 0.000161918, -0.000555896
+Peak value 0.000311 at (aprox.) 530.0 nm
+
+ Result is XYZ: 0.000000 0.001443 0.002413, Yxy: 0.001443 0.000000 0.374215
+=== nearblack10 grey24 dbv=1353 rgb10=24,24,24 t=1275
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000837006, -0.000435179, -0.000120538, -5.3607e-05, -0.000169081, -0.000115314, -4.48327e-05, 0.000538131, 0.00108024, 0.000386258, 0.00020668, 3.31776e-05, 0.000146054, 0.000250811, 0.000973328, 0.00133603, 0.000920311, 0.000527881, 0.000187708, 0.000178317, 0.00025508, -0.000101094, 0.000278373, 0.000956841, 0.00115883, 0.000976206, 0.000730924, 0.000184903, -0.000381958, -1.21763e-05, -0.000925089, -0.00109129, -0.0010312, -0.00100987, -0.00028452, -0.00121649
+Peak value 0.001336 at (aprox.) 530.0 nm
+
+ Result is XYZ: 0.032589 0.037706 0.022504, Yxy: 0.037706 0.351181 0.406317
+=== nearblack10 grey32 dbv=1353 rgb10=32,32,32 t=1287
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.00071361, -0.000345036, -0.000107107, -6.83985e-06, -2.72848e-05, -9.82449e-06, 7.9833e-05, 0.00148679, 0.00261911, 0.00128879, 0.00047293, 0.000251159, 0.000290076, 0.000726777, 0.00171962, 0.00238057, 0.00177968, 0.000946244, 0.000429254, 0.000528653, 0.000228022, -1.82706e-05, 0.000449061, 0.0017796, 0.00226908, 0.00205055, 0.00103916, 0.000327008, 0.000161598, 0.00040115, 0.000506205, 0.000476921, 9.14077e-05, -0.000187681, 0.000645446, 7.21724e-06
+Peak value 0.002619 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.068611 0.073577 0.066542, Yxy: 0.073577 0.328707 0.352498
+=== nearblack10 grey48 dbv=1353 rgb10=48,48,48 t=1299
+
+Place instrument on spot to be measured,
+and hit [A-Z] to read white and setup FWA compensation (keyed to letter)
+[a-z] to read and make FWA compensated reading from keyed reference
+'r' to set reference, 's' to save spectrum,
+'f' to report cal. refresh rate, 'F' to measure refresh rate
+'h' to toggle high res., 'k' to do a calibration
+Hit ESC or Q to exit, instrument switch or any other key to take a reading: Spectrum from 380.000 to 730.000 nm in 36 steps
+-0.000747746, -0.00052061, -0.000134827, 6.66011e-05, 0.000133842, 5.23917e-05, 0.000510024, 0.00362896, 0.00660937, 0.00323475, 0.00121816, 0.000769339, 0.000802419, 0.00187375, 0.00440212, 0.00567173, 0.00445641, 0.0026081, 0.00158489, 0.0012369, 0.00104533, 0.000283469, 0.0013824, 0.00395396, 0.00504723, 0.00437501, 0.0025193, 0.00153485, 0.000506878, 0.000583699, 0.000420894, 0.000819706, 0.000371346, -4.06633e-05, 0.000240101, -0.000147314
+Peak value 0.006609 at (aprox.) 460.0 nm
+
+ Result is XYZ: 0.172267 0.189307 0.172578, Yxy: 0.189307 0.322506 0.354406

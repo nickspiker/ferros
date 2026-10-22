@@ -16,6 +16,7 @@ for r in rows:
     r["Y"] = float(r["Y_cdm2"]); r["x_"] = float(r["x"]); r["y_"] = float(r["y"])
 out = []
 p = out.append
+w1353 = None
 def sec(name): return [r for r in rows if r["section"] == name]
 
 p("## Window against full field (white)\n")
@@ -49,32 +50,40 @@ for r in sec("apl"):
 for dbv, s in apl.items():
     p(f"| {dbv} | " + " | ".join(f"{s.get(k, float('nan')):.1f}" for k in ["000000", "404040", "808080", "c0c0c0", "ffffff"]) + " |")
 
-p("\n## Tone curves (1 cm window)\n")
-ramps = defaultdict(dict)
-for r in sec("ramps"):
-    ch = "".join(c for c in r["label"] if c.isalpha()); code = int("".join(c for c in r["label"] if c.isdigit()))
-    ramps[(r["dbv"], ch)][code] = r["Y"]
-p("| DBV | channel | Y at 255 | black | gamma (16-240) | worst step off the fit |")
-p("|---|---|---|---|---|---|")
-for (dbv, ch), m in sorted(ramps.items()):
-    top, blk = m.get(255), m.get(0, 0.0)
-    if not top:
+for secname, full, title in (("ramps", 255, "8-bit codes"), ("ramps10", 1023, "10-bit codes, 10 bpc compose + dither")):
+    ramps = defaultdict(dict)
+    for r in sec(secname):
+        ch = "".join(c for c in r["label"] if c.isalpha()); code = int("".join(c for c in r["label"] if c.isdigit()))
+        ramps[(r["dbv"], ch)][code] = r["Y"]
+    if not ramps:
         continue
-    pts = [(c / 255, (y - blk) / (top - blk)) for c, y in m.items() if 16 <= c <= 240 and y > blk]
-    # Least squares on log Y/Ytop = g log c.
-    num = sum(math.log(v) * math.log(u) for u, v in pts); den = sum(math.log(u) ** 2 for u, v in pts)
-    g = num / den if den else float("nan")
-    worst = max(((abs(v / u ** g - 1), c) for (u, v), c in zip(pts, [round(u * 255) for u, _ in pts])), default=(0, 0))
-    p(f"| {dbv} | {ch} | {top:.2f} | {blk:.4f} | {g:.3f} | {100 * worst[0]:.1f} % at {worst[1]} |")
+    p(f"\n## Tone curves, {title} (1 cm window)\n")
+    p("| DBV | channel | Y at full | black | gamma (6-94 %) | worst step off the fit |")
+    p("|---|---|---|---|---|---|")
+    lo, hi = full * 16 // 255, full * 240 // 255
+    for (dbv, ch), m in sorted(ramps.items()):
+        top, blk = m.get(full), m.get(0, 0.0)
+        if not top:
+            continue
+        pts = [(c / full, (y - blk) / (top - blk), c) for c, y in m.items() if lo <= c <= hi and y > blk]
+        num = sum(math.log(v) * math.log(u) for u, v, _ in pts); den = sum(math.log(u) ** 2 for u, v, _ in pts)
+        g = num / den if den else float("nan")
+        worst = max(((abs(v / u ** g - 1), c) for u, v, c in pts), default=(0, 0))
+        p(f"| {dbv} | {ch} | {top:.2f} | {blk:.4f} | {g:.3f} | {100 * worst[0]:.1f} % at {worst[1]} |")
+    if secname == "ramps":
+        w1353 = ramps.get(("1353", "grey"), {}).get(255)
 
-p("\n## Near black (DBV 1353)\n")
-p("| code | Y cd/m² | against γ 2.185 from white |")
-p("|---|---|---|")
-w1353 = ramps.get(("1353", "grey"), {}).get(255)
-for r in sec("nearblack"):
-    c = int("".join(ch for ch in r["label"] if ch.isdigit()))
-    exp = w1353 * (c / 255) ** 2.185 if w1353 else float("nan")
-    p(f"| {c} | {r['Y']:.4f} | {100 * (r['Y'] / exp - 1):+.0f} % |")
+for secname, full in (("nearblack", 255), ("nearblack10", 1023)):
+    rows_nb = sec(secname)
+    if not rows_nb:
+        continue
+    p(f"\n## Near black, {'10' if full == 1023 else '8'}-bit codes (DBV 1353)\n")
+    p("| code | Y cd/m² | against γ 2.185 from white |")
+    p("|---|---|---|")
+    for r in rows_nb:
+        c = int("".join(ch for ch in r["label"] if ch.isdigit()))
+        exp = w1353 * (c / full) ** 2.185 if w1353 else float("nan")
+        p(f"| {c} | {r['Y']:.4f} | {100 * (r['Y'] / exp - 1):+.0f} % |")
 
 p("\n## Colours (1 cm window)\n")
 p("| DBV | patch | Y | x | y |")

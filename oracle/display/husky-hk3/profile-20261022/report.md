@@ -25,9 +25,9 @@
 | 3307 | 990.4 | 989.0 | 995.8 | 998.5 | 988.1 |
 | hbm | 1476.5 | 1477.0 | 1491.7 | 1519.0 | 1507.1 |
 
-## Tone curves (1 cm window)
+## Tone curves, 8-bit codes (1 cm window)
 
-| DBV | channel | Y at 255 | black | gamma (16-240) | worst step off the fit |
+| DBV | channel | Y at full | black | gamma (6-94 %) | worst step off the fit |
 |---|---|---|---|---|---|
 | 1353 | blue | 7.92 | 0.0067 | 2.247 | 9.6 % at 32 |
 | 1353 | green | 96.20 | 0.0022 | 2.205 | 2.5 % at 64 |
@@ -38,7 +38,17 @@
 | 3307 | grey | 988.27 | 0.0202 | 2.191 | 2.9 % at 176 |
 | 3307 | red | 233.56 | 0.0065 | 2.175 | 4.6 % at 176 |
 
-## Near black (DBV 1353)
+## Tone curves, 10-bit codes, 10 bpc compose + dither (1 cm window)
+
+| DBV | channel | Y at full | black | gamma (6-94 %) | worst step off the fit |
+|---|---|---|---|---|---|
+| 1353 | blue | 7.96 | 0.0000 | 2.265 | 10.1 % at 128 |
+| 1353 | green | 95.55 | 0.0019 | 2.226 | 4.5 % at 64 |
+| 1353 | grey | 136.18 | 0.0109 | 2.209 | 3.0 % at 256 |
+| 1353 | red | 33.26 | 0.0000 | 2.262 | 15.9 % at 64 |
+| 3307 | grey | 983.33 | 0.0000 | 2.191 | 3.4 % at 704 |
+
+## Near black, 8-bit codes (DBV 1353)
 
 | code | Y cd/m² | against γ 2.185 from white |
 |---|---|---|
@@ -49,6 +59,20 @@
 | 6 | 0.0404 | +6 % |
 | 8 | 0.0823 | +15 % |
 | 12 | 0.1899 | +10 % |
+
+## Near black, 10-bit codes (DBV 1353)
+
+| code | Y cd/m² | against γ 2.185 from white |
+|---|---|---|
+| 2 | 0.0000 | -100 % |
+| 4 | 0.0000 | -100 % |
+| 6 | 0.0166 | +808 % |
+| 8 | 0.0058 | +68 % |
+| 12 | 0.0151 | +81 % |
+| 16 | 0.0014 | -91 % |
+| 24 | 0.0377 | -0 % |
+| 32 | 0.0736 | +4 % |
+| 48 | 0.1893 | +10 % |
 
 ## Colours (1 cm window)
 

@@ -92,6 +92,28 @@ Grey fits 2.19 at both 133 and 1000 nits, confirming 2.185. The channels agree w
 
 **Drift:** white at 1353 read 136.02 at the start and 137.31 after 37 minutes (+0.95 %).
 
+## 10 bits (2026-10-22)
+
+The panel keeps 8 bits of a 10 bpc stream (DISPLAY.md). In the mode ferros runs (10 bpc blend + DQE dither on the 8 bpc link), with a correctly configured 10-bit layer, a grey ramp steps 0.4 % per 10-bit code (219.4, 220.5, 221.4 nits at codes 512, 513, 514; 223.1 at 516). The tone curve in 10-bit codes (`display-profile.sh run ramps10`, 193 readings):
+
+| DBV | channel | Y at 1023 | γ (codes 64–960) |
+|---|---|---|---|
+| 1353 | grey | 136.18 | 2.209 |
+| 1353 | red | 33.26 | 2.262 |
+| 1353 | green | 95.55 | 2.226 |
+| 1353 | blue | 7.96 | 2.265 |
+| 3307 | grey | 983.33 | 2.191 |
+
+The grey agrees with the 8-bit run (2.189 / 2.191). The channels' spread is the instrument's noise on dim patches: red's worst step is 16 % at code 64, where red emits 0.08 cd/m².
+
+**Near black is below the instrument here.** The i1 Pro's floor is about 0.01–0.02 cd/m², so at DBV 1353 the 10-bit codes under ~24 (0.04 cd/m²) read noise. DBV is a pure gain, so the way down is to measure the bottom codes at DBV 3307 or HBM, where they emit 7–11× the light, and scale back.
+
+**Decided (owner, 2026-10-22):**
+- **The present stage.** 16-bit gamma-2 working values (white = Q14) go through one 1D table, shared by the three channels: square, tanh roll-off into the peak, 1/2.19. That gives 10-bit codes with fraction bits, dithered spatially and temporally (phase buffers flipped at 10 Hz, re-pointed rather than copied) to a 12-bit effective target, then packed BGRA1010102 for the hardware's 10 → 8 dither.
+- **White is equal-energy E.** Out-of-gamut colours move along the line to E at constant luminance until the lowest channel reaches 0. No curve.
+- **Headroom.** Max white is one stop under the panel's max (about 750 of about 1500 cd/m²). Below it the headroom grows with the panel's room, up to the working format's 16× (4 stops).
+- **Blending** happens in gamma 2.
+
 ## Method notes
 
 - The panel runs at 120 Hz; the i1 Pro's integration spans many cycles: white at 1353 read 132.82 (default) vs 132.77 (`-Y R:120`, refresh-locked) vs 132.84 (again); grey 128 30.16 vs 30.23. No beat problem.
