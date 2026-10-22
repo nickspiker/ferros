@@ -1300,6 +1300,22 @@ pub fn fe_powered() -> bool {
     rd(PD_ISPFE_STATUS as usize) & 1 == 1
 }
 
+/// S1S_VDD_CAM (sub PMIC BUCK1S, output G#0F, 200 mV + 6.25 mV a step) to 600 mV, where the camera's DVFS puts it while Linux streams (measured 2026-10-21: 537.5 mV idle, 600 mV streaming; INT stays at 568.75 mV either way). A cold boot leaves it at 575 mV. Only ever raised, never lowered.
+fn cam_rail(rep: &mut Vec<u8>) {
+    let (sub, t) = (crate::acpm::SUB, crate::acpm::T_PMIC);
+    let before = crate::acpm::read(sub, t, 0x0F);
+    let mut wrote = None;
+    if let Ok(c) = before {
+        if c < 0x40 {
+            wrote = Some(crate::acpm::write(sub, t, 0x0F, 0x40));
+            spin_us(1000);
+        }
+    }
+    let after = crate::acpm::read(sub, t, 0x0F);
+    let h = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X}"), Err(e) => alloc::format!("error G#{e:X}") };
+    line(rep, alloc::format!("VDD_CAM: {} -> {} (G#40 = 600 mV, Linux streaming); write {:?}\n", h(before), h(after), wrote));
+}
+
 /// CMU_TOP's ISPFE_NOC clock, the source of the front end's bus, the CSI links' ACLK and the D-PHY clock (cmucal-node.c), set as Linux streams it: PLL_SHARED1_D4 undivided, 465 MHz.
 /// Cold boot leaves it at PLL_SHARED3_D1 divided by six, 111 MHz. Linux's camera open never writes these registers from the CPU — its DVFS asks the ACPM firmware, which does — so no register capture could show it; the hv's live snapshot of a Linux stream against a cold ferros run did (2026-10-21), with the link counting frames and the core silent at a quarter of the clock.
 /// The mux moves first, so the clock only ever slows on the way (SHARED1_D4 ÷ 6, 77 MHz) instead of passing through SHARED3_D1 undivided; each step waits for its busy bit (16).
@@ -1337,6 +1353,7 @@ pub fn fe_up(rep: &mut Vec<u8>) {
     }
     let r = pd_prepare(PD_ISPFE_NEED_SMC);
     line(rep, alloc::format!("prepare call returned G#{r:X}\n"));
+    cam_rail(rep);
     ispfe_noc_clock(rep);
     wr(CMU_ISPFE + 0x1800, 3);
     wr(CMU_ISPFE + 0x1804, 1);
@@ -2243,7 +2260,7 @@ const PDMA_BUF_SLICE: usize = 0x100_0000;
 const PDMA_BUFS: usize = 7;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
-pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32) {
+pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool) {
     let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
     if job.len() < 8 || &job[..4] != b"CPR3" {
         return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
@@ -2367,10 +2384,42 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         0x1C35_0058, 0x1C35_0088, 0x1C35_00B8, 0x1C35_00E8, 0x1C35_0118, 0x1C35_01AC,
         0x1C33_1300, 0x1C33_3300, 0x1C33_5300, 0x1C33_7300, 0x1C33_9300, 0x1C33_B300, 0x1C33_C300, 0x1C33_D300, 0x1C33_E300,
     ];
-    crate::flashlog::line("cam pdma: sampling the G#1C32 per-frame status words while the engine runs");
     let mut series = alloc::string::String::new();
+    // `cam pdma fast`: answer the front end the way Linux's interrupt handler does, within microseconds rather than on a 50 ms tick. Linux never touches the link's frame words; it runs off the core's aggregate (G#1C32_008C), acknowledging and advancing the PDMA as soon as it fires. If the core needs that answer inside the gap between frames, polling at 50 ms would miss it every time and leave exactly what we see: one SHADOW_UPDATE and silence.
+    if fast {
+        crate::flashlog::line("cam pdma fast: polling the core aggregate");
+        let f = crate::platform::cntfrq();
+        let t0 = crate::platform::cntpct();
+        let (mut events, mut idx, mut log) = (0u32, 0u32, alloc::string::String::new());
+        let mut last_pet = t0;
+        while crate::platform::cntpct().wrapping_sub(t0) < f && events < 64 {
+            let cmn = rd(0x1C32_008C);
+            if cmn != 0 {
+                let t = crate::platform::cntpct().wrapping_sub(t0) * 1_000_000 / f;
+                let (img, pd) = (rd(0x1C32_0424), rd(0x1C32_2024));
+                for &a in FRAME_ACK.iter() {
+                    let v = rd(a);
+                    wr(a, v);
+                }
+                idx += 0x10;
+                wr(PDMA + 0x10, idx);
+                events += 1;
+                log.push_str(&alloc::format!("  t+A#{t} us: aggregate G#{cmn:X} img G#{img:X} pd G#{pd:X}; answered, PDMA index G#{idx:X}\n"));
+            }
+            if crate::platform::cntpct().wrapping_sub(last_pet) > f / 16 {
+                crate::platform::pet_watchdogs();
+                last_pet = crate::platform::cntpct();
+            }
+        }
+        line(rep, alloc::format!("fast loop, one second: A#{events} core events answered\n{log}"));
+        let mut b = [0u8; 2];
+        if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).is_ok() {
+            series.push_str(&alloc::format!(" {:02X}", b[0]));
+        }
+    }
+    crate::flashlog::line("cam pdma: sampling the G#1C32 per-frame status words while the engine runs");
     let mut status = [[0u32; FRAME_STATUS.len()]; 10];
-    for f in 1..=10u32 {
+    for f in 1..=(if fast { 0 } else { 10u32 }) {
         spin_us(50_000);
         wr(PDMA + 0x10, f * 0x10);
         for (k, &a) in FRAME_STATUS.iter().enumerate() {
@@ -2380,6 +2429,10 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         for &a in FRAME_ACK.iter() {
             let v = rd(a);
             wr(a, v);
+        }
+        // Then enable loch0's image and PD paths: Linux writes G#81 to G#1C32_00A0 right after acknowledging the first SHADOW_UPDATE (capture access 531, after the index write at 458), and the image path's SOF follows. A plain write, not a read-back acknowledgement, so neither the setup extraction nor FRAME_ACK carried it; the live snapshot showed it (Linux G#81, ferros 0). Its pair G#1C32_00B0 (written 1 then G#80 in setup) is the request, G#1C32_00A4 the stop.
+        if f == 1 {
+            wr(0x1C32_00A0, 0x81);
         }
         // Once, a few frames in, read the whole pipeline by name while the engine is live — the state Linux reads these in.
         if f == 3 {
@@ -2395,6 +2448,9 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         }
     }
     for (k, &a) in FRAME_STATUS.iter().enumerate() {
+        if fast {
+            break;
+        }
         let mut row = alloc::format!("front end G#{:05X} per frame:", a & 0xF_FFFF);
         for f in 0..10 {
             row.push_str(&alloc::format!(" G#{:X}", status[f][k]));

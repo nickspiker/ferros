@@ -366,6 +366,49 @@ unsafe fn stage2_remap(ipa: u64) {
 }
 
 include!(concat!(env!("OUT_DIR"), "/snap_list.rs"));
+include!(concat!(env!("OUT_DIR"), "/xplant_list.rs"));
+static mut XP_LINES: u32 = 0;
+static mut XP_DONE: bool = false;
+
+/// Transplant (FERROS_HV_XPLANT): Linux's camera HAL advances the PDMA's descriptor index (+G#10) once per frame from its interrupt handler, so the stream of those writes is the pulse of a working pipeline. Log each one with its time (128 at most); at index G#100, sixteen frames in, apply XPLANT_LIST on top of the running pipeline. If the pulse goes on, the transplanted sequence leaves a working link-to-core path working; if it stops, the sequence breaks it.
+unsafe fn xplant(idx: u64) {
+    let (now, freq): (u64, u64);
+    asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
+    let n = read_volatile(&raw const XP_LINES);
+    if n < 128 {
+        write_volatile(&raw mut XP_LINES, n + 1);
+        // The pulse alone is not a frame: the HAL keeps advancing the PDMA with the link stopped (control run, 2026-10-21). So each line also carries the core's image write pointer (+G#124, four buffers G#800 apart under Linux) and buffer index (+G#49C), and two link 1 words that move per frame (+G#6A0, +G#678): frames are flowing only while those move.
+        let r = |a: usize| read_volatile(a as *const u32) as u64;
+        let (wp, bi, l6a0, l678) = (r(0x1C32_0124), r(0x1C32_049C), r(0x1C05_06A0), r(0x1C05_0678));
+        let (mut hi, mut ht, mut h1, mut h2, mut h3, mut h4) = ([0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16]);
+        pstore::log(&[b"\nferros hv: XP pulse ", pstore::hex(idx, &mut hi), b" t ", pstore::hex(now / (freq / 1000), &mut ht), b" wp ", pstore::hex(wp, &mut h1), b" bi ", pstore::hex(bi, &mut h2), b" l6a0 ", pstore::hex(l6a0, &mut h3), b" l678 ", pstore::hex(l678, &mut h4), b"\n"]);
+    }
+    if idx != 0x100 || read_volatile(&raw const XP_DONE) {
+        return;
+    }
+    write_volatile(&raw mut XP_DONE, true);
+    let mut i = 0;
+    while i < XPLANT_LIST.len() {
+        let (a, v) = XPLANT_LIST[i];
+        if a == 0 {
+            let t: u64;
+            asm!("mrs {t}, cntpct_el0", t = out(reg) t);
+            loop {
+                let u: u64;
+                asm!("mrs {u}, cntpct_el0", u = out(reg) u);
+                if u.wrapping_sub(t) * 1_000_000 / freq >= v {
+                    break;
+                }
+            }
+        } else {
+            write_volatile(a as *mut u32, v as u32);
+        }
+        i += 1;
+    }
+    asm!("dsb sy");
+    let mut hn = [0u8; 16];
+    pstore::log(&[b"\nferros hv: XP transplant applied, ", pstore::hex(XPLANT_LIST.len() as u64, &mut hn), b" entries\n"]);
+}
 static mut SNAPS: u32 = 0;
 
 /// Live-state snapshot (FERROS_HV_SNAPSHOT): when the camera stack advances the PDMA's descriptor index to G#100 (sixteen frames into a stream), read every register in SNAP_LIST and log it, `SN addr value`, zeros included so a missing line means a lost line. The list holds only registers known to exist (tools/camera-snap-list.py), since a read into a hole can stall the bus. First trigger only.
@@ -1174,6 +1217,9 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 // And mid-stream: the descriptor index (PDMA + G#10, +G#10 per frame) reaching G#100, while the lists are certainly still mapped (at stop the HAL had sometimes already unmapped them, 2026-10-20).
                 if cfg!(hv_snapshot) && wnr == 1 && pa == PDMA as u64 + 0x10 && logval == 0x100 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { snapshot() };
+                }
+                if cfg!(hv_xplant) && wnr == 1 && pa == PDMA as u64 + 0x10 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                    unsafe { xplant(logval) };
                 }
                 if cfg!(hv_pdma_dump) && wnr == 1 && ((pa == PDMA as u64 && (logval & 1 == 1 || logval == 0)) || (pa == PDMA as u64 + 0x10 && logval == 0x100)) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { pdma_dump() };

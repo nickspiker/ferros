@@ -6,7 +6,7 @@ fn main() {
     // Bisection knobs (HV.md): FERROS_HV_NO_WINDOW=1 forwards every SMC from EL2 (no native re-execution window); FERROS_HV_NO_ATA=1 leaves HCR_EL2.ATA clear; FERROS_HV_ACTLR_KEEP=1 leaves ACTLR_EL2 as found; FERROS_HV_LINUX_AT_EL2=1 hands Linux the machine at EL2 after the relocation and DTB work (the hv vanishes: tests the memory map alone); FERROS_HV_TSC_OFF_AFTER_BOOT=1 stops trapping SMCs on each core once eight CPU_ONs have passed (Linux at EL1 with an inert hv; needs deep idle disabled from Android or power-down wakes land in Linux at EL2).
     // A build tag in the banner: the knobs set, so the pstore log names the variant that wrote it (2026-10-17: a log was read as a stats build's when the flash had not happened).
     let mut tag = String::new();
-    for (env, cfg) in [("FERROS_HV_NO_ATA", "hv_no_ata"), ("FERROS_HV_ACTLR_KEEP", "hv_actlr_keep"), ("FERROS_HV_LINUX_AT_EL2", "hv_linux_at_el2"), ("FERROS_HV_TSC_OFF_AFTER_BOOT", "hv_tsc_off_after_boot"), ("FERROS_HV_NO_CHORD_POLL", "hv_no_chord_poll"), ("FERROS_HV_NO_REPORT", "hv_no_report"), ("FERROS_HV_LEAN_RESUME", "hv_lean_resume"), ("FERROS_HV_STAGE2", "hv_stage2"), ("FERROS_HV_NO_PMU_READ", "hv_no_pmu_read"), ("FERROS_HV_ORACLE", "hv_oracle"), ("FERROS_HV_PDMA_DUMP", "hv_pdma_dump"), ("FERROS_HV_ORACLE_SMC", "hv_oracle_smc"), ("FERROS_HV_MODEM_RING", "hv_modem_ring"), ("FERROS_HV_ORACLE_STEP", "hv_oracle_step"), ("FERROS_HV_SNAPSHOT", "hv_snapshot")] {
+    for (env, cfg) in [("FERROS_HV_NO_ATA", "hv_no_ata"), ("FERROS_HV_ACTLR_KEEP", "hv_actlr_keep"), ("FERROS_HV_LINUX_AT_EL2", "hv_linux_at_el2"), ("FERROS_HV_TSC_OFF_AFTER_BOOT", "hv_tsc_off_after_boot"), ("FERROS_HV_NO_CHORD_POLL", "hv_no_chord_poll"), ("FERROS_HV_NO_REPORT", "hv_no_report"), ("FERROS_HV_LEAN_RESUME", "hv_lean_resume"), ("FERROS_HV_STAGE2", "hv_stage2"), ("FERROS_HV_NO_PMU_READ", "hv_no_pmu_read"), ("FERROS_HV_ORACLE", "hv_oracle"), ("FERROS_HV_PDMA_DUMP", "hv_pdma_dump"), ("FERROS_HV_ORACLE_SMC", "hv_oracle_smc"), ("FERROS_HV_MODEM_RING", "hv_modem_ring"), ("FERROS_HV_ORACLE_STEP", "hv_oracle_step"), ("FERROS_HV_SNAPSHOT", "hv_snapshot"), ("FERROS_HV_XPLANT", "hv_xplant")] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
         println!("cargo:rerun-if-env-changed={env}");
         if std::env::var(env).map(|v| v == "1").unwrap_or(false) {
@@ -71,6 +71,20 @@ fn main() {
         Err(_) => Vec::new(),
     };
     std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("snap_list.rs"), format!("pub const SNAP_LIST: [u32; {}] = [{}];\n", snap.len(), snap.join(", "))).unwrap();
+    // FERROS_HV_XPLANT_LIST: a file of writes ("<addr> <value>" in hex, or "delay <us>") that a FERROS_HV_XPLANT=1 build applies on top of Linux's running camera at the same trigger as the snapshot: ferros's own sequences transplanted into a working pipeline, to see which of them stops it. Generated into OUT_DIR/xplant_list.rs as (address, value) pairs, address 0 meaning a delay of `value` microseconds.
+    println!("cargo:rerun-if-env-changed=FERROS_HV_XPLANT_LIST");
+    let xp: Vec<String> = match std::env::var("FERROS_HV_XPLANT_LIST") {
+        Ok(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("FERROS_HV_XPLANT_LIST: cannot read {path}")).lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).map(|l| {
+                let mut it = l.split_whitespace();
+                let (a, v) = (it.next().unwrap(), it.next().unwrap_or_else(|| panic!("FERROS_HV_XPLANT_LIST: {l:?}")));
+                if a == "delay" { format!("(0, {})", v.parse::<u64>().unwrap()) } else { format!("({:#x}, {:#x})", parse(a), parse(v)) }
+            }).collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    std::fs::write(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("xplant_list.rs"), format!("pub const XPLANT_LIST: [(u64, u64); {}] = [{}];\n", xp.len(), xp.join(", "))).unwrap();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=HV_BUILD_TAG={} {}", stamp % 100000, if tag.is_empty() { "base".to_string() } else { tag.trim_end().to_string() });
 }

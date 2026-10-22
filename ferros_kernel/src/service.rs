@@ -817,13 +817,24 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"pmic rails" {
+                                            // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
+                                            let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };
+                                            let hx = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X}"), Err(e) => alloc::format!("error G#{e:X}") };
+                                            let (m, sb, t) = (crate::acpm::MAIN, crate::acpm::SUB, crate::acpm::T_PMIC);
+                                            resp.extend_from_slice(alloc::format!("VDD_INT (BUCK5M): ctrl {} out1 {} out2 {}\nVDD_CAM (BUCK1S): ctrl {} out1 {} out2 {}\n",
+                                                hx(crate::acpm::read(m, t, 0x1F)), mv(crate::acpm::read(m, t, 0x20)), mv(crate::acpm::read(m, t, 0xC7)),
+                                                hx(crate::acpm::read(sb, t, 0x0E)), mv(crate::acpm::read(sb, t, 0x0F)), mv(crate::acpm::read(sb, t, 0xCA))).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam bus" {
                                             // `diag cam bus`: mux and bring up both camera HS-I2C controllers (no device addressed).
                                             crate::camera::buses_up(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"cam pdma" || cmd.params == b"cam pdma slit" {
+                                        if cmd.params == b"cam pdma" || cmd.params == b"cam pdma slit" || cmd.params == b"cam pdma fast" {
                                             // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
                                             let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
                                             if b2.is_none() && cfg!(cam_frame_blob) {
@@ -843,7 +854,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                                 _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
                                             };
-                                            crate::camera::pdma_probe(&mut resp, init, prog, if cmd.params == b"cam pdma slit" { 64 } else { 0 });
+                                            crate::camera::pdma_probe(&mut resp, init, prog, if cmd.params == b"cam pdma slit" { 64 } else { 0 }, cmd.params == b"cam pdma fast");
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

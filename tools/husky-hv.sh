@@ -63,12 +63,14 @@ PY
 python3 $MKB/mkbootimg.py --header_version 4 --kernel $W/kernel.lz4 --ramdisk $W/ramdisk.empty --cmdline "${HV_CMDLINE:-}" -o $W/boot_a_hv.img
 echo "== image: $W/boot_a_hv.img ($(stat -c %s $W/boot_a_hv.img) bytes)"
 [ $FLASH = 1 ] || { echo "not flashing (add --flash). Then: fastboot flash boot_a $W/boot_a_hv.img; fastboot --set-active=a; fastboot reboot"; exit 0; }
-if adb devices 2>/dev/null | grep -qE "device$"; then adb reboot bootloader; elif lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true; fi
+# Decide from the USB bus, not from `adb devices`: phones reachable over the LAN show up there too, and then a bare `adb reboot bootloader` fails.
+if lsusb -d 1209:4665 >/dev/null 2>&1; then timeout 60 target/debug/ferros-bridge reboot fastboot >/dev/null 2>&1 || true
+elif lsusb | grep -q "18d1:4ee[0-9a-f]"; then adb -s "$(adb devices | awk '$2=="device" && $1 !~ /[:.]/ {print $1; exit}')" reboot bootloader || true; fi
 for i in $(seq 60); do lsusb -d 18d1:4ee0 >/dev/null 2>&1 && break; sleep 2; tools/usb-kick.sh --if-wedged; done
 lsusb -d 18d1:4ee0 >/dev/null 2>&1 || { echo "no fastboot device"; exit 1; }
 fastboot flash boot_a $W/boot_a_hv.img 2>&1 | tail -2
 fastboot --set-active=a 2>&1 | tail -1
 fastboot reboot >/dev/null 2>&1
 echo "== booting slot a under the hv; waiting for adb (or ferros, if the gate chose it)"
-for i in $(seq 80); do sleep 3; tools/usb-kick.sh --if-wedged; if lsusb -d 1209:4665 >/dev/null 2>&1; then echo "== FERROS on USB after $((i*3)) s (the gate chose ferros)"; exit 0; fi; if adb devices 2>/dev/null | grep -qE "device$|unauthorized"; then echo "== ANDROID on adb after $((i*3)) s"; adb shell 'dmesg 2>/dev/null | grep -E "started at EL"; ls /sys/firmware/devicetree/base/reserved-memory/ | grep hv' 2>/dev/null; exit 0; fi; lsusb -d 18d1:4ee0 >/dev/null 2>&1 && { echo "== back in fastboot (slot a did not boot)"; exit 1; }; done
+for i in $(seq 80); do sleep 3; tools/usb-kick.sh --if-wedged; if lsusb -d 1209:4665 >/dev/null 2>&1; then echo "== FERROS on USB after $((i*3)) s (the gate chose ferros)"; exit 0; fi; if lsusb | grep -q "18d1:4ee[1-9a-f]"; then echo "== ANDROID on USB after $((i*3)) s"; sleep 5; adb -s "$(adb devices | awk '$2=="device" && $1 !~ /[:.]/ {print $1; exit}')" shell 'dmesg 2>/dev/null | grep -E "started at EL"; ls /sys/firmware/devicetree/base/reserved-memory/ | grep hv' 2>/dev/null; exit 0; fi; lsusb -d 18d1:4ee0 >/dev/null 2>&1 && { echo "== back in fastboot (slot a did not boot)"; exit 1; }; done
 echo "== nothing on USB after 240 s"
