@@ -39,6 +39,9 @@ const FERROS_MAGIC: &[u8; 8] = b"FERROSGT";
 /// In the hv's report page: "gate answered, ferros" for ferros's ready.rs; ferros clears it.
 pub const GATE_MARK_ADDR: usize = 0xA_FFFF_FF10;
 pub const GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
+/// In the ramoops result block, the end of its first page (the hv report page at G#A_FFFF_0000 does not survive a PSCI reset; this block does, measured 2026-10-21): ferros's `diag android` leaves this word before resetting, so the next gate answers "Android" by itself, once, with the screen untouched: the host can switch between the two without anyone at the keys.
+pub const ANDROID_ONCE_ADDR: usize = 0xFD60_0FF8;
+pub const ANDROID_ONCE: u64 = 0x414E_4452_4F49_4431; // "ANDROID1"
 /// Where ABL's splash pixels wait while the gate is on screen: inside the hv's own reservation, above its code and stacks.
 const SPLASH_SAVE: usize = 0xA_FD00_0000;
 const SPLASH_SAVE_MAX: usize = 0x200_0000;
@@ -283,6 +286,13 @@ fn vol_up() -> bool {
 pub fn ask() -> Choice {
     if ferros_image().is_none() {
         return Choice::Android;
+    }
+    unsafe {
+        if read_volatile(ANDROID_ONCE_ADDR as *const u64) == ANDROID_ONCE {
+            write_volatile(ANDROID_ONCE_ADDR as *mut u64, 0);
+            asm!("dsb sy");
+            return Choice::Android;
+        }
     }
     // The power pin as a plain input (ABL may leave it as a wakeup interrupt; Linux sets it up again).
     let c = rd(GPA4_CON) & !(0xF << (POWER_PIN * 4));

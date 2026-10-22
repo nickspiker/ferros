@@ -582,6 +582,12 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"android" {
                                             // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot.
                                             let r = crate::slot::set_active(0);
+                                            // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
+                                            unsafe {
+                                                let p = 0xFD60_0FF8usize as *mut u64;
+                                                core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+                                                core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+                                            }
                                             resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             if r == crate::slot::MARKED {
