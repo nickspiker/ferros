@@ -68,3 +68,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [husky touch bring-up](husky_touch_bringup.md) — FTM5 touch up from cold (2026-10-19): diag touch up/watch/paint; capture = boot probe at loglevel=4, never fts unbind (panics); axes finger test pending
 - [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live under path deps; build breaks inside vsf = wait/retry or message the vsf session, never touch it; no pinning (owner, 2026-10-20); siblings require vsf "0.10"
 - [Settings flow identity → device only](settings_identity_to_device_only.md) — attesting identity's preference written to the device, never device → identity; device.base (tatau code) is the first; spec in SETTINGS.md
+- [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
