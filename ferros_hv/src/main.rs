@@ -1221,7 +1221,8 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 if cfg!(hv_xplant) && wnr == 1 && pa == PDMA as u64 + 0x10 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { xplant(logval) };
                 }
-                if cfg!(hv_pdma_dump) && wnr == 1 && ((pa == PDMA as u64 && (logval & 1 == 1 || logval == 0)) || (pa == PDMA as u64 + 0x10 && logval == 0x100)) && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
+                // Mid-stream only (the descriptor index reaching G#100), one dump per session: the start dump read an empty ring and the stop dump raced the HAL unmapping its lists, and together they spent the dump budget on the first camera of a session that switches lenses (2026-10-22).
+                if cfg!(hv_pdma_dump) && wnr == 1 && pa == PDMA as u64 + 0x10 && logval == 0x100 && unsafe { read_volatile(&raw const ORACLE_ARMED) } {
                     unsafe { pdma_dump() };
                 }
                 unsafe {
