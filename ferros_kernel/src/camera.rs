@@ -2421,6 +2421,8 @@ pub struct Shot {
     pub snap: bool,
     /// `view=<seconds>`: after the ten-frame run, paint the live frame onto the panel for this long (the viewfinder).
     pub view: u32,
+    /// `rate`: after the ten-frame run, count frames over two seconds (the core's buffer index and the sensor's own counter) for the exact frame period.
+    pub rate: bool,
 }
 
 impl Shot {
@@ -2450,6 +2452,7 @@ impl Shot {
             }
         }
         s.snap = params.split(|&c| c == b' ').any(|t| t == b"snap");
+        s.rate = params.split(|&c| c == b' ').any(|t| t == b"rate");
         s
     }
 }
@@ -2693,6 +2696,27 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
             Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
         }
+    }
+    if shot.rate {
+        // Two seconds of frames, the front end answered every 40 ms. The core's buffer index (+G#49C) counts frames it took; the sensor's counter (CCS G#0005, 8 bits) counts frames it sent.
+        let f = crate::platform::cntfrq();
+        let sensor = || { let mut b = [0u8; 1]; crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).map(|_| b[0] as u32).unwrap_or(0) };
+        let (t0, b0, s0) = (crate::platform::cntpct(), rd(0x1C32_049C), sensor());
+        let mut idx = idx_after_loop();
+        while crate::platform::cntpct().wrapping_sub(t0) < 2 * f {
+            spin_us(40_000);
+            idx += 1;
+            wr(PDMA + 0x10, idx * 0x10);
+            for &a in FRAME_ACK.iter() {
+                let v = rd(a);
+                wr(a, v);
+            }
+            crate::platform::pet_watchdogs();
+        }
+        let (t1, b1, s1) = (crate::platform::cntpct(), rd(0x1C32_049C), sensor());
+        let us = t1.wrapping_sub(t0) * 1_000_000 / f;
+        let (nb, ns) = (b1.wrapping_sub(b0), s1.wrapping_sub(s0) & 0xFF);
+        line(rep, alloc::format!("frame rate over A#{us} us: core took A#{nb} frames, sensor counted A#{ns}; period A#{} us (core), A#{} us (sensor)\n", if nb > 0 { us / nb as u64 } else { 0 }, if ns > 0 { us / ns as u64 } else { 0 }));
     }
     if shot.view > 0 {
         crate::flashlog::line("view: frame loop done");
