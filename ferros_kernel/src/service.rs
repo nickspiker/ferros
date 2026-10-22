@@ -827,6 +827,11 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam uw scan" || cmd.params == b"cam uw scan init" {
+                                            crate::camera::uw_scan(&mut resp, cmd.params == b"cam uw scan init");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"cam uw up" {
                                             // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
                                             crate::camera::uw_up(&mut resp);

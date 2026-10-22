@@ -2485,6 +2485,26 @@ pub fn uw_up(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("ultrawide (G#{:02X}) identifier at G#0016: {r:?} G#{:02X}{:02X}{}\n", m.addr, b[0], b[1], if b == [0x07, 0x87] { " — Sony IMX787, as Linux reads it" } else { "" }));
 }
 
+/// `diag cam uw scan` / `diag cam uw scan init`: which 7-bit addresses acknowledge on the ultrawide's bus (a one-byte read of register 0 at each), optionally after replaying the sensor's init: Linux talks to the sensor at G#1A and the lens actuator at G#0F there, and the actuator would not acknowledge from ferros (2026-10-22).
+pub fn uw_scan(rep: &mut Vec<u8>, after_init: bool) {
+    let m = &MODULES[2];
+    if after_init {
+        let (init, _) = Cam::uw_bundle();
+        if let Some(init) = init {
+            let (w, r, fail) = replay_init_on(&init, m.bus, m.addr);
+            line(rep, alloc::format!("sensor init: {w} writes, {r} reads, failure {fail:?}\n"));
+        }
+    }
+    let mut acks = alloc::string::String::new();
+    for a in 0x08u8..0x78 {
+        let mut b = [0u8; 1];
+        if crate::hsi2c::write_read(m.bus, a, &[0x00], &mut b).is_ok() {
+            acks.push_str(&alloc::format!(" G#{a:02X}"));
+        }
+    }
+    line(rep, alloc::format!("acknowledging on the ultrawide's bus:{}\n", if acks.is_empty() { " none" } else { &acks }));
+}
+
 /// Picture settings for `cam pdma`, from `exp=<lines> gain=<code> af=<position>` after the command (all optional; 0 = leave as captured).
 #[derive(Clone, Copy, Default)]
 pub struct Shot {

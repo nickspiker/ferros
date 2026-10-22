@@ -8,14 +8,16 @@ use vsf::spectral_image::{IdtClass, PlaneLayout};
 use vsf::types::BitPackedTensor;
 use vsf::visual::{Samples, Visual};
 
-const W: usize = 4080;
-const H: usize = 3072;
-const STRIDE: usize = 5120;
 
+#[allow(non_snake_case)]
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let raw = std::fs::read(&a[1]).unwrap();
-    assert!(raw.len() >= H * STRIDE, "short frame");
+    // The frame's geometry is the template capture's (same sensor, same mode); the front end's line stride is the RAW10 line rounded up to 64 bytes (main: 4080 -> 5120, ultrawide: 4000 -> 5056, as both front-end programs set it).
+    let mut v = Visual::read_file(std::path::Path::new(&a[2])).unwrap();
+    let (W, H) = (v.planes[0].width, v.planes[0].height);
+    let STRIDE = (W * 10 / 8).div_ceil(64) * 64;
+    assert!(raw.len() >= H * STRIDE, "short frame: {} bytes for {W} x {H} at stride {STRIDE}", raw.len());
     let mut px = vec![0u16; W * H];
     for y in 0..H {
         let row = &raw[y * STRIDE..];
@@ -26,7 +28,6 @@ fn main() {
             }
         }
     }
-    let mut v = Visual::read_file(std::path::Path::new(&a[2])).unwrap();
     let cfa = match &v.planes[0].layout { PlaneLayout::Mosaic { cfa } => cfa.clone(), _ => panic!("template plane is not a mosaic") };
     println!("template cfa {:?} (0 = R, 1 = G, 2 = B as vsf numbers them), {}x{}", cfa, v.planes[0].width, v.planes[0].height);
     // The IDT file is a plain VSF (absidt's sections: characterization, curves, emitter, check), not a visual: read its characterization section directly.
@@ -40,7 +41,6 @@ fn main() {
     // The VSF visual.
     {
         let p = &mut v.planes[0];
-        assert!(p.width == W && p.height == H, "template is {}x{}", p.width, p.height);
         p.samples = Samples::Packed(BitPackedTensor::pack(10, vec![H, W], &px));
         p.black = vec![64.; 3];
         p.white = vec![1023.; 3];
