@@ -16,10 +16,11 @@ Usage: tools/camera-pdma-image.py <hv dump> <out file> [--list N]
 """
 import re, struct, sys
 
-RING_PA, LIST_PA, LOAD_PA, BUF_PA = 0x8800_0000, 0x8801_0000, 0x8802_0000, 0x8810_0000
+RING_PA, LIST_PA, LOAD_PA, BUF_PA = 0x8800_0000, 0x8801_0000, 0x8802_0000, 0xA000_0000
 BUF_SLICE = 0x100_0000
 # As many slices as fit between BUF_PA and the first carveout, which zuma-rmem.dtsi puts at G#9000_0000: seven. Patterning that whole range was briefly blamed for resetting the phone, but all three of those runs were built from list 1 and the only run with list 2 was the one that worked; retested with list 2, seven 16 MiB slices to G#8F10_0000 are fine.
-BUF_SLOTS = (0x9000_0000 - BUF_PA) // BUF_SLICE
+# Since 2026-10-21: 32 slices from G#A000_0000 (nothing reserved between G#9700_0000 and G#E800_0000), one per output, so no two channels share; camera.rs PDMA_BUF_PA / PDMA_BUFS agree.
+BUF_SLOTS = 32
 LOAD_SLICE = 0x1000
 IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 # Address registers whose captured value falls outside that window: list 2 hands them G#0200_0000, G#0158_0000, G#0D18_0000 and G#0FF0_0000, which the window left alone, so with the SYSMMUs in bypass the front end was pointed at physical addresses in the register space. Found by comparing list 2 with the hv's live snapshot of a Linux stream (tools/camera-snap-list.py, 2026-10-21): each holds a different page-aligned IOVA there. G#1C32_05C0 sits in loch0's image path, beside its buffer address at +G#510.
@@ -79,7 +80,7 @@ def regeom(v):
     return (m(hi) << 16) | m(lo)
 
 # Walk the list: rewrite every page-aligned bus address in a (register, value) pair to a buffer slice, and every block-load source to its own slice.
-bufs, load_order, geom = {}, [], 0
+bufs, load_order, geom, owners = {}, [], 0, {}
 i = 0
 while i < len(words):
     h = words[i]; n = h >> 14; op = h & 0x3FFF
@@ -89,6 +90,7 @@ while i < len(words):
             v = words[k2]
             if (IOVA_LO <= v < IOVA_HI or ISPFE + words[k2 - 1] in ADDR_REGS) and v & 0xFFF == 0:
                 words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
+                owners.setdefault(words[k2], []).append(ISPFE + words[k2 - 1])
             else:
                 g = regeom(v)
                 if g != v:
@@ -100,6 +102,7 @@ while i < len(words):
             v = words[k2]
             if (IOVA_LO <= v < IOVA_HI or ISPFE + words[i + 1] + 4 * (k2 - i - 2) in ADDR_REGS) and v & 0xFFF == 0:
                 words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
+                owners.setdefault(words[k2], []).append(ISPFE + words[i + 1] + 4 * (k2 - i - 2))
             else:
                 g = regeom(v)
                 if g != v:
@@ -128,3 +131,5 @@ if height is not None:
     print(f"geometry rewritten from height {HEIGHT_FULL} to {height} in {geom} words")
 print(f"list {len(list_bytes)} B, {len(load_order)} block-load sources, {len(bufs)} output buffers remapped from G#{min(bufs):X}.. to G#{BUF_PA:X}.., G#{BUF_SLICE:X} a slice over {BUF_SLOTS} slices")
 print(f"ring {RING_ENTRIES} entries at G#{RING_PA:X}; total {8 + len(body)} bytes -> {out}")
+for pa in sorted(owners):
+    print(f"  slice G#{pa:X}: " + " ".join(f"G#{r:X}" for r in owners[pa]))

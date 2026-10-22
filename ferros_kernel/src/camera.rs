@@ -2253,11 +2253,11 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
 const PDMA: usize = 0x1C39_0000;
 /// The descriptor ring and the rest of the job live at fixed physical addresses the builder and the kernel agree on (tools/camera-pdma-image.py).
 const PDMA_RING_PA: usize = 0x8800_0000;
-const PDMA_BUF_PA: usize = 0x8810_0000;
+const PDMA_BUF_PA: usize = 0xA000_0000;
 /// A slice has to hold a frame: the captured mode is 4080 x 3072 RAW10, which is 15 MiB, so the 2 MiB slices this started with could never have held one.
-/// Seven of them, which is what fits between PDMA_BUF_PA and the first reserved carveout — zuma-rmem.dtsi puts that at G#9000_0000 and the hv's own addresses all sit below G#8400_0000, so the range is free. tools/camera-pdma-image.py wraps the list's distinct addresses over the same seven and must agree with this number.
+/// Thirty-two of them, one per distinct output address (the list has 22), from G#A000_0000 to G#C000_0000: zuma-rmem.dtsi reserves nothing between G#9700_0000 and G#E800_0000, and on a cold boot nothing else lives there. Seven slices below G#9000_0000 made the 22 outputs share, and the first real frame (2026-10-21) came back with other channels written over its top half. tools/camera-pdma-image.py must agree with these numbers.
 const PDMA_BUF_SLICE: usize = 0x100_0000;
-const PDMA_BUFS: usize = 7;
+const PDMA_BUFS: usize = 32;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
 pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool) {

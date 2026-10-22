@@ -265,3 +265,21 @@ The rest of CMU_TOP differs only in other domains' clocks (AUR, BW, DPU, G3D, MF
 - G#1C32_041C / 201C and G#1C33_7020 / B020 hold the program's 1 where Linux reads 0.
 
 Those are requests the hardware consumes when a frame arrives, and ours are still pending. The remaining differences are buffer addresses, counters and per-frame 3A values. CMU_ISPFE's Q-channel status words (G#1C00_7xxx: PPMU and SYSMMU channels) differ because ferros forces those clocks on.
+
+## First frame (2026-10-21, night)
+
+**The front end's local channels were never enabled.** Linux writes G#81 to G#1C32_00A0 right after acknowledging the first SHADOW_UPDATE (capture access 531, after the PDMA index write at 458), and the image path's SOF follows. G#81 is loch0's image (bit 0) and PD (bit 7) paths, the same layout as the aggregate word. It is a plain write, not a read-and-write-back acknowledgement, so neither the setup extraction (`camera-prog.py` stops "before the per-frame interrupt handling") nor `FRAME_ACK` (read-back pairs only) carried it. The live snapshot did show it (Linux G#81, ferros 0), and it was first misread as status. Its partners: G#1C32_00B0, written 1 then G#80 during setup, is the request; G#1C32_00A4, written 1 then G#80 at stop, is the disable.
+
+With it, `diag cam pdma` gets, every frame:
+- G#1B (SOF, EOF, SHADOW_UPDATE, DMA_DONE) on both of loch0's paths;
+- a buffer index counting 0, 1, 2 and on;
+- the frame in memory.
+
+**Where the frame goes.** The image body is written to the address in **G#1C32_05C0**. That is one of the four registers the builder's IOVA window had missed (`ADDR_REGS`): it was pointing the frame at physical G#0200_0000. G#1C32_0510 holds only a 16-byte header (G#8F, 0, 1, 0). The PD path (G#1C32_21C0) gets 3.75 MiB, 4080 × 768 RAW10. The output slices now sit at G#A000_0000, 32 × 16 MiB, one per output address. The first frame, taken while the 22 outputs still shared seven slices below G#9000_0000, came back with other channels written over its top half. Slices from G#B600_0000 up read back as zeros after patterning, so keep the outputs below that.
+
+**The format is MIPI RAW10, packed.** Four pixels in five bytes (four MSB bytes, then the 2-bit LSBs), stride G#1400 = 5120 bytes, 3072 lines: exactly 15 MiB. Adjacent same-colour rows correlate at 0.94. The first frame: black level about 64, median 68, 99th percentile 108. That is a dim scene at the captured exposure of 20 lines, out of focus because nothing drives the focus actuator. Readback: `bridge read A2000000+n*10000 10000` × 240 (64 KiB per read).
+
+Also ruled out tonight, worth not repeating:
+- **Response timing** (`cam pdma fast` answers the core within microseconds and sees no more than the 50 ms loop did). The single G#81 seen without the enable comes from the PDMA executing the program, not from a frame.
+- **VDD_CAM.** Linux raises S1S_VDD_CAM from 537.5 to 600 mV while streaming. Cold ferros has 575 mV, and ACPM refuses a direct write to that buck (error G#103).
+- **The hv transplant** (`FERROS_HV_XPLANT`). It works mechanically, but Linux's HAL restarts the whole session within 25 ms of any disturbance, so it cannot isolate a breaking write.
