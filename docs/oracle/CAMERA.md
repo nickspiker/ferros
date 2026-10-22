@@ -299,3 +299,18 @@ Also ruled out tonight, worth not repeating:
 **Exposure is already long.** The captured init's last per-frame block sets integration G#535E (21342 lines) in a G#5372-line frame at analogue gain G#0400. The "20 lines" seen earlier is an intermediate value. Copying Linux's block from the older open capture (integration G#0A56, frame length G#2959) doubled the frame rate and stalled the core. So `exp=`/`gain=` now write only what is asked, inside the hold. The hold is the four-byte write `01 04 01 01` and its release `01 04 00 01`: G#0104 is one byte, G#0105 stays 1.
 
 **The front end has to be answered.** A single 15 MiB copy of uncached memory (about 600 ms) left it unacknowledged long enough to stop taking frames for good (buffer index frozen). With the copy cut into 256 KiB pieces and the index advance plus acknowledgement every 50 ms between them, it streams through a whole sweep (index G#7 to G#83). The descriptor ring is now 1024 entries, matching the count register.
+
+## First colour (2026-10-21, night)
+
+`tools/camera-raw2vsf` turns a pulled frame into a VSF visual characterised by the main camera's Absolute IDT (`pixel 8 pro calibration data/derived/cam2-main.idt.vsf`, derived from the Android/Lumis captures), plus a preview PNG. The Lumis main-camera capture is the template: same sensor, same 4080 × 3072 mosaic, black 64, white 1023.
+
+- **The mosaic is G B / R G** in the channel order the IDT was fitted in (Lumis records `cfa` [1, 2, 0, 1] over channels R, G, B). ferros's readout uses the same mode and orientation, so the same layout applies.
+- **`ProfileEntry.matrix` is row-major** (vsf `spectral_image.rs`). `apply_matrix_3x3_f32` reads vsf's own column-major constants, so an IDT matrix must be applied by rows. The first render went through the helper and came out transposed.
+- **Preview:** black-subtract; scale each channel by the IDT's sensitivity, so channel ratios become radiance ratios; absolute matrix to linear VSF RGB; vsf's `VSF_RGB2SRGB` and the sRGB curve for a screen. One exposure scale and no white balance: an Absolute IDT keeps the room light's cast.
+
+```
+tools/camera-pull.sh target/cam/shot [base]
+tools/camera-raw2vsf/target/release/camera-raw2vsf target/cam/shot.raw10 "<lumis main capture>.vsf" "pixel 8 pro calibration data/derived/cam2-main.idt.vsf" shot.vsf shot.png [exposure_s]
+```
+
+The exposure is about 71 ms, estimated from frame timing (G#535E of G#5372 lines at roughly 14 frames a second); the sensor's pixel clock is not yet read, so it is marked as estimated in the file. That figure, and the f-number, are what the IDT's absolute scale needs. Comparing ferros's own calibration capture against the Android-derived IDT needs both exact.

@@ -1,0 +1,10 @@
+[package]
+name = "camera-raw2vsf"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+vsf = { path = "../../../vsf" }
+image = { version = "0.25", default-features = false, features = ["png"] }
