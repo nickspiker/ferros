@@ -86,3 +86,51 @@ That is the whole idea in miniature: a plane, nothing moves, fingers move the vi
 - **Capture.** The 2026-10-16 design put it on a hardware chord, never behind a list. Nothing in the spec contradicts that; Lumis would open from it.
 
 The 2026-10-16 mock is `tools/shell-mock` (fluor, headless, the panel's real geometry; `cargo run --release -- <out dir>` writes PPM frames), and the 2026-10-16 home screen still runs on the phone as `payloads/shelltest` through the display server's `display` endpoint (DISPLAY.md), in Oxanium.
+
+## Proposal: places, the device's own circle, and settings that live where they act (2026-10-22, for the owner's decision)
+
+Reasoned from the spec above rather than from phone conventions: no app grid, no back button, no status bar, no notification shade, no settings tree.
+
+### An app is a place, and opening it is arriving
+
+Zoom is already semantic: closest, a circle opens into its content where it stands. Take that literally for apps. Lumis is not launched; you approach it. As the camera closes on its circle, the circle shows the app's live surface inside its own outline. When the circle fills the screen, the app has the screen and the touches, and pinching out is how you leave. There is nothing to go "back" to, because you never went anywhere: the map is still there under your fingers. This needs one mechanism, not four: the display server composites an app's surface into its circle's screen rectangle, and touches inside a circle that fills the screen go to that circle's process. Every app gets entry, exit and its place on the map from the shell, for free and identically.
+
+### Every circle has a front and a back
+
+The front is what the thing is: the thread, the viewfinder, the map. The back is the facts about it, the same for every circle: who signed it and its ihi; which capabilities it holds, hardware by name; how much time it takes (its area, as a number in the device base); when it last changed and why. Turning a circle over is one gesture everywhere (proposed: a two-finger twist, the one motion that pan and pinch never make). This is where an app's permissions live: not in a settings menu far away, but on the back of the thing they govern. A circle's back is read-only facts plus the few choices that belong to it. Revoking a capability is one of them, and it takes effect at the app's next start.
+
+### The device is a circle too, and its back is the settings
+
+The phone itself is the first circle on the map: the one the spec says first boot places, where you pair with a device you trust. Its front is the dashboard, the state of the device in plain facts:
+- battery, energy and temperature;
+- storage;
+- the radios (WiFi, cellular, the USB link);
+- the press-to-ready time;
+- the ledger of what the agent did.
+
+Every number is in the device base. Its back holds the device's few choices:
+- the number base, the first of them: four choices, each shown as two seconds and a megabyte written in it, so the choice is made by seeing, not by name;
+- names under circles, on or off;
+- the wake (the proximity gate);
+- validate-on-demand for the firmware, with its disclaimer;
+- pairing.
+
+That is the whole of settings: the device's own choices on the device's own circle, and each app's choices on the app's circle. Nothing is two levels deep.
+
+The device circle never lights. Lit means a person sent you something, and the device is not a person. Low battery is the one fact that matters without being looked for, and it is not a circle's business: it belongs to the wake, the one moment a glance is certain.
+
+### What each app brings, in the order the device can carry it
+
+1. **The device circle and its back**, all local: the first place where tatau's four bases are chosen and seen. It proves the place mechanism with nothing borrowed.
+2. **Lumis.** The camera works cold: a live viewfinder in its circle, a tap to take, the frame kept as VSF with the camera's own IDT. The camera code moves out of the kernel's diagnostics into a driver process that serves frames, and Lumis holds that capability. The hardware chord for capture (2026-10-16) opens Lumis from anywhere.
+3. **Opsin**, the recording side: what Lumis kept, viewed in its true colour (the IDT and the pinned panel profile), once sound or a sequence of frames is there to record.
+4. **Photon**: people and threads as circles, placed beside each other once and never moved. It needs WiFi (up), photon_core (host-tested), and the owner's enrollment. Each person is a circle; a thread opens in place.
+5. **Mahere**, the map: needs position (GNSS, not yet up) and its tiles.
+
+### The open questions above, answered as proposals
+
+- **Placement:** the system places, deterministically and beside what a thing relates to: a thread inside its person's neighbourhood, a photo near the camera's circle. Only the owner places by hand, when they want to. Asking a person to place every circle would put a decision in front of every arrival.
+- **Growth against neighbours:** place with air for a circle to reach roughly four times its starting area (twice the radius) before it touches anything. Beyond that, let it overlap, drawn beneath the smaller circle. Moving something would break the one promise, and an overlap breaks nothing.
+- **What lit looks like:** the only colour on an otherwise grey map. Colour already means changed, and grey at rest is already true (icons are photopic grey). No glow and no motion.
+- **The clock:** not on the map. The time of day is the agent's to answer and the wake's to show for a moment, written as a share of the day in the device base.
+- **Time measured for size:** dwell, meaning how long a circle fills the screen. Kept on the device, averaged over weeks, never sent.
