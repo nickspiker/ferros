@@ -26,3 +26,23 @@ Working since 2026-10-19 on slot b, no Linux: `bridge diag "cam bus"`, `"cam up"
 **Also ruled out:** the wide census (whole ISP span plus CMU_TOP plus every EL3 call) shows no unseen front-end page (only its SYSMMUs/S2MPUs) and no EL3 calls during a camera open. The PDMA builder's IOVA window missed four address registers (fixed, `ADDR_REGS`), and that wasn't it either.
 
 **Process trap:** with several adb devices attached (other phones on the LAN), `tools/husky-hv.sh --flash` dies at `adb reboot bootloader`. Use `ANDROID_SERIAL` from Android, or go `bridge reboot fastboot` + fastboot by hand from ferros.
+
+## 2026-10-21 night: FRAMES, focus, colour, viewfinder
+
+**The missing write was G#1C32_00A0 = G#81** (enable loch0 image + PD paths), which Linux writes right after the first SHADOW_UPDATE ack. It was missed because it's a plain write, not a read-back ack, and the setup extraction stopped before per-frame handling. With it: SOF/EOF/DMA_DONE every frame, and a 15 MiB RAW10 frame in DRAM.
+
+**Facts to not re-derive:**
+- **Where the frame lands:** the image body goes to the G#1C32_05C0 address (an `ADDR_REGS` entry), not to G#1C32_0510 (a 16-byte header).
+- **Output slices:** 32 × 16 MiB at G#A000_0000, one per output. Slices from G#B600_0000 up read as zeros.
+- **Format:** MIPI RAW10 packed, stride G#1400, mosaic **G B / R G** (Lumis cfa [1,2,0,1] over R,G,B), black 64.
+- **Exposure is already near max** in the init (21342 of 21362 lines). The hold is `01 04 01 01` / `01 04 00 01` (G#0104 is one byte). Copying Linux's older block (frame length G#2959) stalls the core.
+- **The lens actuator** is at G#0C. Reset 02←G#40, **wait 5 ms**, then 02←0, F1←0, target in 00/01, position read at 84. Focus around 1 m is G#3800.
+- **Service the front end at least every ~50 ms** (index advance + FRAME_ACK) or it stops for good. Chunk long copies.
+- **Adopt the display before the camera** (EL3 poison hang otherwise).
+- **IDT matrices are row-major** (`ProfileEntry.matrix`); `apply_matrix_3x3_f32` is column-major.
+- **A second `cam pdma` needs a cold boot.** `scratchpad coldflash.sh` / `bridge reboot` + fastboot flash boot_b.
+- **`diag android`** leaves a ramoops marker so slot a's gate picks Android unattended.
+
+**Tools:** `tools/camera-pull.sh`, `tools/camera-raw10.py`, `tools/camera-raw2vsf`; `cam pdma af= exp= gain= sweep=<a>:<step> view=<s> snap fast`.
+
+**Next:** the other three cameras; a re-runnable capture without a cold boot; the exact exposure time (pixel clock) for absolute-IDT comparison with the Android captures; screen calibration with the owner.
