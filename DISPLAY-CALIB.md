@@ -106,7 +106,19 @@ The panel keeps 8 bits of a 10 bpc stream (DISPLAY.md). In the mode ferros runs 
 
 The grey agrees with the 8-bit run (2.189 / 2.191). The channels' spread is the instrument's noise on dim patches: red's worst step is 16 % at code 64, where red emits 0.08 cd/m².
 
-**Near black is below the instrument here.** The i1 Pro's floor is about 0.01–0.02 cd/m², so at DBV 1353 the 10-bit codes under ~24 (0.04 cd/m²) read noise. DBV is a pure gain, so the way down is to measure the bottom codes at DBV 3307 or HBM, where they emit 7–11× the light, and scale back.
+**Near black, measured where there is light to measure.** The i1 Pro's floor is about 0.01–0.02 cd/m², so at DBV 1353 the 10-bit codes under ~24 read noise. DBV is a pure gain, so the bottom codes were measured at DBV 3307 (white 983 cd/m²) and at HBM (white 1467) and compared with white × (c/1023)^2.19:
+
+| 10-bit code | DBV 3307 | against γ 2.19 | HBM | against γ 2.19 |
+|---|---|---|---|---|
+| 8 | 0.0298 | +24 % | 0.0371 | +5 % |
+| 12 | 0.0618 | +7 % | 0.0945 | +9 % |
+| 16 | 0.1017 | −7 % | 0.1765 | +9 % |
+| 24 | 0.2701 | +2 % | 0.4236 | +7 % |
+| 32 | 0.4843 | −3 % | 0.7425 | 0 % |
+| 48 | 1.1917 | −2 % | 1.7493 | −3 % |
+| 64 | 2.2764 | 0 % | 3.4281 | +1 % |
+
+A plain power law to at least 10-bit code 8 (1/1250 of white), within the instrument's noise there: no toe, no floor. The present stage's table is one power law over the whole range. Codes 2–6 stay below the instrument even at HBM.
 
 **Decided (owner, 2026-10-22):**
 - **The present stage.** 16-bit gamma-2 working values (white = Q14) go through one 1D table, shared by the three channels: square, tanh roll-off into the peak, 1/2.19. That gives 10-bit codes with fraction bits, dithered spatially and temporally (phase buffers flipped at 10 Hz, re-pointed rather than copied) to a 12-bit effective target, then packed BGRA1010102 for the hardware's 10 → 8 dither.
