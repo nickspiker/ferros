@@ -296,6 +296,11 @@ const SYS_DMA: u64 = 7;
 const SYS_INPUT: u64 = 8;
 /// 9 `sleep(deadline)`: park until CNTPCT reaches `deadline`, so a periodic process (the display server's frame clock) costs nothing between frames instead of spinning through every slice the service loop hands out.
 const SYS_SLEEP: u64 = 9;
+/// Start a signed capsule from the vault as a new process, handing it copies of some of the caller's own capabilities (never more rights than the caller holds; reply capabilities do not pass). x0/x1: request offset and length in the caller's arc, [name len][name][vault key len][vault key][token count][tokens, 32 bytes each]. The child is queued, not entered: the caller carries on. Returns 0, or ERR with the reason on the console.
+const SYS_SPAWN: u64 = 10;
+
+/// Where `SYS_SPAWN` finds capsules: whoever owns the vault registers a reader (vault key -> bytes) while it is alive. Kernel-side only; a process never reads the vault through it, it only names a capsule to start, and the gate still checks the capsule's signature.
+pub static mut CAPSULES: Option<fn(&[u8]) -> Option<Vec<u8>>> = None;
 /// Once pcie1 streams its firmware via SYS_INPUT, input above this is streamed only and the arc stays small; today the full input is still inlined as a bridge (see spawn).
 #[allow(dead_code)]
 const INLINE_INPUT: usize = 4096;
@@ -441,6 +446,38 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     let p = kk.procs[cur].as_mut().unwrap();
     match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_SPAWN => {
+            // Parse [name len][name][key len][key][n][n tokens] from the caller's arc and resolve each token in the caller's own table: a child gets only what its parent holds, at the same rights, and never a reply.
+            let req = p.read(f.x[0], (f.x[1] as usize).min(4096));
+            let mut at = 0usize;
+            let mut take = |n: usize| -> Vec<u8> { let s = req[at.min(req.len())..(at + n).min(req.len())].to_vec(); at += n; s };
+            let nl = take(1).first().copied().unwrap_or(0) as usize;
+            let name = take(nl);
+            let kl = take(1).first().copied().unwrap_or(0) as usize;
+            let key = take(kl);
+            let n = take(1).first().copied().unwrap_or(0) as usize;
+            let mut objects = Vec::new();
+            let mut bad = false;
+            for _ in 0..n {
+                let tok = take(32);
+                match p.lookup(&tok).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                    Some((Object::Reply(_), _)) | Some((Object::Console, _)) | None => bad = true,
+                    Some(o) => objects.push(o),
+                }
+            }
+            let r = if bad { Err("spawn: a token the caller does not hold (or a reply/console)") } else { spawn_queued(if name.is_empty() { &key } else { &name }, &key, &objects) };
+            let kk = k();
+            match r {
+                Ok(_) => f.x[0] = 0,
+                Err(e) => {
+                    kk.console.extend_from_slice(b"spawn refused: ");
+                    kk.console.extend_from_slice(e.as_bytes());
+                    kk.console.push(b'\n');
+                    f.x[0] = ERR;
+                }
+            }
+            0
+        }
         SYS_SLEEP => {
             let now: u64;
             unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
@@ -788,13 +825,33 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
-    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
-    let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
-    let arc = arc_alloc(CODE + code.len() + inline + STACK, guard).ok_or("arc pool exhausted")?;
-    let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
+    let objects = resolve(grants)?;
+    let (me, arc, in_off) = build(name, code, input, &objects, ihi, guard, exec_len)?;
+    let kk = k();
+    kk.exited.clear();
+    let trips0 = kk.ipc_round_trips;
+    if let Some(p) = kk.procs[me].as_mut() {
+        p.state = State::Running;
+    }
+    kk.current = Some(me);
+    arm_slice();
+    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
+    disarm_slice();
+    let kk = k();
+    kk.current = None;
+    let exit = match kk.exited.iter().find(|&&(i, _)| i == me) {
+        Some(&(_, v)) => v,
+        None if matches!(kk.procs[me].as_ref().map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
+        None => PARKED,
+    };
+    Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
+}
+
+/// The grants' kernel objects and rights.
+fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
+    let mut v = Vec::new();
     for g in grants {
-        let (object, rights) = match g {
+        v.push(match g {
             Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
@@ -806,7 +863,19 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
             },
-        };
+        });
+    }
+    Ok(v)
+}
+
+/// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and put it in the table, not yet running. Returns (its index, its arc, the input's offset).
+fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
+    let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
+    let arc = arc_alloc(CODE + code.len() + inline + STACK, guard).ok_or("arc pool exhausted")?;
+    let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
+    for &(object, rights) in objects {
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
@@ -825,9 +894,18 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     crate::cachemap::sync_code(arc.base + CODE, code.len());
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
     crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
+    // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
+    let mut p = p;
+    p.frame.elr = (arc.base + CODE) as u64;
+    p.frame.sp_el0 = (arc.base + arc.size - 16) as u64;
+    p.frame.spsr = 0;
+    p.frame.x[28] = arc.base as u64;
+    p.frame.x[27] = arc.mask() as u64;
+    p.frame.x[0] = GRANTS as u64;
+    p.frame.x[1] = in_off as u64;
+    p.frame.x[2] = input.len() as u64;
+    p.state = State::Runnable;
     let kk = k();
-    kk.exited.clear();
-    let trips0 = kk.ipc_round_trips;
     let me = match kk.procs.iter().position(|q| q.is_none()) {
         Some(i) => {
             kk.procs[i] = Some(p);
@@ -838,16 +916,25 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
             kk.procs.len() - 1
         }
     };
-    kk.current = Some(me);
-    arm_slice();
-    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
-    disarm_slice();
-    let kk = k();
-    kk.current = None;
-    let exit = match kk.exited.iter().find(|&&(i, _)| i == me) {
-        Some(&(_, v)) => v,
-        None if matches!(kk.procs[me].as_ref().map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
-        None => PARKED,
-    };
-    Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
+    Ok((me, arc, in_off))
+}
+
+/// `SYS_SPAWN`'s work: the capsule by vault key through the gate (and, masked, its seal), then a process holding `objects`, queued to run.
+fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<usize, &'static str> {
+    let read = unsafe { CAPSULES }.ok_or("spawn: no vault to read capsules from")?;
+    let capsule = read(key).ok_or("spawn: no such capsule in the vault")?;
+    let sealed = read(b"sealed").unwrap_or_default();
+    let g = crate::oracle::gate(&capsule)?;
+    if g.masked {
+        let s = crate::oracle::seal(&g).ok_or("no system secret: cannot check a seal")?;
+        if !sealed.chunks_exact(32).any(|e| e == s) {
+            return Err("gate: masked capsule not installed (no seal)");
+        }
+    } else if cfg!(ferros_production) {
+        return Err("gate: production refuses unmasked native code");
+    }
+    let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len)?;
+    k().runnable.push_back(me);
+    Ok(me)
 }

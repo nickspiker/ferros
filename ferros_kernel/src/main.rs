@@ -1731,34 +1731,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };
 
-    // The first process: the vault's `init` capsule (put there with `bridge capsule` + `store put init @file`), through the gate and the oracle like any other. No capsule is built into the kernel and no key is near its build. Spawning it is the first thing that needs the wairua (its capabilities are minted under it), so KOHI runs here.
-    let mut init_exit = 0u32;
-    if let Some(Ok(Some(capsule))) = store.as_mut().map(|s| s.get_by_key("init")) {
-        match process::spawn_capsule(b"init", &capsule, b"", &[], &[]) {
-            Ok(o) => {
-                init_exit = (o.exit >> 32) as u32 | 1;
-                checklist::mark(checklist::Item::Arcs);
-                checklist::mark(checklist::Item::Spawn);
-                if o.exit >> 56 != 0xFA {
-                    checklist::mark(checklist::Item::El0);
-                }
-                if !o.console.is_empty() {
-                    checklist::mark(checklist::Item::Syscall);
-                    checklist::mark(checklist::Item::Caps);
-                    checklist::mark(checklist::Item::FirstProcess);
-                    // On the panel: the first bytes of the ihi the oracle gave it, as it reported them ("my ihi: XXXXXXXX").
-                    if let Some(i) = o.console.windows(8).position(|w| w == b"my ihi: ") {
-                        let hex = &o.console[i + 8..(i + 16).min(o.console.len())];
-                        let mut sfx = alloc::vec::Vec::from(&b"ihi "[..]);
-                        sfx.extend_from_slice(hex);
-                        checklist::suffix(checklist::Item::FirstProcess, &sfx);
-                    }
-                }
-                process::push_console(&o.console);
-            }
-            Err(_) => init_exit = 0xE,
-        }
-    }
+    // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
+    let init_exit = 0u32;
 
     let own_base = &raw const _start as usize;
     let extras = alloc::vec![

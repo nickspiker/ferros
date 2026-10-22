@@ -26,6 +26,7 @@ pub mod nr {
     pub const DMA: u64 = 7;
     pub const INPUT: u64 = 8;
     pub const SLEEP: u64 = 9;
+    pub const SPAWN: u64 = 10;
 }
 
 /// The raw trap: number in x8, arguments in x0..x4, result in x0. The kernel may write into any buffer named by the arguments, so nothing is assumed cached across it.
@@ -116,6 +117,29 @@ pub fn off<T: ?Sized>(p: *const T) -> u64 {
 #[inline(always)]
 pub fn cap(grants: u64, slot: u64) -> u64 {
     grants + 4 + 32 * slot
+}
+
+/// Start the signed capsule stored in the vault under `key` as a new process called `name`, handing it copies of this process's own capabilities in grant `slots` (they become the child's slots 1.. in that order; slot 0 is always its console). The child is queued; this process carries on. Returns 0, or ERR (the reason is on the console). At most 14 slots.
+pub fn spawn(grants: u64, name: &[u8], key: &[u8], slots: &[u64]) -> u64 {
+    let mut req = [0u8; 2 + 64 + 64 + 1 + 14 * 32];
+    let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len().min(14));
+    let mut at = 0;
+    req[at] = nl as u8;
+    req[at + 1..at + 1 + nl].copy_from_slice(&name[..nl]);
+    at += 1 + nl;
+    req[at] = kl as u8;
+    req[at + 1..at + 1 + kl].copy_from_slice(&key[..kl]);
+    at += 1 + kl;
+    req[at] = n as u8;
+    at += 1;
+    for &slot in &slots[..n] {
+        let tok = (arc_base() + cap(grants, slot)) as *const u8;
+        for i in 0..32 {
+            req[at + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+        }
+        at += 32;
+    }
+    svc(nr::SPAWN, off(req.as_ptr()), at as u64, 0, 0, 0)
 }
 
 /// End this process; its arc and capabilities cease to exist.

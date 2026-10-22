@@ -27,6 +27,7 @@ members = [
     "payloads/touch",
     "payloads/touchtest",
     "payloads/map",
+    "payloads/init",
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",

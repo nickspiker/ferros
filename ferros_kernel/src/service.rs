@@ -281,11 +281,58 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
 }
 
 /// Shim entry with the USB service: adopt UFS, arm the safety nets, probe the vault, then serve PT over USB until told to leave.
+/// The service loop's vault, lent to `SYS_SPAWN` (process.rs `CAPSULES`) for reading capsules by key: `run` never returns, so the pointer stays good for the rest of the boot.
+static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
+
+fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let k = core::str::from_utf8(key).ok()?;
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k).ok().flatten() }
+}
+
+/// What init holds: everything the shell's three processes need, in the slot order payloads/init expects (its header). The kernel grants it once; init hands each process its share.
+fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
+    use crate::process::Grant::*;
+    alloc::vec![
+        Serve(b"display"),
+        Hardware(b"decon0-main"), Hardware(b"decon0-win"), Hardware(b"decon0-wincon"), Hardware(b"dpu-dma0"), Hardware(b"dpp0"), Hardware(b"gpio-gpp0"),
+        Dma(b"display-fb"), Dma(b"display-heap"),
+        Hardware(b"dsim0"), Hardware(b"dphy0"), Hardware(b"sramc0"), Hardware(b"hdrcomm0"),
+        Serve(b"touch"), Hardware(b"usi2-spi"), Hardware(b"gpio-gpn0"),
+        Use(b"display"), Use(b"touch"),
+    ]
+}
+
+/// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
+fn start_home(store: &mut Option<ShimStore>) {
+    let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten()) else {
+        crate::process::push_console(b"home: no init capsule in the vault\n");
+        return;
+    };
+    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    let mut rep = alloc::vec::Vec::new();
+    crate::touch::up(&mut rep);
+    crate::checklist::at("home: touch up");
+    match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
+        Ok(o) => crate::process::push_console(&o.console),
+        Err(e) => {
+            crate::process::push_console(b"home: init refused: ");
+            crate::process::push_console(e.as_bytes());
+            crate::process::push_console(b"\n");
+        }
+    }
+    crate::checklist::at("home: init ran");
+}
+
 pub fn run(mut b: Boot) -> ! {
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
     report(&b, 0xA0);
     let generation = if b.x0 & 1 == 1 { b.x0 >> 1 } else { 0 };
     let mut store = b.store.take();
+    unsafe {
+        SPAWN_STORE = &raw mut store;
+        crate::process::CAPSULES = Some(read_capsule);
+    }
+    let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
     let exc_start = crate::exception_count();
 
@@ -382,7 +429,16 @@ pub fn run(mut b: Boot) -> ! {
             pt_seq_width = 0;
         }
         let now = cntpct();
-        if !configured_ever && now.wrapping_sub(t_boot) > enum_giveup {
+        // Home: once the ring has completed — the host has the USB link, or a second has passed since the press with no cable — start init and with it the shell.
+        if !home_started {
+            let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
+            if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {
+                home_started = true;
+                start_home(&mut store);
+            }
+        }
+        // No host after 64 s is a dead USB attempt only while nothing else is running: with the shell up, a phone without a cable is the normal case.
+        if !configured_ever && crate::process::alive() == 0 && now.wrapping_sub(t_boot) > enum_giveup {
             leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
         }
         // The idle exit is a dev safety net for a kernel nobody is talking to; a live process (the display server, a driver) is the session itself, so it holds the kernel up like `display --hold` does. The killswitch and `bridge reboot` still end it.

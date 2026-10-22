@@ -669,7 +669,7 @@ dependencies = [
  "nunc-time",
  "nusb",
  "tokio",
- "vsf 0.10.0",
+ "vsf 0.10.1",
 ]
 
 [[package]]
@@ -745,10 +745,25 @@ name = "ferros-payload-hello-el0"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-init"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-ip"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-map"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "libm",
 ]
 
 [[package]]
@@ -809,6 +824,20 @@ version = "0.1.0"
 [[package]]
 name = "ferros-payload-spinner"
 version = "0.1.0"
+
+[[package]]
+name = "ferros-payload-touch"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-touchtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
 
 [[package]]
 name = "ferros-payload-ufsdme"
@@ -879,7 +908,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.10.0",
+ "vsf 0.10.1",
 ]
 
 [[package]]
@@ -920,7 +949,7 @@ dependencies = [
  "fontdue",
  "ihi 0.0.48",
  "manifestus",
- "vsf 0.10.0",
+ "vsf 0.10.1",
 ]
 
 [[package]]
@@ -955,7 +984,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi 0.0.3",
- "vsf 0.10.0",
+ "vsf 0.10.1",
 ]
 
 [[package]]
@@ -998,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "block2",
  "libm",
@@ -1482,12 +1511,12 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.10.0",
+ "vsf 0.10.1",
 ]
 
 [[package]]
@@ -1903,7 +1932,7 @@ dependencies = [
  "poly1305",
  "raptorq",
  "subtle",
- "vsf 0.10.0",
+ "vsf 0.10.1",
  "zeroize",
 ]
 
@@ -2593,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes-gcm",
  "bitvec",
