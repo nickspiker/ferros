@@ -512,6 +512,13 @@ impl Panel {
     }
 
     /// Push one frame: shadow update, unmask the TE trigger, wait for FRAME_COUNT to move (or 1/4 s), mask it again.
+    /// Push the surface without waiting for the frame: request the shadow update and leave the trigger armed, so the panel takes the new pixels at its next TE. For the boot ring, where waiting a refresh at every boot step put ~15 ms per step into the press-to-ready time (2026-10-22).
+    pub fn present_nowait(&self) {
+        wr(DECON0 + SHD_REG_UP_REQ, rd(DECON0 + SHD_REG_UP_REQ) | self.up);
+        let t = rd(DECON0 + TRIG_CON);
+        wr(DECON0 + TRIG_CON, (t & !HW_TRIG_MASK_DECON) | HW_TRIG_EN);
+    }
+
     pub fn present(&self, rep: &mut alloc::vec::Vec<u8>) {
         let cntfrq = self.cntfrq;
         let up = self.up;

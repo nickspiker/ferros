@@ -28,6 +28,25 @@ fn px(p: &crate::display::Panel, x: usize, y: usize, c: u32) {
     }
 }
 
+/// Black over exactly what `draw` put on the screen (the word, the triangle, the chevron), so the boot ring starts from black without rewriting all four million pixels: the full clear cost ~370 ms of the press-to-ready time on the uncached surface (2026-10-22).
+pub fn erase(p: &crate::display::Panel) {
+    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
+    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
+    let x0 = p.width.saturating_sub(w) / 2;
+    let y0 = (p.rows / 6).saturating_sub(h / 2);
+    let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
+        for y in ya..yb.min(p.rows) {
+            for x in xa..xb.min(p.width) {
+                px(p, x, y, 0);
+            }
+        }
+    };
+    rect(x0, y0, x0 + w, y0 + h);
+    let tip = p.width - 28;
+    rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
+    rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
+}
+
 fn draw(p: &crate::display::Panel) {
     let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
     let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;

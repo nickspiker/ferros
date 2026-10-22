@@ -140,15 +140,8 @@ fn draw_item(c: &Checklist, item: Item, label: &str) {
 }
 
 fn redraw(c: &Checklist, item: Item) {
-    for (_, items) in GROUPS.iter() {
-        for &(it, label) in items.iter() {
-            if it as u8 == item as u8 {
-                draw_item(c, it, label);
-            }
-        }
-    }
-    let mut rep = alloc::vec::Vec::new();
-    c.panel.present(&mut rep);
+    light(c, item);
+    c.panel.present_nowait();
 }
 
 /// Adopt the panel and draw the whole list; `done` items start green. No-op (and every later `mark` too) if there is no panel to drive.
@@ -157,30 +150,167 @@ pub fn start(cntfrq: u64, done: &[Item]) {
     let Some(panel) = crate::display::adopt_once(cntfrq, &mut rep) else {
         return;
     };
+    let _ = rep;
     let mut c = Checklist { panel, done: 1 << Item::Panel as u8, interim: 0, suffix: [([0u8; SUFFIX_MAX], 0); 32] };
     for &d in done {
         c.done |= 1 << d as u8;
     }
-    unsafe {
-        let mut con = c.panel.console(TITLE);
-        con.set_scale(SCALE);
-        con.goto(0, 0);
-        con.puts("ferros");
-        let mut row = 2;
-        for (name, items) in GROUPS.iter() {
-            con.set_fg(HEADER);
-            con.goto(0, row);
-            con.puts(name);
-            row += items.len() + 2;
-        }
-    }
-    for (_, items) in GROUPS.iter() {
-        for &(it, label) in items.iter() {
-            draw_item(&c, it, label);
-        }
-    }
-    c.panel.present(&mut rep);
+    ring_start(&c.panel);
+    c.panel.present_nowait();
     unsafe { *CHECKLIST.0.get() = Some(c) };
+}
+
+// ---------------------------------------------------------------------------
+// The boot ring (owner's design, 2026-10-22): the moment the press lands the screen goes black with one solid dark-brick disc in the middle, no stroke; around it each boot step lights a slice, clockwise from 12 o'clock, styled on logo.svg's phase-diagram slices of iron.
+// - Angle is time: the full circle is the 1 s press-to-ready budget, and each slice spans its step, from the previous step's end to its own (a minimum width so the sub-millisecond steps still show). What stays black at the end is headroom.
+// - Bottom and top (inner and outer radius) are the kind of step, banded like phases: hardware bring-up low against the disc, the disk next, trust (vault, ira, entropy) higher, the link and the processes outermost.
+// - Colour is order: dark brick, brick, amber, then a bright lime, along the warm side only (nothing between magenta and green).
+// All integer: a Q14 quarter-wave sine table and cross products, each slice drawn only inside its own bounding box.
+
+/// Quarter-wave sine, Q14, 257 entries over 0..=90 degrees.
+const SIN_Q14: [i32; 257] = [0, 101, 201, 302, 402, 503, 603, 704, 804, 904, 1005, 1105, 1205, 1306, 1406, 1506, 1606, 1706, 1806, 1906, 2006, 2105, 2205, 2305, 2404, 2503, 2603, 2702, 2801, 2900, 2999, 3098, 3196, 3295, 3393, 3492, 3590, 3688, 3786, 3883, 3981, 4078, 4176, 4273, 4370, 4467, 4563, 4660, 4756, 4852, 4948, 5044, 5139, 5235, 5330, 5425, 5520, 5614, 5708, 5803, 5897, 5990, 6084, 6177, 6270, 6363, 6455, 6547, 6639, 6731, 6823, 6914, 7005, 7096, 7186, 7276, 7366, 7456, 7545, 7635, 7723, 7812, 7900, 7988, 8076, 8163, 8250, 8337, 8423, 8509, 8595, 8680, 8765, 8850, 8935, 9019, 9102, 9186, 9269, 9352, 9434, 9516, 9598, 9679, 9760, 9841, 9921, 10001, 10080, 10159, 10238, 10316, 10394, 10471, 10549, 10625, 10702, 10778, 10853, 10928, 11003, 11077, 11151, 11224, 11297, 11370, 11442, 11514, 11585, 11656, 11727, 11797, 11866, 11935, 12004, 12072, 12140, 12207, 12274, 12340, 12406, 12472, 12537, 12601, 12665, 12729, 12792, 12854, 12916, 12978, 13039, 13100, 13160, 13219, 13279, 13337, 13395, 13453, 13510, 13567, 13623, 13678, 13733, 13788, 13842, 13896, 13949, 14001, 14053, 14104, 14155, 14206, 14256, 14305, 14354, 14402, 14449, 14497, 14543, 14589, 14635, 14680, 14724, 14768, 14811, 14854, 14896, 14937, 14978, 15019, 15059, 15098, 15137, 15175, 15213, 15250, 15286, 15322, 15357, 15392, 15426, 15460, 15493, 15525, 15557, 15588, 15619, 15649, 15679, 15707, 15736, 15763, 15791, 15817, 15843, 15868, 15893, 15917, 15941, 15964, 15986, 16008, 16029, 16049, 16069, 16088, 16107, 16125, 16143, 16160, 16176, 16192, 16207, 16221, 16235, 16248, 16261, 16273, 16284, 16295, 16305, 16315, 16324, 16332, 16340, 16347, 16353, 16359, 16364, 16369, 16373, 16376, 16379, 16381, 16383, 16384, 16384];
+/// Angles are in 1/1024 turns, 0 at 12 o'clock, clockwise.
+const TURN: i32 = 1024;
+fn sin_t(t: i32) -> i32 {
+    let t = t.rem_euclid(TURN);
+    match t / 256 {
+        0 => SIN_Q14[t as usize],
+        1 => SIN_Q14[(512 - t) as usize],
+        2 => -SIN_Q14[(t - 512) as usize],
+        _ => -SIN_Q14[(TURN - t) as usize],
+    }
+}
+/// The screen direction of angle `t`, Q14: x right, y down, 0 straight up.
+fn dir(t: i32) -> (i32, i32) {
+    (sin_t(t), -sin_t(t + 256))
+}
+
+const DISC: u32 = 0x003C_0200;
+/// The disc's radius and the slices' bands, in panel pixels (1344 wide).
+const R_DISC: i32 = 230;
+const BUDGET_US: u64 = 1_000_000;
+const MIN_TURN: i32 = 11;
+const GAP_TURN: i32 = 2;
+/// The colour ramp's stops, warm side only.
+const RAMP: [u32; 4] = [0x003C_0200, 0x00BB_3700, 0x00E4_B200, 0x00B4_FF00];
+
+fn band(item: Item) -> (i32, i32) {
+    match item {
+        Item::Killswitch | Item::CacheMap | Item::Panel => (250, 360),
+        Item::Disk | Item::Slot => (300, 470),
+        Item::VaultOpen | Item::VaultVerified | Item::Ira | Item::Wairua => (360, 560),
+        _ => (420, 640),
+    }
+}
+
+fn ramp(i: u32, n: u32) -> u32 {
+    let n = n.max(2);
+    let pos = (i.min(n - 1) * 3 * 256) / (n - 1);
+    let (seg, f) = ((pos / 256).min(2) as usize, if pos >= 768 { 256 } else { pos % 256 });
+    let (a, b) = (RAMP[seg], RAMP[seg + 1]);
+    let ch = |sh: u32| -> u32 {
+        let (x, y) = (((a >> sh) & 0xFF) as i32, ((b >> sh) & 0xFF) as i32);
+        ((x + (y - x) * f as i32 / 256) as u32) << sh
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+fn put(p: &Panel, x: i32, y: i32, rgb: u32) {
+    if x >= 0 && y >= 0 && (x as usize) < p.width && (y as usize) < p.rows {
+        unsafe { core::ptr::write_volatile((p.fb as *mut u32).add(y as usize * p.stride + x as usize), rgb) };
+    }
+}
+
+fn ring_start(p: &Panel) {
+    // The gate left the screen black but for its own word and arrows: clear just those.
+    crate::ready::erase(p);
+    let (cx, cy) = ((p.width / 2) as i32, (p.rows / 2) as i32);
+    for y in -R_DISC..=R_DISC {
+        for x in -R_DISC..=R_DISC {
+            if x * x + y * y <= R_DISC * R_DISC {
+                put(p, cx + x, cy + y, DISC);
+            }
+        }
+    }
+}
+
+/// One slice: the annulus band [r1, r2) between angles t0 and t1 (1/1024 turns), split into pieces of at most a quarter turn so each is a convex sector the cross-product test can take.
+fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
+    let (cx, cy) = ((p.width / 2) as i32, (p.rows / 2) as i32);
+    let mut a = t0;
+    while a < t1 {
+        let b = (a + 256).min(t1);
+        let (d0, d1) = (dir(a), dir(b));
+        // Bounding box: the four corners, plus any axis extreme the piece crosses.
+        let mut xs = [0i32; 8];
+        let mut ys = [0i32; 8];
+        let mut n = 0;
+        for &(d, r) in [(d0, r1), (d0, r2), (d1, r1), (d1, r2)].iter() {
+            xs[n] = d.0 * r >> 14;
+            ys[n] = d.1 * r >> 14;
+            n += 1;
+        }
+        for q in [0, 256, 512, 768] {
+            let qa = if q < a { q + TURN } else { q };
+            if qa > a && qa < b {
+                let d = dir(q);
+                xs[n] = d.0 * r2 >> 14;
+                ys[n] = d.1 * r2 >> 14;
+                n += 1;
+            }
+        }
+        let (x0, x1) = (*xs[..n].iter().min().unwrap() - 1, *xs[..n].iter().max().unwrap() + 1);
+        let (y0, y1) = (*ys[..n].iter().min().unwrap() - 1, *ys[..n].iter().max().unwrap() + 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let rr = x * x + y * y;
+                if rr < r1 * r1 || rr >= r2 * r2 {
+                    continue;
+                }
+                // Inside the piece: on the clockwise side of its start ray and the anticlockwise side of its end ray.
+                let c0 = d0.0 as i64 * y as i64 - d0.1 as i64 * x as i64;
+                let c1 = x as i64 * d1.1 as i64 - y as i64 * d1.0 as i64;
+                if c0 >= 0 && c1 >= 0 {
+                    put(p, cx + x, cy + y, rgb);
+                }
+            }
+        }
+        a = b;
+    }
+}
+
+/// Where the ring has got to, in 1/1024 turns, and how many slices are lit.
+static mut RING_AT: i32 = 0;
+static mut RING_N: u32 = 0;
+static mut RING_LIT: u32 = 0;
+/// How many steps a cold boot lights after the press, so the ramp ends on lime at the last one: cache map, entropy, disk, vault opened, vault verified, ira, slot, USB (measured 2026-10-22).
+const RING_STEPS: u32 = 8;
+
+/// Light `item`'s slice: from where the ring has got to, to this moment's place in the 1 s budget.
+fn light(c: &Checklist, item: Item) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let press = PRESS.load(Relaxed);
+    let now = crate::platform::cntpct();
+    let f = crate::platform::cntfrq();
+    let us = if press == 0 { 0 } else { now.saturating_sub(press) * 1_000_000 / f };
+    let target = ((us.min(BUDGET_US) * TURN as u64) / BUDGET_US) as i32;
+    unsafe {
+        // Each step lights once: a later `suffix` or interim-to-done redraw of the same item draws nothing new.
+        let lit = &raw mut RING_LIT;
+        if *lit & (1 << item as u8) != 0 {
+            return;
+        }
+        *lit |= 1 << item as u8;
+        let (at, n) = (&raw mut RING_AT, &raw mut RING_N);
+        let t0 = *at;
+        let t1 = target.max(t0 + MIN_TURN).min(TURN);
+        if t1 > t0 {
+            let (r1, r2) = band(item);
+            slice(&c.panel, r1, r2, t0, t1 - GAP_TURN, ramp(*n, RING_STEPS));
+            *at = t1;
+            *n += 1;
+        }
+    }
 }
 
 /// Turn one item green and push a frame.
