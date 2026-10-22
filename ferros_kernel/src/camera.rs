@@ -2259,6 +2259,128 @@ const PDMA_BUF_PA: usize = 0xA000_0000;
 const PDMA_BUF_SLICE: usize = 0x100_0000;
 /// One frame as the front end writes it: 3072 lines at the G#1400 stride.
 const FRAME_BYTES: usize = 3072 * 0x1400;
+/// Integer square root (floor), for the viewfinder's gamma 2 encoding: the kernel does no floating point.
+fn isqrt(v: u32) -> u32 {
+    let mut r = 0u32;
+    let mut bit = 1u32 << 30;
+    let mut v = v;
+    while bit > v {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if v >= r + bit {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    r
+}
+
+/// The PDMA descriptor index the ten-frame loop leaves (it advances once per frame, 1..=10).
+fn idx_after_loop() -> u32 {
+    10
+}
+
+/// The main camera's Absolute IDT folded for the panel, row-major, Q12: camera (R, G, B) counts above black, times the IDT's per-channel sensitivity, through its absolute matrix to VSF RGB, then vsf's VSF_RGB2SRGB, scaled so the largest row sums to 1 (`pixel 8 pro calibration data/derived/cam2-main.idt.vsf`, 2026-10-21). The rows do not sum alike: an Absolute IDT keeps the room light's cast and nothing white-balances it away. Display side is a stand-in until the panel itself is calibrated (VSF RGB -> sRGB primaries, gamma 2 encoding).
+const VIEW_M: [i32; 9] = [5334, -957, -282, -1232, 2358, -450, 409, -1385, 3734];
+
+/// `cam pdma view=<s>`: the viewfinder. The image body at G#A200_0000 is read straight off DRAM (uncached), one 2 x 2 Bayer cell per output pixel, MSBs only (the 8 high bits of RAW10, black at 16), rotated into the portrait panel, each output pixel painted as a 2 x 2 block on ABL's surface. Exposure is one gain from a 64 x 64 pre-sample (99th percentile of green to 90 %). The paint goes in strips with the front end answered between them (index advance + acknowledgement every 40 ms): left alone for a few hundred ms it stops taking frames for good.
+fn viewfinder(rep: &mut Vec<u8>, panel: Option<&crate::display::Panel>, seconds: u32, idx: &mut u32, ack: &[usize]) {
+    let f = crate::platform::cntfrq();
+    let Some(panel) = panel else {
+        return line(rep, alloc::format!("viewfinder: no panel\n"));
+    };
+    let mut last = crate::platform::cntpct();
+    let mut service = |idx: &mut u32, last: &mut u64| {
+        if crate::platform::cntpct().wrapping_sub(*last) > f / 25 {
+            *idx += 1;
+            wr(PDMA + 0x10, *idx * 0x10);
+            for &a in ack.iter() {
+                let v = rd(a);
+                wr(a, v);
+            }
+            crate::platform::pet_watchdogs();
+            *last = crate::platform::cntpct();
+        }
+    };
+    let img = PDMA_BUF_PA + 2 * PDMA_BUF_SLICE;
+    // Pixel (x, y), all ten bits: RAW10 packs four pixels in five bytes, the four MSB bytes then one byte of 2-bit LSBs. MSBs alone left a dark room with a handful of levels (pre-sample 99th percentile 4).
+    let px10 = |x: usize, y: usize| {
+        let g = img + y * 0x1400 + (x / 4) * 5;
+        let (m, l) = unsafe { (core::ptr::read_volatile((g + (x & 3)) as *const u8), core::ptr::read_volatile((g + 4) as *const u8)) };
+        ((m as i32) << 2) | ((l as i32 >> (2 * (x & 3))) & 3)
+    };
+    // The mosaic is G B / R G (Lumis's cfa for this sensor and mode): cell (cx, cy) -> R at (2cx, 2cy+1), G at (2cx, 2cy), B at (2cx+1, 2cy). Output is VIEW_M in Q12 over counts above black (64): kept at Q12, not shifted down, so dim scenes keep their levels.
+    let cell = |cx: usize, cy: usize| -> [i32; 3] {
+        let (x, y) = (2 * cx, 2 * cy);
+        let c = [px10(x, y + 1) - 64, px10(x, y) - 64, px10(x + 1, y) - 64].map(|v| v.max(0));
+        [0, 1, 2].map(|i| VIEW_M[i * 3] * c[0] + VIEW_M[i * 3 + 1] * c[1] + VIEW_M[i * 3 + 2] * c[2])
+    };
+    // Portrait panel, landscape sensor: panel x follows the sensor's rows, panel y its columns. One cell per output pixel at 2 x 2 panel pixels; the sensor's 1536 cell rows span the panel's width.
+    const D: usize = 2;
+    let (ow, oh) = (panel.width / D, panel.rows / D);
+    let scale_q16 = (1536usize << 16) / ow.max(1);
+    let oh_used = oh.min(((2040usize << 16) / scale_q16).max(1));
+    // The 4:3 picture fills the width; centre it in the tall panel.
+    let top = (oh - oh_used) / 2;
+    // Black once, so whatever the surface held (ABL's splash, an older picture) does not show around the centred one.
+    for y in 0..panel.rows {
+        let row = panel.fb + y * panel.stride * 4;
+        for x in 0..panel.width {
+            unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, 0) };
+        }
+        if y % 256 == 0 {
+            service(idx, &mut last);
+        }
+    }
+    let t_end = crate::platform::cntpct() + f * seconds as u64;
+    let mut passes = 0u32;
+    while crate::platform::cntpct() < t_end {
+        // Exposure from a 64 x 64 pre-sample of the green output.
+        let mut g = alloc::vec::Vec::with_capacity(4096);
+        for j in 0..64 {
+            for i in 0..64 {
+                g.push(cell(i * 2040 / 64, j * 1536 / 64)[1]);
+            }
+            service(idx, &mut last);
+        }
+        g.sort_unstable();
+        let p99 = g[4055].max(1) as i64;
+        if passes < 4 {
+            crate::flashlog::line(&alloc::format!("view: pass {passes} pre-sample p99 {p99}"));
+        }
+        // Linear output to 16 bits: gain in Q16 so that the pre-sample's 99th percentile lands at 59000.
+        let gain_q16 = (59_000i64 << 16) / p99;
+        for oy in 0..oh_used {
+            let cx = (oy * scale_q16) >> 16;
+            for ox in 0..ow {
+                let cy = 1535 - ((ox * scale_q16) >> 16).min(1535);
+                let v = cell(cx.min(2039), cy);
+                let enc = |l: i32| (isqrt(((l as i64 * gain_q16) >> 16).clamp(0, 65535) as u32) as i32).min(255);
+                let px = ((enc(v[0]) << 16) | (enc(v[1]) << 8) | enc(v[2])) as u32;
+                for dy in 0..D {
+                    let row = panel.fb + ((top + oy) * D + dy) * panel.stride * 4;
+                    for dx in 0..D {
+                        unsafe { core::ptr::write_volatile((row + (ox * D + dx) * 4) as *mut u32, px) };
+                    }
+                }
+            }
+            if oy % 16 == 0 {
+                service(idx, &mut last);
+            }
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        let mut prep = alloc::vec::Vec::new();
+        panel.present(&mut prep);
+        service(idx, &mut last);
+        passes += 1;
+    }
+    line(rep, alloc::format!("viewfinder: A#{passes} frames painted in A#{seconds} s onto the panel at G#{:X} ({} x {} px, stride {}), front end index G#{:X}\n", panel.fb, panel.width, panel.rows, panel.stride, rd(0x1C32_049C)));
+}
+
 /// Where a focus sweep keeps its eight frames (8 x 16 MiB below the output slices).
 const SWEEP_PA: usize = 0x9800_0000;
 const PDMA_BUFS: usize = 32;
@@ -2279,6 +2401,8 @@ pub struct Shot {
     pub sweep_step: u32,
     /// `snap`: read the 2914-register Linux snapshot three frames in (snap_compare). Off by default: it holds the loop for a long time mid-stream.
     pub snap: bool,
+    /// `view=<seconds>`: after the ten-frame run, paint the live frame onto the panel for this long (the viewfinder).
+    pub view: u32,
 }
 
 impl Shot {
@@ -2292,6 +2416,7 @@ impl Shot {
                 b"exp" => s.exp = v,
                 b"gain" => s.gain = v,
                 b"af" => s.af = v,
+                b"view" => s.view = v,
                 _ => {}
             }
         }
@@ -2327,6 +2452,15 @@ fn focus(rep: &mut Vec<u8>, pos: u32) {
 }
 
 pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>>, slit_lines: u32, fast: bool, shot: Shot) {
+    // The viewfinder's panel is adopted first, before any camera code: adopting it after the camera bring-up hung in its first EL3 call every time (2026-10-21, flash log ends at "adopting the panel"), the pattern of the EL3 poison rule (a direct PMU read, as fe_powered and the PHY isolation readback do, leaves the next SMC hanging). present() makes no EL3 calls.
+    let view_panel = if shot.view > 0 {
+        crate::flashlog::line("view: adopting the panel before the camera");
+        let p = crate::display::adopt(crate::platform::cntfrq(), rep);
+        crate::flashlog::line(&alloc::format!("view: adopted {}", p.is_some()));
+        p
+    } else {
+        None
+    };
     let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
     if job.len() < 8 || &job[..4] != b"CPR3" {
         return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
@@ -2535,6 +2669,10 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
             Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
         }
+    }
+    if shot.view > 0 {
+        crate::flashlog::line("view: frame loop done");
+        viewfinder(rep, view_panel.as_ref(), shot.view, &mut idx_after_loop(), &FRAME_ACK);
     }
     if shot.sweep {
         // Focus sweep while the stream runs: for each lens position, keep answering frames (index advance + acknowledgement every 50 ms, as the loop above) for 400 ms so the lens settles and at least two whole frames land, then copy the image body (G#A200_0000, 15 MiB) to its own slot. The slots sit in DRAM nothing else uses (zuma-rmem.dtsi reserves nothing from G#9700_0000 up to G#E800_0000; the output slices start at G#A000_0000).

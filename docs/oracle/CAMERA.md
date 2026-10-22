@@ -314,3 +314,17 @@ tools/camera-raw2vsf/target/release/camera-raw2vsf target/cam/shot.raw10 "<lumis
 ```
 
 The exposure is about 71 ms, estimated from frame timing (G#535E of G#5372 lines at roughly 14 frames a second); the sensor's pixel clock is not yet read, so it is marked as estimated in the file. That figure, and the f-number, are what the IDT's absolute scale needs. Comparing ferros's own calibration capture against the Android-derived IDT needs both exact.
+
+## Viewfinder (2026-10-21, night)
+
+`diag cam pdma af=<pos> view=<seconds>` paints the live main camera onto the phone's panel:
+- one 2 × 2 Bayer cell per output pixel, 10-bit, at half the panel's resolution;
+- rotated into portrait and centred;
+- coloured through the main camera's Absolute IDT folded with vsf's VSF_RGB2SRGB (`VIEW_M`, Q12, no floating point in the kernel), gamma 2 encoded;
+- exposure from a 64 × 64 pre-sample.
+
+About 0.8 frames a second, limited by uncached reads of the frame (six byte reads a cell). The front end streams throughout (index G#135 after 20 s). A framebuffer readback (`bridge read FAC00000…`) shows the floor scene, in the room's cast.
+
+Two traps:
+- **Adopt the panel before the camera.** `display::adopt` after the camera bring-up hung in its first EL3 call every time (the flash log ended at "adopting the panel"), the EL3 poison pattern after the camera path's direct PMU reads. Adopted at the start of the run, it works, and `present()` makes no EL3 calls.
+- **The display side is a stand-in** (sRGB primaries, gamma 2) until the panel itself is calibrated; the camera side is the measured IDT.
