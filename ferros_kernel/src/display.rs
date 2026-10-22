@@ -93,6 +93,7 @@ pub fn append_hex(out: &mut alloc::vec::Vec<u8>, label: &[u8], v: u32) {
 
 /// Paint `text` (lines separated by '\n') on the panel. Returns a register report (one LABEL=G#value per line) whatever happens, so each step can be checked without seeing the screen.
 /// The adopted base layer: a physically contiguous surface of u32 0x00RRGGBB pixels the CPU writes directly, and what it takes to push a frame.
+#[derive(Clone, Copy)]
 pub struct Panel {
     /// Physical address of the first pixel.
     pub fb: usize,
@@ -308,6 +309,22 @@ pub fn dpu_on() -> bool {
 }
 
 /// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear 0x00RRGGBB pixels (BGRX8888), turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.
+/// The boot's adopted panel, kept: adopting costs about 390 ms (measured 2026-10-22, `diag boot`), and the gate and the checklist each adopted it, one after the other, inside the press-to-ready time. Single core, boot path only.
+static mut ADOPTED: Option<Panel> = None;
+
+/// `adopt` once per boot: the first call adopts, every later one hands back the same panel.
+pub fn adopt_once(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
+    unsafe {
+        let a = &raw mut ADOPTED;
+        if let Some(p) = *a {
+            return Some(p);
+        }
+        let p = adopt(cntfrq, rep);
+        *a = p;
+        p
+    }
+}
+
 pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     // Never touch a powered-down DPU: on husky a CPU read of DECON with the DPU domain off returns 0 but leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever (measured: the boot screen's single DECON_VERSION read in the reboot path made DIAG's PMU readback hang). The domain state is read through the EL3 monitor, which is safe: word 0 of each PMU power-domain block is 1 when on (pd-dpub G#1546_1D00, pd-dpuf0 G#1546_1D80, pd-dpuf1 G#1546_1E00; other offsets are not whitelisted and return -EINVAL).
     let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::platform::priv_reg(a, false, 0));

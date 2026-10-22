@@ -154,7 +154,7 @@ fn redraw(c: &Checklist, item: Item) {
 /// Adopt the panel and draw the whole list; `done` items start green. No-op (and every later `mark` too) if there is no panel to drive.
 pub fn start(cntfrq: u64, done: &[Item]) {
     let mut rep = alloc::vec::Vec::new();
-    let Some(panel) = crate::display::adopt(cntfrq, &mut rep) else {
+    let Some(panel) = crate::display::adopt_once(cntfrq, &mut rep) else {
         return;
     };
     let mut c = Checklist { panel, done: 1 << Item::Panel as u8, interim: 0, suffix: [([0u8; SUFFIX_MAX], 0); 32] };

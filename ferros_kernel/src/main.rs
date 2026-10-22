@@ -1460,8 +1460,14 @@ pub(crate) fn pixel8_eusb_phy_init() {
     const USBCON: usize = 0x1110_0000;
     const EUSB_PHY: usize = 0x1111_0000;
     unsafe {
-            // Tensor cores ~2GHz; ~4000 spin iters/us is generous (over-delay harmless, under-delay breaks PLL/REXT calibration).
-            let udelay = |us: u32| { for _ in 0..us.saturating_mul(4000) { core::hint::spin_loop(); } };
+            // Delays on the generic timer, not a spin count: the old "~4000 spin iterations per us" turned the 3.56 ms these steps ask for into 230 ms of the press-to-ready time (measured 2026-10-22, `diag boot`), the core running far below the clock it assumed. The timer gives exactly what each step specifies whatever the CPU clock.
+            let udelay = |us: u32| {
+                let t0 = platform::cntpct();
+                let ticks = us as u64 * platform::cntfrq() / 1_000_000 + 1;
+                while platform::cntpct().wrapping_sub(t0) < ticks {
+                    core::hint::spin_loop();
+                }
+            };
 
             // --- BLKCON link init (exynos_usbcon_init_link) --- LINKCTRL(G#04): disable qact autogating, force qact, bypass bus filter.
             let mut reg = core::ptr::read_volatile((USBCON + 0x0004) as *const u32);

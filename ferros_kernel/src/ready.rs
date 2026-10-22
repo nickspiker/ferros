@@ -93,7 +93,7 @@ pub fn wait() -> (u64, Choice) {
     let freq = crate::platform::cntfrq();
     let mut rep = alloc::vec::Vec::new();
     crate::checklist::at("gate: adopting panel");
-    if let Some(panel) = crate::display::adopt(freq, &mut rep) {
+    if let Some(panel) = crate::display::adopt_once(freq, &mut rep) {
         crate::checklist::at("gate: panel adopted");
         draw(&panel);
         crate::checklist::at("gate: Ready? drawn");
