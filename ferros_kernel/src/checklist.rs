@@ -185,6 +185,31 @@ fn dir(t: i32) -> (i32, i32) {
     (sin_t(t), -sin_t(t + 256))
 }
 
+/// Dev builds put the ring in the top half and list each step as it comes up in the bottom half (owner, 2026-10-22); production centres the ring and shows nothing else.
+const DEV: bool = cfg!(not(ferros_production));
+
+/// The ring's centre: the middle of the panel, or of its top half in a dev build.
+fn centre(p: &Panel) -> (i32, i32) {
+    ((p.width / 2) as i32, if DEV { (p.rows / 4) as i32 } else { (p.rows / 2) as i32 })
+}
+
+/// A step's name, as the old checklist labelled it.
+fn label_of(item: Item) -> &'static str {
+    for (_, items) in GROUPS.iter() {
+        for &(it, label) in items.iter() {
+            if it as u8 == item as u8 {
+                return label;
+            }
+        }
+    }
+    "?"
+}
+
+/// The dev list's first text row: the bottom half of the panel, at the old checklist's scale (console rows are 16 x SCALE px below a 160 px margin).
+fn list_row(p: &Panel) -> usize {
+    (p.rows / 2 - TOP) / (16 * SCALE) + 1
+}
+
 const DISC: u32 = 0x003C_0200;
 /// The disc's radius and the slices' bands, in panel pixels (1344 wide).
 const R_DISC: i32 = 230;
@@ -224,7 +249,7 @@ fn put(p: &Panel, x: i32, y: i32, rgb: u32) {
 fn ring_start(p: &Panel) {
     // The gate left the screen black but for its own word and arrows: clear just those.
     crate::ready::erase(p);
-    let (cx, cy) = ((p.width / 2) as i32, (p.rows / 2) as i32);
+    let (cx, cy) = centre(p);
     for y in -R_DISC..=R_DISC {
         for x in -R_DISC..=R_DISC {
             if x * x + y * y <= R_DISC * R_DISC {
@@ -236,7 +261,7 @@ fn ring_start(p: &Panel) {
 
 /// One slice: the annulus band [r1, r2) between angles t0 and t1 (1/1024 turns), split into pieces of at most a quarter turn so each is a convex sector the cross-product test can take.
 fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
-    let (cx, cy) = ((p.width / 2) as i32, (p.rows / 2) as i32);
+    let (cx, cy) = centre(p);
     let mut a = t0;
     while a < t1 {
         let b = (a + 256).min(t1);
@@ -306,7 +331,16 @@ fn light(c: &Checklist, item: Item) {
         let t1 = target.max(t0 + MIN_TURN).min(TURN);
         if t1 > t0 {
             let (r1, r2) = band(item);
-            slice(&c.panel, r1, r2, t0, t1 - GAP_TURN, ramp(*n, RING_STEPS));
+            let rgb = ramp(*n, RING_STEPS);
+            slice(&c.panel, r1, r2, t0, t1 - GAP_TURN, rgb);
+            if DEV {
+                // The step's name and its time since the press, in its slice's colour (the darkest lifted to brick so it reads on black).
+                let fg = if (rgb >> 16) & 0xFF < 0x80 { RAMP[1] } else { rgb };
+                let mut con = c.panel.console(fg);
+                con.set_scale(SCALE);
+                con.goto(0, list_row(&c.panel) + *n as usize);
+                con.puts(&alloc::format!("{:<28} +A#{} ms", label_of(item), us / 1000));
+            }
             *at = t1;
             *n += 1;
         }
