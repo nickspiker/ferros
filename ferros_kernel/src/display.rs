@@ -156,6 +156,32 @@ pub fn fill(rgb: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
     rep
 }
 
+/// A measurement patch, one frame: a disc of `rgb` with diameter `diam` pixels centred on the panel, over `surround` everywhere else; `diam` 0 = `rgb` over the whole panel (bridge `display patch`). Hard-edged on purpose: an instrument reads the disc's middle, and the disc's area against the surround is the window size (APL) the panel's own limiter responds to (DISPLAY-CALIB.md).
+pub fn patch(diam: usize, rgb: u32, surround: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
+    let mut rep = alloc::vec::Vec::new();
+    let Some(panel) = adopt(cntfrq, &mut rep) else {
+        return rep;
+    };
+    let (cx, cy) = (panel.width as i64 / 2, panel.rows as i64 / 2);
+    // Pixel centres within the radius: (2x+1-2cx)^2 + (2y+1-2cy)^2 <= diam^2, all in integers.
+    let d2 = (diam as i64) * (diam as i64);
+    let mut lit = 0u64;
+    for y in 0..panel.rows {
+        let row = panel.fb + y * panel.stride * 4;
+        let dy = 2 * y as i64 + 1 - 2 * cy;
+        for x in 0..panel.width {
+            let dx = 2 * x as i64 + 1 - 2 * cx;
+            let inside = diam == 0 || dx * dx + dy * dy <= d2;
+            lit += inside as u64;
+            unsafe { core::ptr::write_volatile((row + x * 4) as *mut u32, if inside { rgb } else { surround }) };
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    panel.present(&mut rep);
+    rep.extend_from_slice(alloc::format!("patch: G#{rgb:06X} disc A#{diam} px ({lit} px lit of {}) over G#{surround:06X}\n", panel.width * panel.rows).as_bytes());
+    rep
+}
+
 const DECON_INT_EN: usize = 0x0060;
 const INT_EN_EXTRA: u32 = 1 << 4;
 const DECON_INT_EN_EXTRA: usize = 0x0064;

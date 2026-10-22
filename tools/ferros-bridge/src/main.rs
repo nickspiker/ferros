@@ -136,6 +136,13 @@ async fn main() {
             let rgb = args.get(3).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);
             cmd_display_raw(&[12, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]).await;
         }
+        "display" if args.get(2).map(String::as_str) == Some("patch") => {
+            // display patch <diameter px> <rrggbb> [surround rrggbb] — a disc centred on the panel over a surround (default black); diameter 0 = full field. For instrument readings (tools/display-profile.sh).
+            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
+            let hex = |i: usize| args.get(i).and_then(|a| u32::from_str_radix(a.trim_start_matches('#'), 16).ok()).unwrap_or(0);
+            let (rgb, sur) = (hex(4), hex(5));
+            cmd_display_raw(&[17, (diam >> 8) as u8, diam as u8, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, (sur >> 16) as u8, (sur >> 8) as u8, sur as u8]).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,

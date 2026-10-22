@@ -336,6 +336,11 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 /// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
 fn start_home(store: &mut Option<ShimStore>) {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
+    if store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten()).is_some() {
+        crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");
+        return;
+    }
     let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten()) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
         return;
@@ -1624,6 +1629,13 @@ pub fn run(mut b: Boot) -> ! {
                                                 crate::display::append_hex(&mut rep, b"DQE_CGC_DITHER=", unsafe { read_volatile((dqe + 0x2400) as *const u32) });
                                                 crate::display::append_hex(&mut rep, b"DECON_GLOBAL_CON=", unsafe { read_volatile(0x1947_0020usize as *const u32) });
                                                 crate::display::append_hex(&mut rep, b"DATA_PATH_CON_0=", unsafe { read_volatile(0x1947_0200usize as *const u32) });
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
+                                            // G#11 [diameter hi] [diameter lo] [r] [g] [b] [surround r] [g] [b] = a measurement disc centred on the panel over a surround; diameter 0 = full field (bridge `display patch <diameter px> <rrggbb> [surround rrggbb]`, tools/display-profile.sh).
+                                            Some((17, args)) if args.len() >= 8 => {
+                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
+                                                let c = |i: usize| (args[i] as u32) << 16 | (args[i + 1] as u32) << 8 | args[i + 2] as u32;
+                                                let rep = crate::display::patch(diam, c(2), c(5), freq);
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
                                             // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
