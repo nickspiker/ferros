@@ -964,6 +964,43 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params.starts_with(b"dvfs") {
+                                            // `diag dvfs`: which core the kernel runs on, its clock measured (2^20 dependent adds), and every DVFS domain's rate as the ACPM firmware holds it. `diag dvfs set <domain index> <kHz>`: ask the firmware for a rate (acpm::dvfs_set), then measure again.
+                                            let measure = || {
+                                                let t0 = cntpct();
+                                                let mut acc = 0u64;
+                                                for _ in 0..(1u64 << 20) {
+                                                    unsafe { core::arch::asm!("add {0}, {0}, #1", inout(reg) acc) };
+                                                }
+                                                let us = ((cntpct() - t0) * 1_000_000 / cntfrq()).max(1);
+                                                (1u64 << 20) / us + (acc & 0)
+                                            };
+                                            let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
+                                            if words.len() == 4 && words[1] == b"set" {
+                                                let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
+                                                match (num(words[2]), num(words[3])) {
+                                                    (Some(d), Some(khz)) if (d as usize) < crate::acpm::DVFS_DOMAINS.len() => {
+                                                        let r = crate::acpm::dvfs_set(d, khz);
+                                                        // The firmware takes a moment to move the PLL; measure after it has.
+                                                        let t = cntpct() + cntfrq() / 100;
+                                                        while cntpct() < t {}
+                                                        resp.extend_from_slice(alloc::format!("set {} to A#{khz} kHz: {r:?}\n", crate::acpm::DVFS_DOMAINS[d as usize]).as_bytes());
+                                                    }
+                                                    _ => resp.extend_from_slice(b"cpu set <domain index> <kHz>\n"),
+                                                }
+                                            }
+                                            let mpidr: u64;
+                                            unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+                                            resp.extend_from_slice(alloc::format!("kernel core MPIDR G#{mpidr:X}, clock ~A#{} MHz\n", measure()).as_bytes());
+                                            for (i, name) in crate::acpm::DVFS_DOMAINS.iter().enumerate() {
+                                                match crate::acpm::dvfs_get(i as u32) {
+                                                    Ok(k) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} A#{k} kHz\n").as_bytes()),
+                                                    Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
+                                                }
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"pmic rails" {
                                             // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
                                             let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };

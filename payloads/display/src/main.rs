@@ -9,7 +9,7 @@
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
 //! - 2 `text [x][y baseline][px][colour][align: 0 left, 1 centre at x, 2 right edge at x][utf-8…]`.
 //! - 3 `rect [x][y][w][h][colour]` (w or h = 0: a one-pixel rule).
-//! - 4 `present`: black under everything, then the frame goes to the panel. Reply byte 1 = whether DECON advanced.
+//! - 4 `present`: the frame goes to the panel (what nothing painted shows black). Reply byte 1 = whether DECON advanced.
 //! - 5 `info` → `[w u16][h u16][frames u32][uptime s u32]`.
 //! - 6 `brightness [dbv u16]`: the panel's DBV (196 = 2 nits … 3307 = 1000 nits; DISPLAY-HK3.md §4), through DSIM from this process.
 //! - 7 `refresh [hz u8]`: 60 or 120, the panel's own command set plus DSIM's command-TE timers.
@@ -200,7 +200,7 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
-/// The camera op's last phases, microseconds: the scene, the black under it, the copy to the framebuffer, the present.
+/// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
 const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
@@ -450,15 +450,9 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     }
 }
 
-/// Black under everything, the last pass of every frame: written outright where nothing is painted, left alone where the paint is opaque, blended only on the antialiased edges between. fluor's full-surface `fill_rect` does the blend on every pixel: 41 ms a frame (2026-10-22), this a fraction of it.
-fn under_black(px: &mut [u32]) {
-    for p in px.iter_mut() {
-        let v = *p;
-        if v >= 0xFF00_0000 {
-            continue;
-        }
-        *p = if v == 0 { BLACK } else { v.under(BLACK, BlendMode::Normal) };
-    }
+/// The finished frame out to the framebuffer. There is no black pass: the layer is BGRX, so the panel never sees the alpha byte, an empty pixel (0) already shows black, and black blended under an antialiased edge adds nothing to its colour — only to the alpha the panel ignores. The pass that did it cost 15-25 ms a frame and changed no visible pixel (2026-10-22).
+fn publish(back: &[u32], screen: &mut [u32]) {
+    screen.copy_from_slice(back);
 }
 
 fn isqrt(v: i64) -> i64 {
@@ -614,7 +608,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 
     pipe.program_layer(win, fb, width as u32, height as u32);
 
-    // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules, and the black last, under everything.
+    // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules; what is left empty shows black (the panel ignores alpha).
     let mut damage = Damage::new();
     pixels.fill(0);
     {
@@ -627,7 +621,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         paint::fill_rect(&mut c, (w * 0.5 - span * 0.004) as isize, (h * 0.56) as isize, (span * 0.008) as isize, (span * 0.008) as isize, AMBER, None, None);
         paint::fill_rect(&mut c, margin as isize, (status_y + span * 0.03) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
         paint::fill_rect(&mut c, margin as isize, (h - span * 0.09) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
-        under_black(c.pixels);
     }
     ALLOC.reset();
     let strip = (status_y + span * 0.02) as usize;
@@ -701,12 +694,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     paint::fill_rect(&mut c, v(1), v(3), v(5), v(7), colour, None, None);
                 }
                 Some(4) => {
-                    {
-                        let mut c = Canvas::new(pixels, width, height, &mut damage);
-                        under_black(c.pixels);
-                    }
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    screen.copy_from_slice(pixels);
+                    publish(pixels, screen);
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -821,14 +810,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         }
                         unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
                         t_phase = now();
-                        // The air: black under everything.
-                        under_black(c.pixels);
                     }
                     ALLOC.reset();
                     unsafe { PHASE_US[1] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    screen.copy_from_slice(pixels);
+                    publish(pixels, screen);
                     ferros_sys::dma_barrier();
                     unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
@@ -933,7 +920,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    screen.copy_from_slice(pixels);
+                    publish(pixels, screen);
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1009,7 +996,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                 }
                 tlog.s(b"; camera: scene ");
-                for (k, name) in [b" ms, black " as &[u8], b" ms, copy ", b" ms, present ", b" ms\n"].iter().enumerate() {
+                for (k, name) in [b" ms, arena " as &[u8], b" ms, copy ", b" ms, present ", b" ms\n"].iter().enumerate() {
                     tlog.dec(unsafe { PHASE_US[k] } / 1000);
                     tlog.s(name);
                 }
@@ -1034,7 +1021,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                screen.copy_from_slice(pixels);
+                publish(pixels, screen);
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, fb, width as u32, height as u32);

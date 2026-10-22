@@ -161,6 +161,12 @@ Everything in the map is integer. The camera centre is in world units ×256 and 
 - draw circles as integer spans, blending only at the rim;
 - write the black ground outright where nothing is painted.
 
-What is left is the core's clock: 576 MHz measured, the bootloader's setting, against roughly 2.9 GHz for the big cores. Raising it is CPU frequency control through ACPM, still to be brought up.
+A fourth change came later: the black pass is gone. The layer is BGRX, so the panel never sees alpha, an empty pixel already shows black, and black under an antialiased edge adds nothing to its colour. The pass cost 15–25 ms and changed no visible pixel. A home-map frame is now under 20 ms, and a dashboard frame 57 ms (38 ms of it scene work hidden under the overlay, which could be skipped).
+
+**The clock, measured properly.** The 576 MHz the display once measured was its share of the core, not the clock. `diag dvfs` asks ACPM's DVFS channel (channel 0, `acpm_dvfs.c`'s protocol) for every domain's rate:
+- the kernel and every process run on CPU0, in the little cluster (CPUCL0), at the bootloader's 1425 MHz, and an add loop measures 1426;
+- `diag "dvfs set 2 1704000"` moved it to 1705 MHz measured.
+
+The big clusters (CPUCL1 1065 MHz, CPUCL2 1164 MHz) run nothing of ours yet: bringing up the other cores is the larger lever.
 
 Each frame is now one call (op 15, a batch): the overlay's text and discs, then the camera op with its keep flag. A call to an endpoint wakes a server that is asleep between polls, so the reply no longer waits for the server's next tick.

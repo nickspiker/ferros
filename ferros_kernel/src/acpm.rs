@@ -103,9 +103,9 @@ pub const E_TIMEOUT: u32 = 2;
 pub const E_FW: u32 = 3;
 pub const E_CHANNEL: u32 = 4;
 
-/// One PMIC transaction on the PMIC channel: `func` 0 read, 1 write, 2 update (value under mask). Returns the reply's word 1.
-fn transact(speedy: u32, typ: u32, reg: u32, func: u32, val: u32, mask: u32) -> Result<u32, u32> {
-    let c = channel(PMIC_CHANNEL).map_err(|_| E_CHANNEL)?;
+/// One transaction on channel `idx`: `cmd` goes out with this call's sequence number in word 0's bits [21:16] (as `__acpm_ipc_send_data` stamps it); with `reply`, the firmware's answer (the four words of the matching reply) comes back, otherwise the call returns once the firmware has the request.
+pub fn call(idx: usize, mut cmd: [u32; 4], reply: bool) -> Result<[u32; 4], u32> {
+    let c = channel(idx).map_err(|_| E_CHANNEL)?;
     let freq = crate::platform::cntfrq();
     let deadline = |ms: u64| crate::platform::cntpct() + freq / 1000 * ms;
     // Wait for room exactly as the kernel does: the AP's tx front two ahead of its rx front means the firmware is behind.
@@ -124,12 +124,7 @@ fn transact(speedy: u32, typ: u32, reg: u32, func: u32, val: u32, mask: u32) -> 
         SEQ = if SEQ >= 63 { 1 } else { SEQ + 1 };
         SEQ
     };
-    let cmd = [
-        (reg & 0xFF) | (typ & 0xF) << 8 | (speedy & 0xF) << 12 | seq << SEQ_SHIFT,
-        (func & 0xFF) | (val & 0xFF) << 8 | (mask & 0xFF) << 16,
-        0,
-        0,
-    ];
+    cmd[0] = (cmd[0] & !(0x3F << SEQ_SHIFT)) | seq << SEQ_SHIFT;
     let slot = c.tx_base + (c.size as usize) * front as usize;
     for (i, &w) in cmd.iter().enumerate() {
         wr(slot + i * 4, w);
@@ -140,6 +135,9 @@ fn transact(speedy: u32, typ: u32, reg: u32, func: u32, val: u32, mask: u32) -> 
     unsafe { core::arch::asm!("dsb sy") };
     wr(c.tx_front, (front + 1) % c.len);
     wr(MBOX + INTGR1, 1 << c.id);
+    if !reply {
+        return Ok([0; 4]);
+    }
     // Poll the reply queue; drop anything that is not ours (ferros is the only client).
     let t = deadline(100);
     loop {
@@ -149,20 +147,47 @@ fn transact(speedy: u32, typ: u32, reg: u32, func: u32, val: u32, mask: u32) -> 
         while i != rx_front {
             let e = c.rx_base + (c.size as usize) * i as usize;
             if (rd(e) >> SEQ_SHIFT) & 0x3F == seq {
-                found = Some(rd(e + 4));
+                found = Some([rd(e), rd(e + 4), rd(e + 8), rd(e + 12)]);
             }
             i = (i + 1) % c.len;
         }
         wr(c.rx_rear, rx_front);
         wr(MBOX + INTCR0, 1 << c.id);
-        if let Some(w1) = found {
-            let code = w1 >> 24;
-            return if code == 0 { Ok(w1) } else { Err(E_FW | code << 8) };
+        if let Some(r) = found {
+            return Ok(r);
         }
         if crate::platform::cntpct() > t {
             return Err(E_TIMEOUT);
         }
     }
+}
+
+/// One PMIC transaction on the PMIC channel: `func` 0 read, 1 write, 2 update (value under mask). Returns the reply's word 1.
+fn transact(speedy: u32, typ: u32, reg: u32, func: u32, val: u32, mask: u32) -> Result<u32, u32> {
+    let cmd = [(reg & 0xFF) | (typ & 0xF) << 8 | (speedy & 0xF) << 12, (func & 0xFF) | (val & 0xFF) << 8 | (mask & 0xFF) << 16, 0, 0];
+    let w1 = call(PMIC_CHANNEL, cmd, true)?[1];
+    let code = w1 >> 24;
+    if code == 0 { Ok(w1) } else { Err(E_FW | code << 8) }
+}
+
+/// The DVFS channel (`acpm-ipc-channel = <0>` on zuma's `cal_if` node, which acpm_dvfs.c borrows): rates for MIF, INT, the three CPU clusters, the DSU, the GPU and the rest, by the index of zuma's `acpm_dvfs_id` (cal-if/zuma/acpm_dvfs_zuma.h).
+pub const DVFS_CHANNEL: usize = 0;
+/// zuma's DVFS domains in `acpm_dvfs_id` order (ACPM_VCLK_TYPE + index).
+pub const DVFS_DOMAINS: [&str; 17] = ["MIF", "INT", "CPUCL0", "CPUCL1", "CPUCL2", "DSU", "BCI", "G3D", "G3DL2", "TPU", "INTCAM", "TNR", "CAM", "MFC", "DISP", "AOC", "BW"];
+const FREQ_REQ: u32 = 0;
+const FREQ_GET: u32 = 1;
+
+/// The rate the firmware holds for a DVFS domain, in kHz (`exynos_acpm_get_rate`: word 3 non-zero is an error code, else word 1 is the rate).
+pub fn dvfs_get(domain: u32) -> Result<u32, u32> {
+    let r = call(DVFS_CHANNEL, [domain, 0, FREQ_GET, 0], true)?;
+    if r[3] != 0 { Err(E_FW | (r[3] & 0xFF) << 8) } else { Ok(r[1]) }
+}
+
+/// Ask the firmware for a DVFS domain's rate, in kHz (`exynos_acpm_set_rate`). The CPU clusters, MIF and INT take no reply in Linux; the rest return word 3 as the result.
+pub fn dvfs_set(domain: u32, khz: u32) -> Result<u32, u32> {
+    let quiet = domain <= 4;
+    let r = call(DVFS_CHANNEL, [domain, khz, FREQ_REQ, 0], !quiet)?;
+    Ok(r[3])
 }
 
 /// Read one PMIC register.
