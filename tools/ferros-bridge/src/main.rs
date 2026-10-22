@@ -143,6 +143,17 @@ async fn main() {
             let (rgb, sur) = (hex(4), hex(5));
             cmd_display_raw(&[17, (diam >> 8) as u8, diam as u8, (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, (sur >> 16) as u8, (sur >> 8) as u8, sur as u8]).await;
         }
+        "display" if args.get(2).map(String::as_str) == Some("patch10") => {
+            // display patch10 <diameter px> <r> <g> <b> [surround grey] — the disc in 10 bits a channel (decimal 0-1023), the layer switched to 2:10:10:10.
+            let n = |i: usize, d: u16| args.get(i).and_then(|a| a.parse::<u16>().ok()).unwrap_or(d).min(1023);
+            let diam = args.get(3).and_then(|a| a.parse::<u16>().ok()).unwrap_or(0);
+            let (r, g, b, s) = (n(4, 0), n(5, 0), n(6, 0), n(7, 0));
+            let mut m = vec![18u8, (diam >> 8) as u8, diam as u8];
+            for v in [r, g, b, s, s, s] {
+                m.extend_from_slice(&v.to_be_bytes());
+            }
+            cmd_display_raw(&m).await;
+        }
         "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,

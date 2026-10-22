@@ -158,10 +158,21 @@ pub fn fill(rgb: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
 
 /// A measurement patch, one frame: a disc of `rgb` with diameter `diam` pixels centred on the panel, over `surround` everywhere else; `diam` 0 = `rgb` over the whole panel (bridge `display patch`). Hard-edged on purpose: an instrument reads the disc's middle, and the disc's area against the surround is the window size (APL) the panel's own limiter responds to (DISPLAY-CALIB.md).
 pub fn patch(diam: usize, rgb: u32, surround: u32, cntfrq: u64) -> alloc::vec::Vec<u8> {
+    patch_px(diam, rgb, surround, false, cntfrq)
+}
+
+/// The same patch in 10 bits a channel: the layer switched to 2:10:10:10 and each value 0-1023 (bridge `display patch10`). For telling a true 10 bpc link from an 8 bpc one with an instrument: one code steps the light by ~0.4 % near the middle of the range only if all ten bits reach the panel.
+pub fn patch10(diam: usize, rgb: [u32; 3], surround: [u32; 3], cntfrq: u64) -> alloc::vec::Vec<u8> {
+    let pack = |c: [u32; 3]| 3 << 30 | (c[0] & 0x3FF) << 20 | (c[1] & 0x3FF) << 10 | (c[2] & 0x3FF);
+    patch_px(diam, pack(rgb), pack(surround), true, cntfrq)
+}
+
+fn patch_px(diam: usize, rgb: u32, surround: u32, ten: bool, cntfrq: u64) -> alloc::vec::Vec<u8> {
     let mut rep = alloc::vec::Vec::new();
     let Some(panel) = adopt(cntfrq, &mut rep) else {
         return rep;
     };
+    panel.set_10bit(ten);
     let (cx, cy) = (panel.width as i64 / 2, panel.rows as i64 / 2);
     // Pixel centres within the radius: (2x+1-2cx)^2 + (2y+1-2cy)^2 <= diam^2, all in integers.
     let d2 = (diam as i64) * (diam as i64);
@@ -178,7 +189,7 @@ pub fn patch(diam: usize, rgb: u32, surround: u32, cntfrq: u64) -> alloc::vec::V
     }
     unsafe { core::arch::asm!("dsb sy") };
     panel.present(&mut rep);
-    rep.extend_from_slice(alloc::format!("patch: G#{rgb:06X} disc A#{diam} px ({lit} px lit of {}) over G#{surround:06X}\n", panel.width * panel.rows).as_bytes());
+    rep.extend_from_slice(alloc::format!("patch: G#{rgb:08X} disc A#{diam} px ({lit} px lit of {}) over G#{surround:08X}{}\n", panel.width * panel.rows, if ten { ", 2:10:10:10" } else { "" }).as_bytes());
     rep
 }
 

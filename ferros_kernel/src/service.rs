@@ -1641,6 +1641,13 @@ pub fn run(mut b: Boot) -> ! {
                                                 let rep = crate::display::patch(diam, c(2), c(5), freq);
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
+                                            // G#12 [diameter hi lo] [r g b, 10-bit, hi lo each] [surround r g b, the same] = the measurement disc in 10 bits a channel, the layer in 2:10:10:10 (bridge `display patch10`).
+                                            Some((18, args)) if args.len() >= 14 => {
+                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
+                                                let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
+                                                let rep = crate::display::patch10(diam, [v(2), v(4), v(6)], [v(8), v(10), v(12)], freq);
+                                                queue_pt_response(&mut pt_out_data, &rep);
+                                            }
                                             // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
                                             Some((12, args)) if args.len() >= 3 => {
                                                 let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);

@@ -9,6 +9,7 @@
 #   cal       the i1 Pro's own white-tile calibration (instrument in its cradle on the tile)
 #   check     one reading of the target, to confirm the instrument sees the disc
 #   run [sections...]   the readings (default: all, in order): drift rolloff sustain apl ramps nearblack colours drift
+#   ten <control|dither|link10|restore>   is the link really 10 bits: grey 10-bit codes 512-520 at ~1000 nits, read twice each, in the 1 cm disc. control = 10 bpc compose on the 8 bpc link with the dither off (expect plateaus four codes wide), dither = the same dithered (the instrument averages it: an even ramp), link10 = the 10 bpc DSC stream, no dither (even steps only if all ten bits arrive), restore = the default (10 bpc compose, dithered)
 #   on        the shell back (remove `home.off`), reboot
 # Output: oracle/display/husky-hk3/profile-<date>/readings.csv (section, label, dbv, window px, rgb, surround, seconds since start, Y cd/m², x, y) and spotread.log (every reading's full output, spectra included).
 # Needs: the instrument readable (sudo chmod a+rw /dev/bus/usb/<bus>/<dev>, or the colord group), cold ferros on USB, a dark room.
@@ -41,6 +42,27 @@ m() {
     local r; r=$(read_one "$sec $label dbv=$d win=$win rgb=$rgb sur=$sur")
     [ -z "$r" ] && r="? ? ?"
     echo "$sec,$label,$d,$win,$rgb,$sur,$(( $(date +%s) - T0 )),${r// /,}" | tee -a "$CSV"
+}
+# The 10-bit disc: 10-bit grey code, read twice.
+m10() {
+    local sec=$1 c=$2
+    run display patch10 "$PX_PER_CM" "$c" "$c" "$c" 0; sleep 1.5
+    for k in 1 2; do
+        local r; r=$(read_one "$sec g10=$c #$k")
+        [ -z "$r" ] && r="? ? ?"
+        echo "$sec,g10-$c-$k,3307,$PX_PER_CM,g10=$c,0,$(( $(date +%s) - T0 )),${r// /,}" | tee -a "$CSV"
+    done
+}
+ten() {
+    case "$1" in
+        control) run display modeset wqhd 10; run display dither 0 ;;
+        dither) run display modeset wqhd 10; run display dither 1 ;;
+        link10) run display modeset wqhd link10 ;;
+        restore) run display modeset wqhd 10; dbv 1353; patch $W1 ffffff; return ;;
+        *) echo "ten control|dither|link10|restore"; return 1 ;;
+    esac
+    dbv 3307
+    for c in $(seq 512 520); do m10 "ten-$1" "$c"; done
 }
 W1=$PX_PER_CM; W2=$((2 * PX_PER_CM)); W4=$((4 * PX_PER_CM))
 LEVELS="196 400 853 1353 2000 2600 3307"
@@ -94,6 +116,9 @@ case "${1:-}" in
     target) dbv 1353; patch $W1 ffffff; echo "target: white disc, A#$W1 px (1 cm at $PX_PER_CM px/cm), 133 nits" ;;
     cal) echo "instrument on its white tile:"; echo | timeout 120 spotread -e -O 2>&1 | tail -3 ;;
     check) mkdir -p "$DIR"; dbv 1353; patch $W1 ffffff; sleep 1.5; echo "Yxy $(read_one check)" ;;
+    ten)
+        mkdir -p "$DIR"; [ -f "$CSV" ] || echo "section,label,dbv,window_px,rgb,surround,t_s,Y_cdm2,x,y" > "$CSV"
+        ten "${2:-}" ;;
     run)
         shift; mkdir -p "$DIR"
         [ -f "$CSV" ] || echo "section,label,dbv,window_px,rgb,surround,t_s,Y_cdm2,x,y" > "$CSV"
