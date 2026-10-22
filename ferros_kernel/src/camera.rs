@@ -396,7 +396,7 @@ pub fn raw_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
         return line(rep, alloc::format!("sensor init failed\n"));
     }
     let iso = 0x1546_3EBCusize;
-    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    phy_isolation_bypass(iso);
     ispfe_dma_open(rep);
     // Our three slices, patterned so a write anywhere shows.
     const SLICES: [usize; 3] = [0x8810_0000, 0x8910_0000, 0x8A10_0000];
@@ -483,7 +483,7 @@ pub fn lochs_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>) {
         return line(rep, alloc::format!("sensor init failed\n"));
     }
     let iso = 0x1546_3EBCusize;
-    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    phy_isolation_bypass(iso);
     ispfe_dma_open(rep);
     for &(a, v) in CORE_ONLY[..25].iter() {
         wr(a, v);
@@ -1351,10 +1351,20 @@ pub fn fe_up(rep: &mut Vec<u8>) {
         line(rep, alloc::format!("domain did not come on; nothing else touched\n"));
         return;
     }
-    let r = pd_prepare(PD_ISPFE_NEED_SMC);
-    line(rep, alloc::format!("prepare call returned G#{r:X}\n"));
+    // The domain prepare call (SMC G#8200_0410) once per boot: made a second time, with the domain already prepared, EL3 never returned (2026-10-21: the flash log of a second `cam pdma` ends at this call, every time).
+    static PREPARED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !PREPARED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::flashlog::line(&alloc::format!("fe_up: domain on (G#{before:X} -> G#{after:X}), prepare call"));
+        let r = pd_prepare(PD_ISPFE_NEED_SMC);
+        line(rep, alloc::format!("prepare call returned G#{r:X}\n"));
+    } else {
+        line(rep, alloc::format!("prepare call already made this boot; not repeated\n"));
+    }
+    crate::flashlog::line("fe_up: VDD_CAM over ACPM");
     cam_rail(rep);
+    crate::flashlog::line("fe_up: ISPFE_NOC clock");
     ispfe_noc_clock(rep);
+    crate::flashlog::line("fe_up: CMU_ISPFE");
     wr(CMU_ISPFE + 0x1800, 3);
     wr(CMU_ISPFE + 0x1804, 1);
     wr(CMU_ISPFE + 0x0600, 0x10);
@@ -2125,7 +2135,7 @@ pub fn frame_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8
         return line(rep, alloc::format!("sensor init failed\n"));
     }
     let iso = 0x1546_3EBCusize;
-    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    phy_isolation_bypass(iso);
     for &(a, v) in crate::camera_rx::RX_START.iter() {
         wr(a, v);
     }
@@ -2259,6 +2269,14 @@ const PDMA_BUF_PA: usize = 0xA000_0000;
 const PDMA_BUF_SLICE: usize = 0x100_0000;
 /// One frame as the front end writes it: 3072 lines at the G#1400 stride.
 const FRAME_BYTES: usize = 3072 * 0x1400;
+/// The combo D-PHY's PMU isolation bypass (PMU G#3EBC bit 0), once per boot: repeated in a second `cam pdma`, its EL3 write never returned (2026-10-21), as the domain prepare call did. The bit stays set until reset.
+fn phy_isolation_bypass(iso: usize) {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    }
+}
+
 /// Integer square root (floor), for the viewfinder's gamma 2 encoding: the kernel does no floating point.
 fn isqrt(v: u32) -> u32 {
     let mut r = 0u32;
@@ -2472,7 +2490,9 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     let Some(init) = init else {
         return line(rep, alloc::format!("refusing: no sensor init table\n"));
     };
+    crate::flashlog::line("cam pdma: fe_up");
     fe_up(rep);
+    crate::flashlog::line("cam pdma: fe_up done, sensor init");
     if !fe_powered() {
         return;
     }
@@ -2482,8 +2502,11 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         return line(rep, alloc::format!("sensor init failed\n"));
     }
     let iso = 0x1546_3EBCusize;
-    let _ = crate::platform::priv_reg(iso as u64, true, rd(iso) | 1);
+    crate::flashlog::line("cam pdma: PHY isolation bypass");
+    phy_isolation_bypass(iso);
+    crate::flashlog::line("cam pdma: ISPFE DMA path");
     ispfe_dma_open(rep);
+    crate::flashlog::line("cam pdma: job and patterning");
     // Lay the job out in DRAM. The SysMMUs are in bypass, so what the engine reads as a bus address is this physical address.
     let w32 = |i: usize| u32::from_le_bytes([job[i], job[i + 1], job[i + 2], job[i + 3]]) as usize;
     let n = w32(4);
@@ -2535,6 +2558,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     }
     unsafe { core::arch::asm!("dsb sy") };
     // Start the engine exactly as the capture shows a camera open starting it.
+    crate::flashlog::line("cam pdma: PDMA start");
     wr(PDMA + 0x2C, 1);
     wr(PDMA + 0x40, 0x1F);
     wr(PDMA + 0x20, 0);
@@ -2800,4 +2824,11 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     if !any {
         line(rep, alloc::format!("no output slice changed at any probe point\n"));
     }
+    // Linux's teardown, so a second run in this boot starts where a camera open expects (camera_close.rs): without it the third run's front end took no frames even with the sensor power-cycled (2026-10-21).
+    crate::flashlog::line("cam pdma: close sequence");
+    for &(a, v) in crate::camera_close::CLOSE.iter() {
+        wr(a, v);
+    }
+    crate::flashlog::line("cam pdma: closed");
+    line(rep, alloc::format!("closed: A#{} teardown writes replayed\n", crate::camera_close::CLOSE.len()));
 }

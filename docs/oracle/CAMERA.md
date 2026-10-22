@@ -328,3 +328,17 @@ About 0.8 frames a second, limited by uncached reads of the frame (six byte read
 Two traps:
 - **Adopt the panel before the camera.** `display::adopt` after the camera bring-up hung in its first EL3 call every time (the flash log ended at "adopting the panel"), the EL3 poison pattern after the camera path's direct PMU reads. Adopted at the start of the run, it works, and `present()` makes no EL3 calls.
 - **The display side is a stand-in** (sRGB primaries, gamma 2) until the panel itself is calibrated; the camera side is the measured IDT.
+
+## Many runs in one boot (2026-10-21, night)
+
+`cam pdma` used to work once per boot, and the second one hung. Measured with flash-log marks at every stage:
+- **The domain prepare call (SMC G#8200_0410) never returns the second time.** It is now made once per boot.
+- **The D-PHY isolation bypass's EL3 write (PMU G#3EBC) hung the same way.** Also once per boot now: the bit stays set until reset.
+- **The front end needs Linux's teardown.** With both fixes the second run completes, but its front end takes no frames. `tools/camera-close.py` extracts every CPU write from the capture's "camera close" mark onward: the PDMA's last index, PHY lanes off, the local channels disabled (G#1C32_00A4 = G#80 then 1), processing blocks cleared, PDMA stopped, links and core reset. That is 223 writes in `camera_close.rs`, replayed at the end of every run.
+- **The sensor needs a power cycle** (`diag cam off`, `diag cam up`) or it does not stream again.
+
+Sequence: `cam bus`, `cam up`, `cam pdma …`, then for each further run `cam off`, `cam up`, `cam pdma …`. Two consecutive runs both take frames (buffer index 0 to 6).
+
+Avoid `bridge read priv:15463EBC` after a camera run: it hung ferros until the watchdog.
+
+**Exposure timing.** CCS from the init: EXTCLK 24 MHz, pre-PLL ÷3, ×245, vt_sys ÷1, vt_pix ÷8, line_length_pck 6320, frame_length 21362, integration 21342. Read literally that is a 551 ms frame; measured, the sensor runs about 14 to 15 frames a second. vt_pix_clk taken as 1960 MHz (the ÷8 not applied, or eight pixel pipes) gives 3.22 µs lines, a 68.9 ms frame and **68.8 ms integration**, consistent with the measured rate. To be confirmed with a timed frame count before it goes into an absolute comparison.

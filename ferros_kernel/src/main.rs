@@ -48,6 +48,8 @@ mod camera;
 mod camera_events;
 #[cfg(feature = "pixel8")]
 mod camera_snap;
+#[cfg(feature = "pixel8")]
+mod camera_close;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
 mod spi;
