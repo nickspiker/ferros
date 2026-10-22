@@ -334,16 +334,17 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 }
 
 /// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
-fn start_home(store: &mut Option<ShimStore>) {
+/// Returns false when the shell is off this boot (`home.off`).
+fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
     if store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten()).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");
-        return;
+        return false;
     }
     let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key("init").ok().flatten()) else {
         crate::process::push_console(b"home: no init capsule in the vault\n");
-        return;
+        return true;
     };
     let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
     let mut rep = alloc::vec::Vec::new();
@@ -358,6 +359,7 @@ fn start_home(store: &mut Option<ShimStore>) {
         }
     }
     crate::checklist::at("home: init ran");
+    true
 }
 
 /// The USB link as of the service loop's last pass, for the facts.
@@ -509,7 +511,8 @@ pub fn run(mut b: Boot) -> ! {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
             if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {
                 home_started = true;
-                start_home(&mut store);
+                // A session with the shell off (`home.off`) is someone measuring: no idle exit while they position an instrument.
+                hold |= !start_home(&mut store);
             }
         }
         // No host after 64 s is a dead USB attempt only while nothing else is running: with the shell up, a phone without a cable is the normal case.
