@@ -26,6 +26,10 @@ IOVA_LO, IOVA_HI = 0x1700_0000, 0x1E00_0000
 # Address registers whose captured value falls outside that window: list 2 hands them G#0200_0000, G#0158_0000, G#0D18_0000 and G#0FF0_0000, which the window left alone, so with the SYSMMUs in bypass the front end was pointed at physical addresses in the register space. Found by comparing list 2 with the hv's live snapshot of a Linux stream (tools/camera-snap-list.py, 2026-10-21): each holds a different page-aligned IOVA there. G#1C32_05C0 sits in loch0's image path, beside its buffer address at +G#510.
 ISPFE = 0x1C30_0000  # list addresses are offsets into the front end (tools/oracle-decode-pdma.py)
 ADDR_REGS = {0x1C32_05C0, 0x1C35_51A8, 0x1C35_51E8, 0x1C35_51F8}
+# Since 2026-10-22: the address registers by name, all 25, measured (the main camera's list plus the hv's live Linux snapshot), and each 16 MiB IOVA granule mapped to one slot with its offset kept. A guessed window broke on the ultrawide's session, whose IOVAs land at G#09AF_4000, G#F800_0000, G#FDFE_0000; and two registers (G#1C35_51C0/C8) hold a buffer's base and an offset into it (G#FA00_0000, G#FA02_EE00), which per-page slots split apart.
+ADDR_ALL = {0x1C320510, 0x1C3205C0, 0x1C322110, 0x1C3221C0, 0x1C3400D0, 0x1C351820, 0x1C3548A0, 0x1C354A84, 0x1C354ECC, 0x1C354FC8, 0x1C355168, 0x1C355178, 0x1C355180, 0x1C355188, 0x1C355190, 0x1C355198, 0x1C3551A0, 0x1C3551A8, 0x1C3551B0, 0x1C3551C0, 0x1C3551C8, 0x1C3551E0, 0x1C3551E8, 0x1C3551F8, 0x1C355200}
+# The image body (G#1C32_05C0) always gets slot 2, so it lands at G#A200_0000 for every camera (camera.rs, tools/camera-pull.sh).
+IMAGE_REG, IMAGE_SLOT = 0x1C3205C0, 2
 RING_ENTRIES = 1024  # camera.rs writes the same count; enough frames for a focus sweep without wrapping (Linux: 1000)
 
 # --list picks which of the session's rotating lists to build from, and it matters: list 2 is the one docs/oracle/CAMERA.md decoded and the one ferros has run, at G#19DC bytes with 18 output buffers, while the default list 1 is G#1A10 with 20. Handing the engine list 1 reset the phone twice before the difference was noticed (2026-10-20). Always pass `--list 2` until there is a reason not to.
@@ -81,6 +85,31 @@ def regeom(v):
 
 # Walk the list: rewrite every page-aligned bus address in a (register, value) pair to a buffer slice, and every block-load source to its own slice.
 bufs, load_order, geom, owners = {}, [], 0, {}
+slot_of = {}
+def remap(reg, v):
+    """A bus address in an address register: its 16 MiB granule's slot, offset kept."""
+    g = v >> 24
+    if g not in slot_of:
+        if reg == IMAGE_REG:
+            slot_of[g] = IMAGE_SLOT
+        else:
+            taken = set(slot_of.values()) | {IMAGE_SLOT}
+            slot_of[g] = next(k for k in range(BUF_SLOTS) if k not in taken)
+    pa = BUF_PA + slot_of[g] * BUF_SLICE + (v & 0xFF_FFFF)
+    bufs.setdefault(v, pa)
+    owners.setdefault(pa, []).append(reg)
+    return pa
+# Pre-scan for the image register, so its granule claims slot 2 before anything else claims slots.
+j = 0
+while j < len(words):
+    h = words[j]; n = h >> 14; op = h & 0x3FFF
+    if op == 2:
+        for k2 in range(j + 2, j + 1 + n, 2):
+            if ISPFE + words[k2 - 1] == IMAGE_REG and words[k2]:
+                slot_of.setdefault(words[k2] >> 24, IMAGE_SLOT)
+    elif h == 0:
+        break
+    j += 1 + n
 i = 0
 while i < len(words):
     h = words[i]; n = h >> 14; op = h & 0x3FFF
@@ -88,9 +117,8 @@ while i < len(words):
     if op == 2:
         for k2 in range(i + 2, i + 1 + n, 2):
             v = words[k2]
-            if (IOVA_LO <= v < IOVA_HI or ISPFE + words[k2 - 1] in ADDR_REGS) and v & 0xFFF == 0:
-                words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
-                owners.setdefault(words[k2], []).append(ISPFE + words[k2 - 1])
+            if ISPFE + words[k2 - 1] in ADDR_ALL and v:
+                words[k2] = remap(ISPFE + words[k2 - 1], v)
             else:
                 g = regeom(v)
                 if g != v:
@@ -100,9 +128,8 @@ while i < len(words):
         # A burst writes consecutive registers from one start address; buffer addresses appear in these too.
         for k2 in range(i + 2, i + 1 + n):
             v = words[k2]
-            if (IOVA_LO <= v < IOVA_HI or ISPFE + words[i + 1] + 4 * (k2 - i - 2) in ADDR_REGS) and v & 0xFFF == 0:
-                words[k2] = bufs.setdefault(v, BUF_PA + (len(bufs) % BUF_SLOTS) * BUF_SLICE)
-                owners.setdefault(words[k2], []).append(ISPFE + words[i + 1] + 4 * (k2 - i - 2))
+            if ISPFE + words[i + 1] + 4 * (k2 - i - 2) in ADDR_ALL and v:
+                words[k2] = remap(ISPFE + words[i + 1] + 4 * (k2 - i - 2), v)
             else:
                 g = regeom(v)
                 if g != v:

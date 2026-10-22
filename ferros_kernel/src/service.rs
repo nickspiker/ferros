@@ -827,6 +827,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"cam uw up" {
+                                            // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
+                                            crate::camera::uw_up(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"pmic rails" {
                                             // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
                                             let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };
@@ -865,6 +871,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
                                             };
                                             let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
+                                            // `cam pdma uw ...`: the ultrawide's own init and CPU setup (FERROS_CAM_UW) instead of the main camera's bundle.
+                                            let (init, prog) = if words.contains(&&b"uw"[..]) { crate::camera::Cam::uw_bundle() } else { (init, prog) };
                                             crate::camera::pdma_probe(&mut resp, init, prog, if words.contains(&&b"slit"[..]) { 64 } else { 0 }, words.contains(&&b"fast"[..]), crate::camera::Shot::parse(&cmd.params));
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;

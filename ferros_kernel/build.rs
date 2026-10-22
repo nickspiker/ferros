@@ -32,6 +32,25 @@ fn main() {
         }
         Err(_) => std::fs::write(&pout, b"").unwrap(),
     }
+    // FERROS_CAM_UW=<prefix>: the ultrawide's <prefix>.init (tools/camera-init.py), <prefix>.cpr2 (tools/camera-cpu.py) and <prefix>.pdma (tools/camera-pdma-image.py), for `diag cam pdma uw`. Dev only and local, like the main camera's: the init carries the sensor vendor's settings.
+    println!("cargo:rustc-check-cfg=cfg(cam_uw_blob)");
+    println!("cargo:rerun-if-env-changed=FERROS_CAM_UW");
+    let od = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    match std::env::var("FERROS_CAM_UW") {
+        Ok(prefix) => {
+            for ext in ["init", "cpr2", "pdma"] {
+                let src = format!("{prefix}.{ext}");
+                println!("cargo:rerun-if-changed={src}");
+                std::fs::copy(&src, od.join(format!("uw_{ext}.bin"))).unwrap_or_else(|e| panic!("FERROS_CAM_UW {src}: {e}"));
+            }
+            println!("cargo:rustc-cfg=cam_uw_blob");
+        }
+        Err(_) => {
+            for ext in ["init", "cpr2", "pdma"] {
+                std::fs::write(od.join(format!("uw_{ext}.bin")), b"").unwrap();
+            }
+        }
+    }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cam_frame.bin");
     match std::env::var("FERROS_CAM_FRAME") {
         Ok(path) => {

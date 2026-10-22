@@ -3,13 +3,13 @@
 
 Writes <prefix>.npy (uint16 Bayer mosaic, sensor values 0..1023) and <prefix>-grey.png: a 2 x 2 binned grey preview for checking exposure and focus only (black-subtracted, square-root stretch). It is not a colour rendering; colour goes through the camera's IDT and VSF RGB.
 Prints black level (from the darkest percentile), exposure percentiles and a sharpness figure (mean squared same-colour gradient).
-Usage: tools/camera-raw10.py <frame.raw10> <prefix>
+Usage: tools/camera-raw10.py <frame.raw10> <prefix> [width height stride]   (default the main camera: 4080 3072 5120; the ultrawide is 4000 3000 5056)
 """
 import sys
 import numpy as np
 from PIL import Image
 
-W, H, STRIDE = 4080, 3072, 5120
+W, H, STRIDE = (int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (4080, 3072, 5120)
 d = np.frombuffer(open(sys.argv[1], 'rb').read(), np.uint8)[:H * STRIDE].reshape(H, STRIDE)[:, :W * 5 // 4]
 g = d.reshape(H, W // 4, 5).astype(np.uint16)
 px = np.empty((H, W // 4, 4), np.uint16)

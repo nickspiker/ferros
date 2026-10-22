@@ -1384,6 +1384,11 @@ pub fn fe_up(rep: &mut Vec<u8>) {
 
 /// Replay a sensor init table: records `W` len(u16 BE) bytes (an I2C write), `R` n(u16) addr(2) (register read, value discarded), `D` microseconds (u32 BE). The table is generated from an oracle capture and kept in the vault (key `cam.boitata.init`), not in the source: it carries the sensor vendor's settings file. Returns (writes, reads, first failure as (record index, error)).
 fn replay_init(t: &[u8]) -> (u32, u32, Option<(u32, u32)>) {
+    replay_init_on(t, SENSOR_BUS.base, SENSOR_ADDR)
+}
+
+/// `replay_init` on any sensor's bus.
+fn replay_init_on(t: &[u8], bus: usize, addr: u8) -> (u32, u32, Option<(u32, u32)>) {
     let (mut i, mut n, mut w, mut r) = (0usize, 0u32, 0u32, 0u32);
     while i < t.len() {
         let k = t[i];
@@ -1393,7 +1398,7 @@ fn replay_init(t: &[u8]) -> (u32, u32, Option<(u32, u32)>) {
                 let d = &t[i + 3..(i + 3 + len).min(t.len())];
                 i += 3 + len;
                 w += 1;
-                crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, d)
+                crate::hsi2c::write_bytes(bus, addr, d)
             }
             b'R' if i + 5 <= t.len() => {
                 let cnt = u16::from_be_bytes([t[i + 1], t[i + 2]]) as usize;
@@ -1401,7 +1406,7 @@ fn replay_init(t: &[u8]) -> (u32, u32, Option<(u32, u32)>) {
                 i += 5;
                 r += 1;
                 let mut buf = [0u8; 8];
-                crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &a, &mut buf[..cnt.min(8)])
+                crate::hsi2c::write_read(bus, addr, &a, &mut buf[..cnt.min(8)])
             }
             b'D' if i + 5 <= t.len() => {
                 spin_us(u32::from_be_bytes([t[i + 1], t[i + 2], t[i + 3], t[i + 4]]) as u64);
@@ -2404,9 +2409,87 @@ const SWEEP_PA: usize = 0x9800_0000;
 const PDMA_BUFS: usize = 32;
 
 /// `diag cam pdma`: the receive side as `cam frame` brings it up, the CPU's own setup writes from the capture, and the front end's register program handed to the **PDMA engine** rather than replayed by the CPU — the only way to reach the G#1C36_xxxx region the CPU cannot write (docs/oracle/CAMERA.md). The job comes from a build-time blob ('CPR3': physical address + bytes per piece).
+/// Which camera `cam pdma` drives: the main (link 1, its bundles FERROS_CAM_FRAME / FERROS_CAM_PDMA) or the ultrawide (`uw`: link 2, FERROS_CAM_UW).
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Cam {
+    #[default]
+    Main,
+    Ultrawide,
+}
+
+impl Cam {
+    /// The sensor's bus and address.
+    fn sensor(self) -> (usize, u8) {
+        match self {
+            Cam::Main => (SENSOR_BUS.base, SENSOR_ADDR),
+            Cam::Ultrawide => (MODULES[2].bus, MODULES[2].addr),
+        }
+    }
+    /// Stream on and off as each sensor's Linux driver writes them: the main's carries image orientation (G#0101 = 3) in the same write, the ultrawide's is G#0100 alone (capture, 2026-10-22).
+    fn stream(self, on: bool) -> &'static [u8] {
+        match (self, on) {
+            (Cam::Main, true) => &[0x01, 0x00, 0x01, 0x03],
+            (Cam::Main, false) => &[0x01, 0x00, 0x00, 0x00],
+            (Cam::Ultrawide, true) => &[0x01, 0x00, 0x01],
+            (Cam::Ultrawide, false) => &[0x01, 0x00, 0x00],
+        }
+    }
+    /// The identifier and where it lives: the main answers G#08EF at G#0000; the ultrawide (Sony IMX787) G#0787 at the CCS sensor register G#0016.
+    fn id(self) -> (u16, [u8; 2]) {
+        match self {
+            Cam::Main => (0x0000, [0x08, 0xEF]),
+            Cam::Ultrawide => (0x0016, [0x07, 0x87]),
+        }
+    }
+    fn rx_start(self) -> &'static [(usize, u32)] {
+        match self {
+            Cam::Main => &crate::camera_rx::RX_START,
+            Cam::Ultrawide => &crate::camera_rx_uw::RX_START_UW,
+        }
+    }
+    fn job(self) -> &'static [u8] {
+        match self {
+            Cam::Main => if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] },
+            Cam::Ultrawide => include_bytes!(concat!(env!("OUT_DIR"), "/uw_pdma.bin")),
+        }
+    }
+    /// The ultrawide's init table and CPU setup (FERROS_CAM_UW), when built in.
+    pub fn uw_bundle() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        if cfg!(cam_uw_blob) {
+            (Some(include_bytes!(concat!(env!("OUT_DIR"), "/uw_init.bin")).to_vec()), Some(include_bytes!(concat!(env!("OUT_DIR"), "/uw_cpr2.bin")).to_vec()))
+        } else {
+            (None, None)
+        }
+    }
+}
+
+/// `diag cam uw up`: the camera-PMIC bus and all four sensor buses up, every module's rails off, then the ultrawide powered in its own sequence (`power_module`) and its identifier read (G#0016, Sony IMX787 answers G#0787).
+pub fn uw_up(rep: &mut Vec<u8>) {
+    let gpp16 = GPIO_PERIC0 + 0x220;
+    for pin in 0..2 {
+        pin_field(gpp16, pin, 2);
+        pin_field(gpp16 + 8, pin, 0);
+    }
+    wr(USI14_MUX, rd(USI14_MUX) & !(1 << 4));
+    crate::hsi2c::bring_up(PMIC_BUS.base, PMIC_BUS.usi_mode, FS_DIV, 0xFF_FFFF);
+    buses_all(rep);
+    pmic_power_on(rep);
+    power_down_all(rep);
+    let m = &MODULES[2];
+    if !power_module(rep, m) {
+        return line(rep, alloc::format!("ultrawide power-up failed\n"));
+    }
+    crate::hsi2c::bring_up(m.bus, SYSREG_PERIC0 + m.usi_off, FS_DIV, 0x2_0000);
+    let mut b = [0u8; 2];
+    let r = crate::hsi2c::write_read(m.bus, m.addr, &[0x00, 0x16], &mut b);
+    line(rep, alloc::format!("ultrawide (G#{:02X}) identifier at G#0016: {r:?} G#{:02X}{:02X}{}\n", m.addr, b[0], b[1], if b == [0x07, 0x87] { " — Sony IMX787, as Linux reads it" } else { "" }));
+}
+
 /// Picture settings for `cam pdma`, from `exp=<lines> gain=<code> af=<position>` after the command (all optional; 0 = leave as captured).
 #[derive(Clone, Copy, Default)]
 pub struct Shot {
+    /// `uw`: drive the ultrawide instead of the main camera.
+    pub cam: Cam,
     /// CCS coarse_integration_time (G#0202), in lines. The captured mode uses 20, out of a frame of 10584.
     pub exp: u32,
     /// CCS analogue_gain_code_global (G#0204).
@@ -2452,6 +2535,9 @@ impl Shot {
             }
         }
         s.snap = params.split(|&c| c == b' ').any(|t| t == b"snap");
+        if params.split(|&c| c == b' ').any(|t| t == b"uw") {
+            s.cam = Cam::Ultrawide;
+        }
         s.rate = params.split(|&c| c == b' ').any(|t| t == b"rate");
         s
     }
@@ -2482,12 +2568,14 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     } else {
         None
     };
-    let job: &[u8] = if cfg!(cam_pdma_blob) { include_bytes!(concat!(env!("OUT_DIR"), "/cam_pdma.bin")) } else { &[] };
+    let job: &[u8] = shot.cam.job();
+    let (sbus, saddr) = shot.cam.sensor();
     if job.len() < 8 || &job[..4] != b"CPR3" {
         return line(rep, alloc::format!("refusing: no PDMA job built in (FERROS_CAM_PDMA=<tools/camera-pdma-image.py output>)\n"));
     }
     let mut id = [0u8; 2];
-    if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0, 0], &mut id).is_err() || id != [0x08, 0xEF] {
+    let (id_reg, id_want) = shot.cam.id();
+    if crate::hsi2c::write_read(sbus, saddr, &[(id_reg >> 8) as u8, id_reg as u8], &mut id).is_err() || id != id_want {
         return line(rep, alloc::format!("refusing: sensor not answering its ID (run `diag cam up`)\n"));
     }
     let Some(init) = init else {
@@ -2499,7 +2587,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     if !fe_powered() {
         return;
     }
-    let (w, r, fail) = replay_init(&init);
+    let (w, r, fail) = replay_init_on(&init, sbus, saddr);
     line(rep, alloc::format!("sensor init: {w} writes, {r} reads replayed\n"));
     if fail.is_some() {
         return line(rep, alloc::format!("sensor init failed\n"));
@@ -2575,20 +2663,20 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     wr(PDMA + 0x28, 1);
     // The receiver last, as a camera open does it: the capture starts the PDMA at line 1421 and only enables the link (SYSREG_ISPFE + G#500 = 2, the end of RX_START) at 1573.
     // Enabling the link first — which is what ferros did until now — left the front end latching its configuration and never seeing a frame start: the only event either channel ever raised was SHADOW_UPDATE, never SOF (zuma-isp-event-info.dtsi names the bits).
-    for &(a, v) in crate::camera_rx::RX_START.iter() {
+    for &(a, v) in shot.cam.rx_start().iter() {
         wr(a, v);
     }
     apply(rep, "CPU setup after the start", cpu.as_ref().map(|c| &c.1[2]));
     line(rep, alloc::format!("PDMA started: base G#{:X} count A#{} ctrl G#{:X} +G#2C G#{:X} +G#40 G#{:X}\n", rd(PDMA + 4), rd(PDMA + 0xC), rd(PDMA), rd(PDMA + 0x2C), rd(PDMA + 0x40)));
     // The receiver's own words before the stream starts. The program's CPU writes land in the same G#1C04_0000.. range the receiver lives in, so they can undo what RX_START configured: if link 1's counters do not move here the way they move under `cam stream`, the frame writer is idle because nothing is arriving, not because the write path is off.
     let link_before = link_snapshot();
-    if shot.af != 0 {
+    if shot.af != 0 && shot.cam == Cam::Main {
         focus(rep, shot.af);
     }
     // Exposure and gain before stream-on, as Linux does (the block at transfers 771-778 precedes stream-on at 781). Written mid-stream instead, the sensor ran on but the core saw SOF with no EOF from then on (2026-10-21).
     // Linux's per-frame block, byte for byte (camera-main-open-transfers.txt 771-778): G#0104 is the one-byte grouped-parameter hold, so the hold is the four-byte write 01 04 01 01 and the release 01 04 00 01 (G#0105 stays 1); then G#0702/G#0704 = 0, digital gain G#020E = G#0100, analogue gain G#0204, integration G#0202, frame length G#0340 = G#2959. The HAL runs 2646 lines (G#0A56) at gain G#0400; the 20 lines in the captured init is overridden every frame and never meant to stand.
     if shot.exp != 0 || shot.gain != 0 {
-        let w = |b: &[u8]| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, b);
+        let w = |b: &[u8]| crate::hsi2c::write_bytes(sbus, saddr, b);
         // Only what was asked, inside the hold. The init's own last block already sets integration G#535E (21342 lines) in a G#5372-line frame and gain G#0400; copying Linux's block wholesale (frame length G#2959) doubled the frame rate and stalled the core (2026-10-21).
         let (e, g) = (shot.exp as u16, shot.gain as u16);
         let mut r = alloc::vec![w(&[0x01, 0x04, 0x01, 0x01])];
@@ -2602,12 +2690,12 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         let ok = r.iter().filter(|x| x.is_ok()).count();
         line(rep, alloc::format!("exposure A#{e} lines (0 = the init's 21342), gain code G#{g:04X} (0 = G#0400): A#{ok} of A#{} writes acknowledged\n", r.len()));
     }
-    let son = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x01, 0x03]);
+    let son = crate::hsi2c::write_bytes(sbus, saddr, shot.cam.stream(true));
     // Narrow the window only once the sensor is streaming. Set before stream-on it simply does not start — the frame counter never leaves zero and nothing reaches the receiver — while changed mid-stream it takes it at once, which is how `diag cam slit` measured 4080 x 64 at about 1184 frames a second (2026-10-20).
     // The front end has to be built for the same height or it is expecting 3072 lines where 64 arrive: tools/camera-pdma-image.py --height.
     if slit_lines > 0 {
         spin_us(100_000);
-        let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
+        let w16 = |a: u16, v: u16| crate::hsi2c::write_bytes(sbus, saddr, &[(a >> 8) as u8, a as u8, (v >> 8) as u8, v as u8]);
         let rows = (slit_lines * 4).min(12288);
         let _ = w16(0x0104, 1);
         let _ = w16(0x0346, 0x0010);
@@ -2661,7 +2749,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         }
         line(rep, alloc::format!("fast loop, one second: A#{events} core events answered\n{log}"));
         let mut b = [0u8; 2];
-        if crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).is_ok() {
+        if crate::hsi2c::write_read(sbus, saddr, &[0x00, 0x05], &mut b).is_ok() {
             series.push_str(&alloc::format!(" {:02X}", b[0]));
         }
     }
@@ -2692,7 +2780,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
             // `live_compare` is not called here. It stalled the bus and reset the phone reading G#1C32_0430, the loch0 image mask — a word the event dump above reads without trouble moments earlier in the same run — so front-end reads mid-stream are timing-dependent rather than simply safe or unsafe (2026-10-21). Its useful result was already in the event dump: see docs/oracle/CAMERA.md.
         }
         let mut b = [0u8; 2];
-        match crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b) {
+        match crate::hsi2c::write_read(sbus, saddr, &[0x00, 0x05], &mut b) {
             Ok(()) => series.push_str(&alloc::format!(" {:02X}", b[0])),
             Err(e) => series.push_str(&alloc::format!(" e{e:X}")),
         }
@@ -2700,7 +2788,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
     if shot.rate {
         // Two seconds of frames, the front end answered every 40 ms. The core's buffer index (+G#49C) counts frames it took; the sensor's counter (CCS G#0005, 8 bits) counts frames it sent.
         let f = crate::platform::cntfrq();
-        let sensor = || { let mut b = [0u8; 1]; crate::hsi2c::write_read(SENSOR_BUS.base, SENSOR_ADDR, &[0x00, 0x05], &mut b).map(|_| b[0] as u32).unwrap_or(0) };
+        let sensor = || { let mut b = [0u8; 1]; crate::hsi2c::write_read(sbus, saddr, &[0x00, 0x05], &mut b).map(|_| b[0] as u32).unwrap_or(0) };
         let (t0, b0, s0) = (crate::platform::cntpct(), rd(0x1C32_049C), sensor());
         let mut idx = idx_after_loop();
         while crate::platform::cntpct().wrapping_sub(t0) < 2 * f {
@@ -2778,7 +2866,7 @@ pub fn pdma_probe(rep: &mut Vec<u8>, init: Option<Vec<u8>>, prog: Option<Vec<u8>
         row.push('\n');
         line(rep, row);
     }
-    let soff = crate::hsi2c::write_bytes(SENSOR_BUS.base, SENSOR_ADDR, &[0x01, 0x00, 0x00, 0x00]);
+    let soff = crate::hsi2c::write_bytes(sbus, saddr, shot.cam.stream(false));
     spin_us(50_000);
     line(rep, alloc::format!("stream on {:?} off {:?}; sensor frame counter:{series}\n", son.is_ok(), soff.is_ok()));
     line(rep, alloc::format!("PDMA after: ctrl G#{:X} index G#{:X} +G#2C G#{:X} +G#30 G#{:X} +G#34 G#{:X} +G#38 G#{:X} +G#3C G#{:X} +G#44 G#{:X}\n", rd(PDMA), rd(PDMA + 0x10), rd(PDMA + 0x2C), rd(PDMA + 0x30), rd(PDMA + 0x34), rd(PDMA + 0x38), rd(PDMA + 0x3C), rd(PDMA + 0x44)));

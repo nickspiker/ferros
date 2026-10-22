@@ -52,6 +52,8 @@ mod camera_snap;
 mod camera_close;
 mod camera_rx;
 #[cfg(feature = "pixel8")]
+mod camera_rx_uw;
+#[cfg(feature = "pixel8")]
 mod spi;
 #[cfg(feature = "pixel8")]
 mod touch;

@@ -359,3 +359,16 @@ Driven from adb through the Pixel Camera app (`tools/husky-hv-camall.sh`): open 
 - **Front ("dokkaebi", G#10 on hsi2c@10890000):** not captured yet on its own bus; the flip tap reaches it.
 
 Still to capture for each: its CSI link and PHY lanes (an ISP front-end capture of that session) and its PDMA program (`FERROS_HV_PDMA_DUMP`). The power-up comes from each module's `module_power_seq` in the device tree, as for the main camera.
+
+## The ultrawide takes pictures (2026-10-22)
+
+`diag cam uw up` then `diag cam pdma uw`, built with `FERROS_CAM_UW=target/cam/uw` (local bundle). Image 4000 × 3000 RAW10 at stride G#13C0, pulled with `tools/camera-pull.sh <prefix> A2000000 4000 3000 5056`.
+
+What it took, all from captures of a Linux switch from the main camera to the ultrawide:
+- **Power** from the existing module table (`power_module`): camera-PMIC LDO1, 8, sub-PMIC LDO12, LDO2, 4, 6 through the overvoltage guard, load switch G#1711, reset gpp6-3. It answers **G#0787 (Sony IMX787)** at G#0016.
+- **Sensor init:** 231 writes including a 4034-byte settings upload, from the single-bus I2C capture (`tools/camera-init.py`, integrity 0). Stream on is G#0100 = 1 alone (the main's write also carries orientation).
+- **Receiver:** CSI **link 2** (G#1C06_0000) and the **csis2 D-PHY lanes** at G#1C10_2300/2400/2500, with the same lane values as the main's csis1 lanes, SYSREG G#1C02_0500 = 4 (`camera_rx_uw.rs`, from `tools/camera-cpu.py`).
+- **Front end:** the same 4495-register PDMA program with its own values: geometry G#FA0 × G#BB8, stride G#13C0, request words G#8D where the main has G#8F. Its CPU setup comes from the capture with the 25 address registers dropped; the program sets those.
+- **The image builder** now remaps the 25 address registers by name and maps each 16 MiB IOVA granule to one slot, offset kept (`tools/camera-pdma-image.py`). The guessed IOVA window failed on this session's addresses, and two registers hold a base and an offset into the same buffer. The image body still pins to slot 2, so it lands at G#A200_0000 for either camera.
+
+The sensor runs at about 30 frames a second and the whole frame lands (G#E77100 bytes). The front end's buffer index stays at 0 and its image path reports SOF without EOF after the first frame, so the per-frame acknowledgement may differ from the main's. Next: its lens actuator (G#0F, the main's protocol), then its own IDT (`derived/cam3-ultrawide.idt.vsf`).
