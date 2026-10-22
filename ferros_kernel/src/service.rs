@@ -817,6 +817,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"boot" {
+                                            // `diag boot`: reset-to-entry, then each boot step's time since ferros was entered (checklist.rs).
+                                            resp.extend_from_slice(crate::checklist::boot_times().as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"pmic rails" {
                                             // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
                                             let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };

@@ -184,7 +184,44 @@ pub fn start(cntfrq: u64, done: &[Item]) {
 }
 
 /// Turn one item green and push a frame.
+/// Boot timing: the counter when the cold kernel was entered (set right after the killswitch arms) and, per item, the counter when it was first marked. Kept apart from the drawn list so items marked before the panel is adopted still get a time. Read by `diag boot`.
+pub static ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static AT: [core::sync::atomic::AtomicU64; 18] = [const { core::sync::atomic::AtomicU64::new(0) }; 18];
+
+fn stamp(item: Item) {
+    let _ = AT[item as usize].compare_exchange(0, crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `diag boot`: milliseconds from reset to ferros's entry, then each checklist item's time since entry, in the order they happened.
+pub fn boot_times() -> alloc::string::String {
+    use core::sync::atomic::Ordering::Relaxed;
+    let f = crate::platform::cntfrq();
+    let us = |t: u64| t * 1_000_000 / f;
+    let e = ENTRY.load(Relaxed);
+    let mut s = alloc::format!("entry A#{} ms after reset\n", us(e) / 1000);
+    let p = PRESS.load(Relaxed);
+    if p != 0 {
+        s.push_str(&alloc::format!("  gate answered      +A#{} us\n", us(p.saturating_sub(e))));
+    }
+    let mut v: alloc::vec::Vec<(u64, &str)> = alloc::vec::Vec::new();
+    for (_, items) in GROUPS.iter() {
+        for &(item, label) in items.iter() {
+            let t = AT[item as usize].load(Relaxed);
+            if t != 0 {
+                v.push((t, label));
+            }
+        }
+    }
+    v.sort_by_key(|x| x.0);
+    for (t, label) in v {
+        s.push_str(&alloc::format!("  {label:<28} +A#{} us\n", us(t.saturating_sub(e))));
+    }
+    s
+}
+
 pub fn mark(item: Item) {
+    stamp(item);
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };
@@ -197,6 +234,7 @@ pub fn mark(item: Item) {
 
 /// Mark an item up through a stand-in (yellow) and redraw it.
 pub fn mark_interim(item: Item) {
+    stamp(item);
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };

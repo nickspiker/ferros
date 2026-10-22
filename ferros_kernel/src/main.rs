@@ -1581,6 +1581,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
+    // Boot timing starts here: everything after this is ferros's own time (`diag boot`).
+    checklist::ENTRY.store(platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
     let cached = cachemap::enable();
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
@@ -1604,6 +1606,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (0, ready::Choice::Ferros)
     };
     let _ = pressed_at;
+    checklist::PRESS.store(pressed_at, core::sync::atomic::Ordering::Relaxed);
 
     // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
     let rep_snap: [u32; 9] = {
