@@ -3,8 +3,9 @@
 //! The circles: the device itself first, at the centre (its front is the dashboard, its back the settings), then the apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
-//! - One finger drags the plane; two fingers pinch to zoom about the point between them.
-//! - A one-finger tap on a circle arrives at it: the camera flies until the circle fills the screen, and its front is shown. A tap in the air around an arrived circle leaves it.
+//! - One finger drags the plane; two fingers pinch to zoom and twist to turn it, about the point between them.
+//! - A one-finger tap on a circle arrives at it: the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
+//! - Nothing is animated and nothing is timed (owner, 2026-10-22: "no animations ... instant, always, no timers"): a view is simply there on the next frame, and a tap is fingers down and up without moving, however long they rested.
 //! - A two-finger tap turns a circle over: its back, the facts about it and its few choices. Another two-finger tap turns it back.
 //! - Arranging by hand (from the device's back): two fingers that land on a circle move and size that circle instead of the view; a tap in the air ends it.
 //!
@@ -57,10 +58,8 @@ const FILL: u32 = 0x2A2A2A;
 
 /// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
 const SLOP: i64 = 24;
-/// A tap is down and up within a quarter second... and a half for two fingers, which rarely land together.
-const TAP_MS: u64 = 512;
-/// A flight is sixteen frames, ~133 ms at 120 Hz.
-const FLIGHT: i64 = 16;
+/// One, in the rotation's Q14.
+const ONE: i64 = 1 << 14;
 
 /// A circle's radius in world units: area = share x the map's total, so r = 110 x sqrt(4 x share). Integer square root, no floats.
 fn radius_of(share: u32) -> i64 {
@@ -193,28 +192,37 @@ impl Batch {
     }
 }
 
-/// The camera: the centre in world units ×256, the zoom in panel pixels per world unit, 16.16.
+/// The camera: the centre in world units ×256, the zoom in panel pixels per world unit, 16.16, and the turn as a unit vector (cos, sin) in Q14 — world to screen is that rotation, then the zoom. A vector rather than an angle: a twist composes by one complex multiply and nothing needs a sine.
 #[derive(Clone, Copy, PartialEq)]
 struct Cam {
     x: i64,
     y: i64,
     z: i64,
+    c: i64,
+    s: i64,
 }
 const Z_MIN: i64 = 9830; // 0.15
 const Z_MAX: i64 = 12 << 16;
 
 impl Cam {
+    /// A panel offset from the centre, in pixels, to world units ×256: the rotation undone, then the zoom.
+    fn delta(&self, dx: i64, dy: i64) -> (i64, i64) {
+        (((self.c * dx + self.s * dy) << 10) / self.z, ((self.c * dy - self.s * dx) << 10) / self.z)
+    }
     /// A panel pixel to world units ×256.
     fn world(&self, w: i64, h: i64, sx: i64, sy: i64) -> (i64, i64) {
-        (self.x + ((sx - w / 2) << 24) / self.z, self.y + ((sy - h / 2) << 24) / self.z)
+        let (dx, dy) = self.delta(sx - w / 2, sy - h / 2);
+        (self.x + dx, self.y + dy)
     }
-    fn op(&self, keep: bool) -> [u8; 14] {
-        let mut m = [0u8; 14];
+    fn op(&self, keep: bool) -> [u8; 18] {
+        let mut m = [0u8; 18];
         m[0] = 14;
         m[1..5].copy_from_slice(&(self.x as i32).to_le_bytes());
         m[5..9].copy_from_slice(&(self.y as i32).to_le_bytes());
         m[9..13].copy_from_slice(&(self.z as u32).to_le_bytes());
         m[13] = keep as u8;
+        m[14..16].copy_from_slice(&(self.c as i16).to_le_bytes());
+        m[16..18].copy_from_slice(&(self.s as i16).to_le_bytes());
         m
     }
 }
@@ -333,29 +341,16 @@ impl Map {
         let (bw, bh) = (((x1 - x0) >> 8).max(1), ((y1 - y0) >> 8).max(1));
         let z = ((self.w * 7 / 8) << 16) / bw;
         let z = z.min(((self.h * 7 / 8) << 16) / bh).clamp(Z_MIN, 1 << 16);
-        Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z }
+        Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z, c: self.cam.c, s: self.cam.s }
     }
 
     /// The camera that has arrived at circle i: it fills the panel's width, less a margin.
     fn at(&self, i: usize) -> Cam {
-        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(Z_MIN, Z_MAX) }
+        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(Z_MIN, Z_MAX), c: self.cam.c, s: self.cam.s }
     }
 
-    /// Fly the camera to `to`: sixteen frames, easing out, the visible span (not the zoom) moving evenly so the approach feels like one motion.
+    /// Go to `to`: the camera is simply there (no animation).
     fn fly(&mut self, to: Cam) {
-        let from = self.cam;
-        let (s0, s1) = ((1i64 << 32) / from.z, (1i64 << 32) / to.z);
-        let mut tick = now();
-        for k in 1..=FLIGHT {
-            let e = 256 - (FLIGHT - k) * (FLIGHT - k) * 256 / (FLIGHT * FLIGHT);
-            let span = s0 + (s1 - s0) * e / 256;
-            self.cam = Cam { x: from.x + (to.x - from.x) * e / 256, y: from.y + (to.y - from.y) * e / 256, z: ((1i64 << 32) / span.max(1)).clamp(Z_MIN, Z_MAX) };
-            let mut b = Batch::new();
-            b.op(&self.cam.op(false));
-            b.send(self.display);
-            tick += freq() / 120;
-            sleep_until(tick);
-        }
         self.cam = to;
     }
 
@@ -640,7 +635,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         xs: xs.map(|x| x << 8),
         ys: ys.map(|y| y << 8),
         rs,
-        cam: Cam { x: 0, y: 0, z: 1 << 16 },
+        cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
         editing: false,
         rows: [(0, 0, Choice::Labels); 8],
@@ -667,7 +662,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut prev = [(false, 0i64, 0i64); 16];
     // The touch session: from the first finger down to the last one up.
     let mut down = false;
-    let mut t0 = 0u64;
     let mut most = 0usize;
     let mut moved = false;
     let mut start = [(false, 0i64, 0i64); 16];
@@ -716,7 +710,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // The session: when it began, how many fingers it ever held, where each landed, and whether any went further than a resting finger does.
         if held > 0 && !down {
             down = true;
-            t0 = now();
             most = 0;
             moved = false;
             start = [(false, 0, 0); 16];
@@ -737,7 +730,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if held == 0 && down {
             down = false;
-            if !moved && now().wrapping_sub(t0) < freq() * TAP_MS / 1000 && most <= 2 {
+            if !moved && most <= 2 {
                 // Where the fingers landed, on average.
                 let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
                 for s in start.iter().filter(|s| s.0) {
@@ -770,8 +763,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if nb == 1 {
                 // One finger: the plane follows it.
                 let id = both[0];
-                map.cam.x -= ((cur[id].1 - prev[id].1) << 24) / map.cam.z;
-                map.cam.y -= ((cur[id].2 - prev[id].2) << 24) / map.cam.z;
+                let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
+                map.cam.x -= dx;
+                map.cam.y -= dy;
             } else if nb == 2 {
                 let (a, b) = (both[0], both[1]);
                 let (pa, pb, ca, cb) = ((prev[a].1, prev[a].2), (prev[b].1, prev[b].2), (cur[a].1, cur[a].2), (cur[b].1, cur[b].2));
@@ -784,19 +778,30 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 if let (true, Some(i)) = (map.editing, grab) {
                     // Arranging: the circle follows the point between the fingers and grows or shrinks with their spread.
-                    map.xs[i] += ((m1x - m0x) << 24) / map.cam.z;
-                    map.ys[i] += ((m1y - m0y) << 24) / map.cam.z;
+                    let (dx, dy) = map.cam.delta(m1x - m0x, m1y - m0y);
+                    map.xs[i] += dx;
+                    map.ys[i] += dy;
                     if d0 > 8 * 16 {
                         map.rs[i] = (map.rs[i] * d1 / d0).clamp(24, 1200);
                     }
                     map.send_move(i);
                     scene_moved = true;
-                } else if d0 > 8 * 16 {
-                    // Two fingers: zoom by how much they spread, about the point between them, so what is under your fingers stays under your fingers.
+                } else if d0 > 8 * 16 && d1 > 8 * 16 {
+                    // Two fingers: zoom by how much they spread and turn by how much they twist, about the point between them, so what is under your fingers stays under your fingers.
                     let (wx, wy) = map.cam.world(w, h, m0x, m0y);
                     map.cam.z = (map.cam.z * d1 / d0).clamp(Z_MIN, Z_MAX);
-                    map.cam.x = wx - ((m1x - w / 2) << 24) / map.cam.z;
-                    map.cam.y = wy - ((m1y - h / 2) << 24) / map.cam.z;
+                    // The twist between the two finger vectors, as (cos, sin) = (dot, cross) / (|a| |b|), composed onto the camera's own turn and brought back to unit length.
+                    let (ax, ay, bx, by) = (pb.0 - pa.0, pb.1 - pa.1, cb.0 - ca.0, cb.1 - ca.1);
+                    let (dot, cross) = (ax * bx + ay * by, ax * by - ay * bx);
+                    // |a| |b| from the two spreads (sixteenths of a pixel each), so the product comes back near Q14 before the exact renormalising square root.
+                    let ab = (d0 * d1 >> 8).max(1);
+                    let (c, s) = ((map.cam.c * dot - map.cam.s * cross) / ab, (map.cam.s * dot + map.cam.c * cross) / ab);
+                    let len = isqrt(c * c + s * s).max(1);
+                    map.cam.c = c * ONE / len;
+                    map.cam.s = s * ONE / len;
+                    let (dx, dy) = map.cam.delta(m1x - w / 2, m1y - h / 2);
+                    map.cam.x = wx - dx;
+                    map.cam.y = wy - dy;
                 }
             }
             if map.cam != before || scene_moved {

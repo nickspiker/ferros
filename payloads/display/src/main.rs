@@ -19,7 +19,7 @@
 //! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the phone is a map of your life).
 //! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 0 = none), `len u8`, `label [16]`.
 //! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`, the centre in world units ×256 (24.8, so a pan at high zoom moves by a pixel, not a world unit): draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
-//!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15).
+//!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15). Optional bytes 14-17: the turn, `[cos i16][sin i16]` in Q14 (world to screen is that rotation, then the zoom); absent = upright.
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]`: one circle of the scene moved and resized in place (the owner arranging by hand).
@@ -748,13 +748,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     if m.get(13).copied().unwrap_or(0) & 1 == 0 {
                         pixels.fill(0);
                     }
+                    // The turn: (cos, sin), Q14 on the wire.
+                    let (rc, rs) = if m.len() >= 18 {
+                        (i16::from_le_bytes([m[14], m[15]]) as f32 / 16384.0, i16::from_le_bytes([m[16], m[17]]) as f32 / 16384.0)
+                    } else {
+                        (1.0, 0.0)
+                    };
                     let mut t_phase = now();
                     {
                         let mut c = Canvas::new(pixels, width, height, &mut damage);
                         for i in 0..unsafe { SCENE_N } {
                             let cir = unsafe { SCENE[i] };
-                            let sx = (cir.x as f32 - cx) * z + w * 0.5;
-                            let sy = (cir.y as f32 - cy) * z + h * 0.5;
+                            let (dx, dy) = (cir.x as f32 - cx, cir.y as f32 - cy);
+                            let sx = (rc * dx - rs * dy) * z + w * 0.5;
+                            let sy = (rs * dx + rc * dy) * z + h * 0.5;
                             let sr = cir.r as f32 * z;
                             if sr < 1.0 || sx + sr < 0.0 || sx - sr > w || sy + sr < 0.0 || sy - sr > h {
                                 continue;
@@ -777,15 +784,22 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let (x0, y0) = ((sx - ri).max(0.0) as usize, (sy - ri).max(0.0) as usize);
                                 let (x1, y1) = (((sx + ri) as usize).min(width), ((sy + ri) as usize).min(height));
                                 let step = size as f32 / (2.0 * ri);
+                                let half = size as f32 * 0.5;
                                 for yy in y0..y1 {
-                                    let v = (((yy as f32 - (sy - ri)) * step) as usize).min(size - 1);
+                                    let oy = yy as f32 - sy;
                                     for xx in x0..x1 {
                                         // Front to back: only where nothing is painted yet (tested first: under an arrived circle's overlay that is every pixel), and only the icon's solid part — its rim goes to the fill underneath, which carries the antialiased edge.
                                         let dst = &mut c.pixels[yy * width + xx];
                                         if *dst >> 24 != 0 {
                                             continue;
                                         }
-                                        let u = (((xx as f32 - (sx - ri)) * step) as usize).min(size - 1);
+                                        // The icon turns with the map: each panel pixel taken back through the rotation into the icon.
+                                        let ox = xx as f32 - sx;
+                                        let (fu, fv) = ((rc * ox + rs * oy) * step + half, (rc * oy - rs * ox) * step + half);
+                                        if fu < 0.0 || fv < 0.0 {
+                                            continue;
+                                        }
+                                        let (u, v) = ((fu as usize).min(size - 1), (fv as usize).min(size - 1));
                                         let k = (v * size + u) * 4;
                                         if px[k + 3] < 128 {
                                             continue;

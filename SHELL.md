@@ -140,7 +140,9 @@ The device circle never lights. Lit means a person sent you something, and the d
 The proposal above, with the owner's gestures ("two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
 
 - **The device's circle** sits at the centre of the map with ferros's logo as its icon. It never lights.
-- **One-finger tap** on a circle arrives at it. The camera flies for sixteen frames, easing out, until the circle fills the width, and the circle's front shows. A tap in the air around it flies back to the whole map. Moving away (a drag or a pinch) also leaves.
+- **One-finger tap** on a circle arrives at it: the next frame has the circle filling the width with its front showing. A tap in the air around it goes back to the whole map. Moving away (a drag or a pinch) also leaves.
+- **Nothing animates and nothing is timed** (owner: "no animations ... instant, always, no timers"). A tap is fingers down and up without moving past the slop, however long they rested.
+- **Two fingers** pinch to zoom and twist to turn the map, about the point between them. The turn is a unit vector (cos, sin) in Q14 that each twist composes onto by one complex multiply, so nothing needs a sine. The icons turn with the map.
 - **Two-finger tap** turns a circle over to its back. Another turns it back.
 - **The device's front** is the dashboard: battery, press to ready, since power on, USB, processes, keys in the vault, and the number base. It redraws once a second, every number in the device base, as glyphs. The facts come from the kernel's `SYS_FACTS` (process.rs), which needs no capability: none of them is a key, a handle or a serial.
 - **The device's back** is the settings:
