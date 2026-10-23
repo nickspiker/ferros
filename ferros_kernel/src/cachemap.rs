@@ -305,7 +305,7 @@ pub fn off_for_handover() {
             "msr sctlr_el2, {t}",
             "isb",
             "tlbi alle2",
-            "ic iallu",
+            "ic ialluis",
             "dsb sy",
             "isb",
             // Back to the loader's register layout (non-VHE), as the next image expects.
@@ -344,7 +344,8 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
         asm!("dsb ish");
         let mut a = base;
         while a < base + size {
-            asm!("tlbi vae1, {x}", x = in(reg) (a as u64) >> 12);
+            // Inner shareable: every core's TLB, not this one's — the workers run processes too (smp.rs).
+            asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
             a += PAGE;
         }
         asm!("dsb ish", "isb");
@@ -363,6 +364,6 @@ pub fn sync_code(addr: usize, len: usize) {
             asm!("dc cvau, {}", in(reg) a);
             a += 64;
         }
-        asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+        asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
     }
 }

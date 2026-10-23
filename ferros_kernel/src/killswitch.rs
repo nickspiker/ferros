@@ -111,6 +111,59 @@ pub fn arm_power_key() {
     wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
 }
 
+/// This core's redistributor frame (GICR_TYPER[63:32] = its affinity), if any.
+fn my_gicr() -> Option<usize> {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let aff = (mpidr & 0xFF_FFFF) as u32 | (((mpidr >> 32) & 0xFF) as u32) << 24;
+    for i in 0..16usize {
+        let base = GICR + i * GICR_STRIDE;
+        if rd(base + 0x0C) == aff {
+            return Some(base);
+        }
+        if rd(base + 0x08) & (1 << 4) != 0 {
+            break;
+        }
+    }
+    None
+}
+
+/// A secondary core's own interrupt setup (smp.rs): its redistributor awake with every SGI/PPI off, the slice timer's PPI on, the CPU interface up, physical IRQs to EL2, unmasked. The distributor, the keys and every SPI stay as the kernel's core set them: nothing shared is touched here.
+pub fn arm_core() -> bool {
+    let Some(gicr) = my_gicr() else { return false };
+    wr(gicr + 0x14, rd(gicr + 0x14) & !(1 << 1));
+    for _ in 0..(1 << 20) {
+        if rd(gicr + 0x14) & (1 << 2) == 0 {
+            break;
+        }
+    }
+    wr(gicr + GICR_SGI + 0x180, 0xFFFF_FFFF);
+    let sgi = gicr + GICR_SGI;
+    let pr = sgi + 0x400 + (26 & !3);
+    wr(pr, (rd(pr) & !(0xFF << ((26 & 3) * 8))) | (0x80 << ((26 & 3) * 8)));
+    wr(sgi + 0x100, 1 << 26);
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, S3_4_C12_C9_5",
+            "orr {t}, {t}, #1",
+            "msr S3_4_C12_C9_5, {t}",
+            "isb",
+            "mov {t}, #0xF0",
+            "msr S3_0_C4_C6_0, {t}",
+            "msr S3_0_C12_C12_3, xzr",
+            "mov {t}, #1",
+            "msr S3_0_C12_C12_7, {t}",
+            "mrs {t}, hcr_el2",
+            "orr {t}, {t}, #(1 << 4)",
+            "msr hcr_el2, {t}",
+            "isb",
+            "msr daifclr, #2",
+            t = out(reg) _,
+        );
+    }
+    true
+}
+
 /// Enable one shared interrupt (SPI, INTID 32..1020) for a process's interrupt grant: level-triggered, middle priority, routed to this core (the kernel's), enabled. `.Lirq` masks it when it fires; `unmask_spi` is the driver's ack.
 pub fn enable_spi(intid: u32) {
     if !(32..1020).contains(&intid) {

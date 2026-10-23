@@ -49,6 +49,7 @@ mod camera_events;
 #[cfg(feature = "pixel8")]
 mod camera_snap;
 mod x3;
+mod smp;
 #[cfg(feature = "pixel8")]
 mod camera_close;
 mod camera_rx;
@@ -567,6 +568,10 @@ _m1_entry:
 ferros_el0_enter:
     adrp    x9, __el0_kctx
     add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
     stp     x19, x20, [x9, #0]
     stp     x21, x22, [x9, #16]
     stp     x23, x24, [x9, #32]
@@ -653,6 +658,10 @@ ferros_el0_enter:
 ferros_el0_resume:
     adrp    x9, __el0_kctx
     add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
     stp     x19, x20, [x9, #0]
     stp     x21, x22, [x9, #16]
     stp     x23, x24, [x9, #32]
@@ -830,6 +839,10 @@ ferros_el0_resume:
     ldr     x0, [sp, #0]
     adrp    x9, __el0_kctx
     add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
     ldp     x19, x20, [x9, #0]
     ldp     x21, x22, [x9, #16]
     ldp     x23, x24, [x9, #32]
@@ -950,7 +963,8 @@ pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
 pub static mut __power_pressed: u64 = 0;
 /// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
 #[unsafe(no_mangle)]
-pub static mut __el0_kctx: [u64; 21] = [0; 21];
+/// The kernel's callee-saved registers, SP and d8-d15 around a process run, per core (24 words = 192 bytes a slot, MPIDR Aff1 picks it): two cores enter processes at once.
+pub static mut __el0_kctx: [[u64; 24]; 16] = [[0; 24]; 16];
 /// Whether the cold boot armed the UFS power-on write protect: 0 not attempted, 1 armed, 2 the device refused (DIAG UFS_POWER_ON_WP).
 pub static UFS_WP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// The flag as the boot found it (DIAG UFS_POWER_ON_WP_BEFORE): 0 clear, 1 set — it survived the reset — 2 unreadable.

@@ -1277,6 +1277,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no vsync thread\n");
         log.flush();
     }
+    // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
+    ferros_sys::pin(ferros_sys::CORES_BIG);
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);

@@ -36,8 +36,59 @@ struct Arcs {
 }
 
 struct Global<T>(UnsafeCell<T>);
-// Single core, never touched from the IRQ handler.
+// Every access is under `LOCK` (see `lock`); the IRQ handler touches none of it.
 unsafe impl<T> Sync for Global<T> {}
+
+// ---------------------------------------------------------------- the kernel lock and the cores
+//
+// One lock over the kernel's shared state (KERNEL.md "Cores"): taken for the microseconds a trap, a slice hand-out or a service-loop call holds it, never across a wait or a run at EL0. Every `pub fn` here takes it; everything private assumes it is held. `LOCK_SPINS` counts contended acquisitions for DIAG.
+static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static LOCK_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn lock() {
+    use core::sync::atomic::Ordering;
+    if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        return;
+    }
+    LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
+    while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+}
+fn unlock() {
+    LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+/// This core's index: MPIDR Aff1 (husky: 0-3 the A510s, 4-7 the A715s, 8 the X3).
+pub fn core() -> usize {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    ((mpidr >> 8) & 0xF) as usize
+}
+/// The thread each core is running at EL0, if any.
+static mut CURRENT: [Option<usize>; 16] = [None; 16];
+fn cur_get() -> Option<usize> {
+    unsafe { (*(&raw const CURRENT))[core()] }
+}
+fn cur_set(t: Option<usize>) {
+    unsafe { (*(&raw mut CURRENT))[core()] = t };
+}
+/// Slices run per core, for DIAG.
+pub static SLICES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+/// How many threads the run queue holds, readable without the lock: an idle core looks here before it takes the lock (five cores taking the lock on every `sev` contended it 100,000 times in a few seconds, 2026-10-23).
+pub static RUNNABLE_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+fn runnable_sync() {
+    RUNNABLE_N.store(k().runnable.len(), core::sync::atomic::Ordering::Release);
+}
+/// A thread onto the run queue; `sev` so an idle core in `wfe` looks.
+fn enqueue_back(t: usize) {
+    k().runnable.push_back(t);
+    runnable_sync();
+    unsafe { core::arch::asm!("sev") };
+}
+fn enqueue_front(t: usize) {
+    k().runnable.push_front(t);
+    runnable_sync();
+    unsafe { core::arch::asm!("sev") };
+}
 
 static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
 
@@ -215,12 +266,29 @@ struct Thread {
     proc: usize,
     frame: Frame,
     state: State,
+    /// Which cores may run it (bit = core index): the workers by default; a thread pins itself with `SYS_PIN` (the display's render thread to the X3). If none of its cores is up, any core takes it.
+    mask: u16,
+}
+/// The A715s (cores 4-7): where processes run unless they ask otherwise.
+pub const MASK_WORKERS: u16 = 0x00F0;
+/// The X3 (core 8): the kernel's core, for the one real compute path (the display's render thread) and otherwise idle between service-loop passes.
+pub const MASK_BIG: u16 = 0x0100;
+/// The cores that are up: the kernel's, and the workers smp.rs reports.
+fn cores_up() -> u16 {
+    MASK_BIG | ((crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed) as u16) << 4)
+}
+/// Whether thread `t` may run on this core.
+fn allowed_here(mask: u16) -> bool {
+    let here = 1u16 << core();
+    mask & here != 0 || mask & cores_up() == 0
 }
 
 struct Process {
     arc: Arc,
     cspace: Vec<CapEntry>,
     epoch: u64,
+    /// Ended (exit, a fault, a kill) while a thread of it still ran on another core: that thread leaves at its next trap, and the last one out frees the arc.
+    dying: bool,
     name: Vec<u8>,
     /// The process's console output is at the start of a line (so the next byte gets the name tag).
     line_start: bool,
@@ -242,7 +310,6 @@ struct Kernel {
     threads: Vec<Option<Thread>>,
     endpoints: Vec<Endpoint>,
     runnable: alloc::collections::VecDeque<usize>,
-    current: Option<usize>,
     /// Everything any process sent its console during the current kernel entry, each line tagged with the sender's name.
     console: Vec<u8>,
     /// Threads that ended during the current entry: (thread, exit value).
@@ -252,7 +319,7 @@ struct Kernel {
 }
 
 /// The scheduler trace (`diag sched`): the last TRACE scheduling events, (count, event, process, detail), written at `trace_at` round the ring. Static, not on the kernel heap.
-static TRACE_RING: Global<[(u64, u8, u8, u16); TRACE]> = Global(UnsafeCell::new([(0, 0, 0, 0); TRACE]));
+static TRACE_RING: Global<[(u64, u8, u8, u16, u8); TRACE]> = Global(UnsafeCell::new([(0, 0, 0, 0, 0); TRACE]));
 
 const TRACE: usize = 4096;
 const TR_CALL: u8 = 1;
@@ -275,12 +342,13 @@ fn tr(ev: u8, who: usize, detail: u64) {
     let kk = k();
     let now: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
-    unsafe { (*TRACE_RING.0.get())[kk.trace_at] = (now, ev, who as u8, detail as u16) };
+    unsafe { (*TRACE_RING.0.get())[kk.trace_at] = (now, ev, who as u8, detail as u16, core() as u8) };
     kk.trace_at = (kk.trace_at + 1) % TRACE;
 }
 
 /// Every thread with its process and state (`diag threads`).
 pub fn threads_report(out: &mut Vec<u8>) {
+    lock();
     let kk = k();
     let now: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
@@ -296,19 +364,25 @@ pub fn threads_report(out: &mut Vec<u8>) {
             State::Waiting(a, d) if a < 1024 => alloc::format!("irq_wait on INTID A#{a}{}, pending {}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }, unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) }),
             State::Waiting(a, d) => alloc::format!("wait on word G#{a:X}{}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }),
         };
-        out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc).as_bytes());
+        out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}, cores G#{:X}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc, t.mask).as_bytes());
     }
-    out.extend_from_slice(alloc::format!("runnable queue: {:?}; current {:?}\n", kk.runnable, kk.current).as_bytes());
+    out.extend_from_slice(alloc::format!("runnable queue: {:?}; running per core {:?}; slices per core {:?}; lock contended A#{}\n", kk.runnable, unsafe { *(&raw const CURRENT) }, SLICES.iter().map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(), LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+    unlock();
 }
 
 /// The trace, oldest first, as text: time since the first entry in microseconds, the event, the process name and the detail. Then per call: the wait before the server took it, the server's time to the reply, and the caller's wait after the reply before it ran again — the three parts of a round trip.
 pub fn sched_report(out: &mut Vec<u8>) {
+    lock();
+    sched_report_locked(out);
+    unlock();
+}
+fn sched_report_locked(out: &mut Vec<u8>) {
     let kk = k();
     let f = crate::platform::cntfrq();
     let ring = unsafe { &*TRACE_RING.0.get() };
     let n = TRACE;
     let name = |i: u8| -> alloc::string::String { alloc::string::String::from_utf8_lossy(&thread_name(i as usize)).into_owned() };
-    let entries: Vec<(u64, u8, u8, u16)> = (0..n).map(|k| ring[(kk.trace_at + k) % n]).filter(|e| e.0 != 0).collect();
+    let entries: Vec<(u64, u8, u8, u16, u8)> = (0..n).map(|k| ring[(kk.trace_at + k) % n]).filter(|e| e.0 != 0).collect();
     let Some(&(t0, ..)) = entries.first() else { return };
     let us = |t: u64| t.wrapping_sub(t0) * 1_000_000 / f;
     // The round trips: a call by X, the deliver to the server, the reply to X, X's next run or switch.
@@ -361,7 +435,7 @@ pub fn sched_report(out: &mut Vec<u8>) {
     // The last 512 events, so a stall just now is in view.
     let start = entries.len().saturating_sub(512);
     for e in &entries[start..] {
-        out.extend_from_slice(alloc::format!("{:>9} {:<10} {:<8} {}\n", us(e.0), TR_NAMES[e.1 as usize], name(e.2), e.3).as_bytes());
+        out.extend_from_slice(alloc::format!("{:>9} c{} {:<10} {:<8} {}\n", us(e.0), e.4, TR_NAMES[e.1 as usize], name(e.2), e.3).as_bytes());
     }
 }
 
@@ -370,7 +444,6 @@ static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
     threads: Vec::new(),
     endpoints: Vec::new(),
     runnable: alloc::collections::VecDeque::new(),
-    current: None,
     console: Vec::new(),
     exited: Vec::new(),
     ipc_round_trips: 0,
@@ -477,7 +550,9 @@ const SYS_WAKE: u64 = 17;
 const SYS_IRQ_WAIT: u64 = 18;
 /// irq_ack(cap): the driver has handled its device (and cleared its own pending bit there): the line is unmasked at the GIC.
 const SYS_IRQ_ACK: u64 = 19;
-const SYS_LAST: u64 = 19;
+/// pin(mask): the cores this thread may run on from now (bit = core index); 0 = the workers. Returns 0.
+const SYS_PIN: u64 = 20;
+const SYS_LAST: u64 = 20;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
 pub struct IrqLine {
@@ -546,9 +621,11 @@ pub fn set_pref(index: usize, value: u8) {
             tatau::set_base(b);
         }
     }
+    lock();
     for p in k().procs.iter().flatten() {
         p.write((PREFS + index) as u64, &[value]);
     }
+    unlock();
 }
 
 /// Whether `value` is valid for preference `index`.
@@ -672,37 +749,72 @@ fn deliver(server: usize, ep: usize) {
     sp.write(tok_off, &token);
     st.frame.x[0] = n as u64;
     st.state = State::Runnable;
-    kk.runnable.push_back(server);
+    // To the front: the caller is about to block, and the server it woke is the thread to run now (a direct hand-off, on this core).
+    enqueue_front(server);
     tr(TR_DELIVER, server, ep as u64);
 }
 
 /// Take the next runnable process (if any) and make it the one the trap returns into.
 fn switch_to_next(f: &mut Frame) -> bool {
-    let kk = k();
-    while let Some(next) = kk.runnable.pop_front() {
+    while let Some(next) = pick_runnable() {
         if let Some(np) = th(next) {
             if np.state == State::Runnable {
                 np.state = State::Running;
                 *f = np.frame;
-                kk.current = Some(next);
+                cur_set(Some(next));
                 tr(TR_SWITCH, next, 0);
                 return true;
             }
         }
     }
-    kk.current = None;
+    cur_set(None);
     tr(TR_PARK, 255, 0);
     false
+}
+
+/// The first queued thread this core may run, taken off the queue (a dead entry is dropped and the next tried).
+fn pick_runnable() -> Option<usize> {
+    let kk = k();
+    let i = kk.runnable.iter().position(|&t| kk.threads.get(t).and_then(|x| x.as_ref()).is_none_or(|x| allowed_here(x.mask)))?;
+    let t = kk.runnable.remove(i);
+    runnable_sync();
+    t
 }
 
 /// Called from `.Lel0_sync` for every synchronous exception taken from EL0, with the running process's live frame. Returns 0 to eret through `f` (which may now be another process's frame), 1 to leave EL0 (value in f.x[0]).
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
+    lock();
+    let r = el0_trap(f);
+    unlock();
+    r
+}
+
+/// A thread of a dying process traps (its process ended on another core while it ran): it leaves now, the last one freeing the arc. Returns true if the thread is gone.
+fn drain_dying(cur: usize) -> bool {
     let kk = k();
-    let Some(cur) = kk.current else {
+    let Some(pi) = kk.threads[cur].as_ref().map(|t| t.proc) else { return true };
+    if !kk.procs.get(pi).and_then(|p| p.as_ref()).is_some_and(|p| p.dying) {
+        return false;
+    }
+    kk.threads[cur] = None;
+    if !kk.threads.iter().any(|x| matches!(x, Some(x) if x.proc == pi)) {
+        if let Some(p) = kk.procs[pi].take() {
+            arc_free(p.arc);
+        }
+    }
+    true
+}
+
+fn el0_trap(f: &mut Frame) -> u64 {
+    let kk = k();
+    let Some(cur) = cur_get() else {
         f.x[0] = ERR;
         return 1;
     };
+    if drain_dying(cur) {
+        return if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 };
+    }
     let ec = (f.esr >> 26) & 0x3F;
     let pi = kk.threads[cur].as_ref().map(|t| t.proc).unwrap_or(usize::MAX);
     let base = proc_of(cur).map(|p| p.arc.base as u64).unwrap_or(0);
@@ -733,9 +845,15 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             frame.x[28] = p.arc.base as u64;
             frame.x[27] = m;
             frame.x[0] = arg;
-            let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable });
-            kk.runnable.push_back(nt);
+            let mask = t.mask;
+            let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask });
+            enqueue_back(nt);
             tr(TR_RUN, nt, 0xFFFF);
+            f.x[0] = 0;
+            0
+        }
+        SYS_PIN => {
+            t.mask = if f.x[0] as u16 == 0 { MASK_WORKERS } else { f.x[0] as u16 };
             f.x[0] = 0;
             0
         }
@@ -822,7 +940,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 if let Some(x) = x {
                     if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
                         x.state = State::Runnable;
-                        kk.runnable.push_back(i);
+                        enqueue_back(i);
                         tr(TR_WAKE, i, 0xFFFF);
                         n += 1;
                     }
@@ -927,7 +1045,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 } else {
                     t.state = State::Runnable;
                     t.frame = *f;
-                    kk.runnable.push_back(cur);
+                    enqueue_back(cur);
                     tr(TR_YIELD, cur, 0);
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
@@ -975,7 +1093,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                                     q.frame.x[0] = 2;
                                 }
                                 q.state = State::Runnable;
-                                kk.runnable.push_back(s);
+                                enqueue_back(s);
                                 tr(TR_WAKE_POLL, s, ep as u64);
                             }
                         }
@@ -1086,7 +1204,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                             ct.frame.x[0] = n as u64;
                             ct.state = State::Runnable;
                             // The caller runs now: it waited. The server goes to the back of the queue (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways).
-                            kk.runnable.push_front(caller);
+                            enqueue_front(caller);
                             kk.ipc_round_trips += 1;
                             tr(TR_REPLY, caller, cur as u64);
                             handed = true;
@@ -1096,7 +1214,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     if handed {
                         t.state = State::Runnable;
                         t.frame = *f;
-                        kk.runnable.push_back(cur);
+                        enqueue_back(cur);
                         if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                     } else {
                         0
@@ -1114,7 +1232,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         }
     };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
-    crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | kk.current.map(|c| c as u64).unwrap_or(0xFF) << 16);
+    crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | cur_get().map(|c| c as u64).unwrap_or(0xFF) << 16);
     r
 }
 
@@ -1137,9 +1255,15 @@ fn add_thread(t: Thread) -> usize {
 fn end_process(pi: usize, cur: usize, value: u64) {
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
+    // A thread running on another core right now is left to leave at its own next trap (`drain_dying`): its arc must stay until then.
+    let elsewhere = mine.iter().any(|&i| i != cur && matches!(kk.threads[i].as_ref().map(|t| t.state), Some(State::Running)));
     for &i in &mine {
+        if i != cur && elsewhere && matches!(kk.threads[i].as_ref().map(|t| t.state), Some(State::Running)) {
+            continue;
+        }
         kk.threads[i] = None;
         kk.runnable.retain(|&r| r != i);
+        runnable_sync();
         for ep in kk.endpoints.iter_mut() {
             ep.queue.retain(|(caller, _)| *caller != i);
             if ep.poller == Some(i) {
@@ -1150,18 +1274,23 @@ fn end_process(pi: usize, cur: usize, value: u64) {
             q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == i));
         }
     }
-    if let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.take()) {
+    if let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) {
         // Say how it ended on the console: a process that outlives its first slice (spawn already returned) has no one else to hear its exit value — a fault or a panic would otherwise vanish.
         if !p.line_start {
             kk.console.push(b'\n');
         }
-        kk.console.extend_from_slice(&p.name);
+        let name = p.name.clone();
+        kk.console.extend_from_slice(&name);
         kk.console.extend_from_slice(b": exit G#");
         for i in (0..16).rev() {
             kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
         }
         kk.console.push(b'\n');
-        arc_free(p.arc);
+        if elsewhere {
+            kk.procs[pi].as_mut().unwrap().dying = true;
+        } else if let Some(p) = kk.procs[pi].take() {
+            arc_free(p.arc);
+        }
     }
     kk.exited.push((cur, value));
 }
@@ -1169,7 +1298,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
 /// A faulting process's state on the console: `name: FAULT esr … elr+… far+… sp+…` then x0..x30, eight per line (G# hex; the three addresses as offsets into its arc).
 fn fault_report(f: &Frame, base: u64) {
     let kk = k();
-    let Some(cur) = kk.current else { return };
+    let Some(cur) = cur_get() else { return };
     let name = thread_name(cur);
     let hex = |out: &mut Vec<u8>, v: u64| {
         out.extend_from_slice(b"G#");
@@ -1207,17 +1336,20 @@ fn fault_report(f: &Frame, base: u64) {
 /// The slice ran out while the current process was at EL0: park it runnable (back of the queue) and leave to the kernel.
 #[unsafe(no_mangle)]
 pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
-    let kk = k();
-    if let Some(cur) = kk.current {
-        if let Some(p) = th(cur) {
-            p.frame = *f;
-            p.state = State::Runnable;
-            kk.runnable.push_back(cur);
+    lock();
+    if let Some(cur) = cur_get() {
+        if !drain_dying(cur) {
+            if let Some(p) = th(cur) {
+                p.frame = *f;
+                p.state = State::Runnable;
+                enqueue_back(cur);
+            }
+            tr(TR_PREEMPT, cur, 0);
         }
-        tr(TR_PREEMPT, cur, 0);
     }
-    kk.current = None;
+    cur_set(None);
     f.x[0] = PREEMPTED;
+    unlock();
     1
 }
 
@@ -1252,7 +1384,7 @@ fn wake_sleepers() {
             if let State::Sleeping(d) = p.state {
                 if d <= now {
                     p.state = State::Runnable;
-                    kk.runnable.push_back(i);
+                    enqueue_back(i);
                     tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
                 }
             } else if let State::Waiting(a, d) = p.state {
@@ -1260,7 +1392,7 @@ fn wake_sleepers() {
                 if a < 1024 && irq_pending_take(a as u32) {
                     p.state = State::Runnable;
                     p.frame.x[0] = 0;
-                    kk.runnable.push_front(i);
+                    enqueue_front(i);
                     tr(TR_WAKE, i, a as u64);
                     continue;
                 }
@@ -1268,7 +1400,7 @@ fn wake_sleepers() {
                 if d != 0 && d <= now {
                     p.state = State::Runnable;
                     p.frame.x[0] = 2;
-                    kk.runnable.push_back(i);
+                    enqueue_back(i);
                     tr(TR_WAKE, i, 0xFFFE);
                 }
             }
@@ -1277,48 +1409,76 @@ fn wake_sleepers() {
 }
 
 pub fn run_slice() -> bool {
+    lock();
     wake_sleepers();
     let kk = k();
-    let Some(next) = kk.runnable.pop_front() else { return false };
-    let Some(p) = th(next) else { return true };
+    let Some(next) = pick_runnable() else {
+        unlock();
+        return false;
+    };
+    let Some(p) = th(next) else {
+        unlock();
+        return true;
+    };
     if p.state != State::Runnable {
+        unlock();
         return true;
     }
     p.state = State::Running;
     let frame = p.frame;
-    kk.current = Some(next);
+    cur_set(Some(next));
     tr(TR_RUN, next, kk.runnable.len() as u64);
+    SLICES[core()].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    unlock();
     arm_slice();
     unsafe { ferros_el0_resume(&frame) };
     disarm_slice();
-    k().current = None;
+    lock();
+    cur_set(None);
+    unlock();
     true
 }
 
 /// Append to the kernel's process console (e.g. a boot-time spawn's output, kept for `diag console`).
 pub fn push_console(bytes: &[u8]) {
+    lock();
     k().console.extend_from_slice(bytes);
+    unlock();
 }
 
 /// Drain what processes have sent their consoles since the last drain.
 pub fn take_console() -> Vec<u8> {
-    core::mem::take(&mut k().console)
+    lock();
+    let v = core::mem::take(&mut k().console);
+    unlock();
+    v
 }
 
 /// End a process by name from outside (the service loop, `diag restart`), whatever it is doing: its arc freed, its calls still queued on any endpoint dropped, and every reply capability pointing at it removed from every other process — so a late reply can never reach whatever process takes its slot next. A server's queued callers stay queued on the endpoint for the next server. Returns whether a process of that name was found. Never call it for the process that is running (only from the kernel's own loop, where none is).
 pub fn kill(name: &[u8]) -> bool {
+    lock();
+    let r = kill_locked(name);
+    unlock();
+    r
+}
+fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
-    if kk.current.is_some_and(|c| kk.threads.get(c).and_then(|t| t.as_ref()).is_some_and(|t| t.proc == i)) {
-        return false;
-    }
-    if let Some(p) = kk.procs[i].take() {
+    let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
+    // A thread of it running on another core leaves at its next trap (`drain_dying`); the arc goes with the last of them.
+    let elsewhere = mine.iter().any(|&t| matches!(kk.threads[t].as_ref().map(|x| x.state), Some(State::Running)));
+    if elsewhere {
+        kk.procs[i].as_mut().unwrap().dying = true;
+    } else if let Some(p) = kk.procs[i].take() {
         arc_free(p.arc);
     }
-    let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
     for t in mine {
+        if elsewhere && matches!(kk.threads[t].as_ref().map(|x| x.state), Some(State::Running)) {
+            continue;
+        }
         kk.threads[t] = None;
         kk.runnable.retain(|&r| r != t);
+        runnable_sync();
         for ep in kk.endpoints.iter_mut() {
             ep.queue.retain(|(caller, _)| *caller != t);
             if ep.poller == Some(t) {
@@ -1336,7 +1496,10 @@ pub fn kill(name: &[u8]) -> bool {
 
 /// How many processes are alive (running, runnable or blocked).
 pub fn alive() -> usize {
-    k().procs.iter().filter(|p| p.is_some()).count()
+    lock();
+    let n = k().procs.iter().filter(|p| p.is_some()).count();
+    unlock();
+    n
 }
 
 /// What a spawn left behind.
@@ -1407,26 +1570,43 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
-    let objects = resolve(grants)?;
-    let (me, arc, in_off) = build(name, code, input, &objects, ihi, guard, exec_len)?;
+    lock();
+    let objects = match resolve(grants) {
+        Ok(o) => o,
+        Err(e) => {
+            unlock();
+            return Err(e);
+        }
+    };
+    let (me, arc, in_off) = match build(name, code, input, &objects, ihi, guard, exec_len) {
+        Ok(b) => b,
+        Err(e) => {
+            unlock();
+            return Err(e);
+        }
+    };
     let kk = k();
     kk.exited.clear();
     let trips0 = kk.ipc_round_trips;
     if let Some(p) = th(me) {
         p.state = State::Running;
     }
-    kk.current = Some(me);
+    cur_set(Some(me));
+    unlock();
     arm_slice();
     unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
     disarm_slice();
+    lock();
     let kk = k();
-    kk.current = None;
+    cur_set(None);
     let exit = match kk.exited.iter().find(|&&(i, _)| i == me) {
         Some(&(_, v)) => v,
         None if matches!(th(me).map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
         None => PARKED,
     };
-    Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
+    let out = Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 };
+    unlock();
+    Ok(out)
 }
 
 /// The grants' kernel objects and rights.
@@ -1471,7 +1651,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
-    let p = Process { arc, cspace, epoch, name: name.to_vec(), line_start: true, input: input.to_vec() };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec() };
     // Grants page: count, then the tokens in slot order. Then the code, then the input.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
@@ -1508,7 +1688,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
             kk.procs.len() - 1
         }
     };
-    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable });
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask: MASK_WORKERS });
     Ok((me, arc, in_off))
 }
 
@@ -1528,6 +1708,6 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
     let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len)?;
-    k().runnable.push_back(me);
+    enqueue_back(me);
     Ok(me)
 }

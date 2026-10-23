@@ -36,7 +36,11 @@ pub mod nr {
     pub const WAKE: u64 = 17;
     pub const IRQ_WAIT: u64 = 18;
     pub const IRQ_ACK: u64 = 19;
+    pub const PIN: u64 = 20;
 }
+/// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
+pub const CORES_WORKERS: u64 = 0x00F0;
+pub const CORES_BIG: u64 = 0x0100;
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
 pub const PREFS: u64 = 0xFC0;
@@ -290,6 +294,11 @@ pub fn irq_wait(cap: u64, deadline: u64) -> u64 {
 /// The device is handled: unmask its line.
 pub fn irq_ack(cap: u64) -> u64 {
     svc(nr::IRQ_ACK, cap, 0, 0, 0, 0)
+}
+
+/// The cores this thread may run on from now (`CORES_*`; 0 = the workers). Threads it spawns later inherit it.
+pub fn pin(mask: u64) -> u64 {
+    svc(nr::PIN, mask, 0, 0, 0, 0)
 }
 
 /// Answer a call; the token stops existing.

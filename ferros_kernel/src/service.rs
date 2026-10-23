@@ -508,6 +508,8 @@ pub fn run(mut b: Boot) -> ! {
     platform::crumb(0xA3);
     crate::checklist::at("usb: controller up");
 
+    // The worker cores (smp.rs): up once the kernel is settled on its own core, before the first slice is handed out.
+    crate::smp::launch_all();
     let freq = cntfrq();
     // Enumeration watchdog (cold-boot values): 2 s of total silence = dead attempt; 4 s since init without SET_CONFIGURATION = wedged EP0. Either re-inits PHY + DWC3, which the host sees as a fresh attach.
     let enum_timeout = freq * 2;
@@ -1479,6 +1481,17 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                                         {
+                                            let (up, on) = crate::smp::report();
+                                            append_hex(&mut resp, b"SMP_UP=", up);
+                                            for (k, v) in on.iter().enumerate() {
+                                                append_hex(&mut resp, alloc::format!("SMP_ON_{k}=").as_bytes(), *v as u32);
+                                            }
+                                            for (k, s) in crate::process::SLICES.iter().enumerate().filter(|(k, _)| (4..=8).contains(k)) {
+                                                append_hex(&mut resp, alloc::format!("SLICES_C{k}=").as_bytes(), s.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                            }
+                                            append_hex(&mut resp, b"LOCK_SPINS=", crate::process::LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                        }
+                                        {
                                             let (bad, at, val) = platform::canary_check();
                                             append_hex(&mut resp, b"CANARY_BAD=", bad);
                                             append_hex(&mut resp, b"CANARY_BASE=", platform::canary_base() as u32);
@@ -1965,6 +1978,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 core::hint::spin_loop();
                                             }
                                             platform::crumb(0xA6);
+                                            // The workers off first: the copy below rewrites the kernel under them (smp.rs).
+                                            crate::smp::stop_all();
                                             unsafe {
                                                 // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.
                                                 core::arch::asm!("msr daifset, #2");
