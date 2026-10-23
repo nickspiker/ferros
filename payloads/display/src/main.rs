@@ -23,7 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]`: one circle of the scene moved and resized in place (the owner arranging by hand).
-//! - 21 `ramps`: the present stage's test screen, straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
+//! - 21 `ramps`: the present stage's test screen (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -477,8 +477,14 @@ fn build_lut(lut: &mut [u16]) {
     }
 }
 
-/// The ordered 4×4 dither (Bayer), in sixteenths: added to a Q4 code before the fraction is dropped, it spreads the two-plus bits below the 10-bit code across each 4×4 cell, which at 489 ppi is 0.2 mm.
+/// The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
 const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// A Q4 10-bit code (= Q6 8-bit) to the 10-bit word's code: dithered to 8 bits by the threshold `t` (0-15, in 16ths of an 8-bit step), the two low bits zero for the DQE's truncation.
+#[inline(always)]
+fn dither8(q4: u32, t: u32) -> u32 {
+    ((q4 + t * 4) >> 6).min(255) << 2
+}
 
 /// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0].
 #[inline(always)]
@@ -498,8 +504,8 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256];
                 *d = 3;
                 continue;
             }
-            let t = bay[x & 3];
-            let q = |ch: usize, c: u32| ((lut8[ch][c as usize] + t) >> 4).min(1023) as u32;
+            let t = bay[x & 3] as u32;
+            let q = |ch: usize, c: u32| dither8(lut8[ch][c as usize] as u32, t);
             *d = pack10(q(0, p >> 16 & 0xFF), q(1, p >> 8 & 0xFF), q(2, p & 0xFF));
         }
         dst.copy_from_slice(out);
@@ -537,7 +543,7 @@ fn ramps(screen: &mut [u32], width: usize, height: usize, lut: &[u16]) {
                 let t = if dither { bay[x & 3] } else { 0 } as u32;
                 // The table, then E's gain on the code, then the dither.
                 let base = lut[v.min(65535) as usize] as u32;
-                let q = |ch: usize| ((base * E_CODE_Q15[ch] >> 15) + t >> 4).min(1023);
+                let q = |ch: usize| dither8(base * E_CODE_Q15[ch] >> 15, t);
                 *d = match k {
                     6 => pack10(q(0), 0, 0),
                     7 => pack10(0, q(1), 0),

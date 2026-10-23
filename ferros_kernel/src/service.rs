@@ -351,6 +351,12 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     // The shell draws in 10 bits (DISPLAY-CALIB.md, 2026-10-22): the 10 bpc blend with the DQE dither onto the 8 bpc link, the mode measured to carry a 10-bit layer's every code. ABL leaves the 8 bpc path; the full modeset is the only proven way across, so it runs once here, between the boot ring and the shell's first frame.
     crate::dpu::modeset_with(false, 0, 2, 0, true, cntfrq(), &mut rep);
     crate::checklist::at("home: 10 bpc blend");
+    // The DQE's dither in shift mode (EN | MODE = plain truncation of the two low bits): the display server dithers to 8-bit codes itself, from its 14-bit table, with the low two bits of each 10-bit code zero, so the panel gets exactly that pattern (12 bits effective; owner, 2026-10-22). A second ordered dither on top of ours, the DQE's own, partly cancelled it into visible steps. Applied with the DQE's shadow at the next present.
+    unsafe {
+        core::ptr::write_volatile((0x194D_0000usize + 0x2800) as *mut u32, 3);
+        let shd = 0x1947_0050usize;
+        core::ptr::write_volatile(shd as *mut u32, core::ptr::read_volatile(shd as *const u32) | 1 << 24);
+    }
     if !rep.is_empty() {
         crate::process::push_console(b"home: modeset: ");
         crate::process::push_console(&rep);

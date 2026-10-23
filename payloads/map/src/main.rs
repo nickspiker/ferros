@@ -3,11 +3,13 @@
 //! The circles: the device itself first, at the centre (its front is the dashboard, its back the settings), then the apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
-//! - One finger drags the plane; two fingers pinch to zoom and twist to turn it, about the point between them.
-//! - A one-finger tap on a circle arrives at it: the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
+//! - One finger dragged from the air moves the plane; dragged from a circle, it moves that circle.
+//! - Two fingers both inside one circle move and size that circle; otherwise they pinch to zoom and twist to turn the plane, about the point between them.
+//! - Only circles smaller than three quarters of the screen's width can be taken hold of: zoomed in until a circle fills the view, it is a place, and the fingers move the plane again.
+//! - A one-finger tap on a circle arrives at it (or launches it, for an app with a capsule): the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
+//! - Whatever was moved is kept in the vault when the fingers lift (owner, 2026-10-22: arranging is always on, no mode).
 //! - Nothing is animated and nothing is timed (owner, 2026-10-22: "no animations ... instant, always, no timers"): a view is simply there on the next frame, and a tap is fingers down and up without moving, however long they rested.
 //! - A two-finger tap turns a circle over: its back, the facts about it and its few choices. Another two-finger tap turns it back.
-//! - Arranging by hand (from the device's back): two fingers that land on a circle move and size that circle instead of the view; a tap in the air ends it.
 //!
 //! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
 //!
@@ -244,7 +246,6 @@ enum View {
 enum Choice {
     Base(u8),
     Labels,
-    Arrange,
 }
 
 /// The four bases in the order the chooser shows them: the house base first.
@@ -270,7 +271,6 @@ struct Map {
     rs: [i64; N],
     cam: Cam,
     view: View,
-    editing: bool,
     /// The device back's rows, as laid out by the last frame: (top, bottom, what).
     rows: [(i64, i64, Choice); 8],
     nrows: usize,
@@ -338,6 +338,26 @@ impl Map {
             n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
         }
         ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &b[..n])
+    }
+
+    /// The circle a finger at this panel pixel takes hold of: the one under it, if it is small enough on screen to be an object rather than the place the view is in, and only on the plane (an arrived circle's front or back moves the view).
+    fn grasp(&self, sx: i64, sy: i64) -> Option<usize> {
+        if self.view != View::Map {
+            return None;
+        }
+        self.hit(sx, sy).filter(|&i| (self.rs[i] * self.cam.z >> 16) < self.w * 3 / 8)
+    }
+
+    /// Keep every circle moved since the last time in the vault.
+    fn save_arranged(&mut self) {
+        for i in 0..N {
+            if self.arranged[i] {
+                self.arranged[i] = false;
+                if !self.save_place(i) {
+                    console(self.grants, b"map: the vault did not take a place\n");
+                }
+            }
+        }
     }
 
     /// The circle under a panel pixel, smallest first when they overlap (the smaller is drawn on top).
@@ -422,12 +442,7 @@ impl Map {
         b.op(&[1]);
         self.nrows = 0;
         match self.view {
-            View::Map => {
-                if self.editing {
-                    b.text(self.w / 2, self.h / 16, 34, GREY, 1, "arranging by hand");
-                    b.text(self.w / 2, self.h / 16 + 52, 28, DIM, 1, "two fingers on a circle move and size it \u{2022} tap the air to finish");
-                }
-            }
+            View::Map => {}
             View::Front(DEVICE) => self.dashboard(&mut b),
             View::Back(DEVICE) => self.settings(&mut b),
             View::Front(i) => {
@@ -531,9 +546,7 @@ impl Map {
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         b.text(cx, y, 36, GREY, 1, if labels { "names under circles: on" } else { "names under circles: off" });
         self.push_row(y - 44, y + 24, Choice::Labels);
-        y += 80;
-        b.text(cx, y, 36, GREY, 1, "arrange by hand");
-        self.push_row(y - 44, y + 24, Choice::Arrange);
+
 
         b.disc(cx, cy, r - r / 25 - 1, FILL);
     }
@@ -569,7 +582,7 @@ impl Map {
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
     fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
-        let before = (self.view, self.editing);
+        let before = self.view;
         self.tap_inner(fingers, sx, sy);
         let mut l = Line::new();
         let name = |v: View| match v {
@@ -578,7 +591,7 @@ impl Map {
             View::Back(i) => ("back of ", CIRCLES[i].label),
         };
         let (a, b) = name(self.view);
-        let _ = write!(l, "map: {fingers}-finger tap at {sx},{sy} -> {a}{b}{}{}\n", if self.editing { ", arranging" } else { "" }, if before == (self.view, self.editing) { " (no change)" } else { "" });
+        let _ = write!(l, "map: {fingers}-finger tap at {sx},{sy} -> {a}{b}{}\n", if before == self.view { " (no change)" } else { "" });
         console(self.grants, l.as_str().as_bytes());
     }
 
@@ -601,22 +614,6 @@ impl Map {
             let (dx, dy) = (sx - self.w / 2, sy - self.h / 2);
             dx * dx + dy * dy <= self.arrived_r() * self.arrived_r()
         };
-        if self.editing {
-            if fingers == 1 && self.hit(sx, sy).is_none() {
-                self.editing = false;
-                // The arrangement is kept now, once, rather than on every frame of a drag.
-                for i in 0..N {
-                    if self.arranged[i] {
-                        self.arranged[i] = false;
-                        if !self.save_place(i) {
-                            console(self.grants, b"map: the vault did not take a place\n");
-                        }
-                    }
-                }
-                self.draw();
-            }
-            return;
-        }
         match (fingers, self.view) {
             (1, View::Map) => {
                 if self.hit(sx, sy) == Some(RAMPS) {
@@ -645,13 +642,6 @@ impl Map {
                             let on = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
                             ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_LABELS, (!on) as u8);
                             self.send_scene();
-                            self.draw();
-                        }
-                        Some(Choice::Arrange) => {
-                            self.view = View::Map;
-                            self.editing = true;
-                            let to = self.home();
-                            self.fly(to);
                             self.draw();
                         }
                         None => {}
@@ -726,7 +716,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         rs,
         cam: Cam { x: 0, y: 0, z: 1 << 16, c: ONE, s: 0 },
         view: View::Map,
-        editing: false,
         rows: [(0, 0, Choice::Labels); 8],
         nrows: 0,
         arranged: [false; N],
@@ -765,9 +754,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut most = 0usize;
     let mut moved = false;
     let mut start = [(false, 0i64, 0i64); 16];
-    // Arranging: the circle two fingers took hold of this session (decided once, when the second finger moves), and whether it has been decided.
+    // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
-    let mut grab_decided = false;
+    let mut grab_n = 0usize;
     let mut last_dashboard = now();
     loop {
         // A preference changed (here or from the bridge): redraw in it.
@@ -814,7 +803,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             moved = false;
             start = [(false, 0, 0); 16];
             grab = None;
-            grab_decided = false;
+            grab_n = 0;
         }
         if down {
             most = most.max(held);
@@ -830,6 +819,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if held == 0 && down {
             down = false;
+            map.save_arranged();
             if !moved && most <= 2 {
                 // Where the fingers landed, on average.
                 let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
@@ -856,28 +846,42 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             let before = map.cam;
             let mut scene_moved = false;
+            if nb != grab_n && nb > 0 {
+                grab_n = nb;
+                grab = if nb == 1 {
+                    map.grasp(start[both[0]].1, start[both[0]].2)
+                } else {
+                    let (ga, gb) = (map.grasp(prev[both[0]].1, prev[both[0]].2), map.grasp(prev[both[1]].1, prev[both[1]].2));
+                    if ga == gb { ga } else { None }
+                };
+            }
             if nb >= 1 && map.view != View::Map {
                 // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again.
                 map.view = View::Map;
             }
             if nb == 1 {
-                // One finger: the plane follows it.
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
-                map.cam.x -= dx;
-                map.cam.y -= dy;
+                if let Some(i) = grab {
+                    // One finger from a circle: the circle follows it.
+                    map.xs[i] += dx;
+                    map.ys[i] += dy;
+                    map.send_move(i);
+                    map.arranged[i] = true;
+                    scene_moved = true;
+                } else {
+                    // One finger from the air: the plane follows it.
+                    map.cam.x -= dx;
+                    map.cam.y -= dy;
+                }
             } else if nb == 2 {
                 let (a, b) = (both[0], both[1]);
                 let (pa, pb, ca, cb) = ((prev[a].1, prev[a].2), (prev[b].1, prev[b].2), (cur[a].1, cur[a].2), (cur[b].1, cur[b].2));
                 let (d0, d1) = (dist16(pa, pb), dist16(ca, cb));
                 let (m0x, m0y) = ((pa.0 + pb.0) / 2, (pa.1 + pb.1) / 2);
                 let (m1x, m1y) = ((ca.0 + cb.0) / 2, (ca.1 + cb.1) / 2);
-                if map.editing && !grab_decided {
-                    grab_decided = true;
-                    grab = map.hit(m0x, m0y);
-                }
-                if let (true, Some(i)) = (map.editing, grab) {
-                    // Arranging: the circle follows the point between the fingers and grows or shrinks with their spread.
+                if let Some(i) = grab {
+                    // Both fingers in one circle: it follows the point between them and grows or shrinks with their spread.
                     let (dx, dy) = map.cam.delta(m1x - m0x, m1y - m0y);
                     map.xs[i] += dx;
                     map.ys[i] += dy;
