@@ -1386,6 +1386,46 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
+                // Text into the app surface for the app in front, in its 16-bit working values: [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…]. The surface is the whole screen (op 22's frame), so x and y are screen coordinates. Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black). The app publishes (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md).
+                Some(24) if m.len() >= 9 => {
+                    let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
+                    let (x0, base, px, val) = (i16le(1), i16le(3), u16::from_le_bytes([m[5], m[6]]) as f32, u16::from_le_bytes([m[7], m[8]]) as u32);
+                    let surf_ok = unsafe { APP_SURF } > 1 && width * height * 8 <= 32 << 20;
+                    if surf_ok && px >= 4.0 && px <= 512.0 {
+                        let surf = unsafe { core::slice::from_raw_parts_mut(APP_SURF as *mut u64, width * height) };
+                        let mut pen = x0 as f32;
+                        for ch in core::str::from_utf8(&m[9..]).unwrap_or("").chars() {
+                            let (met, cov) = font.rasterize(ch, px);
+                            let gx = pen as i32 + met.xmin;
+                            let gy = base - met.ymin - met.height as i32;
+                            for row in 0..met.height as i32 {
+                                let y = gy + row;
+                                if y < 0 || y >= height as i32 {
+                                    continue;
+                                }
+                                for col in 0..met.width as i32 {
+                                    let xx = gx + col;
+                                    if xx < 0 || xx >= width as i32 {
+                                        continue;
+                                    }
+                                    let a = cov[(row * met.width as i32 + col) as usize] as u32;
+                                    if a == 0 {
+                                        continue;
+                                    }
+                                    let v = (val * a / 255).min(0xFFFF) as u64;
+                                    let d = &mut surf[y as usize * width + xx as usize];
+                                    let have = *d & 0xFFFF;
+                                    if v > have {
+                                        *d = (*d & 1 << 48) | v | v << 16 | v << 32;
+                                    }
+                                }
+                            }
+                            pen += met.advance_width;
+                        }
+                    } else {
+                        out[0] = 3;
+                    }
+                }
                 Some(23) => {
                     // The app is done: the screen is the map's again (its next frame repaints everything).
                     unsafe {

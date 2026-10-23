@@ -29,6 +29,7 @@ members = [
     "payloads/map",
     "payloads/init",
     "payloads/ramps",
+    "payloads/threads",
     "payloads/echo_client",
     "payloads/spinner",
     "payloads/pcie1",

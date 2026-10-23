@@ -30,6 +30,10 @@ pub mod nr {
     pub const SET_PREF: u64 = 11;
     pub const FACTS: u64 = 12;
     pub const STORE: u64 = 13;
+    pub const THREAD_SPAWN: u64 = 14;
+    pub const THREAD_EXIT: u64 = 15;
+    pub const WAIT: u64 = 16;
+    pub const WAKE: u64 = 17;
 }
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
@@ -250,6 +254,30 @@ pub fn call(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
 /// Receive on an endpoint: the message lands in `buf`, a single-use reply token in `token`; returns the message length. With `poll`, returns NOTHING at once when no message waits.
 pub fn recv(cap: u64, buf: &mut [u8], token: &mut [u8; 32], poll: bool) -> u64 {
     svc(nr::RECV, cap, off(buf.as_mut_ptr()), buf.len() as u64, off(token.as_mut_ptr()), poll as u64)
+}
+
+/// A new thread of this process: `entry(arg)` on `stack` (its top is the thread's SP; give it 16 KiB or more), runnable at once while the caller carries on. Threads share the arc and every capability; they are not addressable (KERNEL.md "Threads, interrupts and cores"). Returns 0 or ERR.
+pub fn thread_spawn(entry: extern "C" fn(u64) -> !, stack: &mut [u8], arg: u64) -> u64 {
+    let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
+    svc(nr::THREAD_SPAWN, off(entry as usize as *const u8), off(top), arg, 0, 0)
+}
+
+/// This thread ends with `value`; the last thread of a process ends the process.
+pub fn thread_exit(value: u64) -> ! {
+    svc(nr::THREAD_EXIT, value, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Block while `word` still holds `expected`, until another thread of this process calls `wake` on it: 0 then, 1 at once if the word had already changed. A futex: the word is the state, this is the wait.
+pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, 0, 0, 0)
+}
+
+/// Make up to `count` threads waiting on `word` runnable; returns how many.
+pub fn wake(word: &core::sync::atomic::AtomicU64, count: u64) -> u64 {
+    svc(nr::WAKE, off(word as *const _ as *const u8), count, 0, 0, 0)
 }
 
 /// Answer a call; the token stops existing.

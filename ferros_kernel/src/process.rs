@@ -203,13 +203,20 @@ enum State {
     Calling(u64, u64),
     /// Asleep until the generic timer count reaches the deadline (SYS_SLEEP); `wake_sleepers` makes it runnable again.
     Sleeping(u64),
+    /// In `wait` on a word of its arc (the word's address): `wake` on that word by another thread of the process makes it runnable.
+    Waiting(usize),
+}
+
+/// A thread: what the scheduler runs. A saved frame, a state, and the process it belongs to; threads of one process share its arc and every capability in it (KERNEL.md "Threads, interrupts and cores"). Threads are not addressable: nothing outside the kernel names one.
+struct Thread {
+    proc: usize,
+    frame: Frame,
+    state: State,
 }
 
 struct Process {
     arc: Arc,
     cspace: Vec<CapEntry>,
-    frame: Frame,
-    state: State,
     epoch: u64,
     name: Vec<u8>,
     /// The process's console output is at the start of a line (so the next byte gets the name tag).
@@ -220,20 +227,22 @@ struct Process {
 
 struct Endpoint {
     name: Vec<u8>,
-    /// Calls waiting for the server: (caller, message).
+    /// Calls waiting for the server: (calling thread, message).
     queue: alloc::collections::VecDeque<(usize, Vec<u8>)>,
-    /// The process that last polled this endpoint (recv with poll): a call wakes it if it is asleep, so a server that sleeps between polls answers at once rather than at its next deadline.
+    /// The thread that last polled this endpoint (recv with poll): a call wakes it if it is asleep, so a server that sleeps between polls answers at once rather than at its next deadline.
     poller: Option<usize>,
 }
 
 struct Kernel {
     procs: Vec<Option<Process>>,
+    /// The threads; every index in `runnable`, `current`, an endpoint queue, a poller or a reply capability is one of these.
+    threads: Vec<Option<Thread>>,
     endpoints: Vec<Endpoint>,
     runnable: alloc::collections::VecDeque<usize>,
     current: Option<usize>,
     /// Everything any process sent its console during the current kernel entry, each line tagged with the sender's name.
     console: Vec<u8>,
-    /// Processes that ended during the current entry: (process, exit value).
+    /// Threads that ended during the current entry: (thread, exit value).
     exited: Vec<(usize, u64)>,
     ipc_round_trips: u32,
     trace_at: usize,
@@ -273,12 +282,7 @@ pub fn sched_report(out: &mut Vec<u8>) {
     let f = crate::platform::cntfrq();
     let ring = unsafe { &*TRACE_RING.0.get() };
     let n = TRACE;
-    let name = |i: u8| -> alloc::string::String {
-        match kk.procs.get(i as usize) {
-            Some(Some(p)) => alloc::string::String::from_utf8_lossy(&p.name).into_owned(),
-            _ => alloc::format!("p{i}"),
-        }
-    };
+    let name = |i: u8| -> alloc::string::String { alloc::string::String::from_utf8_lossy(&thread_name(i as usize)).into_owned() };
     let entries: Vec<(u64, u8, u8, u16)> = (0..n).map(|k| ring[(kk.trace_at + k) % n]).filter(|e| e.0 != 0).collect();
     let Some(&(t0, ..)) = entries.first() else { return };
     let us = |t: u64| t.wrapping_sub(t0) * 1_000_000 / f;
@@ -338,6 +342,7 @@ pub fn sched_report(out: &mut Vec<u8>) {
 
 static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
     procs: Vec::new(),
+    threads: Vec::new(),
     endpoints: Vec::new(),
     runnable: alloc::collections::VecDeque::new(),
     current: None,
@@ -349,6 +354,28 @@ static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
 
 fn k() -> &'static mut Kernel {
     unsafe { &mut *KERNEL.0.get() }
+}
+
+/// The thread at `t`.
+fn th(t: usize) -> Option<&'static mut Thread> {
+    k().threads.get_mut(t).and_then(|x| x.as_mut())
+}
+/// The process thread `t` belongs to.
+fn proc_of(t: usize) -> Option<&'static mut Process> {
+    let pi = k().threads.get(t).and_then(|x| x.as_ref()).map(|x| x.proc)?;
+    k().procs.get_mut(pi).and_then(|x| x.as_mut())
+}
+/// A thread's name for the console and the trace: its process's name, with `.N` for every thread but the process's first.
+fn thread_name(t: usize) -> Vec<u8> {
+    let kk = k();
+    let Some(Some(x)) = kk.threads.get(t) else { return alloc::format!("t{t}").into_bytes() };
+    let mut n = kk.procs.get(x.proc).and_then(|p| p.as_ref()).map(|p| p.name.clone()).unwrap_or_default();
+    let first = kk.threads.iter().position(|y| matches!(y, Some(y) if y.proc == x.proc));
+    if first != Some(t) {
+        let k = kk.threads[..t].iter().filter(|y| matches!(y, Some(y) if y.proc == x.proc)).count();
+        n.extend_from_slice(alloc::format!(".{k}").as_bytes());
+    }
+    n
 }
 
 impl Process {
@@ -413,6 +440,15 @@ pub const FACT_COUNT: usize = 16;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
+/// thread_spawn(entry, stack_top, arg): a new thread of this process at arc offset `entry` with SP_EL0 at arc offset `stack_top` and x0 = `arg`, runnable at once (the caller carries on). Returns 0 or ERR.
+const SYS_THREAD_SPAWN: u64 = 14;
+/// thread_exit(value): this thread ends; the last thread of a process ends the process as `exit` does.
+const SYS_THREAD_EXIT: u64 = 15;
+/// wait(word, expected): if the 8-byte word at arc offset `word` still holds `expected`, block until another thread of this process wakes it; returns 0 then, or 1 at once if the word had already changed. A futex: threads hand work to each other without IPC.
+const SYS_WAIT: u64 = 16;
+/// wake(word, count): make up to `count` threads of this process waiting on that word runnable; returns how many.
+const SYS_WAKE: u64 = 17;
+const SYS_LAST: u64 = 17;
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
 pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 
@@ -564,15 +600,16 @@ pub const PARKED: u64 = 0xB10C << 48;
 fn deliver(server: usize, ep: usize) {
     let kk = k();
     let Some((caller, msg)) = kk.endpoints[ep].queue.pop_front() else { return };
-    let Some(sp) = kk.procs[server].as_mut() else { return };
-    let State::Receiving(_, buf, cap, tok_off) = sp.state else { return };
+    let Some(st) = th(server) else { return };
+    let Some(sp) = proc_of(server) else { return };
+    let State::Receiving(_, buf, cap, tok_off) = st.state else { return };
     let n = msg.len().min(cap as usize);
     sp.write(buf, &msg[..n]);
     let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
     sp.cspace.push(CapEntry { token, object: Object::Reply(caller), rights: RIGHT_SEND });
     sp.write(tok_off, &token);
-    sp.frame.x[0] = n as u64;
-    sp.state = State::Runnable;
+    st.frame.x[0] = n as u64;
+    st.state = State::Runnable;
     kk.runnable.push_back(server);
     tr(TR_DELIVER, server, ep as u64);
 }
@@ -581,7 +618,7 @@ fn deliver(server: usize, ep: usize) {
 fn switch_to_next(f: &mut Frame) -> bool {
     let kk = k();
     while let Some(next) = kk.runnable.pop_front() {
-        if let Some(np) = kk.procs[next].as_mut() {
+        if let Some(np) = th(next) {
             if np.state == State::Runnable {
                 np.state = State::Running;
                 *f = np.frame;
@@ -605,23 +642,11 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         return 1;
     };
     let ec = (f.esr >> 26) & 0x3F;
-    let base = kk.procs[cur].as_ref().map(|p| p.arc.base as u64).unwrap_or(0);
+    let pi = kk.threads[cur].as_ref().map(|t| t.proc).unwrap_or(usize::MAX);
+    let base = proc_of(cur).map(|p| p.arc.base as u64).unwrap_or(0);
+    // The whole process ends (exit, a fault): every thread of it goes, then the arc.
     let end = |f: &mut Frame, value: u64| -> u64 {
-        let kk = k();
-        if let Some(p) = kk.procs[cur].take() {
-            // Say how it ended on the console: a process that outlives its first slice (spawn already returned) has no one else to hear its exit value — a fault or a panic would otherwise vanish.
-            if !p.line_start {
-                kk.console.push(b'\n');
-            }
-            kk.console.extend_from_slice(&p.name);
-            kk.console.extend_from_slice(b": exit G#");
-            for i in (0..16).rev() {
-                kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
-            }
-            kk.console.push(b'\n');
-            arc_free(p.arc);
-        }
-        kk.exited.push((cur, value));
+        end_process(pi, cur, value);
         if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
     };
     if ec != 0x15 {
@@ -630,12 +655,79 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         fault_report(f, base);
         return end(f, v);
     }
-    let p = kk.procs[cur].as_mut().unwrap();
+    let p = proc_of(cur).unwrap();
+    let t = th(cur).unwrap();
     // Crumbs round every syscall (G#90 + number entering, G#70 + number leaving), so a watchdog reset inside one is readable from PREV_EXIT.
     let nr = f.x[8];
-    crate::platform::crumb(0x90 + nr.min(13));
+    crate::platform::crumb(0x90 + nr.min(SYS_LAST));
     let r = match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
+        SYS_THREAD_SPAWN => {
+            let (entry, stack, arg) = (f.x[0], f.x[1], f.x[2]);
+            let m = p.arc.mask() as u64;
+            let mut frame = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
+            frame.elr = p.arc.base as u64 + (entry & m);
+            frame.sp_el0 = p.arc.base as u64 + (stack & m & !15);
+            frame.x[28] = p.arc.base as u64;
+            frame.x[27] = m;
+            frame.x[0] = arg;
+            let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable });
+            kk.runnable.push_back(nt);
+            tr(TR_RUN, nt, 0xFFFF);
+            f.x[0] = 0;
+            0
+        }
+        SYS_THREAD_EXIT => {
+            let others = kk.threads.iter().enumerate().any(|(i, x)| i != cur && matches!(x, Some(x) if x.proc == pi));
+            if !others {
+                end(f, f.x[0])
+            } else {
+                kk.threads[cur] = None;
+                for ep in kk.endpoints.iter_mut() {
+                    if ep.poller == Some(cur) {
+                        ep.poller = None;
+                    }
+                }
+                for q in kk.procs.iter_mut().flatten() {
+                    q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == cur));
+                }
+                kk.exited.push((cur, f.x[0]));
+                if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+            }
+        }
+        SYS_WAIT => {
+            let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
+            let now = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            if now != f.x[1] {
+                f.x[0] = 1;
+                0
+            } else {
+                t.state = State::Waiting(addr);
+                t.frame = *f;
+                t.frame.x[0] = 0;
+                tr(TR_SLEEP, cur, 0xFFFF);
+                if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+            }
+        }
+        SYS_WAKE => {
+            let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
+            let mut n = 0u64;
+            for (i, x) in kk.threads.iter_mut().enumerate() {
+                if n >= f.x[1] {
+                    break;
+                }
+                if let Some(x) = x {
+                    if x.proc == pi && x.state == State::Waiting(addr) {
+                        x.state = State::Runnable;
+                        kk.runnable.push_back(i);
+                        tr(TR_WAKE, i, 0xFFFF);
+                        n += 1;
+                    }
+                }
+            }
+            f.x[0] = n;
+            0
+        }
         SYS_STORE => {
             let token = p.read(f.x[0], 32);
             let scope = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -730,16 +822,16 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 if kk.runnable.is_empty() {
                     0
                 } else {
-                    p.state = State::Runnable;
-                    p.frame = *f;
+                    t.state = State::Runnable;
+                    t.frame = *f;
                     kk.runnable.push_back(cur);
                     tr(TR_YIELD, cur, 0);
                     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                 }
             } else {
-                p.state = State::Sleeping(f.x[0]);
-                p.frame = *f;
-                p.frame.x[0] = 0;
+                t.state = State::Sleeping(f.x[0]);
+                t.frame = *f;
+                t.frame.x[0] = 0;
                 tr(TR_SLEEP, cur, ((f.x[0] - now) * 1000 / crate::platform::cntfrq()).min(65535));
                 if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
@@ -764,16 +856,16 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    p.state = State::Calling(f.x[3], f.x[4]);
-                    p.frame = *f;
+                    t.state = State::Calling(f.x[3], f.x[4]);
+                    t.frame = *f;
                     tr(TR_CALL, cur, ep as u64);
                     kk.endpoints[ep].queue.push_back((cur, msg));
-                    // A server already waiting on this endpoint takes it now.
-                    if let Some(server) = kk.procs.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
+                    // A server thread already waiting on this endpoint takes it now.
+                    if let Some(server) = kk.threads.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
                         deliver(server, ep);
                     } else if let Some(s) = kk.endpoints[ep].poller {
                         // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
-                        if let Some(q) = kk.procs[s].as_mut() {
+                        if let Some(q) = th(s) {
                             if matches!(q.state, State::Sleeping(_)) {
                                 q.state = State::Runnable;
                                 kk.runnable.push_back(s);
@@ -800,8 +892,8 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 => {
-                    p.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
-                    p.frame = *f;
+                    t.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
+                    t.frame = *f;
                     tr(TR_RECV_BLOCK, cur, ep as u64);
                     if !kk.endpoints[ep].queue.is_empty() {
                         deliver(cur, ep);
@@ -880,12 +972,12 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     p.cspace.swap_remove(i);
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
                     let mut handed = false;
-                    if let Some(cp) = kk.procs[caller].as_mut() {
-                        if let State::Calling(roff, rcap) = cp.state {
+                    if let (Some(ct), Some(cp)) = (th(caller), proc_of(caller)) {
+                        if let State::Calling(roff, rcap) = ct.state {
                             let n = msg.len().min(rcap as usize);
                             cp.write(roff, &msg[..n]);
-                            cp.frame.x[0] = n as u64;
-                            cp.state = State::Runnable;
+                            ct.frame.x[0] = n as u64;
+                            ct.state = State::Runnable;
                             // The caller runs now: it waited. The server goes to the back of the queue (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways).
                             kk.runnable.push_front(caller);
                             kk.ipc_round_trips += 1;
@@ -895,11 +987,9 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     }
                     f.x[0] = 0;
                     if handed {
-                        if let Some(sp) = kk.procs[cur].as_mut() {
-                            sp.state = State::Runnable;
-                            sp.frame = *f;
-                            kk.runnable.push_back(cur);
-                        }
+                        t.state = State::Runnable;
+                        t.frame = *f;
+                        kk.runnable.push_back(cur);
                         if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
                     } else {
                         0
@@ -917,15 +1007,63 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         }
     };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
-    crate::platform::crumb(0x70 + nr.min(13) | (cur as u64) << 8 | kk.current.map(|c| c as u64).unwrap_or(0xFF) << 16);
+    crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | kk.current.map(|c| c as u64).unwrap_or(0xFF) << 16);
     r
+}
+
+/// A thread into the table (a free slot or the end). Returns its index.
+fn add_thread(t: Thread) -> usize {
+    let kk = k();
+    match kk.threads.iter().position(|q| q.is_none()) {
+        Some(i) => {
+            kk.threads[i] = Some(t);
+            i
+        }
+        None => {
+            kk.threads.push(Some(t));
+            kk.threads.len() - 1
+        }
+    }
+}
+
+/// End process `pi` from thread `cur` (exit, a fault, the last thread leaving): every thread of it removed from the tables and the endpoints, every reply capability pointing at any of them dropped, its exit said on the console, its arc freed.
+fn end_process(pi: usize, cur: usize, value: u64) {
+    let kk = k();
+    let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
+    for &i in &mine {
+        kk.threads[i] = None;
+        kk.runnable.retain(|&r| r != i);
+        for ep in kk.endpoints.iter_mut() {
+            ep.queue.retain(|(caller, _)| *caller != i);
+            if ep.poller == Some(i) {
+                ep.poller = None;
+            }
+        }
+        for q in kk.procs.iter_mut().flatten() {
+            q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == i));
+        }
+    }
+    if let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.take()) {
+        // Say how it ended on the console: a process that outlives its first slice (spawn already returned) has no one else to hear its exit value — a fault or a panic would otherwise vanish.
+        if !p.line_start {
+            kk.console.push(b'\n');
+        }
+        kk.console.extend_from_slice(&p.name);
+        kk.console.extend_from_slice(b": exit G#");
+        for i in (0..16).rev() {
+            kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
+        }
+        kk.console.push(b'\n');
+        arc_free(p.arc);
+    }
+    kk.exited.push((cur, value));
 }
 
 /// A faulting process's state on the console: `name: FAULT esr … elr+… far+… sp+…` then x0..x30, eight per line (G# hex; the three addresses as offsets into its arc).
 fn fault_report(f: &Frame, base: u64) {
     let kk = k();
     let Some(cur) = kk.current else { return };
-    let name = kk.procs[cur].as_ref().map(|p| p.name.clone()).unwrap_or_default();
+    let name = thread_name(cur);
     let hex = |out: &mut Vec<u8>, v: u64| {
         out.extend_from_slice(b"G#");
         for i in (0..16).rev() {
@@ -964,7 +1102,7 @@ fn fault_report(f: &Frame, base: u64) {
 pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
     let kk = k();
     if let Some(cur) = kk.current {
-        if let Some(p) = kk.procs[cur].as_mut() {
+        if let Some(p) = th(cur) {
             p.frame = *f;
             p.state = State::Runnable;
             kk.runnable.push_back(cur);
@@ -1002,7 +1140,7 @@ fn wake_sleepers() {
     let kk = k();
     let now: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
-    for (i, p) in kk.procs.iter_mut().enumerate() {
+    for (i, p) in kk.threads.iter_mut().enumerate() {
         if let Some(p) = p {
             if let State::Sleeping(d) = p.state {
                 if d <= now {
@@ -1019,7 +1157,7 @@ pub fn run_slice() -> bool {
     wake_sleepers();
     let kk = k();
     let Some(next) = kk.runnable.pop_front() else { return false };
-    let Some(p) = kk.procs[next].as_mut() else { return true };
+    let Some(p) = th(next) else { return true };
     if p.state != State::Runnable {
         return true;
     }
@@ -1048,20 +1186,25 @@ pub fn take_console() -> Vec<u8> {
 pub fn kill(name: &[u8]) -> bool {
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
-    if kk.current == Some(i) {
+    if kk.current.is_some_and(|c| kk.threads.get(c).and_then(|t| t.as_ref()).is_some_and(|t| t.proc == i)) {
         return false;
     }
     if let Some(p) = kk.procs[i].take() {
         arc_free(p.arc);
     }
-    for ep in kk.endpoints.iter_mut() {
-        ep.queue.retain(|(caller, _)| *caller != i);
-        if ep.poller == Some(i) {
-            ep.poller = None;
+    let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
+    for t in mine {
+        kk.threads[t] = None;
+        kk.runnable.retain(|&r| r != t);
+        for ep in kk.endpoints.iter_mut() {
+            ep.queue.retain(|(caller, _)| *caller != t);
+            if ep.poller == Some(t) {
+                ep.poller = None;
+            }
         }
-    }
-    for q in kk.procs.iter_mut().flatten() {
-        q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == i));
+        for q in kk.procs.iter_mut().flatten() {
+            q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == t));
+        }
     }
     kk.console.extend_from_slice(name);
     kk.console.extend_from_slice(b": killed\n");
@@ -1144,7 +1287,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     let kk = k();
     kk.exited.clear();
     let trips0 = kk.ipc_round_trips;
-    if let Some(p) = kk.procs[me].as_mut() {
+    if let Some(p) = th(me) {
         p.state = State::Running;
     }
     kk.current = Some(me);
@@ -1155,7 +1298,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     kk.current = None;
     let exit = match kk.exited.iter().find(|&&(i, _)| i == me) {
         Some(&(_, v)) => v,
-        None if matches!(kk.procs[me].as_ref().map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
+        None if matches!(th(me).map(|p| p.state), Some(State::Runnable)) => PREEMPTED,
         None => PARKED,
     };
     Ok(Outcome { exit, console: core::mem::take(&mut kk.console), round_trips: kk.ipc_round_trips - trips0 })
@@ -1187,7 +1330,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
     Ok(v)
 }
 
-/// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and put it in the table, not yet running. Returns (its index, its arc, the input's offset).
+/// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
 fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
@@ -1198,7 +1341,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
-    let p = Process { arc, cspace, frame: zero, state: State::Running, epoch, name: name.to_vec(), line_start: true, input: input.to_vec() };
+    let p = Process { arc, cspace, epoch, name: name.to_vec(), line_start: true, input: input.to_vec() };
     // Grants page: count, then the tokens in slot order. Then the code, then the input.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
@@ -1215,18 +1358,17 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
     crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
-    let mut p = p;
-    p.frame.elr = (arc.base + CODE) as u64;
-    p.frame.sp_el0 = (arc.base + arc.size - 16) as u64;
-    p.frame.spsr = 0;
-    p.frame.x[28] = arc.base as u64;
-    p.frame.x[27] = arc.mask() as u64;
-    p.frame.x[0] = GRANTS as u64;
-    p.frame.x[1] = in_off as u64;
-    p.frame.x[2] = input.len() as u64;
-    p.state = State::Runnable;
+    let mut frame = zero;
+    frame.elr = (arc.base + CODE) as u64;
+    frame.sp_el0 = (arc.base + arc.size - 16) as u64;
+    frame.spsr = 0;
+    frame.x[28] = arc.base as u64;
+    frame.x[27] = arc.mask() as u64;
+    frame.x[0] = GRANTS as u64;
+    frame.x[1] = in_off as u64;
+    frame.x[2] = input.len() as u64;
     let kk = k();
-    let me = match kk.procs.iter().position(|q| q.is_none()) {
+    let pi = match kk.procs.iter().position(|q| q.is_none()) {
         Some(i) => {
             kk.procs[i] = Some(p);
             i
@@ -1236,6 +1378,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
             kk.procs.len() - 1
         }
     };
+    let me = add_thread(Thread { proc: pi, frame, state: State::Runnable });
     Ok((me, arc, in_off))
 }
 

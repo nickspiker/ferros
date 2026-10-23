@@ -1,6 +1,6 @@
 //! Ramps: the present stage's test screen, an app (SHELL.md: apps are places) — the first to draw its own pixels. It writes 16-bit working values (gamma 2, white = Q14) into the `app-surface` region and asks the display server to show them (op 22), which publishes them through the one table, E's gains and the dither at full precision. While it is in front it takes the touches itself: a tap shows the column under the finger alone (and a tap shows them all again); two fingers hand the screen back to the map (op 23) and end the app.
 //!
-//! The columns, left to right, each a ramp from black at the top to its brightest at the bottom, with 4-pixel white lines between them: grey to white dithered and undithered; near-black (light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over; the headroom (to 16× white) through the roll-off; red, green, blue to white. "Undithered" columns carry the surface's no-dither bit (48).
+//! The columns, left to right, each a ramp from black at the top to its brightest at the bottom, with 4-pixel white lines between them: grey to white dithered and undithered; near-black (light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over; the headroom (to 16× white) through the roll-off; red, green, blue to white. "Undithered" columns carry the surface's no-dither bit (48). A column alone is named in the black beside it (display op 24: the display's typeface, since apps have none), with what it tests; `PATTERNS` is the list, add a row and a `draw` arm for a new one.
 //!
 //! Launched by the map (SYS_SPAWN) with its own capabilities. Grant slots: 0 console, 1 display (use), 2 touch (use), 3 app-surface.
 #![no_std]
@@ -15,6 +15,49 @@ const COLS: usize = 9;
 const LINE: usize = 4;
 const WHITE: u64 = 16384;
 const NO_DITHER: u64 = 1 << 48;
+
+/// Each column: its name and what to look for, shown when it is alone.
+const PATTERNS: [(&str, &str); COLS] = [
+    ("grey to white", "dithered: 14 bits over the 8-bit link"),
+    ("grey to white", "undithered: the panel's own 8-bit steps"),
+    ("near black", "to 1/64 of white's light, dithered"),
+    ("near black", "to 1/64 of white's light, undithered"),
+    ("near black", "to 1/64, as an 8-bit canvas hands it over"),
+    ("headroom", "to 16x white through the roll-off"),
+    ("red", "to white"),
+    ("green", "to white"),
+    ("blue", "to white"),
+];
+
+/// A line of text into the surface (display op 24): screen coordinates, size in pixels, grey value Q14.
+fn label(display: u64, x: i16, baseline: i16, px: u16, value: u16, s: &str) {
+    let mut m = [0u8; 160];
+    m[0] = 24;
+    m[1..3].copy_from_slice(&x.to_le_bytes());
+    m[3..5].copy_from_slice(&baseline.to_le_bytes());
+    m[5..7].copy_from_slice(&px.to_le_bytes());
+    m[7..9].copy_from_slice(&value.to_le_bytes());
+    let n = s.len().min(m.len() - 9);
+    m[9..9 + n].copy_from_slice(&s.as_bytes()[..n]);
+    let mut r = [0u8; 4];
+    call(display, &m[..9 + n], &mut r);
+}
+
+/// The labels beside a lone column: its name large, what it tests under it, a third of the way down the left black margin; and the column's number so a tap can be matched to the list.
+fn labels(display: u64, w: usize, h: usize, k: usize) {
+    let (name, what) = PATTERNS[k];
+    let strip = w * 3 / 8;
+    let margin = ((w - strip) / 2) as i16;
+    let y = (h / 3) as i16;
+    let mut num = [b'0' + (k as u8 + 1), 0];
+    let n = core::str::from_utf8(&num[..1]).unwrap_or("?");
+    label(display, 24, y - 56, 36, 6000, n);
+    label(display, 24, y, 44, WHITE as u16, name);
+    label(display, 24, y + 48, 28, 6000, what);
+    // The right margin says how to leave.
+    label(display, margin + strip as i16 + LINE as i16 + 24, y, 28, 4000, "tap: all");
+    let _ = &mut num;
+}
 
 fn grey(v: u64) -> u64 {
     v | v << 16 | v << 32
@@ -145,6 +188,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 };
                 draw(surf, w, h, only);
+                if let Some(k) = only {
+                    labels(display, w, h, k);
+                }
                 show(display, w, h);
             }
         }
