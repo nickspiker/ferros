@@ -236,6 +236,103 @@ struct Kernel {
     /// Processes that ended during the current entry: (process, exit value).
     exited: Vec<(usize, u64)>,
     ipc_round_trips: u32,
+    trace_at: usize,
+}
+
+/// The scheduler trace (`diag sched`): the last TRACE scheduling events, (count, event, process, detail), written at `trace_at` round the ring. Static, not on the kernel heap.
+static TRACE_RING: Global<[(u64, u8, u8, u16); TRACE]> = Global(UnsafeCell::new([(0, 0, 0, 0); TRACE]));
+
+const TRACE: usize = 4096;
+const TR_CALL: u8 = 1;
+const TR_DELIVER: u8 = 2;
+const TR_WAKE_POLL: u8 = 3;
+const TR_REPLY: u8 = 4;
+const TR_SLEEP: u8 = 5;
+const TR_WAKE: u8 = 6;
+const TR_SWITCH: u8 = 7;
+const TR_RUN: u8 = 8;
+const TR_PREEMPT: u8 = 9;
+const TR_PARK: u8 = 10;
+const TR_POLL_MISS: u8 = 11;
+const TR_RECV_BLOCK: u8 = 12;
+const TR_NAMES: [&str; 13] = ["-", "call", "deliver", "wake-poll", "reply", "sleep", "wake", "switch", "run", "preempt", "park", "poll-miss", "recv-block"];
+
+/// One scheduling event into the ring.
+fn tr(ev: u8, who: usize, detail: u64) {
+    let kk = k();
+    let now: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+    unsafe { (*TRACE_RING.0.get())[kk.trace_at] = (now, ev, who as u8, detail as u16) };
+    kk.trace_at = (kk.trace_at + 1) % TRACE;
+}
+
+/// The trace, oldest first, as text: time since the first entry in microseconds, the event, the process name and the detail. Then per call: the wait before the server took it, the server's time to the reply, and the caller's wait after the reply before it ran again — the three parts of a round trip.
+pub fn sched_report(out: &mut Vec<u8>) {
+    let kk = k();
+    let f = crate::platform::cntfrq();
+    let ring = unsafe { &*TRACE_RING.0.get() };
+    let n = TRACE;
+    let name = |i: u8| -> alloc::string::String {
+        match kk.procs.get(i as usize) {
+            Some(Some(p)) => alloc::string::String::from_utf8_lossy(&p.name).into_owned(),
+            _ => alloc::format!("p{i}"),
+        }
+    };
+    let entries: Vec<(u64, u8, u8, u16)> = (0..n).map(|k| ring[(kk.trace_at + k) % n]).filter(|e| e.0 != 0).collect();
+    let Some(&(t0, ..)) = entries.first() else { return };
+    let us = |t: u64| t.wrapping_sub(t0) * 1_000_000 / f;
+    // The round trips: a call by X, the deliver to the server, the reply to X, X's next run or switch.
+    let mut trips: Vec<(u8, u8, u64, u64, u64)> = Vec::new();
+    for (k, e) in entries.iter().enumerate() {
+        if e.1 != TR_CALL {
+            continue;
+        }
+        let mut deliver = None;
+        let mut reply = None;
+        let mut back = None;
+        for e2 in &entries[k + 1..] {
+            if deliver.is_none() && e2.1 == TR_DELIVER && e2.3 == e.3 {
+                deliver = Some(e2);
+            } else if deliver.is_some() && reply.is_none() && e2.1 == TR_REPLY && e2.2 == e.2 {
+                reply = Some(e2.0);
+            } else if reply.is_some() && (e2.1 == TR_RUN || e2.1 == TR_SWITCH) && e2.2 == e.2 {
+                back = Some(e2.0);
+                break;
+            }
+        }
+        if let (Some(d), Some(r), Some(b)) = (deliver, reply, back) {
+            trips.push((e.2, d.2, d.0 - e.0, r - d.0, b - r));
+        }
+    }
+    out.extend_from_slice(alloc::format!("sched trace: A#{} events over A#{} ms; A#{} round trips\n", entries.len(), us(entries.last().unwrap().0) / 1000, trips.len()).as_bytes());
+    // The slow trips in full, the rest summed per (caller, server).
+    let mut slow = 0;
+    for &(c, sv, w, h, b) in &trips {
+        if (w + h + b) * 1_000_000 / f > 2_000 && slow < 64 {
+            slow += 1;
+            out.extend_from_slice(alloc::format!("  slow: {} -> {}: waited A#{} us for the server, server A#{} us, waited A#{} us after the reply\n", name(c), name(sv), w * 1_000_000 / f, h * 1_000_000 / f, b * 1_000_000 / f).as_bytes());
+        }
+    }
+    let mut pairs: Vec<(u8, u8, u32, u64, u64, u64)> = Vec::new();
+    for &(c, sv, w, h, b) in &trips {
+        match pairs.iter_mut().find(|p| p.0 == c && p.1 == sv) {
+            Some(p) => {
+                p.2 += 1;
+                p.3 += w;
+                p.4 += h;
+                p.5 += b;
+            }
+            None => pairs.push((c, sv, 1, w, h, b)),
+        }
+    }
+    for &(c, sv, k, w, h, b) in &pairs {
+        out.extend_from_slice(alloc::format!("  {} -> {}: A#{} trips, mean wait A#{} us, server A#{} us, after A#{} us\n", name(c), name(sv), k, w * 1_000_000 / f / k as u64, h * 1_000_000 / f / k as u64, b * 1_000_000 / f / k as u64).as_bytes());
+    }
+    // The last 512 events, so a stall just now is in view.
+    let start = entries.len().saturating_sub(512);
+    for e in &entries[start..] {
+        out.extend_from_slice(alloc::format!("{:>9} {:<10} {:<8} {}\n", us(e.0), TR_NAMES[e.1 as usize], name(e.2), e.3).as_bytes());
+    }
 }
 
 static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
@@ -246,6 +343,7 @@ static KERNEL: Global<Kernel> = Global(UnsafeCell::new(Kernel {
     console: Vec::new(),
     exited: Vec::new(),
     ipc_round_trips: 0,
+    trace_at: 0,
 }));
 
 fn k() -> &'static mut Kernel {
@@ -475,6 +573,7 @@ fn deliver(server: usize, ep: usize) {
     sp.frame.x[0] = n as u64;
     sp.state = State::Runnable;
     kk.runnable.push_back(server);
+    tr(TR_DELIVER, server, ep as u64);
 }
 
 /// Take the next runnable process (if any) and make it the one the trap returns into.
@@ -486,11 +585,13 @@ fn switch_to_next(f: &mut Frame) -> bool {
                 np.state = State::Running;
                 *f = np.frame;
                 kk.current = Some(next);
+                tr(TR_SWITCH, next, 0);
                 return true;
             }
         }
     }
     kk.current = None;
+    tr(TR_PARK, 255, 0);
     false
 }
 
@@ -529,7 +630,10 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         return end(f, v);
     }
     let p = kk.procs[cur].as_mut().unwrap();
-    match f.x[8] {
+    // Crumbs round every syscall (G#90 + number entering, G#70 + number leaving), so a watchdog reset inside one is readable from PREV_EXIT.
+    let nr = f.x[8];
+    crate::platform::crumb(0x90 + nr.min(13));
+    let r = match f.x[8] {
         SYS_EXIT => end(f, f.x[0]),
         SYS_STORE => {
             let token = p.read(f.x[0], 32);
@@ -626,6 +730,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 p.state = State::Sleeping(f.x[0]);
                 p.frame = *f;
                 p.frame.x[0] = 0;
+                tr(TR_SLEEP, cur, ((f.x[0] - now) * 1000 / crate::platform::cntfrq()).min(65535));
                 if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
         }
@@ -651,6 +756,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
                     p.state = State::Calling(f.x[3], f.x[4]);
                     p.frame = *f;
+                    tr(TR_CALL, cur, ep as u64);
                     kk.endpoints[ep].queue.push_back((cur, msg));
                     // A server already waiting on this endpoint takes it now.
                     if let Some(server) = kk.procs.iter().position(|q| matches!(q, Some(q) if matches!(q.state, State::Receiving(e, ..) if e == ep))) {
@@ -661,6 +767,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                             if matches!(q.state, State::Sleeping(_)) {
                                 q.state = State::Runnable;
                                 kk.runnable.push_back(s);
+                                tr(TR_WAKE_POLL, s, ep as u64);
                             }
                         }
                     }
@@ -679,11 +786,13 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && f.x[4] & 1 != 0 && kk.endpoints[ep].queue.is_empty() => {
                     kk.endpoints[ep].poller = Some(cur);
                     f.x[0] = NOTHING;
+                    tr(TR_POLL_MISS, cur, ep as u64);
                     0
                 }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 => {
                     p.state = State::Receiving(ep, f.x[1], f.x[2], f.x[3]);
                     p.frame = *f;
+                    tr(TR_RECV_BLOCK, cur, ep as u64);
                     if !kk.endpoints[ep].queue.is_empty() {
                         deliver(cur, ep);
                     }
@@ -768,6 +877,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                             cp.state = State::Runnable;
                             kk.runnable.push_back(caller);
                             kk.ipc_round_trips += 1;
+                            tr(TR_REPLY, caller, cur as u64);
                         }
                     }
                     f.x[0] = 0;
@@ -783,7 +893,10 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = ERR;
             0
         }
-    }
+    };
+    // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
+    crate::platform::crumb(0x70 + nr.min(13) | (cur as u64) << 8 | kk.current.map(|c| c as u64).unwrap_or(0xFF) << 16);
+    r
 }
 
 /// A faulting process's state on the console: `name: FAULT esr … elr+… far+… sp+…` then x0..x30, eight per line (G# hex; the three addresses as offsets into its arc).
@@ -834,6 +947,7 @@ pub extern "C" fn ferros_el0_preempt(f: &mut Frame) -> u64 {
             p.state = State::Runnable;
             kk.runnable.push_back(cur);
         }
+        tr(TR_PREEMPT, cur, 0);
     }
     kk.current = None;
     f.x[0] = PREEMPTED;
@@ -872,6 +986,7 @@ fn wake_sleepers() {
                 if d <= now {
                     p.state = State::Runnable;
                     kk.runnable.push_back(i);
+                    tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
                 }
             }
         }
@@ -889,6 +1004,7 @@ pub fn run_slice() -> bool {
     p.state = State::Running;
     let frame = p.frame;
     kk.current = Some(next);
+    tr(TR_RUN, next, kk.runnable.len() as u64);
     arm_slice();
     unsafe { ferros_el0_resume(&frame) };
     disarm_slice();

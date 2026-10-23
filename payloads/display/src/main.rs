@@ -322,6 +322,8 @@ impl Pipe {
                 moved = true;
                 break;
             }
+            // Asleep between looks, not spinning: on one core a spin here starved the touch server (its reads took two and three time slices, 2026-10-23).
+            ferros_sys::sleep_until(now() + freq() / 2000);
         }
         let t = self.rd(S_DECON, TRIG_CON);
         self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
@@ -344,6 +346,9 @@ impl Pipe {
         loop {
             if self.rd(S_DECON, FRAME_COUNT) != f0 {
                 break;
+            }
+            if wait {
+                ferros_sys::sleep_until(now() + freq() / 2000);
             }
             if !wait || now().wrapping_sub(t0) > freq() / 4 {
                 if !wait {
@@ -1521,6 +1526,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
             len
         };
+        // A pass of this loop that runs long holds every client up (touch reads wait for the core): timed, and logged when over 30 ms with its parts.
+        let t_pass = now();
+        let mut calls_us = 0u64;
+        let mut ncalls = 0u32;
         // Clients first: every call waiting on the endpoint.
         loop {
             let n = ferros_sys::recv(cap(grants, S_DISPLAY), &mut msg, &mut tok, true);
@@ -1530,6 +1539,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let m = &msg[..(n as usize).min(msg.len())];
             let mut out = [0u8; 16];
             let t_call = now();
+            ncalls += 1;
             // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
             let gap_us = (t_call.wrapping_sub(last_reply) * 1_000_000 / freq()).min(999_999);
             let mut op_us = [0u64; 32];
@@ -1605,6 +1615,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
             ferros_sys::reply(&tok, &out[..len]);
             last_reply = now();
+            calls_us += ferros_sys::us_since(t_call);
         }
 
         let t = now();
@@ -1699,6 +1710,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             log.flush();
         }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
+        let t_idle = now();
         // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
         if unsafe { TEMPORAL } && client_owned && now().wrapping_sub(last_interaction) > freq() / 8 {
             if let Some(k) = (0..PHASES).find(|&k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
@@ -1709,6 +1721,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };
             }
         }
+        let idle_us = ferros_sys::us_since(t_idle);
+        let t_flip = now();
         let next_clean = unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() };
         // Spatial only (preference 4): no flips, so the panel can rest at its idle floor; the phase on the layer already carries a complete spatial dither.
         let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
@@ -1720,8 +1734,26 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let _ = pipe.present(win);
             frames += 1;
         }
+        let flip_us = ferros_sys::us_since(t_flip);
+        let pass_us = ferros_sys::us_since(t_pass);
+        if pass_us > 30_000 {
+            tlog.s(b"display: long pass ");
+            tlog.dec(pass_us / 1000);
+            tlog.s(b" ms: ");
+            tlog.dec(ncalls as u64);
+            tlog.s(b" calls ");
+            tlog.dec(calls_us / 1000);
+            tlog.s(b" ms, idle fill ");
+            tlog.dec(idle_us / 1000);
+            tlog.s(b" ms, flip ");
+            tlog.dec(flip_us / 1000);
+            tlog.s(b" ms\n");
+            tlog.flush();
+        }
         let poll = if now().wrapping_sub(last_interaction) < 2 * freq() { freq() / 120 } else { freq() / 16 };
-        let wake = if unsafe { TEMPORAL } && client_owned { next_tick.min(next_flip) } else { next_tick };
+        // The flip counts toward the wake only while a flip can happen. While a finger moves the next phase stays dirty, no flip fires and `next_flip` falls into the past; a wake set from it made `sleep_until` return at once and this loop spin its whole slice on an empty recv, so every call from the map waited for the slice timer: 10 ms a move, a quarter second a push (the scheduler trace, 2026-10-23).
+        let flip_possible = unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean;
+        let wake = if flip_possible { next_tick.min(next_flip.max(now())) } else { next_tick };
         ferros_sys::sleep_until(wake.min(now() + poll));
     }
 }

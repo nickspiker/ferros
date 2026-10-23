@@ -222,6 +222,11 @@ impl Cam {
         let (dx, dy) = self.delta(sx - w / 2, sy - h / 2);
         (self.x + dx, self.y + dy)
     }
+    /// A world point (×256) to its panel pixel: `world` undone.
+    fn screen(&self, w: i64, h: i64, wx: i64, wy: i64) -> (i64, i64) {
+        let (dx, dy) = (wx - self.x, wy - self.y);
+        (w / 2 + (((self.c * dx - self.s * dy) / ONE * self.z) >> 24), h / 2 + (((self.s * dx + self.c * dy) / ONE * self.z) >> 24))
+    }
     fn op(&self, keep: bool) -> [u8; 18] {
         let mut m = [0u8; 18];
         m[0] = 14;
@@ -883,6 +888,21 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.show_ramps();
     }
     // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back home.
+    // FERROS_MAP_START=ipc: the bare cost of a round trip to each server (64 trivial calls each: display info, touch info).
+    if option_env!("FERROS_MAP_START") == Some("ipc") {
+        for (name, ep, op) in [("display", display, 5u8), ("touch", touch, 2u8)] {
+            let t0 = now();
+            let mut worst = 0u64;
+            for _ in 0..64 {
+                let t = now();
+                call(ep, &[op], &mut r);
+                worst = worst.max(ferros_sys::us_since(t));
+            }
+            let mut l = Line::new();
+            let _ = write!(l, "map: ipc {name}: {} us a round trip, worst {} us\n", ferros_sys::us_since(t0) / 64, worst);
+            console(grants, l.as_str().as_bytes());
+        }
+    }
     if option_env!("FERROS_MAP_START") == Some("bench") {
         let home = map.cam;
         for (name, pinch) in [("pinch+twist", true), ("pan", false)] {
@@ -908,6 +928,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.draw();
     }
     console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
+    if let Some(mode) = option_env!("FERROS_MAP_START") {
+        let mut l = Line::new();
+        let _ = write!(l, "map: dev start mode {mode}\n");
+        console(grants, l.as_str().as_bytes());
+    }
     // The device's number base, as every app reads it (SETTINGS.md): logged now and whenever it changes, which is the proof the preference reaches a running process.
     let mut base = ferros_sys::device_base();
     say_base(grants, base);
@@ -924,6 +949,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
     let mut last_dashboard = now();
+    let mut last_pass = now();
+    let mut draw_us = 0u64;
+    let mut move_us = 0u64;
+    let mut last_ignored = 0u16;
+    let mut push_us = 0u64;
+    // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — down on circle 0, drawn in a line through circle 1 and past it, so the drag (and the push) runs with no one at the panel.
+    let mut synth = 0u32;
     loop {
         // A preference changed (here or from the bridge): redraw in it.
         let b = ferros_sys::device_base();
@@ -955,10 +987,30 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
         }
         // The screen off (the power key): no touches reach the map.
-        let n = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 0 } else { call(touch, &[1], &mut r) as usize };
+        let t_loop = now();
+        let n = if option_env!("FERROS_MAP_START") == Some("drag") && synth < 192 {
+            synth += 1;
+            if synth > 180 {
+                r[0] = 0;
+                1
+            } else {
+                let (ax, ay) = map.cam.screen(w, h, map.xs[0], map.ys[0]);
+                let (bx, by) = map.cam.screen(w, h, map.xs[1], map.ys[1]);
+                let k = synth as i64 - 1;
+                let (x, y) = (ax + (bx - ax) * k * 5 / 4 / 180, ay + (by - ay) * k * 5 / 4 / 180);
+                r[0] = 1;
+                r[1..13].fill(0);
+                r[3] = 1;
+                r[5..7].copy_from_slice(&(x.clamp(0, w - 1) as u16).to_le_bytes());
+                r[7..9].copy_from_slice(&(y.clamp(0, h - 1) as u16).to_le_bytes());
+                13
+            }
+        } else if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 0 } else { call(touch, &[1], &mut r) as usize };
+        let touch_us = ferros_sys::us_since(t_loop);
         let mut cur = [(false, 0i64, 0i64); 16];
         let mut ids = [0usize; 16];
         let mut held = 0usize;
+        let mut ignored = 0u16;
         if n >= 1 && n != ferros_sys::ERR as usize {
             let count = (r[0] as usize).min(16);
             for k in 0..count {
@@ -967,6 +1019,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 let id = (rec[0] as usize) & 15;
+                // Only fingers, gloves and styluses count (FTM5 touch types 1-3): a palm (4), a hover (0) or the grip of the hand holding the phone at the edge (7) is not a finger — counted as one, it turned a one-finger drag into a two-finger twist around the palm (owner, 2026-10-23: "it's spinning around when I only have one finger down").
+                if !(1..=3).contains(&rec[2]) {
+                    ignored |= 1 << rec[2].min(15);
+                    continue;
+                }
                 cur[id] = (true, u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
                 ids[held] = id;
                 held += 1;
@@ -1041,11 +1098,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 if let Some(i) = grab {
                     // One finger from a circle: the circle follows it, pushing the others aside.
+                    let t_m = now();
                     map.xs[i] += dx;
                     map.ys[i] += dy;
                     map.send_move(i);
                     map.arranged[i] = true;
+                    move_us += ferros_sys::us_since(t_m);
+                    let t_p = now();
                     map.push_apart(i);
+                    push_us += ferros_sys::us_since(t_p);
                     scene_moved = true;
                 } else {
                     // One finger from the air: the plane follows it.
@@ -1096,10 +1157,29 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     map.cam.y = wy - dy;
                 }
             }
+            let t_draw = now();
             if map.cam != before || scene_moved {
                 map.draw();
             }
+            draw_us = ferros_sys::us_since(t_draw);
         }
+        // A hitch, measured (owner, 2026-10-23: "smooth for a quarter second, then it hangs"): a pass with a finger down that took over 50 ms from the last one, split into the touch read and the frame.
+        let pass_us = ferros_sys::us_since(last_pass);
+        if held > 0 && pass_us > 50_000 {
+            let mut l = Line::new();
+            let _ = write!(l, "map: stall {} ms (touch read {} ms, move call {} ms, push {} ms, frame {} ms, {} fingers, other contact kinds G#{:X})\n", pass_us / 1000, touch_us / 1000, move_us / 1000, push_us / 1000, draw_us / 1000, held, ignored);
+            console(grants, l.as_str().as_bytes());
+        }
+        if ignored != 0 && ignored != last_ignored {
+            let mut l = Line::new();
+            let _ = write!(l, "map: ignoring contacts that are not fingers (kinds G#{:X})\n", ignored);
+            console(grants, l.as_str().as_bytes());
+        }
+        last_ignored = ignored;
+        last_pass = now();
+        draw_us = 0;
+        move_us = 0;
+        push_us = 0;
         prev = cur;
         // A hundred-and-twentieth of a second while a finger is down, a thirtieth at rest.
         sleep_until(now() + if held > 0 { freq() / 120 } else { freq() / 30 });

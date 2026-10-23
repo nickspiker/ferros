@@ -148,6 +148,8 @@ pub fn probe() -> (i64, u64, u64, u64) {
 
 /// The hand-over block, in the same non-cacheable page as the probe's (one of the two at a time): CPU0 writes the X3's translation and per-core registers here before CPU_ON (the X3 reads them with its MMU off), the X3 says it is parked, CPU0 says go.
 const HOP: usize = RESULT + 0x100;
+/// Where CPU0 sleeps once it has handed the service over (see `hand_over`): two instructions in the hand-over page.
+const PARK: usize = RESULT + 0x800;
 const H_MAIR: usize = 0;
 const H_TCR: usize = 8;
 const H_TTBR: usize = 16;
@@ -228,6 +230,8 @@ pub fn launch() {
     // Whatever an earlier session left in the block is not this boot's: no core is parked until this launch says so.
     unsafe { write_volatile((HOP + H_PARKED) as *mut u64, 0) };
     if mpidr & 0xFFFF != 0 {
+        // A reload, already on the X3 (CPU0 is parked for good): the X3's own setup that `ferros_x3_main` would have done.
+        crate::killswitch::arm_power_key();
         return;
     }
     unsafe {
@@ -282,9 +286,13 @@ pub fn hand_over(b: crate::service::Boot) -> crate::service::Boot {
             }
         }
         core::arch::asm!("msr daifset, #0xF");
-        loop {
-            core::arch::asm!("wfi");
-        }
+        // Parked outside the image, with the MMU off. A RELOAD rewrites every byte of the kernel and zeroes its .bss (the page tables included) while CPU0 sleeps; WFI wakes on any interrupt still aimed at this core whatever the mask, and a core that then fetches through a dead generation's tables and code faults into its old vectors and scribbles on the new kernel (every reload from the X3 hung within seconds, 2026-10-23). So the two instructions it sleeps in live in the hand-over page, which no generation overwrites, and it runs them with no translation under it.
+        let park = PARK as *mut u32;
+        write_volatile(park, 0xD503_207F); // wfi
+        write_volatile(park.add(1), 0x17FF_FFFF); // b .-4
+        core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb");
+        // One asm block from MMU-off to the branch, so nothing touches the stack through a cache the MMU no longer fronts; x9 is scratch (nothing returns to care).
+        core::arch::asm!("mrs x9, sctlr_el2", "bic x9, x9, #1", "msr sctlr_el2, x9", "isb", "br {p}", p = in(reg) PARK as u64, options(noreturn));
     }
 }
 

@@ -607,9 +607,10 @@ pub fn run(mut b: Boot) -> ! {
         match usb.poll_event() {
             UsbEvent::None => {
                 // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires) — but not while a PT transfer is open or a response is still going out: a 10 ms slice per idle pass crawls a transfer to the point where the host gives up, and the half-open transfer then trips the 16 s stall exit (measured 2026-10-16: every PT-stall exit of the day had a busy process running).
-                if pt_inbound.is_none() && pt_out_data.is_empty() {
-                    crate::process::run_slice();
-                }
+                // `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
+                platform::crumb(0xD1);
+                let ran = if pt_inbound.is_none() && pt_out_data.is_empty() { crate::process::run_slice() } else { false };
+                platform::crumb(0xD2);
                 if !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
                     if init_history.len() < 32 {
                         unsafe {
@@ -656,9 +657,11 @@ pub fn run(mut b: Boot) -> ! {
                     usb.bulk_in_send(&chunk);
                 }
                 // Truly idle — enumerated, no transfer half-received, nothing waiting to go out, no process to run — sleep until the next timer event. Anything else keeps the old short spin, so transfers and a live display server behave exactly as before.
-                if usb.is_configured() && pt_inbound.is_none() && pt_out_data.is_empty() && crate::process::alive() == 0 {
+                if usb.is_configured() && pt_inbound.is_none() && pt_out_data.is_empty() && !ran {
                     let t = cntpct();
+                    platform::crumb(0xB3);
                     unsafe { core::arch::asm!("wfe") };
+                    platform::crumb(0xB4);
                     asleep += cntpct().wrapping_sub(t);
                 } else {
                     for _ in 0..64u32 {
@@ -1077,6 +1080,12 @@ pub fn run(mut b: Boot) -> ! {
                                                     Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
                                                 }
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"sched" {
+                                            // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
+                                            crate::process::sched_report(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
