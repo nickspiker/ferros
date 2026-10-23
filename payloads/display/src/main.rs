@@ -104,6 +104,68 @@ extern "C" fn vsync(grants: u64) -> ! {
     }
 }
 
+// ---------------------------------------------------------------- the panel thread
+//
+// The third thread (KERNEL.md "Servers: receive and work are different threads"): everything that talks to the panel over DSI and takes milliseconds — the brightness setting (DBV/HBM) and the screen off/on sequences, whose sleep-out needs 120 ms — runs here, so the render thread never stalls a frame on it. The render thread posts a request (a word each, a sequence bump, a wake) and carries on; screen-on ends with a re-present it asks the render thread for. The DSI link is shared with the dev ops the render thread still runs (6-10): one futex mutex orders them.
+static PANEL_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The brightness wanted: u64::MAX none, else hbm << 16 | dbv.
+static PANEL_BRIGHT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The screen wanted: 0 on, 1 off.
+static PANEL_SCREEN: AtomicU64 = AtomicU64::new(0);
+/// The panel thread's "screen on again, present the frame the layer holds" to the render thread.
+static PANEL_REPRESENT: AtomicU64 = AtomicU64::new(0);
+static DSI_LOCK: AtomicU64 = AtomicU64::new(0);
+static mut PANEL_STACK: [u8; 16384] = [0; 16384];
+
+fn dsi_lock() {
+    while DSI_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        ferros_sys::wait(&DSI_LOCK, 1, 0);
+    }
+}
+fn dsi_unlock() {
+    DSI_LOCK.store(0, Ordering::Release);
+    ferros_sys::wake(&DSI_LOCK, 1);
+}
+
+extern "C" fn panel(grants: u64) -> ! {
+    let dsi = ferros_dsi::Dsim(DsiGrant { grants });
+    let mut screen_off = false;
+    let mut seen = 0u64;
+    loop {
+        let seq = PANEL_SEQ.load(Ordering::Acquire);
+        if seq == seen {
+            ferros_sys::wait(&PANEL_SEQ, seq, 0);
+            continue;
+        }
+        seen = seq;
+        let b = PANEL_BRIGHT.swap(u64::MAX, Ordering::AcqRel);
+        if b != u64::MAX {
+            dsi_lock();
+            set_panel(&dsi, b >> 16 & 1 == 1, b as u16);
+            dsi_unlock();
+        }
+        let off = PANEL_SCREEN.load(Ordering::Acquire) == 1;
+        if off != screen_off && dsi.alive() {
+            screen_off = off;
+            dsi_lock();
+            if off {
+                let _ = dsi.dcs(&[0x28]);
+                let _ = dsi.dcs(&[0x10]);
+            } else {
+                let _ = dsi.dcs(&[0x11]);
+                // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
+                ferros_sys::sleep_until(now() + freq() * 120 / 1000);
+                let _ = dsi.dcs(&[0x29]);
+                PANEL_REPRESENT.store(1, Ordering::Release);
+            }
+            dsi_unlock();
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
+            l.flush();
+        }
+    }
+}
+
 /// Wait for a frame to start — the interrupt, or half a millisecond, whichever first (the count register stays the truth; the fallback keeps a missed interrupt from costing more than it used to).
 fn frame_wait() {
     let seen = FRAME_STARTS.load(Ordering::Acquire);
@@ -1277,6 +1339,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no vsync thread\n");
         log.flush();
     }
+    if ferros_sys::thread_spawn(panel, unsafe { &mut *(&raw mut PANEL_STACK) }, grants) != 0 {
+        log.s(b"display: no panel thread\n");
+        log.flush();
+    }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
@@ -1726,6 +1792,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
             let gap_us = (t_call.wrapping_sub(last_reply) * 1_000_000 / freq()).min(999_999);
             let mut op_us = [0u64; 32];
+            let dsi_op = m.first().is_some_and(|&op| (6..=10).contains(&op));
+            if dsi_op {
+                dsi_lock();
+            }
             let len = if m.first() == Some(&15) {
                 // A batch: [len u16][op…] after [len u16][op…], run in order; the reply is the last op's, with the first failure's status if any failed.
                 let (mut at, mut fail, mut len) = (1usize, 0u8, 1usize);
@@ -1749,6 +1819,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             } else {
                 handle(m, &mut out)
             };
+            if dsi_op {
+                dsi_unlock();
+            }
             // How long a call took, by its first op (a batch by its last), logged when slow and at most every two seconds: the frame budget is the thing to watch.
             let took = ferros_sys::us_since(t_call);
             if took > 20_000 && now().wrapping_sub(last_slow_log) > 2 * freq() {
@@ -1869,7 +1942,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             build_lut(lut, white, peak_e);
             rebuild8(lut, &mut lut8);
             tabs = neon::Tables::from_lut8(&lut8);
-            set_panel(&dsi, hbm, dbv);
+            // The panel's own setting, by the panel thread.
+            PANEL_BRIGHT.store((hbm as u64) << 16 | dbv as u64, Ordering::Release);
+            PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
+            ferros_sys::wake(&PANEL_SEQ, 1);
             let full = draw::Rect::full(width, height);
             unsafe {
                 PHASE_DIRTY = [full; PHASES];
@@ -1895,22 +1971,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             log.flush();
         }
         // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.
+        // The power key (kernel preference 2): the panel thread does the DSI work; the frame the layer holds is presented again once it says the screen is back.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
-        if off != screen_off && dsi.alive() {
+        if off != screen_off {
             screen_off = off;
-            if off {
-                let _ = dsi.dcs(&[0x28]);
-                let _ = dsi.dcs(&[0x10]);
-            } else {
-                let _ = dsi.dcs(&[0x11]);
-                // The panel's sleep-out settling time before display on (DCS, 120 ms).
-                ferros_sys::delay_us(120_000);
-                let _ = dsi.dcs(&[0x29]);
-                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
-                let _ = pipe.present(win);
-            }
-            log.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
-            log.flush();
+            PANEL_SCREEN.store(off as u64, Ordering::Release);
+            PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
+            ferros_sys::wake(&PANEL_SEQ, 1);
+        }
+        if PANEL_REPRESENT.swap(0, Ordering::AcqRel) == 1 {
+            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+            let _ = pipe.present(win);
         }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
         let t_idle = now();

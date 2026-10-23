@@ -73,6 +73,10 @@ fn cur_get() -> Option<usize> {
 fn cur_set(t: Option<usize>) {
     unsafe { (*(&raw mut CURRENT))[core()] = t };
 }
+/// Whether thread `t` is at EL0 on some core right now — the test for "running elsewhere" when a process ends: a thread's `Running` state alone is not it (a stale `Running` with no core kept a dead display process's thread forever and its arc with it, 2026-10-23).
+fn on_a_core(t: usize) -> bool {
+    unsafe { (*(&raw const CURRENT)).iter().any(|c| *c == Some(t)) }
+}
 /// Slices run per core, for DIAG.
 pub static SLICES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 /// How many threads the run queue holds, readable without the lock: an idle core looks here before it takes the lock (five cores taking the lock on every `sev` contended it 100,000 times in a few seconds, 2026-10-23).
@@ -1289,9 +1293,9 @@ fn end_process(pi: usize, cur: usize, value: u64) {
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
     // A thread running on another core right now is left to leave at its own next trap (`drain_dying`): its arc must stay until then.
-    let elsewhere = mine.iter().any(|&i| i != cur && matches!(kk.threads[i].as_ref().map(|t| t.state), Some(State::Running)));
+    let elsewhere = mine.iter().any(|&i| i != cur && on_a_core(i));
     for &i in &mine {
-        if i != cur && elsewhere && matches!(kk.threads[i].as_ref().map(|t| t.state), Some(State::Running)) {
+        if i != cur && on_a_core(i) {
             continue;
         }
         kk.threads[i] = None;
@@ -1501,14 +1505,14 @@ fn kill_locked(name: &[u8]) -> bool {
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
     // A thread of it running on another core leaves at its next trap (`drain_dying`); the arc goes with the last of them.
-    let elsewhere = mine.iter().any(|&t| matches!(kk.threads[t].as_ref().map(|x| x.state), Some(State::Running)));
+    let elsewhere = mine.iter().any(|&t| on_a_core(t));
     if elsewhere {
         kk.procs[i].as_mut().unwrap().dying = true;
     } else if let Some(p) = kk.procs[i].take() {
         arc_free(p.arc);
     }
     for t in mine {
-        if elsewhere && matches!(kk.threads[t].as_ref().map(|x| x.state), Some(State::Running)) {
+        if on_a_core(t) {
             continue;
         }
         kk.threads[t] = None;
