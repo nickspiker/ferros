@@ -23,12 +23,20 @@ to_fastboot() {
     if lsusb -d 1209:4665 >/dev/null 2>&1; then
         echo "== ferros -> fastboot"
         timeout 30 "$BRIDGE" reboot fastboot >/dev/null 2>&1 || true
-    elif adb get-state >/dev/null 2>&1; then
+        for _ in $(seq 40); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
+        # `bridge reboot fastboot` stopped taking on 2026-10-23 (the stamp lost across the watchdog reset, ferros booting again instead); the sure path is through Android, whose `adb reboot bootloader` always lands in fastboot. The gate boots Android without asking on the marker `diag android` leaves (BOOT.md).
+        if lsusb -d 1209:4665 >/dev/null 2>&1; then
+            echo "== fastboot did not take; ferros -> Android -> fastboot"
+            timeout 60 "$BRIDGE" diag android >/dev/null 2>&1 || true
+            for _ in $(seq 60); do adb get-state >/dev/null 2>&1 && break; sleep 2; done
+        fi
+    fi
+    if adb get-state >/dev/null 2>&1; then
         echo "== Android -> fastboot"
         adb reboot bootloader
     fi
-    for _ in $(seq 90); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
-    echo "no fastboot after 3 min — phone needs hands (Power+VolDown)" >&2
+    for _ in $(seq 60); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
+    echo "no fastboot after the Android route either — phone needs hands (Power+VolDown)" >&2
     exit 1
 }
 

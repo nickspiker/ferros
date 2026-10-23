@@ -12,8 +12,16 @@ echo "== unpacking $(basename "$ZIP")"
 for p in $PARTS; do unzip -q -o "$ZIP" "$p.img" -d "$W" 2>/dev/null || echo "   (no $p.img in the zip; skipped)"; done
 to_fastboot() {
     if fastboot devices | grep -q .; then return; fi
-    if adb get-state >/dev/null 2>&1; then adb reboot bootloader; else timeout 30 "$BRIDGE" reboot fastboot >/dev/null 2>&1 || true; fi
-    for _ in $(seq 90); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged >/dev/null 2>&1 || true; done
+    if adb get-state >/dev/null 2>&1; then adb reboot bootloader; else
+        timeout 30 "$BRIDGE" reboot fastboot >/dev/null 2>&1 || true
+        for _ in $(seq 40); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged >/dev/null 2>&1 || true; done
+        # The sure path when the stamp does not take (tools/husky-cold.sh): through Android.
+        if lsusb -d 1209:4665 >/dev/null 2>&1; then
+            timeout 60 "$BRIDGE" diag android >/dev/null 2>&1 || true
+            for _ in $(seq 60); do adb get-state >/dev/null 2>&1 && { adb reboot bootloader; break; }; sleep 2; done
+        fi
+    fi
+    for _ in $(seq 60); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged >/dev/null 2>&1 || true; done
     echo "no fastboot" >&2; exit 1
 }
 to_fastboot
