@@ -256,6 +256,18 @@ ABL (Google's, immovable)
 - **ABL impersonation is the real work item:** Android init expects androidboot.* bootconfig (slot suffix, serial, hardware rev, verifiedbootstate…) that ABL normally synthesizes. ferros must reproduce these or Android userspace misbehaves in non-obvious ways.
 - **OTA caveat (stated plainly):** chainloaded Android cannot self-update its kernel — its OTA wants the boot slots, which are ours. Kernel/vendor updates get re-staged through ferros (future: ferros-bridge stage-android <boot.img>); system-partition OTA still works normally.
 
+### As built on husky (2026-10-22)
+
+The chainload above is not built. What runs instead is mirrored gates:
+- **Slot b** holds cold ferros.
+- **Slot a** holds the hv gate (ferros_hv/src/gate.rs) in front of Android's own kernel, with the same ferros packed in. `tools/husky-cold.sh` rebuilds and flashes both slots on every deploy (`FERROS_NO_SLOT_A=1` to leave slot a alone).
+
+How a boot goes:
+- **Every boot lands on "Ready?"**, from either slot. Power, or 1 s untouched on dev builds, gives ferros. Volume down gives Android.
+- **Android is one-shot.** Volume down at slot b's gate, or `bridge diag android`, makes slot a active and leaves a marker in the ramoops block. Slot a's gate takes it and boots Android without asking, once.
+- **A reboot from Android lands on slot a's gate again**, and from there on ferros. Verified 2026-10-22: `diag android` → Android on slot a → `adb reboot` → ferros on USB 17 s later, shell up. Before this, the volume-down path set no marker and slot a held an oracle capture build, so Android was a trap (owner).
+- **Not yet:** USB up during the gate on dev builds, so the host can choose before anything boots (owner's ask). Today the host chooses from a running ferros.
+
 ### Boot selection
 
 - Default path is **always ferros** — silent boot never lands in Android.

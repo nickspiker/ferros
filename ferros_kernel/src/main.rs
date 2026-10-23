@@ -1710,8 +1710,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
     UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
 
-    // The gate chose Android: slot a active in devinfo (its retries at 3, our active bit cleared), then a plain reset — the bootloader boots Android. The way back is the gate on slot b, which Android reaches with `bootctl set-active-boot-slot 1` + reboot (root), or fastboot.
+    // The gate chose Android: slot a active in devinfo (its retries at 3, our active bit cleared), then a plain reset — the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current).
     if gate_choice == ready::Choice::Android && store.is_some() {
+        // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
+        unsafe {
+            let p = 0xFD60_0FF8usize as *mut u64;
+            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+        }
         let r = slot::set_active(0);
         if r == slot::MARKED {
             platform::crumb(0xC7);

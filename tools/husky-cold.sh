@@ -6,7 +6,7 @@
 # No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). `--android` is the only way back to slot a: slot b no longer falls back on its own.
 #
 # Usage:
-#   tools/husky-cold.sh            build, flash boot_b, make b active, boot, wait for ferros on USB, print DIAG
+#   tools/husky-cold.sh            build, flash boot_b (and boot_a with the hv gate + the same ferros), make b active, boot, wait for ferros on USB, print DIAG
 #   tools/husky-cold.sh <img>      same with a prebuilt boot image
 #   tools/husky-cold.sh --android  leave ferros: fastboot, make a active, reboot into Android
 #   tools/husky-cold.sh --read     last ferros report, from Android's dmesg (slot a handoff kernel prints the ramoops block)
@@ -67,9 +67,15 @@ else
     ( cd "$REPO" && cargo run -q -p ferros-mkimg -- boot "$ELF" --pad 16 -o "$IMG" )
 fi
 echo "== image: $IMG ($(stat -c%s "$IMG") bytes)"
+# Slot a mirrors slot b (BOOT.md "Dual Boot"): its boot image is the hv gate with this same ferros packed in (tools/husky-hv.sh), so every boot of either slot lands on "Ready?" — power or 1 s (dev) = ferros, volume down = Android once — and a reboot from Android comes back to ferros instead of staying in Android (owner, 2026-10-22). FERROS_NO_SLOT_A=1 leaves slot a as it is (an oracle capture build, say).
+HV_IMG=""
+if [ "${FERROS_NO_SLOT_A:-0}" != 1 ]; then
+    ( cd "$REPO" && tools/husky-hv.sh >/dev/null ) && HV_IMG=$REPO/target/hv/boot_a_hv.img || echo "== slot a gate image failed to build; slot a left as it is"
+fi
 
 to_fastboot
 fastboot flash boot_b "$IMG"
+[ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
 fastboot --set-active=b
 t0=$(date +%s)
 fastboot reboot
