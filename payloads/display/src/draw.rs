@@ -155,6 +155,49 @@ pub fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
 }
 
+/// A glow around a disc of radius r centred at (cx, cy) (Q8 pixels): emitted light added behind whatever is already there (alpha stays as it is, so drawn after the circles it lands only where they leave room), falling off as 1/(distance from the edge) — `peak` one pixel out, half that two out, a quarter four out: a step down for every doubling of the distance (owner, 2026-10-23: "imgpx-FF0000-770000-330000"). No root anywhere, as in `disc`: with q = d² − r² = e·(2r + e) for an edge distance e, the brightness is peak · 2r · s / q — exactly peak·s/e near the edge, and a little faster far out, which bounds the reach. `scale_q8` is s, the distance at which the glow is still at peak, in Q8 pixels (256 = one pixel); `floor` the brightness (0-255) below which it stops. Gamma-space values, as the canvas holds them. Returns the rectangle it touched.
+pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, floor: u32) -> Rect {
+    if r < 128 || peak == 0 {
+        return Rect::EMPTY;
+    }
+    let (w, h) = (width as i64, height as i64);
+    let r2 = r * r;
+    let num = peak as i64 * 2 * r * scale_q8;
+    // The farthest q that is still at or above the floor, and a radius that surely contains it: q ≥ 2r·e, so e ≤ q / 2r.
+    let q_max = num / floor.max(1) as i64;
+    let reach = r + q_max / (2 * r) + 256;
+    let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
+    spans(cx, cy, reach, |y, xo0, xo1, _, _| {
+        if y < 0 || y >= h {
+            return;
+        }
+        let rowb = y as usize * width;
+        let dy = (y << 8) + 128 - cy;
+        let dy2 = dy * dy;
+        for x in xo0.max(0)..=xo1.min(w - 1) {
+            let dx = (x << 8) + 128 - cx;
+            let q = dx * dx + dy2 - r2;
+            if q <= 0 || q > q_max {
+                continue;
+            }
+            let p = &mut px[rowb + x as usize];
+            let a = (*p >> 24) as i64;
+            if a == 255 {
+                continue;
+            }
+            let i = (num / q).min(peak as i64);
+            // Into the room the pixel has left (255 − alpha), added and saturated per channel; alpha untouched.
+            let room = 255 - a;
+            let add = |c: i64, sh: u32| -> u32 {
+                let have = (*p >> sh & 0xFF) as i64;
+                ((have + c * i * room / 65025).min(255) as u32) << sh
+            };
+            *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
+        }
+    });
+    Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
+}
+
 /// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are packed premultiplied words (G#AARRGGBB), with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest) — VSF RGB gamma 2 codes, as the bundle holds them.
 #[derive(Clone, Copy)]
 pub struct Mips {

@@ -331,6 +331,10 @@ static mut SCENE_US: [u64; 3] = [1; 3];
 /// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
 const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
 const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
+/// The glow that replaced the ring (owner, 2026-10-23: no stroke, so circles can touch; additive glow, 1/distance): its colour, how bright one pixel out by importance (ring 1, ring 2), the distance it holds that brightness (Q8 px), and the floor where it stops. Tunables, by eye.
+const GLOW_PEAK: [u32; 3] = [0, 0x77, 0xFF];
+const GLOW_SCALE_Q8: i64 = 256;
+const GLOW_FLOOR: u32 = 2;
 const MAP_LIT: u32 = AMBER;
 const BLACK: u32 = rgb(0, 0, 0);
 
@@ -1517,6 +1521,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let mut t_phase = now();
                     unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3] };
                     let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
+                    // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
+                    let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
+                    let mut nglow = 0usize;
                     for i in 0..unsafe { SCENE_N } {
                         let cir = unsafe { SCENE[i] };
                         // World to screen, Q8 pixels: offset, turn, zoom, centre.
@@ -1525,13 +1532,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let sx = (((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128;
                         let sy = (((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128;
                         let sr = cir.r as i64 * z >> 8;
+                        // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
+                        if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
+                            let colour = if cir.lit != 0 { MAP_LIT & 0x00FF_FFFF } else { MAP_RING & 0x00FF_FFFF };
+                            glows[nglow] = (sx, sy, sr, colour, GLOW_PEAK[(cir.ring as usize).min(2)]);
+                            nglow += 1;
+                        }
                         if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                             continue;
                         }
                         // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
-                        let stroke = match cir.ring { 0 => 0, 1 => (sr * 41 >> 10).max(256), _ => (sr * 123 >> 10).max(512) };
+                        // No stroke: the circle's image reaches its radius, so circles touch; importance is the glow, drawn after every circle (below).
+                        let stroke = 0i64;
                         let lit = cir.lit != 0;
-                        let ri = sr - stroke;
+                        let ri = sr;
                         // Front to back: the label, the icon, the fill, the ring's larger disc beneath them all.
                         // Zoom is semantic: a name appears only once the circle is big enough to read it.
                         if sr >= 36 << 8 && cir.len > 0 {
@@ -1562,9 +1576,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
                                 }
                                 draw::disc(px, d, d, c, c, ri, fill);
-                                if stroke > 0 {
-                                    draw::disc(px, d, d, c, c, sr, MAP_RING & 0x00FF_FFFF);
-                                }
+
                             });
                             unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
                             let t_b = now();
@@ -1577,12 +1589,18 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             let t_d = now();
                             unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
                             draw::disc(pixels, width, height, sx, sy, ri, fill);
-                            r = if stroke > 0 { draw::disc(pixels, width, height, sx, sy, sr, MAP_RING & 0x00FF_FFFF) } else { draw::Rect::EMPTY };
+                            r = draw::Rect::EMPTY;
                             unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
                         }
                         let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
                         unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                     }
+                    let t_g = now();
+                    for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
+                        let gr_rect = draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
+                        unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
+                    }
+                    unsafe { SCENE_US[2] = ferros_sys::us_since(t_g) };
                     unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
                     unsafe { PHASE_US[1] = 0 };
@@ -1605,6 +1623,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             for k in 0..4 {
                                 SEC_US[k] += PHASE_US[k];
                             }
+                            SEC_US[1] += SCENE_US[2];
                             SEC_US[4] += 1;
                         }
                         out[1] = 1;
@@ -1975,6 +1994,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.dec(fs - starts_last_tick);
                 tlog.s(b" frame starts/s; camera frames: scene ");
                 tlog.dec(unsafe { SEC_US[0] } / 1000);
+                tlog.s(b" ms (glow ");
+                tlog.dec(unsafe { SEC_US[1] } / 1000);
+                tlog.s(b" ms)");
                 tlog.s(b" ms, publish ");
                 tlog.dec(unsafe { SEC_US[2] } / 1000);
                 tlog.s(b" ms, waited for the last frame ");

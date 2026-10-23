@@ -74,6 +74,11 @@ fn radius_of(share: u32) -> i64 {
     isqrt(BASE_RADIUS * BASE_RADIUS * 4 * share as i64 / 1000)
 }
 
+/// Zigzag decode (the inverse of `save_place`'s zig).
+fn unzig(v: u64) -> i64 {
+    ((v >> 1) as i64) ^ -((v & 1) as i64)
+}
+
 fn isqrt(v: i64) -> i64 {
     if v <= 0 {
         return 0;
@@ -209,8 +214,11 @@ struct Cam {
     c: i64,
     s: i64,
 }
-const Z_MIN: i64 = 9830; // 0.15
-const Z_MAX: i64 = 12 << 16;
+/// The zoom's one fixed point: on release the world is rescaled so the camera's zoom is exactly this (one world unit = one pixel) and every position and radius absorbs the factor — the integers never walk toward an extreme (owner, 2026-10-23: "rescale upon release so we never accidentally hit infinities"). The limits are all relative (`Map::zoom_limits`, `Map::radius_limits`).
+const Z_ONE: i64 = 1 << 16;
+/// The circles together may not shrink below this fraction of the screen's area (1/256), nor the smallest circle grow past the screen; the largest and smallest circle may not differ by more than this in area (256×: 16× in radius).
+const AREA_FRACTION: i64 = 256;
+const RADIUS_RATIO: i64 = 16;
 
 impl Cam {
     /// A panel offset from the centre, in pixels, to world units ×256: the rotation undone, then the zoom.
@@ -336,7 +344,7 @@ impl Map {
                 }
             }
             let ok = got >= 3;
-            if ok && vals[2] > 0 && vals[2] < 4096 {
+            if ok && vals[2] > 0 && vals[2] < 65536 {
                 let unzig = |u: u64| ((u >> 1) as i64) ^ -((u & 1) as i64);
                 self.xs[i] = unzig(vals[0]);
                 self.ys[i] = unzig(vals[1]);
@@ -409,7 +417,135 @@ impl Map {
         if self.view != View::Map {
             return None;
         }
-        self.hit(sx, sy).filter(|&i| (self.rs[i] * self.cam.z >> 16) < self.w * 3 / 8)
+        // A circle that fills the screen (its radius past half the shorter side) is the plane: fingers on it pan and zoom — the way out of the zoom-in limit, where the smallest circle fills the view. Anything smaller is held (the old 3/8-of-width cut made circles ungraspable once zoomed in a little: "intermittent", owner 2026-10-23).
+        self.hit(sx, sy).filter(|&i| (self.rs[i] * self.cam.z >> 16) < self.w.min(self.h) / 2)
+    }
+
+    /// The zoom's bounds, relative to the circles as they are: out, until together they cover 1/AREA_FRACTION of the screen; in, until the smallest alone fills it. (16.16, like `cam.z`.)
+    fn zoom_limits(&self) -> (i64, i64) {
+        let mut sum_r2 = 0i64;
+        let mut r_min = i64::MAX;
+        for i in 0..N {
+            let r = self.rs[i].max(1);
+            sum_r2 += r * r;
+            r_min = r_min.min(r);
+        }
+        // Σ π r² z² ≥ w h / F  →  z ≥ √(w h / (F π Σ r²)); 804 ≈ 256 π, scaled for F.
+        let den = (sum_r2 * 804 * AREA_FRACTION / 256).max(1);
+        let z_out = isqrt((self.w * self.h / den) << 32).max(1);
+        let z_in = (self.w.min(self.h) << 16) / (2 * r_min);
+        (z_out.min(z_in), z_in.max(z_out))
+    }
+
+    /// The radius circle `i` may take, given the others: within RADIUS_RATIO of the smallest and the largest of them.
+    fn radius_limits(&self, i: usize) -> (i64, i64) {
+        let (mut lo, mut hi) = (i64::MAX, 1i64);
+        for j in 0..N {
+            if j != i {
+                lo = lo.min(self.rs[j].max(1));
+                hi = hi.max(self.rs[j]);
+            }
+        }
+        ((hi / RADIUS_RATIO).max(1), (lo * RADIUS_RATIO).max(1))
+    }
+
+    /// The circles may not leave the screen entirely: their joint bounding box on the panel must still touch it (owner, 2026-10-23: "at least one edge has to be touching so we don't lose the circles"). Called after every camera change; the camera is pulled back by the overshoot.
+    fn keep_on_screen(&mut self) {
+        let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for i in 0..N {
+            let (sx, sy) = self.cam.screen(self.w, self.h, self.xs[i], self.ys[i]);
+            let sr = (self.rs[i] * self.cam.z >> 16).max(1);
+            x0 = x0.min(sx - sr);
+            y0 = y0.min(sy - sr);
+            x1 = x1.max(sx + sr);
+            y1 = y1.max(sy + sr);
+        }
+        let shift_x = if x1 < 0 { -x1 } else if x0 > self.w { self.w - x0 } else { 0 };
+        let shift_y = if y1 < 0 { -y1 } else if y0 > self.h { self.h - y0 } else { 0 };
+        if shift_x != 0 || shift_y != 0 {
+            // Content must move by the shift on the panel: the camera moves the other way, in world units.
+            let (dx, dy) = self.cam.delta(shift_x, shift_y);
+            self.cam.x -= dx;
+            self.cam.y -= dy;
+        }
+    }
+
+    /// The release: the camera's zoom back to exactly one, the world rescaled to match (positions ×256 and radii alike), so nothing accumulates. Every circle is then kept, since its stored place changed.
+    fn renormalise(&mut self) {
+        let z = self.cam.z;
+        if z == Z_ONE {
+            return;
+        }
+        for i in 0..N {
+            self.xs[i] = self.xs[i] * z / Z_ONE;
+            self.ys[i] = self.ys[i] * z / Z_ONE;
+            self.rs[i] = (self.rs[i] * z / Z_ONE).max(1);
+            self.arranged[i] = true;
+        }
+        self.cam.x = self.cam.x * z / Z_ONE;
+        self.cam.y = self.cam.y * z / Z_ONE;
+        self.cam.z = Z_ONE;
+        self.send_scene();
+    }
+
+    /// The view — where the camera is and how the plane is turned — into the vault (`map.view`: zigzag x, y, c, s), so a restart shows the plane as it was left. The zoom is always one at a release (`renormalise`), so the scale is already in the radii.
+    fn save_view(&self) -> bool {
+        let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
+        let mut b = [0u8; 64];
+        let mut n = 0;
+        for v in [zig(self.cam.x), zig(self.cam.y), zig(self.cam.c), zig(self.cam.s)] {
+            n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
+        }
+        ferros_sys::store_set(cap(self.grants, S_STORE), b"view", &b[..n])
+    }
+    fn load_view(&mut self) -> bool {
+        let mut v = [0u8; 64];
+        let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), b"view", &mut v) else { return false };
+        let n = (n as usize).min(v.len());
+        let mut vals = [0i64; 4];
+        let mut at = 0;
+        for slot in vals.iter_mut() {
+            match ferros_ledger::ewe::decode_u64(&v[at.min(n)..n]) {
+                Some((x, used)) => {
+                    *slot = unzig(x);
+                    at += used;
+                }
+                None => return false,
+            }
+        }
+        // A sane turn only: (c, s) near the unit circle in Q14.
+        let len2 = vals[2] * vals[2] + vals[3] * vals[3];
+        if !(ONE * ONE * 9 / 10..=ONE * ONE * 11 / 10).contains(&len2) {
+            return false;
+        }
+        self.cam = Cam { x: vals[0], y: vals[1], z: Z_ONE, c: vals[2], s: vals[3] };
+        self.keep_on_screen();
+        true
+    }
+
+    /// Whether, with circle `i` moved by (dx, dy), every circle still has a neighbour within one screen diagonal of it (edge to edge) at the zoom-out limit — distance, not a bounding box, so no orientation and no rectangles (owner, 2026-10-23: "so it never exceeds the screen diagonal; don't want weird rectangles floating around"). Zooming all the way out then always shows a connected set.
+    fn fits_when_out(&self, i: usize, dx: i64, dy: i64) -> bool {
+        let (z_out, _) = self.zoom_limits();
+        // Positions ×256 and radii in world units: the gap in world units ×256, against the diagonal brought to world ×256 at the zoom-out limit.
+        let diag = isqrt(self.w * self.w + self.h * self.h);
+        let limit = ((diag << 16) / z_out.max(1)) << 8;
+        let pos = |j: usize| if j == i { (self.xs[j] + dx, self.ys[j] + dy) } else { (self.xs[j], self.ys[j]) };
+        for a in 0..N {
+            let (ax, ay) = pos(a);
+            let mut nearest = i64::MAX;
+            for b in 0..N {
+                if b == a {
+                    continue;
+                }
+                let (bx, by) = pos(b);
+                let d = isqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by)) - ((self.rs[a] + self.rs[b]) << 8);
+                nearest = nearest.min(d);
+            }
+            if nearest > limit {
+                return false;
+            }
+        }
+        true
     }
 
     /// Keep every circle moved since the last time in the vault.
@@ -494,13 +630,15 @@ impl Map {
         // Zoom so the bounds take seven eighths of the panel either way.
         let (bw, bh) = (((x1 - x0) >> 8).max(1), ((y1 - y0) >> 8).max(1));
         let z = ((self.w * 7 / 8) << 16) / bw;
-        let z = z.min(((self.h * 7 / 8) << 16) / bh).clamp(Z_MIN, 1 << 16);
+        let (lo, hi) = self.zoom_limits();
+        let z = z.min(((self.h * 7 / 8) << 16) / bh).clamp(lo, hi);
         Cam { x: (x0 + x1) / 2, y: (y0 + y1) / 2, z, c: self.cam.c, s: self.cam.s }
     }
 
     /// The camera that has arrived at circle i: it fills the panel's width, less a margin.
     fn at(&self, i: usize) -> Cam {
-        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(Z_MIN, Z_MAX), c: self.cam.c, s: self.cam.s }
+        let (lo, hi) = self.zoom_limits();
+        Cam { x: self.xs[i], y: self.ys[i], z: ((self.arrived_r() << 16) / self.rs[i].max(1)).clamp(lo, hi), c: self.cam.c, s: self.cam.s }
     }
 
     /// Go to `to`: the camera is simply there (no animation).
@@ -875,6 +1013,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     map.send_scene();
     map.cam = map.home();
+    if map.load_view() {
+        console(grants, b"map: the view as it was left\n");
+    }
+    let mut saved_view = map.cam;
     // A development build can start arrived somewhere, to see a front or a back without a finger: FERROS_MAP_START=f<n> or b<n> (circle n).
     if let Some(v) = option_env!("FERROS_MAP_START").map(str::as_bytes) {
         if v.len() == 2 && (v[1] as usize).wrapping_sub(b'0' as usize) < N {
@@ -1053,7 +1195,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if held == 0 && down {
             down = false;
+            // Fingers up: the world back to zoom one, then whatever moved (or everything, after a rescale) into the vault, and the view if it changed.
+            map.renormalise();
             map.save_arranged();
+            if map.cam != saved_view {
+                if map.save_view() {
+                    saved_view = map.cam;
+                } else {
+                    console(grants, b"map: the vault did not take the view\n");
+                }
+            }
             if !moved && most <= 2 {
                 // Where the fingers landed, on average.
                 let (mut sx, mut sy, mut k) = (0i64, 0i64, 0i64);
@@ -1097,8 +1248,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 if let Some(i) = grab {
-                    // One finger from a circle: the circle follows it, pushing the others aside.
+                    // One finger from a circle: the circle follows it, pushing the others aside — as far as everything still fits at the zoom-out limit.
                     let t_m = now();
+                    let (dx, dy) = if map.fits_when_out(i, dx, dy) { (dx, dy) } else { (0, 0) };
                     map.xs[i] += dx;
                     map.ys[i] += dy;
                     map.send_move(i);
@@ -1112,6 +1264,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     // One finger from the air: the plane follows it.
                     map.cam.x -= dx;
                     map.cam.y -= dy;
+                    map.keep_on_screen();
                 }
             } else if nb == 2 {
                 let (a, b) = (both[0], both[1]);
@@ -1122,10 +1275,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 if let Some(i) = grab {
                     // Both fingers in one circle: it follows the point between them and grows or shrinks with their spread.
                     let (dx, dy) = map.cam.delta(m1x - m0x, m1y - m0y);
+                    let (dx, dy) = if map.fits_when_out(i, dx, dy) { (dx, dy) } else { (0, 0) };
                     map.xs[i] += dx;
                     map.ys[i] += dy;
                     if d0 > 8 * 16 && d1 > 8 * 16 {
-                        map.rs[i] = (map.rs[i] * d1 / d0).clamp(24, 1200);
+                        let (lo, hi) = map.radius_limits(i);
+                        map.rs[i] = (map.rs[i] * d1 / d0).clamp(lo, hi.max(lo));
                         // And turns with their twist, as the plane does.
                         let (ax, ay, bx, by) = (pb.0 - pa.0, pb.1 - pa.1, cb.0 - ca.0, cb.1 - ca.1);
                         let (dot, cross) = (ax * bx + ay * by, ax * by - ay * bx);
@@ -1142,7 +1297,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {
                     // Two fingers: zoom by how much they spread and turn by how much they twist, about the point between them, so what is under your fingers stays under your fingers.
                     let (wx, wy) = map.cam.world(w, h, m0x, m0y);
-                    map.cam.z = (map.cam.z * d1 / d0).clamp(Z_MIN, Z_MAX);
+                    let (lo, hi) = map.zoom_limits();
+                    map.cam.z = (map.cam.z * d1 / d0).clamp(lo, hi);
                     // The twist between the two finger vectors, as (cos, sin) = (dot, cross) / (|a| |b|), composed onto the camera's own turn and brought back to unit length.
                     let (ax, ay, bx, by) = (pb.0 - pa.0, pb.1 - pa.1, cb.0 - ca.0, cb.1 - ca.1);
                     let (dot, cross) = (ax * bx + ay * by, ax * by - ay * bx);
@@ -1155,6 +1311,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let (dx, dy) = map.cam.delta(m1x - w / 2, m1y - h / 2);
                     map.cam.x = wx - dx;
                     map.cam.y = wy - dy;
+                    map.keep_on_screen();
                 }
             }
             let t_draw = now();
