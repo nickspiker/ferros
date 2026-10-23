@@ -470,6 +470,13 @@ _m1_entry:
 .Lirq:
     stp     x0, x1, [sp, #-32]!
     stp     x2, x3, [sp, #16]
+    // Stage 1: entered (x1 = this core's stage word, kept in x1 only until the first ldr below).
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #1
+    str     x3, [x1, x2, lsl #3]
     mrs     x0, S3_0_C12_C12_0     // ICC_IAR1_EL1
     movz    x1, #0x0084
     movk    x1, #0x154D, lsl #16
@@ -483,9 +490,21 @@ _m1_entry:
     movk    x0, #0x8400, lsl #16
     smc     #0
 .Lirq_dead:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #3
+    str     x3, [x1, x2, lsl #3]
     wfi
     b       .Lirq_dead
 .Lirq_live:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #2
+    str     x3, [x1, x2, lsl #3]
     adrp    x1, __irq_count
     add     x1, x1, :lo12:__irq_count
     ldr     x2, [x1]
@@ -493,6 +512,8 @@ _m1_entry:
     str     x2, [x1]
     cmp     x0, #1020
     b.hs    .Lirq_ret
+    cmp     x0, #2
+    b.eq    .Lirq_dump
     cmp     x0, #26
     b.eq    .Lirq_tick
     cmp     x0, #60
@@ -510,6 +531,12 @@ _m1_entry:
     movz    x3, #0x0180
     movk    x3, #0x1040, lsl #16
     str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>: masked until a driver's irq_ack (or for good, if no one holds the line)
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #4
+    str     x3, [x1, x2, lsl #3]
     // The line is pending for whoever holds its grant (process.rs IRQS); from EL0 the running thread is parked so the scheduler can run the waiter now, from EL2 the service loop's next slice does.
     adrp    x1, __irq_pending
     add     x1, x1, :lo12:__irq_pending
@@ -526,9 +553,19 @@ _m1_entry:
     isb
     msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
     isb
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #5
+    str     x3, [x1, x2, lsl #3]
     mrs     x1, spsr_el2
     and     x1, x1, #0xF
     cbnz    x1, .Lirq_ret
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mov     x3, #6
+    str     x3, [x1, x2, lsl #3]
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp], #32
     b       .Lel0_preempt
@@ -555,6 +592,27 @@ _m1_entry:
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp], #32
     b       .Lel0_preempt
+// SGI 2: dump where this core is (process.rs `diag core`): the interrupted ELR/SPSR, both stack pointers, and x0-x3 as saved at entry.
+.Lirq_dump:
+    adrp    x1, __core_dump
+    add     x1, x1, :lo12:__core_dump
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    add     x1, x1, x2, lsl #6
+    mrs     x2, elr_el2
+    str     x2, [x1, #0]
+    mrs     x2, spsr_el2
+    str     x2, [x1, #8]
+    add     x2, sp, #32
+    str     x2, [x1, #16]
+    mrs     x2, sp_el0
+    str     x2, [x1, #24]
+    ldp     x2, x3, [sp]
+    stp     x2, x3, [x1, #32]
+    ldp     x2, x3, [sp, #16]
+    stp     x2, x3, [x1, #48]
+    dsb     sy
+    b       .Lirq_eoi
 .Lirq_key:
     movz    x1, #0x0A10
     movk    x1, #0x154D, lsl #16
@@ -567,6 +625,12 @@ _m1_entry:
     msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
     isb
 .Lirq_ret:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #7
+    str     x3, [x1, x2, lsl #3]
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp], #32
     eret
@@ -575,6 +639,7 @@ _m1_entry:
 // Enter a process at EL0 (process.rs `spawn`): x0 = entry, x1 = SP_EL0, x2 = arc base → x28, x3 = arc mask → x27, x4..x6 = the process's x0..x2. Saves the kernel's callee-saved registers and SP in __el0_kctx; `.Lel0_leave` returns from this call with the exit value. Every other register — general and SIMD — is cleared so no kernel value leaks into the process. SPSR = EL0t with interrupts unmasked: the killswitch keeps preempting.
 .global ferros_el0_enter
 ferros_el0_enter:
+    msr     daifset, #2            // as in ferros_el0_resume
     adrp    x9, __el0_kctx
     add     x9, x9, :lo12:__el0_kctx
     mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
@@ -665,6 +730,8 @@ ferros_el0_enter:
 // Resume a parked process (process.rs `run_slice`): x0 = its saved frame (816 bytes, the .Lel0_sync layout: x0–x30, SP_EL0, ELR, SPSR, ESR, FAR, then v0–v31, FPCR, FPSR). Saves the kernel context like ferros_el0_enter, copies the frame onto the stack and erets through the common restore path.
 .global ferros_el0_resume
 ferros_el0_resume:
+    // IRQs masked from here to the eret (the eret restores the thread's own PSTATE). Without this, an interrupt taken between `msr elr_el2`/`msr spsr_el2` in .Lel0_restore and the eret overwrote both with the eret's own address and EL2h, and the eret then returned to itself at EL2 forever — a core parked on one instruction with interrupts open, no slice ticks, no traps (2026-10-23; with SGI kicks at kilohertz it happened within seconds of a drag). The trap-return path never had this: exception entry masks IRQs.
+    msr     daifset, #2
     adrp    x9, __el0_kctx
     add     x9, x9, :lo12:__el0_kctx
     mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
@@ -981,6 +1048,12 @@ pub static UFS_WP_BEFORE: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 /// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
 #[unsafe(no_mangle)]
 pub static mut __irq_count: u64 = 0;
+/// Per core (MPIDR Aff1), where its IRQ handler last was: 1 entered, 2 past the chord check, 3 the dead loop (both volume keys read pressed and SYSTEM_OFF returned), 4 a device line masked and marked pending, 5 after EOI, 6 leaving for the preempt path, 7 returned to the interrupted code. DIAG IRQ_STAGE_Ck; a core stuck in the handler shows where (2026-10-23).
+#[unsafe(no_mangle)]
+pub static mut __irq_stage: [u64; 16] = [0; 16];
+/// Per core, what SGI 2 (`diag core <k>`) found when it interrupted it: ELR, SPSR, SP (the handler's), SP_EL0, then x0-x3 as they were — a stuck core's exact position (2026-10-23).
+#[unsafe(no_mangle)]
+pub static mut __core_dump: [[u64; 8]; 16] = [[0; 8]; 16];
 #[unsafe(no_mangle)]
 static mut __boot_el: u64 = 0;
 /// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).

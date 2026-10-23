@@ -77,6 +77,17 @@ fn cur_set(t: Option<usize>) {
 fn on_a_core(t: usize) -> bool {
     unsafe { (*(&raw const CURRENT)).iter().any(|c| *c == Some(t)) }
 }
+/// Frames found with IRQs masked in their saved PSTATE when about to be resumed (fixed on the spot), and slice ticks re-armed after a tick was taken at EL2 during a syscall: DIAG SPSR_MASKED, TICK_REARMS (the 2026-10-23 freeze: a worker "running" a thread at EL0 that no tick ever reached).
+pub static SPSR_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static TICK_REARMS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A frame about to be resumed at EL0 must have IRQs (and FIQs) open, or the slice timer and the killswitch never reach that core again.
+fn frame_check(f: &mut Frame) {
+    // Interrupts open, and EL0t (M = 0): a frame resumed at any other EL runs the thread's code in the kernel's EL, where its syscalls are skipped by the same-EL handler and it spins forever untimed.
+    if f.spsr & 0xCF != 0 {
+        f.spsr &= !0xCF;
+        SPSR_MASKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 /// Slices run per core, for DIAG.
 pub static SLICES: [core::sync::atomic::AtomicU64; 16] = [const { core::sync::atomic::AtomicU64::new(0) }; 16];
 /// How many threads the run queue holds, readable without the lock: an idle core looks here before it takes the lock (five cores taking the lock on every `sev` contended it 100,000 times in a few seconds, 2026-10-23).
@@ -383,7 +394,7 @@ pub fn threads_report(out: &mut Vec<u8>) {
             State::Waiting(a, d) if a < 1024 => alloc::format!("irq_wait on INTID A#{a}{}, pending {}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }, unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) }),
             State::Waiting(a, d) => alloc::format!("wait on word G#{a:X}{}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }),
         };
-        out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}, cores G#{:X}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc, t.mask).as_bytes());
+        out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}, cores G#{:X}, spsr G#{:X}, pc +G#{:X}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc, t.mask, t.frame.spsr, t.frame.elr.wrapping_sub(kk.procs.get(t.proc).and_then(|p| p.as_ref()).map(|p| p.arc.base as u64).unwrap_or(0)) & 0xFF_FFFF).as_bytes());
     }
     out.extend_from_slice(alloc::format!("runnable queue: {:?}; running per core {:?}; slices per core {:?}; lock contended A#{}\n", kk.runnable, unsafe { *(&raw const CURRENT) }, SLICES.iter().map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(), LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
     unlock();
@@ -797,6 +808,7 @@ fn switch_to_next(f: &mut Frame) -> bool {
             if np.state == State::Runnable {
                 np.state = State::Running;
                 *f = np.frame;
+                frame_check(f);
                 cur_set(Some(next));
                 tr(TR_SWITCH, next, 0);
                 return true;
@@ -823,6 +835,18 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
     lock();
     let r = el0_trap(f);
     unlock();
+    if r == 0 {
+        // Back to EL0 with a slice timer still running: a tick that fired during this syscall was taken at EL2 (.Lirq_tick clears the timer and returns), and without this the thread would run on untimed until its next syscall (2026-10-23).
+        let ctl: u64;
+        unsafe { core::arch::asm!("mrs {}, cnthp_ctl_el2", out(reg) ctl) };
+        if ctl & 1 == 0 {
+            TICK_REARMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let ticks = crate::platform::cntfrq() / 1000;
+            unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", t = in(reg) ticks, c = out(reg) _) };
+        }
+        // The frame the trap returns through (this thread's or the one it switched to) must have interrupts open.
+        frame_check(f);
+    }
     r
 }
 
@@ -1464,7 +1488,8 @@ pub fn run_slice() -> bool {
         return true;
     }
     p.state = State::Running;
-    let frame = p.frame;
+    let mut frame = p.frame;
+    frame_check(&mut frame);
     cur_set(Some(next));
     tr(TR_RUN, next, kk.runnable.len() as u64);
     SLICES[core()].fetch_add(1, core::sync::atomic::Ordering::Relaxed);

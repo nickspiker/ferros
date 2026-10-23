@@ -139,13 +139,13 @@ pub fn arm_core() -> bool {
     }
     wr(gicr + GICR_SGI + 0x180, 0xFFFF_FFFF);
     let sgi = gicr + GICR_SGI;
-    // The slice timer's PPI (26) and the wake SGI (1, process::kick), group 1, middle priority.
-    for n in [26usize, 1] {
+    // The slice timer's PPI (26), the wake SGI (1, process::kick) and the dump SGI (2, `diag core`), group 1, middle priority.
+    for n in [26usize, 1, 2] {
         let pr = sgi + 0x400 + (n & !3);
         wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
     }
     wr(sgi + 0x80, 0xFFFF_FFFF);
-    wr(sgi + 0x100, 1 << 26 | 1 << 1);
+    wr(sgi + 0x100, 1 << 26 | 1 << 1 | 1 << 2);
     unsafe {
         core::arch::asm!(
             "mrs {t}, S3_4_C12_C9_5",

@@ -1106,6 +1106,25 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(k) = cmd.params.strip_prefix(b"core ") {
+                                            // `diag core <k>`: SGI 2 to core k (MPIDR Aff1 = k, Aff0 = 0), whose IRQ handler dumps its position; a moment later the dump is printed.
+                                            let k = core::str::from_utf8(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(99);
+                                            if k < 16 {
+                                                unsafe {
+                                                    core::ptr::write_volatile(&raw mut crate::__core_dump[k as usize], [0; 8]);
+                                                    core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (k << 16) | (2u64 << 24) | 1);
+                                                }
+                                                let t = cntpct();
+                                                while cntpct().wrapping_sub(t) < cntfrq() / 100 {}
+                                                let d = unsafe { core::ptr::read_volatile(&raw const crate::__core_dump[k as usize]) };
+                                                resp.extend_from_slice(alloc::format!("core A#{k}: ELR G#{:X} SPSR G#{:X} SP G#{:X} SP_EL0 G#{:X} x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]).as_bytes());
+                                                if d[0] == 0 {
+                                                    resp.extend_from_slice(b"(no dump: the core did not take the SGI within 10 ms)\n");
+                                                }
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"threads" {
                                             crate::process::threads_report(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
@@ -1488,6 +1507,17 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                                         append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
+                                        for k in 4..9 {
+                                            append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
+                                        }
+                                        append_hex(&mut resp, b"SPSR_MASKED=", crate::process::SPSR_MASKED.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                        append_hex(&mut resp, b"TICK_REARMS=", crate::process::TICK_REARMS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                        {
+                                            let g = crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed);
+                                            append_hex(&mut resp, b"GATE_ANSWER=", (g & 0xFF) as u32);
+                                            append_hex(&mut resp, b"GATE_MS=", (g >> 8 & 0xFF_FFFF) as u32);
+                                            append_hex(&mut resp, b"GATE_POWER_HELD_MS=", (g >> 32) as u32);
+                                        }
                                         // The post-mortem notes (platform::note): this boot's and the previous boot's — the lock's holder (core + 1) and each core's last crumb with the core in the top byte.
                                         for k in 0..7 {
                                             let (v, pv) = (platform::note_read(k), platform::note_read(8 + k));

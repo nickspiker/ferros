@@ -319,6 +319,9 @@ pub fn ask() -> Choice {
     let mut held = false;
     // Keys must be up once before a press counts (a key held from before the gate, e.g. power from switching on, is not an answer).
     let mut armed = false;
+    // Telemetry for ferros's DIAG (GATE_ANSWER, GATE_MS; ready.rs reads them beside the mark): how the gate was answered — 1 power, 2 the dev timer, 3 volume down — and when, in ms from the screen, plus how long the power pin read pressed before it was first seen up (the owner, 2026-10-23: a press right after Ready? seems to take three quarters of a second unless volume up is held first).
+    let mut pressed_at_start_ms = 0u64;
+    let mut first_up: Option<u64> = None;
     let choice = loop {
         for &w in &WATCHDOGS {
             wr(w + 0x08, 0xFFFF);
@@ -329,13 +332,20 @@ pub fn ask() -> Choice {
         }
         if !armed {
             armed = !pw && !dn;
+            if armed && first_up.is_none() {
+                first_up = Some(now());
+                pressed_at_start_ms = now().wrapping_sub(t0) * 1000 / f;
+            }
         } else if pw {
+            gate_telemetry(1, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Ferros;
         } else if dn {
+            gate_telemetry(3, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Android;
         }
         held |= up;
         if !held && now().wrapping_sub(t0) > f {
+            gate_telemetry(2, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Ferros;
         }
         let t = now();
@@ -447,6 +457,14 @@ fn name_is_n(a: usize, want: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// The gate's answer for ferros's DIAG, beside the mark: how (1 power, 2 timer, 3 volume down), when (ms from the screen), and how long the power pin read pressed from the start (ms; 0 = it was up at once).
+fn gate_telemetry(how: u64, ms: u64, pressed_ms: u64) {
+    unsafe {
+        write_volatile((GATE_MARK_ADDR + 8) as *mut u64, how | ms << 8 | pressed_ms << 32);
+        asm!("dsb sy");
+    }
 }
 
 /// Enter ferros: copy the packed image to its link address, mark the gate answered, clean the instruction side, jump at EL2 with ABL's DTB in x0 as ABL would have. Never returns.
