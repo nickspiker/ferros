@@ -86,6 +86,36 @@ fn load(path: &Path) -> Linear {
 }
 
 /// The centred square, averaged down (or up) to SIZE: each output pixel is the exact area-weighted mean of the source it covers.
+/// The icon's own art, cropped square: the box of every pixel at least half opaque, made square about its centre. App icons often sit inset on a transparent canvas (Mahere's round map fills the middle 80 %, Lumis's has a margin and a soft shadow); scaled as they come, that margin showed as a ring of the circle's fill around the art (owner, 2026-10-23: "a baked circle in the image data"). Cropped, every icon reaches the circle's edge.
+fn content(src: &Linear) -> Linear {
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for y in 0..src.h {
+        for x in 0..src.w {
+            if src.px[y * src.w + x][3] >= 0.5 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return Linear { w: src.w, h: src.h, px: src.px.clone() };
+    }
+    let side = (x1 - x0).max(y1 - y0);
+    let (cx2, cy2) = (x0 + x1, y0 + y1);
+    let mut px = vec![[0f32; 4]; side * side];
+    for y in 0..side {
+        for x in 0..side {
+            let (sx, sy) = ((cx2 as isize - side as isize) / 2 + x as isize, (cy2 as isize - side as isize) / 2 + y as isize);
+            if sx >= 0 && sy >= 0 && (sx as usize) < src.w && (sy as usize) < src.h {
+                px[y * side + x] = src.px[sy as usize * src.w + sx as usize];
+            }
+        }
+    }
+    Linear { w: side, h: side, px }
+}
+
 fn square(src: &Linear) -> Linear {
     let s = src.w.min(src.h);
     let (ox, oy) = ((src.w - s) / 2, (src.h - s) / 2);
@@ -160,7 +190,7 @@ fn main() {
     let mut sheet = image::RgbaImage::from_pixel((SIZE * APPS.len() + 8 * (APPS.len() + 1)) as u32, (2 * SIZE + 24) as u32, image::Rgba([0, 0, 0, 255]));
     for (k, (name, rel)) in APPS.iter().enumerate() {
         let path = Path::new(CODE).join(rel);
-        let mut img = square(&load(&path));
+        let mut img = square(&content(&load(&path)));
         circle(&mut img);
         let mut rgba = Vec::with_capacity(SIZE * SIZE * 4);
         let mut grey = Vec::with_capacity(SIZE * SIZE);
