@@ -458,16 +458,18 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     }
 }
 
-/// The present stage's policy (DISPLAY-CALIB.md, "Decided", 2026-10-22): the panel driven at its measured peak (HBM: 1467 cd/m² on this unit) and white at 133 cd/m², so the headroom H = peak ÷ white ≈ 11 — under the working format's 16× ceiling, so all of it is used.
+/// The present stage's policy (DISPLAY-CALIB.md, "Decided", 2026-10-22): the panel driven at its measured peak (HBM: 1467 cd/m² of native white on this unit) and white at 133 cd/m².
 const PEAK_NITS: f32 = 1467.0;
 const WHITE_NITS: f32 = 133.0;
+/// White is equal-energy E, applied at the tail end (owner): per-channel gains in linear light after the roll-off, so E at full is the brightest the panel shows and some native codes are never reached. Solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white-e.py`, the DBV 3307 readings): R 1.0, G 0.7394, B 0.8172 in light; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15.
+const E_CODE_Q15: [u32; 3] = [32768, 28548, 29883];
+const E_LIGHT: f32 = 0.801;
 /// The panel's measured power law (γ 2.19 in 8- and 10-bit codes, to 10-bit code 8; DISPLAY-CALIB.md).
 const PANEL_GAMMA: f32 = 2.19;
 
-/// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368). One entry folds the whole display transform: the owner's pinned curve, Y/peak = tanh²(v/√H) (linear at black, white just under 1/H, highlights rolled into the peak with nothing clipped), then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise). Built once, here, with the f32 tanh the test card already uses; everything per pixel is integer.
+/// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
 fn build_lut(lut: &mut [u16]) {
-    let h = PEAK_NITS / WHITE_NITS;
-    let k = 1.0 / sqrt(h);
+    let k = libm::atanhf(sqrt(WHITE_NITS / (PEAK_NITS * E_LIGHT)));
     for (i, e) in lut.iter_mut().enumerate() {
         let y = tanh(i as f32 / 16384.0 * k);
         let q = pow(y, 2.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
@@ -485,7 +487,7 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
 }
 
 /// The 8-bit canvas through the present stage: each channel value read as gamma 2 with white at 255, its Q4 code from the table (`lut8`), the dither, the BGRA1010102 word. Empty pixels (most of the map) skip all of it. A row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
-fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[u16; 256]) {
+fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256]; 3]) {
     let mut row = [0u32; 4096];
     for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
         let bay = &BAYER[y & 3];
@@ -497,8 +499,8 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[u16; 256]) 
                 continue;
             }
             let t = bay[x & 3];
-            let q = |c: u32| ((lut8[c as usize] + t) >> 4).min(1023) as u32;
-            *d = pack10(q(p >> 16 & 0xFF), q(p >> 8 & 0xFF), q(p & 0xFF));
+            let q = |ch: usize, c: u32| ((lut8[ch][c as usize] + t) >> 4).min(1023) as u32;
+            *d = pack10(q(0, p >> 16 & 0xFF), q(1, p >> 8 & 0xFF), q(2, p & 0xFF));
         }
         dst.copy_from_slice(out);
     }
@@ -532,14 +534,15 @@ fn ramps(screen: &mut [u32], width: usize, height: usize, lut: &[u16]) {
                     // The 8-bit canvas: v rounded to a 255th of white.
                     v = (v * 255 + 8192) / 16384 * 16384 / 255;
                 }
-                let t = if dither { bay[x & 3] } else { 0 };
-                let q = |v: u32| ((lut[v.min(65535) as usize] + t) >> 4).min(1023) as u32;
-                let c = q(v);
+                let t = if dither { bay[x & 3] } else { 0 } as u32;
+                // The table, then E's gain on the code, then the dither.
+                let base = lut[v.min(65535) as usize] as u32;
+                let q = |ch: usize| ((base * E_CODE_Q15[ch] >> 15) + t >> 4).min(1023);
                 *d = match k {
-                    6 => pack10(c, 0, 0),
-                    7 => pack10(0, c, 0),
-                    8 => pack10(0, 0, c),
-                    _ => pack10(c, c, c),
+                    6 => pack10(q(0), 0, 0),
+                    7 => pack10(0, q(1), 0),
+                    8 => pack10(0, 0, q(2)),
+                    _ => pack10(q(0), q(1), q(2)),
                 };
             }
         }
@@ -691,15 +694,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
     build_lut(lut);
-    let mut lut8 = [0u16; 256];
-    for (c, e) in lut8.iter_mut().enumerate() {
-        *e = lut[c * 16384 / 255];
+    // The 8-bit canvas's tables, one per channel with E's gain on the code already in.
+    let mut lut8 = [[0u16; 256]; 3];
+    for (ch, t) in lut8.iter_mut().enumerate() {
+        for (c, e) in t.iter_mut().enumerate() {
+            *e = (lut[c * 16384 / 255] as u32 * E_CODE_Q15[ch] >> 15) as u16;
+        }
     }
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
     ALLOC.mark();
-    log.s(b"display: present table (H ");
-    log.dec((PEAK_NITS / WHITE_NITS * 10.0) as u64);
-    log.s(b"/10, white at 10-bit code ");
+    log.s(b"display: present table (E peak ");
+    log.dec((PEAK_NITS * E_LIGHT) as u64);
+    log.s(b" cd/m2, white ");
+    log.dec(WHITE_NITS as u64);
+    log.s(b", white at 10-bit code ");
     log.dec((lut[16384] >> 4) as u64);
     log.s(b") in ");
     log.dec(lut_ms);
