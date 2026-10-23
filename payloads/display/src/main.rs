@@ -74,11 +74,32 @@ static mut VSYNC_STACK: [u8; 16384] = [0; 16384];
 /// The frame-start thread: each start of a frame at DECON clears its pending bit, counts it and wakes whoever waits for it.
 extern "C" fn vsync(grants: u64) -> ! {
     let (irq, decon) = (cap(grants, S_IRQ_FS), cap(grants, S_DECON));
+    let mut said = 0u32;
     loop {
-        ferros_sys::irq_wait(irq, 0);
-        ferros_sys::mmio_write(decon, INT_PEND, INT_EN_FRAME_START);
-        FRAME_STARTS.fetch_add(1, Ordering::Release);
-        ferros_sys::wake(&FRAME_STARTS, 4);
+        let r = ferros_sys::irq_wait(irq, 0);
+        // The first returns, and any error, on the console: a wait that comes back at once forever is a spinning thread that costs everyone their slices (2026-10-23).
+        if (r != 0 && said < 4) || said < 2 {
+            said += 1;
+            let mut l = Log { grants, buf: [0; 256], n: 0 };
+            l.s(b"display: vsync irq_wait -> G#");
+            l.hex(r as u32);
+            l.s(if r == ferros_sys::ERR { b" (ERR: no such capability)\n" } else { b"\n" });
+            l.flush();
+            if r == ferros_sys::ERR {
+                ferros_sys::thread_exit(1);
+            }
+        }
+        // Everything pending is cleared (write-1-to-clear), not only frame-start: a stale frame-done bit left the line asserted and the loop ran 162,000 times a second (2026-10-23).
+        let pend = ferros_sys::mmio_read(decon, INT_PEND) as u32;
+        ferros_sys::mmio_write(decon, INT_PEND, pend);
+        let extra = ferros_sys::mmio_read(decon, INT_PEND_EXTRA) as u32;
+        if extra != 0 {
+            ferros_sys::mmio_write(decon, INT_PEND_EXTRA, extra);
+        }
+        if pend & INT_EN_FRAME_START != 0 {
+            FRAME_STARTS.fetch_add(1, Ordering::Release);
+            ferros_sys::wake(&FRAME_STARTS, 4);
+        }
         ferros_sys::irq_ack(irq);
     }
 }
@@ -1247,9 +1268,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no receive thread\n");
         log.flush();
     }
-    // Frame-start interrupts on at DECON (INT_EN: the block's enable and the frame-start bit), then the thread that takes them.
-    pipe.wr(S_DECON, INT_PEND, INT_EN_FRAME_START);
-    pipe.wr(S_DECON, INT_EN, pipe.rd(S_DECON, INT_EN) | 1 | INT_EN_FRAME_START);
+    // Frame-start interrupts, and only those, on at DECON (the bootloader leaves every source enabled, INT_EN G#303011, with frame-done pending and never cleared); the pending bits cleared first; then the thread that takes them.
+    pipe.wr(S_DECON, INT_EN, 0);
+    pipe.wr(S_DECON, INT_PEND, !0);
+    pipe.wr(S_DECON, INT_PEND_EXTRA, !0);
+    pipe.wr(S_DECON, INT_EN, 1 | INT_EN_FRAME_START);
     if ferros_sys::thread_spawn(vsync, unsafe { &mut *(&raw mut VSYNC_STACK) }, grants) != 0 {
         log.s(b"display: no vsync thread\n");
         log.flush();

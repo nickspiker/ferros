@@ -392,10 +392,10 @@ husky has 1× Cortex-X3, 4× A715, 4× A510 (ASID.md). The kernel today is one c
 
 ### Order
 
-1. Reply hand-off and the past-deadline yield (the yield is built; the hand-off is a few lines).
-2. Threads: `thread_spawn`/`thread_exit`, `wait`/`wake`, the run queue of threads.
-3. The display server split into receive, render and panel threads; the touch server into interrupt and receive.
-4. Interrupt grants: `irq_wait`/`irq_ack`; touch INT, DECON frame-done/TE.
+1. Reply hand-off and the past-deadline yield — built 2026-10-23.
+2. Threads: `thread_spawn`/`thread_exit`, `wait`/`wake` (with a deadline), the run queue of threads — built 2026-10-23 (`payloads/threads` is the test; `diag threads` lists every thread and its state).
+3. The display server split into receive and render threads (a request ring between them; a map call costs 5 µs with a frame in flight) — built 2026-10-23. The panel thread is still to come.
+4. Interrupt grants: `irq_wait`/`irq_ack`, the `IRQS` registry (touch INT gpn0-0 = SPI 0; DECON0 frame-start 243, frame-done 242) — built 2026-10-23: the touch server waits on its line, the display's vsync thread counts frame starts and `settle`/`present` wait for them. Two lessons: DECON comes up with every interrupt source enabled and frame-done pending, so a handler must clear everything pending or the line never drops (162,000 wakes a second); and a line is armed at the first `irq_wait`, not at grant, since init holds every grant and waits on none. TE is on a shared PERIC0 line (SPI 634, gpp0-3) and is not granted yet.
 5. Cores: the kernel lock, per-core queues, SGIs, the generalised hand-over; bring up the A715s first (the X3 is already there), then the A510s and move the waiting servers onto them.
 6. Pinning and tiled rendering; measure every step with `diag sched`, which grows a core column.
 

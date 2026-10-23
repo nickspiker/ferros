@@ -350,8 +350,9 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22],
-        b"touch" => &[14, 15, 16],
+        // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25],
+        b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22],
         _ => return None,
     };
@@ -1093,6 +1094,11 @@ pub fn run(mut b: Boot) -> ! {
                                                     Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
                                                 }
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"threads" {
+                                            crate::process::threads_report(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

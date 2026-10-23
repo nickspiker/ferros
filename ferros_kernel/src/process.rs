@@ -279,6 +279,28 @@ fn tr(ev: u8, who: usize, detail: u64) {
     kk.trace_at = (kk.trace_at + 1) % TRACE;
 }
 
+/// Every thread with its process and state (`diag threads`).
+pub fn threads_report(out: &mut Vec<u8>) {
+    let kk = k();
+    let now: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
+    let f = crate::platform::cntfrq();
+    for (i, t) in kk.threads.iter().enumerate() {
+        let Some(t) = t else { continue };
+        let st = match t.state {
+            State::Running => alloc::format!("running"),
+            State::Runnable => alloc::format!("runnable"),
+            State::Receiving(ep, ..) => alloc::format!("recv on endpoint A#{ep}"),
+            State::Calling(..) => alloc::format!("calling"),
+            State::Sleeping(d) => alloc::format!("sleeping, A#{} ms left", d.saturating_sub(now) * 1000 / f),
+            State::Waiting(a, d) if a < 1024 => alloc::format!("irq_wait on INTID A#{a}{}, pending {}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }, unsafe { core::ptr::read_volatile(&raw const __irq_pending[a]) }),
+            State::Waiting(a, d) => alloc::format!("wait on word G#{a:X}{}", if d != 0 { alloc::format!(", A#{} ms left", d.saturating_sub(now) * 1000 / f) } else { alloc::string::String::new() }),
+        };
+        out.extend_from_slice(alloc::format!("thread A#{i} {} (process A#{}): {st}\n", alloc::string::String::from_utf8_lossy(&thread_name(i)), t.proc).as_bytes());
+    }
+    out.extend_from_slice(alloc::format!("runnable queue: {:?}; current {:?}\n", kk.runnable, kk.current).as_bytes());
+}
+
 /// The trace, oldest first, as text: time since the first entry in microseconds, the event, the process name and the detail. Then per call: the wait before the server took it, the server's time to the reply, and the caller's wait after the reply before it ran again — the three parts of a round trip.
 pub fn sched_report(out: &mut Vec<u8>) {
     let kk = k();
@@ -748,6 +770,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                         f.x[0] = 0;
                         0
                     } else {
+                        crate::killswitch::enable_spi(intid);
                         let deadline = f.x[1];
                         let t_now: u64;
                         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
@@ -1427,11 +1450,9 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 Some(i) => (Object::Store(i), RIGHT_SEND),
                 None => return Err("no such store scope"),
             },
+            // The line is armed at the GIC by the first `irq_wait`, not here: init holds every grant and waits on none.
             Grant::Irq(n) => match IRQS.iter().position(|r| r.name.as_bytes() == *n) {
-                Some(i) => {
-                    crate::killswitch::enable_spi(IRQS[i].intid);
-                    (Object::Irq(i), RIGHT_SEND)
-                }
+                Some(i) => (Object::Irq(i), RIGHT_SEND),
                 None => return Err("no such interrupt line"),
             },
         });
