@@ -274,8 +274,13 @@ struct Map {
     /// The device back's rows, as laid out by the last frame: (top, bottom, what).
     rows: [(i64, i64, Choice); 8],
     nrows: usize,
+    /// Each circle's own turn (its icon), (cos, sin) in Q14; two fingers in a circle twist it.
+    rc: [i64; N],
+    rsn: [i64; N],
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
     arranged: [bool; N],
+    /// The one ramps column shown alone, if any.
+    ramps_only: Option<usize>,
     /// The display server's ramps are on the panel (the present stage's test screen); any tap comes back.
     ramps: bool,
 }
@@ -295,7 +300,7 @@ impl Map {
         6 + n
     }
 
-    /// The arrangement made by hand, from the vault: each circle's place as three EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), then the radius.
+    /// The arrangement made by hand, from the vault: each circle's place as EWE integers (CLAUDE.md: no fixed widths on storage) — x and y in world units ×256, zigzag-mapped (they can be negative), the radius, and then (since the circles turn) its turn as cos and sin in Q14, zigzag; a place kept before turns existed has three and stays upright.
     fn load_places(&mut self) -> usize {
         let mut loaded = 0;
         for i in 0..N {
@@ -305,22 +310,31 @@ impl Map {
             let Some(n) = ferros_sys::store_get(cap(self.grants, S_STORE), &key[..kl], &mut v) else { continue };
             let v = &v[..n.min(64)];
             let mut at = 0;
-            let mut vals = [0u64; 3];
-            let mut ok = true;
+            let mut vals = [0u64; 5];
+            let mut got = 0;
             for slot in vals.iter_mut() {
                 match ferros_ledger::ewe::decode_u64(&v[at.min(v.len())..]) {
                     Some((x, k)) => {
                         *slot = x;
                         at += k;
+                        got += 1;
                     }
-                    None => ok = false,
+                    None => break,
                 }
             }
+            let ok = got >= 3;
             if ok && vals[2] > 0 && vals[2] < 4096 {
                 let unzig = |u: u64| ((u >> 1) as i64) ^ -((u & 1) as i64);
                 self.xs[i] = unzig(vals[0]);
                 self.ys[i] = unzig(vals[1]);
                 self.rs[i] = vals[2] as i64;
+                if got == 5 {
+                    let (c, sn) = (unzig(vals[3]), unzig(vals[4]));
+                    if c.abs() <= ONE && sn.abs() <= ONE && c * c + sn * sn > ONE * ONE / 2 {
+                        self.rc[i] = c;
+                        self.rsn[i] = sn;
+                    }
+                }
                 loaded += 1;
             }
         }
@@ -334,10 +348,47 @@ impl Map {
         let zig = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
         let mut b = [0u8; 32];
         let mut n = 0;
-        for v in [zig(self.xs[i]), zig(self.ys[i]), self.rs[i] as u64] {
+        for v in [zig(self.xs[i]), zig(self.ys[i]), self.rs[i] as u64, zig(self.rc[i]), zig(self.rsn[i])] {
             n += ferros_ledger::ewe::encode_u64(&mut b[n..], v);
         }
         ferros_sys::store_set(cap(self.grants, S_STORE), &key[..kl], &b[..n])
+    }
+
+    /// No two circles overlap: after circle `held` moved or grew, every overlapping pair is pushed apart along the line between their centres until they touch (with a hair of air), the held one never moving — so a push carries on through the neighbours (owner, 2026-10-22). A few rounds settle it; every circle that moved is redrawn and kept when the fingers lift.
+    fn push_apart(&mut self, held: usize) {
+        const AIR: i64 = 4;
+        for _ in 0..8 {
+            let mut any = false;
+            for a in 0..N {
+                for b in a + 1..N {
+                    let (dx, dy) = (self.xs[b] - self.xs[a], self.ys[b] - self.ys[a]);
+                    let want = (self.rs[a] + self.rs[b] + AIR) << 8;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 >= want * want {
+                        continue;
+                    }
+                    any = true;
+                    let d = isqrt(d2);
+                    let (ux, uy) = if d > 0 { ((dx << 14) / d, (dy << 14) / d) } else { (ONE, 0) };
+                    let gap = want - d;
+                    // The held circle stays where the fingers are; between two others, each gives half.
+                    let (ka, kb) = if a == held { (0, gap) } else if b == held { (gap, 0) } else { (gap / 2, gap - gap / 2) };
+                    self.xs[a] -= ux * ka >> 14;
+                    self.ys[a] -= uy * ka >> 14;
+                    self.xs[b] += ux * kb >> 14;
+                    self.ys[b] += uy * kb >> 14;
+                    for i in [a, b] {
+                        if i != held {
+                            self.arranged[i] = true;
+                            self.send_move(i);
+                        }
+                    }
+                }
+            }
+            if !any {
+                break;
+            }
+        }
     }
 
     /// The circle a finger at this panel pixel takes hold of: the one under it, if it is small enough on screen to be an object rather than the place the view is in, and only on the plane (an arrived circle's front or back moves the view).
@@ -395,16 +446,24 @@ impl Map {
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
         call(self.display, &m, &mut r);
+        // The circles' own turns ride on `scene move`: a fresh scene starts every circle upright.
+        for i in 0..N {
+            if self.rc[i] != ONE || self.rsn[i] != 0 {
+                self.send_move(i);
+            }
+        }
     }
 
     /// One circle moved or resized in the display server's scene (op 17).
     fn send_move(&self, i: usize) {
-        let mut m = [0u8; 12];
+        let mut m = [0u8; 16];
         m[0] = 17;
         m[1] = i as u8;
         m[2..6].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
         m[6..10].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
         m[10..12].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
+        m[12..14].copy_from_slice(&(self.rc[i] as i16).to_le_bytes());
+        m[14..16].copy_from_slice(&(self.rsn[i] as i16).to_le_bytes());
         let mut r = [0u8; 4];
         call(self.display, &m, &mut r);
     }
@@ -606,8 +665,26 @@ impl Map {
 
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
         if self.ramps {
-            self.ramps = false;
-            self.draw();
+            // On the ramps: one finger on a column shows it alone, one finger again shows them all; two fingers go back to the map.
+            if fingers == 2 {
+                self.ramps = false;
+                self.ramps_only = None;
+                self.draw();
+                return;
+            }
+            self.ramps_only = match self.ramps_only {
+                Some(_) => None,
+                None => {
+                    // The display server's column layout: nine columns between 4-pixel lines.
+                    let col = (self.w - 4 * 10) / 9;
+                    Some(((sx - 4).max(0) / (col + 4)).clamp(0, 8) as usize)
+                }
+            };
+            let mut r = [0u8; 4];
+            match self.ramps_only {
+                Some(k) => call(self.display, &[21, k as u8], &mut r),
+                None => call(self.display, &[21], &mut r),
+            };
             return;
         }
         let inside = {
@@ -718,10 +795,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         view: View::Map,
         rows: [(0, 0, Choice::Labels); 8],
         nrows: 0,
+        rc: [ONE; N],
+        rsn: [0; N],
         arranged: [false; N],
+        ramps_only: None,
         ramps: false,
     };
     let kept = map.load_places();
+    // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
+    map.push_apart(N);
     if kept > 0 {
         let mut l = Line::new();
         let _ = write!(l, "map: {kept} circle(s) where the owner put them\n");
@@ -863,11 +945,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 if let Some(i) = grab {
-                    // One finger from a circle: the circle follows it.
+                    // One finger from a circle: the circle follows it, pushing the others aside.
                     map.xs[i] += dx;
                     map.ys[i] += dy;
                     map.send_move(i);
                     map.arranged[i] = true;
+                    map.push_apart(i);
                     scene_moved = true;
                 } else {
                     // One finger from the air: the plane follows it.
@@ -885,11 +968,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let (dx, dy) = map.cam.delta(m1x - m0x, m1y - m0y);
                     map.xs[i] += dx;
                     map.ys[i] += dy;
-                    if d0 > 8 * 16 {
+                    if d0 > 8 * 16 && d1 > 8 * 16 {
                         map.rs[i] = (map.rs[i] * d1 / d0).clamp(24, 1200);
+                        // And turns with their twist, as the plane does.
+                        let (ax, ay, bx, by) = (pb.0 - pa.0, pb.1 - pa.1, cb.0 - ca.0, cb.1 - ca.1);
+                        let (dot, cross) = (ax * bx + ay * by, ax * by - ay * bx);
+                        let ab = (d0 * d1 >> 8).max(1);
+                        let (c, sn) = ((map.rc[i] * dot - map.rsn[i] * cross) / ab, (map.rsn[i] * dot + map.rc[i] * cross) / ab);
+                        let len = isqrt(c * c + sn * sn).max(1);
+                        map.rc[i] = c * ONE / len;
+                        map.rsn[i] = sn * ONE / len;
                     }
                     map.send_move(i);
                     map.arranged[i] = true;
+                    map.push_apart(i);
                     scene_moved = true;
                 } else if d0 > 8 * 16 && d1 > 8 * 16 {
                     // Two fingers: zoom by how much they spread and turn by how much they twist, about the point between them, so what is under your fingers stays under your fingers.

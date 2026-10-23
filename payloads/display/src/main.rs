@@ -22,8 +22,8 @@
 //!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15). Optional bytes 14-17: the turn, `[cos i16][sin i16]` in Q14 (world to screen is that rotation, then the zoom); absent = upright.
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
-//! - 17 `scene move [index u8][x i32][y i32][r u16]`: one circle of the scene moved and resized in place (the owner arranging by hand).
-//! - 21 `ramps`: the present stage's test screen (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
+//! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
+//! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -55,6 +55,8 @@ const S_DSIM: u64 = 10;
 const S_DPHY: u64 = 11;
 const S_SRAMC0: u64 = 12;
 const S_HDRCOMM0: u64 = 13;
+/// 14: the `display-phases` region (64 MiB, non-cacheable): the four temporal dither frames.
+const S_PHASES: u64 = 14;
 
 /// DSIM0 through its grant: one syscall per register access, the generic timer for the waits.
 struct DsiGrant {
@@ -181,8 +183,11 @@ struct Circle {
     icon: u8,
     len: u8,
     label: [u8; 16],
+    /// The circle's own turn (its icon), (cos, sin) in Q14, on top of the camera's: set by `scene move`.
+    c: i16,
+    s: i16,
 }
-const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16] };
+const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0 };
 
 /// The apps' icons, bundled by tools/app-icons: b"ICN2", count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
@@ -480,10 +485,93 @@ fn build_lut(lut: &mut [u16]) {
 /// The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
 const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-/// A Q4 10-bit code (= Q6 8-bit) to the 10-bit word's code: dithered to 8 bits by the threshold `t` (0-15, in 16ths of an 8-bit step), the two low bits zero for the DQE's truncation.
+/// A Q4 10-bit code (= Q6 8-bit) to the 10-bit word's code: dithered to 8 bits by the threshold `th` (0-63, in 64ths of an 8-bit step), the two low bits zero for the DQE's truncation.
 #[inline(always)]
-fn dither8(q4: u32, t: u32) -> u32 {
-    ((q4 + t * 4) >> 6).min(255) << 2
+fn dither8(q4: u32, th: u32) -> u32 {
+    ((q4 + th) >> 6).min(255) << 2
+}
+
+/// The temporal dither (owner, 2026-10-22): four frames, flipped every 100 ms. Each pixel's threshold is its 4×4 Bayer level (4 bits, ×4) plus a temporal rank (2 bits) that differs from frame to frame, so over the four frames the pixel shows all 64 levels of the six fraction bits: 8-bit codes on the link, 14 bits effective. The rank's order is offset per 4×4 cell, so no frame is darker or lighter than another as a whole.
+const PHASES: usize = 4;
+const TEMPORAL_RANK: [u32; 4] = [0, 2, 1, 3];
+
+#[inline(always)]
+fn threshold(x: usize, y: usize, k: usize) -> u32 {
+    BAYER[y & 3][x & 3] as u32 * 4 + TEMPORAL_RANK[(k + (x >> 2) + (y >> 2)) & 3]
+}
+
+/// The four phase frames (`display-phases`), each 16 MiB apart; set at start when the region is granted.
+static mut PHASE_BASE: [usize; PHASES] = [1; PHASES];
+static mut TEMPORAL: bool = false;
+/// The phase on the layer now.
+static mut CUR_PHASE: usize = 0;
+
+/// The buffer the layer should show: the current phase when the temporal dither is on, else the one framebuffer.
+fn layer_fb(fb: usize) -> usize {
+    unsafe { if TEMPORAL { PHASE_BASE[CUR_PHASE] } else { fb } }
+}
+
+fn phase_slice(k: usize, n: usize) -> &'static mut [u32] {
+    unsafe { core::slice::from_raw_parts_mut(PHASE_BASE[k] as *mut u32, n) }
+}
+
+/// Phase frames not yet written for the current content: a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22), and the idle loop fills the rest one at a time from the back buffer; the flip only moves to a phase that is current.
+static mut PHASE_DIRTY: [bool; PHASES] = [true; PHASES];
+
+/// The 8-bit canvas into the phase frames in `mask` (bit k = phase k) in one pass: the table once per pixel, then each phase's threshold and word; a row at a time through cached buffers, then wide copies out.
+fn publish10x4(back: &[u32], width: usize, height: usize, lut8: &[[u16; 256]; 3], mask: u32) {
+    let mut rows = [[0u32; 1344]; PHASES];
+    let w = width.min(1344);
+    for y in 0..height {
+        let src = &back[y * width..y * width + w];
+        // Black first, in one fill per phase row; then only painted pixels are worked (most of the map is empty: the per-pixel loop over all four rows cost 55 ms a frame, 2026-10-22).
+        for (k, row) in rows.iter_mut().enumerate() {
+            if mask >> k & 1 == 1 {
+                row[..w].fill(3);
+            }
+        }
+        let mut x = 0usize;
+        while x < w {
+            // Four empty pixels at a time skip together.
+            if x & 3 == 0 && x + 4 <= w && (src[x] | src[x + 1] | src[x + 2] | src[x + 3]) & 0x00FF_FFFF == 0 {
+                x += 4;
+                continue;
+            }
+            let p = src[x] & 0x00FF_FFFF;
+            if p == 0 {
+                x += 1;
+                continue;
+            }
+            let (r, g, b) = (lut8[0][(p >> 16 & 0xFF) as usize] as u32, lut8[1][(p >> 8 & 0xFF) as usize] as u32, lut8[2][(p & 0xFF) as usize] as u32);
+            for (k, row) in rows.iter_mut().enumerate() {
+                if mask >> k & 1 == 1 {
+                    let th = threshold(x, y, k);
+                    row[x] = pack10(dither8(r, th), dither8(g, th), dither8(b, th));
+                }
+            }
+            x += 1;
+        }
+        for (k, row) in rows.iter().enumerate() {
+            if mask >> k & 1 == 1 {
+                phase_slice(k, width * height)[y * width..y * width + w].copy_from_slice(&row[..w]);
+            }
+        }
+    }
+    unsafe {
+        for k in 0..PHASES {
+            if mask >> k & 1 == 1 {
+                PHASE_DIRTY[k] = false;
+            }
+        }
+    }
+}
+
+/// Content changed: write the phase on the layer now, mark the others stale.
+fn publish_current(back: &[u32], width: usize, height: usize, lut8: &[[u16; 256]; 3]) {
+    unsafe {
+        PHASE_DIRTY = [true; PHASES];
+        publish10x4(back, width, height, lut8, 1 << CUR_PHASE);
+    }
 }
 
 /// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0].
@@ -504,7 +592,7 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256];
                 *d = 3;
                 continue;
             }
-            let t = bay[x & 3] as u32;
+            let t = bay[x & 3] as u32 * 4;
             let q = |ch: usize, c: u32| dither8(lut8[ch][c as usize] as u32, t);
             *d = pack10(q(0, p >> 16 & 0xFF), q(1, p >> 8 & 0xFF), q(2, p & 0xFF));
         }
@@ -512,23 +600,33 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256];
     }
 }
 
-/// The ramps (op 21): straight from 16-bit working values to the panel, to see the present stage do its whole job. Bands, top to bottom, each a horizontal ramp across the width: grey to white dithered, and undithered (the fraction dropped); near-black (v to 1/8, light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over (v in 1/255 steps); the headroom (v to 4.0, light to 16× white) through the roll-off; then red, green and blue to white.
-fn ramps(screen: &mut [u32], width: usize, height: usize, lut: &[u16]) {
-    const BANDS: usize = 9;
-    let gap = 8usize;
-    let band = (height - gap * (BANDS + 1)) / BANDS;
-    let mut row = [0u32; 4096];
+/// The ramps (op 21): straight from 16-bit working values to the panel, to see the present stage do its whole job. Columns, left to right, each a ramp from the top (black) to the bottom (the owner, 2026-10-22: vertical, for the longer run between steps), with 4-pixel white lines between them: grey to white dithered, and undithered (the fraction dropped); near-black (v to 1/8, light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over (v in 1/255 steps); the headroom (v to 4.0, light to 16× white) through the roll-off; then red, green and blue to white. Written into every phase frame, each with its own thresholds (or the one framebuffer, spatial only).
+fn ramps(outs: &mut [&mut [u32]], width: usize, height: usize, lut: &[u16], only: Option<usize>) {
+    const COLS: usize = 9;
+    const LINE: usize = 4;
+    let col = (width - LINE * (COLS + 1)) / COLS;
+    // One column alone (the owner, 2026-10-22: the dim ones against black, without their bright neighbours): a strip three eighths of the width down the middle, a thin white line each side, black elsewhere.
+    let strip = width * 3 / 8;
+    let (s0, s1) = ((width - strip) / 2, (width + strip) / 2);
+    let n = outs.len();
+    let mut rows = [[0u32; 1344]; PHASES];
+    let w = width.min(1344);
     for y in 0..height {
-        let out = &mut row[..width];
-        let k = y.saturating_sub(gap) / (band + gap);
-        let inside = y >= gap && (y - gap) % (band + gap) < band && k < BANDS;
-        if !inside {
-            out.fill(3);
-        } else {
-            let bay = &BAYER[y & 3];
-            for (x, d) in out.iter_mut().enumerate() {
-                // The ramp's position, 0..=65535 across the width.
-                let f = (x as u32 * 65535 / (width as u32 - 1)) as u32;
+        // The ramp's position, 0..=65535 down the height.
+        let f = (y as u32 * 65535 / (height as u32 - 1)) as u32;
+        for x in 0..w {
+            let (k, inside, black) = match only {
+                Some(k) => (k, x >= s0 && x < s1, x + LINE < s0 || x >= s1 + LINE),
+                None => {
+                    let k = x.saturating_sub(LINE) / (col + LINE);
+                    (k, x >= LINE && (x - LINE) % (col + LINE) < col && k < COLS, false)
+                }
+            };
+            let (v, dither, chan) = if black {
+                (0u32, false, 3usize)
+            } else if !inside {
+                (16384u32, true, 3usize)
+            } else {
                 let (top, dither, eight) = match k {
                     0 | 1 => (16384u32, k == 0, false),
                     2 | 3 | 4 => (2048, k != 3, k == 4),
@@ -537,22 +635,26 @@ fn ramps(screen: &mut [u32], width: usize, height: usize, lut: &[u16]) {
                 };
                 let mut v = f * top / 65535;
                 if eight {
-                    // The 8-bit canvas: v rounded to a 255th of white.
                     v = (v * 255 + 8192) / 16384 * 16384 / 255;
                 }
-                let t = if dither { bay[x & 3] } else { 0 } as u32;
-                // The table, then E's gain on the code, then the dither.
-                let base = lut[v.min(65535) as usize] as u32;
-                let q = |ch: usize| dither8(base * E_CODE_Q15[ch] >> 15, t);
-                *d = match k {
-                    6 => pack10(q(0), 0, 0),
-                    7 => pack10(0, q(1), 0),
-                    8 => pack10(0, 0, q(2)),
-                    _ => pack10(q(0), q(1), q(2)),
+                (v, dither, match k { 6 => 0, 7 => 1, 8 => 2, _ => 3 })
+            };
+            let base = lut[v.min(65535) as usize] as u32;
+            let q4 = [base * E_CODE_Q15[0] >> 15, base * E_CODE_Q15[1] >> 15, base * E_CODE_Q15[2] >> 15];
+            for (p, row) in rows.iter_mut().enumerate().take(n) {
+                let th = if !dither { 0 } else if n == PHASES { threshold(x, y, p) } else { BAYER[y & 3][x & 3] as u32 * 4 };
+                let c = |ch: usize| dither8(q4[ch], th);
+                row[x] = match chan {
+                    0 => pack10(c(0), 0, 0),
+                    1 => pack10(0, c(1), 0),
+                    2 => pack10(0, 0, c(2)),
+                    _ => pack10(c(0), c(1), c(2)),
                 };
             }
         }
-        screen[y * width..(y + 1) * width].copy_from_slice(out);
+        for (p, out) in outs.iter_mut().enumerate() {
+            out[y * width..y * width + w].copy_from_slice(&rows[p][..w]);
+        }
     }
 }
 
@@ -734,7 +836,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let status_y = span * 0.05;
     let status_px = span * 0.021;
 
-    pipe.program_layer(win, fb, width as u32, height as u32);
+    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
 
     // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules; what is left empty shows black (the panel ignores alpha).
     let mut damage = Damage::new();
@@ -779,6 +881,22 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     }
     log.flush();
     unsafe { TEN = ten };
+    // The temporal dither's four frames, when the region is granted and the pipe is in 10 bits.
+    let phases = ferros_sys::dma(cap(grants, S_PHASES)) as usize;
+    if ten && phases != 0 && phases != u64::MAX as usize && width * height * 4 <= 16 << 20 {
+        unsafe {
+            for k in 0..PHASES {
+                PHASE_BASE[k] = phases + k * (16 << 20);
+                phase_slice(k, width * height).fill(3);
+            }
+            TEMPORAL = true;
+        }
+        log.s(b"display: temporal dither on: four frames, flipped every 100 ms\n");
+    } else {
+        log.s(b"display: no temporal dither (spatial only)\n");
+    }
+    log.flush();
+    let mut next_flip = now() + freq() / 10;
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
@@ -834,9 +952,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
-                    pipe.program_layer(win, fb, width as u32, height as u32);
+                    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     frames += 1;
                     out[1] = moved as u8;
@@ -858,7 +976,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let i32le = |i: usize| i32::from_le_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
                         let mut label = [0u8; 16];
                         label.copy_from_slice(&m[at + 14..at + 30]);
-                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label };
+                        let c = Circle { x: i32le(at), y: i32le(at + 4), r: u16::from_le_bytes([m[at + 8], m[at + 9]]), ring: m[at + 10], lit: m[at + 11], icon: m[at + 12], len: m[at + 13].min(16), label, c: 16384, s: 0 };
                         unsafe {
                             SCENE[SCENE_N] = c;
                             SCENE_N += 1;
@@ -913,6 +1031,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let (x1, y1) = (((sx + ri) as usize).min(width), ((sy + ri) as usize).min(height));
                                 let step = size as f32 / (2.0 * ri);
                                 let half = size as f32 * 0.5;
+                                // The icon's turn on screen: the camera's, then the circle's own.
+                                let (cc, cs) = (cir.c as f32 / 16384.0, cir.s as f32 / 16384.0);
+                                let (rc, rs) = (rc * cc - rs * cs, rs * cc + rc * cs);
                                 for yy in y0..y1 {
                                     let oy = yy as f32 - sy;
                                     for xx in x0..x1 {
@@ -954,11 +1075,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe { PHASE_US[1] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
-                    pipe.program_layer(win, fb, width as u32, height as u32);
+                    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
                     frames += 1;
@@ -967,10 +1088,18 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(21) => {
                     client_owned = true;
+                    // `[column u8]`: that column alone (0-8); absent or past 8: all of them.
+                    let only = m.get(1).map(|&c| c as usize).filter(|&c| c < 9);
                     if ten {
-                        ramps(screen, width, height, lut);
+                        if unsafe { TEMPORAL } {
+                            let (a, b, c, d) = (phase_slice(0, width * height), phase_slice(1, width * height), phase_slice(2, width * height), phase_slice(3, width * height));
+                            ramps(&mut [a, b, c, d], width, height, lut, only);
+                            unsafe { PHASE_DIRTY = [false; PHASES] };
+                        } else {
+                            ramps(&mut [&mut *screen], width, height, lut, only);
+                        }
                         ferros_sys::dma_barrier();
-                        pipe.program_layer(win, fb, width as u32, height as u32);
+                        pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                         let (moved, _) = pipe.present(win);
                         frames += 1;
                         out[1] = moved as u8;
@@ -994,6 +1123,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             SCENE[i].x = i32le(2);
                             SCENE[i].y = i32le(6);
                             SCENE[i].r = u16::from_le_bytes([m[10], m[11]]);
+                            if m.len() >= 16 {
+                                SCENE[i].c = i16::from_le_bytes([m[12], m[13]]);
+                                SCENE[i].s = i16::from_le_bytes([m[14], m[15]]);
+                            }
                         }
                     } else {
                         out[0] = 1;
@@ -1073,9 +1206,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
-                    pipe.program_layer(win, fb, width as u32, height as u32);
+                    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     frames += 1;
                     client_owned = true;
@@ -1174,10 +1307,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
-                pipe.program_layer(win, fb, width as u32, height as u32);
+                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                 let (moved, irq) = pipe.present(win);
                 frames += 1;
                 if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
@@ -1195,8 +1328,24 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
+        // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). The panel then never rests at its idle floor; the owner chose the bits over the ~0.2 W (2026-10-22).
+        // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
+        if unsafe { TEMPORAL } && client_owned {
+            if let Some(k) = (0..PHASES).find(|&k| unsafe { PHASE_DIRTY[k] }) {
+                publish10x4(pixels, width, height, &lut8, 1 << k);
+            }
+        }
+        let next_clean = unsafe { !PHASE_DIRTY[(CUR_PHASE + 1) % PHASES] };
+        if unsafe { TEMPORAL } && client_owned && next_clean && now() >= next_flip {
+            next_flip = now() + freq() / 10;
+            unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
+            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+            let _ = pipe.present(win);
+            frames += 1;
+        }
         let poll = if now().wrapping_sub(last_interaction) < 2 * freq() { freq() / 120 } else { freq() / 16 };
-        ferros_sys::sleep_until(next_tick.min(now() + poll));
+        let wake = if unsafe { TEMPORAL } && client_owned { next_tick.min(next_flip) } else { next_tick };
+        ferros_sys::sleep_until(wake.min(now() + poll));
     }
 }
 

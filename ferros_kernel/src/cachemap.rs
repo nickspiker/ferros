@@ -57,6 +57,12 @@ pub const DISPLAY_HEAP: (usize, usize) = (0x8600_0000, 0x8800_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_HEAP: (usize, usize) = (0, 0);
 
+/// The display's temporal dither phases (cold only): 64 MiB of Normal non-cacheable, EL0 read/write memory for four 16 MiB frames the display server writes once per content change and the layer flips between every 100 ms (DISPLAY-CALIB.md, the present stage). Free DRAM on a cold boot: above the camera's diagnostic buffers (which end at G#8B10_0000) and below the first firmware carveout (G#9000_0000). Granted as the DMA region `display-phases`.
+#[cfg(not(shim_handoff))]
+pub const DISPLAY_PHASES: (usize, usize) = (0x8C00_0000, 0x9000_0000);
+#[cfg(shim_handoff)]
+pub const DISPLAY_PHASES: (usize, usize) = (0, 0);
+
 /// HCR_EL2 / CPTR_EL2 as the loader left them, restored before RELOAD hands over.
 static mut BOOT_HCR: u64 = 0;
 static mut BOOT_CPTR: u64 = 0;
@@ -140,10 +146,11 @@ pub fn enable() -> bool {
     let (q0, q1) = DMA_POOL;
     let (f0, f1) = DISPLAY_FB;
     let (h0, h1) = DISPLAY_HEAP;
+    let (t0, t1) = DISPLAY_PHASES;
     let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
     // The framebuffers and the display heap sit outside the window but in its GiB (so the level-2 table covers them), 2 MiB aligned, apart from each other.
     let outside = |a: usize, b: usize| a == b || (a % MIB2 == 0 && b % MIB2 == 0 && a / GIB == w0 / GIB && (b - 1) / GIB == w0 / GIB && (b <= w0 || a >= w1));
-    let fb_ok = outside(f0, f1) && outside(h0, h1) && (f1 <= h0 || h1 <= f0 || f0 == f1 || h0 == h1);
+    let fb_ok = outside(f0, f1) && outside(h0, h1) && (f1 <= h0 || h1 <= f0 || f0 == f1 || h0 == h1) && outside(t0, t1) && (t0 == t1 || (t0 >= f1.max(h1)));
     if w0 / GIB != (w1 - 1) / GIB || d0 < w0 || d1 > w1 || (d1 - 1) / MIB2 - d0 / MIB2 >= 2 || p0 < w0 || p1 > w1 || (d0 < p1 && p0 < d1) || !dma_ok || !fb_ok {
         return false;
     }
@@ -161,7 +168,7 @@ pub fn enable() -> bool {
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if f0 != f1 && a >= f0 && a + MIB2 <= f1 {
+            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) {
                 dma_pool(vhe, a, BLOCK)
             } else if h0 != h1 && a >= h0 && a + MIB2 <= h1 {
                 pool(vhe, a, BLOCK) | UXN

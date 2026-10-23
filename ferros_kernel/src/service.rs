@@ -330,6 +330,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Use(b"display"), Use(b"touch"),
         Settings,
         Store(b"map"),
+        Dma(b"display-phases"),
     ]
 }
 
