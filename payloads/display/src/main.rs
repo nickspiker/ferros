@@ -618,6 +618,89 @@ fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, 
     }
 }
 
+/// Each scene circle's rendered pixels (icon, fill, ring — premultiplied, from transparent), kept while its size, turn, colour and icon stay the same, so a pan blits instead of drawing again. Circles over 1100 pixels across are drawn directly. In a 10 MiB arena of the heap; when it fills, everything is drawn again into it from the start.
+#[derive(Clone, Copy)]
+struct Sprite {
+    /// Word offset into the arena, words reserved, side in pixels.
+    off: usize,
+    cap: usize,
+    d: usize,
+    key: [i64; 6],
+    valid: bool,
+}
+const NO_SPRITE: Sprite = Sprite { off: 0, cap: 0, d: 0, key: [0; 6], valid: false };
+static mut SPRITES: [Sprite; 256] = [NO_SPRITE; 256];
+/// Each circle's key in the last frame: a circle whose key just changed (a pinch, a twist) is drawn directly — drawing it into its sprite and blitting would cost more than drawing it — and only cached once it holds still for a frame.
+static mut LAST_KEY: [[i64; 6]; 256] = [[0; 6]; 256];
+static mut ARENA: usize = 1;
+static mut ARENA_NEXT: usize = 1;
+const ARENA_WORDS: usize = (10 << 20) / 4;
+const SPRITE_MAX: usize = 1100;
+
+/// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
+fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], usize)) -> (&'static [u32], &'static [u32]) {
+    unsafe {
+        let words = d * d + d;
+        let sp = &mut *(&raw mut SPRITES[i]);
+        if !(sp.valid && sp.key == key && sp.d == d) {
+            if sp.cap < words {
+                if ARENA_NEXT + words > ARENA_WORDS {
+                    // Full: every sprite is drawn again from the start of the arena.
+                    for k in 0..256 {
+                        SPRITES[k].valid = false;
+                        SPRITES[k].cap = 0;
+                    }
+                    ARENA_NEXT = 0;
+                }
+                sp.off = ARENA_NEXT;
+                sp.cap = words;
+                ARENA_NEXT += words;
+            }
+            let buf = core::slice::from_raw_parts_mut((ARENA as *mut u32).add(sp.off), words);
+            let (px, ext) = buf.split_at_mut(d * d);
+            px.fill(0);
+            draw_into(px, d);
+            for (r, e) in ext.iter_mut().enumerate() {
+                let row = &px[r * d..(r + 1) * d];
+                match (row.iter().position(|&p| p != 0), row.iter().rposition(|&p| p != 0)) {
+                    (Some(a), Some(b)) => *e = a as u32 | (b as u32) << 16,
+                    _ => *e = 1,
+                }
+            }
+            sp.key = key;
+            sp.d = d;
+            sp.valid = true;
+        }
+        let buf = core::slice::from_raw_parts((ARENA as *const u32).add(sp.off), words);
+        (&buf[..d * d], &buf[d * d..])
+    }
+}
+
+/// A sprite under what is there, its top-left at (ox, oy).
+fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d: usize, ox: i64, oy: i64) {
+    for r in 0..d {
+        let y = oy + r as i64;
+        if y < 0 || y >= height as i64 {
+            continue;
+        }
+        let (a, b) = ((ext[r] & 0xFFFF) as i64, (ext[r] >> 16) as i64);
+        if a > b {
+            continue;
+        }
+        let (x0, x1) = ((ox + a).max(0), (ox + b).min(width as i64 - 1));
+        if x0 > x1 {
+            continue;
+        }
+        let row = &mut px[y as usize * width + x0 as usize..=y as usize * width + x1 as usize];
+        let src = &spr[r * d + (x0 - ox) as usize..=r * d + (x1 - ox) as usize];
+        for (p, &q) in row.iter_mut().zip(src.iter()) {
+            if q != 0 {
+                *p = if *p == 0 { q } else { draw::under(*p, q) };
+            }
+        }
+    }
+}
+
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
@@ -869,6 +952,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         v.leak()
     };
+    unsafe {
+        ARENA = alloc::vec![0u32; ARENA_WORDS].leak().as_mut_ptr() as usize;
+        ARENA_NEXT = 0;
+    }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
     log.dec((PEAK_NITS * E_LIGHT) as u64);
@@ -1069,8 +1156,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let cir = unsafe { SCENE[i] };
                         // World to screen, Q8 pixels: offset, turn, zoom, centre.
                         let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
-                        let sx = ((rc * dx - rs * dy) >> 14) * z / 65536 + wq;
-                        let sy = ((rs * dx + rc * dy) >> 14) * z / 65536 + hq;
+                        // Centres on whole pixels, so a cached sprite and a fresh drawing always line up.
+                        let sx = (((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128;
+                        let sy = (((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128;
                         let sr = cir.r as i64 * z >> 8;
                         if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
                             continue;
@@ -1092,18 +1180,42 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             }
                         }
                         let t_i = now();
-                        if let Some(mp) = mips.get((cir.icon as usize).wrapping_sub(1)) {
-                            // The icon's turn on screen: the camera's, then the circle's own.
-                            let (cc, cs) = (cir.c as i64, cir.s as i64);
-                            let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                            draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
+                        let (cc, cs) = (cir.c as i64, cir.s as i64);
+                        let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                        let fill = if lit { MAP_LIT & 0x00FF_FFFF } else { MAP_FILL & 0x00FF_FFFF };
+                        let mp = mips.get((cir.icon as usize).wrapping_sub(1));
+                        let d = (2 * ((sr >> 8) + 3)) as usize;
+                        let mut r = draw::Rect::EMPTY;
+                        let still = unsafe { LAST_KEY[i] == [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
+                        unsafe { LAST_KEY[i] = [sr, stroke, tc, ts, lit as i64, cir.icon as i64] };
+                        if d <= SPRITE_MAX && still {
+                            // Cached: drawn at the sprite's centre pixel, then blitted.
+                            let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
+                            let (spr, ext) = sprite(i, key, d, |px, d| {
+                                let c = ((d as i64 / 2) << 8) | 128;
+                                if let Some(mp) = mp {
+                                    draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
+                                }
+                                draw::disc(px, d, d, c, c, ri, fill);
+                                if stroke > 0 {
+                                    draw::disc(px, d, d, c, c, sr, MAP_RING & 0x00FF_FFFF);
+                                }
+                            });
+                            unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
+                            let t_b = now();
+                            blit(pixels, width, height, spr, ext, d, (sx >> 8) - d as i64 / 2, (sy >> 8) - d as i64 / 2);
+                            unsafe { SCENE_US[1] += ferros_sys::us_since(t_b) };
+                        } else {
+                            if let Some(mp) = mp {
+                                draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
+                            }
+                            let t_d = now();
+                            unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
+                            draw::disc(pixels, width, height, sx, sy, ri, fill);
+                            r = if stroke > 0 { draw::disc(pixels, width, height, sx, sy, sr, MAP_RING & 0x00FF_FFFF) } else { draw::Rect::EMPTY };
+                            unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
                         }
-                        let t_d = now();
-                        unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                        draw::disc(pixels, width, height, sx, sy, ri, if lit { MAP_LIT & 0x00FF_FFFF } else { MAP_FILL & 0x00FF_FFFF });
-                        let r = if stroke > 0 { draw::disc(pixels, width, height, sx, sy, sr, MAP_RING & 0x00FF_FFFF) } else { draw::Rect::EMPTY };
-                        let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 2, y0: ((sy - sr) >> 8) as i32 - 2, x1: ((sx + sr) >> 8) as i32 + 3, y1: ((sy + sr) >> 8) as i32 + 3 }.clip(width, height);
-                        unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
+                        let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 3, y0: ((sy - sr) >> 8) as i32 - 3, x1: ((sx + sr) >> 8) as i32 + 4, y1: ((sy + sr) >> 8) as i32 + 4 }.clip(width, height);
                         unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                     }
                     unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
@@ -1347,7 +1459,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.hex(unsafe { SETTLE_TIMEOUT[3] });
                 tlog.s(b"; icons ");
                 tlog.dec(unsafe { SCENE_US[0] } / 1000);
-                tlog.s(b" ms, discs ");
+                tlog.s(b" ms (drawn; cached: sprites), discs or blits ");
                 tlog.dec(unsafe { SCENE_US[1] } / 1000);
                 tlog.s(b" ms; publish neon ");
                 tlog.dec(unsafe { PUB_TICKS[0] } * 1000 / freq());
