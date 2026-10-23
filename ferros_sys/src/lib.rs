@@ -213,10 +213,10 @@ pub fn cap(grants: u64, slot: u64) -> u64 {
     grants + 4 + 32 * slot
 }
 
-/// Start the signed capsule stored in the vault under `key` as a new process called `name`, handing it copies of this process's own capabilities in grant `slots` (they become the child's slots 1.. in that order; slot 0 is always its console). The child is queued; this process carries on. Returns 0, or ERR (the reason is on the console). At most 14 slots.
+/// Start the signed capsule stored in the vault under `key` as a new process called `name`, handing it copies of this process's own capabilities in grant `slots` (they become the child's slots 1.. in that order; slot 0 is always its console). The child is queued; this process carries on. Returns 0, or ERR (the reason is on the console). At most 24 slots.
 pub fn spawn(grants: u64, name: &[u8], key: &[u8], slots: &[u64]) -> u64 {
-    let mut req = [0u8; 2 + 64 + 64 + 1 + 14 * 32];
-    let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len().min(14));
+    let mut req = [0u8; 2 + 64 + 64 + 1 + 24 * 32];
+    let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len().min(24));
     let mut at = 0;
     req[at] = nl as u8;
     req[at + 1..at + 1 + nl].copy_from_slice(&name[..nl]);

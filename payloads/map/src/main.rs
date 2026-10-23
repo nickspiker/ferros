@@ -15,7 +15,7 @@
 //!
 //! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic until the owner arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`.
+//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the app surface (handed to the app in front).
 
 #![no_std]
 #![no_main]
@@ -28,6 +28,8 @@ const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
+/// 5: the app surface, passed on to the app in front.
+const S_APPSURF: u64 = 5;
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
 struct Spec {
@@ -282,8 +284,11 @@ struct Map {
     rsn: [i64; N],
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
     arranged: [bool; N],
-    /// The one ramps column shown alone, if any.
+    /// The one ramps column shown alone, if any (the display-side ramps of op 21, kept for comparison).
     ramps_only: Option<usize>,
+    /// The app in front has shown itself, and when it was launched.
+    app_seen: bool,
+    app_since: u64,
     /// The display server's ramps are on the panel (the present stage's test screen); any tap comes back.
     ramps: bool,
 }
@@ -682,13 +687,26 @@ impl Map {
         console(self.grants, l.as_str().as_bytes());
     }
 
-    /// Launch the Ramps app: its capsule from the vault, given this process's display capability (SYS_SPAWN: a child gets only what its parent holds). It draws and ends; the next tap brings the map back.
+    /// Launch the Ramps app: its capsule from the vault, given the display, touch and the app surface (SYS_SPAWN: a child gets only what its parent holds). While it is in front the map takes no touches; it comes back when the display says no app is in front any more (after it has seen this one arrive).
     fn show_ramps(&mut self) {
-        if ferros_sys::spawn(self.grants, b"ramps", b"ramps", &[S_DISPLAY]) == 0 {
+        if ferros_sys::spawn(self.grants, b"ramps", b"ramps", &[S_DISPLAY, S_TOUCH, S_APPSURF]) == 0 {
             self.ramps = true;
+            self.app_seen = false;
+            self.app_since = now();
         } else {
             console(self.grants, b"map: could not launch ramps\n");
         }
+    }
+
+    /// While an app is in front: has it handed the screen back (or never arrived)?
+    fn app_done(&mut self) -> bool {
+        let mut r = [0u8; 16];
+        let n = call(self.display, &[5], &mut r);
+        let active = n >= 13 && r[12] == 1;
+        if active {
+            self.app_seen = true;
+        }
+        (self.app_seen && !active) || (!self.app_seen && now().wrapping_sub(self.app_since) > 2 * freq())
     }
 
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
@@ -839,6 +857,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         arranged: [false; N],
         ramps_only: None,
         ramps: false,
+        app_seen: false,
+        app_since: 0,
     };
     let kept = map.load_places();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
@@ -924,6 +944,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
 
+        // An app in front: it has the touches; the map only watches for it to hand the screen back.
+        if map.ramps {
+            if map.app_done() {
+                map.ramps = false;
+                map.draw();
+            } else {
+                sleep_until(now() + freq() / 10);
+                continue;
+            }
+        }
         // The screen off (the power key): no touches reach the map.
         let n = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 0 } else { call(touch, &[1], &mut r) as usize };
         let mut cur = [(false, 0i64, 0i64); 16];

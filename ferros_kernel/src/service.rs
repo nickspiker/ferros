@@ -339,15 +339,16 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Settings,
         Store(b"map"),
         Dma(b"display-phases"),
+        Dma(b"app-surface"),
     ]
 }
 
 /// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21],
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22],
         b"touch" => &[14, 15, 16],
-        b"map" => &[17, 18, 19, 20],
+        b"map" => &[17, 18, 19, 20, 22],
         _ => return None,
     };
     let all = home_grants();

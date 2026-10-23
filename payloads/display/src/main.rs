@@ -23,6 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
+//! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
@@ -60,6 +61,8 @@ const S_SRAMC0: u64 = 12;
 const S_HDRCOMM0: u64 = 13;
 /// 14: the `display-phases` region (64 MiB, non-cacheable): the four temporal dither frames.
 const S_PHASES: u64 = 14;
+/// 15: the `app-surface` region (32 MiB, cacheable): the app in front draws its 16-bit pixels there.
+const S_APPSURF: u64 = 15;
 
 /// DSIM0 through its grant: one syscall per register access, the generic timer for the waits.
 struct DsiGrant {
@@ -737,6 +740,39 @@ fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d
     }
 }
 
+/// The app in front, if any: its frame in the surface (x, y, w, h on screen; the surface holds w × h pixels, row by row), published from there — every phase, the idle fill included — until it says it is done (op 23).
+static mut APP: Option<draw::Rect> = None;
+static mut APP_SURF: usize = 1;
+
+/// The app's 16-bit pixels into phase `k` over `r` (screen coordinates, inside the app's frame `f`): each pixel's R, G, B (bits 0-15, 16-31, 32-47) are working values — gamma 2, white = Q14 — through the one table, E's gains and the dither; bit 48 set = no dither for that pixel (the ramps' comparison columns). Outside the app's frame: black.
+fn publish_app(f: draw::Rect, r: draw::Rect, lut: &[u16], k: usize, width: usize, height: usize) {
+    let r = r.clip(width, height);
+    if r.is_empty() {
+        return;
+    }
+    let dst = phase_slice(k, width * height);
+    let fw = (f.x1 - f.x0) as usize;
+    let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
+    let mut row = [0u32; 1344];
+    for y in r.y0 as usize..r.y1 as usize {
+        for x in r.x0 as usize..r.x1 as usize {
+            let inside = (x as i32) >= f.x0 && (x as i32) < f.x1 && (y as i32) >= f.y0 && (y as i32) < f.y1;
+            row[x] = if !inside {
+                3
+            } else {
+                let p = surf[(y - f.y0 as usize) * fw + (x - f.x0 as usize)];
+                let th = if p >> 48 & 1 == 1 { 0 } else { threshold(x, y, k) };
+                let q = |ch: usize| {
+                    let v = (p >> (16 * ch) & 0xFFFF) as usize;
+                    dither8(lut[v] as u32 * E_CODE_Q15[ch] >> 15, th)
+                };
+                pack10(q(0), q(1), q(2))
+            };
+        }
+        dst[y * width + r.x0 as usize..y * width + r.x1 as usize].copy_from_slice(&row[r.x0 as usize..r.x1 as usize]);
+    }
+}
+
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
@@ -1087,6 +1123,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no temporal dither (spatial only)\n");
     }
     log.flush();
+    let surf = ferros_sys::dma(cap(grants, S_APPSURF)) as usize;
+    if surf != 0 && surf != u64::MAX as usize {
+        unsafe { APP_SURF = surf };
+    }
     let mut next_flip = now() + freq() / 10;
     let mut screen_off = false;
     // A frame armed and not yet seen to start (Pipe::arm / settle).
@@ -1102,6 +1142,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut msg = [0u8; 4096];
     let mut tok = [0u8; 32];
     let mut last_slow_log = 0u64;
+    let mut last_reply = 0u64;
     // A second console writer: `log` is lent to the op handler for the whole pass.
     let mut tlog = Log { grants, buf: [0; 256], n: 0 };
     loop {
@@ -1321,6 +1362,44 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
+                Some(22) if m.len() >= 9 => {
+                    // An app's frame: [x u16][y u16][w u16][h u16] on screen, its pixels in the surface. Into the next phase now, the others from the surface while idle; the map's screen comes back after op 23.
+                    client_owned = true;
+                    last_interaction = now();
+                    let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
+                    let f = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
+                    let surf_ok = unsafe { APP_SURF } > 1 && (v(5) as usize) * (v(7) as usize) * 8 <= 32 << 20;
+                    if ten && unsafe { TEMPORAL } && surf_ok {
+                        let full = draw::Rect::full(width, height);
+                        unsafe {
+                            APP = Some(f);
+                            PHASE_DIRTY = [full; PHASES];
+                        }
+                        pipe.settle(&mut armed, true);
+                        let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                        publish_app(f, full, lut, k, width, height);
+                        unsafe {
+                            PHASE_DIRTY[k] = draw::Rect::EMPTY;
+                            CUR_PHASE = k;
+                            // When the app is done, the map's next frame starts from a clear screen.
+                            PREV_DMG = full;
+                        }
+                        ferros_sys::dma_barrier();
+                        pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                        armed = Some(pipe.arm(win));
+                        frames += 1;
+                    } else {
+                        out[0] = 3;
+                    }
+                }
+                Some(23) => {
+                    // The app is done: the screen is the map's again (its next frame repaints everything).
+                    unsafe {
+                        APP = None;
+                        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
+                        PREV_DMG = draw::Rect::full(width, height);
+                    }
+                }
                 Some(16) if m.len() >= 11 => {
                     let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;
                     let r = u16::from_le_bytes([m[5], m[6]]) as isize;
@@ -1350,7 +1429,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     out[2..4].copy_from_slice(&(height as u16).to_le_bytes());
                     out[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
                     out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
-                    len = 12;
+                    out[12] = unsafe { APP }.is_some() as u8;
+                    len = 13;
                 }
                 // The panel, through DSIM: every write bracketed by the hk3 level-2 unlock/lock as the stock driver does.
                 Some(6) if m.len() >= 3 => {
@@ -1450,6 +1530,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let m = &msg[..(n as usize).min(msg.len())];
             let mut out = [0u8; 16];
             let t_call = now();
+            // The time since the last reply: what the client spent between calls (its own work, the scheduler, this loop's own sleep).
+            let gap_us = (t_call.wrapping_sub(last_reply) * 1_000_000 / freq()).min(999_999);
             let mut op_us = [0u64; 32];
             let len = if m.first() == Some(&15) {
                 // A batch: [len u16][op…] after [len u16][op…], run in order; the reply is the last op's, with the first failure's status if any failed.
@@ -1482,7 +1564,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.dec(m.first().copied().unwrap_or(0) as u64);
                 tlog.s(b" (");
                 tlog.dec(n);
-                tlog.s(b" bytes) took ");
+                tlog.s(b" bytes, ");
+                tlog.dec(gap_us / 1000);
+                tlog.s(b" ms after the last reply) took ");
                 tlog.dec(took / 1000);
                 tlog.s(b" ms;");
                 for (op, &us) in op_us.iter().enumerate() {
@@ -1520,6 +1604,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.flush();
             }
             ferros_sys::reply(&tok, &out[..len]);
+            last_reply = now();
         }
 
         let t = now();
@@ -1617,7 +1702,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
         if unsafe { TEMPORAL } && client_owned && now().wrapping_sub(last_interaction) > freq() / 8 {
             if let Some(k) = (0..PHASES).find(|&k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
-                publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] });
+                match unsafe { APP } {
+                    Some(f) => publish_app(f, unsafe { PHASE_DIRTY[k] }, lut, k, width, height),
+                    None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),
+                }
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };
             }
         }

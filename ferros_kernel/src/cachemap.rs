@@ -20,6 +20,8 @@ struct Table([u64; 512]);
 
 static mut L1: Table = Table([0; 512]);
 static mut L2: Table = Table([0; 512]);
+/// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except APP_SURFACE.
+static mut L2_HI: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
 /// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 8 MiB = 4 blocks, the shim pool 2 MiB = 1.
 static mut POOL_L3: [Table; 4] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
@@ -62,6 +64,12 @@ pub const DISPLAY_HEAP: (usize, usize) = (0, 0);
 pub const DISPLAY_PHASES: (usize, usize) = (0x8C00_0000, 0x9000_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_PHASES: (usize, usize) = (0, 0);
+
+/// The apps' surface (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory at the bottom of the GiB above the window — a full panel's 16-bit pixels (1344 × 2992 × 8 bytes), which an app draws and the display server publishes (SHELL.md, apps as places). Free on a cold boot: Android's reserved carveouts in this GiB start at G#E800_0000 (zuma-rmem.dtsi). Granted as the region `app-surface` to the display server and, through the map, to the app in front.
+#[cfg(not(shim_handoff))]
+pub const APP_SURFACE: (usize, usize) = (0xC000_0000, 0xC200_0000);
+#[cfg(shim_handoff)]
+pub const APP_SURFACE: (usize, usize) = (0, 0);
 
 /// HCR_EL2 / CPTR_EL2 as the loader left them, restored before RELOAD hands over.
 static mut BOOT_HCR: u64 = 0;
@@ -195,6 +203,17 @@ pub fn enable() -> bool {
             } else {
                 normal(vhe, a, BLOCK)
             };
+        }
+        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surface Normal.
+        let (s0, s1) = APP_SURFACE;
+        if s0 != s1 && s0 / GIB == w0 / GIB + 1 && s0 % MIB2 == 0 && s1 % MIB2 == 0 && (s1 - 1) / GIB == s0 / GIB {
+            let l2h = &mut *(&raw mut L2_HI);
+            let base = s0 / GIB * GIB;
+            for (j, e) in l2h.0.iter_mut().enumerate() {
+                let a = base + j * MIB2;
+                *e = if a >= s0 && a + MIB2 <= s1 { pool(vhe, a, BLOCK) | UXN } else { device(vhe, a, BLOCK) };
+            }
+            l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }
         // The tables went to DRAM with the MMU off. Discard any stale lines over the window (left by the loader; ours bypassed the cache) before the window becomes cacheable — including the table walker's view of the tables.
         asm!("dsb sy");
