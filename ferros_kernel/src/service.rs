@@ -334,6 +334,45 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     ]
 }
 
+/// Each shell process's capabilities, as init hands them out (payloads/init: the slots of `home_grants`, 1-based), for restarting one from the vault without a reboot.
+fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
+    let slots: &[usize] = match name {
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21],
+        b"touch" => &[14, 15, 16],
+        b"map" => &[17, 18, 19, 20],
+        _ => return None,
+    };
+    let all = home_grants();
+    Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).collect())
+}
+
+/// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
+fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Vec<u8>) {
+    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+        let Some(grants) = shell_grants(name) else {
+            rep.extend_from_slice(b"not a shell process: ");
+            rep.extend_from_slice(name);
+            rep.push(b'\n');
+            continue;
+        };
+        let killed = crate::process::kill(name);
+        let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()) else {
+            rep.extend_from_slice(b"no capsule in the vault for ");
+            rep.extend_from_slice(name);
+            rep.push(b'\n');
+            continue;
+        };
+        match crate::process::spawn_capsule(name, &capsule, b"", &grants, &sealed) {
+            Ok(o) => {
+                crate::process::push_console(&o.console);
+                rep.extend_from_slice(alloc::format!("{} {}\n", core::str::from_utf8(name).unwrap_or("?"), if killed { "restarted" } else { "started" }).as_bytes());
+            }
+            Err(e) => rep.extend_from_slice(alloc::format!("{}: {e}\n", core::str::from_utf8(name).unwrap_or("?")).as_bytes()),
+        }
+    }
+}
+
 /// The ring has completed: bring the touch controller up (the kernel's part, as `diag touch up` does) and start the vault's `init`, which starts the shell. Its console goes to `diag console`.
 /// Returns false when the shell is off this boot (`home.off`).
 fn start_home(store: &mut Option<ShimStore>) -> bool {
@@ -1029,6 +1068,11 @@ pub fn run(mut b: Boot) -> ! {
                                                     Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
                                                 }
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if let Some(names) = cmd.params.strip_prefix(b"restart ") {
+                                            restart(&mut store, names, &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

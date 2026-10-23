@@ -898,6 +898,30 @@ pub fn take_console() -> Vec<u8> {
     core::mem::take(&mut k().console)
 }
 
+/// End a process by name from outside (the service loop, `diag restart`), whatever it is doing: its arc freed, its calls still queued on any endpoint dropped, and every reply capability pointing at it removed from every other process — so a late reply can never reach whatever process takes its slot next. A server's queued callers stay queued on the endpoint for the next server. Returns whether a process of that name was found. Never call it for the process that is running (only from the kernel's own loop, where none is).
+pub fn kill(name: &[u8]) -> bool {
+    let kk = k();
+    let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
+    if kk.current == Some(i) {
+        return false;
+    }
+    if let Some(p) = kk.procs[i].take() {
+        arc_free(p.arc);
+    }
+    for ep in kk.endpoints.iter_mut() {
+        ep.queue.retain(|(caller, _)| *caller != i);
+        if ep.poller == Some(i) {
+            ep.poller = None;
+        }
+    }
+    for q in kk.procs.iter_mut().flatten() {
+        q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == i));
+    }
+    kk.console.extend_from_slice(name);
+    kk.console.extend_from_slice(b": killed\n");
+    true
+}
+
 /// How many processes are alive (running, runnable or blocked).
 pub fn alive() -> usize {
     k().procs.iter().filter(|p| p.is_some()).count()
@@ -919,6 +943,7 @@ const CODE: usize = 0x1000;
 const STACK: usize = 64 * 1024;
 
 /// A capability to grant at spawn: a dev endpoint by name, to serve (receive) or to use (send).
+#[derive(Clone, Copy)]
 pub enum Grant<'a> {
     Serve(&'a [u8]),
     Use(&'a [u8]),
