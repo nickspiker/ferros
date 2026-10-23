@@ -708,8 +708,75 @@ fn phase_slice(k: usize, n: usize) -> &'static mut [u32] {
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
 
 /// The 8-bit canvas into the phase frames in `mask` (bit k = phase k), over `r` only (widened to 16-pixel steps): NEON, 16 pixels per step (neon.rs), a row at a time through a cached buffer, then wide copies out. The scalar `publish10` below is the reference.
+// ---------------------------------------------------------------- the publish workers
+//
+// A tall publish is cut into row bands, one per worker core plus the render thread's own (KERNEL.md "Cores": tiled rendering across the workers — the publish is the first pass split this way; the pattern for the effects to come). The workers wait on a job word; the render thread writes the job, wakes them, does band 0 itself, then waits for their count (with a deadline, so a lost worker costs a frame, not the server). Phase frames are non-cacheable and the canvas is inner-shareable: no maintenance between cores.
+const PUB_WORKERS: usize = 3;
+/// Rows below which one thread does the whole rect. Measured 2026-10-23 on a full frame: the X3 alone 4.2 ms, three A715 bands plus the X3's 5.2 ms — the A715s' NEON is the long pole, so the split is off (i32::MAX) until there is a pass the X3 is not better at alone; the mechanism stays for that.
+const PUB_SPLIT_ROWS: i32 = i32::MAX;
+static PUB_JOB: AtomicU64 = AtomicU64::new(0);
+static PUB_DONE: AtomicU64 = AtomicU64::new(0);
+static PUB_UP: AtomicU64 = AtomicU64::new(0);
+/// The job: canvas base, width, height, phase mask, the rect, the band count.
+static mut PUB_PARAMS: (usize, usize, usize, u32, draw::Rect, usize) = (0, 0, 0, 0, draw::Rect::EMPTY, 1);
+static mut PUB_TABS: neon::Tables = neon::Tables { code: [[[0; 64]; 4]; 3], frac: [[[0; 64]; 4]; 3] };
+static mut PUB_STACKS: [[u8; 16384]; PUB_WORKERS] = [[0; 16384]; PUB_WORKERS];
+
+/// Band `i` of `n` of `r`, by rows.
+fn band(r: draw::Rect, i: usize, n: usize) -> draw::Rect {
+    let rows = (r.y1 - r.y0) as usize;
+    draw::Rect { x0: r.x0, y0: r.y0 + (rows * i / n) as i32, x1: r.x1, y1: r.y0 + (rows * (i + 1) / n) as i32 }
+}
+
+extern "C" fn pub_worker(idx: u64) -> ! {
+    PUB_UP.fetch_add(1, Ordering::AcqRel);
+    let mut seen = 0u64;
+    loop {
+        let seq = PUB_JOB.load(Ordering::Acquire);
+        if seq == seen {
+            ferros_sys::wait(&PUB_JOB, seq, 0);
+            continue;
+        }
+        seen = seq;
+        let (base, w, h, mask, r, n) = unsafe { PUB_PARAMS };
+        if (idx as usize) + 1 < n {
+            let back = unsafe { core::slice::from_raw_parts(base as *const u32, w * h) };
+            publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, band(r, idx as usize + 1, n));
+        }
+        PUB_DONE.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&PUB_DONE, 1);
+    }
+}
+
+/// The canvas through the present stage into the phases `mask` names, over `r`: in bands across the workers when tall, else here.
 fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, mask: u32, r: draw::Rect) {
     let r = r.clip(width, height);
+    if r.is_empty() {
+        return;
+    }
+    let workers = PUB_UP.load(Ordering::Acquire) as usize;
+    if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 {
+        publish_band(back, width, height, tabs, mask, r);
+        return;
+    }
+    let n = workers + 1;
+    unsafe {
+        PUB_TABS = *tabs;
+        PUB_PARAMS = (back.as_ptr() as usize, width, height, mask, r, n);
+    }
+    let done0 = PUB_DONE.load(Ordering::Acquire);
+    PUB_JOB.fetch_add(1, Ordering::AcqRel);
+    ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
+    publish_band(back, width, height, tabs, mask, band(r, 0, n));
+    let deadline = now() + freq() / 50;
+    while PUB_DONE.load(Ordering::Acquire).wrapping_sub(done0) < workers as u64 {
+        if ferros_sys::wait(&PUB_DONE, PUB_DONE.load(Ordering::Acquire), deadline) == 2 {
+            break;
+        }
+    }
+}
+
+fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
     }
@@ -742,6 +809,8 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, m
         }
     }
 }
+/// Per second (the frames/s line): the camera ops' scene, -, publish and wait times summed, and their count.
+static mut SEC_US: [u64; 5] = [0; 5];
 /// The publish's own split, in counter ticks since the last camera op: the NEON loop, the copy out, and pixels.
 static mut PUB_TICKS: [u64; 3] = [1; 3];
 
@@ -1343,6 +1412,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no panel thread\n");
         log.flush();
     }
+    for i in 0..PUB_WORKERS {
+        if ferros_sys::thread_spawn(pub_worker, unsafe { &mut (*(&raw mut PUB_STACKS))[i] }, i as u64) != 0 {
+            log.s(b"display: no publish worker\n");
+            log.flush();
+        }
+    }
     // The render thread on the big core (KERNEL.md "Cores": pinning by latency class — this is the one real compute path; receive and vsync stay on the workers, where the map and the touch server run, so a call hands off on the caller's own core). After the other threads are spawned: they inherit the mask.
     ferros_sys::pin(ferros_sys::CORES_BIG);
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
@@ -1526,6 +1601,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         armed = Some(pipe.arm(win));
                         frames += 1;
                         FRAMES.store(frames, Ordering::Relaxed);
+                        unsafe {
+                            for k in 0..4 {
+                                SEC_US[k] += PHASE_US[k];
+                            }
+                            SEC_US[4] += 1;
+                        }
                         out[1] = 1;
                         len = 2;
                     } else {
@@ -1892,9 +1973,18 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.dec(frames - frames_last_tick);
                 tlog.s(b" frames/s, ");
                 tlog.dec(fs - starts_last_tick);
-                tlog.s(b" frame starts/s\n");
+                tlog.s(b" frame starts/s; camera frames: scene ");
+                tlog.dec(unsafe { SEC_US[0] } / 1000);
+                tlog.s(b" ms, publish ");
+                tlog.dec(unsafe { SEC_US[2] } / 1000);
+                tlog.s(b" ms, waited for the last frame ");
+                tlog.dec(unsafe { SEC_US[3] } / 1000);
+                tlog.s(b" ms, in ");
+                tlog.dec(unsafe { SEC_US[4] });
+                tlog.s(b" camera ops\n");
                 tlog.flush();
             }
+            unsafe { SEC_US = [0; 5] };
             frames_last_tick = frames;
             starts_last_tick = fs;
             if !client_owned {
@@ -1950,14 +2040,19 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             unsafe {
                 PHASE_DIRTY = [full; PHASES];
             }
+            let mut pub_us = 0u64;
             if unsafe { TEMPORAL } && client_owned {
                 pipe.settle(&mut armed, true);
+                let t_p = now();
                 publish_next(pixels, width, height, &tabs, full);
+                pub_us = ferros_sys::us_since(t_p);
                 ferros_sys::dma_barrier();
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                 armed = Some(pipe.arm(win));
             }
-            log.s(b"display: brightness ");
+            log.s(b"display: full publish ");
+            log.dec(pub_us);
+            log.s(b" us; brightness ");
             log.dec(b as u64);
             log.s(b": white ");
             log.dec(white as u64);
