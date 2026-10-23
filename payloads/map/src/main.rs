@@ -823,6 +823,31 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     if option_env!("FERROS_MAP_START") == Some("rr") {
         map.show_ramps();
     }
+    // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back home.
+    if option_env!("FERROS_MAP_START") == Some("bench") {
+        let home = map.cam;
+        for (name, pinch) in [("pinch+twist", true), ("pan", false)] {
+            let t0 = now();
+            for k in 0..32i64 {
+                if pinch {
+                    map.cam.z = map.cam.z * 1030 / 1000;
+                    let (c, sn) = (map.cam.c * 16364 / ONE - map.cam.s * 572 / ONE, map.cam.s * 16364 / ONE + map.cam.c * 572 / ONE);
+                    map.cam.c = c;
+                    map.cam.s = sn;
+                } else {
+                    map.cam.x += 7 << 8;
+                    map.cam.y += (k & 3) << 8;
+                }
+                map.draw();
+            }
+            let us = ferros_sys::us_since(t0) / 32;
+            let mut l = Line::new();
+            let _ = write!(l, "map: bench {name}: {} us a frame ({} fps)\n", us, 1_000_000 / us.max(1));
+            console(grants, l.as_str().as_bytes());
+            map.cam = home;
+        }
+        map.draw();
+    }
     console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
     // The device's number base, as every app reads it (SETTINGS.md): logged now and whenever it changes, which is the proof the preference reaches a running process.
     let mut base = ferros_sys::device_base();

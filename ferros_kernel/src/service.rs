@@ -1071,6 +1071,17 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"x3" {
+                                            // `diag x3`: start the big core on a timing probe and report (x3.rs).
+                                            let f = cntfrq();
+                                            let rate = |t: u64| if t > 0 { (1u64 << 24) * f / t / 1_000_000 } else { 0 };
+                                            let (d0, i0) = crate::x3::local();
+                                            resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
+                                            let (ret, d, i, mpidr) = crate::x3::probe();
+                                            resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                                             restart(&mut store, names, &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);

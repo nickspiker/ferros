@@ -34,6 +34,9 @@
 
 extern crate alloc;
 
+mod draw;
+mod neon;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
@@ -208,8 +211,12 @@ static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
 /// Whether the layer is 10-bit (set once at start; `program_layer` reads it).
 static mut TEN: bool = false;
+/// What DECON said when a settle timed out: TRIG_CON, SHD_REG_UP_REQ, FRAME_COUNT, the count it was waiting to move.
+static mut SETTLE_TIMEOUT: [u32; 4] = [1; 4];
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
+/// Inside the scene: icons, discs, labels (µs, the last camera op).
+static mut SCENE_US: [u64; 3] = [1; 3];
 /// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
 const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
 const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
@@ -318,6 +325,36 @@ impl Pipe {
         let irq = self.rd(S_DMA0, RDMA_IRQ);
         self.wr(S_DMA0, RDMA_IRQ, irq & IDMA_IRQ_CLEAR);
         (moved, irq)
+    }
+    /// Start a frame and return at once: the shadow update and the TE trigger unmasked; `settle` masks it again once the frame has started. Returns FRAME_COUNT as it was, for `settle`.
+    fn arm(&self, win: u32) -> u32 {
+        let f0 = self.rd(S_DECON, FRAME_COUNT);
+        self.wr(S_DECON, SHD_REG_UP_REQ, self.rd(S_DECON, SHD_REG_UP_REQ) | SHD_GLOBAL | SHD_CMP | (1 << win));
+        let t = self.rd(S_DECON, TRIG_CON);
+        self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_MASK) | HW_TRIG_EN);
+        f0
+    }
+    /// An armed frame that has started: mask the trigger (so the TE does not keep re-sending the same frame) and forget it. With `wait`, spin until it starts (a quarter second at most); otherwise only look.
+    fn settle(&self, armed: &mut Option<u32>, wait: bool) {
+        let Some(f0) = *armed else { return };
+        let t0 = now();
+        loop {
+            if self.rd(S_DECON, FRAME_COUNT) != f0 {
+                break;
+            }
+            if !wait || now().wrapping_sub(t0) > freq() / 4 {
+                if !wait {
+                    return;
+                }
+                unsafe {
+                    SETTLE_TIMEOUT = [self.rd(S_DECON, TRIG_CON), self.rd(S_DECON, SHD_REG_UP_REQ), self.rd(S_DECON, FRAME_COUNT), f0];
+                }
+                break;
+            }
+        }
+        let t = self.rd(S_DECON, TRIG_CON);
+        self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
+        *armed = None;
     }
     /// The first enabled window on channel 0 (the base layer ABL draws on; 5 on a cold boot).
     fn base_window(&self) -> u32 {
@@ -515,64 +552,75 @@ fn phase_slice(k: usize, n: usize) -> &'static mut [u32] {
     unsafe { core::slice::from_raw_parts_mut(PHASE_BASE[k] as *mut u32, n) }
 }
 
-/// Phase frames not yet written for the current content: a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22), and the idle loop fills the rest one at a time from the back buffer; the flip only moves to a phase that is current.
-static mut PHASE_DIRTY: [bool; PHASES] = [true; PHASES];
+/// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
+static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
 
-/// The 8-bit canvas into the phase frames in `mask` (bit k = phase k) in one pass: the table once per pixel, then each phase's threshold and word; a row at a time through cached buffers, then wide copies out.
-fn publish10x4(back: &[u32], width: usize, height: usize, lut8: &[[u16; 256]; 3], mask: u32) {
-    let mut rows = [[0u32; 1344]; PHASES];
-    let w = width.min(1344);
-    for y in 0..height {
-        let src = &back[y * width..y * width + w];
-        // Black first, in one fill per phase row; then only painted pixels are worked (most of the map is empty: the per-pixel loop over all four rows cost 55 ms a frame, 2026-10-22).
-        for (k, row) in rows.iter_mut().enumerate() {
-            if mask >> k & 1 == 1 {
-                row[..w].fill(3);
-            }
+/// The 8-bit canvas into the phase frames in `mask` (bit k = phase k), over `r` only (widened to 16-pixel steps): NEON, 16 pixels per step (neon.rs), a row at a time through a cached buffer, then wide copies out. The scalar `publish10` below is the reference.
+fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, mask: u32, r: draw::Rect) {
+    let r = r.clip(width, height);
+    if r.is_empty() {
+        return;
+    }
+    let (x0, x1) = ((r.x0 as usize) & !15, ((r.x1 as usize + 15) & !15).min(width & !15));
+    let mut row = [0u32; 1344];
+    for k in 0..PHASES {
+        if mask >> k & 1 == 0 {
+            continue;
         }
-        let mut x = 0usize;
-        while x < w {
-            // Four empty pixels at a time skip together.
-            if x & 3 == 0 && x + 4 <= w && (src[x] | src[x + 1] | src[x + 2] | src[x + 3]) & 0x00FF_FFFF == 0 {
-                x += 4;
-                continue;
-            }
-            let p = src[x] & 0x00FF_FFFF;
-            if p == 0 {
-                x += 1;
-                continue;
-            }
-            let (r, g, b) = (lut8[0][(p >> 16 & 0xFF) as usize] as u32, lut8[1][(p >> 8 & 0xFF) as usize] as u32, lut8[2][(p & 0xFF) as usize] as u32);
-            for (k, row) in rows.iter_mut().enumerate() {
-                if mask >> k & 1 == 1 {
-                    let th = threshold(x, y, k);
-                    row[x] = pack10(dither8(r, th), dither8(g, th), dither8(b, th));
+        let dst = phase_slice(k, width * height);
+        for y in r.y0 as usize..r.y1 as usize {
+            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+            let t_n = now();
+            unsafe {
+                let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
+                let src = back.as_ptr().add(y * width);
+                let mut x = x0;
+                while x < x1 {
+                    neon::sixteen(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    x += 16;
                 }
             }
-            x += 1;
-        }
-        for (k, row) in rows.iter().enumerate() {
-            if mask >> k & 1 == 1 {
-                phase_slice(k, width * height)[y * width..y * width + w].copy_from_slice(&row[..w]);
+            let t_c = now();
+            dst[y * width + x0..y * width + x1].copy_from_slice(&row[x0..x1]);
+            unsafe {
+                PUB_TICKS[0] += t_c - t_n;
+                PUB_TICKS[1] += now() - t_c;
+                PUB_TICKS[2] += ((x1 - x0) as u64) << 0;
             }
         }
     }
+}
+/// The publish's own split, in counter ticks since the last camera op: the NEON loop, the copy out, and pixels.
+static mut PUB_TICKS: [u64; 3] = [1; 3];
+
+/// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
+fn publish_current(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, r: draw::Rect) {
     unsafe {
         for k in 0..PHASES {
-            if mask >> k & 1 == 1 {
-                PHASE_DIRTY[k] = false;
-            }
+            PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
         }
+        let k = CUR_PHASE;
+        publish10x4(back, width, height, tabs, 1 << k, PHASE_DIRTY[k]);
+        PHASE_DIRTY[k] = draw::Rect::EMPTY;
     }
 }
 
-/// Content changed: write the phase on the layer now, mark the others stale.
-fn publish_current(back: &[u32], width: usize, height: usize, lut8: &[[u16; 256]; 3]) {
+/// The same, into the next phase in turn rather than the one on the layer (which the panel may still be reading): it becomes the current one. The frame after can be armed at once, without waiting for this one to go out (the buffer it writes was on screen three frames before). During motion consecutive frames thus carry consecutive phases' thresholds — the temporal dither at the frame rate.
+fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, r: draw::Rect) {
     unsafe {
-        PHASE_DIRTY = [true; PHASES];
-        publish10x4(back, width, height, lut8, 1 << CUR_PHASE);
+        for k in 0..PHASES {
+            PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
+        }
+        let k = (CUR_PHASE + 1) % PHASES;
+        publish10x4(back, width, height, tabs, 1 << k, PHASE_DIRTY[k]);
+        PHASE_DIRTY[k] = draw::Rect::EMPTY;
+        CUR_PHASE = k;
     }
 }
+
+/// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
+static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
+static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
 
 /// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0].
 #[inline(always)]
@@ -810,6 +858,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
     }
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
+    let tabs = neon::Tables::from_lut8(&lut8);
+    // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
+    let mips: &'static [draw::Mips] = {
+        let mut v = alloc::vec::Vec::new();
+        let mut n = 1u8;
+        while let Some((px, grey, size)) = icon(n) {
+            v.push(draw::Mips::build(px, grey, size));
+            n += 1;
+        }
+        v.leak()
+    };
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
     log.dec((PEAK_NITS * E_LIGHT) as u64);
@@ -898,6 +957,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.flush();
     let mut next_flip = now() + freq() / 10;
     let mut screen_off = false;
+    // A frame armed and not yet seen to start (Pipe::arm / settle).
+    let mut armed: Option<u32> = None;
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
@@ -919,7 +980,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             match m.first() {
                 Some(1) => {
                     client_owned = true;
-                    pixels.fill(0);
+                    // Only what the last frame drew needs clearing; the rest of the back buffer is still empty.
+                    unsafe {
+                        draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                        CUR_DMG = draw::Rect::EMPTY;
+                    }
                 }
                 Some(2) if m.len() >= 12 => {
                     let x = u16::from_le_bytes([m[1], m[2]]) as f32;
@@ -929,18 +994,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let align = m[11];
                     match core::str::from_utf8(&m[12..]) {
                         Ok(t) if px >= 4.0 && px <= 512.0 => {
+                            let tw = text_width(&font, t, px);
+                            let left = match align { 1 => x - tw * 0.5, 2 => x - tw, _ => x };
                             let mut c = Canvas::new(pixels, width, height, &mut damage);
-                            match align {
-                                1 => {
-                                    let tw = text_width(&font, t, px);
-                                    text(&mut c, &font, t, x - tw * 0.5, y, px, colour);
-                                }
-                                2 => text_right(&mut c, &font, t, x, y, px, colour),
-                                _ => {
-                                    text(&mut c, &font, t, x, y, px, colour);
-                                }
-                            }
+                            text(&mut c, &font, t, left, y, px, colour);
                             ALLOC.reset();
+                            let r = draw::Rect { x0: left as i32 - 2, y0: (y - px) as i32 - 2, x1: (left + tw) as i32 + 3, y1: (y + px * 0.4) as i32 + 3 };
+                            unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) };
                         }
                         _ => out[0] = 1,
                     }
@@ -950,10 +1010,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let colour = 0xFF00_0000 | u32::from_le_bytes([m[9], m[10], m[11], m[12]]) & 0x00FF_FFFF;
                     let mut c = Canvas::new(pixels, width, height, &mut damage);
                     paint::fill_rect(&mut c, v(1), v(3), v(5), v(7), colour, None, None);
+                    let r = draw::Rect { x0: v(1) as i32, y0: v(3) as i32, x1: (v(1) + v(5).max(1)) as i32, y1: (v(3) + v(7).max(1)) as i32 };
+                    unsafe { CUR_DMG = CUR_DMG.union(r.clip(width, height)) };
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -988,104 +1050,93 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 Some(14) if m.len() >= 13 => {
                     client_owned = true;
                     last_interaction = now();
-                    let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as f32 / 256.0;
-                    let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as f32 / 256.0;
-                    let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as f32 / 65536.0;
-                    // Flag bit 0: keep what the frame already holds (a `begin` and the client's text and rects, sent first in the same batch), so the scene goes under an overlay; without it the frame starts empty.
+                    // The camera, in integers: the centre in world units ×256, the zoom 16.16, the turn (cos, sin) Q14.
+                    let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as i64;
+                    let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as i64;
+                    let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as i64;
+                    let (rc, rs) = if m.len() >= 18 { (i16::from_le_bytes([m[14], m[15]]) as i64, i16::from_le_bytes([m[16], m[17]]) as i64) } else { (16384, 0) };
+                    // Flag bit 0: keep what the frame already holds (a `begin` and the client's overlay, sent first in the same batch), so the scene goes under it; without it the frame starts from the last frame's rectangle cleared.
                     if m.get(13).copied().unwrap_or(0) & 1 == 0 {
-                        pixels.fill(0);
+                        unsafe {
+                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            CUR_DMG = draw::Rect::EMPTY;
+                        }
                     }
-                    // The turn: (cos, sin), Q14 on the wire.
-                    let (rc, rs) = if m.len() >= 18 {
-                        (i16::from_le_bytes([m[14], m[15]]) as f32 / 16384.0, i16::from_le_bytes([m[16], m[17]]) as f32 / 16384.0)
-                    } else {
-                        (1.0, 0.0)
-                    };
                     let mut t_phase = now();
-                    {
-                        let mut c = Canvas::new(pixels, width, height, &mut damage);
-                        for i in 0..unsafe { SCENE_N } {
-                            let cir = unsafe { SCENE[i] };
-                            let (dx, dy) = (cir.x as f32 - cx, cir.y as f32 - cy);
-                            let sx = (rc * dx - rs * dy) * z + w * 0.5;
-                            let sy = (rs * dx + rc * dy) * z + h * 0.5;
-                            let sr = cir.r as f32 * z;
-                            if sr < 1.0 || sx + sr < 0.0 || sx - sr > w || sy + sr < 0.0 || sy - sr > h {
-                                continue;
-                            }
-                            // Importance is the ring's weight, in screen pixels so it stays legible at every zoom.
-                            let stroke = match cir.ring { 0 => 0.0, 1 => libm::fmaxf(1.0, sr * 0.04), _ => libm::fmaxf(2.0, sr * 0.12) };
-                            let lit = cir.lit != 0;
-                            // fluor composites front to back: the label first, then the fill, then the ring's larger disc, which lands only on the band the fill left open.
-                            // Zoom is semantic: a name appears only once the circle is big enough to read it.
-                            if sr >= 36.0 && cir.len > 0 {
-                                if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
-                                    let px = libm::fminf(libm::fmaxf(sr * 0.32, 12.0), 72.0);
-                                    let tw = text_width(&font, t, px);
-                                    text(&mut c, &font, t, sx - tw * 0.5, sy + px * 0.35, px, if lit { BLACK } else { WHITE });
-                                }
-                            }
-                            // The app's icon, inside the ring: grey at rest, identifying by shape, and in its own colours only while lit — so colour on the map still means exactly one thing, that this changed.
-                            if let Some((px, grey, size)) = icon(cir.icon) {
-                                let ri = sr - stroke;
-                                let (x0, y0) = ((sx - ri).max(0.0) as usize, (sy - ri).max(0.0) as usize);
-                                let (x1, y1) = (((sx + ri) as usize).min(width), ((sy + ri) as usize).min(height));
-                                let step = size as f32 / (2.0 * ri);
-                                let half = size as f32 * 0.5;
-                                // The icon's turn on screen: the camera's, then the circle's own.
-                                let (cc, cs) = (cir.c as f32 / 16384.0, cir.s as f32 / 16384.0);
-                                let (rc, rs) = (rc * cc - rs * cs, rs * cc + rc * cs);
-                                for yy in y0..y1 {
-                                    let oy = yy as f32 - sy;
-                                    for xx in x0..x1 {
-                                        // Front to back: only where nothing is painted yet (tested first: under an arrived circle's overlay that is every pixel), and only the icon's solid part — its rim goes to the fill underneath, which carries the antialiased edge.
-                                        let dst = &mut c.pixels[yy * width + xx];
-                                        if *dst >> 24 != 0 {
-                                            continue;
-                                        }
-                                        // The icon turns with the map: each panel pixel taken back through the rotation into the icon.
-                                        let ox = xx as f32 - sx;
-                                        let (fu, fv) = ((rc * ox + rs * oy) * step + half, (rc * oy - rs * ox) * step + half);
-                                        if fu < 0.0 || fv < 0.0 {
-                                            continue;
-                                        }
-                                        let (u, v) = ((fu as usize).min(size - 1), (fv as usize).min(size - 1));
-                                        let k = (v * size + u) * 4;
-                                        if px[k + 3] < 128 {
-                                            continue;
-                                        }
-                                        let rgb = if lit {
-                                            (px[k] as u32) << 16 | (px[k + 1] as u32) << 8 | px[k + 2] as u32
-                                        } else {
-                                            let y = grey[k / 4] as u32;
-                                            y << 16 | y << 8 | y
-                                        };
-                                        *dst = 0xFF00_0000 | rgb;
-                                    }
-                                }
-                            }
-                            disc(c.pixels, width, height, sx as i64, sy as i64, (sr - stroke) as i64, if lit { MAP_LIT } else { MAP_FILL });
-                            if stroke > 0.0 {
-                                disc(c.pixels, width, height, sx as i64, sy as i64, sr as i64, MAP_RING);
+                    unsafe { SCENE_US = [0; 3]; PUB_TICKS = [0; 3] };
+                    let (wq, hq) = ((width as i64) << 7, (height as i64) << 7);
+                    for i in 0..unsafe { SCENE_N } {
+                        let cir = unsafe { SCENE[i] };
+                        // World to screen, Q8 pixels: offset, turn, zoom, centre.
+                        let (dx, dy) = (((cir.x as i64) << 8) - cx, ((cir.y as i64) << 8) - cy);
+                        let sx = ((rc * dx - rs * dy) >> 14) * z / 65536 + wq;
+                        let sy = ((rs * dx + rc * dy) >> 14) * z / 65536 + hq;
+                        let sr = cir.r as i64 * z >> 8;
+                        if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
+                            continue;
+                        }
+                        // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
+                        let stroke = match cir.ring { 0 => 0, 1 => (sr * 41 >> 10).max(256), _ => (sr * 123 >> 10).max(512) };
+                        let lit = cir.lit != 0;
+                        let ri = sr - stroke;
+                        // Front to back: the label, the icon, the fill, the ring's larger disc beneath them all.
+                        // Zoom is semantic: a name appears only once the circle is big enough to read it.
+                        if sr >= 36 << 8 && cir.len > 0 {
+                            if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
+                                let px = ((sr >> 8) as f32 * 0.32).clamp(12.0, 72.0);
+                                let tw = text_width(&font, t, px);
+                                let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
+                                let mut c = Canvas::new(pixels, width, height, &mut damage);
+                                text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { WHITE });
+                                ALLOC.reset();
                             }
                         }
-                        unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
-                        t_phase = now();
+                        let t_i = now();
+                        if let Some(mp) = mips.get((cir.icon as usize).wrapping_sub(1)) {
+                            // The icon's turn on screen: the camera's, then the circle's own.
+                            let (cc, cs) = (cir.c as i64, cir.s as i64);
+                            let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                            draw::icon(pixels, width, height, sx, sy, ri, tc, ts, mp, lit);
+                        }
+                        let t_d = now();
+                        unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
+                        draw::disc(pixels, width, height, sx, sy, ri, if lit { MAP_LIT & 0x00FF_FFFF } else { MAP_FILL & 0x00FF_FFFF });
+                        let r = if stroke > 0 { draw::disc(pixels, width, height, sx, sy, sr, MAP_RING & 0x00FF_FFFF) } else { draw::Rect::EMPTY };
+                        let whole = draw::Rect { x0: ((sx - sr) >> 8) as i32 - 2, y0: ((sy - sr) >> 8) as i32 - 2, x1: ((sx + sr) >> 8) as i32 + 3, y1: ((sy + sr) >> 8) as i32 + 3 }.clip(width, height);
+                        unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
+                        unsafe { CUR_DMG = CUR_DMG.union(whole).union(r) };
                     }
-                    ALLOC.reset();
-                    unsafe { PHASE_US[1] = ferros_sys::us_since(t_phase) };
+                    unsafe { PHASE_US[0] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
-                    // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
-                    ferros_sys::dma_barrier();
-                    unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
-                    t_phase = now();
-                    pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
-                    let (moved, _) = pipe.present(win);
-                    unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
-                    frames += 1;
-                    out[1] = moved as u8;
-                    len = 2;
+                    unsafe { PHASE_US[1] = 0 };
+                    // What changed on screen: what the last frame drew and what this one drew.
+                    let changed = unsafe { PREV_DMG.union(CUR_DMG).clip(width, height) };
+                    unsafe { PREV_DMG = CUR_DMG };
+                    // The finished frame out. Temporal: into the next phase, armed without waiting for it to go out (only for the previous frame to have started); the layer flips to it at the next TE.
+                    if ten && unsafe { TEMPORAL } {
+                        pipe.settle(&mut armed, true);
+                        unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
+                        t_phase = now();
+                        publish_next(pixels, width, height, &tabs, changed);
+                        ferros_sys::dma_barrier();
+                        unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
+                        pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                        armed = Some(pipe.arm(win));
+                        frames += 1;
+                        out[1] = 1;
+                        len = 2;
+                    } else {
+                        if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                        ferros_sys::dma_barrier();
+                        unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
+                        t_phase = now();
+                        pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                        let (moved, _) = pipe.present(win);
+                        unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
+                        frames += 1;
+                        out[1] = moved as u8;
+                        len = 2;
+                    }
                 }
                 Some(21) => {
                     client_owned = true;
@@ -1095,7 +1146,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         if unsafe { TEMPORAL } {
                             let (a, b, c, d) = (phase_slice(0, width * height), phase_slice(1, width * height), phase_slice(2, width * height), phase_slice(3, width * height));
                             ramps(&mut [a, b, c, d], width, height, lut, only);
-                            unsafe { PHASE_DIRTY = [false; PHASES] };
+                            // Every phase now holds the ramps; the next frame of the map starts from a clear screen (its first publish covers everything).
+                            unsafe {
+                                PHASE_DIRTY = [draw::Rect::EMPTY; PHASES];
+                                PREV_DMG = draw::Rect::full(width, height);
+                            }
                         } else {
                             ramps(&mut [&mut *screen], width, height, lut, only);
                         }
@@ -1113,8 +1168,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;
                     let r = u16::from_le_bytes([m[5], m[6]]) as isize;
                     let colour = 0xFF00_0000 | u32::from_le_bytes([m[7], m[8], m[9], m[10]]) & 0x00FF_FFFF;
-                    let mut c = Canvas::new(pixels, width, height, &mut damage);
-                    disc(c.pixels, width, height, v(1) as i64, v(3) as i64, r as i64, colour);
+                    let r = draw::disc(pixels, width, height, ((v(1) as i64) << 8) + 128, ((v(3) as i64) << 8) + 128, (r as i64) << 8, colour & 0x00FF_FFFF);
+                    unsafe { CUR_DMG = CUR_DMG.union(r) };
                 }
                 Some(17) if m.len() >= 12 => {
                     let i = m[1] as usize;
@@ -1207,7 +1262,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1282,8 +1337,26 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         tlog.s(b" ms");
                     }
                 }
+                tlog.s(b"; settle timeout TRIG ");
+                tlog.hex(unsafe { SETTLE_TIMEOUT[0] });
+                tlog.s(b" SHD ");
+                tlog.hex(unsafe { SETTLE_TIMEOUT[1] });
+                tlog.s(b" FC ");
+                tlog.hex(unsafe { SETTLE_TIMEOUT[2] });
+                tlog.s(b" was ");
+                tlog.hex(unsafe { SETTLE_TIMEOUT[3] });
+                tlog.s(b"; icons ");
+                tlog.dec(unsafe { SCENE_US[0] } / 1000);
+                tlog.s(b" ms, discs ");
+                tlog.dec(unsafe { SCENE_US[1] } / 1000);
+                tlog.s(b" ms; publish neon ");
+                tlog.dec(unsafe { PUB_TICKS[0] } * 1000 / freq());
+                tlog.s(b" ms, copy ");
+                tlog.dec(unsafe { PUB_TICKS[1] } * 1000 / freq());
+                tlog.s(b" ms, kpx ");
+                tlog.dec(unsafe { PUB_TICKS[2] } / 1000);
                 tlog.s(b"; camera: scene ");
-                for (k, name) in [b" ms, arena " as &[u8], b" ms, copy ", b" ms, present ", b" ms\n"].iter().enumerate() {
+                for (k, name) in [b" ms, - " as &[u8], b" ms, publish ", b" ms, waited for the last frame ", b" ms\n"].iter().enumerate() {
                     tlog.dec(unsafe { PHASE_US[k] } / 1000);
                     tlog.s(name);
                 }
@@ -1308,7 +1381,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &lut8) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
@@ -1330,6 +1403,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
         // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). The panel then never rests at its idle floor; the owner chose the bits over the ~0.2 W (2026-10-22).
+        // A frame armed by the last camera op: masked again once it has started.
+        pipe.settle(&mut armed, false);
         // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         if off != screen_off && dsi.alive() {
@@ -1349,14 +1424,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             log.flush();
         }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
-        if unsafe { TEMPORAL } && client_owned {
-            if let Some(k) = (0..PHASES).find(|&k| unsafe { PHASE_DIRTY[k] }) {
-                publish10x4(pixels, width, height, &lut8, 1 << k);
+        // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
+        if unsafe { TEMPORAL } && client_owned && now().wrapping_sub(last_interaction) > freq() / 8 {
+            if let Some(k) = (0..PHASES).find(|&k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
+                publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] });
+                unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };
             }
         }
-        let next_clean = unsafe { !PHASE_DIRTY[(CUR_PHASE + 1) % PHASES] };
+        let next_clean = unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() };
         if unsafe { TEMPORAL } && client_owned && !screen_off && next_clean && now() >= next_flip {
             next_flip = now() + freq() / 10;
+            pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
             let _ = pipe.present(win);

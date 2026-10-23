@@ -1,0 +1,277 @@
+//! The scene's rasteriser, all integer (owner, 2026-10-22: "keep it integer"): damage rectangles, antialiased discs without a square root, icons sampled through a mip chain with bilinear filtering and their own alpha, and front-to-back compositing on premultiplied pixels.
+//!
+//! Pixels are fluor's words: G#AARRGGBB, colour premultiplied by alpha, composited front to back — what is drawn first is on top, and a pixel takes only what its alpha leaves room for. An empty pixel is 0; the panel ignores alpha, so whatever stays empty shows black.
+
+/// A half-open pixel rectangle; empty when x0 >= x1 or y0 >= y1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl Rect {
+    pub const EMPTY: Rect = Rect { x0: i32::MAX, y0: i32::MAX, x1: i32::MIN, y1: i32::MIN };
+    pub fn full(w: usize, h: usize) -> Rect {
+        Rect { x0: 0, y0: 0, x1: w as i32, y1: h as i32 }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+    pub fn union(self, o: Rect) -> Rect {
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return self;
+        }
+        Rect { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
+    }
+    pub fn clip(self, w: usize, h: usize) -> Rect {
+        let r = Rect { x0: self.x0.max(0), y0: self.y0.max(0), x1: self.x1.min(w as i32), y1: self.y1.min(h as i32) };
+        if r.is_empty() { Rect::EMPTY } else { r }
+    }
+    /// Widened to multiples of 4 horizontally (the publish skips empty pixels four at a time).
+    pub fn align4(self, w: usize) -> Rect {
+        if self.is_empty() {
+            return self;
+        }
+        Rect { x0: self.x0 & !3, y0: self.y0, x1: ((self.x1 + 3) & !3).min(w as i32), y1: self.y1 }
+    }
+}
+
+/// Empty the rectangle (transparent, 0).
+pub fn clear(px: &mut [u32], width: usize, r: Rect) {
+    if r.is_empty() {
+        return;
+    }
+    for y in r.y0..r.y1 {
+        let row = y as usize * width;
+        px[row + r.x0 as usize..row + r.x1 as usize].fill(0);
+    }
+}
+
+/// `src` (premultiplied) under `dst` (premultiplied): dst keeps what it has and takes src in the room its alpha leaves.
+#[inline(always)]
+pub fn under(dst: u32, src: u32) -> u32 {
+    let da = dst >> 24;
+    if da == 255 {
+        return dst;
+    }
+    if dst == 0 {
+        return src;
+    }
+    let room = 255 - da;
+    let mix = |sh: u32| -> u32 {
+        let d = dst >> sh & 0xFF;
+        let s = src >> sh & 0xFF;
+        (d + (s * room + 127) / 255).min(255) << sh
+    };
+    mix(24) | mix(16) | mix(8) | mix(0)
+}
+
+/// An opaque colour (G#RRGGBB) at coverage `cov` (0-255), premultiplied.
+#[inline(always)]
+fn at_coverage(colour: u32, cov: u32) -> u32 {
+    if cov >= 255 {
+        return 0xFF00_0000 | colour;
+    }
+    let m = |sh: u32| ((colour >> sh & 0xFF) * cov + 127) / 255 << sh;
+    cov << 24 | m(16) | m(8) | m(0)
+}
+
+/// The rows a disc covers, with each row's horizontal reach found without a square root: the reach only shrinks moving away from the centre row, so it is walked down a pixel at a time as the rows go (O(r) for the whole disc). Calls `row(y, x_outer_lo, x_outer_hi, x_inner_lo, x_inner_hi)` with the outer span (every pixel the edge may touch) and the inner span (pixels wholly inside), both inclusive, unclipped.
+fn spans(cx: i64, cy: i64, r: i64, mut row: impl FnMut(i64, i64, i64, i64, i64)) {
+    // All in Q8 pixels; a pixel's centre is (x·256 + 128).
+    let (ro, ri) = (r + 256, (r - 256).max(0));
+    let (ro2, ri2) = (ro * ro, ri * ri);
+    let ytop = (cy - ro) >> 8;
+    let ybot = (cy + ro) >> 8;
+    let ymid = cy >> 8;
+    // Walk up from the middle row, then down from it, each side with its own shrinking reach.
+    for dir in [-1i64, 1] {
+        let (mut ho, mut hi) = ((ro >> 8) + 2, (ri >> 8) + 2);
+        let mut y = if dir < 0 { ymid } else { ymid + 1 };
+        while (dir < 0 && y >= ytop) || (dir > 0 && y <= ybot) {
+            let dy = (y << 8) + 128 - cy;
+            let dy2 = dy * dy;
+            if dy2 > ro2 {
+                break;
+            }
+            // Shrink the outer reach until the pixel past it is outside the outer radius; the same for the inner.
+            let fits = |h: i64, r2: i64| {
+                let dx = (h << 8).max(0);
+                dx * dx + dy2 <= r2
+            };
+            while ho > 0 && !fits(ho - 1, ro2) {
+                ho -= 1;
+            }
+            while hi > 0 && !fits(hi, ri2) {
+                hi -= 1;
+            }
+            let c = cx >> 8;
+            let inner = dy2 <= ri2;
+            row(y, c - ho - 1, c + ho + 1, if inner { c - hi + 1 } else { 1 }, if inner { c + hi - 1 } else { 0 });
+            y += dir;
+        }
+    }
+}
+
+/// A disc of `colour` (opaque G#RRGGBB) centred at (cx, cy) with radius r, all in Q8 pixels, drawn under what is there, antialiased: an edge pixel's coverage is ½ − (d² − r²)/(2r), the first-order distance from the edge, with one reciprocal per disc and no division or root per pixel. Returns the rectangle it touched.
+pub fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) -> Rect {
+    if r < 128 {
+        return Rect::EMPTY;
+    }
+    let (w, h) = (width as i64, height as i64);
+    let r2 = r * r;
+    // 255 / (2r · 256) in Q24, so cov = 128 − ((d² − r²) · k >> 24).
+    let k = ((255i64 << 24) / (2 * r)) >> 8;
+    let opaque = 0xFF00_0000 | colour;
+    spans(cx, cy, r, |y, xo0, xo1, xi0, xi1| {
+        if y < 0 || y >= h {
+            return;
+        }
+        let rowb = y as usize * width;
+        let dy = (y << 8) + 128 - cy;
+        let dy2 = dy * dy;
+        for x in xo0.max(0)..=xo1.min(w - 1) {
+            let p = &mut px[rowb + x as usize];
+            if *p >> 24 == 255 {
+                continue;
+            }
+            if x >= xi0 && x <= xi1 {
+                *p = if *p == 0 { opaque } else { under(*p, opaque) };
+                continue;
+            }
+            let dx = (x << 8) + 128 - cx;
+            let cov = 128 - ((dx * dx + dy2 - r2) * k >> 24);
+            if cov <= 0 {
+                continue;
+            }
+            *p = under(*p, at_coverage(colour, cov.min(255) as u32));
+        }
+    });
+    Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
+}
+
+/// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are packed premultiplied words (G#AARRGGBB), with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest) — VSF RGB gamma 2 codes, as the bundle holds them.
+#[derive(Clone, Copy)]
+pub struct Mips {
+    pub size: usize,
+    pub levels: usize,
+    /// Level l starts at `offset[l]` texels; its rows are `size >> l` + 4 texels long (the border).
+    pub offset: [usize; 8],
+    pub rgba: &'static [u32],
+    pub grey: &'static [u32],
+}
+
+const PAD: usize = 2;
+
+impl Mips {
+    /// From the bundle's straight-alpha RGBA and grey planes.
+    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize) -> Mips {
+        let mut total = 0;
+        let mut offset = [0usize; 8];
+        let mut levels = 0;
+        let mut s = size;
+        while s >= 4 && levels < 8 {
+            offset[levels] = total;
+            total += (s + 2 * PAD) * (s + 2 * PAD);
+            levels += 1;
+            s /= 2;
+        }
+        let rgba: &'static mut [u32] = alloc::vec![0u32; total].leak();
+        let grey: &'static mut [u32] = alloc::vec![0u32; total].leak();
+        let at = |l: usize, x: usize, y: usize| offset[l] + (y + PAD) * ((size >> l) + 2 * PAD) + x + PAD;
+        for y in 0..size {
+            for x in 0..size {
+                let i = y * size + x;
+                let a = rgba_in[i * 4 + 3] as u32;
+                let pm = |c: u8| (c as u32 * a + 127) / 255;
+                rgba[at(0, x, y)] = a << 24 | pm(rgba_in[i * 4]) << 16 | pm(rgba_in[i * 4 + 1]) << 8 | pm(rgba_in[i * 4 + 2]);
+                let g = pm(grey_in[i]);
+                grey[at(0, x, y)] = a << 24 | g << 16 | g << 8 | g;
+            }
+        }
+        let mut s = size;
+        for l in 1..levels {
+            let n = s / 2;
+            for y in 0..n {
+                for x in 0..n {
+                    for plane in [&mut *rgba, &mut *grey] {
+                        let mut acc = [0u32; 4];
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let t = plane[at(l - 1, 2 * x + dx, 2 * y + dy)];
+                            for c in 0..4 {
+                                acc[c] += t >> (8 * c) & 0xFF;
+                            }
+                        }
+                        plane[at(l, x, y)] = (0..4).fold(0, |w, c| w | ((acc[c] + 2) / 4) << (8 * c));
+                    }
+                }
+            }
+            s = n;
+        }
+        Mips { size, levels, offset, rgba, grey }
+    }
+}
+
+/// Bilinear between four packed texels, two channels per multiply (red-blue and alpha-green each ride one word's two 16-bit halves); `fu`, `fv` in 256ths.
+#[inline(always)]
+fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, fu: u32, fv: u32) -> u32 {
+    let (w00, w10, w01, w11) = ((256 - fu) * (256 - fv) >> 8, fu * (256 - fv) >> 8, (256 - fu) * fv >> 8, fu * fv >> 8);
+    let rb = (p00 & 0x00FF_00FF) * w00 + (p10 & 0x00FF_00FF) * w10 + (p01 & 0x00FF_00FF) * w01 + (p11 & 0x00FF_00FF) * w11;
+    let ag = (p00 >> 8 & 0x00FF_00FF) * w00 + (p10 >> 8 & 0x00FF_00FF) * w10 + (p01 >> 8 & 0x00FF_00FF) * w01 + (p11 >> 8 & 0x00FF_00FF) * w11;
+    (rb >> 8 & 0x00FF_00FF) | (ag & 0xFF00_FF00)
+}
+
+/// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there. The mip level is the smallest at least as wide as the disc, so a texel never shrinks more than 2:1; between texels, bilinear. `lit`: the icon's own colours, else its grey (the map at rest). Returns the rectangle it touched.
+pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips, lit: bool) -> Rect {
+    if r < 256 {
+        return Rect::EMPTY;
+    }
+    let diameter = ((2 * r) >> 8) as usize;
+    let mut l = 0;
+    while l + 1 < m.levels && (m.size >> (l + 1)) >= diameter {
+        l += 1;
+    }
+    let size = (m.size >> l) as i64;
+    let stride = size as usize + 2 * PAD;
+    let tex = &(if lit { m.rgba } else { m.grey })[m.offset[l]..m.offset[l] + stride * stride];
+    // Texels per screen pixel in Q16, and the four steps of the inverse turn.
+    let k = (size << 24) / (2 * r);
+    let (du_dx, dv_dx) = (c * k >> 14, -s * k >> 14);
+    let (du_dy, dv_dy) = (s * k >> 14, c * k >> 14);
+    let (w, h) = (width as i64, height as i64);
+    // Texel space with the border: centre at size/2 + PAD, bilinear taps at −½.
+    let half = ((size << 16) >> 1) + ((PAD as i64) << 16) - (1 << 15);
+    let (lo, hi) = (0i64, (size + 2 * PAD as i64 - 1) << 16);
+    spans(cx, cy, r, |y, xo0, xo1, _, _| {
+        if y < 0 || y >= h {
+            return;
+        }
+        let rowb = y as usize * width;
+        let x0 = xo0.max(0);
+        let x1 = xo1.min(w - 1);
+        if x0 > x1 {
+            return;
+        }
+        let (ox, oy) = ((x0 << 8) + 128 - cx, (y << 8) + 128 - cy);
+        let mut u = half + ((ox * du_dx + oy * du_dy) >> 8);
+        let mut v = half + ((ox * dv_dx + oy * dv_dy) >> 8);
+        let row = &mut px[rowb + x0 as usize..=rowb + x1 as usize];
+        for p in row.iter_mut() {
+            if *p >> 24 != 255 && u >= lo && v >= lo && u < hi && v < hi {
+                let i = (v >> 16) as usize * stride + (u >> 16) as usize;
+                let t = bilerp(tex[i], tex[i + 1], tex[i + stride], tex[i + stride + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32);
+                if t >> 24 != 0 {
+                    *p = if *p == 0 { t } else { under(*p, t) };
+                }
+            }
+            u += du_dx;
+            v += dv_dx;
+        }
+    });
+    Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
+}

@@ -48,6 +48,7 @@ mod camera;
 mod camera_events;
 #[cfg(feature = "pixel8")]
 mod camera_snap;
+mod x3;
 #[cfg(feature = "pixel8")]
 mod camera_close;
 mod camera_rx;
@@ -1599,6 +1600,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
     platform::enable_icache();
+    // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
+    if cfg!(ferros_x3) || option_env!("FERROS_X3") == Some("1") {
+        x3::launch();
+    }
 
     // The previous session's report (ramoops DRAM survives warm resets), then the safety nets: fault sink + panic reporter into the report block, cluster watchdogs.
     let prev = platform::read_report();
@@ -1710,6 +1715,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     };
     UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
 
+    platform::crumb(0xE4);
     // The gate chose Android: slot a active in devinfo (its retries at 3, our active bit cleared), then a plain reset — the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current).
     if gate_choice == ready::Choice::Android && store.is_some() {
         // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
@@ -1743,6 +1749,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             tatau::set_base(b);
         }
     }
+    platform::crumb(0xE5);
     process::set_pref(process::PREF_BASE, tatau::base().code());
     // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
     if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
@@ -1778,8 +1785,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         (b"INIT=".as_slice(), init_exit),
     ];
     // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
+    platform::crumb(0xE6);
     checklist::at("service start");
-    service::run(service::Boot {
+    let boot = service::Boot {
         kind: service::BootKind::Cold,
         link_base: own_base,
         stage: own_base + (32 << 20),
@@ -1790,7 +1798,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         prev,
         extras,
         ufs_probe: Some(cold_ufs::probe),
-    })
+    };
+    // On the X3 if it is parked by now (FERROS_X3 builds); otherwise here, as always.
+    let boot = if option_env!("FERROS_X3") == Some("1") { x3::hand_over(boot) } else { boot };
+    platform::crumb(0xE7);
+    service::run(boot)
 }
 
 /// Hot-reload: jump to a new kernel image at the given DRAM address.
