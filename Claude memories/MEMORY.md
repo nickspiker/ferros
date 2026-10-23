@@ -71,3 +71,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
 - [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape
 - [sched trace + past-deadline spin](sched_trace_and_past_deadline_spin.md) — diag sched is the IPC/latency tool; a server sleeping on a past deadline spins its slice (the 2026-10-23 drag stall); the reload hang was a 64 KiB kernel stack overflowing into .bss (512 KiB now); DIAG canary + STACK_USED_MAX
+- [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) — ~95 % notch is the per-frame off-window under the DDIC; HBM/dimming/60 Hz/G#BD table all tested 2026-10-23, none moves it; 100 % is not on this panel
