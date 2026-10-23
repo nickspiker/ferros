@@ -1601,7 +1601,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
     platform::enable_icache();
     // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
-    if cfg!(ferros_x3) || option_env!("FERROS_X3") == Some("1") {
+    if option_env!("FERROS_X3") != Some("0") {
         x3::launch();
     }
 
@@ -1799,8 +1799,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         extras,
         ufs_probe: Some(cold_ufs::probe),
     };
-    // On the X3 if it is parked by now (FERROS_X3 builds); otherwise here, as always.
-    let boot = if option_env!("FERROS_X3") == Some("1") { x3::hand_over(boot) } else { boot };
+    // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
+    let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };
     platform::crumb(0xE7);
     service::run(boot)
 }
