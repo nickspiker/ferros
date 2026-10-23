@@ -464,13 +464,16 @@ pub struct IrqLine {
 }
 /// gpn0-0, the touch controller's INT: SPI 0 (IRQ_ALIVE_CUSTOM_EINT0, zuma-pinctrl.dtsi; gpn0 is a one-pin bank with its own line).
 pub const IRQ_TOUCH_INT: u32 = 32;
-/// DECON0 "frame_done": SPI 242 (zuma-drm-dpu.dtsi).
+/// DECON0 "frame_done": SPI 242 (zuma-drm-dpu.dtsi); "frame_start": SPI 243.
 pub const IRQ_DECON0_FRAME_DONE: u32 = 274;
+pub const IRQ_DECON0_FRAME_START: u32 = 275;
 pub static IRQS: &[IrqLine] = &[
     // The touch controller's INT line: gpn0-0 (docs/oracle/TOUCH.md), the far-alive EINT bank.
     IrqLine { name: "touch-int", intid: IRQ_TOUCH_INT },
     // DECON0's frame-done: the frame the panel is reading has gone out; the next can be written.
     IrqLine { name: "decon0-frame-done", intid: IRQ_DECON0_FRAME_DONE },
+    // DECON0's frame-start: the trigger took and the frame is going out (what the display's `settle` waits for).
+    IrqLine { name: "decon0-frame-start", intid: IRQ_DECON0_FRAME_START },
 ];
 /// One byte per INTID, set by `.Lirq` when a granted line fires (the line is masked at the same time), cleared by `irq_wait` when a thread takes it.
 #[unsafe(no_mangle)]

@@ -12,7 +12,7 @@ use ferros_sys::{console, exit, spawn};
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
 const SHELL: [(&[u8], &[u8], &[u64]); 3] = [
-    (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22]),
+    (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
     (b"map", b"map", &[17, 18, 19, 20, 22]),
 ];

@@ -342,8 +342,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Store(b"map"),
         Dma(b"display-phases"),
         Dma(b"app-surface"),
-        // 23 the touch controller's interrupt line, 24 DECON0's frame-done (KERNEL.md "Interrupts to user space").
-        Irq(b"touch-int"), Irq(b"decon0-frame-done"),
+        // 23 the touch controller's interrupt line, 24 DECON0's frame-done, 25 its frame-start (KERNEL.md "Interrupts to user space").
+        Irq(b"touch-int"), Irq(b"decon0-frame-done"), Irq(b"decon0-frame-start"),
     ]
 }
 

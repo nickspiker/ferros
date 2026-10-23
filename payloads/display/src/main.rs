@@ -64,6 +64,30 @@ const S_HDRCOMM0: u64 = 13;
 const S_PHASES: u64 = 14;
 /// 15: the `app-surface` region (32 MiB, cacheable): the app in front draws its 16-bit pixels there.
 const S_APPSURF: u64 = 15;
+/// DECON0's frame-start interrupt line (kernel `decon0-frame-start`): the `vsync` thread waits on it and moves FRAME_STARTS, which `settle` and `present` wait on instead of polling FRAME_COUNT.
+const S_IRQ_FS: u64 = 16;
+const INT_EN: u64 = 0x0060;
+const INT_EN_FRAME_START: u32 = 1 << 12;
+static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
+static mut VSYNC_STACK: [u8; 16384] = [0; 16384];
+
+/// The frame-start thread: each start of a frame at DECON clears its pending bit, counts it and wakes whoever waits for it.
+extern "C" fn vsync(grants: u64) -> ! {
+    let (irq, decon) = (cap(grants, S_IRQ_FS), cap(grants, S_DECON));
+    loop {
+        ferros_sys::irq_wait(irq, 0);
+        ferros_sys::mmio_write(decon, INT_PEND, INT_EN_FRAME_START);
+        FRAME_STARTS.fetch_add(1, Ordering::Release);
+        ferros_sys::wake(&FRAME_STARTS, 4);
+        ferros_sys::irq_ack(irq);
+    }
+}
+
+/// Wait for a frame to start — the interrupt, or half a millisecond, whichever first (the count register stays the truth; the fallback keeps a missed interrupt from costing more than it used to).
+fn frame_wait() {
+    let seen = FRAME_STARTS.load(Ordering::Acquire);
+    ferros_sys::wait(&FRAME_STARTS, seen, now() + freq() / 2000);
+}
 
 /// DSIM0 through its grant: one syscall per register access, the generic timer for the waits.
 struct DsiGrant {
@@ -324,7 +348,7 @@ impl Pipe {
                 break;
             }
             // Asleep between looks, not spinning: on one core a spin here starved the touch server (its reads took two and three time slices, 2026-10-23).
-            ferros_sys::sleep_until(now() + freq() / 2000);
+            frame_wait();
         }
         let t = self.rd(S_DECON, TRIG_CON);
         self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
@@ -349,7 +373,7 @@ impl Pipe {
                 break;
             }
             if wait {
-                ferros_sys::sleep_until(now() + freq() / 2000);
+                frame_wait();
             }
             if !wait || now().wrapping_sub(t0) > freq() / 4 {
                 if !wait {
@@ -1223,8 +1247,16 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(b"display: no receive thread\n");
         log.flush();
     }
+    // Frame-start interrupts on at DECON (INT_EN: the block's enable and the frame-start bit), then the thread that takes them.
+    pipe.wr(S_DECON, INT_PEND, INT_EN_FRAME_START);
+    pipe.wr(S_DECON, INT_EN, pipe.rd(S_DECON, INT_EN) | 1 | INT_EN_FRAME_START);
+    if ferros_sys::thread_spawn(vsync, unsafe { &mut *(&raw mut VSYNC_STACK) }, grants) != 0 {
+        log.s(b"display: no vsync thread\n");
+        log.flush();
+    }
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
+    let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
     loop {
         // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
         let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
@@ -1755,6 +1787,18 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         if t >= next_tick {
             let secs = t / freq();
             next_tick = (secs + 1) * freq();
+            // The frame rate, once a second while frames are coming (presents and flips both count), with the frame starts DECON reported through its interrupt: the two agree when every frame goes out.
+            let fs = FRAME_STARTS.load(Ordering::Relaxed);
+            if frames != frames_last_tick && client_owned {
+                tlog.s(b"display: ");
+                tlog.dec(frames - frames_last_tick);
+                tlog.s(b" frames/s, ");
+                tlog.dec(fs - starts_last_tick);
+                tlog.s(b" frame starts/s\n");
+                tlog.flush();
+            }
+            frames_last_tick = frames;
+            starts_last_tick = fs;
             if !client_owned {
                 // The status line: uptime left, the link right; repainted every second — the strip cleared to transparent, text, then black under it.
                 pixels[..strip * width].fill(0);
