@@ -103,22 +103,30 @@ pub fn pet_watchdogs() {
 }
 
 /// Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0 (or an exit reason).
-/// A post-mortem note in the report block's free words (G#50-G#78: slot 0-5), read as PREV_NOTE_n by the next boot's DIAG. Slot 0: the kernel lock's holder (core + 1, 0 = free; process.rs). Slots 1-5: cores 4-8's last crumb. Cheap enough for the hot paths: one uncached store.
+/// Where the post-mortem notes live: a page at G#B000_0000, between ABL's staging buffers (it reads the boot partitions to G#A000_0000-G#AB00_0000) and the hv (G#B200_0000), where nothing a boot does writes. The earlier choices all got overwritten (2026-10-23): the ramoops page by the gate, the X3 result page by a running log, G#80F0_0000 by ABL's 17 MB gate image (G#8008_0000-G#8118_0000), G#C1FF_0000 by the modem firmware the bootloader loads into cp_rmem. Cacheable: every write is cleaned to DRAM so a watchdog reset keeps it. Slots 0-7 are this boot's, 8-15 the previous boot's (`notes_rotate`), read as NOTE_n / PREV_NOTE_n in DIAG.
+pub const NOTES: usize = 0xB000_0000;
+/// Slot 0: the kernel lock's holder (core + 1, 0 = free; process.rs). Slots 1-5: cores 4-8's last crumb, the core in the top byte. Slot 6: the service loop's last crumb.
 pub fn note(slot: usize, v: u64) {
     unsafe {
-        // In ferros's own result page (x3.rs RESULT, non-cacheable, below everything ABL loads), not the ramoops block: the hv gate rewrites that block on every boot, so notes there never survived a gate boot (2026-10-23). `bridge read 819FF900 64` after the next boot.
-        write_volatile((crate::x3::RESULT + 0x900 + (slot & 7) * 8) as *mut u64, v);
+        let a = NOTES + (slot & 7) * 8;
+        write_volatile(a as *mut u64, v);
+        core::arch::asm!("dc civac, {a}", a = in(reg) a as u64);
     }
+}
+pub fn note_read(slot: usize) -> u64 {
+    unsafe { read_volatile((NOTES + (slot & 15) * 8) as *const u64) }
 }
 
 /// At boot, before any note is written: the previous boot's notes copied to RESULT+G#980 (`bridge read 819FF980 64`), and the live slots cleared — so a boot that hung leaves its last per-core crumbs readable from the boot after it.
 pub fn notes_rotate() {
     unsafe {
         for i in 0..8 {
-            let v = core::ptr::read_volatile((crate::x3::RESULT + 0x900 + i * 8) as *const u64);
-            write_volatile((crate::x3::RESULT + 0x980 + i * 8) as *mut u64, v);
-            write_volatile((crate::x3::RESULT + 0x900 + i * 8) as *mut u64, 0);
+            let v = read_volatile((NOTES + i * 8) as *const u64);
+            write_volatile((NOTES + 0x40 + i * 8) as *mut u64, v);
+            write_volatile((NOTES + i * 8) as *mut u64, 0);
+            core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (NOTES + i * 8) as u64, b = in(reg) (NOTES + 0x40 + i * 8) as u64);
         }
+        core::arch::asm!("dsb sy");
     }
 }
 

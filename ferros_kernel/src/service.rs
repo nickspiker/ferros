@@ -1488,6 +1488,14 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                                         append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
+                                        // The post-mortem notes (platform::note): this boot's and the previous boot's — the lock's holder (core + 1) and each core's last crumb with the core in the top byte.
+                                        for k in 0..7 {
+                                            let (v, pv) = (platform::note_read(k), platform::note_read(8 + k));
+                                            append_hex(&mut resp, alloc::format!("NOTE_{k}_HI=").as_bytes(), (v >> 32) as u32);
+                                            append_hex(&mut resp, alloc::format!("NOTE_{k}=").as_bytes(), v as u32);
+                                            append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}_HI=").as_bytes(), (pv >> 32) as u32);
+                                            append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}=").as_bytes(), pv as u32);
+                                        }
                                         {
                                             let (up, on) = crate::smp::report();
                                             append_hex(&mut resp, b"SMP_UP=", up);
@@ -1498,6 +1506,15 @@ pub fn run(mut b: Boot) -> ! {
                                                 append_hex(&mut resp, alloc::format!("SLICES_C{k}=").as_bytes(), s.load(core::sync::atomic::Ordering::Relaxed) as u32);
                                             }
                                             append_hex(&mut resp, b"LOCK_SPINS=", crate::process::LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                            for (k, w) in crate::smp::IDLE_WAKES.iter().enumerate() {
+                                                append_hex(&mut resp, alloc::format!("IDLE_WAKES_C{}=", k + 4).as_bytes(), w.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                            }
+                                            // Why idle cores take the lock: the queue count, the interrupt flag, and how far off the next deadline is (signed ms; negative = already passed, which would make every core look on every event-stream tick).
+                                            append_hex(&mut resp, b"IDLE_RUNNABLE_N=", crate::process::RUNNABLE_N.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                            append_hex(&mut resp, b"IDLE_IRQ_ANY=", unsafe { core::ptr::read_volatile(&raw const crate::process::__irq_any) } as u32);
+                                            let nw = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Relaxed);
+                                            let now = cntpct();
+                                            append_hex(&mut resp, b"IDLE_NEXT_WAKE_MS=", if nw == u64::MAX { 0x7FFF_FFFF } else { ((nw as i64 - now as i64) * 1000 / freq as i64) as u32 });
                                         }
                                         {
                                             let (bad, at, val) = platform::canary_check();
@@ -1571,10 +1588,7 @@ pub fn run(mut b: Boot) -> ! {
                                             append_hex(&mut resp, b"PREV_EXIT=", prev[3] as u32);
                                             append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
                                             // The post-mortem notes (platform::note): the lock's holder, then cores 4-8's last crumb (core in the top byte).
-                                            append_hex(&mut resp, b"PREV_LOCK_HOLDER=", prev[10] as u32);
-                                            for k in 1..6 {
-                                                append_hex(&mut resp, alloc::format!("PREV_CRUMB_C{}=", k + 3).as_bytes(), prev[10 + k] as u32);
-                                            }
+                                            // (notes: below, from platform::NOTES, which survives every kind of boot)
                                             append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
                                             append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
                                             // The PT record (leave(): words 24..27): the last command (cap bytes, op), and at a stall exit the open transfer and its age.

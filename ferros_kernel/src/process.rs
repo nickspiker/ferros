@@ -80,16 +80,29 @@ pub static RUNNABLE_N: core::sync::atomic::AtomicUsize = core::sync::atomic::Ato
 fn runnable_sync() {
     RUNNABLE_N.store(k().runnable.len(), core::sync::atomic::Ordering::Release);
 }
-/// A thread onto the run queue; `sev` so an idle core in `wfe` looks.
+/// Wake every other core: `sev` for one in `wfe` (the kernel's core, on the event stream) and SGI 1 to all others for the workers in `wfi` (smp.rs idle loop). ICC_SGI1R_EL1 with IRM (bit 40) = every core but this one.
+pub fn kick(mask: u16) {
+    unsafe {
+        core::arch::asm!("sev");
+        // Only when a worker may run it: the render thread, pinned to the X3, sat in the queue whenever the X3 was busy, and every kick for it woke four cores to find nothing (2026-10-23).
+        if mask & MASK_WORKERS != 0 || mask & cores_up() == 0 {
+            core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (1u64 << 40) | (1u64 << 24));
+        }
+    }
+}
+fn mask_of(t: usize) -> u16 {
+    k().threads.get(t).and_then(|x| x.as_ref()).map(|x| x.mask).unwrap_or(0xFFFF)
+}
+/// A thread onto the run queue, and the idle cores that may run it told.
 fn enqueue_back(t: usize) {
     k().runnable.push_back(t);
     runnable_sync();
-    unsafe { core::arch::asm!("sev") };
+    kick(mask_of(t));
 }
 fn enqueue_front(t: usize) {
     k().runnable.push_front(t);
     runnable_sync();
-    unsafe { core::arch::asm!("sev") };
+    kick(mask_of(t));
 }
 
 static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
@@ -574,6 +587,23 @@ pub static IRQS: &[IrqLine] = &[
     // DECON0's frame-start: the trigger took and the frame is going out (what the display's `settle` waits for).
     IrqLine { name: "decon0-frame-start", intid: IRQ_DECON0_FRAME_START },
 ];
+/// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
+#[unsafe(no_mangle)]
+pub static mut __irq_any: u64 = 0;
+/// The earliest deadline any sleeping or timed-waiting thread has (u64::MAX = none), kept by `deadlines_sync` under the lock: an idle core takes the lock to wake sleepers only once it has passed, instead of every millisecond (160,000 contended acquisitions in 80 s at idle before this, 2026-10-23).
+pub static NEXT_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+fn deadlines_sync() {
+    let kk = k();
+    let mut next = u64::MAX;
+    for t in kk.threads.iter().flatten() {
+        match t.state {
+            State::Sleeping(d) => next = next.min(d),
+            State::Waiting(_, d) if d != 0 => next = next.min(d),
+            _ => {}
+        }
+    }
+    NEXT_WAKE.store(next, core::sync::atomic::Ordering::Release);
+}
 /// One byte per INTID, set by `.Lirq` when a granted line fires (the line is masked at the same time), cleared by `irq_wait` when a thread takes it.
 #[unsafe(no_mangle)]
 pub static mut __irq_pending: [u8; 1024] = [0; 1024];
@@ -1235,6 +1265,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
     };
     // Leaving: the number, the process the trap entered from (bits 8-15), the process it returns into or FF when it leaves EL0 (bits 16-23).
     crate::platform::crumb(0x70 + nr.min(SYS_LAST) | (cur as u64) << 8 | cur_get().map(|c| c as u64).unwrap_or(0xFF) << 16);
+    deadlines_sync();
     r
 }
 
@@ -1379,6 +1410,7 @@ fn disarm_slice() {
 /// Sleepers whose deadline has passed become runnable (called before every slice).
 fn wake_sleepers() {
     let kk = k();
+    unsafe { core::ptr::write_volatile(&raw mut __irq_any, 0) };
     let now: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
     for (i, p) in kk.threads.iter_mut().enumerate() {
@@ -1408,6 +1440,7 @@ fn wake_sleepers() {
             }
         }
     }
+    deadlines_sync();
 }
 
 pub fn run_slice() -> bool {

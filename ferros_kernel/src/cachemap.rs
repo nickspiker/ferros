@@ -67,6 +67,7 @@ pub const DISPLAY_PHASES: (usize, usize) = (0, 0);
 
 /// The apps' surface (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory at the bottom of the GiB above the window — a full panel's 16-bit pixels (1344 × 2992 × 8 bytes), which an app draws and the display server publishes (SHELL.md, apps as places). Free on a cold boot: Android's reserved carveouts in this GiB start at G#E800_0000 (zuma-rmem.dtsi). Granted as the region `app-surface` to the display server and, through the map, to the app in front.
 #[cfg(not(shim_handoff))]
+/// Overlaps the modem's reserved memory (cp_rmem, where the bootloader loads modem firmware: machine code found at G#C1FF_0000 after every cold boot, 2026-10-23). Harmless while the modem is held in reset; must move before cellular comes up.
 pub const APP_SURFACE: (usize, usize) = (0xC000_0000, 0xC200_0000);
 #[cfg(shim_handoff)]
 pub const APP_SURFACE: (usize, usize) = (0, 0);

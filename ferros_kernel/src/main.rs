@@ -515,6 +515,15 @@ _m1_entry:
     add     x1, x1, :lo12:__irq_pending
     mov     w2, #1
     strb    w2, [x1, x0]
+    adrp    x1, __irq_any
+    add     x1, x1, :lo12:__irq_any
+    str     x2, [x1]
+    dsb     sy
+    sev                            // the kernel's core, if in wfe, looks for the waiter
+    mov     x1, #(1 << 24)
+    orr     x1, x1, #(1 << 40)
+    msr     S3_0_C12_C11_5, x1     // ICC_SGI1R_EL1: SGI 1 to every other core — the workers sleep in wfi
+    isb
     msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
     isb
     mrs     x1, spsr_el2
