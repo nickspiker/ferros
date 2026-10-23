@@ -246,6 +246,8 @@ enum View {
 enum Choice {
     Base(u8),
     Labels,
+    /// The brightness dots: which one is decided by x.
+    Brightness,
 }
 
 /// The four bases in the order the chooser shows them: the house base first.
@@ -605,9 +607,30 @@ impl Map {
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         b.text(cx, y, 36, GREY, 1, if labels { "names under circles: on" } else { "names under circles: off" });
         self.push_row(y - 44, y + 24, Choice::Labels);
+        // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
+        y += 80;
+        b.text(cx, y, 36, GREY, 1, "brightness");
+        y += 60;
+        let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
+        let (x0, step) = Map::dots(cx, r);
+        for k in 0..9 {
+            let x = x0 + k * step;
+            if k == now {
+                b.disc(x, y, 14, WHITE);
+            } else {
+                b.disc(x, y, 8, DIM);
+            }
+        }
+        self.push_row(y - 40, y + 40, Choice::Brightness);
 
 
         b.disc(cx, cy, r - r / 25 - 1, FILL);
+    }
+
+    /// The brightness dots' first x and spacing on the device's back.
+    fn dots(cx: i64, r: i64) -> (i64, i64) {
+        let step = r * 3 / 2 / 8;
+        (cx - 4 * step, step)
     }
 
     fn push_row(&mut self, top: i64, bottom: i64, what: Choice) {
@@ -713,6 +736,12 @@ impl Map {
                     match row {
                         Some(Choice::Base(code)) => {
                             ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BASE, code);
+                            self.draw();
+                        }
+                        Some(Choice::Brightness) => {
+                            let (x0, step) = Map::dots(self.w / 2, self.arrived_r());
+                            let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
+                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
                             self.draw();
                         }
                         Some(Choice::Labels) => {

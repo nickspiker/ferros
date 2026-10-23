@@ -1751,6 +1751,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     platform::crumb(0xE5);
     process::set_pref(process::PREF_BASE, tatau::base().code());
+    // Brightness (device.brightness, stops below the brightest white; absent = 2, white about 147 cd/m²).
+    let bright = store.as_mut().and_then(|s| s.get_by_key("device.brightness").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 8).unwrap_or(2);
+    process::set_pref(process::PREF_BRIGHTNESS, bright);
     // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
     if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
         if v <= 1 {

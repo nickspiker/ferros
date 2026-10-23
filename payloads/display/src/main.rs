@@ -510,13 +510,49 @@ const E_LIGHT: f32 = 0.801;
 const PANEL_GAMMA: f32 = 2.19;
 
 /// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
-fn build_lut(lut: &mut [u16]) {
-    let k = libm::atanhf(sqrt(WHITE_NITS / (PEAK_NITS * E_LIGHT)));
+fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
+    let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
     for (i, e) in lut.iter_mut().enumerate() {
         let y = tanh(i as f32 / 16384.0 * k);
         let q = pow(y, 2.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
         *e = if q.is_nan() || q < 0.0 { 0 } else if q > 16368.0 { 16368 } else { q as u16 };
     }
+}
+
+/// The panel's brightness: high brightness mode with DBV G#FFF, or normal mode at `dbv`.
+fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
+    let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
+    r.is_ok()
+}
+
+/// The panel's brightness (DBV) against its light, measured in the 1 cm window (DISPLAY-CALIB.md, 2026-10-22): normal mode to DBV 3307; above that, high brightness mode at its full 1472 cd/m² (native white).
+const DBV_NITS: [(f32, f32); 7] = [(196.0, 1.9), (400.0, 9.2), (853.0, 49.9), (1353.0, 136.2), (2000.0, 324.6), (2600.0, 588.5), (3307.0, 984.2)];
+const HBM_NITS: f32 = 1471.9;
+
+/// The panel setting that gives a native peak as close to `nits` as it has: (high brightness mode, DBV, the native peak it gives). Between measured points, log-linear.
+fn panel_for(nits: f32) -> (bool, u16, f32) {
+    if nits > DBV_NITS[6].1 {
+        return (true, 4095, HBM_NITS);
+    }
+    if nits <= DBV_NITS[0].1 {
+        return (false, DBV_NITS[0].0 as u16, DBV_NITS[0].1);
+    }
+    for w in DBV_NITS.windows(2) {
+        let ((d0, n0), (d1, n1)) = (w[0], w[1]);
+        if nits <= n1 {
+            let t = libm::logf(nits / n0) / libm::logf(n1 / n0);
+            return (false, (d0 + (d1 - d0) * t) as u16, nits);
+        }
+    }
+    (false, 3307, DBV_NITS[6].1)
+}
+
+/// Brightness step (stops below the brightest white) to (white, the E peak the table lands on, the panel setting): the brightest white is half the E peak at the panel's top (owner: max white one stop under max); each step halves it; the panel's own brightness comes down once its peak would be more than 16× white (the working format's headroom), so the codes are never wasted on light no value can reach.
+fn brightness(step: u8) -> (f32, f32, bool, u16) {
+    let top_e = HBM_NITS * E_LIGHT;
+    let white = top_e * 0.5 / (1u32 << step.min(8)) as f32;
+    let (hbm, dbv, native) = panel_for((white * 16.0).min(top_e) / E_LIGHT);
+    (white, native * E_LIGHT, hbm, dbv)
 }
 
 /// The ordered 4×4 dither (Bayer), in sixteenths. The table's Q4 10-bit code is a Q6 8-bit code; the threshold (×4, in 64ths) is added before the six fraction bits are dropped, so each 4×4 cell (0.2 mm at 489 ppi) carries four bits below the 8-bit code the link takes: 12 bits effective. The DQE's own dither is in shift mode (kernel `start_home`), passing these 8 bits through untouched — two ordered dithers stacked partly cancelled into visible steps (owner's eyes, 2026-10-22).
@@ -932,16 +968,25 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
-    build_lut(lut);
+    let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
+    let (white0, peak0, hbm0, dbv0) = brightness(bright);
+    build_lut(lut, white0, peak0);
     // The 8-bit canvas's tables, one per channel with E's gain on the code already in.
     let mut lut8 = [[0u16; 256]; 3];
+    let rebuild8 = |lut: &[u16], lut8: &mut [[u16; 256]; 3]| {
+        for (ch, t) in lut8.iter_mut().enumerate() {
+            for (c, e) in t.iter_mut().enumerate() {
+                *e = (lut[c * 16384 / 255] as u32 * E_CODE_Q15[ch] >> 15) as u16;
+            }
+        }
+    };
     for (ch, t) in lut8.iter_mut().enumerate() {
         for (c, e) in t.iter_mut().enumerate() {
             *e = (lut[c * 16384 / 255] as u32 * E_CODE_Q15[ch] >> 15) as u16;
         }
     }
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
-    let tabs = neon::Tables::from_lut8(&lut8);
+    let mut tabs = neon::Tables::from_lut8(&lut8);
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
     let mips: &'static [draw::Mips] = {
         let mut v = alloc::vec::Vec::new();
@@ -958,9 +1003,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
-    log.dec((PEAK_NITS * E_LIGHT) as u64);
+    log.dec(peak0 as u64);
     log.s(b" cd/m2, white ");
-    log.dec(WHITE_NITS as u64);
+    log.dec(white0 as u64);
     log.s(b", white at 10-bit code ");
     log.dec((lut[16384] >> 4) as u64);
     log.s(b") in ");
@@ -1020,8 +1065,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // 10 bits when the kernel has put DECON in the 10 bpc blend (GLOBAL_CON bit 20, set by the modeset before the shell starts): the layer becomes 10-bit and every frame goes through the present stage, with the panel at its peak (HBM) so the table's headroom is real. Otherwise the 8-bit copy, as before.
     let ten = pipe.rd(S_DECON, 0x0020) & (1 << 20) != 0;
     if ten && dsi.alive() {
-        let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, 0xE0])).and_then(|_| dsi.dcs(&[0x51, 0x0F, 0xFF])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
-        log.s(if r.is_ok() { b"display: 10 bits, panel at its peak (HBM), white 133 cd/m2\n" } else { b"display: 10 bits, but the HBM command stuck\n" });
+        let r = set_panel(&dsi, hbm0, dbv0);
+        log.s(if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
     } else {
         log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
     }
@@ -1517,6 +1562,39 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). The panel then never rests at its idle floor; the owner chose the bits over the ~0.2 W (2026-10-22).
         // A frame armed by the last camera op: masked again once it has started.
         pipe.settle(&mut armed, false);
+        // Brightness (preference 3): a new white, so a new table and panel setting, and every pixel published again from the back buffer as it stands.
+        let b = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
+        if b != bright && ten {
+            bright = b;
+            let (white, peak_e, hbm, dbv) = brightness(b);
+            build_lut(lut, white, peak_e);
+            rebuild8(lut, &mut lut8);
+            tabs = neon::Tables::from_lut8(&lut8);
+            set_panel(&dsi, hbm, dbv);
+            let full = draw::Rect::full(width, height);
+            unsafe {
+                PHASE_DIRTY = [full; PHASES];
+            }
+            if unsafe { TEMPORAL } && client_owned {
+                pipe.settle(&mut armed, true);
+                publish_next(pixels, width, height, &tabs, full);
+                ferros_sys::dma_barrier();
+                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                armed = Some(pipe.arm(win));
+            }
+            log.s(b"display: brightness ");
+            log.dec(b as u64);
+            log.s(b": white ");
+            log.dec(white as u64);
+            log.s(b" cd/m2, E peak ");
+            log.dec(peak_e as u64);
+            log.s(if hbm { b" (HBM)\n" } else { b" (DBV " });
+            if !hbm {
+                log.dec(dbv as u64);
+                log.s(b")\n");
+            }
+            log.flush();
+        }
         // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         if off != screen_off && dsi.alive() {

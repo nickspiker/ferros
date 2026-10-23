@@ -40,6 +40,8 @@ pub const PREF_BASE: u64 = 0;
 pub const PREF_LABELS: u64 = 1;
 /// Preference 2: the screen, 0 on, 1 off (the power key toggles it).
 pub const PREF_SCREEN_OFF: u64 = 2;
+/// Preference 3: brightness in stops below the brightest white (0-8).
+pub const PREF_BRIGHTNESS: u64 = 3;
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

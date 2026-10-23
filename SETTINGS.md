@@ -26,6 +26,23 @@ Every number a person reads is drawn in one of four bases (`Code/tatau`): arabic
 
 Whether the map writes a circle's name under it: one byte, 0 off (the default: icons identify) or 1 on, preference 1 in every process's block. Set from the same back of the device's circle, kept and applied exactly as the base is.
 
+## Brightness (`device.brightness`)
+
+Brightness is a whole number of stops below the brightest white, 0 to 8, one byte, preference 3 (absent = 2). It is set on the device's back as a row of nine dots, dimmest on the left.
+- **Step 0** puts white at half the panel's peak: the owner's "max white one stop under max". On this unit's E-white peak of 1178 cd/m², that is 589 cd/m².
+- **Each further step halves white:** 294, 147, 73, 37, 18, 9, 4.6 and 2.3 cd/m².
+- **The panel's own brightness** stays at its high-brightness peak while that peak is within 16× of white, the headroom the working format holds. Below that, it comes down so its peak is exactly 16× white, set from the measured DBV table.
+- **The display server** rebuilds its one table (tanh into the peak, white exactly on target) and republishes the frame when the preference changes. On the X3 the rebuild takes about a millisecond.
+
+Measured on the phone, 2026-10-22:
+
+| Step | White | E peak | Panel |
+|---|---|---|---|
+| 0 | 589 | 1178 | HBM |
+| 2 | 147 | 1178 | HBM |
+| 5 | 18 | 294 | DBV 2126 |
+| 8 | 2.3 | 36 | DBV 831 |
+
 ## How a process sees and changes them
 
 - Every process reads the current values from its own grants page (`ferros_sys::device_base`, `ferros_sys::pref`): the kernel rewrites that block in every live process the moment a value changes.
