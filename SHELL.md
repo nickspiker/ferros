@@ -170,3 +170,35 @@ A fourth change came later: the black pass is gone. The layer is BGRX, so the pa
 The big clusters (CPUCL1 1065 MHz, CPUCL2 1164 MHz) run nothing of ours yet: bringing up the other cores is the larger lever.
 
 Each frame is now one call (op 15, a batch): the overlay's text and discs, then the camera op with its keep flag. A call to an endpoint wakes a server that is asleep between polls, so the reply no longer waits for the server's next tick.
+
+## Tonight's build (2026-10-22 night)
+
+**Gestures** (owner, same day):
+- **One finger** dragged from a circle moves that circle; dragged from the air, it pans.
+- **Two fingers** both inside one circle move, size and turn that circle. Otherwise they pinch and twist the plane.
+- **Circles push each other** instead of overlapping, and a push carries on through the neighbours. Every move is kept in the vault when the fingers lift. There is no arranging mode any more.
+- **Circles wider than three quarters of the screen are places, not objects:** the fingers move the plane there, so a zoomed-in view can't trap them.
+- **Tap** arrives (or launches: Ramps). The power key turns the screen off and on.
+
+**Settings on the device's back:** the number base, names under circles, and brightness (nine dots, a stop apart; SETTINGS.md).
+
+**Ramps** is an app (payloads/ramps): vertical ramps with 4 px white lines, one column alone on a tap.
+
+**How a frame is drawn now** (payloads/display/src/draw.rs, neon.rs). All integer, on the X3 (KERNEL.md):
+- **Damage rectangles:** only what the last frame and this one drew is cleared and published.
+- **Discs:** antialiased without a square root. Span edges are walked down row by row, and an edge pixel's coverage is the first-order distance (d² − r²)/2r, with one reciprocal per disc.
+- **Icons:** sampled from a mip chain with bilinear filtering, two channels per multiply, on padded levels (no bounds tests). Premultiplied front-to-back compositing.
+- **Sprites:** each circle is drawn once while it holds still and blitted on pans. Centres are snapped to whole pixels so the two always line up.
+- **Publish:** the 10-bit publish runs in NEON, 16 pixels per step: table lookups by TBL, the dither as one add.
+- **Present:** each frame goes into the next temporal phase and is armed without waiting, so consecutive frames carry consecutive phases.
+
+Measured with the map's bench start (`FERROS_MAP_START=bench`):
+
+| | A510 at 1.4–1.7 GHz | X3 at 2.9 GHz |
+|---|---|---|
+| Pan frame | 135–185 ms | **10.7 ms** (93 fps) |
+| Pinch with twist frame | 257–305 ms | **29 ms** (34 fps) |
+
+**Development loop:**
+- `tools/husky-shell.sh display|map|…` builds, stores and restarts the processes in about 7 s, no reboot (kernel `diag restart`).
+- `tools/husky-screen.sh` grabs the frame: the raw words, the panel's codes, and an sRGB view.
