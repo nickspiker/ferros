@@ -103,8 +103,33 @@ pub fn pet_watchdogs() {
 }
 
 /// Breadcrumb at G#18 (kernel prints it as `mbr_sig`): bumped per step so a stall leaves the last marker; the completed report writes low byte 0 (or an exit reason).
+/// A post-mortem note in the report block's free words (G#50-G#78: slot 0-5), read as PREV_NOTE_n by the next boot's DIAG. Slot 0: the kernel lock's holder (core + 1, 0 = free; process.rs). Slots 1-5: cores 4-8's last crumb. Cheap enough for the hot paths: one uncached store.
+pub fn note(slot: usize, v: u64) {
+    unsafe {
+        // In ferros's own result page (x3.rs RESULT, non-cacheable, below everything ABL loads), not the ramoops block: the hv gate rewrites that block on every boot, so notes there never survived a gate boot (2026-10-23). `bridge read 819FF900 64` after the next boot.
+        write_volatile((crate::x3::RESULT + 0x900 + (slot & 7) * 8) as *mut u64, v);
+    }
+}
+
+/// At boot, before any note is written: the previous boot's notes copied to RESULT+G#980 (`bridge read 819FF980 64`), and the live slots cleared — so a boot that hung leaves its last per-core crumbs readable from the boot after it.
+pub fn notes_rotate() {
+    unsafe {
+        for i in 0..8 {
+            let v = core::ptr::read_volatile((crate::x3::RESULT + 0x900 + i * 8) as *const u64);
+            write_volatile((crate::x3::RESULT + 0x980 + i * 8) as *mut u64, v);
+            write_volatile((crate::x3::RESULT + 0x900 + i * 8) as *mut u64, 0);
+        }
+    }
+}
+
 pub fn crumb(c: u64) {
     LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let core = ((mpidr >> 8) & 0xF) as usize;
+    if (4..=8).contains(&core) {
+        note(core - 3, c | (core as u64) << 56);
+    }
     unsafe {
         write_volatile((RAMOOPS_RESULT + 0x00) as *mut u64, RESULT_MAGIC);
         write_volatile((RAMOOPS_RESULT + 0x18) as *mut u64, c);

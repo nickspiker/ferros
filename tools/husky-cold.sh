@@ -81,12 +81,13 @@ else
     fastboot flash boot_b "$IMG"
 fi
 [ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
-fastboot --set-active=b
+# No slot switch: ABL boots the UFS boot LUN's slot regardless, and `--set-active` marks the other slot "de-activated" (bit 3) — ABL then refuses it and sits in fastboot in 12 s (2026-10-23: four bounces, all this). Both slots carry the same image; the current one is re-written as active so a stray bit 3 is cleared.
+fastboot --set-active="$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')" >/dev/null 2>&1 || true
 t0=$(date +%s)
 fastboot reboot
 while :; do
     if lsusb -d 1209:4665 >/dev/null 2>&1; then
-        echo "== ferros on USB after $(( $(date +%s) - t0 ))s (cold boot, slot b)"
+        echo "== ferros on USB after $(( $(date +%s) - t0 ))s (cold boot, the boot LUN's slot)"
         sleep 1
         "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"
         exit 0

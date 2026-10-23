@@ -1628,6 +1628,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     platform::enable_icache();
     platform::canary_init();
     platform::stack_paint();
+    platform::notes_rotate();
     // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
     if option_env!("FERROS_X3") != Some("0") {
         x3::launch();

@@ -528,6 +528,7 @@ pub fn run(mut b: Boot) -> ! {
     let mut st = PtStats::default();
     // A PT transfer that stops moving for 16 s is a wedged endpoint: report it and leave rather than idling for 512 s.
     let stall_giveup = freq * 16;
+    let mut pt_stalls = 0u32;
     let mut t_pt = t_init;
     // `display --hold` keeps a message on the panel: the idle exit is off until a host REBOOT ends the session (both volume keys still kill it: killswitch.rs).
     let mut hold = false;
@@ -610,6 +611,7 @@ pub fn run(mut b: Boot) -> ! {
         if configured_ever && !hold && crate::process::alive() == 0 && now.wrapping_sub(t_command) > idle_giveup {
             leave(&b, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
         }
+        // A transfer half-open for 16 s is dropped and the bulk endpoint re-armed; it used to end the session in fastboot, which, on the first boot after a flash, the host's own first DIAG managed to trigger — a phone that leaves because a cable hiccuped is not a phone (2026-10-23: three of the day's four flashes "landed in fastboot after 34 s"). Counted for DIAG (PT_STALLS); the host simply retries.
         if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
             if let Some(x) = &pt_inbound {
                 st.open_sid = x.sid.0 as u32;
@@ -617,7 +619,12 @@ pub fn run(mut b: Boot) -> ! {
                 st.open_total = x.expected_total as u32;
                 st.pt_age_ms = (now.wrapping_sub(t_pt) * 1000 / freq) as u32;
             }
-            leave(&b, EXIT_PT_STALL, attempts, configured_ever, Some(&usb), &st);
+            pt_stalls += 1;
+            pt_inbound = None;
+            pt_seq_width = 0;
+            pt_out_data.clear();
+            usb.bulk_out_arm();
+            platform::crumb(0xB6);
         }
 
         match usb.poll_event() {
@@ -1480,6 +1487,7 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
+                                        append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
                                         {
                                             let (up, on) = crate::smp::report();
                                             append_hex(&mut resp, b"SMP_UP=", up);
@@ -1562,6 +1570,11 @@ pub fn run(mut b: Boot) -> ! {
                                             // Why the previous session ended (crumb byte G#Bx = exit reason, G#EExx = panic; a nonzero fault ELR = the fault sink fired).
                                             append_hex(&mut resp, b"PREV_EXIT=", prev[3] as u32);
                                             append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
+                                            // The post-mortem notes (platform::note): the lock's holder, then cores 4-8's last crumb (core in the top byte).
+                                            append_hex(&mut resp, b"PREV_LOCK_HOLDER=", prev[10] as u32);
+                                            for k in 1..6 {
+                                                append_hex(&mut resp, alloc::format!("PREV_CRUMB_C{}=", k + 3).as_bytes(), prev[10 + k] as u32);
+                                            }
                                             append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
                                             append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
                                             // The PT record (leave(): words 24..27): the last command (cap bytes, op), and at a stall exit the open transfer and its age.

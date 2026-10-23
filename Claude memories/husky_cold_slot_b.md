@@ -26,3 +26,6 @@ metadata:
 - It is the same ira-rooted vault as the handoff path: the `note` written via the handoff reads back on the cold boot.
 - **Slot b marks itself successful** (slot.rs, 2026-10-14): devinfo = UFS LUN 3 LBA 6, word per slot at G#30 (retries, flags b1 successful b2 active b3 fastboot-ok). ABL confirms `slot-successful:b:yes`; 5 plain reboots stayed in ferros. devinfo ALSO holds serials/MACs/IMEIs: never alter beyond the flag bit; full backup in keys/husky-devinfo-2026-10-14.bin. Details in BOOT.md.
 - See [[ufs_husky_wall]].
+
+
+**2026-10-23 corrections:** ABL boots the UFS boot LUN's slot (a on this phone) whatever `fastboot --set-active` says; `--set-active=b` marks a "de-activated" (devinfo bit 3) and ABL then sits in fastboot in 12 s every boot until `--set-active=a` (or a ferros boot) rewrites the word. Never switch slots from fastboot on husky; both slots carry the same gate image and slot b's boot-chain partitions are mirrored from the factory build. A PT stall no longer exits to fastboot (PT_STALLS in DIAG). The report block (RAMOOPS_RESULT) is rewritten by the hv gate every boot: post-mortem notes live in the X3 result page instead (`bridge read 819FF980 64` = the previous boot's; platform::note).

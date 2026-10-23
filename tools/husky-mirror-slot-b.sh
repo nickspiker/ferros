@@ -22,6 +22,6 @@ for p in $PARTS; do
     fastboot flash "${p}_b" "$W/$p.img" 2>&1 | grep -E "Writing|FAIL" | sed "s/^/   ${p}_b: /"
 done
 # Slot b stays the active slot; the gate on it asks as before.
-fastboot --set-active=b >/dev/null 2>&1 || true
+fastboot --set-active="$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')" >/dev/null 2>&1 || true
 fastboot reboot
 echo "== slot b mirrored; rebooting (Ready? -> ferros in a second; volume down there = Android, from either slot now)"

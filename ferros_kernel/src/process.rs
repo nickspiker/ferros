@@ -46,15 +46,17 @@ static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::ne
 pub static LOCK_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 fn lock() {
     use core::sync::atomic::Ordering;
-    if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-        return;
+    if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
+        while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
     }
-    LOCK_SPINS.fetch_add(1, Ordering::Relaxed);
-    while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
-    }
+    // Who holds it, for the post-mortem (a hang with the lock held names its core).
+    crate::platform::note(0, core() as u64 + 1);
 }
 fn unlock() {
+    crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
 /// This core's index: MPIDR Aff1 (husky: 0-3 the A510s, 4-7 the A715s, 8 the X3).

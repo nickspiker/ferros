@@ -291,6 +291,18 @@ pub fn ask() -> Choice {
         if read_volatile(ANDROID_ONCE_ADDR as *const u64) == ANDROID_ONCE {
             write_volatile(ANDROID_ONCE_ADDR as *mut u64, 0);
             asm!("dsb sy");
+            // FERROS_GATE_PANEL_TEST builds: the marker path also paints the gate and restores the splash, exactly as the key path does — so the key path's effect on Linux's display handover can be tested from the host (`bridge diag android`), with no finger (2026-10-23: Android chosen by key came up with its display stuck on the logo; by marker it was fine).
+            if option_env!("FERROS_GATE_PANEL_TEST").is_some() {
+                let c = rd(GPA4_CON) & !(0xF << (POWER_PIN * 4));
+                wr(GPA4_CON, c);
+                if let Some(p) = adopt() {
+                    draw(&p);
+                    present(&p);
+                    let t = now();
+                    while now().wrapping_sub(t) < freq() {}
+                    restore(&p);
+                }
+            }
             return Choice::Android;
         }
     }
