@@ -508,8 +508,20 @@ _m1_entry:
     lsl     w1, w1, w3
     movz    x3, #0x0180
     movk    x3, #0x1040, lsl #16
-    str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>
-    b       .Lirq_eoi
+    str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>: masked until a driver's irq_ack (or for good, if no one holds the line)
+    // The line is pending for whoever holds its grant (process.rs IRQS); from EL0 the running thread is parked so the scheduler can run the waiter now, from EL2 the service loop's next slice does.
+    adrp    x1, __irq_pending
+    add     x1, x1, :lo12:__irq_pending
+    mov     w2, #1
+    strb    w2, [x1, x0]
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
 // The power key was pressed (gpa4-0 falling edge, killswitch.rs arm_power_key): record it for the "Ready?" gate and clear its pending bit.
 .Lirq_power:
     adrp    x1, __power_pressed

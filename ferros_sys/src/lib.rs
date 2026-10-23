@@ -34,6 +34,8 @@ pub mod nr {
     pub const THREAD_EXIT: u64 = 15;
     pub const WAIT: u64 = 16;
     pub const WAKE: u64 = 17;
+    pub const IRQ_WAIT: u64 = 18;
+    pub const IRQ_ACK: u64 = 19;
 }
 
 /// Where the kernel keeps this process's copy of the device preferences (SETTINGS.md): a 32-byte block in the grants page, rewritten by the kernel whenever a preference changes.
@@ -278,6 +280,16 @@ pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) 
 /// Make up to `count` threads waiting on `word` runnable; returns how many.
 pub fn wake(word: &core::sync::atomic::AtomicU64, count: u64) -> u64 {
     svc(nr::WAKE, off(word as *const _ as *const u8), count, 0, 0, 0)
+}
+
+/// Block until the interrupt line the token grants fires (0), or the counter reaches `deadline` (2; 0 = none). A line that fired while no one waited answers at once. The line stays masked until `irq_ack`; clear the device's own pending bit before acking.
+pub fn irq_wait(cap: u64, deadline: u64) -> u64 {
+    svc(nr::IRQ_WAIT, cap, deadline, 0, 0, 0)
+}
+
+/// The device is handled: unmask its line.
+pub fn irq_ack(cap: u64) -> u64 {
+    svc(nr::IRQ_ACK, cap, 0, 0, 0, 0)
 }
 
 /// Answer a call; the token stops existing.

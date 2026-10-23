@@ -111,6 +111,30 @@ pub fn arm_power_key() {
     wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
 }
 
+/// Enable one shared interrupt (SPI, INTID 32..1020) for a process's interrupt grant: level-triggered, middle priority, routed to this core (the kernel's), enabled. `.Lirq` masks it when it fires; `unmask_spi` is the driver's ack.
+pub fn enable_spi(intid: u32) {
+    if !(32..1020).contains(&intid) {
+        return;
+    }
+    let n = intid as usize;
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, (mpidr & 0xFF_FFFF) | (mpidr & 0xFF_0000_0000)) };
+    let pr = GICD + 0x400 + (n & !3);
+    wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
+    let cfg = GICD + 0xC00 + (n / 16) * 4;
+    wr(cfg, rd(cfg) & !(2 << ((n % 16) * 2)));
+    wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
+}
+
+/// Unmask a shared interrupt `.Lirq` masked when it fired.
+pub fn unmask_spi(intid: u32) {
+    if (32..1020).contains(&intid) {
+        let n = intid as usize;
+        wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
+    }
+}
+
 /// Enable one private interrupt (PPI, INTID 16..31) on this CPU's redistributor at middle priority — e.g. the EL2 timer (26) that ends a process's time slice. No-op if `arm` found no redistributor.
 pub fn enable_ppi(intid: u32) {
     let frame = REPORT[0].load(core::sync::atomic::Ordering::Relaxed);

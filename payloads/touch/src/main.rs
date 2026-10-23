@@ -15,12 +15,14 @@
 #![no_std]
 #![no_main]
 
-use ferros_sys::{cap, console, delay_us, freq, mmio_read, mmio_write, now, recv, reply, sleep_until, NOTHING};
+use ferros_sys::{cap, console, delay_us, freq, mmio_read, mmio_write, now, recv, reply, NOTHING};
 
 const S_CONSOLE: u64 = 0;
 const S_TOUCH: u64 = 1;
 const S_SPI: u64 = 2;
 const S_GPIO: u64 = 3;
+/// The controller's interrupt line (kernel `touch-int`, gpn0-0): the loop waits on it instead of polling the pin.
+const S_IRQ: u64 = 4;
 
 // The s3c64xx SPI registers, offsets from the port's base (ferros_kernel/src/spi.rs).
 const CH_CFG: u64 = 0x00;
@@ -39,6 +41,11 @@ const PACKET_CNT_EN: u32 = 1 << 16;
 const MODE_BYTE: u32 = 0x1FF8_0000;
 /// The interrupt line is gpn0 pin 0; a GPIO bank's data register is at +4, and the line is active low.
 const GPIO_DAT: u64 = 0x04;
+const GPIO_CON: u64 = 0x00;
+/// The bank's external-interrupt registers (pinctrl-exynos.h, relative to the GPIO_CUSTOM_ALIVE block the grant covers): control (a nibble per pin: 0 = low level), mask and pending.
+const EINT_CON: u64 = 0x700;
+const EINT_MASK: u64 = 0x900;
+const EINT_PEND: u64 = 0xA00;
 
 /// FTM5 commands (docs/oracle/TOUCH.md).
 const FIFO_READ: u8 = 0x87;
@@ -67,6 +74,19 @@ impl Port {
     /// True while the controller is asserting its interrupt line.
     fn irq(&self) -> bool {
         mmio_read(cap(self.grants, S_GPIO), GPIO_DAT) as u32 & 1 == 0
+    }
+    /// gpn0-0 as a level-low external interrupt, unmasked, pending cleared: the GIC line (S_IRQ) then fires while the controller holds INT low.
+    fn irq_setup(&self) {
+        let g = cap(self.grants, S_GPIO);
+        mmio_write(g, GPIO_CON, (mmio_read(g, GPIO_CON) as u32 & !0xF) | 0xF);
+        mmio_write(g, EINT_CON, mmio_read(g, EINT_CON) as u32 & !0xF);
+        mmio_write(g, EINT_PEND, 1);
+        mmio_write(g, EINT_MASK, mmio_read(g, EINT_MASK) as u32 & !1);
+    }
+    /// The line handled: the bank's pending bit cleared, the GIC line unmasked.
+    fn irq_done(&self) {
+        mmio_write(cap(self.grants, S_GPIO), EINT_PEND, 1);
+        ferros_sys::irq_ack(cap(self.grants, S_IRQ));
     }
     fn flush(&self) {
         self.wr(CH_CFG, self.rd(CH_CFG) & !(CH_TX_ON | CH_RX_ON));
@@ -213,6 +233,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut out = [0u8; 1 + REC * SLOTS];
     let mut token = [0u8; 32];
     let tick = freq() / 128;
+    p.irq_setup();
     loop {
         // The controller first, so a client's call is answered from a table that is already current.
         if p.irq() {
@@ -282,7 +303,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             };
             reply(&token, &out[..len]);
         }
-        sleep_until(now() + tick);
+        // Until the controller raises its line, a client calls (the kernel ends the wait early for the endpoint's poller), or the tick — whichever first. The line is masked from firing to `irq_done`; the drain above has emptied the FIFO by then, so INT is high again.
+        ferros_sys::irq_wait(cap(grants, S_IRQ), now() + tick);
+        p.irq_done();
     }
 }
 

@@ -130,6 +130,8 @@ pub enum Object {
     Settings,
     /// Served by the kernel: a scope of the device vault (index into `STORES`): get and set the keys under its prefix, named relative to it (`SYS_STORE`).
     Store(usize),
+    /// An interrupt line (index into `IRQS`): `irq_wait` blocks a thread until it fires, `irq_ack` unmasks it again (KERNEL.md "Interrupts to user space").
+    Irq(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -163,6 +165,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Hardware(i) => (3, i as u64),
         Object::Settings => (6, 0),
         Object::Store(i) => (7, i as u64),
+        Object::Irq(i) => (8, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -448,7 +451,41 @@ const SYS_THREAD_EXIT: u64 = 15;
 const SYS_WAIT: u64 = 16;
 /// wake(word, count): make up to `count` threads of this process waiting on that word runnable; returns how many.
 const SYS_WAKE: u64 = 17;
-const SYS_LAST: u64 = 17;
+/// irq_wait(cap, deadline): block until the line fires (0), or the deadline passes (2; 0 = none); if it fired while no one waited, return 0 at once. The line is masked at the GIC from the moment it fires until `irq_ack`.
+const SYS_IRQ_WAIT: u64 = 18;
+/// irq_ack(cap): the driver has handled its device (and cleared its own pending bit there): the line is unmasked at the GIC.
+const SYS_IRQ_ACK: u64 = 19;
+const SYS_LAST: u64 = 19;
+
+/// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
+pub struct IrqLine {
+    pub name: &'static str,
+    pub intid: u32,
+}
+/// gpn0-0, the touch controller's INT: SPI 0 (IRQ_ALIVE_CUSTOM_EINT0, zuma-pinctrl.dtsi; gpn0 is a one-pin bank with its own line).
+pub const IRQ_TOUCH_INT: u32 = 32;
+/// DECON0 "frame_done": SPI 242 (zuma-drm-dpu.dtsi).
+pub const IRQ_DECON0_FRAME_DONE: u32 = 274;
+pub static IRQS: &[IrqLine] = &[
+    // The touch controller's INT line: gpn0-0 (docs/oracle/TOUCH.md), the far-alive EINT bank.
+    IrqLine { name: "touch-int", intid: IRQ_TOUCH_INT },
+    // DECON0's frame-done: the frame the panel is reading has gone out; the next can be written.
+    IrqLine { name: "decon0-frame-done", intid: IRQ_DECON0_FRAME_DONE },
+];
+/// One byte per INTID, set by `.Lirq` when a granted line fires (the line is masked at the same time), cleared by `irq_wait` when a thread takes it.
+#[unsafe(no_mangle)]
+pub static mut __irq_pending: [u8; 1024] = [0; 1024];
+/// Threads block on an interrupt as `Waiting(intid, deadline)`: an INTID is far below any arc address, so the two never meet.
+fn irq_pending_take(intid: u32) -> bool {
+    unsafe {
+        let p = &raw mut __irq_pending[intid as usize];
+        let v = core::ptr::read_volatile(p);
+        if v != 0 {
+            core::ptr::write_volatile(p, 0);
+        }
+        v != 0
+    }
+}
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
 pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 
@@ -695,6 +732,40 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                 if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
             }
         }
+        SYS_IRQ_WAIT | SYS_IRQ_ACK => {
+            let token = p.read(f.x[0], 32);
+            match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Irq(i)) => {
+                    let intid = IRQS[i].intid;
+                    if nr == SYS_IRQ_ACK {
+                        crate::killswitch::unmask_spi(intid);
+                        f.x[0] = 0;
+                        0
+                    } else if irq_pending_take(intid) {
+                        f.x[0] = 0;
+                        0
+                    } else {
+                        let deadline = f.x[1];
+                        let t_now: u64;
+                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
+                        if deadline != 0 && deadline <= t_now {
+                            f.x[0] = 2;
+                            0
+                        } else {
+                            t.state = State::Waiting(intid as usize, deadline);
+                            t.frame = *f;
+                            t.frame.x[0] = 0;
+                            tr(TR_SLEEP, cur, intid as u64);
+                            if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                        }
+                    }
+                }
+                _ => {
+                    f.x[0] = ERR;
+                    0
+                }
+            }
+        }
         SYS_WAIT => {
             let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
             let now = unsafe { core::ptr::read_volatile(addr as *const u64) };
@@ -872,7 +943,11 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     } else if let Some(s) = kk.endpoints[ep].poller {
                         // A polling server asleep between polls: wake it now (its sleep returns early, which a poll loop reads as "look again").
                         if let Some(q) = th(s) {
-                            if matches!(q.state, State::Sleeping(_)) {
+                            // Asleep, or in a timed interrupt wait (a driver that serves an endpoint and waits for its device in one loop): back with 2, as at its deadline.
+                            if matches!(q.state, State::Sleeping(_)) || matches!(q.state, State::Waiting(a, _) if a < 1024) {
+                                if matches!(q.state, State::Waiting(..)) {
+                                    q.frame.x[0] = 2;
+                                }
                                 q.state = State::Runnable;
                                 kk.runnable.push_back(s);
                                 tr(TR_WAKE_POLL, s, ep as u64);
@@ -1154,7 +1229,15 @@ fn wake_sleepers() {
                     kk.runnable.push_back(i);
                     tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
                 }
-            } else if let State::Waiting(_, d) = p.state {
+            } else if let State::Waiting(a, d) = p.state {
+                // An interrupt the thread waits on has fired: it runs first (the device is waiting on it).
+                if a < 1024 && irq_pending_take(a as u32) {
+                    p.state = State::Runnable;
+                    p.frame.x[0] = 0;
+                    kk.runnable.push_front(i);
+                    tr(TR_WAKE, i, a as u64);
+                    continue;
+                }
                 // A timed wait whose deadline passed: back with 2.
                 if d != 0 && d <= now {
                     p.state = State::Runnable;
@@ -1260,6 +1343,8 @@ pub enum Grant<'a> {
     Settings,
     /// A scope of the device vault, by name (syscall 13).
     Store(&'a [u8]),
+    /// An interrupt line from the registry, by name (syscalls 18, 19).
+    Irq(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -1338,6 +1423,13 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Store(n) => match STORES.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Store(i), RIGHT_SEND),
                 None => return Err("no such store scope"),
+            },
+            Grant::Irq(n) => match IRQS.iter().position(|r| r.name.as_bytes() == *n) {
+                Some(i) => {
+                    crate::killswitch::enable_spi(IRQS[i].intid);
+                    (Object::Irq(i), RIGHT_SEND)
+                }
+                None => return Err("no such interrupt line"),
             },
         });
     }
