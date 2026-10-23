@@ -263,8 +263,9 @@ The chainload above is not built. What runs instead is mirrored gates:
 - **Slot a** holds the hv gate (ferros_hv/src/gate.rs) in front of Android's own kernel, with the same ferros packed in. `tools/husky-cold.sh` rebuilds and flashes both slots on every deploy (`FERROS_NO_SLOT_A=1` to leave slot a alone).
 
 How a boot goes:
-- **Every boot lands on "Ready?"**, from either slot. Power, or 1 s untouched on dev builds, gives ferros. Volume down gives Android.
-- **Android is one-shot.** Volume down at slot b's gate, or `bridge diag android`, makes slot a active and leaves a marker in the ramoops block. Slot a's gate takes it and boots Android without asking, once.
+- **Every boot lands on "Ready?"**, from either slot. Power, or 1 s untouched on dev builds, gives ferros. Volume down gives Android. Volume up holds.
+- **Dev builds have USB up at the gate** (since 2026-10-23): the controller is brought up before the screen and serviced while the gate waits, so the host answers it like the keys — `ferros-bridge gate ferros|android|hold` (an EP0 vendor request, G#5C) — and the service takes the enumerated controller over after the press, so the host sees one device. Release builds bring USB up only after the press.
+- **Android is one-shot, and it is a slot switch.** Volume down (or `gate android`) at slot b's gate, or `bridge diag android`, makes slot a active and leaves a marker in the ramoops block the moment the disk link is up — before the vault, the display or the shell — and resets. Slot a's gate takes the marker and boots Android without asking, once. Android cannot be chainloaded from slot b: its own Android partitions are not a working system (`product_b` is empty), so the one boot through ABL into slot a is the price of the choice.
 - **A reboot from Android lands on slot a's gate again**, and from there on ferros. Verified 2026-10-22: `diag android` → Android on slot a → `adb reboot` → ferros on USB 17 s later, shell up. Before this, the volume-down path set no marker and slot a held an oracle capture build, so Android was a trap (owner).
 - **Not yet:** USB up during the gate on dev builds, so the host can choose before anything boots (owner's ask). Today the host chooses from a running ferros.
 

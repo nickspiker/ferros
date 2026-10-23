@@ -350,3 +350,65 @@ pub fn report_exit(exit: u8) {
         ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x40);
     }
 }
+
+
+/// A canary across the kernel's .bss: 64 KiB of a known pattern, written once at boot and checked by DIAG (CANARY_BAD, CANARY_AT, CANARY_VAL). A reloaded generation read garbage from its statics (UFS_LOST came back as an address, 2026-10-23); the first word to change, and what it changed to, names the writer.
+static mut CANARY: [u64; 8192] = [0; 8192];
+pub fn canary_init() {
+    unsafe {
+        for (i, w) in (*(&raw mut CANARY)).iter_mut().enumerate() {
+            core::ptr::write_volatile(w, 0xC0FF_EE00_0000_0000 | i as u64);
+        }
+    }
+}
+/// (words changed, address of the first, its value).
+pub fn canary_check() -> (u32, usize, u64) {
+    let mut bad = 0u32;
+    let mut first = (0usize, 0u64);
+    unsafe {
+        for (i, w) in (*(&raw const CANARY)).iter().enumerate() {
+            let v = core::ptr::read_volatile(w);
+            if v != 0xC0FF_EE00_0000_0000 | i as u64 {
+                if bad == 0 {
+                    first = (w as *const u64 as usize, v);
+                }
+                bad += 1;
+            }
+        }
+    }
+    (bad, first.0, first.1)
+}
+pub fn canary_base() -> usize {
+    unsafe { &raw const CANARY as usize }
+}
+
+unsafe extern "C" {
+    static __stack_bottom: u8;
+    static __stack_top: u8;
+}
+const STACK_PAINT: u64 = 0x5AC4_5AC4_5AC4_5AC4;
+/// Paint the kernel stack below the current frame, so `stack_used_max` can read how deep it has ever gone.
+pub fn stack_paint() {
+    unsafe {
+        let sp: u64;
+        core::arch::asm!("mov {}, sp", out(reg) sp);
+        let bottom = &raw const __stack_bottom as usize;
+        let mut a = bottom;
+        while a + 8 <= (sp as usize).saturating_sub(512) {
+            core::ptr::write_volatile(a as *mut u64, STACK_PAINT);
+            a += 8;
+        }
+    }
+}
+/// (stack size, deepest use so far in bytes): the first word from the bottom that is no longer paint.
+pub fn stack_used_max() -> (u32, u32) {
+    unsafe {
+        let bottom = &raw const __stack_bottom as usize;
+        let top = &raw const __stack_top as usize;
+        let mut a = bottom;
+        while a + 8 <= top && core::ptr::read_volatile(a as *const u64) == STACK_PAINT {
+            a += 8;
+        }
+        ((top - bottom) as u32, (top - a) as u32)
+    }
+}

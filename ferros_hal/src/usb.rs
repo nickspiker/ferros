@@ -258,6 +258,14 @@ const USB_REQ_SET_ADDRESS: u8 = 5;
 const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_REQ_SET_CONFIGURATION: u8 = 9;
 
+/// Vendor gate request (bmRequestType G#40, host-to-device, no data): wValue 1 = ferros, 2 = Android, 3 = hold — the host's power, volume-down and volume-up at the "Ready?" gate (dev builds bring USB up before the gate for this; `ferros-bridge gate <ferros|android|hold>`).
+pub const VENDOR_REQ_GATE: u8 = 0x5C;
+static GATE_REQUEST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The gate request the host sent, once (0 = none).
+pub fn take_gate_request() -> u8 {
+    GATE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Vendor debug readout request (bmRequestType G#C0, device-to-host vendor).
 /// Returns 16 LE u32 counters — a live window into the PT dispatch loop that works even when the bulk path is wedged, since EP0 keeps running.
 pub const VENDOR_REQ_DBG: u8 = 0x5A;
@@ -1887,6 +1895,11 @@ impl Dwc3Dev {
                 // Return 2 bytes of zeros (self-powered, no remote wakeup)
                 self.ep0_send(&[0, 0], TRBCTL_CONTROL_DATA);
                 self.ep0_state = Ep0State::DataIn;
+                true
+            }
+            VENDOR_REQ_GATE if bm_request_type == 0x40 => {
+                GATE_REQUEST.store(w_value as u8, core::sync::atomic::Ordering::Relaxed);
+                self.ep0_state = Ep0State::StatusInWait;
                 true
             }
             VENDOR_REQ_DBG2 if bm_request_type == 0xC0 => {

@@ -638,18 +638,7 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, m
 static mut PUB_TICKS: [u64; 3] = [1; 3];
 
 /// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
-fn publish_current(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, r: draw::Rect) {
-    unsafe {
-        for k in 0..PHASES {
-            PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
-        }
-        let k = CUR_PHASE;
-        publish10x4(back, width, height, tabs, 1 << k, PHASE_DIRTY[k]);
-        PHASE_DIRTY[k] = draw::Rect::EMPTY;
-    }
-}
-
-/// The same, into the next phase in turn rather than the one on the layer (which the panel may still be reading): it becomes the current one. The frame after can be armed at once, without waiting for this one to go out (the buffer it writes was on screen three frames before). During motion consecutive frames thus carry consecutive phases' thresholds — the temporal dither at the frame rate.
+/// A frame into the ring: the next phase in turn, never the one on the layer (which the panel may still be reading), and it becomes the current one. Every frame goes this way — a camera op, an app's frame, the status line — so the frame after can be armed at once (the buffer it writes was on screen three frames before) and consecutive frames carry consecutive phases' thresholds: the temporal dither at whatever rate frames come, 120 Hz under a finger, 10 Hz at rest (the flip below, which publishes nothing once the ring holds the image).
 fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, r: draw::Rect) {
     unsafe {
         for k in 0..PHASES {
@@ -1193,7 +1182,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1504,7 +1493,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1634,7 +1623,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                if ten && unsafe { TEMPORAL } { publish_current(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
@@ -1713,7 +1702,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let t_idle = now();
         // Only once the frames have stopped coming (an eighth of a second without a camera op): while a finger moves, the phases wait and the frames go out spatial only, rather than every frame also paying for a stale phase.
         if unsafe { TEMPORAL } && client_owned && now().wrapping_sub(last_interaction) > freq() / 8 {
-            if let Some(k) = (0..PHASES).find(|&k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
+            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+            if unsafe { !PHASE_DIRTY[k].is_empty() } {
                 match unsafe { APP } {
                     Some(f) => publish_app(f, unsafe { PHASE_DIRTY[k] }, lut, k, width, height),
                     None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),

@@ -255,7 +255,8 @@ const TR_PREEMPT: u8 = 9;
 const TR_PARK: u8 = 10;
 const TR_POLL_MISS: u8 = 11;
 const TR_RECV_BLOCK: u8 = 12;
-const TR_NAMES: [&str; 13] = ["-", "call", "deliver", "wake-poll", "reply", "sleep", "wake", "switch", "run", "preempt", "park", "poll-miss", "recv-block"];
+const TR_YIELD: u8 = 13;
+const TR_NAMES: [&str; 14] = ["-", "call", "deliver", "wake-poll", "reply", "sleep", "wake", "switch", "run", "preempt", "park", "poll-miss", "recv-block", "yield"];
 
 /// One scheduling event into the ring.
 fn tr(ev: u8, who: usize, detail: u64) {
@@ -724,8 +725,17 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
             let now: u64;
             unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) now) };
             if f.x[0] <= now {
+                // A deadline already passed is a yield: anyone runnable goes first, this process comes back round. A server whose wake time had fallen into the past spun its whole slice on sleep/recv and held every client until the slice timer (the display, 2026-10-23); now it gives the core up on each pass instead.
                 f.x[0] = 0;
-                0
+                if kk.runnable.is_empty() {
+                    0
+                } else {
+                    p.state = State::Runnable;
+                    p.frame = *f;
+                    kk.runnable.push_back(cur);
+                    tr(TR_YIELD, cur, 0);
+                    if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                }
             } else {
                 p.state = State::Sleeping(f.x[0]);
                 p.frame = *f;
@@ -869,19 +879,31 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     // Single use: the token leaves the cspace before anything else happens.
                     p.cspace.swap_remove(i);
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    let mut handed = false;
                     if let Some(cp) = kk.procs[caller].as_mut() {
                         if let State::Calling(roff, rcap) = cp.state {
                             let n = msg.len().min(rcap as usize);
                             cp.write(roff, &msg[..n]);
                             cp.frame.x[0] = n as u64;
                             cp.state = State::Runnable;
-                            kk.runnable.push_back(caller);
+                            // The caller runs now: it waited. The server goes to the back of the queue (KERNEL.md "Threads, interrupts and cores": direct hand-off both ways).
+                            kk.runnable.push_front(caller);
                             kk.ipc_round_trips += 1;
                             tr(TR_REPLY, caller, cur as u64);
+                            handed = true;
                         }
                     }
                     f.x[0] = 0;
-                    0
+                    if handed {
+                        if let Some(sp) = kk.procs[cur].as_mut() {
+                            sp.state = State::Runnable;
+                            sp.frame = *f;
+                            kk.runnable.push_back(cur);
+                        }
+                        if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
+                    } else {
+                        0
+                    }
                 }
                 _ => {
                     f.x[0] = ERR;

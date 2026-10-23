@@ -55,6 +55,7 @@ fn usage() {
     eprintln!("  install <kernel.signed>  Install signed kernel to UFS + stem entry");
     eprintln!("  ping [count]      Raw USB ping-pong test (no PT, default 256)");
     eprintln!("  terminal     Bidirectional PT session");
+    eprintln!("  gate <ferros|android|hold>  Answer the Ready? gate from the host (dev builds have USB up at the gate)");
     eprintln!("  dbg          Read PT dispatch debug counters via EP0 (works even if bulk path is wedged)");
     eprintln!("  dbg2         Read raw DWC3 event ring + TRB snapshots via EP0");
     eprintln!("  run <payload.bin> [hex]  Hot-load a payload blob, call it, print its output");
@@ -254,6 +255,18 @@ async fn main() {
             cmd_install(&args[2]).await;
         }
         "terminal" => cmd_terminal().await,
+        "gate" => {
+            let v = match args.get(2).map(|s| s.as_str()) {
+                Some("ferros") => 1,
+                Some("android") => 2,
+                Some("hold") => 3,
+                _ => {
+                    eprintln!("Usage: ferros-bridge gate <ferros|android|hold>");
+                    std::process::exit(1);
+                }
+            };
+            cmd_gate(v).await
+        }
         "dbg" => cmd_dbg().await,
         "dbg2" => cmd_dbg2().await,
         "run" => {
@@ -733,6 +746,23 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         }
         other => {
             eprintln!("No payload response: {other:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_gate(value: u16) {
+    let link = match usb::UsbLink::open() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match link.gate(value).await {
+        Ok(()) => println!("gate answered: {}", ["", "ferros", "android", "hold"][value as usize]),
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     }

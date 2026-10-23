@@ -16,7 +16,7 @@ use ferros_pt::transfer::InboundTransfer;
 use crate::platform::{self, append_hex, cntfrq, cntpct, open_usb_dma_path, queue_pt_response};
 use crate::vault_boot::{report_vault, ShimStore, VaultProbe};
 
-const DWC3: usize = 0x1121_0000;
+pub const DWC3: usize = 0x1121_0000;
 const USBCON: usize = 0x1110_0000;
 
 /// Which way ferros got here; decides the DIAG banner and where exits go.
@@ -48,6 +48,8 @@ pub struct Boot {
     pub extras: alloc::vec::Vec<(&'static [u8], u32)>,
     /// `bridge diag ufs`: the cold path's UFS link-startup probe.
     pub ufs_probe: Option<fn() -> alloc::vec::Vec<u8>>,
+    /// A USB controller already up and enumerated (a dev build's gate brings it up before the press); the service takes it over instead of starting its own.
+    pub usb: Option<ferros_hal::usb::Dwc3Dev>,
 }
 
 /// What `reboot_to_bootloader` returned when a fastboot request fell through (0 = never tried); reported in r[23].
@@ -483,13 +485,22 @@ pub fn run(mut b: Boot) -> ! {
     let dma = open_usb_dma_path();
     platform::crumb(0xA1);
     crate::checklist::at("usb: dma path open");
-    crate::pixel8_eusb_phy_init();
-    platform::crumb(0xA2);
-    crate::checklist::at("usb: phy up");
-    ferros_hal::usb::set_dwc3_base(DWC3);
-    let mut usb = match ferros_hal::usb::Dwc3Dev::init() {
-        Some(u) => u,
-        None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),
+    let mut usb = match b.usb.take() {
+        Some(u) => {
+            platform::crumb(0xA2);
+            crate::checklist::at("usb: up since the gate");
+            u
+        }
+        None => {
+            crate::pixel8_eusb_phy_init();
+            platform::crumb(0xA2);
+            crate::checklist::at("usb: phy up");
+            ferros_hal::usb::set_dwc3_base(DWC3);
+            match ferros_hal::usb::Dwc3Dev::init() {
+                Some(u) => u,
+                None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),
+            }
+        }
     };
     platform::crumb(0xA3);
     crate::checklist::at("usb: controller up");
@@ -1458,6 +1469,20 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
+                                        append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
+                                        {
+                                            let (bad, at, val) = platform::canary_check();
+                                            append_hex(&mut resp, b"CANARY_BAD=", bad);
+                                            append_hex(&mut resp, b"CANARY_BASE=", platform::canary_base() as u32);
+                                            append_hex(&mut resp, b"CANARY_AT=", at as u32);
+                                            append_hex(&mut resp, b"CANARY_VAL_HI=", (val >> 32) as u32);
+                                            append_hex(&mut resp, b"CANARY_VAL_LO=", val as u32);
+                                        }
+                                        {
+                                            let (size, used) = platform::stack_used_max();
+                                            append_hex(&mut resp, b"STACK_SIZE=", size);
+                                            append_hex(&mut resp, b"STACK_USED_MAX=", used);
+                                        }
                                         append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
                                         append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
                                         append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));

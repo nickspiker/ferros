@@ -105,10 +105,12 @@ pub fn show() -> (u32, u32) {
     (text, tri)
 }
 
-/// Show the screen and wait for the press. Returns the generic-timer count at the press and what was chosen.
-pub fn wait() -> (u64, Choice) {
-    // Nothing answers on USB before the press: stop the controller ABL may have left running.
-    unsafe { core::ptr::write_volatile(DWC3_DCTL as *mut u32, core::ptr::read_volatile(DWC3_DCTL as *const u32) & !(1 << 31)) };
+/// Show the screen and wait for the press. Returns the generic-timer count at the press and what was chosen. With a USB controller (dev builds bring one up before the gate), the loop services its enumeration and takes the host's gate request as it takes the keys: 1 = ferros, 2 = Android, 3 = hold (owner, 2026-10-22: dev has USB at the gate so Android can be chosen from the host; release has no USB before the press).
+pub fn wait(mut usb: Option<&mut ferros_hal::usb::Dwc3Dev>) -> (u64, Choice) {
+    // Nothing answers on USB before the press (release): stop the controller ABL may have left running.
+    if usb.is_none() {
+        unsafe { core::ptr::write_volatile(DWC3_DCTL as *mut u32, core::ptr::read_volatile(DWC3_DCTL as *const u32) & !(1 << 31)) };
+    }
     let freq = crate::platform::cntfrq();
     let mut rep = alloc::vec::Vec::new();
     crate::checklist::at("gate: adopting panel");
@@ -139,11 +141,39 @@ pub fn wait() -> (u64, Choice) {
             break;
         }
         held |= crate::killswitch::volume_key_down();
+        if let Some(u) = usb.as_deref_mut() {
+            use ferros_hal::usb::UsbEvent;
+            match u.poll_event() {
+                UsbEvent::Reset => u.handle_reset(),
+                UsbEvent::ConnectDone { .. } => {
+                    u.handle_connect_done();
+                    u.ep0_start_setup();
+                    u.bulk_out_arm();
+                }
+                UsbEvent::Disconnect => u.handle_disconnect(),
+                UsbEvent::Ep0Setup { request } => {
+                    if !u.handle_setup(&request) {
+                        u.ep0_stall();
+                    }
+                }
+                _ => {}
+            }
+            match ferros_hal::usb::take_gate_request() {
+                1 => break,
+                2 => {
+                    choice = Choice::Android;
+                    break;
+                }
+                3 => held = true,
+                _ => {}
+            }
+        }
         if cfg!(not(ferros_production)) && !held && crate::platform::cntpct().wrapping_sub(t0) > freq {
             break;
         }
-        // Sleep until the next interrupt: the press, or a 100 ms timer wake to pet the watchdogs.
-        unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", t = in(reg) freq / 10, c = out(reg) _) };
+        // Sleep until the next interrupt: the press, or a timer wake to pet the watchdogs — every 100 ms, or every millisecond while USB enumerates (EP0 is polled here).
+        let tick = if usb.is_some() { freq / 1000 } else { freq / 10 };
+        unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfi", t = in(reg) tick, c = out(reg) _) };
     }
     unsafe { core::arch::asm!("msr cnthp_ctl_el2, xzr", "isb") };
     (crate::platform::cntpct(), choice)

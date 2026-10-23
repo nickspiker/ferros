@@ -74,7 +74,12 @@ if [ "${FERROS_NO_SLOT_A:-0}" != 1 ]; then
 fi
 
 to_fastboot
-fastboot flash boot_b "$IMG"
+# Both slots carry the same gate image (owner, 2026-10-23: identical slots, every boot lands on Ready?, Android is a jump from the gate — the gate rewrites bootconfig's slot suffix to _a, the one slot with an Android on it). FERROS_PURE_B=1 puts the bare cold ferros on slot b instead (no gate, no Android from it).
+if [ -n "$HV_IMG" ] && [ "${FERROS_PURE_B:-0}" != 1 ]; then
+    fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
+else
+    fastboot flash boot_b "$IMG"
+fi
 [ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
 fastboot --set-active=b
 t0=$(date +%s)

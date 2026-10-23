@@ -337,6 +337,106 @@ pub fn ask() -> Choice {
     choice
 }
 
+/// Android from whichever slot this gate is on. Only slot a holds an Android (slot b's own system partitions are stock or empty), and ABL names the booted slot to the kernel in bootconfig, `androidboot.slot_suffix = "_b"`, the blob at the end of the initrd (data, LE u32 size, LE u32 byte-sum checksum, "#BOOTCONFIG\n"). Rewrite the suffix to `_a` there and lower the checksum by one, so Android mounts slot a's partitions and the choice is a jump, not a slot switch and a reboot (owner, 2026-10-23: identical slots, no flags). The initrd bounds come from the DTB's /chosen. Returns whether a suffix was rewritten (already `_a`, or nothing found: untouched).
+pub fn android_from_slot_a(dtb: usize) -> bool {
+    let be32 = |a: usize| u32::from_be_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
+    if be32(dtb) != 0xD00D_FEED {
+        return false;
+    }
+    let (off_struct, off_strings, size_struct) = (be32(dtb + 8) as usize, be32(dtb + 12) as usize, be32(dtb + 36) as usize);
+    let strings = dtb + off_strings;
+    let (mut p, end) = (dtb + off_struct, dtb + off_struct + size_struct);
+    let (mut depth, mut in_chosen) = (0usize, false);
+    let (mut start, mut stop) = (0u64, 0u64);
+    let name_is = |a: usize, want: &[u8]| -> bool {
+        for (i, &c) in want.iter().enumerate() {
+            if unsafe { read_volatile((a + i) as *const u8) } != c {
+                return false;
+            }
+        }
+        let last = unsafe { read_volatile((a + want.len()) as *const u8) };
+        last == 0
+    };
+    while p + 4 <= end {
+        let tok = be32(p);
+        p += 4;
+        match tok {
+            1 => {
+                depth += 1;
+                in_chosen = depth == 2 && name_is(p, b"chosen");
+                let mut n = 0;
+                while unsafe { read_volatile((p + n) as *const u8) } != 0 {
+                    n += 1;
+                }
+                p += (n + 1 + 3) & !3;
+            }
+            2 => {
+                if in_chosen {
+                    break;
+                }
+                depth -= 1;
+            }
+            3 => {
+                let (len, nameoff) = (be32(p) as usize, be32(p + 4) as usize);
+                let data = p + 8;
+                if in_chosen {
+                    let val = match len {
+                        4 => be32(data) as u64,
+                        8 => (be32(data) as u64) << 32 | be32(data + 4) as u64,
+                        _ => 0,
+                    };
+                    if name_is(strings + nameoff, b"linux,initrd-start") {
+                        start = val;
+                    } else if name_is(strings + nameoff, b"linux,initrd-end") {
+                        stop = val;
+                    }
+                }
+                p = data + ((len + 3) & !3);
+            }
+            4 => {}
+            _ => break,
+        }
+    }
+    if start == 0 || stop <= start + 20 {
+        return false;
+    }
+    let foot = stop as usize - 12;
+    if !name_is_n(foot, b"#BOOTCONFIG\n") {
+        return false;
+    }
+    let le32 = |a: usize| u32::from_le_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
+    let size = le32(foot - 8) as usize;
+    let csum_at = foot - 4;
+    if size == 0 || size > stop as usize - start as usize {
+        return false;
+    }
+    let data = foot - 8 - size;
+    let key = b"androidboot.slot_suffix = \"_b\"";
+    let mut at = data;
+    while at + key.len() <= data + size {
+        if name_is_n(at, key) {
+            let b_at = at + key.len() - 2;
+            unsafe {
+                write_volatile(b_at as *mut u8, b'a');
+                write_volatile(csum_at as *mut u32, le32(csum_at).wrapping_sub(1));
+                asm!("dc civac, {a}", "dc civac, {c}", "dsb sy", a = in(reg) b_at as u64, c = in(reg) csum_at as u64);
+            }
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+fn name_is_n(a: usize, want: &[u8]) -> bool {
+    for (i, &c) in want.iter().enumerate() {
+        if unsafe { read_volatile((a + i) as *const u8) } != c {
+            return false;
+        }
+    }
+    true
+}
+
 /// Enter ferros: copy the packed image to its link address, mark the gate answered, clean the instruction side, jump at EL2 with ABL's DTB in x0 as ABL would have. Never returns.
 pub fn start_ferros(dtb: u64) -> ! {
     let (src, len) = ferros_image().expect("packed ferros image");

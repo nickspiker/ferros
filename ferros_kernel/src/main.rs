@@ -117,7 +117,7 @@ mod ufs_device;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + 64KB stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
+/// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + the kernel stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
 // Cold boot: 8 MiB (room for multi-MiB PT transfers such as WiFi firmware; image + stack + heap end below G#8100_0000, where the arc pool starts). The handoff carveout is 12 MiB with its staging slot 6 MiB in, so it keeps 4 MiB.
 #[cfg(not(shim_handoff))]
 const HEAP_SIZE: usize = 8 * 1024 * 1024;
@@ -1600,6 +1600,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
     platform::enable_icache();
+    platform::canary_init();
+    platform::stack_paint();
     // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
     if option_env!("FERROS_X3") != Some("0") {
         x3::launch();
@@ -1613,10 +1615,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
     // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
-    let (pressed_at, gate_choice) = if ready::answered_by_hv() {
+    let hv_answered = ready::answered_by_hv();
+    let real_boot = dtb_addr != 0 && dtb_addr & 1 == 0;
+    // Dev builds bring USB up before the gate, so the host can answer it (`ferros-bridge gate ferros|android|hold`) as the keys do; the service takes the controller over after the press. Release builds have no USB until the press (owner, 2026-10-22).
+    let mut gate_usb: Option<ferros_hal::usb::Dwc3Dev> = None;
+    if cfg!(not(ferros_production)) && !hv_answered && real_boot {
+        pixel8_eusb_phy_init();
+        ferros_hal::usb::set_dwc3_base(service::DWC3);
+        gate_usb = ferros_hal::usb::Dwc3Dev::init();
+        checklist::at(if gate_usb.is_some() { "gate: usb up" } else { "gate: usb failed" });
+    }
+    let (pressed_at, gate_choice) = if hv_answered {
         (platform::cntpct(), ready::Choice::Ferros)
-    } else if dtb_addr != 0 && dtb_addr & 1 == 0 {
-        ready::wait()
+    } else if real_boot {
+        ready::wait(gate_usb.as_mut())
     } else {
         (0, ready::Choice::Ferros)
     };
@@ -1676,6 +1688,21 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if link_up {
         checklist::mark(checklist::Item::Disk);
     }
+    // The gate chose Android: the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault) — slot a active, then a plain reset; the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current). Android cannot boot from slot b's own partitions (product_b is empty), which is why the choice is a slot switch and not a chainload.
+    if gate_choice == ready::Choice::Android && link_up {
+        // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
+        unsafe {
+            let p = 0xFD60_0FF8usize as *mut u64;
+            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+        }
+        let r = slot::set_active(0);
+        if r == slot::MARKED {
+            platform::crumb(0xC7);
+            platform::reboot();
+        }
+        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
+    }
     platform::crumb(0xC2);
     let t_vault = platform::cntpct();
     if link_up {
@@ -1716,21 +1743,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
 
     platform::crumb(0xE4);
-    // The gate chose Android: slot a active in devinfo (its retries at 3, our active bit cleared), then a plain reset — the bootloader boots slot a, whose hv gate takes the one-shot marker and goes to Android. The way back is a reboot: slot a's gate asks again (1 s on dev builds) and boots the ferros packed into it (tools/husky-cold.sh keeps that copy current).
-    if gate_choice == ready::Choice::Android && store.is_some() {
-        // Tell slot a's gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of asking again and auto-choosing ferros after a second, as `diag android` does; cleaned to DRAM, since the gate reads it with the caches off. Every later boot of slot a asks again, so a reboot from Android lands on the gate and, untouched, on ferros (owner, 2026-10-22: never stuck in Android).
-        unsafe {
-            let p = 0xFD60_0FF8usize as *mut u64;
-            core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-            core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-        }
-        let r = slot::set_active(0);
-        if r == slot::MARKED {
-            platform::crumb(0xC7);
-            platform::reboot();
-        }
-        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
-    }
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
@@ -1805,6 +1817,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         prev,
         extras,
         ufs_probe: Some(cold_ufs::probe),
+        usb: gate_usb,
     };
     // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
     let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };

@@ -9,7 +9,7 @@
  *
  * Memory map (after ABL hands off):
  *   0x8008_0000 - ...          : ferros kernel (.text, .rodata, .data, .bss)
- *   ...         - __stack_top  : 64 KB kernel stack, then the 4 MiB heap
+ *   ...         - __stack_top  : 512 KiB kernel stack, then the heap
  *   0x8208_0000                : RELOAD/RUN staging slot (base + 32 MiB)
  *   0xFD60_0000                : ramoops result block (survives warm resets)
  */
@@ -60,8 +60,9 @@ SECTIONS
     __kernel_end = .;
     __kernel_size = __kernel_end - _start;
 
-    /* Stack: 64KB, placed after kernel image */
-    . = . + 0x10000;
+    /* Stack: 512 KiB, placed after the kernel image. 64 KiB overflowed into .bss on reloads: a reload runs the service loop on this stack under main's whole frame (a cold boot runs it on the X3's own 256 KiB stack), and a vault write or a spawn under load walked 22 KB past the bottom (the .bss canary, 2026-10-23). DIAG's STACK_USED_MAX is the measured depth. */
+    __stack_bottom = .;
+    . = . + 0x80000;
     __stack_top = .;
 
     /DISCARD/ : {

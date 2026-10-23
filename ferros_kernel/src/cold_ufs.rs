@@ -43,21 +43,32 @@ pub fn bring_up() -> bool {
     crate::s2mpu::fence();
     wr(0x1302_0710, rd(0x1302_0710) & !0x3); // non-coherent DMA (ferros does explicit cache maintenance)
     unsafe { core::arch::asm!("dsb sy") };
-    power_on_device();
     let ufs = ferros_hal::ufs::UfsController::new(UFS_BASE);
+    let answers = |ufs: &ferros_hal::ufs::UfsController| {
+        for _ in 0..4 {
+            if ufs.read_block(0) == 0 {
+                let d = ufs.data_buffer();
+                if d[0x1FE] == 0x55 && d[0x1FF] == 0xAA {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    // A link already up (a RELOAD: the previous generation brought it up) is adopted — our own transfer list on it, proven by the block read — not reset. full_init on a live link came up and served the shell's first reads, then lost a command minutes later, every time (2026-10-23); the Linux handoff always adopted its link this way.
+    // Only when the device is powered — gpp0-1 high, which only a previous generation of ferros does; ABL leaves HCE and the link bits set over a hibernated, unpowered device, and adopting that cost four 1 s timeouts on every cold boot (2026-10-23).
+    if rd(GPP0 + 4) & (1 << 1) != 0 && ufs.link_is_up() {
+        ufs.init_transfer_list();
+        if answers(&ufs) {
+            return true;
+        }
+    }
+    power_on_device();
     let rep = ufs.full_init();
     if rep.fail_step != 0 && rep.nop_ocs != 0 {
         return false;
     }
-    for _ in 0..4 {
-        if ufs.read_block(0) == 0 {
-            let d = ufs.data_buffer();
-            if d[0x1FE] == 0x55 && d[0x1FF] == 0xAA {
-                return true;
-            }
-        }
-    }
-    false
+    answers(&ufs)
 }
 
 /// Run the full cold UFS bring-up once and return the report text.

@@ -345,6 +345,62 @@ If the X3 is not parked by service start, or doesn't take the hand-over within a
 
 Measured (`diag x3`, `diag dvfs`): CPU0 at 1.70 GHz does about 4.9 G simple adds a second over four chains; the X3 at 2.91 GHz does 11.4 G. On the display server's real work (bilinear icons, discs, NEON publish), a pan frame went from 135–185 ms to 20 ms and a pinch frame from 257–305 ms to 29 ms. The A510's NEON is shared between core pairs and is weak; the X3's is not.
 
+## Threads, interrupts and cores (design, 2026-10-23)
+
+What exists: one core, one thread per process, run-to-block with a 10 ms slice timer as the backstop, one FIFO run queue, and the kernel's own service loop (USB, PT, the watchdogs) taking a turn between slices. It is enough for the shell at 93 fps, and the day it looked too slow (the quarter-second drag stall) the fault was a server spinning its slice on a stale deadline, not the model — found with `diag sched`, the scheduler trace. Two rules came out of that day and hold for everything below: **a server never holds the core while it waits for anything**, and **a wait with no future deadline is a yield**. The rest of this section is how the model grows to threads and eight cores without giving those up, in the order it should be built.
+
+### Scheduling on one core (the base every core runs)
+
+- **Direct hand-off both ways.** A `call` to a server waiting in `recv` switches straight into it (built). A `reply` switches straight back to the caller; the server goes to the back of the queue (to build — today the caller queues and the server runs on, which is the wrong priority: the one who waited goes first).
+- **A sleep whose deadline has passed is a yield**: anyone runnable goes first, the sleeper comes back round (built 2026-10-23). A server's end-of-pass sleep therefore always gives the core up, whatever its bookkeeping did to the deadline.
+- **The slice timer is a backstop**, never the pacing. If a trace shows round trips quantised to SLICE_MS, something is spinning; find it, do not shorten the slice.
+- **The kernel's service loop is the idle task.** It runs when nothing is runnable (and between slices only while a PT transfer is open, which it must pace). Nothing runnable means WFI on the event stream, 333 µs ticks (built 2026-10-23; before it the shell kept the X3 at 2.9 GHz for as long as ferros was up).
+
+### Threads
+
+A **thread** is a saved frame, a stack and a scheduling state, belonging to a process; the process is the arc, the capability space, the name and the *ihi*. Threads of one process share the arc and every capability in it (KERNEL.md Execution Model: "each with its own stack, so tokio and rayon get real threads"). The run queue holds threads. `call`, `recv`, `reply`, `sleep` already act on "the current runnable thing"; most of the scheduler is a rename.
+
+- **Syscalls added:** `thread_spawn(entry, stack_offset, arg)` and `thread_exit(value)`; `wait(word_offset, expected)` and `wake(word_offset, count)` on a word in the arc — a futex, so threads of one process hand work to each other without IPC. Every offset is an arc offset the kernel masks, as for every other syscall.
+- **Threads are not addressable.** No thread identifiers leave the kernel; IPC stays endpoint-addressed (Module 4). A reply token belongs to the process, so any thread of a server may reply. `recv` by two threads on one endpoint is allowed: the kernel delivers to whichever is waiting (a thread pool is that and nothing more).
+- **Exit and kill are per process**: every thread ends, the arc is freed, queued calls and reply capabilities are cleaned as `kill` does today.
+- **The frame** is the one `.Lel0_sync`/`.Lel0_preempt` save now (816 bytes with the vector state); the per-thread kernel stack is not needed — the kernel runs on its own stack and processes trap in, as today.
+
+### Servers: receive and work are different threads
+
+A server's endpoint must be answerable in microseconds whatever its hardware is doing. The pattern:
+
+- **One receive thread** that blocks only in `recv`, never on hardware. It takes requests into state in the arc and `wake`s a worker.
+- **Workers** do the slow things: wait for a frame to go out, for an I2C transaction, for a DMA to land. They `wait` on a word when idle.
+- **The display server**: a receive thread (scene ops, camera ops, an app's publish, into a double-buffered scene), a render thread (draws whatever scene is newest into the canvas, publishes into the ring's next phase, arms the frame), a panel thread (DCS writes, brightness, screen off/on, which take milliseconds the others must not wait for). A client's call then costs microseconds with a frame in flight.
+- **The touch server**: an interrupt thread feeds the contact table; the receive thread answers reads from it. No polling cadence anywhere.
+
+### Interrupts to user space
+
+A **grant of an interrupt** is a capability object like a hardware grant: `Grant::Irq(intid)`, minted at spawn. `irq_wait(cap)` blocks the thread until the line fires; the kernel masks the line at the GIC and wakes the waiter; the driver handles its device and calls `irq_ack(cap)`, which unmasks it. Level and edge both work this way (the line stays masked until acked). The kernel's own interrupts stay its own: the two volume keys are the killswitch and never reach a process, the slice timer and the power key stay in the kernel. First lines: the FTM5 touch INT, DECON frame-done and TE (so the render thread is paced by the panel, not by a 0.5 ms sleep loop), DSIM, and the sensors as they come. USB stays with the kernel's service loop until that loop itself becomes a process.
+
+### Cores
+
+husky has 1× Cortex-X3, 4× A715, 4× A510 (ASID.md). The kernel today is one core's worth of code: `k()` is a bare global, the run queue is one, there are no locks, and the one core is the X3 (previous section). Going to eight:
+
+- **Per-core state**: a run queue, `current`, the idle loop and the slice timer per core. The kernel's shared state (processes, endpoints, capabilities, the trace) sits behind **one kernel lock** — a spinlock taken for the microseconds a trap holds it. The kernel's paths are short enough that one lock is right at this scale; splitting it per object is an optimisation with a proof cost, later if ever.
+- **A thread runs on the core that woke it** unless it is pinned: a `call` into a server waiting on this core switches directly, as now; into a server waiting on another core, the caller blocks and the callee is queued there with an SGI to wake that core if it sleeps. A reply likewise. Migration is explicit (a pin), never a balancer's guess.
+- **Pinning by latency class, not "UI core vs OS core."** X3: the display server's render thread (the one real compute path: discs, text, effects, the NEON publish). A715s: app processes, and render workers when a frame is tiled across them. A510s: everything that only waits — the service loop and USB, touch, sensors, the always-on display — at their lowest DVFS step, so the big cores sleep whenever nothing is runnable on them. The kernel's own path runs on whatever core trapped; it has no home.
+- **Bring-up**: PSCI CPU_ON per core with the hand-over block generalised to a slot per core (the X3 hop is the first instance: the same registers, its own stack); each core initialises its own redistributor, enables its slice-timer PPI and event stream, and parks in WFI until its queue gets a thread. CPU0 may then be a worker like the others instead of parking for good.
+- **Memory**: kernel structures are Normal cacheable inner-shareable, so the cores are coherent in hardware; the non-cacheable regions (DMA, the phase ring, the hand-over page) stay as they are. Processes are isolated by compiled masking regardless of core (Execution Model).
+- **Power**: an idle core is in WFI; a cluster with nothing runnable drops its DVFS step through ACPM (`dvfs_set` exists per domain); the watchdogs stay petted by the service loop wherever it runs.
+- **Proof**: the single-core theorems carry over per core; the new obligation is the kernel lock — every access to shared state under it, no path that sleeps or waits for hardware while holding it. That is the same rule as for servers, one level down.
+
+### Order
+
+1. Reply hand-off and the past-deadline yield (the yield is built; the hand-off is a few lines).
+2. Threads: `thread_spawn`/`thread_exit`, `wait`/`wake`, the run queue of threads.
+3. The display server split into receive, render and panel threads; the touch server into interrupt and receive.
+4. Interrupt grants: `irq_wait`/`irq_ack`; touch INT, DECON frame-done/TE.
+5. Cores: the kernel lock, per-core queues, SGIs, the generalised hand-over; bring up the A715s first (the X3 is already there), then the A510s and move the waiting servers onto them.
+6. Pinning and tiled rendering; measure every step with `diag sched`, which grows a core column.
+
+What the GPU and TPU are not for: the compositor at 1344×2992 fits on NEON across the A715s, and effects (glow, shadow, shine) are separable integer blurs on sprite-cached pixels. The Mali needs its closed CSF firmware and a shader compiler we do not have; it belongs after toka, when an app needs it. The TPU is closed end to end and is not on the path.
+
 ## Module 1: Cryptographic Address Space
 
 ### Principle

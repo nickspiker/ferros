@@ -70,3 +70,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Settings flow identity → device only](settings_identity_to_device_only.md) — attesting identity's preference written to the device, never device → identity; device.base (tatau code) is the first; spec in SETTINGS.md
 - [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
 - [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape
+- [sched trace + past-deadline spin](sched_trace_and_past_deadline_spin.md) — diag sched is the IPC/latency tool; a server sleeping on a past deadline spins its slice (the 2026-10-23 drag stall); the reload hang was a 64 KiB kernel stack overflowing into .bss (512 KiB now); DIAG canary + STACK_USED_MAX

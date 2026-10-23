@@ -251,6 +251,45 @@ pub struct UfsController {
     base: usize,
 }
 
+/// UTP transfers that never completed (the time-bounded completion wait below gave up): a link that is up but has lost a command. Read by the kernel's DIAG.
+pub static UFS_LOST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn ticks() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+    t
+}
+#[cfg(target_arch = "aarch64")]
+fn tick_hz() -> u64 {
+    let f: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f) };
+    f
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn ticks() -> u64 { 0 }
+#[cfg(not(target_arch = "aarch64"))]
+fn tick_hz() -> u64 { 1 }
+
+impl UfsController {
+    /// Wait for the transfer request to complete (IS.UTRCS), at most `ms`; a command that never completes is counted in `UFS_LOST` and left to the caller's OCS check. Bounded by time, not by a count of register reads: the count-bounded polls took seconds each with no watchdog pet, and a reloaded kernel whose re-initialised link lost a command read as a hung kernel (2026-10-23).
+    fn wait_transfer(&self, ms: u64) -> bool {
+        let t0 = ticks();
+        let limit = tick_hz() / 1000 * ms;
+        loop {
+            let is = self.read_reg(regs::IS);
+            if is & regs::IS_UTRCS != 0 {
+                self.write_reg(regs::IS, regs::IS_UTRCS);
+                return true;
+            }
+            if ticks().wrapping_sub(t0) > limit {
+                UFS_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        }
+    }
+}
+
 impl UfsController {
     pub fn new(base: usize) -> Self {
         Self { base }
@@ -335,14 +374,8 @@ impl UfsController {
             self.nexus(false); // device-management UPIU: nexus bit clear
             self.write_reg(regs::UTRLDBR, 1);
 
-            // Poll for completion
-            for _ in 0..1_000_000u32 {
-                let is = self.read_reg(regs::IS);
-                if is & regs::IS_UTRCS != 0 {
-                    self.write_reg(regs::IS, regs::IS_UTRCS);
-                    break;
-                }
-            }
+            // Completion, time-bounded (wait_transfer).
+            let _ = self.wait_transfer(1000);
 
             // Read results
             crate::mmio::cache_invalidate(utrd_addr_phys, 32);
@@ -409,15 +442,7 @@ impl UfsController {
 
             self.nexus(false); // device-management UPIU: nexus bit clear
             self.write_reg(regs::UTRLDBR, 1);
-
-            // Poll
-            for _ in 0..1_000_000u32 {
-                let is = self.read_reg(regs::IS);
-                if is & regs::IS_UTRCS != 0 {
-                    self.write_reg(regs::IS, regs::IS_UTRCS);
-                    break;
-                }
-            }
+            let _ = self.wait_transfer(1000);
 
             // Read results
             crate::mmio::cache_invalidate(utrd_phys, 32);
@@ -478,13 +503,7 @@ impl UfsController {
             core::arch::asm!("dsb sy");
             self.nexus(false);
             self.write_reg(regs::UTRLDBR, 1);
-            for _ in 0..1_000_000u32 {
-                let is = self.read_reg(regs::IS);
-                if is & regs::IS_UTRCS != 0 {
-                    self.write_reg(regs::IS, regs::IS_UTRCS);
-                    break;
-                }
-            }
+            let _ = self.wait_transfer(1000);
             crate::mmio::cache_invalidate(utrd_phys, 32);
             crate::mmio::cache_invalidate(ucd_phys, 1024);
             let ocs = ((*buf).utrd.dw[2] & 0xFF) as u8;
@@ -625,14 +644,8 @@ impl UfsController {
             self.nexus(cmd_type == 0); // SCSI (cmd_type 0) sets the nexus bit, native UFS (query) clears it
             self.write_reg(regs::UTRLDBR, 1);
 
-            // Poll for completion
-            for _ in 0..10_000_000u32 {
-                let is = self.read_reg(regs::IS);
-                if is & regs::IS_UTRCS != 0 {
-                    self.write_reg(regs::IS, regs::IS_UTRCS);
-                    break;
-                }
-            }
+            // Completion, time-bounded (wait_transfer).
+            let _ = self.wait_transfer(4000);
 
             // Invalidate caches to see DMA results
             crate::mmio::cache_invalidate(utrd_phys, 32);

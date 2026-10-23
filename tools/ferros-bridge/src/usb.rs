@@ -124,6 +124,20 @@ impl UsbLink {
         Ok(out)
     }
 
+    /// Answer the "Ready?" gate from the host (VENDOR_REQ_GATE G#5C, no data): 1 = ferros, 2 = Android, 3 = hold. Dev builds have USB up at the gate for this.
+    pub async fn gate(&self, value: u16) -> Result<(), String> {
+        use nusb::transfer::{ControlOut, ControlType, Recipient};
+        let completion = self.interface.control_out(ControlOut {
+            control_type: ControlType::Vendor,
+            recipient: Recipient::Device,
+            request: 0x5C,
+            value,
+            index: 0,
+            data: &[],
+        }).await;
+        completion.status.map_err(|e| format!("gate control_out failed: {e}"))
+    }
+
     /// Read the raw event-path debug block (VENDOR_REQ_DBG2 G#5B): 12 event words + count + TRB snapshots + last DEPCMD failure.
     pub async fn read_dbg2(&self) -> Result<[u32; 16], String> {
         use nusb::transfer::{ControlIn, ControlType, Recipient};
