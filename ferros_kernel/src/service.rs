@@ -509,11 +509,19 @@ pub fn run(mut b: Boot) -> ! {
     // Ticks spent asleep in the idle loop, and since when, for DIAG's IDLE_PCT.
     let mut asleep: u64 = 0;
     let t_awake_from = cntpct();
+    // The gate's own press is spent; from here a press is the screen's (below).
+    unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
 
     loop {
         platform::pet_watchdogs();
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
+        // The power key turns the screen off and on (owner, 2026-10-22): a preference every process sees at once (process.rs PREF_SCREEN_OFF); the display server darkens the panel. The wake policy (proximity) comes later.
+        if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
+            unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
+            let off = crate::process::pref(crate::process::PREF_SCREEN_OFF) ^ 1;
+            crate::process::set_pref(crate::process::PREF_SCREEN_OFF, off);
+        }
         USB_LINK.store(usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
         if pt_done {
             pt_done = false;

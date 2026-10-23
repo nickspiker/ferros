@@ -897,6 +897,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     }
     log.flush();
     let mut next_flip = now() + freq() / 10;
+    let mut screen_off = false;
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
@@ -1329,6 +1330,24 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
         // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). The panel then never rests at its idle floor; the owner chose the bits over the ~0.2 W (2026-10-22).
+        // The power key (kernel preference 2): the panel's display off and sleep in while the screen is off, sleep out and display on when it comes back, with the frame the layer already holds. No flips while dark.
+        let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        if off != screen_off && dsi.alive() {
+            screen_off = off;
+            if off {
+                let _ = dsi.dcs(&[0x28]);
+                let _ = dsi.dcs(&[0x10]);
+            } else {
+                let _ = dsi.dcs(&[0x11]);
+                // The panel's sleep-out settling time before display on (DCS, 120 ms).
+                ferros_sys::delay_us(120_000);
+                let _ = dsi.dcs(&[0x29]);
+                pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                let _ = pipe.present(win);
+            }
+            log.s(if off { b"display: screen off\n" } else { b"display: screen on\n" });
+            log.flush();
+        }
         // A stale phase first, from the back buffer, one per pass so a call waiting on the endpoint is never held up by more than one.
         if unsafe { TEMPORAL } && client_owned {
             if let Some(k) = (0..PHASES).find(|&k| unsafe { PHASE_DIRTY[k] }) {
@@ -1336,7 +1355,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         let next_clean = unsafe { !PHASE_DIRTY[(CUR_PHASE + 1) % PHASES] };
-        if unsafe { TEMPORAL } && client_owned && next_clean && now() >= next_flip {
+        if unsafe { TEMPORAL } && client_owned && !screen_off && next_clean && now() >= next_flip {
             next_flip = now() + freq() / 10;
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);

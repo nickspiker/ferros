@@ -38,6 +38,8 @@ pub const PREFS: u64 = 0xFC0;
 pub const PREF_BASE: u64 = 0;
 /// Preference 1: names under the map's circles (0 off, 1 on).
 pub const PREF_LABELS: u64 = 1;
+/// Preference 2: the screen, 0 on, 1 off (the power key toggles it).
+pub const PREF_SCREEN_OFF: u64 = 2;
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

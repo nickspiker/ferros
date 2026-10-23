@@ -322,6 +322,13 @@ pub const PREFS: usize = 0xFC0;
 pub const PREF_BASE: usize = 0;
 /// Preference 1: names under the map's circles, 0 off (the default: icons identify) or 1 on.
 pub const PREF_LABELS: usize = 1;
+/// Preference 2: the screen, 0 on (the default) or 1 off — toggled by the kernel on each power-key press (service.rs); the display server darkens the panel, the map stops taking touches.
+pub const PREF_SCREEN_OFF: usize = 2;
+
+/// A preference as the kernel holds it now.
+pub fn pref(index: usize) -> u8 {
+    if index < 32 { unsafe { PREFS_NOW[index] } } else { 0 }
+}
 static mut PREFS_NOW: [u8; 32] = [0; 32];
 
 /// Keeps a changed preference in the vault: (preference, value) -> stored. Registered by whoever owns the vault (service.rs).
@@ -348,6 +355,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
     match index {
         PREF_BASE => tatau::Base::from_code(value).is_some(),
         PREF_LABELS => value <= 1,
+        PREF_SCREEN_OFF => value <= 1,
         _ => false,
     }
 }

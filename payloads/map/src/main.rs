@@ -860,7 +860,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
 
-        let n = call(touch, &[1], &mut r) as usize;
+        // The screen off (the power key): no touches reach the map.
+        let n = if ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1 { 0 } else { call(touch, &[1], &mut r) as usize };
         let mut cur = [(false, 0i64, 0i64); 16];
         let mut ids = [0usize; 16];
         let mut held = 0usize;
