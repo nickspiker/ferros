@@ -69,3 +69,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live under path deps; build breaks inside vsf = wait/retry or message the vsf session, never touch it; no pinning (owner, 2026-10-20); siblings require vsf "0.10"
 - [Settings flow identity → device only](settings_identity_to_device_only.md) — attesting identity's preference written to the device, never device → identity; device.base (tatau code) is the first; spec in SETTINGS.md
 - [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
+- [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape

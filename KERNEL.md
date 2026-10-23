@@ -331,6 +331,20 @@ Measured on husky: a 4 MiB copy 157 ms → 0.78 ms (~200×), BLAKE3 1.6 → 215 
 
 ---
 
+## Where it runs on husky: the big core (2026-10-22)
+
+The kernel is one core's worth of code (no locks, one service loop, processes in time slices on the same core), and on husky that core is the **Cortex-X3** (CPU8, affinity G#800), not the A510 the bootloader starts on.
+
+How it gets there (`ferros_kernel/src/x3.rs`):
+1. Right after the cache map is on, CPU0 asks EL3 to start CPU8 (PSCI CPU_ON). The X3 enters with its MMU off, loads CPU0's live translation and per-core registers from a hand-over block in non-cacheable memory, and parks on its own stack. The registers are HCR, MAIR, TCR, TTBR0, SCTLR, CPTR, VBAR and CNTHCTL. CNTHCTL is the one easily missed: without it, EL0's first counter read traps.
+2. The boot continues on CPU0: the gate, the checklist, the disk, the vault. On a cold boot the X3 has long since parked by then, and reloads show it parked within 90 ms.
+3. At service start, CPU0 moves the boot state into a static, says go, and parks itself (interrupts masked, in WFI; no CPU_OFF, so its cluster and the watchdogs stay as they were).
+4. The X3 takes the state and runs `killswitch::arm` and `arm_power_key`, which route the keys to it. It raises its own clock to 2.91 GHz through ACPM and runs the service loop. The slice timer's PPI is enabled by the first slice, on whichever core that is.
+
+If the X3 is not parked by service start, or doesn't take the hand-over within a quarter second, CPU0 runs the service as before. A hot reload issued from the X3 starts the new kernel there, and it stays. `FERROS_X3=0` builds keep everything on CPU0.
+
+Measured (`diag x3`, `diag dvfs`): CPU0 at 1.70 GHz does about 4.9 G simple adds a second over four chains; the X3 at 2.91 GHz does 11.4 G. On the display server's real work (bilinear icons, discs, NEON publish), a pan frame went from 135–185 ms to 20 ms and a pinch frame from 257–305 ms to 29 ms. The A510's NEON is shared between core pairs and is weak; the X3's is not.
+
 ## Module 1: Cryptographic Address Space
 
 ### Principle
