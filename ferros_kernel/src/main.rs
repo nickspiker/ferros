@@ -1754,6 +1754,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Brightness (device.brightness, stops below the brightest white; absent = 2, white about 147 cd/m²).
     let bright = store.as_mut().and_then(|s| s.get_by_key("device.brightness").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 8).unwrap_or(2);
     process::set_pref(process::PREF_BRIGHTNESS, bright);
+    // The dither (device.dither: 0 spatial and temporal, 1 spatial only; absent = 0).
+    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.dither").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
+        process::set_pref(process::PREF_DITHER, v);
+    }
     // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
     if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
         if v <= 1 {

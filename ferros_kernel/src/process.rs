@@ -326,6 +326,8 @@ pub const PREF_LABELS: usize = 1;
 pub const PREF_SCREEN_OFF: usize = 2;
 /// Preference 3: brightness, in stops below the brightest white (0 = white at half the panel's peak; each step halves it; 8 is the dimmest); the display server turns it into the white its table uses and the panel's own brightness (DISPLAY-CALIB.md, "Decided").
 pub const PREF_BRIGHTNESS: usize = 3;
+/// Preference 4: the dither, 0 spatial and temporal (four phase frames flipped every 100 ms: 14 bits on the 8-bit link), 1 spatial only (12 bits; the panel can rest at its idle floor between frames).
+pub const PREF_DITHER: usize = 4;
 
 /// A preference as the kernel holds it now.
 pub fn pref(index: usize) -> u8 {
@@ -359,6 +361,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_LABELS => value <= 1,
         PREF_SCREEN_OFF => value <= 1,
         PREF_BRIGHTNESS => value <= 8,
+        PREF_DITHER => value <= 1,
         _ => false,
     }
 }

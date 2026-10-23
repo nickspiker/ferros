@@ -246,6 +246,7 @@ enum View {
 enum Choice {
     Base(u8),
     Labels,
+    Dither,
     /// The brightness dots: which one is decided by x.
     Brightness,
 }
@@ -607,6 +608,10 @@ impl Map {
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
         b.text(cx, y, 36, GREY, 1, if labels { "names under circles: on" } else { "names under circles: off" });
         self.push_row(y - 44, y + 24, Choice::Labels);
+        y += 80;
+        let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
+        b.text(cx, y, 36, GREY, 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
+        self.push_row(y - 44, y + 24, Choice::Dither);
         // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
         y += 80;
         b.text(cx, y, 36, GREY, 1, "brightness");
@@ -742,6 +747,11 @@ impl Map {
                             let (x0, step) = Map::dots(self.w / 2, self.arrived_r());
                             let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
                             ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
+                            self.draw();
+                        }
+                        Some(Choice::Dither) => {
+                            let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
+                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_DITHER, (!spatial) as u8);
                             self.draw();
                         }
                         Some(Choice::Labels) => {

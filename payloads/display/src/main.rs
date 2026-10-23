@@ -1622,7 +1622,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         let next_clean = unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() };
-        if unsafe { TEMPORAL } && client_owned && !screen_off && next_clean && now() >= next_flip {
+        // Spatial only (preference 4): no flips, so the panel can rest at its idle floor; the phase on the layer already carries a complete spatial dither.
+        let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
+        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && now() >= next_flip {
             next_flip = now() + freq() / 10;
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };

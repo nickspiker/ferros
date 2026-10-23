@@ -195,6 +195,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.brightness" && len == 1 && params[2 + klen] <= 8 {
                         crate::process::set_pref(crate::process::PREF_BRIGHTNESS, params[2 + klen]);
                     }
+                    if key == "device.dither" && len == 1 && params[2 + klen] <= 1 {
+                        crate::process::set_pref(crate::process::PREF_DITHER, params[2 + klen]);
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -300,6 +303,7 @@ fn store_pref(index: usize, value: u8) -> bool {
         crate::process::PREF_BASE => "device.base",
         crate::process::PREF_LABELS => "device.labels",
         crate::process::PREF_BRIGHTNESS => "device.brightness",
+        crate::process::PREF_DITHER => "device.dither",
         _ => return false,
     };
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, alloc::vec![value]).is_ok()).unwrap_or(false) }
