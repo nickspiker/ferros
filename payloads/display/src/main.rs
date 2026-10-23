@@ -40,6 +40,7 @@ mod neon;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
 use fluor::canvas::{Canvas, Damage};
 use fluor::paint;
@@ -924,6 +925,85 @@ fn uptime(buf: &mut [u8; 8], secs: u64) -> &str {
     core::str::from_utf8(buf).unwrap_or("--:--:--")
 }
 
+// ---------------------------------------------------------------- the receive thread and the request ring
+//
+// Two threads (KERNEL.md "Threads, interrupts and cores": receive and work are different threads). The receive thread blocks in `recv` and never touches hardware or the canvas: it answers `5` (the query) from statics, and puts every other message into this ring for the render thread, replying at once — so a client's call costs microseconds whatever the panel is doing. A frame (op 14, or a batch, 15) that arrives while the previous frame still waits in the ring replaces it: the client outran the renderer, and only the newest scene matters. The dev and hardware ops that answer with data (a DSI read, "moved") wait for the render thread to run them and reply with its result.
+const RING: usize = 16;
+const SLOT: usize = 4096;
+static mut RING_MSG: [[u8; SLOT]; RING] = [[0; SLOT]; RING];
+static mut RING_LEN: [u16; RING] = [0; RING];
+static mut RING_REPLY: [[u8; 16]; RING] = [[0; 16]; RING];
+static mut RING_RLEN: [u8; RING] = [0; RING];
+/// Slots consumed (the render thread advances it) and filled (the receive thread advances it); the difference is the queue.
+static RING_HEAD: AtomicU64 = AtomicU64::new(0);
+static RING_TAIL: AtomicU64 = AtomicU64::new(0);
+/// Per slot, how many requests the render thread has completed in it: a waiting receive thread sees it move.
+static RING_DONE: [AtomicU64; RING] = [const { AtomicU64::new(0) }; RING];
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static mut SCREEN_WH: (u16, u16) = (0, 0);
+static mut RECV_STACK: [u8; 32768] = [0; 32768];
+
+/// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
+fn op_is_sync(op: u8) -> bool {
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21)
+}
+
+extern "C" fn receive(grants: u64) -> ! {
+    let ep = cap(grants, S_DISPLAY);
+    let mut msg = [0u8; SLOT];
+    let mut tok = [0u8; 32];
+    loop {
+        let n = ferros_sys::recv(ep, &mut msg, &mut tok, false);
+        if n == ferros_sys::ERR || n == 0 || n > SLOT as u64 {
+            continue;
+        }
+        let n = n as usize;
+        let op = msg[0];
+        if op == 5 {
+            let (w, h) = unsafe { SCREEN_WH };
+            let mut out = [0u8; 13];
+            out[0..2].copy_from_slice(&w.to_le_bytes());
+            out[2..4].copy_from_slice(&h.to_le_bytes());
+            out[4..8].copy_from_slice(&(FRAMES.load(Ordering::Relaxed) as u32).to_le_bytes());
+            out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
+            out[12] = unsafe { APP }.is_some() as u8;
+            ferros_sys::reply(&tok, &out);
+            continue;
+        }
+        // Room: wait for the render thread to consume a slot.
+        let mut head = RING_HEAD.load(Ordering::Acquire);
+        let mut tail = RING_TAIL.load(Ordering::Relaxed);
+        while tail - head >= RING as u64 {
+            ferros_sys::wait(&RING_HEAD, head, 0);
+            head = RING_HEAD.load(Ordering::Acquire);
+        }
+        let frame = matches!(op, 14 | 15);
+        // A frame behind another unconsumed frame replaces it (the slot being overwritten is never the one the render thread is copying: at least two are queued, and it works on the oldest).
+        let (slot, append) = if frame && tail - head >= 2 && matches!(unsafe { RING_MSG[((tail - 1) % RING as u64) as usize][0] }, 14 | 15) { (((tail - 1) % RING as u64) as usize, false) } else { ((tail % RING as u64) as usize, true) };
+        unsafe {
+            RING_MSG[slot][..n].copy_from_slice(&msg[..n]);
+            RING_LEN[slot] = n as u16;
+        }
+        let done = RING_DONE[slot].load(Ordering::Acquire);
+        if append {
+            tail += 1;
+            RING_TAIL.store(tail, Ordering::Release);
+        }
+        ferros_sys::wake(&RING_TAIL, 1);
+        if op_is_sync(op) {
+            while RING_DONE[slot].load(Ordering::Acquire) == done {
+                ferros_sys::wait(&RING_DONE[slot], done, 0);
+            }
+            let len = unsafe { RING_RLEN[slot] } as usize;
+            let reply = unsafe { RING_REPLY[slot] };
+            ferros_sys::reply(&tok, &reply[..len.min(16)]);
+        } else {
+            // Replied before it is drawn: status 0, and "moved" for a frame as before.
+            ferros_sys::reply(&tok, if frame { &[0, 1] } else { &[0] });
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
@@ -1134,11 +1214,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut last_interaction = 0u64;
     let mut next_tick = (now() / freq() + 1) * freq();
     let mut msg = [0u8; 4096];
-    let mut tok = [0u8; 32];
     let mut last_slow_log = 0u64;
     let mut last_reply = 0u64;
     // A second console writer: `log` is lent to the op handler for the whole pass.
     let mut tlog = Log { grants, buf: [0; 256], n: 0 };
+    unsafe { SCREEN_WH = (width as u16, height as u16) };
+    if ferros_sys::thread_spawn(receive, unsafe { &mut *(&raw mut RECV_STACK) }, grants) != 0 {
+        log.s(b"display: no receive thread\n");
+        log.flush();
+    }
+    // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
+    let mut seen_tail = 0u64;
     loop {
         // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
         let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
@@ -1187,6 +1273,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                     out[1] = moved as u8;
                     len = 2;
                 }
@@ -1315,6 +1402,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                         armed = Some(pipe.arm(win));
                         frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                         out[1] = 1;
                         len = 2;
                     } else {
@@ -1326,6 +1414,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let (moved, _) = pipe.present(win);
                         unsafe { PHASE_US[3] = ferros_sys::us_since(t_phase) };
                         frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                         out[1] = moved as u8;
                         len = 2;
                     }
@@ -1350,6 +1439,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                         let (moved, _) = pipe.present(win);
                         frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                         out[1] = moved as u8;
                         len = 2;
                     } else {
@@ -1382,6 +1472,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                         armed = Some(pipe.arm(win));
                         frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                     } else {
                         out[0] = 3;
                     }
@@ -1538,6 +1629,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
                     frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                     client_owned = true;
                     out[1] = moved as u8;
                     len = 2;
@@ -1559,13 +1651,18 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let t_pass = now();
         let mut calls_us = 0u64;
         let mut ncalls = 0u32;
-        // Clients first: every call waiting on the endpoint.
+        // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
-            let n = ferros_sys::recv(cap(grants, S_DISPLAY), &mut msg, &mut tok, true);
-            if n == ferros_sys::NOTHING || n == ferros_sys::ERR {
+            let head = RING_HEAD.load(Ordering::Relaxed);
+            if head == RING_TAIL.load(Ordering::Acquire) {
                 break;
             }
-            let m = &msg[..(n as usize).min(msg.len())];
+            let slot = (head % RING as u64) as usize;
+            let n = unsafe { RING_LEN[slot] } as usize;
+            msg[..n].copy_from_slice(unsafe { &RING_MSG[slot][..n] });
+            RING_HEAD.store(head + 1, Ordering::Release);
+            ferros_sys::wake(&RING_HEAD, 1);
+            let m = &msg[..n];
             let mut out = [0u8; 16];
             let t_call = now();
             ncalls += 1;
@@ -1602,7 +1699,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.s(b"display: call op ");
                 tlog.dec(m.first().copied().unwrap_or(0) as u64);
                 tlog.s(b" (");
-                tlog.dec(n);
+                tlog.dec(n as u64);
                 tlog.s(b" bytes, ");
                 tlog.dec(gap_us / 1000);
                 tlog.s(b" ms after the last reply) took ");
@@ -1642,7 +1739,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 tlog.flush();
             }
-            ferros_sys::reply(&tok, &out[..len]);
+            if m.first().is_some_and(|&op| op_is_sync(op)) {
+                unsafe {
+                    RING_REPLY[slot] = out;
+                    RING_RLEN[slot] = len.min(16) as u8;
+                }
+                RING_DONE[slot].fetch_add(1, Ordering::Release);
+                ferros_sys::wake(&RING_DONE[slot], 1);
+            }
             last_reply = now();
             calls_us += ferros_sys::us_since(t_call);
         }
@@ -1669,6 +1773,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                 let (moved, irq) = pipe.present(win);
                 frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
                 if frames == 1 || frames % 30 == 0 || !moved || irq & !(1 << 16) != 0 {
                     log.s(b"display: frame ");
                     log.dec(frames);
@@ -1763,6 +1868,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
             let _ = pipe.present(win);
             frames += 1;
+                        FRAMES.store(frames, Ordering::Relaxed);
         }
         let flip_us = ferros_sys::us_since(t_flip);
         let pass_us = ferros_sys::us_since(t_pass);
@@ -1780,11 +1886,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             tlog.s(b" ms\n");
             tlog.flush();
         }
-        let poll = if now().wrapping_sub(last_interaction) < 2 * freq() { freq() / 120 } else { freq() / 16 };
-        // The flip counts toward the wake only while a flip can happen. While a finger moves the next phase stays dirty, no flip fires and `next_flip` falls into the past; a wake set from it made `sleep_until` return at once and this loop spin its whole slice on an empty recv, so every call from the map waited for the slice timer: 10 ms a move, a quarter second a push (the scheduler trace, 2026-10-23).
+        // Until a request arrives (the receive thread moves the ring's tail) or the next deadline: the second's tick; the flip, only while a flip can happen (while a finger moves the next phase stays dirty and `next_flip` falls into the past — a wake set from it made the old sleep return at once and this loop spin its slice, 2026-10-23); and a stale phase to refill once the frames have stopped coming.
         let flip_possible = unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean;
-        let wake = if flip_possible { next_tick.min(next_flip.max(now())) } else { next_tick };
-        ferros_sys::sleep_until(wake.min(now() + poll));
+        let mut wake = next_tick;
+        if flip_possible {
+            wake = wake.min(next_flip.max(now()));
+        }
+        if unsafe { TEMPORAL } && client_owned && (0..PHASES).any(|k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
+            wake = wake.min((last_interaction + freq() / 8).max(now()));
+        }
+        let tail = RING_TAIL.load(Ordering::Acquire);
+        if tail == seen_tail {
+            ferros_sys::wait(&RING_TAIL, tail, wake);
+        }
+        seen_tail = RING_TAIL.load(Ordering::Acquire);
     }
 }
 

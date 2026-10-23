@@ -270,9 +270,9 @@ pub fn thread_exit(value: u64) -> ! {
     }
 }
 
-/// Block while `word` still holds `expected`, until another thread of this process calls `wake` on it: 0 then, 1 at once if the word had already changed. A futex: the word is the state, this is the wait.
-pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64) -> u64 {
-    svc(nr::WAIT, off(word as *const _ as *const u8), expected, 0, 0, 0)
+/// Block while `word` still holds `expected`, until another thread of this process calls `wake` on it (0), or the counter reaches `deadline` (2; 0 = none); 1 at once if the word had already changed. A futex with a timeout: the word is the state, this is the wait, and a server loop waits for a request or its next deadline in one call.
+pub fn wait(word: &core::sync::atomic::AtomicU64, expected: u64, deadline: u64) -> u64 {
+    svc(nr::WAIT, off(word as *const _ as *const u8), expected, deadline, 0, 0)
 }
 
 /// Make up to `count` threads waiting on `word` runnable; returns how many.

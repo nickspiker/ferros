@@ -203,8 +203,8 @@ enum State {
     Calling(u64, u64),
     /// Asleep until the generic timer count reaches the deadline (SYS_SLEEP); `wake_sleepers` makes it runnable again.
     Sleeping(u64),
-    /// In `wait` on a word of its arc (the word's address): `wake` on that word by another thread of the process makes it runnable.
-    Waiting(usize),
+    /// In `wait` on a word of its arc (the word's address, and a deadline or 0): `wake` on that word by another thread of the process makes it runnable (x0 = 0), or the deadline passing does (x0 = 2).
+    Waiting(usize, u64),
 }
 
 /// A thread: what the scheduler runs. A saved frame, a state, and the process it belongs to; threads of one process share its arc and every capability in it (KERNEL.md "Threads, interrupts and cores"). Threads are not addressable: nothing outside the kernel names one.
@@ -444,7 +444,7 @@ const SYS_STORE: u64 = 13;
 const SYS_THREAD_SPAWN: u64 = 14;
 /// thread_exit(value): this thread ends; the last thread of a process ends the process as `exit` does.
 const SYS_THREAD_EXIT: u64 = 15;
-/// wait(word, expected): if the 8-byte word at arc offset `word` still holds `expected`, block until another thread of this process wakes it; returns 0 then, or 1 at once if the word had already changed. A futex: threads hand work to each other without IPC.
+/// wait(word, expected, deadline): if the 8-byte word at arc offset `word` still holds `expected`, block until another thread of this process wakes it (returns 0) or CNTPCT reaches `deadline` (returns 2; 0 = no deadline); returns 1 at once if the word had already changed. A futex with a timeout: threads hand work to each other without IPC, and a server's loop waits for a request or its next deadline in one call.
 const SYS_WAIT: u64 = 16;
 /// wake(word, count): make up to `count` threads of this process waiting on that word runnable; returns how many.
 const SYS_WAKE: u64 = 17;
@@ -698,11 +698,17 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
         SYS_WAIT => {
             let addr = p.arc.base + ((f.x[0] as usize) & p.arc.mask() & !7);
             let now = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            let deadline = f.x[2];
+            let t_now: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t_now) };
             if now != f.x[1] {
                 f.x[0] = 1;
                 0
+            } else if deadline != 0 && deadline <= t_now {
+                f.x[0] = 2;
+                0
             } else {
-                t.state = State::Waiting(addr);
+                t.state = State::Waiting(addr, deadline);
                 t.frame = *f;
                 t.frame.x[0] = 0;
                 tr(TR_SLEEP, cur, 0xFFFF);
@@ -717,7 +723,7 @@ pub extern "C" fn ferros_el0_trap(f: &mut Frame) -> u64 {
                     break;
                 }
                 if let Some(x) = x {
-                    if x.proc == pi && x.state == State::Waiting(addr) {
+                    if x.proc == pi && matches!(x.state, State::Waiting(a, _) if a == addr) {
                         x.state = State::Runnable;
                         kk.runnable.push_back(i);
                         tr(TR_WAKE, i, 0xFFFF);
@@ -1147,6 +1153,14 @@ fn wake_sleepers() {
                     p.state = State::Runnable;
                     kk.runnable.push_back(i);
                     tr(TR_WAKE, i, ((now - d) * 1000 / crate::platform::cntfrq()).min(65535));
+                }
+            } else if let State::Waiting(_, d) = p.state {
+                // A timed wait whose deadline passed: back with 2.
+                if d != 0 && d <= now {
+                    p.state = State::Runnable;
+                    p.frame.x[0] = 2;
+                    kk.runnable.push_back(i);
+                    tr(TR_WAKE, i, 0xFFFE);
                 }
             }
         }

@@ -55,7 +55,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             break;
         }
         waits += 1;
-        if wait(&DONE, d) == 1 {
+        if wait(&DONE, d, 0) == 1 {
             early += 1;
         }
     }
