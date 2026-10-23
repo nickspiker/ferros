@@ -23,6 +23,7 @@
 //! - 15 `batch [len u16][op…]…`: several ops in one call, in order — a frame with an overlay is `begin`, its text and rects and discs, then `camera` with the keep flag, which draws the scene under them and presents. One call per frame rather than one per op: each call is a round trip through the scheduler. The reply is the last op's, its status the first failure's.
 //! - 16 `disc [x i16][y i16][r u16][colour]`: a filled circle in panel pixels (the shell's shapes are circles; a ring is a smaller disc of the ground colour sent first, since what is sent first is on top).
 //! - 17 `scene move [index u8][x i32][y i32][r u16]`: one circle of the scene moved and resized in place (the owner arranging by hand).
+//! - 21 `ramps`: the present stage's test screen, straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -200,6 +201,8 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
+/// Whether the layer is 10-bit (set once at start; `program_layer` reads it).
+static mut TEN: bool = false;
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
@@ -275,7 +278,12 @@ impl Pipe {
         self.wr(S_WIN, w + 0x1C, 0);
         self.wr(S_WINCON, w, 1);
         let ctrl = self.rd(S_DMA0, RDMA_IN_CTRL_0);
-        self.wr(S_DMA0, RDMA_IN_CTRL_0, (ctrl & !(IDMA_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | IDMA_BGRX8888);
+        let ten = unsafe { TEN };
+        self.wr(S_DMA0, RDMA_IN_CTRL_0, (ctrl & !(IDMA_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | if ten { 19 << 8 } else { IDMA_BGRX8888 });
+        // A 10-bit layer keeps its two low bits only if the DPP and HDR-common blocks are told the format too (bits [2:0] = 1, ARGB8101010) with their 10 bpc bit (6); measured 2026-10-22.
+        let fmt = if ten { 1 | 1 << 6 } else { 0 };
+        self.wr(S_DPP0, 0x0038, (self.rd(S_DPP0, 0x0038) & !(7 | 1 << 6)) | fmt);
+        self.wr(S_HDRCOMM0, 0x000C, (self.rd(S_HDRCOMM0, 0x000C) & !(7 | 1 << 6)) | fmt);
         self.wr(S_DMA0, RDMA_SRC_WIDTH, width);
         self.wr(S_DMA0, 0x0014, height);
         self.wr(S_DMA0, RDMA_SRC_OFFSET, 0);
@@ -450,6 +458,95 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
     }
 }
 
+/// The present stage's policy (DISPLAY-CALIB.md, "Decided", 2026-10-22): the panel driven at its measured peak (HBM: 1467 cd/m² on this unit) and white at 133 cd/m², so the headroom H = peak ÷ white ≈ 11 — under the working format's 16× ceiling, so all of it is used.
+const PEAK_NITS: f32 = 1467.0;
+const WHITE_NITS: f32 = 133.0;
+/// The panel's measured power law (γ 2.19 in 8- and 10-bit codes, to 10-bit code 8; DISPLAY-CALIB.md).
+const PANEL_GAMMA: f32 = 2.19;
+
+/// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368). One entry folds the whole display transform: the owner's pinned curve, Y/peak = tanh²(v/√H) (linear at black, white just under 1/H, highlights rolled into the peak with nothing clipped), then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise). Built once, here, with the f32 tanh the test card already uses; everything per pixel is integer.
+fn build_lut(lut: &mut [u16]) {
+    let h = PEAK_NITS / WHITE_NITS;
+    let k = 1.0 / sqrt(h);
+    for (i, e) in lut.iter_mut().enumerate() {
+        let y = tanh(i as f32 / 16384.0 * k);
+        let q = pow(y, 2.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
+        *e = if q.is_nan() || q < 0.0 { 0 } else if q > 16368.0 { 16368 } else { q as u16 };
+    }
+}
+
+/// The ordered 4×4 dither (Bayer), in sixteenths: added to a Q4 code before the fraction is dropped, it spreads the two-plus bits below the 10-bit code across each 4×4 cell, which at 489 ppi is 0.2 mm.
+const BAYER: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// A 10-bit pixel as the hardware takes it once DMA, DPP and HDR-common agree (kernel `Panel::set_10bit`): B[31:22] G[21:12] R[11:2] A[1:0].
+#[inline(always)]
+fn pack10(r: u32, g: u32, b: u32) -> u32 {
+    b << 22 | g << 12 | r << 2 | 3
+}
+
+/// The 8-bit canvas through the present stage: each channel value read as gamma 2 with white at 255, its Q4 code from the table (`lut8`), the dither, the BGRA1010102 word. Empty pixels (most of the map) skip all of it. A row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
+fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[u16; 256]) {
+    let mut row = [0u32; 4096];
+    for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
+        let bay = &BAYER[y & 3];
+        let out = &mut row[..src.len()];
+        for (x, (s, d)) in src.iter().zip(out.iter_mut()).enumerate() {
+            let p = *s & 0x00FF_FFFF;
+            if p == 0 {
+                *d = 3;
+                continue;
+            }
+            let t = bay[x & 3];
+            let q = |c: u32| ((lut8[c as usize] + t) >> 4).min(1023) as u32;
+            *d = pack10(q(p >> 16 & 0xFF), q(p >> 8 & 0xFF), q(p & 0xFF));
+        }
+        dst.copy_from_slice(out);
+    }
+}
+
+/// The ramps (op 21): straight from 16-bit working values to the panel, to see the present stage do its whole job. Bands, top to bottom, each a horizontal ramp across the width: grey to white dithered, and undithered (the fraction dropped); near-black (v to 1/8, light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over (v in 1/255 steps); the headroom (v to 4.0, light to 16× white) through the roll-off; then red, green and blue to white.
+fn ramps(screen: &mut [u32], width: usize, height: usize, lut: &[u16]) {
+    const BANDS: usize = 9;
+    let gap = 8usize;
+    let band = (height - gap * (BANDS + 1)) / BANDS;
+    let mut row = [0u32; 4096];
+    for y in 0..height {
+        let out = &mut row[..width];
+        let k = y.saturating_sub(gap) / (band + gap);
+        let inside = y >= gap && (y - gap) % (band + gap) < band && k < BANDS;
+        if !inside {
+            out.fill(3);
+        } else {
+            let bay = &BAYER[y & 3];
+            for (x, d) in out.iter_mut().enumerate() {
+                // The ramp's position, 0..=65535 across the width.
+                let f = (x as u32 * 65535 / (width as u32 - 1)) as u32;
+                let (top, dither, eight) = match k {
+                    0 | 1 => (16384u32, k == 0, false),
+                    2 | 3 | 4 => (2048, k != 3, k == 4),
+                    5 => (65535, true, false),
+                    _ => (16384, true, false),
+                };
+                let mut v = f * top / 65535;
+                if eight {
+                    // The 8-bit canvas: v rounded to a 255th of white.
+                    v = (v * 255 + 8192) / 16384 * 16384 / 255;
+                }
+                let t = if dither { bay[x & 3] } else { 0 };
+                let q = |v: u32| ((lut[v.min(65535) as usize] + t) >> 4).min(1023) as u32;
+                let c = q(v);
+                *d = match k {
+                    6 => pack10(c, 0, 0),
+                    7 => pack10(0, c, 0),
+                    8 => pack10(0, 0, c),
+                    _ => pack10(c, c, c),
+                };
+            }
+        }
+        screen[y * width..(y + 1) * width].copy_from_slice(out);
+    }
+}
+
 /// The finished frame out to the framebuffer. There is no black pass: the layer is BGRX, so the panel never sees the alpha byte, an empty pixel (0) already shows black, and black blended under an antialiased edge adds nothing to its colour — only to the alpha the panel ignores. The pass that did it cost 15-25 ms a frame and changed no visible pixel (2026-10-22).
 fn publish(back: &[u32], screen: &mut [u32]) {
     screen.copy_from_slice(back);
@@ -590,7 +687,24 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             ferros_sys::exit(3);
         }
     };
+    // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
+    let t_lut = now();
+    let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
+    build_lut(lut);
+    let mut lut8 = [0u16; 256];
+    for (c, e) in lut8.iter_mut().enumerate() {
+        *e = lut[c * 16384 / 255];
+    }
+    let lut_ms = ferros_sys::us_since(t_lut) / 1000;
     ALLOC.mark();
+    log.s(b"display: present table (H ");
+    log.dec((PEAK_NITS / WHITE_NITS * 10.0) as u64);
+    log.s(b"/10, white at 10-bit code ");
+    log.dec((lut[16384] >> 4) as u64);
+    log.s(b") in ");
+    log.dec(lut_ms);
+    log.s(b" ms\n");
+    log.flush();
     log.s(b"display: typeface up in ");
     log.dec(ferros_sys::us_since(t_font) / 1000);
     log.s(b" ms, heap ");
@@ -640,6 +754,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         log.s(if f1.is_none() && f2.is_none() { b"display: panel idle floor 10 Hz, TE fixed 120\n" } else { b"display: idle floor / TE command stuck\n" });
         log.flush();
     }
+
+    // 10 bits when the kernel has put DECON in the 10 bpc blend (GLOBAL_CON bit 20, set by the modeset before the shell starts): the layer becomes 10-bit and every frame goes through the present stage, with the panel at its peak (HBM) so the table's headroom is real. Otherwise the 8-bit copy, as before.
+    let ten = pipe.rd(S_DECON, 0x0020) & (1 << 20) != 0;
+    if ten && dsi.alive() {
+        let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, 0xE0])).and_then(|_| dsi.dcs(&[0x51, 0x0F, 0xFF])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
+        log.s(if r.is_ok() { b"display: 10 bits, panel at its peak (HBM), white 133 cd/m2\n" } else { b"display: 10 bits, but the HBM command stuck\n" });
+    } else {
+        log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
+    }
+    log.flush();
+    unsafe { TEN = ten };
 
     let mut frames = 0u64;
     let mut clock = [0u8; 8];
@@ -695,7 +820,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    publish(pixels, screen);
+                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -815,7 +940,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe { PHASE_US[1] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    publish(pixels, screen);
+                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
                     t_phase = now();
@@ -825,6 +950,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     frames += 1;
                     out[1] = moved as u8;
                     len = 2;
+                }
+                Some(21) => {
+                    client_owned = true;
+                    if ten {
+                        ramps(screen, width, height, lut);
+                        ferros_sys::dma_barrier();
+                        pipe.program_layer(win, fb, width as u32, height as u32);
+                        let (moved, _) = pipe.present(win);
+                        frames += 1;
+                        out[1] = moved as u8;
+                        len = 2;
+                    } else {
+                        out[0] = 3;
+                    }
                 }
                 Some(16) if m.len() >= 11 => {
                     let v = |i: usize| i16::from_le_bytes([m[i], m[i + 1]]) as isize;
@@ -920,7 +1059,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    publish(pixels, screen);
+                    if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, fb, width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1021,7 +1160,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                publish(pixels, screen);
+                if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, fb, width as u32, height as u32);

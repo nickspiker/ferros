@@ -398,6 +398,11 @@ fn after_te(cntfrq: u64) {
 /// The whole modeset to `fhd` or WQHD, then one frame. Reports every step that misbehaved, the panel's raster register and the TE rate afterwards.
 /// `rate`: 0 keeps the link rate, 1 = 1368 Mbps, 2 = 1346 Mbps. `bpc`: 0 keeps the blend depth, 1 = 8 bpc, 2 = 10 bpc, 3 = 10 bpc blend **and a 10 bpc DSC stream to the panel** (the experiment; `f2` is then the byte written to the panel's F2 register at offset 1 in place of the raster's 01 / 81, 0 = leave the raster's). Bridge `display modeset fhd|wqhd [1368|1346] [8|10|link10] [f2=XX]`.
 pub fn modeset(fhd: bool, rate: u8, bpc: u8, f2_byte: u8, cntfrq: u64, rep: &mut Vec<u8>) {
+    modeset_with(fhd, rate, bpc, f2_byte, false, cntfrq, rep)
+}
+
+/// `modeset`, and with `quiet` nothing after DECON is running again: no frame painted, no TE measurement (half a second), no readbacks. For the boot path, where the next frame is the shell's (service.rs `start_home`).
+pub fn modeset_with(fhd: bool, rate: u8, bpc: u8, f2_byte: u8, quiet: bool, cntfrq: u64, rep: &mut Vec<u8>) {
     if !dpu_on() || !crate::dsim::alive() {
         rep.extend_from_slice(b"display not running\n");
         return;
@@ -462,6 +467,9 @@ pub fn modeset(fhd: bool, rate: u8, bpc: u8, f2_byte: u8, cntfrq: u64, rep: &mut
     }
     let t = rd(DECON0 + TRIG_CON);
     wr(DECON0 + TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+    if quiet {
+        return;
+    }
 
     let r2 = crate::display::show(if fhd { b"ferros FHD modeset" } else { b"ferros WQHD modeset" }, cntfrq);
     rep.extend_from_slice(&r2);

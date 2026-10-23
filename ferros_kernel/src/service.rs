@@ -348,6 +348,14 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     };
     let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
     let mut rep = alloc::vec::Vec::new();
+    // The shell draws in 10 bits (DISPLAY-CALIB.md, 2026-10-22): the 10 bpc blend with the DQE dither onto the 8 bpc link, the mode measured to carry a 10-bit layer's every code. ABL leaves the 8 bpc path; the full modeset is the only proven way across, so it runs once here, between the boot ring and the shell's first frame.
+    crate::dpu::modeset_with(false, 0, 2, 0, true, cntfrq(), &mut rep);
+    crate::checklist::at("home: 10 bpc blend");
+    if !rep.is_empty() {
+        crate::process::push_console(b"home: modeset: ");
+        crate::process::push_console(&rep);
+        rep.clear();
+    }
     crate::touch::up(&mut rep);
     crate::checklist::at("home: touch up");
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {

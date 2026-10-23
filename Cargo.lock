@@ -802,6 +802,13 @@ name = "ferros-payload-pmuprobe"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-ramps"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-repeaterprobe"
 version = "0.1.0"
 
@@ -1517,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",

@@ -38,15 +38,18 @@ struct Spec {
 }
 
 /// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
-const CIRCLES: [Spec; 5] = [
+const CIRCLES: [Spec; 6] = [
     Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
     Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
     Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
     Spec { label: "Lumis", ring: 1, lit: 0, share: 200, icon: 3, needs: "the camera as a process" },
     Spec { label: "Opsin", ring: 1, lit: 0, share: 150, icon: 4, needs: "Lumis's frames" },
+    // The present stage's test screen, as an app: a tap launches its capsule (payloads/ramps).
+    Spec { label: "Ramps", ring: 1, lit: 0, share: 60, icon: 6, needs: "" },
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;
+const RAMPS: usize = 5;
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
 const BASE_RADIUS: i64 = 110;
@@ -273,6 +276,8 @@ struct Map {
     nrows: usize,
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
     arranged: [bool; N],
+    /// The display server's ramps are on the panel (the present stage's test screen); any tap comes back.
+    ramps: bool,
 }
 
 impl Map {
@@ -529,6 +534,7 @@ impl Map {
         y += 80;
         b.text(cx, y, 36, GREY, 1, "arrange by hand");
         self.push_row(y - 44, y + 24, Choice::Arrange);
+
         b.disc(cx, cy, r - r / 25 - 1, FILL);
     }
 
@@ -551,9 +557,10 @@ impl Map {
         let _ = tatau::share(&mut v, f, a.share as u64, 1000, 2);
         Map::row(b, cx, y, "your time", v.as_str());
         y += 64;
-        Map::row(b, cx, y, "installed", "not yet");
+        let here = a.needs.is_empty();
+        Map::row(b, cx, y, "installed", if here { "yes" } else { "not yet" });
         y += 64;
-        Map::row(b, cx, y, "waits for", a.needs);
+        Map::row(b, cx, y, "waits for", if here { "nothing" } else { a.needs });
         y += 64;
         Map::row(b, cx, y, "capabilities", "none");
         b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "time is set by hand until it is measured");
@@ -575,7 +582,21 @@ impl Map {
         console(self.grants, l.as_str().as_bytes());
     }
 
+    /// Launch the Ramps app: its capsule from the vault, given this process's display capability (SYS_SPAWN: a child gets only what its parent holds). It draws and ends; the next tap brings the map back.
+    fn show_ramps(&mut self) {
+        if ferros_sys::spawn(self.grants, b"ramps", b"ramps", &[S_DISPLAY]) == 0 {
+            self.ramps = true;
+        } else {
+            console(self.grants, b"map: could not launch ramps\n");
+        }
+    }
+
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
+        if self.ramps {
+            self.ramps = false;
+            self.draw();
+            return;
+        }
         let inside = {
             let (dx, dy) = (sx - self.w / 2, sy - self.h / 2);
             dx * dx + dy * dy <= self.arrived_r() * self.arrived_r()
@@ -598,7 +619,9 @@ impl Map {
         }
         match (fingers, self.view) {
             (1, View::Map) => {
-                if let Some(i) = self.hit(sx, sy) {
+                if self.hit(sx, sy) == Some(RAMPS) {
+                    self.show_ramps();
+                } else if let Some(i) = self.hit(sx, sy) {
                     let to = self.at(i);
                     self.fly(to);
                     self.view = View::Front(i);
@@ -707,6 +730,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         rows: [(0, 0, Choice::Labels); 8],
         nrows: 0,
         arranged: [false; N],
+        ramps: false,
     };
     let kept = map.load_places();
     if kept > 0 {
@@ -725,6 +749,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     map.draw();
+    if option_env!("FERROS_MAP_START") == Some("rr") {
+        map.show_ramps();
+    }
     console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
     // The device's number base, as every app reads it (SETTINGS.md): logged now and whenever it changes, which is the proof the preference reaches a running process.
     let mut base = ferros_sys::device_base();
