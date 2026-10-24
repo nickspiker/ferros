@@ -157,8 +157,9 @@ impl KVault {
     }
 
     /// Store `value` under `name`, durably (manifestus commits per put). Returns the value's vault address.
-    pub fn set(&mut self, name: &str, value: Vec<u8>) -> Result<[u8; 32], KvError> {
-        let a = self.raw_put(name, &value)?;
+    /// Store `value` under `name`. A slice, not an owned buffer: the store command's put used to copy the whole payload into a Vec just to hand it here, a third copy of a 2.7 MB capsule in the kernel heap (2026-10-23: it ran the heap out).
+    pub fn set(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
+        let a = self.raw_put(name, value)?;
         if reserved(name) {
             return Ok(a);
         }

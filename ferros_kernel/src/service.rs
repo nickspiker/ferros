@@ -57,6 +57,8 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 
 /// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
+/// Where PT transfers over 1 MiB are received: the 6 MiB between the DMA pool and the reload stub, inside the kernel's cacheable window (cachemap WINDOW), used by nothing else.
+const PT_BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
 
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
 const EXIT_REBOOT: u8 = 0xB0;
@@ -185,7 +187,7 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             };
             let len = params.len() - 2 - klen;
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
-            match store.set(&key, params[2 + klen..].to_vec()) {
+            match store.set(&key, &params[2 + klen..]) {
                 Ok(h) => {
                     // A preference set from the bridge applies at once, as one set from the device does (SYS_SET_PREF): every live process sees it on its next frame.
                     if key == "device.base" && len == 1 && tatau::Base::from_code(params[2 + klen]).is_some() {
@@ -312,7 +314,7 @@ fn store_pref(index: usize, value: u8) -> bool {
         crate::process::PREF_DITHER => "device.dither",
         _ => return false,
     };
-    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, alloc::vec![value]).is_ok()).unwrap_or(false) }
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, &[value]).is_ok()).unwrap_or(false) }
 }
 
 /// `SYS_STORE`'s vault: the kernel has already checked the capability and prefixed the key with its scope.
@@ -321,7 +323,7 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     match value {
         Some(v) => {
             crate::flashlog::line(&alloc::format!("store set {key:?} {} bytes (process)", v.len()));
-            st.set(key, v.to_vec()).map(|_| None).map_err(|_| ())
+            st.set(key, v).map(|_| None).map_err(|_| ())
         }
         None => st.get_by_key(key).map_err(|_| ()),
     }
@@ -2172,7 +2174,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     if !list.chunks_exact(32).any(|e| e == seal) {
                                                         list.extend_from_slice(&seal);
                                                     }
-                                                    match store.set("sealed", list) {
+                                                    match store.set("sealed", &list) {
                                                         Ok(_) => {
                                                             let mut r = alloc::vec![0u8];
                                                             r.extend_from_slice(&seal);
@@ -2243,13 +2245,20 @@ pub fn run(mut b: Boot) -> ! {
                         // The previous transfer's buffer goes first: allocating the new one beside it doubled the peak, and with the store's own copy a 2.2 MB capsule ran the kernel heap out (2026-10-23, the 256-px icon bundle).
                         pt_inbound = None;
                         pt_data_buf = alloc::vec::Vec::new();
-                        pt_data_buf = alloc::vec![0u8; spec.total as usize];
+                        // A transfer over 1 MiB lands in a fixed region outside the heap (PT_BIG): a 2.7 MB display capsule needed its receive buffer and the vault's working copy contiguous in a heap earlier puts had fragmented, and the kernel panicked out of memory twice (2026-10-23).
+                        let total = spec.total as usize;
+                        let (buf_ptr, buf_len) = if total > 1 << 20 && total <= PT_BIG.1 - PT_BIG.0 {
+                            (PT_BIG.0 as *mut u8, total)
+                        } else {
+                            pt_data_buf = alloc::vec![0u8; total];
+                            (pt_data_buf.as_mut_ptr(), pt_data_buf.len())
+                        };
                         pt_bitmap_buf = alloc::vec![0u64; ferros_pt::transfer::bitmap_words(spec.count)];
-                        // SAFETY: pt_data_buf/pt_bitmap_buf outlive pt_inbound (both are replaced only when a new SPEC replaces the transfer).
+                        // SAFETY: the receive buffer (pt_data_buf, or PT_BIG) and pt_bitmap_buf outlive pt_inbound (both are replaced only when a new SPEC replaces the transfer).
                         let xfer = unsafe {
                             InboundTransfer::new(
                                 &spec,
-                                core::slice::from_raw_parts_mut(pt_data_buf.as_mut_ptr(), pt_data_buf.len()),
+                                core::slice::from_raw_parts_mut(buf_ptr, buf_len),
                                 core::slice::from_raw_parts_mut(pt_bitmap_buf.as_mut_ptr(), pt_bitmap_buf.len()),
                             )
                         };

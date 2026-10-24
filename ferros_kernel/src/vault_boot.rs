@@ -88,7 +88,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
                 Ok(other) => {
                     // A fresh (genesised) vault, or the genesis value missing: write it. Never a format: manifestus refuses to genesis over sealed blocks it cannot bootstrap.
                     crate::flashlog::line(&alloc::format!("kvault: genesis value {}, writing it", if other.is_some() { "wrong" } else { "absent" }));
-                    match store.set(LKEY, MSG.to_vec()) {
+                    match store.set(LKEY, MSG) {
                         Ok(_) => p.sealed = 1,
                         Err(e) => {
                             crate::flashlog::line(&alloc::format!("kvault: genesis write FAILED: {e:?}"));
