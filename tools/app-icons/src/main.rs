@@ -8,7 +8,7 @@
 //! - The grey, for the map at rest (colour there means only "changed"), is photopic luminance: VSF RGB to cone space by vsf's `VSF_RGB2LMS` (Stockman–Sharpe 10°), then CIE 170-2's V*₁₀ weights, vsf's `LMS2PHOTOPIC`. That makes VSF RGB's weights R 0.258, G 0.635, B 0.107, and E white exactly 1.
 //! - Stored as VSF RGB gamma 2 codes, white at 255 — untagged VSF RGB, the panel pipeline's plain path (DISPLAY-DESIGN.md §6). Light above white clips per channel; it is sRGB's white in blue, a few percent.
 //!
-//! Output: target/icons/icons.bin = b"ICN2", count (u8), size (u16 LE), then per icon size x size RGBA (straight alpha) followed by size x size grey, one byte each. The order is the map's (payloads/map): icon n is the n-th app, and 0 means no icon. Also target/icons/sheet.png, the colours over the greys, as the codes the panel is sent.
+//! Output: target/icons/icons.bin = b"ICN3", count (u8), size (u16 LE), then per icon size x size RGBA (straight alpha) followed by size x size grey, one byte each, the colours and the grey as VSF RGB gamma2tanh codes (tanh(√L), 8 bits; ICN2 was gamma 2). The order is the map's (payloads/map): icon n is the n-th app, and 0 means no icon. Also target/icons/sheet.png, the colours over the greys, as the codes the panel is sent.
 //!
 //! Usage: app-icons <out dir>
 use std::{env, fs, path::Path, process};
@@ -19,13 +19,13 @@ use vsf::colour::legacy::constants::SRGB2VSF_RGB;
 use vsf::colour::legacy::transfer::srgb_eotf;
 use vsf::colour::spectral::constants::{LMS2PHOTOPIC, VSF_RGB2LMS};
 
-const SIZE: usize = 128;
+const SIZE: usize = 256;
 const CODE: &str = "/mnt/Harbor/Code";
 
 /// The map's apps, in its order, and where each keeps its icon.
 const APPS: [(&str, &str); 6] = [
-    ("Photon", "photon/assets/icon-128.png"),
-    ("Mahere", "mahere/installers/icon-256.png"),
+    ("Photon", "photon/assets/icon-1024.png"),
+    ("Mahere", "mahere/installers/icon-1024.png"),
     ("Lumis", "lumis/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp"),
     ("Opsin", "opsin/assets/opsin_orb.vsf"),
     // The device's own circle (SHELL.md): ferros's logo, the phase-diagram slices of iron.
@@ -184,7 +184,7 @@ fn main() {
     }
     let out = Path::new(&args[1]);
     fs::create_dir_all(out).unwrap_or_else(|e| fail(format!("{}: {e}", out.display())));
-    let mut blob = b"ICN2".to_vec();
+    let mut blob = b"ICN3".to_vec();
     blob.push(APPS.len() as u8);
     blob.extend_from_slice(&(SIZE as u16).to_le_bytes());
     let mut sheet = image::RgbaImage::from_pixel((SIZE * APPS.len() + 8 * (APPS.len() + 1)) as u32, (2 * SIZE + 24) as u32, image::Rgba([0, 0, 0, 255]));
@@ -197,10 +197,12 @@ fn main() {
         for (i, p) in img.px.iter().enumerate() {
             let a = p[3];
             let lin = if a > 0.0 { [p[0] / a, p[1] / a, p[2] / a] } else { [0.0; 3] };
+            // Stored as VSF RGB gamma2tanh (owner, 2026-10-23: "256 and VSF RGB g2t"): tanh(√L) codes, so light above diffuse white is kept, not clipped here; the sheet below still shows the gamma 2 codes the 8-bit canvas gets.
             let (c, g) = ([code(lin[0]), code(lin[1]), code(lin[2])], code(photopic(lin)));
+            let g2t = |l: f32| vsf::colour::convert::delinearize_gamma2tanh_u8_f32(l.max(0.0));
             let a8 = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-            rgba.extend_from_slice(&[c[0], c[1], c[2], a8]);
-            grey.push(g);
+            rgba.extend_from_slice(&[g2t(lin[0]), g2t(lin[1]), g2t(lin[2]), a8]);
+            grey.push(g2t(photopic(lin)));
             // The sheet: each icon over black, as the codes the panel receives.
             let (x, y) = ((8 + k * (SIZE + 8) + i % SIZE) as u32, (8 + i / SIZE) as u32);
             let over = |v: u8| ((v as f32) * a).round() as u8;

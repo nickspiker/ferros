@@ -417,8 +417,17 @@ impl Map {
         if self.view != View::Map {
             return None;
         }
-        // A circle that fills the screen (its radius past half the shorter side) is the plane: fingers on it pan and zoom — the way out of the zoom-in limit, where the smallest circle fills the view. Anything smaller is held (the old 3/8-of-width cut made circles ungraspable once zoomed in a little: "intermittent", owner 2026-10-23).
-        self.hit(sx, sy).filter(|&i| (self.rs[i] * self.cam.z >> 16) < self.w.min(self.h) / 2)
+        // A circle is the plane only when it covers the whole screen — all four corners inside it, nothing else to see: then fingers on it pan and zoom, the way out of the zoom-in limit. Any other circle under the fingers is held, however big and wherever its centre is (owner, 2026-10-23: a big circle with its centre off screen only moved the camera).
+        self.hit(sx, sy).filter(|&i| !self.covers_screen(i))
+    }
+
+    /// Whether circle `i` covers all four corners of the screen (distance squared, world units).
+    fn covers_screen(&self, i: usize) -> bool {
+        [(0, 0), (self.w, 0), (0, self.h), (self.w, self.h)].iter().all(|&(sx, sy)| {
+            let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
+            let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
+            dx * dx + dy * dy <= self.rs[i] * self.rs[i]
+        })
     }
 
     /// The zoom's bounds, relative to the circles as they are: out, until together they cover 1/AREA_FRACTION of the screen; in, until the smallest alone fills it. (16.16, like `cam.z`.)

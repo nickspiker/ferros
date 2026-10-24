@@ -303,12 +303,25 @@ struct Circle {
 }
 const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0 };
 
-/// The apps' icons, bundled by tools/app-icons: b"ICN2", count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
+/// The bundle's codes to canvas values: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 values with white at 255 — so atanh(c/256) × 255, clipped at white until the canvas has headroom (16 bits). None for ICN2 (gamma 2 already).
+fn icon_decode() -> Option<[u8; 256]> {
+    if ICONS.len() < 4 || &ICONS[..4] != b"ICN3" {
+        return None;
+    }
+    let mut t = [0u8; 256];
+    for (c, e) in t.iter_mut().enumerate() {
+        let v = libm::atanhf(c as f32 / 256.0) * 255.0 + 0.5;
+        *e = if v.is_nan() || v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 };
+    }
+    Some(t)
+}
+
+/// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
 static ICONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons.bin"));
 
 /// The n-th icon (from 1): its RGBA, its grey, and its side, if the bundle has it.
 fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
-    if n == 0 || ICONS.len() < 7 || &ICONS[..4] != b"ICN2" || n > ICONS[4] {
+    if n == 0 || ICONS.len() < 7 || !(&ICONS[..4] == b"ICN2" || &ICONS[..4] == b"ICN3") || n > ICONS[4] {
         return None;
     }
     let size = u16::from_le_bytes([ICONS[5], ICONS[6]]) as usize;
@@ -1279,10 +1292,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut tabs = neon::Tables::from_lut8(&lut8);
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
     let mips: &'static [draw::Mips] = {
+        let decode = icon_decode();
         let mut v = alloc::vec::Vec::new();
         let mut n = 1u8;
         while let Some((px, grey, size)) = icon(n) {
-            v.push(draw::Mips::build(px, grey, size));
+            v.push(draw::Mips::build(px, grey, size, decode.as_ref()));
             n += 1;
         }
         v.leak()

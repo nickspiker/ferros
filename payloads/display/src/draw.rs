@@ -174,16 +174,21 @@ pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
         let rowb = y as usize * width;
         let dy = (y << 8) + 128 - cy;
         let dy2 = dy * dy;
-        for x in xo0.max(0)..=xo1.min(w - 1) {
+        let (x0, x1) = (xo0.max(0), xo1.min(w - 1));
+        // One pixel of glow; false once the walk has reached the circle (q ≤ 0), where it stops.
+        let mut put = |x: i64| -> bool {
             let dx = (x << 8) + 128 - cx;
             let q = dx * dx + dy2 - r2;
-            if q <= 0 || q > q_max {
-                continue;
+            if q <= 0 {
+                return false;
+            }
+            if q > q_max {
+                return true;
             }
             let p = &mut px[rowb + x as usize];
             let a = (*p >> 24) as i64;
             if a == 255 {
-                continue;
+                return true;
             }
             let i = (num / q).min(peak as i64);
             // Into the room the pixel has left (255 − alpha), added and saturated per channel; alpha untouched.
@@ -193,6 +198,24 @@ pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
                 ((have + c * i * room / 65025).min(255) as u32) << sh
             };
             *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
+            true
+        };
+        // From each end of the row inward to the circle's edge: the interior is never visited (zoomed in, it is most of the screen, and visiting it pixel by pixel was the lag, 2026-10-23).
+        let mut left_stop = x1 + 1;
+        let mut x = x0;
+        while x <= x1 {
+            if !put(x) {
+                left_stop = x;
+                break;
+            }
+            x += 1;
+        }
+        let mut x = x1;
+        while x > left_stop {
+            if !put(x) {
+                break;
+            }
+            x -= 1;
         }
     });
     Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
@@ -213,7 +236,9 @@ const PAD: usize = 2;
 
 impl Mips {
     /// From the bundle's straight-alpha RGBA and grey planes.
-    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize) -> Mips {
+    /// `decode`: a code-to-canvas table applied to the colour and grey bytes as they come in (the bundle's gamma2tanh codes to the gamma 2 values the canvas holds), or none for codes that are canvas values already.
+    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize, decode: Option<&[u8; 256]>) -> Mips {
+        let dec = |c: u8| decode.map_or(c, |t| t[c as usize]);
         let mut total = 0;
         let mut offset = [0usize; 8];
         let mut levels = 0;
@@ -231,7 +256,7 @@ impl Mips {
             for x in 0..size {
                 let i = y * size + x;
                 let a = rgba_in[i * 4 + 3] as u32;
-                let pm = |c: u8| (c as u32 * a + 127) / 255;
+                let pm = |c: u8| (dec(c) as u32 * a + 127) / 255;
                 rgba[at(0, x, y)] = a << 24 | pm(rgba_in[i * 4]) << 16 | pm(rgba_in[i * 4 + 1]) << 8 | pm(rgba_in[i * 4 + 2]);
                 let g = pm(grey_in[i]);
                 grey[at(0, x, y)] = a << 24 | g << 16 | g << 8 | g;

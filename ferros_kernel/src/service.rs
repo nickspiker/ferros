@@ -2198,6 +2198,9 @@ pub fn run(mut b: Boot) -> ! {
                         st.specs += 1;
                         t_pt = cntpct();
                         pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
+                        // The previous transfer's buffer goes first: allocating the new one beside it doubled the peak, and with the store's own copy a 2.2 MB capsule ran the kernel heap out (2026-10-23, the 256-px icon bundle).
+                        pt_inbound = None;
+                        pt_data_buf = alloc::vec::Vec::new();
                         pt_data_buf = alloc::vec![0u8; spec.total as usize];
                         pt_bitmap_buf = alloc::vec![0u64; ferros_pt::transfer::bitmap_words(spec.count)];
                         // SAFETY: pt_data_buf/pt_bitmap_buf outlive pt_inbound (both are replaced only when a new SPEC replaces the transfer).
