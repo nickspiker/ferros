@@ -4,19 +4,23 @@
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
-R=$REPO/target/aarch64-unknown-none/release
+K=$REPO/target/aarch64-unknown-none/release
+# Processes build as EL0 (`cargo el0`, .cargo/config.toml), into their own target directory.
+R=$REPO/target/el0/aarch64-unknown-none/release
 RELOAD=1; SHELL_CLIENT=1
 for a in "$@"; do case $a in --no-reload) RELOAD=0;; --no-shell) SHELL_CLIENT=0;; esac; done
 cd "$REPO" || exit 1
-cargo build -q -p ferros_kernel -p ferros-payload-display -p ferros-payload-shelltest --target aarch64-unknown-none --release || exit 1
-for b in ferros_kernel display shelltest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
+cargo build -q -p ferros_kernel --target aarch64-unknown-none --release || exit 1
+cargo el0 -q -p ferros-payload-display -p ferros-payload-shelltest || exit 1
+aarch64-linux-gnu-objcopy -O binary "$K/ferros_kernel" "$K/ferros_kernel.bin" || exit 1
+for b in display shelltest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
 if lsusb -d 18d1:4ee0 >/dev/null 2>&1; then echo "phone in fastboot: rebooting into ferros"; timeout 30 fastboot reboot >/dev/null 2>&1; fi
 for _ in $(seq 60); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 lsusb -d 1209:4665 >/dev/null 2>&1 || { echo "ferros is not on USB"; exit 1; }
 # Before the reload: the kernel found running says why the previous one left (the flashed kernel only knows PREV_EXIT; the reloaded one also prints the PT record).
 echo "found: $("$B" diag 2>/dev/null | grep -E "^GEN|^PREV_EXIT|^PREV_PT_CMD_CAP|^PREV_ALIVE" | tr '\n' ' ')"
 if [ $RELOAD = 1 ]; then
-    timeout 300 "$B" reload "$R/ferros_kernel.bin" >/dev/null 2>&1
+    timeout 300 "$B" reload "$K/ferros_kernel.bin" >/dev/null 2>&1
     sleep 4
     for _ in $(seq 20); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 fi

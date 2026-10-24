@@ -6,7 +6,8 @@
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
-R=$REPO/target/aarch64-unknown-none/release
+# Processes build as EL0 (`cargo el0`, .cargo/config.toml), into their own target directory.
+R=$REPO/target/el0/aarch64-unknown-none/release
 LOG=$REPO/target/husky-net.log
 KEEP=${1:-600}
 FWDIR=${FWDIR:-/mnt/Harbor/firmware/husky}
@@ -14,7 +15,7 @@ FW=${FW:-$FWDIR/fw_bcmdhd.bin_4398_d0}
 NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}
 CLM=${CLM:-$FWDIR/bcmdhd_clm.blob_4398_d0}
 CRED=${CRED:-/mnt/Harbor/Code/keys/wifi.txt}
-( cd "$REPO" && cargo build -q -p ferros-payload-pcie1 -p ferros-payload-ip -p ferros-payload-nettest --target aarch64-unknown-none --release ) || exit 1
+( cd "$REPO" && cargo el0 -q -p ferros-payload-pcie1 -p ferros-payload-ip -p ferros-payload-nettest ) || exit 1
 for b in pcie1 ip nettest; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
 # MASKED=1: run ip and nettest as sandboxed images (tools/ferros-masked-build.sh; the checker accepted every instruction).
 IPB=$R/ip.bin; NTB=$R/nettest.bin; IPFLAG=; NTFLAG=

@@ -6,7 +6,8 @@
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
-R=$REPO/target/aarch64-unknown-none/release
+# Processes build as EL0 (`cargo el0`, .cargo/config.toml), into their own target directory.
+R=$REPO/target/el0/aarch64-unknown-none/release
 LAST=${1:-03}
 FIRST=${2:-00}
 # Stage 07's blobs (tools/husky-firmware.sh fetches them from the phone, firmware/husky/MANIFEST.md pins them). Chip rev 3 = d0 (dhd_custom_cis.c chip_revs); the NVRAM is the module's (OTP CIS VID → vid_naming_table_4398; V17 = cal_ROW/JP/MMW byte for byte, cal_NA differs only in FTM ranging calibration).
@@ -17,7 +18,7 @@ NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}
 CLM=${CLM:-$FWDIR/bcmdhd_clm.blob_4398_d0}
 # The WiFi credential (never committed, never printed): SSID on the first line, passphrase on the second.
 CRED=${CRED:-/mnt/Harbor/Code/keys/wifi.txt}
-( cd "$REPO" && cargo build -q -p ferros-payload-pcie1 --target aarch64-unknown-none --release && aarch64-linux-gnu-objcopy -O binary "$R/pcie1" "$R/pcie1.bin" ) || exit 1
+( cd "$REPO" && cargo el0 -q -p ferros-payload-pcie1 && aarch64-linux-gnu-objcopy -O binary "$R/pcie1" "$R/pcie1.bin" ) || exit 1
 HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu"
 for s in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
     [[ "$s" < "$FIRST" ]] && continue

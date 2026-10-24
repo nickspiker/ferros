@@ -5,12 +5,12 @@ set -euo pipefail
 REPO=/mnt/Harbor/Code/ferros
 cd "$REPO"
 B=target/debug/ferros-bridge
-R=target/aarch64-unknown-none/release
+R=target/el0/aarch64-unknown-none/release
 [ $# -gt 0 ] || { sed -n '2,4p' "$0"; exit 1; }
 pkgs=(); for n in "$@"; do pkgs+=(-p "ferros-payload-$n"); done
 # The display server embeds the app icons; bring the bundle up to date first.
 [[ " $* " == *" display "* ]] && (cd tools/app-icons && cargo run -q --release -- "$REPO/target/icons" >/dev/null)
-cargo build -q "${pkgs[@]}" --target aarch64-unknown-none --release 2>&1 | grep -E "^error" -A10 && exit 1 || true
+cargo el0 -q "${pkgs[@]}" 2>&1 | grep -E "^error" -A10 && exit 1 || true
 restart=()
 for n in "$@"; do
     aarch64-linux-gnu-objcopy -O binary "$R/$n" "$R/$n.bin"

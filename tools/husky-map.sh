@@ -7,19 +7,23 @@
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
-R=$REPO/target/aarch64-unknown-none/release
+K=$REPO/target/aarch64-unknown-none/release
+# Processes build as EL0 (`cargo el0`, .cargo/config.toml), into their own target directory.
+R=$REPO/target/el0/aarch64-unknown-none/release
 RELOAD=1
 for a in "$@"; do case $a in --no-reload) RELOAD=0;; esac; done
 cd "$REPO" || exit 1
 # The apps' icons, from each app's own codebase, in VSF RGB, bundled into the display server at build time (tools/app-icons).
 (cd tools/app-icons && cargo run -q --release -- "$REPO/target/icons" >/dev/null) || exit 1
-cargo build -q -p ferros_kernel -p ferros-payload-display -p ferros-payload-touch -p ferros-payload-map --target aarch64-unknown-none --release || exit 1
+cargo build -q -p ferros_kernel --target aarch64-unknown-none --release || exit 1
+cargo el0 -q -p ferros-payload-display -p ferros-payload-touch -p ferros-payload-map || exit 1
 cargo build -q --bin ferros-bridge || exit 1
-for b in ferros_kernel display touch map; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
+aarch64-linux-gnu-objcopy -O binary "$K/ferros_kernel" "$K/ferros_kernel.bin" || exit 1
+for b in display touch map; do aarch64-linux-gnu-objcopy -O binary "$R/$b" "$R/$b.bin" || exit 1; done
 for _ in $(seq 60); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 lsusb -d 1209:4665 >/dev/null 2>&1 || { echo "ferros is not on USB (cold ferros on slot b: tools/husky-cold.sh)"; exit 1; }
 if [ $RELOAD = 1 ]; then
-    timeout 300 "$B" reload "$R/ferros_kernel.bin" >/dev/null 2>&1
+    timeout 300 "$B" reload "$K/ferros_kernel.bin" >/dev/null 2>&1
     sleep 4
     for _ in $(seq 20); do lsusb -d 1209:4665 >/dev/null 2>&1 && break; sleep 2; done
 fi
