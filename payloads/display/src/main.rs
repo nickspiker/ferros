@@ -982,49 +982,62 @@ static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4
 /// The 8-bit canvas into the phase frames in `mask` (bit k = phase k), over `r` only (widened to 16-pixel steps): NEON, 16 pixels per step (neon.rs), a row at a time through a cached buffer, then wide copies out. The scalar `publish10` below is the reference.
 // ---------------------------------------------------------------- the publish workers
 //
-// A tall publish is cut into row bands, one per worker core plus the render thread's own (KERNEL.md "Cores": tiled rendering across the workers — the publish is the first pass split this way; the pattern for the effects to come). The workers wait on a job word; the render thread writes the job, wakes them, does band 0 itself, then waits for their count (with a deadline, so a lost worker costs a frame, not the server). Phase frames are non-cacheable and the canvas is inner-shareable: no maintenance between cores.
+// A tall publish is cut into stripes of rows that the render thread and the worker cores take until none are left (KERNEL.md "Cores": tiled rendering across the workers — the publish is the first pass split this way; the pattern for the effects to come). Taken, not dealt: a core that is busy or slow (the A715s run the map and touch, and at 1.07 GHz) simply takes fewer, and nothing waits on a share it was given. The render thread waits until every stripe taken has been finished — never gives up on one, so a phase is never left half written (a 20 ms deadline did that under a pan: the late worker then wrote its stale band over newer content, 2026-10-24). A stripe is claimed by a compare-and-swap on (job, next stripe), so a worker that wakes late for a finished job finds the job number changed and claims nothing. Phase frames are non-cacheable and the canvas is inner-shareable: no maintenance between cores.
 const PUB_WORKERS: usize = 3;
 /// Rows below which one thread does the whole rect (the wake and the wait cost more than a short rect saves).
 const PUB_SPLIT_ROWS: i32 = 64;
-/// Each band's share of the rows, in 256ths: the render thread's X3 first, then each A715 worker. Weighted by the cores' measured rates through the ODT (2026-10-24, PMU on each: the X3 at 2.85 GHz 1.9 ns a pixel, an A715 at its 1.07 GHz 7.4 ns), so the bands finish together. Equal bands (2026-10-23) left the A715s the long pole and the split slower than the X3 alone.
-const PUB_SHARE: [usize; PUB_WORKERS + 1] = [145, 37, 37, 37];
+/// Rows a stripe: small enough that the cores' different rates even out, large enough that claiming is noise.
+const PUB_STRIPE: i32 = 32;
 static PUB_JOB: AtomicU64 = AtomicU64::new(0);
-static PUB_DONE: AtomicU64 = AtomicU64::new(0);
 static PUB_UP: AtomicU64 = AtomicU64::new(0);
-/// The job: canvas base, width, height, phase mask, the rect, the band count.
+/// The current job and its next stripe: job << 32 | stripe.
+static PUB_CLAIM: AtomicU64 = AtomicU64::new(0);
+/// Stripes of the current job finished (job << 32 | count).
+static PUB_FINISHED: AtomicU64 = AtomicU64::new(0);
+/// The job: canvas base, width, height, phase mask, the rect, the stripe count.
 static mut PUB_PARAMS: (usize, usize, usize, u32, draw::Rect, usize) = (0, 0, 0, 0, draw::Rect::EMPTY, 1);
 static mut PUB_TABS: neon::Odt = unsafe { core::mem::zeroed() };
 static mut PUB_STACKS: [[u8; 16384]; PUB_WORKERS] = [[0; 16384]; PUB_WORKERS];
 
-/// Band `i` of `n` of `r`, by rows, in `PUB_SHARE`'s proportions (rescaled when fewer workers are up).
-fn band(r: draw::Rect, i: usize, n: usize) -> draw::Rect {
-    let rows = (r.y1 - r.y0) as usize;
-    let total: usize = PUB_SHARE[..n].iter().sum();
-    let before: usize = PUB_SHARE[..i].iter().sum();
-    draw::Rect { x0: r.x0, y0: r.y0 + (rows * before / total) as i32, x1: r.x1, y1: r.y0 + (rows * (before + PUB_SHARE[i]) / total) as i32 }
-}
-
-extern "C" fn pub_worker(idx: u64) -> ! {
-    PUB_UP.fetch_add(1, Ordering::AcqRel);
-    let mut seen = 0u64;
+/// Take stripes of job `job` until none are left; each one finished is counted. Returns when the job has no stripe left to take (others may still be finishing theirs).
+fn pub_take(job: u64) {
     loop {
-        let seq = PUB_JOB.load(Ordering::Acquire);
-        if seq == seen {
-            ferros_sys::wait(&PUB_JOB, seq, 0);
+        let c = PUB_CLAIM.load(Ordering::Acquire);
+        if c >> 32 != job & 0xFFFF_FFFF {
+            return;
+        }
+        let (base, w, h, mask, r, n) = unsafe { PUB_PARAMS };
+        let i = (c & 0xFFFF_FFFF) as usize;
+        if i >= n {
+            return;
+        }
+        if PUB_CLAIM.compare_exchange(c, c + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             continue;
         }
-        seen = seq;
-        let (base, w, h, mask, r, n) = unsafe { PUB_PARAMS };
-        if (idx as usize) + 1 < n {
-            let back = unsafe { core::slice::from_raw_parts(base as *const u32, w * h) };
-            publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, band(r, idx as usize + 1, n));
-        }
-        PUB_DONE.fetch_add(1, Ordering::AcqRel);
-        ferros_sys::wake(&PUB_DONE, 1);
+        let y0 = r.y0 + i as i32 * PUB_STRIPE;
+        let stripe = draw::Rect { x0: r.x0, y0, x1: r.x1, y1: (y0 + PUB_STRIPE).min(r.y1) };
+        let back = unsafe { core::slice::from_raw_parts(base as *const u32, w * h) };
+        publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
+        PUB_FINISHED.fetch_add(1, Ordering::AcqRel);
+        ferros_sys::wake(&PUB_FINISHED, 1);
     }
 }
 
-/// The canvas through the present stage into the phases `mask` names, over `r`: in bands across the workers when tall, else here.
+extern "C" fn pub_worker(_idx: u64) -> ! {
+    PUB_UP.fetch_add(1, Ordering::AcqRel);
+    let mut seen = 0u64;
+    loop {
+        let job = PUB_JOB.load(Ordering::Acquire);
+        if job == seen {
+            ferros_sys::wait(&PUB_JOB, job, 0);
+            continue;
+        }
+        seen = job;
+        pub_take(job);
+    }
+}
+
+/// The canvas through the present stage into the phases `mask` names, over `r`: in stripes taken by the workers and this thread when tall, else here.
 fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     let r = r.clip(width, height);
     if r.is_empty() {
@@ -1044,20 +1057,24 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask
         fps_dot(mask, width, height);
         return;
     }
-    let n = workers + 1;
+    let n = ((r.y1 - r.y0 + PUB_STRIPE - 1) / PUB_STRIPE) as usize;
+    let job = PUB_JOB.load(Ordering::Acquire) + 1;
     unsafe {
         PUB_TABS = *tabs;
         PUB_PARAMS = (back.as_ptr() as usize, width, height, mask, r, n);
     }
-    let done0 = PUB_DONE.load(Ordering::Acquire);
-    PUB_JOB.fetch_add(1, Ordering::AcqRel);
+    PUB_FINISHED.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+    PUB_CLAIM.store((job & 0xFFFF_FFFF) << 32, Ordering::Release);
+    PUB_JOB.store(job, Ordering::Release);
     ferros_sys::wake(&PUB_JOB, PUB_WORKERS as u64);
-    publish_band(back, width, height, tabs, mask, band(r, 0, n));
-    let deadline = now() + freq() / 50;
-    while PUB_DONE.load(Ordering::Acquire).wrapping_sub(done0) < workers as u64 {
-        if ferros_sys::wait(&PUB_DONE, PUB_DONE.load(Ordering::Acquire), deadline) == 2 {
+    pub_take(job);
+    // Every stripe taken, finished: no deadline — a stripe in a worker's hands is being written, and leaving now would flip to a half-written phase.
+    loop {
+        let f = PUB_FINISHED.load(Ordering::Acquire);
+        if (f & 0xFFFF_FFFF) as usize >= n {
             break;
         }
+        ferros_sys::wait(&PUB_FINISHED, f, now() + freq() / 1000);
     }
     fps_dot(mask, width, height);
 }
@@ -2603,7 +2620,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let next_clean = unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() };
         // Spatial only (preference 4): no flips, so the panel can rest at its idle floor; the phase on the layer already carries a complete spatial dither.
         let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
-        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && now() >= next_flip {
+        // The flip this pass decided at its top, when the clock was drawn into the phase it shows: re-reading the time here flipped, now and then, to a phase whose clock had not been drawn (its edge 400 ms behind, 2026-10-24).
+        if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due {
             next_flip = now() + freq() / 10;
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
