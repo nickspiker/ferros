@@ -1767,7 +1767,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
                                 let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
                                 let unit = text_width(&font, t, 100.0).max(1.0);
-                                let px = (room / unit * 100.0).clamp(8.0, 256.0);
+                                // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
+                                let px = room / unit * 100.0;
                                 // The digits turn with the face (and, once the accelerometer is in, with gravity).
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
                                 let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
@@ -1789,7 +1790,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         // Zoom is semantic: a name appears only once the circle is big enough to read it.
                         if sr >= 36 << 8 && cir.len > 0 {
                             if let Ok(t) = core::str::from_utf8(&cir.label[..cir.len as usize]) {
-                                let px = ((sr >> 8) as f32 * 0.32).clamp(12.0, 72.0);
+                                // A third of the radius, at every zoom (no cap: it stopped at 72 px; the 36-px threshold above is when a name appears at all).
+                                let px = (sr >> 8) as f32 * 0.32;
                                 let tw = text_width(&font, t, px);
                                 let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
                                 let mut c = Canvas::new(pixels, width, height, &mut damage);

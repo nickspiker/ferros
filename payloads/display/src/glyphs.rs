@@ -62,13 +62,16 @@ impl Glyphs {
         let (cm, gm) = (self.font.charmap(), self.font.glyph_metrics(&[]).scale(px));
         let mut ctx: Option<ScaleContext> = None;
         let (mut pen_x, mut pen_y, mut adv_total) = (x, y, 0.0f32);
-        let size_q = (px * 4.0) as u64 & 0xFFF;
+        // The key: valid (bit 63), size in quarter pixels (16 bits, 47-62: to 16383 px), glyph (16 bits, 31-46), turn (16 bits, 15-30), the pen's quarter-pixel phase (4 bits, 11-14).
+        let size_q = (px * 4.0) as u64 & 0xFFFF;
         let turn_q = ((((tc * 127.0) as i64) & 0xFF) << 8 | (((ts * 127.0) as i64) & 0xFF)) as u64;
         for ch in text.chars() {
             let gid = cm.map(ch);
             let (ix, iy) = (floor(pen_x), floor(pen_y));
             let (fx, fy) = (((pen_x - ix) * 4.0) as u64 & 3, ((pen_y - iy) * 4.0) as u64 & 3);
-            let key = 1 << 63 | (gid as u64) << 32 | size_q << 20 | turn_q << 4 | fx << 2 | fy;
+            let key = 1 << 63 | size_q << 47 | (gid as u64) << 31 | turn_q << 15 | fx << 13 | fy << 11;
+            // A glyph too big for the cache (over a quarter of it) is drawn straight from its rendering: (left, top, w, h, coverage).
+            let mut big: Option<(i32, i32, u32, u32, alloc::vec::Vec<u8>)> = None;
             let e = match self.lookup(key) {
                 Some(e) => e,
                 None => {
@@ -79,17 +82,28 @@ impl Glyphs {
                     let tf = Transform::new(tc, -ts, ts, tc, 0.0, 0.0);
                     let offset = Vector::new(fx as f32 * 0.25, -(fy as f32) * 0.25);
                     match Render::new(&[Source::Outline]).format(Format::Alpha).offset(offset).transform(Some(tf)).render(&mut scaler, gid) {
-                        Some(img) => self.insert(key, img.placement.left, img.placement.top, img.placement.width, img.placement.height, &img.data),
+                        Some(img) => {
+                            let (l, t, w, h) = (img.placement.left, img.placement.top, img.placement.width, img.placement.height);
+                            if (w * h) as usize > ARENA / 4 {
+                                big = Some((l, t, w, h, img.data));
+                                EMPTY
+                            } else {
+                                self.insert(key, l, t, w, h, &img.data)
+                            }
+                        }
                         None => EMPTY,
                     }
                 }
             };
-            // The glyph's pixel (left, −top) from the pen's whole pixel.
-            let (gx, gy) = (ix as i64 + e.left as i64, iy as i64 - e.top as i64);
-            let (gw, gh) = (e.w as usize, e.h as usize);
+            // The glyph's pixel (left, −top) from the pen's whole pixel; its coverage from the cache, or from its own rendering when it is too big to keep.
+            let (left, top, gw, gh, cov): (i64, i64, usize, usize, &[u8]) = match &big {
+                Some((l, t, w, h, d)) => (*l as i64, *t as i64, *w as usize, *h as usize, &d[..]),
+                None => (e.left as i64, e.top as i64, e.w as usize, e.h as usize, &self.arena[e.off as usize..e.off as usize + e.w as usize * e.h as usize]),
+            };
+            let (gx, gy) = (ix as i64 + left, iy as i64 - top);
             for row in 0..gh {
                 for col in 0..gw {
-                    let a = self.arena[e.off as usize + row * gw + col] as u32;
+                    let a = cov[row * gw + col] as u32;
                     if a != 0 {
                         put(gx + col as i64, gy + row as i64, a);
                     }
