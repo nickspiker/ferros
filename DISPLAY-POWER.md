@@ -46,6 +46,24 @@ The number is the **whole phone**: SoC with one core spinning in the EL2 service
 - **AOD is the floor of the display: 2.12 W whole-phone on black** — 1.1 W under 120 Hz black at 140 nits, and 0.3 W under black at 2 nits. With the SoC still spinning a core, that 2.12 W is almost all SoC + USB; the AOD panel itself is in the low hundreds of milliwatts, and white AOD content costs 0.5 W over black (at its 853-DBV brightness). The AOD figure that matters for battery life needs the core asleep — see below.
 - **The TE pin at the idle floors read 120 Hz in this sweep because the TE was fixed**: `display idle … changeable` switches the panel to changeable TE only for its own measurement (it saw 28 / 8 Hz at the 30 / 10 Hz floors) and puts fixed TE back, as Android runs; the panel keeps idling underneath, which is what the power shows. Not a hardware question.
 
+## The temporal dither and the idle floor, under the display server (2026-10-24)
+
+The display server flips the layer between its four dither phase frames every 100 ms at rest (DISPLAY-CALIB.md, the present stage), with the panel's 10 Hz auto-rate floor set and TE fixed at 120 Hz. Measured whole-phone, screen **on**, the map at rest at full brightness (HBM), 16 samples over 4 s per row, four visits each (`device.dither` 0/1 for flips on/off; `bridge display idle 10|0` for the floor):
+
+| state | readings | typical |
+|---|---|---|
+| flips on, floor 10 Hz (the default) | 2.99, 3.01, 3.04, (3.69) | **3.03 W** |
+| flips off, floor 10 Hz | 3.06, 3.03, 3.04, 3.06 | **3.05 W** |
+| flips off, held at 120 Hz | 3.32, 3.30, 3.28, 3.30 | **3.30 W** |
+| flips on, held at 120 Hz | 3.30, 3.66, 3.68, 3.68 | **3.67 W** |
+
+- **With the floor set, the flips are free.** With changeable TE for the reading, the panel stood still with the flips off and ran at ~24 Hz with them on: it idles between flips, not at 120. The "~0.2 W" the code once quoted was an estimate, never measured.
+- **The floor is worth ~0.26 W** here (held at 120 against the floor, no flips).
+- **Flips at a held 120 Hz cost 0.37 W more** — the combination to avoid.
+- The one high reading in the first row came right after the floor was switched back on from 120 through the kernel's bench path while flips ran; after real bursts of frames (a map restart, three times) the draw was back at ~3.0 W within 4 s.
+- An earlier set of readings that showed no difference anywhere was taken with the screen **off** (the owner had turned it off): the server neither flips nor publishes then. Check the console's `screen on` before a display power row.
+- So partial updates (only the rows with content per flip) would save nothing measurable on top of this; the dither costs nothing as configured.
+
 ## Still to measure
 
 - The SoC's own floor: the same rows with the core in WFI instead of spinning, once the service loop sleeps between PT packets; then the absolute numbers mean something as battery life.

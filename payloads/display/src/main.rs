@@ -871,6 +871,23 @@ fn phase_slice(k: usize, n: usize) -> &'static mut [u32] {
     unsafe { core::slice::from_raw_parts_mut(PHASE_BASE[k] as *mut u32, n) }
 }
 
+/// FERROS_FPS_DOT=1 (dev builds): the centre pixel of each phase frame stamped red, green, blue, black for phases 0-3 after every publish into it, so the dot cycles R G B K at whatever rate the layer flips (10 Hz at rest, the frame rate under a finger) and a stall shows as a stuck colour. Absent from other builds.
+const FPS_DOT: bool = option_env!("FERROS_FPS_DOT").is_some();
+/// The four colours as BGRA1010102 words (B[31:22] G[21:12] R[11:2] A[1:0]).
+const FPS_DOT_WORDS: [u32; PHASES] = [0x3FF << 2 | 3, 0x3FF << 12 | 3, 0x3FF << 22 | 3, 3];
+
+/// The dev dot into the phases in `mask` (bit k = phase k), when built in.
+#[inline(always)]
+fn fps_dot(mask: u32, width: usize, height: usize) {
+    if FPS_DOT {
+        for k in 0..PHASES {
+            if mask >> k & 1 == 1 {
+                phase_slice(k, width * height)[height / 2 * width + width / 2] = FPS_DOT_WORDS[k];
+            }
+        }
+    }
+}
+
 /// What each phase frame has not yet been given of the current content, as one rectangle (empty = current): a present writes only the phase on the layer (all four took 71 ms a frame, 2026-10-22) and adds what it changed to the others' rectangles; the idle loop brings the others up to date one at a time; the flip only moves to a phase that is current.
 static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 }; PHASES];
 
@@ -928,6 +945,7 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask
     let workers = PUB_UP.load(Ordering::Acquire) as usize;
     if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 {
         publish_band(back, width, height, tabs, mask, r);
+        fps_dot(mask, width, height);
         return;
     }
     let n = workers + 1;
@@ -945,6 +963,7 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask
             break;
         }
     }
+    fps_dot(mask, width, height);
 }
 
 fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
@@ -1131,6 +1150,7 @@ fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: 
         }
         dst[y * width + r.x0 as usize..y * width + r.x1 as usize].copy_from_slice(&row[r.x0 as usize..r.x1 as usize]);
     }
+    fps_dot(1 << k, width, height);
 }
 
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
@@ -2306,7 +2326,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         // Asleep until the next poll or the next tick, whichever is first; the service loop has the CPU meanwhile. A sixteenth of a second at rest — a client waits at most that long — but a hundred-and-twentieth for two seconds after the map moves its camera, since a 62 ms wait per call caps a pinch at sixteen frames a second.
-        // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). The panel then never rests at its idle floor; the owner chose the bits over the ~0.2 W (2026-10-22).
+        // The temporal dither: the next phase frame on the layer every 100 ms, once a client owns the surface (the frames are only written by its presents). Measured 2026-10-24 with the screen on (DISPLAY-POWER.md): with the 10 Hz floor set the flips cost nothing (3.03 W against 3.05 without them) — the panel idles at its floor between them; held at 120 Hz they would cost 0.37 W.
         // A frame armed by the last camera op: masked again once it has started.
         pipe.settle(&mut armed, false);
         // Brightness (preference 3): a new white, so a new table and panel setting, and every pixel published again from the back buffer as it stands.
