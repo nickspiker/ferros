@@ -20,6 +20,11 @@ pub fn set_tz(secs: i64) {
     TZ.store(secs, Ordering::Relaxed);
     crate::process::set_wall(BASE.load(Ordering::Relaxed), secs);
 }
+/// The same with the kernel lock held (the store command runs under it).
+pub fn set_tz_held(secs: i64) {
+    TZ.store(secs, Ordering::Relaxed);
+    crate::process::set_wall_held(BASE.load(Ordering::Relaxed), secs);
+}
 
 /// The RTC's fields: (year, month 1-12, day 1-31, hour, minute, second).
 pub fn read() -> Result<(u32, u32, u32, u32, u32, u32), u32> {

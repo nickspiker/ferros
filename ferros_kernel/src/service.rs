@@ -191,20 +191,20 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 Ok(h) => {
                     // A preference set from the bridge applies at once, as one set from the device does (SYS_SET_PREF): every live process sees it on its next frame.
                     if key == "device.base" && len == 1 && tatau::Base::from_code(params[2 + klen]).is_some() {
-                        crate::process::set_pref(crate::process::PREF_BASE, params[2 + klen]);
+                        crate::process::set_pref_held(crate::process::PREF_BASE, params[2 + klen]);
                     }
                     if key == "device.labels" && len == 1 && params[2 + klen] <= 1 {
-                        crate::process::set_pref(crate::process::PREF_LABELS, params[2 + klen]);
+                        crate::process::set_pref_held(crate::process::PREF_LABELS, params[2 + klen]);
                     }
                     if key == "device.brightness" && len == 1 && params[2 + klen] <= 8 {
-                        crate::process::set_pref(crate::process::PREF_BRIGHTNESS, params[2 + klen]);
+                        crate::process::set_pref_held(crate::process::PREF_BRIGHTNESS, params[2 + klen]);
                     }
                     if key == "device.tz" && len == 4 {
                         let b = &params[2 + klen..2 + klen + 4];
-                        crate::rtc::set_tz(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64);
+                        crate::rtc::set_tz_held(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64);
                     }
                     if key == "device.dither" && len == 1 && params[2 + klen] <= 1 {
-                        crate::process::set_pref(crate::process::PREF_DITHER, params[2 + klen]);
+                        crate::process::set_pref_held(crate::process::PREF_DITHER, params[2 + klen]);
                     }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
@@ -368,7 +368,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
 
 /// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
 fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Vec<u8>) {
-    let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+    // Vault reads under the kernel lock (the vault's one owner at a time); the spawns below take it themselves.
+    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
         let Some(grants) = shell_grants(name) else {
             rep.extend_from_slice(b"not a shell process: ");
@@ -377,7 +378,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             continue;
         };
         let killed = crate::process::kill(name);
-        let Some(capsule) = store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten()) else {
+        let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
             rep.push(b'\n');
@@ -484,7 +485,7 @@ fn gauge_poll() {
                 Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
                 Err(_) => [crate::process::FACT_UNKNOWN; 4],
             };
-            if let Some(keys) = (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok()) {
+            if let Some(keys) = crate::process::with_lock(|| (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok())) {
                 VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -1697,7 +1698,8 @@ pub fn run(mut b: Boot) -> ! {
                                         resp.extend_from_slice(b"END\n");
                                         queue_pt_response(&mut pt_out_data, &resp);
                                     } else if cmd.cap == cap_store {
-                                        let resp = store_command(store.as_mut(), cmd.op, cmd.params);
+                                        // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
+                                        let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
                                         queue_pt_response(&mut pt_out_data, &resp);
                                     } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
                                         // A leading G#01 byte = hold (bridge `display --hold`); G#02 = a DSI packet script for the panel (dsim::sequence, bridge `display dcs`); G#03 = dump the DSIM link registers (bridge `display dsim`). Anything else is text for the painter.

@@ -680,6 +680,30 @@ fn write_pref_all(index: usize, value: u8) {
     }
 }
 
+/// Run `f` with the kernel lock held — the service loop's way into the vault, which is part of the kernel's locked state (syscalls reach it with the lock held; KERNEL.md "Cores"). Inside `f`, only the `_held` variants of lock-taking functions.
+pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
+    lock();
+    let r = f();
+    unlock();
+    r
+}
+
+/// `set_pref` for a caller already holding the kernel lock (a syscall, or `with_lock`).
+pub fn set_pref_held(index: usize, value: u8) {
+    set_pref_locked(index, value)
+}
+
+/// `set_wall` for a caller already holding the kernel lock.
+pub fn set_wall_held(base: u64, tz: i64) {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&base.to_le_bytes());
+    b[8..].copy_from_slice(&tz.to_le_bytes());
+    unsafe { (&mut *(&raw mut PREFS_NOW))[PREF_WALL..PREF_WALL + 16].copy_from_slice(&b) };
+    for p in k().procs.iter().flatten() {
+        p.write((PREFS + PREF_WALL) as u64, &b);
+    }
+}
+
 /// `set_pref` for the syscall path, where the lock is held.
 fn set_pref_locked(index: usize, value: u8) {
     if index >= 32 {
