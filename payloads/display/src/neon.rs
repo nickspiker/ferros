@@ -51,9 +51,9 @@ unsafe fn channel(tabs: &Tables, ch: usize, v: uint8x16_t, th: uint8x16_t) -> ui
     }
 }
 
-/// 16 pixels of canvas (`src`) to 16 words (`dst`), with this row's threshold vector for the phase.
+/// 16 pixels of canvas (`src`) to 16 words (`dst`), with this row's threshold vector for the phase. Returns the lanes that are not grey (bit i = pixel i), whose words the caller writes again through the ODT: the channel tables are right only where R = G = B.
 #[inline(always)]
-pub unsafe fn sixteen(tabs: &Tables, src: *const u32, dst: *mut u32, th: uint8x16_t) {
+pub unsafe fn sixteen(tabs: &Tables, src: *const u32, dst: *mut u32, th: uint8x16_t) -> u32 {
     unsafe {
         // Pixels are G#AARRGGBB little-endian: bytes B, G, R, A.
         let p = vld4q_u8(src as *const u8);
@@ -63,7 +63,7 @@ pub unsafe fn sixteen(tabs: &Tables, src: *const u32, dst: *mut u32, th: uint8x1
             for i in 0..4 {
                 vst1q_u32(dst.add(4 * i), k);
             }
-            return;
+            return 0;
         }
         let (rc, gc, bc) = (channel(tabs, 0, r, th), channel(tabs, 1, g, th), channel(tabs, 2, b, th));
         // Widen each code byte to a word and place it: blue at 24, green at 14, red at 4, alpha bits 3.
@@ -78,6 +78,19 @@ pub unsafe fn sixteen(tabs: &Tables, src: *const u32, dst: *mut u32, th: uint8x1
             let w = vorrq_u32(vorrq_u32(vshlq_n_u32::<24>(bw[i]), vshlq_n_u32::<14>(gw[i])), vorrq_u32(vshlq_n_u32::<4>(rw[i]), three));
             vst1q_u32(dst.add(4 * i), w);
         }
+        let grey = vandq_u8(vceqq_u8(r, g), vceqq_u8(g, b));
+        if vminvq_u8(grey) == 0xFF {
+            return 0;
+        }
+        let mut lanes = [0u8; 16];
+        vst1q_u8(lanes.as_mut_ptr(), grey);
+        let mut m = 0u32;
+        for (i, l) in lanes.iter().enumerate() {
+            if *l == 0 {
+                m |= 1 << i;
+            }
+        }
+        m
     }
 }
 

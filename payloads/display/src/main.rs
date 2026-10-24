@@ -694,6 +694,90 @@ const E_LIGHT: f32 = 0.801;
 /// The panel's measured power law (γ 2.19 in 8- and 10-bit codes, to 10-bit code 8; DISPLAY-CALIB.md).
 const PANEL_GAMMA: f32 = 2.19;
 
+/// The ODT, VSF RGB → panel linear RGB (`tools/panel-white-e.py`, the DBV 3307 readings): the panel's three primaries from the profile's spectra under VSF's observer, the matrix they make inverted; rows are panel R, G, B, columns VSF R, G, B. Absolute (E in is E on the glass), so its row sums are E's gains above: a grey gets exactly the gains, which is why greys keep the one-table path and only colour comes through `odt`. Model tier, from one unit (pixel 8 pro calibration data/README.md).
+const ODT: [[f32; 3]; 3] = [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]];
+const E_GAIN: [f32; 3] = [ODT[0][0] + ODT[0][1] + ODT[0][2], ODT[1][0] + ODT[1][1] + ODT[1][2], ODT[2][0] + ODT[2][1] + ODT[2][2]];
+/// Photopic luminance on VSF RGB (vsf's LMS2PHOTOPIC through VSF_RGB2LMS): sums to 1, so E at light v has luminance v.
+const LUM: [f32; 3] = [0.258390, 0.634615, 0.106995];
+
+/// The output table's reach: light from 2^-28 of the peak (below every white's darkest dithered step) to the peak, 1024 entries an octave.
+const CODE_OCTAVES: usize = 28;
+
+/// The colour path's two tables. `lin`: a 16-bit working value to its light after the roll-off, a fraction of the E peak, tanh²(a·v) — the table's first half, before the panel's 1/2.19. `lin8`: the same at the 8-bit canvas's 256 values. `code`: panel-linear light to its Q4 10-bit code, (light)^(1/2.19), indexed by the f32's exponent and top ten mantissa bits and interpolated on the rest (no square root: `fsqrt` returns 0 in this process, see `sqrt`).
+static mut LIN: &[f32] = &[];
+static mut LIN8: [f32; 256] = [0.0; 256];
+static mut CODE: &[u16] = &[];
+
+/// `lin` and `lin8` for a white and peak, as `build_lut` (the same `a`).
+fn build_lin(lin: &mut [f32], lin8: &mut [f32; 256], white: f32, peak_e: f32) {
+    let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
+    for (i, e) in lin.iter_mut().enumerate() {
+        let y = tanh(i as f32 / 16384.0 * k);
+        *e = y * y;
+    }
+    for (c, e) in lin8.iter_mut().enumerate() {
+        *e = lin[c * 16384 / 255];
+    }
+}
+
+/// `code`, once: entry i is light 2^(i/1024 − 28) on the octave's mantissa grid.
+fn build_code(code: &mut [u16]) {
+    for (i, e) in code.iter_mut().enumerate() {
+        let v = f32::from_bits(((127 - CODE_OCTAVES as u32) << 23) + ((i as u32) << 13));
+        let q = pow(v, 1.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
+        *e = if q > 16368.0 { 16368 } else { q as u16 };
+    }
+}
+
+/// Panel-linear light (0..1 of the channel's native peak) to its Q4 10-bit code.
+#[inline(always)]
+fn code_of(code: &[u16], v: f32) -> u32 {
+    if v >= 1.0 {
+        return code[CODE_OCTAVES << 10] as u32;
+    }
+    let b = v.to_bits();
+    let lo = (127 - CODE_OCTAVES as u32) << 23;
+    if v <= 0.0 || b < lo {
+        return 0;
+    }
+    let i = ((b - lo) >> 13) as usize;
+    let f = b & 0x1FFF;
+    let (a, c) = (code[i] as u32, code[i + 1] as u32);
+    a + ((c - a) * f >> 13)
+}
+
+/// A colour (VSF RGB light after the roll-off, fractions of the E peak) to its three Q4 panel codes: the ODT, then the gamut (owner, DISPLAY-CALIB.md "Decided"): a colour the panel cannot show moves along its line to E — the grey of its own luminance — to the most saturated point on that line the panel reaches. The roll-off keeps every VSF channel under the peak, so that grey is always inside and the line always has a point.
+#[inline(always)]
+fn odt(code: &[u16], l: [f32; 3]) -> [u32; 3] {
+    let mut p = [0.0f32; 3];
+    for (r, e) in p.iter_mut().enumerate() {
+        *e = ODT[r][0] * l[0] + ODT[r][1] * l[1] + ODT[r][2] * l[2];
+    }
+    if p[0] < 0.0 || p[1] < 0.0 || p[2] < 0.0 || p[0] > 1.0 || p[1] > 1.0 || p[2] > 1.0 {
+        let y = LUM[0] * l[0] + LUM[1] * l[1] + LUM[2] * l[2];
+        let mut t = 1.0f32;
+        for c in 0..3 {
+            let q = y * E_GAIN[c];
+            if p[c] < 0.0 {
+                t = t.min(q / (q - p[c]));
+            } else if p[c] > 1.0 {
+                t = t.min((1.0 - q) / (p[c] - q));
+            }
+        }
+        for c in 0..3 {
+            let q = y * E_GAIN[c];
+            p[c] = q + t * (p[c] - q);
+        }
+    }
+    [code_of(code, p[0]), code_of(code, p[1]), code_of(code, p[2])]
+}
+
+/// One 8-bit canvas pixel's colour codes (non-grey; greys take the channel tables).
+#[inline(always)]
+fn odt8(p: u32) -> [u32; 3] {
+    unsafe { odt(CODE, [LIN8[(p >> 16 & 0xFF) as usize], LIN8[(p >> 8 & 0xFF) as usize], LIN8[(p & 0xFF) as usize]]) }
+}
+
 /// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
 fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
     let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
@@ -864,7 +948,16 @@ fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, 
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
-                    neon::sixteen(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    let colour = neon::sixteen(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    // The lanes that are not grey: the ODT, one pixel at a time.
+                    let mut m = colour;
+                    while m != 0 {
+                        let i = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let q = odt8(*src.add(x + i));
+                        let t = th[i] as u32;
+                        *row.as_mut_ptr().add(x + i) = pack10(dither8(q[0], t), dither8(q[1], t), dither8(q[2], t));
+                    }
                     x += 16;
                 }
             }
@@ -1003,11 +1096,14 @@ fn publish_app(f: draw::Rect, r: draw::Rect, lut: &[u16], k: usize, width: usize
             } else {
                 let p = surf[(y - f.y0 as usize) * fw + (x - f.x0 as usize)];
                 let th = if p >> 48 & 1 == 1 { 0 } else { threshold(x, y, k) };
-                let q = |ch: usize| {
-                    let v = (p >> (16 * ch) & 0xFFFF) as usize;
-                    dither8(lut[v] as u32 * E_CODE_Q15[ch] >> 15, th)
+                let (r, g, b) = ((p & 0xFFFF) as usize, (p >> 16 & 0xFFFF) as usize, (p >> 32 & 0xFFFF) as usize);
+                let q4 = if r == g && g == b {
+                    let base = lut[r] as u32;
+                    [base * E_CODE_Q15[0] >> 15, base * E_CODE_Q15[1] >> 15, base * E_CODE_Q15[2] >> 15]
+                } else {
+                    unsafe { odt(CODE, [LIN[r], LIN[g], LIN[b]]) }
                 };
-                pack10(q(0), q(1), q(2))
+                pack10(dither8(q4[0], th), dither8(q4[1], th), dither8(q4[2], th))
             };
         }
         dst[y * width + r.x0 as usize..y * width + r.x1 as usize].copy_from_slice(&row[r.x0 as usize..r.x1 as usize]);
@@ -1037,8 +1133,14 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256];
                 continue;
             }
             let t = bay[x & 3] as u32 * 4;
-            let q = |ch: usize, c: u32| dither8(lut8[ch][c as usize] as u32, t);
-            *d = pack10(q(0, p >> 16 & 0xFF), q(1, p >> 8 & 0xFF), q(2, p & 0xFF));
+            let (r, g, b) = (p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF);
+            *d = if r == g && g == b {
+                let q = |ch: usize, c: u32| dither8(lut8[ch][c as usize] as u32, t);
+                pack10(q(0, r), q(1, g), q(2, b))
+            } else {
+                let q = odt8(p);
+                pack10(dither8(q[0], t), dither8(q[1], t), dither8(q[2], t))
+            };
         }
         dst.copy_from_slice(out);
     }
@@ -1328,6 +1430,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
+    // The colour path's tables (`odt`).
+    let lin: &'static mut [f32] = alloc::vec![0f32; 65536].leak();
+    let code: &'static mut [u16] = alloc::vec![0u16; (CODE_OCTAVES << 10) + 1].leak();
+    build_code(code);
+    unsafe {
+        build_lin(lin, &mut *(&raw mut LIN8), white0, peak0);
+        LIN = &*(lin as *const [f32]);
+        CODE = code;
+    }
     // The 8-bit canvas's tables, one per channel with E's gain on the code already in.
     let mut lut8 = [[0u16; 256]; 3];
     let rebuild8 = |lut: &[u16], lut8: &mut [[u16; 256]; 3]| {
@@ -2175,6 +2286,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
             build_lut(lut, white, peak_e);
+            unsafe { build_lin(lin, &mut *(&raw mut LIN8), white, peak_e) };
             rebuild8(lut, &mut lut8);
             tabs = neon::Tables::from_lut8(&lut8);
             // The panel's own setting, by the panel thread.

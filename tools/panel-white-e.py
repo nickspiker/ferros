@@ -99,3 +99,7 @@ for row in O:
 print("the panel's primaries in VSF RGB (columns: panel R, G, B at full code, E-scaled):")
 for row in inv(O):
     print("  " + "  ".join(f"{x:+.4f}" for x in row))
+print("photopic luminance on VSF RGB (sums to 1): " + " ".join(f"{x:.6f}" for x in photopic))
+print("for payloads/display (ODT rows, LUM):")
+print("  [" + ", ".join("[" + ", ".join(f"{x:.6f}" for x in row) + "]" for row in O) + "]")
+print("  [" + ", ".join(f"{x:.6f}" for x in photopic) + "]")
