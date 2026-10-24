@@ -221,17 +221,18 @@ pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
     Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
 }
 
-/// One ring of the clock face: how far round it is (Q16 of a turn, clockwise from 12:00), which way this period goes (false: medium grey sweeps in over the dark; true: the dark sweeps back in over the grey — the ring alternates every time it wraps), and its tick count.
+/// One ring of the clock face: how far round it is (Q16 of a turn, clockwise from 12:00; the sweep clicks back to dark when it wraps), whether its fill is the lighter grey (the hour ring after noon), and its tick count.
 #[derive(Clone, Copy)]
 pub struct Ring {
     pub frac_q16: u32,
-    pub dark_sweep: bool,
+    pub lighter: bool,
     pub ticks: usize,
 }
 
 /// The clock's colours: the face, the swept fill, the strokes between the rings, the ticks.
 pub const CLOCK_FACE: u32 = 0x00_2A_2A_2A;
 pub const CLOCK_FILL: u32 = 0x00_70_70_70;
+pub const CLOCK_FILL_PM: u32 = 0x00_9C_9C_9C;
 pub const CLOCK_STROKE: u32 = 0;
 pub const CLOCK_TICK: u32 = 0x00_FF_FF_FF;
 /// The face's bands from the outside in, in 256ths of the radius: outer ring, stroke, middle ring, stroke, inner ring, stroke, then the centre (where the time is written, by the caller).
@@ -245,36 +246,69 @@ fn mix(a: u32, b: u32, c: i64) -> u32 {
 }
 
 /// The clock face (the map's clock circle) at (cx, cy), radius r, Q8 pixels: three rings, each a sweep from 12:00 in the fill colour over the face colour, separated by black strokes, with white ticks; under what is there (the caller writes the time in the centre first). All squared distances and cross products — no root, no angle: a pixel is inside a sweep of angle θ when it is anticlockwise of θ's direction (one cross product), on the right half for θ ≤ ½ turn, either for more. `dirs[k]` is the unit direction (sin, −cos) of k/60 of a turn, Q14. Returns the rectangle it touched.
-pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, rings: &[Ring; 3], dirs: &[(i64, i64); 60]) -> Rect {
+/// `(tc, ts)`: the face's turn, Q14 (the circle's own turn on top of the camera's): ticks, sweeps and the zero mark turn with it.
+pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, rings: &[Ring; 3], dirs: &[(i64, i64); 60], tc: i64, ts: i64) -> Rect {
     if r < 2048 {
         return Rect::EMPTY;
     }
     let (w, h) = (width as i64, height as i64);
     let rad: [i64; 7] = core::array::from_fn(|i| r * BANDS[i] >> 8);
-    // Ticks first (front to back: what is drawn first stays on top): radial 1-pixel lines across each ring, inset a pixel at both ends.
+    // A face direction to the screen: turned by (tc, ts).
+    let turn = |(ux, uy): (i64, i64)| ((ux * tc - uy * ts) >> 14, (ux * ts + uy * tc) >> 14);
+    // The tick segments: each ring's ticks across it, and the zero mark at the top of the centre — (direction, inner radius, outer radius).
+    let mut segs: [((i64, i64), i64, i64); 140] = [((0, 0), 0, 0); 140];
+    let mut nseg = 0;
     for (ri, ring) in rings.iter().enumerate() {
-        let (r_out, r_in) = (rad[2 * ri] - 256, rad[2 * ri + 1] + 256);
         let n = ring.ticks.max(1);
         for k in 0..n {
-            let (ux, uy) = dirs[(k * 60 / n) % 60];
+            if nseg < segs.len() {
+                segs[nseg] = (turn(dirs[(k * 60 / n) % 60]), rad[2 * ri + 1] + 256, rad[2 * ri] - 256);
+                nseg += 1;
+            }
+        }
+    }
+    // The zero mark: from 70 % of the centre's radius to a pixel inside its edge, on the face's 12:00.
+    segs[nseg] = (turn(dirs[0]), rad[6] * 7 / 10, rad[6] - 256);
+    nseg += 1;
+    // Ticks first (front to back: what is drawn first stays on top): radial 1-pixel lines across each ring, inset a pixel at both ends.
+    for &((ux, uy), r_in, r_out) in &segs[..nseg] {
+        {
             let (ex, ey) = (cx + (ux * r_out >> 14), cy + (uy * r_out >> 14));
             let (sx, sy) = (cx + (ux * r_in >> 14), cy + (uy * r_in >> 14));
-            let (x0, x1) = ((sx.min(ex) >> 8) - 1, (sx.max(ex) >> 8) + 1);
-            let (y0, y1) = ((sy.min(ey) >> 8) - 1, (sy.max(ey) >> 8) + 1);
-            for y in y0.max(0)..=y1.min(h - 1) {
-                for x in x0.max(0)..=x1.min(w - 1) {
-                    let (dx, dy) = ((x << 8) + 128 - cx, (y << 8) + 128 - cy);
-                    let along = (dx * ux + dy * uy) >> 14;
-                    if along < r_in || along > r_out {
-                        continue;
+            // Along the tick's own length, a pixel at a time on its major axis, touching the three pixels across it: a box around a diagonal tick is its length squared, a million pixels a tick when zoomed in.
+            let mut touch = |x: i64, y: i64| {
+                if x < 0 || y < 0 || x >= w || y >= h {
+                    return;
+                }
+                let (dx, dy) = ((x << 8) + 128 - cx, (y << 8) + 128 - cy);
+                let along = (dx * ux + dy * uy) >> 14;
+                if along < r_in || along > r_out {
+                    return;
+                }
+                let perp = ((ux * dy - uy * dx) >> 14).abs();
+                let cov = 256 - perp;
+                if cov <= 0 {
+                    return;
+                }
+                let p = &mut px[y as usize * width + x as usize];
+                *p = under(*p, at_coverage(CLOCK_TICK, cov.min(255) as u32));
+            };
+            let (ldx, ldy) = (ex - sx, ey - sy);
+            if ldx.abs() >= ldy.abs() {
+                let (a, b) = ((sx.min(ex) >> 8).max(0), (sx.max(ex) >> 8).min(w - 1));
+                for x in a..=b {
+                    let yc = if ldx == 0 { sy } else { sy + (((x << 8) + 128 - sx) * ldy) / ldx };
+                    for y in (yc >> 8) - 1..=(yc >> 8) + 1 {
+                        touch(x, y);
                     }
-                    let perp = ((ux * dy - uy * dx) >> 14).abs();
-                    let cov = 256 - perp;
-                    if cov <= 0 {
-                        continue;
+                }
+            } else {
+                let (a, b) = ((sy.min(ey) >> 8).max(0), (sy.max(ey) >> 8).min(h - 1));
+                for y in a..=b {
+                    let xc = sx + (((y << 8) + 128 - sy) * ldx) / ldy;
+                    for x in (xc >> 8) - 1..=(xc >> 8) + 1 {
+                        touch(x, y);
                     }
-                    let p = &mut px[y as usize * width + x as usize];
-                    *p = under(*p, at_coverage(CLOCK_TICK, cov.min(255) as u32));
                 }
             }
         }
@@ -290,11 +324,13 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
     let full: [bool; 3] = core::array::from_fn(|i| rings[i].frac_q16 >= 1 << 16);
     // A ring's colour at a pixel: the sweep's coverage (antialiased on its leading edge and along 12:00), fill or face by the period's direction.
     let ring_colour = |i: usize, dx: i64, dy: i64| -> u32 {
+        // Into the face's own frame (the turn undone), where 12:00 is up.
+        let (dx, dy) = ((dx * tc + dy * ts) >> 14, (dy * tc - dx * ts) >> 14);
         let (bx, by, past_half) = bound[i];
         let cov_x = (dx + 128).clamp(0, 256);
         let cov_line = (-((bx * dy - by * dx) >> 14) + 128).clamp(0, 256);
         let swept = if full[i] { 256 } else if rings[i].frac_q16 == 0 { 0 } else if past_half { cov_x.max(cov_line) } else { cov_x.min(cov_line) };
-        if rings[i].dark_sweep { mix(CLOCK_FACE, CLOCK_FILL, swept) } else { mix(CLOCK_FILL, CLOCK_FACE, swept) }
+        mix(if rings[i].lighter { CLOCK_FILL_PM } else { CLOCK_FILL }, CLOCK_FACE, swept)
     };
     // Each band's colour, by index: 0, 2, 4 the rings; 1, 3, 5 the strokes; 6 the centre.
     let band_colour = |b: usize, dx: i64, dy: i64| -> u32 {

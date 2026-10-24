@@ -448,16 +448,9 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     if press != 0 && home > press {
         v[0] = (home - press) * 1_000_000 / f;
     }
-    let now = cntpct();
+    // The gauge as the service loop last sampled it (gauge_poll): never I2C here — this runs inside a syscall under the kernel lock, on whichever core called, and a gauge read that hung there held the lock and froze the X3 (2026-10-23, twice).
     unsafe {
-        let g = &mut *(&raw mut GAUGE);
-        if g.1 == 0 || now.wrapping_sub(g.1) > 2 * f {
-            g.1 = now;
-            g.0 = match crate::hsi2c::gauge::sample() {
-                Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
-                Err(_) => [crate::process::FACT_UNKNOWN; 4],
-            };
-        }
+        let g = &*(&raw const GAUGE);
         v[1..5].copy_from_slice(&g.0);
     }
     v[5] = USB_LINK.load(Relaxed) as u64;
@@ -471,6 +464,21 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     }
     v[9] = crate::rtc::TZ.load(Relaxed) as u64;
     v
+}
+
+/// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4.
+fn gauge_poll() {
+    let (f, now) = (cntfrq(), cntpct());
+    unsafe {
+        let g = &mut *(&raw mut GAUGE);
+        if g.1 == 0 || now.wrapping_sub(g.1) > 2 * f {
+            g.1 = now;
+            g.0 = match crate::hsi2c::gauge::sample() {
+                Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
+                Err(_) => [crate::process::FACT_UNKNOWN; 4],
+            };
+        }
+    }
 }
 
 pub fn run(mut b: Boot) -> ! {
@@ -606,8 +614,9 @@ pub fn run(mut b: Boot) -> ! {
         }
         let now = cntpct();
         // Home: once the ring has completed — the host has the USB link, or a second has passed since the press with no cable — start init and with it the shell.
-        // The wall clock, re-read hourly (rtc.rs); cheap to call every pass.
+        // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
+        gauge_poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
             if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {

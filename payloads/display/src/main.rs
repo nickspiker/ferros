@@ -334,16 +334,21 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 const WIDGET_CLOCK: u8 = 0x80;
 /// The 60 directions (sin, −cos) of k/60 of a turn, Q14, for the clock face (built once at start).
 static mut CLOCK_DIRS: [(i64, i64); 60] = [(0, 0); 60];
-/// A clock is on the screen (the last frame drew one): the render thread redraws the scene each second.
+/// A clock is on the screen (the last frame drew one): the render thread checks each second whether its digits changed.
 static mut CLOCK_SHOWN: bool = false;
+/// The unit the last drawn clock showed (seconds of the day, or dozenal 50 s units): a redraw happens only when it changes.
+static mut CLOCK_KEY: i64 = -1;
+/// The screen rectangle the clocks of the last frame covered: a clock-only redraw publishes just this.
+static mut CLOCK_RECT: draw::Rect = draw::Rect::EMPTY;
+/// The frame being drawn is a clock refresh: publish only CLOCK_RECT (the camera has not moved, so nothing else changed).
+static mut CLOCK_ONLY: bool = false;
 /// The last plain camera op (op 14 that started a frame from scratch, not over an overlay), replayed each second while a clock shows; None when the last frame had an overlay or an app.
 static mut LAST_CAM: Option<([u8; 18], usize)> = None;
 
-/// The clock's rings and the time written in its centre, from local wall time: decimal (seconds outer, minutes middle, the 12-hour hand inner — AM sweeps the fill in, PM sweeps the dark back) or dozenal (the day in 12 × 12 × 12: dozenal hours inner over the whole day, their twelfths middle, those twelfths' twelfths — 50 s — outer), every ring alternating the direction of its sweep each time it wraps.
-fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize) {
+/// The clock's rings and the time written in its centre, from local wall time, and the unit it counts in (the key: the clock is redrawn only when it changes). Decimal: seconds outer, minutes middle, the 12-hour hand inner (after noon its fill is a lighter grey: the AM/PM). Dozenal: the day in 12 × 12 × 12 units of 50 s — dozenal hours inner over the whole day, their twelfths middle, the 50 s units outer. Every ring is a sweep of grey over the dark from 12:00 that clicks back to dark when it wraps (owner, 2026-10-23); the rings move in the same units as the digits, so a redraw only when the digits change shows everything.
+fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize, i64) {
     let (secs, _) = ferros_sys::local_time().unwrap_or((0, 0));
     let sod = secs.rem_euclid(86400);
-    let day = secs.div_euclid(86400);
     let q = |num: i64, den: i64| ((num << 16) / den.max(1)) as u32;
     let dozenal = ferros_sys::pref(ferros_sys::PREF_BASE) & 0x7F == 12;
     let mut n = 0;
@@ -360,9 +365,9 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize) {
         let u = sod / 50;
         let (d1, d2, d3) = (u / 144, (u / 12) % 12, u % 12);
         let rings = [
-            draw::Ring { frac_q16: q(sod % 600, 600), dark_sweep: (sod / 600) % 2 == 1, ticks: 12 },
-            draw::Ring { frac_q16: q(sod % 7200, 7200), dark_sweep: d1 % 2 == 1, ticks: 12 },
-            draw::Ring { frac_q16: q(sod, 86400), dark_sweep: day % 2 == 1, ticks: 12 },
+            draw::Ring { frac_q16: q(d3, 12), lighter: false, ticks: 12 },
+            draw::Ring { frac_q16: q(u % 144, 144), lighter: false, ticks: 12 },
+            draw::Ring { frac_q16: q(u, 1728), lighter: false, ticks: 12 },
         ];
         for (k, d) in [d1, d2, d3].iter().enumerate() {
             if k > 0 {
@@ -370,13 +375,13 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize) {
             }
             put(char::from_u32(0x10 + *d as u32).unwrap_or('?'), &mut n);
         }
-        (rings, n)
+        (rings, n, u)
     } else {
         let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);
         let rings = [
-            draw::Ring { frac_q16: q(sec, 60), dark_sweep: (sod / 60) % 2 == 1, ticks: 60 },
-            draw::Ring { frac_q16: q(m * 60 + sec, 3600), dark_sweep: h % 2 == 1, ticks: 60 },
-            draw::Ring { frac_q16: q((h % 12) * 3600 + m * 60 + sec, 43200), dark_sweep: h >= 12, ticks: 12 },
+            draw::Ring { frac_q16: q(sec, 60), lighter: false, ticks: 60 },
+            draw::Ring { frac_q16: q(m * 60 + sec, 3600), lighter: false, ticks: 60 },
+            draw::Ring { frac_q16: q((h % 12) * 3600 + m * 60 + sec, 43200), lighter: h >= 12, ticks: 12 },
         ];
         for (k, v) in [h, m, sec].iter().enumerate() {
             if k > 0 {
@@ -385,7 +390,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize) {
             put((b'0' + (*v / 10) as u8) as char, &mut n);
             put((b'0' + (*v % 10) as u8) as char, &mut n);
         }
-        (rings, n)
+        (rings, n, sod)
     }
 }
 
@@ -415,6 +420,8 @@ fn text_under(pixels: &mut [u32], width: usize, height: usize, font: &fontdue::F
             }
         }
         pen += m.advance_width;
+        // Each glyph's buffers back to the heap before the next: at clock sizes fontdue's accumulator is hundreds of KB a glyph, and eight of them ran the display's heap out (the display vanished on a zoom into the clock, 2026-10-23).
+        ALLOC.reset();
     }
 }
 
@@ -1624,6 +1631,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     // Flag bit 0: keep what the frame already holds (a `begin` and the client's overlay, sent first in the same batch), so the scene goes under it; without it the frame starts from the last frame's rectangle cleared.
                     unsafe {
                         CLOCK_SHOWN = false;
+                        CLOCK_RECT = draw::Rect::EMPTY;
                         LAST_CAM = if m.get(13).copied().unwrap_or(0) & 1 == 0 && m.len() <= 18 {
                             let mut b = [0u8; 18];
                             b[..m.len()].copy_from_slice(m);
@@ -1669,21 +1677,26 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
                         if cir.icon == WIDGET_CLOCK {
                             let mut tb = [0u8; 32];
-                            let (rings, tn) = clock_state(&mut tb);
+                            let (rings, tn, key) = clock_state(&mut tb);
+                            unsafe { CLOCK_KEY = key };
                             if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
                                 // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
                                 let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
                                 let unit = text_width(&font, t, 100.0).max(1.0);
-                                let px = (room / unit * 100.0).clamp(8.0, 400.0);
+                                let px = (room / unit * 100.0).clamp(8.0, 256.0);
                                 let tw = text_width(&font, t, px);
                                 let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
                                 text_under(pixels, width, height, &font, t, fx - tw * 0.5, fy + px * 0.36, px, WHITE);
                                 ALLOC.reset();
                             }
-                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings, unsafe { &*(&raw const CLOCK_DIRS) });
+                            // The face's turn: the camera's and the circle's own, as the icons get it.
+                            let (cc, cs) = (cir.c as i64, cir.s as i64);
+                            let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings, unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
                             unsafe {
                                 CUR_DMG = CUR_DMG.union(r);
                                 CLOCK_SHOWN = true;
+                                CLOCK_RECT = CLOCK_RECT.union(r);
                             }
                             continue;
                         }
@@ -1753,7 +1766,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     t_phase = now();
                     unsafe { PHASE_US[1] = 0 };
                     // What changed on screen: what the last frame drew and what this one drew.
-                    let changed = unsafe { PREV_DMG.union(CUR_DMG).clip(width, height) };
+                    // A clock refresh (the camera has not moved): only the clock's own rectangle changed.
+                    let changed = unsafe { if CLOCK_ONLY { CLOCK_RECT.clip(width, height) } else { PREV_DMG.union(CUR_DMG).clip(width, height) } };
                     unsafe { PREV_DMG = CUR_DMG };
                     // The finished frame out. Temporal: into the next phase, armed without waiting for it to go out (only for the previous frame to have started); the layer flips to it at the next TE.
                     if ten && unsafe { TEMPORAL } {
@@ -2027,7 +2041,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             clock_due = false;
             if let Some((b, n)) = unsafe { LAST_CAM } {
                 let mut out = [0u8; 16];
+                unsafe { CLOCK_ONLY = true };
                 let _ = handle(&b[..n], &mut out);
+                unsafe { CLOCK_ONLY = false };
             }
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
@@ -2142,7 +2158,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let secs = t / freq();
             next_tick = (secs + 1) * freq();
             if client_owned && unsafe { CLOCK_SHOWN && (*(&raw const LAST_CAM)).is_some() && (*(&raw const APP)).is_none() } {
-                clock_due = true;
+                let mut tb = [0u8; 32];
+                let (_, _, key) = clock_state(&mut tb);
+                if key != unsafe { CLOCK_KEY } {
+                    clock_due = true;
+                }
             }
             // The frame rate, once a second while frames are coming (presents and flips both count), with the frame starts DECON reported through its interrupt: the two agree when every frame goes out.
             let fs = FRAME_STARTS.load(Ordering::Relaxed);
