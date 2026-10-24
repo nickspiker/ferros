@@ -1237,6 +1237,16 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"aoc fault" {
+                                            resp.extend_from_slice(alloc::format!("AoC SYSMMU fault [status, va, info0, info1, info2]: {:X?}\n", crate::aoc::mmu_fault()).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc mmu" {
+                                            crate::aoc::mmu(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"aoc boot" {
                                             // `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) and start it through GSA's mailbox (aoc.rs `boot`). Each piece is read under the kernel lock (the vault's one owner).
                                             let st = &raw mut store;
