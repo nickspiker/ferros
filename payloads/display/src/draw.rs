@@ -164,19 +164,19 @@ fn log2_q16(q: u64) -> i64 {
     (((63 - lz) as i64) << 16) + m + ((m * (65536 - m) >> 16) * 89 >> 8)
 }
 
-/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): full `peak` at the circle's edge (out to `scale_q8`), then down by the same step every octave of q = d² − r² (the squared distance past the edge, ≈ 2r·e near it), to exactly zero 2^`oct_log2` octaves out — no floor, no tail cut. Light reads roughly in log, so the fade looks even. Additive into the room each pixel has left (255 − alpha), as `glow`, so a circle's opaque interior takes nothing and needs no test.
-pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, oct_log2: u32) -> Rect {
+/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): down by the same step every octave of q = d² − r² (the squared distance past the edge), from full `peak` to exactly zero over 2^`oct_log2` octaves — no floor, no tail cut — and reaching 1/`frac` of the radius past the edge, whatever the size (owner: smaller circle, thinner glow; the glow is part of the circle's shape at every zoom). At d = r(1 + 1/frac), q = r²·(2·frac + 1)/frac², which fixes where it ends; full light holds to that over 2^(2^oct_log2). Added to the gamma-2 values, into the room each pixel has left (255 − alpha), so a circle's opaque interior takes nothing and needs no test (the linear-light try looked worse, 2026-10-24).
+pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;
     }
     let (w, h) = (width as i64, height as i64);
     let r2 = r * r;
-    // Full light to q0 (scale past the edge), zero at q0 · 2^octaves.
-    let q0 = 2 * r * scale_q8;
+    // Zero at q_max (1/frac of the radius past the edge), full light to q_max over 2^octaves.
+    let q_max = r2 * (2 * frac + 1) / (frac * frac);
+    let q0 = (q_max >> (1 << oct_log2)).max(1);
     let l0 = log2_q16(q0 as u64);
     let span = 1i64 << (16 + oct_log2);
-    let q_max = q0 << (1 << oct_log2);
-    let reach = r + q_max / (2 * r) + 256;
+    let reach = r + r / frac + 256;
     let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
     let peak = peak as i64;
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
