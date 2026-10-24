@@ -36,6 +36,7 @@
 extern crate alloc;
 
 mod draw;
+mod glyphs;
 mod neon;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -394,35 +395,14 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize, i64) {
     }
 }
 
-/// Text into the canvas front to back: each glyph pixel premultiplied by its coverage and put under what is there, so it composes with what is drawn after it (the clock's centre) without a dark fringe.
-fn text_under(pixels: &mut [u32], width: usize, height: usize, font: &fontdue::Font, s: &str, x: f32, baseline: f32, px: f32, colour: u32) {
-    let mut pen = x;
-    for ch in s.chars() {
-        let (m, cov) = font.rasterize(ch, px);
-        let gx = pen as isize + m.xmin as isize;
-        let gy = baseline as isize - m.ymin as isize - m.height as isize;
-        for row in 0..m.height as isize {
-            let y = gy + row;
-            if y < 0 || y >= height as isize {
-                continue;
-            }
-            for col in 0..m.width as isize {
-                let xx = gx + col;
-                if xx < 0 || xx >= width as isize {
-                    continue;
-                }
-                let a = cov[(row * m.width as isize + col) as usize] as u32;
-                if a == 0 {
-                    continue;
-                }
-                let p = &mut pixels[y as usize * width + xx as usize];
-                *p = draw::under(*p, draw::at_coverage(colour & 0x00FF_FFFF, a));
-            }
-        }
-        pen += m.advance_width;
-        // Each glyph's buffers back to the heap before the next: at clock sizes fontdue's accumulator is hundreds of KB a glyph, and eight of them ran the display's heap out (the display vanished on a zoom into the clock, 2026-10-23).
-        ALLOC.reset();
-    }
+/// Text centred on (cx, cy) and turned by (c, s), front to back: the clock's digits, which turn with its face.
+fn text_turned_centre(pixels: &mut [u32], width: usize, height: usize, s: &str, cx: f32, cy: f32, px: f32, turn: (f32, f32), colour: u32) {
+    let g = glyph_engine();
+    let tw = g.width(s, px);
+    // The baseline's start in the text's own frame, (−width/2, +0.36 em) from the centre, turned onto the screen.
+    let (fx, fy) = (-tw * 0.5, px * 0.36);
+    let (tc, ts) = turn;
+    g.draw(pixels, width, height, s, cx + tc * fx - ts * fy, cy + ts * fx + tc * fy, px, turn, colour);
 }
 
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
@@ -599,53 +579,30 @@ impl Pipe {
     }
 }
 
-/// Text through fontdue: glyph coverage blended into the canvas, left-aligned at (x, baseline). Returns the advance.
-fn text(c: &mut Canvas, font: &fontdue::Font, s: &str, x: f32, baseline: f32, px: f32, colour: u32) -> f32 {
-    let mut pen = x;
-    let (w, h) = (c.width as isize, c.height as isize);
-    for ch in s.chars() {
-        let (m, cov) = font.rasterize(ch, px);
-        let gx = pen as isize + m.xmin as isize;
-        let gy = baseline as isize - m.ymin as isize - m.height as isize;
-        for row in 0..m.height as isize {
-            let y = gy + row;
-            if y < 0 || y >= h {
-                continue;
-            }
-            for col in 0..m.width as isize {
-                let xx = gx + col;
-                if xx < 0 || xx >= w {
-                    continue;
-                }
-                let a = cov[(row * m.width as isize + col) as usize] as u32;
-                if a == 0 {
-                    continue;
-                }
-                let i = (y * w + xx) as usize;
-                let d = c.pixels[i];
-                let mix = |sh: u32| {
-                    let dc = (d >> sh) & 0xFF;
-                    let sc = (colour >> sh) & 0xFF;
-                    ((dc * (255 - a) + sc * a) / 255) << sh
-                };
-                c.pixels[i] = 0xFF00_0000 | mix(16) | mix(8) | mix(0);
-            }
-        }
-        pen += m.advance_width;
-    }
-    pen - x
+/// The typeface's glyph engine (glyphs.rs: swash, outlines turned before rasterising, cached), made once at start.
+static mut GLYPHS: Option<glyphs::Glyphs> = None;
+fn glyph_engine() -> &'static mut glyphs::Glyphs {
+    unsafe { (*(&raw mut GLYPHS)).as_mut().expect("glyphs") }
+}
+/// A handle standing for the typeface at the call sites (the engine itself is the static above).
+struct Font;
+
+/// Text into the canvas, front to back (under what is there), upright, left-aligned at (x, baseline). Returns the advance.
+fn text(c: &mut Canvas, _font: &Font, s: &str, x: f32, baseline: f32, px: f32, colour: u32) -> f32 {
+    let (w, h) = (c.width, c.height);
+    glyph_engine().draw(c.pixels, w, h, s, x, baseline, px, (1.0, 0.0), colour)
 }
 
-fn text_width(font: &fontdue::Font, s: &str, px: f32) -> f32 {
-    s.chars().map(|ch| font.metrics(ch, px).advance_width).sum()
+fn text_width(_font: &Font, s: &str, px: f32) -> f32 {
+    glyph_engine().width(s, px)
 }
 
-fn text_center(c: &mut Canvas, font: &fontdue::Font, s: &str, baseline: f32, px: f32, colour: u32) {
+fn text_center(c: &mut Canvas, font: &Font, s: &str, baseline: f32, px: f32, colour: u32) {
     let w = text_width(font, s, px);
     text(c, font, s, (c.width as f32 - w) * 0.5, baseline, px, colour);
 }
 
-fn text_right(c: &mut Canvas, font: &fontdue::Font, s: &str, right: f32, baseline: f32, px: f32, colour: u32) {
+fn text_right(c: &mut Canvas, font: &Font, s: &str, right: f32, baseline: f32, px: f32, colour: u32) {
     let w = text_width(font, s, px);
     text(c, font, s, right - w, baseline, px, colour);
 }
@@ -956,7 +913,8 @@ static mut SPRITES: [Sprite; 256] = [NO_SPRITE; 256];
 static mut LAST_KEY: [[i64; 6]; 256] = [[0; 6]; 256];
 static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
-const ARENA_WORDS: usize = (10 << 20) / 4;
+/// 6 MiB: the display's heap is the 16 MiB below the back buffer in its 32 MiB region, and the 256-px icon mips (4.4 MB) plus the glyph cache (2 MiB) left no room for 10 (2026-10-23: the display failed at start).
+const ARENA_WORDS: usize = (6 << 20) / 4;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
@@ -1355,14 +1313,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.s(b" MHz\n");
     log.flush();
     let t_font = now();
-    let font = match fontdue::Font::from_bytes(FONT, fontdue::FontSettings::default()) {
-        Ok(f) => f,
-        Err(_) => {
+    match glyphs::Glyphs::new(FONT) {
+        Some(g) => unsafe { GLYPHS = Some(g) },
+        None => {
             log.s(b"display: typeface failed to parse\n");
             log.flush();
             ferros_sys::exit(3);
         }
-    };
+    }
+    let font = Font;
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
@@ -1684,9 +1643,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
                                 let unit = text_width(&font, t, 100.0).max(1.0);
                                 let px = (room / unit * 100.0).clamp(8.0, 256.0);
-                                let tw = text_width(&font, t, px);
-                                let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
-                                text_under(pixels, width, height, &font, t, fx - tw * 0.5, fy + px * 0.36, px, WHITE);
+                                // The digits turn with the face (and, once the accelerometer is in, with gravity).
+                                let (cc, cs) = (cir.c as i64, cir.s as i64);
+                                let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                                text_turned_centre(pixels, width, height, t, (sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5, px, (fc as f32 / 16384.0, fs as f32 / 16384.0), WHITE);
                                 ALLOC.reset();
                             }
                             // The face's turn: the camera's and the circle's own, as the icons get it.
@@ -1869,35 +1829,19 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let surf_ok = unsafe { APP_SURF } > 1 && width * height * 8 <= 32 << 20;
                     if surf_ok && px >= 4.0 && px <= 512.0 {
                         let surf = unsafe { core::slice::from_raw_parts_mut(APP_SURF as *mut u64, width * height) };
-                        let mut pen = x0 as f32;
-                        for ch in core::str::from_utf8(&m[9..]).unwrap_or("").chars() {
-                            let (met, cov) = font.rasterize(ch, px);
-                            let gx = pen as i32 + met.xmin;
-                            let gy = base - met.ymin - met.height as i32;
-                            for row in 0..met.height as i32 {
-                                let y = gy + row;
-                                if y < 0 || y >= height as i32 {
-                                    continue;
-                                }
-                                for col in 0..met.width as i32 {
-                                    let xx = gx + col;
-                                    if xx < 0 || xx >= width as i32 {
-                                        continue;
-                                    }
-                                    let a = cov[(row * met.width as i32 + col) as usize] as u32;
-                                    if a == 0 {
-                                        continue;
-                                    }
-                                    let v = (val * a / 255).min(0xFFFF) as u64;
-                                    let d = &mut surf[y as usize * width + xx as usize];
-                                    let have = *d & 0xFFFF;
-                                    if v > have {
-                                        *d = (*d & 1 << 48) | v | v << 16 | v << 32;
-                                    }
-                                }
+                        let t = core::str::from_utf8(&m[9..]).unwrap_or("");
+                        glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
+                            if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
+                                return;
                             }
-                            pen += met.advance_width;
-                        }
+                            let v = (val * a / 255).min(0xFFFF) as u64;
+                            let d = &mut surf[y as usize * width + x as usize];
+                            let have = *d & 0xFFFF;
+                            if v > have {
+                                *d = (*d & 1 << 48) | v | v << 16 | v << 32;
+                            }
+                        });
+                        ALLOC.reset();
                     } else {
                         out[0] = 3;
                     }

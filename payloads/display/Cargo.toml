@@ -12,5 +12,6 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_dsi = { path = "../../ferros_dsi" }
 fluor = { path = "../../../fluor", default-features = false, features = ["host-bare"] }
-fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+# Text: swash in no_std (its libm feature), native f32 — outlines transformed before rasterising, so text turns at any angle (glyphs.rs). fontdue is gone.
+swash = { version = "0.2.9", default-features = false, features = ["scale", "render", "libm"] }
 libm = "0.2"
