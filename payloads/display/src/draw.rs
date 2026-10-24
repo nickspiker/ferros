@@ -156,6 +156,74 @@ pub fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
 }
 
 /// A glow around a disc of radius r centred at (cx, cy) (Q8 pixels): emitted light added behind whatever is already there (alpha stays as it is, so drawn after the circles it lands only where they leave room), falling off as 1/(distance from the edge) — `peak` one pixel out, half that two out, a quarter four out: a step down for every doubling of the distance (owner, 2026-10-23: "imgpx-FF0000-770000-330000"). No root anywhere, as in `disc`: with q = d² − r² = e·(2r + e) for an edge distance e, the brightness is peak · 2r · s / q — exactly peak·s/e near the edge, and a little faster far out, which bounds the reach. `scale_q8` is s, the distance at which the glow is still at peak, in Q8 pixels (256 = one pixel); `floor` the brightness (0-255) below which it stops. Gamma-space values, as the canvas holds them. Returns the rectangle it touched.
+/// log2 of q > 0 in Q16 octaves, without a divide or a table (Mitchell): the top bit's place is the integer part, the bits under it the fraction, plus m·(1 − m)·0.3466 (one multiply), which takes the straight-line fraction's kinks at each octave down to under a hundredth of an octave.
+#[inline(always)]
+fn log2_q16(q: u64) -> i64 {
+    let lz = q.leading_zeros();
+    let m = ((q << lz) << 1 >> 48) as i64;
+    (((63 - lz) as i64) << 16) + m + ((m * (65536 - m) >> 16) * 89 >> 8)
+}
+
+/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): full `peak` at the circle's edge (out to `scale_q8`), then down by the same step every octave of q = d² − r² (the squared distance past the edge, ≈ 2r·e near it), to exactly zero 2^`oct_log2` octaves out — no floor, no tail cut. Light reads roughly in log, so the fade looks even. Additive into the room each pixel has left (255 − alpha), as `glow`, so a circle's opaque interior takes nothing and needs no test.
+pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, oct_log2: u32) -> Rect {
+    if r < 128 || peak == 0 {
+        return Rect::EMPTY;
+    }
+    let (w, h) = (width as i64, height as i64);
+    let r2 = r * r;
+    // Full light to q0 (scale past the edge), zero at q0 · 2^octaves.
+    let q0 = 2 * r * scale_q8;
+    let l0 = log2_q16(q0 as u64);
+    let span = 1i64 << (16 + oct_log2);
+    let q_max = q0 << (1 << oct_log2);
+    let reach = r + q_max / (2 * r) + 256;
+    let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
+    let peak = peak as i64;
+    spans(cx, cy, reach, |y, xo0, xo1, _, _| {
+        if y < 0 || y >= h {
+            return;
+        }
+        let rowb = y as usize * width;
+        let dy = (y << 8) + 128 - cy;
+        let dy2 = dy * dy;
+        let (x0, x1) = (xo0.max(0), xo1.min(w - 1));
+        let mut put = |x: i64| -> bool {
+            let dx = (x << 8) + 128 - cx;
+            let q = dx * dx + dy2 - r2;
+            if q <= 0 {
+                return false;
+            }
+            let t = (log2_q16(q as u64) - l0).clamp(0, span);
+            let i = peak * (span - t) >> (16 + oct_log2);
+            let p = &mut px[rowb + x as usize];
+            let room = 255 - (*p >> 24) as i64;
+            let add = |c: i64, sh: u32| -> u32 {
+                let have = (*p >> sh & 0xFF) as i64;
+                ((have + c * i * room / 65025).min(255) as u32) << sh
+            };
+            *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
+            true
+        };
+        let mut left_stop = x1 + 1;
+        let mut x = x0;
+        while x <= x1 {
+            if !put(x) {
+                left_stop = x;
+                break;
+            }
+            x += 1;
+        }
+        let mut x = x1;
+        while x > left_stop {
+            if !put(x) {
+                break;
+            }
+            x -= 1;
+        }
+    });
+    Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
+}
+
 pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, floor: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;

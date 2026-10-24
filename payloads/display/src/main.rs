@@ -424,6 +424,9 @@ const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
 const GLOW_PEAK: [u32; 3] = [0, 0x77, 0xFF];
 const GLOW_SCALE_Q8: i64 = 256;
 const GLOW_FLOOR: u32 = 2;
+/// The log glow (`draw::glow_log`) in place of the 1/distance one: on, and how far it reaches, 2^GLOW_OCT_LOG2 octaves of squared distance past full light (2 = four octaves). Tunables, by eye.
+const GLOW_LOG: bool = true;
+const GLOW_OCT_LOG2: u32 = 2;
 const MAP_LIT: u32 = AMBER;
 const BLACK: u32 = rgb(0, 0, 0);
 
@@ -1821,7 +1824,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                     let t_g = now();
                     for &(gx, gy, gr, colour, peak) in &glows[..nglow] {
-                        let gr_rect = draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR);
+                        let gr_rect = if GLOW_LOG {
+                            draw::glow_log(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_OCT_LOG2)
+                        } else {
+                            draw::glow(pixels, width, height, gx, gy, gr, colour, peak, GLOW_SCALE_Q8, GLOW_FLOOR)
+                        };
                         unsafe { CUR_DMG = CUR_DMG.union(gr_rect) };
                     }
                     unsafe { SCENE_US[2] = ferros_sys::us_since(t_g) };
