@@ -240,3 +240,18 @@ pub unsafe fn thresholds_at(base: uint8x16_t, x: usize) -> uint8x16_t {
         vqtbl1q_u8(base, i)
     }
 }
+
+/// Four sprite pixels under four canvas pixels, front to back (draw::under, branch-free): each byte d + (s·room + 127) / 255, saturated, room = 255 − the canvas pixel's alpha — which is already s where the canvas is empty (room 255) and d where it is opaque (room 0). The divide by 255 as (x + (x >> 8) + 128) >> 8, within one of the scalar's rounding.
+#[inline(always)]
+pub unsafe fn under4(dst: *mut u32, src: *const u32) {
+    unsafe {
+        const ALPHA: [u8; 16] = [3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15];
+        let d = vld1q_u8(dst as *const u8);
+        let s = vld1q_u8(src as *const u8);
+        let room = vmvnq_u8(vqtbl1q_u8(d, vld1q_u8(ALPHA.as_ptr())));
+        let lo = vmull_u8(vget_low_u8(s), vget_low_u8(room));
+        let hi = vmull_high_u8(s, room);
+        let q = vrshrn_high_n_u16::<8>(vrshrn_n_u16::<8>(vsraq_n_u16::<8>(lo, lo)), vsraq_n_u16::<8>(hi, hi));
+        vst1q_u8(dst as *mut u8, vqaddq_u8(d, q));
+    }
+}

@@ -1078,10 +1078,15 @@ fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d
         }
         let row = &mut px[y as usize * width + x0 as usize..=y as usize * width + x1 as usize];
         let src = &spr[r * d + (x0 - ox) as usize..=r * d + (x1 - ox) as usize];
-        for (p, &q) in row.iter_mut().zip(src.iter()) {
-            if q != 0 {
-                *p = if *p == 0 { q } else { draw::under(*p, q) };
-            }
+        // Four at a time (neon.rs `under4`, branch-free), the row's last few one by one.
+        let n4 = row.len() & !3;
+        let mut i = 0;
+        while i < n4 {
+            unsafe { neon::under4(row.as_mut_ptr().add(i), src.as_ptr().add(i)) };
+            i += 4;
+        }
+        for (p, &q) in row[n4..].iter_mut().zip(src[n4..].iter()) {
+            *p = draw::under(*p, q);
         }
     }
 }
