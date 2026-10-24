@@ -242,18 +242,23 @@ pub fn boot(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut 
     let ipc = CARVEOUT + image_size;
     parameters(ipc);
     unsafe { core::arch::asm!("dsb sy") };
-    let t2 = crate::platform::cntpct();
-    let r = crate::gsa::call(crate::gsa::CMD_AOC, &[AOC_START], 2048);
-    say(out, format!("GSA start: {r:?}\n"));
-    // Up when the firmware has replaced the parameter block with its control block.
-    while us(t2) < 4_000_000 {
+    // Loaded, parameters in place. The start goes over Trusty (`diag trusty aoc`), as Linux does: GSA's mailbox command 91 moves the state but does not run the firmware, and leaves GSA in a state the Trusty start then refuses.
+    let st = crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256);
+    say(out, format!("loaded; GSA AoC state {st:?} (1 = loaded); start with `diag trusty aoc`\n"));
+    true
+}
+
+/// The AoC's control block: up once the firmware has replaced the parameter block with it (magic G#A0C0_0A0C). Polls up to `ms`; returns whether it came up and the first words.
+pub fn wait_online(ms: u64) -> (bool, [u32; 7]) {
+    let ipc = CARVEOUT + 0x1C0_0000;
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    while crate::platform::cntpct() - t0 < f / 1000 * ms {
         if rd32(ipc) == AOC_MAGIC {
             break;
         }
     }
-    let up = rd32(ipc) == AOC_MAGIC;
-    say(out, format!("control block after A#{} us: magic G#{:X} fw G#{:X} hw G#{:X} status G#{:X} services A#{}\n", us(t2), rd32(ipc), rd32(ipc + 4), rd32(ipc + 8), rd32(ipc + 12), rd32(ipc + 24)));
-    up
+    (rd32(ipc) == AOC_MAGIC, [rd32(ipc), rd32(ipc + 4), rd32(ipc + 8), rd32(ipc + 12), rd32(ipc + 16), rd32(ipc + 20), rd32(ipc + 24)])
 }
 
 // ── The AoC's SYSMMU (sysmmu@19090000, v9.0), as Linux enables it before the load ──

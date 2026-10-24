@@ -429,6 +429,16 @@ pub fn aoc_start(out: &mut alloc::vec::Vec<u8>) {
             let err = u32::from_le_bytes(buf[4..8].try_into().unwrap());
             let state = u32::from_le_bytes(buf[8..12].try_into().unwrap());
             out.extend_from_slice(alloc::format!("GSA reply: cmd G#{cmd:X} err A#{err} state A#{state} (2 = running)\n").as_bytes());
+            if err == 0 {
+                let (up, w) = crate::aoc::wait_online(4000);
+                out.extend_from_slice(alloc::format!("AoC control block: up {up}, magic G#{:X} fw G#{:X} hw G#{:X} status G#{:X} services A#{}\n", w[0], w[1], w[2], w[3], w[6]).as_bytes());
+            }
+        }
+        Some((_, _, n)) if n >= 8 => {
+            // Header only: hwmgr_rsp_hdr {cmd, err} with no state — GSA refused the command.
+            let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+            let err = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as i32;
+            out.extend_from_slice(alloc::format!("GSA refused: cmd G#{cmd:X} err A#{err}\n").as_bytes());
         }
         Some((_, _, n)) => out.extend_from_slice(alloc::format!("short GSA reply: A#{n} bytes\n").as_bytes()),
         None => out.extend_from_slice(b"no GSA reply\n"),
