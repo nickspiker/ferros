@@ -10,7 +10,9 @@ use ferros_hal::mmio::{cache_clean, cache_invalidate};
 // ── SMC call numbers (smcall.h) ──
 const SMC_SC_VIRTIO_GET_DESCR: u64 = 0x3200_0014;
 const SMC_SC_VIRTIO_START: u64 = 0x3200_0015;
+const SMC_SC_VDEV_RESET: u64 = 0x3200_0017;
 const SMC_SC_VDEV_KICK_VQ: u64 = 0x3200_0018;
+const SMC_NC_VDEV_KICK_VQ: u64 = 0x3200_0019;
 const SMC_SC_NOP: u64 = 0x3C00_0003;
 const SMC_SC_RESTART_LAST: u64 = 0x3C00_0000;
 /// Fast call to select the Trusty API version (SMC_FASTCALL_NR(SECURE_MONITOR=60, 11)); Trusty stays at version 0 until the AP selects one, and the modern path (SMP, the NOP queue, memory objects, the virtio worker) depends on it. Current is 5.
@@ -163,8 +165,9 @@ impl Vq {
     }
 }
 
+/// Kick a queue. At API version >= SMP_NOP (we select 5) the direct SMC_SC_VDEV_KICK_VQ is rejected (-7); the kick goes through the NOP queue instead — SMC_SC_NOP with the NC_VDEV_KICK_VQ selector and the two notify ids, exactly as Android does (captured from its Trusty driver over the hv SMC oracle, 2026-10-24: `NOP 0x32000019 <vdev> <vring>`).
 fn kick(vq: &Vq) -> i64 {
-    std_call(SMC_SC_VDEV_KICK_VQ, vq.vdev_notify as u64, vq.vring_notify as u64, 0)
+    std_call(SMC_SC_NOP, SMC_NC_VDEV_KICK_VQ, vq.vdev_notify as u64, vq.vring_notify as u64)
 }
 
 static mut RXVQ: Option<Vq> = None;
@@ -266,6 +269,8 @@ fn virtio_bringup(out: &mut alloc::vec::Vec<u8>) -> Result<(), &'static str> {
             buf_pa: [0; RX_SLOTS],
         })
     };
+    // Reset the vdev before setting up its queues, as the virtio core does at the start of probe (SMC_SC_VDEV_RESET, arg = vdev notifyid; -7 is returned and ignored when nothing is up yet).
+    std_call(SMC_SC_VDEV_RESET, vdev_notify as u64, 0, 0);
     let mut rx = make(0, (&raw mut VRING_RX) as *mut u8 as usize)?;
     let tx = make(1, (&raw mut VRING_TX) as *mut u8 as usize)?;
     out.extend_from_slice(alloc::format!("rx: num A#{} align G#{:X} notify A#{}; tx: num A#{} align G#{:X} notify A#{}\n", rx.num, rx.align, rx.vring_notify, tx.num, tx.align, tx.vring_notify).as_bytes());
@@ -299,37 +304,12 @@ fn virtio_bringup(out: &mut alloc::vec::Vec<u8>) -> Result<(), &'static str> {
         RXVQ = Some(rx);
         TXVQ = Some(tx);
     }
-    let dfeatures = rd32(vdev + 8);
-    out.extend_from_slice(alloc::format!("GET_DESCR sz A#{sz}, START ret A#{r}, dfeatures G#{dfeatures:X}\n").as_bytes());
-    // Probe the tx direction: send a CONN_REQ, kick tx, pump NOP, and see whether Trusty consumes our tx buffer (tx used.idx advances) and whether anything lands on rx. This isolates whether the vring plumbing works at all.
-    let mut p = alloc::vec![0u8; 8 + 256];
-    p[0..4].copy_from_slice(&CTRL_CONN_REQ.to_le_bytes());
-    p[4..8].copy_from_slice(&256u32.to_le_bytes());
-    let port = b"com.android.trusty.gsa.hwmgr.aoc";
-    p[8..8 + port.len()].copy_from_slice(port);
-    // After START: did Trusty touch the descriptor (status/gfeatures/vring handle)?
-    unsafe { cache_invalidate(descr, PAGE) };
-    out.extend_from_slice(alloc::format!("descr after START: status G#{:X} gfeatures G#{:X} rx-da G#{:X} rx-pa G#{:X}\n", unsafe { read_volatile((descr + vdev + 20) as *const u8) }, rd32(vdev + 12), rd32(vdev + 24), rd32(vdev + 24 + 16)).as_bytes());
-    send(TIPC_CTRL_ADDR, &p);
-    let txq = unsafe { (*(&raw const TXVQ)).as_ref().unwrap() };
-    let rxq = unsafe { (*(&raw const RXVQ)).as_ref().unwrap() };
-    let ks = kick(txq);
-    // The queued (non-secure) kick variant, used when api >= SMP_NOP.
-    let knc = std_call(0x3200_0019, txq.vdev_notify as u64, txq.vring_notify as u64, 0);
-    out.extend_from_slice(alloc::format!("kick tx: SC ret A#{ks}, NC ret A#{knc}\n").as_bytes());
-    kick(rxq);
-    for _ in 0..4000 {
+    out.extend_from_slice(alloc::format!("GET_DESCR sz A#{sz}, START ret A#{r}\n").as_bytes());
+    // Kick rx (via the NOP queue) so Trusty takes our posted buffers and can place GO_ONLINE; connect() then pumps NOP and waits for it.
+    kick(unsafe { (*(&raw const RXVQ)).as_ref().unwrap() });
+    for _ in 0..512 {
         std_call(SMC_SC_NOP, 0, 0, 0);
     }
-    let txq = unsafe { (*(&raw mut TXVQ)).as_mut().unwrap() };
-    let rxq = unsafe { (*(&raw mut RXVQ)).as_mut().unwrap() };
-    unsafe {
-        cache_invalidate(txq.base, txq.bytes);
-        cache_invalidate(rxq.base, rxq.bytes);
-    }
-    let txu = unsafe { read_volatile((txq.used() + 2) as *const u16) };
-    let rxu = unsafe { read_volatile((rxq.used() + 2) as *const u16) };
-    out.extend_from_slice(alloc::format!("after CONN_REQ: tx used.idx A#{txu} (sent 1), rx used.idx A#{rxu}\n").as_bytes());
     Ok(())
 }
 
