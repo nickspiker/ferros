@@ -2182,7 +2182,7 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                         }
                                     } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
-                                        // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24).
+                                        // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24). A stopgap: in production it becomes a portal verb the owner's identity holds in full (STATUS.md next, PORTAL.md §5).
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
                                         let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
                                         let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
