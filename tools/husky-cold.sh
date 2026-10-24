@@ -18,10 +18,15 @@ BRIDGE=$REPO/target/debug/ferros-bridge
 ELF=$REPO/target/aarch64-unknown-none/release/ferros_kernel
 IMG=$REPO/target/aarch64-unknown-none/release/ferros_cold.img
 # Other phones may share this host's adb (2026-10-23: a Pixel 3a); every adb call here means the husky. Its serial is read live, never written down.
-if [ -z "${ANDROID_SERIAL:-}" ]; then
-    s=$(adb devices -l 2>/dev/null | awk '/product:husky/{print $1; exit}')
-    [ -n "$s" ] && export ANDROID_SERIAL=$s
-fi
+husky() {
+    if [ -z "${ANDROID_SERIAL:-}" ]; then
+        local s
+        s=$(adb devices -l 2>/dev/null | awk '/product:husky/{print $1; exit}')
+        [ -n "$s" ] && export ANDROID_SERIAL=$s
+    fi
+    return 0
+}
+husky
 
 to_fastboot() {
     if fastboot devices | grep -q .; then return; fi
@@ -33,9 +38,10 @@ to_fastboot() {
         if lsusb -d 1209:4665 >/dev/null 2>&1; then
             echo "== fastboot did not take; ferros -> Android -> fastboot"
             timeout 60 "$BRIDGE" diag android >/dev/null 2>&1 || true
-            for _ in $(seq 60); do adb get-state >/dev/null 2>&1 && break; sleep 2; done
+            for _ in $(seq 60); do husky; adb get-state >/dev/null 2>&1 && break; sleep 2; done
         fi
     fi
+    husky
     if adb get-state >/dev/null 2>&1; then
         echo "== Android -> fastboot"
         adb reboot bootloader
@@ -47,6 +53,7 @@ to_fastboot() {
 
 android_up() {
     for _ in $(seq 120); do
+        husky
         [ "$(timeout 3 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && return 0
         sleep 3
     done
@@ -109,6 +116,7 @@ while :; do
         echo "== landed in fastboot after $(( $(date +%s) - t0 ))s — ferros left (or never enumerated); boot Android with: $0 --android"
         exit 1
     fi
+    husky
     if adb get-state >/dev/null 2>&1; then
         echo "== Android came up after $(( $(date +%s) - t0 ))s — ABL fell back to slot a"
         read_report
