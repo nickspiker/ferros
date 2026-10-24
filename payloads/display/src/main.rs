@@ -346,14 +346,104 @@ static mut CLOCK_KEY: i64 = -1;
 static mut CLOCK_RECT: draw::Rect = draw::Rect::EMPTY;
 /// The frame being drawn is a clock refresh: publish only CLOCK_RECT (the camera has not moved, so nothing else changed).
 static mut CLOCK_ONLY: bool = false;
+/// The clock between frames: Some(k) while the last camera op is replayed with `draw::CLIP` set to the clock's rectangle, to publish that region alone into phase k (the one the next flip shows) — no clear beyond the clip, no frame armed, no interaction counted, the frame's damage left as the last full op made it.
+static mut CLIP_PHASE: Option<usize> = None;
+/// The last frame a client sent — a camera op alone, or a batch holding one (the map's: `begin`, its overlay, the camera with the keep flag) — as it came: the clock's redraws replay it.
+static mut LAST_FRAME: ([u8; SLOT], usize) = ([0; SLOT], 0);
+
+/// Whether a batch (op 15) holds a camera op.
+fn batch_has_camera(m: &[u8]) -> bool {
+    let mut at = 1usize;
+    while at + 2 <= m.len() {
+        let l = u16::from_le_bytes([m[at], m[at + 1]]) as usize;
+        if at + 2 + l > m.len() {
+            return false;
+        }
+        if m.get(at + 2) == Some(&14) {
+            return true;
+        }
+        at += 2 + l;
+    }
+    false
+}
+
+/// Where the clock was last drawn: centre x, y, radius (Q8 px), its turn (Q14), ring count.
+static mut CLOCK_GEOM: (i64, i64, i64, i64, i64, usize) = (0, 0, 0, 16384, 0, 3);
+/// The clock as last drawn into the back buffer: each ring's sweep and fill, the digits' key.
+#[derive(Clone, Copy, PartialEq)]
+struct ClockShown {
+    frac: [u32; 4],
+    lighter: [bool; 4],
+    key: i64,
+}
+static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 4], lighter: [false; 4], key: -1 };
+/// The clock each phase frame holds (None: unknown, after a publish that was not the clock's — the next redraw for it is whole).
+static mut PHASE_CLOCK: [Option<ClockShown>; PHASES] = [None; PHASES];
+
+/// The parts of the clock that differ between `was` and `now`, each its own rectangle (redrawn one at a time, so a wedge on one side and the centre do not become one box across the face): per ring, the wedge its sweep edge moved through (the bounding box of the edge at both ends, and any quarter-turn extreme between, a few pixels wide); the centre when the digits changed. None when a ring wrapped, changed its fill, or moved more than an eighth of a turn: then the whole clock.
+fn clock_dirty(was: &ClockShown, now: &ClockShown) -> Option<([draw::Rect; 5], usize)> {
+    let (cx, cy, r, tc, ts, n) = unsafe { CLOCK_GEOM };
+    let dirs = unsafe { &*(&raw const CLOCK_DIRS) };
+    let mut parts = [draw::Rect::EMPTY; 5];
+    let mut np = 0;
+    let pt = |rad: i64, (ux, uy): (i64, i64)| {
+        let (vx, vy) = ((ux * tc - uy * ts) >> 14, (ux * ts + uy * tc) >> 14);
+        ((cx + (vx * rad >> 14)) >> 8, (cy + (vy * rad >> 14)) >> 8)
+    };
+    for i in 0..n {
+        let (a, b) = (was.frac[i], now.frac[i]);
+        if a == b && was.lighter[i] == now.lighter[i] {
+            continue;
+        }
+        if b < a || b - a > 1 << 13 || was.lighter[i] != now.lighter[i] {
+            return None;
+        }
+        let (ro, ri) = draw::clock_ring_radii(r, n, i);
+        let mut x0 = i64::MAX;
+        let (mut y0, mut x1, mut y1) = (i64::MAX, i64::MIN, i64::MIN);
+        let mut add = |(x, y): (i64, i64)| {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        };
+        for f in [a, b] {
+            let d = draw::clock_dir(dirs, f);
+            add(pt(ro, d));
+            add(pt(ri, d));
+        }
+        // A quarter turn between the two (in the face's frame) bulges the arc past its ends.
+        for q in 1..4u32 {
+            if a < q << 14 && b > q << 14 {
+                add(pt(ro, draw::clock_dir(dirs, q << 14)));
+            }
+        }
+        parts[np] = draw::Rect { x0: x0 as i32 - 3, y0: y0 as i32 - 3, x1: x1 as i32 + 4, y1: y1 as i32 + 4 };
+        np += 1;
+    }
+    if was.key != now.key {
+        let rc = draw::clock_centre_radius(r, n) >> 8;
+        let (x, y) = (cx >> 8, cy >> 8);
+        parts[np] = draw::Rect { x0: (x - rc - 2) as i32, y0: (y - rc - 2) as i32, x1: (x + rc + 3) as i32, y1: (y + rc + 3) as i32 };
+        np += 1;
+    }
+    Some((parts, np))
+}
+
+/// The clock between frames: time spent and how many, logged every 1024 (~100 s at rest).
+static mut CLIP_US: [u64; 2] = [0; 2];
+
 /// The last plain camera op (op 14 that started a frame from scratch, not over an overlay), replayed each second while a clock shows; None when the last frame had an overlay or an app.
 static mut LAST_CAM: Option<([u8; 18], usize)> = None;
 
-/// The clock's rings and the time written in its centre, from local wall time, and the unit it counts in (the key: the clock is redrawn only when it changes). Decimal: seconds outer, minutes middle, the 12-hour hand inner (after noon its fill is a lighter grey: the AM/PM). Dozenal: the day in 12 × 12 × 12 units of 50 s — dozenal hours inner over the whole day, their twelfths middle, the 50 s units outer. Every ring is a sweep of grey over the dark from 12:00 that clicks back to dark when it wraps (owner, 2026-10-23); the rings move in the same units as the digits, so a redraw only when the digits change shows everything.
-fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize, i64) {
-    let (secs, _) = ferros_sys::local_time().unwrap_or((0, 0));
-    let sod = secs.rem_euclid(86400);
-    let q = |num: i64, den: i64| ((num << 16) / den.max(1)) as u32;
+/// The clock's rings and the time written in its centre, from local wall time to the counter's tick, and the unit its digits count in (the key: the digits change when it does). Every ring is a continuous sweep of grey over the dark from 12:00 that clicks back to dark when it wraps (owner, 2026-10-23; continuous 2026-10-24, drawn at whatever rate frames go out). Decimal, three rings: seconds outer, minutes middle, the 12-hour hand inner (after noon its fill is a lighter grey: the AM/PM); digits h:m:s. Dozenal, four rings, the day in twelfths four times over: outermost the 50 s unit's twelfths (about 4.2 s each), then the 50 s units, the dozenal hour's twelfths, the dozenal hours over the whole day; digits from the hour down, without trailing zils (owner: noon is Lun, not Lun:Zil:Zil:Zil).
+fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64) {
+    let (secs, sub) = ferros_sys::local_time().unwrap_or((0, 0));
+    let hz = freq() as i64;
+    // Ticks of the counter since local midnight.
+    let t = secs.rem_euclid(86400) * hz + sub as i64;
+    // Where t is in a period of `p` ticks, Q16 of a turn.
+    let frac = |p: i64| (((t % p) << 16) / p.max(1)) as u32;
     let dozenal = ferros_sys::pref(ferros_sys::PREF_BASE) & 0x7F == 12;
     let mut n = 0;
     let mut put = |c: char, n: &mut usize| {
@@ -365,28 +455,26 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize, i64) {
             }
         }
     };
+    let ring = |frac_q16: u32, lighter: bool, ticks: usize| draw::Ring { frac_q16, lighter, ticks };
     if dozenal {
-        let u = sod / 50;
-        let (d1, d2, d3) = (u / 144, (u / 12) % 12, u % 12);
-        let rings = [
-            draw::Ring { frac_q16: q(d3, 12), lighter: false, ticks: 12 },
-            draw::Ring { frac_q16: q(u % 144, 144), lighter: false, ticks: 12 },
-            draw::Ring { frac_q16: q(u, 1728), lighter: false, ticks: 12 },
-        ];
-        for (k, d) in [d1, d2, d3].iter().enumerate() {
+        // 50 s / 12 in ticks (the counter runs at 24.576 MHz: 102,400,000, exact).
+        let q4 = 50 * hz / 12;
+        let rings = [ring(frac(q4 * 12), false, 12), ring(frac(q4 * 144), false, 12), ring(frac(q4 * 1728), false, 12), ring(frac(q4 * 20736), false, 12)];
+        let u = t / q4;
+        let d = [u / 1728, (u / 144) % 12, (u / 12) % 12, u % 12];
+        // The last place that is not zil; the hour always shows.
+        let last = (1..4).rev().find(|&k| d[k] != 0).unwrap_or(0);
+        for (k, v) in d.iter().enumerate().take(last + 1) {
             if k > 0 {
                 put(':', &mut n);
             }
-            put(char::from_u32(0x10 + *d as u32).unwrap_or('?'), &mut n);
+            put(char::from_u32(0x10 + *v as u32).unwrap_or('?'), &mut n);
         }
-        (rings, n, u)
+        (rings, 4, n, u)
     } else {
+        let sod = t / hz;
         let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);
-        let rings = [
-            draw::Ring { frac_q16: q(sec, 60), lighter: false, ticks: 60 },
-            draw::Ring { frac_q16: q(m * 60 + sec, 3600), lighter: false, ticks: 60 },
-            draw::Ring { frac_q16: q((h % 12) * 3600 + m * 60 + sec, 43200), lighter: h >= 12, ticks: 12 },
-        ];
+        let rings = [ring(frac(60 * hz), false, 60), ring(frac(3600 * hz), false, 60), ring(frac(43200 * hz), h >= 12, 12), ring(0, false, 0)];
         for (k, v) in [h, m, sec].iter().enumerate() {
             if k > 0 {
                 put(':', &mut n);
@@ -394,7 +482,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize, i64) {
             put((b'0' + (*v / 10) as u8) as char, &mut n);
             put((b'0' + (*v % 10) as u8) as char, &mut n);
         }
-        (rings, n, sod)
+        (rings, 3, n, sod)
     }
 }
 
@@ -942,6 +1030,14 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask
     if r.is_empty() {
         return;
     }
+    // A publish that is not the clock's own may carry an older clock (the back buffer's, whenever it was drawn): its next redraw is whole.
+    if unsafe { CLIP_PHASE }.is_none() {
+        for k in 0..PHASES {
+            if mask >> k & 1 == 1 {
+                unsafe { PHASE_CLOCK[k] = None };
+            }
+        }
+    }
     let workers = PUB_UP.load(Ordering::Acquire) as usize;
     if r.y1 - r.y0 < PUB_SPLIT_ROWS || workers == 0 {
         publish_band(back, width, height, tabs, mask, r);
@@ -1063,7 +1159,11 @@ fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], 
             let buf = core::slice::from_raw_parts_mut((ARENA as *mut u32).add(sp.off), words);
             let (px, ext) = buf.split_at_mut(d * d);
             px.fill(0);
+            // A sprite is drawn whole, in its own coordinates: the screen's clip (a widget's redraw) does not apply. Built under it, a sprite came out mostly empty and was cached that way (2026-10-24: black corners where the clock's redraw met its neighbours).
+            let clip = draw::CLIP;
+            draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
             draw_into(px, d);
+            draw::CLIP = clip;
             for (r, e) in ext.iter_mut().enumerate() {
                 let row = &px[r * d..(r + 1) * d];
                 match (row.iter().position(|&p| p != 0), row.iter().rposition(|&p| p != 0)) {
@@ -1082,16 +1182,17 @@ fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], 
 
 /// A sprite under what is there, its top-left at (ox, oy).
 fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d: usize, ox: i64, oy: i64) {
+    let (bx0, by0, bx1, by1) = draw::bounds(width, height);
     for r in 0..d {
         let y = oy + r as i64;
-        if y < 0 || y >= height as i64 {
+        if y < by0 || y >= by1 {
             continue;
         }
         let (a, b) = ((ext[r] & 0xFFFF) as i64, (ext[r] >> 16) as i64);
         if a > b {
             continue;
         }
-        let (x0, x1) = ((ox + a).max(0), (ox + b).min(width as i64 - 1));
+        let (x0, x1) = ((ox + a).max(bx0), (ox + b).min(bx1 - 1));
         if x0 > x1 {
             continue;
         }
@@ -1121,6 +1222,7 @@ fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: 
         return;
     }
     let dst = phase_slice(k, width * height);
+    unsafe { PHASE_CLOCK[k] = None };
     let fw = (f.x1 - f.x0) as usize;
     let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
     let mut row = [3u32; 1344];
@@ -1654,10 +1756,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             match m.first() {
                 Some(1) => {
                     client_owned = true;
-                    // Only what the last frame drew needs clearing; the rest of the back buffer is still empty.
+                    // Only what the last frame drew needs clearing; the rest of the back buffer is still empty. Between frames (the clock's redraw), only the clip.
                     unsafe {
-                        draw::clear(pixels, width, PREV_DMG.clip(width, height));
-                        CUR_DMG = draw::Rect::EMPTY;
+                        if { CLIP_PHASE }.is_some() {
+                            draw::clear(pixels, width, draw::CLIP.clip(width, height));
+                        } else {
+                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            CUR_DMG = draw::Rect::EMPTY;
+                        }
                     }
                 }
                 Some(2) if m.len() >= 12 => {
@@ -1724,7 +1830,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(14) if m.len() >= 13 => {
                     client_owned = true;
-                    last_interaction = now();
+                    let clip_k = unsafe { CLIP_PHASE };
+                    if clip_k.is_none() {
+                        last_interaction = now();
+                    }
+                    let saved_dmg = unsafe { (PREV_DMG, CUR_DMG) };
                     // The camera, in integers: the centre in world units ×256, the zoom 16.16, the turn (cos, sin) Q14.
                     let cx = i32::from_le_bytes([m[1], m[2], m[3], m[4]]) as i64;
                     let cy = i32::from_le_bytes([m[5], m[6], m[7], m[8]]) as i64;
@@ -1745,7 +1855,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     if m.get(13).copied().unwrap_or(0) & 1 == 0 {
                         let t_c = now();
                         unsafe {
-                            draw::clear(pixels, width, PREV_DMG.clip(width, height));
+                            draw::clear(pixels, width, if clip_k.is_some() { draw::CLIP.clip(width, height) } else { PREV_DMG.clip(width, height) });
                             CUR_DMG = draw::Rect::EMPTY;
                             CLEAR_US = ferros_sys::us_since(t_c);
                         }
@@ -1764,6 +1874,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let sx = (((rc * dx - rs * dy) >> 14) * z / 65536 + wq) & !255 | 128;
                         let sy = (((rs * dx + rc * dy) >> 14) * z / 65536 + hq) & !255 | 128;
                         let sr = cir.r as i64 * z >> 8;
+                        // Between frames, only what reaches the clip (the circle and its glow, 1/12 of the radius out) is drawn.
+                        if clip_k.is_some() {
+                            let reach = sr + sr / GLOW_FRACTION + 512;
+                            let c = unsafe { draw::CLIP };
+                            if (sx + reach) >> 8 < c.x0 as i64 || (sx - reach) >> 8 >= c.x1 as i64 || (sy + reach) >> 8 < c.y0 as i64 || (sy - reach) >> 8 >= c.y1 as i64 {
+                                continue;
+                            }
+                        }
                         // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
                         if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
                             let colour = if cir.lit != 0 { MAP_LIT & 0x00FF_FFFF } else { MAP_RING & 0x00FF_FFFF };
@@ -1781,7 +1899,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
                         if cir.icon == WIDGET_CLOCK {
                             let mut tb = [0u8; 32];
-                            let (rings, tn, key) = clock_state(&mut tb);
+                            let (rings, nrings, tn, key) = clock_state(&mut tb);
                             unsafe { CLOCK_KEY = key };
                             if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
                                 // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
@@ -1798,7 +1916,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             // The face's turn: the camera's and the circle's own, as the icons get it.
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
                             let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings, unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
+                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings[..nrings], unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
+                            unsafe {
+                                CLOCK_GEOM = (sx, sy, sr, fc, fs, nrings);
+                                BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key };
+                            }
                             unsafe {
                                 CUR_DMG = CUR_DMG.union(r);
                                 CLOCK_SHOWN = true;
@@ -1878,6 +2000,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe { PHASE_US[1] = 0 };
                     // What changed on screen: what the last frame drew and what this one drew.
                     // A clock refresh (the camera has not moved): only the clock's own rectangle changed.
+                    if let Some(k) = clip_k {
+                        unsafe {
+                            publish10x4(pixels, width, height, &tabs, 1 << k, draw::CLIP.clip(width, height));
+                            (PREV_DMG, CUR_DMG) = saved_dmg;
+                        }
+                        ferros_sys::dma_barrier();
+                        return len;
+                    }
                     let changed = unsafe { if CLOCK_ONLY { CLOCK_RECT.clip(width, height) } else { PREV_DMG.union(CUR_DMG).clip(width, height) } };
                     unsafe { PREV_DMG = CUR_DMG };
                     // The finished frame out. Temporal: into the next phase, armed without waiting for it to go out (only for the previous frame to have started); the layer flips to it at the next TE.
@@ -2134,14 +2264,80 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let t_pass = now();
         let mut calls_us = 0u64;
         let mut ncalls = 0u32;
-        // A clock on the screen and a new second: the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
+        // A clock on the screen, spatial dither only (no flips): a new second, the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
+        // The last frame again: a camera op, or each op of a batch in order.
+        let mut replay = |handle: &mut dyn FnMut(&[u8], &mut [u8; 16]) -> usize| {
+            let (b, n) = unsafe { *(&raw const LAST_FRAME) };
+            let m = &b[..n];
+            let mut out = [0u8; 16];
+            if m.first() == Some(&15) {
+                let mut at = 1usize;
+                while at + 2 <= m.len() {
+                    let l = u16::from_le_bytes([m[at], m[at + 1]]) as usize;
+                    if at + 2 + l > m.len() {
+                        break;
+                    }
+                    let _ = handle(&m[at + 2..at + 2 + l], &mut out);
+                    at += 2 + l;
+                }
+            } else if !m.is_empty() {
+                let _ = handle(m, &mut out);
+            }
+        };
         if clock_due {
             clock_due = false;
-            if let Some((b, n)) = unsafe { LAST_CAM } {
-                let mut out = [0u8; 16];
-                unsafe { CLOCK_ONLY = true };
-                let _ = handle(&b[..n], &mut out);
-                unsafe { CLOCK_ONLY = false };
+            unsafe { CLOCK_ONLY = true };
+            replay(&mut handle);
+            unsafe { CLOCK_ONLY = false };
+        }
+        // The clock between frames (owner, 2026-10-24: its rings move at the frame rate): when this pass will flip, the clock's region alone is drawn again (`draw::CLIP`) and published into the phase the flip shows, so every phase carries the current clock while it is on the glass. Under a finger the camera ops draw it with everything else; at rest the 10 Hz flips carry it, no frame added.
+        let flip_due = unsafe { TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
+        if flip_due && unsafe { CLOCK_SHOWN && !{ CLOCK_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
+            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+            // What phase k's clock lacks: the wedges the sweeps moved through since it was last drawn there, and the centre if the digits changed; the whole clock when that is not known.
+            let mut tb = [0u8; 32];
+            let (rings, _, _, key) = clock_state(&mut tb);
+            let now_c = ClockShown { frac: core::array::from_fn(|i| rings[i].frac_q16), lighter: core::array::from_fn(|i| rings[i].lighter), key };
+            let whole = ([unsafe { CLOCK_RECT }, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY], 1);
+            let (parts, np) = match unsafe { PHASE_CLOCK[k] } {
+                Some(was) => clock_dirty(&was, &now_c).unwrap_or(whole),
+                None => whole,
+            };
+            let t_clip = now();
+            let mut px_n = 0u64;
+            let mut drew = false;
+            for clip in parts[..np].iter().map(|c| c.clip(width, height)).filter(|c| !c.is_empty()) {
+                px_n += ((clip.x1 - clip.x0) as u64) * ((clip.y1 - clip.y0) as u64);
+                unsafe {
+                    draw::CLIP = clip;
+                    CLIP_PHASE = Some(k);
+                }
+                replay(&mut handle);
+                drew = true;
+                unsafe {
+                    CLIP_PHASE = None;
+                    draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                }
+            }
+            {
+                unsafe {
+                    // What phase k now holds: the state just drawn, if anything was; unchanged otherwise.
+                    if drew {
+                        PHASE_CLOCK[k] = Some(BACK_CLOCK);
+                    }
+                    CLIP_US[0] += ferros_sys::us_since(t_clip);
+                    CLIP_US[1] += 1;
+                    if CLIP_US[1] == 1024 {
+                        let mut l = Log { grants, buf: [0; 256], n: 0 };
+                        l.s(b"display: clock between frames: ");
+                        l.dec(CLIP_US[0] / 1024);
+                        l.s(b" us each, the last ");
+                        l.dec(px_n);
+                        l.s(b" px\n");
+                        l.flush();
+                        CLIP_US = [0; 2];
+                    }
+                }
             }
         }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
@@ -2189,6 +2385,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             } else {
                 handle(m, &mut out)
             };
+            if m.first() == Some(&14) || (m.first() == Some(&15) && batch_has_camera(m)) {
+                unsafe {
+                    let lf = &mut *(&raw mut LAST_FRAME);
+                    lf.0[..m.len()].copy_from_slice(m);
+                    lf.1 = m.len();
+                }
+            }
             if dsi_op {
                 dsi_unlock();
             }
@@ -2255,9 +2458,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         if t >= next_tick {
             let secs = t / freq();
             next_tick = (secs + 1) * freq();
-            if client_owned && unsafe { CLOCK_SHOWN && (*(&raw const LAST_CAM)).is_some() && (*(&raw const APP)).is_none() } {
+            if client_owned && (!unsafe { TEMPORAL } || ferros_sys::pref(ferros_sys::PREF_DITHER) != 0) && unsafe { CLOCK_SHOWN && LAST_FRAME.1 > 0 && (*(&raw const APP)).is_none() } {
                 let mut tb = [0u8; 32];
-                let (_, _, key) = clock_state(&mut tb);
+                let (_, _, _, key) = clock_state(&mut tb);
                 if key != unsafe { CLOCK_KEY } {
                     clock_due = true;
                 }
