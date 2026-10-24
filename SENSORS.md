@@ -36,6 +36,34 @@ So Google's sensor firmware means a Trusty client in ferros: FF-A messaging to t
 
 The other route stays open and unmeasured: keep the AoC in reset and drive the sensors' buses from the AP, if the AoC block's own I2C/I3C/SPI controllers answer the AP through the `blk_aoc` window (G#1700_0000, 32 MiB) and their addresses and the sensors' wiring can be read out of aoc.bin. That avoids the TEE and Google's firmware, but every sensor driver (ICM45631, TMD3719, MLX90632, ...) becomes ferros's.
 
+## The direct route, measured: closed (2026-10-23)
+
+The AoC's own peripheral table (in aoc.bin's SRAM image) gives its controllers' bases in the AoC's address space; the AP sees them at that base + G#1700_0000. The registry scripts on the phone (`/vendor/etc/sensors/registry/husky_*.reg`) give the wiring:
+
+| Bus | Sensor | Address | Interrupt (AoC GPIO pin) |
+|---|---|---|---|
+| i2c0 | TMD3719 light/proximity | G#39 | 45 |
+| i2c0 | MMC5633 magnetometer 0 | G#30 | — |
+| i2c0 | ICP20100 pressure | G#63 | 47 |
+| i2c0 | VD6282 spectral | G#20 | 56–59 |
+| i2c0 | MLX90632 infrared thermometer | G#3B | — |
+| i3c0 | ICM45631 IMU | G#68 | 43 |
+| i3c0 | MMC5633 magnetometer 1 | G#30 | — |
+
+Controllers: I2C0–3 at AoC G#01A0_6000.., SPI0–4 G#01A0_A000.., five DesignWare I3C masters G#01A0_F000.., two Silvaco I3C G#01C0_A000/B000, a DesignWare APB GPIO at G#01C0_0000.
+
+From the AP (`diag aoc`, aoc.rs), with the AoC block powered and acknowledged: every read inside the block aborts (SRAM, PCU, I2C, I3C, SPI, DMA) except the GPIO's first page. The GPIO reads live pin levels (the sensors' interrupt lines sit high, as idle open-drain lines do) and takes writes, but its configuration has no hardware-control mode and the pads do not follow it: the pin mux is elsewhere and walled off. EL3's privileged register read refuses the block (error −22). So the AP cannot reach the sensor buses by any path found; only the AoC can.
+
+## Starting the AoC through GSA's mailbox (2026-10-23, in progress)
+
+GSA's non-secure mailbox (gsa.rs) takes AoC commands on this firmware, no Trusty: command 91 with 0 answers the state. ferros loads the phone's own aoc.bin from the vault (`tools/husky-aoc-fw.sh`, 14 pieces of 2 MiB; a 4 MiB piece reset the phone, not yet measured why), the body at the carve-out's start and the 4 KiB signed header beside it, and GSA's load (90) authenticates it in 30 ms. The states over the mailbox: 0 inactive, 1 loaded, start (1) gives 4, releasing the A32 (5) gives 2, running; shutdown (4) returns to 1. `diag aoc boot`, then `diag gsa aoc 5`.
+
+It does not come online yet: the parameter block stays where it was written (the firmware writes its control block, magic G#A0C0_0A0C, over it), no mailbox interrupt, no AoC watchdog. Linux's kernel log for the same image: online 0.65 s after start with 94 services.
+
+The oracle capture of Android's bring-up (hv traps on the power request, GSA's mailbox, the AoC GPIO and mailbox, the AoC SYSMMU, SSMT and S2MPU; local only, /mnt/Harbor/tmp/aoc-oracle-2026-10-23) shows what ferros does not do yet: Linux enables the AoC's SYSMMU (sysmmu@19090000, v9.0) before the load — the page table base into G#1909_8404 (G#8C880, i.e. a table at G#8C88_0000), G#20F84 into G#1909_8408, the default stream (G#10B at G#1909_2000) and 37 stream entries (G#1909_2010 + 16·n: config, G#301, the stream id, mask G#3F), then VM 0's control G#24 → G#25 (G#1909_8000) and G#1 at G#1909_8010. It wraps the load in GSA's wakelock (150/151) and drops the power request after the AoC is up. It never touches the AoC GPIO page or S2MPU during bring-up. The next step is to reproduce the SYSMMU enable; what the AoC's non-secure page table must map is the open question (the secure side, G#190A_0000, is GSA's and unreadable).
+
+Capture logistics learned: root on this phone is Magisk in slot b's init_boot, so making slot a active (`fastboot --set-active=a`) boots without root; after an oracle flash, put the image on both boot slots and leave b active. DRAM does not survive the trip through fastboot, so a capture is read from Android's pstore after a forced panic.
+
 ## Capturing USF (2026-10-23)
 
 Android's sensors HAL (`android.hardware.sensors-service.multihal`, libraries `sensors.usf.so` + `libusf.so`) talks to the AoC through one character device, `/dev/acd-com.google.usf` (plus `.non_wake_up`), served by `aoc_channel_dev.ko` (Google's `kernel/google-modules/aoc`, cloned at /mnt/Harbor/ferros-ref/aoc). The messages are FlatBuffers (libusf carries FlatBuffers 1.12; its message types include sensor list, sensor info, get server, get time, self test, debug buffer and an I2C transfer). The sensor rails are the AP's to switch: the AoC platform device holds the sub-PMIC's LDO5 (3.3 V) and LDO7 (1.8 V), which ferros reaches over ACPM.

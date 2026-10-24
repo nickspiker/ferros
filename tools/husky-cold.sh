@@ -117,7 +117,8 @@ while :; do
         exit 1
     fi
     husky
-    if adb get-state >/dev/null 2>&1; then
+    # `adb get-state` can answer for a moment after `fastboot reboot` (2026-10-23: "Android came up after 0s" while ferros was booting); only a real adb device on the bus counts.
+    if [ "$(adb get-state 2>/dev/null)" = device ] && lsusb | grep -q "18d1:4ee[1-9a-f]"; then
         echo "== Android came up after $(( $(date +%s) - t0 ))s — ABL fell back to slot a"
         read_report
         exit 1
