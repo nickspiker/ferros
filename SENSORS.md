@@ -117,3 +117,13 @@ The TMU and its trim fuses belong to the ACPM firmware; the AP asks on IPC chann
 At idle with the X3 spinning at 2.91 GHz every zone reads 48-52 °C.
 
 ferros (`acpm::tmu_read`, the service loop's `thermal_poll`) reads every zone once a second on the kernel's core and keeps them for `diag thermal`, DIAG `SOC_C` and fact 10 (the device circle's "chip" row). The throttle: the hottest CPU zone at 95 °C (Linux's control temperature for the big cluster; its "hot" trip is 115) takes the X3 to 1.4 GHz, and below 85 gives its rate back; fact 11 and DIAG `THROTTLED_MHZ` say when it holds. `diag thermal at <C>` moves the trip to test it on a cool phone (tested both ways at 50 and back at 95). Linux's own governor (PI control, MPMM, the GPU/TPU zones) is not reproduced: the mid and little clusters already run at 1.065 and 1.425 GHz, the GPU at 150 MHz.
+
+## Fingerprint: never (owner decision, 2026-10-24)
+
+ferros supports biometrics only if the biometric material moves with the identity. Husky's fingerprint reader looks built to prevent exactly that, so it is marked **never, unless Google hands over the keys, or the raw sensor turns out reachable from ferros**.
+
+What the device tree shows (measured): the reader is a Goodix optical under-display sensor (`goodix,fingerprint`, zuma-board-udfps.dtsi), lit at panel coordinates 672, 2261 (zuma-husky-touch.dtsi `st,udfps-coords`). Linux is given only its interrupt pin (gpa7-3), its reset pin (gpp1-0) and a 3.3 V rail (s_ldo15, `L15S_UDFPS_AVDD`, always on). It is given no data bus: every other SPI device on husky (touch spi_20, the speaker amps spi_19, UWB spi_18) sits under its own controller, while the fingerprint node sits under `&odm` with its SPI controller described nowhere.
+
+What that implies (inferred, not verified on the phone): the sensor's SPI bus belongs to the secure world, capture, templates and matching run in a Trusty app, Android receives only a signed yes/no, and the templates are sealed to keys in Google's TEE, so they can never leave the device.
+
+The one way back without Google: if the sensor's SPI controller proves reachable from the normal world (the fault-safe register probe used on the AoC block would settle it, once the controller is identified), ferros could capture raw images itself and keep its own templates in the vault, moving with the identity. Using Goodix's Trusty app through ferros's tipc client is possible too, but it only gives a device-bound yes/no, which the identity rule excludes.
