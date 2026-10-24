@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""The panel's channel gains for equal-energy white (E) under VSF's observer, from measured spectra.
+"""The panel's ODT, VSF RGB → panel linear RGB, and its equal-energy (E) gains, from measured spectra, all in VSF RGB.
 
-VSF's white is E, the flat spectrum. Under the Stockman & Sharpe (2000) 10° cone fundamentals as vsf carries them (each channel normalised to sum to 1), a flat spectrum gives L = M = S, so "the panel shows E" means: the mix of its three primaries gives equal L, M and S. This integrates each primary's measured spectrum (spotread, 380-730 nm in 10 nm steps, the profile's `colours` readings) against the cone fundamentals, solves for the gains g (largest = 1) that make R + G + B equal in L, M and S, and reports what the present stage needs:
-  - the gains in linear light, and the multipliers on the 10-bit code (g^(1/γ), γ = 2.19, Q15);
-  - how much light E white keeps against the panel's native white (photopic, vsf's LMS2PHOTOPIC weights), which scales the peak the roll-off lands on.
-The 1931 answer (from the readings' XYZ) is printed beside it, for comparison only.
+VSF RGB is the connection space and its white is E, the flat spectrum, at R = G = B = 1. The observer is Stockman & Sharpe (2000) 10°, which vsf stores as cone fundamentals; turned into VSF RGB's own colour-matching functions (vsf's LMS2VSF_RGB applied per wavelength), they give each spectrum's VSF RGB directly, with no other space in between. This integrates each primary's measured spectrum (spotread, 380-730 nm in 10 nm steps, the profile's `colours` readings) against them, which gives the panel's three primaries in VSF RGB, and from those:
+  - the gains g (largest = 1) that make R + G + B equal E, in linear light, and the multipliers on the 10-bit code (g^(1/γ), γ = 2.19, Q15);
+  - how much light E white keeps against the panel's native white (photopic, vsf's LMS2PHOTOPIC weights carried into VSF RGB), which scales the peak the roll-off lands on;
+  - the whole ODT: the primaries' matrix inverted, scaled so the largest row sums to 1. Absolute (no adaptation: E in is E on the glass), so its row sums are the gains; the gains are the matrix's grey axis, and the off-diagonals are what a gains-only present stage leaves out. Also the panel's primaries in VSF RGB, E-scaled, where a negative or a channel above 1 is outside the panel's reach.
+The 1931 answer for the gains (from the readings' XYZ) is printed beside them, for comparison only.
 
 Usage: tools/panel-white-e.py <profile dir> [dbv, default 1353]
 """
@@ -22,15 +23,27 @@ def spectrum(label):
     vals = [float(v) for v in m[4].split(",")]
     return lo, (hi - lo) / (n - 1), vals, (float(m[5]), float(m[6]), float(m[7]))
 
-# vsf's cone fundamentals: LMS_2000_10DEG_1NM_DATA, 390-830 nm at 1 nm, interleaved L M S.
 src = open("/mnt/Harbor/Code/vsf/src/colour/spectral/constants.rs").read()
-block = re.search(r"LMS_2000_10DEG_1NM_DATA[^=]*=\s*\[(.*?)\];", src, re.S)[1]
-nums = [float(x.replace("_", "").replace("f32", "")) for x in re.findall(r"-?[0-9][0-9_.]*(?:e-?[0-9]+)?_?f32", block)]
-cmf = {390 + i: nums[3 * i:3 * i + 3] for i in range(len(nums) // 3)}
-w = re.search(r"LMS2PHOTOPIC: \[f32; 3\] = \[(.*?)\]", src, re.S)[1]
-photopic = [float(x.replace("_", "").replace("f32", "")) for x in re.findall(r"-?[0-9][0-9_.]*(?:_?f32)?", w)][:3]
+def floats(body):
+    return [float(x.replace("_", "").replace("f32", "")) for x in re.findall(r"-?[0-9][0-9_.]*(?:e-?[0-9]+)?_?f32", body)]
+def matrix(name):
+    # vsf's matrices are column-major; m[row][col].
+    v = floats(re.search(rf"pub const {name}: \[f32; 9\] = \[(.*?)\];", src, re.S)[1])
+    return [[v[3 * c + r] for c in range(3)] for r in range(3)]
+def mul(a, v):
+    return [sum(a[r][k] * v[k] for k in range(3)) for r in range(3)]
 
-def lms(label):
+# VSF RGB's colour-matching functions, 390-830 nm at 1 nm: vsf's cone fundamentals (LMS_2000_10DEG_1NM_DATA, interleaved L M S) through LMS2VSF_RGB.
+nums = floats(re.search(r"LMS_2000_10DEG_1NM_DATA[^=]*=\s*\[(.*?)\];", src, re.S)[1])
+to_vsf = matrix("LMS2VSF_RGB")
+cmf = {390 + i: mul(to_vsf, nums[3 * i:3 * i + 3]) for i in range(len(nums) // 3)}
+# Photopic luminance as weights on VSF RGB: LMS2PHOTOPIC · VSF_RGB2LMS.
+w = re.search(r"LMS2PHOTOPIC: \[f32; 3\] = \[(.*?)\]", src, re.S)[1]
+photopic_lms = [float(x.replace("_", "").replace("f32", "")) for x in re.findall(r"-?[0-9][0-9_.]*(?:_?f32)?", w)][:3]
+from_vsf = matrix("VSF_RGB2LMS")
+photopic = [sum(photopic_lms[k] * from_vsf[k][c] for k in range(3)) for c in range(3)]
+
+def vsf_rgb(label):
     lo, step, vals, _ = spectrum(label)
     acc = [0.0, 0.0, 0.0]
     for nm in range(390, 731):
@@ -55,11 +68,16 @@ def solve(m, rhs):
         out.append(det(a) / D)
     return out
 
-P = [lms(c) for c in ("red", "green", "blue")]
+def inv(m):
+    cols = [solve(m, [1.0 if i == j else 0.0 for i in range(3)]) for j in range(3)]
+    return [[cols[j][i] for j in range(3)] for i in range(3)]
+
+# The panel's primaries in VSF RGB, one per column.
+P = [vsf_rgb(c) for c in ("red", "green", "blue")]
 M = [[P[c][r] for c in range(3)] for r in range(3)]
 g = solve(M, [1.0, 1.0, 1.0])
 g = [x / max(g) for x in g]
-lum = lambda v: photopic[0] * v[0] + photopic[1] * v[1] + photopic[2] * v[2]
+lum = lambda v: sum(photopic[c] * v[c] for c in range(3))
 native = lum([sum(P[c][r] for c in range(3)) for r in range(3)])
 e = lum([sum(g[c] * P[c][r] for c in range(3)) for r in range(3)])
 gamma = 2.19
@@ -71,3 +89,13 @@ M31 = [[X[c][r] for c in range(3)] for r in range(3)]
 g31 = solve(M31, [1.0, 1.0, 1.0])
 g31 = [x / max(g31) for x in g31]
 print(f"for comparison, E under CIE 1931 2° (X = Y = Z): R {g31[0]:.4f} G {g31[1]:.4f} B {g31[2]:.4f}")
+
+O = inv(M)
+top = max(sum(row) for row in O)
+O = [[x / top for x in row] for row in O]
+print("ODT, VSF RGB -> panel linear RGB (rows: panel R, G, B; columns: VSF R, G, B; row sums = E's gains):")
+for row in O:
+    print("  " + "  ".join(f"{x:+.4f}" for x in row) + f"   sum {sum(row):.4f}")
+print("the panel's primaries in VSF RGB (columns: panel R, G, B at full code, E-scaled):")
+for row in inv(O):
+    print("  " + "  ".join(f"{x:+.4f}" for x in row))
