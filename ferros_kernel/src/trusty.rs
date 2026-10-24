@@ -289,11 +289,11 @@ fn virtio_bringup(out: &mut alloc::vec::Vec<u8>) -> Result<(), &'static str> {
     let mut tx = tx;
     tx.buf_handle[0] = th;
     tx.buf_pa[0] = tb;
-    // Finish the virtio handshake in the descriptor before START, as the virtio core does: accept the device's features (gfeatures = dfeatures) and drive status to ACKNOWLEDGE|DRIVER|DRIVER_OK|FEATURES_OK (0x0F). Trusty reads these at START and only then brings the tipc device up and emits GO_ONLINE.
+    // Finish the virtio handshake in the descriptor before START: accept the device's features (gfeatures = dfeatures) and set status to exactly ACKNOWLEDGE|DRIVER|DRIVER_OK (0x07). Trusty's tipc probe (trusty/lk/trusty lib/trusty/tipc_virtio_dev.c `validate_descr`) rejects anything else — FEATURES_OK included, which only modern (VERSION_1) devices set — and virtio_start (trusty_virtio.c) discards the probe's error and still returns 0, so a wrong status left every queue uninitialised: START = 0, the kick fails, no GO_ONLINE (2026-10-24).
     let dfeatures = rd32(vdev + 8);
     unsafe {
         write_volatile((descr + vdev + 12) as *mut u32, dfeatures); // gfeatures
-        write_volatile((descr + vdev + 20) as *mut u8, 0x0F); // status
+        write_volatile((descr + vdev + 20) as *mut u8, 0x07); // status: ACK | DRIVER | DRIVER_OK
     }
     unsafe { cache_clean(descr, PAGE) };
     let r = std_call(SMC_SC_VIRTIO_START, descr_id & 0xFFFF_FFFF, descr_id >> 32, sz as u64);
