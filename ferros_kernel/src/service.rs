@@ -2181,7 +2181,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 queue_pt_response(&mut pt_out_data, &rep);
                                             }
                                         }
-                                    } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
+                                    } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
+                                        // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24).
                                         // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
                                         let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
                                         let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
@@ -2200,7 +2201,7 @@ pub fn run(mut b: Boot) -> ! {
                                         resp[..8].copy_from_slice(&ret.to_le_bytes());
                                         resp[8..].copy_from_slice(&back.to_le_bytes());
                                         queue_pt_response(&mut pt_out_data, &resp);
-                                    } else if cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
+                                    } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
                                         // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
                                         let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
                                         let addr = (raw & !(1 << 63)) as usize;
