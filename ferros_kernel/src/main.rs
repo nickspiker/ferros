@@ -51,6 +51,8 @@ mod camera_snap;
 mod x3;
 mod smp;
 mod rtc;
+mod aoc;
+mod gsa;
 #[cfg(feature = "pixel8")]
 mod camera_close;
 mod camera_rx;

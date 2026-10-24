@@ -1219,6 +1219,62 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(n) = cmd.params.strip_prefix(b"gsa aoc ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u32>().ok()).filter(|n| [0, 1, 4, 5, 6].contains(n)) {
+                                            // `diag gsa aoc <n>`: one AoC management command on GSA's mailbox (gsa_aoc.h `enum gsa_aoc_cmd`: 0 get state, 1 start, 4 shutdown to loaded, 5 release the A32 from reset, 6 reset), then the control block's first words.
+                                            let r = crate::gsa::call(crate::gsa::CMD_AOC, &[n], 2048);
+                                            let cb = |o: usize| unsafe { core::ptr::read_volatile((crate::aoc::CARVEOUT + 0x1C0_0000 + o) as *const u32) };
+                                            resp.extend_from_slice(alloc::format!("aoc cmd {n}: {r:X?}; control block G#{:X} G#{:X} G#{:X} G#{:X}\n", cb(0), cb(4), cb(8), cb(12)).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"gsa echo" || cmd.params == b"gsa aoc" {
+                                            // `diag gsa echo` / `diag gsa aoc`: GSA's non-secure mailbox (gsa.rs), read-only commands only — the echo test, and the AoC's state over the mailbox (command 91, GSA_AOC_GET_STATE), which Linux on zuma sends over Trusty instead.
+                                            let r = if cmd.params == b"gsa echo" { crate::gsa::call(crate::gsa::CMD_ECHO, &[0x1234_5678, 0x0A0C_0A0C], 256) } else { crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256) };
+                                            resp.extend_from_slice(match r {
+                                                Ok((c, e, a)) => alloc::format!("rsp cmd G#{c:X} err A#{e} args {:X?}\n", a),
+                                                Err(m) => alloc::format!("{m}\n"),
+                                            }.as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc boot" {
+                                            // `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) and start it through GSA's mailbox (aoc.rs `boot`). Each piece is read under the kernel lock (the vault's one owner).
+                                            let st = &raw mut store;
+                                            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                                            crate::aoc::boot(&mut get, &mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc pins" || cmd.params.starts_with(b"aoc gpio ") {
+                                            // `diag aoc pins`: the AoC GPIO's four ports of pin levels. `diag aoc gpio <hex offset> <hex value>`: write one register of that page, then show the levels (aoc.rs).
+                                            let mut it = cmd.params.strip_prefix(b"aoc gpio ").unwrap_or(b"").split(|&c| c == b' ').filter(|t| !t.is_empty()).filter_map(|t| core::str::from_utf8(t).ok()).filter_map(|t| usize::from_str_radix(t.trim_start_matches("G#"), 16).ok());
+                                            if let (Some(o), Some(v)) = (it.next(), it.next()) {
+                                                let ok = crate::aoc::gpio_write(o, v as u32);
+                                                resp.extend_from_slice(alloc::format!("write +G#{o:X} = G#{v:X}: {ok}\n").as_bytes());
+                                            }
+                                            let p = crate::aoc::pins();
+                                            resp.extend_from_slice(alloc::format!("pins a G#{:08X} b G#{:08X} c G#{:08X} d G#{:08X}\n", p[0], p[1], p[2], p[3]).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc" || cmd.params == b"aoc on" || cmd.params == b"aoc off" || cmd.params.starts_with(b"aoc peek ") {
+                                            // `diag aoc [on|off|peek <hex>]`: the AoC block from the AP, AoC in reset (aoc.rs). `on`/`off` move its power request first; `peek` reads one register, saying ABORT if it faulted.
+                                            if let Some(h) = cmd.params.strip_prefix(b"aoc peek ") {
+                                                match core::str::from_utf8(h).ok().and_then(|t| usize::from_str_radix(t.trim().trim_start_matches("G#"), 16).ok()) {
+                                                    Some(a) if crate::aoc::req().1 & 1 == 1 || a < crate::aoc::BLK || a >= crate::aoc::BLK + (32 << 20) => resp.extend_from_slice(alloc::format!("G#{a:X}: {:?}\n", crate::aoc::probe32(a).map(|v| alloc::format!("G#{v:X}"))).as_bytes()),
+                                                    Some(_) => resp.extend_from_slice(b"AoC block not acknowledged; refusing to read inside it\n"),
+                                                    None => resp.extend_from_slice(b"peek <hex address>\n"),
+                                                }
+                                            } else {
+                                                if cmd.params != b"aoc" {
+                                                    let (ack, us) = crate::aoc::request(cmd.params == b"aoc on", 256);
+                                                    resp.extend_from_slice(alloc::format!("request {}: ack G#{ack:X} after A#{us} us\n", if cmd.params == b"aoc on" { 1 } else { 0 }).as_bytes());
+                                                }
+                                                crate::aoc::report(&mut resp);
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ffa" {
                                             // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
                                             let smc = |a: [u64; 3]| -> [u64; 4] {
