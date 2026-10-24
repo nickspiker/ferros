@@ -12,11 +12,12 @@ pub const FFA_FEATURES: u64 = 0x8400_0064;
 pub const FFA_RXTX_MAP64: u64 = 0xC400_0066;
 pub const FFA_RXTX_UNMAP: u64 = 0x8400_0067;
 pub const FFA_ID_GET: u64 = 0x8400_0069;
+pub const FFA_MEM_SHARE: u64 = 0x8400_0073;
 pub const FFA_MEM_SHARE64: u64 = 0xC400_0073;
 pub const FFA_MEM_RECLAIM: u64 = 0x8400_0077;
 
-/// Major 1, minor 1 (what Trusty here reports; Linux asks 1.0 and accepts a higher minor).
-pub const CURRENT_VERSION: u64 = (1 << 16) | 1;
+/// Major 1, minor 0: Linux's Trusty driver asks for 1.0, and the memory-transaction descriptor `mem_share` lays out is the 1.0 format (1.1 added fields to the MTD head). Requesting 1.0 makes the SPMC interpret our descriptor as 1.0. The secure world here reports 1.1 but honours a 1.0 caller.
+pub const CURRENT_VERSION: u64 = 1 << 16;
 /// The secure-world endpoint id (trusty.c `ffa_remote_id = 0x8000`).
 pub const SECURE_ID: u64 = 0x8000;
 pub const PAGE: usize = 4096;
@@ -61,11 +62,13 @@ pub fn init() -> Result<u32, i32> {
     if (v >> 16) & 0x7FFF != 1 {
         return Err(-1);
     }
-    call([FFA_FEATURES, FFA_MEM_SHARE64, 0, 0, 0, 0, 0, 0])?;
+    call([FFA_FEATURES, FFA_MEM_SHARE, 0, 0, 0, 0, 0, 0])?;
     let id = call([FFA_ID_GET, 0, 0, 0, 0, 0, 0, 0])?[2];
     unsafe { LOCAL_ID = id as u16 };
     let tx = (&raw const FFA_TX) as u64;
     let rx = (&raw const FFA_RX) as u64;
+    // A warm ferros reload does not reset the secure world, so a prior boot's RX/TX pair may still be mapped (RXTX_MAP would then return DENIED); unmap first, ignoring the error on a cold boot where nothing is mapped.
+    let _ = smc8([FFA_RXTX_UNMAP, 0, 0, 0, 0, 0, 0, 0]);
     // RXTX_MAP (64-bit): tx page, rx page, count in 4 KiB pages.
     call([FFA_RXTX_MAP64, tx, rx, 1, 0, 0, 0, 0])?;
     Ok(v as u32)
@@ -91,4 +94,46 @@ pub fn w64(p: *mut u8, off: usize, v: u64) {
 }
 pub fn r32(p: *const u8, off: usize) -> u32 {
     unsafe { read_volatile(p.add(off) as *const u32) }
+}
+
+/// FF-A attributes for the shared buffers: Normal memory, write-back cacheable, inner-shareable (FFA_MEM_ATTR_NORMAL_MEMORY_CACHED_WB | INNER_SHAREABLE = 0x2C | 0x03), matching Linux's Trusty driver and ferros's own cacheable window, so the secure world and ferros stay coherent on the same cores. Read+write permission.
+const MEM_ATTR_WB_INNER: u8 = 0x2F;
+const MEM_PERM_RW: u8 = 0x2;
+
+/// Share a physically contiguous, 4 KiB-aligned region [pa, pa+pages*4096) with the secure world (FFA_MEM_SHARE, trusty.c `trusty_transfer_memory`). The descriptor is laid out in the mapped TX buffer; the call returns the 64-bit memory handle Trusty refers to the region by. ferros is identity-mapped, so a buffer's address is its physical address.
+pub fn mem_share(pa: usize, pages: u32) -> Result<u64, i32> {
+    let tx = tx_ptr();
+    unsafe { core::ptr::write_bytes(tx, 0, 80) };
+    // ffa_mtd head (32 bytes).
+    w16(tx, 0, unsafe { LOCAL_ID }); // sender_id
+    unsafe { *tx.add(2) = MEM_ATTR_WB_INNER }; // memory_region_attributes
+    w32(tx, 4, 0); // flags = 0 (MEM_SHARE)
+    w64(tx, 8, 0); // handle = 0
+    w64(tx, 16, 0); // tag
+    w32(tx, 28, 1); // emad_count
+    // ffa_emad[0] (16 bytes) at off 32.
+    w16(tx, 32, SECURE_ID as u16); // endpoint_id
+    unsafe { *tx.add(34) = MEM_PERM_RW }; // memory_access_permissions
+    unsafe { *tx.add(35) = 0 }; // flags
+    w32(tx, 36, 48); // comp_mrd_offset = offsetof(mtd, emad[1]) = 32 + 16
+    // ffa_comp_mrd at off 48 (16-byte head).
+    w32(tx, 48, pages); // total_page_count
+    w32(tx, 52, 1); // address_range_count
+    // ffa_cons_mrd[0] at off 64 (16 bytes).
+    w64(tx, 64, pa as u64); // address
+    w32(tx, 72, pages); // page_count
+    let total_len = 80u64;
+    unsafe { core::arch::asm!("dsb sy") };
+    let r = smc8([FFA_MEM_SHARE, total_len, total_len, 0, 0, 0, 0, 0]);
+    if r[0] == FFA_SUCCESS {
+        Ok(r[2] | (r[3] << 32))
+    } else {
+        Err(r[2] as i32)
+    }
+}
+
+/// Hand a shared region back (teardown; not in the critical path).
+pub fn mem_reclaim(handle: u64) -> Result<(), i32> {
+    let r = smc8([FFA_MEM_RECLAIM, handle & 0xFFFF_FFFF, handle >> 32, 0, 0, 0, 0, 0]);
+    if r[0] == FFA_SUCCESS { Ok(()) } else { Err(r[2] as i32) }
 }

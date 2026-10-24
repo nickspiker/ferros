@@ -54,6 +54,7 @@ mod rtc;
 mod aoc;
 mod gsa;
 mod ffa;
+mod trusty;
 #[cfg(feature = "pixel8")]
 mod camera_close;
 mod camera_rx;

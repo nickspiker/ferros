@@ -1285,6 +1285,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"trusty aoc" {
+                                            // `diag trusty aoc`: start the AoC through Trusty — FF-A, virtio, the GSA hwmgr tipc channel, the START message (trusty.rs). Needs the firmware already loaded (diag aoc boot).
+                                            crate::trusty::aoc_start(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ffa init" {
                                             // `diag ffa init`: bring up FF-A as Linux's Trusty driver does (ffa.rs) — version, our id, the RX/TX map — the transport ferros needs to reach the secure world.
                                             match crate::ffa::init() {
