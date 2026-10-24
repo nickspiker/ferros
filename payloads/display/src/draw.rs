@@ -164,8 +164,7 @@ fn log2_q16(q: u64) -> i64 {
     (((63 - lz) as i64) << 16) + m + ((m * (65536 - m) >> 16) * 89 >> 8)
 }
 
-/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): full light at the circle's edge (out to `scale_q8`), then down by the same step of light every octave of q = d² − r² (the squared distance past the edge, ≈ 2r·e near it), to exactly zero 2^`oct_log2` octaves out — no floor, no tail cut. Light reads roughly in log, so the fade looks even.
-/// In linear light (owner, 2026-10-24: light adds in light; blending in gamma 2 is for paint): each channel's value v is gamma 2, so the pixel becomes √(v² + ℓ), ℓ the glow's light into the room it has left (255 − alpha) — a circle's opaque interior takes nothing and needs no test, and two halos that meet add as light. At the edge over black a pixel lands where the gamma-2 glow put it (`peak` scales the colour's code there); out from it the fade is linear in light, not its square.
+/// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): full `peak` at the circle's edge (out to `scale_q8`), then down by the same step every octave of q = d² − r² (the squared distance past the edge, ≈ 2r·e near it), to exactly zero 2^`oct_log2` octaves out — no floor, no tail cut. Light reads roughly in log, so the fade looks even. Additive into the room each pixel has left (255 − alpha), as `glow`, so a circle's opaque interior takes nothing and needs no test.
 pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, oct_log2: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;
@@ -178,15 +177,9 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
     let span = 1i64 << (16 + oct_log2);
     let q_max = q0 << (1 << oct_log2);
     let reach = r + q_max / (2 * r) + 256;
-    // Each channel's light at the edge: the code the gamma-2 glow gave there (colour · peak / 255), squared, in 0..1 — as lanes B, G, R, A (alpha takes no light).
-    let edge = |c: u32| {
-        let v = (c & 0xFF) as f32 * peak as f32 * (1.0 / 65025.0);
-        v * v
-    };
-    let light = [edge(colour), edge(colour >> 8), edge(colour >> 16), 0.0];
-    let inv_span = 1.0 / span as f32;
+    let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
+    let peak = peak as i64;
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
-        use core::arch::aarch64::*;
         if y < 0 || y >= h {
             return;
         }
@@ -194,7 +187,6 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
         let dy = (y << 8) + 128 - cy;
         let dy2 = dy * dy;
         let (x0, x1) = (xo0.max(0), xo1.min(w - 1));
-        let lv = unsafe { vld1q_f32(light.as_ptr()) };
         let mut put = |x: i64| -> bool {
             let dx = (x << 8) + 128 - cx;
             let q = dx * dx + dy2 - r2;
@@ -202,20 +194,14 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
                 return false;
             }
             let t = (log2_q16(q as u64) - l0).clamp(0, span);
+            let i = peak * (span - t) >> (16 + oct_log2);
             let p = &mut px[rowb + x as usize];
-            // The glow's light here: its fall-off, times the room the pixel has left.
-            let k = (span - t) as f32 * inv_span * (255 - (*p >> 24)) as f32 * (1.0 / 255.0);
-            // The pixel's four bytes as four lanes, in 0..1; √(v² + ℓ·k) on all four at once (one reciprocal-square-root estimate and one Newton step); back to bytes. Alpha's ℓ is 0, so it comes back as it was.
-            unsafe {
-                let v = vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(*p as u64))))), 1.0 / 255.0);
-                let x = vaddq_f32(vfmaq_n_f32(vmulq_f32(v, v), lv, k), vdupq_n_f32(1e-20));
-                let e = vrsqrteq_f32(x);
-                let e = vmulq_f32(e, vrsqrtsq_f32(vmulq_f32(x, e), e));
-                let o = vcvtq_u32_f32(vfmaq_n_f32(vdupq_n_f32(0.5), vmulq_f32(x, e), 255.0));
-                let o = vminq_u32(o, vdupq_n_u32(255));
-                let b = vmovn_u16(vcombine_u16(vmovn_u32(o), vdup_n_u16(0)));
-                *p = vget_lane_u32::<0>(vreinterpret_u32_u8(b));
-            }
+            let room = 255 - (*p >> 24) as i64;
+            let add = |c: i64, sh: u32| -> u32 {
+                let have = (*p >> sh & 0xFF) as i64;
+                ((have + c * i * room / 65025).min(255) as u32) << sh
+            };
+            *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
             true
         };
         let mut left_stop = x1 + 1;
