@@ -1285,6 +1285,15 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"ffa init" {
+                                            // `diag ffa init`: bring up FF-A as Linux's Trusty driver does (ffa.rs) — version, our id, the RX/TX map — the transport ferros needs to reach the secure world.
+                                            match crate::ffa::init() {
+                                                Ok(v) => resp.extend_from_slice(alloc::format!("FF-A up: version A#{}.{}, our id G#{:X}, secure G#{:X}\n", v >> 16, v & 0xFFFF, unsafe { crate::ffa::LOCAL_ID }, crate::ffa::SECURE_ID).as_bytes()),
+                                                Err(e) => resp.extend_from_slice(alloc::format!("FF-A init failed: A#{e}\n").as_bytes()),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"ffa" {
                                             // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
                                             let smc = |a: [u64; 3]| -> [u64; 4] {
