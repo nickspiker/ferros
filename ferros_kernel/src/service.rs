@@ -468,7 +468,49 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
         v[8] = base;
     }
     v[9] = crate::rtc::TZ.load(Relaxed) as u64;
+    let hottest = THERMAL.iter().map(|t| t.load(Relaxed)).max().unwrap_or(0);
+    if hottest != 0 {
+        v[10] = hottest as u64;
+    }
+    v[11] = (THROTTLED_FROM.load(Relaxed) != 0) as u64;
     v
+}
+
+/// Each thermal zone's temperature, whole °C, as the service loop last read it (thermal_poll; acpm::TMU_ZONES order); 0 = never read.
+pub static THERMAL: [core::sync::atomic::AtomicU8; 7] = [const { core::sync::atomic::AtomicU8::new(0) }; 7];
+/// The X3's rate before the thermal throttle took it down, kHz; 0 = not throttled.
+static THROTTLED_FROM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The CPU temperature at which the X3 is taken down (°C); it gets its rate back below this less 10. Linux's control temperature for the big cluster is 95 (zuma's `BIG` thermal zone, its passive trip), its "hot" 115. `diag thermal at <C>` moves it, to test the throttle on a cool phone; every boot starts at 95.
+static THROTTLE_AT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(95);
+/// The X3's rate under the throttle, kHz: half its top rate, the firmware takes it as asked (measured 2026-10-23, the core then counts ~1297 M dependent adds/s).
+const THROTTLE_KHZ: u32 = 1_400_000;
+
+/// From the service loop on the kernel's core, once a second: every thermal zone over ACPM (28 us each, measured), for fact 10 and `diag thermal`; and the throttle — the hottest CPU zone (big, mid, little) at THROTTLE_AT takes the X3 (CPUCL2, the kernel's own core and the one that spins) to THROTTLE_KHZ, and 10 below gives it back. The mid and little clusters already run at 1.065 and 1.425 GHz and are left alone.
+fn thermal_poll() {
+    use core::sync::atomic::Ordering::Relaxed;
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let (f, now) = (cntfrq(), cntpct());
+    let last = LAST.load(Relaxed);
+    if last != 0 && now.wrapping_sub(last) < f {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    for (i, t) in THERMAL.iter().enumerate() {
+        if let Ok((c, _, _)) = crate::acpm::tmu_read(i as u32) {
+            t.store(c, Relaxed);
+        }
+    }
+    let cpu = THERMAL[..3].iter().map(|t| t.load(Relaxed)).max().unwrap_or(0);
+    let from = THROTTLED_FROM.load(Relaxed);
+    let at = THROTTLE_AT.load(Relaxed);
+    if from == 0 && cpu >= at {
+        let was = crate::acpm::dvfs_get(4).unwrap_or(2_910_000);
+        if crate::acpm::dvfs_set(4, THROTTLE_KHZ).is_ok() {
+            THROTTLED_FROM.store(was.max(1), Relaxed);
+        }
+    } else if from != 0 && cpu < at.saturating_sub(10) && crate::acpm::dvfs_set(4, from).is_ok() {
+        THROTTLED_FROM.store(0, Relaxed);
+    }
 }
 
 /// The vault's key count for fact 7, kept by the service loop (gauge_poll).
@@ -628,6 +670,7 @@ pub fn run(mut b: Boot) -> ! {
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
         gauge_poll();
+        thermal_poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
             if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {
@@ -1170,6 +1213,29 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(c) = cmd.params.strip_prefix(b"thermal at ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u8>().ok()) {
+                                            THROTTLE_AT.store(c.max(20), core::sync::atomic::Ordering::Relaxed);
+                                            resp.extend_from_slice(alloc::format!("throttle at A#{} C, release below A#{} C (takes effect within a second)\n", c.max(20), c.max(20) - 10).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"thermal" || cmd.params == b"thermal init" {
+                                            // `diag thermal`: every TMU zone as the ACPM firmware reads it (acpm::tmu_read) — the hottest probe, the zone's status, each probe; `diag thermal init` sends TMU_IPC_INIT first (Linux does once at probe).
+                                            if cmd.params == b"thermal init" {
+                                                resp.extend_from_slice(alloc::format!("init: {:?}\n", crate::acpm::tmu_init().map(|c| alloc::format!("caps G#{c:X}")).map_err(|e| alloc::format!("G#{e:X}"))).as_bytes());
+                                            }
+                                            let t0 = cntpct();
+                                            let _ = crate::acpm::tmu_read(0);
+                                            resp.extend_from_slice(alloc::format!("one zone read: A#{} us; throttle at A#{} C; X3 throttled from: A#{} kHz (0 = not)\n", cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq(), THROTTLE_AT.load(core::sync::atomic::Ordering::Relaxed), THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                                            for (i, name) in crate::acpm::TMU_ZONES.iter().enumerate() {
+                                                match crate::acpm::tmu_read(i as u32) {
+                                                    Ok((t, st, p)) => resp.extend_from_slice(alloc::format!("{name:>6}: A#{t} C  stat G#{st:X}  probes {:?}\n", p).as_bytes()),
+                                                    Err(e) => resp.extend_from_slice(alloc::format!("{name:>6}: G#{e:X}\n").as_bytes()),
+                                                }
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"threads" {
                                             crate::process::threads_report(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
@@ -1552,6 +1618,9 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                                         append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
                                         append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
+                                        // The hottest thermal zone, °C (thermal_poll), and the X3's pre-throttle rate in MHz while the thermal throttle holds it (0 = not throttled).
+                                        append_hex(&mut resp, b"SOC_C=", THERMAL.iter().map(|t| t.load(core::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0) as u32);
+                                        append_hex(&mut resp, b"THROTTLED_MHZ=", THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed) / 1000);
                                         for k in 4..9 {
                                             append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
                                         }

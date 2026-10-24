@@ -736,6 +736,22 @@ impl Map {
         }
         Map::row(b, cx, y, "in the vault", v.as_str());
         y += 64;
+        // The hottest part of the SoC as the kernel last read it (once a second, over ACPM), and whether the kernel has the big core's clock down for it.
+        let mut v = Line::new();
+        match facts.soc_temp_c() {
+            Some(c) => {
+                let _ = tatau::count(&mut v, f, c, 1);
+                v.s(" °C");
+                if facts.throttled() == Some(true) {
+                    v.s("  throttled");
+                }
+            }
+            None => {
+                v.s("-");
+            }
+        }
+        Map::row(b, cx, y, "chip", v.as_str());
+        y += 64;
         Map::row(b, cx, y, "numbers", base_name(ferros_sys::device_base()));
         b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "two fingers: settings");
         b.disc(cx, cy, r - r / 25 - 1, FILL);

@@ -14,7 +14,7 @@ What the Pixel 8 Pro has, read from Android's sensor service on the phone (`adb 
 
 The rest of the list (gravity, rotation vector, step counter, lift to wake, double twist, …) is Google's fusion running on the AoC from these parts.
 
-Outside the AoC, ferros already reads: the battery fuel gauge (MAX77759, I2C: charge, temperature, voltage, current), the RTC (s2mpg14 via ACPM), touch (FTM5), the keys. The SoC's own thermal zones (TMU) are behind ACPM, which ferros speaks.
+Outside the AoC, ferros already reads: the battery fuel gauge (MAX77759, I2C: charge, temperature, voltage, current), the RTC (s2mpg14 via ACPM), touch (FTM5), the keys. The SoC's own thermal zones (TMU) are behind ACPM, which ferros speaks: read since 2026-10-23 (below).
 
 ## The way in
 
@@ -23,3 +23,21 @@ An hv oracle capture first: Android under the hv, recording how it boots the AoC
 - Keep the AoC off and drive the sensors' buses directly from ferros, if the AP can reach them.
 
 The capture decides which.
+
+## SoC temperature (TMU over ACPM) — working 2026-10-23
+
+The TMU and its trim fuses belong to the ACPM firmware; the AP asks on IPC channel 9 (zuma's `acpm_tmu` node; the driver is `exynos_acpm_tmu.c`). TMU_IPC_READ_TEMP (type 2) with the zone id in byte 2 of word 1 answers in whole °C: word 1's top byte is the zone's hottest probe, word 2 byte 0 its status, and the next seven bytes each probe (zero past the last). No TMU_IPC_INIT is needed on a cold boot (it answers capabilities G#3: APM interrupt + divider). One zone takes 28 us.
+
+| id | zone | probes |
+|---|---|---|
+| 0 | BIG (the X3) | 2 |
+| 1 | MID | 4 |
+| 2 | LITTLE | 2 |
+| 3 | G3D (GPU) | 3 |
+| 4 | ISP | 1 |
+| 5 | TPU | 3 |
+| 6 | AUR | 3 |
+
+At idle with the X3 spinning at 2.91 GHz every zone reads 48-52 °C.
+
+ferros (`acpm::tmu_read`, the service loop's `thermal_poll`) reads every zone once a second on the kernel's core and keeps them for `diag thermal`, DIAG `SOC_C` and fact 10 (the device circle's "chip" row). The throttle: the hottest CPU zone at 95 °C (Linux's control temperature for the big cluster; its "hot" trip is 115) takes the X3 to 1.4 GHz, and below 85 gives its rate back; fact 11 and DIAG `THROTTLED_MHZ` say when it holds. `diag thermal at <C>` moves the trip to test it on a cool phone (tested both ways at 50 and back at 95). Linux's own governor (PI control, MPMM, the GPU/TPU zones) is not reproduced: the mid and little clusters already run at 1.065 and 1.425 GHz, the GPU at 150 MHz.

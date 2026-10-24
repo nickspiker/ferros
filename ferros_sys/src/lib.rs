@@ -128,6 +128,14 @@ impl Facts {
     pub fn vault_keys(&self) -> Option<u64> {
         self.get(7)
     }
+    /// The hottest part of the SoC (any thermal zone: CPU clusters, GPU, ISP, TPU, AUR), whole degrees C.
+    pub fn soc_temp_c(&self) -> Option<u64> {
+        self.get(10)
+    }
+    /// Whether the kernel has the big core's clock down for heat.
+    pub fn throttled(&self) -> Option<bool> {
+        self.get(11).map(|v| v != 0)
+    }
 }
 
 /// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.

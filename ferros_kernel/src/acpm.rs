@@ -204,3 +204,27 @@ pub fn write(speedy: u32, typ: u32, reg: u32, val: u8) -> Result<(), u32> {
 pub fn update(speedy: u32, typ: u32, reg: u32, val: u8, mask: u8) -> Result<(), u32> {
     transact(speedy, typ, reg, 2, val as u32, mask as u32).map(|_| ())
 }
+
+/// The thermal channel (`acpm-ipc-channel = <9>` on zuma's `acpm_tmu` node; exynos_acpm_tmu.c). The firmware owns the TMU and its trim fuses; the AP asks.
+pub const TMU_CHANNEL: usize = 9;
+/// zuma's thermal zones by their `id` (zuma-b0-*.dts `tmuctrl_N`): the three CPU clusters, the GPU, the camera ISP, the TPU and the AUR (the AoC's audio/sensor core).
+pub const TMU_ZONES: [&str; 7] = ["BIG", "MID", "LITTLE", "G3D", "ISP", "TPU", "AUR"];
+const TMU_IPC_INIT: u32 = 0x01;
+const TMU_IPC_READ_TEMP: u32 = 0x02;
+
+/// TMU_IPC_INIT (`exynos_acpm_tmu_set_init`): Linux sends it once at probe; the reply's `ret` byte carries the firmware's capability bits (1 APM interrupt, 2 APM divider).
+pub fn tmu_init() -> Result<u8, u32> {
+    let r = call(TMU_CHANNEL, [0, TMU_IPC_INIT, 0, 0], true)?;
+    Ok((r[1] >> 8) as u8)
+}
+
+/// One zone's temperature (`exynos_acpm_tmu_set_read_temp`): request word 1 = type | tzid << 16; reply word 1 = type | ret << 8 | tzid << 16 | temp << 24 (whole °C, the zone's hottest probe), word 2 byte 0 the zone's status and bytes 1-3 + word 3 the zone's probes one by one (zero past the last). Returns (temp, stat, probes).
+pub fn tmu_read(zone: u32) -> Result<(u8, u8, [u8; 7]), u32> {
+    let r = call(TMU_CHANNEL, [0, TMU_IPC_READ_TEMP | (zone & 0xFF) << 16, 0, 0], true)?;
+    let ret = (r[1] >> 8) as u8 as i8;
+    if ret < 0 {
+        return Err(E_FW | (ret as u8 as u32) << 8);
+    }
+    let p = [(r[2] >> 8) as u8, (r[2] >> 16) as u8, (r[2] >> 24) as u8, r[3] as u8, (r[3] >> 8) as u8, (r[3] >> 16) as u8, (r[3] >> 24) as u8];
+    Ok(((r[1] >> 24) as u8, r[2] as u8, p))
+}
