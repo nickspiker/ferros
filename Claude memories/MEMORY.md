@@ -79,3 +79,5 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Bluetooth pairing moves with identity](bluetooth_pairing_moves_with_identity.md) — one radio at a time, follows the user; clone identity BT address + host-held keys (dual-boot trick generalised); lifecycle TBD
 - [Radio addresses belong to the identity](radio_addresses_belong_to_identity.md) — WiFi MAC + BT address worn by the identity, not the device; platform table; M1 BCM4378 takes a host-set BT address natively
 - [MVNO is data-only](mvno_data_only.md) — no POTS/numbers/SMS/MMS/911; EMS via Photon (optional); never plan around telephony; CALEA = just comply (intercepts see Photon ciphertext)
+- [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) — one branchless per-pixel path; clz/exponent/shift tricks over divides and LUTs; a compare forking two maths paths is not a shortcut; owner picks, then build + time
+- [PMU timing: pin to the X3](pmu_timing_pin_x3.md) — unpinned EL0 timings land on the A715s at 1.07 GHz (3-4x off); pin, sleep 1 ms, report cycles/µs as the clock
