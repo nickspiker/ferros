@@ -122,7 +122,7 @@ A plain power law to at least 10-bit code 8 (1/1250 of white), within the instru
 
 **Decided (owner, 2026-10-22):**
 - **The present stage.** 16-bit gamma-2 working values (white = Q14) go through one 1D table, shared by the three channels: square, tanh roll-off into the peak, 1/2.19. That gives 10-bit codes with fraction bits, dithered spatially and temporally (phase buffers flipped at 10 Hz, re-pointed rather than copied) to a 12-bit effective target, then packed BGRA1010102 for the hardware's 10 → 8 dither.
-- **White is equal-energy E.** Out-of-gamut colours move along the line to E at constant luminance until the lowest channel reaches 0. No curve.
+- **White is equal-energy E.** ~~Out-of-gamut colours move along the line to E at constant luminance until the lowest channel reaches 0.~~ Superseded 2026-10-24 (below): each channel clamps on its own, bottoms to 0 and tops to the panel's peak, done by the output tables rather than an instruction. No curve.
 - **Headroom.** Max white is one stop under the panel's max (about 750 of about 1500 cd/m²). Below it the headroom grows with the panel's room, up to the working format's 16× (4 stops).
 - **Blending** happens in gamma 2.
 
@@ -136,3 +136,35 @@ A plain power law to at least 10-bit code 8 (1/1250 of white), within the instru
 ## Emission duty: the ~95 % notch is the panel's, not ours (2026-10-23)
 
 The owner sees the HK3's emission at roughly 94-97 % duty at every brightness, Android included, never 100 %. Tested live with the owner as the detector (`ferros-bridge display dcs`), each variant sent whole with the level-1 keys: HBM mode at DBV G#FFF (G#53 = G#E0) — identical; normal mode with the dimming bit (G#53 = G#28) — identical; 60 Hz NS op mode (G#F2 01, G#60 18) — the off-window grew, so the notch is per frame; the HBM-style G#BD early-exit and frame-count table in normal mode (`BD 21 00 83 03 01`, the halved counts at G#BD offset 1E) — the panel took it, picture fine, notch unchanged. The driver (panel-google-hk3.c) sends nothing that names AOR, duty or PWM; the DDIC derives the emission timing from its own tables per mode. Conclusion: the gap is the pixel circuit's per-frame off-window (the scan), under the DDIC alone; no host-visible register moves it, and 100 % is not on this panel. Brightness is already set by the present stage (the table, the dither) wherever the panel's own DBV is not needed; the notch is not a dimming mechanism we could take over.
+
+
+## The ODT: VSF RGB → the panel (2026-10-24)
+
+Until today the present stage had no gamut matrix: VSF RGB went straight to the panel's primaries, with only per-channel gains putting the white at E. Greys were right (the gains are the white), colour was close but off on the red-green axis (greens leaned yellow, reds orange); blue was already right.
+
+**The matrix** (`tools/panel-white-e.py`, the DBV 3307 spectra integrated against VSF RGB's own colour-matching functions — Stockman & Sharpe 10° through vsf's LMS2VSF_RGB, no other space in between): rows panel R, G, B; columns VSF R, G, B; absolute (E in is E on the glass), so its row sums are E's gains.
+
+```
++1.3596  −0.3725  +0.0129   sum 1.0000
+−0.0984  +0.8640  −0.0261   sum 0.7394
++0.0018  −0.0011  +0.8165   sum 0.8172
+```
+
+Over the gains it is identity on blue and a 2×2 on red-green (panel red takes −37 % of VSF green, panel green −13 % of VSF red): that block is the whole colour correction. Every sRGB colour lands inside the panel (smallest channel 0.007, none over 1), so only colour beyond sRGB is ever out of gamut. Model tier, from one unit.
+
+**Decided (owner, 2026-10-24):**
+- Out of gamut: each channel on its own, bottoms to 0, tops to the panel's peak. No line to E (the earlier rule), no division.
+- One path for every pixel, branchless: no grey test, no scalar fallback. The matrix is written as gains + K, `p = g∘l + K_R·(l_R − l_G) + K_B·(l_B − l_G)` with K = ODT − diag(g) (rows sum to zero), so a grey's differences are exactly 0 and greys come out as g∘l with no special case.
+- f16 for the per-pixel maths (8 lanes), the panel's 1/2.19 from the f16's own bits: the exponent picks the code at its octave's foot, the top six mantissa bits a nudge across the octave (interpolated on the low four). The clamp is the tables: a negative light's sign bit indexes past the 32-entry exponent table, which TBL answers with 0; exponents past the peak saturate the dither.
+
+**The pipe** (payloads/display/src/neon.rs `Odt`), per 16 pixels:
+1. light: the 8-bit canvas as u = c²/65536 (an exact u8 multiply and one fixed-point convert) into a degree-4 polynomial fitted to tanh²(k·v) at each brightness; an app's 16-bit working values (to 16× white) as tanh(k·v) in f32 by Lambert's continued fraction to 7th order, squared, narrowed to f16;
+2. the ODT as gains + K (f16, 11 instructions per 8 pixels);
+3. the output code from the f16's bits (TBL, one widening multiply, a rounding narrow);
+4. the dither (saturating add, saturating narrowing shift) and the pack: the 10-10-10-2 word's four bytes as four planes, one `st4`.
+
+Checked against f64 on the phone: canvas greys within 6 Q4 (a tenth of an 8-bit step), canvas colour within 21 Q4 (only channels the matrix cancels to near zero, a negligible amount of light next to the pixel's others); the app path within 1 8-bit code (truncation).
+
+**Measured on husky with the PMU** (ferros_kernel/src/pmu.rs, opened to EL0 the same day): canvas 86 cycles and 199 instructions per 16 pixels on the X3 (1.9 ns a pixel at 2.85 GHz), 126 cycles on an A715 (7.4 ns at its 1.07 GHz); the app path 157 cycles on the X3. A full-frame publish, split in bands weighted by those rates (X3 57 %, each A715 14 %): 5.2 ms (the grey-table path alone was 9 ms for a mostly black map, which it skipped). Along the way: the built-in target's strict-align had LLVM turn every NEON load and store into scalar pieces through the stack; processes now build with `cargo el0` (.cargo/config.toml), without it.
+
+Timed and set aside: the scalar f32 ODT (9 ns a pixel on the X3), the scalar integer one (Q30 light, Q28 matrix, `clz` output; 9–10 ns, and within 1 Q4 of f32 only with Q28 — Q16 lost up to 5 codes where channels cancel), plain f16 (fast but up to 18 codes off before gains + K).

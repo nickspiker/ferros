@@ -68,3 +68,7 @@ opt-level = "s"       # size-optimized for embedded
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The display server's per-pixel paths are measured for speed, not size (the ODT timing, 2026-10-24).
+[profile.release.package.ferros-payload-display]
+opt-level = 3

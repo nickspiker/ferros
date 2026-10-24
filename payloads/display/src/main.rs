@@ -688,94 +688,101 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
 /// The present stage's policy (DISPLAY-CALIB.md, "Decided", 2026-10-22): the panel driven at its measured peak (HBM: 1467 cd/m² of native white on this unit) and white at 133 cd/m².
 const PEAK_NITS: f32 = 1467.0;
 const WHITE_NITS: f32 = 133.0;
-/// White is equal-energy E, applied at the tail end (owner): per-channel gains in linear light after the roll-off, so E at full is the brightest the panel shows and some native codes are never reached. Solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white-e.py`, the DBV 3307 readings): R 1.0, G 0.7394, B 0.8172 in light; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15.
+/// White is equal-energy E (owner): solved from the panel's measured spectra under VSF's observer (Stockman & Sharpe 10°, `tools/panel-white-e.py`, the DBV 3307 readings), E needs R 1.0, G 0.7394, B 0.8172 of each channel's light — the ODT's row sums below; E keeps 80.1 % of native white's light, which is the peak the roll-off lands on. On the code they are g^(1/2.19), Q15: the ramps (op 21) apply them to the one table directly.
 const E_CODE_Q15: [u32; 3] = [32768, 28548, 29883];
 const E_LIGHT: f32 = 0.801;
 /// The panel's measured power law (γ 2.19 in 8- and 10-bit codes, to 10-bit code 8; DISPLAY-CALIB.md).
 const PANEL_GAMMA: f32 = 2.19;
 
-/// The ODT, VSF RGB → panel linear RGB (`tools/panel-white-e.py`, the DBV 3307 readings): the panel's three primaries from the profile's spectra under VSF's observer, the matrix they make inverted; rows are panel R, G, B, columns VSF R, G, B. Absolute (E in is E on the glass), so its row sums are E's gains above: a grey gets exactly the gains, which is why greys keep the one-table path and only colour comes through `odt`. Model tier, from one unit (pixel 8 pro calibration data/README.md).
+/// The ODT, VSF RGB → panel linear RGB (`tools/panel-white-e.py`, the DBV 3307 readings): the panel's three primaries from the profile's spectra under VSF's observer, the matrix they make inverted; rows are panel R, G, B, columns VSF R, G, B. Absolute (E in is E on the glass), so its row sums are E's gains. Model tier, from one unit (pixel 8 pro calibration data/README.md). Applied to every pixel by `neon::Odt` (neon.rs), with no clamp: out-of-gamut channels land at 0 or at the panel's top through the output tables (owner, 2026-10-24); every sRGB colour lands inside, so only colour beyond sRGB ever meets them.
 const ODT: [[f32; 3]; 3] = [[1.359550, -0.372458, 0.012909], [-0.098444, 0.863965, -0.026116], [0.001826, -0.001101, 0.816481]];
 const E_GAIN: [f32; 3] = [ODT[0][0] + ODT[0][1] + ODT[0][2], ODT[1][0] + ODT[1][1] + ODT[1][2], ODT[2][0] + ODT[2][1] + ODT[2][2]];
-/// Photopic luminance on VSF RGB (vsf's LMS2PHOTOPIC through VSF_RGB2LMS): sums to 1, so E at light v has luminance v.
-const LUM: [f32; 3] = [0.258390, 0.634615, 0.106995];
 
-/// The output table's reach: light from 2^-28 of the peak (below every white's darkest dithered step) to the peak, 1024 entries an octave.
-const CODE_OCTAVES: usize = 28;
+/// The ODT's light scale: the E peak at 2^14 in f16, so 2^-28 of the peak is f16's smallest normal.
+const F16_SCALE: f64 = 16384.0;
 
-/// The colour path's two tables. `lin`: a 16-bit working value to its light after the roll-off, a fraction of the E peak, tanh²(a·v) — the table's first half, before the panel's 1/2.19. `lin8`: the same at the 8-bit canvas's 256 values. `code`: panel-linear light to its Q4 10-bit code, (light)^(1/2.19), indexed by the f32's exponent and top ten mantissa bits and interpolated on the rest (no square root: `fsqrt` returns 0 in this process, see `sqrt`).
-static mut LIN: &[f32] = &[];
-static mut LIN8: [f32; 256] = [0.0; 256];
-static mut CODE: &[u16] = &[];
-
-/// `lin` and `lin8` for a white and peak, as `build_lut` (the same `a`).
-fn build_lin(lin: &mut [f32], lin8: &mut [f32; 256], white: f32, peak_e: f32) {
-    let k = libm::atanhf(sqrt((white / peak_e).min(0.999)));
-    for (i, e) in lin.iter_mut().enumerate() {
-        let y = tanh(i as f32 / 16384.0 * k);
-        *e = y * y;
-    }
-    for (c, e) in lin8.iter_mut().enumerate() {
-        *e = lin[c * 16384 / 255];
-    }
+/// An f32 to f16 bits, by the cores' own convert (Rust's f16 is unstable).
+fn f32_to_f16(x: f32) -> u16 {
+    let h: u32;
+    unsafe { core::arch::asm!("fcvt {h:h}, {x:s}", "umov {o:w}, {h:v}.h[0]", h = out(vreg) _, x = in(vreg) x, o = out(reg) h, options(pure, nomem, nostack)) };
+    h as u16
 }
 
-/// `code`, once: entry i is light 2^(i/1024 − 28) on the octave's mantissa grid.
-fn build_code(code: &mut [u16]) {
-    for (i, e) in code.iter_mut().enumerate() {
-        let v = f32::from_bits(((127 - CODE_OCTAVES as u32) << 23) + ((i as u32) << 13));
-        let q = pow(v, 1.0 / PANEL_GAMMA) * 1023.0 * 16.0 + 0.5;
-        *e = if q > 16368.0 { 16368 } else { q as u16 };
-    }
-}
-
-/// Panel-linear light (0..1 of the channel's native peak) to its Q4 10-bit code.
-#[inline(always)]
-fn code_of(code: &[u16], v: f32) -> u32 {
-    if v >= 1.0 {
-        return code[CODE_OCTAVES << 10] as u32;
-    }
-    let b = v.to_bits();
-    let lo = (127 - CODE_OCTAVES as u32) << 23;
-    if v <= 0.0 || b < lo {
-        return 0;
-    }
-    let i = ((b - lo) >> 13) as usize;
-    let f = b & 0x1FFF;
-    let (a, c) = (code[i] as u32, code[i + 1] as u32);
-    a + ((c - a) * f >> 13)
-}
-
-/// A colour (VSF RGB light after the roll-off, fractions of the E peak) to its three Q4 panel codes: the ODT, then the gamut (owner, DISPLAY-CALIB.md "Decided"): a colour the panel cannot show moves along its line to E — the grey of its own luminance — to the most saturated point on that line the panel reaches. The roll-off keeps every VSF channel under the peak, so that grey is always inside and the line always has a point.
-#[inline(always)]
-fn odt(code: &[u16], l: [f32; 3]) -> [u32; 3] {
-    let mut p = [0.0f32; 3];
-    for (r, e) in p.iter_mut().enumerate() {
-        *e = ODT[r][0] * l[0] + ODT[r][1] * l[1] + ODT[r][2] * l[2];
-    }
-    if p[0] < 0.0 || p[1] < 0.0 || p[2] < 0.0 || p[0] > 1.0 || p[1] > 1.0 || p[2] > 1.0 {
-        let y = LUM[0] * l[0] + LUM[1] * l[1] + LUM[2] * l[2];
-        let mut t = 1.0f32;
-        for c in 0..3 {
-            let q = y * E_GAIN[c];
-            if p[c] < 0.0 {
-                t = t.min(q / (q - p[c]));
-            } else if p[c] > 1.0 {
-                t = t.min((1.0 - q) / (p[c] - q));
+/// The ODT's constants and tables (`neon::Odt`) for a white and the E peak it rolls off into (`build_lut`'s k = atanh(√(white/peak))):
+/// - the canvas light polynomial: tanh²(k·c/255)·2^14 as u·(a1 + a2·u + a3·u² + a4·u³) with u = c²/65536, by least squares on the relative error over the 255 non-zero values (degree 4: within 6 Q4 evaluated in f16 at the brightest white, under 2 below);
+/// - the app light's k/16384 and 2^14;
+/// - the output tables: per exponent, twice the code at the octave's foot, 2·16368·2^((e − 29)/2.19) (e = 0: zero and subnormals, under 2^-28 of the peak, code 0; e = 30, 31: past the peak, the most a u16 holds, so the dither saturates); per top six mantissa bits, the nudge (1 + i/64)^(1/2.19) in Q15 and its slope to the next.
+fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
+    use core::arch::aarch64::*;
+    let k = libm::atanh(libm::sqrt((white / peak_e).min(0.999) as f64));
+    let mut ata = [[0f64; 4]; 4];
+    let mut atb = [0f64; 4];
+    for c in 1..256 {
+        let v = c as f64 / 255.0;
+        let u = (c * c) as f64 / 65536.0;
+        let t = libm::tanh(k * v);
+        let l = t * t * F16_SCALE;
+        let w = 1.0 / l;
+        let row = [u * w, u * u * w, u * u * u * w, u * u * u * u * w];
+        for i in 0..4 {
+            for j in 0..4 {
+                ata[i][j] += row[i] * row[j];
             }
-        }
-        for c in 0..3 {
-            let q = y * E_GAIN[c];
-            p[c] = q + t * (p[c] - q);
+            atb[i] += row[i] * l * w;
         }
     }
-    [code_of(code, p[0]), code_of(code, p[1]), code_of(code, p[2])]
-}
-
-/// One 8-bit canvas pixel's colour codes (non-grey; greys take the channel tables).
-#[inline(always)]
-fn odt8(p: u32) -> [u32; 3] {
-    unsafe { odt(CODE, [LIN8[(p >> 16 & 0xFF) as usize], LIN8[(p >> 8 & 0xFF) as usize], LIN8[(p & 0xFF) as usize]]) }
+    for i in 0..4 {
+        for j in i + 1..4 {
+            let f = ata[j][i] / ata[i][i];
+            for m in i..4 {
+                ata[j][m] -= f * ata[i][m];
+            }
+            atb[j] -= f * atb[i];
+        }
+    }
+    let mut a = [0f64; 4];
+    for i in (0..4).rev() {
+        let mut s = atb[i];
+        for j in i + 1..4 {
+            s -= ata[i][j] * a[j];
+        }
+        a[i] = s / ata[i][i];
+    }
+    let h = |x: f64| f32_to_f16(x as f32);
+    let gm = 1.0 / PANEL_GAMMA;
+    let nudge = |i: usize| (pow(1.0 + i as f32 / 64.0, gm) * 32768.0 + 0.5) as u32;
+    let (mut nudge_hi, mut nudge_lo, mut slope) = ([0u8; 64], [0u8; 64], [0u8; 64]);
+    for i in 0..64 {
+        let n = nudge(i);
+        nudge_hi[i] = (n >> 8) as u8;
+        nudge_lo[i] = n as u8;
+        slope[i] = (nudge(i + 1) - n) as u8;
+    }
+    let (mut scale_hi, mut scale_lo) = ([0u8; 32], [0u8; 32]);
+    for e in 1..32 {
+        let s = if e < 30 { (2.0 * 16368.0 * pow(2.0, (e as f32 - 29.0) * gm) + 0.5) as u32 } else { 65535 };
+        scale_hi[e] = (s >> 8) as u8;
+        scale_lo[e] = s as u8;
+    }
+    let kk = |r: usize, c: usize| (ODT[r][c] - if r == c { E_GAIN[r] } else { 0.0 }) as f64;
+    let c0 = [E_GAIN[0] as f64, E_GAIN[1] as f64, E_GAIN[2] as f64, kk(0, 0), kk(0, 2), kk(1, 0), kk(1, 2), kk(2, 0)].map(h);
+    let c1 = [kk(2, 2), a[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
+    let kf = [(k / 16384.0) as f32, F16_SCALE as f32, 0.0, 0.0];
+    unsafe {
+        neon::Odt {
+            nudge_hi: vld1q_u8_x4(nudge_hi.as_ptr()),
+            nudge_lo: vld1q_u8_x4(nudge_lo.as_ptr()),
+            slope: vld1q_u8_x4(slope.as_ptr()),
+            scale_hi: vld1q_u8_x2(scale_hi.as_ptr()),
+            scale_lo: vld1q_u8_x2(scale_lo.as_ptr()),
+            c0: vld1q_u16(c0.as_ptr()),
+            c1: vld1q_u16(c1.as_ptr()),
+            a3: vdupq_n_u16(h(a[2])),
+            a2: vdupq_n_u16(h(a[1])),
+            a1: vdupq_n_u16(h(a[0])),
+            k: vld1q_f32(kf.as_ptr()),
+        }
+    }
 }
 
 /// The present stage's one table: a 16-bit working value (gamma 2, white = 1.0 = Q14 16384, up to 4.0 = 16× white in light) to a 10-bit panel code with 4 fraction bits (Q4, 0..16368), before the white point. One entry folds the whole display transform: the roll-off, Y/peak = tanh²(a·v), always on, with infinity on the panel's peak and `a` solved so white lands exactly on its share of it, tanh²(a) = white ÷ peak, a = atanh(√(white/peak)) (owner, 2026-10-22: at the brightest setting white is half the peak); then the panel's 1/2.19. Shared by the three channels (their curves agree within the instrument's noise); E's per-channel gains come after it. Built once, here, with f32; everything per pixel is integer.
@@ -865,20 +872,24 @@ static mut PHASE_DIRTY: [draw::Rect; PHASES] = [draw::Rect { x0: 0, y0: 0, x1: 4
 //
 // A tall publish is cut into row bands, one per worker core plus the render thread's own (KERNEL.md "Cores": tiled rendering across the workers — the publish is the first pass split this way; the pattern for the effects to come). The workers wait on a job word; the render thread writes the job, wakes them, does band 0 itself, then waits for their count (with a deadline, so a lost worker costs a frame, not the server). Phase frames are non-cacheable and the canvas is inner-shareable: no maintenance between cores.
 const PUB_WORKERS: usize = 3;
-/// Rows below which one thread does the whole rect. Measured 2026-10-23 on a full frame: the X3 alone 4.2 ms, three A715 bands plus the X3's 5.2 ms — the A715s' NEON is the long pole, so the split is off (i32::MAX) until there is a pass the X3 is not better at alone; the mechanism stays for that.
-const PUB_SPLIT_ROWS: i32 = i32::MAX;
+/// Rows below which one thread does the whole rect (the wake and the wait cost more than a short rect saves).
+const PUB_SPLIT_ROWS: i32 = 64;
+/// Each band's share of the rows, in 256ths: the render thread's X3 first, then each A715 worker. Weighted by the cores' measured rates through the ODT (2026-10-24, PMU on each: the X3 at 2.85 GHz 1.9 ns a pixel, an A715 at its 1.07 GHz 7.4 ns), so the bands finish together. Equal bands (2026-10-23) left the A715s the long pole and the split slower than the X3 alone.
+const PUB_SHARE: [usize; PUB_WORKERS + 1] = [145, 37, 37, 37];
 static PUB_JOB: AtomicU64 = AtomicU64::new(0);
 static PUB_DONE: AtomicU64 = AtomicU64::new(0);
 static PUB_UP: AtomicU64 = AtomicU64::new(0);
 /// The job: canvas base, width, height, phase mask, the rect, the band count.
 static mut PUB_PARAMS: (usize, usize, usize, u32, draw::Rect, usize) = (0, 0, 0, 0, draw::Rect::EMPTY, 1);
-static mut PUB_TABS: neon::Tables = neon::Tables { code: [[[0; 64]; 4]; 3], frac: [[[0; 64]; 4]; 3] };
+static mut PUB_TABS: neon::Odt = unsafe { core::mem::zeroed() };
 static mut PUB_STACKS: [[u8; 16384]; PUB_WORKERS] = [[0; 16384]; PUB_WORKERS];
 
-/// Band `i` of `n` of `r`, by rows.
+/// Band `i` of `n` of `r`, by rows, in `PUB_SHARE`'s proportions (rescaled when fewer workers are up).
 fn band(r: draw::Rect, i: usize, n: usize) -> draw::Rect {
     let rows = (r.y1 - r.y0) as usize;
-    draw::Rect { x0: r.x0, y0: r.y0 + (rows * i / n) as i32, x1: r.x1, y1: r.y0 + (rows * (i + 1) / n) as i32 }
+    let total: usize = PUB_SHARE[..n].iter().sum();
+    let before: usize = PUB_SHARE[..i].iter().sum();
+    draw::Rect { x0: r.x0, y0: r.y0 + (rows * before / total) as i32, x1: r.x1, y1: r.y0 + (rows * (before + PUB_SHARE[i]) / total) as i32 }
 }
 
 extern "C" fn pub_worker(idx: u64) -> ! {
@@ -902,7 +913,7 @@ extern "C" fn pub_worker(idx: u64) -> ! {
 }
 
 /// The canvas through the present stage into the phases `mask` names, over `r`: in bands across the workers when tall, else here.
-fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, mask: u32, r: draw::Rect) {
+fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     let r = r.clip(width, height);
     if r.is_empty() {
         return;
@@ -929,7 +940,7 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, m
     }
 }
 
-fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, mask: u32, r: draw::Rect) {
+fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
     }
@@ -948,16 +959,7 @@ fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, 
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
-                    let colour = neon::sixteen(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
-                    // The lanes that are not grey: the ODT, one pixel at a time.
-                    let mut m = colour;
-                    while m != 0 {
-                        let i = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        let q = odt8(*src.add(x + i));
-                        let t = th[i] as u32;
-                        *row.as_mut_ptr().add(x + i) = pack10(dither8(q[0], t), dither8(q[1], t), dither8(q[2], t));
-                    }
+                    neon::sixteen_odt(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
                     x += 16;
                 }
             }
@@ -978,7 +980,7 @@ static mut PUB_TICKS: [u64; 3] = [1; 3];
 
 /// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
 /// A frame into the ring: the next phase in turn, never the one on the layer (which the panel may still be reading), and it becomes the current one. Every frame goes this way — a camera op, an app's frame, the status line — so the frame after can be armed at once (the buffer it writes was on screen three frames before) and consecutive frames carry consecutive phases' thresholds: the temporal dither at whatever rate frames come, 120 Hz under a finger, 10 Hz at rest (the flip below, which publishes nothing once the ring holds the image).
-fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Tables, r: draw::Rect) {
+fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, r: draw::Rect) {
     unsafe {
         for k in 0..PHASES {
             PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
@@ -1079,7 +1081,7 @@ static mut APP: Option<draw::Rect> = None;
 static mut APP_SURF: usize = 1;
 
 /// The app's 16-bit pixels into phase `k` over `r` (screen coordinates, inside the app's frame `f`): each pixel's R, G, B (bits 0-15, 16-31, 32-47) are working values — gamma 2, white = Q14 — through the one table, E's gains and the dither; bit 48 set = no dither for that pixel (the ramps' comparison columns). Outside the app's frame: black.
-fn publish_app(f: draw::Rect, r: draw::Rect, lut: &[u16], k: usize, width: usize, height: usize) {
+fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
     let r = r.clip(width, height);
     if r.is_empty() {
         return;
@@ -1087,24 +1089,30 @@ fn publish_app(f: draw::Rect, r: draw::Rect, lut: &[u16], k: usize, width: usize
     let dst = phase_slice(k, width * height);
     let fw = (f.x1 - f.x0) as usize;
     let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
-    let mut row = [0u32; 1344];
+    let mut row = [3u32; 1344];
     for y in r.y0 as usize..r.y1 as usize {
-        for x in r.x0 as usize..r.x1 as usize {
-            let inside = (x as i32) >= f.x0 && (x as i32) < f.x1 && (y as i32) >= f.y0 && (y as i32) < f.y1;
-            row[x] = if !inside {
-                3
-            } else {
-                let p = surf[(y - f.y0 as usize) * fw + (x - f.x0 as usize)];
-                let th = if p >> 48 & 1 == 1 { 0 } else { threshold(x, y, k) };
-                let (r, g, b) = ((p & 0xFFFF) as usize, (p >> 16 & 0xFFFF) as usize, (p >> 32 & 0xFFFF) as usize);
-                let q4 = if r == g && g == b {
-                    let base = lut[r] as u32;
-                    [base * E_CODE_Q15[0] >> 15, base * E_CODE_Q15[1] >> 15, base * E_CODE_Q15[2] >> 15]
-                } else {
-                    unsafe { odt(CODE, [LIN[r], LIN[g], LIN[b]]) }
-                };
-                pack10(dither8(q4[0], th), dither8(q4[1], th), dither8(q4[2], th))
-            };
+        row[r.x0 as usize..r.x1 as usize].fill(3);
+        // The frame's part of this row: 16 pixels a step through the ODT (neon.rs `sixteen_app`), the last step through a padded copy.
+        let (xa, xb) = ((r.x0.max(f.x0)) as usize, (r.x1.min(f.x1)) as usize);
+        if (y as i32) >= f.y0 && (y as i32) < f.y1 && xa < xb {
+            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+            let src = &surf[(y - f.y0 as usize) * fw..];
+            unsafe {
+                let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
+                let mut x = xa;
+                while x + 16 <= xb {
+                    neon::sixteen_app(tabs, src.as_ptr().add(x - f.x0 as usize), row.as_mut_ptr().add(x), neon::thresholds_at(base, x));
+                    x += 16;
+                }
+                if x < xb {
+                    let n = xb - x;
+                    let mut pin = [0u64; 16];
+                    let mut pout = [0u32; 16];
+                    pin[..n].copy_from_slice(&src[x - f.x0 as usize..x - f.x0 as usize + n]);
+                    neon::sixteen_app(tabs, pin.as_ptr(), pout.as_mut_ptr(), neon::thresholds_at(base, x));
+                    row[x..xb].copy_from_slice(&pout[..n]);
+                }
+            }
         }
         dst[y * width + r.x0 as usize..y * width + r.x1 as usize].copy_from_slice(&row[r.x0 as usize..r.x1 as usize]);
     }
@@ -1120,29 +1128,24 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
     b << 22 | g << 12 | r << 2 | 3
 }
 
-/// The 8-bit canvas through the present stage: each channel value read as gamma 2 with white at 255, its Q4 code from the table (`lut8`), the dither, the BGRA1010102 word. Empty pixels (most of the map) skip all of it. A row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
-fn publish10(back: &[u32], screen: &mut [u32], width: usize, lut8: &[[u16; 256]; 3]) {
+/// The 8-bit canvas through the present stage with the spatial dither only (temporal off): the ODT 16 pixels a step (neon.rs `sixteen_odt`) with this row's Bayer thresholds, a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
+fn publish10(back: &[u32], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
     let mut row = [0u32; 4096];
+    let w16 = width & !15;
     for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
-        let bay = &BAYER[y & 3];
-        let out = &mut row[..src.len()];
-        for (x, (s, d)) in src.iter().zip(out.iter_mut()).enumerate() {
-            let p = *s & 0x00FF_FFFF;
-            if p == 0 {
-                *d = 3;
-                continue;
-            }
-            let t = bay[x & 3] as u32 * 4;
-            let (r, g, b) = (p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF);
-            *d = if r == g && g == b {
-                let q = |ch: usize, c: u32| dither8(lut8[ch][c as usize] as u32, t);
-                pack10(q(0, r), q(1, g), q(2, b))
-            } else {
-                let q = odt8(p);
-                pack10(dither8(q[0], t), dither8(q[1], t), dither8(q[2], t))
-            };
+        let mut th = [0u8; 16];
+        for (x, t) in th.iter_mut().enumerate() {
+            *t = (BAYER[y & 3][x & 3] * 4) as u8;
         }
-        dst.copy_from_slice(out);
+        unsafe {
+            let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
+            let mut x = 0;
+            while x < w16 {
+                neon::sixteen_odt(tabs, src.as_ptr().add(x), row.as_mut_ptr().add(x), thv);
+                x += 16;
+            }
+        }
+        dst[..w16].copy_from_slice(&row[..w16]);
     }
 }
 
@@ -1430,31 +1433,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
-    // The colour path's tables (`odt`).
-    let lin: &'static mut [f32] = alloc::vec![0f32; 65536].leak();
-    let code: &'static mut [u16] = alloc::vec![0u16; (CODE_OCTAVES << 10) + 1].leak();
-    build_code(code);
-    unsafe {
-        build_lin(lin, &mut *(&raw mut LIN8), white0, peak0);
-        LIN = &*(lin as *const [f32]);
-        CODE = code;
-    }
-    // The 8-bit canvas's tables, one per channel with E's gain on the code already in.
-    let mut lut8 = [[0u16; 256]; 3];
-    let rebuild8 = |lut: &[u16], lut8: &mut [[u16; 256]; 3]| {
-        for (ch, t) in lut8.iter_mut().enumerate() {
-            for (c, e) in t.iter_mut().enumerate() {
-                *e = (lut[c * 16384 / 255] as u32 * E_CODE_Q15[ch] >> 15) as u16;
-            }
-        }
-    };
-    for (ch, t) in lut8.iter_mut().enumerate() {
-        for (c, e) in t.iter_mut().enumerate() {
-            *e = (lut[c * 16384 / 255] as u32 * E_CODE_Q15[ch] >> 15) as u16;
-        }
-    }
+    // The ODT's tables for this white (neon.rs `Odt`): every pixel's path.
+    let mut tabs = odt_tables(white0, peak0);
     let lut_ms = ferros_sys::us_since(t_lut) / 1000;
-    let mut tabs = neon::Tables::from_lut8(&lut8);
     // Each app icon's mip chain (draw::Mips), premultiplied, built once and kept.
     let mips: &'static [draw::Mips] = {
         let decode = icon_decode();
@@ -1657,7 +1638,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 Some(4) => {
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -1862,7 +1843,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[1] = 1;
                         len = 2;
                     } else {
-                        if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                        if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                         ferros_sys::dma_barrier();
                         unsafe { PHASE_US[2] = ferros_sys::us_since(t_phase) };
                         t_phase = now();
@@ -1917,7 +1898,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         }
                         pipe.settle(&mut armed, true);
                         let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                        publish_app(f, full, lut, k, width, height);
+                        publish_app(f, full, &tabs, k, width, height);
                         unsafe {
                             PHASE_DIRTY[k] = draw::Rect::EMPTY;
                             CUR_PHASE = k;
@@ -2064,7 +2045,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     log.flush();
                     testcard(pixels, width, height);
                     // The finished frame to the framebuffer: reads from cache, writes combined.
-                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                    if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                     ferros_sys::dma_barrier();
                     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                     let (moved, _) = pipe.present(win);
@@ -2255,7 +2236,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
                 ALLOC.reset();
                 // The finished frame to the framebuffer: reads from cache, writes combined.
-                if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &lut8) } else { publish(pixels, screen) }
+                if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
                 // The layer is ours every frame: the kernel's bench ops (bridge display …) still re-point it when they run.
                 pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
@@ -2286,9 +2267,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             bright = b;
             let (white, peak_e, hbm, dbv) = brightness(b);
             build_lut(lut, white, peak_e);
-            unsafe { build_lin(lin, &mut *(&raw mut LIN8), white, peak_e) };
-            rebuild8(lut, &mut lut8);
-            tabs = neon::Tables::from_lut8(&lut8);
+            tabs = odt_tables(white, peak_e);
             // The panel's own setting, by the panel thread.
             PANEL_BRIGHT.store((hbm as u64) << 16 | dbv as u64, Ordering::Release);
             PANEL_SEQ.fetch_add(1, Ordering::AcqRel);
@@ -2342,7 +2321,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
             if unsafe { !PHASE_DIRTY[k].is_empty() } {
                 match unsafe { APP } {
-                    Some(f) => publish_app(f, unsafe { PHASE_DIRTY[k] }, lut, k, width, height),
+                    Some(f) => publish_app(f, unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height),
                     None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),
                 }
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };
