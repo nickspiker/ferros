@@ -1822,10 +1822,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     len = 2;
                 }
                 Some(12) => {
+                    // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
+                    unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
                     unsafe { SCENE_N = 0 };
                 }
                 Some(13) if m.len() >= 2 => {
+                    // The scene changed: the last frame no longer matches it, so the clock is not redrawn from it until the client sends the frame that does (a pinch's renormalise rescaled the scene under the old camera, and the replay drew a clock and scenery at the wrong scale into the clock's square, 2026-10-24).
+                    unsafe { LAST_FRAME.1 = 0 };
                     client_owned = true;
                     let count = m[1] as usize;
                     let mut at = 2usize;
@@ -2163,6 +2167,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe { CUR_DMG = CUR_DMG.union(r) };
                 }
                 Some(17) if m.len() >= 12 => {
+                    unsafe { LAST_FRAME.1 = 0 };
                     let i = m[1] as usize;
                     if i < unsafe { SCENE_N } {
                         let i32le = |k: usize| i32::from_le_bytes([m[k], m[k + 1], m[k + 2], m[k + 3]]);
