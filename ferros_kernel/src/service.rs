@@ -454,9 +454,11 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
         v[1..5].copy_from_slice(&g.0);
     }
     v[5] = USB_LINK.load(Relaxed) as u64;
-    v[6] = crate::process::alive() as u64;
-    if let Some(keys) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).and_then(|s| s.keys().ok()) {
-        v[7] = keys.len() as u64;
+    // Inside a syscall the kernel lock is held: the lock-free count, and the vault's key count as the service loop last read it (the vault is the service loop's, on its own core).
+    v[6] = crate::process::alive_locked() as u64;
+    let keys = VAULT_KEYS.load(Relaxed);
+    if keys != u64::MAX {
+        v[7] = keys;
     }
     let base = crate::rtc::BASE.load(Relaxed);
     if base != 0 {
@@ -466,7 +468,10 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v
 }
 
-/// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4.
+/// The vault's key count for fact 7, kept by the service loop (gauge_poll).
+static VAULT_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
     unsafe {
@@ -477,6 +482,9 @@ fn gauge_poll() {
                 Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
                 Err(_) => [crate::process::FACT_UNKNOWN; 4],
             };
+            if let Some(keys) = (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok()) {
+                VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }

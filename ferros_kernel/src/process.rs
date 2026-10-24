@@ -669,10 +669,29 @@ pub fn set_pref(index: usize, value: u8) {
         }
     }
     lock();
+    write_pref_all(index, value);
+    unlock();
+}
+
+/// The preference into every live process's page, with the kernel lock already held (from inside a syscall: `set_pref` there waited on its own core's lock).
+fn write_pref_all(index: usize, value: u8) {
     for p in k().procs.iter().flatten() {
         p.write((PREFS + index) as u64, &[value]);
     }
-    unlock();
+}
+
+/// `set_pref` for the syscall path, where the lock is held.
+fn set_pref_locked(index: usize, value: u8) {
+    if index >= 32 {
+        return;
+    }
+    unsafe { (*(&raw mut PREFS_NOW))[index] = value };
+    if index == PREF_BASE {
+        if let Some(b) = tatau::Base::from_code(value) {
+            tatau::set_base(b);
+        }
+    }
+    write_pref_all(index, value);
 }
 
 /// Bytes 16-31 of the preferences block: the wall clock's base (unix seconds × counter frequency − the counter, u64 LE; 0 = not read yet) and the time zone (seconds east of UTC, i64 LE), so a process reads the time from its own memory and counter with no syscall (rtc.rs; ferros_sys::local_time). Set by the kernel when either changes.
@@ -1069,7 +1088,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let held = matches!(p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), Some((Object::Settings, r)) if r & RIGHT_SEND != 0);
             let (index, value) = (f.x[1] as usize, f.x[2] as u8);
             f.x[0] = if held && pref_valid(index, value) && unsafe { PREF_STORE }.map(|st| st(index, value)).unwrap_or(false) {
-                set_pref(index, value);
+                set_pref_locked(index, value);
                 0
             } else {
                 ERR
@@ -1575,9 +1594,13 @@ fn kill_locked(name: &[u8]) -> bool {
 /// How many processes are alive (running, runnable or blocked).
 pub fn alive() -> usize {
     lock();
-    let n = k().procs.iter().filter(|p| p.is_some()).count();
+    let n = alive_locked();
     unlock();
     n
+}
+/// The same with the lock already held — from inside a syscall (the facts provider): `alive` there took the lock its own core held and waited on itself forever, which froze the phone whenever the device's settings were open (2026-10-23).
+pub fn alive_locked() -> usize {
+    k().procs.iter().filter(|p| p.is_some()).count()
 }
 
 /// What a spawn left behind.
