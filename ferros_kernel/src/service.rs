@@ -206,6 +206,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.dither" && len == 1 && params[2 + klen] <= 1 {
                         crate::process::set_pref_held(crate::process::PREF_DITHER, params[2 + klen]);
                     }
+                    if key == "device.theme" && len == 1 && params[2 + klen] < crate::process::THEMES {
+                        crate::process::set_pref_held(crate::process::PREF_THEME, params[2 + klen]);
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -312,6 +315,7 @@ fn store_pref(index: usize, value: u8) -> bool {
         crate::process::PREF_LABELS => "device.labels",
         crate::process::PREF_BRIGHTNESS => "device.brightness",
         crate::process::PREF_DITHER => "device.dither",
+        crate::process::PREF_THEME => "device.theme",
         _ => return false,
     };
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, &[value]).is_ok()).unwrap_or(false) }
@@ -596,6 +600,10 @@ pub fn run(mut b: Boot) -> ! {
     let mut t_command = t_init;
     let mut attempts: u32 = 1;
     let mut configured_ever = false;
+    // The USB link's story in the flash log (2026-10-24: three times the link went and never came back while the kernel kept running, and nothing recorded why): each change of configured state, every disconnect, bus reset and re-initialisation, and a heartbeat every 64 s — at most 256 lines a boot.
+    let mut usb_log_n = 0u32;
+    let mut usb_was_configured = false;
+    let mut t_heartbeat = cntpct();
     let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
     // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
     let mut att_ev = [0u32; 3];
@@ -705,6 +713,22 @@ pub fn run(mut b: Boot) -> ! {
             platform::crumb(0xB6);
         }
 
+        let usb_log = |n: &mut u32, text: &str| {
+            if *n < 256 {
+                *n += 1;
+                crate::flashlog::line(text);
+            }
+        };
+        let dsts = || unsafe { read_volatile((DWC3 + 0xC70C) as *const u32) };
+        if now.wrapping_sub(t_heartbeat) > 64 * freq {
+            t_heartbeat = now;
+            let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
+            usb_log(&mut usb_log_n, &alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
+        }
+        if usb.is_configured() != usb_was_configured {
+            usb_was_configured = usb.is_configured();
+            usb_log(&mut usb_log_n, &alloc::format!("usb: {} at {} s (DSTS G#{:08X})", if usb_was_configured { "configured" } else { "not configured" }, now.wrapping_sub(t_boot) / freq, dsts()));
+        }
         match usb.poll_event() {
             UsbEvent::None => {
                 // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires) — but not while a PT transfer is open or a response is still going out: a 10 ms slice per idle pass crawls a transfer to the point where the host gives up, and the half-open transfer then trips the 16 s stall exit (measured 2026-10-16: every PT-stall exit of the day had a busy process running).
@@ -740,9 +764,12 @@ pub fn run(mut b: Boot) -> ! {
                             init_history.push(h);
                         }
                     }
+                    usb_log(&mut usb_log_n, &alloc::format!("usb: re-initialising (attempt {}) at {} s, DSTS G#{:08X}", attempts + 1, now.wrapping_sub(t_boot) / freq, dsts()));
                     crate::pixel8_eusb_phy_init();
                     if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() {
                         usb = nu;
+                    } else {
+                        usb_log(&mut usb_log_n, "usb: DWC3 init failed");
                     }
                     attempts += 1;
                     att_ev = [0; 3];
@@ -771,6 +798,9 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
             UsbEvent::Reset => {
+                if configured_ever {
+                    usb_log(&mut usb_log_n, &alloc::format!("usb: bus reset at {} s (DSTS G#{:08X})", now.wrapping_sub(t_boot) / freq, dsts()));
+                }
                 att_ev[0] += 1;
                 t_progress = cntpct();
                 usb.handle_reset();
@@ -786,6 +816,7 @@ pub fn run(mut b: Boot) -> ! {
                 usb.bulk_out_arm();
             }
             UsbEvent::Disconnect => {
+                usb_log(&mut usb_log_n, &alloc::format!("usb: disconnect at {} s (DSTS G#{:08X})", now.wrapping_sub(t_boot) / freq, dsts()));
                 usb.handle_disconnect();
                 pt_inbound = None;
                 pt_seq_width = 0;

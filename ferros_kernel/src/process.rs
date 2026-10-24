@@ -647,6 +647,10 @@ pub const PREF_SCREEN_OFF: usize = 2;
 pub const PREF_BRIGHTNESS: usize = 3;
 /// Preference 4: the dither, 0 spatial and temporal (four phase frames flipped every 100 ms: 14 bits on the 8-bit link), 1 spatial only (12 bits; the panel can rest at its idle floor between frames).
 pub const PREF_DITHER: usize = 4;
+/// Preference 5: the theme, an index into ferros_sys::theme::THEMES (0 = grey, the default).
+pub const PREF_THEME: usize = 5;
+/// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
+pub const THEMES: u8 = 4;
 
 /// A preference as the kernel holds it now.
 pub fn pref(index: usize) -> u8 {
@@ -673,10 +677,20 @@ pub fn set_pref(index: usize, value: u8) {
     unlock();
 }
 
-/// The preference into every live process's page, with the kernel lock already held (from inside a syscall: `set_pref` there waited on its own core's lock).
+/// The preference into every live process's page, with the kernel lock already held (from inside a syscall: `set_pref` there waited on its own core's lock). Then every thread waiting on a word wakes (its `wait` returns 0 and its loop looks again — every wait in the system is a loop that re-checks), so a server asleep until its next deadline sees the change now: the screen came back on the power key only at the display's next tick, anywhere up to a second later (owner, 2026-10-24). Interrupt waits are left alone.
 fn write_pref_all(index: usize, value: u8) {
-    for p in k().procs.iter().flatten() {
+    let kk = k();
+    for p in kk.procs.iter().flatten() {
         p.write((PREFS + index) as u64, &[value]);
+    }
+    for i in 0..kk.threads.len() {
+        if let Some(x) = kk.threads[i].as_mut() {
+            if matches!(x.state, State::Waiting(a, _) if a >= 1024) {
+                x.state = State::Runnable;
+                x.frame.x[0] = 0;
+                enqueue_back(i);
+            }
+        }
     }
 }
 
@@ -740,6 +754,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_SCREEN_OFF => value <= 1,
         PREF_BRIGHTNESS => value <= 8,
         PREF_DITHER => value <= 1,
+        PREF_THEME => value < THEMES,
         _ => false,
     }
 }

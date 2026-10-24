@@ -507,18 +507,14 @@ static mut SETTLE_TIMEOUT: [u32; 4] = [1; 4];
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// Inside the scene: icons, discs, labels (µs, the last camera op).
 static mut SCENE_US: [u64; 3] = [1; 3];
-/// The map's colours: a quiet grey plane, the ring a lighter grey, and amber — the only colour — for what changed since it was last seen.
-const MAP_FILL: u32 = rgb(0x2A, 0x2A, 0x2A);
-const MAP_RING: u32 = rgb(0x8A, 0x8A, 0x8A);
+/// The map's colours, the glow's strength: the theme (ferros_sys::theme).
 /// The glow that replaced the ring (owner, 2026-10-23: no stroke, so circles can touch; additive glow, 1/distance): its colour, how bright one pixel out by importance (ring 1, ring 2), the distance it holds that brightness (Q8 px), and the floor where it stops. Tunables, by eye.
-const GLOW_PEAK: [u32; 3] = [0, 0x77, 0xFF];
 const GLOW_SCALE_Q8: i64 = 256;
 const GLOW_FLOOR: u32 = 2;
 /// The log glow (`draw::glow_log`) in place of the 1/distance one: on; how far it reaches, 1/GLOW_FRACTION of the circle's radius past its edge at every size (owner, 2026-10-24: 1/12, no minimum, no maximum); and its fade, 2^GLOW_OCT_LOG2 octaves of squared distance from full light to none (2 = four). Tunables, by eye.
 const GLOW_LOG: bool = true;
 const GLOW_FRACTION: i64 = 12;
 const GLOW_OCT_LOG2: u32 = 2;
-const MAP_LIT: u32 = AMBER;
 const BLACK: u32 = rgb(0, 0, 0);
 
 struct Log {
@@ -1887,6 +1883,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     // The glows, collected as the circles go and drawn after all of them, so they land behind every circle (front to back: what is drawn later goes under). Each: centre, radius (Q8), colour, peak.
                     let mut glows = [(0i64, 0i64, 0i64, 0u32, 0u32); 256];
                     let mut nglow = 0usize;
+                    // The theme (ferros_sys::theme, device preference 5): every colour the scene chooses.
+                    let th = ferros_sys::theme::current();
                     for i in 0..unsafe { SCENE_N } {
                         let cir = unsafe { SCENE[i] };
                         // World to screen, Q8 pixels: offset, turn, zoom, centre.
@@ -1905,8 +1903,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         }
                         // Its glow, before the visibility cut: a circle just off the screen still lights its edge.
                         if sr >= 256 && cir.ring > 0 && nglow < glows.len() {
-                            let colour = if cir.lit != 0 { MAP_LIT & 0x00FF_FFFF } else { MAP_RING & 0x00FF_FFFF };
-                            glows[nglow] = (sx, sy, sr, colour, GLOW_PEAK[(cir.ring as usize).min(2)]);
+                            let colour = if cir.lit != 0 { th.lit & 0x00FF_FFFF } else { th.ring & 0x00FF_FFFF };
+                            glows[nglow] = (sx, sy, sr, colour, th.glow_peak[(cir.ring as usize).min(2)]);
                             nglow += 1;
                         }
                         if sr < 256 || sx + sr < 0 || sx - sr > (width as i64) << 8 || sy + sr < 0 || sy - sr > (height as i64) << 8 {
@@ -1914,7 +1912,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         }
                         // Importance is the ring's weight, in screen pixels so it stays legible at every zoom: thin 4 % (at least a pixel), heavy 12 % (at least two).
                         // No stroke: the circle's image reaches its radius, so circles touch; importance is the glow, drawn after every circle (below).
-                        let stroke = 0i64;
+                        // No stroke any more; the slot in the sprite's key holds the theme, which colours a plain circle's fill.
+                        let stroke = ferros_sys::theme::index() as i64;
                         let lit = cir.lit != 0;
                         let ri = sr;
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
@@ -1931,7 +1930,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 // The digits turn with the face (and, once the accelerometer is in, with gravity).
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
                                 let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                                text_turned_centre(pixels, width, height, t, (sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5, px, (fc as f32 / 16384.0, fs as f32 / 16384.0), WHITE);
+                                text_turned_centre(pixels, width, height, t, (sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5, px, (fc as f32 / 16384.0, fs as f32 / 16384.0), 0xFF00_0000 | th.text);
                                 ALLOC.reset();
                             }
                             // The face's turn: the camera's and the circle's own, as the icons get it.
@@ -1958,14 +1957,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let tw = text_width(&font, t, px);
                                 let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
                                 let mut c = Canvas::new(pixels, width, height, &mut damage);
-                                text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { WHITE });
+                                text(&mut c, &font, t, fx - tw * 0.5, fy + px * 0.35, px, if lit { BLACK } else { 0xFF00_0000 | th.text });
                                 ALLOC.reset();
                             }
                         }
                         let t_i = now();
                         let (cc, cs) = (cir.c as i64, cir.s as i64);
                         let (tc, ts) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                        let fill = if lit { MAP_LIT & 0x00FF_FFFF } else { MAP_FILL & 0x00FF_FFFF };
+                        let fill = if lit { th.lit & 0x00FF_FFFF } else { th.plane & 0x00FF_FFFF };
                         let mp = mips.get((cir.icon as usize).wrapping_sub(1));
                         let d = (2 * ((sr >> 8) + 3)) as usize;
                         let mut r = draw::Rect::EMPTY;

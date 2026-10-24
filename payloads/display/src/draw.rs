@@ -310,12 +310,7 @@ pub struct Ring {
     pub ticks: usize,
 }
 
-/// The clock's colours: the face, the swept fill, the strokes between the rings, the ticks.
-pub const CLOCK_FACE: u32 = 0x00_2A_2A_2A;
-pub const CLOCK_FILL: u32 = 0x00_70_70_70;
-pub const CLOCK_FILL_PM: u32 = 0x00_9C_9C_9C;
-pub const CLOCK_STROKE: u32 = 0;
-pub const CLOCK_TICK: u32 = 0x00_FF_FF_FF;
+/// The clock's colours come from the theme (ferros_sys::theme): the face is its plane, then the swept fill, the fill after noon, the strokes between the rings, the ticks ahead of the fill and those it has passed.
 /// The face's bands from the outside in, in 256ths of the radius: each ring then its stroke, outermost first, then the centre (where the time is written, by the caller). Three rings (decimal: seconds, minutes, hours) or four (dozenal: the 50 s unit's twelfths, the 50 s units, the twelfths of a dozenal hour, the dozenal hours); the centre is the same size in both.
 const BANDS3: [i64; 7] = [256, 214, 208, 172, 166, 130, 124];
 const BANDS4: [i64; 9] = [256, 222, 216, 188, 182, 156, 150, 130, 124];
@@ -355,6 +350,8 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
     }
     let (w, h) = (width as i64, height as i64);
     let (bx0, by0, bx1, by1) = bounds(width, height);
+    let th = ferros_sys::theme::current();
+    let (clock_face, clock_fill, clock_fill_pm, clock_stroke, clock_tick, clock_tick_passed) = (th.plane, th.clock_fill, th.clock_fill_pm, th.clock_stroke, th.clock_tick, th.clock_tick_passed);
     let n = rings.len().clamp(1, 4);
     let bands: &[i64] = if n == 4 { &BANDS4 } else { &BANDS3 };
     // The centre's band index: 2n (each ring and its stroke before it).
@@ -371,13 +368,13 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
         for k in 0..t {
             if nseg < segs.len() - 1 {
                 let reached = ring.frac_q16 >= 1 << 16 || (ring.frac_q16 > 0 && (ring.frac_q16 as u64) * t as u64 >= (k as u64) << 16);
-                segs[nseg] = (turn(dirs[(k * 60 / t) % 60]), rad[2 * ri + 1] + 256, rad[2 * ri] - 256, if reached { CLOCK_STROKE } else { CLOCK_TICK });
+                segs[nseg] = (turn(dirs[(k * 60 / t) % 60]), rad[2 * ri + 1] + 256, rad[2 * ri] - 256, if reached { clock_tick_passed } else { clock_tick });
                 nseg += 1;
             }
         }
     }
     // The zero mark: from 70 % of the centre's radius to a pixel inside its edge, on the face's 12:00.
-    segs[nseg] = (turn(dirs[0]), rad[cb] * 7 / 10, rad[cb] - 256, CLOCK_TICK);
+    segs[nseg] = (turn(dirs[0]), rad[cb] * 7 / 10, rad[cb] - 256, clock_tick);
     nseg += 1;
     // Ticks first (front to back: what is drawn first stays on top): radial 1-pixel lines across each ring, inset a pixel at both ends.
     for &((ux, uy), r_in, r_out, tick) in &segs[..nseg] {
@@ -439,16 +436,16 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
         let cov_x = (dx + 128).clamp(0, 256);
         let cov_line = (-((bx * dy - by * dx) >> 14) + 128).clamp(0, 256);
         let swept = if full[i] { 256 } else if rings[i].frac_q16 == 0 { 0 } else if past_half { cov_x.max(cov_line) } else { cov_x.min(cov_line) };
-        mix(if rings[i].lighter { CLOCK_FILL_PM } else { CLOCK_FILL }, CLOCK_FACE, swept)
+        mix(if rings[i].lighter { clock_fill_pm } else { clock_fill }, clock_face, swept)
     };
     // Each band's colour, by index: even below the centre the rings, odd the strokes, `cb` the centre.
     let band_colour = |b: usize, dx: i64, dy: i64| -> u32 {
         if b >= cb {
-            CLOCK_FACE
+            clock_face
         } else if b % 2 == 0 {
             ring_colour(b / 2, dx, dy)
         } else {
-            CLOCK_STROKE
+            clock_stroke
         }
     };
     let r2: [i64; 9] = core::array::from_fn(|i| rad[i] * rad[i]);

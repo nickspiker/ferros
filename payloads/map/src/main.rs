@@ -61,10 +61,19 @@ const RAMPS: usize = 5;
 const BASE_RADIUS: i64 = 110;
 
 // Colours, as the display server takes them (G#00RRGGBB): the map's own greys, white for what is current.
-const WHITE: u32 = 0xF0F0F0;
-const GREY: u32 = 0x9A9A9A;
-const DIM: u32 = 0x5C5C5C;
-const FILL: u32 = 0x2A2A2A;
+// The colours are the theme's (ferros_sys::theme, device preference 5), read as each frame is built.
+fn white() -> u32 {
+    ferros_sys::theme::current().text
+}
+fn grey() -> u32 {
+    ferros_sys::theme::current().text2
+}
+fn dim() -> u32 {
+    ferros_sys::theme::current().text3
+}
+fn fill() -> u32 {
+    ferros_sys::theme::current().plane
+}
 
 /// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
 const SLOP: i64 = 24;
@@ -267,6 +276,7 @@ enum Choice {
     Base(u8),
     Labels,
     Dither,
+    Theme,
     /// The brightness dots: which one is decided by x.
     Brightness,
 }
@@ -742,8 +752,8 @@ impl Map {
             View::Back(DEVICE) => self.settings(&mut b),
             View::Front(i) => {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-                b.text(cx, cy + r + 96, 52, WHITE, 1, CIRCLES[i].label);
-                b.text(cx, cy + r + 160, 32, GREY, 1, "not here yet \u{2022} two fingers for its back");
+                b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[i].label);
+                b.text(cx, cy + r + 160, 32, grey(), 1, "not here yet \u{2022} two fingers for its back");
             }
             View::Back(i) => self.app_back(&mut b, i),
         }
@@ -753,8 +763,8 @@ impl Map {
 
     /// Label and value on a row: the label right of centre's left, the value left of centre's right.
     fn row(b: &mut Batch, cx: i64, y: i64, label: &str, value: &str) {
-        b.text(cx - 20, y, 36, GREY, 2, label);
-        b.text(cx + 20, y, 36, WHITE, 0, value);
+        b.text(cx - 20, y, 36, grey(), 2, label);
+        b.text(cx + 20, y, 36, white(), 0, value);
     }
 
     /// The device's front: the state of the device in plain facts, every number in the device base.
@@ -763,7 +773,7 @@ impl Map {
         let f = ferros_sys::numbers(Style::Glyphs);
         let facts = ferros_sys::facts();
         let mut y = cy - r * 9 / 16;
-        b.text(cx, y, 72, WHITE, 1, "ferros");
+        b.text(cx, y, 72, white(), 1, "ferros");
         y += 120;
         let mut v = Line::new();
         match facts.battery_pct() {
@@ -827,15 +837,15 @@ impl Map {
         Map::row(b, cx, y, "chip", v.as_str());
         y += 64;
         Map::row(b, cx, y, "numbers", base_name(ferros_sys::device_base()));
-        b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "two fingers: settings");
-        b.disc(cx, cy, r - r / 25 - 1, FILL);
+        b.text(cx, cy + r * 3 / 4, 28, dim(), 1, "two fingers: settings");
+        b.disc(cx, cy, r - r / 25 - 1, fill());
     }
 
     /// The device's back: its few choices. The number base is chosen by seeing — each row is two seconds and a mebibyte (2^23 bits, a whole number of doublings) written in that base — with its name small beneath.
     fn settings(&mut self, b: &mut Batch) {
         let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
         let mut y = cy - r * 5 / 8;
-        b.text(cx, y, 56, WHITE, 1, "settings");
+        b.text(cx, y, 56, white(), 1, "settings");
         y += 96;
         let now_base = ferros_sys::device_base();
         for code in BASES {
@@ -845,40 +855,45 @@ impl Map {
             v.s("   ");
             let _ = tatau::size_bits(&mut v, f, 1 << 23, 1);
             let current = code == now_base;
-            b.text(cx, y, 44, if current { WHITE } else { GREY }, 1, v.as_str());
-            b.text(cx, y + 38, 24, if current { GREY } else { DIM }, 1, base_name(code));
+            b.text(cx, y, 44, if current { white() } else { grey() }, 1, v.as_str());
+            b.text(cx, y + 38, 24, if current { grey() } else { dim() }, 1, base_name(code));
             if current {
-                b.disc(cx - r * 5 / 8, y - 14, 10, WHITE);
+                b.disc(cx - r * 5 / 8, y - 14, 10, white());
             }
             self.push_row(y - 56, y + 52, Choice::Base(code));
             y += 112;
         }
         y += 24;
         let labels = ferros_sys::pref(ferros_sys::PREF_LABELS) == 1;
-        b.text(cx, y, 36, GREY, 1, if labels { "names under circles: on" } else { "names under circles: off" });
+        b.text(cx, y, 36, grey(), 1, if labels { "names under circles: on" } else { "names under circles: off" });
         self.push_row(y - 44, y + 24, Choice::Labels);
         y += 80;
         let spatial = ferros_sys::pref(ferros_sys::PREF_DITHER) == 1;
-        b.text(cx, y, 36, GREY, 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
+        b.text(cx, y, 36, grey(), 1, if spatial { "dither: spatial (the panel rests)" } else { "dither: spatial and temporal" });
         self.push_row(y - 44, y + 24, Choice::Dither);
+        y += 80;
+        let mut tl = Line::new();
+        let _ = write!(tl, "theme: {}", ferros_sys::theme::current().name);
+        b.text(cx, y, 36, grey(), 1, tl.as_str());
+        self.push_row(y - 44, y + 24, Choice::Theme);
         // Brightness: nine dots, a stop apart, dimmest on the left; the current one larger and white.
         y += 80;
-        b.text(cx, y, 36, GREY, 1, "brightness");
+        b.text(cx, y, 36, grey(), 1, "brightness");
         y += 60;
         let now = 8 - ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS).min(8) as i64;
         let (x0, step) = Map::dots(cx, r);
         for k in 0..9 {
             let x = x0 + k * step;
             if k == now {
-                b.disc(x, y, 14, WHITE);
+                b.disc(x, y, 14, white());
             } else {
-                b.disc(x, y, 8, DIM);
+                b.disc(x, y, 8, dim());
             }
         }
         self.push_row(y - 40, y + 40, Choice::Brightness);
 
 
-        b.disc(cx, cy, r - r / 25 - 1, FILL);
+        b.disc(cx, cy, r - r / 25 - 1, fill());
     }
 
     /// The brightness dots' first x and spacing on the device's back.
@@ -900,7 +915,7 @@ impl Map {
         let f = ferros_sys::numbers(Style::Glyphs);
         let a = &CIRCLES[i];
         let mut y = cy - r / 2;
-        b.text(cx, y, 64, WHITE, 1, a.label);
+        b.text(cx, y, 64, white(), 1, a.label);
         y += 112;
         let mut v = Line::new();
         let _ = tatau::share(&mut v, f, a.share as u64, 1000, 2);
@@ -912,8 +927,8 @@ impl Map {
         Map::row(b, cx, y, "waits for", if here { "nothing" } else { a.needs });
         y += 64;
         Map::row(b, cx, y, "capabilities", "none");
-        b.text(cx, cy + r * 3 / 4, 28, DIM, 1, "time is set by hand until it is measured");
-        b.disc(cx, cy, r - r / 25 - 1, FILL);
+        b.text(cx, cy + r * 3 / 4, 28, dim(), 1, "time is set by hand until it is measured");
+        b.disc(cx, cy, r - r / 25 - 1, fill());
     }
 
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
@@ -1009,6 +1024,11 @@ impl Map {
                             let (x0, step) = Map::dots(self.w / 2, self.arrived_r());
                             let k = ((sx - x0 + step / 2) / step).clamp(0, 8);
                             ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_BRIGHTNESS, (8 - k) as u8);
+                            self.draw();
+                        }
+                        Some(Choice::Theme) => {
+                            let next = (ferros_sys::theme::index() + 1) % ferros_sys::theme::THEMES.len();
+                            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_THEME, next as u8);
                             self.draw();
                         }
                         Some(Choice::Dither) => {
@@ -1188,6 +1208,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut base = ferros_sys::device_base();
     say_base(grants, base);
     let mut labels = ferros_sys::pref(ferros_sys::PREF_LABELS);
+    let mut theme_seen = ferros_sys::pref(ferros_sys::PREF_THEME);
 
     // The previous frame's held contacts, by contact id: present, x, y.
     let mut prev = [(false, 0i64, 0i64); 16];
@@ -1224,6 +1245,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if l != labels {
             labels = l;
             map.send_scene();
+            map.draw();
+        }
+        // A new theme: everything drawn again in it.
+        let tm = ferros_sys::pref(ferros_sys::PREF_THEME);
+        if tm != theme_seen {
+            theme_seen = tm;
             map.draw();
         }
         // The dashboard is live: once a second while it is showing.

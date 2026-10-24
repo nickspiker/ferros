@@ -1891,6 +1891,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.dither").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
         process::set_pref(process::PREF_DITHER, v);
     }
+    // The theme (device.theme: an index into ferros_sys::theme::THEMES; absent = 0, grey).
+    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.theme").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v < process::THEMES) {
+        process::set_pref(process::PREF_THEME, v);
+    }
     // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
     if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
         if v <= 1 {
