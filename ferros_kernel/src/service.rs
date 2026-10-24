@@ -1255,6 +1255,11 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"aoc usf" {
+                                            crate::aoc::usf_probe(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if let Some(n) = cmd.params.strip_prefix(b"aoc svc ").and_then(|t| core::str::from_utf8(t).ok()) {
                                             crate::aoc::svc_report(n.trim(), &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);

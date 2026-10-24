@@ -495,3 +495,99 @@ pub fn svc_report(name: &str, out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(alloc::format!("  {lbl}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}\n", rd32(r), rd32(r + 4), rd32(r + 8), rd32(r + 12), rd32(r + 16), rd32(r + 20), rd32(r + 24)).as_bytes());
     }
 }
+
+// ── Talking to an AoC queue service (aoc_ipc write/read + mailbox signal) ──
+// The carve-out is Device memory in ferros's map (uncached), so queue reads/writes need no cache maintenance; a dsb orders the payload before the tx bump and the mailbox kick.
+const MBOX_BLOCKS: [usize; 3] = [0x1520_0000, 0x1522_0000, 0x1524_0000];
+const MB_INTGR0: usize = 0x20;
+
+/// Signal the AoC on a service's mailbox index (aoc: write 1<<(idx%16) to that mailbox block's INTGR0; 16 channels per block, a32/f1/p6).
+fn mbox_signal(idx: u32) {
+    let block = MBOX_BLOCKS[(idx / 16) as usize % 3];
+    wr32(block + MB_INTGR0, 1 << (idx % 16));
+}
+
+/// Write one message to a queue service's DOWN ring (AP->AoC) and signal the AoC. The slot holds an 8-byte header {u16 len, 0, 0, 0} then the payload.
+pub fn ipc_write(h: usize, payload: &[u8]) -> bool {
+    let r = region(h, 1);
+    let (off, size, slots, tx, rx) = (rd32(r) as usize, rd32(r + 4) as usize, rd32(r + 8), rd32(r + 12), rd32(r + 16));
+    if slots == 0 || payload.len() + 8 > size || tx.wrapping_sub(rx) >= slots {
+        return false;
+    }
+    let dst = IPC + off + size * (tx % slots) as usize;
+    wr32(dst, payload.len() as u32 & 0xFFFF); // length in the low u16, r1..r3 zero
+    wr32(dst + 4, 0);
+    for (i, &b) in payload.iter().enumerate() {
+        unsafe { write_volatile((dst + 8 + i) as *mut u8, b) };
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr32(r + 12, tx.wrapping_add(1));
+    let irq = (rd32(h + 32) >> 19) & 0x1F;
+    mbox_signal(irq);
+    true
+}
+
+/// Read one message from a queue service's UP ring (AoC->AP) if one is waiting; returns the bytes copied.
+pub fn ipc_read(h: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = region(h, 0);
+    let (off, size, slots, tx, rx) = (rd32(r) as usize, rd32(r + 4) as usize, rd32(r + 8), rd32(r + 12), rd32(r + 16));
+    if slots == 0 || tx == rx {
+        return None;
+    }
+    let src = IPC + off + size * (rx % slots) as usize;
+    let len = (rd32(src) & 0xFFFF) as usize;
+    let n = len.min(buf.len()).min(size - 8);
+    for i in 0..n {
+        buf[i] = unsafe { read_volatile((src + 8 + i) as *const u8) };
+    }
+    wr32(r + 16, rx.wrapping_add(1));
+    Some(n)
+}
+
+/// `diag aoc usf`: open a logical channel on com.google.usf (aoc_channel_dev: a control message [channel_index 0][AOCC_CMD_OPEN_CHANNEL 0][my channel]) and poll the UP ring for any reply, dumping each message's channel and head.
+pub fn usf_probe(out: &mut alloc::vec::Vec<u8>) {
+    let h = service("com.google.usf");
+    if h == 0 {
+        out.extend_from_slice(b"com.google.usf not found (is the AoC up? diag aoc boot + diag trusty aoc)\n");
+        return;
+    }
+    let chan: u32 = 1;
+    // AOCC_CMD_OPEN_CHANNEL: {i32 channel_index = 0, i32 command_code = 0, i32 channel_to_modify = chan}.
+    let mut openmsg = alloc::vec::Vec::new();
+    openmsg.extend_from_slice(&0u32.to_le_bytes());
+    openmsg.extend_from_slice(&0u32.to_le_bytes());
+    openmsg.extend_from_slice(&chan.to_le_bytes());
+    out.extend_from_slice(alloc::format!("open channel {chan}: {}\n", ipc_write(h, &openmsg)).as_bytes());
+    // The first USF request Android's sensor HAL sends: a FlatBuffer "get server by UUID" (captured 2026-10-23). Prefixed with our channel, it should draw a reply on the same channel. This proves the USF transport end to end; the full FlatBuffer handshake is the sensor HAL's job later.
+    const USF_GET_SERVER: [u8; 108] = [
+        0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+        0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        0x28, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x08, 0x00, 0x04, 0x00,
+        0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x6b, 0x31, 0xcb, 0xf0,
+        0x74, 0x4a, 0x14, 0xa1, 0xd4, 0xe8, 0xae, 0x8a, 0x3e, 0x09, 0xfc, 0x4d,
+    ];
+    let mut req = alloc::vec::Vec::new();
+    req.extend_from_slice(&chan.to_le_bytes());
+    req.extend_from_slice(&USF_GET_SERVER);
+    out.extend_from_slice(alloc::format!("send USF get-server on channel {chan}: {}\n", ipc_write(h, &req)).as_bytes());
+    // Poll the UP ring for ~500 ms.
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    let mut buf = [0u8; 1024];
+    let mut got = 0;
+    while crate::platform::cntpct() - t0 < f / 2 {
+        if let Some(n) = ipc_read(h, &mut buf) {
+            got += 1;
+            let ch = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+            out.extend_from_slice(alloc::format!("UP msg {got}: A#{n} bytes, channel G#{ch:X}, head {:02X?}\n", &buf[4..20.min(n)]).as_bytes());
+            if got >= 8 {
+                break;
+            }
+        }
+    }
+    if got == 0 {
+        out.extend_from_slice(b"no UP messages (AoC did not answer the channel open)\n");
+    }
+}
