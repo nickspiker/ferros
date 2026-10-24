@@ -25,6 +25,7 @@
 //! - 17 `scene move [index u8][x i32][y i32][r u16]` (optionally `[cos i16][sin i16]`, the circle's own turn in Q14): one circle of the scene moved, resized and turned in place (the owner arranging by hand).
 //! - 22 `app [x u16][y u16][w u16][h u16]`: the app in front's frame, its 16-bit pixels in the `app-surface` region (R, G, B in bits 0-15, 16-31, 32-47: working values, gamma 2, white = Q14; bit 48 = no dither), published at full precision; 23 `app done`: the screen is the map's again. Op 5's reply carries whether an app is in front (byte 12).
 //! - 21 `ramps [column u8]`: the present stage's test screen, or one column of it alone on black between two thin white lines (dithered bands: our 4×4 to 8 bits, 12 effective; undithered: the 8-bit truncation), straight from 16-bit working values (see `ramps`); status 3 when the pipe is not in 10 bits.
+//! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -1319,6 +1320,16 @@ extern "C" fn receive(grants: u64) -> ! {
             out[8..12].copy_from_slice(&((now() / freq()) as u32).to_le_bytes());
             out[12] = unsafe { APP }.is_some() as u8;
             ferros_sys::reply(&tok, &out);
+            continue;
+        }
+        if op == 24 {
+            // Answered here, never queued: the wait is the reply (op 24 above). Another client's call waits behind it at most a refresh.
+            let seen = FRAME_STARTS.load(Ordering::Acquire);
+            let deadline = now() + freq() / 120;
+            while FRAME_STARTS.load(Ordering::Acquire) == seen && now() < deadline {
+                ferros_sys::wait(&FRAME_STARTS, seen, deadline);
+            }
+            ferros_sys::reply(&tok, &(FRAME_STARTS.load(Ordering::Acquire) as u32).to_le_bytes());
             continue;
         }
         // Room: wait for the render thread to consume a slot.

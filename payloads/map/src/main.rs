@@ -1123,8 +1123,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut move_us = 0u64;
     let mut last_ignored = 0u16;
     let mut push_us = 0u64;
-    // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — down on circle 0, drawn in a line through circle 1 and past it, so the drag (and the push) runs with no one at the panel.
+    // FERROS_MAP_START=drag: a synthetic finger instead of the touch server for the first 192 passes — two seconds after start (past the display's first full frame), a pan through the air and back, so the frame pacing can be measured with no one at the panel (it logs passes, draws and the rate).
     let mut synth = 0u32;
+    // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
+    let (mut synth_t0, mut synth_draws, mut synth_at) = (0u64, 0u32, (0i64, 0i64));
+    let map_start = now();
     loop {
         // A preference changed (here or from the bridge): redraw in it.
         let b = ferros_sys::device_base();
@@ -1157,16 +1160,33 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
-        let n = if option_env!("FERROS_MAP_START") == Some("drag") && synth < 192 {
+        let n = if option_env!("FERROS_MAP_START") == Some("drag") && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
             synth += 1;
+            if synth == 1 {
+                synth_t0 = now();
+                synth_draws = 0;
+                // An empty spot to put the finger on: up the middle from the bottom until no circle is under it.
+                synth_at = (w / 2, h - 160);
+                let mut y = h - 160;
+                while y > 160 && map.hit(w / 2, y).is_some() {
+                    y -= 40;
+                }
+                synth_at.1 = y;
+            }
+            if synth == 181 {
+                let mut l = Line::new();
+                let ms = ferros_sys::us_since(synth_t0) / 1000;
+                let _ = write!(l, "map: drag 180 passes in {} ms, {} draws: {} draws/s\n", ms, synth_draws, synth_draws as u64 * 1000 / ms.max(1));
+                console(grants, l.as_str().as_bytes());
+            }
             if synth > 180 {
                 r[0] = 0;
                 1
             } else {
-                let (ax, ay) = map.cam.screen(w, h, map.xs[0], map.ys[0]);
-                let (bx, by) = map.cam.screen(w, h, map.xs[1], map.ys[1]);
+                // A pan through the air, 90 passes up and 90 back, so the plane ends where it was and the lift is no tap.
                 let k = synth as i64 - 1;
-                let (x, y) = (ax + (bx - ax) * k * 5 / 4 / 180, ay + (by - ay) * k * 5 / 4 / 180);
+                let off = if k < 90 { k * 6 } else { (180 - k) * 6 };
+                let (x, y) = (synth_at.0, synth_at.1 - off);
                 r[0] = 1;
                 r[1..13].fill(0);
                 r[3] = 1;
@@ -1344,6 +1364,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let t_draw = now();
             if map.cam != before || scene_moved {
                 map.draw();
+                synth_draws += 1;
             }
             draw_us = ferros_sys::us_since(t_draw);
         }
@@ -1365,8 +1386,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         move_us = 0;
         push_us = 0;
         prev = cur;
-        // A hundred-and-twentieth of a second while a finger is down, a thirtieth at rest.
-        sleep_until(now() + if held > 0 { freq() / 120 } else { freq() / 30 });
+        // Locked to the panel while a finger is down: each pass starts when the display's next frame has started (op 24, `frame wait`), so the touch is read fresh right after a refresh begins and the update is ready for the next one — one update a refresh while it fits, every other refresh (steady, no beat) when it does not. Was a fixed 1/120 s after the work: a period of work + 8.3 ms, about 60 a second (2026-10-24); the display replies to a frame before drawing it, so the frame call itself paces nothing. A thirtieth at rest.
+        if held == 0 {
+            sleep_until(now() + freq() / 30);
+        } else {
+            let mut fr = [0u8; 4];
+            call(display, &[24], &mut fr);
+        }
     }
 }
 
