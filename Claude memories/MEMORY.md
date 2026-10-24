@@ -74,4 +74,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) — ~95 % notch is the per-frame off-window under the DDIC; HBM/dimming/60 Hz/G#BD table all tested 2026-10-23, none moves it; 100 % is not on this panel
 - [SMP first cut](smp_first_cut.md) — 5 cores since 2026-10-23: X3 kernel+render, 4× A715 workers; one lock, global queue, sev; pin masks; DIAG SMP_UP/SLICES/LOCK_SPINS; TLBI-is + per-core kctx lessons; FERROS_SMP=0
 - [eret race: IRQs masked around eret](eret_race_irqs_masked.md) — the 2026-10-23 freezes: resume path loaded ELR/SPSR with IRQs open, an SGI in the window parked cores on a self-returning eret; diag core <k> SGI dump found it
-- [AoC start needs Trusty](aoc_start_needs_trusty.md) — all sensors behind the AoC/USF; GSA loads aoc.bin, only Trusty IPC starts it; diag ffa answers; route choice put to owner 2026-10-23
+- [AoC start (no Trusty)](aoc_start_needs_trusty.md) — sensors only via the AoC (AP firewalled from its buses); GSA NS mailbox loads+starts it without Trusty; not online yet, next = AoC SYSMMU enable like Linux (2026-10-23)
