@@ -126,6 +126,7 @@ pub fn launch_all() {
 extern "C" fn ferros_core_main(block: usize) -> ! {
     let k = ((block - BLOCKS) / BLOCK) & 3;
     crate::killswitch::arm_core();
+    crate::pmu::el0_on();
     UP.fetch_or(1 << k, Ordering::AcqRel);
     let mut last_look = 0u64;
     loop {

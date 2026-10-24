@@ -99,6 +99,9 @@ mod cachemap;
 // KOHI: PIPE's entropy gathering + health stack in software (the wairua's source).
 #[cfg(feature = "pixel8")]
 mod kohi;
+// The performance monitors, open to EL0 on every core (pmu.rs).
+#[cfg(feature = "pixel8")]
+mod pmu;
 // The gate and the oracle: signed capsules, ihi at spawn (ORACLE.md).
 #[cfg(feature = "pixel8")]
 mod oracle;

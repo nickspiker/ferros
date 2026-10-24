@@ -369,3 +369,55 @@ pub fn console(grants: u64, text: &[u8]) {
 pub fn panic_exit() -> ! {
     exit(0xDEAD)
 }
+
+/// The performance monitors, which the kernel opens to EL0 on every core (ferros_kernel/src/pmu.rs). Core-wide: counts include whatever else ran on the core, so a measurement wants the process pinned and the loop long against a slice. Event counters are 32 bits.
+pub mod pmu {
+    /// Common ARMv8 events (PMEVTYPER evtCount).
+    pub const SW_INCR: u32 = 0x00;
+    pub const L1D_CACHE_REFILL: u32 = 0x03;
+    pub const INST_RETIRED: u32 = 0x08;
+    pub const BR_MIS_PRED: u32 = 0x10;
+    pub const CPU_CYCLES: u32 = 0x11;
+    pub const STALL_FRONTEND: u32 = 0x23;
+    pub const STALL_BACKEND: u32 = 0x24;
+    pub const ASE_SPEC: u32 = 0x74;
+
+    /// The cycle counter (64 bits; counts EL0, EL1 and EL2).
+    #[inline(always)]
+    pub fn cycles() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("isb", "mrs {}, pmccntr_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+
+    /// How many event counters this core has (PMCR_EL0.N).
+    pub fn counters() -> u32 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, pmcr_el0", out(reg) v, options(nomem, nostack)) };
+        ((v >> 11) & 0x1F) as u32
+    }
+
+    /// Event counter `n` counts `event` at EL0 only (PMEVTYPER: P set, U and NSH clear), from zero.
+    pub fn program(n: u32, event: u32) {
+        unsafe {
+            core::arch::asm!(
+                "msr pmselr_el0, {n}",
+                "isb",
+                "msr pmxevtyper_el0, {t}",
+                "msr pmxevcntr_el0, xzr",
+                "isb",
+                n = in(reg) n as u64,
+                t = in(reg) (1u64 << 31) | event as u64,
+                options(nostack),
+            )
+        };
+    }
+
+    /// Event counter `n`'s count.
+    #[inline(always)]
+    pub fn read(n: u32) -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("msr pmselr_el0, {n}", "isb", "mrs {v}, pmxevcntr_el0", n = in(reg) n as u64, v = out(reg) v, options(nostack)) };
+        v
+    }
+}

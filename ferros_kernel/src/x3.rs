@@ -309,6 +309,7 @@ extern "C" fn ferros_x3_main(hop: usize) -> ! {
             core::arch::asm!("wfe");
         }
         let b = (*(&raw mut HANDOVER)).take();
+        crate::pmu::el0_on();
         write_volatile((hop + H_STARTED) as *mut u64, GO);
         core::arch::asm!("dsb sy");
         let Some(b) = b else {
