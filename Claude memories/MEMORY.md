@@ -77,3 +77,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [AoC + USF under ferros](aoc_start_needs_trusty.md) — SOLVED 2026-10-24: AoC GSA-loaded + Trusty-started, IPC rings driven directly, USF "get server" answered 88 bytes (matches Android); no Linux. Remaining: USF FlatBuffer sensor protocol on top
 - [Biometrics move with identity](biometrics_move_with_identity.md) — owner rule 2026-10-24; husky fingerprint marked never (device-bound in Google's TEE) unless Google gives keys or the raw sensor SPI proves reachable
 - [Bluetooth pairing moves with identity](bluetooth_pairing_moves_with_identity.md) — one radio at a time, follows the user; clone identity BT address + host-held keys (dual-boot trick generalised); lifecycle TBD
+- [Radio addresses belong to the identity](radio_addresses_belong_to_identity.md) — WiFi MAC + BT address worn by the identity, not the device; platform table; M1 BCM4378 takes a host-set BT address natively
