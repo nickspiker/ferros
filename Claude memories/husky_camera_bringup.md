@@ -1,6 +1,6 @@
 ---
 name: husky-camera-bringup
-description: ferros powers husky's main camera from a cold boot and the sensor answers (model ID G#08EF, 2026-10-19) — diag cam bus/up/off; the five traps (ACPM, HS-I2C timeout + error IRQ enables, camera-PMIC chip select, voltages before enables); next is the CSI receive side
+description: ferros powers husky's main camera cold and DRIVES the sensor — its own window and rate, 4080x64 at ~1184 fps (2026-10-20) — but no frame reaches memory; the ISP's register names come from LWIS's device tree, and the break is link 1 -> front-end channel
 metadata:
   type: project
 ---
@@ -16,6 +16,26 @@ Working since 2026-10-19 on slot b, no Linux: `bridge diag "cam bus"`, `"cam up"
 **Receive side (2026-10-19):** `diag cam fe`/`cam stream` bring up the ISP front end (pd_ispfe on cold; PMU status read direct, config/prepare via EL3), replay the sensor init from the vault (cam.boitata.init, 744 writes), bypass the D-PHY's PMU isolation (G#3EBC bit 0 — a PMU write the oracle can't see), and configure CSI link 1 (version reads G#5000, PHY lanes reach G#3). **Streaming works (2026-10-19):** with a byte-exact init (the first was corrupt, see [[feedback_oracle_capture_integrity]]) the sensor's frame counter runs ~14 fps and CSI link 1 latches its interrupt sources and fills its counter words at G#634-G#6C4. The master clock was never the problem (its pad reads low even while running). Census mode (FERROS_HV_ORACLE_CENSUS=1) found the 42 ISPFE pages a camera open uses. DMA (PDMA G#1C39_0000 behind 3 ISPFE S2MPUs) comes after frames flow.
 
 **Next:** PDMA + the three ISPFE S2MPUs/SYSMMUs for a first raw frame in memory. Related: [[ira_entropy_sources_husky]] (camera calibration EEPROMs on these buses).
+
+
+## 2026-10-20: the sensor is ours, the ISP front end is not
+
+**The ISP's register map is in the Pixel tree, in the open.** `zuma-isp-event-info.dtsi` (7847 lines) + `dt-bindings/lwis/platform/zuma/*.h` name every interrupt source, mask, overflow and reset register of every ISP block and every bit in them. LWIS's *logic* is a passthrough, which is why it got written off, but its device tree carries the semantics the closed HAL otherwise keeps. `tools/gen-isp-events.py` generates `ferros_kernel/src/camera_events.rs` (203 named sources); `diag cam events` prints the ones reporting, counting an armed mask as interesting too. **Use this before diffing any ISP register by hand.**
+
+It immediately re-read words the driver had printed for days: `CSIS_LINK1 + G#14 = G#100` is **ERR_DESKEW_OVER** (a D-PHY lane deskew overflow), not an "interrupt latch"; `+G#1C` LINE_END, `+G#24` FRAME_START ch0-2, `+G#2C` FRAME_END ch0-2.
+
+**Where it breaks:** link 1 takes frames (frame start and end, three channels); the front end's local channel 0 is armed with Linux's own mask G#1A and raises only SHADOW_UPDATE, never SOF; the PDMA engine reports no errors. Nothing carries frames from the link into the channel. That one hop is the whole remaining problem.
+
+**Ruled out — do not redo:** the PDMA-before-link ordering; the 28 per-frame interrupt acknowledgements (real, implemented as `FRAME_ACK`, necessary but not sufficient); missing boot-time init (`diag cam preexist` compares all 45 registers Linux read non-zero before ever writing — 36 match, 9 are stale status); a DMA on the link to bypass the front end (the csis-link-phy space has only int0/int1/fs/fe per context, no DMA); VOTF (serves downstream rgbp/yuvp/mcsc/gdc only).
+
+**The sensor speaks MIPI CCS (SMIA++), so it is fully ours.** Only 20 of the 1347 init writes define the mode; the rest is vendor tuning. `diag cam slit` proves it: four writes in a grouped-parameter hold (`y_addr_start`, `y_addr_end`, `y_output_size`, `frame_length_lines`) take 4080x3072 at ~16 fps to **4080x64 at ~1184 fps**, measured on the sensor's own frame counter. Traps: set before stream-on the sensor never starts; set mid-stream it works but leaves the sensor stuck until a **cold boot** (a reload does not power-cycle it).
+The CCS *limit* block at G#1100 does not exist on this part — G#10F4, G#1104 and G#1140 all return G#41400000, address aliasing. Verified as the sensor's answer, not ours (`diag cam probe`). So the envelope comes from experiment.
+
+**The front end's geometry is legible:** stride at +G#20554/+G#22154 = G#1400 (4080 RAW10 on a 256-byte boundary), frame size as (height<<16)|width = G#0C000FF0 at ~12 registers, once reversed as G#0FF00C00, height halved at G#600 and quartered in +G#40014's high half. `camera-pdma-image.py --height N` rewrites it. Necessary, not sufficient — a matched slit still writes nothing.
+
+**Traps in our own tooling:** `camera-pdma-image.py` needs **`--list 2`** (the default list 1 is a different program and resets the phone); output slices must be **16 MiB** (a 4080x3072 RAW10 frame is 15 MiB and they were 2 MiB, so no correct frame could ever have landed) but only **two** of them (patterning as far as G#8F10_0000 resets the phone; G#8810_0000-G#8AA0_0000 is safe); patterning them needs a `pet_watchdogs()` in the loop. And the write test used to count a probe point only if it read neither pattern nor zero — a dark frame is mostly zeroes, so it was blind to the result it existed to find.
+
+Full detail: ferros/docs/oracle/CAMERA.md.
 
 ## 2026-10-21: the clock no capture could show
 
