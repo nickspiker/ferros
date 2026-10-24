@@ -85,6 +85,9 @@ The panel is google-hk3 on DSIM0 (DISPLAY-HK3.md; the oracle of every transition
 
 ## Status
 
+The present stage as built — content, compositing, the ODT, the dither, frames and timing — is DISPLAY-DESIGN.md §6a (2026-10-24); the panel's measurements and the ODT's derivation are DISPLAY-CALIB.md. What follows is the bring-up log.
+
+
 Driver-wise (2026-10-15): ferros pushes frames on ABL's pipeline (adopt DECON, write ABL's surface, shadow update + trigger); it owns no power-up from off, no DSI command path (brightness G#51, display off/on G#28/G#29, sleep in/out G#10/G#11), no framebuffer of its own, no tear-effect sync, and it lives in the kernel rather than as a process. On cold boot the SYSMMU/S2MPU items below are moot (ABL leaves translation off). **Before the display driver work starts: a knobs inventory (everything DECON/DPP/DSIM/DSC/panel lets us set) and the ideal design, for the owner to review — no code first.**
 
 - [x] Identify panel/DPU (command mode + DSC, cal_9865)

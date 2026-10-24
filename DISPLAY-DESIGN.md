@@ -57,9 +57,38 @@ Content arrives as VSF `gamma2tanh` (vsf colour.md: `v = tanh(√L)` per channel
 
 **Pinned (owner, 2026-10-17):** this pipeline is the reference colour profile for everything the owner's projects show or store. Mahere today stores imagery as √(tanh(x)) (tanh in linear light, then gamma 2) and displays through Opsin's cubic rail — a sibling; once the panel pipeline is final it ports to Mahere's imagery and to VSF's gamma2tanh definition, and the two are not allowed to drift meanwhile.
 
+## 6a. As built (2026-10-24)
+
+§6 was the plan; this is what runs. Two decisions moved since: **white is equal-energy E** (owner, 2026-10-22; not the panel's native 6750 K), and **the transform runs in software, in NEON, not in the DQE** — the DQE is in the path only for its dither (shift mode) and the 10 bpc blend; its matrix and LUTs and the CGC are off. Software keeps the roll-off, the gamut handling and the dither's precision in our hands, and measured it is cheap enough (below).
+
+**Content** (all VSF RGB, gamma 2 — the code is √light):
+- the 8-bit canvas the display server composites (white = 255, nothing above);
+- an app's 16-bit surface (white = Q14, to 4.0 = 16× white in light; bit 48 = no dither);
+- icons: sRGB assets through vsf's SRGB2VSF_RGB colorimetrically (no adaptation), stored as gamma2tanh codes (`tools/app-icons`), decoded to the canvas's gamma 2;
+- the map's own colours (greys, white, amber) authored as VSF RGB gamma-2 codes.
+Two things skip the pipe on purpose: the ramps test screen (op 21, straight through the tone table) and the kernel's own screens before the server starts (8-bit, panel-native).
+
+**Compositing** (payloads/display `draw.rs`, fluor): front to back, premultiplied, `under` — blending in gamma 2, as decided for paint. Circles are cached as sprites per size and turn (`display-sprites`, 32 MiB) and blitted four pixels a step. The glow is the exception that proves the rule only half way: it is added in gamma 2 too (the linear-light glow was tried and looked worse, 2026-10-24), falling off in log distance — Mitchell's log2 by `clz`, the same step every octave of q = d² − r², zero at r/12 past the edge at every size, no divide, no table.
+
+**The present stage** (payloads/display `neon.rs` `Odt`, one branchless path for every pixel, 16 at a time):
+1. light — canvas: u = c²/65536 (an exact u8 multiply, one fixed-point convert) into a degree-4 polynomial fitted to the roll-off `tanh²(k·√L)`, k = atanh(√(white/peak)), at each brightness; app: tanh by Lambert's continued fraction (7th order, f32), squared;
+2. the ODT (DISPLAY-CALIB.md "The ODT"), gains + K in f16 — the gains are E's white, K the red-green correction;
+3. the panel's 1/2.19 from the f16's bits (exponent → the octave's foot, top six mantissa bits → the nudge, interpolated); the tables are the gamut clamp (negatives to 0, past the peak saturates);
+4. dither: Bayer 4×4 plus a temporal rank over four phase frames (flipped at 10 Hz at rest, consecutive phases under a finger) to the 8-bit code the link takes, 14 bits effective; packed BGRA1010102 by one `st4`.
+Sixteen black pixels skip all of it.
+
+**Frames**: the server replies to a frame before drawing it and keeps only the newest; op 24 (`frame wait`) returns when the panel's next frame starts, and the map waits on it once a pass with a finger down, so updates lock to the 120 Hz refresh (one a refresh while an update fits, a steady every-other when not). A tall publish is cut into row bands weighted by the cores' measured rates (X3 145/256, each A715 37/256).
+
+**Measured** (PMU on the cores, `ferros_sys::pmu`; synthetic pans, `FERROS_MAP_START=drag|crowd`): the ODT 86 cycles per 16 pixels on the X3 (1.9 ns a pixel), a full-frame publish 5.2 ms banded; the map's seven circles 120 frames for 120 updates at ~3.7 ms an update; a 207-circle crowd 174 frames for 175 updates (scene 3.2 ms — glow 1.8, blits 1.2 — publish 3.0). Processes build without strict-align (`cargo el0`), which is what lets NEON loads and stores be single instructions.
+
+**Tunables** (payloads/display): `GLOW_FRACTION` (12), `GLOW_OCT_LOG2` (2: four octaves), `GLOW_PEAK`, `PUB_SHARE`, `PUB_SPLIT_ROWS`; the ODT and E's gains come from `tools/panel-white-e.py`.
+
 ## 7. Open
 
 - The regulator path from EL2 to S2MPG14/15 (ACPM/SPMI), needed for cold power-up and for reading the panel's rails.
-- Whether the panel accepts a 10 bpc PPS (plan step 5; `modeset … link10`, eyes).
-- The gamut matrix under VSF's observer from the i1 Pro's spectra, and the EOTF at a second brightness (DISPLAY-CALIB.md).
-- Touch input (SPI, `spitouch`), which the shell needs and nothing covers yet.
+- Whether the panel accepts a 10 bpc PPS: measured 2026-10-22, it does not deliver 10 bits (DISPLAY.md); the 10 bpc blend + dither does.
+- ~~The gamut matrix under VSF's observer~~ — done 2026-10-24 (§6a, DISPLAY-CALIB.md). The EOTF at a second brightness — done 2026-10-22.
+- ~~Touch input~~ — done 2026-10-19 (payloads/touch).
+- The A715s run the publish bands at 1.07 GHz (measured 2026-10-24): their DVFS point is the next lever on a full-frame publish.
+- The scene is the X3's alone (glow 1.8 ms, blits 1.2 with 207 circles): bands across the workers, as the publish is, when a screen holds more; the glow vectorises now that it has no divide.
+- The kernel's own screens (before the server) are panel-native, not through the ODT.
