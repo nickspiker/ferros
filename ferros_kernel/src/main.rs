@@ -50,6 +50,7 @@ mod camera_events;
 mod camera_snap;
 mod x3;
 mod smp;
+mod rtc;
 #[cfg(feature = "pixel8")]
 mod camera_close;
 mod camera_rx;
@@ -1875,6 +1876,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Brightness (device.brightness, stops below the brightest white; absent = 2, white about 147 cd/m²).
     let bright = store.as_mut().and_then(|s| s.get_by_key("device.brightness").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 8).unwrap_or(2);
     process::set_pref(process::PREF_BRIGHTNESS, bright);
+    // The time zone (device.tz: seconds east of UTC, i32 LE; absent = UTC).
+    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.tz").ok().flatten()).filter(|v| v.len() == 4) {
+        rtc::TZ.store(i32::from_le_bytes([v[0], v[1], v[2], v[3]]) as i64, core::sync::atomic::Ordering::Relaxed);
+    }
     // The dither (device.dither: 0 spatial and temporal, 1 spatial only; absent = 0).
     if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.dither").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
         process::set_pref(process::PREF_DITHER, v);

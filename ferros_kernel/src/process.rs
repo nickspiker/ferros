@@ -675,6 +675,20 @@ pub fn set_pref(index: usize, value: u8) {
     unlock();
 }
 
+/// Bytes 16-31 of the preferences block: the wall clock's base (unix seconds × counter frequency − the counter, u64 LE; 0 = not read yet) and the time zone (seconds east of UTC, i64 LE), so a process reads the time from its own memory and counter with no syscall (rtc.rs; ferros_sys::local_time). Set by the kernel when either changes.
+pub const PREF_WALL: usize = 16;
+pub fn set_wall(base: u64, tz: i64) {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&base.to_le_bytes());
+    b[8..].copy_from_slice(&tz.to_le_bytes());
+    unsafe { (&mut *(&raw mut PREFS_NOW))[PREF_WALL..PREF_WALL + 16].copy_from_slice(&b) };
+    lock();
+    for p in k().procs.iter().flatten() {
+        p.write((PREFS + PREF_WALL) as u64, &b);
+    }
+    unlock();
+}
+
 /// Whether `value` is valid for preference `index`.
 fn pref_valid(index: usize, value: u8) -> bool {
     match index {

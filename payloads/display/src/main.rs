@@ -330,6 +330,94 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
     let grey = ICONS.get(at + size * size * 4..at + size * size * 5)?;
     Some((px, grey, size))
 }
+/// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
+const WIDGET_CLOCK: u8 = 0x80;
+/// The 60 directions (sin, −cos) of k/60 of a turn, Q14, for the clock face (built once at start).
+static mut CLOCK_DIRS: [(i64, i64); 60] = [(0, 0); 60];
+/// A clock is on the screen (the last frame drew one): the render thread redraws the scene each second.
+static mut CLOCK_SHOWN: bool = false;
+/// The last plain camera op (op 14 that started a frame from scratch, not over an overlay), replayed each second while a clock shows; None when the last frame had an overlay or an app.
+static mut LAST_CAM: Option<([u8; 18], usize)> = None;
+
+/// The clock's rings and the time written in its centre, from local wall time: decimal (seconds outer, minutes middle, the 12-hour hand inner — AM sweeps the fill in, PM sweeps the dark back) or dozenal (the day in 12 × 12 × 12: dozenal hours inner over the whole day, their twelfths middle, those twelfths' twelfths — 50 s — outer), every ring alternating the direction of its sweep each time it wraps.
+fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 3], usize) {
+    let (secs, _) = ferros_sys::local_time().unwrap_or((0, 0));
+    let sod = secs.rem_euclid(86400);
+    let day = secs.div_euclid(86400);
+    let q = |num: i64, den: i64| ((num << 16) / den.max(1)) as u32;
+    let dozenal = ferros_sys::pref(ferros_sys::PREF_BASE) & 0x7F == 12;
+    let mut n = 0;
+    let mut put = |c: char, n: &mut usize| {
+        let mut b = [0u8; 4];
+        for &x in c.encode_utf8(&mut b).as_bytes() {
+            if *n < text.len() {
+                text[*n] = x;
+                *n += 1;
+            }
+        }
+    };
+    if dozenal {
+        let u = sod / 50;
+        let (d1, d2, d3) = (u / 144, (u / 12) % 12, u % 12);
+        let rings = [
+            draw::Ring { frac_q16: q(sod % 600, 600), dark_sweep: (sod / 600) % 2 == 1, ticks: 12 },
+            draw::Ring { frac_q16: q(sod % 7200, 7200), dark_sweep: d1 % 2 == 1, ticks: 12 },
+            draw::Ring { frac_q16: q(sod, 86400), dark_sweep: day % 2 == 1, ticks: 12 },
+        ];
+        for (k, d) in [d1, d2, d3].iter().enumerate() {
+            if k > 0 {
+                put(':', &mut n);
+            }
+            put(char::from_u32(0x10 + *d as u32).unwrap_or('?'), &mut n);
+        }
+        (rings, n)
+    } else {
+        let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);
+        let rings = [
+            draw::Ring { frac_q16: q(sec, 60), dark_sweep: (sod / 60) % 2 == 1, ticks: 60 },
+            draw::Ring { frac_q16: q(m * 60 + sec, 3600), dark_sweep: h % 2 == 1, ticks: 60 },
+            draw::Ring { frac_q16: q((h % 12) * 3600 + m * 60 + sec, 43200), dark_sweep: h >= 12, ticks: 12 },
+        ];
+        for (k, v) in [h, m, sec].iter().enumerate() {
+            if k > 0 {
+                put(':', &mut n);
+            }
+            put((b'0' + (*v / 10) as u8) as char, &mut n);
+            put((b'0' + (*v % 10) as u8) as char, &mut n);
+        }
+        (rings, n)
+    }
+}
+
+/// Text into the canvas front to back: each glyph pixel premultiplied by its coverage and put under what is there, so it composes with what is drawn after it (the clock's centre) without a dark fringe.
+fn text_under(pixels: &mut [u32], width: usize, height: usize, font: &fontdue::Font, s: &str, x: f32, baseline: f32, px: f32, colour: u32) {
+    let mut pen = x;
+    for ch in s.chars() {
+        let (m, cov) = font.rasterize(ch, px);
+        let gx = pen as isize + m.xmin as isize;
+        let gy = baseline as isize - m.ymin as isize - m.height as isize;
+        for row in 0..m.height as isize {
+            let y = gy + row;
+            if y < 0 || y >= height as isize {
+                continue;
+            }
+            for col in 0..m.width as isize {
+                let xx = gx + col;
+                if xx < 0 || xx >= width as isize {
+                    continue;
+                }
+                let a = cov[(row * m.width as isize + col) as usize] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let p = &mut pixels[y as usize * width + xx as usize];
+                *p = draw::under(*p, draw::at_coverage(colour & 0x00FF_FFFF, a));
+            }
+        }
+        pen += m.advance_width;
+    }
+}
+
 /// The map's retained scene. A static, not a heap vector: this process's heap is a bump allocator that every op resets to the mark after the typeface, so anything kept across calls on it would be overwritten by the next text op.
 static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
@@ -1441,6 +1529,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // What the ring's tail was when this pass last looked: the wait at the end of a pass returns as soon as it moves.
     let mut seen_tail = 0u64;
     let (mut frames_last_tick, mut starts_last_tick) = (0u64, 0u64);
+    let mut clock_due = false;
+    // The clock face's 60 directions, once.
+    unsafe {
+        for k in 0..60 {
+            let a = k as f32 * core::f32::consts::TAU / 60.0;
+            CLOCK_DIRS[k] = ((libm::sinf(a) * 16384.0) as i64, (-libm::cosf(a) * 16384.0) as i64);
+        }
+    }
     loop {
         // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
         let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
@@ -1526,6 +1622,16 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let z = u32::from_le_bytes([m[9], m[10], m[11], m[12]]) as i64;
                     let (rc, rs) = if m.len() >= 18 { (i16::from_le_bytes([m[14], m[15]]) as i64, i16::from_le_bytes([m[16], m[17]]) as i64) } else { (16384, 0) };
                     // Flag bit 0: keep what the frame already holds (a `begin` and the client's overlay, sent first in the same batch), so the scene goes under it; without it the frame starts from the last frame's rectangle cleared.
+                    unsafe {
+                        CLOCK_SHOWN = false;
+                        LAST_CAM = if m.get(13).copied().unwrap_or(0) & 1 == 0 && m.len() <= 18 {
+                            let mut b = [0u8; 18];
+                            b[..m.len()].copy_from_slice(m);
+                            Some((b, m.len()))
+                        } else {
+                            None
+                        };
+                    }
                     if m.get(13).copied().unwrap_or(0) & 1 == 0 {
                         unsafe {
                             draw::clear(pixels, width, PREV_DMG.clip(width, height));
@@ -1560,6 +1666,27 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let stroke = 0i64;
                         let lit = cir.lit != 0;
                         let ri = sr;
+                        // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
+                        if cir.icon == WIDGET_CLOCK {
+                            let mut tb = [0u8; 32];
+                            let (rings, tn) = clock_state(&mut tb);
+                            if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
+                                // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
+                                let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
+                                let unit = text_width(&font, t, 100.0).max(1.0);
+                                let px = (room / unit * 100.0).clamp(8.0, 400.0);
+                                let tw = text_width(&font, t, px);
+                                let (fx, fy) = ((sx >> 8) as f32, (sy >> 8) as f32);
+                                text_under(pixels, width, height, &font, t, fx - tw * 0.5, fy + px * 0.36, px, WHITE);
+                                ALLOC.reset();
+                            }
+                            let r = draw::clock(pixels, width, height, sx, sy, sr, &rings, unsafe { &*(&raw const CLOCK_DIRS) });
+                            unsafe {
+                                CUR_DMG = CUR_DMG.union(r);
+                                CLOCK_SHOWN = true;
+                            }
+                            continue;
+                        }
                         // Front to back: the label, the icon, the fill, the ring's larger disc beneath them all.
                         // Zoom is semantic: a name appears only once the circle is big enough to read it.
                         if sr >= 36 << 8 && cir.len > 0 {
@@ -1895,6 +2022,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let t_pass = now();
         let mut calls_us = 0u64;
         let mut ncalls = 0u32;
+        // A clock on the screen and a new second: the last plain frame drawn again, as if the map had sent it (the clock reads the time as it draws).
+        if clock_due {
+            clock_due = false;
+            if let Some((b, n)) = unsafe { LAST_CAM } {
+                let mut out = [0u8; 16];
+                let _ = handle(&b[..n], &mut out);
+            }
+        }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
             let head = RING_HEAD.load(Ordering::Relaxed);
@@ -2006,6 +2141,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         if t >= next_tick {
             let secs = t / freq();
             next_tick = (secs + 1) * freq();
+            if client_owned && unsafe { CLOCK_SHOWN && (*(&raw const LAST_CAM)).is_some() && (*(&raw const APP)).is_none() } {
+                clock_due = true;
+            }
             // The frame rate, once a second while frames are coming (presents and flips both count), with the frame starts DECON reported through its interrupt: the two agree when every frame goes out.
             let fs = FRAME_STARTS.load(Ordering::Relaxed);
             if frames != frames_last_tick && client_owned {

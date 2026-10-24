@@ -42,7 +42,7 @@ struct Spec {
 }
 
 /// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
-const CIRCLES: [Spec; 6] = [
+const CIRCLES: [Spec; 7] = [
     Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
     Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
     Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
@@ -50,6 +50,8 @@ const CIRCLES: [Spec; 6] = [
     Spec { label: "Opsin", ring: 1, lit: 0, share: 150, icon: 4, needs: "Lumis's frames" },
     // The present stage's test screen, as an app: a tap launches its capsule (payloads/ramps).
     Spec { label: "Ramps", ring: 1, lit: 0, share: 60, icon: 6, needs: "" },
+    // The clock, a widget the display draws itself (icon G#80, display WIDGET_CLOCK): three rings and the time, decimal or dozenal by the device's number base.
+    Spec { label: "Clock", ring: 1, lit: 0, share: 150, icon: 0x80, needs: "" },
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;

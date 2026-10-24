@@ -73,7 +73,7 @@ pub fn under(dst: u32, src: u32) -> u32 {
 
 /// An opaque colour (G#RRGGBB) at coverage `cov` (0-255), premultiplied.
 #[inline(always)]
-fn at_coverage(colour: u32, cov: u32) -> u32 {
+pub fn at_coverage(colour: u32, cov: u32) -> u32 {
     if cov >= 255 {
         return 0xFF00_0000 | colour;
     }
@@ -219,6 +219,138 @@ pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
         }
     });
     Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
+}
+
+/// One ring of the clock face: how far round it is (Q16 of a turn, clockwise from 12:00), which way this period goes (false: medium grey sweeps in over the dark; true: the dark sweeps back in over the grey — the ring alternates every time it wraps), and its tick count.
+#[derive(Clone, Copy)]
+pub struct Ring {
+    pub frac_q16: u32,
+    pub dark_sweep: bool,
+    pub ticks: usize,
+}
+
+/// The clock's colours: the face, the swept fill, the strokes between the rings, the ticks.
+pub const CLOCK_FACE: u32 = 0x00_2A_2A_2A;
+pub const CLOCK_FILL: u32 = 0x00_70_70_70;
+pub const CLOCK_STROKE: u32 = 0;
+pub const CLOCK_TICK: u32 = 0x00_FF_FF_FF;
+/// The face's bands from the outside in, in 256ths of the radius: outer ring, stroke, middle ring, stroke, inner ring, stroke, then the centre (where the time is written, by the caller).
+const BANDS: [i64; 7] = [256, 214, 208, 172, 166, 130, 124];
+
+/// Blend two colours by `c` of 256 (the first at c = 256).
+fn mix(a: u32, b: u32, c: i64) -> u32 {
+    let c = c.clamp(0, 256) as u32;
+    let m = |sh: u32| (((a >> sh & 0xFF) * c + (b >> sh & 0xFF) * (256 - c)) >> 8) << sh;
+    m(16) | m(8) | m(0)
+}
+
+/// The clock face (the map's clock circle) at (cx, cy), radius r, Q8 pixels: three rings, each a sweep from 12:00 in the fill colour over the face colour, separated by black strokes, with white ticks; under what is there (the caller writes the time in the centre first). All squared distances and cross products — no root, no angle: a pixel is inside a sweep of angle θ when it is anticlockwise of θ's direction (one cross product), on the right half for θ ≤ ½ turn, either for more. `dirs[k]` is the unit direction (sin, −cos) of k/60 of a turn, Q14. Returns the rectangle it touched.
+pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, rings: &[Ring; 3], dirs: &[(i64, i64); 60]) -> Rect {
+    if r < 2048 {
+        return Rect::EMPTY;
+    }
+    let (w, h) = (width as i64, height as i64);
+    let rad: [i64; 7] = core::array::from_fn(|i| r * BANDS[i] >> 8);
+    // Ticks first (front to back: what is drawn first stays on top): radial 1-pixel lines across each ring, inset a pixel at both ends.
+    for (ri, ring) in rings.iter().enumerate() {
+        let (r_out, r_in) = (rad[2 * ri] - 256, rad[2 * ri + 1] + 256);
+        let n = ring.ticks.max(1);
+        for k in 0..n {
+            let (ux, uy) = dirs[(k * 60 / n) % 60];
+            let (ex, ey) = (cx + (ux * r_out >> 14), cy + (uy * r_out >> 14));
+            let (sx, sy) = (cx + (ux * r_in >> 14), cy + (uy * r_in >> 14));
+            let (x0, x1) = ((sx.min(ex) >> 8) - 1, (sx.max(ex) >> 8) + 1);
+            let (y0, y1) = ((sy.min(ey) >> 8) - 1, (sy.max(ey) >> 8) + 1);
+            for y in y0.max(0)..=y1.min(h - 1) {
+                for x in x0.max(0)..=x1.min(w - 1) {
+                    let (dx, dy) = ((x << 8) + 128 - cx, (y << 8) + 128 - cy);
+                    let along = (dx * ux + dy * uy) >> 14;
+                    if along < r_in || along > r_out {
+                        continue;
+                    }
+                    let perp = ((ux * dy - uy * dx) >> 14).abs();
+                    let cov = 256 - perp;
+                    if cov <= 0 {
+                        continue;
+                    }
+                    let p = &mut px[y as usize * width + x as usize];
+                    *p = under(*p, at_coverage(CLOCK_TICK, cov.min(255) as u32));
+                }
+            }
+        }
+    }
+    // The sweep boundary of each ring: θ's direction (sin θ, −cos θ), Q14, from the 60-step table, interpolated.
+    let bound: [(i64, i64, bool); 3] = core::array::from_fn(|i| {
+        let f = rings[i].frac_q16 as i64;
+        let pos = f * 60;
+        let (k, t) = ((pos >> 16) as usize, pos & 0xFFFF);
+        let (a, b) = (dirs[k % 60], dirs[(k + 1) % 60]);
+        (a.0 + ((b.0 - a.0) * t >> 16), a.1 + ((b.1 - a.1) * t >> 16), f > 1 << 15)
+    });
+    let full: [bool; 3] = core::array::from_fn(|i| rings[i].frac_q16 >= 1 << 16);
+    // A ring's colour at a pixel: the sweep's coverage (antialiased on its leading edge and along 12:00), fill or face by the period's direction.
+    let ring_colour = |i: usize, dx: i64, dy: i64| -> u32 {
+        let (bx, by, past_half) = bound[i];
+        let cov_x = (dx + 128).clamp(0, 256);
+        let cov_line = (-((bx * dy - by * dx) >> 14) + 128).clamp(0, 256);
+        let swept = if full[i] { 256 } else if rings[i].frac_q16 == 0 { 0 } else if past_half { cov_x.max(cov_line) } else { cov_x.min(cov_line) };
+        if rings[i].dark_sweep { mix(CLOCK_FACE, CLOCK_FILL, swept) } else { mix(CLOCK_FILL, CLOCK_FACE, swept) }
+    };
+    // Each band's colour, by index: 0, 2, 4 the rings; 1, 3, 5 the strokes; 6 the centre.
+    let band_colour = |b: usize, dx: i64, dy: i64| -> u32 {
+        match b {
+            0 | 2 | 4 => ring_colour(b / 2, dx, dy),
+            1 | 3 | 5 => CLOCK_STROKE,
+            _ => CLOCK_FACE,
+        }
+    };
+    let r2: [i64; 7] = core::array::from_fn(|i| rad[i] * rad[i]);
+    // 255 / (2 rad) in Q24 per boundary, as in `disc`: the first-order distance to a boundary from d² with a multiply.
+    let kb: [i64; 7] = core::array::from_fn(|i| ((255i64 << 24) / (2 * rad[i].max(1))) >> 8);
+    spans(cx, cy, r, |y, xo0, xo1, _, _| {
+        if y < 0 || y >= h {
+            return;
+        }
+        let rowb = y as usize * width;
+        let dy = (y << 8) + 128 - cy;
+        let dy2 = dy * dy;
+        for x in xo0.max(0)..=xo1.min(w - 1) {
+            let p = &mut px[rowb + x as usize];
+            if *p >> 24 == 255 {
+                continue;
+            }
+            let dx = (x << 8) + 128 - cx;
+            let d2 = dx * dx + dy2;
+            if d2 > r2[0] + 2 * rad[0] * 256 {
+                continue;
+            }
+            // The band: the first boundary the pixel is outside of, counted from the inside.
+            let mut b = 6;
+            while b > 0 && d2 > r2[b] {
+                b -= 1;
+            }
+            // Its coverage across the nearer boundary: outside the face (b = 0's outer edge) fades to nothing; elsewhere it blends with the neighbouring band.
+            let out_cov = 128 - ((d2 - r2[b]) * kb[b] >> 24);
+            let in_cov = if b < 6 { 128 + ((d2 - r2[b + 1]) * kb[b + 1] >> 24) } else { 256 };
+            let here = band_colour(b, dx, dy);
+            let (colour, alpha) = if out_cov < 256 && (b > 0 || out_cov > 0) {
+                if b == 0 {
+                    (here, out_cov.clamp(0, 255))
+                } else {
+                    (mix(here, band_colour(b - 1, dx, dy), out_cov), 255)
+                }
+            } else if in_cov < 256 && b < 6 {
+                (mix(here, band_colour(b + 1, dx, dy), in_cov), 255)
+            } else {
+                (here, 255)
+            };
+            if alpha <= 0 {
+                continue;
+            }
+            *p = under(*p, at_coverage(colour, alpha as u32));
+        }
+    });
+    Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
 }
 
 /// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are packed premultiplied words (G#AARRGGBB), with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest) — VSF RGB gamma 2 codes, as the bundle holds them.

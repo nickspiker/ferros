@@ -197,6 +197,10 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.brightness" && len == 1 && params[2 + klen] <= 8 {
                         crate::process::set_pref(crate::process::PREF_BRIGHTNESS, params[2 + klen]);
                     }
+                    if key == "device.tz" && len == 4 {
+                        let b = &params[2 + klen..2 + klen + 4];
+                        crate::rtc::set_tz(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64);
+                    }
                     if key == "device.dither" && len == 1 && params[2 + klen] <= 1 {
                         crate::process::set_pref(crate::process::PREF_DITHER, params[2 + klen]);
                     }
@@ -435,7 +439,7 @@ static USB_LINK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// The last battery sample and when it was taken: the gauge is read at most every two seconds, however often a dashboard asks.
 static mut GAUGE: ([u64; 4], u64) = ([crate::process::FACT_UNKNOWN; 4], 0);
 
-/// SYS_FACTS (process.rs): 0 press to home µs; 1 battery %; 2 battery temperature, hundredths of a degree C (i64); 3 cell voltage µV; 4 battery current µA, positive = charging (i64); 5 USB link up (0/1); 6 processes alive; 7 keys in the vault; the rest unknown.
+/// SYS_FACTS (process.rs): 0 press to home µs; 1 battery %; 2 battery temperature, hundredths of a degree C (i64); 3 cell voltage µV; 4 battery current µA, positive = charging (i64); 5 USB link up (0/1); 6 processes alive; 7 keys in the vault; 8 the wall clock's base — unix seconds × counter frequency − the counter, so unix time = (base + counter) / frequency (rtc.rs; unknown until the PMIC's clock has been read); 9 the time zone, seconds east of UTC (i64); the rest unknown.
 fn facts() -> [u64; crate::process::FACT_COUNT] {
     use core::sync::atomic::Ordering::Relaxed;
     let mut v = [crate::process::FACT_UNKNOWN; crate::process::FACT_COUNT];
@@ -461,6 +465,11 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     if let Some(keys) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).and_then(|s| s.keys().ok()) {
         v[7] = keys.len() as u64;
     }
+    let base = crate::rtc::BASE.load(Relaxed);
+    if base != 0 {
+        v[8] = base;
+    }
+    v[9] = crate::rtc::TZ.load(Relaxed) as u64;
     v
 }
 
@@ -510,6 +519,8 @@ pub fn run(mut b: Boot) -> ! {
 
     // The worker cores (smp.rs): up once the kernel is settled on its own core, before the first slice is handed out.
     crate::smp::launch_all();
+    // The wall clock (rtc.rs): read now, so the first process to ask has it.
+    let _ = crate::rtc::sync();
     let freq = cntfrq();
     // Enumeration watchdog (cold-boot values): 2 s of total silence = dead attempt; 4 s since init without SET_CONFIGURATION = wedged EP0. Either re-inits PHY + DWC3, which the host sees as a fresh attach.
     let enum_timeout = freq * 2;
@@ -595,6 +606,8 @@ pub fn run(mut b: Boot) -> ! {
         }
         let now = cntpct();
         // Home: once the ring has completed — the host has the USB link, or a second has passed since the press with no cable — start init and with it the shell.
+        // The wall clock, re-read hourly (rtc.rs); cheap to call every pass.
+        crate::rtc::poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
             if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {
@@ -1122,6 +1135,18 @@ pub fn run(mut b: Boot) -> ! {
                                                     resp.extend_from_slice(b"(no dump: the core did not take the SGI within 10 ms)\n");
                                                 }
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"rtc" {
+                                            // `diag rtc`: the PMIC's clock read now, the unix time it gives, the base the kernel keeps, and the zone.
+                                            match crate::rtc::read() {
+                                                Ok((y, mo, d, h, mi, s)) => resp.extend_from_slice(alloc::format!("rtc: {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC\n").as_bytes()),
+                                                Err(e) => resp.extend_from_slice(alloc::format!("rtc: read failed, ACPM G#{e:X}\n").as_bytes()),
+                                            }
+                                            let _ = crate::rtc::sync();
+                                            let base = crate::rtc::BASE.load(core::sync::atomic::Ordering::Relaxed);
+                                            resp.extend_from_slice(alloc::format!("unix now A#{}; zone A#{} s east of UTC\n", base.wrapping_add(cntpct()) / cntfrq(), crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
