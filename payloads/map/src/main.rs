@@ -207,6 +207,9 @@ impl Batch {
     }
 }
 
+/// FERROS_MAP_START=crowd's extra circles (`Map::crowd`): x, y, r in world units, and how many.
+static mut CROWD: ([i64; 256], [i64; 256], [i64; 256], usize) = ([0; 256], [0; 256], [0; 256], 0);
+
 /// The camera: the centre in world units ×256, the zoom in panel pixels per world unit, 16.16, and the turn as a unit vector (cos, sin) in Q14 — world to screen is that rotation, then the zoom. A vector rather than an angle: a twist composes by one complex multiply and nothing needs a sine.
 #[derive(Clone, Copy, PartialEq)]
 struct Cam {
@@ -606,12 +609,83 @@ impl Map {
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
         call(self.display, &m, &mut r);
+        self.send_crowd();
         // The circles' own turns ride on `scene move`: a fresh scene starts every circle upright.
         for i in 0..N {
             if self.rc[i] != ONE || self.rsn[i] != 0 {
                 self.send_move(i);
             }
         }
+    }
+
+    /// The crowd's circles (world units: x, y, r), kept so every `send_scene` appends them again after the map's own.
+    fn send_crowd(&self) {
+        let (xs, ys, rs, k) = unsafe { &*(&raw const CROWD) };
+        let mut r = [0u8; 4];
+        let mut done = 0;
+        while done < *k {
+            let count = (*k - done).min(120);
+            let mut m = [0u8; 2 + 30 * 120];
+            m[0] = 13;
+            m[1] = count as u8;
+            for c in 0..count {
+                let i = done + c;
+                let at = 2 + c * 30;
+                m[at..at + 4].copy_from_slice(&(xs[i] as i32).to_le_bytes());
+                m[at + 4..at + 8].copy_from_slice(&(ys[i] as i32).to_le_bytes());
+                m[at + 8..at + 10].copy_from_slice(&(rs[i].clamp(1, 65535) as u16).to_le_bytes());
+                m[at + 10] = (i % 3) as u8;
+                m[at + 11] = (i % 17 == 0) as u8;
+                m[at + 12] = [1u8, 2, 3, 4, 5, 6][i % 6];
+            }
+            call(self.display, &m[..2 + 30 * count], &mut r);
+            done += count;
+        }
+    }
+
+    /// A stress scene (FERROS_MAP_START=crowd): `n` circles of random size, 20-120 px across at the current zoom, around the view (1.2 screens), none overlapping each other or the map's own, appended to the display's scene only. Random importance (so the glows vary), a few lit, icons from the bundle in turn. Returns how many fit.
+    fn crowd(&self, n: usize) -> usize {
+        let mut rng = Rng(0x6372_6F77_6400_0001);
+        let z = self.cam.z.max(1);
+        let px = |p: i64| p * 65536 / z;
+        let (cx, cy) = (self.cam.x >> 8, self.cam.y >> 8);
+        let (hw, hh) = (px(self.w) * 6 / 10, px(self.h) * 6 / 10);
+        let mut xs = [0i64; 256];
+        let mut ys = [0i64; 256];
+        let mut rs = [0i64; 256];
+        let mut k = 0;
+        for i in 0..N {
+            xs[k] = self.xs[i] >> 8;
+            ys[k] = self.ys[i] >> 8;
+            rs[k] = self.rs[i];
+            k += 1;
+        }
+        let own = k;
+        let mut tries = 0;
+        while k < own + n && tries < 200_000 {
+            tries += 1;
+            let r = px(20 + (rng.next() >> 40) as i64 % 101);
+            let (x, y) = (cx + rng.signed(hw), cy + rng.signed(hh));
+            if (0..k).all(|j| {
+                let (dx, dy, g) = (x - xs[j], y - ys[j], r + rs[j]);
+                dx * dx + dy * dy >= g * g
+            }) {
+                xs[k] = x;
+                ys[k] = y;
+                rs[k] = r;
+                k += 1;
+            }
+        }
+        let mut c = (xs, ys, rs, 0usize);
+        for i in own..k {
+            c.0[i - own] = xs[i];
+            c.1[i - own] = ys[i];
+            c.2[i - own] = rs[i];
+        }
+        c.3 = k - own;
+        unsafe { CROWD = c };
+        self.send_crowd();
+        k - own
     }
 
     /// One circle moved or resized in the display server's scene (op 17).
@@ -1097,6 +1171,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         map.draw();
     }
     console(grants, b"map: home drawn; tap arrives, two fingers turn a circle over\n");
+    // FERROS_MAP_START=crowd: 200 more circles in the display's scene only (never the vault), for timing a busy home screen.
+    if option_env!("FERROS_MAP_START") == Some("crowd") {
+        let placed = map.crowd(200);
+        let mut l = Line::new();
+        let _ = write!(l, "map: crowd of {} circles added\n", placed);
+        console(grants, l.as_str().as_bytes());
+        map.draw();
+    }
     if let Some(mode) = option_env!("FERROS_MAP_START") {
         let mut l = Line::new();
         let _ = write!(l, "map: dev start mode {mode}\n");
@@ -1128,6 +1210,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // FERROS_MAP_START=drag: the drag's own rate, for measuring the frame pacing with no one at the panel.
     let (mut synth_t0, mut synth_draws, mut synth_at) = (0u64, 0u32, (0i64, 0i64));
     let map_start = now();
+    // The display's frame-start count, from the last frame wait (op 24).
+    let (mut frame_count, mut synth_f0) = (0u32, 0u32);
     loop {
         // A preference changed (here or from the bridge): redraw in it.
         let b = ferros_sys::device_base();
@@ -1160,11 +1244,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // The screen off (the power key): no touches reach the map.
         let t_loop = now();
-        let n = if option_env!("FERROS_MAP_START") == Some("drag") && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
+        let n = if matches!(option_env!("FERROS_MAP_START"), Some("drag") | Some("crowd")) && synth < 192 && now().wrapping_sub(map_start) > 2 * freq() {
             synth += 1;
-            if synth == 1 {
+            if synth == 2 {
+                // From the second pass: the first frame wait's reply is in.
                 synth_t0 = now();
                 synth_draws = 0;
+                synth_f0 = frame_count;
+            }
+            if synth == 1 {
                 // An empty spot to put the finger on: up the middle from the bottom until no circle is under it.
                 synth_at = (w / 2, h - 160);
                 let mut y = h - 160;
@@ -1176,7 +1264,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if synth == 181 {
                 let mut l = Line::new();
                 let ms = ferros_sys::us_since(synth_t0) / 1000;
-                let _ = write!(l, "map: drag 180 passes in {} ms, {} draws: {} draws/s\n", ms, synth_draws, synth_draws as u64 * 1000 / ms.max(1));
+                let frames = frame_count.wrapping_sub(synth_f0);
+                let _ = write!(l, "map: drag 179 passes in {} ms, {} draws, {} frames on the panel: {} frames/s\n", ms, synth_draws, frames, frames as u64 * 1000 / ms.max(1));
                 console(grants, l.as_str().as_bytes());
             }
             if synth > 180 {
@@ -1392,6 +1481,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         } else {
             let mut fr = [0u8; 4];
             call(display, &[24], &mut fr);
+            frame_count = u32::from_le_bytes(fr);
         }
     }
 }

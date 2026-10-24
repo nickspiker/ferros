@@ -350,6 +350,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Dma(b"app-surface"),
         // 23 the touch controller's interrupt line, 24 DECON0's frame-done, 25 its frame-start (KERNEL.md "Interrupts to user space").
         Irq(b"touch-int"), Irq(b"decon0-frame-done"), Irq(b"decon0-frame-start"),
+        // 26 the display's sprite cache.
+        Dma(b"display-sprites"),
     ]
 }
 
@@ -357,7 +359,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25],
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26],
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22],
         _ => return None,

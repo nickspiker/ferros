@@ -72,6 +72,12 @@ pub const APP_SURFACE: (usize, usize) = (0xC000_0000, 0xC200_0000);
 #[cfg(shim_handoff)]
 pub const APP_SURFACE: (usize, usize) = (0, 0);
 
+/// The display's sprite cache (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory in the same GiB, 32 MiB clear of the apps' surface (in case the bootloader's modem image runs past it): every circle's drawn pixels, kept while its size and turn stay, so a pan blits rather than redraws. A screen packed with circles needs ~20 MB of square sprites; the 6 MiB the display's heap could spare thrashed at 200 circles (2026-10-24: every icon redrawn every frame, 11 ms). Free per the device tree (the first carveout in this GiB is G#E800_0000). Granted as the region `display-sprites`.
+#[cfg(not(shim_handoff))]
+pub const DISPLAY_SPRITES: (usize, usize) = (0xC400_0000, 0xC600_0000);
+#[cfg(shim_handoff)]
+pub const DISPLAY_SPRITES: (usize, usize) = (0, 0);
+
 /// HCR_EL2 / CPTR_EL2 as the loader left them, restored before RELOAD hands over.
 static mut BOOT_HCR: u64 = 0;
 static mut BOOT_CPTR: u64 = 0;
@@ -205,14 +211,16 @@ pub fn enable() -> bool {
                 normal(vhe, a, BLOCK)
             };
         }
-        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surface Normal.
+        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surface and the display's sprites Normal.
         let (s0, s1) = APP_SURFACE;
+        let (p0, p1) = DISPLAY_SPRITES;
         if s0 != s1 && s0 / GIB == w0 / GIB + 1 && s0 % MIB2 == 0 && s1 % MIB2 == 0 && (s1 - 1) / GIB == s0 / GIB {
             let l2h = &mut *(&raw mut L2_HI);
             let base = s0 / GIB * GIB;
             for (j, e) in l2h.0.iter_mut().enumerate() {
                 let a = base + j * MIB2;
-                *e = if a >= s0 && a + MIB2 <= s1 { pool(vhe, a, BLOCK) | UXN } else { device(vhe, a, BLOCK) };
+                let normal_here = (a >= s0 && a + MIB2 <= s1) || (p0 != p1 && a >= p0 && a + MIB2 <= p1);
+                *e = if normal_here { pool(vhe, a, BLOCK) | UXN } else { device(vhe, a, BLOCK) };
             }
             l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }

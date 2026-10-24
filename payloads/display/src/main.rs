@@ -68,6 +68,8 @@ const S_PHASES: u64 = 14;
 const S_APPSURF: u64 = 15;
 /// DECON0's frame-start interrupt line (kernel `decon0-frame-start`): the `vsync` thread waits on it and moves FRAME_STARTS, which `settle` and `present` wait on instead of polling FRAME_COUNT.
 const S_IRQ_FS: u64 = 16;
+/// 17: the `display-sprites` region (32 MiB, cacheable): the sprite arena. Absent (a display spawned by hand with fewer slots), the arena comes from the heap at its old 6 MiB.
+const S_SPRITES: u64 = 17;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -979,7 +981,10 @@ fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mas
     }
 }
 /// Per second (the frames/s line): the camera ops' scene, -, publish and wait times summed, and their count.
-static mut SEC_US: [u64; 5] = [0; 5];
+/// [scene, glow, publish, wait, ops, icons drawn, blits, clear].
+static mut SEC_US: [u64; 8] = [0; 8];
+/// The last camera op's clear of the previous frame's rectangle, µs.
+static mut CLEAR_US: u64 = 0;
 /// The publish's own split, in counter ticks since the last camera op: the NEON loop, the copy out, and pixels.
 static mut PUB_TICKS: [u64; 3] = [1; 3];
 
@@ -1013,8 +1018,8 @@ static mut SPRITES: [Sprite; 256] = [NO_SPRITE; 256];
 static mut LAST_KEY: [[i64; 6]; 256] = [[0; 6]; 256];
 static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
-/// 6 MiB: the display's heap is the 16 MiB below the back buffer in its 32 MiB region, and the 256-px icon mips (4.4 MB) plus the glyph cache (2 MiB) left no room for 10 (2026-10-23: the display failed at start).
-const ARENA_WORDS: usize = (6 << 20) / 4;
+/// The arena's size in words: the `display-sprites` region's 32 MiB when granted (a screen packed with circles needs ~20 MB of square sprites; 6 MiB thrashed at 200, 2026-10-24), else 6 MiB of the heap (the 16 MiB below the back buffer, where the 256-px icon mips, 4.4 MB, and the glyph cache, 2 MiB, left no room for 10, 2026-10-23).
+static mut ARENA_WORDS: usize = (6 << 20) / 4;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
@@ -1463,7 +1468,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         v.leak()
     };
     unsafe {
-        ARENA = alloc::vec![0u32; ARENA_WORDS].leak().as_mut_ptr() as usize;
+        let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
+        if sprites != 0 && sprites != ferros_sys::ERR {
+            ARENA = sprites as usize;
+            ARENA_WORDS = (32 << 20) / 4;
+        } else {
+            ARENA = alloc::vec![0u32; ARENA_WORDS].leak().as_mut_ptr() as usize;
+        }
         ARENA_NEXT = 0;
     }
     ALLOC.mark();
@@ -1707,9 +1718,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         };
                     }
                     if m.get(13).copied().unwrap_or(0) & 1 == 0 {
+                        let t_c = now();
                         unsafe {
                             draw::clear(pixels, width, PREV_DMG.clip(width, height));
                             CUR_DMG = draw::Rect::EMPTY;
+                            CLEAR_US = ferros_sys::us_since(t_c);
                         }
                     }
                     let mut t_phase = now();
@@ -1858,6 +1871,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             }
                             SEC_US[1] += SCENE_US[2];
                             SEC_US[4] += 1;
+                            SEC_US[5] += SCENE_US[0];
+                            SEC_US[6] += SCENE_US[1];
+                            SEC_US[7] += CLEAR_US;
                         }
                         out[1] = 1;
                         len = 2;
@@ -2230,6 +2246,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.dec(unsafe { SEC_US[0] } / 1000);
                 tlog.s(b" ms (glow ");
                 tlog.dec(unsafe { SEC_US[1] } / 1000);
+                tlog.s(b" ms, icons ");
+                tlog.dec(unsafe { SEC_US[5] } / 1000);
+                tlog.s(b" ms, blits ");
+                tlog.dec(unsafe { SEC_US[6] } / 1000);
+                tlog.s(b" ms, clear ");
+                tlog.dec(unsafe { SEC_US[7] } / 1000);
                 tlog.s(b" ms)");
                 tlog.s(b" ms, publish ");
                 tlog.dec(unsafe { SEC_US[2] } / 1000);
@@ -2240,7 +2262,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 tlog.s(b" camera ops\n");
                 tlog.flush();
             }
-            unsafe { SEC_US = [0; 5] };
+            unsafe { SEC_US = [0; 8] };
             frames_last_tick = frames;
             starts_last_tick = fs;
             if !client_owned {

@@ -765,6 +765,8 @@ pub static DMA: &[Dma] = &[
     Dma { name: "display-phases", base: crate::cachemap::DISPLAY_PHASES.0, size: crate::cachemap::DISPLAY_PHASES.1 - crate::cachemap::DISPLAY_PHASES.0 },
     // The apps' 16-bit surface (cachemap APP_SURFACE): cacheable, shared by the display server and the app in front.
     Dma { name: "app-surface", base: crate::cachemap::APP_SURFACE.0, size: crate::cachemap::APP_SURFACE.1 - crate::cachemap::APP_SURFACE.0 },
+    // The display's sprite cache (cachemap DISPLAY_SPRITES): cacheable, the display server's alone.
+    Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
 ];
 /// A named scope of the device vault a spawn can grant: every key under `prefix`. A process names keys relative to its scope and cannot reach outside it (no `/`-style escapes exist: the kernel only ever prepends).
 pub struct StoreScope {

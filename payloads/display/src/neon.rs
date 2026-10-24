@@ -185,6 +185,14 @@ unsafe fn dither_pack(q: [uint16x8_t; 6], th: uint8x16_t, dst: *mut u32) {
 pub unsafe fn odt16(o: &Odt, src: *const u32) -> [uint16x8_t; 6] {
     unsafe {
         let (b, g, r) = ld4(src);
+        odt16_bgr(o, b, g, r)
+    }
+}
+
+/// `odt16` from the three channel planes already loaded.
+#[inline(always)]
+unsafe fn odt16_bgr(o: &Odt, b: uint8x16_t, g: uint8x16_t, r: uint8x16_t) -> [uint16x8_t; 6] {
+    unsafe {
         let (lr0, lg0, lb0) = light8(o, vget_low_u8(r), vget_low_u8(g), vget_low_u8(b));
         let (lr1, lg1, lb1) = light8(o, vget_high_u8(r), vget_high_u8(g), vget_high_u8(b));
         let (r0, g0, b0) = matrix8(o, lr0, lg0, lb0);
@@ -194,10 +202,18 @@ pub unsafe fn odt16(o: &Odt, src: *const u32) -> [uint16x8_t; 6] {
     }
 }
 
-/// 16 canvas pixels through the ODT, dithered by this row's thresholds, into 16 words.
+/// 16 canvas pixels through the ODT, dithered by this row's thresholds, into 16 words. Sixteen black pixels (the map's empty plane, most of the screen) are 16 black words without the ODT: no work for nothing, one branch per 16 pixels that holds its direction across a black run (owner, 2026-10-24: a crowded screen's full publish spent half its time making black black).
 #[inline(always)]
 pub unsafe fn sixteen_odt(o: &Odt, src: *const u32, dst: *mut u32, th: uint8x16_t) {
-    unsafe { dither_pack(odt16(o, src), th, dst) }
+    unsafe {
+        let (b, g, r) = ld4(src);
+        if vmaxvq_u8(vorrq_u8(vorrq_u8(r, g), b)) == 0 {
+            let k = vdupq_n_u32(3);
+            core::arch::asm!("stp {k:q}, {k:q}, [{p}]", "stp {k:q}, {k:q}, [{p}, #32]", p = in(reg) dst, k = in(vreg) k, options(nostack, preserves_flags));
+            return;
+        }
+        dither_pack(odt16_bgr(o, b, g, r), th, dst)
+    }
 }
 
 /// 16 of an app's pixels (u64 each: R, G, B working values in bits 0-15, 16-31, 32-47; bit 48 = no dither) through the ODT, dithered by `th` except where bit 48 asks not, into 16 words.
