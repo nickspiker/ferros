@@ -17,6 +17,11 @@ REPO=/mnt/Harbor/Code/ferros
 BRIDGE=$REPO/target/debug/ferros-bridge
 ELF=$REPO/target/aarch64-unknown-none/release/ferros_kernel
 IMG=$REPO/target/aarch64-unknown-none/release/ferros_cold.img
+# Other phones may share this host's adb (2026-10-23: a Pixel 3a); every adb call here means the husky. Its serial is read live, never written down.
+if [ -z "${ANDROID_SERIAL:-}" ]; then
+    s=$(adb devices -l 2>/dev/null | awk '/product:husky/{print $1; exit}')
+    [ -n "$s" ] && export ANDROID_SERIAL=$s
+fi
 
 to_fastboot() {
     if fastboot devices | grep -q .; then return; fi
