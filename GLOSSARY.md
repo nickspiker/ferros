@@ -100,6 +100,7 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 | *detected* | read receipt, consent-gated: no observation until the detector fires, and the sender learns nothing until the receiver's does; states run *in flight* → *arrived* → *detected* | the measurement |
 | `fluor` | CPU compositor / GUI toolkit | fluorescence |
 | `ferros` | the field — OS, kernel, oracle, vault, ledger, RUA | iron (Fe) |
+| *portal* | the one boundary where every request to a device arrives as a signed exact VSF value, is checked against fleet-written grants, answered, and recorded; the terminal distilled (see [PORTAL.md](PORTAL.md)) | Latin *porta*, from PIE *per-* "to cross over" |
 | `pipe` | the PIPE identity chip — patent + RTL; *whakaira*/*ira*/*wairua* in silicon | the wire interface |
 
 ---

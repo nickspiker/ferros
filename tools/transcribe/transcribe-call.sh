@@ -4,8 +4,8 @@
 #
 #   usage: transcribe-call.sh <call.ogg>  [> transcript.txt]
 #
-# Env overrides: WHISPER_MODEL (default large-v3), WHISPER_LANG (default en),
-#                WHISPER_VAD_MODEL (default bundled silero).
+# Env overrides: WHISPER_BIN, WHISPER_MODEL (default large-v3), WHISPER_LANG (default en),
+#                WHISPER_VAD_MODEL (default silero), WHISPER_THREADS.
 #
 # Anti-hallucination: each channel is ~50% silence (the other party talking), and
 # Whisper invents/loops speech over silence. VAD skips the silent stretches so it
@@ -13,15 +13,31 @@
 set -euo pipefail
 IN="${1:?usage: transcribe-call.sh <call.ogg>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WHISPER="$HERE/build/bin/whisper-cli"
+# Prefer a local build, fall back to a checkout in $HOME — whisper.cpp is commonly built there and
+# this repo does not vendor it. Same resolution as transcribe-tracks.sh.
+WHISPER="${WHISPER_BIN:-}"
+if [ -z "$WHISPER" ]; then
+    for c in "$HERE/build/bin/whisper-cli" "$HOME/whisper.cpp/build/bin/whisper-cli"; do
+        [ -x "$c" ] && { WHISPER="$c"; break; }
+    done
+fi
 MODEL="${WHISPER_MODEL:-$HOME/whisper-models/ggml-large-v3.bin}"
-VAD_MODEL="${WHISPER_VAD_MODEL:-$HERE/models/ggml-silero-v5.1.2.bin}"
+VAD_MODEL="${WHISPER_VAD_MODEL:-}"
+if [ -z "$VAD_MODEL" ]; then
+    for c in "$HERE/models/ggml-silero-v5.1.2.bin" "$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin"; do
+        [ -f "$c" ] && { VAD_MODEL="$c"; break; }
+    done
+fi
 LANG="${WHISPER_LANG:-en}"
+# The two channels run one after the other, so each gets the whole box. whisper.cpp scales poorly
+# past ~16 threads, so cap it there.
+THREADS="${WHISPER_THREADS:-$(nproc)}"
+[ "$THREADS" -gt 16 ] && THREADS=16
 
-[ -x "$WHISPER" ] || { echo "whisper-cli not found at $WHISPER" >&2; exit 1; }
+[ -n "$WHISPER" ] || { echo "whisper-cli not found (set WHISPER_BIN)" >&2; exit 1; }
 [ -f "$MODEL" ]   || { echo "model not found at $MODEL" >&2; exit 1; }
 
-WFLAGS=(-m "$MODEL" -l "$LANG" -oj -mc 0 -ml 1)   # -ml 1 = word-level timestamps (merge needs them)
+WFLAGS=(-m "$MODEL" -l "$LANG" -oj -mc 0 -ml 1 -t "$THREADS")   # -ml 1 = word-level timestamps (merge needs them)
 if [ -f "$VAD_MODEL" ]; then
   WFLAGS+=(--vad --vad-model "$VAD_MODEL")
 else
