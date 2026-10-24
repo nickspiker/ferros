@@ -1255,6 +1255,11 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(n) = cmd.params.strip_prefix(b"aoc svc ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                            crate::aoc::svc_report(n.trim(), &mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"aoc pins" || cmd.params.starts_with(b"aoc gpio ") {
                                             // `diag aoc pins`: the AoC GPIO's four ports of pin levels. `diag aoc gpio <hex offset> <hex value>`: write one register of that page, then show the levels (aoc.rs).
                                             let mut it = cmd.params.strip_prefix(b"aoc gpio ").unwrap_or(b"").split(|&c| c == b' ').filter(|t| !t.is_empty()).filter_map(|t| core::str::from_utf8(t).ok()).filter_map(|t| usize::from_str_radix(t.trim_start_matches("G#"), 16).ok());

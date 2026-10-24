@@ -445,3 +445,53 @@ pub fn mmu(out: &mut alloc::vec::Vec<u8>) {
 pub fn mmu_fault() -> [u32; 5] {
     [rd32(0x1909_8060), rd32(0x1909_8070), rd32(0x1909_8074), rd32(0x1909_8078), rd32(0x1909_807C)]
 }
+
+// ── The AoC service rings (aoc_ipc, google-modules/aoc_ipc) ──
+/// The IPC control block and service table live at the carve-out plus the image size. The image is G#1C0_0000 for husky's aoc.bin (the superbin header's image_size).
+pub const IPC: usize = CARVEOUT + 0x1C0_0000;
+/// Each service header: a 32-byte name, u32 flags, then two 28-byte regions (UP = AoC→AP = index 0, DOWN = AP→AoC = index 1); region = {offset, size, slots, tx, rx, wp, rp}. The table starts at the control block's `services_offset`.
+const SVC_HDR: usize = 92;
+const REGION: usize = 28;
+
+/// Walk the service table for `name`; returns the service header's address, or 0.
+pub fn service(name: &str) -> usize {
+    let count = rd32(IPC + 24) as usize; // services count (after magic/fw/hw/status + u64 supported_features)
+    let base = IPC + rd32(IPC + 32) as usize; // services_offset
+    for i in 0..count {
+        let h = base + i * SVC_HDR;
+        let mut n = alloc::string::String::new();
+        for k in 0..32 {
+            let c = unsafe { read_volatile((h + k) as *const u8) };
+            if c == 0 {
+                break;
+            }
+            n.push(c as char);
+        }
+        if n == name {
+            return h;
+        }
+    }
+    0
+}
+
+fn region(h: usize, dir: usize) -> usize {
+    h + 36 + dir * REGION
+}
+
+/// `diag aoc svc <name>`: a service's type, mailbox index and both rings' geometry and pointers.
+pub fn svc_report(name: &str, out: &mut alloc::vec::Vec<u8>) {
+    out.extend_from_slice(alloc::format!("control block: magic G#{:X} services A#{} service_size A#{} services_offset G#{:X}\n", rd32(IPC), rd32(IPC + 24), rd32(IPC + 28), rd32(IPC + 32)).as_bytes());
+    let h = service(name);
+    if h == 0 {
+        out.extend_from_slice(alloc::format!("{name}: not found\n").as_bytes());
+        return;
+    }
+    let flags = rd32(h + 32);
+    let ty = (flags >> 16) & 7;
+    let irq = (flags >> 19) & 0x1F;
+    out.extend_from_slice(alloc::format!("{name} @ G#{h:X}: flags G#{flags:X} type A#{ty} (0 queue, 1 ring, 2 buffer) mbox A#{irq}\n").as_bytes());
+    for (d, lbl) in [(0usize, "UP  AoC->AP"), (1, "DOWN AP->AoC")] {
+        let r = region(h, d);
+        out.extend_from_slice(alloc::format!("  {lbl}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}\n", rd32(r), rd32(r + 4), rd32(r + 8), rd32(r + 12), rd32(r + 16), rd32(r + 20), rd32(r + 24)).as_bytes());
+    }
+}
