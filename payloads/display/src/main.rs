@@ -1572,10 +1572,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             let key = [sr, stroke, tc, ts, lit as i64, cir.icon as i64];
                             let (spr, ext) = sprite(i, key, d, |px, d| {
                                 let c = ((d as i64 / 2) << 8) | 128;
-                                if let Some(mp) = mp {
-                                    draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
+                                // The fill only where there is no art: under an icon it showed as a dark rim along the edge.
+                                match mp {
+                                    Some(mp) => {
+                                        draw::icon(px, d, d, c, c, ri, tc, ts, mp, lit);
+                                    }
+                                    None => {
+                                        draw::disc(px, d, d, c, c, ri, fill);
+                                    }
                                 }
-                                draw::disc(px, d, d, c, c, ri, fill);
 
                             });
                             unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
@@ -1588,7 +1593,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             }
                             let t_d = now();
                             unsafe { SCENE_US[0] += ferros_sys::us_since(t_i) };
-                            draw::disc(pixels, width, height, sx, sy, ri, fill);
+                            if mp.is_none() {
+                                draw::disc(pixels, width, height, sx, sy, ri, fill);
+                            }
                             r = draw::Rect::EMPTY;
                             unsafe { SCENE_US[1] += ferros_sys::us_since(t_d) };
                         }

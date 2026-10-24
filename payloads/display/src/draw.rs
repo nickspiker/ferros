@@ -274,6 +274,7 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
     if r < 256 {
         return Rect::EMPTY;
     }
+    // The art is sampled as if its circle were larger than the one drawn — by 2 px, or 2 texels of the chosen level if that is more — so the drawn edge always lands on fully opaque art: the icon's own antialiased rim (the bundle's circle cut, bilinear taps into the transparent border) never reaches the screen, and the edge's antialiasing is this disc's coverage alone (owner, 2026-10-23: "come in at least 2 px before you start drawing, so there's a trim").
     let diameter = ((2 * r) >> 8) as usize;
     let mut l = 0;
     while l + 1 < m.levels && (m.size >> (l + 1)) >= diameter {
@@ -282,15 +283,21 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
     let size = (m.size >> l) as i64;
     let stride = size as usize + 2 * PAD;
     let tex = &(if lit { m.rgba } else { m.grey })[m.offset[l]..m.offset[l] + stride * stride];
-    // Texels per screen pixel in Q16, and the four steps of the inverse turn.
-    let k = (size << 24) / (2 * r);
+    // One texel in Q8 screen pixels at radius r, and the trim: the larger of 2 px and 2 texels.
+    let texel = (2 * r) / size.max(1);
+    let r_art = r + (2 * 256i64).max(2 * texel);
+    // Texels per screen pixel in Q16, and the four steps of the inverse turn — for the art's larger circle.
+    let k = (size << 24) / (2 * r_art);
     let (du_dx, dv_dx) = (c * k >> 14, -s * k >> 14);
     let (du_dy, dv_dy) = (s * k >> 14, c * k >> 14);
     let (w, h) = (width as i64, height as i64);
     // Texel space with the border: centre at size/2 + PAD, bilinear taps at −½.
     let half = ((size << 16) >> 1) + ((PAD as i64) << 16) - (1 << 15);
     let (lo, hi) = (0i64, (size + 2 * PAD as i64 - 1) << 16);
-    spans(cx, cy, r, |y, xo0, xo1, _, _| {
+    // The edge's coverage, as `disc` computes it: 128 − (d² − r²)·k >> 24, with k = 255 / 2r in Q24.
+    let r2 = r * r;
+    let kc = ((255i64 << 24) / (2 * r)) >> 8;
+    spans(cx, cy, r, |y, xo0, xo1, xi0, xi1| {
         if y < 0 || y >= h {
             return;
         }
@@ -301,13 +308,30 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
             return;
         }
         let (ox, oy) = ((x0 << 8) + 128 - cx, (y << 8) + 128 - cy);
+        let dy2 = oy * oy;
         let mut u = half + ((ox * du_dx + oy * du_dy) >> 8);
         let mut v = half + ((ox * dv_dx + oy * dv_dy) >> 8);
         let row = &mut px[rowb + x0 as usize..=rowb + x1 as usize];
-        for p in row.iter_mut() {
+        for (n, p) in row.iter_mut().enumerate() {
             if *p >> 24 != 255 && u >= lo && v >= lo && u < hi && v < hi {
                 let i = (v >> 16) as usize * stride + (u >> 16) as usize;
-                let t = bilerp(tex[i], tex[i + 1], tex[i + stride], tex[i + stride + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32);
+                let mut t = bilerp(tex[i], tex[i + 1], tex[i + stride], tex[i + stride + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32);
+                // Outside the inner span: the pixel straddles the edge, so the texel is scaled by the disc's coverage (premultiplied: every channel).
+                let x = x0 + n as i64;
+                if x < xi0 || x > xi1 {
+                    let dx = (x << 8) + 128 - cx;
+                    let cov = 128 - ((dx * dx + dy2 - r2) * kc >> 24);
+                    if cov <= 0 {
+                        u += du_dx;
+                        v += dv_dx;
+                        continue;
+                    }
+                    if cov < 255 {
+                        let c = cov as u32;
+                        let sc = |sh: u32| ((t >> sh & 0xFF) * c + 127) / 255 << sh;
+                        t = sc(24) | sc(16) | sc(8) | sc(0);
+                    }
+                }
                 if t >> 24 != 0 {
                     *p = if *p == 0 { t } else { under(*p, t) };
                 }
