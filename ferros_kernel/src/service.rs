@@ -1219,6 +1219,20 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"ffa" {
+                                            // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
+                                            let smc = |a: [u64; 3]| -> [u64; 4] {
+                                                let (r0, r1, r2, r3): (u64, u64, u64, u64);
+                                                unsafe { core::arch::asm!("smc #0", inout("x0") a[0] => r0, inout("x1") a[1] => r1, inout("x2") a[2] => r2, inout("x3") 0u64 => r3, inout("x4") 0u64 => _, inout("x5") 0u64 => _, inout("x6") 0u64 => _, inout("x7") 0u64 => _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _) };
+                                                [r0, r1, r2, r3]
+                                            };
+                                            for (name, args) in [("FFA_VERSION 1.1", [0x8400_0063, 0x1_0001, 0]), ("FFA_ID_GET", [0x8400_0069, 0, 0]), ("FFA_FEATURES RXTX_MAP64", [0x8400_0064, 0xC400_0066, 0])] {
+                                                let r = smc(args);
+                                                resp.extend_from_slice(alloc::format!("{name}: x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", r[0], r[1], r[2], r[3]).as_bytes());
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"thermal" || cmd.params == b"thermal init" {
                                             // `diag thermal`: every TMU zone as the ACPM firmware reads it (acpm::tmu_read) — the hottest probe, the zone's status, each probe; `diag thermal init` sends TMU_IPC_INIT first (Linux does once at probe).
                                             if cmd.params == b"thermal init" {

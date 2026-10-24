@@ -24,6 +24,18 @@ An hv oracle capture first: Android under the hv, recording how it boots the AoC
 
 The capture decides which.
 
+## Starting the AoC: GSA loads, Trusty starts (2026-10-23)
+
+On a cold ferros the AoC has never run: Linux's `aoc` driver starts it, every boot. Its sequence (Google's `kernel/google-modules/aoc` at /mnt/Harbor/ferros-ref/aoc, GSA in soc-gs `drivers/soc/google/gsa`):
+1. Copy `/vendor/firmware/aoc.bin` (29 MB, Google-signed: a 4 KiB header GSA checks, then the body) into the `aoc_reserve` carve-out at G#9400_0000.
+2. Ask GSA, Google's security processor, to authenticate and lock it: `GSA_MB_CMD_LOAD_AOC_FW_IMG` on GSA's non-secure mailbox (`gsa_load_aoc_fw_image`, gsa_core.c). ferros can do this itself.
+3. Take the AoC out of reset: not a mailbox command. `gsa_send_aoc_cmd` (GSA_AOC_START and the reset/shutdown commands) goes over Trusty IPC to the secure-world service `com.android.trusty.gsa.hwmgr.aoc` (gsa_core.c, hwmgr-ipc.h). There is no other way in.
+4. Wait for the AoC to come online, find its services in shared memory (`aoc_ipc`, in the husky kernel tree at /mnt/Harbor/husky-kernel/private/google-modules/aoc_ipc) and talk USF on the `com.google.usf` service (below).
+
+So Google's sensor firmware means a Trusty client in ferros: FF-A messaging to the secure world, Trusty's virtio rings in shared memory, Trusty IPC on top, and giving Trusty CPU time when it asks (Linux's driver is ~7000 lines of C in the husky tree's `trusty/drivers/trusty`). The first step answers: `diag ffa` from cold ferros at EL2 gets FFA_VERSION 1.1, FFA_ID_GET success (ferros is partition 0) and FFA_FEATURES success for RXTX_MAP (2026-10-23).
+
+The other route stays open and unmeasured: keep the AoC in reset and drive the sensors' buses from the AP, if the AoC block's own I2C/I3C/SPI controllers answer the AP through the `blk_aoc` window (G#1700_0000, 32 MiB) and their addresses and the sensors' wiring can be read out of aoc.bin. That avoids the TEE and Google's firmware, but every sensor driver (ICM45631, TMD3719, MLX90632, ...) becomes ferros's.
+
 ## Capturing USF (2026-10-23)
 
 Android's sensors HAL (`android.hardware.sensors-service.multihal`, libraries `sensors.usf.so` + `libusf.so`) talks to the AoC through one character device, `/dev/acd-com.google.usf` (plus `.non_wake_up`), served by `aoc_channel_dev.ko` (Google's `kernel/google-modules/aoc`, cloned at /mnt/Harbor/ferros-ref/aoc). The messages are FlatBuffers (libusf carries FlatBuffers 1.12; its message types include sensor list, sensor info, get server, get time, self test, debug buffer and an I2C transfer). The sensor rails are the AP's to switch: the AoC platform device holds the sub-PMIC's LDO5 (3.3 V) and LDO7 (1.8 V), which ferros reaches over ACPM.
