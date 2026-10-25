@@ -96,7 +96,13 @@ pub fn arm_safety() {
 }
 
 /// Reload both cluster watchdog counters. Loops that legitimately run long (the USB service loop) call this every iteration; a real hang stops the pets and the watchdog resets warm.
+/// Set once a watchdog reset has been ordered (`reboot_to_bootloader`): from then on nothing pets the watchdogs. The vault pets them on every operation (kvault.rs), and the map writes the vault from the worker cores all the time, so the reset that `bridge reboot fastboot` waits for never came (2026-10-24: 64 s of a frozen service loop, USB gone, ferros still running after).
+static RESET_ORDERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn pet_watchdogs() {
+    if RESET_ORDERED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     for &wdt in &WATCHDOGS {
         unsafe { write_volatile((wdt + 0x08) as *mut u32, 0xFFFF) };
     }
@@ -229,6 +235,7 @@ pub fn reboot_to_bootloader() -> u64 {
     if r != 0 {
         return r;
     }
+    RESET_ORDERED.store(true, core::sync::atomic::Ordering::Relaxed);
     // Fire the cluster watchdogs: count = reload = 1, prescaler 0, DIV16, RSTEN, so the counter expires every tick. Measured on husky with payloads/wdtfire: the reset is NOT immediate — these watchdogs reset the SoC about 15-20 s after they start expiring (a single expiry with the running configuration reset ~1 min later), so this waits up to 64 s by the clock. Writes are spaced 1 ms apart (the block sits behind a slow clock; back-to-back writes with the I-cache on were not proven). The bootloader then reads the stamped mode and stops in fastboot (RST_STAT CLUSTER0_NONCPU_WDTRESET, "Reboot mode: 0xfc").
     let ms = |n: u64| {
         let t0 = cntpct();
@@ -252,7 +259,8 @@ pub fn reboot_to_bootloader() -> u64 {
     while cntpct().wrapping_sub(t0) < cntfrq() * 64 {
         core::hint::spin_loop();
     }
-    // Still here after 64 s: report it.
+    // Still here after 64 s: report it, and let the watchdogs be petted again.
+    RESET_ORDERED.store(false, core::sync::atomic::Ordering::Relaxed);
     crumb(0xB7);
     WATCHDOG_DID_NOT_FIRE
 }
