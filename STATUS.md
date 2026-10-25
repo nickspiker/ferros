@@ -44,7 +44,7 @@ The reusable core of a ferros-native Photon client: `wire.rs` (ping/pong/photon/
 
 ## Next, in rough order
 
-**The owner's order (2026-10-24):** the clock upright by gravity (the accelerometer through the AoC's USF) and the 16-bit canvas; then the proximity-inhibited wake (designed with the owner once the proximity sensor's specs are known); then the spectrometer, GPS, the cellular radio, Photon.
+**The owner's order (2026-10-24):** the clock upright by gravity (the accelerometer through the AoC's USF) and the 16-bit canvas; then the proximity-inhibited wake (designed with the owner once the proximity sensor's specs are known); then the spectrometer, GPS, the cellular radio; then the keyboard, the IME and OS housekeeping (a task manager and the like); then Photon.
 
 
 1. **The touch server:** an EL0 process taking the controller's interrupt (gpn0-0) instead of polling, serving a `touch` endpoint — raw eight-bit pressure straight through to the app, with mm/px and px/RU published. The display server is the pattern to copy. Then fluor grows the `Event::Touch` arm its event doc already reserves (pressure, the contact ellipse, touch id, contact kind), pressure threads through `PointerArbiter` into `Context`, and `theme`'s `HELD` becomes a ramp so a control brightens under a harder press. Mouse hosts report full pressure on press, so nothing on desktop changes. Then `shelltest` answers a real tap.
