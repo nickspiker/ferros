@@ -186,66 +186,104 @@ fn parameters(ipc: usize) {
 }
 
 /// `diag aoc boot`: load and start the AoC from the vault's copy of aoc.bin. `get` reads one vault key. Returns whether the AoC came up (its control block magic).
-pub fn boot(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> bool {
-    use alloc::format;
-    let say = |out: &mut alloc::vec::Vec<u8>, s: alloc::string::String| out.extend_from_slice(s.as_bytes());
-    let f = crate::platform::cntfrq();
-    let us = |t0: u64| (crate::platform::cntpct() - t0) * 1_000_000 / f;
+/// GSA's view of the AoC: 0 inactive, 1 loaded, 2 running (None: GSA did not answer).
+pub fn gsa_state() -> Option<u32> {
     match crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256) {
-        Ok((_, 0, a)) if a.first() == Some(&0) => {}
-        r => {
-            say(out, format!("GSA AoC state is not inactive ({r:?}); not loading\n"));
-            return false;
+        Ok((_, 0, a)) => a.first().map(|&s| s as u32),
+        _ => None,
+    }
+}
+
+/// Loading the firmware a piece at a time, so the service loop can go on between pieces (each 2 MiB piece is some 50 ms out of the vault; the whole image 0.7 s, too long for the X3 to stop serving USB and drawing).
+pub struct Loader {
+    pub next: usize,
+    off: usize,
+    image_size: usize,
+}
+
+impl Loader {
+    /// Begin, if GSA has the AoC inactive.
+    pub fn begin(out: &mut alloc::vec::Vec<u8>) -> Option<Loader> {
+        match gsa_state() {
+            Some(0) => Some(Loader { next: 0, off: 0, image_size: 0 }),
+            s => {
+                out.extend_from_slice(alloc::format!("GSA AoC state is not inactive ({s:?}); not loading\n").as_bytes());
+                None
+            }
         }
     }
-    // The pieces, in order, into the carve-out: the file's first 4 KiB is GSA's signed header, the rest the body at the load address.
-    let t0 = crate::platform::cntpct();
-    let (mut off, mut image_size) = (0usize, 0usize);
-    for i in 0.. {
-        let Some(piece) = get(&format!("aoc.fw.{i}")) else { break };
-        let mut p: &[u8] = &piece;
-        if off == 0 {
-            if p.len() < AUTH_HEADER + 16 || u32::from_le_bytes(p[AUTH_HEADER..AUTH_HEADER + 4].try_into().unwrap()) != SUPERBIN_MAGIC {
-                say(out, "aoc.fw.0 is not an AoC image (no superbin magic after the 4 KiB header)\n".into());
-                return false;
+
+    /// Copy the next piece into the carve-out: Ok(true) when one was copied, Ok(false) when there are no more. The file's first 4 KiB is GSA's signed header, the rest the body at the load address.
+    pub fn piece(&mut self, get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> Result<bool, ()> {
+        let i = self.next;
+        let Some(piece) = get(&alloc::format!("aoc.fw.{i}")) else {
+            if self.off == 0 {
+                out.extend_from_slice(b"no aoc.fw.* in the vault (tools/husky-aoc-fw.sh puts them there)\n");
+                return Err(());
             }
-            image_size = u32::from_le_bytes(p[AUTH_HEADER + 12..AUTH_HEADER + 16].try_into().unwrap()) as usize;
+            return Ok(false);
+        };
+        let mut p: &[u8] = &piece;
+        if self.off == 0 {
+            if p.len() < AUTH_HEADER + 16 || u32::from_le_bytes(p[AUTH_HEADER..AUTH_HEADER + 4].try_into().unwrap()) != SUPERBIN_MAGIC {
+                out.extend_from_slice(b"aoc.fw.0 is not an AoC image (no superbin magic after the 4 KiB header)\n");
+                return Err(());
+            }
+            self.image_size = u32::from_le_bytes(p[AUTH_HEADER + 12..AUTH_HEADER + 16].try_into().unwrap()) as usize;
             copy_dev(HDR_BUF, &p[..AUTH_HEADER]);
             p = &p[AUTH_HEADER..];
-            off = AUTH_HEADER;
+            self.off = AUTH_HEADER;
         }
-        let at = off - AUTH_HEADER;
-        if at + p.len() > image_size.max(1) + (16 << 20) || at + p.len() > HDR_BUF - CARVEOUT {
-            say(out, format!("piece {i} runs past the carve-out's image area\n"));
-            return false;
+        let at = self.off - AUTH_HEADER;
+        if at + p.len() > self.image_size.max(1) + (16 << 20) || at + p.len() > HDR_BUF - CARVEOUT {
+            out.extend_from_slice(alloc::format!("piece {i} runs past the carve-out's image area\n").as_bytes());
+            return Err(());
         }
         copy_dev(CARVEOUT + at, p);
-        off += p.len();
+        self.off += p.len();
+        self.next += 1;
+        Ok(true)
     }
-    unsafe { core::arch::asm!("dsb sy") };
-    if off == 0 {
-        say(out, "no aoc.fw.* in the vault (tools/husky-aoc-fw.sh puts them there)\n".into());
-        return false;
+
+    /// With every piece in: the AoC SYSMMU from the firmware's own IOMMU table (now in HDR_BUF), the block's power request, GSA's load (it authenticates the image), the parameter block. The start then goes over Trusty (trusty::aoc_start), as Linux does: GSA's mailbox command 91 moves the state but does not run the firmware, and leaves GSA in a state the Trusty start then refuses.
+    pub fn finish(&self, out: &mut alloc::vec::Vec<u8>) -> bool {
+        let f = crate::platform::cntfrq();
+        unsafe { core::arch::asm!("dsb sy") };
+        out.extend_from_slice(alloc::format!("copied A#{} bytes (image size G#{:X})\n", self.off, self.image_size).as_bytes());
+        mmu(out);
+        let (ack, _) = request(true, 256);
+        out.extend_from_slice(alloc::format!("aoc_req ack G#{ack:X}\n").as_bytes());
+        let t1 = crate::platform::cntpct();
+        let r = crate::gsa::call(GSA_CMD_LOAD_AOC, &[HDR_BUF as u32, 0, CARVEOUT as u32, 0], 8192);
+        out.extend_from_slice(alloc::format!("GSA load: {r:?} after A#{} us\n", (crate::platform::cntpct() - t1) * 1_000_000 / f).as_bytes());
+        if !matches!(r, Ok((_, 0, _))) {
+            return false;
+        }
+        parameters(CARVEOUT + self.image_size);
+        unsafe { core::arch::asm!("dsb sy") };
+        out.extend_from_slice(alloc::format!("loaded; GSA AoC state {:?} (1 = loaded)\n", gsa_state()).as_bytes());
+        true
     }
-    say(out, format!("copied A#{} bytes (image size G#{image_size:X}) in A#{} us\n", off, us(t0)));
-    // Enable the AoC SYSMMU from the firmware's own IOMMU table (now in HDR_BUF) before the load, as Linux does.
-    mmu(out);
-    let (ack, _) = request(true, 256);
-    say(out, format!("aoc_req ack G#{ack:X}\n"));
-    let t1 = crate::platform::cntpct();
-    let r = crate::gsa::call(GSA_CMD_LOAD_AOC, &[HDR_BUF as u32, 0, CARVEOUT as u32, 0], 8192);
-    say(out, format!("GSA load: {r:?} after A#{} us\n", us(t1)));
-    match r {
-        Ok((_, 0, _)) => {}
-        _ => return false,
+}
+
+/// `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) in one go; start it with `diag trusty aoc`.
+pub fn boot(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> bool {
+    let Some(mut l) = Loader::begin(out) else { return false };
+    let t0 = crate::platform::cntpct();
+    loop {
+        match l.piece(get, out) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(()) => return false,
+        }
     }
-    let ipc = CARVEOUT + image_size;
-    parameters(ipc);
-    unsafe { core::arch::asm!("dsb sy") };
-    // Loaded, parameters in place. The start goes over Trusty (`diag trusty aoc`), as Linux does: GSA's mailbox command 91 moves the state but does not run the firmware, and leaves GSA in a state the Trusty start then refuses.
-    let st = crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256);
-    say(out, format!("loaded; GSA AoC state {st:?} (1 = loaded); start with `diag trusty aoc`\n"));
-    true
+    out.extend_from_slice(alloc::format!("pieces in A#{} us\n", (crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()).as_bytes());
+    l.finish(out)
+}
+
+/// Whether the firmware's control block is up (its magic in place of the parameter block).
+pub fn online() -> bool {
+    rd32(IPC) == AOC_MAGIC
 }
 
 /// The AoC's control block: up once the firmware has replaced the parameter block with it (magic G#A0C0_0A0C). Polls up to `ms`; returns whether it came up and the first words.
@@ -455,7 +493,11 @@ const REGION: usize = 28;
 
 /// Walk the service table for `name`; returns the service header's address, or 0.
 pub fn service(name: &str) -> usize {
-    let count = rd32(IPC + 24) as usize; // services count (after magic/fw/hw/status + u64 supported_features)
+    // Before the firmware is up the carve-out holds whatever DRAM held: no table to walk.
+    if rd32(IPC) != AOC_MAGIC {
+        return 0;
+    }
+    let count = (rd32(IPC + 24) as usize).min(128); // services count (after magic/fw/hw/status + u64 supported_features)
     let base = IPC + rd32(IPC + 32) as usize; // services_offset
     for i in 0..count {
         let h = base + i * SVC_HDR;
@@ -541,6 +583,10 @@ pub fn ipc_read(h: usize, buf: &mut [u8]) -> Option<usize> {
         buf[i] = unsafe { read_volatile((src + 8 + i) as *const u8) };
     }
     wr32(r + 16, rx.wrapping_add(1));
+    // A ring that was full before this read: tell the AoC there is room again, as aoc_service_read does (a stream left full otherwise waits for a signal that never comes).
+    if tx.wrapping_sub(rx) >= slots {
+        mbox_signal((rd32(h + 32) >> 19) & 0x1F);
+    }
     Some(n)
 }
 
@@ -589,5 +635,27 @@ pub fn usf_probe(out: &mut alloc::vec::Vec<u8>) {
     }
     if got == 0 {
         out.extend_from_slice(b"no UP messages (AoC did not answer the channel open)\n");
+    }
+}
+
+/// `diag aoc services`: every service's index and name.
+pub fn services(out: &mut alloc::vec::Vec<u8>) {
+    if rd32(IPC) != AOC_MAGIC {
+        out.extend_from_slice(b"AoC not up\n");
+        return;
+    }
+    let count = (rd32(IPC + 24) as usize).min(128);
+    let base = IPC + rd32(IPC + 32) as usize;
+    for i in 0..count {
+        let h = base + i * SVC_HDR;
+        let mut n = alloc::string::String::new();
+        for k in 0..32 {
+            let c = unsafe { read_volatile((h + k) as *const u8) };
+            if c == 0 {
+                break;
+            }
+            n.push(c as char);
+        }
+        out.extend_from_slice(alloc::format!("{i} {n}\n").as_bytes());
     }
 }

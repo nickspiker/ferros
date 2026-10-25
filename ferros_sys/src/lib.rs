@@ -138,6 +138,11 @@ impl Facts {
     pub fn throttled(&self) -> Option<bool> {
         self.get(11).map(|v| v != 0)
     }
+    /// The gravity vector the AoC last reported, m/s², in the panel's frame: x right, y up, z out of the glass (a phone held upright reads y ≈ +9.8, one lying face up z ≈ +9.8). None until the sensors are up.
+    pub fn gravity(&self) -> Option<[f32; 3]> {
+        let (xy, z) = (self.get(12)?, self.get(13)?);
+        Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
+    }
 }
 
 /// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.

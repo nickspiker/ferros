@@ -119,7 +119,7 @@ extern "C" fn vsync(grants: u64) -> ! {
         if (r != 0 && said < 4) || said < 2 {
             said += 1;
             let mut l = Log { grants, buf: [0; 256], n: 0 };
-            l.s(b"display: vsync irq_wait -> G#");
+            l.s(b"display: vsync irq_wait -> ");
             l.hex(r as u32);
             l.s(if r == ferros_sys::ERR { b" (ERR: no such capability)\n" } else { b"\n" });
             l.flush();
@@ -403,8 +403,41 @@ struct ClockShown {
     frac: [u32; 4],
     lighter: [bool; 4],
     key: i64,
+    /// The gravity turn it was drawn at (GRAV_TURN; zero without one).
+    turn: (i64, i64),
 }
-static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 4], lighter: [false; 4], key: -1 };
+static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 4], lighter: [false; 4], key: -1, turn: (0, 0) };
+
+/// The clock upright by gravity (owner's order, 2026-10-24): the face's turn, Q14 (cos, sin), that puts its 12:00 and its digits up against gravity on the glass, whatever the map's own turn. None until the AoC has sent a sample (then the face turns with the map, as before).
+static mut GRAV_TURN: Option<(i64, i64)> = None;
+/// The angle GRAV_TURN holds, radians clockwise from the panel's up.
+static mut GRAV_ANGLE: f32 = 0.0;
+/// Gravity's share in the glass's plane below which the phone counts as lying flat and the clock keeps its turn: 2.5 m/s², about 15° from flat.
+const GRAV_FLAT: f32 = 2.5;
+/// The turn moves only when gravity has moved more than this from it (radians, about a degree), so the sensor's noise does not redraw the face every sample.
+const GRAV_STEP: f32 = 0.0175;
+
+/// Read gravity (SYS_FACTS) once a pass and turn the clock to it. Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y).
+fn gravity_poll() {
+    let Some([x, y, _]) = ferros_sys::facts().gravity() else { return };
+    if x * x + y * y < GRAV_FLAT * GRAV_FLAT {
+        return;
+    }
+    let a = libm::atan2f(x, y);
+    let mut d = a - unsafe { GRAV_ANGLE };
+    if d > core::f32::consts::PI {
+        d -= 2.0 * core::f32::consts::PI;
+    } else if d < -core::f32::consts::PI {
+        d += 2.0 * core::f32::consts::PI;
+    }
+    if unsafe { GRAV_TURN }.is_some() && d.abs() < GRAV_STEP {
+        return;
+    }
+    unsafe {
+        GRAV_ANGLE = a;
+        GRAV_TURN = Some(((libm::cosf(a) * 16384.0) as i64, (libm::sinf(a) * 16384.0) as i64));
+    }
+}
 /// The clock each phase frame holds (None: unknown, after a publish that was not the clock's — the next redraw for it is whole).
 static mut PHASE_CLOCK: [Option<ClockShown>; PHASES] = [None; PHASES];
 
@@ -412,6 +445,9 @@ static mut PHASE_CLOCK: [Option<ClockShown>; PHASES] = [None; PHASES];
 fn clock_dirty(was: &ClockShown, now: &ClockShown) -> Option<([draw::Rect; 5], usize)> {
     let (cx, cy, r, tc, ts, n) = unsafe { CLOCK_GEOM };
     let dirs = unsafe { &*(&raw const CLOCK_DIRS) };
+    if was.turn != now.turn {
+        return None;
+    }
     let mut parts = [draw::Rect::EMPTY; 5];
     let mut np = 0;
     let pt = |rad: i64, (ux, uy): (i64, i64)| {
@@ -1898,9 +1934,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let unit = text_width(&font, widest, 100.0).max(1.0);
                                 // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
                                 let px = room / unit * 100.0;
-                                // The digits turn with the face (and, once the accelerometer is in, with gravity).
+                                // The digits turn with the face: upright by gravity once the AoC reports it, else with the map's and the circle's own turn.
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
-                                let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                                let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
                                 let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
                                 let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
                                 text_turned_centre(pixels, width, height, t, cxf, cyf, px, (tcf, tsf), 0xFF00_0000 | th.text);
@@ -1912,13 +1948,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     ALLOC.reset();
                                 }
                             }
-                            // The face's turn: the camera's and the circle's own, as the icons get it.
+                            // The face's turn: gravity's when known, else the camera's and the circle's own, as the icons get it.
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
-                            let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
+                            let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
                             let r = draw::clock(pixels, width, height, sx, sy, sr, &rings[..nrings], unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
                             unsafe {
                                 CLOCK_GEOM = (sx, sy, sr, fc, fs, nrings);
-                                BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key };
+                                BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key, turn: GRAV_TURN.unwrap_or((0, 0)) };
                             }
                             unsafe {
                                 CUR_DMG = CUR_DMG.union(r);
@@ -2284,6 +2320,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 let _ = handle(m, &mut out);
             }
         };
+        gravity_poll();
         if clock_due {
             clock_due = false;
             unsafe { CLOCK_ONLY = true };
@@ -2297,7 +2334,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             // What phase k's clock lacks: the wedges the sweeps moved through since it was last drawn there, and the centre if the digits changed; the whole clock when that is not known.
             let mut tb = [0u8; 32];
             let (rings, _, _, key, _) = clock_state(&mut tb);
-            let now_c = ClockShown { frac: core::array::from_fn(|i| rings[i].frac_q16), lighter: core::array::from_fn(|i| rings[i].lighter), key };
+            let now_c = ClockShown { frac: core::array::from_fn(|i| rings[i].frac_q16), lighter: core::array::from_fn(|i| rings[i].lighter), key, turn: unsafe { GRAV_TURN }.unwrap_or((0, 0)) };
             let whole = ([unsafe { CLOCK_RECT }, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY], 1);
             let (parts, np) = match unsafe { PHASE_CLOCK[k] } {
                 Some(was) => clock_dirty(&was, &now_c).unwrap_or(whole),

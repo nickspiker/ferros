@@ -480,7 +480,86 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
         v[10] = hottest as u64;
     }
     v[11] = (THROTTLED_FROM.load(Relaxed) != 0) as u64;
+    // The gravity vector (usf.rs), once a sample has come.
+    let gz = crate::usf::GRAVITY_Z.load(Relaxed);
+    if gz >> 32 != 0 {
+        v[12] = crate::usf::GRAVITY_XY.load(Relaxed);
+        v[13] = gz;
+    }
     v
+}
+
+/// The sensors' chain from cold: Google's AoC firmware out of the vault, loaded through GSA (aoc::boot), started through Trusty (trusty::aoc_start), then the gravity stream on USF. Skips the firmware when the AoC is already up (a warm reload: its control block holds the magic).
+fn sensors_up(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> bool {
+    let t0 = cntpct();
+    crate::usf::power(out);
+    if crate::aoc::gsa_state() != Some(2) {
+        if !crate::aoc::boot(get, out) || !crate::trusty::aoc_start(out, 4000) {
+            return false;
+        }
+    }
+    let ok = crate::usf::start(64, false, out);
+    out.extend_from_slice(alloc::format!("sensors up in {} ms\n", cntpct().wrapping_sub(t0) * 1000 / cntfrq()).as_bytes());
+    ok
+}
+
+/// The sensors' bring-up as background work of the service loop, a step a pass, so the X3 never stops serving USB and drawing for the 1.4 s it takes whole: the rails, the firmware out of the vault a 2 MiB piece at a time, GSA's load and the Trusty start, then polling until the firmware is online, then the gravity stream.
+enum SensorBoot {
+    Wait,
+    Pieces(crate::aoc::Loader),
+    Online(u64),
+    Usf,
+    Done,
+}
+
+/// The sensors start this long after the service loop does: the home screen first.
+const SENSORS_AFTER_S: u64 = 4;
+
+/// One step of the sensors' bring-up; what it said goes to the flash log.
+fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>) -> SensorBoot {
+    let f = cntfrq();
+    let mut out = alloc::vec::Vec::new();
+    let next = match st {
+        SensorBoot::Wait => {
+            crate::usf::power(&mut out);
+            match crate::aoc::gsa_state() {
+                // Running already (a warm reload): the firmware is up; open the stream again.
+                Some(2) if crate::aoc::online() => SensorBoot::Usf,
+                Some(0) => match crate::aoc::Loader::begin(&mut out) {
+                    Some(l) => SensorBoot::Pieces(l),
+                    None => SensorBoot::Done,
+                },
+                s => {
+                    out.extend_from_slice(alloc::format!("GSA AoC state {s:?}: not starting\n").as_bytes());
+                    SensorBoot::Done
+                }
+            }
+        }
+        SensorBoot::Pieces(mut l) => match l.piece(get, &mut out) {
+            Ok(true) => SensorBoot::Pieces(l),
+            Ok(false) if l.finish(&mut out) && crate::trusty::aoc_start(&mut out, 0) => SensorBoot::Online(now),
+            _ => SensorBoot::Done,
+        },
+        SensorBoot::Online(t0) if crate::aoc::online() => {
+            out.extend_from_slice(alloc::format!("AoC online after A#{} ms\n", now.wrapping_sub(t0) * 1000 / f).as_bytes());
+            SensorBoot::Usf
+        }
+        SensorBoot::Online(t0) if now.wrapping_sub(t0) > 4 * f => {
+            out.extend_from_slice(b"AoC not online after 4 s\n");
+            SensorBoot::Done
+        }
+        SensorBoot::Usf => {
+            crate::usf::start(64, false, &mut out);
+            SensorBoot::Done
+        }
+        other => other,
+    };
+    for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        if let Ok(t) = core::str::from_utf8(l) {
+            crate::flashlog::line(&alloc::format!("sensors: {t}"));
+        }
+    }
+    next
 }
 
 /// Each thermal zone's temperature, whole °C, as the service loop last read it (thermal_poll; acpm::TMU_ZONES order); 0 = never read.
@@ -608,6 +687,7 @@ pub fn run(mut b: Boot) -> ! {
     // The fourth drop (2026-10-24, 753 s into the boot) left no disconnect and no reset on this side: the host logged "USB disconnect" and the only trace here was DSTS's link state going 0 (on) → 3 (L2 suspend) and staying there, with the kernel still "configured". The dev host never suspends the port (power/control = on), so a link held in suspend for 16 s is a host that has gone: re-initialise, which drops the pull-up and brings a fresh enumeration.
     let mut t_awake = cntpct();
     let mut link_was = 0u32;
+    let mut sensor_boot = SensorBoot::Wait;
     let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
     // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
     let mut att_ev = [0u32; 3];
@@ -728,6 +808,12 @@ pub fn run(mut b: Boot) -> ! {
             t_heartbeat = now;
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
             usb_log(&mut usb_log_n, &alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
+        }
+        crate::usf::poll();
+        if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
+            let st = &raw mut store;
+            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+            sensor_boot = sensor_step(core::mem::replace(&mut sensor_boot, SensorBoot::Done), now, &mut get);
         }
         let link = (dsts() >> 18) & 15;
         if link != 3 {
@@ -1305,6 +1391,35 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                                            // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
+                                            if cmd.params == b"sensors up" {
+                                                let st = &raw mut store;
+                                                let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                                                sensors_up(&mut get, &mut resp);
+                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf raw ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                                                if v.len() == 2 {
+                                                    crate::usf::raw(v[0], v[1], &mut resp);
+                                                }
+                                            } else if let Some(path) = cmd.params.strip_prefix(b"usf reg ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                crate::usf::reg(path.trim(), &mut resp);
+                                            } else if cmd.params == b"usf power" {
+                                                crate::usf::power(&mut resp);
+                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf start") {
+                                                let a = core::str::from_utf8(a).unwrap_or("");
+                                                let ms = a.split_whitespace().find_map(|t| t.parse::<u64>().ok()).unwrap_or(64);
+                                                crate::usf::start(ms, a.contains("wake"), &mut resp);
+                                            }
+                                            crate::usf::report(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc services" {
+                                            crate::aoc::services(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"aoc usf" {
                                             crate::aoc::usf_probe(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
@@ -1347,7 +1462,7 @@ pub fn run(mut b: Boot) -> ! {
                                         }
                                         if cmd.params == b"trusty aoc" {
                                             // `diag trusty aoc`: start the AoC through Trusty — FF-A, virtio, the GSA hwmgr tipc channel, the START message (trusty.rs). Needs the firmware already loaded (diag aoc boot).
-                                            crate::trusty::aoc_start(&mut resp);
+                                            crate::trusty::aoc_start(&mut resp, 4000);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

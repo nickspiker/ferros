@@ -398,10 +398,11 @@ fn connect(port: &str, out: &mut alloc::vec::Vec<u8>) -> Result<u32, &'static st
 }
 
 /// `diag trusty aoc`: the whole path — FF-A up, virtio up, connect to GSA's AoC hwmgr port, send START, read the state back.
-pub fn aoc_start(out: &mut alloc::vec::Vec<u8>) {
+/// `wait_ms`: how long to wait for the firmware to come online after GSA starts it (0: return at once, the caller polls aoc::online).
+pub fn aoc_start(out: &mut alloc::vec::Vec<u8>, wait_ms: u64) -> bool {
     if let Err(e) = crate::ffa::init() {
         out.extend_from_slice(alloc::format!("FF-A init failed: A#{e}\n").as_bytes());
-        return;
+        return false;
     }
     // Select the Trusty API version first, as Linux's probe does; without it Trusty does not run the modern virtio path.
     let api = crate::ffa::smc8([SMC_FC_API_VERSION, TRUSTY_API_VERSION_CURRENT, 0, 0, 0, 0, 0, 0])[0];
@@ -409,13 +410,13 @@ pub fn aoc_start(out: &mut alloc::vec::Vec<u8>) {
     sched_share(out);
     if let Err(e) = virtio_bringup(out) {
         out.extend_from_slice(alloc::format!("virtio bring-up failed: {e}\n").as_bytes());
-        return;
+        return false;
     }
     let remote = match connect("com.android.trusty.gsa.hwmgr.aoc", out) {
         Ok(r) => r,
         Err(e) => {
             out.extend_from_slice(alloc::format!("connect failed: {e}\n").as_bytes());
-            return;
+            return false;
         }
     };
     unsafe { REMOTE = remote };
@@ -429,18 +430,26 @@ pub fn aoc_start(out: &mut alloc::vec::Vec<u8>) {
             let err = u32::from_le_bytes(buf[4..8].try_into().unwrap());
             let state = u32::from_le_bytes(buf[8..12].try_into().unwrap());
             out.extend_from_slice(alloc::format!("GSA reply: cmd G#{cmd:X} err A#{err} state A#{state} (2 = running)\n").as_bytes());
-            if err == 0 {
-                let (up, w) = crate::aoc::wait_online(4000);
+            if err == 0 && wait_ms > 0 {
+                let (up, w) = crate::aoc::wait_online(wait_ms);
                 out.extend_from_slice(alloc::format!("AoC control block: up {up}, magic G#{:X} fw G#{:X} hw G#{:X} status G#{:X} services A#{}\n", w[0], w[1], w[2], w[3], w[6]).as_bytes());
             }
+            err == 0
         }
         Some((_, _, n)) if n >= 8 => {
             // Header only: hwmgr_rsp_hdr {cmd, err} with no state — GSA refused the command.
             let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             let err = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as i32;
             out.extend_from_slice(alloc::format!("GSA refused: cmd G#{cmd:X} err A#{err}\n").as_bytes());
+            false
         }
-        Some((_, _, n)) => out.extend_from_slice(alloc::format!("short GSA reply: A#{n} bytes\n").as_bytes()),
-        None => out.extend_from_slice(b"no GSA reply\n"),
+        Some((_, _, n)) => {
+            out.extend_from_slice(alloc::format!("short GSA reply: A#{n} bytes\n").as_bytes());
+            false
+        }
+        None => {
+            out.extend_from_slice(b"no GSA reply\n");
+            false
+        }
     }
 }

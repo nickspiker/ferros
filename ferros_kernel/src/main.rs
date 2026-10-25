@@ -52,6 +52,7 @@ mod x3;
 mod smp;
 mod rtc;
 mod aoc;
+mod usf;
 mod gsa;
 mod ffa;
 mod trusty;
