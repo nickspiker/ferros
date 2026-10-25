@@ -44,9 +44,41 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now};
-use fluor::canvas::{Canvas, Damage};
-use fluor::paint;
-use fluor::pixel::{Blend, BlendMode};
+use draw::Px;
+
+/// The 16-bit canvas as the text and rectangle calls see it (they once drew on fluor's 8-bit canvas; the shapes of those calls are kept).
+struct Canvas<'a> {
+    pixels: &'a mut [Px],
+    width: usize,
+    height: usize,
+}
+impl<'a> Canvas<'a> {
+    fn new(pixels: &'a mut [Px], width: usize, height: usize, _damage: &mut Damage) -> Canvas<'a> {
+        Canvas { pixels, width, height }
+    }
+}
+/// Kept for the call shape; the scene tracks its damage itself.
+struct Damage;
+impl Damage {
+    fn new() -> Damage {
+        Damage
+    }
+}
+mod paint {
+    use super::{draw, Canvas};
+    /// A rectangle of `colour` (G#AARRGGBB, 8-bit codes; alpha its coverage) under what is there; a zero width or height is one pixel (the rules).
+    pub fn fill_rect(c: &mut Canvas, x: isize, y: isize, w: isize, h: isize, colour: u32, _: Option<()>, _: Option<()>) {
+        let (w, h) = (w.max(1), h.max(1));
+        let (bx0, by0, bx1, by1) = draw::bounds(c.width, c.height);
+        let px = draw::at_coverage(colour & 0x00FF_FFFF, colour >> 24);
+        for yy in (y as i64).max(by0)..((y + h) as i64).min(by1) {
+            for xx in (x as i64).max(bx0)..((x + w) as i64).min(bx1) {
+                let p = &mut c.pixels[yy as usize * c.width + xx as usize];
+                *p = draw::under(*p, px);
+            }
+        }
+    }
+}
 
 const S_CONSOLE: u64 = 0;
 const S_DISPLAY: u64 = 1;
@@ -70,6 +102,8 @@ const S_APPSURF: u64 = 15;
 const S_IRQ_FS: u64 = 16;
 /// 17: the `display-sprites` region (32 MiB, cacheable): the sprite arena. Absent (a display spawned by hand with fewer slots), the arena comes from the heap at its old 6 MiB.
 const S_SPRITES: u64 = 17;
+/// 18: the `display-canvas` region (32 MiB, cacheable): the 16-bit back buffer. Without it there is no canvas: the server says so and leaves.
+const S_CANVAS: u64 = 18;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -258,10 +292,6 @@ impl Bump {
             *self.end.get() = base + HEAP_REGION;
         }
     }
-    /// Stop allocating at `end` (the back buffer starts there).
-    fn limit(&self, end: usize) {
-        unsafe { *self.end.get() = end };
-    }
     fn mark(&self) {
         unsafe { *self.mark.get() = *self.next.get() };
     }
@@ -307,17 +337,15 @@ struct Circle {
 }
 const NO_CIRCLE: Circle = Circle { x: 0, y: 0, r: 0, ring: 0, lit: 0, icon: 0, len: 0, label: [0; 16], c: 16384, s: 0 };
 
-/// The bundle's codes to canvas values: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 values with white at 255 — so atanh(c/256) × 255, clipped at white until the canvas has headroom (16 bits). None for ICN2 (gamma 2 already).
-fn icon_decode() -> Option<[u8; 256]> {
-    if ICONS.len() < 4 || &ICONS[..4] != b"ICN3" {
-        return None;
-    }
-    let mut t = [0u8; 256];
+/// The bundle's codes to canvas values, 16 bits: ICN3 bundles hold VSF RGB gamma2tanh codes (tanh(√L), bucket bottom c/256), the canvas gamma 2 working values with white at Q14 — so atanh(c/256) × 16384, highlights above white kept (to about 3× white at code 255) now the canvas has the headroom. ICN2 (gamma 2 codes, white at 255): c × 16384 / 255.
+fn icon_decode() -> [u16; 256] {
+    let g2t = ICONS.len() >= 4 && &ICONS[..4] == b"ICN3";
+    let mut t = [0u16; 256];
     for (c, e) in t.iter_mut().enumerate() {
-        let v = libm::atanhf(c as f32 / 256.0) * 255.0 + 0.5;
-        *e = if v.is_nan() || v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 };
+        let v = if g2t { libm::atanhf(c as f32 / 256.0) * 16384.0 + 0.5 } else { c as f32 * 16384.0 / 255.0 + 0.5 };
+        *e = if v.is_nan() || v < 0.0 { 0 } else if v > 65535.0 { 65535 } else { v as u16 };
     }
-    Some(t)
+    t
 }
 
 /// The apps' icons, bundled by tools/app-icons: b"ICN3" (gamma2tanh codes; ICN2: gamma 2), count u8, size u16 LE, then per icon size x size RGBA, already cut to a circle, followed by its size x size grey (photopic luminance), all VSF RGB gamma 2 codes. Empty when the build had no bundle.
@@ -491,7 +519,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
 }
 
 /// Text centred on (cx, cy) and turned by (c, s), front to back: the clock's digits, which turn with its face.
-fn text_turned_centre(pixels: &mut [u32], width: usize, height: usize, s: &str, cx: f32, cy: f32, px: f32, turn: (f32, f32), colour: u32) {
+fn text_turned_centre(pixels: &mut [Px], width: usize, height: usize, s: &str, cx: f32, cy: f32, px: f32, turn: (f32, f32), colour: u32) {
     let g = glyph_engine();
     let tw = g.width(s, px);
     // The baseline's start in the text's own frame, (−width/2, +0.36 em) from the centre, turned onto the screen.
@@ -755,7 +783,7 @@ fn knee(l: f32, white: f32, k: f32) -> f32 {
 }
 
 /// The highlight test card. Scene light L across the width on a log scale, −6 stops to +3.26 (9.6× white, gamma2tanh's top). Top half: the display curve, Y/peak = tanh²(√(L/H)) with H = 1.75 — slope 1 at black, white at 41 % of the peak, the stops above rolled smoothly, nothing clipped. Bottom half: linear at the same white, clipped at the peak. A 12-pixel line of code 255 between them is the peak itself. Ticks (dark lines) at L = 1, 2, 4, 8.
-fn testcard(pixels: &mut [u32], width: usize, height: usize) {
+fn testcard(pixels: &mut [Px], width: usize, height: usize) {
     let stops_lo = -6.0f32;
     let stops_hi = libm::log2f(9.6);
     for x in 0..width {
@@ -775,7 +803,7 @@ fn testcard(pixels: &mut [u32], width: usize, height: usize) {
             let c = if tick && (band == 3 || band == 4) { 0 } else { c };
             // The panel's peak, code 255, as a 12-pixel line between the halves: the reference both ramps' tops are judged against.
             let c = if y >= height / 2 - 6 && y < height / 2 + 6 { 255 } else { c };
-            pixels[y * width + x] = 0xFF00_0000 | c << 16 | c << 8 | c;
+            pixels[y * width + x] = draw::opaque(c << 16 | c << 8 | c);
         }
     }
 }
@@ -804,45 +832,11 @@ fn f32_to_f16(x: f32) -> u16 {
 }
 
 /// The ODT's constants and tables (`neon::Odt`) for a white and the E peak it rolls off into (`build_lut`'s k = atanh(√(white/peak))):
-/// - the canvas light polynomial: tanh²(k·c/255)·2^14 as u·(a1 + a2·u + a3·u² + a4·u³) with u = c²/65536, by least squares on the relative error over the 255 non-zero values (degree 4: within 6 Q4 evaluated in f16 at the brightest white, under 2 below);
 /// - the app light's k/16384 and 2^14;
 /// - the output tables: per exponent, twice the code at the octave's foot, 2·16368·2^((e − 29)/2.19) (e = 0: zero and subnormals, under 2^-28 of the peak, code 0; e = 30, 31: past the peak, the most a u16 holds, so the dither saturates); per top six mantissa bits, the nudge (1 + i/64)^(1/2.19) in Q15 and its slope to the next.
 fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
     use core::arch::aarch64::*;
     let k = libm::atanh(libm::sqrt((white / peak_e).min(0.999) as f64));
-    let mut ata = [[0f64; 4]; 4];
-    let mut atb = [0f64; 4];
-    for c in 1..256 {
-        let v = c as f64 / 255.0;
-        let u = (c * c) as f64 / 65536.0;
-        let t = libm::tanh(k * v);
-        let l = t * t * F16_SCALE;
-        let w = 1.0 / l;
-        let row = [u * w, u * u * w, u * u * u * w, u * u * u * u * w];
-        for i in 0..4 {
-            for j in 0..4 {
-                ata[i][j] += row[i] * row[j];
-            }
-            atb[i] += row[i] * l * w;
-        }
-    }
-    for i in 0..4 {
-        for j in i + 1..4 {
-            let f = ata[j][i] / ata[i][i];
-            for m in i..4 {
-                ata[j][m] -= f * ata[i][m];
-            }
-            atb[j] -= f * atb[i];
-        }
-    }
-    let mut a = [0f64; 4];
-    for i in (0..4).rev() {
-        let mut s = atb[i];
-        for j in i + 1..4 {
-            s -= ata[i][j] * a[j];
-        }
-        a[i] = s / ata[i][i];
-    }
     let h = |x: f64| f32_to_f16(x as f32);
     let gm = 1.0 / PANEL_GAMMA;
     let nudge = |i: usize| (pow(1.0 + i as f32 / 64.0, gm) * 32768.0 + 0.5) as u32;
@@ -861,7 +855,7 @@ fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
     }
     let kk = |r: usize, c: usize| (ODT[r][c] - if r == c { E_GAIN[r] } else { 0.0 }) as f64;
     let c0 = [E_GAIN[0] as f64, E_GAIN[1] as f64, E_GAIN[2] as f64, kk(0, 0), kk(0, 2), kk(1, 0), kk(1, 2), kk(2, 0)].map(h);
-    let c1 = [kk(2, 2), a[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
+    let c1 = [kk(2, 2), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].map(h);
     let kf = [(k / 16384.0) as f32, F16_SCALE as f32, 0.0, 0.0];
     unsafe {
         neon::Odt {
@@ -872,9 +866,6 @@ fn odt_tables(white: f32, peak_e: f32) -> neon::Odt {
             scale_lo: vld1q_u8_x2(scale_lo.as_ptr()),
             c0: vld1q_u16(c0.as_ptr()),
             c1: vld1q_u16(c1.as_ptr()),
-            a3: vdupq_n_u16(h(a[2])),
-            a2: vdupq_n_u16(h(a[1])),
-            a1: vdupq_n_u16(h(a[0])),
             k: vld1q_f32(kf.as_ptr()),
         }
     }
@@ -1016,7 +1007,7 @@ fn pub_take(job: u64) {
         }
         let y0 = r.y0 + i as i32 * PUB_STRIPE;
         let stripe = draw::Rect { x0: r.x0, y0, x1: r.x1, y1: (y0 + PUB_STRIPE).min(r.y1) };
-        let back = unsafe { core::slice::from_raw_parts(base as *const u32, w * h) };
+        let back = unsafe { core::slice::from_raw_parts(base as *const Px, w * h) };
         publish_band(back, w, h, unsafe { &*(&raw const PUB_TABS) }, mask, stripe);
         PUB_FINISHED.fetch_add(1, Ordering::AcqRel);
         ferros_sys::wake(&PUB_FINISHED, 1);
@@ -1038,7 +1029,7 @@ extern "C" fn pub_worker(_idx: u64) -> ! {
 }
 
 /// The canvas through the present stage into the phases `mask` names, over `r`: in stripes taken by the workers and this thread when tall, else here.
-fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
+fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     let r = r.clip(width, height);
     if r.is_empty() {
         return;
@@ -1079,7 +1070,7 @@ fn publish10x4(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask
     fps_dot(mask, width, height);
 }
 
-fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
+fn publish_band(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask: u32, r: draw::Rect) {
     if r.is_empty() {
         return;
     }
@@ -1098,7 +1089,7 @@ fn publish_band(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, mas
                 let src = back.as_ptr().add(y * width);
                 let mut x = x0;
                 while x < x1 {
-                    neon::sixteen_odt(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
+                    neon::sixteen_canvas(tabs, src.add(x), row.as_mut_ptr().add(x), thv);
                     x += 16;
                 }
             }
@@ -1122,7 +1113,7 @@ static mut PUB_TICKS: [u64; 3] = [1; 3];
 
 /// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
 /// A frame into the ring: the next phase in turn, never the one on the layer (which the panel may still be reading), and it becomes the current one. Every frame goes this way — a camera op, an app's frame, the status line — so the frame after can be armed at once (the buffer it writes was on screen three frames before) and consecutive frames carry consecutive phases' thresholds: the temporal dither at whatever rate frames come, 120 Hz under a finger, 10 Hz at rest (the flip below, which publishes nothing once the ring holds the image).
-fn publish_next(back: &[u32], width: usize, height: usize, tabs: &neon::Odt, r: draw::Rect) {
+fn publish_next(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, r: draw::Rect) {
     unsafe {
         for k in 0..PHASES {
             PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
@@ -1151,11 +1142,11 @@ static mut LAST_KEY: [[i64; 6]; 256] = [[0; 6]; 256];
 static mut ARENA: usize = 1;
 static mut ARENA_NEXT: usize = 1;
 /// The arena's size in words: the `display-sprites` region's 32 MiB when granted (a screen packed with circles needs ~20 MB of square sprites; 6 MiB thrashed at 200, 2026-10-24), else 6 MiB of the heap (the 16 MiB below the back buffer, where the 256-px icon mips, 4.4 MB, and the glyph cache, 2 MiB, left no room for 10, 2026-10-23).
-static mut ARENA_WORDS: usize = (6 << 20) / 4;
+static mut ARENA_WORDS: usize = (6 << 20) / 8;
 const SPRITE_MAX: usize = 1100;
 
 /// Circle i's sprite for this key: reused if it is current, else drawn (into its own space if that is big enough, otherwise new space, the arena started over when full). The sprite is d × d pixels with the circle at its centre pixel, followed by d words of row extents (first | last << 16, both inclusive; first > last for an empty row). Returns the sprite's words and extents.
-fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], usize)) -> (&'static [u32], &'static [u32]) {
+fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [Px], usize)) -> (&'static [Px], &'static [Px]) {
     unsafe {
         let words = d * d + d;
         let sp = &mut *(&raw mut SPRITES[i]);
@@ -1173,7 +1164,7 @@ fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], 
                 sp.cap = words;
                 ARENA_NEXT += words;
             }
-            let buf = core::slice::from_raw_parts_mut((ARENA as *mut u32).add(sp.off), words);
+            let buf = core::slice::from_raw_parts_mut((ARENA as *mut Px).add(sp.off), words);
             let (px, ext) = buf.split_at_mut(d * d);
             px.fill(0);
             // A sprite is drawn whole, in its own coordinates: the screen's clip (a widget's redraw) does not apply. Built under it, a sprite came out mostly empty and was cached that way (2026-10-24: black corners where the clock's redraw met its neighbours).
@@ -1184,7 +1175,7 @@ fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], 
             for (r, e) in ext.iter_mut().enumerate() {
                 let row = &px[r * d..(r + 1) * d];
                 match (row.iter().position(|&p| p != 0), row.iter().rposition(|&p| p != 0)) {
-                    (Some(a), Some(b)) => *e = a as u32 | (b as u32) << 16,
+                    (Some(a), Some(b)) => *e = a as u64 | (b as u64) << 16,
                     _ => *e = 1,
                 }
             }
@@ -1192,13 +1183,13 @@ fn sprite(i: usize, key: [i64; 6], d: usize, draw_into: impl FnOnce(&mut [u32], 
             sp.d = d;
             sp.valid = true;
         }
-        let buf = core::slice::from_raw_parts((ARENA as *const u32).add(sp.off), words);
+        let buf = core::slice::from_raw_parts((ARENA as *const Px).add(sp.off), words);
         (&buf[..d * d], &buf[d * d..])
     }
 }
 
 /// A sprite under what is there, its top-left at (ox, oy).
-fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d: usize, ox: i64, oy: i64) {
+fn blit(px: &mut [Px], width: usize, height: usize, spr: &[Px], ext: &[Px], d: usize, ox: i64, oy: i64) {
     let (bx0, by0, bx1, by1) = draw::bounds(width, height);
     for r in 0..d {
         let y = oy + r as i64;
@@ -1215,14 +1206,14 @@ fn blit(px: &mut [u32], width: usize, height: usize, spr: &[u32], ext: &[u32], d
         }
         let row = &mut px[y as usize * width + x0 as usize..=y as usize * width + x1 as usize];
         let src = &spr[r * d + (x0 - ox) as usize..=r * d + (x1 - ox) as usize];
-        // Four at a time (neon.rs `under4`, branch-free), the row's last few one by one.
-        let n4 = row.len() & !3;
+        // Two at a time (neon.rs `under2`, branch-free), the row's last one alone.
+        let n2 = row.len() & !1;
         let mut i = 0;
-        while i < n4 {
-            unsafe { neon::under4(row.as_mut_ptr().add(i), src.as_ptr().add(i)) };
-            i += 4;
+        while i < n2 {
+            unsafe { neon::under2(row.as_mut_ptr().add(i), src.as_ptr().add(i)) };
+            i += 2;
         }
-        for (p, &q) in row[n4..].iter_mut().zip(src[n4..].iter()) {
+        for (p, &q) in row[n2..].iter_mut().zip(src[n2..].iter()) {
             *p = draw::under(*p, q);
         }
     }
@@ -1283,7 +1274,7 @@ fn pack10(r: u32, g: u32, b: u32) -> u32 {
 }
 
 /// The 8-bit canvas through the present stage with the spatial dither only (temporal off): the ODT 16 pixels a step (neon.rs `sixteen_odt`) with this row's Bayer thresholds, a row at a time through a cached buffer, then one wide copy into the non-cacheable framebuffer.
-fn publish10(back: &[u32], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
+fn publish10(back: &[Px], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
     let mut row = [0u32; 4096];
     let w16 = width & !15;
     for (y, (src, dst)) in back.chunks(width).zip(screen.chunks_mut(width)).enumerate() {
@@ -1295,7 +1286,7 @@ fn publish10(back: &[u32], screen: &mut [u32], width: usize, tabs: &neon::Odt) {
             let thv = core::arch::aarch64::vld1q_u8(th.as_ptr());
             let mut x = 0;
             while x < w16 {
-                neon::sixteen_odt(tabs, src.as_ptr().add(x), row.as_mut_ptr().add(x), thv);
+                neon::sixteen_canvas(tabs, src.as_ptr().add(x), row.as_mut_ptr().add(x), thv);
                 x += 16;
             }
         }
@@ -1362,8 +1353,11 @@ fn ramps(outs: &mut [&mut [u32]], width: usize, height: usize, lut: &[u16], only
 }
 
 /// The finished frame out to the framebuffer. There is no black pass: the layer is BGRX, so the panel never sees the alpha byte, an empty pixel (0) already shows black, and black blended under an antialiased edge adds nothing to its colour — only to the alpha the panel ignores. The pass that did it cost 15-25 ms a frame and changed no visible pixel (2026-10-22).
-fn publish(back: &[u32], screen: &mut [u32]) {
-    screen.copy_from_slice(back);
+fn publish(back: &[Px], screen: &mut [u32]) {
+    let c8 = |v: u64| ((v & 0xFFFF) * 255 / 16384).min(255) as u32;
+    for (d, &p) in screen.iter_mut().zip(back.iter()) {
+        *d = 0xFF00_0000 | c8(p) << 16 | c8(p >> 16) << 8 | c8(p >> 32);
+    }
 }
 
 fn isqrt(v: i64) -> i64 {
@@ -1379,41 +1373,6 @@ fn isqrt(v: i64) -> i64 {
     x
 }
 
-/// A filled circle under what is already there (fluor's order), antialiased at its rim, in integers: each row's whole span inside the circle is filled with plain writes and tests, and only the pixel or two at each end of a row gets a coverage from its distance to the centre. fluor's `circle_filled` blends every pixel: 18 ms for a screen-sized disc (2026-10-22).
-fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) {
-    if r <= 0 {
-        return;
-    }
-    let (w, h) = (width as i64, height as i64);
-    for y in (cy - r - 1).max(0)..=(cy + r + 1).min(h - 1) {
-        let dy = y - cy;
-        let outer = (r + 1) * (r + 1) - dy * dy;
-        if outer < 0 {
-            continue;
-        }
-        let inner = (r - 1) * (r - 1) - dy * dy;
-        let hi = if inner >= 0 { isqrt(inner) } else { -1 };
-        let ho = isqrt(outer);
-        let row = &mut px[y as usize * width..(y as usize + 1) * width];
-        for x in (cx - ho).max(0)..=(cx + ho).min(w - 1) {
-            let dx = x - cx;
-            let p = &mut row[x as usize];
-            if *p >= 0xFF00_0000 {
-                continue;
-            }
-            if dx.abs() <= hi {
-                *p = if *p == 0 { colour } else { (*p).under(colour, BlendMode::Normal) };
-            } else {
-                // Coverage = r − d + ½, in 256ths.
-                let d = isqrt((dx * dx + dy * dy) << 16);
-                let cov = ((r << 8) + 128 - d).clamp(0, 255);
-                if cov > 0 {
-                    *p = (*p).under((cov as u32) << 24 | colour & 0x00FF_FFFF, BlendMode::Normal);
-                }
-            }
-        }
-    }
-}
 
 /// hh:mm:ss since boot — the only clock this process has until a time source is granted.
 fn uptime(buf: &mut [u8; 8], secs: u64) -> &str {
@@ -1559,8 +1518,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::exit(2);
     }
     // The back buffer: every frame is composited here, in cacheable memory, and copied to the framebuffer only at present. fluor reads every pixel it blends onto, and a read from the non-cacheable framebuffer costs about 300 ns: drawing straight into it took 2.7 s for one dashboard frame (2026-10-22: a screen-sized disc 394 ms, the scene 2.3 s, while clearing all 16 MB took 1 ms — the writes are combined, the reads are not).
-    let back = (heap + HEAP_REGION - width * height * 4) & !0xFFF;
-    ALLOC.limit(back);
+    // The back buffer: the 16-bit canvas in its own region (8 bytes a pixel); the heap keeps its whole region.
+    let back = ferros_sys::dma(cap(grants, S_CANVAS));
+    if back == 0 || back == ferros_sys::ERR || (width * height * 8) > (32 << 20) {
+        log.s(b"display: no canvas region (display-canvas): cannot draw\n");
+        log.flush();
+        ferros_sys::exit(3);
+    }
+    let back = back as usize;
     // Input byte 0 = 1: a deliberate panic, to prove the panic handler's console line.
     let mut sel = [0u8; 1];
     let _ = input;
@@ -1606,7 +1571,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let mut v = alloc::vec::Vec::new();
         let mut n = 1u8;
         while let Some((px, grey, size)) = icon(n) {
-            v.push(draw::Mips::build(px, grey, size, decode.as_ref()));
+            v.push(draw::Mips::build(px, grey, size, &decode));
             n += 1;
         }
         v.leak()
@@ -1615,9 +1580,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let sprites = ferros_sys::dma(cap(grants, S_SPRITES));
         if sprites != 0 && sprites != ferros_sys::ERR {
             ARENA = sprites as usize;
-            ARENA_WORDS = (32 << 20) / 4;
+            ARENA_WORDS = (64 << 20) / 8;
         } else {
-            ARENA = alloc::vec![0u32; ARENA_WORDS].leak().as_mut_ptr() as usize;
+            ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
         ARENA_NEXT = 0;
     }
@@ -1639,7 +1604,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.s(b" KiB\n");
     log.flush();
 
-    let pixels: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(back as *mut u32, width * height) };
+    let pixels: &mut [Px] = unsafe { core::slice::from_raw_parts_mut(back as *mut Px, width * height) };
     let screen: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
     let span = width as f32;
     let (w, h) = (width as f32, height as f32);

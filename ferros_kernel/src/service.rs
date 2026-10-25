@@ -354,8 +354,9 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Dma(b"app-surface"),
         // 23 the touch controller's interrupt line, 24 DECON0's frame-done, 25 its frame-start (KERNEL.md "Interrupts to user space").
         Irq(b"touch-int"), Irq(b"decon0-frame-done"), Irq(b"decon0-frame-start"),
-        // 26 the display's sprite cache.
+        // 26 the display's sprite cache, 27 its canvas.
         Dma(b"display-sprites"),
+        Dma(b"display-canvas"),
     ]
 }
 
@@ -363,7 +364,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26],
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22],
         _ => return None,
@@ -604,6 +605,9 @@ pub fn run(mut b: Boot) -> ! {
     let mut usb_log_n = 0u32;
     let mut usb_was_configured = false;
     let mut t_heartbeat = cntpct();
+    // The fourth drop (2026-10-24, 753 s into the boot) left no disconnect and no reset on this side: the host logged "USB disconnect" and the only trace here was DSTS's link state going 0 (on) → 3 (L2 suspend) and staying there, with the kernel still "configured". The dev host never suspends the port (power/control = on), so a link held in suspend for 16 s is a host that has gone: re-initialise, which drops the pull-up and brings a fresh enumeration.
+    let mut t_awake = cntpct();
+    let mut link_was = 0u32;
     let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
     // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
     let mut att_ev = [0u32; 3];
@@ -725,6 +729,15 @@ pub fn run(mut b: Boot) -> ! {
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
             usb_log(&mut usb_log_n, &alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
+        let link = (dsts() >> 18) & 15;
+        if link != 3 {
+            t_awake = now;
+        }
+        if link != link_was && configured_ever {
+            usb_log(&mut usb_log_n, &alloc::format!("usb: link state {} -> {} at {} s (DSTS G#{:08X})", link_was, link, now.wrapping_sub(t_boot) / freq, dsts()));
+        }
+        link_was = link;
+        let host_gone = usb.is_configured() && now.wrapping_sub(t_awake) > 16 * freq;
         if usb.is_configured() != usb_was_configured {
             usb_was_configured = usb.is_configured();
             usb_log(&mut usb_log_n, &alloc::format!("usb: {} at {} s (DSTS G#{:08X})", if usb_was_configured { "configured" } else { "not configured" }, now.wrapping_sub(t_boot) / freq, dsts()));
@@ -736,7 +749,11 @@ pub fn run(mut b: Boot) -> ! {
                 platform::crumb(0xD1);
                 let ran = if pt_inbound.is_none() && pt_out_data.is_empty() { crate::process::run_slice() } else { false };
                 platform::crumb(0xD2);
-                if !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
+                if host_gone || !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
+                    if host_gone {
+                        usb_log(&mut usb_log_n, &alloc::format!("usb: link suspended 16 s while configured at {} s: the host has gone, reconnecting", now.wrapping_sub(t_boot) / freq));
+                        t_awake = now;
+                    }
                     if init_history.len() < 32 {
                         unsafe {
                             let n = usb.evt_ring_n as usize;

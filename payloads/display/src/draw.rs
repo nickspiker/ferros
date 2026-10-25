@@ -1,6 +1,6 @@
 //! The scene's rasteriser, all integer (owner, 2026-10-22: "keep it integer"): damage rectangles, antialiased discs without a square root, icons sampled through a mip chain with bilinear filtering and their own alpha, and front-to-back compositing on premultiplied pixels.
 //!
-//! Pixels are fluor's words: G#AARRGGBB, colour premultiplied by alpha, composited front to back — what is drawn first is on top, and a pixel takes only what its alpha leaves room for. An empty pixel is 0; the panel ignores alpha, so whatever stays empty shows black.
+//! Pixels are 64-bit (the 16-bit canvas, owner, 2026-10-24): R, G, B in bits 0-15, 16-31, 32-47 as VSF RGB gamma-2 working values — white at Q14 (16384), up to 4.0 (16× white in light) — and alpha in bits 48-63, colour premultiplied by it; the same layout as an app's surface. Composited front to back — what is drawn first is on top, and a pixel takes only what its alpha leaves room for. An empty pixel is 0 and shows black. Colours handed in (the theme's) are 8-bit codes G#RRGGBB, white at 255, widened here.
 
 /// A half-open pixel rectangle; empty when x0 >= x1 or y0 >= y1.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,23 @@ pub fn bounds(width: usize, height: usize) -> (i64, i64, i64, i64) {
     (c.x0 as i64, c.y0 as i64, c.x1 as i64, c.y1 as i64)
 }
 
-pub fn clear(px: &mut [u32], width: usize, r: Rect) {
+/// A canvas pixel: R, G, B, A, 16 bits each (module doc).
+pub type Px = u64;
+const ALPHA: u64 = 0xFFFF << 48;
+
+/// An 8-bit code (white at 255) as a 16-bit working value (white at Q14).
+#[inline(always)]
+pub fn wide8(c: u32) -> u64 {
+    ((c as u64 & 0xFF) * 16384 + 127) / 255
+}
+
+/// G#RRGGBB (8-bit codes) as an opaque pixel.
+#[inline(always)]
+pub fn opaque(colour: u32) -> Px {
+    ALPHA | wide8(colour >> 16) | wide8(colour >> 8) << 16 | wide8(colour) << 32
+}
+
+pub fn clear(px: &mut [Px], width: usize, r: Rect) {
     if r.is_empty() {
         return;
     }
@@ -64,31 +80,32 @@ pub fn clear(px: &mut [u32], width: usize, r: Rect) {
 
 /// `src` (premultiplied) under `dst` (premultiplied): dst keeps what it has and takes src in the room its alpha leaves.
 #[inline(always)]
-pub fn under(dst: u32, src: u32) -> u32 {
-    let da = dst >> 24;
-    if da == 255 {
+pub fn under(dst: Px, src: Px) -> Px {
+    let da = dst >> 48;
+    if da == 0xFFFF {
         return dst;
     }
     if dst == 0 {
         return src;
     }
-    let room = 255 - da;
-    let mix = |sh: u32| -> u32 {
-        let d = dst >> sh & 0xFF;
-        let s = src >> sh & 0xFF;
-        (d + (s * room + 127) / 255).min(255) << sh
+    let room = 0xFFFF - da;
+    let mix = |sh: u32| -> u64 {
+        let d = dst >> sh & 0xFFFF;
+        let s = src >> sh & 0xFFFF;
+        (d + (s * room + 0x7FFF) / 0xFFFF).min(0xFFFF) << sh
     };
-    mix(24) | mix(16) | mix(8) | mix(0)
+    mix(48) | mix(32) | mix(16) | mix(0)
 }
 
-/// An opaque colour (G#RRGGBB) at coverage `cov` (0-255), premultiplied.
+/// An opaque colour (G#RRGGBB, 8-bit codes) at coverage `cov` (0-255), premultiplied.
 #[inline(always)]
-pub fn at_coverage(colour: u32, cov: u32) -> u32 {
+pub fn at_coverage(colour: u32, cov: u32) -> Px {
     if cov >= 255 {
-        return 0xFF00_0000 | colour;
+        return opaque(colour);
     }
-    let m = |sh: u32| ((colour >> sh & 0xFF) * cov + 127) / 255 << sh;
-    cov << 24 | m(16) | m(8) | m(0)
+    let a = cov as u64 * 257;
+    let m = |c: u32| (wide8(c) * a + 0x7FFF) / 0xFFFF;
+    a << 48 | m(colour >> 16) | m(colour >> 8) << 16 | m(colour) << 32
 }
 
 /// The rows a disc covers, with each row's horizontal reach found without a square root: the reach only shrinks moving away from the centre row, so it is walked down a pixel at a time as the rows go (O(r) for the whole disc). Calls `row(y, x_outer_lo, x_outer_hi, x_inner_lo, x_inner_hi)` with the outer span (every pixel the edge may touch) and the inner span (pixels wholly inside), both inclusive, unclipped.
@@ -129,16 +146,15 @@ fn spans(cx: i64, cy: i64, r: i64, mut row: impl FnMut(i64, i64, i64, i64, i64))
 }
 
 /// A disc of `colour` (opaque G#RRGGBB) centred at (cx, cy) with radius r, all in Q8 pixels, drawn under what is there, antialiased: an edge pixel's coverage is ½ − (d² − r²)/(2r), the first-order distance from the edge, with one reciprocal per disc and no division or root per pixel. Returns the rectangle it touched.
-pub fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) -> Rect {
+pub fn disc(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32) -> Rect {
     if r < 128 {
         return Rect::EMPTY;
     }
-    let (w, h) = (width as i64, height as i64);
     let (bx0, by0, bx1, by1) = bounds(width, height);
     let r2 = r * r;
     // 255 / (2r · 256) in Q24, so cov = 128 − ((d² − r²) · k >> 24).
     let k = ((255i64 << 24) / (2 * r)) >> 8;
-    let opaque = 0xFF00_0000 | colour;
+    let solid = opaque(colour);
     spans(cx, cy, r, |y, xo0, xo1, xi0, xi1| {
         if y < by0 || y >= by1 {
             return;
@@ -148,11 +164,11 @@ pub fn disc(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
         let dy2 = dy * dy;
         for x in xo0.max(bx0)..=xo1.min(bx1 - 1) {
             let p = &mut px[rowb + x as usize];
-            if *p >> 24 == 255 {
+            if *p >> 48 == 0xFFFF {
                 continue;
             }
             if x >= xi0 && x <= xi1 {
-                *p = if *p == 0 { opaque } else { under(*p, opaque) };
+                *p = if *p == 0 { solid } else { under(*p, solid) };
                 continue;
             }
             let dx = (x << 8) + 128 - cx;
@@ -176,11 +192,10 @@ fn log2_q16(q: u64) -> i64 {
 }
 
 /// The glow, falling off in log distance (owner, 2026-10-24: no divide, no table): down by the same step every octave of q = d² − r² (the squared distance past the edge), from full `peak` to exactly zero over 2^`oct_log2` octaves — no floor, no tail cut — and reaching 1/`frac` of the radius past the edge, whatever the size (owner: smaller circle, thinner glow; the glow is part of the circle's shape at every zoom). At d = r(1 + 1/frac), q = r²·(2·frac + 1)/frac², which fixes where it ends; full light holds to that over 2^(2^oct_log2). Added to the gamma-2 values, into the room each pixel has left (255 − alpha), so a circle's opaque interior takes nothing and needs no test (the linear-light try looked worse, 2026-10-24).
-pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32) -> Rect {
+pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, frac: i64, oct_log2: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;
     }
-    let (w, h) = (width as i64, height as i64);
     let (bx0, by0, bx1, by1) = bounds(width, height);
     let r2 = r * r;
     // Zero at q_max (1/frac of the radius past the edge), full light to q_max over 2^octaves.
@@ -189,7 +204,7 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
     let l0 = log2_q16(q0 as u64);
     let span = 1i64 << (16 + oct_log2);
     let reach = r + r / frac + 256;
-    let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
+    let (cr, cg, cb) = (wide8(colour >> 16) as i64, wide8(colour >> 8) as i64, wide8(colour) as i64);
     let peak = peak as i64;
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
@@ -208,12 +223,13 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
             let t = (log2_q16(q as u64) - l0).clamp(0, span);
             let i = peak * (span - t) >> (16 + oct_log2);
             let p = &mut px[rowb + x as usize];
-            let room = 255 - (*p >> 24) as i64;
-            let add = |c: i64, sh: u32| -> u32 {
-                let have = (*p >> sh & 0xFF) as i64;
-                ((have + c * i * room / 65025).min(255) as u32) << sh
+            let room = 0xFFFF - (*p >> 48) as i64;
+            // Added into the room the pixel has left, held at white (the glow does not reach above it).
+            let add = |c: i64, sh: u32| -> u64 {
+                let have = (*p >> sh & 0xFFFF) as i64;
+                ((have + c * i * room / (255 * 0xFFFF)).min(have.max(16384)) as u64) << sh
             };
-            *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
+            *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
             true
         };
         let mut left_stop = x1 + 1;
@@ -236,18 +252,17 @@ pub fn glow_log(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r
     Rect { x0: ((cx - reach) >> 8) as i32 - 1, y0: ((cy - reach) >> 8) as i32 - 1, x1: ((cx + reach) >> 8) as i32 + 2, y1: ((cy + reach) >> 8) as i32 + 2 }.clip(width, height)
 }
 
-pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, floor: u32) -> Rect {
+pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, colour: u32, peak: u32, scale_q8: i64, floor: u32) -> Rect {
     if r < 128 || peak == 0 {
         return Rect::EMPTY;
     }
-    let (w, h) = (width as i64, height as i64);
     let (bx0, by0, bx1, by1) = bounds(width, height);
     let r2 = r * r;
     let num = peak as i64 * 2 * r * scale_q8;
     // The farthest q that is still at or above the floor, and a radius that surely contains it: q ≥ 2r·e, so e ≤ q / 2r.
     let q_max = num / floor.max(1) as i64;
     let reach = r + q_max / (2 * r) + 256;
-    let (cr, cg, cb) = ((colour >> 16 & 0xFF) as i64, (colour >> 8 & 0xFF) as i64, (colour & 0xFF) as i64);
+    let (cr, cg, cb) = (wide8(colour >> 16) as i64, wide8(colour >> 8) as i64, wide8(colour) as i64);
     spans(cx, cy, reach, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;
@@ -267,18 +282,18 @@ pub fn glow(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
                 return true;
             }
             let p = &mut px[rowb + x as usize];
-            let a = (*p >> 24) as i64;
-            if a == 255 {
+            let a = (*p >> 48) as i64;
+            if a == 0xFFFF {
                 return true;
             }
             let i = (num / q).min(peak as i64);
-            // Into the room the pixel has left (255 − alpha), added and saturated per channel; alpha untouched.
-            let room = 255 - a;
-            let add = |c: i64, sh: u32| -> u32 {
-                let have = (*p >> sh & 0xFF) as i64;
-                ((have + c * i * room / 65025).min(255) as u32) << sh
+            // Into the room the pixel has left (opaque − alpha), added per channel and held at white; alpha untouched.
+            let room = 0xFFFF - a;
+            let add = |c: i64, sh: u32| -> u64 {
+                let have = (*p >> sh & 0xFFFF) as i64;
+                ((have + c * i * room / (255 * 0xFFFF)).min(have.max(16384)) as u64) << sh
             };
-            *p = (*p & 0xFF00_0000) | add(cr, 16) | add(cg, 8) | add(cb, 0);
+            *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
             true
         };
         // From each end of the row inward to the circle's edge: the interior is never visited (zoomed in, it is most of the screen, and visiting it pixel by pixel was the lag, 2026-10-23).
@@ -344,7 +359,7 @@ fn mix(a: u32, b: u32, c: i64) -> u32 {
 
 /// The clock face (the map's clock circle) at (cx, cy), radius r, Q8 pixels: three rings, each a sweep from 12:00 in the fill colour over the face colour, separated by black strokes, with white ticks; under what is there (the caller writes the time in the centre first). All squared distances and cross products — no root, no angle: a pixel is inside a sweep of angle θ when it is anticlockwise of θ's direction (one cross product), on the right half for θ ≤ ½ turn, either for more. `dirs[k]` is the unit direction (sin, −cos) of k/60 of a turn, Q14. Returns the rectangle it touched.
 /// `(tc, ts)`: the face's turn, Q14 (the circle's own turn on top of the camera's): ticks, sweeps and the zero mark turn with it.
-pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, rings: &[Ring], dirs: &[(i64, i64); 60], tc: i64, ts: i64) -> Rect {
+pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, rings: &[Ring], dirs: &[(i64, i64); 60], tc: i64, ts: i64) -> Rect {
     if r < 2048 {
         return Rect::EMPTY;
     }
@@ -460,7 +475,7 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
         let dy2 = dy * dy;
         for x in xo0.max(bx0)..=xo1.min(bx1 - 1) {
             let p = &mut px[rowb + x as usize];
-            if *p >> 24 == 255 {
+            if *p >> 48 == 0xFFFF {
                 continue;
             }
             let dx = (x << 8) + 128 - cx;
@@ -497,24 +512,25 @@ pub fn clock(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i
     Rect { x0: ((cx - r) >> 8) as i32 - 2, y0: ((cy - r) >> 8) as i32 - 2, x1: ((cx + r) >> 8) as i32 + 3, y1: ((cy + r) >> 8) as i32 + 3 }.clip(width, height)
 }
 
-/// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are packed premultiplied words (G#AARRGGBB), with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest) — VSF RGB gamma 2 codes, as the bundle holds them.
+/// One icon's mip chain: level 0 is the bundle's size, each next one half that, averaged 2×2, down to 4×4. Texels are canvas pixels (`Px`: 16 bits a channel, premultiplied) with a transparent border of two texels around every level so the sampler never tests bounds: `rgba` in the icon's colours, `grey` in its photopic grey (the map at rest). Sixteen bits all the way down (owner, 2026-10-24: an 8-bit image averaged down gains precision — 256×256 to 8×8 averages 1024 samples a texel): level 0 is the bundle's 8-bit codes widened, and every 2×2 average keeps its fraction instead of rounding back to 8 bits.
 #[derive(Clone, Copy)]
 pub struct Mips {
     pub size: usize,
     pub levels: usize,
     /// Level l starts at `offset[l]` texels; its rows are `size >> l` + 4 texels long (the border).
     pub offset: [usize; 8],
-    pub rgba: &'static [u32],
-    pub grey: &'static [u32],
+    pub rgba: &'static [Px],
+    pub grey: &'static [Px],
 }
 
 const PAD: usize = 2;
 
 impl Mips {
     /// From the bundle's straight-alpha RGBA and grey planes.
-    /// `decode`: a code-to-canvas table applied to the colour and grey bytes as they come in (the bundle's gamma2tanh codes to the gamma 2 values the canvas holds), or none for codes that are canvas values already.
-    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize, decode: Option<&[u8; 256]>) -> Mips {
-        let dec = |c: u8| decode.map_or(c, |t| t[c as usize]);
+    /// `decode`: each bundle code's 16-bit canvas value (gamma2tanh or gamma 2 codes to working values, white at Q14, highlights above it kept).
+    pub fn build(rgba_in: &[u8], grey_in: &[u8], size: usize, decode: &[u16; 256]) -> Mips {
+        // The bundle's code to its 16-bit canvas value (main.rs `icon_decode`).
+        let dec = |c: u8| decode[c as usize] as u64;
         let mut total = 0;
         let mut offset = [0usize; 8];
         let mut levels = 0;
@@ -525,17 +541,18 @@ impl Mips {
             levels += 1;
             s /= 2;
         }
-        let rgba: &'static mut [u32] = alloc::vec![0u32; total].leak();
-        let grey: &'static mut [u32] = alloc::vec![0u32; total].leak();
+        let rgba: &'static mut [Px] = alloc::vec![0u64; total].leak();
+        let grey: &'static mut [Px] = alloc::vec![0u64; total].leak();
         let at = |l: usize, x: usize, y: usize| offset[l] + (y + PAD) * ((size >> l) + 2 * PAD) + x + PAD;
         for y in 0..size {
             for x in 0..size {
                 let i = y * size + x;
-                let a = rgba_in[i * 4 + 3] as u32;
-                let pm = |c: u8| (dec(c) as u32 * a + 127) / 255;
-                rgba[at(0, x, y)] = a << 24 | pm(rgba_in[i * 4]) << 16 | pm(rgba_in[i * 4 + 1]) << 8 | pm(rgba_in[i * 4 + 2]);
+                let a = rgba_in[i * 4 + 3] as u64;
+                // Premultiplied in 16 bits: the widened code times alpha.
+                let pm = |c: u8| (dec(c) * a + 127) / 255;
+                rgba[at(0, x, y)] = (a * 257) << 48 | pm(rgba_in[i * 4]) | pm(rgba_in[i * 4 + 1]) << 16 | pm(rgba_in[i * 4 + 2]) << 32;
                 let g = pm(grey_in[i]);
-                grey[at(0, x, y)] = a << 24 | g << 16 | g << 8 | g;
+                grey[at(0, x, y)] = (a * 257) << 48 | g | g << 16 | g << 32;
             }
         }
         let mut s = size;
@@ -544,14 +561,14 @@ impl Mips {
             for y in 0..n {
                 for x in 0..n {
                     for plane in [&mut *rgba, &mut *grey] {
-                        let mut acc = [0u32; 4];
+                        let mut acc = [0u64; 4];
                         for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                             let t = plane[at(l - 1, 2 * x + dx, 2 * y + dy)];
                             for c in 0..4 {
-                                acc[c] += t >> (8 * c) & 0xFF;
+                                acc[c] += t >> (16 * c) & 0xFFFF;
                             }
                         }
-                        plane[at(l, x, y)] = (0..4).fold(0, |w, c| w | ((acc[c] + 2) / 4) << (8 * c));
+                        plane[at(l, x, y)] = (0..4).fold(0u64, |w, c| w | ((acc[c] + 2) / 4) << (16 * c));
                     }
                 }
             }
@@ -561,17 +578,19 @@ impl Mips {
     }
 }
 
-/// Bilinear between four packed texels, two channels per multiply (red-blue and alpha-green each ride one word's two 16-bit halves); `fu`, `fv` in 256ths.
+/// Bilinear between four texels, two channels per multiply (R and B, then G and A, each pair riding one word's two 32-bit halves); `fu`, `fv` in 256ths.
 #[inline(always)]
-fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, fu: u32, fv: u32) -> u32 {
+fn bilerp(p00: Px, p10: Px, p01: Px, p11: Px, fu: u32, fv: u32) -> Px {
+    let (fu, fv) = (fu as u64, fv as u64);
     let (w00, w10, w01, w11) = ((256 - fu) * (256 - fv) >> 8, fu * (256 - fv) >> 8, (256 - fu) * fv >> 8, fu * fv >> 8);
-    let rb = (p00 & 0x00FF_00FF) * w00 + (p10 & 0x00FF_00FF) * w10 + (p01 & 0x00FF_00FF) * w01 + (p11 & 0x00FF_00FF) * w11;
-    let ag = (p00 >> 8 & 0x00FF_00FF) * w00 + (p10 >> 8 & 0x00FF_00FF) * w10 + (p01 >> 8 & 0x00FF_00FF) * w01 + (p11 >> 8 & 0x00FF_00FF) * w11;
-    (rb >> 8 & 0x00FF_00FF) | (ag & 0xFF00_FF00)
+    const M: u64 = 0x0000_FFFF_0000_FFFF;
+    let rb = (p00 & M) * w00 + (p10 & M) * w10 + (p01 & M) * w01 + (p11 & M) * w11;
+    let ga = (p00 >> 16 & M) * w00 + (p10 >> 16 & M) * w10 + (p01 >> 16 & M) * w01 + (p11 >> 16 & M) * w11;
+    (rb >> 8 & M) | (ga >> 8 & M) << 16
 }
 
 /// An icon inside the disc of radius `r` (Q8) at (cx, cy), turned by (c, s) Q14 — screen to icon is the inverse turn — under what is there. The mip level is the smallest at least as wide as the disc, so a texel never shrinks more than 2:1; between texels, bilinear. `lit`: the icon's own colours, else its grey (the map at rest). Returns the rectangle it touched.
-pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips, lit: bool) -> Rect {
+pub fn icon(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, c: i64, s: i64, m: &Mips, lit: bool) -> Rect {
     if r < 256 {
         return Rect::EMPTY;
     }
@@ -591,7 +610,6 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
     let k = (size << 24) / (2 * r_art);
     let (du_dx, dv_dx) = (c * k >> 14, -s * k >> 14);
     let (du_dy, dv_dy) = (s * k >> 14, c * k >> 14);
-    let (w, h) = (width as i64, height as i64);
     let (bx0, by0, bx1, by1) = bounds(width, height);
     // Texel space with the border: centre at size/2 + PAD, bilinear taps at −½.
     let half = ((size << 16) >> 1) + ((PAD as i64) << 16) - (1 << 15);
@@ -615,7 +633,7 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
         let mut v = half + ((ox * dv_dx + oy * dv_dy) >> 8);
         let row = &mut px[rowb + x0 as usize..=rowb + x1 as usize];
         for (n, p) in row.iter_mut().enumerate() {
-            if *p >> 24 != 255 && u >= lo && v >= lo && u < hi && v < hi {
+            if *p >> 48 != 0xFFFF && u >= lo && v >= lo && u < hi && v < hi {
                 let i = (v >> 16) as usize * stride + (u >> 16) as usize;
                 let mut t = bilerp(tex[i], tex[i + 1], tex[i + stride], tex[i + stride + 1], (u >> 8 & 0xFF) as u32, (v >> 8 & 0xFF) as u32);
                 // Outside the inner span: the pixel straddles the edge, so the texel is scaled by the disc's coverage (premultiplied: every channel).
@@ -629,12 +647,12 @@ pub fn icon(px: &mut [u32], width: usize, height: usize, cx: i64, cy: i64, r: i6
                         continue;
                     }
                     if cov < 255 {
-                        let c = cov as u32;
-                        let sc = |sh: u32| ((t >> sh & 0xFF) * c + 127) / 255 << sh;
-                        t = sc(24) | sc(16) | sc(8) | sc(0);
+                        let c = cov as u64;
+                        let sc = |sh: u32| ((t >> sh & 0xFFFF) * c + 127) / 255 << sh;
+                        t = sc(48) | sc(32) | sc(16) | sc(0);
                     }
                 }
-                if t >> 24 != 0 {
+                if t >> 48 != 0 {
                     *p = if *p == 0 { t } else { under(*p, t) };
                 }
             }
