@@ -659,3 +659,24 @@ pub fn services(out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(alloc::format!("{i} {n}\n").as_bytes());
     }
 }
+
+/// `diag aoc log [service]`: drain a service's UP ring (default `logging`, the firmware's own log: 256 × 128-byte messages, full from boot unless read) and show each message's printable text.
+pub fn log(name: &str, out: &mut alloc::vec::Vec<u8>) {
+    let h = service(name);
+    if h == 0 {
+        out.extend_from_slice(alloc::format!("{name}: not found\n").as_bytes());
+        return;
+    }
+    let mut buf = [0u8; 1024];
+    let mut n = 0;
+    while let Some(len) = ipc_read(h, &mut buf) {
+        n += 1;
+        let text: alloc::string::String = buf[..len].iter().map(|&c| if (0x20..0x7F).contains(&c) { c as char } else if c == b'\n' || c == 0 { ' ' } else { '.' }).collect();
+        out.extend_from_slice(text.trim().as_bytes());
+        out.push(b'\n');
+        if n >= 512 {
+            break;
+        }
+    }
+    out.extend_from_slice(alloc::format!("({n} messages)\n").as_bytes());
+}

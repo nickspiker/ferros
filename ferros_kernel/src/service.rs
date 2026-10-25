@@ -1424,7 +1424,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
                                             // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
                                             if cmd.params == b"sensors up" {
                                                 let st = &raw mut store;
@@ -1437,6 +1437,16 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                             } else if let Some(path) = cmd.params.strip_prefix(b"usf reg ").and_then(|t| core::str::from_utf8(t).ok()) {
                                                 crate::usf::reg(path.trim(), &mut resp);
+                                            } else if cmd.params == b"usf ev" {
+                                                crate::usf::events(&mut resp);
+                                            } else if cmd.params == b"usf sensors" {
+                                                crate::usf::sensors(&mut resp);
+                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf subh ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                // `diag usf subh <handle> <ms> <mode> [wake]`
+                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                                                if v.len() >= 3 {
+                                                    crate::usf::subscribe(v[0] as u32, v[1], v[2] as u32, a.contains("wake"), &mut resp);
+                                                }
                                             } else if cmd.params == b"usf trace" {
                                                 crate::usf::trace(&mut resp);
                                             } else if let Some(ms) = cmd.params.strip_prefix(b"usf sub ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
@@ -1451,6 +1461,12 @@ pub fn run(mut b: Boot) -> ! {
                                                 crate::usf::start(&mut get, ms, a.contains("wake"), &mut resp);
                                             }
                                             crate::usf::report(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"aoc log" || cmd.params.starts_with(b"aoc log ") {
+                                            let n = core::str::from_utf8(cmd.params.strip_prefix(b"aoc log").unwrap_or(b"")).unwrap_or("").trim();
+                                            crate::aoc::log(if n.is_empty() { "logging" } else { n }, &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

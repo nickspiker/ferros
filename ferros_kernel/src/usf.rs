@@ -164,7 +164,20 @@ fn drain(want: Option<u32>) -> Option<(u32, alloc::vec::Vec<u8>)> {
 fn sample(p: &[u8]) {
     EVENTS.fetch_add(1, Ordering::Relaxed);
     let (Some(ty), Some(&count), Some(&size)) = (u16_at(p, 12), p.get(14), p.get(15)) else { return };
-    if ty != 22 || size < 12 || count == 0 {
+    if ty != 22 {
+        // Any other sensor: its latest event kept whole, for `diag usf ev`.
+        unsafe {
+            let t = &mut *(&raw mut LAST_EV);
+            let i = t.iter().position(|e| e.0 == ty || e.1 == 0).unwrap_or(0);
+            let n = p.len().min(128);
+            t[i].0 = ty;
+            t[i].1 = n;
+            t[i].2[..n].copy_from_slice(&p[..n]);
+            t[i].3 += 1;
+        }
+        return;
+    }
+    if size < 12 || count == 0 {
         return;
     }
     let at = 16 + (count as usize - 1) * (8 + size as usize) + 8;
@@ -197,6 +210,61 @@ fn sample(p: &[u8]) {
 
 /// The last two gravity samples: [x | y << 32, z, time in counter ticks] for the newest, then the same for the one before (f32 bits, m/s²). SYS_FACTS 14–19.
 pub static PAIR: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The latest event of each other sensor type seen: (USF sensor type, bytes, the event's first 128 bytes, how many came).
+static mut LAST_EV: [(u16, usize, [u8; 128], u32); 8] = [(0, 0, [0; 128], 0); 8];
+
+/// `diag usf ev`: each sensor type's latest event — the header (subscriber handle, subscription, type, sample count, bytes per sample) and each sample's timestamp and values as f32 and as raw words.
+pub fn events(out: &mut alloc::vec::Vec<u8>) {
+    let t = unsafe { &*(&raw const LAST_EV) };
+    for &(ty, n, ref b, cnt) in t.iter().filter(|e| e.1 != 0) {
+        let p = &b[..n];
+        let (count, size) = (p.get(14).copied().unwrap_or(0) as usize, p.get(15).copied().unwrap_or(0) as usize);
+        out.extend_from_slice(alloc::format!("type {ty}: {cnt} events, last A#{n} bytes, subscription {:?}, {count} samples of {size} bytes\n", u32_at(p, 8)).as_bytes());
+        for k in 0..count {
+            let at = 16 + k * (8 + size);
+            let ts = u32_at(p, at).unwrap_or(0) as u64 | (u32_at(p, at + 4).unwrap_or(0) as u64) << 32;
+            out.extend_from_slice(alloc::format!("  ts G#{ts:X}:").as_bytes());
+            for w in 0..size / 4 {
+                if let Some(v) = u32_at(p, at + 8 + 4 * w) {
+                    out.extend_from_slice(alloc::format!(" {:.4} (G#{v:08X})", f32::from_bits(v)).as_bytes());
+                }
+            }
+            out.push(b'\n');
+        }
+    }
+}
+
+/// `diag usf sensors`: every handle the AoC lists, with its name.
+pub fn sensors(out: &mut alloc::vec::Vec<u8>) {
+    for k in 1..128 {
+        if let Some(n) = info(k) {
+            out.extend_from_slice(alloc::format!("{k}: {n}\n").as_bytes());
+        }
+    }
+}
+
+/// Subscribe to any sensor: `mode` 1 continuous, 2 on change, 3 one-shot; `period_ms`; no batching. Returns the subscription (0: refused).
+pub fn subscribe(handle: u32, period_ms: u64, mode: u32, wake: bool, out: &mut alloc::vec::Vec<u8>) -> u32 {
+    let mut m = SUBSCRIBE.to_vec();
+    put32(&mut m, 52, handle);
+    m[126] = if wake { 0 } else { 1 };
+    m[127] = 0;
+    m[128..136].copy_from_slice(&0u64.to_le_bytes());
+    m[136..144].copy_from_slice(&(period_ms * 1_000_000).to_le_bytes());
+    put32(&mut m, 148, mode);
+    let Some(txn) = send(m, Some(60)) else {
+        out.extend_from_slice(b"usf: subscribe not sent (ring full)\n");
+        return 0;
+    };
+    let r = reply(txn, 256);
+    let id = r.as_ref().and_then(|(_, b)| body_u32(b, 0)).unwrap_or(0);
+    out.extend_from_slice(alloc::format!("usf: subscribe handle {handle} every {period_ms} ms mode {mode}: status {:?}, subscription {id}\n", r.as_ref().map(|(s, _)| *s)).as_bytes());
+    if id != 0 && SUB_ID.load(Ordering::Relaxed) == 0 {
+        SUB_ID.store(id, Ordering::Relaxed);
+    }
+    id
+}
 
 /// The last 32 gravity samples: (AoC timestamp ns, counter at arrival, x y z bits), and how many were written.
 static mut TRACE: ([(u64, u64, [u32; 3]); 32], usize) = ([(0, 0, [0; 3]); 32], 0);
