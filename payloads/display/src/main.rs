@@ -368,7 +368,7 @@ const WIDGET_CLOCK: u8 = 0x80;
 /// The light scope (the map's icon G#82): the 16 kHz trace of one channel over the last second, and the four colour channels' levels in stops beneath.
 const WIDGET_SCOPE: u8 = 0x82;
 /// The fast trace, as SYS_LIGHT last gave it: up to four seconds at 16 kHz, and the call's header.
-static mut SCOPE_BUF: [i32; 65536 + 4] = [0; 65536 + 4];
+static mut SCOPE_BUF: [i32; 65536 + 8192 + 4] = [0; 65536 + 8192 + 4];
 /// The slow channels' history: (counter ticks, counts per unit gain for the six channels), the last 64 spectral samples (~13 s at the AoC's ~5 a second).
 static mut SLOW: ([(u64, [f32; 6]); 64], usize) = ([(0, [0.0; 6]); 64], 0);
 static mut SLOW_SEQ: u64 = 0;
@@ -379,6 +379,8 @@ static mut SCOPE_RECT: draw::Rect = draw::Rect::EMPTY;
 static mut SCOPE_LIVE: draw::Rect = draw::Rect::EMPTY;
 /// The time the scope shows, µs (display op 25: the focused scope's drag; a second by default).
 static mut SCOPE_SPAN_US: u32 = 1_000_000;
+/// The scope folded on its dominant period (display op 25's mode byte, a tap on the focused scope): the average cycle, twice, in place of the trace.
+static mut SCOPE_FOLD: bool = false;
 /// The widget in focus (display op 25; 0 none): it is redrawn and flipped at the panel's rate, everything else stays at the 10 Hz flips (owner, 2026-10-25).
 static mut FOCUS: u8 = 0;
 /// The scope's redraws between frames: total µs and count, logged every 256.
@@ -652,23 +654,84 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
     let span_us = unsafe { SCOPE_SPAN_US } as u64;
     // ── the fast trace ──
     let buf = unsafe { &mut *(&raw mut SCOPE_BUF) };
-    // Only the span's samples are asked for (four words more for the call's header), so a short span costs a short copy.
+    // The span's samples are asked for (four words more for the call's header), so a short span costs a short copy, and LOCK_REACH more for the lock, which ends the window on a rising crossing up to that far back.
     let (_, rate0, _, _) = ferros_sys::light(&mut buf[..4]);
-    let want = ((span_us * rate0.max(1) as u64 / 1_000_000) as usize).clamp(2, buf.len() - 4);
-    let (_end, _rate, mask, got) = ferros_sys::light(&mut buf[..want + 4]);
+    let want = ((span_us * rate0.max(1) as u64 / 1_000_000) as usize).clamp(2, buf.len() - 4 - LOCK_REACH);
+    let (_end, _rate, mask, got) = ferros_sys::light(&mut buf[..want + LOCK_REACH + 4]);
+    let all = &buf[..got];
     let n = got.min(want);
     let ch = (mask.trailing_zeros() as usize).min(5);
-    if n >= 2 {
-        let s = &buf[got - n..got];
-        let mean = s.iter().map(|&v| v as i64).sum::<i64>() / n as i64;
-        let peak = s.iter().map(|&v| (v as i64 - mean).abs()).max().unwrap_or(1).max(1) as f32;
-        // Half-pixel rows and columns.
-        let (rows, cols) = ((top_h * 2.0) as usize, (bw * 2.0) as usize);
-        let half = rows as f32 * 0.5;
-        let row = |v: f32| (half - (v - mean as f32) / peak * (half - 1.0)).clamp(0.0, rows as f32 - 1.0);
-        let mut cov = alloc::vec![0f32; rows];
+    // Half-pixel rows and columns.
+    let (rows, cols) = ((top_h * 2.0) as usize, (bw * 2.0) as usize);
+    // The dominant period and its newest rising crossing, from at least a quarter second (`scope_lock`), as an index into `all`.
+    let from = got.saturating_sub(want.max(4096) + LOCK_REACH);
+    let lock = scope_lock(&all[from..]).map(|(p, t)| (p, t + from as f32));
+    let fold = unsafe { SCOPE_FOLD } && lock.is_some_and(|(p, _)| n as f32 >= p);
+    // What is drawn: the samples themselves (a slice, the window ending on the lock's crossing when there is one), or a value per half-pixel column (narrower than a sample: the straight line between the samples around it; folded: the average cycle).
+    let mut colv: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
+    let mut s: &[i32] = &[];
+    if fold {
+        // Folded (owner, 2026-10-25): every sample of the span placed by its phase in the dominant period, averaged into a bin per half-pixel column of one cycle, two cycles across the box, a rising crossing at the left edge and the middle. ~120 cycles a second of a 120 Hz source average the noise down ~11×, and as the period is no whole number of samples, successive cycles land at different phases and fill the cycle in finer than 16 kHz (a sampling scope's equivalent time).
+        let (p, tc) = lock.unwrap_or((1.0, 0.0));
+        let nb = (cols / 2).max(1);
+        let mut sum = alloc::vec![0f32; nb];
+        let mut cnt = alloc::vec![0u32; nb];
+        let w = &all[got - n..];
+        let base = (got - n) as f32 - tc;
+        for (i, &v) in w.iter().enumerate() {
+            let ph = (base + i as f32) / p;
+            let k = (((ph - libm::floorf(ph)) * nb as f32) as usize).min(nb - 1);
+            sum[k] += v as f32;
+            cnt[k] += 1;
+        }
+        // Empty bins (a cycle wider than the span's samples can fill) take the straight line between their filled neighbours, round the cycle.
+        let filled: alloc::vec::Vec<usize> = (0..nb).filter(|&k| cnt[k] > 0).collect();
+        if !filled.is_empty() {
+            let mut cyc = alloc::vec![0f32; nb];
+            for (j, &k) in filled.iter().enumerate() {
+                let k2 = filled[(j + 1) % filled.len()];
+                let (va, vb) = (sum[k] / cnt[k] as f32, sum[k2] / cnt[k2] as f32);
+                let gap = (k2 + nb - k - 1) % nb + 1;
+                for d in 0..gap {
+                    cyc[(k + d) % nb] = va + (vb - va) * d as f32 / gap as f32;
+                }
+            }
+            colv = (0..cols).map(|c| cyc[c % nb]).collect();
+        }
+    } else if n >= 2 {
+        // Locked: the window ends on the newest rising crossing (the fitted one, so it does not jitter), so every frame starts at the same phase and the waveform stands still; unlocked, on the newest sample.
+        let (e, f) = match lock {
+            Some((_, tc)) if libm::floorf(tc) as usize + 1 >= n && (libm::floorf(tc) as usize) < got => (libm::floorf(tc) as usize + 1, tc - libm::floorf(tc)),
+            _ => (got, 1.0),
+        };
+        s = &all[e - n..e];
         let per = n as f32 / cols as f32;
-        let mut prev = row(s[0] as f32);
+        if per < 1.0 {
+            // Narrower than a sample: the straight line between the samples around the column's centre; τ (the window's own time, 0 to n) is the slice's position τ + f − 1, the window ending exactly on the crossing.
+            colv = (0..cols)
+                .map(|col| {
+                    let t = ((col as f32 + 0.5) * per + f - 1.0).max(0.0);
+                    let i = (t as usize).min(n - 2);
+                    let fr = (t - i as f32).min(1.0);
+                    s[i] as f32 + (s[i + 1] - s[i]) as f32 * fr
+                })
+                .collect();
+        }
+    }
+    let drawn = !colv.is_empty() || s.len() >= 2;
+    if drawn {
+        let (mean, peak) = if !colv.is_empty() {
+            let m = colv.iter().sum::<f32>() / colv.len() as f32;
+            (m, colv.iter().map(|&v| (v - m).abs()).fold(1.0f32, f32::max))
+        } else {
+            let m = (s.iter().map(|&v| v as i64).sum::<i64>() / s.len() as i64) as f32;
+            (m, s.iter().map(|&v| (v as f32 - m).abs()).fold(1.0f32, f32::max))
+        };
+        let half = rows as f32 * 0.5;
+        let row = |v: f32| (half - (v - mean) / peak * (half - 1.0)).clamp(0.0, rows as f32 - 1.0);
+        let mut cov = alloc::vec![0f32; rows];
+        let per = if colv.is_empty() { s.len() as f32 / cols as f32 } else { 1.0 };
+        let mut prev = row(if colv.is_empty() { s[0] as f32 } else { colv[0] });
         // A cell's opacity: a floor for being crossed at all, so every join shows (a fast edge lit only by its share of the column's segments came out at ~0.16 coverage, a few percent of light on the gamma-2 canvas: the edges vanished and the trace fell apart into strokes, 2026-10-25), plus the share of segments that cross it, square-rooted, so where the trace dwells is brighter; half, as two half-pixel columns share each pixel.
         let inv = 1.0 / per.max(1.0);
         for col in 0..cols {
@@ -681,18 +744,14 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
                 }
                 *prev = y;
             };
-            if per >= 1.0 {
-                let a = ((col as f32 * per) as usize).min(n - 1);
-                let b = (((col + 1) as f32 * per) as usize).clamp(a + 1, n);
+            if colv.is_empty() {
+                let a = ((col as f32 * per) as usize).min(s.len() - 1);
+                let b = (((col + 1) as f32 * per) as usize).clamp(a + 1, s.len());
                 for &v in &s[a..b] {
                     seg(&mut cov, row(v as f32), &mut prev);
                 }
             } else {
-                // Narrower than a sample: the point of the straight line between the two samples around the column's centre.
-                let t = (col as f32 + 0.5) * per;
-                let i = (t as usize).min(n - 2);
-                let f = (t - i as f32).min(1.0);
-                seg(&mut cov, row(s[i] as f32 + (s[i + 1] - s[i]) as f32 * f), &mut prev);
+                seg(&mut cov, row(colv[col]), &mut prev);
             }
             let u = u0 + (col as f32 + 0.5) * 0.5;
             for (rr, &c) in cov.iter().enumerate() {
@@ -767,6 +826,56 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
         }
     }
     draw::disc(pixels, width, height, cx, cy, r, plate)
+}
+
+/// How far back the scope's lock may end its window: half a second at 16 kHz, a period of 2 Hz and longer than any flicker worth locking to.
+const LOCK_REACH: usize = 8192;
+
+/// The dominant period of a stretch of the light trace and the time of its newest rising crossing, both in samples (fractional), or None when there is no steady one. Rising crossings of the stretch's mean with hysteresis (armed only once the trace has been a tenth of its swing below the mean, so noise at the mean cannot double-count), each placed between its two samples by the straight line through them; the median interval gives a first period, every crossing its cycle number by it (so a missed crossing does not break the count), and a least-squares line through (cycle, time) gives the period to a small fraction of a sample. No lock when there are fewer than three crossings, the period is under four samples, or the crossings scatter more than a tenth of a period from the line.
+fn scope_lock(s: &[i32]) -> Option<(f32, f32)> {
+    let n = s.len();
+    if n < 64 {
+        return None;
+    }
+    let mean = s.iter().map(|&v| v as i64).sum::<i64>() / n as i64;
+    let h = s.iter().map(|&v| (v as i64 - mean).abs()).max().unwrap_or(0) / 10;
+    if h == 0 {
+        return None;
+    }
+    let mut cross: alloc::vec::Vec<f64> = alloc::vec::Vec::new();
+    let mut armed = false;
+    for i in 1..n {
+        let (d0, d1) = (s[i - 1] as i64 - mean, s[i] as i64 - mean);
+        armed |= d1 < -h;
+        if armed && d0 < 0 && d1 >= 0 {
+            cross.push((i - 1) as f64 + (-d0) as f64 / (d1 - d0) as f64);
+            armed = false;
+        }
+    }
+    let m = cross.len();
+    if m < 3 {
+        return None;
+    }
+    let mut iv: alloc::vec::Vec<f64> = cross.windows(2).map(|w| w[1] - w[0]).collect();
+    iv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let p0 = iv[iv.len() / 2];
+    if p0 < 4.0 {
+        return None;
+    }
+    let ks: alloc::vec::Vec<f64> = cross.iter().map(|&t| libm::round((t - cross[0]) / p0)).collect();
+    let (sk, st) = (ks.iter().sum::<f64>(), cross.iter().sum::<f64>());
+    let (skk, skt) = (ks.iter().map(|k| k * k).sum::<f64>(), ks.iter().zip(&cross).map(|(k, t)| k * t).sum::<f64>());
+    let den = m as f64 * skk - sk * sk;
+    if den <= 0.0 {
+        return None;
+    }
+    let p = (m as f64 * skt - sk * st) / den;
+    let a = (st - p * sk) / m as f64;
+    let rms = libm::sqrt(ks.iter().zip(&cross).map(|(k, t)| (t - a - p * k) * (t - a - p * k)).sum::<f64>() / m as f64);
+    if !(p >= 4.0) || rms > 0.1 * p {
+        return None;
+    }
+    Some((p as f32, (a + p * ks[m - 1]) as f32))
 }
 
 /// The counter ticks in a second.
@@ -2428,11 +2537,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
-                // Focus: [icon u8, 0 none][span µs u32]. The focused widget is redrawn and flipped every frame; the span is the time the scope shows (2^-6 s to 4 s).
+                // Focus: [icon u8, 0 none][span µs u32][mode u8: bit 0 fold]. The focused widget is redrawn and flipped every frame; the span is the time the scope shows (2^-6 s to 4 s).
                 Some(25) if m.len() >= 6 => {
                     unsafe {
                         FOCUS = m[1];
                         SCOPE_SPAN_US = u32::from_le_bytes([m[2], m[3], m[4], m[5]]).clamp(15_625, 4_000_000);
+                        SCOPE_FOLD = m.get(6).copied().unwrap_or(0) & 1 == 1;
                     }
                 }
                 Some(23) => {

@@ -329,8 +329,10 @@ struct Map {
     scope_span_us: u32,
     scope_axis: u8,
     scope_acc: i64,
-    /// The focus and span the display last heard (display op 25).
-    focus_sent: (u8, u32),
+    /// The focused scope folded on its dominant period (a one-finger tap toggles it).
+    scope_fold: bool,
+    /// The focus, span and mode the display last heard (display op 25).
+    focus_sent: (u8, u32, bool),
 }
 
 impl Map {
@@ -764,7 +766,7 @@ impl Map {
             View::Back(DEVICE) => self.settings(&mut b),
             View::Front(SCOPE) => {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-                b.text(cx, cy + r + 64, 32, grey(), 1, "drag across: time \u{2022} swipe up or down: channel \u{2022} two fingers: back");
+                b.text(cx, cy + r + 64, 32, grey(), 1, "tap: fold \u{2022} drag across: time \u{2022} swipe up or down: channel \u{2022} two fingers: back");
             }
             View::Front(i) => {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
@@ -778,15 +780,16 @@ impl Map {
         self.send_focus();
     }
 
-    /// The display told what is in focus (op 25): the scope when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; and the span it shows. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
+    /// The display told what is in focus (op 25): the scope when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; the span it shows; and whether it is folded. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
     fn send_focus(&mut self) {
-        let f = (if self.view == View::Front(SCOPE) { CIRCLES[SCOPE].icon } else { 0 }, self.scope_span_us);
+        let f = (if self.view == View::Front(SCOPE) { CIRCLES[SCOPE].icon } else { 0 }, self.scope_span_us, self.scope_fold);
         if f != self.focus_sent {
             self.focus_sent = f;
-            let mut m = [0u8; 6];
+            let mut m = [0u8; 7];
             m[0] = 25;
             m[1] = f.0;
             m[2..6].copy_from_slice(&f.1.to_le_bytes());
+            m[6] = f.2 as u8;
             let mut r = [0u8; 4];
             call(self.display, &m, &mut r);
         }
@@ -1070,6 +1073,11 @@ impl Map {
                     self.draw();
                 }
             }
+            (1, View::Front(SCOPE)) if inside => {
+                // The focused scope: a tap folds it on its dominant period, or unfolds it (owner, 2026-10-25).
+                self.scope_fold = !self.scope_fold;
+                self.send_focus();
+            }
             (1, View::Front(_)) | (1, View::Back(_)) => {
                 if !inside {
                     self.view = View::Map;
@@ -1194,7 +1202,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         scope_span_us: 1_000_000,
         scope_axis: 0,
         scope_acc: 0,
-        focus_sent: (0, 1_000_000),
+        scope_fold: false,
+        focus_sent: (0, 1_000_000, false),
         app_seen: false,
         app_since: 0,
     };
