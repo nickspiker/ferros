@@ -636,10 +636,16 @@ fn irq_pending_take(intid: u32) -> bool {
         let v = core::ptr::read_volatile(p);
         if v != 0 {
             core::ptr::write_volatile(p, 0);
+            // A finger on the glass: the clock policy's sign of someone using the phone (service.rs clock_policy).
+            if intid == IRQ_TOUCH_INT {
+                INPUT_AT.store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
+            }
         }
         v != 0
     }
 }
+/// When a touch interrupt was last taken by the touch driver (counter ticks; 0 never): the clock policy holds the active clocks for a second after it.
+pub static INPUT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
 pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 

@@ -35,6 +35,19 @@ The X3 alone, with MIF 1014, INT 178, CPUCL0 324 and CPUCL1 402 (the clusters' f
 - **Floors are real.** CPUCL0 at 300 kHz below its 324 MHz minimum (zuma-cpu.dtsi) was answered `Ok` by ACPM and hard-reset the phone a few seconds later; the next boot found ACPM refusing (`Err(2)`) and reset again. Only the device tree's operating points (CPUCL0 324–1704, CPUCL1 402–2367, X3 500–2914 MHz; MIF 421–3744; INT 178–1066).
 - Earlier: the AOD floor (panel in its low-power mode) was 2.12 W whole-phone with the old measurement, so roughly 1.9 W of today's floor is SoC, DRAM and USB, not panel.
 
+## 2026-10-25: the clock policy
+
+`clock_policy` (service.rs): rest — X3 2.0 GHz, MIF 1014, INT 178, CPUCL1 402, CPUCL0 324 — and active — the boot's clocks — on a touch taken by the touch driver or a PT transfer, held a second. On by default from 16 s after the service loop starts; `diag dvfs policy on|off`, `diag dvfs profile rest|active`.
+
+| state | draw |
+|---|---|
+| boot clocks, same scene | 3.50–3.59 W |
+| rest (policy), fresh boot | **2.21–2.22 W** |
+
+The small clusters at their floors alone took 3.5 to 2.80 W; MIF and INT then 2.54 W; the X3 at 2.0 GHz 2.23 W.
+
+**The hang it first had:** the clusters', MIF's and INT's rate requests take no reply (as Linux sends them); five went out back to back and the loop went into `wfe` straight after. With the charger cut (the phone on battery) the X3 never woke from that `wfe`: the watchdog reset it, the last crumb G#B3 (before the idle `wfe`), its timer control still G#C7 (event stream on) — so not a lost event stream. The same switches by hand (followed by a PT reply, not a sleep) never hung. Fixed by reading each domain's rate after setting it: the read takes a reply and the firmware answers in order, so the loop sleeps only once every request is done. The longest such request measured 2.8 ms.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.

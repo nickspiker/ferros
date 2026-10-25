@@ -763,6 +763,53 @@ fn power_poll() {
     }
 }
 
+/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor and CPU0's (parked) at its 324 MHz floor (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver or a PT transfer moving, held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
+const CLOCKS_REST: [(u32, u32); 5] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000)];
+const CLOCKS_ACTIVE: [(u32, u32); 5] = [(0, 2_028_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (4, 2_914_000)];
+/// The policy's state: 0 not yet applied, 1 rest, 2 active; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
+static mut CLOCK_STATE: u8 = 0;
+static mut CLOCK_POLICY_ON: bool = true;
+static mut CLOCK_SWITCHES: u32 = 0;
+static mut CLOCK_WAIT_MAX_US: u64 = 0;
+
+fn clock_policy(pt_busy: bool, booted_for: u64) {
+    let (f, now) = (cntfrq(), cntpct());
+    // Not while the boot is still loading firmware (the AoC's 29 MB copy, Trusty) at the boot's own clocks.
+    if unsafe { !CLOCK_POLICY_ON } || booted_for < 16 * f {
+        return;
+    }
+    let input = crate::process::INPUT_AT.load(core::sync::atomic::Ordering::Relaxed);
+    let active = pt_busy || (input != 0 && now.wrapping_sub(input) < f);
+    if pt_busy {
+        unsafe { PT_BUSY_AT = now };
+    }
+    let active = active || now.wrapping_sub(unsafe { PT_BUSY_AT }) < f;
+    if (if active { 2 } else { 1 }) != unsafe { CLOCK_STATE } {
+        clock_profile(active);
+    }
+}
+
+/// One of the two operating points, every domain in order; then the X3's timer control (its event stream, which wakes the idle loop's `wfe`) and the counter into note 6, and the switch count into note 7, so a hang after a switch says what the core was left with (the first policy build hung the X3 in `wfe` within a minute of going to rest, 2026-10-25).
+fn clock_profile(active: bool) {
+    // Each request answered before the next and before the loop may sleep: the clusters', MIF's and INT's rate requests take no reply (as Linux sends them), so five went out back to back and the loop went straight into `wfe` with the firmware still at work — and on battery (the charger cut) the X3 never woke from that `wfe` (2026-10-25, twice). A rate read takes a reply, and the firmware answers in order: its answer means the request before it is done. The longest wait goes into DIAG.
+    for &(d, khz) in if active { &CLOCKS_ACTIVE } else { &CLOCKS_REST } {
+        let t0 = cntpct();
+        let _ = crate::acpm::dvfs_set(d, khz);
+        let _ = crate::acpm::dvfs_get(d);
+        let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
+        unsafe { CLOCK_WAIT_MAX_US = CLOCK_WAIT_MAX_US.max(us) };
+    }
+    let v: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
+        CLOCK_STATE = if active { 2 } else { 1 };
+        CLOCK_SWITCHES += 1;
+        platform::note(6, (CLOCK_STATE as u64) << 56 | v);
+        platform::note(7, (CLOCK_SWITCHES as u64) << 40 | cntpct() >> 16);
+    }
+}
+static mut PT_BUSY_AT: u64 = 0;
+
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
@@ -953,6 +1000,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::rtc::poll();
         gauge_poll();
         power_poll();
+        clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
         thermal_poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
@@ -1483,6 +1531,20 @@ pub fn run(mut b: Boot) -> ! {
                                                 (1u64 << 20) / us + (acc & 0)
                                             };
                                             let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
+                                            // `diag dvfs policy on|off`: the rest/active clock policy (clock_policy) runs, or holds off so `dvfs set` sticks.
+                                            // `diag dvfs profile rest|active`: one of the policy's operating points by hand.
+                                            if words.len() == 3 && words[1] == b"profile" {
+                                                clock_profile(words[2] == b"active");
+                                            }
+                                            if words.len() == 3 && words[1] == b"policy" {
+                                                unsafe {
+                                                    CLOCK_POLICY_ON = words[2] == b"on";
+                                                    if CLOCK_POLICY_ON {
+                                                        CLOCK_STATE = 0;
+                                                    }
+                                                }
+                                            }
+                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active), {} switches, longest request {} us\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }).as_bytes());
                                             if words.len() == 4 && words[1] == b"set" {
                                                 let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
                                                 match (num(words[2]), num(words[3])) {
