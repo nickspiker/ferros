@@ -1519,6 +1519,32 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(a) = cmd.params.strip_prefix(b"i2c ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                            // `diag i2c <bus G#base> <target G#> <read n> [write bytes G#..]`: a raw transfer on an HS-I2C controller that is already up (hsi2c::ready): the bytes written, then n read. For identifying chips; it never brings a bus up.
+                                            let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
+                                            let hx = |s: &str| u64::from_str_radix(s.trim_start_matches("G#"), 16).ok();
+                                            match (t.first().and_then(|s| hx(s)), t.get(1).and_then(|s| hx(s)), t.get(2).and_then(|s| s.parse::<usize>().ok())) {
+                                                (Some(base), Some(target), Some(n)) => {
+                                                    let w: alloc::vec::Vec<u8> = t[3..].iter().filter_map(|s| hx(s)).map(|v| v as u8).collect();
+                                                    let mut r = alloc::vec![0u8; n.min(64)];
+                                                    let res = if n == 0 { crate::hsi2c::write_bytes(base as usize, target as u8, &w) } else if w.is_empty() { crate::hsi2c::read_one(base as usize, target as u8, &mut r) } else { crate::hsi2c::write_read(base as usize, target as u8, &w, &mut r) };
+                                                    resp.extend_from_slice(alloc::format!("i2c G#{base:X} target G#{target:X}: {res:?} read {:02X?}\n", r).as_bytes());
+                                                }
+                                                _ => resp.extend_from_slice(b"i2c <bus base> <target> <read n> [write bytes]\n"),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"gnss" || cmd.params.starts_with(b"gnss ") {
+                                            // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
+                                            if cmd.params == b"gnss up" {
+                                                crate::gnss::up(&mut resp);
+                                            } else {
+                                                crate::gnss::state(&mut resp);
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"haptic" || cmd.params.starts_with(b"haptic ") {
                                             // `diag haptic` (state, read only), `diag haptic up` (bus, reset, IDs), `diag haptic play <n>` (ROM waveform n): the vibration motor's CS40L26 (haptics.rs).
                                             let a = core::str::from_utf8(&cmd.params[6..]).unwrap_or("").trim();

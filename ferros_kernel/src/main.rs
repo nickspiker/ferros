@@ -54,6 +54,7 @@ mod rtc;
 mod aoc;
 mod usf;
 mod haptics;
+mod gnss;
 mod gsa;
 mod ffa;
 mod trusty;
