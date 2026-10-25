@@ -1980,9 +1980,10 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"log" {
-                                            // `diag log`: the last 16 KiB of the flash text log (flashlog.rs).
-                                            resp.extend_from_slice(&crate::flashlog::tail(16 * 1024));
+                                        if cmd.params == b"log" || cmd.params.starts_with(b"log ") {
+                                            // `diag log [KiB]`: the last 16 KiB of the flash text log (flashlog.rs), or the last KiB asked for (up to 256: a reply's room).
+                                            let kib = core::str::from_utf8(&cmd.params[3..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256);
+                                            resp.extend_from_slice(&crate::flashlog::tail(kib * 1024));
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
