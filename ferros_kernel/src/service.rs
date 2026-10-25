@@ -763,9 +763,9 @@ fn power_poll() {
     }
 }
 
-/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor and CPU0's (parked) at its 324 MHz floor (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver or a PT transfer moving, held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
-const CLOCKS_REST: [(u32, u32); 5] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000)];
-const CLOCKS_ACTIVE: [(u32, u32); 5] = [(0, 2_028_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (4, 2_914_000)];
+/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver or a PT transfer moving, held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
+const CLOCKS_REST: [(u32, u32); 6] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000)];
+const CLOCKS_ACTIVE: [(u32, u32); 6] = [(0, 2_028_000), (5, 1_197_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (4, 2_914_000)];
 /// The policy's state: 0 not yet applied, 1 rest, 2 active; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
 static mut CLOCK_STATE: u8 = 0;
 static mut CLOCK_POLICY_ON: bool = true;
@@ -809,6 +809,8 @@ fn clock_profile(active: bool) {
     }
 }
 static mut PT_BUSY_AT: u64 = 0;
+/// Idle sleeps the EL2 timer's backstop ended (the event stream did not): DIAG BACKSTOP_WAKES.
+static BACKSTOP_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
@@ -949,6 +951,7 @@ pub fn run(mut b: Boot) -> ! {
     }
     // Ticks spent asleep in the idle loop, and since when, for DIAG's IDLE_PCT.
     let mut asleep: u64 = 0;
+    let mut backstop_ppi = false;
     let t_awake_from = cntpct();
     // The gate's own press is spent; from here a press is the screen's (below).
     unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
@@ -1129,9 +1132,19 @@ pub fn run(mut b: Boot) -> ! {
                 if usb.is_configured() && pt_inbound.is_none() && pt_out_data.is_empty() && !ran {
                     let t = cntpct();
                     platform::crumb(0xB3);
-                    unsafe { core::arch::asm!("wfe") };
+                    // A backstop under the event stream: the EL2 timer armed 2 ms out, so a GIC interrupt ends this `wfe` even if the event stream cannot. On battery at the rest clocks the X3 went into this `wfe` and never came out — the last crumb G#B3, its event stream still on (2026-10-25, three times) — as if the core had been taken down while it waited, where only an interrupt brings a core back. Taken at EL2 the tick only stops the timer (.Lirq_tick). The event stream wakes it first every time it can (333 us), so the timer is disarmed before it fires; a sleep that ran past 1.5 ms was ended by the backstop, and DIAG counts those.
+                    if !backstop_ppi {
+                        crate::killswitch::enable_ppi(26);
+                        backstop_ppi = true;
+                    }
+                    let backstop = cntfrq() / 500;
+                    unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
                     platform::crumb(0xB4);
-                    asleep += cntpct().wrapping_sub(t);
+                    let slept = cntpct().wrapping_sub(t);
+                    if slept > backstop * 3 / 4 {
+                        BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    asleep += slept;
                 } else {
                     for _ in 0..64u32 {
                         core::hint::spin_loop();
@@ -2251,6 +2264,7 @@ pub fn run(mut b: Boot) -> ! {
                                         let r = |a: usize| unsafe { read_volatile(a as *const u32) };
                                         append_hex(&mut resp, b"GEN=", generation as u32);
                                         // Percent of time since the service loop started that the core spent asleep in `wfe`, rather than spinning.
+                                        append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
                                         append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                                         append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);

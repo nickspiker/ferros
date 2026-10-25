@@ -48,6 +48,10 @@ The small clusters at their floors alone took 3.5 to 2.80 W; MIF and INT then 2.
 
 **The hang it first had:** the clusters', MIF's and INT's rate requests take no reply (as Linux sends them); five went out back to back and the loop went into `wfe` straight after. With the charger cut (the phone on battery) the X3 never woke from that `wfe`: the watchdog reset it, the last crumb G#B3 (before the idle `wfe`), its timer control still G#C7 (event stream on) — so not a lost event stream. The same switches by hand (followed by a PT reply, not a sleep) never hung. Fixed by reading each domain's rate after setting it: the read takes a reply and the firmware answers in order, so the loop sleeps only once every request is done. The longest such request measured 2.8 ms.
 
+Then the DSU (the clusters' shared L3 and snoop, 1197 MHz) to its 324 MHz floor: 2.24 → 2.16 W, now in the rest profile. BCI (840 → 315 MHz): nothing measurable. The camera, TNR, MFC and BW domains refuse a rate (`Err(1)`/`Err(2)`): powered off, as they should be — never send them requests.
+
+A third hang came after those refused requests, with the DSU and BCI at their floors and the charger cut: the same signature (the X3 in the idle `wfe`, event stream on). The idle `wfe` now has a backstop: the EL2 timer armed 2 ms out, so a GIC interrupt ends the wait whatever the event stream does, and DIAG `BACKSTOP_WAKES` counts sleeps it ended. Ten 30 s windows at rest since: no hang, no backstop wake — so the backstop has not been needed, and the two triggers taken away (the no-reply burst, requests to powered-off domains) are the likelier explanation. Kept as a net.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
