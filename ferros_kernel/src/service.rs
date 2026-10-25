@@ -700,7 +700,7 @@ struct PowerWin {
 static mut POWER_WIN: Option<PowerWin> = None;
 static mut POWER_RESULT: Option<alloc::string::String> = None;
 
-fn power_start(secs: u64, gap16: u64, input: bool) -> alloc::string::String {
+fn power_start(secs: u64, gap16: u64, input: bool, delay: u64) -> alloc::string::String {
     let (f, now) = (cntfrq(), cntpct());
     if unsafe { (*(&raw const POWER_WIN)).is_some() } {
         return "a window is already running\n".into();
@@ -715,7 +715,8 @@ fn power_start(secs: u64, gap16: u64, input: bool) -> alloc::string::String {
         }
     };
     let input_prev = if input && charger_prev.is_some() { crate::hsi2c::charger::input_select(false).ok() } else { None };
-    let settle = now + f / 2;
+    // `after <n>`: sampling starts n seconds later (up to 120), so the cable can come out first.
+    let settle = now + f / 2 + delay.min(120) * f;
     unsafe {
         POWER_RESULT = None;
         POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs });
@@ -765,9 +766,11 @@ fn power_poll() {
 }
 
 /// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver or a PT transfer moving, held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
-const CLOCKS_REST: [(u32, u32); 6] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000)];
-const CLOCKS_ACTIVE: [(u32, u32); 6] = [(0, 2_028_000), (5, 1_197_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (4, 2_914_000)];
-/// The policy's state: 0 not yet applied, 1 rest, 2 active; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
+const CLOCKS_REST: [(u32, u32); 7] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 400_000)];
+/// Dark — the screen off, nobody touching, no transfer: nothing is drawn, so the X3 and MIF go to their floors and the display's clock to its 143 MHz floor (measured 70 mW under rest with the screen off).
+const CLOCKS_DARK: [(u32, u32); 7] = [(4, 500_000), (0, 421_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 143_000)];
+const CLOCKS_ACTIVE: [(u32, u32); 7] = [(0, 2_028_000), (5, 1_197_000), (1, 356_000), (3, 1_065_000), (2, 1_425_000), (14, 400_000), (4, 2_914_000)];
+/// The policy's state: 0 not yet applied, 1 rest, 2 active, 3 dark; and whether it runs (`diag dvfs policy off` holds the clocks wherever `dvfs set` puts them, for measuring). Switches counted for DIAG.
 static mut CLOCK_STATE: u8 = 0;
 static mut CLOCK_POLICY_ON: bool = true;
 static mut CLOCK_SWITCHES: u32 = 0;
@@ -785,15 +788,22 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         unsafe { PT_BUSY_AT = now };
     }
     let active = active || now.wrapping_sub(unsafe { PT_BUSY_AT }) < f;
-    if (if active { 2 } else { 1 }) != unsafe { CLOCK_STATE } {
-        clock_profile(active);
+    let dark = !active && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
+    let want = if active { 2 } else if dark { 3 } else { 1 };
+    if want != unsafe { CLOCK_STATE } {
+        clock_profile(want);
     }
 }
 
 /// One of the two operating points, every domain in order; then the X3's timer control (its event stream, which wakes the idle loop's `wfe`) and the counter into note 6, and the switch count into note 7, so a hang after a switch says what the core was left with (the first policy build hung the X3 in `wfe` within a minute of going to rest, 2026-10-25).
-fn clock_profile(active: bool) {
+fn clock_profile(want: u8) {
+    let table: &[(u32, u32)] = match want {
+        2 => &CLOCKS_ACTIVE,
+        3 => &CLOCKS_DARK,
+        _ => &CLOCKS_REST,
+    };
     // Each request answered before the next and before the loop may sleep: the clusters', MIF's and INT's rate requests take no reply (as Linux sends them), so five went out back to back and the loop went straight into `wfe` with the firmware still at work — and on battery (the charger cut) the X3 never woke from that `wfe` (2026-10-25, twice). A rate read takes a reply, and the firmware answers in order: its answer means the request before it is done. The longest wait goes into DIAG.
-    for &(d, khz) in if active { &CLOCKS_ACTIVE } else { &CLOCKS_REST } {
+    for &(d, khz) in table {
         let t0 = cntpct();
         let _ = crate::acpm::dvfs_set(d, khz);
         let _ = crate::acpm::dvfs_get(d);
@@ -803,7 +813,7 @@ fn clock_profile(active: bool) {
     let v: u64;
     unsafe {
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
-        CLOCK_STATE = if active { 2 } else { 1 };
+        CLOCK_STATE = want;
         CLOCK_SWITCHES += 1;
         platform::note(6, (CLOCK_STATE as u64) << 56 | v);
         platform::note(7, (CLOCK_SWITCHES as u64) << 40 | cntpct() >> 16);
@@ -1556,7 +1566,7 @@ pub fn run(mut b: Boot) -> ! {
                                             // `diag dvfs policy on|off`: the rest/active clock policy (clock_policy) runs, or holds off so `dvfs set` sticks.
                                             // `diag dvfs profile rest|active`: one of the policy's operating points by hand.
                                             if words.len() == 3 && words[1] == b"profile" {
-                                                clock_profile(words[2] == b"active");
+                                                clock_profile(match words[2] { b"active" => 2, b"dark" => 3, _ => 1 });
                                             }
                                             if words.len() == 3 && words[1] == b"policy" {
                                                 unsafe {
@@ -1566,7 +1576,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     }
                                                 }
                                             }
-                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active), {} switches, longest request {} us\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }).as_bytes());
+                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active, 3 dark), {} switches, longest request {} us\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }).as_bytes());
                                             if words.len() == 4 && words[1] == b"set" {
                                                 let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
                                                 match (num(words[2]), num(words[3])) {
@@ -2181,8 +2191,9 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"power" || cmd.params.starts_with(b"power start") {
                                             // `diag power start <s> [gap in 1/16 s] [input]`, then `diag power`: the system's draw over a window, sampled by the service loop's own passes (power_start / power_poll), the charger cut for it.
                                             if let Some(a) = cmd.params.strip_prefix(b"power start").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                                                resp.extend_from_slice(power_start(v.first().copied().unwrap_or(16), v.get(1).copied().unwrap_or(2), a.contains("input")).as_bytes());
+                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().take_while(|w| *w != "after").filter_map(|t| t.parse().ok()).collect();
+                                                let delay = a.split_whitespace().skip_while(|w| *w != "after").nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+                                                resp.extend_from_slice(power_start(v.first().copied().unwrap_or(16), v.get(1).copied().unwrap_or(2), a.contains("input"), delay).as_bytes());
                                             } else {
                                                 match unsafe { (&*(&raw const POWER_WIN), &*(&raw const POWER_RESULT)) } {
                                                     (Some(w), _) => resp.extend_from_slice(alloc::format!("running: {} samples so far\n", w.n).as_bytes()),
