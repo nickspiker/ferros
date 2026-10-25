@@ -374,6 +374,24 @@ pub fn pre_h8_exit(p: CalParams) -> u32 {
     0
 }
 
+/// Post-hibernate-ENTER cal (`ufs_cal_post_h8_enter`, zuma `post_h8_enter` table), run after DME_HIBERN8_ENTER completes and before the internal clocks are stopped — the mirror of `pre_h8_exit`. Rows, each over its lanes before the next: per-connected-lane PMA_TRSV_SQ 0x9F4=0x08 and 0xA00=0x3A (squelch off), PMA_COMN 0x000=0x51 (once), per-lane PMA_TRSV 0xB64=0x30 then 0x33. Caller must have the FORCE_HCS clock-stop enables cleared.
+pub fn post_h8_enter(p: CalParams) -> u32 {
+    for lane in 0..p.connected_rx_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0x9F4, 0x08);
+    }
+    for lane in 0..p.connected_rx_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0xA00, 0x3A);
+    }
+    wr(base::PMA + 0x000, 0x51);
+    for lane in 0..p.available_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0xB64, 0x30);
+    }
+    for lane in 0..p.available_lane {
+        wr(base::PMA + PMA_LANE_STRIDE * lane as usize + 0xB64, 0x33);
+    }
+    0
+}
+
 /// Pre power-mode-change cal for FAST mode, HS series B. Also masks PA_ERROR_IND_RECEIVED in the DL error IRQ shadow, as the reference does before every PMC.
 pub fn pre_pmc_hs_b(p: CalParams) -> u32 {
     const DL_ERROR_IRQ_MASK: usize = 0x4844;

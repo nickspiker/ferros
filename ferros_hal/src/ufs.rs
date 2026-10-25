@@ -254,6 +254,15 @@ pub struct UfsController {
 /// UTP transfers that never completed (the time-bounded completion wait below gave up): a link that is up but has lost a command. Read by the kernel's DIAG.
 pub static UFS_LOST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The link hibernates when idle (POWER.md, 2026-10-25), as Linux's clock gating does on this host (zuma's device tree has no auto-hibernate, so Linux enters by hand): `h8_enter_if_idle` after an idle stretch — DME_HIBERN8_ENTER, IS.UHES, the post-enter PHY cal, the internal clocks stopped — and every command first brings the link back (`h8_wake`: clocks on, the pre-exit PHY cal, DME_HIBERN8_EXIT, IS.UHXS). On by default (`H8_ENABLED`; `diag ufs h8 off` holds the link awake): only the service loop ever enters it, after the boot. Measured 2026-10-25: screen off 1.69 → 1.04 W, screen on 2.2 → 1.61 W — the link had idled at full speed for as long as ferros ran. Counts for DIAG: entries, exits, failures (an enter or exit that did not complete; the link is then treated as awake and the next command shows whether it lives).
+pub static H8_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static H8_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static H8_LAST_USE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static H8_COUNTS: [core::sync::atomic::AtomicU32; 3] = [core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0)];
+/// The clocks the hibernate stops: Linux's CLK_STOP_ALL (REFCLKOUT, REFCLK, UNIPRO MCLK and PCLK, G#17) — not `vs::CLK_STOP_ALL` (G#1F), which also stops the M-PHY's APB clock; Linux leaves that one running.
+const H8_CLK_STOP: u32 = 0x17;
+const H8_CAL: crate::ufs_cal::CalParams = crate::ufs_cal::CalParams { available_lane: 2, connected_rx_lane: 2, active_rx_lane: 2 };
+
 #[cfg(target_arch = "aarch64")]
 fn ticks() -> u64 {
     let t: u64;
@@ -614,7 +623,63 @@ impl UfsController {
     }
 
     /// Common UTRD setup, doorbell, poll, return OCS. Caller must have already filled ucd.cmd_upiu and prdt.
+    /// Wait up to `ms` for an IS bit, and clear it: true if it came.
+    fn wait_is(&self, bit: u32, ms: u64) -> bool {
+        let end = ticks() + tick_hz() / 1000 * ms;
+        while ticks() < end {
+            if self.read_reg(regs::IS) & bit != 0 {
+                self.write_reg(regs::IS, bit);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Out of hibernate before a command (Exynos hibern8_notify EXIT: clocks on, then the pre-exit cal, then the DME command).
+    fn h8_wake(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !H8_ON.load(Relaxed) {
+            return;
+        }
+        self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) & !H8_CLK_STOP);
+        crate::ufs_cal::pre_h8_exit(H8_CAL);
+        let ok = matches!(self.uic_cmd(uic::DME_HIBERN8_EXIT, 0, 0, 0), Ok(0)) && self.wait_is(regs::IS_UHXS, 20);
+        H8_ON.store(false, Relaxed);
+        H8_COUNTS[if ok { 1 } else { 2 }].fetch_add(1, Relaxed);
+    }
+
+    /// The link awake now, whatever its state: before a reload hands the controller to a kernel that expects it awake.
+    pub fn h8_wake_now(&self) {
+        self.h8_wake();
+    }
+
+    /// Into hibernate if the link has been idle `idle_ticks` with nothing in the doorbell (Exynos hibern8_notify ENTER: the DME command, then the post-enter cal, then the clocks stopped). Returns whether it went in. Callers hold the kernel lock, as every command does.
+    pub fn h8_enter_if_idle(&self, idle_ticks: u64) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !H8_ENABLED.load(Relaxed) || H8_ON.load(Relaxed) || ticks().wrapping_sub(H8_LAST_USE.load(Relaxed)) < idle_ticks || !self.link_is_up() || self.read_reg(regs::UTRLDBR) != 0 {
+            return false;
+        }
+        let ok = matches!(self.uic_cmd(uic::DME_HIBERN8_ENTER, 0, 0, 0), Ok(0)) && self.wait_is(regs::IS_UHES, 20);
+        if !ok {
+            H8_COUNTS[2].fetch_add(1, Relaxed);
+            H8_LAST_USE.store(ticks(), Relaxed);
+            return false;
+        }
+        crate::ufs_cal::post_h8_enter(H8_CAL);
+        self.hci_w(vs::CLKSTOP_CTRL, self.hci(vs::CLKSTOP_CTRL) | H8_CLK_STOP);
+        H8_ON.store(true, Relaxed);
+        H8_COUNTS[0].fetch_add(1, Relaxed);
+        true
+    }
+
     fn send_command(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
+        self.h8_wake();
+        let r = self.send_command_awake(cmd_type, direction, prdt_count);
+        H8_LAST_USE.store(ticks(), core::sync::atomic::Ordering::Relaxed);
+        r
+    }
+
+    fn send_command_awake(&self, cmd_type: u32, direction: u32, prdt_count: u16) -> u8 {
         unsafe {
             let buf = &raw mut UFS_BUF;
             let ucd_addr = &raw const (*buf).ucd as usize as u64;

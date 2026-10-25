@@ -234,7 +234,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut token = [0u8; 32];
     let tick = freq() / 128;
     p.irq_setup();
+    let mut screen_off = false;
     loop {
+        // Screen off, sensing off (owner, 2026-10-25: lean power): the controller stops scanning while the screen is dark and starts again when it comes back, as the vendor driver's mode handler does on screen down/up — scan mode active with every sensing bit clear (`A0 00 00`) or set (`A0 00 FF`), each after the two-byte zero write to G#2000_0000 the controller needs before a mode change.
+        let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        if off != screen_off {
+            screen_off = off;
+            p.transact(&[0xFA, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], &mut []);
+            p.transact(&[0xA0, 0x00, if off { 0x00 } else { 0xFF }], &mut []);
+        }
         // The controller first, so a client's call is answered from a table that is already current.
         if p.irq() {
             let mut batch = [[0u8; EVT_SIZE]; 32];

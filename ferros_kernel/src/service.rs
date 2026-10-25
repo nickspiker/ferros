@@ -680,6 +680,7 @@ fn thermal_poll() {
 
 /// The vault's key count for fact 7, kept by the service loop (gauge_poll).
 static VAULT_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static VAULT_KEYS_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// A power measurement that does not disturb what it measures (2026-10-25: the old `display power` busy-waited between samples on the kernel's core, so every reading carried the X3 spinning flat out and the display stalled behind it). `diag power start <s> [gap 1/16 s] [input]` cuts the charger (and with `input` deselects CHGIN too) and returns at once; the service loop takes a gauge sample on its ordinary passes whenever one is due, from half a second after the cut (the gauge's own settling), and puts the charger back at the deadline whatever the host does. `diag power` reads the result. Fields: start, settle end, end, next sample, gap (ticks), charger mode before, input before, current sum (µA), voltage sum (µV), samples, min and max current (µA).
 struct PowerWin {
@@ -823,8 +824,12 @@ fn gauge_poll() {
                 Ok(s) => [s.soc as u64, s.temp_cc as i64 as u64, s.vcell_uv as u64, s.current_ua as i64 as u64],
                 Err(_) => [crate::process::FACT_UNKNOWN; 4],
             };
-            if let Some(keys) = crate::process::with_lock(|| (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok())) {
-                VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
+            // The vault's key count only every 64 s: it reads the flash, and every 2 s it woke the UFS link out of hibernate (POWER.md).
+            if VAULT_KEYS.load(core::sync::atomic::Ordering::Relaxed) == u64::MAX || now.wrapping_sub(VAULT_KEYS_AT.load(core::sync::atomic::Ordering::Relaxed)) > 64 * f {
+                VAULT_KEYS_AT.store(now, core::sync::atomic::Ordering::Relaxed);
+                if let Some(keys) = crate::process::with_lock(|| (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).and_then(|s| s.keys().ok())) {
+                    VAULT_KEYS.store(keys.len() as u64, core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1004,6 +1009,10 @@ pub fn run(mut b: Boot) -> ! {
         gauge_poll();
         power_poll();
         clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
+        // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
+        if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
+        }
         thermal_poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
@@ -2138,10 +2147,22 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params.starts_with(b"ufs h8") {
+                                            // `diag ufs h8 [on|off]`: the UFS link's hibernate on idle (ferros_hal ufs), and its counts.
+                                            if cmd.params == b"ufs h8 on" || cmd.params == b"ufs h8 off" {
+                                                ferros_hal::ufs::H8_ENABLED.store(cmd.params == b"ufs h8 on", core::sync::atomic::Ordering::Relaxed);
+                                            }
+                                            let c = |i: usize| ferros_hal::ufs::H8_COUNTS[i].load(core::sync::atomic::Ordering::Relaxed);
+                                            resp.extend_from_slice(alloc::format!("ufs hibernate on idle {}: {} entries, {} exits, {} failures; lost commands {}\n", if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { "on" } else { "off" }, c(0), c(1), c(2), ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"smp off" || cmd.params == b"smp on" {
                                             // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
                                             if cmd.params == b"smp off" {
-                                                crate::smp::stop_all();
+                                                ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
+                                            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
+                                            crate::smp::stop_all();
                                             } else {
                                                 crate::smp::launch_all();
                                             }
@@ -2823,6 +2844,8 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                             platform::crumb(0xA6);
                                             // The workers off first: the copy below rewrites the kernel under them (smp.rs).
+                                            ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
+                                            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
                                             crate::smp::stop_all();
                                             unsafe {
                                                 // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.

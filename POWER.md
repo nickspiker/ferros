@@ -52,6 +52,21 @@ Then the DSU (the clusters' shared L3 and snoop, 1197 MHz) to its 324 MHz floor:
 
 A third hang came after those refused requests, with the DSU and BCI at their floors and the charger cut: the same signature (the X3 in the idle `wfe`, event stream on). The idle `wfe` now has a backstop: the EL2 timer armed 2 ms out, so a GIC interrupt ends the wait whatever the event stream does, and DIAG `BACKSTOP_WAKES` counts sleeps it ended. Ten 30 s windows at rest since: no hang, no backstop wake — so the backstop has not been needed, and the two triggers taken away (the no-reply burst, requests to powered-off domains) are the likelier explanation. Kept as a net.
 
+## 2026-10-25: Android for comparison, and the UFS link
+
+Android on the same phone (slot a, production build, no root): the cable out, adb over WiFi, `current_now` once a second with the screen on (home screen, brightness 158/255) and the battery's charge counter over 15 minutes with it off (WiFi and the adb connection up, so a light idle, not its deepest).
+
+| | Android | ferros |
+|---|---|---|
+| screen on, idle | 1.16 W | 3.50 W at the start of the day → 2.21 W (clock policy) → **1.58 W** (UFS hibernate) |
+| screen off | 0.31 W | 1.70 W → **1.02 W** |
+
+Screen off at rest with the clocks at their floors still drew 1.63 W, and the CPUs were not it: the four workers switched off saved 60 mW, the X3 at its floor 60 mW. The UFS link was: it idled at full speed for as long as ferros ran. Linux on zuma has no auto-hibernate (no `samsung,support-ah8`) and enters by hand from its clock-gating path, with the vendor PHY steps around it (`exynos_ufs_hibern8_notify`: post_h8_enter after DME_HIBERN8_ENTER, then the internal clocks stopped; clocks on and pre_h8_exit before DME_HIBERN8_EXIT). ferros now does the same (ferros_hal ufs `h8_enter_if_idle`, `h8_wake` before every command): after 16 ms idle the link hibernates. **0.65 W** with the screen off (1.69 → 1.04), 0.6 W with it on. Every command brings it back; vault writes and reads come through intact, no failure and no lost command over hundreds of entries. `diag ufs h8 [on|off]` and its counts; a reload wakes it first.
+
+The vault's key count (fact 7) was read every 2 s and woke the link each time; now every 64 s.
+
+Touch: the controller kept scanning with the screen off. The touch process now sends the vendor driver's screen-down mode (`A0 00 00`, sensing off) when the screen goes off and `A0 00 FF` when it comes back.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
