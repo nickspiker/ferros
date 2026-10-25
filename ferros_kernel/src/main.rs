@@ -53,6 +53,7 @@ mod smp;
 mod rtc;
 mod aoc;
 mod usf;
+mod haptics;
 mod gsa;
 mod ffa;
 mod trusty;
