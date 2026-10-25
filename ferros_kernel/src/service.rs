@@ -498,7 +498,7 @@ fn sensors_up(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mu
             return false;
         }
     }
-    let ok = crate::usf::start(64, false, out);
+    let ok = crate::usf::start(get, 64, false, out);
     out.extend_from_slice(alloc::format!("sensors up in {} ms\n", cntpct().wrapping_sub(t0) * 1000 / cntfrq()).as_bytes());
     ok
 }
@@ -509,6 +509,8 @@ enum SensorBoot {
     Pieces(crate::aoc::Loader),
     Online(u64),
     Usf,
+    /// Registry pushed at this count: waiting for the AoC to probe its buses (asked every 64 ms).
+    Probe(u64, u64),
     Done,
 }
 
@@ -549,9 +551,24 @@ fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<all
             SensorBoot::Done
         }
         SensorBoot::Usf => {
-            crate::usf::start(64, false, &mut out);
-            SensorBoot::Done
+            if crate::usf::open(&mut out) && crate::usf::registry(get, &mut out) {
+                SensorBoot::Probe(now, now)
+            } else {
+                SensorBoot::Done
+            }
         }
+        SensorBoot::Probe(t0, last) if now.wrapping_sub(last) > f / 16 => match crate::usf::sensor_count() {
+            Some(n) if n > 0 => {
+                out.extend_from_slice(alloc::format!("A#{n} sensors after A#{} ms\n", now.wrapping_sub(t0) * 1000 / f).as_bytes());
+                crate::usf::subscribe_gravity(64, false, &mut out);
+                SensorBoot::Done
+            }
+            _ if now.wrapping_sub(t0) > 4 * f => {
+                out.extend_from_slice(b"no sensors 4 s after the registry\n");
+                SensorBoot::Done
+            }
+            _ => SensorBoot::Probe(t0, now),
+        },
         other => other,
     };
     for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
@@ -1409,7 +1426,9 @@ pub fn run(mut b: Boot) -> ! {
                                             } else if let Some(a) = cmd.params.strip_prefix(b"usf start") {
                                                 let a = core::str::from_utf8(a).unwrap_or("");
                                                 let ms = a.split_whitespace().find_map(|t| t.parse::<u64>().ok()).unwrap_or(64);
-                                                crate::usf::start(ms, a.contains("wake"), &mut resp);
+                                                let st = &raw mut store;
+                                                let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                                                crate::usf::start(&mut get, ms, a.contains("wake"), &mut resp);
                                             }
                                             crate::usf::report(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);

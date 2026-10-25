@@ -203,8 +203,8 @@ fn info(handle: u32) -> Option<alloc::string::String> {
     body_text(&body, 0).map(alloc::string::String::from)
 }
 
-/// Bring the gravity stream up: open our channel, ask for the sensor manager (as the HAL does first), find the Gravity sensor (handle 54 in this firmware; looked up by name in case it moves), subscribe every `period_ms` with no batching. `wake`: deliver on com.google.usf rather than the non-wake-up service. Returns what happened, for the log.
-pub fn start(period_ms: u64, wake: bool, out: &mut alloc::vec::Vec<u8>) -> bool {
+/// Open our channel and ask for the sensor manager (the HAL's first request): what the rest needs. Returns whether the AoC answered.
+pub fn open(out: &mut alloc::vec::Vec<u8>) -> bool {
     SVC[0].store(aoc::service("com.google.usf"), Ordering::Relaxed);
     SVC[1].store(aoc::service("com.google.usf.non_wake_up"), Ordering::Relaxed);
     let h = usf();
@@ -217,16 +217,77 @@ pub fn start(period_ms: u64, wake: bool, out: &mut alloc::vec::Vec<u8>) -> bool 
     let opened = aoc::ipc_write(h, &open);
     let server = send(GET_SERVER.to_vec(), Some(60)).and_then(|t| reply(t, 64));
     out.extend_from_slice(alloc::format!("usf: channel {CHAN} open {opened}, sensor manager {:?}\n", server.as_ref().map(|(s, b)| (*s, body_u32(b, 0)))).as_bytes());
+    server.is_some()
+}
+
+/// The sensors the AoC lists (type 5 to the sensor manager, handle 13): how many. Zero until the registry is loaded and its buses probed.
+pub fn sensor_count() -> Option<usize> {
+    let mut m = BARE.to_vec();
+    put32(&mut m, 52, 13);
+    put32(&mut m, 56, 5);
+    let txn = send(m, Some(60))?;
+    let (_, body) = reply(txn, 64)?;
+    let f = field(&body, root(&body)?, 0)?;
+    u32_at(&body, f + u32_at(&body, f)? as usize).map(|n| n as usize)
+}
+
+/// Push the sensor registry, as the sensor HAL does on connect (sensors.usf.so SensorHal::LoadRegistry; decoded 2026-10-24): each script whole as a LoadScript request (type 24, body {f0 the text and its NUL, f1 the board's CDT, f2 its MLB number}) to the registry server, in order, stopping at the first error, then a Set (type 22) of "/" with loaded=1, on which the AoC probes its buses and the sensors appear. Skipped when the registry already says loaded (a warm reload). `get` reads the vault: the scripts are `aoc.reg.0`, `aoc.reg.1`, … (tools/husky-aoc-reg.sh).
+pub fn registry(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> bool {
+    let Some(rh) = server(&REGISTRY) else {
+        out.extend_from_slice(b"registry server: no answer\n");
+        return false;
+    };
+    // Loaded already? A Get of "/" lists its props.
+    if let Some(txn) = request(rh, 21, Some(&fb(&[F::B(b"/\0")]))) {
+        if let Some((0, body)) = reply(txn, 64) {
+            if body.windows(7).any(|w| w == b"loaded\0") {
+                out.extend_from_slice(b"registry: loaded already\n");
+                return true;
+            }
+        }
+    }
+    let (cdt, mlb) = (CDT.load(Ordering::Relaxed), MLB.load(Ordering::Relaxed));
+    out.extend_from_slice(alloc::format!("registry: board CDT G#{cdt:X} MLB A#{mlb}\n").as_bytes());
+    let mut n = 0;
+    for i in 0.. {
+        let Some(mut text) = get(&alloc::format!("aoc.reg.{i}")) else { break };
+        text.push(0);
+        let body = fb(&[F::B(&text), if cdt == 0 { F::N } else { F::U(cdt) }, if mlb == 0 { F::N } else { F::U(mlb) }]);
+        let Some(txn) = request(rh, 24, Some(&body)) else {
+            out.extend_from_slice(alloc::format!("registry: script {i} not sent\n").as_bytes());
+            return false;
+        };
+        match reply(txn, 512) {
+            Some((0, _)) => n += 1,
+            r => {
+                out.extend_from_slice(alloc::format!("registry: script {i} ({} bytes): {:?}\n", text.len(), r.map(|(s, _)| s)).as_bytes());
+                return false;
+            }
+        }
+    }
+    if n == 0 {
+        out.extend_from_slice(b"registry: no aoc.reg.* in the vault (tools/husky-aoc-reg.sh)\n");
+        return false;
+    }
+    let set = fb(&[F::B(b"/\0"), F::T(alloc::vec![alloc::vec![F::B(b"loaded\0"), F::B(b"1\0")]])]);
+    let r = request(rh, 22, Some(&set)).and_then(|t| reply(t, 512));
+    out.extend_from_slice(alloc::format!("registry: {n} scripts loaded, loaded=1: {:?}\n", r.as_ref().map(|(s, _)| *s)).as_bytes());
+    matches!(r, Some((0, _)))
+}
+
+/// Subscribe to the Gravity sensor (handle 54 in this firmware; looked up by name in case it moves) every `period_ms`, no batching. `wake`: deliver on com.google.usf rather than the non-wake-up service.
+pub fn subscribe_gravity(period_ms: u64, wake: bool, out: &mut alloc::vec::Vec<u8>) -> bool {
     let mut handle = 54;
-    let name = info(handle);
+    let mut name = info(handle);
     // Android's HAL lists it as "Gravity Sensor".
     let is_gravity = |n: &Option<alloc::string::String>| n.as_deref().is_some_and(|n| n.starts_with("Gravity"));
     if !is_gravity(&name) {
         out.extend_from_slice(alloc::format!("usf: handle 54 is {name:?}; looking for Gravity\n").as_bytes());
         handle = 0;
         for k in 18..96 {
-            if is_gravity(&info(k)) {
-                handle = k;
+            let n = info(k);
+            if is_gravity(&n) {
+                (handle, name) = (k, n);
                 break;
             }
         }
@@ -248,9 +309,27 @@ pub fn start(period_ms: u64, wake: bool, out: &mut alloc::vec::Vec<u8>) -> bool 
     };
     let r = reply(txn, 256);
     let id = r.as_ref().and_then(|(_, b)| body_u32(b, 0)).unwrap_or(0);
-    out.extend_from_slice(alloc::format!("usf: subscribe Gravity (handle {handle}) every {period_ms} ms, {}: status {:?}, subscription {id}\n", if wake { "wake" } else { "non-wake" }, r.as_ref().map(|(s, _)| *s)).as_bytes());
+    out.extend_from_slice(alloc::format!("usf: subscribe {name:?} (handle {handle}) every {period_ms} ms, {}: status {:?}, subscription {id}\n", if wake { "wake" } else { "non-wake" }, r.as_ref().map(|(s, _)| *s)).as_bytes());
     SUB_ID.store(id.max(1), Ordering::Relaxed);
     id != 0
+}
+
+/// `diag usf start [wake] [ms]`: open, push the registry, wait up to 2 s for sensors, subscribe — all at once (the boot does it a step a pass).
+pub fn start(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, period_ms: u64, wake: bool, out: &mut alloc::vec::Vec<u8>) -> bool {
+    if !open(out) || !registry(get, out) {
+        return false;
+    }
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    let mut n = 0;
+    while crate::platform::cntpct().wrapping_sub(t0) < 2 * f {
+        n = sensor_count().unwrap_or(0);
+        if n > 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(alloc::format!("usf: A#{n} sensors after A#{} ms\n", crate::platform::cntpct().wrapping_sub(t0) * 1000 / f).as_bytes());
+    subscribe_gravity(period_ms, wake, out)
 }
 
 /// The sensors' two rails on the sub PMIC (zuma-common.dtsi, the AoC's `sensor_power_list`): LDO7S 1.8 V (L7S_SENSORS_FPS) and LDO5S 3.3 V (L5S_PROX), control registers G#35 and G#33 (s2mpg15-register.h); bit 7 enables. Both are boot-on in the device tree.
@@ -303,52 +382,134 @@ pub fn raw(handle: u32, ty: u32, out: &mut alloc::vec::Vec<u8>) {
     }
 }
 
-// ── Building requests (the same shapes as the captured ones: each table's vtable just before it, its vector just after) ──
-/// A FlatBuffer holding one table whose fields are 4-byte scalars and, last, one [ubyte] vector.
-fn table(scalars: &[u32], vector: Option<&[u8]>) -> alloc::vec::Vec<u8> {
-    let nf = scalars.len() + vector.is_some() as usize;
-    let vsize = 4 + 2 * nf;
-    let vt = 4;
-    let t = (vt + vsize + 3) & !3;
-    let mut b = alloc::vec::Vec::new();
-    b.extend_from_slice(&(t as u32).to_le_bytes());
-    b.extend_from_slice(&(vsize as u16).to_le_bytes());
-    b.extend_from_slice(&((4 + 4 * nf) as u16).to_le_bytes());
-    for i in 0..nf {
-        b.extend_from_slice(&((4 + 4 * i) as u16).to_le_bytes());
-    }
-    b.resize(t, 0);
-    b.extend_from_slice(&((t - vt) as i32).to_le_bytes());
-    for &v in scalars {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
-    if let Some(v) = vector {
-        b.extend_from_slice(&4u32.to_le_bytes());
-        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-        b.extend_from_slice(v);
+// ── Building messages ──
+/// A FlatBuffer field: a 4-byte scalar, a [ubyte] vector, a vector of tables, or absent (a FlatBuffer leaves a default-valued field out).
+pub enum F<'a> {
+    U(u32),
+    B(&'a [u8]),
+    T(alloc::vec::Vec<alloc::vec::Vec<F<'a>>>),
+    N,
+}
+
+/// Lay one table out at the end of `b`, forward: its vtable, then the table (soffset, a 4-byte slot per present field), then each field's vector or nested tables after it, so every uoffset points forward. Returns the table's position. Any valid layout parses the same; the AoC's registry server answered these (2026-10-24).
+fn emit(b: &mut alloc::vec::Vec<u8>, fields: &[F]) -> usize {
+    let pad4 = |b: &mut alloc::vec::Vec<u8>| {
         while b.len() % 4 != 0 {
             b.push(0);
         }
+    };
+    pad4(b);
+    let vt = b.len();
+    let present = fields.iter().filter(|f| !matches!(f, F::N)).count();
+    b.extend_from_slice(&((4 + 2 * fields.len()) as u16).to_le_bytes());
+    b.extend_from_slice(&((4 + 4 * present) as u16).to_le_bytes());
+    let mut k = 0;
+    for f in fields {
+        let o = if matches!(f, F::N) { 0 } else { k += 1; 4 * k };
+        b.extend_from_slice(&(o as u16).to_le_bytes());
     }
+    pad4(b);
+    let t = b.len();
+    b.extend_from_slice(&((t - vt) as i32).to_le_bytes());
+    let mut slots = alloc::vec::Vec::new();
+    for f in fields {
+        match f {
+            F::N => {}
+            F::U(v) => b.extend_from_slice(&v.to_le_bytes()),
+            _ => {
+                slots.push(b.len());
+                b.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    let patch = |b: &mut alloc::vec::Vec<u8>, at: usize, to: usize| b[at..at + 4].copy_from_slice(&((to - at) as u32).to_le_bytes());
+    let mut si = 0;
+    for f in fields {
+        match f {
+            F::B(v) => {
+                pad4(b);
+                let v0 = b.len();
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                b.extend_from_slice(v);
+                patch(b, slots[si], v0);
+                si += 1;
+            }
+            F::T(list) => {
+                pad4(b);
+                let v0 = b.len();
+                b.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                let first = b.len();
+                b.resize(first + 4 * list.len(), 0);
+                for (i, e) in list.iter().enumerate() {
+                    let et = emit(b, e);
+                    patch(b, first + 4 * i, et);
+                }
+                patch(b, slots[si], v0);
+                si += 1;
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
+/// A whole FlatBuffer whose root table has these fields.
+fn fb(fields: &[F]) -> alloc::vec::Vec<u8> {
+    let mut b = alloc::vec![0u8; 4];
+    let t = emit(&mut b, fields);
+    b[0..4].copy_from_slice(&(t as u32).to_le_bytes());
     b
 }
 
-/// A whole request on our channel: [channel][outer {kind 1, payload: inner {type, transaction, handle, body}}]; its transaction.
-fn request(handle: u32, ty: u32, body: Option<&[u8]>) -> Option<u32> {
+/// The largest message the transport sends whole (libusf EfwTransportClient: G#3F4, without the channel word); a longer one goes as fragments (kind 3).
+const MAX_MSG: usize = 1012;
+
+/// Put one finished outer message on our channel, as fragments when it is longer than MAX_MSG: each {f0 1, f1 the whole length, f2 the byte offset (absent at 0), f3 the slice} in a kind-3 message; the AoC joins the slices and parses the whole (libusf UsfTransport::SendMsgFrag).
+fn send_msg(outer: &[u8]) -> bool {
     let h = usf();
     if h == 0 {
-        return None;
+        return false;
     }
+    let put = |m: &[u8]| {
+        let mut w = CHAN.to_le_bytes().to_vec();
+        w.extend_from_slice(m);
+        // A full ring (256 slots) drains as the AoC reads: wait up to 64 ms for room.
+        let f = crate::platform::cntfrq();
+        let t0 = crate::platform::cntpct();
+        while !aoc::ipc_write(h, &w) {
+            if crate::platform::cntpct().wrapping_sub(t0) > f / 16 {
+                return false;
+            }
+        }
+        true
+    };
+    if outer.len() <= MAX_MSG {
+        return put(outer);
+    }
+    let frag = |c: &[u8], off: usize| fb(&[F::U(3), F::B(&fb(&[F::U(1), F::U(outer.len() as u32), if off == 0 { F::N } else { F::U(off as u32) }, F::B(c)]))]);
+    let overhead = frag(&[0; 4], 1).len() - 4;
+    let chunk = (MAX_MSG - overhead) & !3;
+    let mut off = 0;
+    while off < outer.len() {
+        let c = &outer[off..(off + chunk).min(outer.len())];
+        if !put(&frag(c, off)) {
+            return false;
+        }
+        off += c.len();
+    }
+    true
+}
+
+/// A request on our channel: outer {kind 1, payload: {type, transaction, handle, body}}; its transaction.
+fn request(handle: u32, ty: u32, body: Option<&[u8]>) -> Option<u32> {
     let txn = TXN.fetch_add(1, Ordering::Relaxed);
-    let inner = table(&[ty, txn, handle], body);
-    let mut m = CHAN.to_le_bytes().to_vec();
-    m.extend_from_slice(&table(&[1], Some(&inner)));
-    aoc::ipc_write(h, &m).then_some(txn)
+    let inner = fb(&[F::U(ty), F::U(txn), F::U(handle), body.map(F::B).unwrap_or(F::N)]);
+    send_msg(&fb(&[F::U(1), F::B(&inner)])).then_some(txn)
 }
 
 /// Open a server by its 16-byte UUID (type 3 to handle 1): its handle.
 fn server(uuid: &[u8; 16]) -> Option<u32> {
-    let txn = request(1, 3, Some(&table(&[], Some(uuid))))?;
+    let txn = request(1, 3, Some(&fb(&[F::B(uuid)])))?;
     let (_, body) = reply(txn, 64)?;
     body_u32(&body, 0)
 }
@@ -364,7 +525,7 @@ pub fn reg(path: &str, out: &mut alloc::vec::Vec<u8>) {
     };
     let mut p = path.as_bytes().to_vec();
     p.push(0);
-    let Some(txn) = request(rh, 21, Some(&table(&[], Some(&p)))) else { return };
+    let Some(txn) = request(rh, 21, Some(&fb(&[F::B(&p)]))) else { return };
     let Some((status, body)) = reply(txn, 128) else {
         out.extend_from_slice(b"registry read: no answer\n");
         return;
@@ -383,4 +544,72 @@ pub fn reg(path: &str, out: &mut alloc::vec::Vec<u8>) {
             out.extend_from_slice(alloc::format!("{label}{}{}\n", text(0).unwrap_or_default(), text(1).map(|v| alloc::format!(" = {v}")).unwrap_or_default()).as_bytes());
         }
     }
+}
+
+// ── The board's identity for the registry scripts ──
+/// The board's CDT (product << 16 | stage << 12 | major << 8 | minor << 4 | variant) as ABL's device tree gives it in /chosen/plat, read at entry (`read_board`); 0 when absent. The registry scripts filter their sections on it (`?+0x20000:0xFFFF0000`, husky_dvt excludes proto and EVT stages); with 0 the AoC skips husky_common and husky_dvt and no sensor appears.
+pub static CDT: AtomicU32 = AtomicU32::new(0);
+/// The board's MLB number from /chosen/config/pcbcfg ("MLB-<n>"); 0 when absent.
+pub static MLB: AtomicU32 = AtomicU32::new(0);
+
+/// Read /chosen/plat {product, stage, major, minor, variant} (big-endian cells) and /chosen/config pcbcfg out of the FDT at `addr`, as libusf's UsfRegistryStoreFile::GetDevCdtInfo does from /sys/firmware/devicetree. A walk of the structure block tracking the node path.
+pub fn read_board(addr: u64) {
+    let be = |p: usize| unsafe { u32::from_be(core::ptr::read_unaligned(p as *const u32)) };
+    let base = addr as usize;
+    if be(base) != 0xD00D_FEED {
+        return;
+    }
+    let size = be(base + 4) as usize;
+    let (st, strs) = (base + be(base + 8) as usize, base + be(base + 12) as usize);
+    let end = base + size.min(4 << 20);
+    let name_at = |p: usize| -> &'static [u8] {
+        let mut n = 0;
+        while p + n < end && unsafe { *((p + n) as *const u8) } != 0 {
+            n += 1;
+        }
+        unsafe { core::slice::from_raw_parts(p as *const u8, n) }
+    };
+    // The path as node names, depth 0 = root.
+    let mut path: [&[u8]; 8] = [b""; 8];
+    let mut depth = 0usize;
+    let mut cells = [0u32; 5];
+    let mut pos = st;
+    while pos + 4 <= end {
+        let tok = be(pos);
+        pos += 4;
+        match tok {
+            1 => {
+                let n = name_at(pos);
+                if depth < 8 {
+                    path[depth] = n;
+                }
+                depth += 1;
+                pos = (pos + n.len() + 1 + 3) & !3;
+            }
+            2 => depth = depth.saturating_sub(1),
+            3 => {
+                let (len, off) = (be(pos) as usize, be(pos + 4) as usize);
+                let data = pos + 8;
+                let pname = name_at(strs + off);
+                if depth == 3 && path[1] == b"chosen" && path[2] == b"plat" && len == 4 {
+                    let k = [b"product".as_slice(), b"stage", b"major", b"minor", b"variant"].iter().position(|&k| k == pname);
+                    if let Some(k) = k {
+                        cells[k] = be(data);
+                    }
+                }
+                if depth == 3 && path[1] == b"chosen" && path[2] == b"config" && pname == b"pcbcfg" {
+                    let v = unsafe { core::slice::from_raw_parts(data as *const u8, len) };
+                    if let Some(rest) = v.strip_prefix(b"MLB-") {
+                        let n = rest.iter().take_while(|c| c.is_ascii_digit()).fold(0u32, |a, &c| a * 10 + (c - b'0') as u32);
+                        MLB.store(n, Ordering::Relaxed);
+                    }
+                }
+                pos = (data + len + 3) & !3;
+            }
+            4 => {}
+            _ => break,
+        }
+    }
+    let [product, stage, major, minor, variant] = cells;
+    CDT.store(product << 16 | (stage & 15) << 12 | (major & 15) << 8 | (minor & 15) << 4 | (variant & 15), Ordering::Relaxed);
 }

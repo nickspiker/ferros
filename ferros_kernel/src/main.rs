@@ -1735,6 +1735,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
     let hv_answered = ready::answered_by_hv();
     let real_boot = dtb_addr != 0 && dtb_addr & 1 == 0;
+    // The board's CDT and MLB for the sensor registry scripts (usf.rs), while ABL's device tree is still where it put it.
+    if real_boot {
+        usf::read_board(dtb_addr);
+    }
     // Dev builds bring USB up before the gate, so the host can answer it (`ferros-bridge gate ferros|android|hold`) as the keys do; the service takes the controller over after the press. Release builds have no USB until the press (owner, 2026-10-22).
     let mut gate_usb: Option<ferros_hal::usb::Dwc3Dev> = None;
     if cfg!(not(ferros_production)) && !hv_answered && real_boot {
