@@ -164,6 +164,18 @@ fn drain(want: Option<u32>) -> Option<(u32, alloc::vec::Vec<u8>)> {
 fn sample(p: &[u8]) {
     EVENTS.fetch_add(1, Ordering::Relaxed);
     let (Some(ty), Some(&count), Some(&size)) = (u16_at(p, 12), p.get(14), p.get(15)) else { return };
+    if ty == 12 && size >= 48 && count > 0 {
+        // The rear spectral sensor (VD6282): the newest sample's six channel counts and six gains, for the spectral widget (SYS_FACTS 20–26).
+        let at = 16 + (count as usize - 1) * (8 + size as usize) + 8;
+        for i in 0..6 {
+            let pair = |o: usize| u32_at(p, at + 4 * o).unwrap_or(0) as u64 | (u32_at(p, at + 4 * (o + 1)).unwrap_or(0) as u64) << 32;
+            if i % 2 == 0 {
+                SPECTRAL[i / 2].store(pair(i), Ordering::Relaxed);
+                SPECTRAL[3 + i / 2].store(pair(6 + i), Ordering::Relaxed);
+            }
+        }
+        SPECTRAL[6].fetch_add(1, Ordering::Relaxed);
+    }
     if ty != 22 {
         // Any other sensor: its latest event kept whole, for `diag usf ev`.
         unsafe {
@@ -208,6 +220,9 @@ fn sample(p: &[u8]) {
     }
 }
 
+/// The rear spectral sensor's newest sample: channel counts 0|1, 2|3, 4|5 and gains 0|1, 2|3, 4|5 as f32 bit pairs, then how many samples have come. SYS_FACTS 20–26.
+pub static SPECTRAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
 /// The last two gravity samples: [x | y << 32, z, time in counter ticks] for the newest, then the same for the one before (f32 bits, m/s²). SYS_FACTS 14–19.
 pub static PAIR: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
@@ -233,6 +248,29 @@ pub fn events(out: &mut alloc::vec::Vec<u8>) {
             out.push(b'\n');
         }
     }
+}
+
+/// The handle of the first listed sensor whose name starts with `name`.
+pub fn find(name: &str) -> Option<u32> {
+    (1..128).find(|&k| info(k).is_some_and(|n| n.starts_with(name)))
+}
+
+/// The DisplayInfo server's UUID (the sensor HAL's DisplayInfo thread opens it; handle 17 under Android).
+const DISPLAY_INFO: [u8; 16] = [0xa8, 0x8e, 0xc6, 0x24, 0x10, 0x40, 0x2a, 0xed, 0xca, 0xb9, 0xa5, 0xaa, 0xd6, 0xa2, 0xee, 0xd2];
+
+/// Tell the AoC the display's state (type 1001 to the DisplayInfo server; sensors.usf.so UsfMsgDisplayInfo, decoded 2026-10-24): f0 brightness as DBV, f1 status (0 off, 1 on, 2 AOD, 3 HBM), f2 the refresh rate, f6 the panel's operating rate, f8 PWM mode (−1: not switchable), f9 the message version (2), f10 luma (3 floats, from the histogram) and f11 leakage (floats). The under-display TMD3719 times its light and proximity bursts to the panel by these; without them it logs "Sync delay shouldn't be less than 0" and never measures. Zero scalars are left out, as the HAL does.
+pub fn display_info(dbv: u32, on: bool, hz: u32, out: &mut alloc::vec::Vec<u8>) -> bool {
+    let Some(h) = server(&DISPLAY_INFO) else {
+        out.extend_from_slice(b"display info server: no answer\n");
+        return false;
+    };
+    let nz = |v: u32| if v == 0 { F::N } else { F::U(v) };
+    let luma = [0u32; 3];
+    let leak = [0u32; 1];
+    let body = fb(&[nz(dbv), nz(on as u32), nz(hz), F::N, F::N, F::N, nz(hz), F::N, F::U(0xFF), F::U(2), F::W(&luma), F::W(&leak)]);
+    let r = request(h, 1001, Some(&body)).and_then(|t| reply(t, 128));
+    out.extend_from_slice(alloc::format!("display info (handle {h}): DBV {dbv}, {}, {hz} Hz: {:?}\n", if on { "on" } else { "off" }, r.as_ref().map(|(s, _)| *s)).as_bytes());
+    r.is_some()
 }
 
 /// `diag usf sensors`: every handle the AoC lists, with its name.
@@ -518,6 +556,8 @@ pub fn raw(handle: u32, ty: u32, out: &mut alloc::vec::Vec<u8>) {
 pub enum F<'a> {
     U(u32),
     B(&'a [u8]),
+    /// A vector of 4-byte elements (f32 bits): its length counts elements.
+    W(&'a [u32]),
     T(alloc::vec::Vec<alloc::vec::Vec<F<'a>>>),
     N,
 }
@@ -562,6 +602,16 @@ fn emit(b: &mut alloc::vec::Vec<u8>, fields: &[F]) -> usize {
                 let v0 = b.len();
                 b.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 b.extend_from_slice(v);
+                patch(b, slots[si], v0);
+                si += 1;
+            }
+            F::W(v) => {
+                pad4(b);
+                let v0 = b.len();
+                b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for w in v.iter() {
+                    b.extend_from_slice(&w.to_le_bytes());
+                }
                 patch(b, slots[si], v0);
                 si += 1;
             }

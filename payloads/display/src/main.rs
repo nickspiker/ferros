@@ -194,6 +194,7 @@ extern "C" fn panel(grants: u64) -> ! {
                 // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
                 ferros_sys::sleep_until(now() + freq() * 120 / 1000);
                 let _ = dsi.dcs(&[0x29]);
+                te2(&dsi);
                 PANEL_REPRESENT.store(1, Ordering::Release);
             }
             dsi_unlock();
@@ -364,6 +365,16 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 }
 /// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
 const WIDGET_CLOCK: u8 = 0x80;
+/// The rear spectral sensor's widget (the map's icon G#81): a bar per channel.
+const WIDGET_SPECTRAL: u8 = 0x81;
+/// The spectral sensor's newest sample as this pass read it (SYS_FACTS 20–26): counts, gains, sample number.
+static mut SPECTRAL_NOW: Option<([f32; 6], [f32; 6], u64)> = None;
+/// Where the spectral widget was last drawn, and whether a frame holds it (as CLOCK_SHOWN / CLOCK_RECT for the clock).
+static mut SPEC_SHOWN: bool = false;
+static mut SPEC_RECT: draw::Rect = draw::Rect::EMPTY;
+/// The sample number the back buffer's widget shows, and each phase frame's (u64::MAX: unknown, redraw).
+static mut BACK_SPEC: u64 = u64::MAX;
+static mut PHASE_SPEC: [u64; PHASES] = [u64::MAX; PHASES];
 /// The 60 directions (sin, −cos) of k/60 of a turn, Q14, for the clock face (built once at start).
 static mut CLOCK_DIRS: [(i64, i64); 60] = [(0, 0); 60];
 /// A clock is on the screen (the last frame drew one): the render thread checks each second whether its digits changed.
@@ -415,7 +426,9 @@ const GRAV_LAG_MS: u64 = 16;
 
 /// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the phone's tilt says, however small; drawn when a frame goes out (the 10 Hz flips at rest, every frame under a finger). Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
 fn gravity_poll() -> bool {
-    let Some(((l, tl), (p, tp))) = ferros_sys::facts().gravity_pair() else { return false };
+    let f = ferros_sys::facts();
+    unsafe { SPECTRAL_NOW = f.spectral() };
+    let Some(((l, tl), (p, tp))) = f.gravity_pair() else { return false };
     let t = now().wrapping_sub(freq() * GRAV_LAG_MS / 1000);
     // Where t falls between the two samples (held at either end: a late sample holds the last, never extrapolates).
     let s = if tl > tp { ((t as i64 - tp as i64) as f32 / (tl - tp) as f32).clamp(0.0, 1.0) } else { 1.0 };
@@ -548,6 +561,36 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
         }
         (rings, 3, n, sod, Some(h >= 12))
     }
+}
+
+/// The rear spectral sensor's widget in a circle at (cx, cy), radius r (Q8 px): a bar per channel, front to back over the circle's plate. Each bar is the channel's counts per unit gain on a log scale (a tenth of a count to the ADC's 2^24 at gain 1), so the auto-gain's changes do not move it; its index under it. Returns the rectangle it touched.
+fn spectral_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
+    let rp = (r >> 8) as f32;
+    let (x0, y_base) = ((cx >> 8) as f32 - rp * 0.6, (cy >> 8) as f32 + rp * 0.35);
+    let (w, hmax) = (rp * 1.2, rp * 0.8);
+    let slot = w / 6.0;
+    if let Some((c, g, _)) = unsafe { SPECTRAL_NOW } {
+        for i in 0..6 {
+            let v = if g[i] > 0.0 { c[i] / g[i] } else { 0.0 };
+            // log10 from 0.1 (−1) to 2^24 (7.2): 8.2 decades over the bar's height.
+            let f = ((libm::log10f(v.max(0.1)) + 1.0) / 8.2).clamp(0.0, 1.0);
+            let h = (hmax * f).max(1.0);
+            let bx = x0 + slot * i as f32 + slot * 0.15;
+            let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+            paint::fill_rect(&mut cv, bx as isize, (y_base - h) as isize, (slot * 0.7) as isize, h as isize, 0xFF00_0000 | th.text, None, None);
+        }
+    }
+    let px = rp * 0.14;
+    if px >= 6.0 {
+        for i in 0..6 {
+            let d = [b'0' + i as u8];
+            let t = core::str::from_utf8(&d).unwrap_or("");
+            let tw = text_width(font, t, px);
+            let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+            text(&mut cv, font, t, x0 + slot * (i as f32 + 0.5) - tw * 0.5, y_base + px * 1.2, px, 0xFF00_0000 | th.text2);
+        }
+    }
+    draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF)
 }
 
 /// Text centred on (cx, cy) and turned by (c, s), front to back: the clock's digits, which turn with its face.
@@ -913,10 +956,23 @@ fn build_lut(lut: &mut [u16], white: f32, peak_e: f32) {
     }
 }
 
-/// The panel's brightness: high brightness mode with DBV G#FFF, or normal mode at `dbv`.
+/// The panel's brightness: high brightness mode with DBV G#FFF, or normal mode at `dbv`. TE2 with it.
 fn set_panel(dsi: &ferros_dsi::Dsim<DsiGrant>, hbm: bool, dbv: u16) -> bool {
     let r = dsi.dcs(&[0xF0, 0x5A, 0x5A]).and_then(|_| dsi.dcs(&[0x53, if hbm { 0xE0 } else { 0x20 }])).and_then(|_| dsi.dcs(&[0x51, (dbv >> 8) as u8, dbv as u8])).and_then(|_| dsi.dcs(&[0xF0, 0xA5, 0xA5]));
+    te2(dsi);
     r.is_ok()
+}
+
+/// The panel's TE2 output, the beat the under-display light and proximity sensor (TMD3719) times its bursts to: on, changeable, rising edge G#10 and falling G#30 lines into the frame (panel-google-hk3.c `hk3_update_te2_internal`; ABL leaves it off, and without it the sensor never measured, 2026-10-24). Sent with the brightness and after every display on.
+fn te2(dsi: &ferros_dsi::Dsim<DsiGrant>) {
+    let _ = dsi.dcs(&[0xF0, 0x5A, 0x5A]);
+    let _ = dsi.dcs(&[0xB0, 0x00, 0x42, 0xF2]);
+    let _ = dsi.dcs(&[0xF2, 0x0D]);
+    let _ = dsi.dcs(&[0xB0, 0x00, 0x01, 0xB9]);
+    let _ = dsi.dcs(&[0xB9, 0x04]);
+    let _ = dsi.dcs(&[0xB0, 0x00, 0x1E, 0xB9]);
+    let _ = dsi.dcs(&[0xB9, 0x00, 0x10, 0x00, 0x30]);
+    let _ = dsi.dcs(&[0xF0, 0xA5, 0xA5]);
 }
 
 /// The panel's brightness (DBV) against its light, measured in the 1 cm window (DISPLAY-CALIB.md, 2026-10-22): normal mode to DBV 3307; above that, high brightness mode at its full 1472 cd/m² (native white).
@@ -1070,7 +1126,10 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
     if unsafe { CLIP_PHASE }.is_none() {
         for k in 0..PHASES {
             if mask >> k & 1 == 1 {
-                unsafe { PHASE_CLOCK[k] = None };
+                unsafe {
+                    PHASE_CLOCK[k] = None;
+                    PHASE_SPEC[k] = u64::MAX;
+                }
             }
         }
     }
@@ -1262,7 +1321,10 @@ fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: 
         return;
     }
     let dst = phase_slice(k, width * height);
-    unsafe { PHASE_CLOCK[k] = None };
+    unsafe {
+        PHASE_CLOCK[k] = None;
+        PHASE_SPEC[k] = u64::MAX;
+    }
     let fw = (f.x1 - f.x0) as usize;
     let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
     let mut row = [3u32; 1344];
@@ -1864,6 +1926,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe {
                         CLOCK_SHOWN = false;
                         CLOCK_RECT = draw::Rect::EMPTY;
+                        SPEC_SHOWN = false;
+                        SPEC_RECT = draw::Rect::EMPTY;
                         LAST_CAM = if m.get(13).copied().unwrap_or(0) & 1 == 0 && m.len() <= 18 {
                             let mut b = [0u8; 18];
                             b[..m.len()].copy_from_slice(m);
@@ -1920,6 +1984,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let lit = cir.lit != 0;
                         let ri = sr;
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
+                        if cir.icon == WIDGET_SPECTRAL {
+                            let r = spectral_widget(pixels, width, height, sx, sy, sr, th, &font);
+                            ALLOC.reset();
+                            unsafe {
+                                CUR_DMG = CUR_DMG.union(r);
+                                SPEC_SHOWN = true;
+                                SPEC_RECT = SPEC_RECT.union(r);
+                                BACK_SPEC = SPECTRAL_NOW.map(|s| s.2).unwrap_or(0);
+                            }
+                            continue;
+                        }
                         if cir.icon == WIDGET_CLOCK {
                             let mut tb = [0u8; 32];
                             let (rings, nrings, tn, key, pm) = clock_state(&mut tb);
@@ -2381,6 +2456,26 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         l.flush();
                         CLIP_US = [0; 2];
                         CLOCK_PART_US = [0; 2];
+                    }
+                }
+            }
+        }
+        // The spectral widget between frames, as the clock: on a flip, its circle drawn again into the phase the flip shows when a newer sample has come since that phase last held it.
+        if flip_due && unsafe { SPEC_SHOWN && !{ SPEC_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
+            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+            let seq = unsafe { SPECTRAL_NOW }.map(|s| s.2).unwrap_or(0);
+            if unsafe { PHASE_SPEC[k] } != seq {
+                let clip = unsafe { SPEC_RECT }.clip(width, height);
+                if !clip.is_empty() {
+                    unsafe {
+                        draw::CLIP = clip;
+                        CLIP_PHASE = Some(k);
+                    }
+                    replay(&mut handle);
+                    unsafe {
+                        CLIP_PHASE = None;
+                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
+                        PHASE_SPEC[k] = BACK_SPEC;
                     }
                 }
             }

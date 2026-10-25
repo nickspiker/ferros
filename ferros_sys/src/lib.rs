@@ -143,6 +143,16 @@ impl Facts {
         let (xy, z) = (self.get(12)?, self.get(13)?);
         Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
     }
+    /// The rear spectral sensor's (VD6282) newest sample: six channel counts, their six gains, and how many samples have come (a new one when it moves). The registry names the channels r, g, b, c1, c2, ir; which slot is which is not yet measured.
+    pub fn spectral(&self) -> Option<([f32; 6], [f32; 6], u64)> {
+        let seq = self.get(26)?;
+        let w = |i: usize| -> Option<[f32; 2]> {
+            let v = self.get(i)?;
+            Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+        };
+        let (c0, c1, c2, g0, g1, g2) = (w(20)?, w(21)?, w(22)?, w(23)?, w(24)?, w(25)?);
+        Some(([c0[0], c0[1], c1[0], c1[1], c2[0], c2[1]], [g0[0], g0[1], g1[0], g1[1], g2[0], g2[1]], seq))
+    }
     /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the phone whatever its own rate.
     pub fn gravity_pair(&self) -> Option<(([f32; 3], u64), ([f32; 3], u64))> {
         let v = |i: usize| -> Option<([f32; 3], u64)> {
