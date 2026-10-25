@@ -413,7 +413,7 @@ static mut GRAV_TURN: Option<(i64, i64)> = None;
 /// How far behind the phone the clock's turn runs: gravity is evaluated this long before now, between the last two samples the AoC sent (their own timestamps), so every frame sees the phone's attitude at the same lag whatever the frame and sample rates. One 10 ms sample period, plus the ~1 ms the samples take to arrive, plus margin: 16 ms.
 const GRAV_LAG_MS: u64 = 16;
 
-/// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the phone's tilt says, however small. Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
+/// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the phone's tilt says, however small; drawn when a frame goes out (the 10 Hz flips at rest, every frame under a finger). Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
 fn gravity_poll() -> bool {
     let Some(((l, tl), (p, tp))) = ferros_sys::facts().gravity_pair() else { return false };
     let t = now().wrapping_sub(freq() * GRAV_LAG_MS / 1000);
@@ -490,6 +490,8 @@ fn clock_dirty(was: &ClockShown, now: &ClockShown) -> Option<([draw::Rect; 5], u
 
 /// The clock between frames: time spent and how many, logged every 1024 (~100 s at rest).
 static mut CLIP_US: [u64; 2] = [0; 2];
+/// Inside those redraws: the digits (and am/pm), the face, µs summed since the last log.
+static mut CLOCK_PART_US: [u64; 2] = [0; 2];
 
 /// The last plain camera op (op 14 that started a frame from scratch, not over an overlay), replayed each second while a clock shows; None when the last frame had an overlay or an app.
 static mut LAST_CAM: Option<([u8; 18], usize)> = None;
@@ -1849,6 +1851,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let clip_k = unsafe { CLIP_PHASE };
                     if clip_k.is_none() {
                         last_interaction = now();
+                        // Gravity for this frame: under a finger the map's frames come back to back and the loop's top (where gravity is read at rest) is not reached between them, so the clock kept the turn it had when the touch began (owner, 2026-10-24).
+                        gravity_poll();
                     }
                     let saved_dmg = unsafe { (PREV_DMG, CUR_DMG) };
                     // The camera, in integers: the centre in world units ×256, the zoom 16.16, the turn (cos, sin) Q14.
@@ -1933,6 +1937,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
                                 let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
                                 let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
+                                let t_digits = now();
                                 text_turned_centre(pixels, width, height, t, cxf, cyf, px, (tcf, tsf), 0xFF00_0000 | th.text);
                                 ALLOC.reset();
                                 // am / pm under the digits, half their size, turned with the face.
@@ -1941,11 +1946,14 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     text_turned_centre(pixels, width, height, if pm { "pm" } else { "am" }, cxf - tsf * d, cyf + tcf * d, px * 0.45, (tcf, tsf), 0xFF00_0000 | th.text2);
                                     ALLOC.reset();
                                 }
+                                unsafe { CLOCK_PART_US[0] += ferros_sys::us_since(t_digits) };
                             }
+                            let t_face = now();
                             // The face's turn: gravity's when known, else the camera's and the circle's own, as the icons get it.
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
                             let (fc, fs) = unsafe { GRAV_TURN }.unwrap_or(((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14));
                             let r = draw::clock(pixels, width, height, sx, sy, sr, &rings[..nrings], unsafe { &*(&raw const CLOCK_DIRS) }, fc, fs);
+                            unsafe { CLOCK_PART_US[1] += ferros_sys::us_since(t_face) };
                             unsafe {
                                 CLOCK_GEOM = (sx, sy, sr, fc, fs, nrings);
                                 BACK_CLOCK = ClockShown { frac: core::array::from_fn(|k| rings[k].frac_q16), lighter: core::array::from_fn(|k| rings[k].lighter), key, turn: GRAV_TURN.unwrap_or((0, 0)) };
@@ -2314,11 +2322,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 let _ = handle(m, &mut out);
             }
         };
-        // A new turn is drawn now, not at the next 10 Hz flip: the clock-only redraw below runs on this pass's flip, so a turning phone gets a frame per pass (up to the panel's 120 Hz).
-        let turning = gravity_poll();
-        if turning {
-            next_flip = now();
-        }
+        // Gravity at its fixed lag, each pass: drawn at rest on the 10 Hz flips, under a finger on every frame (owner, 2026-10-24: "10 Hz unless touched" — a frame per turn cost the X3 4.4 ms each, 24 % of it on a desk, 53 % in a hand, and 79 °C). The fixed lag keeps the 10 Hz steps even: each shows where the phone was 16 ms before it, not whichever sample came last.
+        gravity_poll();
         if clock_due {
             clock_due = false;
             unsafe { CLOCK_ONLY = true };
@@ -2362,15 +2367,20 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                     CLIP_US[0] += ferros_sys::us_since(t_clip);
                     CLIP_US[1] += 1;
-                    if CLIP_US[1] == 1024 {
+                    if CLIP_US[1] == 256 {
                         let mut l = Log { grants, buf: [0; 256], n: 0 };
                         l.s(b"display: clock between frames: ");
-                        l.dec(CLIP_US[0] / 1024);
-                        l.s(b" us each, the last ");
+                        l.dec(CLIP_US[0] / 256);
+                        l.s(b" us each (digits ");
+                        l.dec(CLOCK_PART_US[0] / 256);
+                        l.s(b" us, face ");
+                        l.dec(CLOCK_PART_US[1] / 256);
+                        l.s(b" us, the rest the clear and the publish), the last ");
                         l.dec(px_n);
                         l.s(b" px\n");
                         l.flush();
                         CLIP_US = [0; 2];
+                        CLOCK_PART_US = [0; 2];
                     }
                 }
             }
@@ -2672,10 +2682,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         if unsafe { TEMPORAL } && client_owned && (0..PHASES).any(|k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
             wake = wake.min((last_interaction + freq() / 8).max(now()));
-        }
-        // Gravity, while the clock is on the glass: every 8 ms while it turns (a frame per panel refresh), every 32 ms at rest, so a turn starts within about three samples.
-        if unsafe { CLOCK_SHOWN && { GRAV_TURN }.is_some() } && !screen_off {
-            wake = wake.min(now() + freq() / if turning { 128 } else { 32 });
         }
         let tail = RING_TAIL.load(Ordering::Acquire);
         if tail == seen_tail {
