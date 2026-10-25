@@ -34,7 +34,7 @@ to_fastboot() {
         echo "== ferros -> fastboot"
         timeout 30 "$BRIDGE" reboot fastboot >/dev/null 2>&1 || true
         for _ in $(seq 40); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
-        # `bridge reboot fastboot` stopped taking on 2026-10-23 (the stamp lost across the watchdog reset, ferros booting again instead); the sure path is through Android, whose `adb reboot bootloader` always lands in fastboot. The gate boots Android without asking on the marker `diag android` leaves (BOOT.md).
+        # `bridge reboot fastboot` lands in fastboot ~40 s after the command (fixed 2026-10-24: the vault's watchdog pets, from the map's writes on the worker cores, had been holding off the reset; platform.rs RESET_ORDERED). Should it not take, the route through Android: its `adb reboot bootloader` always lands in fastboot; the gate boots Android without asking on the marker `diag android` leaves (BOOT.md).
         if lsusb -d 1209:4665 >/dev/null 2>&1; then
             echo "== fastboot did not take; ferros -> Android -> fastboot"
             timeout 60 "$BRIDGE" diag android >/dev/null 2>&1 || true
