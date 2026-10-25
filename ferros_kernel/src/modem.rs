@@ -551,7 +551,14 @@ fn endpoint(rep: &mut Vec<u8>) -> bool {
     for (off, v) in [(0x200usize, 0u32), (0x208, MEM_CPU), (0x20C, 0), (0x210, MEM_CPU + 0x00FE_FFFF), (0x214, MEM_BUS), (0x218, 0), (0x204, 0x8000_0000)] {
         wr(ATU + off, v);
     }
-    let id = cfg_rd(0);
+    // The CP's endpoint may not answer configuration at once after the link trains: all ones until it does. Up to 256 ms (2026-10-24 night: G#FFFFFFFF 113 µs after L0, twice).
+    let t0 = now();
+    let mut id = cfg_rd(0);
+    while id == 0xFFFF_FFFF && since_us(t0) < 256_000 {
+        ms(1);
+        id = cfg_rd(0);
+    }
+    line(rep, alloc::format!("config answered after A#{} us\n", since_us(t0)));
     kv(rep, "cp.vendor_device", id);
     if id & 0xFFFF != 0x144D {
         line(rep, alloc::format!("not the Samsung CP: stopping\n"));
@@ -818,17 +825,20 @@ fn link_cycle(rep: &mut Vec<u8>) -> bool {
 }
 
 /// Put one boot-channel frame in the TX ring: the 12-byte SIT header, the command word, and `body` (the rest of the payload). Then the head, the message mask and the doorbell.
-fn send_frame(seq: &mut u8, cmd: u16, body: &[u8], data: Option<&[u8]>) -> Result<(), alloc::string::String> {
+fn send_frame(seq: &mut u16, cmd: u16, body: &[u8], data: Option<&[u8]>) -> Result<(), alloc::string::String> {
     let payload = 2 + body.len() + data.map(|d| d.len()).unwrap_or(0);
     let total = 12 + payload;
+    // Every frame takes a multiple of 8 bytes in the ring, zero filled (cpif `exynos_calc_padding_size`: the capture's G#A321 is G#14 long and moves the head G#18).
+    let padded = (total + 7) & !7;
     let head = rd(TXQ_HEAD);
     let tail = rd(TXQ_TAIL);
     let free = (tail + TX_RING_LEN - head - 1) % TX_RING_LEN;
-    if head >= TX_RING_LEN || tail >= TX_RING_LEN || (free as usize) < total {
-        return Err(alloc::format!("tx ring full or bad: head {head} tail {tail} need {total}"));
+    if head >= TX_RING_LEN || tail >= TX_RING_LEN || (free as usize) < padded {
+        return Err(alloc::format!("tx ring full or bad: head {head} tail {tail} need {padded}"));
     }
+    // The frame counter is a full u16 in bytes 2–3 (the capture runs past G#FF); the channel's own sequence is its low byte.
     *seq = seq.wrapping_add(1);
-    let hdr = [0xCD, 0xAB, *seq, 0, 0x00, 0xC0, total as u8, (total >> 8) as u8, CH_BOOT, *seq, 0, 0];
+    let hdr = [0xCD, 0xAB, *seq as u8, (*seq >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, CH_BOOT, *seq as u8, 0, 0];
     let mut pos = head;
     let mut put = |b: &[u8]| {
         for &x in b {
@@ -842,6 +852,7 @@ fn send_frame(seq: &mut u8, cmd: u16, body: &[u8], data: Option<&[u8]>) -> Resul
     if let Some(d) = data {
         put(d);
     }
+    put(&[0u8; 8][..padded - total]);
     unsafe { core::arch::asm!("dsb sy") };
     wr(TXQ_HEAD, pos);
     unsafe { core::arch::asm!("dsb sy") };
@@ -869,7 +880,7 @@ fn recv_frame(ms_wait: u64) -> Result<u16, alloc::string::String> {
             }
             let flen = at(6) as u32 | (at(7) as u32) << 8;
             let cmd = at(12) as u16 | (at(13) as u16) << 8;
-            tail = (tail + flen.max(12)) % len_max;
+            tail = (tail + ((flen.max(12) + 7) & !7)) % len_max;
             wr(tailr, tail);
             // The root complex's MSI status is write-1-to-clear (DBI G#830): left set, the CP's next interrupt is coalesced into the one already pending.
             let msi = rd(DBI + 0x830);
@@ -887,7 +898,7 @@ fn recv_frame(ms_wait: u64) -> Result<u16, alloc::string::String> {
 }
 
 /// One command and its answer: the CP answers G#Axxx with the same number in G#Cxxx.
-fn command(seq: &mut u8, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), alloc::string::String> {
+fn command(seq: &mut u16, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), alloc::string::String> {
     send_frame(seq, cmd, body, None)?;
     // Whether the CP reads what we put in the ring at all: it consumes at the tx tail.
     let t0 = now();
@@ -904,10 +915,19 @@ fn command(seq: &mut u8, cmd: u16, body: &[u8], ms_wait: u64) -> Result<(), allo
 }
 
 /// Send one section over the boot channel: begin (G#A1n0), the data frames (G#A1nB, each acked), end (G#A1nD). `read` fills the chunk at an offset.
-fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(rep: &mut Vec<u8>, seq: &mut u8, id: u32, size: u32, mut read: F) -> Result<(), alloc::string::String> {
+fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(rep: &mut Vec<u8>, seq: &mut u16, id: u32, size: u32, mut read: F) -> Result<(), alloc::string::String> {
     let n = ((id & 0xF) << 4) as u16;
     let t0 = now();
     command(seq, 0xA100 | n, &[0, 0], 2000)?;
+    let frames = send_data(seq, id, size, &mut read)?;
+    command(seq, 0xA10D | n, &[0, 0], 2000)?;
+    line(rep, alloc::format!("section A#{id}: G#{size:X} bytes in A#{frames} frames, A#{} ms\n", since_us(t0) / 1000));
+    Ok(())
+}
+
+/// A stage's data frames (G#A1nB {u16 chunk + 8, u32 total, u32 offset, data}), each acked by G#C1nB; how many.
+fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq: &mut u16, id: u32, size: u32, read: &mut F) -> Result<u32, alloc::string::String> {
+    let n = ((id & 0xF) << 4) as u16;
     let mut buf = alloc::vec![0u8; CHUNK];
     let mut off = 0u32;
     let mut frames = 0u32;
@@ -927,9 +947,7 @@ fn send_section<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(r
         off += want as u32;
         frames += 1;
     }
-    command(seq, 0xA10D | n, &[0, 0], 2000)?;
-    line(rep, alloc::format!("section A#{id}: G#{size:X} bytes in A#{frames} frames, A#{} ms\n", since_us(t0) / 1000));
-    Ok(())
+    Ok(frames)
 }
 
 /// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`; the three NV sections need the per-unit files on f2fs, which ferros cannot read yet, so they are skipped and the CP's answer to the start command says whether it minds.
@@ -949,7 +967,7 @@ fn download(rep: &mut Vec<u8>) {
     let toc = toc(&first);
     // The daemon's first boot-channel write comes well after the link acknowledgement; give the CP's bootloader the same breathing room.
     ms(500);
-    let mut seq = 0u8;
+    let mut seq = 0u16;
     let mut step = |rep: &mut Vec<u8>, what: &str, r: Result<(), alloc::string::String>| -> bool {
         match r {
             Ok(()) => true,
@@ -959,20 +977,23 @@ fn download(rep: &mut Vec<u8>) {
             }
         }
     };
-    // Hello, then the CP's "bootloader ready" (G#C11B), then G#A11D.
-    if !step(rep, "hello", command(&mut seq, 0xA110, &[0, 0], 2000)) {
+    // Stage 1 is the TOC itself (cbd `build_std_dload_control`, decoded 2026-10-24): start G#A110 → G#C110, one data frame G#A11B carrying modem.bin[0..G#410] (the table of contents with its signature) → its ack G#C11B, then G#A11D → G#C11D. The C11B the capture showed "unprompted" is that ack: the capture had missed the one A11B frame, ferros never sent it, and the CP waited for it and dropped everything after.
+    if !step(rep, "TOC start", command(&mut seq, 0xA110, &[0, 0], 2000)) {
         return;
     }
-    // The CP's own "bootloader ready" (G#C11B) follows G#C110 straight away in the capture of Linux; here it does not always come, so it is noted and not waited on.
-    match recv_frame(2000) {
-        Ok(c) => line(rep, alloc::format!("CP ready: G#{c:04X} (expect G#C11B)\n")),
-        Err(e) => line(rep, alloc::format!("no CP-ready frame ({e}); carrying on\n")),
+    let toc_len = 0x410usize.min(first.len());
+    let toc_bytes = first[..toc_len].to_vec();
+    match send_data(&mut seq, 1, toc_len as u32, &mut |off: u64, out: &mut [u8]| {
+        out.copy_from_slice(&toc_bytes[off as usize..off as usize + out.len()]);
+        Ok(())
+    }) {
+        Ok(f) => line(rep, alloc::format!("TOC sent in A#{f} frame, acked (G#C11B)\n")),
+        Err(e) => return line(rep, alloc::format!("TOC data: {e}\n")),
     }
-    // G#A110/G#A11B/G#A11D are section 1 (BOOT, TOC id 1) begin/data/end on this channel, not a handshake: the CP's ROM already has BOOT, and in the capture the CP answers the begin and then emits G#C11B unprompted before the daemon closes with G#A11D. Here the unprompted frame never comes and G#A11D is consumed without an answer, so section 1 is closed with whatever the CP offers and the sections that matter follow.
-    match command(&mut seq, 0xA11D, &[0, 0], 2000) {
-        Ok(()) => line(rep, alloc::format!("section 1 closed (G#C11D)\n")),
-        Err(e) => line(rep, alloc::format!("section 1 close unanswered ({e}); carrying on to section 2\n")),
+    if !step(rep, "TOC done", command(&mut seq, 0xA11D, &[0, 0], 2000)) {
+        return;
     }
+    line(rep, alloc::format!("stage 1 (TOC) complete (G#C11D)\n"));
     for name in ["MAIN", "VSS", "APM"] {
         let Some(s) = toc.iter().find(|s| s.name() == name) else {
             line(rep, alloc::format!("{name}: not in the TOC\n"));
@@ -998,15 +1019,16 @@ fn download(rep: &mut Vec<u8>) {
             let mut b = alloc::vec::Vec::new();
             b.extend_from_slice(&0u16.to_le_bytes());
             b.extend_from_slice(&s.crc.to_le_bytes());
-            if !step(rep, "MAIN CRC", command(&mut seq, 0xA321, &b, 4000)) {
-                return;
+            // Its answer is G#C3n0, not the G#C3n1 the generic Axxx → Cxxx rule gives (cbd waits for C320 after A321; 2026-10-24 night it came).
+            send_frame(&mut seq, 0xA321, &b, None).ok();
+            match recv_frame(4000) {
+                Ok(0xC320) => line(rep, alloc::format!("MAIN CRC accepted (G#C320)\n")),
+                Ok(c) => return line(rep, alloc::format!("MAIN CRC: got G#{c:04X}, expected G#C320\n")),
+                Err(e) => return line(rep, alloc::format!("MAIN CRC: {e}\n")),
             }
         }
     }
-    line(rep, alloc::format!("NV_NORM / NV_PROT / REPLAY skipped: their files are on f2fs\n"));
-    match command(&mut seq, 0xA400, &[0, 0], 8000) {
-        Ok(()) => line(rep, alloc::format!("START acknowledged (G#C400) -- the CP is running its main firmware\n")),
-        Err(e) => line(rep, alloc::format!("START: {e}\n")),
-    }
+    // Stopped here on purpose: the three NV stages (calibration, IMEI) are per-unit files on f2fs that ferros cannot read yet, and G#A400 starts the CP's main firmware — which without its NV would come up on the air with no identity. Not until the real NV is in hand.
+    line(rep, alloc::format!("MAIN, VSS and APM loaded; stopped before the NV stages and START (G#A400): the CP is not started without its own NV\n"));
     line(rep, alloc::format!("cp2ap_msg G#{:X}, cp2ap_status G#{:X}, boot_stage G#{:X}\n", rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE)));
 }
