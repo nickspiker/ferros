@@ -73,3 +73,18 @@ The display server flips the layer between its four dither phase frames every 10
 ## 2026-10-24: the clock by gravity, no dead zones
 
 The clock follows gravity at a fixed 16 ms lag with no threshold (100 Hz samples; the turn quantised only to 1/256 px at its rim). Lying flat on its back the in-glass part of gravity is ~0.47 m/s², so the sensor's ~0.001 m/s² wander moves the angle ~0.1° and the clock redraws its region 35–48 frames/s at rest. Measured as above (16 samples, charger off, home screen): tracking **3215 mW**, the same build pinned to the 10 Hz flips **3221 mW** — no measurable cost, inside the ±50 mW spread. The panel scans at a fixed 120 Hz either way; a clock-region redraw is small next to it.
+
+## The light scope and the sensor stream (2026-10-25)
+
+Charger off for each window (`bridge display power N 2 battery2`), the map zoomed on the scope, each state settled 30 s or more:
+
+| State | System draw |
+|---|---|
+| no flicker stream (booted with `device.scope` 0), scope off | 3171 mW |
+| flicker stream on (16 kHz from the AoC, ~165 USF messages/s), scope drawn at 10 Hz | 3177–3189 mW |
+| stream on, scope drawing off | 3144 mW |
+| stream on, scope focused (redrawn every flip, 70–90 frames/s) | 3178 mW |
+
+The scope and its stream cost nothing measurable at this resolution (±50 mW); the floor is the rest of the system. The DVFS table at the time: MIF 2028 MHz, the X3 2910 MHz, CPUCL0 1425 MHz, CPUCL1 1065 MHz, DSU 1197 MHz — nothing scales down at idle, and a `cpu set 0` request for a lower MIF was not taken (still 2028 MHz after it).
+
+**Measuring trap:** short windows (32 samples) taken back to back with other bridge commands between them read either ~3.15 W or ~3.85 W, at random; three 16 s windows in a row read 3.1 W each. The high readings came only in the short, back-to-back windows, so they are taken as an artifact of switching the charger off and on (not confirmed which part), not a real 0.7 W state. Readings taken seconds after a display restart are high too (the restart redraws and refills all four phases). Use long windows, settled.
