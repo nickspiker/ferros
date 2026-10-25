@@ -111,6 +111,29 @@ ferros brings the sensors up by itself, 4 s into the service loop, a step a pass
 
 5. **The front light and proximity sensor (TMD3719) needs the display.** It sits under the OLED and times its IR and light bursts to the panel: it needs (a) the panel's TE2 output, which ABL leaves off — the display programs it with the brightness and after every display on (`F0 5A 5A`, `B0 00 42 F2`, `F2 0D`, `B0 00 01 B9`, `B9 04` changeable, `B0 00 1E B9`, `B9 00 10 00 30` rising/falling, `F0 A5 A5`; panel-google-hk3.c `hk3_update_te2_internal`), and (b) the display's state from the AP: a type-1001 message to the DisplayInfo server (UUID a8 8e c6 24 10 40 2a ed ca b9 a5 aa d6 a2 ee d2; body {f0 DBV, f1 status 0 off / 1 on / 2 AOD / 3 HBM, f2 refresh Hz, f6 the panel's operating Hz, f8 PWM mode −1, f9 version 2, f10 luma [f32 ×3], f11 leakage [f32]}, zero scalars left out; decoded from sensors.usf.so `UsfMsgDisplayInfo` and the capture). Without them the AoC logs "Sync delay shouldn't be less than 0 after adjustment" and a watchdog with status 0, and nothing is measured. Android also holds the panel at 30 Hz or more while proximity is active (ProxMonitorService). With both, from a cold boot: "Far00" and the first lux. A proximity sample (type 3) is 15 floats, not a bool: Android's distance (0 near, 5 far), the processed pdata0/pdata1, this phone's factory baselines (191.94, 70.45), the raw photodiode counts, the 120 Hz burst delay (105) and some not yet named. Still to send: the DBV the display actually uses (a fixed 1353 for now), status changes with the power key, and the panel identity Set (`/dev/display_info/0`: panel name, serial, is_original) the light sensor checks its calibration against.
 
+6. **Every sensor, 2026-10-24 night.** With the registry, the display's state and TE2 in place, 39 of the 41 sensors the AoC lists subscribe and stream (`diag usf sensors`, `diag usf subh <handle> <ms> <mode>`, `diag usf ev`); the two refusals (status 2) are the proximity-gated touch gestures, whose touch controller ferros keeps from the AoC. Each sample event carries its own count and size, so the formats below are read off the wire; values are the phone lying face up on the desk.
+
+| USF type | sensor | sample (floats) | reading |
+|---|---|---|---|
+| 1 | ICM45631 accelerometer | x y z m/s² | (−0.03, 0.35, 9.78) |
+| 2 | ICM45631 gyroscope | x y z rad/s | ~5e-4 (still) |
+| 8 | ICM45631 temperature | °C | 34.9 |
+| 22 | Gravity (fused) | x y z m/s² | the clock's |
+| 23 | linear acceleration | x y z m/s² | ~0.03 |
+| 20 / 21 / 27 | game / geomagnetic / rotation vector | quaternion (+ accuracy) | unit quaternions |
+| 24 | orientation | azimuth pitch roll ° | 167.8, −2.2, −0.4 |
+| 6 | magnetometers (MMC5633 ×2, fused) | x y z µT | (−7.6, −40.3, −87.2): 96 µT, uncalibrated or metal near the desk |
+| 4 / 5 | ICP20100 pressure / its temperature | hPa / °C | 1003.45 / 34.0 |
+| 56 / 67 | MLX90632 IR thermometer / extended | object °C, sensor °C, raw | 32.8, 31.8, … / 32.8, 32.0 |
+| 36 | TMD3719 temperature | °C | 32.5 |
+| 3 | TMD3719 proximity | 15 floats (above) | far, raw 231/111 |
+| 9 / 54 | TMD3719 light / light raw | 15 floats | lux fields 0 tonight with 8090910, 200000, 1653120 after: to look at |
+| 74 | ALSP fusion info | 8 floats | far, pdata0 23.96, baseline 191.94, DBV 1353 |
+| 68 / 69 | AAD proximity / voice-call proximity | fused | far |
+| 12 / 13 / 46 | VD6282 spectral / flicker / rear light | 16 floats / 1 / lux | channels; 12812; 0.027 |
+| 48 / 14 | auto brightness / binned brightness | 16 floats / 3 | — |
+| 30, 33, 70, … | step counter, stationary detect, motion state, tilt, lift, twist, pickup | events | 0 steps, stationary |
+
 The AoC's own log is readable: `diag aoc log` drains the firmware's `logging` ring (256 × 128 bytes, full from boot until read), and it names what each driver is waiting for.
 
 `diag usf` shows the rails, the stream's counters and the last vector; `diag usf reg <path>` reads a registry node; `diag usf raw <handle> <type>` sends a bare request and dumps the replies; `diag aoc services` lists the AoC's 94 services.

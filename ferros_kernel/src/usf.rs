@@ -260,7 +260,7 @@ pub static SPECTRAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub static PAIR: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The latest event of each other sensor type seen: (USF sensor type, bytes, the event's first 128 bytes, how many came).
-static mut LAST_EV: [(u16, usize, [u8; 128], u32); 8] = [(0, 0, [0; 128], 0); 8];
+static mut LAST_EV: [(u16, usize, [u8; 128], u32); 32] = [(0, 0, [0; 128], 0); 32];
 
 /// `diag usf ev`: each sensor type's latest event — the header (subscriber handle, subscription, type, sample count, bytes per sample) and each sample's timestamp and values as f32 and as raw words.
 pub fn events(out: &mut alloc::vec::Vec<u8>) {
