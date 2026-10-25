@@ -144,22 +144,86 @@ fn drain(want: Option<u32>) -> Option<(u32, alloc::vec::Vec<u8>)> {
             if ch & 0x7FFF_FFFF != CHAN {
                 continue;
             }
-            match kind {
-                2 => {
-                    if let Some((txn, status, body)) = response(payload) {
-                        if Some(txn) == want {
-                            got = Some((status, body.to_vec()));
-                        }
-                    }
-                }
-                9 => sample(payload),
-                // The light waveform (libusf HandleFlickerFormatMsg / HandleFlickerDataMsg): kind 13 its format, kind 4 its data, each a nested FlatBuffer in the payload. Kept raw for `diag usf flk` until the layout is pinned down.
-                4 | 13 => flk_keep(kind, payload),
-                _ => {}
-            }
+            dispatch(kind, payload, want, &mut got);
         }
     }
     got
+}
+
+/// How many messages of each outer kind have come (index = kind, 15 = anything higher): `diag usf flk` shows them.
+static KINDS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+
+/// A fragmented message being joined: the bytes so far and the whole length.
+static mut FRAG: (alloc::vec::Vec<u8>, usize) = (alloc::vec::Vec::new(), 0);
+
+/// One outer message (libusf `UsfMsg` {f0 kind, f1 payload}; ProcessMsg): 2 a response, 9 a packed sample event, 5 an event wrapping an inner UsfMsg (13 the light waveform's format, 4 its data), 3 a fragment of a longer message (joined, then dispatched as a whole message without a channel word).
+fn dispatch(kind: u8, payload: &[u8], want: Option<u32>, got: &mut Option<(u32, alloc::vec::Vec<u8>)>) {
+    KINDS[(kind as usize).min(15)].fetch_add(1, Ordering::Relaxed);
+    match kind {
+        2 => {
+            if let Some((txn, status, body)) = response(payload) {
+                if Some(txn) == want {
+                    *got = Some((status, body.to_vec()));
+                }
+            }
+        }
+        9 => sample(payload),
+        5 => {
+            // An event: an inner UsfMsg {f0 kind, f1 bytes}.
+            let inner = (|| {
+                let t = root(payload)?;
+                let k = *payload.get(field(payload, t, 0)?)?;
+                let b = vector(payload, field(payload, t, 1)?)?;
+                Some((k, b))
+            })();
+            if let Some((k, b)) = inner {
+                if k == 13 || k == 4 {
+                    flk_keep(k, b);
+                }
+                if k == 13 {
+                    flk_format(b);
+                } else if k == 4 {
+                    flk_data(b);
+                }
+            }
+        }
+        3 => {
+            // A fragment {f1 the whole length, f2 the byte offset (absent at the start), f3 the chunk}.
+            let parts = (|| {
+                let t = root(payload)?;
+                let total = u32_at(payload, field(payload, t, 1)?)? as usize;
+                let off = field(payload, t, 2).and_then(|f| u32_at(payload, f)).unwrap_or(0) as usize;
+                let chunk = vector(payload, field(payload, t, 3)?)?;
+                Some((total, off, chunk))
+            })();
+            let Some((total, off, chunk)) = parts else { return };
+            let f = unsafe { &mut *(&raw mut FRAG) };
+            if off == 0 {
+                f.0.clear();
+                f.1 = total;
+            }
+            if off != f.0.len() || total != f.1 || total > 64 * 1024 {
+                f.0.clear();
+                return;
+            }
+            f.0.extend_from_slice(chunk);
+            if f.0.len() >= f.1 {
+                let whole = core::mem::take(&mut f.0);
+                let parsed = (|| {
+                    let t = root(&whole)?;
+                    let k = *whole.get(field(&whole, t, 0)?)?;
+                    let b = vector(&whole, field(&whole, t, 1)?)?;
+                    Some((k, b.to_vec()))
+                })();
+                if let Some((k, b)) = parsed {
+                    if k != 3 {
+                        dispatch(k, &b, want, got);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A sample event: {u32 1, u32 the subscriber's handle, u32 subscription, u16 sensor type, u8 count, u8 bytes per sample}, then each sample {u64 timestamp, the values}. Gravity (type 22): three f32, m/s².
@@ -281,6 +345,63 @@ fn flk_keep(kind: u8, p: &[u8]) {
     }
 }
 
+/// The light waveform's format (FlickerFormat: f0 rate Hz, f1 code — 2/3/4 uncompressed bytes per sample, 6 Compressed1 —, f2 little-endian, f3 low bits to ignore): rate | bytes << 32 | ignore << 40 | little-endian << 48. Seen on husky: 16000 Hz, 4 bytes, low 8 ignored, little-endian.
+pub static SCOPE_FMT: AtomicU64 = AtomicU64::new(0);
+/// The last SCOPE_LEN samples of the light waveform (signed, the format's bits, ignored low bits shifted out), a ring indexed by the stream's own sample number; SCOPE_N the samples written so far (the next sample's number).
+pub const SCOPE_LEN: usize = 8192;
+pub static mut SCOPE: [i32; SCOPE_LEN] = [0; SCOPE_LEN];
+pub static SCOPE_N: AtomicU64 = AtomicU64::new(0);
+
+fn flk_format(p: &[u8]) {
+    let Some(t) = root(p) else { return };
+    let rate = field(p, t, 0).and_then(|f| u32_at(p, f)).unwrap_or(0) as u64;
+    let code = field(p, t, 1).and_then(|f| p.get(f).copied()).unwrap_or(0) as u64;
+    let le = field(p, t, 2).and_then(|f| p.get(f).copied()).unwrap_or(0) as u64;
+    let ign = field(p, t, 3).and_then(|f| p.get(f).copied()).unwrap_or(0) as u64;
+    SCOPE_FMT.store(rate | code << 32 | ign << 40 | le << 48, Ordering::Relaxed);
+}
+
+/// FlickerData (f0 the byte offset of these samples in the stream, f1 the samples): decoded into the ring at their own sample numbers, so a lost message leaves a gap rather than shifting the trace. Uncompressed formats only (code 2/3/4); Compressed1 is not handled yet.
+fn flk_data(p: &[u8]) {
+    let fmt = SCOPE_FMT.load(Ordering::Relaxed);
+    let (code, ign, le) = (((fmt >> 32) & 0xFF) as usize, ((fmt >> 40) & 0xFF) as u32, (fmt >> 48) & 1 == 1);
+    if !(2..=4).contains(&code) {
+        return;
+    }
+    let Some(t) = root(p) else { return };
+    let off = field(p, t, 0).and_then(|f| u32_at(p, f)).unwrap_or(0) as u64;
+    let Some(d) = field(p, t, 1).and_then(|f| vector(p, f)) else { return };
+    let first = off / code as u64;
+    let ring = unsafe { &mut *(&raw mut SCOPE) };
+    for (i, s) in d.chunks_exact(code).enumerate() {
+        let mut raw: u32 = 0;
+        for (k, &b) in s.iter().enumerate() {
+            raw |= (b as u32) << (8 * if le { k } else { code - 1 - k });
+        }
+        // Sign from the sample's own top bit, then the ignored low bits off.
+        let v = ((raw << (32 - 8 * code as u32)) as i32) >> (32 - 8 * code as u32);
+        ring[((first + i as u64) % SCOPE_LEN as u64) as usize] = v >> ign;
+    }
+    let end = first + (d.len() / code) as u64;
+    if end > SCOPE_N.load(Ordering::Relaxed) {
+        SCOPE_N.store(end, Ordering::Relaxed);
+    }
+}
+
+/// `diag usf scope <n>`: the last n (≤ 4096) samples of the light waveform, oldest first, as signed decimal, with the format.
+pub fn scope_dump(n: usize, out: &mut alloc::vec::Vec<u8>) {
+    let fmt = SCOPE_FMT.load(Ordering::Relaxed);
+    let end = SCOPE_N.load(Ordering::Relaxed);
+    let n = n.min(4096).min(end as usize);
+    out.extend_from_slice(alloc::format!("scope: rate {} Hz, code {}, ignore {} bits, end sample {end}, {n} samples\n", fmt & 0xFFFF_FFFF, (fmt >> 32) & 0xFF, (fmt >> 40) & 0xFF).as_bytes());
+    let ring = unsafe { &*(&raw const SCOPE) };
+    for i in 0..n as u64 {
+        let k = end - n as u64 + i;
+        out.extend_from_slice(alloc::format!("{} ", ring[(k % SCOPE_LEN as u64) as usize]).as_bytes());
+    }
+    out.push(b'\n');
+}
+
 /// `diag usf flk [start]`: subscribe the flicker sensor as libusf's EnableFlickerSensor does (mode 1, a 10 s period, no latency, non-wake, client id G#30002), then the format and data messages kept so far, raw.
 pub fn flk(start: bool, out: &mut alloc::vec::Vec<u8>) {
     if start {
@@ -310,6 +431,8 @@ pub fn flk(start: bool, out: &mut alloc::vec::Vec<u8>) {
     }
     let f = unsafe { &*(&raw const FLK) };
     let hex = |b: &[u8]| -> alloc::string::String { b.iter().map(|x| alloc::format!("{x:02x}")).collect() };
+    let kinds: alloc::vec::Vec<(usize, u32)> = (0..16).map(|k| (k, KINDS[k].load(Ordering::Relaxed))).filter(|&(_, n)| n != 0).collect();
+    out.extend_from_slice(alloc::format!("outer kinds seen (kind, count): {kinds:?}\n").as_bytes());
     out.extend_from_slice(alloc::format!("format messages A#{}, data messages A#{}\n", f.3, f.4).as_bytes());
     if f.3 > 0 {
         out.extend_from_slice(alloc::format!("format (A#{} bytes): {}\n", f.1, hex(&f.0[..f.1.min(256)])).as_bytes());
