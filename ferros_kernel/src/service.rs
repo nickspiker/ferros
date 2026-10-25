@@ -209,6 +209,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.theme" && len == 1 && params[2 + klen] < crate::process::THEMES {
                         crate::process::set_pref_held(crate::process::PREF_THEME, params[2 + klen]);
                     }
+                    if key == "device.prox_wake" && len == 1 && params[2 + klen] <= 1 {
+                        crate::process::set_pref_held(crate::process::PREF_PROX_WAKE, params[2 + klen]);
+                    }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
                     r.extend_from_slice(&h);
@@ -316,6 +319,7 @@ fn store_pref(index: usize, value: u8) -> bool {
         crate::process::PREF_BRIGHTNESS => "device.brightness",
         crate::process::PREF_DITHER => "device.dither",
         crate::process::PREF_THEME => "device.theme",
+        crate::process::PREF_PROX_WAKE => "device.prox_wake",
         _ => return false,
     };
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, &[value]).is_ok()).unwrap_or(false) }
@@ -498,6 +502,12 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
                 v[20 + i] = crate::usf::SPECTRAL[i].load(Relaxed);
             }
         }
+        // Proximity (usf.rs PROX): distance | processed pdata0, processed pdata1 | raw pdata0, raw pdata1 | samples.
+        if crate::usf::PROX[2].load(Relaxed) >> 32 != 0 {
+            for i in 0..3 {
+                v[27 + i] = crate::usf::PROX[i].load(Relaxed);
+            }
+        }
         // The last two samples with their times, for gravity at a fixed lag.
         if crate::usf::PAIR[5].load(Relaxed) != 0 {
             for i in 0..6 {
@@ -588,6 +598,10 @@ fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<all
                 crate::usf::subscribe_gravity(GRAVITY_MS, false, &mut out);
                 // The display's state for the under-display TMD3719 (light, proximity): it times its bursts to the panel by it and never measures without it. The panel runs 120 Hz; DBV is the display's usual setting until the display server reports its own (TODO).
                 crate::usf::display_info(DISPLAY_DBV, true, 120, &mut out);
+                // Proximity, on change, for the wake (owner's rule) and the dashboard: its raw counts as well as near/far.
+                if let Some(h) = crate::usf::find("TMD3719 Proximity") {
+                    crate::usf::subscribe(h, 25, 2, false, &mut out);
+                }
                 // The rear spectral sensor, for the spectral widget: every 200 ms (the AoC's own rate for it under Android was 4–8 Hz).
                 if let Some(h) = crate::usf::find("VD6282 Spectral") {
                     crate::usf::subscribe(h, 200, 1, false, &mut out);
@@ -736,6 +750,7 @@ pub fn run(mut b: Boot) -> ! {
     let mut t_awake = cntpct();
     let mut link_was = 0u32;
     let mut sensor_boot = SensorBoot::Wait;
+    let mut screen_off_told = false;
     let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
     // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
     let mut att_ev = [0u32; 3];
@@ -799,7 +814,20 @@ pub fn run(mut b: Boot) -> ! {
         if unsafe { core::ptr::read_volatile(&raw const crate::__power_pressed) } != 0 {
             unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
             let off = crate::process::pref(crate::process::PREF_SCREEN_OFF) ^ 1;
-            crate::process::set_pref(crate::process::PREF_SCREEN_OFF, off);
+            // The proximity wake (owner's rule): a press lights the screen only if nothing is near the sensor. Fails open: with no proximity reading yet (sensors not up, or the AoC failed), the press wakes as before, so a sensor fault never locks the owner out.
+            let refused = off == 0 && crate::process::pref(crate::process::PREF_PROX_WAKE) == 1 && crate::usf::prox_near() == Some(true);
+            if refused {
+                crate::flashlog::line(&alloc::format!("wake refused: proximity near ({:?})", crate::usf::prox_counts()));
+            } else {
+                crate::process::set_pref(crate::process::PREF_SCREEN_OFF, off);
+            }
+        }
+        // The display's state follows the screen: the under-display sensor times its bursts to the panel and must know when it goes dark.
+        let screen_off = crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
+        if crate::usf::display_ready() && screen_off != screen_off_told {
+            screen_off_told = screen_off;
+            let mut out = alloc::vec::Vec::new();
+            crate::usf::display_info(DISPLAY_DBV, !screen_off, 120, &mut out);
         }
         USB_LINK.store(usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
         if pt_done {

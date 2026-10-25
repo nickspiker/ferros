@@ -1896,6 +1896,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.dither").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
         process::set_pref(process::PREF_DITHER, v);
     }
+    // The proximity wake (device.prox_wake: 0 off, 1 on; absent = off until tuned).
+    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.prox_wake").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
+        process::set_pref(process::PREF_PROX_WAKE, v);
+    }
     // The theme (device.theme: an index into ferros_sys::theme::THEMES; absent = 0, grey).
     if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.theme").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v < process::THEMES) {
         process::set_pref(process::PREF_THEME, v);

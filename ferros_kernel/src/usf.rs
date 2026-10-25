@@ -176,6 +176,15 @@ fn sample(p: &[u8]) {
         }
         SPECTRAL[6].fetch_add(1, Ordering::Relaxed);
     }
+    if ty == 3 && size >= 32 && count > 0 {
+        // Proximity (TMD3719): the newest sample's distance (0 near, 5 far), processed pdata0/pdata1, and the raw counts (floats 6 and 7).
+        let at = 16 + (count as usize - 1) * (8 + size as usize) + 8;
+        let w = |i: usize| u32_at(p, at + 4 * i).unwrap_or(0) as u64;
+        PROX[0].store(w(0) | w(1) << 32, Ordering::Relaxed);
+        PROX[1].store(w(2) | w(6) << 32, Ordering::Relaxed);
+        let n = (PROX[2].load(Ordering::Relaxed) >> 32).wrapping_add(1).max(1);
+        PROX[2].store(w(7) | n << 32, Ordering::Relaxed);
+    }
     if ty != 22 {
         // Any other sensor: its latest event kept whole, for `diag usf ev`.
         unsafe {
@@ -218,6 +227,30 @@ fn sample(p: &[u8]) {
             t.1 += 1;
         }
     }
+}
+
+/// Proximity's newest sample (f32 bits): distance | processed pdata0, processed pdata1 | raw pdata0, raw pdata1 | samples so far. SYS_FACTS 27–29.
+pub static PROX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether proximity reads near (Android's distance below its maximum, the AoC's own thresholds with this phone's calibration); None before the first sample.
+pub fn prox_near() -> Option<bool> {
+    if PROX[2].load(Ordering::Relaxed) >> 32 == 0 {
+        return None;
+    }
+    Some(f32::from_bits(PROX[0].load(Ordering::Relaxed) as u32) < 5.0)
+}
+
+/// Proximity's numbers for the log: distance, processed pdata0/1, raw pdata0/1.
+pub fn prox_counts() -> [f32; 5] {
+    let (a, b, c) = (PROX[0].load(Ordering::Relaxed), PROX[1].load(Ordering::Relaxed), PROX[2].load(Ordering::Relaxed));
+    let f = |v: u64| f32::from_bits(v as u32);
+    [f(a), f(a >> 32), f(b), f(b >> 32), f(c)]
+}
+
+/// Whether the display's state has been told once (the DisplayInfo server answered): then changes are worth sending.
+static DISPLAY_TOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn display_ready() -> bool {
+    DISPLAY_TOLD.load(Ordering::Relaxed)
 }
 
 /// The rear spectral sensor's newest sample: channel counts 0|1, 2|3, 4|5 and gains 0|1, 2|3, 4|5 as f32 bit pairs, then how many samples have come. SYS_FACTS 20–26.
@@ -269,6 +302,9 @@ pub fn display_info(dbv: u32, on: bool, hz: u32, out: &mut alloc::vec::Vec<u8>) 
     let leak = [0u32; 1];
     let body = fb(&[nz(dbv), nz(on as u32), nz(hz), F::N, F::N, F::N, nz(hz), F::N, F::U(0xFF), F::U(2), F::W(&luma), F::W(&leak)]);
     let r = request(h, 1001, Some(&body)).and_then(|t| reply(t, 128));
+    if r.is_some() {
+        DISPLAY_TOLD.store(true, Ordering::Relaxed);
+    }
     out.extend_from_slice(alloc::format!("display info (handle {h}): DBV {dbv}, {}, {hz} Hz: {:?}\n", if on { "on" } else { "off" }, r.as_ref().map(|(s, _)| *s)).as_bytes());
     r.is_some()
 }
@@ -514,6 +550,7 @@ pub fn power(out: &mut alloc::vec::Vec<u8>) {
 
 /// `diag usf`: the rails, the stream's counters and the last gravity vector.
 pub fn report(out: &mut alloc::vec::Vec<u8>) {
+    out.extend_from_slice(alloc::format!("proximity wake {}, proximity near {:?} (distance, pdata0, pdata1, raw0, raw1: {:?}), display told {}\n", crate::process::pref(crate::process::PREF_PROX_WAKE), prox_near(), prox_counts(), display_ready()).as_bytes());
     for (name, reg) in RAILS {
         out.extend_from_slice(alloc::format!("{name} ctrl: {:?}\n", crate::acpm::read(crate::acpm::SUB, crate::acpm::T_PMIC, reg).map(|c| alloc::format!("G#{c:02X}"))).as_bytes());
     }

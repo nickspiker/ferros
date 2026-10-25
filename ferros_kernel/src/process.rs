@@ -654,6 +654,8 @@ pub const PREF_BRIGHTNESS: usize = 3;
 pub const PREF_DITHER: usize = 4;
 /// Preference 5: the theme, an index into ferros_sys::theme::THEMES (0 = grey, the default).
 pub const PREF_THEME: usize = 5;
+/// Preference 6: the proximity wake (owner's rule, 2026-08-21: the screen lights only if the power key is pressed and nothing is near the proximity sensor), 0 off (the default until it is tuned) or 1 on (service.rs).
+pub const PREF_PROX_WAKE: usize = 6;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
 
@@ -769,6 +771,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_BRIGHTNESS => value <= 8,
         PREF_DITHER => value <= 1,
         PREF_THEME => value < THEMES,
+        PREF_PROX_WAKE => value <= 1,
         _ => false,
     }
 }

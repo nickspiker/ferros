@@ -56,6 +56,8 @@ pub const PREF_BRIGHTNESS: u64 = 3;
 pub const PREF_DITHER: u64 = 4;
 /// Preference 5: the theme, an index into `theme::THEMES` (0 = grey).
 pub const PREF_THEME: u64 = 5;
+/// Preference 6: the proximity wake, 0 off or 1 on (the kernel refuses a wake press while proximity reads near).
+pub const PREF_PROX_WAKE: u64 = 6;
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {
@@ -142,6 +144,12 @@ impl Facts {
     pub fn gravity(&self) -> Option<[f32; 3]> {
         let (xy, z) = (self.get(12)?, self.get(13)?);
         Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
+    }
+    /// Proximity (the front TMD3719): Android's distance (0 near, 5 far by the AoC's own thresholds), the processed pdata0 and pdata1, and the raw photodiode counts pdata0 and pdata1; None before the first sample.
+    pub fn proximity(&self) -> Option<[f32; 5]> {
+        let (a, b, c) = (self.get(27)?, self.get(28)?, self.get(29)?);
+        let f = |v: u64| f32::from_bits(v as u32);
+        Some([f(a), f(a >> 32), f(b), f(b >> 32), f(c)])
     }
     /// The rear spectral sensor's (VD6282) newest sample: six channel counts, their six gains, and how many samples have come (a new one when it moves). The registry names the channels r, g, b, c1, c2, ir; which slot is which is not yet measured.
     pub fn spectral(&self) -> Option<([f32; 6], [f32; 6], u64)> {
