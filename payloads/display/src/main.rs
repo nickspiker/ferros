@@ -437,7 +437,7 @@ static mut CLIP_US: [u64; 2] = [0; 2];
 static mut LAST_CAM: Option<([u8; 18], usize)> = None;
 
 /// The clock's rings and the time written in its centre, from local wall time to the counter's tick, and the unit its digits count in (the key: the digits change when it does). Every ring is a continuous sweep of grey over the dark from 12:00 that clicks back to dark when it wraps (owner, 2026-10-23; continuous 2026-10-24, drawn at whatever rate frames go out). Decimal, three rings: seconds outer, minutes middle, the 12-hour hand inner (after noon its fill is a lighter grey: the AM/PM); digits h:m:s. Dozenal, four rings, the day in twelfths four times over: outermost the 50 s unit's twelfths (about 4.2 s each), then the 50 s units, the dozenal hour's twelfths, the dozenal hours over the whole day; digits from the hour down, without trailing zils (owner: noon is Lun, not Lun:Zil:Zil:Zil).
-fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64) {
+fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Option<bool>) {
     let (secs, sub) = ferros_sys::local_time().unwrap_or((0, 0));
     let hz = freq() as i64;
     // Ticks of the counter since local midnight.
@@ -470,19 +470,23 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64) {
             }
             put(char::from_u32(0x10 + *v as u32).unwrap_or('?'), &mut n);
         }
-        (rings, 4, n, u)
+        (rings, 4, n, u, None)
     } else {
         let sod = t / hz;
         let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);
         let rings = [ring(frac(60 * hz), false, 60), ring(frac(3600 * hz), false, 60), ring(frac(43200 * hz), h >= 12, 12), ring(0, false, 0)];
-        for (k, v) in [h, m, sec].iter().enumerate() {
-            if k > 0 {
-                put(':', &mut n);
-            }
-            put((b'0' + (*v / 10) as u8) as char, &mut n);
-            put((b'0' + (*v % 10) as u8) as char, &mut n);
+        // Twelve-hour digits to match the twelve-hour hand ring, the hour without a leading zero (9:05:07, not 09:05:07), 12 at noon and midnight; am or pm written under them (owner, 2026-10-24).
+        let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+        if h12 >= 10 {
+            put((b'0' + (h12 / 10) as u8) as char, &mut n);
         }
-        (rings, 3, n, sod)
+        put((b'0' + (h12 % 10) as u8) as char, &mut n);
+        for v in [m, sec] {
+            put(':', &mut n);
+            put((b'0' + (v / 10) as u8) as char, &mut n);
+            put((b'0' + (v % 10) as u8) as char, &mut n);
+        }
+        (rings, 3, n, sod, Some(h >= 12))
     }
 }
 
@@ -1919,19 +1923,29 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
                         if cir.icon == WIDGET_CLOCK {
                             let mut tb = [0u8; 32];
-                            let (rings, nrings, tn, key) = clock_state(&mut tb);
+                            let (rings, nrings, tn, key, pm) = clock_state(&mut tb);
                             unsafe { CLOCK_KEY = key };
                             if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
                                 // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
                                 let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
-                                let unit = text_width(&font, t, 100.0).max(1.0);
+                                // Sized by the widest the time can be (12:00:00, or four dozenal places), so the digits keep one size as the time's own width changes.
+                                let widest = if nrings == 4 { "\u{10}:\u{10}:\u{10}:\u{10}" } else { "00:00:00" };
+                                let unit = text_width(&font, widest, 100.0).max(1.0);
                                 // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
                                 let px = room / unit * 100.0;
                                 // The digits turn with the face (and, once the accelerometer is in, with gravity).
                                 let (cc, cs) = (cir.c as i64, cir.s as i64);
                                 let (fc, fs) = ((rc * cc - rs * cs) >> 14, (rs * cc + rc * cs) >> 14);
-                                text_turned_centre(pixels, width, height, t, (sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5, px, (fc as f32 / 16384.0, fs as f32 / 16384.0), 0xFF00_0000 | th.text);
+                                let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
+                                let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
+                                text_turned_centre(pixels, width, height, t, cxf, cyf, px, (tcf, tsf), 0xFF00_0000 | th.text);
                                 ALLOC.reset();
+                                // am / pm under the digits, half their size, turned with the face.
+                                if let Some(pm) = pm {
+                                    let d = px * 0.8;
+                                    text_turned_centre(pixels, width, height, if pm { "pm" } else { "am" }, cxf - tsf * d, cyf + tcf * d, px * 0.45, (tcf, tsf), 0xFF00_0000 | th.text2);
+                                    ALLOC.reset();
+                                }
                             }
                             // The face's turn: the camera's and the circle's own, as the icons get it.
                             let (cc, cs) = (cir.c as i64, cir.s as i64);
@@ -2317,7 +2331,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
             // What phase k's clock lacks: the wedges the sweeps moved through since it was last drawn there, and the centre if the digits changed; the whole clock when that is not known.
             let mut tb = [0u8; 32];
-            let (rings, _, _, key) = clock_state(&mut tb);
+            let (rings, _, _, key, _) = clock_state(&mut tb);
             let now_c = ClockShown { frac: core::array::from_fn(|i| rings[i].frac_q16), lighter: core::array::from_fn(|i| rings[i].lighter), key };
             let whole = ([unsafe { CLOCK_RECT }, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY], 1);
             let (parts, np) = match unsafe { PHASE_CLOCK[k] } {
@@ -2481,7 +2495,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             next_tick = (secs + 1) * freq();
             if client_owned && (!unsafe { TEMPORAL } || ferros_sys::pref(ferros_sys::PREF_DITHER) != 0) && unsafe { CLOCK_SHOWN && LAST_FRAME.1 > 0 && (*(&raw const APP)).is_none() } {
                 let mut tb = [0u8; 32];
-                let (_, _, _, key) = clock_state(&mut tb);
+                let (_, _, _, key, _) = clock_state(&mut tb);
                 if key != unsafe { CLOCK_KEY } {
                     clock_due = true;
                 }
