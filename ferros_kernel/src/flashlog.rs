@@ -67,8 +67,12 @@ pub fn init() -> bool {
     ok
 }
 
-/// Append one line. Silently does nothing before `init` or once the region is full.
+/// Append one line. Silently does nothing before `init` or once the region is full. Under the kernel lock: the log's blocks share the UFS with the vault, and a line written from the service loop while a syscall on another core read the vault broke that read (2026-10-24: init's spawn of touch failed at boot with "unsealed block", the touch server never started).
 pub fn line(text: &str) {
+    crate::process::with_lock_held_or(|| line_locked(text))
+}
+
+fn line_locked(text: &str) {
     let Some(s) = (unsafe { (*(&raw mut STATE)).as_mut() }) else { return };
     let ms = crate::platform::cntpct() / (crate::platform::cntfrq() / 1000);
     let full = alloc::format!("b{} t{} {}\n", s.boot, ms, text);
@@ -92,8 +96,12 @@ pub fn line(text: &str) {
     write_header(s);
 }
 
-/// The last `max` bytes of the log, for `diag log`.
+/// The last `max` bytes of the log, for `diag log`; under the kernel lock, as `line`.
 pub fn tail(max: usize) -> Vec<u8> {
+    crate::process::with_lock_held_or(|| tail_locked(max))
+}
+
+fn tail_locked(max: usize) -> Vec<u8> {
     let Some(s) = (unsafe { (*(&raw const STATE)).as_ref() }) else { return b"flash log not open\n".to_vec() };
     let mut out = Vec::new();
     let blocks_back = (max / 4096 + 1) as u32;

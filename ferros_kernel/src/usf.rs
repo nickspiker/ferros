@@ -172,6 +172,35 @@ fn sample(p: &[u8]) {
     let n = (GRAVITY_Z.load(Ordering::Relaxed) >> 32) as u32;
     GRAVITY_XY.store(x as u64 | (y as u64) << 32, Ordering::Relaxed);
     GRAVITY_Z.store(z as u64 | (n.wrapping_add(1).max(1) as u64) << 32, Ordering::Relaxed);
+    // The trace for `diag usf trace`: every sample of the event, with the AoC's timestamp (low 56 bits, ns) and when this pass saw it.
+    let now = crate::platform::cntpct();
+    for k in 0..count as usize {
+        let at = 16 + k * (8 + size as usize);
+        let ts = u32_at(p, at).unwrap_or(0) as u64 | (u32_at(p, at + 4).unwrap_or(0) as u64) << 32;
+        let v = [u32_at(p, at + 8).unwrap_or(0), u32_at(p, at + 12).unwrap_or(0), u32_at(p, at + 16).unwrap_or(0)];
+        unsafe {
+            let t = &mut *(&raw mut TRACE);
+            t.0[t.1 % 32] = (ts & 0x00FF_FFFF_FFFF_FFFF, now, v);
+            t.1 += 1;
+        }
+    }
+}
+
+/// The last 32 gravity samples: (AoC timestamp ns, counter at arrival, x y z bits), and how many were written.
+static mut TRACE: ([(u64, u64, [u32; 3]); 32], usize) = ([(0, 0, [0; 3]); 32], 0);
+
+/// `diag usf trace`: the last 32 samples, oldest first, with the AoC's timestamp against ferros's counter (in ns at its frequency).
+pub fn trace(out: &mut alloc::vec::Vec<u8>) {
+    let f = crate::platform::cntfrq();
+    let now = crate::platform::cntpct();
+    out.extend_from_slice(alloc::format!("counter A#{f} Hz, now A#{} ns\n", now as u128 * 1_000_000_000 / f as u128).as_bytes());
+    let t = unsafe { &*(&raw const TRACE) };
+    for i in 0..32.min(t.1) {
+        let (ts, at, v) = t.0[(t.1 + 32 - 32.min(t.1) + i) % 32];
+        let at_ns = (at as u128 * 1_000_000_000 / f as u128) as i128;
+        let g = |b: u32| f32::from_bits(b);
+        out.extend_from_slice(alloc::format!("ts A#{ts} arrival-ts A#{} us  ({:.4}, {:.4}, {:.4})\n", (at_ns - ts as i128) / 1000, g(v[0]), g(v[1]), g(v[2])).as_bytes());
+    }
 }
 
 /// Call often (each pass of the service loop): reads whatever the AoC has sent. A few uncached reads when nothing has.
@@ -212,7 +241,9 @@ pub fn open(out: &mut alloc::vec::Vec<u8>) -> bool {
         out.extend_from_slice(b"usf: com.google.usf not found (the AoC is not up)\n");
         return false;
     }
-    // AOCC_CMD_OPEN_CHANNEL: {channel 0, command 0, the channel}.
+    // AOCC_CMD_CLOSE_CHANNEL first ({channel 0, command 1, the channel}): a warm reload finds the AoC still serving the last kernel's subscriptions on this channel, and closing it ends them (the HAL's restart did the same; nothing came on a closed channel again), so samples are not delivered twice. Then AOCC_CMD_OPEN_CHANNEL {0, 0, the channel}.
+    let close = [0u32.to_le_bytes(), 1u32.to_le_bytes(), CHAN.to_le_bytes()].concat();
+    aoc::ipc_write(h, &close);
     let open = [0u32.to_le_bytes(), 0u32.to_le_bytes(), CHAN.to_le_bytes()].concat();
     let opened = aoc::ipc_write(h, &open);
     let server = send(GET_SERVER.to_vec(), Some(60)).and_then(|t| reply(t, 64));
@@ -250,7 +281,8 @@ pub fn registry(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &
     out.extend_from_slice(alloc::format!("registry: board CDT G#{cdt:X} MLB A#{mlb}\n").as_bytes());
     let mut n = 0;
     for i in 0.. {
-        let Some(mut text) = get(&alloc::format!("aoc.reg.{i}")) else { break };
+        let Some(text) = get(&alloc::format!("aoc.reg.{i}")) else { break };
+        let mut text = strip(&text, KEEP_OFF);
         text.push(0);
         let body = fb(&[F::B(&text), if cdt == 0 { F::N } else { F::U(cdt) }, if mlb == 0 { F::N } else { F::U(mlb) }]);
         let Some(txn) = request(rh, 24, Some(&body)) else {
@@ -273,6 +305,25 @@ pub fn registry(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &
     let r = request(rh, 22, Some(&set)).and_then(|t| reply(t, 512));
     out.extend_from_slice(alloc::format!("registry: {n} scripts loaded, loaded=1: {:?}\n", r.as_ref().map(|(s, _)| *s)).as_bytes());
     matches!(r, Some((0, _)))
+}
+
+/// Registry nodes ferros does not hand the AoC: the touch controller (`/dev/ftm5`, on the AoC's own SPI bus for its tap and long-press gestures) and the touch bus arbitration (`/tbn`). With them the AoC probes the touch IC and takes its bus, and ferros's touch goes dead (2026-10-24, the first boot with the registry). Touch is ferros's; the AoC's gestures can come back later as a deliberate handover.
+const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/tbn"];
+
+/// A registry script without the node blocks that start with any of `drop`: a block is its `+/path` line and the indented lines under it.
+fn strip(text: &[u8], drop: &[&[u8]]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(text.len());
+    let mut skipping = false;
+    for line in text.split_inclusive(|&c| c == b'\n') {
+        let indented = line.first().is_some_and(|&c| c == b' ' || c == b'\t');
+        if !indented {
+            skipping = drop.iter().any(|d| line.starts_with(d));
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }
 
 /// Subscribe to the Gravity sensor (handle 54 in this firmware; looked up by name in case it moves) every `period_ms`, no batching. `wake`: deliver on com.google.usf rather than the non-wake-up service.

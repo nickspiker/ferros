@@ -335,7 +335,14 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
 
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
-    unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k).ok().flatten() }
+    match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k) } {
+        Ok(v) => v,
+        // A read that failed is not an absent key: say which (2026-10-24, touch "not in the vault" at boot, found by a restart minutes later).
+        Err(e) => {
+            crate::flashlog::line(&alloc::format!("spawn: reading {k:?} failed: {e:?}"));
+            None
+        }
+    }
 }
 
 /// What init holds: everything the shell's three processes need, in the slot order payloads/init expects (its header). The kernel grants it once; init hands each process its share.
@@ -1408,7 +1415,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
                                             // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
                                             if cmd.params == b"sensors up" {
                                                 let st = &raw mut store;
@@ -1421,6 +1428,10 @@ pub fn run(mut b: Boot) -> ! {
                                                 }
                                             } else if let Some(path) = cmd.params.strip_prefix(b"usf reg ").and_then(|t| core::str::from_utf8(t).ok()) {
                                                 crate::usf::reg(path.trim(), &mut resp);
+                                            } else if cmd.params == b"usf trace" {
+                                                crate::usf::trace(&mut resp);
+                                            } else if let Some(ms) = cmd.params.strip_prefix(b"usf sub ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
+                                                crate::usf::subscribe_gravity(ms, false, &mut resp);
                                             } else if cmd.params == b"usf power" {
                                                 crate::usf::power(&mut resp);
                                             } else if let Some(a) = cmd.params.strip_prefix(b"usf start") {
@@ -1785,8 +1796,8 @@ pub fn run(mut b: Boot) -> ! {
                                         }
                                         if cmd.params == b"kv selftest" {
                                             // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
-                                            match store.as_mut() {
-                                                Some(s) => resp.extend_from_slice(s.selftest().as_bytes()),
+                                            match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
+                                                Some(t) => resp.extend_from_slice(t.as_bytes()),
                                                 None => resp.extend_from_slice(b"no vault open\n"),
                                             }
                                             queue_pt_response(&mut pt_out_data, &resp);
@@ -2495,7 +2506,7 @@ pub fn run(mut b: Boot) -> ! {
                                             }
                                             let input = &pr[at.min(pr.len())..];
                                             // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
-                                            let sealed = store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+                                            let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
                                             match crate::process::spawn_capsule(if name.is_empty() { b"proc" } else { name }, code, input, &grants, &sealed) {
                                                 Ok(o) => {
                                                     use crate::checklist::{mark, Item};
@@ -2531,11 +2542,11 @@ pub fn run(mut b: Boot) -> ! {
                                             let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                                             let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
                                                 (Ok(seal), Some(store)) => {
-                                                    let mut list = store.get_by_key("sealed").ok().flatten().unwrap_or_default();
+                                                    let mut list = crate::process::with_lock(|| store.get_by_key("sealed").ok().flatten()).unwrap_or_default();
                                                     if !list.chunks_exact(32).any(|e| e == seal) {
                                                         list.extend_from_slice(&seal);
                                                     }
-                                                    match store.set("sealed", &list) {
+                                                    match crate::process::with_lock(|| store.set("sealed", &list)) {
                                                         Ok(_) => {
                                                             let mut r = alloc::vec![0u8];
                                                             r.extend_from_slice(&seal);

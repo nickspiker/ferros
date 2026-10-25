@@ -44,6 +44,9 @@ unsafe impl<T> Sync for Global<T> {}
 // One lock over the kernel's shared state (KERNEL.md "Cores"): taken for the microseconds a trap, a slice hand-out or a service-loop call holds it, never across a wait or a run at EL0. Every `pub fn` here takes it; everything private assumes it is held. `LOCK_SPINS` counts contended acquisitions for DIAG.
 static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub static LOCK_SPINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The core holding the kernel lock, plus one (0: free): lets code that runs both inside syscalls and from the service loop take the lock only when it does not already hold it (`with_lock_held_or`).
+static HOLDER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 fn lock() {
     use core::sync::atomic::Ordering;
     if LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
@@ -52,10 +55,12 @@ fn lock() {
             core::hint::spin_loop();
         }
     }
+    HOLDER.store(core() + 1, Ordering::Relaxed);
     // Who holds it, for the post-mortem (a hang with the lock held names its core).
     crate::platform::note(0, core() as u64 + 1);
 }
 fn unlock() {
+    HOLDER.store(0, core::sync::atomic::Ordering::Relaxed);
     crate::platform::note(0, 0);
     LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
@@ -700,6 +705,15 @@ pub fn with_lock<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     unlock();
     r
+}
+
+/// `f` under the kernel lock, whether or not this core already holds it (a syscall does; the service loop does not): for code both reach, such as the flash log.
+pub fn with_lock_held_or<R>(f: impl FnOnce() -> R) -> R {
+    if HOLDER.load(core::sync::atomic::Ordering::Relaxed) == core() + 1 {
+        f()
+    } else {
+        with_lock(f)
+    }
 }
 
 /// `set_pref` for a caller already holding the kernel lock (a syscall, or `with_lock`).
