@@ -1481,7 +1481,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf flk") || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
                                             // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
                                             if cmd.params == b"sensors up" {
                                                 let st = &raw mut store;
@@ -1500,6 +1500,8 @@ pub fn run(mut b: Boot) -> ! {
                                                 if v.len() >= 2 {
                                                     crate::usf::display_info(v[0], !a.contains("off"), v[1], &mut resp);
                                                 }
+                                            } else if cmd.params == b"usf flk" || cmd.params == b"usf flk start" {
+                                                crate::usf::flk(cmd.params == b"usf flk start", &mut resp);
                                             } else if cmd.params == b"usf ev" {
                                                 crate::usf::events(&mut resp);
                                             } else if cmd.params == b"usf sensors" {

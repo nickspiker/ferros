@@ -153,6 +153,8 @@ fn drain(want: Option<u32>) -> Option<(u32, alloc::vec::Vec<u8>)> {
                     }
                 }
                 9 => sample(payload),
+                // The light waveform (libusf HandleFlickerFormatMsg / HandleFlickerDataMsg): kind 13 its format, kind 4 its data, each a nested FlatBuffer in the payload. Kept raw for `diag usf flk` until the layout is pinned down.
+                4 | 13 => flk_keep(kind, payload),
                 _ => {}
             }
         }
@@ -258,6 +260,65 @@ pub static SPECTRAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// The last two gravity samples: [x | y << 32, z, time in counter ticks] for the newest, then the same for the one before (f32 bits, m/s²). SYS_FACTS 14–19.
 pub static PAIR: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The flicker stream's messages as they came: the last format (kind 13) and the last four data messages (kind 4), first 256 bytes each, and how many of each.
+static mut FLK: ([u8; 256], usize, [([u8; 256], usize); 4], u32, u32) = ([0; 256], 0, [([0; 256], 0); 4], 0, 0);
+
+fn flk_keep(kind: u8, p: &[u8]) {
+    let n = p.len().min(256);
+    unsafe {
+        let f = &mut *(&raw mut FLK);
+        if kind == 13 {
+            f.0[..n].copy_from_slice(&p[..n]);
+            f.1 = p.len();
+            f.3 += 1;
+        } else {
+            let i = (f.4 % 4) as usize;
+            f.2[i].0[..n].copy_from_slice(&p[..n]);
+            f.2[i].1 = p.len();
+            f.4 += 1;
+        }
+    }
+}
+
+/// `diag usf flk [start]`: subscribe the flicker sensor as libusf's EnableFlickerSensor does (mode 1, a 10 s period, no latency, non-wake, client id G#30002), then the format and data messages kept so far, raw.
+pub fn flk(start: bool, out: &mut alloc::vec::Vec<u8>) {
+    if start {
+        match find("VD6282 Flicker") {
+            Some(h) => {
+                let mut m = SUBSCRIBE.to_vec();
+                put32(&mut m, 52, h);
+                m[126] = 1;
+                m[127] = 0;
+                put32(&mut m, 112, 0x0003_0002);
+                m[128..136].copy_from_slice(&0u64.to_le_bytes());
+                m[136..144].copy_from_slice(&10_000_000_000u64.to_le_bytes());
+                put32(&mut m, 148, 1);
+                let r = send(m, Some(60)).and_then(|t| reply(t, 256));
+                out.extend_from_slice(alloc::format!("flicker subscribe (handle {h}): {:?}\n", r.map(|(s, b)| (s, body_u32(&b, 0)))).as_bytes());
+                if SUB_ID.load(Ordering::Relaxed) == 0 {
+                    SUB_ID.store(1, Ordering::Relaxed);
+                }
+            }
+            None => out.extend_from_slice(b"no VD6282 Flicker sensor listed\n"),
+        }
+        let f = crate::platform::cntfrq();
+        let t0 = crate::platform::cntpct();
+        while crate::platform::cntpct().wrapping_sub(t0) < f / 2 {
+            drain(None);
+        }
+    }
+    let f = unsafe { &*(&raw const FLK) };
+    let hex = |b: &[u8]| -> alloc::string::String { b.iter().map(|x| alloc::format!("{x:02x}")).collect() };
+    out.extend_from_slice(alloc::format!("format messages A#{}, data messages A#{}\n", f.3, f.4).as_bytes());
+    if f.3 > 0 {
+        out.extend_from_slice(alloc::format!("format (A#{} bytes): {}\n", f.1, hex(&f.0[..f.1.min(256)])).as_bytes());
+    }
+    for i in 0..(f.4.min(4) as usize) {
+        let (b, n) = &f.2[i];
+        out.extend_from_slice(alloc::format!("data (A#{n} bytes): {}\n", hex(&b[..(*n).min(256)])).as_bytes());
+    }
+}
 
 /// The latest event of each other sensor type seen: (USF sensor type, bytes, the event's first 128 bytes, how many came).
 static mut LAST_EV: [(u16, usize, [u8; 128], u32); 32] = [(0, 0, [0; 128], 0); 32];
