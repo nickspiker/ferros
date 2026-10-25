@@ -792,8 +792,13 @@ impl Map {
         }
     }
 
-    /// One finger on the focused scope (owner, 2026-10-25): across, the time it shows — to the right stretches the trace (a shorter span), to the left compresses it, a factor of two per half the screen's width, from 2^-6 s to 4 s; up or down, the next or the previous channel, a step per eighth of the screen's height. The gesture's axis is whichever its travel (tx, ty) favoured when it passed the slop, and holds until the fingers lift.
+    /// One finger on the focused scope (owner, 2026-10-25), along the plot's own axes however it is turned: across, the time it shows — to the right stretches the trace (a shorter span), to the left compresses it, a factor of two per half the screen's width, from 2^-6 s to 4 s; up or down, the next or the previous channel, a step per eighth of the screen's height. The gesture's axis is whichever its travel (tx, ty) favoured when it passed the slop, and holds until the fingers lift.
     fn scope_drag(&mut self, dx: i64, dy: i64, tx: i64, ty: i64) {
+        // Into the plot's own axes: its turn on the screen is the camera's and the circle's (as the display draws it), undone.
+        let (cc, cs) = (self.rc[SCOPE], self.rsn[SCOPE]);
+        let (tc, ts) = ((self.cam.c * cc - self.cam.s * cs) >> 14, (self.cam.s * cc + self.cam.c * cs) >> 14);
+        let local = |x: i64, y: i64| ((tc * x + ts * y) >> 14, (tc * y - ts * x) >> 14);
+        let ((dx, dy), (tx, ty)) = (local(dx, dy), local(tx, ty));
         if self.scope_axis == 0 {
             self.scope_axis = if tx.abs() >= ty.abs() { 1 } else { 2 };
         }
