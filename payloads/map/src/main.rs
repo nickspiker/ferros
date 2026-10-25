@@ -42,7 +42,7 @@ struct Spec {
 }
 
 /// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
-const CIRCLES: [Spec; 9] = [
+const CIRCLES: [Spec; 8] = [
     Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
     Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
     Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
@@ -52,14 +52,16 @@ const CIRCLES: [Spec; 9] = [
     Spec { label: "Ramps", ring: 1, lit: 0, share: 60, icon: 6, needs: "" },
     // The clock, a widget the display draws itself (icon G#80, display WIDGET_CLOCK): three rings and the time, decimal or dozenal by the device's number base.
     Spec { label: "Clock", ring: 1, lit: 0, share: 150, icon: 0x80, needs: "" },
-    // The rear spectral sensor, a widget the display draws itself (icon G#81, display WIDGET_SPECTRAL): a bar per channel, live.
-    Spec { label: "Spectral", ring: 1, lit: 0, share: 100, icon: 0x81, needs: "" },
-    // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the phone.
+    // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the phone. (The spectral bars, G#81, went 2026-10-25: the scope's levels show the same channels.)
     Spec { label: "Scope", ring: 1, lit: 0, share: 150, icon: 0x82, needs: "" },
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;
 const RAMPS: usize = 5;
+/// The light scope: arrived at, it is in focus (`Map::scope_drag`).
+const SCOPE: usize = 7;
+/// The scope's channels a vertical swipe steps through, as device preference 7 numbers them (1 + the VD6282's channel: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear), longest wavelength first and the composites last.
+const SCOPE_STEPS: [u8; 6] = [5, 1, 4, 3, 2, 6];
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
 const BASE_RADIUS: i64 = 110;
@@ -323,6 +325,12 @@ struct Map {
     app_since: u64,
     /// The display server's ramps are on the panel (the present stage's test screen); any tap comes back.
     ramps: bool,
+    /// The time the focused scope shows, µs, and the gesture under way on it: its axis (0 not yet known, 1 across: the time, 2 up and down: the channel) and the vertical travel not yet spent on a step.
+    scope_span_us: u32,
+    scope_axis: u8,
+    scope_acc: i64,
+    /// The focus and span the display last heard (display op 25).
+    focus_sent: (u8, u32),
 }
 
 impl Map {
@@ -754,6 +762,10 @@ impl Map {
             View::Map => {}
             View::Front(DEVICE) => self.dashboard(&mut b),
             View::Back(DEVICE) => self.settings(&mut b),
+            View::Front(SCOPE) => {
+                let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+                b.text(cx, cy + r + 64, 32, grey(), 1, "drag across: time \u{2022} swipe up or down: channel \u{2022} two fingers: back");
+            }
             View::Front(i) => {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
                 b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[i].label);
@@ -763,6 +775,48 @@ impl Map {
         }
         b.op(&self.cam.op(true));
         b.send(self.display);
+        self.send_focus();
+    }
+
+    /// The display told what is in focus (op 25): the scope when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; and the span it shows. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
+    fn send_focus(&mut self) {
+        let f = (if self.view == View::Front(SCOPE) { CIRCLES[SCOPE].icon } else { 0 }, self.scope_span_us);
+        if f != self.focus_sent {
+            self.focus_sent = f;
+            let mut m = [0u8; 6];
+            m[0] = 25;
+            m[1] = f.0;
+            m[2..6].copy_from_slice(&f.1.to_le_bytes());
+            let mut r = [0u8; 4];
+            call(self.display, &m, &mut r);
+        }
+    }
+
+    /// One finger on the focused scope (owner, 2026-10-25): across, the time it shows — to the right stretches the trace (a shorter span), to the left compresses it, a factor of two per half the screen's width, from 2^-6 s to 4 s; up or down, the next or the previous channel, a step per eighth of the screen's height. The gesture's axis is whichever its travel (tx, ty) favoured when it passed the slop, and holds until the fingers lift.
+    fn scope_drag(&mut self, dx: i64, dy: i64, tx: i64, ty: i64) {
+        if self.scope_axis == 0 {
+            self.scope_axis = if tx.abs() >= ty.abs() { 1 } else { 2 };
+        }
+        if self.scope_axis == 1 {
+            let f = libm::exp2f(-(dx as f32) / (self.w as f32 * 0.5));
+            self.scope_span_us = ((self.scope_span_us as f32 * f) as u32).clamp(15_625, 4_000_000);
+            self.send_focus();
+            return;
+        }
+        self.scope_acc += dy;
+        let step = (self.h / 8).max(1);
+        while self.scope_acc.abs() >= step {
+            let up = self.scope_acc < 0;
+            self.scope_acc += if up { step } else { -step };
+            let now_ch = ferros_sys::pref(ferros_sys::PREF_SCOPE);
+            let at = SCOPE_STEPS.iter().position(|&c| c == now_ch);
+            let k = match (at, up) {
+                (None, _) => 0,
+                (Some(i), true) => (i + 1) % SCOPE_STEPS.len(),
+                (Some(i), false) => (i + SCOPE_STEPS.len() - 1) % SCOPE_STEPS.len(),
+            };
+            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_SCOPE, SCOPE_STEPS[k]);
+        }
     }
 
     /// Label and value on a row: the label right of centre's left, the value left of centre's right.
@@ -1058,6 +1112,13 @@ impl Map {
                     self.draw();
                 }
             }
+            (2, View::Front(SCOPE)) => {
+                // The focused scope: two fingers leave it (owner, 2026-10-25), back to the map.
+                self.view = View::Map;
+                let to = self.home();
+                self.fly(to);
+                self.draw();
+            }
             (2, View::Front(i)) => {
                 self.view = View::Back(i);
                 self.draw();
@@ -1125,6 +1186,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         arranged: [false; N],
         ramps_only: None,
         ramps: false,
+        scope_span_us: 1_000_000,
+        scope_axis: 0,
+        scope_acc: 0,
+        focus_sent: (0, 1_000_000),
         app_seen: false,
         app_since: 0,
     };
@@ -1347,6 +1412,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             start = [(false, 0, 0); 16];
             grab = None;
             grab_n = 0;
+            map.scope_axis = 0;
+            map.scope_acc = 0;
         }
         if down {
             most = most.max(held);
@@ -1408,11 +1475,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     if ga == gb { ga } else { None }
                 };
             }
-            if nb >= 1 && map.view != View::Map {
+            // One finger on the focused scope works the scope, not the plane.
+            let on_scope = nb == 1 && map.view == View::Front(SCOPE);
+            if on_scope {
+                let id = both[0];
+                map.scope_drag(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2, cur[id].1 - start[id].1, cur[id].2 - start[id].2);
+            }
+            if !on_scope && nb >= 1 && map.view != View::Map {
                 // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again.
                 map.view = View::Map;
             }
-            if nb == 1 {
+            if nb == 1 && !on_scope {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 if let Some(i) = grab {

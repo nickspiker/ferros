@@ -365,26 +365,26 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 }
 /// Scene icon ids at and above this are widgets the display draws itself, not bundle icons: G#80 the clock.
 const WIDGET_CLOCK: u8 = 0x80;
-/// The rear spectral sensor's widget (the map's icon G#81): a bar per channel.
-const WIDGET_SPECTRAL: u8 = 0x81;
 /// The light scope (the map's icon G#82): the 16 kHz trace of one channel over the last second, and the four colour channels' levels in stops beneath.
 const WIDGET_SCOPE: u8 = 0x82;
-/// The fast trace, as SYS_LIGHT last gave it: up to a second at 16 kHz.
-static mut SCOPE_BUF: [i32; 16384] = [0; 16384];
+/// The fast trace, as SYS_LIGHT last gave it: up to four seconds at 16 kHz, and the call's header.
+static mut SCOPE_BUF: [i32; 65536 + 4] = [0; 65536 + 4];
 /// The slow channels' history: (counter ticks, counts per unit gain for the six channels), the last 64 spectral samples (~13 s at the AoC's ~5 a second).
 static mut SLOW: ([(u64, [f32; 6]); 64], usize) = ([(0, [0.0; 6]); 64], 0);
 static mut SLOW_SEQ: u64 = 0;
-/// Where the scope was drawn and whether a frame holds it (as SPEC_SHOWN / SPEC_RECT).
+/// Where the scope was drawn and whether a frame holds it (as CLOCK_SHOWN / CLOCK_RECT for the clock).
 static mut SCOPE_SHOWN: bool = false;
 static mut SCOPE_RECT: draw::Rect = draw::Rect::EMPTY;
+/// The part of the scope that changes between frames (its plot and labels), as the last draw placed it: what the redraws between frames clear and draw again.
+static mut SCOPE_LIVE: draw::Rect = draw::Rect::EMPTY;
+/// The time the scope shows, µs (display op 25: the focused scope's drag; a second by default).
+static mut SCOPE_SPAN_US: u32 = 1_000_000;
+/// The widget in focus (display op 25; 0 none): it is redrawn and flipped at the panel's rate, everything else stays at the 10 Hz flips (owner, 2026-10-25).
+static mut FOCUS: u8 = 0;
+/// The scope's redraws between frames: total µs and count, logged every 256.
+static mut SCOPE_US: [u64; 2] = [0; 2];
 /// The spectral sensor's newest sample as this pass read it (SYS_FACTS 20–26): counts, gains, sample number.
 static mut SPECTRAL_NOW: Option<([f32; 6], [f32; 6], u64)> = None;
-/// Where the spectral widget was last drawn, and whether a frame holds it (as CLOCK_SHOWN / CLOCK_RECT for the clock).
-static mut SPEC_SHOWN: bool = false;
-static mut SPEC_RECT: draw::Rect = draw::Rect::EMPTY;
-/// The sample number the back buffer's widget shows, and each phase frame's (u64::MAX: unknown, redraw).
-static mut BACK_SPEC: u64 = u64::MAX;
-static mut PHASE_SPEC: [u64; PHASES] = [u64::MAX; PHASES];
 /// The 60 directions (sin, −cos) of k/60 of a turn, Q14, for the clock face (built once at start).
 static mut CLOCK_DIRS: [(i64, i64); 60] = [(0, 0); 60];
 /// A clock is on the screen (the last frame drew one): the render thread checks each second whether its digits changed.
@@ -583,16 +583,19 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
     }
 }
 
-/// The light scope in a circle at (cx, cy), radius r (Q8 px), front to back over its plate (owner, 2026-10-25). Top: the last second of the flicker engine's 16 kHz trace (one channel, AC: the engine takes out the light's steady level), drawn as a phosphor — every sample-to-sample segment adds coverage to the rows it crosses in its pixel column, so a dense waveform shades and an edge stays sharp — on a symmetric scale fitted to the second; its channel and dominant frequency (zero crossings) above it. Bottom: the colour channels' levels over the same second, in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, sample and hold between the AoC's ~5 readings a second. The trace ends at the newest sample, so each redraw moves it left by the time since the last.
+/// The light scope in a circle at (cx, cy), radius r (Q8 px), front to back over its black plate (owner, 2026-10-25: black, so the curves show). Top: the flicker engine's 16 kHz trace of one channel over the span (SCOPE_SPAN_US, a second unless the focused scope's drag changed it), AC (the engine takes out the light's steady level; the faint line through the middle is that level, the trace's zero), drawn as a phosphor — every sample-to-sample segment adds coverage to the rows it crosses in its pixel column, so a dense waveform shades and an edge stays sharp — on a symmetric scale fitted to the span; its channel and dominant frequency (zero crossings) above it. Bottom: the colour channels' levels over the same span, in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, sample and hold between the AoC's ~5 readings a second. The trace ends at the newest sample, so each redraw moves it left by the time since the last. Everything it draws stays inside the circle at every size (text too: no minimum size, so a small circle's labels never reach past the region its redraws clear). Returns the circle's rectangle; SCOPE_LIVE gets the part that changes (the plot and its labels).
 fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
     let rp = (r >> 8) as f32;
     let on = ferros_sys::pref(ferros_sys::PREF_SCOPE);
+    let plate = BLACK & 0x00FF_FFFF;
     // The plot box, inside the circle.
     let (bx, by, bw, bh) = ((cx >> 8) as f32 - rp * 0.66, (cy >> 8) as f32 - rp * 0.55, rp * 1.32, rp * 1.1);
     let (w, top_h, gap) = (bw as usize, (bh * 0.55) as usize, (bh * 0.06) as usize);
     let bot_h = (bh as usize).saturating_sub(top_h + gap);
     let (x0, y0) = (bx as i64, by as i64);
     let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+    let px = rp * 0.11;
+    unsafe { SCOPE_LIVE = draw::Rect { x0: bx as i32, y0: (by - px * 1.4) as i32, x1: (bx + bw) as i32 + 1, y1: (by + bh + px * 1.6) as i32 + 1 } };
     // One pixel at an opacity, under what is there.
     let mut put = |pixels: &mut [Px], x: i64, y: i64, colour: u32, a: u32| {
         if x < bx0 || y < by0 || x >= bx1 || y >= by1 || a == 0 {
@@ -604,22 +607,27 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
     // Channel colours (register order, provisional): red, visible, blue, green, IR, clear.
     const COL: [u32; 6] = [0xFF4040, 0xC0C0C0, 0x4080FF, 0x40E060, 0xB040A0, 0xFFFFFF];
     const NAME: [&str; 6] = ["red", "visible", "blue", "green", "IR", "clear"];
-    let px = (rp * 0.11).max(8.0);
-    if on == 0 || w < 8 || top_h < 8 {
+    if on == 0 {
         let mut cv = Canvas::new(pixels, width, height, &mut Damage);
         let t = "scope off";
         let tw = text_width(font, t, px);
         text(&mut cv, font, t, (cx >> 8) as f32 - tw * 0.5, (cy >> 8) as f32, px, 0xFF00_0000 | th.text2);
-        return draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF);
+        return draw::disc(pixels, width, height, cx, cy, r, plate);
     }
+    if w < 2 || top_h < 2 {
+        return draw::disc(pixels, width, height, cx, cy, r, plate);
+    }
+    let span_us = unsafe { SCOPE_SPAN_US } as u64;
     // ── the fast trace ──
     let buf = unsafe { &mut *(&raw mut SCOPE_BUF) };
-    let (_end, rate, mask, got) = ferros_sys::light(&mut buf[..]);
-    // The newest second of what came (oldest first in the buffer).
-    let n = got.min(rate.max(1) as usize);
+    // Only the span's samples are asked for (four words more for the call's header), so a short span costs a short copy.
+    let (_, rate0, _, _) = ferros_sys::light(&mut buf[..4]);
+    let want = ((span_us * rate0.max(1) as u64 / 1_000_000) as usize).clamp(2, buf.len() - 4);
+    let (_end, rate, mask, got) = ferros_sys::light(&mut buf[..want + 4]);
+    let n = got.min(want);
     let ch = (mask.trailing_zeros() as usize).min(5);
     let mut freq = 0.0f32;
-    if n >= 2 * w.max(2) {
+    if n >= 2 {
         let s = &buf[got - n..got];
         let mean = s.iter().map(|&v| v as i64).sum::<i64>() / n as i64;
         let peak = s.iter().map(|&v| (v as i64 - mean).abs()).max().unwrap_or(1).max(1) as f32;
@@ -630,10 +638,13 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
         let mut prev = row(s[0]);
         let mut crossings = 0u32;
         let mut last_sign = s[0] as i64 >= mean;
+        // A span shorter than the box has columns between samples: each holds the sample before it, so the samples show as steps.
+        let mut seen = 0usize;
         for col in 0..w {
             cov.iter_mut().for_each(|c| *c = 0.0);
-            let (a, b) = ((col as f32 * per) as usize, (((col + 1) as f32 * per) as usize).min(n));
-            for &v in &s[a..b] {
+            let a = ((col as f32 * per) as usize).min(n - 1);
+            let b = (((col + 1) as f32 * per) as usize).clamp(a + 1, n);
+            for (i, &v) in s[a..b].iter().enumerate() {
                 let y = row(v);
                 let (lo, hi) = (prev.min(y), prev.max(y));
                 let (r0, r1) = (lo as usize, (hi as usize).min(top_h - 1));
@@ -642,10 +653,13 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
                     cov[rr] += wgt;
                 }
                 prev = y;
-                let sign = v as i64 >= mean;
-                if sign != last_sign {
-                    crossings += 1;
-                    last_sign = sign;
+                if a + i >= seen {
+                    seen = a + i + 1;
+                    let sign = v as i64 >= mean;
+                    if sign != last_sign {
+                        crossings += 1;
+                        last_sign = sign;
+                    }
                 }
             }
             let norm = 255.0 * 3.0 / per.max(1.0);
@@ -656,8 +670,13 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
             }
         }
         freq = crossings as f32 * 0.5 * rate as f32 / n as f32;
+        // The trace's zero: the light's steady level, under the trace.
+        let yz = y0 + half as i64;
+        for col in 0..w {
+            put(pixels, x0 + col as i64, yz, th.text2, 64);
+        }
     }
-    // Its label: the channel and the dominant frequency.
+    // Its label: the channel and the dominant frequency, above the box.
     {
         let mut cv = Canvas::new(pixels, width, height, &mut Damage);
         let mut t = alloc::string::String::new();
@@ -667,14 +686,16 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
     // ── the slow levels, in stops ──
     let h = unsafe { &*(&raw const SLOW) };
     let t_now = now();
-    let span = freq_ticks();
+    let span = freq_ticks() * span_us / 1_000_000;
     // Slots, as the spectral widget labels them (provisional): r 0, g 1, b 2, ir 4.
     const SLOW_CH: [(usize, u32); 4] = [(0, 0xFF4040), (1, 0x40E060), (2, 0x4080FF), (4, 0xB040A0)];
     let count = h.1.min(64);
     let pts: alloc::vec::Vec<(u64, [f32; 6])> = (0..count).map(|i| h.0[(h.1 - count + i) % 64]).collect();
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
-    for &(_, v) in pts.iter().filter(|(t, _)| t_now.wrapping_sub(*t) < 2 * span) {
+    // The scale's window: twice the span, and never less than half a second, so a short span still holds the reading it shows.
+    let window = (2 * span).max(freq_ticks() / 2);
+    for &(_, v) in pts.iter().filter(|(t, _)| t_now.wrapping_sub(*t) < window) {
         for &(slot, _) in &SLOW_CH {
             if v[slot] > 0.0 {
                 let l = libm::log2f(v[slot]);
@@ -683,11 +704,12 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
             }
         }
     }
+    let yb = y0 + (top_h + gap) as i64;
+    let mut label = alloc::string::String::new();
     if lo <= hi && bot_h > 4 {
         let (lo, hi) = (libm::floorf(lo), libm::ceilf(hi).max(libm::floorf(lo) + 1.0));
-        let yb = y0 + (top_h + gap) as i64;
         let yrow = |l: f32| yb + ((hi - l) / (hi - lo) * (bot_h as f32 - 1.0)) as i64;
-        // Each channel: sample and hold across the second, newest at the right.
+        // Each channel: sample and hold across the span, newest at the right.
         for &(slot, colour) in &SLOW_CH {
             let mut last_y: Option<i64> = None;
             for col in 0..w {
@@ -716,47 +738,24 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
             }
             st += 1.0;
         }
-        let mut cv = Canvas::new(pixels, width, height, &mut Damage);
-        let mut t = alloc::string::String::new();
-        let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{:.0} stops", hi - lo));
-        text(&mut cv, font, &t, bx, (yb + bot_h as i64) as f32 + px * 1.1, px * 0.8, 0xFF00_0000 | th.text2);
+        let _ = core::fmt::Write::write_fmt(&mut label, format_args!("{:.0} stops  ", hi - lo));
     }
-    draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF)
+    // Under the box: the scale's depth and the span.
+    {
+        if span_us >= 1_000_000 {
+            let _ = core::fmt::Write::write_fmt(&mut label, format_args!("{:.1} s", span_us as f32 / 1e6));
+        } else {
+            let _ = core::fmt::Write::write_fmt(&mut label, format_args!("{:.0} ms", span_us as f32 / 1e3));
+        }
+        let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+        text(&mut cv, font, &label, bx, (yb + bot_h as i64) as f32 + px * 1.1, px * 0.8, 0xFF00_0000 | th.text2);
+    }
+    draw::disc(pixels, width, height, cx, cy, r, plate)
 }
 
 /// The counter ticks in a second.
 fn freq_ticks() -> u64 {
     freq()
-}
-
-/// The rear spectral sensor's widget in a circle at (cx, cy), radius r (Q8 px): a bar per channel, front to back over the circle's plate. Each bar is the channel's counts per unit gain on a log scale (a tenth of a count to the ADC's 2^24 at gain 1), so the auto-gain's changes do not move it; its name under it. Returns the rectangle it touched.
-fn spectral_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
-    let rp = (r >> 8) as f32;
-    let (x0, y_base) = ((cx >> 8) as f32 - rp * 0.6, (cy >> 8) as f32 + rp * 0.35);
-    let (w, hmax) = (rp * 1.2, rp * 0.8);
-    let slot = w / 6.0;
-    if let Some((c, g, _)) = unsafe { SPECTRAL_NOW } {
-        for i in 0..6 {
-            let v = if g[i] > 0.0 { c[i] / g[i] } else { 0.0 };
-            // log10 from 0.1 (−1) to 2^24 (7.2): 8.2 decades over the bar's height.
-            let f = ((libm::log10f(v.max(0.1)) + 1.0) / 8.2).clamp(0.0, 1.0);
-            let h = (hmax * f).max(1.0);
-            let bx = x0 + slot * i as f32 + slot * 0.15;
-            let mut cv = Canvas::new(pixels, width, height, &mut Damage);
-            paint::fill_rect(&mut cv, bx as isize, (y_base - h) as isize, (slot * 0.7) as isize, h as isize, 0xFF00_0000 | th.text, None, None);
-        }
-    }
-    // The channels by Google's names (registry and factory calibration: r, g, b, clr1, clr2, ir), in the order the golden calibration lists them, which last night's readings fit; provisional until the laser lines settle it.
-    const NAMES: [&str; 6] = ["r", "g", "b", "c1", "ir", "c2"];
-    let px = rp * 0.14;
-    if px >= 6.0 {
-        for (i, t) in NAMES.iter().enumerate() {
-            let tw = text_width(font, t, px);
-            let mut cv = Canvas::new(pixels, width, height, &mut Damage);
-            text(&mut cv, font, t, x0 + slot * (i as f32 + 0.5) - tw * 0.5, y_base + px * 1.2, px, 0xFF00_0000 | th.text2);
-        }
-    }
-    draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF)
 }
 
 /// Text centred on (cx, cy) and turned by (c, s), front to back: the clock's digits, which turn with its face.
@@ -1294,7 +1293,6 @@ fn publish10x4(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, mask:
             if mask >> k & 1 == 1 {
                 unsafe {
                     PHASE_CLOCK[k] = None;
-                    PHASE_SPEC[k] = u64::MAX;
                 }
             }
         }
@@ -1489,7 +1487,6 @@ fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: 
     let dst = phase_slice(k, width * height);
     unsafe {
         PHASE_CLOCK[k] = None;
-        PHASE_SPEC[k] = u64::MAX;
     }
     let fw = (f.x1 - f.x0) as usize;
     let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
@@ -2092,8 +2089,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     unsafe {
                         CLOCK_SHOWN = false;
                         CLOCK_RECT = draw::Rect::EMPTY;
-                        SPEC_SHOWN = false;
-                        SPEC_RECT = draw::Rect::EMPTY;
                         SCOPE_SHOWN = false;
                         SCOPE_RECT = draw::Rect::EMPTY;
                         LAST_CAM = if m.get(13).copied().unwrap_or(0) & 1 == 0 && m.len() <= 18 {
@@ -2159,17 +2154,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 CUR_DMG = CUR_DMG.union(r);
                                 SCOPE_SHOWN = true;
                                 SCOPE_RECT = SCOPE_RECT.union(r);
-                            }
-                            continue;
-                        }
-                        if cir.icon == WIDGET_SPECTRAL {
-                            let r = spectral_widget(pixels, width, height, sx, sy, sr, th, &font);
-                            ALLOC.reset();
-                            unsafe {
-                                CUR_DMG = CUR_DMG.union(r);
-                                SPEC_SHOWN = true;
-                                SPEC_RECT = SPEC_RECT.union(r);
-                                BACK_SPEC = SPECTRAL_NOW.map(|s| s.2).unwrap_or(0);
                             }
                             continue;
                         }
@@ -2420,6 +2404,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
+                // Focus: [icon u8, 0 none][span µs u32]. The focused widget is redrawn and flipped every frame; the span is the time the scope shows (2^-6 s to 4 s).
+                Some(25) if m.len() >= 6 => {
+                    unsafe {
+                        FOCUS = m[1];
+                        SCOPE_SPAN_US = u32::from_le_bytes([m[2], m[3], m[4], m[5]]).clamp(15_625, 4_000_000);
+                    }
+                }
                 Some(23) => {
                     // The app is done: the screen is the map's again (its next frame repaints everything).
                     unsafe {
@@ -2638,11 +2629,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
             }
         }
-        // The scope between frames: on every flip while it is on, its circle drawn again into the phase the flip shows (its trace moves every flip: a tenth of its width at 10 Hz).
+        // The scope between frames: on every flip while it is on, its plot and labels (SCOPE_LIVE, inside its circle) drawn again into the phase the flip shows (its trace moves every flip: a tenth of its width at 10 Hz, every frame when it is in focus).
         if flip_due && ferros_sys::pref(ferros_sys::PREF_SCOPE) != 0 && unsafe { SCOPE_SHOWN && !{ SCOPE_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
-            let clip = unsafe { SCOPE_RECT }.clip(width, height);
+            let clip = unsafe { SCOPE_LIVE.intersect(SCOPE_RECT) }.clip(width, height);
             if !clip.is_empty() {
+                let t_s = now();
                 unsafe {
                     draw::CLIP = clip;
                     CLIP_PHASE = Some(k);
@@ -2651,25 +2643,17 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 unsafe {
                     CLIP_PHASE = None;
                     draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
-                }
-            }
-        }
-        // The spectral widget between frames, as the clock: on a flip, its circle drawn again into the phase the flip shows when a newer sample has come since that phase last held it.
-        if flip_due && unsafe { SPEC_SHOWN && !{ SPEC_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
-            let k = unsafe { (CUR_PHASE + 1) % PHASES };
-            let seq = unsafe { SPECTRAL_NOW }.map(|s| s.2).unwrap_or(0);
-            if unsafe { PHASE_SPEC[k] } != seq {
-                let clip = unsafe { SPEC_RECT }.clip(width, height);
-                if !clip.is_empty() {
-                    unsafe {
-                        draw::CLIP = clip;
-                        CLIP_PHASE = Some(k);
-                    }
-                    replay(&mut handle);
-                    unsafe {
-                        CLIP_PHASE = None;
-                        draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
-                        PHASE_SPEC[k] = BACK_SPEC;
+                    SCOPE_US[0] += ferros_sys::us_since(t_s);
+                    SCOPE_US[1] += 1;
+                    if SCOPE_US[1] == 256 {
+                        let mut l = Log { grants, buf: [0; 256], n: 0 };
+                        l.s(b"display: scope between frames: ");
+                        l.dec(SCOPE_US[0] / 256);
+                        l.s(b" us each, ");
+                        l.dec(((clip.x1 - clip.x0) as u64) * ((clip.y1 - clip.y0) as u64));
+                        l.s(if FOCUS == WIDGET_SCOPE { b" px, in focus\n" } else { b" px\n" });
+                        l.flush();
+                        SCOPE_US = [0; 2];
                     }
                 }
             }
@@ -2939,7 +2923,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let temporal_on = ferros_sys::pref(ferros_sys::PREF_DITHER) == 0;
         // The flip this pass decided at its top, when the clock was drawn into the phase it shows: re-reading the time here flipped, now and then, to a phase whose clock had not been drawn (its edge 400 ms behind, 2026-10-24).
         if unsafe { TEMPORAL } && client_owned && !screen_off && temporal_on && next_clean && flip_due {
-            next_flip = now() + freq() / 10;
+            // The focused widget at the panel's rate (120 Hz; `settle` holds a flip to the frame the panel is on), everything else on the 10 Hz flips.
+            next_flip = now() + if unsafe { FOCUS } != 0 { freq() / 120 } else { freq() / 10 };
             pipe.settle(&mut armed, true);
             unsafe { CUR_PHASE = (CUR_PHASE + 1) % PHASES };
             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);

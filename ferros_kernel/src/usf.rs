@@ -388,7 +388,7 @@ pub fn vd_access(handle: u32, set: bool, param: u32, f4: Option<u32>, f7: Option
 /// The light waveform's format (FlickerFormat: f0 rate Hz, f1 code — 2/3/4 uncompressed bytes per sample, 6 Compressed1 —, f2 little-endian, f3 low bits to ignore): rate | bytes << 32 | ignore << 40 | little-endian << 48. Seen on husky: 16000 Hz, 4 bytes, low 8 ignored, little-endian.
 pub static SCOPE_FMT: AtomicU64 = AtomicU64::new(0);
 /// The last SCOPE_LEN samples of the light waveform (signed, the format's bits, ignored low bits shifted out), a ring indexed by the stream's own sample number; SCOPE_N the samples written so far (the next sample's number).
-pub const SCOPE_LEN: usize = 16384;
+pub const SCOPE_LEN: usize = 65536;
 pub static mut SCOPE: [i32; SCOPE_LEN] = [0; SCOPE_LEN];
 pub static SCOPE_N: AtomicU64 = AtomicU64::new(0);
 

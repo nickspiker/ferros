@@ -28,6 +28,10 @@ impl Rect {
         }
         Rect { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
     }
+    pub fn intersect(self, o: Rect) -> Rect {
+        let r = Rect { x0: self.x0.max(o.x0), y0: self.y0.max(o.y0), x1: self.x1.min(o.x1), y1: self.y1.min(o.y1) };
+        if r.is_empty() { Rect::EMPTY } else { r }
+    }
     pub fn clip(self, w: usize, h: usize) -> Rect {
         let r = Rect { x0: self.x0.max(0), y0: self.y0.max(0), x1: self.x1.min(w as i32), y1: self.y1.min(h as i32) };
         if r.is_empty() { Rect::EMPTY } else { r }
