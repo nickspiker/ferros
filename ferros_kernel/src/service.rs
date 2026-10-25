@@ -681,6 +681,88 @@ fn thermal_poll() {
 /// The vault's key count for fact 7, kept by the service loop (gauge_poll).
 static VAULT_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// A power measurement that does not disturb what it measures (2026-10-25: the old `display power` busy-waited between samples on the kernel's core, so every reading carried the X3 spinning flat out and the display stalled behind it). `diag power start <s> [gap 1/16 s] [input]` cuts the charger (and with `input` deselects CHGIN too) and returns at once; the service loop takes a gauge sample on its ordinary passes whenever one is due, from half a second after the cut (the gauge's own settling), and puts the charger back at the deadline whatever the host does. `diag power` reads the result. Fields: start, settle end, end, next sample, gap (ticks), charger mode before, input before, current sum (µA), voltage sum (µV), samples, min and max current (µA).
+struct PowerWin {
+    settle: u64,
+    end: u64,
+    next: u64,
+    gap: u64,
+    charger_prev: Option<u8>,
+    input_prev: Option<u8>,
+    sum_ua: i64,
+    sum_uv: u64,
+    n: u32,
+    min_ua: i32,
+    max_ua: i32,
+    secs: u64,
+}
+static mut POWER_WIN: Option<PowerWin> = None;
+static mut POWER_RESULT: Option<alloc::string::String> = None;
+
+fn power_start(secs: u64, gap16: u64, input: bool) -> alloc::string::String {
+    let (f, now) = (cntfrq(), cntpct());
+    if unsafe { (*(&raw const POWER_WIN)).is_some() } {
+        return "a window is already running\n".into();
+    }
+    let secs = secs.clamp(1, 64);
+    let mut msg = alloc::string::String::new();
+    let charger_prev = match crate::hsi2c::charger::set_mode(0) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            msg += &alloc::format!("charger mode write failed: G#{e:X}; measuring as is\n");
+            None
+        }
+    };
+    let input_prev = if input && charger_prev.is_some() { crate::hsi2c::charger::input_select(false).ok() } else { None };
+    let settle = now + f / 2;
+    unsafe {
+        POWER_RESULT = None;
+        POWER_WIN = Some(PowerWin { settle, end: settle + secs * f, next: settle, gap: (gap16.clamp(1, 64) * f / 16).max(1), charger_prev, input_prev, sum_ua: 0, sum_uv: 0, n: 0, min_ua: i32::MAX, max_ua: i32::MIN, secs });
+    }
+    msg += &alloc::format!("power window: {secs} s from half a second after the charger cut{}; read it with `diag power`\n", if input_prev.is_some() { ", CHGIN deselected" } else { "" });
+    msg
+}
+
+/// From the service loop: the running power window's sample when one is due, and its end.
+fn power_poll() {
+    let Some(w) = (unsafe { (*(&raw mut POWER_WIN)).as_mut() }) else { return };
+    let now = cntpct();
+    if now >= w.next && now < w.end {
+        w.next = now.max(w.next) + w.gap;
+        if let Ok(g) = crate::hsi2c::gauge::sample() {
+            w.sum_ua += g.current_ua as i64;
+            w.sum_uv += g.vcell_uv as u64;
+            w.n += 1;
+            w.min_ua = w.min_ua.min(g.current_ua);
+            w.max_ua = w.max_ua.max(g.current_ua);
+        }
+    }
+    if now >= w.end {
+        let mut r = alloc::string::String::new();
+        if let Some(p) = w.input_prev {
+            if let Err(e) = crate::hsi2c::charger::restore_input(p) {
+                r += &alloc::format!("CHARGER INPUT RESTORE FAILED: G#{e:X} — write G#69[G#C5] = G#{p:02X} by hand\n");
+            }
+        }
+        if let Some(p) = w.charger_prev {
+            if let Err(e) = crate::hsi2c::charger::restore(p) {
+                r += &alloc::format!("CHARGER RESTORE FAILED: G#{e:X} — write G#69[G#B9] = G#{p:02X} by hand\n");
+            }
+        }
+        if w.n > 0 {
+            let ma = w.sum_ua / w.n as i64 / 1000;
+            let mv = w.sum_uv / w.n as u64 / 1000;
+            r += &alloc::format!("{} s, {} samples: {ma} mA (min {}, max {}) at {mv} mV = {} mW (negative = discharging)\n", w.secs, w.n, w.min_ua / 1000, w.max_ua / 1000, ma * mv as i64 / 1000);
+        } else {
+            r += "no gauge samples\n";
+        }
+        unsafe {
+            POWER_RESULT = Some(r);
+            POWER_WIN = None;
+        }
+    }
+}
+
 /// From the service loop on the kernel's core: the battery gauge every two seconds, for facts 1-4, and the vault's key count, for fact 7.
 fn gauge_poll() {
     let (f, now) = (cntfrq(), cntpct());
@@ -870,6 +952,7 @@ pub fn run(mut b: Boot) -> ! {
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
         gauge_poll();
+        power_poll();
         thermal_poll();
         if !home_started {
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
@@ -1976,6 +2059,21 @@ pub fn run(mut b: Boot) -> ! {
                                             match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
                                                 Some(t) => resp.extend_from_slice(t.as_bytes()),
                                                 None => resp.extend_from_slice(b"no vault open\n"),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"power" || cmd.params.starts_with(b"power start") {
+                                            // `diag power start <s> [gap in 1/16 s] [input]`, then `diag power`: the system's draw over a window, sampled by the service loop's own passes (power_start / power_poll), the charger cut for it.
+                                            if let Some(a) = cmd.params.strip_prefix(b"power start").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                                                resp.extend_from_slice(power_start(v.first().copied().unwrap_or(16), v.get(1).copied().unwrap_or(2), a.contains("input")).as_bytes());
+                                            } else {
+                                                match unsafe { (&*(&raw const POWER_WIN), &*(&raw const POWER_RESULT)) } {
+                                                    (Some(w), _) => resp.extend_from_slice(alloc::format!("running: {} samples so far\n", w.n).as_bytes()),
+                                                    (None, Some(r)) => resp.extend_from_slice(r.as_bytes()),
+                                                    (None, None) => resp.extend_from_slice(b"no window yet: diag power start <s>\n"),
+                                                }
                                             }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
