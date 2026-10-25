@@ -2138,6 +2138,25 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"smp off" || cmd.params == b"smp on" {
+                                            // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
+                                            if cmd.params == b"smp off" {
+                                                crate::smp::stop_all();
+                                            } else {
+                                                crate::smp::launch_all();
+                                            }
+                                            let (up, _) = crate::smp::report();
+                                            resp.extend_from_slice(alloc::format!("workers up G#{up:X}\n").as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"screen off" || cmd.params == b"screen on" {
+                                            // `diag screen off|on`: what the power key does (preference 2), from the host, for measuring.
+                                            crate::process::set_pref(crate::process::PREF_SCREEN_OFF, (cmd.params == b"screen off") as u8);
+                                            resp.extend_from_slice(b"screen preference set\n");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"power" || cmd.params.starts_with(b"power start") {
                                             // `diag power start <s> [gap in 1/16 s] [input]`, then `diag power`: the system's draw over a window, sampled by the service loop's own passes (power_start / power_poll), the charger cut for it.
                                             if let Some(a) = cmd.params.strip_prefix(b"power start").and_then(|t| core::str::from_utf8(t).ok()) {
