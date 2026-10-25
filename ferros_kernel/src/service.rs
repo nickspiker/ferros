@@ -395,20 +395,33 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             rep.push(b'\n');
             continue;
         };
+        // Each step in the flash log and the crumb (G#71 killing, G#72 reading, G#73 spawning, G#74 done; 2026-10-25: a reset followed a display restart with nothing recorded after the vault took the new build).
+        let nm = core::str::from_utf8(name).unwrap_or("?");
+        crate::flashlog::line(&alloc::format!("restart {nm}: killing"));
+        platform::crumb(0x71);
         let killed = crate::process::kill(name);
+        crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
+        platform::crumb(0x72);
         let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
             rep.push(b'\n');
             continue;
         };
+        crate::flashlog::line(&alloc::format!("restart {nm}: capsule {} bytes; spawning", capsule.len()));
+        platform::crumb(0x73);
         match crate::process::spawn_capsule(name, &capsule, b"", &grants, &sealed) {
             Ok(o) => {
                 crate::process::push_console(&o.console);
                 rep.extend_from_slice(alloc::format!("{} {}\n", core::str::from_utf8(name).unwrap_or("?"), if killed { "restarted" } else { "started" }).as_bytes());
+                crate::flashlog::line(&alloc::format!("restart {nm}: started"));
             }
-            Err(e) => rep.extend_from_slice(alloc::format!("{}: {e}\n", core::str::from_utf8(name).unwrap_or("?")).as_bytes()),
+            Err(e) => {
+                rep.extend_from_slice(alloc::format!("{}: {e}\n", core::str::from_utf8(name).unwrap_or("?")).as_bytes());
+                crate::flashlog::line(&alloc::format!("restart {nm}: {e}"));
+            }
         }
+        platform::crumb(0x74);
     }
 }
 
@@ -883,7 +896,8 @@ pub fn run(mut b: Boot) -> ! {
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
             t_heartbeat = now;
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
-            usb_log(&mut usb_log_n, &alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
+            // Outside the USB lines' 256-line budget: after 4.5 h the heartbeats had used it up, and the half hour before a reset went unrecorded (2026-10-25). The log region (64 MiB) holds months of them.
+            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
         crate::usf::poll();
         if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
