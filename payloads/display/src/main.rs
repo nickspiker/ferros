@@ -586,7 +586,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
     }
 }
 
-/// The light scope in a circle at (cx, cy), radius r (Q8 px), turned by (tc, ts) — the camera's turn and the circle's own, as icons are, so it lies however the fingers placed it — front to back over its black plate (owner, 2026-10-25). No text: the plot alone (text cost every redraw). Top: the flicker engine's 16 kHz trace of one channel over the span (SCOPE_SPAN_US), AC (the AoC's PDM decimator high-passes it; the faint line through the middle is that zero), drawn as a phosphor on a grid of half pixels both ways — every sample-to-sample segment adds coverage to the half-pixel rows it crosses in its half-pixel column, so a dense waveform shades and an edge stays sharp; when a column is narrower than a sample the samples are joined by straight lines. Bottom: the colour channels' levels over the same span in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, the AoC's ~5 readings a second joined by straight lines and the newest held to the right edge. Everything is laid out in the circle's own frame (u right, v down, pixels from its centre) and reaches the screen through `splat`, a point spread over the four pixels around it, so a turned plot stays smooth. Returns the circle's rectangle; SCOPE_LIVE gets the part that changes (the plot's turned box).
+/// The light scope in a circle at (cx, cy), radius r (Q8 px), turned by (tc, ts) — the camera's turn and the circle's own, as icons are, so it lies however the fingers placed it — front to back over its black plate (owner, 2026-10-25). No text: the plot alone (text cost every redraw). Top: the flicker engine's 16 kHz trace of one channel over the span (SCOPE_SPAN_US), AC (the AoC's PDM decimator high-passes it), drawn as a phosphor on a grid of half pixels both ways — every sample-to-sample segment lights the half-pixel rows it crosses in its half-pixel column, brighter where more of them cross, so every join shows and a dense waveform shades; when a column is narrower than a sample the samples are joined by straight lines. Bottom: the colour channels' levels over the same span in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, the AoC's ~5 readings a second joined by straight lines and the newest held to the right edge. Everything is laid out in the circle's own frame (u right, v down, pixels from its centre) and reaches the screen through `splat`, a point spread over the four pixels around it, so a turned plot stays smooth. Returns the circle's rectangle; SCOPE_LIVE gets the part that changes (the plot's turned box).
 fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, turn: (f32, f32), th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
     let rp = (r >> 8) as f32;
     let on = ferros_sys::pref(ferros_sys::PREF_SCOPE);
@@ -669,16 +669,15 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
         let mut cov = alloc::vec![0f32; rows];
         let per = n as f32 / cols as f32;
         let mut prev = row(s[0] as f32);
-        // Each half-pixel cell carries a quarter of a pixel's opacity; a column's coverage sums to about the samples in it.
-        let norm = 3.0 / per.max(1.0) * 0.25;
+        // A cell's opacity: a floor for being crossed at all, so every join shows (a fast edge lit only by its share of the column's segments came out at ~0.16 coverage, a few percent of light on the gamma-2 canvas: the edges vanished and the trace fell apart into strokes, 2026-10-25), plus the share of segments that cross it, square-rooted, so where the trace dwells is brighter; half, as two half-pixel columns share each pixel.
+        let inv = 1.0 / per.max(1.0);
         for col in 0..cols {
             cov.iter_mut().for_each(|c| *c = 0.0);
             let mut seg = |cov: &mut [f32], y: f32, prev: &mut f32| {
                 let (lo, hi) = (prev.min(y), prev.max(y));
                 let (r0, r1) = (lo as usize, (hi as usize).min(rows - 1));
-                let wgt = 1.0 / (r1 - r0 + 1) as f32;
                 for c in &mut cov[r0..=r1] {
-                    *c += wgt;
+                    *c += 1.0;
                 }
                 *prev = y;
             };
@@ -698,13 +697,10 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
             let u = u0 + (col as f32 + 0.5) * 0.5;
             for (rr, &c) in cov.iter().enumerate() {
                 if c > 0.0 {
-                    splat(pixels, u, v0 + (rr as f32 + 0.5) * 0.5, COL[ch], (c * norm).min(1.0));
+                    splat(pixels, u, v0 + (rr as f32 + 0.5) * 0.5, COL[ch], 0.5 * (0.6 + 0.4 * libm::sqrtf((c * inv).min(1.0))));
                 }
             }
         }
-        // The trace's zero: the light's steady level, under the trace.
-        let vz = v0 + half * 0.5;
-        line(pixels, (u0, vz), (u0 + bw, vz), th.text2, 0.25);
     }
     // ── the slow levels, in stops ──
     let h = unsafe { &*(&raw const SLOW) };
