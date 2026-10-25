@@ -588,7 +588,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
     }
 }
 
-/// The light scope in a circle at (cx, cy), radius r (Q8 px), turned by (tc, ts) — the camera's turn and the circle's own, as icons are, so it lies however the fingers placed it — front to back over its black plate (owner, 2026-10-25). No text: the plot alone (text cost every redraw). Top: the flicker engine's 16 kHz trace of one channel over the span (SCOPE_SPAN_US), AC (the AoC's PDM decimator high-passes it), drawn as a phosphor on a grid of half pixels both ways — every sample-to-sample segment lights the half-pixel rows it crosses in its half-pixel column, brighter where more of them cross, so every join shows and a dense waveform shades; when a column is narrower than a sample the samples are joined by straight lines. Bottom: the colour channels' levels over the same span in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, the AoC's ~5 readings a second joined by straight lines and the newest held to the right edge. Everything is laid out in the circle's own frame (u right, v down, pixels from its centre) and reaches the screen through `splat`, a point spread over the four pixels around it, so a turned plot stays smooth. Returns the circle's rectangle; SCOPE_LIVE gets the part that changes (the plot's turned box).
+/// The light scope in a circle at (cx, cy), radius r (Q8 px), turned by (tc, ts) — the camera's turn and the circle's own, as icons are, so it lies however the fingers placed it — front to back over its black plate (owner, 2026-10-25). One line of text above the plot, words only: the channel and the mode (free, locked, fold). Top: the flicker engine's 16 kHz trace of one channel over the span (SCOPE_SPAN_US), AC (the AoC's PDM decimator high-passes it), drawn as a phosphor on a grid of half pixels both ways — every sample-to-sample segment lights the half-pixel rows it crosses in its half-pixel column, brighter where more of them cross, so every join shows and a dense waveform shades; when a column is narrower than a sample the samples are joined by straight lines. Bottom: the colour channels' levels over the same span in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, the AoC's ~5 readings a second joined by straight lines and the newest held to the right edge. Everything is laid out in the circle's own frame (u right, v down, pixels from its centre) and reaches the screen through `splat`, a point spread over the four pixels around it, so a turned plot stays smooth. Returns the circle's rectangle; SCOPE_LIVE gets the part that changes (the plot's turned box).
 fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, turn: (f32, f32), th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
     let rp = (r >> 8) as f32;
     let on = ferros_sys::pref(ferros_sys::PREF_SCOPE);
@@ -599,10 +599,14 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
     let (u0, v0, bw, bh) = (-rp * 0.66, -rp * 0.55, rp * 1.32, rp * 1.1);
     let (top_h, gap) = (bh * 0.55, bh * 0.06);
     let bot_h = bh - top_h - gap;
-    // The turned box's screen bounds: what the redraws between frames clear and draw again.
+    // The label's size and the line it sits on, above the box.
+    let lpx = rp * 0.09;
+    let lv = v0 - lpx * 0.9;
+    // The turned box's screen bounds, with the label: what the redraws between frames clear and draw again.
     {
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for (u, v) in [(u0, v0), (u0 + bw, v0), (u0, v0 + bh), (u0 + bw, v0 + bh)] {
+        let vt = lv - lpx;
+        for (u, v) in [(u0, vt), (u0 + bw, vt), (u0, v0 + bh), (u0 + bw, v0 + bh)] {
             let (x, y) = (ox + tc * u - ts * v, oy + ts * u + tc * v);
             x0 = x0.min(x);
             y0 = y0.min(y);
@@ -717,6 +721,14 @@ fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64
                 })
                 .collect();
         }
+    }
+    // The label: the channel and the mode, words only (owner, 2026-10-25: no number that changes, so it is not rasterised anew as values move), turned with the plot.
+    {
+        const NAME: [&str; 6] = ["red", "visible", "blue", "green", "IR", "clear"];
+        let mode = if fold { "fold" } else if lock.is_some() { "locked" } else { "free" };
+        let mut t = alloc::string::String::new();
+        let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{} \u{2022} {}", NAME[ch], mode));
+        text_turned_centre(pixels, width, height, &t, ox - ts * lv, oy + tc * lv, lpx, turn, 0xFF00_0000 | th.text2);
     }
     let drawn = !colv.is_empty() || s.len() >= 2;
     if drawn {
