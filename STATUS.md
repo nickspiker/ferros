@@ -44,6 +44,15 @@ The reusable core of a ferros-native Photon client: `wire.rs` (ping/pong/photon/
 
 ## Next, in rough order
 
+**Hardware bring-up, the night of 2026-10-24/25 (each with its diag, doc and commit):**
+- **Sensors (SENSORS.md):** 39 of the AoC's 41 sensors stream under ferros from every boot (rails, firmware, registry push with the board CDT, the display's state and TE2 for the under-display light/proximity sensor). Gravity turns the clock; proximity carries its raw counts; the proximity wake is built, off until tuned (`device.prox_wake`).
+- **Haptics:** the CS40L26 answers (rev A1, ROM firmware); `diag haptic play <n>` queues a ROM waveform — not yet felt.
+- **GNSS (GNSS.md):** the BCM4776 powers and answers its wake handshake and SPI framing; next is a capture of lhd's patch download.
+- **Modem (docs/oracle/MODEM-BOOT-RECON.md):** the boot channel runs through — TOC, MAIN (98 MB, CRC accepted), VSS, APM; stopped on purpose before the per-unit NV and START.
+- **GPU (GPU.md):** Mali-G715 r1p2, 7 cores, answers; the CSF bring-up plan written (after toka).
+- **TPU (TPU.md):** firmware loaded through GSA, started through Trusty, its first KCI exchange answered (changelist 836291931). Next: the in-kernel VII path (a captured model replayed).
+- Fixed along the way: the flash log raced vault reads from other cores (touch failed to start at boot); `bridge reboot fastboot` resets again (vault writes kept petting the watchdog); the AoC no longer takes the touch bus.
+
 **The owner's order (2026-10-24):** the clock upright by gravity (the accelerometer through the AoC's USF) and the 16-bit canvas; then the proximity-inhibited wake (designed with the owner once the proximity sensor's specs are known); then the spectrometer, GPS, the cellular radio; then the keyboard, the IME and OS housekeeping (a task manager and the like); then Photon.
 
 

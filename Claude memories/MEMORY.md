@@ -81,3 +81,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [MVNO is data-only](mvno_data_only.md) — no POTS/numbers/SMS/MMS/911; EMS via Photon (optional); never plan around telephony; CALEA = just comply (intercepts see Photon ciphertext)
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) — one branchless per-pixel path; clz/exponent/shift tricks over divides and LUTs; a compare forking two maths paths is not a shortcut; owner picks, then build + time
 - [PMU timing: pin to the X3](pmu_timing_pin_x3.md) — unpinned EL0 timings land on the A715s at 1.07 GHz (3-4x off); pin, sleep 1 ms, report cycles/µs as the clock
+- [Hardware night 2026-10-25](husky_hardware_night_2026_10_25.md) — sensors 39/41, haptics, GNSS, modem boot channel, GPU, TPU firmware all alive; where each stands + traps (rails off, flashlog lock, watchdog pets, LPM)
