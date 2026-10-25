@@ -1535,6 +1535,11 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"tpu state" {
+                                            crate::trusty::tpu_state(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"gnss" || cmd.params.starts_with(b"gnss ") {
                                             // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
                                             if cmd.params == b"gnss up" {

@@ -358,11 +358,14 @@ fn send(dst: u32, payload: &[u8]) {
 }
 
 /// Open the named tipc port and return its remote channel address.
+/// Whether tipc has come online (GO_ONLINE arrives once per virtio start): a second connection in the same boot does not wait for it again.
+static ONLINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn connect(port: &str, out: &mut alloc::vec::Vec<u8>) -> Result<u32, &'static str> {
     let mut buf = [0u8; 512];
-    // Wait for GO_ONLINE on the control plane.
-    let mut online = false;
-    for _ in 0..8 {
+    // Wait for GO_ONLINE on the control plane (once a boot).
+    let mut online = ONLINE.load(core::sync::atomic::Ordering::Relaxed);
+    for _ in 0..if online { 0 } else { 8 } {
         if let Some((_, dst, n)) = recv(&mut buf) {
             if dst == TIPC_CTRL_ADDR && n >= 8 && u32::from_le_bytes(buf[0..4].try_into().unwrap()) == CTRL_GO_ONLINE {
                 online = true;
@@ -373,6 +376,7 @@ fn connect(port: &str, out: &mut alloc::vec::Vec<u8>) -> Result<u32, &'static st
     if !online {
         return Err("no GO_ONLINE from Trusty");
     }
+    ONLINE.store(true, core::sync::atomic::Ordering::Relaxed);
     out.extend_from_slice(b"tipc online\n");
     // CONN_REQ: ctrl msg {type=CONN_REQ, body_len=256} + name[256].
     let mut p = alloc::vec![0u8; 8 + 256];
@@ -450,6 +454,31 @@ pub fn aoc_start(out: &mut alloc::vec::Vec<u8>, wait_ms: u64) -> bool {
         None => {
             out.extend_from_slice(b"no GSA reply\n");
             false
+        }
+    }
+}
+
+/// `diag tpu state`: ask GSA's TPU manager over Trusty (com.android.trusty.gsa.hwmgr.tpu, the same frames as the AoC's: request {1 = STATE_CMD, 0 = GET_STATE}, reply {G#8000_0001, err, state}; states 0 inactive, 1 loaded, 2 running, 3 suspended). Needs Trusty already up this boot (the sensors' AoC start brings it up); never a second virtio bring-up (warm reloads leak shares).
+pub fn tpu_state(out: &mut alloc::vec::Vec<u8>) {
+    if !ONLINE.load(core::sync::atomic::Ordering::Relaxed) {
+        out.extend_from_slice(b"Trusty is not up this boot (the sensors start it; a warm reload cannot)\n");
+        return;
+    }
+    for port in ["com.android.trusty.gsa.hwmgr.tpu", "com.android.trusty.gsa.hwmgr.dsp"] {
+        match connect(port, out) {
+            Ok(remote) => {
+                send(remote, &[1u32.to_le_bytes(), 0u32.to_le_bytes()].concat());
+                let mut buf = [0u8; 64];
+                match recv(&mut buf) {
+                    Some((_, _, n)) if n >= 12 => {
+                        let w = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+                        out.extend_from_slice(alloc::format!("{port}: cmd G#{:X} err A#{} state A#{}\n", w(0), w(1) as i32, w(2)).as_bytes());
+                    }
+                    Some((_, _, n)) => out.extend_from_slice(alloc::format!("{port}: short reply, A#{n} bytes\n").as_bytes()),
+                    None => out.extend_from_slice(alloc::format!("{port}: no reply\n").as_bytes()),
+                }
+            }
+            Err(e) => out.extend_from_slice(alloc::format!("{port}: {e}\n").as_bytes()),
         }
     }
 }
