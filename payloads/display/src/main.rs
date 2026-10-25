@@ -563,7 +563,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
     }
 }
 
-/// The rear spectral sensor's widget in a circle at (cx, cy), radius r (Q8 px): a bar per channel, front to back over the circle's plate. Each bar is the channel's counts per unit gain on a log scale (a tenth of a count to the ADC's 2^24 at gain 1), so the auto-gain's changes do not move it; its index under it. Returns the rectangle it touched.
+/// The rear spectral sensor's widget in a circle at (cx, cy), radius r (Q8 px): a bar per channel, front to back over the circle's plate. Each bar is the channel's counts per unit gain on a log scale (a tenth of a count to the ADC's 2^24 at gain 1), so the auto-gain's changes do not move it; its name under it. Returns the rectangle it touched.
 fn spectral_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
     let rp = (r >> 8) as f32;
     let (x0, y_base) = ((cx >> 8) as f32 - rp * 0.6, (cy >> 8) as f32 + rp * 0.35);
@@ -580,11 +580,11 @@ fn spectral_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: 
             paint::fill_rect(&mut cv, bx as isize, (y_base - h) as isize, (slot * 0.7) as isize, h as isize, 0xFF00_0000 | th.text, None, None);
         }
     }
+    // The channels by Google's names (registry and factory calibration: r, g, b, clr1, clr2, ir), in the order the golden calibration lists them, which last night's readings fit; provisional until the laser lines settle it.
+    const NAMES: [&str; 6] = ["r", "g", "b", "c1", "ir", "c2"];
     let px = rp * 0.14;
     if px >= 6.0 {
-        for i in 0..6 {
-            let d = [b'0' + i as u8];
-            let t = core::str::from_utf8(&d).unwrap_or("");
+        for (i, t) in NAMES.iter().enumerate() {
             let tw = text_width(font, t, px);
             let mut cv = Canvas::new(pixels, width, height, &mut Damage);
             text(&mut cv, font, t, x0 + slot * (i as f32 + 0.5) - tw * 0.5, y_base + px * 1.2, px, 0xFF00_0000 | th.text2);
