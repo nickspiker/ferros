@@ -482,3 +482,35 @@ pub fn tpu_state(out: &mut alloc::vec::Vec<u8>) {
         }
     }
 }
+
+/// The TPU manager's tipc connection, opened once a boot.
+static TPU_REMOTE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// One state command to GSA's TPU manager (0 GET_STATE, 1 START, 2 SUSPEND, 3 RESUME, 4 SHUTDOWN): the state it answers (0 inactive, 1 loaded, 2 running, 3 suspended), or why not.
+pub fn tpu_cmd(cmd: u32, out: &mut alloc::vec::Vec<u8>) -> Result<u32, &'static str> {
+    if !ONLINE.load(core::sync::atomic::Ordering::Relaxed) {
+        return Err("Trusty is not up this boot");
+    }
+    let mut remote = TPU_REMOTE.load(core::sync::atomic::Ordering::Relaxed);
+    if remote == 0 {
+        remote = connect("com.android.trusty.gsa.hwmgr.tpu", out)?;
+        TPU_REMOTE.store(remote, core::sync::atomic::Ordering::Relaxed);
+    }
+    send(remote, &[1u32.to_le_bytes(), cmd.to_le_bytes()].concat());
+    let mut buf = [0u8; 64];
+    match recv(&mut buf) {
+        Some((_, _, n)) if n >= 12 => {
+            let w = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            if w(1) != 0 {
+                out.extend_from_slice(alloc::format!("hwmgr.tpu: command {cmd} err A#{}\n", w(1) as i32).as_bytes());
+                return Err("GSA refused the TPU command");
+            }
+            Ok(w(2))
+        }
+        Some((_, _, n)) if n >= 8 => {
+            out.extend_from_slice(alloc::format!("hwmgr.tpu: command {cmd} err A#{} (no state)\n", u32::from_le_bytes(buf[4..8].try_into().unwrap()) as i32).as_bytes());
+            Err("GSA refused the TPU command")
+        }
+        _ => Err("no reply from hwmgr.tpu"),
+    }
+}

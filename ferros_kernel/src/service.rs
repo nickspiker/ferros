@@ -1535,6 +1535,18 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"tpu load" {
+                                            let st = &raw mut store;
+                                            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                                            crate::tpu::load(&mut get, &mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"tpu start" {
+                                            crate::tpu::start(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"tpu state" {
                                             crate::trusty::tpu_state(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
