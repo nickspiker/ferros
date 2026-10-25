@@ -492,6 +492,12 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     if gz >> 32 != 0 {
         v[12] = crate::usf::GRAVITY_XY.load(Relaxed);
         v[13] = gz;
+        // The last two samples with their times, for gravity at a fixed lag.
+        if crate::usf::PAIR[5].load(Relaxed) != 0 {
+            for i in 0..6 {
+                v[14 + i] = crate::usf::PAIR[i].load(Relaxed);
+            }
+        }
     }
     v
 }
@@ -520,6 +526,9 @@ enum SensorBoot {
     Probe(u64, u64),
     Done,
 }
+
+/// Gravity's sampling period, ms: 100 Hz, so the clock's turn lags the phone by a fixed 16 ms (owner, 2026-10-24: the 25 Hz stream against the 10 Hz redraws stepped unevenly).
+const GRAVITY_MS: u64 = 10;
 
 /// The sensors start this long after the service loop does: the home screen first.
 const SENSORS_AFTER_S: u64 = 4;
@@ -567,7 +576,7 @@ fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<all
         SensorBoot::Probe(t0, last) if now.wrapping_sub(last) > f / 16 => match crate::usf::sensor_count() {
             Some(n) if n > 0 => {
                 out.extend_from_slice(alloc::format!("A#{n} sensors after A#{} ms\n", now.wrapping_sub(t0) * 1000 / f).as_bytes());
-                crate::usf::subscribe_gravity(64, false, &mut out);
+                crate::usf::subscribe_gravity(GRAVITY_MS, false, &mut out);
                 SensorBoot::Done
             }
             _ if now.wrapping_sub(t0) > 4 * f => {

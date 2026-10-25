@@ -78,7 +78,7 @@ pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 16]);
+pub struct Facts(pub [u64; 32]);
 
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 pub fn local_time() -> Option<(i64, u64)> {
@@ -143,6 +143,14 @@ impl Facts {
         let (xy, z) = (self.get(12)?, self.get(13)?);
         Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
     }
+    /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the phone whatever its own rate.
+    pub fn gravity_pair(&self) -> Option<(([f32; 3], u64), ([f32; 3], u64))> {
+        let v = |i: usize| -> Option<([f32; 3], u64)> {
+            let (xy, z, t) = (self.get(i)?, self.get(i + 1)?, self.get(i + 2)?);
+            Some(([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)], t))
+        };
+        Some((v(14)?, v(17)?))
+    }
 }
 
 /// Read `key` from the vault scope a Store capability names (the key is relative to the scope): Some(the value's whole length, of which at most `buf.len()` bytes were copied), or None if it is absent or the call was refused.
@@ -158,7 +166,7 @@ pub fn store_set(cap: u64, key: &[u8], value: &[u8]) -> bool {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    let mut b = [0u8; 128];
+    let mut b = [0u8; 256];
     svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }

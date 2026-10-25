@@ -410,34 +410,28 @@ static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 4], lighter: [false; 
 
 /// The clock upright by gravity (owner's order, 2026-10-24): the face's turn, Q14 (cos, sin), that puts its 12:00 and its digits up against gravity on the glass, whatever the map's own turn. None until the AoC has sent a sample (then the face turns with the map, as before).
 static mut GRAV_TURN: Option<(i64, i64)> = None;
-/// The angle GRAV_TURN holds, radians clockwise from the panel's up.
-static mut GRAV_ANGLE: f32 = 0.0;
-/// Gravity's share in the glass's plane below which the phone counts as lying flat and the clock keeps its turn: 2.5 m/s², about 15° from flat.
-const GRAV_FLAT: f32 = 2.5;
-/// The turn moves only when gravity has moved more than this from it (radians, about a degree), so the sensor's noise does not redraw the face every sample.
-const GRAV_STEP: f32 = 0.0175;
+/// How far behind the phone the clock's turn runs: gravity is evaluated this long before now, between the last two samples the AoC sent (their own timestamps), so every frame sees the phone's attitude at the same lag whatever the frame and sample rates. One 10 ms sample period, plus the ~1 ms the samples take to arrive, plus margin: 16 ms.
+const GRAV_LAG_MS: u64 = 16;
 
-/// Read gravity (SYS_FACTS) once a pass and turn the clock to it. Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y).
-fn gravity_poll() {
-    let Some([x, y, _]) = ferros_sys::facts().gravity() else { return };
-    if x * x + y * y < GRAV_FLAT * GRAV_FLAT {
-        return;
+/// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the phone's tilt says, however small. Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
+fn gravity_poll() -> bool {
+    let Some(((l, tl), (p, tp))) = ferros_sys::facts().gravity_pair() else { return false };
+    let t = now().wrapping_sub(freq() * GRAV_LAG_MS / 1000);
+    // Where t falls between the two samples (held at either end: a late sample holds the last, never extrapolates).
+    let s = if tl > tp { ((t as i64 - tp as i64) as f32 / (tl - tp) as f32).clamp(0.0, 1.0) } else { 1.0 };
+    let (x, y) = (p[0] + (l[0] - p[0]) * s, p[1] + (l[1] - p[1]) * s);
+    if x == 0.0 && y == 0.0 {
+        return false;
     }
-    let a = libm::atan2f(x, y);
-    let mut d = a - unsafe { GRAV_ANGLE };
-    if d > core::f32::consts::PI {
-        d -= 2.0 * core::f32::consts::PI;
-    } else if d < -core::f32::consts::PI {
-        d += 2.0 * core::f32::consts::PI;
-    }
-    if unsafe { GRAV_TURN }.is_some() && d.abs() < GRAV_STEP {
-        return;
-    }
-    unsafe {
-        GRAV_ANGLE = a;
-        GRAV_TURN = Some(((libm::cosf(a) * 16384.0) as i64, (libm::sinf(a) * 16384.0) as i64));
-    }
+    // To the face's own resolution: its edge is antialiased in 1/256 of a pixel, so at radius R pixels a turn under 1/(256 R) radians changes no pixel — and R in the clock's Q8 units is 256 R, so the step is 1/R(Q8). Not a dead zone: every turn the glass can show is drawn, at once; one it cannot show is not a frame.
+    let r_q8 = (unsafe { CLOCK_GEOM }.2).max(256) as f32;
+    let a = libm::roundf(libm::atan2f(x, y) * r_q8) / r_q8;
+    let turn = ((libm::cosf(a) * 16384.0) as i64, (libm::sinf(a) * 16384.0) as i64);
+    let changed = unsafe { GRAV_TURN } != Some(turn);
+    unsafe { GRAV_TURN = Some(turn) };
+    changed
 }
+
 /// The clock each phase frame holds (None: unknown, after a publish that was not the clock's — the next redraw for it is whole).
 static mut PHASE_CLOCK: [Option<ClockShown>; PHASES] = [None; PHASES];
 
@@ -2320,7 +2314,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 let _ = handle(m, &mut out);
             }
         };
-        gravity_poll();
+        // A new turn is drawn now, not at the next 10 Hz flip: the clock-only redraw below runs on this pass's flip, so a turning phone gets a frame per pass (up to the panel's 120 Hz).
+        let turning = gravity_poll();
+        if turning {
+            next_flip = now();
+        }
         if clock_due {
             clock_due = false;
             unsafe { CLOCK_ONLY = true };
@@ -2674,6 +2672,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
         if unsafe { TEMPORAL } && client_owned && (0..PHASES).any(|k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
             wake = wake.min((last_interaction + freq() / 8).max(now()));
+        }
+        // Gravity, while the clock is on the glass: every 8 ms while it turns (a frame per panel refresh), every 32 ms at rest, so a turn starts within about three samples.
+        if unsafe { CLOCK_SHOWN && { GRAV_TURN }.is_some() } && !screen_off {
+            wake = wake.min(now() + freq() / if turning { 128 } else { 32 });
         }
         let tail = RING_TAIL.load(Ordering::Acquire);
         if tail == seen_tail {

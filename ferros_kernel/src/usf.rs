@@ -174,10 +174,19 @@ fn sample(p: &[u8]) {
     GRAVITY_Z.store(z as u64 | (n.wrapping_add(1).max(1) as u64) << 32, Ordering::Relaxed);
     // The trace for `diag usf trace`: every sample of the event, with the AoC's timestamp (low 56 bits, ns) and when this pass saw it.
     let now = crate::platform::cntpct();
+    let f = crate::platform::cntfrq() as u128;
     for k in 0..count as usize {
         let at = 16 + k * (8 + size as usize);
         let ts = u32_at(p, at).unwrap_or(0) as u64 | (u32_at(p, at + 4).unwrap_or(0) as u64) << 32;
         let v = [u32_at(p, at + 8).unwrap_or(0), u32_at(p, at + 12).unwrap_or(0), u32_at(p, at + 16).unwrap_or(0)];
+        // The last two samples with their times on ferros's counter, for a reader that wants gravity at a fixed lag (the display's clock): the AoC stamps in ns on the same clock (measured 2026-10-24: each sample arrives ~1 ms after its stamp).
+        let ticks = ((ts & 0x00FF_FFFF_FFFF_FFFF) as u128 * f / 1_000_000_000) as u64;
+        for i in 0..3 {
+            PAIR[3 + i].store(PAIR[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        PAIR[0].store(v[0] as u64 | (v[1] as u64) << 32, Ordering::Relaxed);
+        PAIR[1].store(v[2] as u64, Ordering::Relaxed);
+        PAIR[2].store(ticks, Ordering::Relaxed);
         unsafe {
             let t = &mut *(&raw mut TRACE);
             t.0[t.1 % 32] = (ts & 0x00FF_FFFF_FFFF_FFFF, now, v);
@@ -185,6 +194,9 @@ fn sample(p: &[u8]) {
         }
     }
 }
+
+/// The last two gravity samples: [x | y << 32, z, time in counter ticks] for the newest, then the same for the one before (f32 bits, m/s²). SYS_FACTS 14–19.
+pub static PAIR: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The last 32 gravity samples: (AoC timestamp ns, counter at arrival, x y z bits), and how many were written.
 static mut TRACE: ([(u64, u64, [u32; 3]); 32], usize) = ([(0, 0, [0; 3]); 32], 0);

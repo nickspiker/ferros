@@ -569,7 +569,7 @@ const SYS_SPAWN: u64 = 10;
 const SYS_SET_PREF: u64 = 11;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
-pub const FACT_COUNT: usize = 16;
+pub const FACT_COUNT: usize = 32;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
