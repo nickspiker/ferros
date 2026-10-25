@@ -367,6 +367,16 @@ fn icon(n: u8) -> Option<(&'static [u8], &'static [u8], usize)> {
 const WIDGET_CLOCK: u8 = 0x80;
 /// The rear spectral sensor's widget (the map's icon G#81): a bar per channel.
 const WIDGET_SPECTRAL: u8 = 0x81;
+/// The light scope (the map's icon G#82): the 16 kHz trace of one channel over the last second, and the four colour channels' levels in stops beneath.
+const WIDGET_SCOPE: u8 = 0x82;
+/// The fast trace, as SYS_LIGHT last gave it: up to a second at 16 kHz.
+static mut SCOPE_BUF: [i32; 16384] = [0; 16384];
+/// The slow channels' history: (counter ticks, counts per unit gain for the six channels), the last 64 spectral samples (~13 s at the AoC's ~5 a second).
+static mut SLOW: ([(u64, [f32; 6]); 64], usize) = ([(0, [0.0; 6]); 64], 0);
+static mut SLOW_SEQ: u64 = 0;
+/// Where the scope was drawn and whether a frame holds it (as SPEC_SHOWN / SPEC_RECT).
+static mut SCOPE_SHOWN: bool = false;
+static mut SCOPE_RECT: draw::Rect = draw::Rect::EMPTY;
 /// The spectral sensor's newest sample as this pass read it (SYS_FACTS 20–26): counts, gains, sample number.
 static mut SPECTRAL_NOW: Option<([f32; 6], [f32; 6], u64)> = None;
 /// Where the spectral widget was last drawn, and whether a frame holds it (as CLOCK_SHOWN / CLOCK_RECT for the clock).
@@ -428,6 +438,16 @@ const GRAV_LAG_MS: u64 = 16;
 fn gravity_poll() -> bool {
     let f = ferros_sys::facts();
     unsafe { SPECTRAL_NOW = f.spectral() };
+    if let Some((c, g, seq)) = unsafe { SPECTRAL_NOW } {
+        if seq != unsafe { SLOW_SEQ } {
+            unsafe {
+                SLOW_SEQ = seq;
+                let h = &mut *(&raw mut SLOW);
+                h.0[h.1 % 64] = (now(), core::array::from_fn(|i| if g[i] > 0.0 { c[i] / g[i] } else { 0.0 }));
+                h.1 += 1;
+            }
+        }
+    }
     let Some(((l, tl), (p, tp))) = f.gravity_pair() else { return false };
     let t = now().wrapping_sub(freq() * GRAV_LAG_MS / 1000);
     // Where t falls between the two samples (held at either end: a late sample holds the last, never extrapolates).
@@ -561,6 +581,152 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
         }
         (rings, 3, n, sod, Some(h >= 12))
     }
+}
+
+/// The light scope in a circle at (cx, cy), radius r (Q8 px), front to back over its plate (owner, 2026-10-25). Top: the last second of the flicker engine's 16 kHz trace (one channel, AC: the engine takes out the light's steady level), drawn as a phosphor — every sample-to-sample segment adds coverage to the rows it crosses in its pixel column, so a dense waveform shades and an edge stays sharp — on a symmetric scale fitted to the second; its channel and dominant frequency (zero crossings) above it. Bottom: the colour channels' levels over the same second, in stops (log2 of counts per unit gain), one scale fitted to all four together, a faint line per stop, sample and hold between the AoC's ~5 readings a second. The trace ends at the newest sample, so each redraw moves it left by the time since the last.
+fn scope_widget(pixels: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64, th: &ferros_sys::theme::Theme, font: &Font) -> draw::Rect {
+    let rp = (r >> 8) as f32;
+    let on = ferros_sys::pref(ferros_sys::PREF_SCOPE);
+    // The plot box, inside the circle.
+    let (bx, by, bw, bh) = ((cx >> 8) as f32 - rp * 0.66, (cy >> 8) as f32 - rp * 0.55, rp * 1.32, rp * 1.1);
+    let (w, top_h, gap) = (bw as usize, (bh * 0.55) as usize, (bh * 0.06) as usize);
+    let bot_h = (bh as usize).saturating_sub(top_h + gap);
+    let (x0, y0) = (bx as i64, by as i64);
+    let (bx0, by0, bx1, by1) = draw::bounds(width, height);
+    // One pixel at an opacity, under what is there.
+    let mut put = |pixels: &mut [Px], x: i64, y: i64, colour: u32, a: u32| {
+        if x < bx0 || y < by0 || x >= bx1 || y >= by1 || a == 0 {
+            return;
+        }
+        let p = &mut pixels[y as usize * width + x as usize];
+        *p = draw::under(*p, draw::at_coverage(colour & 0x00FF_FFFF, a.min(255)));
+    };
+    // Channel colours (register order, provisional): red, visible, blue, green, IR, clear.
+    const COL: [u32; 6] = [0xFF4040, 0xC0C0C0, 0x4080FF, 0x40E060, 0xB040A0, 0xFFFFFF];
+    const NAME: [&str; 6] = ["red", "visible", "blue", "green", "IR", "clear"];
+    let px = (rp * 0.11).max(8.0);
+    if on == 0 || w < 8 || top_h < 8 {
+        let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+        let t = "scope off";
+        let tw = text_width(font, t, px);
+        text(&mut cv, font, t, (cx >> 8) as f32 - tw * 0.5, (cy >> 8) as f32, px, 0xFF00_0000 | th.text2);
+        return draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF);
+    }
+    // ── the fast trace ──
+    let buf = unsafe { &mut *(&raw mut SCOPE_BUF) };
+    let (_end, rate, mask, got) = ferros_sys::light(&mut buf[..]);
+    // The newest second of what came (oldest first in the buffer).
+    let n = got.min(rate.max(1) as usize);
+    let ch = (mask.trailing_zeros() as usize).min(5);
+    let mut freq = 0.0f32;
+    if n >= 2 * w.max(2) {
+        let s = &buf[got - n..got];
+        let mean = s.iter().map(|&v| v as i64).sum::<i64>() / n as i64;
+        let peak = s.iter().map(|&v| (v as i64 - mean).abs()).max().unwrap_or(1).max(1) as f32;
+        let half = top_h as f32 * 0.5;
+        let row = |v: i32| (half - (v as i64 - mean) as f32 / peak * (half - 1.0)).clamp(0.0, top_h as f32 - 1.0);
+        let mut cov = alloc::vec![0f32; top_h];
+        let per = n as f32 / w as f32;
+        let mut prev = row(s[0]);
+        let mut crossings = 0u32;
+        let mut last_sign = s[0] as i64 >= mean;
+        for col in 0..w {
+            cov.iter_mut().for_each(|c| *c = 0.0);
+            let (a, b) = ((col as f32 * per) as usize, (((col + 1) as f32 * per) as usize).min(n));
+            for &v in &s[a..b] {
+                let y = row(v);
+                let (lo, hi) = (prev.min(y), prev.max(y));
+                let (r0, r1) = (lo as usize, (hi as usize).min(top_h - 1));
+                let wgt = 1.0 / (r1 - r0 + 1) as f32;
+                for rr in r0..=r1 {
+                    cov[rr] += wgt;
+                }
+                prev = y;
+                let sign = v as i64 >= mean;
+                if sign != last_sign {
+                    crossings += 1;
+                    last_sign = sign;
+                }
+            }
+            let norm = 255.0 * 3.0 / per.max(1.0);
+            for (rr, &c) in cov.iter().enumerate() {
+                if c > 0.0 {
+                    put(pixels, x0 + col as i64, y0 + rr as i64, COL[ch], (c * norm) as u32);
+                }
+            }
+        }
+        freq = crossings as f32 * 0.5 * rate as f32 / n as f32;
+    }
+    // Its label: the channel and the dominant frequency.
+    {
+        let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+        let mut t = alloc::string::String::new();
+        let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{}  {:.0} Hz", NAME[ch], freq));
+        text(&mut cv, font, &t, bx, by - px * 0.4, px, 0xFF00_0000 | th.text2);
+    }
+    // ── the slow levels, in stops ──
+    let h = unsafe { &*(&raw const SLOW) };
+    let t_now = now();
+    let span = freq_ticks();
+    // Slots, as the spectral widget labels them (provisional): r 0, g 1, b 2, ir 4.
+    const SLOW_CH: [(usize, u32); 4] = [(0, 0xFF4040), (1, 0x40E060), (2, 0x4080FF), (4, 0xB040A0)];
+    let count = h.1.min(64);
+    let pts: alloc::vec::Vec<(u64, [f32; 6])> = (0..count).map(|i| h.0[(h.1 - count + i) % 64]).collect();
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for &(_, v) in pts.iter().filter(|(t, _)| t_now.wrapping_sub(*t) < 2 * span) {
+        for &(slot, _) in &SLOW_CH {
+            if v[slot] > 0.0 {
+                let l = libm::log2f(v[slot]);
+                lo = lo.min(l);
+                hi = hi.max(l);
+            }
+        }
+    }
+    if lo <= hi && bot_h > 4 {
+        let (lo, hi) = (libm::floorf(lo), libm::ceilf(hi).max(libm::floorf(lo) + 1.0));
+        let yb = y0 + (top_h + gap) as i64;
+        let yrow = |l: f32| yb + ((hi - l) / (hi - lo) * (bot_h as f32 - 1.0)) as i64;
+        // Each channel: sample and hold across the second, newest at the right.
+        for &(slot, colour) in &SLOW_CH {
+            let mut last_y: Option<i64> = None;
+            for col in 0..w {
+                // The time this column shows, and the newest sample at or before it.
+                let back = span * (w - 1 - col) as u64 / w as u64;
+                let at = t_now.wrapping_sub(back);
+                let v = pts.iter().rev().find(|(t, _)| *t <= at).map(|(_, v)| v[slot]);
+                let Some(v) = v.filter(|&v| v > 0.0) else { continue };
+                let y = yrow(libm::log2f(v));
+                let (a, b) = match last_y {
+                    Some(ly) => (ly.min(y), ly.max(y)),
+                    None => (y, y),
+                };
+                for yy in a..=b {
+                    put(pixels, x0 + col as i64, yy, colour, 230);
+                }
+                last_y = Some(y);
+            }
+        }
+        // A faint line per stop.
+        let mut st = lo;
+        while st <= hi {
+            let y = yrow(st);
+            for col in 0..w {
+                put(pixels, x0 + col as i64, y, th.text2, 40);
+            }
+            st += 1.0;
+        }
+        let mut cv = Canvas::new(pixels, width, height, &mut Damage);
+        let mut t = alloc::string::String::new();
+        let _ = core::fmt::Write::write_fmt(&mut t, format_args!("{:.0} stops", hi - lo));
+        text(&mut cv, font, &t, bx, (yb + bot_h as i64) as f32 + px * 1.1, px * 0.8, 0xFF00_0000 | th.text2);
+    }
+    draw::disc(pixels, width, height, cx, cy, r, th.plane & 0x00FF_FFFF)
+}
+
+/// The counter ticks in a second.
+fn freq_ticks() -> u64 {
+    freq()
 }
 
 /// The rear spectral sensor's widget in a circle at (cx, cy), radius r (Q8 px): a bar per channel, front to back over the circle's plate. Each bar is the channel's counts per unit gain on a log scale (a tenth of a count to the ADC's 2^24 at gain 1), so the auto-gain's changes do not move it; its name under it. Returns the rectangle it touched.
@@ -1928,6 +2094,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         CLOCK_RECT = draw::Rect::EMPTY;
                         SPEC_SHOWN = false;
                         SPEC_RECT = draw::Rect::EMPTY;
+                        SCOPE_SHOWN = false;
+                        SCOPE_RECT = draw::Rect::EMPTY;
                         LAST_CAM = if m.get(13).copied().unwrap_or(0) & 1 == 0 && m.len() <= 18 {
                             let mut b = [0u8; 18];
                             b[..m.len()].copy_from_slice(m);
@@ -1984,6 +2152,16 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         let lit = cir.lit != 0;
                         let ri = sr;
                         // A widget the display draws itself (not a bundle icon): the clock — its time in the centre first, then the face under it; never cached, it changes every second.
+                        if cir.icon == WIDGET_SCOPE {
+                            let r = scope_widget(pixels, width, height, sx, sy, sr, th, &font);
+                            ALLOC.reset();
+                            unsafe {
+                                CUR_DMG = CUR_DMG.union(r);
+                                SCOPE_SHOWN = true;
+                                SCOPE_RECT = SCOPE_RECT.union(r);
+                            }
+                            continue;
+                        }
                         if cir.icon == WIDGET_SPECTRAL {
                             let r = spectral_widget(pixels, width, height, sx, sy, sr, th, &font);
                             ALLOC.reset();
@@ -2457,6 +2635,22 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         CLIP_US = [0; 2];
                         CLOCK_PART_US = [0; 2];
                     }
+                }
+            }
+        }
+        // The scope between frames: on every flip while it is on, its circle drawn again into the phase the flip shows (its trace moves every flip: a tenth of its width at 10 Hz).
+        if flip_due && ferros_sys::pref(ferros_sys::PREF_SCOPE) != 0 && unsafe { SCOPE_SHOWN && !{ SCOPE_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
+            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+            let clip = unsafe { SCOPE_RECT }.clip(width, height);
+            if !clip.is_empty() {
+                unsafe {
+                    draw::CLIP = clip;
+                    CLIP_PHASE = Some(k);
+                }
+                replay(&mut handle);
+                unsafe {
+                    CLIP_PHASE = None;
+                    draw::CLIP = draw::Rect { x0: 0, y0: 0, x1: i32::MAX, y1: i32::MAX };
                 }
             }
         }

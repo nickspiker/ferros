@@ -37,6 +37,7 @@ pub mod nr {
     pub const IRQ_WAIT: u64 = 18;
     pub const IRQ_ACK: u64 = 19;
     pub const PIN: u64 = 20;
+    pub const LIGHT: u64 = 21;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -56,6 +57,8 @@ pub const PREF_BRIGHTNESS: u64 = 3;
 pub const PREF_DITHER: u64 = 4;
 /// Preference 5: the theme, an index into `theme::THEMES` (0 = grey).
 pub const PREF_THEME: u64 = 5;
+/// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its fast trace follows (register order: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear; provisional).
+pub const PREF_SCOPE: u64 = 7;
 /// Preference 6: the proximity wake, 0 off or 1 on (the kernel refuses a wake press while proximity reads near).
 pub const PREF_PROX_WAKE: u64 = 6;
 
@@ -180,6 +183,24 @@ pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
 /// Write `value` under `key` in a Store capability's vault scope; true when the vault took it.
 pub fn store_set(cap: u64, key: &[u8], value: &[u8]) -> bool {
     svc(nr::STORE, cap, 1 | (value.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(value.as_ptr())) == 0
+}
+
+/// The light scope's latest samples into `buf` (SYS_LIGHT): (the stream's next sample number, rate Hz, channel mask, how many samples were written at the front of `buf`, oldest first).
+pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
+    let bytes = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4) };
+    let mut hdr = [0u8; 16];
+    // The kernel writes its 16-byte header then the samples into the one buffer: read it off and move the samples to the front.
+    let n = svc(nr::LIGHT, off(bytes.as_ptr()), bytes.len() as u64, 0, 0, 0) as usize;
+    if n < 16 {
+        return (0, 0, 0, 0);
+    }
+    hdr.copy_from_slice(&bytes[..16]);
+    let count = (n - 16) / 4;
+    bytes.copy_within(16..16 + count * 4, 0);
+    let end = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+    let rate = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let mask = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+    (end, rate, mask, count)
 }
 
 /// Read the facts now.

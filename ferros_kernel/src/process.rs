@@ -587,7 +587,9 @@ const SYS_IRQ_WAIT: u64 = 18;
 const SYS_IRQ_ACK: u64 = 19;
 /// pin(mask): the cores this thread may run on from now (bit = core index); 0 = the workers. Returns 0.
 const SYS_PIN: u64 = 20;
-const SYS_LAST: u64 = 20;
+/// The light scope's samples (usf.rs): x0/x1 a buffer and its length; a 16-byte header {u64 the stream's next sample number, u32 rate Hz, u32 the channel mask} then the latest samples (i32, oldest first) as many as fit, up to a second. No capability: it is the light falling on the back of the phone. Returns the bytes written.
+const SYS_LIGHT: u64 = 21;
+const SYS_LAST: u64 = 21;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
 pub struct IrqLine {
@@ -656,6 +658,8 @@ pub const PREF_DITHER: usize = 4;
 pub const PREF_THEME: usize = 5;
 /// Preference 6: the proximity wake (owner's rule, 2026-08-21: the screen lights only if the power key is pressed and nothing is near the proximity sensor), 0 off (the default until it is tuned) or 1 on (service.rs).
 pub const PREF_PROX_WAKE: usize = 6;
+/// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its 16 kHz trace follows (in the sensor's register order, VD6283 datasheet: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear — provisional for the VD6282) (usf.rs, the display's scope widget).
+pub const PREF_SCOPE: usize = 7;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
 
@@ -772,6 +776,7 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_DITHER => value <= 1,
         PREF_THEME => value < THEMES,
         PREF_PROX_WAKE => value <= 1,
+        PREF_SCOPE => value <= 6,
         _ => false,
     }
 }
@@ -1130,6 +1135,19 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 }
                 _ => ERR,
             };
+            0
+        }
+        SYS_LIGHT => {
+            let want = ((f.x[1] as usize).saturating_sub(16) / 4).min(crate::usf::SCOPE_LEN);
+            let (end, rate, mask) = crate::usf::scope_head();
+            let n = want.min(end as usize);
+            let mut b = alloc::vec::Vec::with_capacity(16 + 4 * n);
+            b.extend_from_slice(&end.to_le_bytes());
+            b.extend_from_slice(&rate.to_le_bytes());
+            b.extend_from_slice(&mask.to_le_bytes());
+            crate::usf::scope_copy(end, n, &mut b);
+            p.write(f.x[0], &b);
+            f.x[0] = b.len() as u64;
             0
         }
         SYS_FACTS => {

@@ -345,10 +345,50 @@ fn flk_keep(kind: u8, p: &[u8]) {
     }
 }
 
+/// `diag usf regset <path> <key> <value>`: one registry Set (type 22) to the registry server — a property changed at runtime (whether the driver rereads it is the driver's business).
+pub fn regset(path: &str, key: &str, value: &str, out: &mut alloc::vec::Vec<u8>) {
+    let Some(rh) = server(&REGISTRY) else {
+        out.extend_from_slice(b"registry server: no answer\n");
+        return;
+    };
+    let z = |s: &str| {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    };
+    let (p, k, v) = (z(path), z(key), z(value));
+    let set = fb(&[F::B(&p), F::T(alloc::vec![alloc::vec![F::B(&k), F::B(&v)]])]);
+    let r = request(rh, 22, Some(&set)).and_then(|t| reply(t, 256));
+    out.extend_from_slice(alloc::format!("registry set {path} {key}={value}: {:?}\n", r.map(|(s, _)| s)).as_bytes());
+}
+
+/// The VD6282 access request (libusf SpectralSensorDeviceAccess::Transact): type 1001 to the sensor's own handle, body Vd6282MsgAccessReqResp {f0 0 get / 1 set, f1 param, f2/f3 u32 frequency metrics, f4 u8 channel, f5 f32 gain, f6 u8, f7 u8 register value, f8 u32 saturation, f9 u32 exposure or sampling period, f10 u8 register address, f11 u64 UID, f12–f15 bools, f16 u8 second channel}; params 0 ExposureTime, 1 FlickerFrequencyMetrics, 2 FlickerSaturation, 3 FlickerChannel, 4 Gain, 5 FlickerPedestal, 6 SamplingPeriod, 7 Register, 8 DeviceUid, 10 TorchLightState, 11 SpectralAutoGain, 12 FlickerAutoGain, 13 FlickerConfig, 14 SpectralApplyFacCal. The reply carries the same table: every 4-byte-or-smaller field is shown as it came.
+pub fn vd_access(handle: u32, set: bool, param: u32, f4: Option<u32>, f7: Option<u32>, f9: Option<u32>, out: &mut alloc::vec::Vec<u8>) {
+    let opt = |v: Option<u32>| v.map(F::U).unwrap_or(F::N);
+    let body = fb(&[F::U(set as u32), F::U(param), F::N, F::N, opt(f4), F::N, F::N, opt(f7), F::N, opt(f9)]);
+    let r = request(handle, 1001, Some(&body)).and_then(|t| reply(t, 256));
+    match r {
+        Some((status, b)) => {
+            out.extend_from_slice(alloc::format!("access {} param {param}: status {status}", if set { "set" } else { "get" }).as_bytes());
+            // The reply body is a FlatBuffer whose root table is the access table.
+            if let Some(t) = root(&b) {
+                for i in 0..17 {
+                    if let Some(f) = field(&b, t, i) {
+                        let v = u32_at(&b, f).unwrap_or(b.get(f).copied().unwrap_or(0) as u32);
+                        out.extend_from_slice(alloc::format!(" f{i}=G#{v:X}").as_bytes());
+                    }
+                }
+            }
+            out.push(b'\n');
+        }
+        None => out.extend_from_slice(b"access: no reply\n"),
+    }
+}
+
 /// The light waveform's format (FlickerFormat: f0 rate Hz, f1 code — 2/3/4 uncompressed bytes per sample, 6 Compressed1 —, f2 little-endian, f3 low bits to ignore): rate | bytes << 32 | ignore << 40 | little-endian << 48. Seen on husky: 16000 Hz, 4 bytes, low 8 ignored, little-endian.
 pub static SCOPE_FMT: AtomicU64 = AtomicU64::new(0);
 /// The last SCOPE_LEN samples of the light waveform (signed, the format's bits, ignored low bits shifted out), a ring indexed by the stream's own sample number; SCOPE_N the samples written so far (the next sample's number).
-pub const SCOPE_LEN: usize = 8192;
+pub const SCOPE_LEN: usize = 16384;
 pub static mut SCOPE: [i32; SCOPE_LEN] = [0; SCOPE_LEN];
 pub static SCOPE_N: AtomicU64 = AtomicU64::new(0);
 
@@ -385,6 +425,38 @@ fn flk_data(p: &[u8]) {
     let end = first + (d.len() / code) as u64;
     if end > SCOPE_N.load(Ordering::Relaxed) {
         SCOPE_N.store(end, Ordering::Relaxed);
+    }
+}
+
+/// The channel mask the flicker engine follows (bit n-1 = channel n), as last set.
+static SCOPE_MASK: AtomicU32 = AtomicU32::new(0x20);
+
+/// SYS_LIGHT's header: the next sample number, the rate, the channel mask.
+pub fn scope_head() -> (u64, u32, u32) {
+    (SCOPE_N.load(Ordering::Relaxed), SCOPE_FMT.load(Ordering::Relaxed) as u32, SCOPE_MASK.load(Ordering::Relaxed))
+}
+
+/// The `n` samples before sample number `end`, oldest first, little-endian i32 into `out` (the writer may be mid-message: a torn sample at the newest edge is the cost of not locking).
+pub fn scope_copy(end: u64, n: usize, out: &mut alloc::vec::Vec<u8>) {
+    let ring = unsafe { &*(&raw const SCOPE) };
+    for i in 0..n as u64 {
+        let k = end - n as u64 + i;
+        out.extend_from_slice(&ring[(k % SCOPE_LEN as u64) as usize].to_le_bytes());
+    }
+}
+
+/// Follow preference 7: 1–6 subscribes the flicker stream (once) and points the flicker engine at that channel (access request param 3, FlickerChannel, f4 the one-bit mask); 0 leaves it streaming (no unsubscribe is known: the stream costs the AP ~100 small messages a second) and the display stops drawing it.
+pub fn scope_follow(ch: u8, out: &mut alloc::vec::Vec<u8>) {
+    if ch == 0 {
+        return;
+    }
+    if SCOPE_N.load(Ordering::Relaxed) == 0 {
+        flk(true, out);
+    }
+    let mask = 1u32 << (ch - 1);
+    if let Some(h) = find("VD6282 Flicker") {
+        vd_access(h, true, 3, Some(mask), None, None, out);
+        SCOPE_MASK.store(mask, Ordering::Relaxed);
     }
 }
 
@@ -620,7 +692,7 @@ pub fn registry(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &
     let mut n = 0;
     for i in 0.. {
         let Some(text) = get(&alloc::format!("aoc.reg.{i}")) else { break };
-        let mut text = strip(&text, KEEP_OFF);
+        let mut text = replace_lines(&strip(&text, KEEP_OFF), OVERRIDE);
         text.push(0);
         let body = fb(&[F::B(&text), if cdt == 0 { F::N } else { F::U(cdt) }, if mlb == 0 { F::N } else { F::U(mlb) }]);
         let Some(txn) = request(rh, 24, Some(&body)) else {
@@ -647,6 +719,26 @@ pub fn registry(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &
 
 /// Registry nodes ferros does not hand the AoC: the touch controller (`/dev/ftm5`, on the AoC's own SPI bus for its tap and long-press gestures) and the touch bus arbitration (`/tbn`). With them the AoC probes the touch IC and takes its bus, and ferros's touch goes dead (2026-10-24, the first boot with the registry). Touch is ferros's; the AoC's gestures can come back later as a deliberate handover.
 const KEEP_OFF: &[&[u8]] = &[b"+/dev/ftm5", b"+/tbn"];
+
+/// Registry properties ferros sets differently from Google's scripts, as (the line as the script has it, ferros's line). The rear spectral sensor reports only when green or clear moves by 10 % or 100 counts (`g_change_thresh=100 0.1`, `c1_…`): a steady light gave 2–5 samples a second at any requested period; at 0 0 every reading is a sample (its info says 16 ms at the fastest), which the scope widget wants (owner, 2026-10-25). The driver reads them at probe only: a runtime Set did nothing.
+const OVERRIDE: &[(&[u8], &[u8])] = &[(b"  g_change_thresh=100 0.1", b"  g_change_thresh=0 0"), (b"  c1_change_thresh=100 0.1", b"  c1_change_thresh=0 0")];
+
+/// A script with whole lines replaced (OVERRIDE): a line equal to the first of a pair, up to its line end, becomes the second.
+fn replace_lines(text: &[u8], pairs: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(text.len());
+    for line in text.split_inclusive(|&c| c == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        match pairs.iter().find(|(from, _)| body == *from) {
+            Some((_, to)) => {
+                out.extend_from_slice(to);
+                out.push(b'\n');
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+    out
+}
 
 /// A registry script without the node blocks that start with any of `drop`: a block is its `+/path` line and the indented lines under it.
 fn strip(text: &[u8], drop: &[&[u8]]) -> alloc::vec::Vec<u8> {

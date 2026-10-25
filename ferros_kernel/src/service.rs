@@ -209,6 +209,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                     if key == "device.theme" && len == 1 && params[2 + klen] < crate::process::THEMES {
                         crate::process::set_pref_held(crate::process::PREF_THEME, params[2 + klen]);
                     }
+                    if key == "device.scope" && len == 1 && params[2 + klen] <= 6 {
+                        crate::process::set_pref_held(crate::process::PREF_SCOPE, params[2 + klen]);
+                    }
                     if key == "device.prox_wake" && len == 1 && params[2 + klen] <= 1 {
                         crate::process::set_pref_held(crate::process::PREF_PROX_WAKE, params[2 + klen]);
                     }
@@ -320,6 +323,7 @@ fn store_pref(index: usize, value: u8) -> bool {
         crate::process::PREF_DITHER => "device.dither",
         crate::process::PREF_THEME => "device.theme",
         crate::process::PREF_PROX_WAKE => "device.prox_wake",
+        crate::process::PREF_SCOPE => "device.scope",
         _ => return false,
     };
     unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, &[value]).is_ok()).unwrap_or(false) }
@@ -395,13 +399,13 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             rep.push(b'\n');
             continue;
         };
-        // Each step in the flash log and the crumb (G#71 killing, G#72 reading, G#73 spawning, G#74 done; 2026-10-25: a reset followed a display restart with nothing recorded after the vault took the new build).
+        // Each step in the flash log and the crumb (G#51 killing, G#52 reading, G#53 spawning, G#54 done — G#70+ are the syscalls; 2026-10-25: a reset followed a display restart with nothing recorded after the vault took the new build).
         let nm = core::str::from_utf8(name).unwrap_or("?");
         crate::flashlog::line(&alloc::format!("restart {nm}: killing"));
-        platform::crumb(0x71);
+        platform::crumb(0x51);
         let killed = crate::process::kill(name);
         crate::flashlog::line(&alloc::format!("restart {nm}: {} ; reading the capsule", if killed { "killed" } else { "was not running" }));
-        platform::crumb(0x72);
+        platform::crumb(0x52);
         let Some(capsule) = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key(core::str::from_utf8(name).unwrap_or("")).ok().flatten())) else {
             rep.extend_from_slice(b"no capsule in the vault for ");
             rep.extend_from_slice(name);
@@ -409,7 +413,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             continue;
         };
         crate::flashlog::line(&alloc::format!("restart {nm}: capsule {} bytes; spawning", capsule.len()));
-        platform::crumb(0x73);
+        platform::crumb(0x53);
         match crate::process::spawn_capsule(name, &capsule, b"", &grants, &sealed) {
             Ok(o) => {
                 crate::process::push_console(&o.console);
@@ -421,7 +425,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
                 crate::flashlog::line(&alloc::format!("restart {nm}: {e}"));
             }
         }
-        platform::crumb(0x74);
+        platform::crumb(0x54);
     }
 }
 
@@ -764,6 +768,7 @@ pub fn run(mut b: Boot) -> ! {
     let mut link_was = 0u32;
     let mut sensor_boot = SensorBoot::Wait;
     let mut screen_off_told = false;
+    let mut scope_told = 0u8;
     let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
     // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
     let mut att_ev = [0u32; 3];
@@ -833,6 +838,18 @@ pub fn run(mut b: Boot) -> ! {
                 crate::flashlog::line(&alloc::format!("wake refused: proximity near ({:?})", crate::usf::prox_counts()));
             } else {
                 crate::process::set_pref(crate::process::PREF_SCREEN_OFF, off);
+            }
+        }
+        // The light scope (preference 7): the flicker stream subscribed and its channel set when it changes (usf.rs scope_follow).
+        let scope = crate::process::pref(crate::process::PREF_SCOPE);
+        if crate::usf::display_ready() && scope != scope_told {
+            scope_told = scope;
+            let mut out = alloc::vec::Vec::new();
+            crate::usf::scope_follow(scope, &mut out);
+            for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+                if let Ok(t) = core::str::from_utf8(l) {
+                    crate::flashlog::line(&alloc::format!("scope: {t}"));
+                }
             }
         }
         // The display's state follows the screen: the under-display sensor times its bursts to the panel and must know when it goes dark.
@@ -1481,7 +1498,7 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf flk") || cmd.params.starts_with(b"usf scope ") || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf flk") || cmd.params.starts_with(b"usf scope ") || cmd.params.starts_with(b"usf vd ") || cmd.params.starts_with(b"usf regset ") || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
                                             // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
                                             if cmd.params == b"sensors up" {
                                                 let st = &raw mut store;
@@ -1499,6 +1516,18 @@ pub fn run(mut b: Boot) -> ! {
                                                 let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
                                                 if v.len() >= 2 {
                                                     crate::usf::display_info(v[0], !a.contains("off"), v[1], &mut resp);
+                                                }
+                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf regset ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                let t: alloc::vec::Vec<&str> = a.splitn(3, ' ').collect();
+                                                if t.len() == 3 {
+                                                    crate::usf::regset(t[0], t[1], t[2], &mut resp);
+                                                }
+                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf vd ").and_then(|t| core::str::from_utf8(t).ok()) {
+                                                // `diag usf vd <handle> get|set <param> [ch=<n>] [v=<n>]`: the VD6282 access request (usf.rs vd_access).
+                                                let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
+                                                let kv = |k: &str| t.iter().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
+                                                if let (Some(h), Some(p)) = (t.first().and_then(|v| v.parse().ok()), t.get(2).and_then(|v| v.parse().ok())) {
+                                                    crate::usf::vd_access(h, t.get(1) == Some(&"set"), p, kv("ch="), kv("ped="), kv("v="), &mut resp);
                                                 }
                                             } else if let Some(n) = cmd.params.strip_prefix(b"usf scope ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<usize>().ok()) {
                                                 crate::usf::scope_dump(n, &mut resp);
