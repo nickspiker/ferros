@@ -1,6 +1,6 @@
-//! Files on Android's partitions, read-only: GPT lookup by partition name on any UFS LU, and an ext4 mount of it (ferros_ext4).
+//! Files on Android's partitions, read-only: GPT lookup by partition name on any UFS LU, and an ext4 (ferros_ext4) or f2fs (ferros_f2fs) mount of it.
 //!
-//! The modem needs this (docs/oracle/MODEM-BOOT-RECON.md): its firmware is `images/default/modem.bin` in the `modem_a` partition and its per-unit NV images are `nv_normal.bin` / `nv_protected.bin` in `efs`.
+//! The modem needs this (docs/oracle/MODEM-BOOT-RECON.md): its firmware is `images/default/modem.bin` in the `modem_a` partition (ext4) and its per-unit NV images are `nv_normal.bin` / `nv_protected.bin` in `efs` and `replay_region.bin` in `modem_userdata` (both f2fs).
 //! Reads are single 4 KiB UFS blocks through the HAL's bounce buffer, so throughput is one command per block.
 
 use alloc::string::String;
@@ -88,6 +88,39 @@ impl ferros_ext4::Disk for PartDisk {
         }
         Ok(())
     }
+}
+
+impl ferros_f2fs::Disk for PartDisk {
+    fn read_block(&mut self, block: u64, buf: &mut [u8; ferros_f2fs::BLOCK]) -> Result<(), ferros_f2fs::Error> {
+        let lba = self.part.first + block;
+        if lba > self.part.last || lba > u32::MAX as u64 {
+            return Err(ferros_f2fs::Error::Corrupt);
+        }
+        if self.ufs.read_block_lun(self.part.lun, lba as u32) != 0 || self.ufs.last_response_status() != 0 {
+            return Err(ferros_f2fs::Error::Io);
+        }
+        buf.copy_from_slice(&self.ufs.data_buffer()[..ferros_f2fs::BLOCK]);
+        Ok(())
+    }
+}
+
+/// An f2fs mount of a named partition.
+pub fn mount_f2fs(name: &str) -> Result<ferros_f2fs::Fs<PartDisk>, String> {
+    let part = find(name).ok_or_else(|| alloc::format!("partition {name} not found"))?;
+    ferros_f2fs::Fs::mount(PartDisk::new(part)).map_err(|e| alloc::format!("{name}: {e:?}"))
+}
+
+/// A whole file from an f2fs partition.
+pub fn read_f2fs(name: &str, path: &str) -> Result<Vec<u8>, String> {
+    let mut fs = mount_f2fs(name)?;
+    let ino = fs.open(path.as_bytes()).map_err(|e| alloc::format!("{name}{path}: {e:?}"))?;
+    if !ino.is_file() || ino.size > 64 << 20 {
+        return Err(alloc::format!("{name}{path}: not a file of a sane size"));
+    }
+    let mut v = vec![0u8; ino.size as usize];
+    let n = fs.read_at(&ino, 0, &mut v).map_err(|e| alloc::format!("{name}{path}: {e:?}"))?;
+    v.truncate(n);
+    Ok(v)
 }
 
 /// An ext4 mount of a named partition, with its two working blocks.

@@ -1,6 +1,6 @@
 //! Read-only ext4: enough to find a file by path and read it.
 //!
-//! ferros needs this for the modem: its firmware (`modem.bin` in the `modem` partition) and the per-unit NV files (`efs`) are on ext4 partitions Android formatted (docs/oracle/MODEM-BOOT-RECON.md).
+//! ferros needs this for the modem: its firmware (`modem.bin` in the `modem` partition) is on an ext4 partition Android formatted (docs/oracle/MODEM-BOOT-RECON.md); the per-unit NV files are on f2fs (ferros_f2fs).
 //! Supported: 1 KiB-64 KiB blocks, 32- and 64-bit group descriptors, extent-mapped files and directories (any tree depth), uninitialised extents (read as zeros), fast symlinks (target inside the inode) and slow ones, path lookup through symlinks.
 //! Not supported, refused with an error: block-mapped (pre-extent) files, inline data, encryption.
 //! No journal replay: the partitions are read-only on Android and nothing here writes.

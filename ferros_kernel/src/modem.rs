@@ -24,6 +24,8 @@ impl Section {
 }
 
 pub const MODEM_PART: &str = "modem_a";
+/// The per-unit NV files (f2fs): the boot channel's NV_NORM, NV_PROT and REPLAY sections.
+pub const NV_FILES: [(&str, &[&str]); 2] = [("efs", &["/nv_normal.bin", "/nv_protected.bin"]), ("modem_userdata", &["/replay_region.bin"])];
 pub const MODEM_BIN: &str = "/images/default/modem.bin";
 
 /// Parse the TOC from the first block of modem.bin.
@@ -68,32 +70,25 @@ pub fn files(rep: &mut Vec<u8>) {
             }
         },
     }
-    match crate::partfs::mount("efs") {
-        Err(e) => {
-            // Not ext4 (f2fs has its magic G#F2F52010 at byte G#400): say which, and show the first bytes so the real format is identifiable.
-            line(rep, alloc::format!("efs: {e}\n"));
-            if let Some(p) = crate::partfs::find("efs") {
-                let mut d = crate::partfs::PartDisk::new(p);
-                let mut b = alloc::vec![0u8; 4096];
-                use ferros_ext4::Disk;
-                if d.read_blocks(0, &mut b).is_ok() {
-                    let w = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-                    line(rep, alloc::format!("efs: LU A#{} LBA A#{}..A#{}; block 0 +0 G#{:X} +G#400 G#{:X} (f2fs is G#F2F52010), +G#438 G#{:X} (ext4 magic G#EF53 in the low half)\n", p.lun, p.first, p.last, w(0), w(0x400), w(0x438)));
+    // The per-unit NV files on f2fs: sizes, and a short BLAKE3 of each to compare with an image of the partition (the contents are per-unit and never printed).
+    for (part, files) in NV_FILES {
+        match crate::partfs::mount_f2fs(part) {
+            Err(e) => line(rep, alloc::format!("{e}\n")),
+            Ok(mut fs) => {
+                line(rep, alloc::format!("{part}: f2fs, checkpoint version G#{:X}\n", fs.checkpoint_ver));
+                if let Ok(root) = fs.root() {
+                    let mut names = Vec::new();
+                    let _ = fs.list(&root, &mut |n, ino| names.push((alloc::string::String::from_utf8_lossy(n).into_owned(), ino)));
+                    line(rep, alloc::format!("{part}/: {}\n", names.iter().map(|(n, i)| alloc::format!("{n} (ino A#{i})")).collect::<Vec<_>>().join(", ")));
+                }
+                for f in files.iter() {
+                    match crate::partfs::read_f2fs(part, f) {
+                        Ok(v) => line(rep, alloc::format!("{part}{f}: A#{} bytes, BLAKE3 {}\n", v.len(), &blake3::hash(&v).to_hex()[..16])),
+                        Err(e) => line(rep, alloc::format!("{e}\n")),
+                    }
                 }
             }
         }
-        Ok(mut m) => {
-            for f in ["/nv_normal.bin", "/nv_protected.bin"] {
-                match m.open(f) {
-                    Ok(i) => line(rep, alloc::format!("efs{f}: A#{} bytes\n", i.size)),
-                    Err(e) => line(rep, alloc::format!("efs: {e}\n")),
-                }
-            }
-        }
-    }
-    match crate::partfs::find("modem_userdata") {
-        Some(p) => line(rep, alloc::format!("modem_userdata: LU A#{} LBA A#{}..A#{} (f2fs, not read: replay_region.bin)\n", p.lun, p.first, p.last)),
-        None => line(rep, alloc::format!("modem_userdata not found\n")),
     }
     let ms = (crate::platform::cntpct() - t0) / (crate::platform::cntfrq() / 1000);
     line(rep, alloc::format!("A#{ms} ms\n"));

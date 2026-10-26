@@ -669,7 +669,7 @@ dependencies = [
  "nunc-time",
  "nusb",
  "tokio",
- "vsf 0.10.1",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -919,12 +919,16 @@ name = "ferros_ext4"
 version = "0.1.0"
 
 [[package]]
+name = "ferros_f2fs"
+version = "0.1.0"
+
+[[package]]
 name = "ferros_hal"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_layout",
- "vsf 0.10.1",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -954,6 +958,7 @@ dependencies = [
  "ferros_dsc",
  "ferros_dsi",
  "ferros_ext4",
+ "ferros_f2fs",
  "ferros_hal",
  "ferros_hal_m1",
  "ferros_heap",
@@ -966,7 +971,7 @@ dependencies = [
  "ihi 0.0.48",
  "manifestus",
  "tatau",
- "vsf 0.10.1",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -1001,7 +1006,7 @@ dependencies = [
  "ferros_hal",
  "ferros_layout",
  "ihi 0.0.3",
- "vsf 0.10.1",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -1047,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "block2",
  "libm",
@@ -1540,12 +1545,12 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.10.1",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -1961,7 +1966,7 @@ dependencies = [
  "poly1305",
  "raptorq",
  "subtle",
- "vsf 0.10.1",
+ "vsf 0.10.2",
  "zeroize",
 ]
 
@@ -2690,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "aes-gcm",
  "bitvec",

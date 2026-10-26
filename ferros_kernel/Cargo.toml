@@ -20,6 +20,7 @@ ferros_hal = { path = "../ferros_hal", default-features = false, features = ["al
 ferros_hal_m1 = { path = "../ferros_hal_m1", optional = true }
 ferros_layout = { path = "../ferros_layout" }
 ferros_ext4 = { path = "../ferros_ext4" }
+ferros_f2fs = { path = "../ferros_f2fs" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ferros_vault = { path = "../vault", default-features = false }
 # The storage engine (the owner's, shared with Photon and the rest of the stack): mirrored 4 KiB blocks, generation ring, plow-managed tract, COW HAMT. no_std core; the kernel backs its BlockDev with UFS (kvault.rs).

@@ -3,6 +3,6 @@ name = "ferros_ext4"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Read-only ext4 for ferros: find a file by path and read it, block by block, through a caller's block reader (the modem images and per-unit NV files live on ext4 partitions)"
+description = "Read-only ext4 for ferros: find a file by path and read it, block by block, through a caller's block reader (the modem's images live on an ext4 partition)"
 
 [dependencies]
