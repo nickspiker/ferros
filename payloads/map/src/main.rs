@@ -1203,7 +1203,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         scope_axis: 0,
         scope_acc: 0,
         scope_fold: false,
-        focus_sent: (0, 1_000_000, false),
+        // Nothing sent yet, whatever the display holds: a display server that outlived a map restarted while the scope was in focus kept flipping at the panel's rate, and the clock policy saw a display animating and held the active clocks (2.9 W at rest, 2026-10-25). The first frame always says.
+        focus_sent: (0xFF, 0, false),
         app_seen: false,
         app_since: 0,
     };

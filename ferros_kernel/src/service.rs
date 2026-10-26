@@ -767,7 +767,7 @@ fn power_poll() {
     }
 }
 
-/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver or a PT transfer moving, held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
+/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver, a PT transfer moving, or the display sending frames faster than its rest flips (a focused widget), held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
 const CLOCKS_REST: [(u32, u32); 7] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 400_000)];
 /// Dark — the screen off, nobody touching, no transfer: nothing is drawn, so the X3 and MIF go to their floors and the display's clock to its 143 MHz floor (measured 70 mW under rest with the screen off).
 const CLOCKS_DARK: [(u32, u32); 7] = [(4, 500_000), (0, 421_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 143_000)];
@@ -790,6 +790,17 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         unsafe { PT_BUSY_AT = now };
     }
     let active = active || now.wrapping_sub(unsafe { PT_BUSY_AT }) < f;
+    // Frames faster than the rest flips: counted over quarter seconds, six or more (24 a second; the rest flips are 10) marks the display animating — a focused widget gets the active clocks as a finger does (2026-10-25: the focused scope ran 61 frames a second at the rest clocks, 93 at the active ones).
+    unsafe {
+        if now.wrapping_sub(FRAMES_WINDOW.0) >= f / 4 {
+            let n = crate::process::FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed);
+            if n.wrapping_sub(FRAMES_WINDOW.1) >= 6 {
+                FRAMES_FAST_AT = now;
+            }
+            FRAMES_WINDOW = (now, n);
+        }
+    }
+    let active = active || (unsafe { FRAMES_FAST_AT } != 0 && now.wrapping_sub(unsafe { FRAMES_FAST_AT }) < f);
     let dark = !active && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
     let want = if active { 2 } else if dark { 3 } else { 1 };
     if want != unsafe { CLOCK_STATE } {
@@ -822,6 +833,8 @@ fn clock_profile(want: u8) {
     }
 }
 static mut PT_BUSY_AT: u64 = 0;
+static mut FRAMES_WINDOW: (u64, u64) = (0, 0);
+static mut FRAMES_FAST_AT: u64 = 0;
 /// Idle sleeps the EL2 timer's backstop ended (the event stream did not): DIAG BACKSTOP_WAKES.
 static BACKSTOP_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -957,13 +970,13 @@ pub fn run(mut b: Boot) -> ! {
     }
     let heap_end = ((&raw const __stack_top as usize + 0xFFF) & !0xFFF) + crate::HEAP_SIZE;
 
-    // The generic timer's event stream: an event on every 0 -> 1 transition of counter bit 12, every 8192 ticks — 333 us at 24.576 MHz. A core in `wfe` wakes on it without taking an interrupt, so the idle loop below can sleep instead of spinning and still answer USB well inside anything the host would notice.
+    // The generic timer's event stream: an event on every 0 -> 1 transition of counter bit 15, every 65536 ticks — 2.7 ms at 24.576 MHz (bit 12, 333 us, until 2026-10-25: bit 15 is 15-25 mW less with the screen off, and the idle `wfe`'s EL2 timer is armed at the next thread deadline, so deadlines no longer wait on the stream). Earlier: an event on every 0 -> 1 transition of counter bit 12, every 8192 ticks — 333 us at 24.576 MHz. A core in `wfe` wakes on it without taking an interrupt, so the idle loop below can sleep instead of spinning and still answer USB well inside anything the host would notice.
     // The period sets the split. Each wake runs one full loop pass, about 13 us of work, so bit 9 (41.7 us) left the core awake a third of the time — 68% asleep, measured — while bit 12 leaves it awake about 4%. Only the first packet of a new command can wait up to one period; a transfer in progress never sleeps.
     // Without it the loop pinned one core at full speed for as long as ferros was up, and with nothing else running that core was most of the phone's heat (owner, 2026-10-21: "why's it so hot? 1 core, always on?").
     unsafe {
         let mut v: u64;
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
-        v = (v & !(0xF << 4 | 1 << 3)) | 1 << 2 | 12 << 4;
+        v = (v & !(0xF << 4 | 1 << 3)) | 1 << 2 | 15 << 4;
         core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
     }
     // Ticks spent asleep in the idle loop, and since when, for DIAG's IDLE_PCT.
@@ -1177,11 +1190,13 @@ pub fn run(mut b: Boot) -> ! {
                         crate::killswitch::enable_ppi(26);
                         backstop_ppi = true;
                     }
-                    let backstop = cntfrq() / 500;
+                    // Armed at the next sleeping thread's deadline when that is sooner (process::NEXT_WAKE), so deadlines land on time however slow the event stream: with the stream every 2.7 ms (bit 15, 15-25 mW under bit 12's 333 us with the screen off, 2026-10-25) a display waiting on its next flip would otherwise wake up to a stream period late.
+                    let next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire);
+                    let backstop = next.saturating_sub(cntpct()).clamp(cntfrq() / 20_000, cntfrq() / 500);
                     unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
                     platform::crumb(0xB4);
                     let slept = cntpct().wrapping_sub(t);
-                    if slept > backstop * 3 / 4 {
+                    if slept > cntfrq() / 500 * 3 / 4 {
                         BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
                     asleep += slept;
@@ -2183,6 +2198,19 @@ pub fn run(mut b: Boot) -> ! {
                                                 Some(t) => resp.extend_from_slice(t.as_bytes()),
                                                 None => resp.extend_from_slice(b"no vault open\n"),
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if let Some(n) = cmd.params.strip_prefix(b"evnt ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
+                                            // `diag evnt <bit>`: the kernel core's event stream on counter bit n (8-15: the selector is four bits; 12, every 333 us, is the boot's), for measuring what its wakeups cost. The idle wfe's 2 ms EL2-timer backstop holds whatever the setting.
+                                            let n = n.clamp(8, 15);
+                                            unsafe {
+                                                let mut v: u64;
+                                                core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
+                                                v = (v & !(0xF << 4)) | (n & 0xF) << 4;
+                                                core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
+                                            }
+                                            resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

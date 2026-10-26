@@ -640,12 +640,18 @@ fn irq_pending_take(intid: u32) -> bool {
             if intid == IRQ_TOUCH_INT {
                 INPUT_AT.store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
             }
+            // Frames going out: the clock policy's sign that something is animating at more than the rest flips (a focused widget).
+            if intid == IRQ_DECON0_FRAME_START {
+                FRAME_STARTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         v != 0
     }
 }
 /// When a touch interrupt was last taken by the touch driver (counter ticks; 0 never): the clock policy holds the active clocks for a second after it.
 pub static INPUT_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Display frame starts taken by the display server's frame thread, counted for the clock policy.
+pub static FRAME_STARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Fills the facts (service.rs, which owns the vault, the USB link and the buses).
 pub static mut FACTS: Option<fn() -> [u64; FACT_COUNT]> = None;
 

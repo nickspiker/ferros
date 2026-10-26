@@ -112,6 +112,14 @@ The meters' external shunt channels (VSYS feeds, zuma-pmic.dtsi `external_rail`:
 - The modem, never booted by ferros, draws ~40–60 mW across its feed, its RF front end and its PMIC: powering it down (pmucal_cp, the IF PMIC) is a candidate.
 - BB_HLDO stays ~324 mW screen on or off and its LDOs read a few mW each: its load is still unknown — or its resolution (BB_POWER, 0.010989 mW per count, the one constant not cross-checked) is off.
 
+## 2026-10-25: the kernel's sleep, and focus
+
+- The kernel core's event stream every 2.7 ms (counter bit 15) instead of 333 us: 15–25 mW less with the screen off (four alternating windows). The idle `wfe`'s EL2 timer is armed at the next sleeping thread's deadline (capped at 2 ms), so deadlines land on time whatever the stream. `diag evnt <8-15>` sets the stream live.
+- The clock policy counts display frame starts: more than 24 a second (the rest flips are 10) is active, as a finger is. The focused scope ran 61 frames a second at the rest clocks and runs 90 at the active ones — **at 3.96 W**: full rate in focus is that expensive.
+- A display server that outlived a map restarted in focus kept flipping at the panel's rate, and the policy held the active clocks (2.9 W at rest): the map now always sends its focus state on its first frame.
+
+Fresh boot, all of today's changes: screen on at rest **1.21–1.26 W**, screen off **0.61 W** (cable in).
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
