@@ -84,6 +84,18 @@ Screen off, dark profile, the cable in (rail outputs, mW): BB_HLDO 336 · S3S_LL
 - BB_HLDO (the 3.0–3.6 V buck-boost under the high-voltage LDOs) and SA (the 1.8 V I/O buck: UWB, display I/O, audio codec, …) are always-on in Linux as well; their loads are what to find, not the rails.
 - L2S_PLL_MIPI_UFS stays at 127 mW with the screen off and UFS hibernating: PLLs and PHYs left running.
 
+## 2026-10-25: the unused power domains off
+
+Every SoC power domain read on through EL3 — ABL leaves them so: the GPU and its embedded part, G2D, the camera's ISP chain (GDC, GSE, MCSC, RGBP, TNR, YUVP, ISPFE), MFC, AUR, BW, EH, the TPU. ferros had never turned one off. pd.rs runs Linux's off sequence for each (flexpmu_cal_local_zuma.h: the secure world's save, SMC G#8200_0410; the domain CMU's controller option bit 24; PMU CONFIGURATION bit 0 — every PMU access through EL3, a fixed millisecond in place of a STATUS poll, for the EL3 poison rule), once, 16 s into the service loop.
+
+| | before | after |
+|---|---|---|
+| rail outputs, screen off (odpm) | 1558 mW | 1185 mW (PLL rail 127 → 25, INT 85 → 23, GPU 66 → 15, camera 35 → 14, S3S_LLDO1 168 → 49) |
+| battery, screen off, cable in | 0.98 W | **0.63 W** |
+| battery, screen on | 1.58 W | **1.24 W** |
+
+Bringing a domain back (`diag pd on`, CONFIGURATION through EL3 and the secure restore, without Linux's saved CMU registers) is not yet trusted: a TPU on/off by hand preceded a reset during the next power window. The camera and TPU diags refuse while their domains are gated; the GPU's way back (its embedded part's PLL and atomic-alias sequence) is not written.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.

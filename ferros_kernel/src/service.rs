@@ -1021,6 +1021,8 @@ pub fn run(mut b: Boot) -> ! {
         gauge_poll();
         power_poll();
         crate::odpm::poll();
+        // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
+        crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
         clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -1263,6 +1265,14 @@ pub fn run(mut b: Boot) -> ! {
                                     st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
                                     if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                                        // The camera's and the TPU's power domains are gated after boot (pd.rs). Their diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
+                                        if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else if cmd.params.starts_with(b"tpu") { Some("tpu") } else { None } {
+                                            if !crate::pd::is_on(name) {
+                                                resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());
+                                                queue_pt_response(&mut pt_out_data, &resp);
+                                                continue;
+                                            }
+                                        }
                                         if cmd.params.starts_with(b"lun ") {
                                             // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
                                             let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
@@ -2173,6 +2183,12 @@ pub fn run(mut b: Boot) -> ! {
                                                 Some(t) => resp.extend_from_slice(t.as_bytes()),
                                                 None => resp.extend_from_slice(b"no vault open\n"),
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"pd" || cmd.params.starts_with(b"pd ") {
+                                            // `diag pd [off <name>|all]`: the unused SoC power domains (pd.rs).
+                                            crate::pd::diag(core::str::from_utf8(&cmd.params[2..]).unwrap_or(""), &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

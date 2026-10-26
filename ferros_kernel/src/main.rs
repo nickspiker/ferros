@@ -43,6 +43,7 @@ mod hsi2c;
 #[cfg(feature = "pixel8")]
 mod acpm;
 mod odpm;
+mod pd;
 #[cfg(feature = "pixel8")]
 mod camera;
 #[cfg(feature = "pixel8")]
