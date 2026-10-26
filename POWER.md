@@ -67,6 +67,12 @@ The vault's key count (fact 7) was read every 2 s and woke the link each time; n
 
 Touch: the controller kept scanning with the screen off. The touch process now sends the vendor driver's screen-down mode (`A0 00 00`, sensing off) when the screen goes off and `A0 00 FF` when it comes back.
 
+## 2026-10-25: the cable out, and the dark profile
+
+Screen off, the dark clock profile (X3 500 MHz, MIF 421, the display clock 143 MHz; the policy's third state), a 60 s window started with `after 60` and the cable pulled before it began: **0.85 W** — against ~0.98 W with the cable in, so the live USB link (PHY, repeater, controller, the host's polling) is ~0.13 W, and it includes the USB re-init the loop runs every 2 s while no host is there. Android, cable out, screen off: 0.31 W.
+
+Pulling the cable used to lose the link for good: the MAX77759's USB data switch (TCPC vendor register G#93) opens on a detach and nothing closed it again. Fixed (the re-init closes it when CC is attached and VBUS present); see the USB commit of the same day.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
