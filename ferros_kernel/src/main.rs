@@ -120,6 +120,7 @@ mod ready;
 // Bring-up checklist on the panel: red until done, green once done.
 #[cfg(feature = "pixel8")]
 mod checklist;
+mod text;
 
 // UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
 mod ufs_device;
@@ -1890,6 +1891,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     platform::crumb(0xE5);
     process::set_pref(process::PREF_BASE, tatau::base().code());
+    checklist::base_known();
     // Brightness (device.brightness, stops below the brightest white; absent = 2, white about 147 cd/m²).
     let bright = store.as_mut().and_then(|s| s.get_by_key("device.brightness").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 8).unwrap_or(2);
     process::set_pref(process::PREF_BRIGHTNESS, bright);

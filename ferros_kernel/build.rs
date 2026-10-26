@@ -78,6 +78,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FERROS_SHIM_HANDOFF");
     println!("cargo:rerun-if-env-changed=FERROS_SHIM_ENTRY");
     ready_text();
+    text_atlas();
 }
 
 /// The "Ready?" gate text (BOOT.md), rasterised once on the host: Oxanium ExtraLight at 200 px into OUT_DIR/ready.bin = [width u32 LE][height u32 LE][one alpha byte per pixel, row-major]. The kernel only blits it.
@@ -116,4 +117,39 @@ fn ready_text() {
     out.extend_from_slice(&img);
     let dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(std::path::Path::new(&dir).join("ready.bin"), out).unwrap();
+}
+
+/// The kernel's text (text.rs): Oxanium Regular with the dozenal digit glyphs (`+glyphs`, U+0010-U+001B, where tatau puts them) rasterised anti-aliased at the boot screen's line height, with every glyph's advance, so the kernel draws proportional text by blending alpha, no rasteriser at boot. ASCII, the twelve digits, and tatau's radix point and sign arrows.
+/// atlas.bin: "FAT1", u16 ascent, u16 line height, u16 count, then per glyph {u32 code point, u16 advance, i16 xmin, i16 ymin, u16 width, u16 height, u32 offset}, then the alpha bytes.
+fn text_atlas() {
+    let font_path = format!("{}/../assets/fonts/Oxanium-Regular+glyphs.ttf", std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed={font_path}");
+    let bytes = std::fs::read(&font_path).expect("Oxanium-Regular+glyphs.ttf");
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("font");
+    // The size whose line (ascent - descent) is the checklist's 48-pixel row.
+    let probe = font.horizontal_line_metrics(100.0).expect("line metrics");
+    let px = 100.0 * 46.0 / (probe.ascent - probe.descent);
+    let line = font.horizontal_line_metrics(px).expect("line metrics");
+    let chars: Vec<char> = (0x20u32..0x7F).chain(0x10..0x1C).chain([0xB7, 0x2191, 0x2193]).filter_map(char::from_u32).collect();
+    let mut table = Vec::new();
+    let mut data = Vec::new();
+    for &c in &chars {
+        let (m, bmp) = font.rasterize(c, px);
+        table.extend_from_slice(&(c as u32).to_le_bytes());
+        table.extend_from_slice(&(m.advance_width.round() as u16).to_le_bytes());
+        table.extend_from_slice(&(m.xmin as i16).to_le_bytes());
+        table.extend_from_slice(&(m.ymin as i16).to_le_bytes());
+        table.extend_from_slice(&(m.width as u16).to_le_bytes());
+        table.extend_from_slice(&(m.height as u16).to_le_bytes());
+        table.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        data.extend_from_slice(&bmp);
+    }
+    let mut out = b"FAT1".to_vec();
+    out.extend_from_slice(&(line.ascent.ceil() as u16).to_le_bytes());
+    out.extend_from_slice(&((line.ascent - line.descent).ceil() as u16).to_le_bytes());
+    out.extend_from_slice(&(chars.len() as u16).to_le_bytes());
+    out.extend_from_slice(&table);
+    out.extend_from_slice(&data);
+    let dir = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(std::path::Path::new(&dir).join("atlas.bin"), out).unwrap();
 }

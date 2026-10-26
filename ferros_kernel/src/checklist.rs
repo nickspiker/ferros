@@ -124,19 +124,21 @@ fn draw_item(c: &Checklist, item: Item, label: &str) {
     let color = if !done { RED } else if c.interim & (1 << item as u8) != 0 { YELLOW } else { GREEN };
     let row = row_of(item);
     draw_circle(&c.panel, row, done, color);
-    unsafe {
-        let mut con = c.panel.console(color);
-        con.set_scale(SCALE);
-        con.goto(LABEL_COL, row);
-        con.puts(label);
-        let (text, len) = &c.suffix[item as usize];
-        if *len > 0 {
-            con.putc(b' ');
-            for &b in &text[..*len] {
-                con.putc(b);
-            }
-        }
+    // The label in Oxanium (text.rs), the row's text area cleared first so a redraw does not blend over the last one.
+    let sf = surface(&c.panel);
+    let (x, top) = ((LEFT + LABEL_COL * CHAR_W) as i32, (TOP + row * LINE_H) as i32);
+    sf.fill(x as usize, top as usize, c.panel.width.saturating_sub(x as usize + LEFT), LINE_H, 0);
+    let pen = sf.draw(x, top, label, color);
+    let (text, len) = &c.suffix[item as usize];
+    if *len > 0 {
+        let pen = sf.draw(pen, top, " ", color);
+        sf.draw(pen, top, core::str::from_utf8(&text[..*len]).unwrap_or("?"), color);
     }
+}
+
+/// The panel as a surface for text.rs.
+fn surface(p: &Panel) -> crate::text::Surface {
+    crate::text::Surface { fb: p.fb as *mut u32, width: p.width, height: p.rows, stride: p.stride }
 }
 
 fn redraw(c: &Checklist, item: Item) {
@@ -304,6 +306,41 @@ fn slice(p: &Panel, r1: i32, r2: i32, t0: i32, t1: i32, rgb: u32) {
     }
 }
 
+/// The lit steps' rows (item, µs since the press, colour), so the times can be drawn again in the device's base once the vault has said what it is (`base_known`).
+const TIMED: usize = 16;
+static mut RING_ROWS: [(Item, u64, u32); TIMED] = [(Item::Arcs, 0, 0); TIMED];
+
+/// One step's row: its name and its time since the press, in the device's number base (tatau's digit glyphs, which the Oxanium +glyphs atlas carries).
+fn time_row(c: &Checklist, n: usize, item: Item, us: u64, fg: u32) {
+    let mut t = alloc::string::String::new();
+    let _ = tatau::duration_ns(&mut t, tatau::Fmt::current(tatau::Style::Glyphs), us * 1000, 3);
+    // Oxanium (text.rs): the name at the left, the time at a tab stop, the row cleared first so a redraw in the device's base replaces the old one.
+    let sf = surface(&c.panel);
+    let top = TOP + (list_row(&c.panel) + n) * LINE_H;
+    sf.fill(LEFT, top, c.panel.width.saturating_sub(2 * LEFT), LINE_H, 0);
+    sf.draw(LEFT as i32, top as i32, label_of(item), fg);
+    let pen = sf.draw((LEFT + TIME_TAB) as i32, top as i32, "+", fg);
+    sf.draw(pen, top as i32, &t, fg);
+}
+
+/// Where a step's time starts, from the left margin (the longest label is about 26 characters wide).
+const TIME_TAB: usize = 29 * CHAR_W;
+
+/// The device's number base is known (main.rs, after the vault): every step drawn before it was drawn in the default base, so draw their times again.
+pub fn base_known() {
+    let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
+        return;
+    };
+    if !DEV {
+        return;
+    }
+    let n = (unsafe { RING_N } as usize).min(TIMED);
+    for k in 0..n {
+        let (item, us, fg) = unsafe { (*(&raw const RING_ROWS))[k] };
+        time_row(c, k, item, us, fg);
+    }
+}
+
 /// Where the ring has got to, in 1/1024 turns, and how many slices are lit.
 static mut RING_AT: i32 = 0;
 static mut RING_N: u32 = 0;
@@ -336,10 +373,10 @@ fn light(c: &Checklist, item: Item) {
             if DEV {
                 // The step's name and its time since the press, in its slice's colour (the darkest lifted to brick so it reads on black).
                 let fg = if (rgb >> 16) & 0xFF < 0x80 { RAMP[1] } else { rgb };
-                let mut con = c.panel.console(fg);
-                con.set_scale(SCALE);
-                con.goto(0, list_row(&c.panel) + *n as usize);
-                con.puts(&alloc::format!("{:<28} +A#{} ms", label_of(item), us / 1000));
+                if (*n as usize) < TIMED {
+                    (*(&raw mut RING_ROWS))[*n as usize] = (item, us, fg);
+                }
+                time_row(c, *n as usize, item, us, fg);
             }
             *at = t1;
             *n += 1;
