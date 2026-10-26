@@ -758,6 +758,8 @@ fn power_poll() {
         } else {
             r += "no gauge samples\n";
         }
+        // Into the flash log too: a window run with the cable out ends before the host can ask, and if the USB link does not come back the reset that recovers it would take the result with it (2026-10-25).
+        crate::flashlog::line(&alloc::format!("power: {}", r.trim_end()));
         unsafe {
             POWER_RESULT = Some(r);
             POWER_WIN = None;
@@ -1128,6 +1130,22 @@ pub fn run(mut b: Boot) -> ! {
                         }
                     }
                     usb_log(&mut usb_log_n, &alloc::format!("usb: re-initialising (attempt {}) at {} s, DSTS G#{:08X}", attempts + 1, now.wrapping_sub(t_boot) / freq, dsts()));
+                    // The Type-C port controller's USB switch (the MAX77759's TCPC, G#25 on hsi2c_11, vendor register G#93 USBSW_CTRL: G#09 connects D+/D- to the SoC's PHY, 0 parks them): after the cable came out and went back in, the link never came back (2026-10-25, four times) — VBUS present and CC attached on the replug, the eUSB2 repeater correctly tuned, the charger in its mode, yet the host never saw the phone. The chip opens the switch for its own BC1.2 charger detection on a new VBUS, and Google's driver closes it on every attach ("switches will not be configured by HW", tcpci_max77759.c enable_data_path_locked); ABL closes it at power-on and ferros never had. So: attached, VBUS present and the switch not G#09 — close it. The controller's role, CC, power status and the switch into the flash log on every eighth attempt and whenever it acts.
+                    {
+                        use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
+                        const TCPC: u8 = 0x25;
+                        let r = |reg: u8| read_byte(HSI2C_11, TCPC, reg).map(|v| v as u32).unwrap_or(0x8000);
+                        let (role, cc, pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
+                        let attached = cc & 0x8000 == 0 && cc & 0xF != 0;
+                        let vbus = pwr & 0x8000 == 0 && pwr & 0x4 != 0;
+                        let act = attached && vbus && sw != 0x09;
+                        if act {
+                            let _ = write_byte(HSI2C_11, TCPC, 0x93, 0x09);
+                        }
+                        if attempts % 8 == 0 || act {
+                            crate::flashlog::line(&alloc::format!("usb: re-init {}: tcpc role G#{role:X} cc G#{cc:X} power G#{pwr:X} usb switch G#{sw:X}{}", attempts + 1, if act { " -> closed (G#09)" } else { "" }));
+                        }
+                    }
                     crate::pixel8_eusb_phy_init();
                     if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() {
                         usb = nu;
