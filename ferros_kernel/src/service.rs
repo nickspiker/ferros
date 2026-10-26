@@ -803,10 +803,25 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
     let active = active || (unsafe { FRAMES_FAST_AT } != 0 && now.wrapping_sub(unsafe { FRAMES_FAST_AT }) < f);
     let dark = !active && crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
     let want = if active { 2 } else if dark { 3 } else { 1 };
-    if want != unsafe { CLOCK_STATE } {
+    let was = unsafe { CLOCK_STATE };
+    if want != was {
+        // The workers are off while dark (2026-10-25: their cluster drew ~28 mW idle in `wfe` with the screen off; Android's 8): started before leaving the dark profile, stopped after entering it, so no clock request goes to their cluster while it is down. Threads meant for the workers run on the X3 meanwhile (process.rs: a mask with no core up runs anywhere).
+        let workers_dark = DARK_WORKERS_OFF.load(core::sync::atomic::Ordering::Relaxed);
+        if was == 3 && workers_dark {
+            crate::smp::launch_all();
+            let t0 = cntpct();
+            while crate::smp::UP.load(core::sync::atomic::Ordering::Acquire) != 0xF && cntpct().wrapping_sub(t0) < f / 20 {
+                core::hint::spin_loop();
+            }
+        }
         clock_profile(want);
+        if want == 3 && workers_dark {
+            crate::smp::stop_all();
+        }
     }
 }
+/// `diag smp dark on|off`: whether the workers go off with the dark profile (on by default).
+pub static DARK_WORKERS_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// One of the two operating points, every domain in order; then the X3's timer control (its event stream, which wakes the idle loop's `wfe`) and the counter into note 6, and the switch count into note 7, so a hang after a switch says what the core was left with (the first policy build hung the X3 in `wfe` within a minute of going to rest, 2026-10-25).
 fn clock_profile(want: u8) {
@@ -1621,7 +1636,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     }
                                                 }
                                             }
-                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active, 3 dark), {} switches, longest request {} us\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }).as_bytes());
+                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active, 3 dark), {} switches, longest request {} us; display frame starts {}, workers up G#{:X}\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }, crate::process::FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed), crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
                                             if words.len() == 4 && words[1] == b"set" {
                                                 let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
                                                 match (num(words[2]), num(words[3])) {
@@ -2251,12 +2266,16 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"smp dark on" || cmd.params == b"smp dark off" {
+                                            DARK_WORKERS_OFF.store(cmd.params == b"smp dark on", core::sync::atomic::Ordering::Relaxed);
+                                            resp.extend_from_slice(alloc::format!("workers off while dark: {}\n", cmd.params == b"smp dark on").as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"smp off" || cmd.params == b"smp on" {
                                             // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
                                             if cmd.params == b"smp off" {
-                                                ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
-                                            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
-                                            crate::smp::stop_all();
+                                                crate::smp::stop_all();
                                             } else {
                                                 crate::smp::launch_all();
                                             }

@@ -120,12 +120,33 @@ The meters' external shunt channels (VSYS feeds, zuma-pmic.dtsi `external_rail`:
 
 Fresh boot, all of today's changes: screen on at rest **1.21–1.26 W**, screen off **0.61 W** (cable in).
 
+## 2026-10-25 night: against Android rail by rail, and the workers off while dark
+
+Android's meters (`/sys/bus/iio/devices/iio:device0/1`, `energy_value` over 30 s, screen asleep, cable in) next to ferros's sweep in the same state:
+
+| rail | Android | ferros |
+|---|---|---|
+| BB_HLDO | 324 mW | 330 mW |
+| CPUCL0 (A510s) | 55 | 43 |
+| CPUCL1 (A715s) | 8 | 28 → **under 1 with the workers off** |
+| CPUCL2 (X3) | 2 | 30 |
+| MIF / INT | 26 / 24 | 28 / 22 |
+| LLDO1 / LLDO2 | 40 / 55 | 47 / 52 |
+| PLL_MIPI_UFS | 17 | 25 |
+| DDR (VDD2H) | 22 | 19 |
+| CAM / AOC / G3D / DISP | 5 / 4 / 1 / 1 | 14 / 11 / 8 / 6 |
+| VSYS modem / RFFE | 41 / 17 | 19 / 17 |
+
+- **BB_HLDO is not ferros's**: Android's own driver (channel 7 switched to `BUCKBOOST` through `enabled_rails`) reads the same ~324 mW with the whole phone at 0.31 W, so the figure is the meter's scale on that channel, not a load. Crossed off the list below.
+- **The worker cluster:** ferros's four A715s idling in `wfe` held 28 mW; Android's are power-collapsed. Now the dark profile turns them off (PSCI CPU_OFF after the dark clocks are set; CPU_ON before they are left, so no clock request reaches a cluster that is down; threads meant for them run on the X3 meanwhile): **screen off 611 → 576 mW** at the battery, two A/B pairs (`diag smp dark on|off`). Each PT command wakes them for its active second, which costs nothing measurable.
+- What is left on the rails: the X3 holding the kernel (30 mW against Android's 2: Android's big core sleeps power-collapsed; ferros's kernel core can only clock-gate in `wfe` unless the kernel moves to an A510 while dark), UFS's PLL (+8), and the camera/AoC/GPU/display rails (+5-9 each: the domains are gated, the rails stay up).
+
 ## Where it stands, and what is left (2026-10-25 evening)
 
 | | start of the day | now | Android (same phone) |
 |---|---|---|---|
 | screen on, at rest | 3.50–3.59 W | **1.21–1.26 W** | 1.16 W |
-| screen off, cable in | (1.70 W with the first clock policy) | **0.61 W** | — |
+| screen off, cable in | (1.70 W with the first clock policy) | **0.58 W** (0.61 before the workers went off while dark) | — |
 | screen off, cable out | — | (0.85 W before the domains were gated) | 0.31 W |
 | the scope in focus (90 frames/s) | — | 3.96 W | — |
 
@@ -133,7 +154,7 @@ Left, roughly by size:
 
 1. **The cable-out screen-off number again**, with everything since: the live USB link was ~0.13 W of the cable-in figure.
 2. **The USB re-init loop while no cable is in**: every 2 s a full PHY and controller init. Re-init only when the TCPC shows VBUS (the replug path closes the data switch then anyway). Needs a hand on the cable to test.
-3. **BB_HLDO** (~324 mW by the meter, screen on or off, its LDOs a few mW each): either a load hanging on the 3.3 V buck-boost or its meter resolution is off — the meter's absolute total exceeds what the battery delivers, so treat its absolute numbers with care; its changes match the gauge.
+3. ~~BB_HLDO~~: Android's meter reads the same (above); not a load.
 4. **The modem's supplies** (~40 mW: its VSYS feed, RF front end, its PMIC) with the CP already held off (CP_PWR low) — likely what Android pays too.
 5. **Bringing gated domains back properly** (Linux's saved CMU registers replayed; the GPU's embedded part), so the camera, TPU and GPU work can run without a reboot.
 6. **Screen on: the rest redraws** — the gravity-following clock repaints its whole face on every 10 Hz flip and the scope its plot box; cheaper redraws would let the X3 rest below 2 GHz. A design choice for the owner (the clock's no-dead-zone rule is part of it).
