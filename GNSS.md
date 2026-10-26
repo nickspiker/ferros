@@ -51,6 +51,16 @@ Captures on rooted Android with `tools/gtrace` (a freestanding ptrace tracer, bu
 
 **Agreement:** the same engine under Android gave the same place (its fixes under gpsd's log, the same spot to a few metres); both sit about 150 m north and 40 m east of the fix Android's host engine (gpsd with Maps) reported indoors an hour earlier. Which of the two engines is right indoors is open; an outdoor fix with both settles it.
 
+## Aiding: Broadcom's LTO (measured 2026-10-26)
+
+The replay carries gpsd's aiding from the capture night: the time (ferros rewrites it from the RTC), the last position, the ephemerides gpsd kept, and an LTO file — why the first fix takes ~11 s. LTO ("Long Term Orbits") is Broadcom's service, from Global Locate (hence glpals.com and gpsd's `Gl*` names): every satellite's orbit and clock predicted days ahead. gpsd keeps checking it against the broadcast ephemerides (`CompareLtoBEPos … deltaPos`, 145 lines in one night's log) and flags satellites where they disagree.
+
+- **Where the Pixel gets it:** its `/data/vendor/gps/lto2.dat` is byte-for-byte `http://gllto2.glpals.com/7day/v5/latest/lto2.dat` (~188 KB), fetched daily (gps.xml `HttpSyncLto`, `LtoSyncThresholdDays=1`; `ltoStatus.txt` = unix time of the last fetch). The server regenerates it a few times a day.
+- **Open:** plain HTTP and HTTPS both answer; no key, account, signature or terms shown anywhere. Variants on the same path: `7day/v2` 59 KB, `v3` 103 KB, `v4` 146 KB, `v5` 188 KB, `4day/v5` 123 KB (gpsd's compiled-in URL is the 4day one). Also `http://gllto.glpals.com/rtistatus5.dat` (240 bytes, real-time satellite health); gpsd's `rto.dat` URL answers 404.
+- **The file:** magic `ff ca de 00`, u32 length (file − 8), u32 1, 16 bytes that change per file (likely the "LTO file id" gpsd logs and sends with its upload), u32 G#75A0DE5 and u32 5292 (the header's end) in every variant, u32 70, then 70 × (index, offset) into G#44-byte records, then the bulk. gpsd logs "LTO under license to 'google', license #69" on reading one: the feed is made for Google's licence; the bytes are served to anyone.
+- **Our stance:** published openly, unposted and unauthenticated, exactly as the Pixel fetches it; ferros fetches it the same way for its own chip. If Broadcom or Google ask, it comes down.
+- **Not done yet:** a fresh file into the chip. gpsd's upload is the `1e83`/`1e82` messages; one capture on Android with the exact file it uploads shows the layout, then ferros builds them from a file it fetched (desktop over USB/Photon, or WiFi). Alongside, not instead: the chip's own learned ephemerides kept in the vault, and public broadcast ephemerides (IGS/NASA), so one company's feed is never the only path.
+
 ## Next
 
 1. ~~Navigation~~ — done above.

@@ -341,6 +341,17 @@ impl Deframer {
     }
 }
 
+// ── Aiding: what the chip is told before it looks at the sky (GNSS.md "Aiding") ──
+//
+// The replay carries gpsd's aiding from the capture: the time (rewritten below), the last position, the ephemerides gpsd kept, and an LTO file.
+// LTO ("Long Term Orbits") is Broadcom's (from Global Locate, hence glpals.com and gpsd's Gl* names): every satellite's orbit and clock predicted days ahead, so a start without fresh ephemerides takes seconds instead of a cold search.
+// Where it comes from, as measured 2026-10-26: the Pixel's /data/vendor/gps/lto2.dat is byte-for-byte the file at http://gllto2.glpals.com/7day/v5/latest/lto2.dat (~188 KB).
+// The same server answers over plain HTTP and HTTPS, with no key, account, signature or terms shown; it is regenerated a few times a day (Last-Modified) and gpsd re-fetches daily (gps.xml HttpSyncLto, LtoSyncThresholdDays=1; ltoStatus.txt holds the unix time of the last fetch).
+// Variants on the same path: 7day/v2 59 KB, v3 103 KB, v4 146 KB, v5 188 KB, 4day/v5 123 KB (gpsd's compiled-in URL is the 4day one; growing with the constellations covered, by inference); http://gllto.glpals.com/rtistatus5.dat (240 bytes, real-time satellite health); gpsd's rto.dat (real-time orbits) URL answers 404.
+// The file as read: magic ff ca de 00, u32 length (file − 8), u32 1, 16 bytes that change per file (likely the "LTO file id" gpsd logs), u32 G#75A0DE5 and u32 5292 (the header's end) in every variant, u32 70, then 70 × (index u32, offset u32) into G#44-byte records before the bulk; gpsd logs "LTO under license to 'google', license #69" when it reads one.
+// Our stance: the file is published openly, unposted and unauthenticated, as the Pixel itself fetches it; ferros fetches it the same way for its own chip, and if Broadcom or Google ask, this comes down.
+// Not done yet: feeding a fresh file to the chip (gpsd's upload is the `1e83`/`1e82` messages in the replay; one capture with the exact file uploaded shows their layout).
+
 /// GPS time now from the wall clock (rtc.rs): milliseconds since the GPS epoch (1980-01-06), UTC plus the 18 leap seconds; None before the RTC has been read.
 fn gps_ms_now() -> Option<u64> {
     let base = crate::rtc::BASE.load(core::sync::atomic::Ordering::Relaxed);
