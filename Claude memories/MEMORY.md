@@ -17,7 +17,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: don't SSH](feedback_no_ssh.md) — never SSH into another machine unless explicitly told to
 - [Feedback: no manual line wraps](feedback_no_line_wraps.md) — write each sentence on one line in doc/block comments; editor handles wrapping
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) — commit AND push at every verified step without asking; stage only your own hunks
-- [Feedback: USB port wedge](feedback_usb_port_wedge.md) — phone silent after a -71 storm = HOST port gave up; recover with tools/usb-kick.sh (udev rule since 2026-10-20), ask for a replug only if kicks fail
+- [Feedback: USB port wedge](feedback_usb_port_wedge.md) — -71 storm = HOST port gave up (tools/usb-kick.sh); silent after a real replug = phone TCPC USB switch G#93 (fixed 2026-10-25)
 - [Feedback: measure before fixing](feedback_measure_before_fixing.md) — surface diagnostics FIRST when a system fails intermittently; don't write fixes from theories
 - [PIPE: slow is the security property](pipe_slow_is_security.md) — bounded throughput hard-caps attacker sample rate; pick slowest clock that meets usability, not fastest that closes timing
 - [PIPE TRNG silicon primitives](pipe_trng_silicon_primitives.md) — four physics sources (metastability, TERO, subthreshold inverter, shot-noise diode) for on-die TRNG; FPGA can't validate metastability/subthreshold
@@ -82,3 +82,5 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) — one branchless per-pixel path; clz/exponent/shift tricks over divides and LUTs; a compare forking two maths paths is not a shortcut; owner picks, then build + time
 - [PMU timing: pin to the X3](pmu_timing_pin_x3.md) — unpinned EL0 timings land on the A715s at 1.07 GHz (3-4x off); pin, sleep 1 ms, report cycles/µs as the clock
 - [Hardware night 2026-10-25](husky_hardware_night_2026_10_25.md) — sensors 39/41, haptics, GNSS, modem boot channel, GPU, TPU firmware all alive; where each stands + traps (rails off, flashlog lock, watchdog pets, LPM)
+- [Power profile traps](power_profile_traps.md) — measure with `diag power start` (old display power busy-waits); DVFS only inside zuma-cpu.dtsi floors (CPUCL0 300 MHz hard-reset); X3 2.9→2.0 GHz = 0.66 W; plan in POWER.md
+- [GNSS fix via on-chip engine](gnss_onchip_fix.md) — ferros GPS fix = BCM4776's own engine via replayed gpsd on-chip session (IgnoreOnChipRequest off, batchOption 2), time rewritten from RTC; 11 s first fix; ~150 m off Android's host engine indoors
