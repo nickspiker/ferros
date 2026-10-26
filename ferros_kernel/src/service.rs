@@ -1034,6 +1034,7 @@ pub fn run(mut b: Boot) -> ! {
         gauge_poll();
         power_poll();
         crate::odpm::poll();
+        crate::gnss::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
         clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
@@ -1824,11 +1825,16 @@ pub fn run(mut b: Boot) -> ! {
                                             // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
                                             if cmd.params == b"gnss up" {
                                                 crate::gnss::up(&mut resp);
-                                            } else if cmd.params == b"gnss boot" {
-                                                // `diag gnss boot`: the chip powered and its patch downloaded by ferros, lhd's opening replayed from the vault's `gnss.replay` (gnss.rs boot).
+                                            } else if cmd.params == b"gnss fix" {
+                                                crate::gnss::fix(&mut resp);
+                                            } else if cmd.params == b"gnss off" {
+                                                crate::gnss::off(&mut resp);
+                                            } else if cmd.params.starts_with(b"gnss boot") {
+                                                // `diag gnss boot [s]`: the chip powered and its patch downloaded by ferros, a session of lhd's replayed from the vault's `gnss.replay` (gnss.rs boot), then `s` seconds (default 10, at most 600) of what the chip sends, its fixes decoded.
+                                                let tail_s = core::str::from_utf8(&cmd.params[9..]).ok().and_then(|t| t.trim().parse::<u64>().ok()).unwrap_or(10).min(600);
                                                 let st = &raw mut store;
                                                 let replay = crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key("gnss.replay").ok().flatten()) }).unwrap_or_default();
-                                                crate::gnss::boot(&replay, &mut resp);
+                                                crate::gnss::boot(&replay, tail_s, &mut resp);
                                             } else {
                                                 crate::gnss::state(&mut resp);
                                             }

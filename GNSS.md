@@ -41,10 +41,22 @@ Captures on rooted Android with `tools/gtrace` (a freestanding ptrace tracer, bu
 
 **Navigating under ferros:** the first 60 s of lhd's session replayed in real time (each record waits for its acks and lhd's own gap): 987 records, all 980 reliable packets acked, 9,163 frames from the chip with no CRC failure, and in the ten seconds after, **18.1 KB/s from the chip** — the rate it streamed measurements to gpsd on Android once tracking — its messages now mostly `1F80` with `1F81`. The configuration and aiding in that session are stale (the capture's time and position); the chip navigates regardless.
 
+## The on-chip engine: a fix under ferros (2026-10-25 night)
+
+**How gpsd turns it on:** gpsd's config has `IgnoreOnChipRequest` (a `hal` attribute; with it true the `$pglirm,req_breadcrumb,pvtOnChip,…` request on `glgpsctrl` is dropped, which is why it did nothing before). With it false (a copy of gps.xml bind-mounted over /vendor's, `Log="LOGCAT"` and `LogPriMask="LOG_DEBUG"` for gpsd's own log) and no other location client active, `$pglirm,req_breadcrumb,pvtOnChip,periodSec,1,batchOption,2` makes gpsd switch "from on-host ME to on-chip ME": it restarts the chip, sends its configuration, LTO orbits, ephemerides from its store, the time (`87 81`) and its last position with the time (`d0 81`), then a breadcrumb request. `batchOption` 2 is `GL_BATCH_OPT_MASK_ON_LOCATION_FIX` (each fix reported, period 1 s); with 0 the chip batches silently. Then gpsd sends nothing more: the chip navigates alone and sends a fix a second.
+
+**The fix message:** chip payload `1f 80 …`, inner frame `c0 c1 … c0 c4` (G#C0 inside escaped as `c0 c0`; inner header: class `01 81`, length u16, checksum u16 = the 16-bit sum of class, length and body bytes without the 2-byte trailer, then the body), body id byte G#16 (the tenth byte from the class). gpsd's decoder (the `BlobStatus V:%c Lms:%u Lat:…` log, its bit reader at G#49C6F0) reads the message as **little-endian 32-bit words, most significant bit first**; from the class's first bit: error estimate u10 m at bit 221, the chip's ms clock u32 at 231, latitude s32 at 311 and longitude s32 at 343 in 2⁻²³ degrees, altitude s16 m at 375, speed s16 /64 m/s at 407, track s16 /64 ° at 439. Checked against gpsd's own decode of all 213 fixes in the capture.
+
+**Under ferros:** `diag gnss boot [s]` replays that session (the vault's `gnss.replay`: 533 host records, 18 s; the patch, LTO and this place's last position are in it, so vault and Harbor only), with the two time messages rewritten from the RTC (GPS time = UTC + 18 s; the checksum adjusted by the bytes' difference, the packet CRC redone; a time of week whose bytes would need the C0 escape moves on a millisecond). Result: **the first fix 11.2 s after power-up, 84 fixes in 90 s, settling at ±8 m**. The session stays up after the diag: the service loop reads the chip when HOST_REQ rises (`gnss::poll`), `diag gnss fix` shows the count and the latest, `diag gnss off` drops it (nSTANDBY low, the rails off). The chip draws about 39 mA tracking (its own `$PGLOR,…,PWR` report under Android).
+
+**Agreement:** the same engine under Android gave the same place (its fixes under gpsd's log, the same spot to a few metres); both sit about 150 m north and 40 m east of the fix Android's host engine (gpsd with Maps) reported indoors an hour earlier. Which of the two engines is right indoors is open; an outdoor fix with both settles it.
+
 ## Next
 
 1. ~~Navigation~~ — done above.
-2. **A position:** either decode the measurement messages (pseudoranges, Doppler, the navigation data) and solve on the AP — ferros's own position engine — or reach the on-chip engine through the AoC's path. Both are real work; the first keeps everything on the AP.
+2. ~~A position~~ — the on-chip engine, above.
+3. Without gpsd's aiding: the replay carries the capture's LTO orbits and ephemerides (good for days and hours) and the last position; a cold replay without them, and ferros's own store of what the chip learns, are what make it independent of that capture.
+4. The fix to processes (a SYS_FACTS slot like gravity's) and the session on a policy (on while something asks, off otherwise).
 
 Earlier plan, kept for reference:
 
