@@ -2344,6 +2344,12 @@ pub fn run(mut b: Boot) -> ! {
                                         let r = |a: usize| unsafe { read_volatile(a as *const u32) };
                                         append_hex(&mut resp, b"GEN=", generation as u32);
                                         // Percent of time since the service loop started that the core spent asleep in `wfe`, rather than spinning.
+                                        // CPU0's state as PSCI sees it (AFFINITY_INFO: 0 on, 1 off, 2 on pending): whether the park's CPU_OFF took (x3.rs).
+                                        {
+                                            let r: i64;
+                                            unsafe { core::arch::asm!("smc #0", inout("x0") 0x8400_0004u64 => r, in("x1") 0u64, in("x2") 0u64) };
+                                            append_hex(&mut resp, b"CPU0_AFFINITY=", r as u32);
+                                        }
                                         append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
                                         append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
                                         append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);

@@ -148,7 +148,7 @@ pub fn probe() -> (i64, u64, u64, u64) {
 
 /// The hand-over block, in the same non-cacheable page as the probe's (one of the two at a time): CPU0 writes the X3's translation and per-core registers here before CPU_ON (the X3 reads them with its MMU off), the X3 says it is parked, CPU0 says go.
 const HOP: usize = RESULT + 0x100;
-/// Where CPU0 sleeps once it has handed the service over (see `hand_over`): two instructions in the hand-over page.
+/// Where CPU0 goes once it has handed the service over (see `hand_over`): PSCI CPU_OFF, else a WFI loop — five instructions in the hand-over page.
 const PARK: usize = RESULT + 0x800;
 const H_MAIR: usize = 0;
 const H_TCR: usize = 8;
@@ -287,9 +287,13 @@ pub fn hand_over(b: crate::service::Boot) -> crate::service::Boot {
         }
         core::arch::asm!("msr daifset, #0xF");
         // Parked outside the image, with the MMU off. A RELOAD rewrites every byte of the kernel and zeroes its .bss (the page tables included) while CPU0 sleeps; WFI wakes on any interrupt still aimed at this core whatever the mask, and a core that then fetches through a dead generation's tables and code faults into its old vectors and scribbles on the new kernel (every reload from the X3 hung within seconds, 2026-10-23). So the two instructions it sleeps in live in the hand-over page, which no generation overwrites, and it runs them with no translation under it.
+        // First PSCI CPU_OFF (G#8400_0002): nothing runs here again, so the core goes off rather than waiting. PSCI takes it (DIAG CPU0_AFFINITY reads 1, off) and `reboot fastboot` still works (the cluster watchdogs live outside the cores). It bought little: the little cluster's rail stayed ~50 mW (odpm, 2026-10-25), so that rail is mostly shared logic (the DSU and L3), not CPU0. If PSCI ever refuses, the call returns and the core sleeps in the WFI loop after it, as before.
         let park = PARK as *mut u32;
-        write_volatile(park, 0xD503_207F); // wfi
-        write_volatile(park.add(1), 0x17FF_FFFF); // b .-4
+        write_volatile(park, 0xD280_0040); // movz x0, #2
+        write_volatile(park.add(1), 0xF2B0_8000); // movk x0, #0x8400, lsl #16
+        write_volatile(park.add(2), 0xD400_0003); // smc #0
+        write_volatile(park.add(3), 0xD503_207F); // wfi
+        write_volatile(park.add(4), 0x17FF_FFFF); // b .-4
         core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb");
         // One asm block from MMU-off to the branch, so nothing touches the stack through a cache the MMU no longer fronts; x9 is scratch (nothing returns to care).
         core::arch::asm!("mrs x9, sctlr_el2", "bic x9, x9, #1", "msr sctlr_el2, x9", "isb", "br {p}", p = in(reg) PARK as u64, options(noreturn));
