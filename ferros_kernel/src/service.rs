@@ -1020,6 +1020,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::rtc::poll();
         gauge_poll();
         power_poll();
+        crate::odpm::poll();
         clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2171,6 +2172,16 @@ pub fn run(mut b: Boot) -> ! {
                                             match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
                                                 Some(t) => resp.extend_from_slice(t.as_bytes()),
                                                 None => resp.extend_from_slice(b"no vault open\n"),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"odpm" || cmd.params == b"odpm start" {
+                                            // `diag odpm start`, then `diag odpm`: every supply rail's power from the PMICs' meters (odpm.rs).
+                                            if cmd.params == b"odpm start" {
+                                                resp.extend_from_slice(crate::odpm::start().as_bytes());
+                                            } else {
+                                                crate::odpm::report(&mut resp);
                                             }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;

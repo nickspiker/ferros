@@ -73,6 +73,17 @@ Screen off, the dark clock profile (X3 500 MHz, MIF 421, the display clock 143 M
 
 Pulling the cable used to lose the link for good: the MAX77759's USB data switch (TCPC vendor register G#93) opens on a detach and nothing closed it again. Fixed (the re-init closes it when CC is attached and VBUS present); see the USB commit of the same day.
 
+## 2026-10-25: rail by rail (the PMICs' meters)
+
+`diag odpm start`, then `diag odpm` (odpm.rs): the S2MPG14's and S2MPG15's on-device power meters, every named rail (zuma-pmic.dtsi) in batches of 12 per PMIC, a second each, sampled from the service loop. A clock switch resets the accumulators under a batch (the first sweep read 14–43 W on some rails: wrapped differences), so a batch that goes backwards is measured again and the sweep starts two seconds after its command. The outputs are each rail's own: the LLDO bucks feed the LDOs, so their sum counts some power twice; the panel's VSYS feed and the radios are outside.
+
+Screen off, dark profile, the cable in (rail outputs, mW): BB_HLDO 336 · S3S_LLDO1 168 · L2S_PLL_MIPI_UFS 127 · SA 113 · S5M_VDD_INT 91 · S11S_G3D_GLB 66 · S6M_LLDO1 56 · S4M_VDD_CPUCL0 54 · L1M_ALIVE 54 · S8M_LLDO2 51 · S2M_VDD_CPUCL2 38 · S6S_LLDO2 37 · S3M_VDD_CPUCL1 36 · S1S_VDD_CAM 36 · S1M_VDD_MIF 32 · L24S_HSI 31 · S7S_MLDO 26 · S10S_VDD_SLC_M 23 · L6M_HSI 22 · S4S_VDD2H_MEM 20 · the eUSB LDOs 31 together · the PCIe LDOs ~15 · S12S_VDD_AUR 12. Screen on at rest adds the X3 (CPUCL2 412 mW: the between-frames redraws and the loop), the display's supplies (L22M_DISP_VDDD 87, L14M_DISP_VCI 22) and more on INT, CPUCL0 and MIF.
+
+- The CPUs are no longer the floor (the X3 38 mW dark).
+- **Blocks ferros never uses draw from their rails because their SoC power domains are on**: the GPU (S11S_G3D_GLB 66 mW and its others), the camera (S1S_VDD_CAM 36), AUR (12), and the PCIe PHYs (~15). Linux keeps these rails always-on too and saves by gating the domains in the PMU (exynos-pd); ferros gates none. That is the next real fix — through the PMU, carefully (EL3 refuses even reads of those registers; the EL3 poison rule).
+- BB_HLDO (the 3.0–3.6 V buck-boost under the high-voltage LDOs) and SA (the 1.8 V I/O buck: UWB, display I/O, audio codec, …) are always-on in Linux as well; their loads are what to find, not the rails.
+- L2S_PLL_MIPI_UFS stays at 127 mW with the screen off and UFS hibernating: PLLs and PHYs left running.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
