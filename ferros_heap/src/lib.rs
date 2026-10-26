@@ -205,6 +205,17 @@ impl Heap {
         total
     }
 
+    /// The largest free block, bytes (diagnostics: the biggest allocation that can still succeed, near enough).
+    pub fn largest_free(&self) -> usize {
+        let mut best = 0usize;
+        let mut cur = self.head.next.as_deref();
+        while let Some(node) = cur {
+            best = best.max(node.size);
+            cur = node.next.as_deref();
+        }
+        best
+    }
+
     /// Number of free blocks (diagnostics; 1 == fully coalesced).
     pub fn free_blocks(&self) -> usize {
         let mut n = 0usize;
@@ -329,6 +340,14 @@ impl LockedHeap {
         }
     }
 
+    /// Adds a second region to the heap (it joins the free list; allocations may land in either).
+    ///
+    /// # Safety
+    /// The region must be valid, unused, mapped as normal memory and `'static`, and must not overlap the heap's other memory.
+    pub unsafe fn extend(&self, start: usize, size: usize) {
+        unsafe { self.0.lock().add_free_region(start, size) }
+    }
+
     /// Locks the heap and returns a guard for direct access (mainly for tests).
     pub fn lock(&self) -> SpinGuard<'_, Heap> {
         self.0.lock()
@@ -340,13 +359,28 @@ impl LockedHeap {
     }
 }
 
+/// Bytes allocated now, and the most there have been since `reset_peak` (diagnostics: what a big operation costs the heap at its worst).
+pub static IN_USE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static PEAK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Start a new high-water mark at what is allocated now.
+pub fn reset_peak() {
+    PEAK.store(IN_USE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { self.0.lock().alloc(layout) }
+        let p = unsafe { self.0.lock().alloc(layout) };
+        if !p.is_null() {
+            let now = IN_USE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(now, Ordering::Relaxed);
+        }
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.0.lock().dealloc(ptr, layout) }
+        unsafe { self.0.lock().dealloc(ptr, layout) };
+        IN_USE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 }
 

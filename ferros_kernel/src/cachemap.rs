@@ -8,7 +8,7 @@
 //! - The 2 MiB blocks holding the device DMA buffers (`.bss.dma`) get level-3 tables: those 4 KiB pages are Normal non-cacheable, so DMA never needs cache maintenance.
 //! - DMA_POOL (cold only): 2 MiB of Normal non-cacheable memory a driver process reaches directly (EL0 read/write, never executable at any level) — the memory its device DMAs into (rings, buffers). It is granted like hardware (process.rs `DMA`), and the device's IOMMU/S2MPU window is meant to cover exactly it, so the device reaches nothing else.
 //!
-//! The window is ferros's image, stack, heap and staging slot: 36 MiB from the cold link base, or the whole 12 MiB handoff carveout (0x9240_0000..0x9300_0000, tpu_fw_reserved after it).
+//! The window is ferros's image, stack, heap, staging slot and the heap's second region: 64 MiB from DRAM base to the display framebuffer on a cold boot, or the whole 12 MiB handoff carveout (0x9240_0000..0x9300_0000, tpu_fw_reserved after it).
 //!
 //! VHE (HCR_EL2.E2H + TGE, where the cores have it): the kernel runs as an EL2 host and processes run at EL0 under this same table, so a process gets cached memory and working atomics. The table then also carries one static split, never changed per process: EL0 may touch only the arc pool (POOL) and may execute only there; EL2 may not execute pool code (and architecturally can't anyway: privileged execution of EL0-writable memory is always a permission fault in the EL2&0 regime); the kernel, MMIO, DMA pages and the staging slot are EL2-only, so dev RUN payloads still execute at EL2 from the slot. Spawning a process copies its staged code into its arc in the pool. Isolation between processes stays compiled masking (KERNEL.md, Execution Model).
 //! Switching E2H changes the layout of several EL2 registers — CPTR_EL2 then reads in CPACR form, where an unset FPEN traps FP/SIMD at EL2 and the kernel's own memcpy would fault — so the switch sets FPEN explicitly, and RELOAD restores the boot HCR_EL2/CPTR_EL2 before handing over.
@@ -32,7 +32,10 @@ unsafe extern "C" {
 }
 
 #[cfg(not(shim_handoff))]
-const WINDOW: (usize, usize) = (0x8000_0000, 0x8240_0000);
+const WINDOW: (usize, usize) = (0x8000_0000, 0x8400_0000);
+/// The kernel heap's second region (cold only): the window's top above the staging slot (STAGE G#8208_0000 + its 4 MiB, to the next 2 MiB) up to the display framebuffer. The first 12 MiB heap sits between the image and the arc pool and cannot grow; storing a 2.78 MB value needs a vault working set several times its size, and ran the heap out (2026-10-26).
+#[cfg(not(shim_handoff))]
+pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8400_0000);
 #[cfg(shim_handoff)]
 const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
 /// The arc pool: EL0-accessible, a power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).

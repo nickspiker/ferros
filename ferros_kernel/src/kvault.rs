@@ -7,7 +7,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ferros_hal::ufs::UfsController;
 use ferros_vault::crypto::NonceSource;
@@ -124,22 +124,31 @@ impl KVault {
 
     fn seal(&mut self, plain: &[u8]) -> Result<Vec<u8>, KvError> {
         let n = self.nonce.next_nonce();
-        let mut out = Vec::from(&n[..]);
-        out.extend(self.cipher.encrypt(XNonce::from_slice(&n), plain).map_err(|_| KvError::Seal)?);
+        // One allocation the size of the result: the nonce, the plaintext encrypted where it lies, then the tag — the same bytes `encrypt` gives. Sealing through `encrypt` into a growing Vec held two copies of the value at once (and a third while the Vec grew), and a 2.78 MB display capsule ran the 12 MiB heap out (2026-10-26, panic "memory allocation … failed" in the crumbs).
+        let mut out = Vec::with_capacity(24 + plain.len() + 16);
+        out.extend_from_slice(&n[..]);
+        out.extend_from_slice(plain);
+        let tag = self.cipher.encrypt_in_place_detached(XNonce::from_slice(&n), b"", &mut out[24..]).map_err(|_| KvError::Seal)?;
+        out.extend_from_slice(&tag);
         Ok(out)
     }
 
-    fn unseal(&self, sealed: &[u8]) -> Result<Vec<u8>, KvError> {
-        if sealed.len() < 24 {
+    /// Opened where it lies, as `seal` closes: the nonce taken off the front, the rest decrypted in the same buffer and its tag dropped — one copy of a large value in the heap, not two.
+    fn unseal(&self, mut sealed: Vec<u8>) -> Result<Vec<u8>, KvError> {
+        if sealed.len() < 24 + 16 {
             return Err(KvError::Open);
         }
-        self.cipher.decrypt(XNonce::from_slice(&sealed[..24]), &sealed[24..]).map_err(|_| KvError::Open)
+        let mut n = [0u8; 24];
+        n.copy_from_slice(&sealed[..24]);
+        sealed.drain(..24);
+        self.cipher.decrypt_in_place(XNonce::from_slice(&n), b"", &mut sealed).map_err(|_| KvError::Open)?;
+        Ok(sealed)
     }
 
     fn raw_get(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
         let a = self.addr(name);
         match self.vault.get(&a)? {
-            Some(s) => Ok(Some(self.unseal(&s)?)),
+            Some(s) => Ok(Some(self.unseal(s)?)),
             None => Ok(None),
         }
     }

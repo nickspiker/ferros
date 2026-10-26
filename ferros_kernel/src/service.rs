@@ -1495,6 +1495,13 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"heap peak reset" {
+                                            // `diag heap peak reset`: a new heap high-water mark from now (HEAP_PEAK in DIAG).
+                                            ferros_heap::reset_peak();
+                                            resp.extend_from_slice(b"heap peak reset\n");
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"console" {
                                             // What processes have sent their consoles since the last read (background slices included), and how many are alive.
                                             append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
@@ -2523,6 +2530,14 @@ pub fn run(mut b: Boot) -> ! {
                                         append_hex(&mut resp, b"STAGE=", b.stage as u32);
                                         append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
                                         append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
+                                        // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
+                                        if let Some((free, blocks, largest)) = crate::heap_stats() {
+                                            append_hex(&mut resp, b"HEAP_FREE=", free as u32);
+                                            append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", blocks as u32);
+                                            append_hex(&mut resp, b"HEAP_LARGEST_FREE=", largest as u32);
+                                        }
+                                        append_hex(&mut resp, b"HEAP_IN_USE=", ferros_heap::IN_USE.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                        append_hex(&mut resp, b"HEAP_PEAK=", ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed) as u32);
                                         if let Some(probe) = &b.probe {
                                             append_hex(&mut resp, b"UFS_LINK=", probe.link_up as u32);
                                             append_hex(&mut resp, b"VAULT_OPENED=", probe.opened as u32);

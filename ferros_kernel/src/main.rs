@@ -178,6 +178,10 @@ static ALLOC: BumpAlloc = BumpAlloc;
 #[cfg(feature = "pixel8")]
 #[global_allocator]
 static KERNEL_HEAP: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+/// The kernel heap's (free bytes, free blocks, largest free block), for DIAG; None if the heap is busy.
+pub fn heap_stats() -> Option<(usize, usize, usize)> {
+    KERNEL_HEAP.try_lock().map(|h| (h.free_bytes(), h.free_blocks(), h.largest_free()))
+}
 
 // ---------------------------------------------------------------------------
 // Boot stub — minimal, no MMU
@@ -1722,6 +1726,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
+    // The heap's second region, now that the cache map makes it normal memory (an allocation's unaligned copies fault on Device memory): cachemap HEAP2.
+    if cached {
+        unsafe { KERNEL_HEAP.extend(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
+    }
     platform::enable_icache();
     platform::canary_init();
     platform::stack_paint();
