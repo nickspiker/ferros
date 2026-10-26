@@ -42,6 +42,7 @@ members = [
     "photon_core",
     "payloads/ip",
     "payloads/nettest",
+    "payloads/httptest",
     "payloads/wxtest",
     "payloads/beamtest",
     "payloads/wdtfire",

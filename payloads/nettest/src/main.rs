@@ -89,7 +89,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // Addresses as they appear (INFO flags: bit 0 IPv4 bound, bit 1 IPv6 global).
         let n = a.udp(&[3], &mut out);
         let o = &out;
-        if n == 51 && o[50] != shown {
+        if n >= 51 && o[50] != shown {
             shown = o[50];
             a.put(b"addresses: v4 ");
             a.addr(4, &o[6..10]);

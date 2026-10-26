@@ -766,6 +766,13 @@ name = "ferros-payload-hello-el0"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-httptest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-init"
 version = "0.1.0"
 dependencies = [

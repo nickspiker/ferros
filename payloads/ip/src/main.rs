@@ -1,4 +1,4 @@
-//! The IP process: ARP + IPv4 (DHCP, echo) and IPv6 (neighbour discovery, router solicitation, SLAAC, echo), with UDP for applications. A client of the WiFi driver's `wlan` endpoint (Ethernet frames) and the server of `udp` (datagrams for apps). Photon on ferros needs exactly this (WIFI.md; no TCP, no TLS).
+//! The IP process: ARP + IPv4 (DHCP, echo) and IPv6 (neighbour discovery, router solicitation, SLAAC, echo), with UDP for applications and a small client-only TCP (owner, 2026-10-26: fetches over plain HTTP, like Broadcom's LTO file; nothing listens). A client of the WiFi driver's `wlan` endpoint (Ethernet frames) and the server of `udp` (datagrams and connections for apps). Photon itself needs only UDP (WIFI.md).
 //!
 //! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy
 //! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy.
@@ -6,7 +6,13 @@
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
 //! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0).
-//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global).
+//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global), the DHCP-given DNS server (4).
+//! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
+//! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
+//! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection.
+//! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on).
+//!
+//! TCP here: two connections, a 4 KiB receive window each (what the client has not yet taken; the window is the flow control), a 2 KiB send buffer, MSS 1200, go-back retransmission from the oldest unacknowledged byte (1 s, doubling to 8 s, six tries), no options but MSS on the SYN.
 //!
 //! Checksums are ones'-complement sums (RFC 1071: wide adds, one fold at the end). IPv4 UDP goes out with checksum 0 (allowed); IPv6 UDP and every ICMP carry one. The IPv6 interface identifier is random per session (from the entropy right) until a persistent device secret is granted (then RFC 7217 stable-privacy). No duplicate address detection yet.
 //!
@@ -66,7 +72,47 @@ struct Ip {
     nd_n: usize,
     q: [Datagram; QN],
     frames: u32,
+    dns: [u8; 4],
+    tcp: [Tcp; TCPN],
+    eph: u16,
+    seed: u32,
 }
+
+const TCPN: usize = 2;
+const RXW: usize = 4096;
+const TXB: usize = 2048;
+const MSS: usize = 1200;
+
+/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed.
+#[derive(Clone, Copy)]
+struct Tcp {
+    state: u8,
+    fam: u8,
+    addr: [u8; 16],
+    rport: u16,
+    lport: u16,
+    iss: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_max: u32,
+    rcv_nxt: u32,
+    peer_win: u32,
+    rx: [u8; RXW],
+    rx_head: usize,
+    rx_len: usize,
+    tx: [u8; TXB],
+    tx_len: usize,
+    fin_queued: bool,
+    fin_sent: bool,
+    fin_ever: bool,
+    fin_acked: bool,
+    peer_fin: bool,
+    rto: u64,
+    rto_t: u64,
+    tries: u32,
+    closed_t: u64,
+}
+const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0 };
 
 impl Ip {
     fn cap(&self, slot: u64) -> u64 {
@@ -246,6 +292,11 @@ impl Ip {
                 self.v4_put(src);
                 self.put(b"\n");
             }
+            6 if self.bound && dst == self.v4 && body.len() >= 20 => {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&src);
+                self.tcp_in(4, a, body);
+            }
             17 if body.len() >= 8 => {
                 let sport = u16::from_be_bytes([body[0], body[1]]);
                 let dport = u16::from_be_bytes([body[2], body[3]]);
@@ -319,6 +370,8 @@ impl Ip {
                     mask = v4;
                 } else if code == 3 {
                     router = v4;
+                } else if code == 6 {
+                    self.dns = v4;
                 }
             }
             if code == 53 && l >= 1 {
@@ -506,6 +559,8 @@ impl Ip {
                 }
                 self.nd_learn(target, mac);
             }
+        } else if nh == 6 && body.len() >= 20 && !multicast {
+            self.tcp_in(6, src, body);
         } else if nh == 17 && body.len() >= 8 && !multicast {
             let sport = u16::from_be_bytes([body[0], body[1]]);
             let dport = u16::from_be_bytes([body[2], body[3]]);
@@ -609,6 +664,221 @@ impl Ip {
         }
     }
 
+    // ---- TCP (client only) ----
+
+    /// A segment of connection `i`: `flags` (FIN 1, SYN 2, RST 4, PSH 8, ACK 16), sequence `seq`, `payload`; the window is the receive buffer's room. Returns whether it went out (false: the next hop is not resolved yet).
+    fn tcp_out(&mut self, i: usize, flags: u8, seq: u32, payload: &[u8]) -> bool {
+        let c = self.tcp[i];
+        let mut seg = [0u8; 20 + 4 + MSS];
+        let hl = if flags & 2 != 0 { 24 } else { 20 };
+        let n = hl + payload.len();
+        seg[0..2].copy_from_slice(&c.lport.to_be_bytes());
+        seg[2..4].copy_from_slice(&c.rport.to_be_bytes());
+        seg[4..8].copy_from_slice(&seq.to_be_bytes());
+        seg[8..12].copy_from_slice(&(if flags & 16 != 0 { c.rcv_nxt } else { 0 }).to_be_bytes());
+        seg[12] = ((hl / 4) as u8) << 4;
+        seg[13] = flags;
+        seg[14..16].copy_from_slice(&((RXW - c.rx_len) as u16).to_be_bytes());
+        if hl == 24 {
+            seg[20..24].copy_from_slice(&[2, 4, (MSS >> 8) as u8, MSS as u8]);
+        }
+        seg[hl..n].copy_from_slice(payload);
+        if c.fam == 4 {
+            let dst: [u8; 4] = c.addr[..4].try_into().unwrap();
+            let Some(mac) = self.next_hop4(dst) else { return false };
+            let me = self.v4;
+            let mut ph = [0u8; 12];
+            ph[..4].copy_from_slice(&me);
+            ph[4..8].copy_from_slice(&dst);
+            ph[9] = 6;
+            ph[10..12].copy_from_slice(&(n as u16).to_be_bytes());
+            let ck = csum(&seg[..n], sum(&ph));
+            seg[16..18].copy_from_slice(&ck.to_be_bytes());
+            self.ipv4_send(mac, me, dst, 6, &seg[..n]);
+        } else {
+            let link_local = c.addr[0] == 0xFE && c.addr[1] & 0xC0 == 0x80;
+            let src = if link_local { self.ll } else { self.global };
+            let Some(mac) = self.next_hop6(c.addr) else { return false };
+            let ck = Self::sum6(&src, &c.addr, 6, &seg[..n]);
+            seg[16..18].copy_from_slice(&ck.to_be_bytes());
+            self.ipv6_send(mac, src, c.addr, 6, &seg[..n], 64);
+        }
+        true
+    }
+
+    fn tcp_connect(&mut self, fam: u8, addr: [u8; 16], port: u16, out: &mut [u8]) -> usize {
+        if (fam == 4 && !self.bound) || (fam == 6 && !self.have_global && !(addr[0] == 0xFE && addr[1] & 0xC0 == 0x80)) || (fam != 4 && fam != 6) {
+            out[0] = 2;
+            return 1;
+        }
+        let Some(i) = self.tcp.iter().position(|c| c.state == 0) else {
+            out[0] = 4;
+            return 1;
+        };
+        // A fresh initial sequence number and an ephemeral port from the session's randomness (an LCG stepped off the entropy-seeded value).
+        self.seed = self.seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.eph = 49152 + (self.eph.wrapping_add(1 + (self.seed >> 20) as u16 % 97) % 16384);
+        let iss = self.seed;
+        let t = now();
+        self.tcp[i] = Tcp { state: 1, fam, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, ..TCP_FREE };
+        self.tcp_out(i, 2, iss, &[]);
+        out[0] = 0;
+        out[1] = i as u8;
+        2
+    }
+
+    fn tcp_in(&mut self, fam: u8, src: [u8; 16], seg: &[u8]) {
+        let sport = u16::from_be_bytes([seg[0], seg[1]]);
+        let dport = u16::from_be_bytes([seg[2], seg[3]]);
+        let Some(i) = self.tcp.iter().position(|c| c.state != 0 && c.fam == fam && c.addr == src && c.rport == sport && c.lport == dport) else { return };
+        let seq = u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]);
+        let ack = u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]);
+        let off = ((seg[12] >> 4) as usize * 4).clamp(20, seg.len());
+        let flags = seg[13];
+        let win = u16::from_be_bytes([seg[14], seg[15]]) as u32;
+        let data = &seg[off..];
+        let c = &mut self.tcp[i];
+        if flags & 4 != 0 {
+            c.state = 4;
+            return;
+        }
+        if c.state == 1 {
+            if flags & 18 == 18 && ack == c.iss.wrapping_add(1) {
+                c.rcv_nxt = seq.wrapping_add(1);
+                c.snd_una = ack;
+                c.peer_win = win;
+                c.state = 2;
+                c.tries = 0;
+                self.tcp_out(i, 16, ack, &[]);
+            }
+            return;
+        }
+        c.peer_win = win;
+        if flags & 16 != 0 {
+            // What the ack covers: data from the send buffer's front, then our FIN. Up to the most ever sent: after a go-back the ack can run ahead of what has been resent.
+            let acked = ack.wrapping_sub(c.snd_una);
+            let in_flight = c.snd_max.wrapping_sub(c.snd_una);
+            if acked > 0 && acked <= in_flight {
+                let data_acked = (acked as usize).min(c.tx_len);
+                c.tx.copy_within(data_acked..c.tx_len, 0);
+                c.tx_len -= data_acked;
+                if c.fin_ever && ack == c.snd_max {
+                    c.fin_acked = true;
+                }
+                c.snd_una = ack;
+                if ack.wrapping_sub(c.snd_nxt) as i32 > 0 {
+                    c.snd_nxt = ack;
+                }
+                c.tries = 0;
+                c.rto = self.freq;
+                c.rto_t = now() + c.rto;
+            }
+        }
+        let mut reply = false;
+        if !data.is_empty() {
+            if seq == c.rcv_nxt {
+                let take = data.len().min(RXW - c.rx_len);
+                for (k, &b) in data[..take].iter().enumerate() {
+                    c.rx[(c.rx_head + c.rx_len + k) % RXW] = b;
+                }
+                c.rx_len += take;
+                c.rcv_nxt = c.rcv_nxt.wrapping_add(take as u32);
+            }
+            reply = true;
+        }
+        if flags & 1 != 0 && seq.wrapping_add(data.len() as u32) == c.rcv_nxt && !c.peer_fin {
+            c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+            c.peer_fin = true;
+            if c.state == 2 {
+                c.state = 3;
+            }
+            reply = true;
+        }
+        if reply {
+            let s = c.snd_nxt;
+            self.tcp_out(i, 16, s, &[]);
+        }
+    }
+
+    /// Each pass: new data out (within the peer's window), our FIN once the data is out, retransmission from the oldest unacknowledged byte on timeout, and freeing finished connections.
+    fn tcp_tick(&mut self) {
+        let t = now();
+        for i in 0..TCPN {
+            let c = self.tcp[i];
+            if c.state == 0 {
+                continue;
+            }
+            if (c.fin_acked && c.peer_fin) || (c.closed_t != 0 && t.wrapping_sub(c.closed_t) > 16 * self.freq) {
+                self.tcp[i] = TCP_FREE;
+                continue;
+            }
+            if c.state == 4 {
+                continue;
+            }
+            let in_flight = c.snd_max.wrapping_sub(c.snd_una);
+            if in_flight > 0 && t > c.rto_t {
+                if c.tries >= 6 {
+                    self.tcp[i].state = 4;
+                    continue;
+                }
+                let c = &mut self.tcp[i];
+                c.tries += 1;
+                c.rto = (c.rto * 2).min(8 * self.freq);
+                c.rto_t = t + c.rto;
+                if c.state == 1 {
+                    let iss = c.iss;
+                    self.tcp_out(i, 2, iss, &[]);
+                    continue;
+                }
+                // Go back to the oldest unacknowledged byte.
+                c.snd_nxt = c.snd_una;
+                c.fin_sent = false;
+            }
+            if self.tcp[i].state < 2 {
+                continue;
+            }
+            // New data, MSS at a time, within the peer's window.
+            loop {
+                let c = self.tcp[i];
+                let sent = c.snd_nxt.wrapping_sub(c.snd_una) as usize;
+                let unsent = c.tx_len.saturating_sub(sent);
+                let room = (c.peer_win as usize).saturating_sub(sent);
+                let n = unsent.min(room).min(MSS);
+                if n == 0 {
+                    break;
+                }
+                let mut p = [0u8; MSS];
+                p[..n].copy_from_slice(&c.tx[sent..sent + n]);
+                if !self.tcp_out(i, 16 | 8, c.snd_nxt, &p[..n]) {
+                    break;
+                }
+                let c = &mut self.tcp[i];
+                if c.snd_una == c.snd_nxt {
+                    c.rto_t = t + c.rto.max(self.freq);
+                }
+                c.snd_nxt = c.snd_nxt.wrapping_add(n as u32);
+                if c.snd_nxt.wrapping_sub(c.snd_max) as i32 > 0 {
+                    c.snd_max = c.snd_nxt;
+                }
+            }
+            let c = self.tcp[i];
+            if c.fin_queued && !c.fin_sent && c.snd_nxt.wrapping_sub(c.snd_una) as usize >= c.tx_len {
+                if self.tcp_out(i, 16 | 1, c.snd_nxt, &[]) {
+                    let c = &mut self.tcp[i];
+                    if c.snd_una == c.snd_nxt {
+                        c.rto_t = t + c.rto.max(self.freq);
+                    }
+                    c.snd_nxt = c.snd_nxt.wrapping_add(1);
+                    if c.snd_nxt.wrapping_sub(c.snd_max) as i32 > 0 {
+                        c.snd_max = c.snd_nxt;
+                    }
+                    c.fin_sent = true;
+                    c.fin_ever = true;
+                }
+            }
+        }
+    }
+
     /// One `udp` request; returns the reply length written to `out`.
     fn serve(&mut self, m: &[u8], out: &mut [u8]) -> usize {
         match m.first() {
@@ -640,7 +910,69 @@ impl Ip {
                 out[18..34].copy_from_slice(&self.ll);
                 out[34..50].copy_from_slice(&self.global);
                 out[50] = self.bound as u8 | (self.have_global as u8) << 1;
-                51
+                out[51..55].copy_from_slice(&self.dns);
+                55
+            }
+            Some(4) if m.len() >= 20 => {
+                let addr: [u8; 16] = m[2..18].try_into().unwrap();
+                let port = u16::from_be_bytes([m[18], m[19]]);
+                self.tcp_connect(m[1], addr, port, out)
+            }
+            Some(5) if m.len() >= 2 => {
+                let i = m[1] as usize;
+                if i >= TCPN || self.tcp[i].state == 0 || self.tcp[i].state == 4 || self.tcp[i].fin_queued {
+                    out[0] = 5;
+                    return 1;
+                }
+                let c = &mut self.tcp[i];
+                let n = (m.len() - 2).min(TXB - c.tx_len);
+                let at = c.tx_len;
+                c.tx[at..at + n].copy_from_slice(&m[2..2 + n]);
+                c.tx_len += n;
+                out[0] = 0;
+                out[1..3].copy_from_slice(&(n as u16).to_be_bytes());
+                self.tcp_tick();
+                3
+            }
+            Some(6) if m.len() >= 2 => {
+                let i = m[1] as usize;
+                if i >= TCPN || self.tcp[i].state == 0 {
+                    out[0] = 5;
+                    return 1;
+                }
+                let was_low = RXW - self.tcp[i].rx_len < RXW / 2;
+                let c = &mut self.tcp[i];
+                out[0] = match c.state {
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    _ => 4,
+                };
+                let n = c.rx_len.min(out.len() - 1);
+                for k in 0..n {
+                    out[1 + k] = c.rx[(c.rx_head + k) % RXW];
+                }
+                c.rx_head = (c.rx_head + n) % RXW;
+                c.rx_len -= n;
+                // A window that had shrunk below half has grown: say so (a window update), or a sender avoiding silly windows waits for its persist timer.
+                if was_low && n > 0 && c.state >= 2 {
+                    let s = c.snd_nxt;
+                    self.tcp_out(i, 16, s, &[]);
+                }
+                1 + n
+            }
+            Some(7) if m.len() >= 2 => {
+                let i = m[1] as usize;
+                if i < TCPN && self.tcp[i].state != 0 {
+                    let c = &mut self.tcp[i];
+                    c.fin_queued = true;
+                    c.closed_t = now();
+                    if c.state == 4 {
+                        self.tcp[i] = TCP_FREE;
+                    }
+                }
+                out[0] = 0;
+                1
             }
             _ => {
                 out[0] = 3;
@@ -711,6 +1043,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         nd_n: 0,
         q: [EMPTY; QN],
         frames: 0,
+        dns: [0; 4],
+        tcp: [TCP_FREE; TCPN],
+        eph: 0,
+        seed: 0,
     };
     // Who we are: the driver's MAC.
     let mut info = [0u8; 16];
@@ -726,6 +1062,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     let r = &r;
     ip.xid = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    ip.seed = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+    ip.eph = u16::from_le_bytes([r[6], r[7]]);
     ip.iid.copy_from_slice(&r[8..16]);
     ip.ll[0] = 0xFE;
     ip.ll[1] = 0x80;
@@ -743,6 +1081,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
     loop {
+        let mut busy = false;
         // Frames from the driver: [2] → the oldest frame, or nothing.
         for _ in 0..16 {
             let req = [2u8];
@@ -753,6 +1092,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let f = &frame;
             let n = (n as usize).min(f.len());
             ip.frames += 1;
+            busy = true;
             let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
             let ty = u16::from_be_bytes([f[12], f[13]]);
             if ty == 0x0806 {
@@ -769,7 +1109,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             let m = &msg;
             let l = ip.serve(&m[..(n as usize).min(m.len())], &mut out);
             svc(REPLY, ip.off(tok.as_ptr()), ip.off(out.as_ptr()), l as u64, 0, 0);
+            busy = true;
         }
+        ip.tcp_tick();
         // Timers: DHCP retransmits every 2 s until bound; router solicitation every 4 s, three times, until a global address appears.
         let t = now();
         if !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {
@@ -780,6 +1122,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.router_solicit();
         }
         ip.flush();
+        // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26).
+        if !busy {
+            ferros_sys::sleep_until(now() + ip.freq / 1000);
+        }
     }
 }
 

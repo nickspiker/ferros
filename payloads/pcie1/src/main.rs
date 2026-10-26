@@ -1550,6 +1550,10 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
         m.pump_tx(d);
         let n = svc(2, d.cap(WLAN), msg.as_mut_ptr() as u64 - d.base, msg.len() as u64, tok.as_mut_ptr() as u64 - d.base, 1);
         if n == u64::MAX - 1 || n == ERR {
+            // No request and no frame waiting: a millisecond's sleep, not a spinning core (the driver runs from boot since init starts it, 2026-10-26).
+            if m.rxq_len == 0 {
+                ferros_sys::sleep_until(ferros_sys::now() + d.freq / 1000);
+            }
             continue;
         }
         let msg = unsafe { core::ptr::read_volatile(&msg) };
