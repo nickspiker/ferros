@@ -120,10 +120,22 @@ The meters' external shunt channels (VSYS feeds, zuma-pmic.dtsi `external_rail`:
 
 Fresh boot, all of today's changes: screen on at rest **1.21–1.26 W**, screen off **0.61 W** (cable in).
 
-## Plan, biggest first
+## Where it stands, and what is left (2026-10-25 evening)
 
-1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
-2. **A clock policy from what the kernel knows.** Rest: MIF 1014, INT 178, the clusters at their floors, the X3 at the lowest point that keeps the rest work under half its time. Active (a finger down, a PT transfer moving, a frame being drawn): the X3 at 2.0 GHz and MIF 2028, back to rest a second after. 2.9 GHz only if 2.0 misses frames.
-3. **Sleep.** No event stream: the kernel's core waits in `wfi` for the next deadline (its timer) or an interrupt (USB, keys, touch, the AoC's mailbox).
-4. **Power down idle cores** (PSCI CPU_SUSPEND to the power-down state), and the clusters when all their cores are down; the kernel's housekeeping on a small core.
-5. **USB off on battery**: no VBUS, no DWC3 and PHY.
+| | start of the day | now | Android (same phone) |
+|---|---|---|---|
+| screen on, at rest | 3.50–3.59 W | **1.21–1.26 W** | 1.16 W |
+| screen off, cable in | (1.70 W with the first clock policy) | **0.61 W** | — |
+| screen off, cable out | — | (0.85 W before the domains were gated) | 0.31 W |
+| the scope in focus (90 frames/s) | — | 3.96 W | — |
+
+Left, roughly by size:
+
+1. **The cable-out screen-off number again**, with everything since: the live USB link was ~0.13 W of the cable-in figure.
+2. **The USB re-init loop while no cable is in**: every 2 s a full PHY and controller init. Re-init only when the TCPC shows VBUS (the replug path closes the data switch then anyway). Needs a hand on the cable to test.
+3. **BB_HLDO** (~324 mW by the meter, screen on or off, its LDOs a few mW each): either a load hanging on the 3.3 V buck-boost or its meter resolution is off — the meter's absolute total exceeds what the battery delivers, so treat its absolute numbers with care; its changes match the gauge.
+4. **The modem's supplies** (~40 mW: its VSYS feed, RF front end, its PMIC) with the CP already held off (CP_PWR low) — likely what Android pays too.
+5. **Bringing gated domains back properly** (Linux's saved CMU registers replayed; the GPU's embedded part), so the camera, TPU and GPU work can run without a reboot.
+6. **Screen on: the rest redraws** — the gravity-following clock repaints its whole face on every 10 Hz flip and the scope its plot box; cheaper redraws would let the X3 rest below 2 GHz. A design choice for the owner (the clock's no-dead-zone rule is part of it).
+7. **Focus at 90 frames a second costs ~2.7 W over rest**: whether focus should run at full clocks is the owner's call.
+8. Brightness: the panel's floor alone moves ~0.8 W between 2 and 140 nits; automatic brightness from the front light sensor is the owner's call.
