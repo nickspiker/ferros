@@ -533,7 +533,7 @@ pub fn boot(replay: &[u8], tail_s: u64, out: &mut alloc::vec::Vec<u8>) {
             if d.fixes > shown && shown < 4 {
                 shown = d.fixes;
                 if let Some(x) = d.fix {
-                    out.extend_from_slice(alloc::format!("fix {shown} at {} ms after power-up: {}\n", d.first_fix_at.wrapping_sub(t_all) * 1000 / f, x.line()).as_bytes());
+                    out.extend_from_slice(alloc::format!("fix {shown} at {} ms after power-up: {}\n", crate::platform::cntpct().wrapping_sub(t_all) * 1000 / f, x.line()).as_bytes());
                 }
             }
         }
