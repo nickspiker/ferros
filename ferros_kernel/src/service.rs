@@ -1824,6 +1824,11 @@ pub fn run(mut b: Boot) -> ! {
                                             // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
                                             if cmd.params == b"gnss up" {
                                                 crate::gnss::up(&mut resp);
+                                            } else if cmd.params == b"gnss boot" {
+                                                // `diag gnss boot`: the chip powered and its patch downloaded by ferros, lhd's opening replayed from the vault's `gnss.replay` (gnss.rs boot).
+                                                let st = &raw mut store;
+                                                let replay = crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key("gnss.replay").ok().flatten()) }).unwrap_or_default();
+                                                crate::gnss::boot(&replay, &mut resp);
                                             } else {
                                                 crate::gnss::state(&mut resp);
                                             }

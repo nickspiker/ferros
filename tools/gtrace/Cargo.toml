@@ -1,0 +1,15 @@
+[package]
+name = "gtrace"
+version = "0.1.0"
+edition = "2021"
+description = "A freestanding ptrace syscall tracer for aarch64 Android (no libc, no NDK): spawns a program and logs its file I/O on chosen device paths, for capturing what a vendor daemon says to a chip."
+
+# Its own workspace: an aarch64 Linux binary, not part of ferros's build.
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[profile.dev]
+panic = "abort"

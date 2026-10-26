@@ -132,3 +132,238 @@ pub fn up(out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("HOST_REQ within 1 s: {rose:?} ms\n").as_bytes());
     state(out);
 }
+
+// ── The transport (GNSS.md "The transport"): the SSI stream under it, Broadcom's packet layer above. ──
+
+/// One SSI transfer, full duplex (bcm_gps_spi.c, SSI_MODE 1, SSI_LEN 2: control byte G#50 = full duplex | 2-byte length | stream | write): out `[G#50, len lo, len hi, data]`, in the same clocks `[status, its len lo, hi, its data]`. The chip's bytes go to `sink`; returns the status byte.
+fn ssi(data: &[u8], sink: &mut alloc::vec::Vec<u8>) -> Result<u8, &'static str> {
+    let n = data.len();
+    let mut tx = alloc::vec![0u8; n + 3];
+    tx[0] = 0x50;
+    tx[1] = n as u8;
+    tx[2] = (n >> 8) as u8;
+    tx[3..].copy_from_slice(data);
+    let mut rx = alloc::vec![0u8; n + 3];
+    crate::spi::GNSS.stream(&tx, &mut rx)?;
+    let have = (rx[1] as usize | (rx[2] as usize) << 8).min(n);
+    sink.extend_from_slice(&rx[3..3 + have]);
+    Ok(rx[0])
+}
+
+/// What the chip has waiting (HOST_REQ high): a three-byte probe for its length, then a transfer of that length (bcm_ssi_rx).
+fn ssi_read(sink: &mut alloc::vec::Vec<u8>) -> Result<usize, &'static str> {
+    let mut rx = [0u8; 3];
+    crate::spi::GNSS.stream(&[0x50, 0, 0], &mut rx)?;
+    let len = (rx[1] as usize | (rx[2] as usize) << 8).min(8 * 1024 - 3);
+    if len == 0 {
+        return Ok(0);
+    }
+    let before = sink.len();
+    ssi(&alloc::vec![0u8; len], sink)?;
+    Ok(sink.len() - before)
+}
+
+/// Broadcom's packet CRC (lhd: a table-driven CRC-8, polynomial G#4D MSB-first, initial 0, over everything after the sequence byte), the result's nibbles swapped.
+fn crc(bytes: &[u8]) -> u8 {
+    let mut c = 0u8;
+    for &b in bytes {
+        c ^= b;
+        for _ in 0..8 {
+            c = if c & 0x80 != 0 { c << 1 ^ 0x4D } else { c << 1 };
+        }
+    }
+    c.rotate_left(4)
+}
+
+/// The chip's side of the packet stream, deframed: `b0 00` opens, `b0 01` closes, `b0 03/04/05` stand for G#B0/G#11/G#13. Each frame: sequence, length low, flags, one byte per set flag bit in bit order (G#40 the length's high byte, G#80 the flags' high byte), the payload, the CRC. An ack (flags G#05 or G#25, no payload) names the host sequence it acknowledges in its first field.
+struct Deframer {
+    raw: alloc::vec::Vec<u8>,
+    acked: [bool; 256],
+    frames: u32,
+    acks: u32,
+    crc_bad: u32,
+    kinds: alloc::collections::BTreeMap<u16, u32>,
+    /// The first 16 and the latest 8 frames as received (sequence, flags, payload head), for `boot`'s report.
+    first: alloc::vec::Vec<alloc::string::String>,
+    last: alloc::collections::VecDeque<alloc::string::String>,
+}
+
+impl Deframer {
+    fn new() -> Self {
+        Deframer { raw: alloc::vec::Vec::new(), acked: [false; 256], frames: 0, acks: 0, crc_bad: 0, kinds: alloc::collections::BTreeMap::new(), first: alloc::vec::Vec::new(), last: alloc::collections::VecDeque::new() }
+    }
+    fn feed(&mut self, bytes: &[u8]) {
+        self.raw.extend_from_slice(bytes);
+        loop {
+            let Some(s) = self.raw.windows(2).position(|w| w == [0xB0, 0x00]) else {
+                self.raw.clear();
+                return;
+            };
+            let Some(e) = self.raw[s + 2..].windows(2).position(|w| w == [0xB0, 0x01]).map(|e| e + s + 2) else {
+                self.raw.drain(..s);
+                return;
+            };
+            let mut f = alloc::vec::Vec::with_capacity(e - s);
+            let mut j = s + 2;
+            while j < e {
+                if self.raw[j] == 0xB0 && j + 1 < e {
+                    f.push(match self.raw[j + 1] {
+                        3 => 0xB0,
+                        4 => 0x11,
+                        5 => 0x13,
+                        _ => 0,
+                    });
+                    j += 2;
+                } else {
+                    f.push(self.raw[j]);
+                    j += 1;
+                }
+            }
+            self.raw.drain(..e + 2);
+            self.frame(&f);
+        }
+    }
+    fn frame(&mut self, f: &[u8]) {
+        if f.len() < 4 {
+            return;
+        }
+        if crc(&f[1..f.len() - 1]) != f[f.len() - 1] {
+            self.crc_bad += 1;
+            return;
+        }
+        let shown = alloc::format!("{:02X?}", &f[..f.len().min(24)]);
+        if self.first.len() < 16 {
+            self.first.push(shown);
+        } else {
+            if self.last.len() == 8 {
+                self.last.pop_front();
+            }
+            self.last.push_back(shown);
+        }
+        self.frames += 1;
+        let mut flags = f[2] as u16;
+        let mut i = 3;
+        let mut first = None;
+        for bit in 0..16 {
+            if bit == 8 && flags & 0x80 == 0 {
+                break;
+            }
+            if flags & 1 << bit != 0 && i < f.len() - 1 {
+                if first.is_none() {
+                    first = Some(f[i]);
+                }
+                if bit == 7 {
+                    flags |= (f[i] as u16) << 8;
+                }
+                i += 1;
+            }
+        }
+        // An ack: flags bits 0 and 2 (the acknowledged host sequence first) and no payload; under ferros the chip also sets bit 5 (a third field, a window or credit count), Android's capture showed G#05 alone.
+        if flags & 0x05 == 0x05 && i == f.len() - 1 {
+            self.acks += 1;
+            if let Some(seq) = first {
+                self.acked[seq as usize] = true;
+            }
+            return;
+        }
+        let p = &f[i..f.len() - 1];
+        if p.len() >= 2 {
+            *self.kinds.entry((p[0] as u16) << 8 | p[1] as u16).or_insert(0) += 1;
+        }
+    }
+}
+
+/// The host frames in a record that want an ack (flags bit G#02): their sequence numbers.
+fn reliable_seqs(rec: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0;
+    while i + 4 < rec.len() {
+        if rec[i] == 0xB0 && rec[i + 1] == 0x00 {
+            // The sequence and flags bytes, unescaped.
+            let un = |k: usize| -> (u8, usize) { if rec[k] == 0xB0 { (match rec[k + 1] { 3 => 0xB0, 4 => 0x11, _ => 0x13 }, 2) } else { (rec[k], 1) } };
+            let (seq, a) = un(i + 2);
+            let (_len, b) = un(i + 2 + a);
+            let (flags, _) = un(i + 2 + a + b);
+            if flags & 0x02 != 0 {
+                out.push(seq);
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `diag gnss boot`: the chip up from cold and its patch downloaded by ferros — lhd's own opening replayed (`replay`: the vault's `gnss.replay`, records `[len u16][gap ms u16][bytes]` cut from a capture of lhd: the autobaud bursts, the transport sync, and the 239-packet patch download; Google's patch is in it, so it lives in the vault and on Harbor, never in the repo). Each record goes out through the SSI layer; a record with reliable frames waits (up to 300 ms) for the chip to ack every one before the next, reading whenever HOST_REQ is up; the rest wait lhd's own gap (at most 200 ms). Then two seconds of whatever the chip sends.
+pub fn boot(replay: &[u8], out: &mut alloc::vec::Vec<u8>) {
+    if replay.len() < 4 || &replay[..4] != b"GNR1" {
+        out.extend_from_slice(b"no replay (vault key gnss.replay, GNR1 records)\n");
+        return;
+    }
+    up(out);
+    set_dat(MCU_REQ, true);
+    let mut d = Deframer::new();
+    let mut rx = alloc::vec::Vec::new();
+    let (mut recs, mut waits, mut late, mut errs) = (0u32, 0u32, 0u32, 0u32);
+    let f = crate::platform::cntfrq();
+    let mut i = 4;
+    let t_all = crate::platform::cntpct();
+    while i + 4 <= replay.len() {
+        let len = u16::from_le_bytes([replay[i], replay[i + 1]]) as usize;
+        let gap = u16::from_le_bytes([replay[i + 2], replay[i + 3]]) as u64;
+        let rec = &replay[i + 4..(i + 4 + len).min(replay.len())];
+        i += 4 + len;
+        recs += 1;
+        crate::platform::pet_watchdogs();
+        rx.clear();
+        if ssi(rec, &mut rx).is_err() {
+            errs += 1;
+        }
+        d.feed(&rx);
+        let want = reliable_seqs(rec);
+        let t0 = crate::platform::cntpct();
+        let limit = if want.is_empty() { f / 1000 * gap.min(200) } else { f / 1000 * 60 };
+        while crate::platform::cntpct().wrapping_sub(t0) < limit {
+            if !want.is_empty() && want.iter().all(|&s| d.acked[s as usize]) {
+                break;
+            }
+            if get(HOST_REQ) {
+                rx.clear();
+                if ssi_read(&mut rx).is_err() {
+                    errs += 1;
+                }
+                d.feed(&rx);
+            }
+        }
+        if !want.is_empty() {
+            waits += 1;
+            if !want.iter().all(|&s| d.acked[s as usize]) {
+                late += 1;
+            }
+        }
+    }
+    let t0 = crate::platform::cntpct();
+    while crate::platform::cntpct().wrapping_sub(t0) < 2 * f {
+        crate::platform::pet_watchdogs();
+        if get(HOST_REQ) {
+            rx.clear();
+            let _ = ssi_read(&mut rx);
+            d.feed(&rx);
+        }
+    }
+    let ms = crate::platform::cntpct().wrapping_sub(t_all) * 1000 / f;
+    out.extend_from_slice(alloc::format!("replayed {recs} records in {ms} ms ({errs} SPI errors); {waits} waited for acks, {late} not acked in time; the chip: {} frames, {} acks, {} CRC failures\n", d.frames, d.acks, d.crc_bad).as_bytes());
+    out.extend_from_slice(b"the chip's message kinds (first two payload bytes: count):");
+    for (k, n) in &d.kinds {
+        out.extend_from_slice(alloc::format!(" {k:04X}:{n}").as_bytes());
+    }
+    out.extend_from_slice(b"\n");
+    for (k, l) in d.first.iter().enumerate() {
+        out.extend_from_slice(alloc::format!("first {k}: {l}\n").as_bytes());
+    }
+    for l in &d.last {
+        out.extend_from_slice(alloc::format!("last: {l}\n").as_bytes());
+    }
+    set_dat(MCU_REQ, false);
+}

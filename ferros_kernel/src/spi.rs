@@ -205,6 +205,42 @@ impl Port {
         r
     }
 
+    /// Full duplex of any length under one native chip select: `tx` out and as many bytes into `rx`, the FIFOs topped up and drained as they go (at most 32 bytes in flight, inside either FIFO) — `duplex` loads the whole transfer into the TX FIFO at once and is for transfers that fit it. The GNSS chip's SSI frames run to 8 KB (gnss.rs).
+    pub fn stream(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), &'static str> {
+        let b = self.base;
+        let n = tx.len().min(rx.len());
+        wr(b + FB_CLK, self.fb);
+        wr(b + SLAVE_SEL, 0);
+        wr(b + PACKET_CNT, 0);
+        wr(b + PACKET_CNT, n as u32);
+        wr(b + PACKET_CNT, n as u32 | PACKET_CNT_EN);
+        wr(b + MODE_CFG, MODE_BYTE);
+        let ch = (rd(b + CH_CFG) & !(CH_TX_ON | CH_RX_ON | 0xC)) | self.mode;
+        wr(b + CH_CFG, ch | CH_RX_ON | CH_TX_ON);
+        let (mut ti, mut ri) = (0usize, 0usize);
+        let t = now() + ticks_us(200_000);
+        let mut r = Ok(());
+        while ri < n {
+            while ti < n && ti - ri < 32 {
+                wr(b + TX_DATA, tx[ti] as u32);
+                ti += 1;
+            }
+            let have = ((rd(b + STATUS) >> 15) & 0x1FF) as usize;
+            for _ in 0..have.min(n - ri) {
+                rx[ri] = rd(b + RX_DATA) as u8;
+                ri += 1;
+            }
+            if now() > t {
+                r = Err("SPI stream timed out");
+                break;
+            }
+        }
+        self.flush();
+        spin_us(10);
+        wr(b + SLAVE_SEL, 1);
+        r
+    }
+
     /// One chip-select-wrapped transaction: write `cmd`, then read `out.len()` bytes when non-empty. CS rises 10 µs after the last byte.
     pub fn transact(&self, cs: Cs, cmd: &[u8], out: &mut [u8]) -> Result<(), &'static str> {
         let b = self.base;

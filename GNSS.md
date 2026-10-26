@@ -27,7 +27,25 @@ Rails on the sub PMIC (enable bit 7, voltage bits 5:0): L9S_GNSS_CORE G#37 (725 
 - **Firmware**: ROM plus a RAM patch loaded every boot, /vendor/firmware/SensorHub.patch (336212 bytes of ASCII hex; blob 164413 bytes, a Cortex-M patch with an on-chip position engine and NMEA generator). lhd's download states: AUTOBAUD → SYNC → VERSION_INIT → REQUEST_DOWNLOAD → DOWNLOAD_START/COMPLETE → VERSION_CONFIRM → "Patch loaded and verified" → transport synchronised. The transport above SSI is Broadcom's proprietary "TransportLayer" (reliable packets, sequence numbers) carrying RPC; not NMEA. lhd also reads the die's lot/wafer position: identity data, never logged or committed.
 - **Getting a position**, cheapest first: the on-chip engine (`$pglirm,req_breadcrumb,pvtOnChip,periodSec,%d,...` in lhd, gpsd and the patch); else gpsd's session replayed and its measurements decoded (ferros's own position engine); else CHPP through the AoC's CHRE (the chip has a UART to the AoC).
 
+## Captured and decoded (2026-10-25)
+
+Captures on rooted Android with `tools/gtrace` (a freestanding ptrace tracer, built for aarch64 Android without libc or the NDK): lhd started under it with the system's lhd and gpsd stopped, every read and write on `/dev/ttyBCM`, `/dev/bbd_control` and the nSTANDBY sysfs file logged with its bytes. Captures, the patch and lhd/gpsd binaries stay on Harbor (/mnt/Harbor/tmp/gnss-capture-2026-10-25): they are Google's and this phone's.
+
+- **What lhd does:** nSTANDBY `0`, read back, `1`; `BBD:PassThru=1` to `/dev/bbd_control` (the kernel's bridge driver then passes bytes straight through); bursts of G#80 (autobaud); then Broadcom's packet transport on `/dev/ttyBCM`. The kernel driver adds only the SSI framing below.
+- **SSI (bcm_gps_spi.c, SSI_MODE 1, SSI_LEN 2):** full duplex, control byte G#50; out `[G#50, len lo, len hi, data]`, in the same clocks `[status, its len lo, hi, its data]`; a read is a three-byte probe then a transfer of that length; MCU_REQ/MCU_RESP wake around it, HOST_REQ says the chip has data.
+- **The packet transport (from lhd's builder, G#42368):** `b0 00` opens, `b0 01` closes; G#B0, G#11, G#13 inside are escaped as `b0 03`, `b0 04`, `b0 05`. A frame: sequence (host and chip each count their own), length low, flags, then one byte per set flag bit in bit order (G#02 the reliability/channel byte on host packets, G#40 the length's high byte, G#80 the flags' high byte, G#100/G#200 zero bytes on the sync packets), the payload, then **CRC-8 (polynomial G#4D, MSB first, initial 0) over everything after the sequence byte, nibbles swapped**. Verified on all 50,244 frames of the first capture. Host packets with flag G#02 are acked by the chip (flags G#05 or G#25, no payload, the acknowledged sequence first); the chip's own packets are never acked by the host. Sessions open with sync packets (host flags G#380, chip G#180).
+- **Above it:** host RPCs start G#1E, chip messages G#1F, then an id and a length, wrapping an inner `c0 c1 … c0 c4` frame. The patch goes as 239 messages `05 83 96 …` with an address and a 912-byte chunk each; a second stage as `1e 83`.
+- **The position on Android is gpsd's**, computed on the host from the chip's measurements: no NMEA and no plain position travel over this transport (the chip's ~20 KB/s after the fix carries measurements). The patch has an on-chip engine and NMEA generator (`ONCHIP_NMEA`, `$PGLOR`) and formats `$pglirm,req_breadcrumb,pvtOnChip,…` itself; gpsd only parses that string (G#31E7C4, from message type 11 of its dispatcher) and starts an on-chip batching session from it — the request seems to come from the AoC side (the chip's UART to it), and the on-chip fixes go back there. Writing the string into gpsd's `glgpsctrl` pipe did nothing.
+
+**Under ferros (`diag gnss boot`):** the chip powered from cold, the transport synced and the patch downloaded by ferros itself — lhd's opening replayed from the vault (`gnss.replay`, records cut from the capture; Google's patch is in it, so vault and Harbor only): 554 records in 3.3 s, every reliable packet acked, no CRC failures, and the chip's opening messages byte-identical to what it sent lhd, then its periodic `1F80` reports.
+
 ## Next
+
+1. **Navigation:** replay the next part of lhd's session (gpsd's configuration and start), stale aiding included, and see the measurement stream start under ferros.
+2. **A position:** either decode the measurement messages (pseudoranges, Doppler, the navigation data) and solve on the AP — ferros's own position engine — or reach the on-chip engine through the AoC's path. Both are real work; the first keeps everything on the AP.
+
+Earlier plan, kept for reference:
+
 
 1. One capture on rooted Android: `strace -f -tt -x -s 65536 -e read,write,openat -p <lhd>` across a stop/start of lhd + gpsd: the whole transport stream both ways and the timed nSTANDBY writes. (An hv trap of the SPI page misses the PDMA transfers; a kprobe on `bcm_spi_sync` or a rebuilt module with `ssi_dbg` sees the SSI layer.)
 2. The patch into the vault (Google's file: Harbor, never the repo); the download replayed from the capture, each reply checked.
