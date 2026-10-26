@@ -822,6 +822,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-photon"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+ "photon_core",
+]
+
+[[package]]
 name = "ferros-payload-pmupoke"
 version = "0.1.0"
 

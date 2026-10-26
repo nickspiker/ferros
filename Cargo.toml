@@ -43,6 +43,7 @@ members = [
     "payloads/ip",
     "payloads/nettest",
     "payloads/httptest",
+    "payloads/photon",
     "payloads/wxtest",
     "payloads/beamtest",
     "payloads/wdtfire",

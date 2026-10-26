@@ -5,7 +5,7 @@
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
-//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv6 link-scope multicast (ff02::, e.g. Photon's LAN discovery group) is delivered like unicast.
+//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast.
 //! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global), the DHCP-given DNS server (4).
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
@@ -276,7 +276,8 @@ impl Ip {
         }
         let src: [u8; 4] = p[12..16].try_into().unwrap();
         let dst: [u8; 4] = p[16..20].try_into().unwrap();
-        let ours = (self.bound && dst == self.v4) || dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k]));
+        // Ours: our address, broadcast (limited or the subnet's), or IPv4 multicast (224/4: Photon's LAN beacon group 239.104.199.144; the firmware passes all multicast, and only opened ports keep a datagram).
+        let ours = (self.bound && dst == self.v4) || dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k])) || dst[0] & 0xF0 == 0xE0;
         let body = &p[ihl..total];
         match p[9] {
             // ICMP echo request → reply to the sender's MAC (no resolution needed).
