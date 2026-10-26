@@ -5,7 +5,7 @@
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
-//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0).
+//! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv6 link-scope multicast (ff02::, e.g. Photon's LAN discovery group) is delivered like unicast.
 //! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global), the DHCP-given DNS server (4).
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
@@ -38,6 +38,7 @@ struct Datagram {
     sport: u16,
     dport: u16,
     len: usize,
+    seq: u32,
     data: [u8; 1472],
 }
 
@@ -73,6 +74,9 @@ struct Ip {
     q: [Datagram; QN],
     frames: u32,
     dns: [u8; 4],
+    ports: [u16; 8],
+    ports_at: usize,
+    qseq: u32,
     tcp: [Tcp; TCPN],
     eph: u16,
     seed: u32,
@@ -561,7 +565,7 @@ impl Ip {
             }
         } else if nh == 6 && body.len() >= 20 && !multicast {
             self.tcp_in(6, src, body);
-        } else if nh == 17 && body.len() >= 8 && !multicast {
+        } else if nh == 17 && body.len() >= 8 && (!multicast || dst[1] & 15 == 2) {
             let sport = u16::from_be_bytes([body[0], body[1]]);
             let dport = u16::from_be_bytes([body[2], body[3]]);
             let ulen = (u16::from_be_bytes([body[4], body[5]]) as usize).clamp(8, body.len());
@@ -613,11 +617,18 @@ impl Ip {
     // ---- UDP for applications ----
 
     fn queue(&mut self, fam: u8, addr: [u8; 16], sport: u16, dport: u16, data: &[u8]) {
+        if dport == 0 || !self.ports.contains(&dport) {
+            return;
+        }
+        // A free slot, else the oldest datagram's.
         let slot = match self.q.iter().position(|d| !d.used) {
             Some(i) => i,
-            None => return,
+            None => (0..QN).min_by_key(|&i| self.q[i].seq).unwrap_or(0),
         };
+        self.qseq = self.qseq.wrapping_add(1);
+        let seq = self.qseq;
         let d = &mut self.q[slot];
+        d.seq = seq;
         let n = data.len().min(d.data.len());
         d.used = true;
         d.fam = fam;
@@ -626,6 +637,14 @@ impl Ip {
         d.dport = dport;
         d.len = n;
         d.data[..n].copy_from_slice(&data[..n]);
+    }
+
+    /// Keep datagrams for `port` from now on (one of the last eight opened).
+    fn open_port(&mut self, port: u16) {
+        if !self.ports.contains(&port) {
+            self.ports[self.ports_at] = port;
+            self.ports_at = (self.ports_at + 1) % self.ports.len();
+        }
     }
 
     fn udp_send(&mut self, fam: u8, addr: [u8; 16], dport: u16, sport: u16, payload: &[u8]) -> u8 {
@@ -886,12 +905,15 @@ impl Ip {
                 let addr: [u8; 16] = m[2..18].try_into().unwrap();
                 let dport = u16::from_be_bytes([m[18], m[19]]);
                 let sport = u16::from_be_bytes([m[20], m[21]]);
+                self.open_port(sport);
                 out[0] = self.udp_send(m[1], addr, dport, sport, &m[22..]);
                 1
             }
             Some(2) if m.len() >= 3 => {
                 let port = u16::from_be_bytes([m[1], m[2]]);
-                let Some(i) = self.q.iter().position(|d| d.used && d.dport == port) else { return 0 };
+                self.open_port(port);
+                // The port's oldest datagram.
+                let Some(i) = (0..QN).filter(|&i| self.q[i].used && self.q[i].dport == port).min_by_key(|&i| self.q[i].seq) else { return 0 };
                 let d = &mut self.q[i];
                 d.used = false;
                 out[0] = d.fam;
@@ -1011,7 +1033,7 @@ fn csum(data: &[u8], init: u32) -> u16 {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
-    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, data: [0; 1472] };
+    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [0; 1472] };
     let mut ip = Ip {
         grants,
         base,
@@ -1044,6 +1066,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         q: [EMPTY; QN],
         frames: 0,
         dns: [0; 4],
+        ports: [0; 8],
+        ports_at: 0,
+        qseq: 0,
         tcp: [TCP_FREE; TCPN],
         eph: 0,
         seed: 0,
