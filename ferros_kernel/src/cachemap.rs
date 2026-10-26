@@ -33,6 +33,20 @@ unsafe extern "C" {
 
 #[cfg(not(shim_handoff))]
 const WINDOW: (usize, usize) = (0x8000_0000, 0x8400_0000);
+/// Discard any stale lines over the heap's second region (left by the loader) before the heap uses it: `enable` leaves it out to keep its 26 MiB of line-by-line invalidation off the boot path. Nothing may have touched the region yet.
+#[cfg(not(shim_handoff))]
+pub fn heap2_prepare() {
+    unsafe {
+        asm!("dsb sy");
+        let mut a = HEAP2.0;
+        while a < HEAP2.1 {
+            asm!("dc ivac, {}", in(reg) a);
+            a += 64;
+        }
+        asm!("dsb sy");
+    }
+}
+
 /// The kernel heap's second region (cold only): the window's top above the staging slot (STAGE G#8208_0000 + its 4 MiB, to the next 2 MiB) up to the display framebuffer. The first 12 MiB heap sits between the image and the arc pool and cannot grow; storing a 2.78 MB value needs a vault working set several times its size, and ran the heap out (2026-10-26).
 #[cfg(not(shim_handoff))]
 pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8400_0000);
@@ -234,9 +248,11 @@ pub fn enable() -> bool {
             }
             l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }
-        // The tables went to DRAM with the MMU off. Discard any stale lines over the window (left by the loader; ours bypassed the cache) before the window becomes cacheable — including the table walker's view of the tables.
+        // The tables went to DRAM with the MMU off. Discard any stale lines over the window (left by the loader; ours bypassed the cache) before the window becomes cacheable — including the table walker's view of the tables. Not the heap's second region (cold): it is discarded later, off the boot path, before the heap takes it (`heap2_prepare`; its 26 MiB of lines cost the boot ~235 ms here, 2026-10-26).
         asm!("dsb sy");
         let mut a = w0;
+        #[cfg(not(shim_handoff))]
+        let w1 = HEAP2.0;
         while a < w1 {
             asm!("dc ivac, {}", in(reg) a);
             a += 64;

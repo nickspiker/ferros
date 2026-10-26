@@ -178,6 +178,20 @@ static ALLOC: BumpAlloc = BumpAlloc;
 #[cfg(feature = "pixel8")]
 #[global_allocator]
 static KERNEL_HEAP: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
+/// Whether the cache map is on, so the heap's second region can join (it must be normal memory: an allocation's unaligned copies fault on Device memory).
+static HEAP2_CACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HEAP2_JOINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// From the service loop, once, a couple of seconds after it starts: the heap's second region (cachemap HEAP2) prepared and added to the kernel heap. The first 12 MiB carry the boot until then.
+#[cfg(not(shim_handoff))]
+pub fn heap2_join() {
+    if !HEAP2_CACHED.load(Ordering::Relaxed) || HEAP2_JOINED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    cachemap::heap2_prepare();
+    unsafe { KERNEL_HEAP.extend(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
+}
+
 /// The kernel heap's (free bytes, free blocks, largest free block), for DIAG; None if the heap is busy.
 pub fn heap_stats() -> Option<(usize, usize, usize)> {
     KERNEL_HEAP.try_lock().map(|h| (h.free_bytes(), h.free_blocks(), h.largest_free()))
@@ -1726,10 +1740,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let stack_top = unsafe { &__stack_top as *const u8 as usize };
     let heap_base = (stack_top + 0xFFF) & !0xFFF;
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
-    // The heap's second region, now that the cache map makes it normal memory (an allocation's unaligned copies fault on Device memory): cachemap HEAP2.
-    if cached {
-        unsafe { KERNEL_HEAP.extend(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
-    }
+    // The heap's second region joins later, from the service loop (`heap2_join`): its stale lines must be discarded first, and that takes ~235 ms the boot should not wait for.
+    HEAP2_CACHED.store(cached, Ordering::Relaxed);
     platform::enable_icache();
     platform::canary_init();
     platform::stack_paint();

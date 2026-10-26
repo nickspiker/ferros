@@ -1059,6 +1059,11 @@ pub fn run(mut b: Boot) -> ! {
         crate::rtc::poll();
         gauge_poll();
         power_poll();
+        // The heap's second region, 2 s in (main.rs heap2_join: its line invalidation kept off the boot path).
+        #[cfg(not(shim_handoff))]
+        if now.wrapping_sub(t_boot) > 2 * cntfrq() {
+            crate::heap2_join();
+        }
         crate::odpm::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
