@@ -357,6 +357,20 @@ fn power_on(rep: &mut Vec<u8>) {
     }
 }
 
+/// `diag modem off`: the CP powered down, the first half of `power_on` (the WAKEUP pulse, NRESET, CP_WRST_N, CP_PWR and PM_WRST_N low). The PCIe side is left as it is: only the modem diags touch it, and each starts from the survey.
+pub fn off(rep: &mut Vec<u8>) {
+    AP2CP_WAKEUP.out(true);
+    ms(10);
+    AP2CP_WAKEUP.out(false);
+    NRESET.out(false);
+    CP_WRST_N.out(false);
+    CP_PWR.out(false);
+    ms(30);
+    PM_WRST_N.out(false);
+    AP_ACTIVE.out(false);
+    line(rep, alloc::format!("CP off: CP_PWR {} NRESET {} CP_WRST_N {} PM_WRST_N {}; PS_HOLD {}\n", CP_PWR.get() as u8, NRESET.get() as u8, CP_WRST_N.get() as u8, PM_WRST_N.get() as u8, PS_HOLD.get() as u8));
+}
+
 /// Stage 2: PHY. Pins (PERST low, CLKREQ function 2 pull-up), SOC+G#4000 = G#15, PMU PHY isolation released, the ch0 power-down clear, then the ch0 PHY configuration with its lock polls (logged, not fatal, as Linux does).
 fn phy(rep: &mut Vec<u8>) {
     for off in [0x10, 0x14, 0x18] {
@@ -945,7 +959,7 @@ fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq:
     Ok(frames)
 }
 
-/// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`; the three NV sections need the per-unit files on f2fs, which ferros cannot read yet, so they are skipped and the CP's answer to the start command says whether it minds.
+/// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`, the three NV sections out of the per-unit files on f2fs (efs, modem_userdata); START is not sent.
 fn download(rep: &mut Vec<u8>) {
     let mut m = match crate::partfs::mount(MODEM_PART) {
         Ok(m) => m,
@@ -960,6 +974,15 @@ fn download(rep: &mut Vec<u8>) {
         return line(rep, alloc::format!("{e}\n"));
     }
     let toc = toc(&first);
+    // The per-unit NV files, read before anything is sent so a missing file stops the download before it starts (cbd would stand in all-G#FF; ferros does not).
+    let mut nv = Vec::new();
+    for (part, path, id) in [("efs", "/nv_normal.bin", 5u32), ("efs", "/nv_protected.bin", 6), ("modem_userdata", "/replay_region.bin", 7)] {
+        match crate::partfs::read_f2fs(part, path) {
+            Ok(v) if v.len() == 0x8_0000 => nv.push((path, id, v)),
+            Ok(v) => return line(rep, alloc::format!("{part}{path}: A#{} bytes, expected G#8_0000\n", v.len())),
+            Err(e) => return line(rep, alloc::format!("{e}\n")),
+        }
+    }
     // The daemon's first boot-channel write comes well after the link acknowledgement; give the CP's bootloader the same breathing room.
     ms(500);
     let mut seq = 0u16;
@@ -1023,7 +1046,17 @@ fn download(rep: &mut Vec<u8>) {
             }
         }
     }
-    // Stopped here on purpose: the three NV stages (calibration, IMEI) are per-unit files on f2fs that ferros cannot read yet, and G#A400 starts the CP's main firmware — which without its NV would come up on the air with no identity. Not until the real NV is in hand.
-    line(rep, alloc::format!("MAIN, VSS and APM loaded; stopped before the NV stages and START (G#A400): the CP is not started without its own NV\n"));
+    // The three NV sections in the captured order (NV_NORM 5, NV_PROT 6, REPLAY sent as section 7), straight from the f2fs files; their contents are never logged.
+    for (path, id, v) in &nv {
+        let r = send_section(rep, &mut seq, *id, v.len() as u32, |off, out| {
+            out.copy_from_slice(&v[off as usize..off as usize + out.len()]);
+            Ok(())
+        });
+        if !step(rep, path, r) {
+            return;
+        }
+    }
+    // Stopped here on purpose: G#A400 starts the CP's main firmware, which puts this phone on the air under its own identity. That waits for the owner's go-ahead.
+    line(rep, alloc::format!("MAIN, VSS, APM and the three NV sections loaded; stopped before START (G#A400), which waits for the owner\n"));
     line(rep, alloc::format!("cp2ap_msg G#{:X}, cp2ap_status G#{:X}, boot_stage G#{:X}\n", rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE)));
 }

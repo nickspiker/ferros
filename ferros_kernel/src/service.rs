@@ -2301,6 +2301,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"modem off" {
+                                            // `diag modem off`: the CP powered down (modem.rs off).
+                                            crate::modem::off(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"modem readmain" {
                                             // `diag modem readmain`: read MAIN off the flash, CRC it against the TOC, time it.
                                             crate::modem::read_main(&mut resp);
