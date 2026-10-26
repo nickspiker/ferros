@@ -204,6 +204,11 @@ pub struct Fix {
     pub track: i32,
 }
 
+/// Fix-class messages (`01 81`, id G#16) seen, those the flag check turned away, and the bits 201-220 of the last one turned away (for `boot`'s report).
+static FIX_MSGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FIX_REJECTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FIX_REJECTED_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// The latest fix, from the service loop's GNSS session.
 pub static mut LAST_FIX: Option<Fix> = None;
 
@@ -239,7 +244,15 @@ impl Fix {
         if m.len() < 60 || m[0] != 0x01 || m[1] != 0x81 || m[9] != 0x16 {
             return None;
         }
-        let fix = Fix { err: bits(&m, 221, 10), lms: bits(&m, 231, 32), lat: sbits(&m, 311, 32), lon: sbits(&m, 343, 32), alt: sbits(&m, 375, 16), speed: sbits(&m, 407, 16), track: sbits(&m, 439, 16) };
+        FIX_MSGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // The flag bits gpsd reads one at a time just before the error estimate: 210 altitude present, 212 position valid (its "V:T"), 213 track present, 215 speed present. A message without a valid position (the engine still searching) carries none of the fields below at these offsets.
+        if bits(&m, 212, 1) == 0 || bits(&m, 210, 1) == 0 || bits(&m, 215, 1) == 0 {
+            FIX_REJECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            FIX_REJECTED_BITS.store(bits(&m, 201, 20), core::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let track = if bits(&m, 213, 1) == 1 { sbits(&m, 439, 16) } else { 0 };
+        let fix = Fix { err: bits(&m, 221, 10), lms: bits(&m, 231, 32), lat: sbits(&m, 311, 32), lon: sbits(&m, 343, 32), alt: sbits(&m, 375, 16), speed: sbits(&m, 407, 16), track };
         (fix.lat.unsigned_abs() <= 90 << 23 && fix.lon.unsigned_abs() <= 180 << 23 && fix.err < 1023 && (fix.lat, fix.lon) != (0, 0)).then_some(fix)
     }
     pub fn line(&self) -> alloc::string::String {
@@ -362,8 +375,8 @@ fn gps_ms_now() -> Option<u64> {
     Some((t / f * 1000 + t % f * 1000 / f).checked_sub(315_964_800_000)? + 18_000)
 }
 
-/// A record carrying gpsd's time aiding, rewritten with the time now: in the capture it is the capture's time, and a replay hours later would tell the chip a wrong one. Two messages carry it (GNSS.md): `87 81` (the GPS week u16 then the time of week in ms u32, 8 bytes after the inner `c0 c1`) and `d0 81` (position and time; the week 58 bytes after it, two zero bytes, then the time of week). The inner checksum (the 16-bit sum of the class, length and body, 6 bytes after `c0 c1`) is adjusted by the bytes' difference; a time of week whose bytes or new checksum would hold G#C0 (the inner escape) moves on a millisecond. Then the packet's CRC is redone and the frame escaped again. None when the record holds neither message or the clock is not set.
-fn patch_time(rec: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+/// A record carrying gpsd's aiding, rewritten with ferros's own: in the capture it is the capture's time and place, and a replay hours later or elsewhere would tell the chip wrong ones. Two messages carry it (GNSS.md "Aiding"): `87 81` (the GPS week u16 then the time of week in ms u32, 8 bytes after the inner `c0 c1`) and `d0 81` (position and time: latitude u32 in 2⁻¹⁶ degrees 10 bytes after `c0 c1`, longitude u32 in 2⁻¹⁵ degrees west-positive at 22, the week at 58, two zero bytes, the time of week at 62). The time comes from the RTC; the position, when given, is ferros's last fix (`pos`, in `Fix` units), else the capture's stays. The inner checksum (the 16-bit sum of the class, length and body, 6 bytes after `c0 c1`) is adjusted by the bytes' difference; a value whose bytes or new checksum would hold G#C0 (the inner escape) moves on by one unit. Then the packet's CRC is redone and the frame escaped again. None when the record holds neither message or the clock is not set.
+fn patch_aiding(rec: &[u8], pos: Option<(i32, i32)>) -> Option<alloc::vec::Vec<u8>> {
     let now = gps_ms_now()?;
     let mut out = alloc::vec::Vec::with_capacity(rec.len() + 8);
     let mut changed = false;
@@ -386,7 +399,7 @@ fn patch_time(rec: &[u8]) -> Option<alloc::vec::Vec<u8>> {
             }
         }
         i = e + 2;
-        if patch_frame(&mut f, now) {
+        if patch_frame(&mut f, now, pos) {
             changed = true;
         }
         out.extend_from_slice(&[0xB0, 0x00]);
@@ -403,7 +416,7 @@ fn patch_time(rec: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     changed.then_some(out)
 }
 
-fn patch_frame(f: &mut [u8], now: u64) -> bool {
+fn patch_frame(f: &mut [u8], now: u64, pos: Option<(i32, i32)>) -> bool {
     if f.len() < 4 {
         return false;
     }
@@ -425,31 +438,39 @@ fn patch_frame(f: &mut [u8], now: u64) -> bool {
     let Some(c) = p.iter().take(8).zip(p.iter().skip(1)).position(|(&a, &b)| a == 0xC0 && b == 0xC1) else {
         return false;
     };
-    let (week_at, tow_at) = match p.get(c + 2..c + 4) {
-        Some([0x87, 0x81]) => (c + 8, c + 10),
-        Some([0xD0, 0x81]) => (c + 58, c + 62),
+    // (week, time of week, latitude, longitude) offsets; the position only in `d0 81`.
+    let (week_at, tow_at, place) = match p.get(c + 2..c + 4) {
+        Some([0x87, 0x81]) => (c + 8, c + 10, None),
+        Some([0xD0, 0x81]) => (c + 58, c + 62, pos.map(|(lat, lon)| (c + 10, (lat >> 7) as u32, c + 22, (-(lon >> 8)) as u32))),
         _ => return false,
     };
     // Offsets hold only if nothing before the fields was escaped.
     if p.len() < tow_at + 4 || p[c + 2..tow_at + 4].contains(&0xC0) {
         return false;
     }
-    let old: u32 = p[week_at..week_at + 2].iter().chain(&p[tow_at..tow_at + 4]).map(|&b| b as u32).sum();
-    let ck = u16::from_le_bytes([p[c + 6], p[c + 7]]);
+    let mut at: alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
     let week = (now / 604_800_000) as u16;
-    let mut tow = (now % 604_800_000) as u32;
-    for _ in 0..16 {
-        let (w, t) = (week.to_le_bytes(), tow.to_le_bytes());
-        let new: u32 = w.iter().chain(&t).map(|&b| b as u32).sum();
+    let tow = (now % 604_800_000) as u32;
+    let ck = u16::from_le_bytes([p[c + 6], p[c + 7]]);
+    for n in 0..16u32 {
+        at.clear();
+        at.push((week_at, week.to_le_bytes().to_vec()));
+        at.push((tow_at, (tow + n).to_le_bytes().to_vec()));
+        if let Some((lat_at, lat, lon_at, lon)) = place {
+            at.push((lat_at, (lat + n).to_le_bytes().to_vec()));
+            at.push((lon_at, (lon + n).to_le_bytes().to_vec()));
+        }
+        let old: u32 = at.iter().map(|(o, v)| p[*o..*o + v.len()].iter().map(|&b| b as u32).sum::<u32>()).sum();
+        let new: u32 = at.iter().map(|(_, v)| v.iter().map(|&b| b as u32).sum::<u32>()).sum();
         let ck2 = (ck as u32).wrapping_sub(old).wrapping_add(new) as u16;
-        if !w.iter().chain(&t).chain(&ck2.to_le_bytes()).any(|&b| b == 0xC0) {
-            p[week_at..week_at + 2].copy_from_slice(&w);
-            p[tow_at..tow_at + 4].copy_from_slice(&t);
+        if !at.iter().flat_map(|(_, v)| v.iter()).chain(&ck2.to_le_bytes()).any(|&b| b == 0xC0) {
+            for (o, v) in &at {
+                p[*o..*o + v.len()].copy_from_slice(v);
+            }
             p[c + 6..c + 8].copy_from_slice(&ck2.to_le_bytes());
             f[end] = crc(&f[1..end]);
             return true;
         }
-        tow += 1;
     }
     false
 }
@@ -477,7 +498,7 @@ fn reliable_seqs(rec: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 /// `diag gnss boot`: the chip up from cold and its patch downloaded by ferros — lhd's own opening replayed (`replay`: the vault's `gnss.replay`, records `[len u16][gap ms u16][bytes]` cut from a capture of lhd: the autobaud bursts, the transport sync, and the 239-packet patch download; Google's patch is in it, so it lives in the vault and on Harbor, never in the repo). Each record goes out through the SSI layer; a record with reliable frames waits (up to 300 ms) for the chip to ack every one before the next, reading whenever HOST_REQ is up; the rest wait lhd's own gap (at most 200 ms). Then ten seconds of whatever the chip sends, and its rate.
-pub fn boot(replay: &[u8], tail_s: u64, out: &mut alloc::vec::Vec<u8>) {
+pub fn boot(replay: &[u8], tail_s: u64, pos: Option<(i32, i32)>, out: &mut alloc::vec::Vec<u8>) {
     if replay.len() < 4 || &replay[..4] != b"GNR1" {
         out.extend_from_slice(b"no replay (vault key gnss.replay, GNR1 records)\n");
         return;
@@ -498,7 +519,7 @@ pub fn boot(replay: &[u8], tail_s: u64, out: &mut alloc::vec::Vec<u8>) {
         recs += 1;
         crate::platform::pet_watchdogs();
         rx.clear();
-        let patched = patch_time(rec);
+        let patched = patch_aiding(rec, pos);
         if patched.is_some() {
             timed += 1;
         }
@@ -550,11 +571,15 @@ pub fn boot(replay: &[u8], tail_s: u64, out: &mut alloc::vec::Vec<u8>) {
         }
     }
     out.extend_from_slice(alloc::format!("the last {tail_s} s: {tail_bytes} bytes from the chip ({} B/s)\n", tail_bytes as u64 / tail_s.max(1)).as_bytes());
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        out.extend_from_slice(alloc::format!("fix-class messages: {}, turned away by the flag check: {} (last one's bits 201-220: {:020b})\n", FIX_MSGS.load(Relaxed), FIX_REJECTED.load(Relaxed), FIX_REJECTED_BITS.load(Relaxed)).as_bytes());
+    }
     match d.fix {
         Some(x) => out.extend_from_slice(alloc::format!("{} fixes from the chip's own engine, the first {} ms after power-up; the latest: {}\n", d.fixes, d.first_fix_at.wrapping_sub(t_all) * 1000 / f, x.line()).as_bytes()),
         None => out.extend_from_slice(b"no fix from the chip\n"),
     }
-    out.extend_from_slice(alloc::format!("time aiding: {timed} records rewritten with the time now ({})\n", if gps_ms_now().is_some() { "from the RTC" } else { "no wall clock: the capture's time went" }).as_bytes());
+    out.extend_from_slice(alloc::format!("aiding: {timed} records rewritten with the time now ({}) and {}\n", if gps_ms_now().is_some() { "from the RTC" } else { "no wall clock: the capture's time went" }, if pos.is_some() { "ferros's last fix" } else { "the capture's position (no last fix yet)" }).as_bytes());
     let ms = crate::platform::cntpct().wrapping_sub(t_all) * 1000 / f;
     out.extend_from_slice(alloc::format!("replayed {recs} records in {ms} ms ({errs} SPI errors); {waits} waited for acks, {late} not acked in time; the chip: {} frames, {} acks, {} CRC failures\n", d.frames, d.acks, d.crc_bad).as_bytes());
     out.extend_from_slice(b"the chip's message kinds (first two payload bytes: count):");

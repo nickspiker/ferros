@@ -51,6 +51,17 @@ Captures on rooted Android with `tools/gtrace` (a freestanding ptrace tracer, bu
 
 **Agreement:** the same engine under Android gave the same place (its fixes under gpsd's log, the same spot to a few metres); both sit about 150 m north and 40 m east of the fix Android's host engine (gpsd with Maps) reported indoors an hour earlier. Which of the two engines is right indoors is open; an outdoor fix with both settles it.
 
+## From the sky, on ferros's own aiding (2026-10-26)
+
+What gpsd sends after the patch download, from the on-chip capture (lhd4): the chip's second firmware stage (`02 80` writes with ~1 KB code chunks, ~58 KB), configuration (`03 00`, `06 00`, `10 00`, `17 00` strings), then the aiding — `87 81` time, `d0 81` position and time (sent three times), `8e 81` ×3, `83 81`, `92 81` (not identified), and the LTO subset as `82 81` messages (`1e83` + continuations, ~10 KB). In on-chip mode gpsd uploads no ephemerides ("GenerateAiding() skip because it's onchip ME").
+
+- **Cutting messages out of a replay:** the transport sequence is not under the CRC, so a frame after a cut gets its sequence moved back by the frames cut; every RPC carries a trailer counter (+1 per message, restarting with the second stage), moved back the same way. A rebuild that cuts nothing is byte-identical to the capture.
+- **Without the LTO** (`gnss.replay.sky`, 517 records): first fix 166 s once, nothing in 300 s once (indoors); the chip decodes its own orbits.
+- **`d0 81` is needed:** cut, or with its position zeroed, the chip stays silent for 5-8 minutes (a zero position with whatever uncertainty the message carries points it at the wrong sky). Decoded so far: latitude u32 in 2⁻¹⁶ degrees at body offset 2 (10 bytes after `c0 c1`), longitude u32 in 2⁻¹⁵ degrees, west positive, at body offset 14; the rest (likely altitude and uncertainties) not yet.
+- **ferros's own position:** every session's last fix goes into the vault (`gnss.last`), and the next session's `d0 81` carries it (gnss.rs `patch_aiding`). **With no LTO, ferros's last fix and the RTC's time: first fix at 92 s, 393 fixes in 8 minutes, ±6 m** (`diag gnss boot 480 sky`). What remains from the capture is Broadcom's firmware and gpsd's configuration, not data about the sky.
+- The replay with the LTO kept (`gnss.replay`) slowed as its aiding aged: 11-18 s on 2026-10-25, 78 s and once nothing in 90 s the next morning.
+- Open: the first start with no position at all (the uncertainty field), and the three unidentified messages.
+
 ## Aiding: Broadcom's LTO (measured 2026-10-26)
 
 The replay carries gpsd's aiding from the capture night: the time (ferros rewrites it from the RTC), the last position, the ephemerides gpsd kept, and an LTO file — why the first fix takes ~11 s. LTO ("Long Term Orbits") is Broadcom's service, from Global Locate (hence glpals.com and gpsd's `Gl*` names): every satellite's orbit and clock predicted days ahead. gpsd keeps checking it against the broadcast ephemerides (`CompareLtoBEPos … deltaPos`, 145 lines in one night's log) and flags satellites where they disagree.
