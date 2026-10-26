@@ -330,19 +330,30 @@ pub struct Ring {
 }
 
 /// The clock's colours come from the theme (ferros_sys::theme): the face is its plane, then the swept fill, the fill after noon, the strokes between the rings, the ticks ahead of the fill and those it has passed.
-/// The face's bands from the outside in, in 256ths of the radius: each ring then its stroke, outermost first, then the centre (where the time is written, by the caller). Three rings (decimal: seconds, minutes, hours) or four (dozenal: the 50 s unit's twelfths, the 50 s units, the twelfths of a dozenal hour, the dozenal hours); the centre is the same size in both.
+/// The face's bands from the outside in, in 256ths of the radius: each ring then its stroke, outermost first, then the centre (where the time is written, by the caller). Three rings (decimal: seconds, minutes, hours), four (dozenal: the 50 s unit's twelfths, the 50 s units, the twelfths of a dozenal hour, the dozenal hours) or six (the dozenal clock in focus: two more places); the centre is the same size in all.
 const BANDS3: [i64; 7] = [256, 214, 208, 172, 166, 130, 124];
 const BANDS4: [i64; 9] = [256, 222, 216, 188, 182, 156, 150, 130, 124];
+/// Six rings (the dozenal clock in focus, its day in twelfths six times over): narrower, the centre the same size.
+const BANDS6: [i64; 13] = [256, 240, 234, 218, 212, 196, 190, 174, 168, 152, 146, 130, 124];
+
+/// The bands for an `n`-ring face.
+fn bands_for(n: usize) -> &'static [i64] {
+    match n {
+        6 => &BANDS6,
+        4 => &BANDS4,
+        _ => &BANDS3,
+    }
+}
 
 /// Ring `i` of an `n`-ring face of radius r (Q8): its outer and inner radius, Q8.
 pub fn clock_ring_radii(r: i64, n: usize, i: usize) -> (i64, i64) {
-    let bands: &[i64] = if n == 4 { &BANDS4 } else { &BANDS3 };
+    let bands = bands_for(n);
     (r * bands[2 * i] >> 8, r * bands[2 * i + 1] >> 8)
 }
 
 /// The centre's radius (where the digits are), Q8.
 pub fn clock_centre_radius(r: i64, n: usize) -> i64 {
-    let bands: &[i64] = if n == 4 { &BANDS4 } else { &BANDS3 };
+    let bands = bands_for(n);
     r * bands[2 * n] >> 8
 }
 
@@ -371,11 +382,11 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
     let (bx0, by0, bx1, by1) = bounds(width, height);
     let th = ferros_sys::theme::current();
     let (clock_face, clock_fill, clock_fill_pm, clock_stroke, clock_tick, clock_tick_passed) = (th.plane, th.clock_fill, th.clock_fill_pm, th.clock_stroke, th.clock_tick, th.clock_tick_passed);
-    let n = rings.len().clamp(1, 4);
-    let bands: &[i64] = if n == 4 { &BANDS4 } else { &BANDS3 };
+    let n = rings.len().clamp(1, 6);
+    let bands = bands_for(n);
     // The centre's band index: 2n (each ring and its stroke before it).
     let cb = 2 * n;
-    let rad: [i64; 9] = core::array::from_fn(|i| if i < bands.len() { r * bands[i] >> 8 } else { 0 });
+    let rad: [i64; 13] = core::array::from_fn(|i| if i < bands.len() { r * bands[i] >> 8 } else { 0 });
     // A face direction to the screen: turned by (tc, ts).
     let turn = |(ux, uy): (i64, i64)| ((ux * tc - uy * ts) >> 14, (ux * ts + uy * tc) >> 14);
     // The tick segments: each ring's ticks across it, and the zero mark at the top of the centre — (direction, inner radius, outer radius).

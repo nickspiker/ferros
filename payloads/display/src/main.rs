@@ -426,13 +426,13 @@ static mut CLOCK_GEOM: (i64, i64, i64, i64, i64, usize) = (0, 0, 0, 16384, 0, 3)
 /// The clock as last drawn into the back buffer: each ring's sweep and fill, the digits' key.
 #[derive(Clone, Copy, PartialEq)]
 struct ClockShown {
-    frac: [u32; 4],
-    lighter: [bool; 4],
+    frac: [u32; 6],
+    lighter: [bool; 6],
     key: i64,
     /// The gravity turn it was drawn at (GRAV_TURN; zero without one).
     turn: (i64, i64),
 }
-static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 4], lighter: [false; 4], key: -1, turn: (0, 0) };
+static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 6], lighter: [false; 6], key: -1, turn: (0, 0) };
 
 /// The clock upright by gravity (owner's order, 2026-10-24): the face's turn, Q14 (cos, sin), that puts its 12:00 and its digits up against gravity on the glass, whatever the map's own turn. None until the AoC has sent a sample (then the face turns with the map, as before).
 static mut GRAV_TURN: Option<(i64, i64)> = None;
@@ -474,13 +474,13 @@ fn gravity_poll() -> bool {
 static mut PHASE_CLOCK: [Option<ClockShown>; PHASES] = [None; PHASES];
 
 /// The parts of the clock that differ between `was` and `now`, each its own rectangle (redrawn one at a time, so a wedge on one side and the centre do not become one box across the face): per ring, the wedge its sweep edge moved through (the bounding box of the edge at both ends, and any quarter-turn extreme between, a few pixels wide); the centre when the digits changed. None when a ring wrapped, changed its fill, or moved more than an eighth of a turn: then the whole clock.
-fn clock_dirty(was: &ClockShown, now: &ClockShown) -> Option<([draw::Rect; 5], usize)> {
+fn clock_dirty(was: &ClockShown, now: &ClockShown) -> Option<([draw::Rect; 8], usize)> {
     let (cx, cy, r, tc, ts, n) = unsafe { CLOCK_GEOM };
     let dirs = unsafe { &*(&raw const CLOCK_DIRS) };
     if was.turn != now.turn {
         return None;
     }
-    let mut parts = [draw::Rect::EMPTY; 5];
+    let mut parts = [draw::Rect::EMPTY; 8];
     let mut np = 0;
     let pt = |rad: i64, (ux, uy): (i64, i64)| {
         let (vx, vy) = ((ux * tc - uy * ts) >> 14, (ux * ts + uy * tc) >> 14);
@@ -535,7 +535,9 @@ static mut CLOCK_PART_US: [u64; 2] = [0; 2];
 static mut LAST_CAM: Option<([u8; 18], usize)> = None;
 
 /// The clock's rings and the time written in its centre, from local wall time to the counter's tick, and the unit its digits count in (the key: the digits change when it does). Every ring is a continuous sweep of grey over the dark from 12:00 that clicks back to dark when it wraps (owner, 2026-10-23; continuous 2026-10-24, drawn at whatever rate frames go out). Decimal, three rings: seconds outer, minutes middle, the 12-hour hand inner (after noon its fill is a lighter grey: the AM/PM); digits h:m:s. Dozenal, four rings, the day in twelfths four times over: outermost the 50 s unit's twelfths (about 4.2 s each), then the 50 s units, the dozenal hour's twelfths, the dozenal hours over the whole day; digits from the hour down, without trailing zils (owner: noon is Lun, not Lun:Zil:Zil:Zil).
-fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Option<bool>) {
+fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 6], usize, usize, i64, Option<bool>) {
+    // In focus (the map arrived at it, display op 25), the dozenal clock shows two more places (owner, 2026-10-26): six rings, and six glyphs in two rows of three, the last place about a 35th of a second.
+    let focused = unsafe { FOCUS } == WIDGET_CLOCK;
     let (secs, sub) = ferros_sys::local_time().unwrap_or((0, 0));
     let hz = freq() as i64;
     // Ticks of the counter since local midnight.
@@ -554,10 +556,32 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
         }
     };
     let ring = |frac_q16: u32, lighter: bool, ticks: usize| draw::Ring { frac_q16, lighter, ticks };
-    if dozenal {
+    if dozenal && focused {
+        // Six places: the day's share in dozenal, exact in 128-bit integers (a place's unit is not a whole number of counter ticks): place k counts day / 12^(k+1).
+        let day = 86400 * hz as i128;
+        let tt = t as i128;
+        let places = 6u32;
+        // Ring j (0 outermost) sweeps the unit of place (places - 1 - j): its fraction of that unit.
+        let rings: [draw::Ring; 6] = core::array::from_fn(|j| {
+            let m = places as i128 - 1 - j as i128;
+            let scaled = tt * 12i128.pow(m as u32) % day;
+            ring((scaled * 65536 / day) as u32, false, 12)
+        });
+        let u = (tt * 12i128.pow(places) / day) as i64;
+        let d: [i64; 6] = core::array::from_fn(|k| (u / 12i64.pow(places - 1 - k as u32)) % 12);
+        for (k, v) in d.iter().enumerate() {
+            if k == 3 {
+                put('\n', &mut n);
+            } else if k > 0 {
+                put(':', &mut n);
+            }
+            put(char::from_u32(0x10 + *v as u32).unwrap_or('?'), &mut n);
+        }
+        (rings, 6, n, u, None)
+    } else if dozenal {
         // 50 s / 12 in ticks (the counter runs at 24.576 MHz: 102,400,000, exact).
         let q4 = 50 * hz / 12;
-        let rings = [ring(frac(q4 * 12), false, 12), ring(frac(q4 * 144), false, 12), ring(frac(q4 * 1728), false, 12), ring(frac(q4 * 20736), false, 12)];
+        let rings = [ring(frac(q4 * 12), false, 12), ring(frac(q4 * 144), false, 12), ring(frac(q4 * 1728), false, 12), ring(frac(q4 * 20736), false, 12), ring(0, false, 0), ring(0, false, 0)];
         let u = t / q4;
         let d = [u / 1728, (u / 144) % 12, (u / 12) % 12, u % 12];
         // The last place that is not zil; the hour always shows.
@@ -572,7 +596,7 @@ fn clock_state(text: &mut [u8; 32]) -> ([draw::Ring; 4], usize, usize, i64, Opti
     } else {
         let sod = t / hz;
         let (h, m, sec) = (sod / 3600, (sod / 60) % 60, sod % 60);
-        let rings = [ring(frac(60 * hz), false, 60), ring(frac(3600 * hz), false, 60), ring(frac(43200 * hz), h >= 12, 12), ring(0, false, 0)];
+        let rings = [ring(frac(60 * hz), false, 60), ring(frac(3600 * hz), false, 60), ring(frac(43200 * hz), h >= 12, 12), ring(0, false, 0), ring(0, false, 0), ring(0, false, 0)];
         // Twelve-hour digits to match the twelve-hour hand ring, the hour without a leading zero (9:05:07, not 09:05:07), 12 at noon and midnight; am or pm written under them (owner, 2026-10-24).
         let h12 = if h % 12 == 0 { 12 } else { h % 12 };
         if h12 >= 10 {
@@ -2309,8 +2333,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                             if let Ok(t) = core::str::from_utf8(&tb[..tn]) {
                                 // The centre's width (124/256 of the radius, both sides), less a margin, at the text's natural width.
                                 let room = (sr >> 8) as f32 * 2.0 * 124.0 / 256.0 * 0.82;
-                                // Sized by the widest the time can be (12:00:00, or four dozenal places), so the digits keep one size as the time's own width changes.
-                                let widest = if nrings == 4 { "\u{10}:\u{10}:\u{10}:\u{10}" } else { "00:00:00" };
+                                // Sized by the widest the time can be (12:00:00, four dozenal places, or a row of three in focus), so the digits keep one size as the time's own width changes.
+                                let widest = match nrings {
+                                    6 => "\u{10}:\u{10}:\u{10}",
+                                    4 => "\u{10}:\u{10}:\u{10}:\u{10}",
+                                    _ => "00:00:00",
+                                };
                                 let unit = text_width(&font, widest, 100.0).max(1.0);
                                 // As big as the face makes room for, at every zoom (owner, 2026-10-24: no cap — at 256 px the digits stopped growing with the clock).
                                 let px = room / unit * 100.0;
@@ -2320,8 +2348,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                 let (tcf, tsf) = (fc as f32 / 16384.0, fs as f32 / 16384.0);
                                 let (cxf, cyf) = ((sx >> 8) as f32 + 0.5, (sy >> 8) as f32 + 0.5);
                                 let t_digits = now();
-                                text_turned_centre(pixels, width, height, t, cxf, cyf, px, (tcf, tsf), 0xFF00_0000 | th.text);
-                                ALLOC.reset();
+                                // Two rows in focus (the upper three places over the lower three), one otherwise; rows stack along the face's own down.
+                                let rows = t.split('\n').count() as f32;
+                                for (k, line) in t.split('\n').enumerate() {
+                                    let d = (k as f32 - (rows - 1.0) * 0.5) * px * 1.15;
+                                    text_turned_centre(pixels, width, height, line, cxf - tsf * d, cyf + tcf * d, px, (tcf, tsf), 0xFF00_0000 | th.text);
+                                    ALLOC.reset();
+                                }
                                 // am / pm under the digits, half their size, turned with the face.
                                 if let Some(pm) = pm {
                                     let d = px * 0.8;
@@ -2724,9 +2757,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let flip_due = unsafe { TEMPORAL } && !screen_off && ferros_sys::pref(ferros_sys::PREF_DITHER) == 0 && unsafe { PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } && now() >= next_flip;
         // With a widget in focus the flips run at the panel's rate; the clock keeps 10 Hz, drawn into every phase at once (owner, 2026-10-25: the focused widget at full rate, everything else at 10).
         let focus = unsafe { FOCUS } != 0;
-        let clock_now = !focus || now() >= clock_slow_next;
+        // The clock itself in focus runs at the panel's rate too (its last place turns over ~35 times a second).
+        let clock_focus = unsafe { FOCUS } == WIDGET_CLOCK;
+        let clock_now = !focus || clock_focus || now() >= clock_slow_next;
         if flip_due && clock_now && unsafe { CLOCK_SHOWN && !{ CLOCK_RECT }.is_empty() && (*(&raw const APP)).is_none() && LAST_FRAME.1 > 0 } {
-            if focus {
+            if focus && !clock_focus {
                 clock_slow_next = now() + freq() / 10;
                 unsafe { CLIP_MASK = (1 << PHASES) - 1 };
             }
@@ -2735,7 +2770,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let mut tb = [0u8; 32];
             let (rings, _, _, key, _) = clock_state(&mut tb);
             let now_c = ClockShown { frac: core::array::from_fn(|i| rings[i].frac_q16), lighter: core::array::from_fn(|i| rings[i].lighter), key, turn: unsafe { GRAV_TURN }.unwrap_or((0, 0)) };
-            let whole = ([unsafe { CLOCK_RECT }, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY, draw::Rect::EMPTY], 1);
+            let whole = ({
+                let mut w = [draw::Rect::EMPTY; 8];
+                w[0] = unsafe { CLOCK_RECT };
+                w
+            }, 1);
             let (parts, np) = match unsafe { PHASE_CLOCK[k] } {
                 Some(was) => clock_dirty(&was, &now_c).unwrap_or(whole),
                 None => whole,

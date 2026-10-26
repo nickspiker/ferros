@@ -60,6 +60,8 @@ const DEVICE: usize = 0;
 const RAMPS: usize = 5;
 /// The light scope: arrived at, it is in focus (`Map::scope_drag`).
 const SCOPE: usize = 7;
+/// The clock: arrived at, it is in focus, and the display shows it to two more places (owner, 2026-10-26).
+const CLOCK: usize = 6;
 /// The scope's channels a vertical swipe steps through, as device preference 7 numbers them (1 + the VD6282's channel: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear), longest wavelength first and the composites last.
 const SCOPE_STEPS: [u8; 6] = [5, 1, 4, 3, 2, 6];
 
@@ -780,9 +782,17 @@ impl Map {
         self.send_focus();
     }
 
-    /// The display told what is in focus (op 25): the scope when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; the span it shows; and whether it is folded. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
+    /// The display told what is in focus (op 25): the scope or the clock when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; the scope's span and whether it is folded. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
     fn send_focus(&mut self) {
-        let f = (if self.view == View::Front(SCOPE) { CIRCLES[SCOPE].icon } else { 0 }, self.scope_span_us, self.scope_fold);
+        let f = (
+            match self.view {
+                View::Front(SCOPE) => CIRCLES[SCOPE].icon,
+                View::Front(CLOCK) => CIRCLES[CLOCK].icon,
+                _ => 0,
+            },
+            self.scope_span_us,
+            self.scope_fold,
+        );
         if f != self.focus_sent {
             self.focus_sent = f;
             let mut m = [0u8; 7];
