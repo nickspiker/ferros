@@ -295,7 +295,7 @@ fn reliable_seqs(rec: &[u8]) -> alloc::vec::Vec<u8> {
     out
 }
 
-/// `diag gnss boot`: the chip up from cold and its patch downloaded by ferros — lhd's own opening replayed (`replay`: the vault's `gnss.replay`, records `[len u16][gap ms u16][bytes]` cut from a capture of lhd: the autobaud bursts, the transport sync, and the 239-packet patch download; Google's patch is in it, so it lives in the vault and on Harbor, never in the repo). Each record goes out through the SSI layer; a record with reliable frames waits (up to 300 ms) for the chip to ack every one before the next, reading whenever HOST_REQ is up; the rest wait lhd's own gap (at most 200 ms). Then two seconds of whatever the chip sends.
+/// `diag gnss boot`: the chip up from cold and its patch downloaded by ferros — lhd's own opening replayed (`replay`: the vault's `gnss.replay`, records `[len u16][gap ms u16][bytes]` cut from a capture of lhd: the autobaud bursts, the transport sync, and the 239-packet patch download; Google's patch is in it, so it lives in the vault and on Harbor, never in the repo). Each record goes out through the SSI layer; a record with reliable frames waits (up to 300 ms) for the chip to ack every one before the next, reading whenever HOST_REQ is up; the rest wait lhd's own gap (at most 200 ms). Then ten seconds of whatever the chip sends, and its rate.
 pub fn boot(replay: &[u8], out: &mut alloc::vec::Vec<u8>) {
     if replay.len() < 4 || &replay[..4] != b"GNR1" {
         out.extend_from_slice(b"no replay (vault key gnss.replay, GNR1 records)\n");
@@ -323,9 +323,11 @@ pub fn boot(replay: &[u8], out: &mut alloc::vec::Vec<u8>) {
         d.feed(&rx);
         let want = reliable_seqs(rec);
         let t0 = crate::platform::cntpct();
-        let limit = if want.is_empty() { f / 1000 * gap.min(200) } else { f / 1000 * 60 };
+        // lhd's own gap to the next record (up to a second), and for reliable packets at least 60 ms for their acks: the session after the download is paced in real time, as gpsd's configuration and start went.
+        let limit = f / 1000 * gap.min(1000).max(if want.is_empty() { 0 } else { 60 });
+        let pace = f / 1000 * gap.min(1000);
         while crate::platform::cntpct().wrapping_sub(t0) < limit {
-            if !want.is_empty() && want.iter().all(|&s| d.acked[s as usize]) {
+            if !want.is_empty() && want.iter().all(|&s| d.acked[s as usize]) && crate::platform::cntpct().wrapping_sub(t0) >= pace {
                 break;
             }
             if get(HOST_REQ) {
@@ -344,14 +346,17 @@ pub fn boot(replay: &[u8], out: &mut alloc::vec::Vec<u8>) {
         }
     }
     let t0 = crate::platform::cntpct();
-    while crate::platform::cntpct().wrapping_sub(t0) < 2 * f {
+    let mut tail_bytes = 0usize;
+    while crate::platform::cntpct().wrapping_sub(t0) < 10 * f {
         crate::platform::pet_watchdogs();
         if get(HOST_REQ) {
             rx.clear();
             let _ = ssi_read(&mut rx);
+            tail_bytes += rx.len();
             d.feed(&rx);
         }
     }
+    out.extend_from_slice(alloc::format!("the last 10 s: {tail_bytes} bytes from the chip ({} B/s)\n", tail_bytes / 10).as_bytes());
     let ms = crate::platform::cntpct().wrapping_sub(t_all) * 1000 / f;
     out.extend_from_slice(alloc::format!("replayed {recs} records in {ms} ms ({errs} SPI errors); {waits} waited for acks, {late} not acked in time; the chip: {} frames, {} acks, {} CRC failures\n", d.frames, d.acks, d.crc_bad).as_bytes());
     out.extend_from_slice(b"the chip's message kinds (first two payload bytes: count):");

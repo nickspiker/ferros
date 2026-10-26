@@ -39,9 +39,11 @@ Captures on rooted Android with `tools/gtrace` (a freestanding ptrace tracer, bu
 
 **Under ferros (`diag gnss boot`):** the chip powered from cold, the transport synced and the patch downloaded by ferros itself — lhd's opening replayed from the vault (`gnss.replay`, records cut from the capture; Google's patch is in it, so vault and Harbor only): 554 records in 3.3 s, every reliable packet acked, no CRC failures, and the chip's opening messages byte-identical to what it sent lhd, then its periodic `1F80` reports.
 
+**Navigating under ferros:** the first 60 s of lhd's session replayed in real time (each record waits for its acks and lhd's own gap): 987 records, all 980 reliable packets acked, 9,163 frames from the chip with no CRC failure, and in the ten seconds after, **18.1 KB/s from the chip** — the rate it streamed measurements to gpsd on Android once tracking — its messages now mostly `1F80` with `1F81`. The configuration and aiding in that session are stale (the capture's time and position); the chip navigates regardless.
+
 ## Next
 
-1. **Navigation:** replay the next part of lhd's session (gpsd's configuration and start), stale aiding included, and see the measurement stream start under ferros.
+1. ~~Navigation~~ — done above.
 2. **A position:** either decode the measurement messages (pseudoranges, Doppler, the navigation data) and solve on the AP — ferros's own position engine — or reach the on-chip engine through the AoC's path. Both are real work; the first keeps everything on the AP.
 
 Earlier plan, kept for reference:
