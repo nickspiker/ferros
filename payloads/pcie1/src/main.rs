@@ -25,6 +25,8 @@ const PMU: u64 = 12;
 const ENTROPY: u64 = 13;
 /// The DMA region (`--dma pcie1-dma`, after the entropy right).
 const DMA: u64 = 14;
+/// The vault scope `wifi.` (grant slot after the `wlan` endpoint; init grants it at boot): the firmware (`fw`), the NVRAM text (`nvram`), the CLM blob (`clm`) and the credential (`cred`), for a start with no input files.
+const STORE: u64 = 16;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -202,7 +204,9 @@ impl Drv {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
-    let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else { 0 };
+    // Spawned by init at boot there is no input (a spawn from the vault carries none): with the vault scope granted, the whole bring-up from the vault's files; from the bridge, the stage byte it was given.
+    let has_store = unsafe { core::ptr::read_volatile((base + grants) as *const u32) } as u64 > STORE;
+    let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else if has_store { 14 } else { 0 };
     let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false, win: u32::MAX };
     let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
     run(&mut d, stage, rest);
@@ -609,13 +613,23 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     }
 
     // ---- stage 7: download and start the firmware (dhd_pcie.c _dhdpcie_download_firmware with the CA7 path of __dhdpcie_bus_download_state). Input after the stage byte: [u32 LE len][firmware .bin][u32 LE len][NVRAM text]. ----
-    let Some((fw, nv, clm, cred)) = split_files(files) else {
-        d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob [--input-file wifi_credential]]\n");
-        d.failed = true;
-        return;
+    // The files: the bridge's --input-file inputs, or, with none, the vault scope `wifi.` (init's boot start): the firmware streamed from the vault into the chip's RAM a piece at a time, the small files into scratch at 1 MiB into the DMA region (its rings and buffers end below 576 KiB).
+    let (fw, nv, clm, cred): (Fw, &mut [u8], &[u8], &[u8]) = match split_files(files) {
+        Some((fw, nv, clm, cred)) => (Fw::Mem(fw), nv, clm, cred),
+        None => match from_vault(d) {
+            Some(v) => v,
+            None => {
+                d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob [--input-file wifi_credential]], or the vault's wifi.fw / wifi.nvram / wifi.clm / wifi.cred\n");
+                d.failed = true;
+                d.flush();
+                return;
+            }
+        },
     };
     d.kv(b"fw.len", fw.len() as u32);
     d.kv(b"nvram.raw_len", nv.len() as u32);
+    d.kv(b"clm.len", clm.len() as u32);
+    d.flush();
     if fw.len() < 4 || fw.len() as u32 > ramsize {
         d.put(b"firmware does not fit\n");
         d.failed = true;
@@ -660,9 +674,27 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     let ramtop = RAM_BASE + ramsize;
     d.tcm_wr(ramtop - 4, 0);
     // The image at the RAM base; its first word is the reset instruction, written to address 0 last.
-    let resetinstr = u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]);
     let t0 = d.now();
-    let bad = d.tcm_write_verify(RAM_BASE, fw);
+    let (resetinstr, bad) = match fw {
+        Fw::Mem(fw) => (u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]), d.tcm_write_verify(RAM_BASE, fw)),
+        Fw::Vault(len) => {
+            let mut chunk = [0u8; 4096];
+            let (mut off, mut bad, mut first) = (0usize, 0u32, 0u32);
+            while off < len {
+                let n = (len - off).min(chunk.len());
+                if store_get_at(d, b"fw", off, &mut chunk[..n]).is_none() {
+                    bad += 1;
+                    break;
+                }
+                if off == 0 {
+                    first = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                bad += d.tcm_write_verify(RAM_BASE + off as u32, &chunk[..n]);
+                off += n;
+            }
+            (first, bad)
+        }
+    };
     d.kv(b"fw.write_verify_ms", ((d.now().wrapping_sub(t0) * 1000) / d.freq) as u32);
     d.kv(b"fw.bad_words", bad);
     d.flush();
@@ -1733,6 +1765,59 @@ fn split_files(b: &mut [u8]) -> Option<(&[u8], &mut [u8], &[u8], &[u8])> {
         _ => &[],
     };
     Some((first, second, third, fourth))
+}
+
+/// Where the firmware comes from: the process input (the bridge), or the vault, streamed (its length).
+enum Fw<'a> {
+    Mem(&'a [u8]),
+    Vault(usize),
+}
+impl Fw<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Fw::Mem(f) => f.len(),
+            Fw::Vault(n) => *n,
+        }
+    }
+}
+
+/// Part of a value in the vault scope `wifi.` (SYS_STORE, piecewise: bit 1, the offset in bits 32-63): `buf.len()` bytes from `off`. Returns the value's whole length.
+fn store_get_at(d: &Drv, key: &[u8], off: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(13, d.cap(STORE), 2 | (buf.len() as u64) << 8 | (off as u64) << 32, key.as_ptr() as u64 - d.base, key.len() as u64, buf.as_mut_ptr() as u64 - d.base);
+    (r != ERR && r != ERR - 1).then_some(r as usize)
+}
+
+/// The files from the vault scope `wifi.`: the firmware's length (it is streamed later), and the NVRAM text, CLM blob and credential read whole into scratch in the DMA region (1 MiB in, 64 KiB each at most).
+fn from_vault(d: &Drv) -> Option<(Fw<'static>, &'static mut [u8], &'static [u8], &'static [u8])> {
+    let dma = svc(7, d.cap(DMA), 0, 0, 0, 0);
+    if dma == ERR {
+        return None;
+    }
+    let mut head = [0u8; 4];
+    let fw_len = store_get_at(d, b"fw", 0, &mut head)?;
+    let mut read = |key: &[u8], at: u64| -> Option<&'static mut [u8]> {
+        let mut h = [0u8; 4];
+        let len = store_get_at(d, key, 0, &mut h)?;
+        if len > 0x1_0000 {
+            return None;
+        }
+        // SAFETY: the DMA region is this process's alone, mapped EL0 read/write for the boot; this scratch lies past every ring and buffer the driver places there.
+        let buf = unsafe { core::slice::from_raw_parts_mut((dma + at) as *mut u8, len) };
+        // The vault copies into this process's own memory (an arc offset): through a piece on the stack, then into the scratch (the first try handed the DMA region's address and the process ended without a word, 2026-10-26).
+        let mut piece = [0u8; 4096];
+        let mut off = 0;
+        while off < len {
+            let n = (len - off).min(piece.len());
+            store_get_at(d, key, off, &mut piece[..n])?;
+            buf[off..off + n].copy_from_slice(&piece[..n]);
+            off += n;
+        }
+        Some(buf)
+    };
+    let nv = read(b"nvram", 0x10_0000)?;
+    let clm = read(b"clm", 0x11_0000).map(|b| &*b).unwrap_or(&[]);
+    let cred = read(b"cred", 0x12_0000).map(|b| &*b).unwrap_or(&[]);
+    Some((Fw::Vault(fw_len), nv, clm, cred))
 }
 
 /// The WiFi credential file (keys/wifi.txt): the SSID on the first line, the passphrase on the second. Never printed.

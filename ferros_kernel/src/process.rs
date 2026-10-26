@@ -836,6 +836,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "map", prefix: "map." },
     // The GNSS driver's: its session replay (`gnss.replay`, `gnss.replay.sky`) and its last fix (`gnss.last`).
     StoreScope { name: "gnss", prefix: "gnss." },
+    // The WiFi driver's: its firmware (`wifi.fw`), NVRAM text (`wifi.nvram`), CLM blob (`wifi.clm`) and the network credential (`wifi.cred`; secret, never printed).
+    StoreScope { name: "wifi", prefix: "wifi." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
@@ -1169,7 +1171,12 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             Some((_, v)) => {
                                 let piece = &v[at.min(v.len())..(at + len).min(v.len())];
                                 p.write(f.x[4], piece);
-                                v.len() as u64
+                                let total = v.len();
+                                // The last piece read: the copy goes (a 2.1 MB WiFi firmware need not sit in the heap for the rest of the boot).
+                                if at + len >= total {
+                                    *cache = None;
+                                }
+                                total as u64
                             }
                             None => NOTHING,
                         }

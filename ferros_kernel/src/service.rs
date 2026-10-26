@@ -372,6 +372,15 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         // 26 the display's sprite cache, 27 its canvas.
         Dma(b"display-sprites"),
         Dma(b"display-canvas"),
+        // The network (WIFI.md): 28 serve wlan; 29-40 the WiFi driver's hardware (PCIe ch1's blocks, the HSI2 and far-alive GPIO banks, CMU_HSI2, the PMU through EL3); 41 entropy (the driver's firmware seed, the IP stack's choices); 42 the driver's DMA region; 43 the vault scope `wifi.`; 44 use wlan; 45 serve udp.
+        Serve(b"wlan"),
+        Hardware(b"pcie1-elbi"), Hardware(b"pcie1-soc"), Hardware(b"pcie1-pcs"), Hardware(b"pcie1-udbg"), Hardware(b"pcie1-phy"), Hardware(b"pcie1-dbi"), Hardware(b"pcie1-cfg"), Hardware(b"pcie1-mem"),
+        Hardware(b"gpio-hsi2"), Hardware(b"gpio-far-alive"), Hardware(b"cmu-hsi2"), Hardware(b"pmu"),
+        Entropy,
+        Dma(b"pcie1-dma"),
+        Store(b"wifi"),
+        Use(b"wlan"),
+        Serve(b"udp"),
     ]
 }
 
@@ -382,6 +391,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22],
+        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
+        b"ip" => &[44, 45, 41],
         _ => return None,
     };
     let all = home_grants();
