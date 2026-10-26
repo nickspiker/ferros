@@ -1,0 +1,18 @@
+[package]
+name = "ferros-payload-pqprobe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pqprobe"
+path = "src/main.rs"
+
+[dependencies]
+ferros_sys = { path = "../../ferros_sys" }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+ed25519-dalek = { version = "2", default-features = false }
+fn-dsa = { version = "0.4", default-features = false }
+fips205 = { version = "0.4", default-features = false, features = ["slh_dsa_sha2_128s"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
