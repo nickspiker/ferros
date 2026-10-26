@@ -820,16 +820,6 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         }
     }
 }
-/// The latest GNSS fix into the vault as `gnss.last` (latitude, longitude i32 LE in 2⁻²³ degrees): the next session tells the chip where it was (gnss.rs patch_aiding).
-fn gnss_keep_last(store: *mut Option<ShimStore>) {
-    let Some(x) = (unsafe { crate::gnss::LAST_FIX }) else {
-        return;
-    };
-    let mut v = [0u8; 8];
-    v[..4].copy_from_slice(&x.lat.to_le_bytes());
-    v[4..].copy_from_slice(&x.lon.to_le_bytes());
-    let _ = crate::process::with_lock(|| unsafe { (*store).as_mut().map(|s| s.set("gnss.last", &v)) });
-}
 /// `diag smp dark on|off`: whether the workers go off with the dark profile (on by default).
 pub static DARK_WORKERS_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
@@ -1059,7 +1049,6 @@ pub fn run(mut b: Boot) -> ! {
         gauge_poll();
         power_poll();
         crate::odpm::poll();
-        crate::gnss::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
         clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
@@ -1850,21 +1839,8 @@ pub fn run(mut b: Boot) -> ! {
                                             // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
                                             if cmd.params == b"gnss up" {
                                                 crate::gnss::up(&mut resp);
-                                            } else if cmd.params == b"gnss fix" {
-                                                crate::gnss::fix(&mut resp);
                                             } else if cmd.params == b"gnss off" {
-                                                gnss_keep_last(&raw mut store);
                                                 crate::gnss::off(&mut resp);
-                                            } else if cmd.params.starts_with(b"gnss boot") {
-                                                // `diag gnss boot [s] [sky]`: the chip powered and its patch downloaded by ferros, a session of lhd's replayed from the vault's `gnss.replay` (`sky`: `gnss.replay.sky`, the same without the LTO orbits, so the chip decodes its own from the sky) with the time from the RTC and the position from ferros's last fix (`gnss.last`), then `s` seconds (default 10, at most 600) of what the chip sends, its fixes decoded; the latest fix kept as `gnss.last`.
-                                                let words = core::str::from_utf8(&cmd.params[9..]).unwrap_or("");
-                                                let tail_s = words.split_whitespace().find_map(|w| w.parse::<u64>().ok()).unwrap_or(10).min(600);
-                                                let key = if words.split_whitespace().any(|w| w == "sky") { "gnss.replay.sky" } else { "gnss.replay" };
-                                                let st = &raw mut store;
-                                                let (replay, last) = crate::process::with_lock(|| unsafe { (*st).as_mut().map(|s| (s.get_by_key(key).ok().flatten(), s.get_by_key("gnss.last").ok().flatten())) }).unwrap_or_default();
-                                                let pos = last.filter(|v| v.len() == 8).map(|v| (i32::from_le_bytes([v[0], v[1], v[2], v[3]]), i32::from_le_bytes([v[4], v[5], v[6], v[7]])));
-                                                crate::gnss::boot(&replay.unwrap_or_default(), tail_s, pos, &mut resp);
-                                                gnss_keep_last(&raw mut store);
                                             } else {
                                                 crate::gnss::state(&mut resp);
                                             }
@@ -3035,6 +3011,8 @@ pub fn run(mut b: Boot) -> ! {
                                                     3 => crate::process::Grant::Hardware(g),
                                                     4 => crate::process::Grant::Entropy,
                                                     5 => crate::process::Grant::Dma(g),
+                                                    6 => crate::process::Grant::Store(g),
+                                                    7 => crate::process::Grant::Power(g),
                                                     8 => crate::process::Grant::Irq(g),
                                                     _ => crate::process::Grant::Use(g),
                                                 });

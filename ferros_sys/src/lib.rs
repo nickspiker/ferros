@@ -38,6 +38,7 @@ pub mod nr {
     pub const IRQ_ACK: u64 = 19;
     pub const PIN: u64 = 20;
     pub const LIGHT: u64 = 21;
+    pub const POWER: u64 = 22;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -178,6 +179,21 @@ impl Facts {
 pub fn store_get(cap: u64, key: &[u8], buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, (buf.len() as u64) << 8, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+/// Read part of a value larger than one transfer: `buf.len()` bytes (at most 4096) from `offset` of the value under `key`. Returns the value's whole length (the kernel keeps the value between such reads, so walking a large one costs one vault read).
+pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+/// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.
+pub fn power(cap: u64, on: bool) -> bool {
+    pin(CORES_BIG);
+    sleep_until(now() + freq() / 1000);
+    let r = svc(nr::POWER, cap, on as u64, 0, 0, 0);
+    pin(0);
+    r == 0
 }
 
 /// Write `value` under `key` in a Store capability's vault scope; true when the vault took it.

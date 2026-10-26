@@ -218,6 +218,8 @@ pub enum Object {
     Store(usize),
     /// An interrupt line (index into `IRQS`): `irq_wait` blocks a thread until it fires, `irq_ack` unmasks it again (KERNEL.md "Interrupts to user space").
     Irq(usize),
+    /// Served by the kernel: a device's power (index into `POWERS`): rails, clocks and pin modes the driver cannot set itself (`SYS_POWER`).
+    Power(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -252,6 +254,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Settings => (6, 0),
         Object::Store(i) => (7, i as u64),
         Object::Irq(i) => (8, i as u64),
+        Object::Power(i) => (9, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -589,7 +592,9 @@ const SYS_IRQ_ACK: u64 = 19;
 const SYS_PIN: u64 = 20;
 /// The light scope's samples (usf.rs): x0/x1 a buffer and its length; a 16-byte header {u64 the stream's next sample number, u32 rate Hz, u32 the channel mask} then the latest samples (i32, oldest first) as many as fit, up to a second. No capability: it is the light falling on the back of the phone. Returns the bytes written.
 const SYS_LIGHT: u64 = 21;
-const SYS_LAST: u64 = 21;
+/// A device's power: x0 the `Power` capability, x1 1 = on, 0 = off. Runs only on the kernel's core (the X3), where it cannot interleave with the service loop's own firmware calls (ACPM): a thread pins itself there first (`SYS_PIN` G#100, then any sleep). Returns 0, or ERR.
+const SYS_POWER: u64 = 22;
+const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
 pub struct IrqLine {
@@ -608,6 +613,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "decon0-frame-done", intid: IRQ_DECON0_FRAME_DONE },
     // DECON0's frame-start: the trigger took and the frame is going out (what the display's `settle` waits for).
     IrqLine { name: "decon0-frame-start", intid: IRQ_DECON0_FRAME_START },
+    // The GNSS chip's HOST_REQ ("I have data"): gpa5-3, EINT53 in the far-alive bank, its own line (zuma.h IRQ_ALIVE_EINT53 = SPI 63), level high.
+    IrqLine { name: "gnss-host-req", intid: 32 + 63 },
 ];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]
@@ -827,9 +834,13 @@ pub struct StoreScope {
 pub static STORES: &[StoreScope] = &[
     // The map's own state: the arrangement the owner made by hand.
     StoreScope { name: "map", prefix: "map." },
+    // The GNSS driver's: its session replay (`gnss.replay`, `gnss.replay.sky`) and its last fix (`gnss.last`).
+    StoreScope { name: "gnss", prefix: "gnss." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
+/// The last value read piecewise (key, value), so a large value is fetched from the vault once.
+static mut STORE_CACHE: Option<(alloc::string::String, Vec<u8>)> = None;
 /// The largest value `SYS_STORE` moves either way.
 pub const STORE_MAX: usize = 4096;
 
@@ -879,7 +890,16 @@ pub static HARDWARE: &[Hw] = &[
     // Its clocks, rails and reset are not here on purpose: the kernel's `touch::up` does those (ACPM and the HSI0 CMU), so the server never needs a privileged path.
     Hw { name: "usi2-spi", base: 0x111D_0000, size: 0x1000, via_el3: false },
     Hw { name: "gpio-gpn0", base: 0x1506_0000, size: 0x1000, via_el3: false },
+    // The GNSS chip (GNSS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
+    Hw { name: "usi3-spi", base: 0x111E_0000, size: 0x1000, via_el3: false },
 ];
+
+/// A device's power switch a spawn can grant (`bridge spawn --power NAME`): the kernel's sequence for the rails, clocks and pin modes behind a userspace driver.
+pub struct PowerSwitch {
+    pub name: &'static str,
+    pub set: fn(bool) -> bool,
+}
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
@@ -1125,7 +1145,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i),
                 _ => None,
             };
-            let (set, len) = (f.x[1] & 1 == 1, (f.x[1] >> 8) as usize);
+            // x1: bit 0 set, bit 1 a read at an offset (bits 32-63) into a value larger than one transfer, the length in bits 8-31.
+            let (set, at, len) = (f.x[1] & 1 == 1, if f.x[1] & 2 != 0 { Some((f.x[1] >> 32) as usize) } else { None }, ((f.x[1] >> 8) & 0xFF_FFFF) as usize);
             let rel = p.read(f.x[2], (f.x[3] as usize).min(65));
             f.x[0] = match (scope, unsafe { STORE }) {
                 (Some(sc), Some(store)) if !rel.is_empty() && rel.len() <= 64 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && len <= STORE_MAX => {
@@ -1133,7 +1154,25 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     key.push_str(core::str::from_utf8(&rel).unwrap_or(""));
                     if set {
                         let value = p.read(f.x[4], len);
+                        unsafe { *(&raw mut STORE_CACHE) = None };
                         if store(&key, Some(&value)).is_ok() { 0 } else { ERR }
+                    } else if let Some(at) = at {
+                        // A large value read piecewise: the whole value is kept once, for the reads that follow (a 250 KB replay is 62 of them).
+                        let cache = unsafe { &mut *(&raw mut STORE_CACHE) };
+                        if cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                            *cache = match store(&key, None) {
+                                Ok(Some(v)) => Some((key.clone(), v)),
+                                _ => None,
+                            };
+                        }
+                        match cache {
+                            Some((_, v)) => {
+                                let piece = &v[at.min(v.len())..(at + len).min(v.len())];
+                                p.write(f.x[4], piece);
+                                v.len() as u64
+                            }
+                            None => NOTHING,
+                        }
                     } else {
                         match store(&key, None) {
                             Ok(Some(v)) => {
@@ -1144,6 +1183,16 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             Err(()) => ERR,
                         }
                     }
+                }
+                _ => ERR,
+            };
+            0
+        }
+        SYS_POWER => {
+            let token = p.read(f.x[0], 32);
+            f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == MASK_BIG => {
+                    if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
                 }
                 _ => ERR,
             };
@@ -1725,6 +1774,8 @@ pub enum Grant<'a> {
     Store(&'a [u8]),
     /// An interrupt line from the registry, by name (syscalls 18, 19).
     Irq(&'a [u8]),
+    /// A device's power, by name (syscall 22).
+    Power(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -1825,6 +1876,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Irq(n) => match IRQS.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Irq(i), RIGHT_SEND),
                 None => return Err("no such interrupt line"),
+            },
+            Grant::Power(n) => match POWERS.iter().position(|r| r.name.as_bytes() == *n) {
+                Some(i) => (Object::Power(i), RIGHT_SEND),
+                None => return Err("no such power switch"),
             },
         });
     }

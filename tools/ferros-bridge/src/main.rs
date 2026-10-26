@@ -321,6 +321,9 @@ async fn main() {
                     "--use" => { grants.push((2, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--hw" => { grants.push((3, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--irq" => { grants.push((8, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    // --store NAME: a scope of the device vault (syscall 13); --power NAME: a device's power switch (syscall 22).
+                    "--store" => { grants.push((6, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    "--power" => { grants.push((7, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     // --entropy: the right to draw randomness from the session's wairua (syscall 6).
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).
