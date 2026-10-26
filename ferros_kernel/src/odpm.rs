@@ -34,11 +34,14 @@ const NLDO800: f32 = 0.002442002442002;
 const PLDO800: f32 = 0.004884004884004;
 const DVS1200ON: f32 = 0.001831501831501;
 const NLDO1200: f32 = 0.001831501831501;
+/// External channels (a shunt on a VSYS feed): mW per count = VRAIL 2.1978021 × VSHUNT 0.7935698 × TRIM 8 × 10 / the shunt in µΩ (iio/power/odpm.c, s2mpg1415-register.h).
+const EXT10M: f32 = 2.1978021 * 0.7935698 * 8.0 * 10.0 / 10000.0;
+const EXT5M: f32 = 2.1978021 * 0.7935698 * 8.0 * 10.0 / 5000.0;
 
 /// (selector, schematic name, resolution) per rail.
 type Rail = (u8, &'static str, f32);
 
-static MAIN_RAILS: [Rail; 34] = [
+static MAIN_RAILS: [Rail; 37] = [
     (0x01, "S1M_VDD_MIF", CMS),
     (0x02, "S2M_VDD_CPUCL2", CMD),
     (0x03, "S3M_VDD_CPUCL1", CMT),
@@ -73,9 +76,12 @@ static MAIN_RAILS: [Rail; 34] = [
     (0x37, "L23M", PLDO150),
     (0x38, "L24M", PLDO600),
     (0x39, "L25M_TS1_DVDD", PLDO300),
+    (0x5C, "VSYS_PWR_DISPLAY", EXT10M),
+    (0x5D, "VSYS_PWR_MODEM", EXT5M),
+    (0x5E, "VSYS_PWR_RFFE", EXT5M),
 ];
 
-static SUB_RAILS: [Rail; 45] = [
+static SUB_RAILS: [Rail; 48] = [
     (0x01, "S1S_VDD_CAM", CMD),
     (0x02, "S2S_VDD_G3D", CMD),
     (0x03, "S3S_LLDO1", CMS),
@@ -121,6 +127,9 @@ static SUB_RAILS: [Rail; 45] = [
     (0x3B, "L27S", PLDO150),
     (0x3C, "L28S", PLDO150),
     (0x3D, "L29S", PLDO150),
+    (0x5C, "VSYS_PWR_WLAN_BT", EXT10M),
+    (0x5D, "VSYS_PWR_IFPMIC", EXT5M),
+    (0x5E, "VSYS_PWR_MMWAVE", EXT5M),
 ];
 
 fn rd(pmic: u32, reg: u32) -> u8 {
@@ -133,8 +142,11 @@ fn wr(pmic: u32, reg: u32, v: u8) {
 /// The meter on, sampling at 125 Hz (Google's rate), every buck enabled for metering, accumulating power.
 fn enable(pmic: u32) {
     // CTRL1: METER_EN (bit 0), INT_SAMP_RATE (bits 4:2) = 4, 125 Hz.
+    // CTRL1: EXT_METER_EN (bit 1) as well, for the external shunt channels; CTRL2: all three external channels enabled (bits 5:3), their sampling at 31.25 Hz (bits 2:0 = 2, Google's rate).
     let c1 = rd(pmic, CTRL1);
-    wr(pmic, CTRL1, (c1 & !0x1C) | 4 << 2 | 1);
+    wr(pmic, CTRL1, (c1 & !0x1C) | 4 << 2 | 1 << 1 | 1);
+    let c2 = rd(pmic, CTRL2);
+    wr(pmic, CTRL2, (c2 & !0x3F) | 0x7 << 3 | 2);
     wr(pmic, BUCKEN1, 0xFF);
     wr(pmic, BUCKEN1 + 1, 0xFF);
     // Accumulator mode: power on every channel (CTRL4 = 0, CTRL5's low nibble = 0).
@@ -172,7 +184,7 @@ struct Sweep {
     phase: u8,
     until: u64,
     first: [([u64; CHANNELS], u32); 2],
-    mw: [f32; 34 + 45],
+    mw: [f32; 37 + 48],
 }
 static mut SWEEP: Option<Sweep> = None;
 static mut RESULT: Option<alloc::string::String> = None;
@@ -207,7 +219,7 @@ pub fn start() -> &'static str {
     unsafe {
         RESULT = None;
         // The first batch two seconds out: the command that starts a sweep holds the clock policy active for a second, and its switch back would reset the meters under the first batch.
-        SWEEP = Some(Sweep { batch: 0, tries: 0, phase: 0, until: crate::platform::cntpct() + 2 * f, first: [([0; CHANNELS], 0); 2], mw: [f32::NAN; 34 + 45] });
+        SWEEP = Some(Sweep { batch: 0, tries: 0, phase: 0, until: crate::platform::cntpct() + 2 * f, first: [([0; CHANNELS], 0); 2], mw: [f32::NAN; 37 + 48] });
     }
     "odpm sweep started: every rail of both PMICs, 12 at a time, a second each; read it with `diag odpm`\n"
 }
@@ -257,10 +269,10 @@ pub fn poll() {
     }
     // Done: every rail, largest first, and the sums.
     let mut all: alloc::vec::Vec<(&str, f32)> = MAIN_RAILS.iter().chain(SUB_RAILS.iter()).zip(s.mw.iter()).map(|(r, &m)| (r.1, m)).collect();
-    let (main_sum, sub_sum): (f32, f32) = (s.mw[..34].iter().filter(|m| m.is_finite()).sum(), s.mw[34..].iter().filter(|m| m.is_finite()).sum());
+    let (main_sum, sub_sum): (f32, f32) = (s.mw[..37].iter().filter(|m| m.is_finite()).sum(), s.mw[37..].iter().filter(|m| m.is_finite()).sum());
     all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
     let unknown = s.mw.iter().filter(|m| !m.is_finite()).count();
-    let mut out = alloc::format!("odpm: {unknown} rails unknown (reset under every try); main PMIC rails {:.0} mW, sub PMIC rails {:.0} mW, total {:.0} mW (rail outputs, before conversion losses; the panel's VSYS feed and the radios' are not among them)\n", main_sum, sub_sum, main_sum + sub_sum);
+    let mut out = alloc::format!("odpm: {unknown} rails unknown (reset under every try); main PMIC rails {:.0} mW, sub PMIC rails {:.0} mW, total {:.0} mW (the regulators' rail outputs before conversion losses, and the VSYS feeds the external shunts see: the display, modem, RF front end, WiFi/BT, the modem's PMIC, mmWave)\n", main_sum, sub_sum, main_sum + sub_sum);
     for (name, m) in all {
         if m.is_finite() && m >= 0.5 {
             out += &alloc::format!("{m:8.1} mW  {name}\n");

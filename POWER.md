@@ -96,6 +96,22 @@ Every SoC power domain read on through EL3 — ABL leaves them so: the GPU and i
 
 Bringing a domain back (`diag pd on`, CONFIGURATION through EL3 and the secure restore, without Linux's saved CMU registers) is not yet trusted: a TPU on/off by hand preceded a reset during the next power window. The camera and TPU diags refuse while their domains are gated; the GPU's way back (its embedded part's PLL and atomic-alias sequence) is not written.
 
+## 2026-10-25: the external channels
+
+The meters' external shunt channels (VSYS feeds, zuma-pmic.dtsi `external_rail`: 10 mΩ display and WLAN_BT, 5 mΩ the rest) are in the sweep too. With the domains gated:
+
+| | screen off | screen on |
+|---|---|---|
+| "VSYS_PWR_WLAN_BT" (sub VSEN_C1) | 0.7 mW | **318 mW** |
+| VSYS_PWR_MODEM | 17 mW | 26 mW |
+| VSYS_PWR_RFFE | 15 mW | 18 mW |
+| VSYS_PWR_IFPMIC (the modem's PMIC) | 8 mW | 17 mW |
+| VSYS_PWR_DISPLAY, VSYS_PWR_MMWAVE | under 1 mW | under 1 mW |
+
+- The channel the device tree names WLAN_BT follows the screen and WiFi is not running at boot: on husky it is the panel's feed (the names look like another board's). The panel, this dark scene at DBV 1353: ~0.32 W.
+- The modem, never booted by ferros, draws ~40–60 mW across its feed, its RF front end and its PMIC: powering it down (pmucal_cp, the IF PMIC) is a candidate.
+- BB_HLDO stays ~324 mW screen on or off and its LDOs read a few mW each: its load is still unknown — or its resolution (BB_POWER, 0.010989 mW per count, the one constant not cross-checked) is off.
+
 ## Plan, biggest first
 
 1. **Make rest cheap.** The between-frames redraws touch only what changed: the clock's digits once a second and its sweeps' wedges; the scope's plot only (no cleared black), and nothing at all for a widget off screen or off. Then the X3 can rest at a low operating point.
