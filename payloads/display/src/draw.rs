@@ -450,14 +450,14 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
         }
     }
     // The sweep boundary of each ring: θ's direction (sin θ, −cos θ), Q14, from the 60-step table, interpolated.
-    let bound: [(i64, i64, bool); 4] = core::array::from_fn(|i| {
+    let bound: [(i64, i64, bool); 6] = core::array::from_fn(|i| {
         let f = rings.get(i).map(|r| r.frac_q16).unwrap_or(0) as i64;
         let pos = f * 60;
         let (k, t) = ((pos >> 16) as usize, pos & 0xFFFF);
         let (a, b) = (dirs[k % 60], dirs[(k + 1) % 60]);
         (a.0 + ((b.0 - a.0) * t >> 16), a.1 + ((b.1 - a.1) * t >> 16), f > 1 << 15)
     });
-    let full: [bool; 4] = core::array::from_fn(|i| rings.get(i).map(|r| r.frac_q16 >= 1 << 16).unwrap_or(false));
+    let full: [bool; 6] = core::array::from_fn(|i| rings.get(i).map(|r| r.frac_q16 >= 1 << 16).unwrap_or(false));
     // A ring's colour at a pixel: the sweep's coverage (antialiased on its leading edge and along 12:00), fill or face by the period's direction.
     let ring_colour = |i: usize, dx: i64, dy: i64| -> u32 {
         // Into the face's own frame (the turn undone), where 12:00 is up.
@@ -478,9 +478,9 @@ pub fn clock(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i6
             clock_stroke
         }
     };
-    let r2: [i64; 9] = core::array::from_fn(|i| rad[i] * rad[i]);
+    let r2: [i64; 13] = core::array::from_fn(|i| rad[i] * rad[i]);
     // 255 / (2 rad) in Q24 per boundary, as in `disc`: the first-order distance to a boundary from d² with a multiply.
-    let kb: [i64; 9] = core::array::from_fn(|i| ((255i64 << 24) / (2 * rad[i].max(1))) >> 8);
+    let kb: [i64; 13] = core::array::from_fn(|i| ((255i64 << 24) / (2 * rad[i].max(1))) >> 8);
     spans(cx, cy, r, |y, xo0, xo1, _, _| {
         if y < by0 || y >= by1 {
             return;

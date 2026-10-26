@@ -28,6 +28,7 @@ members = [
     "payloads/touch",
     "payloads/gnss",
     "payloads/gnsstest",
+    "payloads/focustest",
     "payloads/touchtest",
     "payloads/map",
     "payloads/init",
