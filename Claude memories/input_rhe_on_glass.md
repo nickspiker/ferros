@@ -18,6 +18,6 @@ How it maps onto the touch server (payloads/touch: per-contact id, phase down/mo
 
 Catch for attest: rhe's phonetic engine spells via a dictionary, but the handle must be exact bytes (a handle may not be a word; one wrong byte derives a different identity) — attest needs a literal mode, not the phoneme engine. Gestures without visible letters resist shoulder-surfing, which suits a secret.
 
-Open: how the phone is held — four fingers on glass implies flat or two-handed landscape; one-handed portrait leaves only the thumb.
+**Owner: prioritise single-finger interaction** (2026-10-27; grip unknown). That makes grip irrelevant (thumb one-handed or index two-handed) but drops chords, so a stroke's meaning is (start zone) × (direction). 4 zones × (tap + 4 swipes) = 20 is too few for letters + digits; recommended: add diagonals, tap + 8 directions = 9 per zone, 4 zones = 36 = exactly 0-9 + a-z, ferros's base36 alphabet. Effort-rank all 36 on real hands (diagonals cost more), cheapest to most frequent. Chords become an optional speed layer later, never required. Open: whether handles fit in 0-9 a-z or need case, punctuation, spaces.
 
-**How to apply:** treat this as the owner's proposed direction, not a decision; design input with the owner before building; give attest a literal exact-character mode.
+**How to apply:** single-finger first; design the 36-stroke set with the owner before building; give attest a literal exact-character mode; chords only as an optional layer.
