@@ -49,11 +49,13 @@ A compiled capsule never leaves the device it was compiled on: no capsule cache,
 **Why:** Security first: runtime translation is the attack surface ferros exists to remove, and the seal proves the capsule passed the checker (SANDBOX.md, trust model A).
 Legally, compiling an app to native code on the device is what Android's own runtime has done since Android 5.0 (ART's install-time and profile-guided compilation), so on-device compilation is how every app developer already expects their code to run.
 Because the compiled output is personal to one device and never distributed, it stays inside a "personal" licence and outside the "copy, modify, distribute" prohibition in D0's quote.
+Compiling at install and keeping the result is the same act as compiling at launch, only earlier: every platform that runs an app turns its code into a distinct native form in memory before executing it (ART's ahead-of-time and JIT compilers, and any JIT anywhere), so "compiled for this device" is not a modified app in any sense that running it is not.
+The stored form is encrypted and keyed to the one device, with one key that unlocks it, so it is never copied, reproduced or published: nobody but that device can read it, and it is never shared.
 Emulating a platform so its software runs elsewhere was held lawful in *Sony Computer Entertainment v. Connectix*, 203 F.3d 596 (9th Cir. 2000); note that apps are licensed rather than sold (*Vernor v. Autodesk*, 621 F.3d 1102 (9th Cir. 2010)), so we lean on the licence terms and fair use, not on 17 U.S.C. §117.
 
 **Cost:** Every device compiles every app it installs; no shared compile cache, ever.
 
-**Revisit if:** a major app's licence explicitly forbids compilation by the platform. Not seen so far, but see O6: Chase UK's broad "modify or tamper" clause is the closest.
+**Revisit if:** a major app's licence explicitly forbids the platform compiling it to run it, as distinct from the user modifying it. Not seen so far; Chase UK's "modify or tamper" clause was weighed and closed at O6.
 
 ### D2 — Attestation always tells the truth (2026-10-27)
 
@@ -170,9 +172,10 @@ Neither carries the original 2011 Google Wallet terms' reported bar on any OS "m
 Google's two Voice documents disagree: the Voice Additional Terms say "Google Voice isn't capable of placing or receiving emergency services calls" (snapshot `google-voice-additional-terms.html`), while the Voice Personal terms, last modified June 9, 2026, say "Dialing to emergency services is supported by Google Voice Personal" with VoIP limitations (snapshot `google-voice-personal-terms.html`).
 If Photon EMS ever reaches public-safety answering points directly, FCC 911 rules for internet telephony (location, call-back) likely apply to it; that needs its own entry before Photon EMS ships.
 
-**O6 — Does install-time compilation "modify" an app?** Chase UK's app licence forbids users to "copy, reproduce, publish, modify or tamper with our app" (snapshot `chase-uk-app-licence.html`).
-Our reading: compiling the unchanged app for the device that runs it is how Android's own runtime executes every app, so it is running the app, not modifying it; the checker refuses code rather than rewriting its meaning.
-The text is broad, though, and nobody has tested it against a non-Android platform; this belongs in front of counsel at O7.
+**O6 — Does install-time compilation "modify" an app?** Resolved 2026-10-27 by the owner: no.
+Chase UK's app licence forbids users to "copy, reproduce, publish, modify or tamper with our app" (snapshot `chase-uk-app-licence.html`).
+Compiling before running is what every runtime does (JIT compiles before the code runs, and the compiled code exists in memory in a distinct form); compiling at install only does it earlier.
+The result is encrypted and keyed to one device with one key, never shared and never readable elsewhere, so nothing is copied, reproduced or published, and the app's meaning is unchanged (the checker refuses code, it does not rewrite it). The reasoning is now part of D1.
 
 **O7 — Counsel before release.** Proposed ship gate: before ferros runs banking or government identity apps for anyone but the owner, one paid review of this log by a technology lawyer, recorded here with the date.
 
