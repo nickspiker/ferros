@@ -40,6 +40,7 @@ Done to step 3 on the first night; steps 4–6 need the owner at the desktop.
 - **The arc pool.** 8 MiB held four guarded 1 MiB arcs; a fifth process was refused. Moved to 16 MiB at G#8300_0000 (the heap's second region shrank to 10 MiB). An app heap region in the kernel is the next step: the client's chain and PT buffers live in a 160 KiB `.data` heap only because its code is 660 KB and the arc must stay under 1 MiB.
 - **The `ip` queue.** 8 datagram slots lost most of a PT blast; 64 in `.data` now.
 - **Console.** The display's per-second stats line alone filled the kernel's console ring; it is ten-secondly now.
+- **The dev box's firewall** drops unsolicited inbound UDP on WiFi (confirmed: nothing the phone sends to a spare port arrives; wired devices' multicast does). The phone's `bind_req` to the desktop's 4383 dies at the door until the desktop has sent to the phone's 4383 first — which is why the desktop now answers a joiner's beacon with a unicast beacon from its main socket; but the beacon that would trigger that is itself dropped. On this box the fix is the owner's: `sudo firewall-cmd --add-port=4383-4384/udp` (add `--permanent` to keep it).
 - **The desktop's log** is `/tmp/photon-nick/photon.log.vsf` (`cargo run -q --bin photonlog -- <path> -g LAN` in the photon repo).
 
 ## Next
