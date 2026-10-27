@@ -191,9 +191,12 @@ Google apps never sign in themselves: they ask Play Services (package `com.googl
 **O1 — Attestation witness.** Apps that accept non-Google attestations (the route GrapheneOS asks app developers to take: check `verifiedBootState` = `SelfSigned` and a published `verifiedBootKey`, because "apps using it directly can support aftermarket operating systems", snapshot `grapheneos-attestation-guide.html`) need a hardware-signed statement, and the only keys banks already trust live in KeyMint/Titan behind the secure world.
 Choice for the owner: relay a truthful hardware attestation with the secure world as the bank's witness only (D5 still holds: it receives no ferros secret), or refuse attestation entirely and accept that apps requiring it will not run.
 
-**O2 — Release key and owner key.** BOOT.md plans boot integrity by relocking with the owner's key.
-If every owner's key differs, no app can allowlist "ferros" by key hash; GrapheneOS publishes one project key for this reason.
-Needs a design that lets an attestation say both "this is ferros" and "locked to this owner", or a decision that ferros gives up app allowlisting.
+**O2 — Release key and owner key.** Distilled 2026-10-27; the decision is the owner's.
+The crux: on husky, ABL writes exactly one key hash into every hardware attestation (`verifiedBootKey`, the root key it verified), so the only key a bank can recognise is one every ferros device shares, and a key every device shares is a key whose theft lets anyone flash any locked ferros device without unlocking it.
+BOOT.md already chose the owner's own key (`avb_custom_key`, "the owner is the CA", no single ferros-project key) for exactly that reason; recognisability by banks is what that choice costs.
+- Owner key only (BOOT.md as written): sovereign, no shared key to steal; every device's attestation carries its own owner's key hash, which no app can allowlist as "ferros", so O1's relay buys nothing and banks that demand attestation stay closed on husky.
+- Project-signed seed, owner key above it: ABL verifies a ferros seed signed by one published key (reproducible, so owners can check it), and the seed boots only kernels signed by the owner's key; apps can allowlist the seed's key, and evil-maid protection is unchanged, but the project key becomes the single key whose theft opens every locked device, which BOOT.md rejected.
+- The long game either way: on the Glyph there is no ABL and the root is PIPE's genesis ceremony, and under TOKEN a bank need not recognise the device's boot chain at all, only the user's credential bound to an uncopiable device secret.
 
 **O3 — US Google Wallet terms.** Resolved 2026-10-27.
 The dedicated Wallet terms URL returned HTTP 500, but Google Pay and Wallet payments in the US are governed by the Google Pay/Google Payments Additional Terms of Service (U.S.), last modified July 22, 2026 (snapshot `google-payments-buyer-terms-us.html`), with the Google Wallet User Policy (snapshot `google-wallet-user-policy.html`).
