@@ -166,6 +166,24 @@ A breach at one service is answered at that service alone: the derivation also f
 
 **Revisit if:** a service drops password sign-in altogether (the same chain could derive a per-service key pair instead of a password, but that is a passkey, and VAULT-KEY's no-passkeys rule is the owner's to revisit), or a service's terms bar the account on more than some number of devices.
 
+### D8 — ferros keeps apps' keys itself, says so honestly, and gives no one a fingerprint (2026-10-27)
+
+**Decision:** ferros provides the Android Keystore itself.
+Each app's keys are derived under that app's own domain separator, so the kernel lets Chase's capsule reach Chase's keys and nothing else, and they are the same on every device in the fleet.
+The keystore root is a random identity-scoped value kept in the fleet-sealed state (as D7's password nonce is), never the fleet key itself: the fleet key is re-minted on every lock, and an app key that changed with it would break every app's device binding at every lock.
+On husky the keys are computed by ferros on the main processor, so ferros reports them at the `Software` security level, which AOSP defines as "Secure as long as the device's Android system complies with the Android Platform Security Model" (snapshot `aosp-key-attestation.html`); on the Glyph, keys held inside PIPE may be reported at a hardware level, and only then.
+ferros never relays Google's hardware attestation (Trusty, Titan), never answers ID attestation (serial number, IMEI), and never signs an attestation with Google's roots or with keys published in AOSP; an attestation request gets a chain rooted in ferros that states the truth, or a refusal.
+Nothing an app can read carries a constant that is the same across apps or that singles out one device: no owner boot-key hash, no device serial, no per-device signature; everything an app sees is derived under that app's domain.
+
+**Why:** Key attestation's stated purpose is "to strongly determine if an asymmetric key pair is hardware-backed, what the properties of the key are, and what constraints are applied to its usage" (snapshot `aosp-key-attestation.html`): it is a statement about one app's key and about who wrote the code guarding it.
+The boot key in an attestation (`verifiedBootKey`, "a secure hash of the public key used to verify the integrity and authenticity of all code that executes during device boot up") proves only that the booted code was signed by that key's holder; what it adds over isolation is that a remote party can see when the code guarding its key was changed by anyone but the expected signer.
+ferros does not give a third party the power to detect what its owner runs on the owner's own device (O1, O2), and isolation alone does not answer that question, so relaying Google's attestation would cost trust in closed code (D5) for nothing.
+An owner-key hash, or any per-device value, in every app's attestation would be a fingerprint linking the owner across every app and every bank; domain separation per app gives each app exactly its own keys and no handle on anything else.
+
+**Cost:** Apps that require hardware-level attestation, or a Google-rooted chain, do not run on ferros.
+
+**Revisit if:** a bank accepts a TOKEN credential in place of device attestation (the long game), or the Glyph's PIPE-held keys need their own attestation format.
+
 ---
 
 ## App classes
@@ -188,15 +206,11 @@ Google apps never sign in themselves: they ask Play Services (package `com.googl
 - Route B, the target: Google's own unmodified Play Services and Play Store APKs run as ordinary sandboxed apps (GrapheneOS's GmsCompat model), beside a ferros services capsule that plays the GmsCompat part and carries all legacy sign-in (D7). The signature apps see is truly Google's; ferros ships none of it (D0); the user installs it; it is compiled, checked and sealed like any app (D1) and holds no ferros secret. Check-in reports the hardware and ferros honestly (D4); Google will see an uncertified device. Cost: Play Services assumes real Android underneath, so ferros's Android API layer must be deep enough for the hardest app there is.
 - Route C, now: apps that need no Google account. Google Voice is the first Google app planned, so it is the first real requirement for route B.
 
-**O1 — Attestation witness.** Apps that accept non-Google attestations (the route GrapheneOS asks app developers to take: check `verifiedBootState` = `SelfSigned` and a published `verifiedBootKey`, because "apps using it directly can support aftermarket operating systems", snapshot `grapheneos-attestation-guide.html`) need a hardware-signed statement, and the only keys banks already trust live in KeyMint/Titan behind the secure world.
-Choice for the owner: relay a truthful hardware attestation with the secure world as the bank's witness only (D5 still holds: it receives no ferros secret), or refuse attestation entirely and accept that apps requiring it will not run.
+**O1 — Attestation witness.** Resolved 2026-10-27 by the owner: no relay; D8.
 
-**O2 — Release key and owner key.** Distilled 2026-10-27; the decision is the owner's.
-The crux: on husky, ABL writes exactly one key hash into every hardware attestation (`verifiedBootKey`, the root key it verified), so the only key a bank can recognise is one every ferros device shares, and a key every device shares is a key whose theft lets anyone flash any locked ferros device without unlocking it.
-BOOT.md already chose the owner's own key (`avb_custom_key`, "the owner is the CA", no single ferros-project key) for exactly that reason; recognisability by banks is what that choice costs.
-- Owner key only (BOOT.md as written): sovereign, no shared key to steal; every device's attestation carries its own owner's key hash, which no app can allowlist as "ferros", so O1's relay buys nothing and banks that demand attestation stay closed on husky.
-- Project-signed seed, owner key above it: ABL verifies a ferros seed signed by one published key (reproducible, so owners can check it), and the seed boots only kernels signed by the owner's key; apps can allowlist the seed's key, and evil-maid protection is unchanged, but the project key becomes the single key whose theft opens every locked device, which BOOT.md rejected.
-- The long game either way: on the Glyph there is no ABL and the root is PIPE's genesis ceremony, and under TOKEN a bank need not recognise the device's boot chain at all, only the user's credential bound to an uncopiable device secret.
+**O2 — Release key and owner key.** Resolved 2026-10-27 by the owner: the owner's own key, as BOOT.md has it.
+The crux was never which key but what the key proves: ABL reports one root key, which tells a remote party who signed the code guarding its key and so lets it notice when anyone else changed that code; a shared project key would make that recognisable to banks and become the one key whose theft opens every locked device, and either way ferros will not let a third party detect what its owner runs.
+Because ferros never reports the boot key to apps (D8), the owner key is not a fingerprint either.
 
 **O3 — US Google Wallet terms.** Resolved 2026-10-27.
 The dedicated Wallet terms URL returned HTTP 500, but Google Pay and Wallet payments in the US are governed by the Google Pay/Google Payments Additional Terms of Service (U.S.), last modified July 22, 2026 (snapshot `google-payments-buyer-terms-us.html`), with the Google Wallet User Policy (snapshot `google-wallet-user-policy.html`).
