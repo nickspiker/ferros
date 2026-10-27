@@ -12,18 +12,23 @@ chase-uk-app-licence.html  https://www.chase.co.uk/gb/en/legal/app-licence-agree
 chase-us-trusted-device.html  https://www.chase.com/personal/banking/education/basics/trusteddevice
 grapheneos-attestation-guide.html  https://grapheneos.org/articles/attestation-compatibility-guide
 grapheneos-chase-thread.json  https://discuss.grapheneos.org/api/discussions/40289
+google-payments-buyer-terms-us.html  https://payments.google.com/payments/apis-secure/u/0/get_legal_document?ldt=buyertos&ldr=US
+google-wallet-user-policy.html  https://wallet.google/policy/
 # NOT captured: https://payments.google.com/payments/apis-secure/u/0/get_legal_document?ldo=0&ldt=googlewallettos&ldl=en-US (HTTP 500 on 2026-10-27)
+# NOTE: the owner's browser showed the non-US Google Pay terms as last modified December 10, 2025 on 2026-10-27, while this capture was served the April 5, 2021 version; the device clause quoted in APK-LEGAL.md D4 is identical in both.
 
 # BLAKE3
 772ca841ae6cd4672641b72fdbbc41bc08db4d72693ca7aeba629a49d1a0fd3d  chase-uk-app-licence.html
 3146b06d66e2133170aabdbae7b58df5ccd6f4bfdc45efd446f8c1abff145da7  chase-us-trusted-device.html
 f64f7e5a437b054b20ed69f4feed7ee4af50ac89ade275379bb83cfa0c9e7b06  google-pay-terms-nonus.html
+b440330639d1f863388825534502fe26dab6838651751cf180bc7526a7cfb507  google-payments-buyer-terms-us.html
 dae0a07d26700edf82f2f8aadd1e0f5fda25afb96a0a808bac0245573ac6ff99  google-play-terms.html
 566064b57a7a27030f97bf54ce7183755c5d549ed90dd5180645ba5d3cf693c4  google-terms.html
 295b4674dbd4a95308fc2738f689c06a5073b1148bc931ac5848075b9340ea4a  google-voice-additional-terms.html
 38c33c9fa2b2b7a55ede55978b732dc2ea86ee07772e2cb1819a77eef8692804  google-voice-personal-terms.html
+04adf9196049bc0acc3de34df1605b76e4d6574c2c5e26e9bcac6711b04933c2  google-wallet-user-policy.html
 e2cc3600273b79b094b232c980f87a7a16793ad4d26304dac2c326cd70b56071  grapheneos-attestation-guide.html
+50eabd7eee5373721ff42cd8ddbd22ba7e924f754723448253df4d19617ba30a  grapheneos-chase-thread.json
 8d39a0af5d54693ef340d89a366f6396bc4e90a1eedbd20a565071eb98fe0747  pixel-binary-transparency.html
 4d397749bc826f869c8a6c95cc17219a84ef0fefcf87312af760b62c1b7093f3  play-integrity-improvements.html
 dea84dafda585635ece9671060dbc0a303f251e558bd0dc391055a35e070b942  trusty-aosp.html
-50eabd7eee5373721ff42cd8ddbd22ba7e924f754723448253df4d19617ba30a  grapheneos-chase-thread.json

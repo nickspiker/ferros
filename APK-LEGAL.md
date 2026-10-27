@@ -63,6 +63,7 @@ ferros ships no tool that does any of these, and does not tell users how to.
 
 **Why:** The Google Play terms forbid any attempt "to, or assist, authorize or encourage others to circumvent, disable or defeat any of the security features or components that protect, obfuscate or otherwise restrict access to, or the manner or extent of use of, any Content or Google Play" (snapshot `google-play-terms.html`).
 The Google ToS forbids "bypassing our systems or protective measures" (snapshot `google-terms.html`).
+The Google Wallet User Policy (effective February 12, 2024) forbids users to "misrepresent yourself", including "providing misleading information about a user's identity, qualifications, ownership, purpose, products, services, or business", and forbids "degrading, disabling, or negatively interfering with any aspect of the product or its services" (snapshot `google-wallet-user-policy.html`); a forged attestation is a misrepresentation about the device, while a truthful one leaves Wallet working exactly as Google built it.
 Under 17 U.S.C. §1201(a)(3)(A), circumvention means to "avoid, bypass, remove, deactivate, or impair a technological measure, without the authority of the copyright owner": the test is authorisation, not whether security went up overall, so "ferros is more secure" does not excuse a false attestation.
 Leaked keyboxes are misappropriated signing keys; using them adds trade-secret and access-device exposure on top of the contract breach.
 A truthful attestation defeats nothing: the security components keep working and report exactly what is running, and the service decides.
@@ -78,7 +79,9 @@ When a service decides ferros does not meet its requirements, that decision stan
 
 **Why:** The terms themselves name no specific OS, certification or bootloader state; they defer to requirements the service sets and changes.
 Google Play: "a Device that meets the system and compatibility requirements for the relevant Content, working Internet access, and compatible software" (snapshot `google-play-terms.html`).
-Google Pay, non-US terms, last modified April 5, 2021: "a device that meets the Service's system and compatibility requirements, which may change from time to time; working Internet access; and compatible software" (snapshot `google-pay-terms-nonus.html`).
+Google Pay/Google Payments Additional Terms of Service (U.S.), last modified July 22, 2026, which govern Google Pay and Google Wallet payments in the US: "a device that meets the Service's system and compatibility requirements, which may change from time to time; working Internet access; and compatible software. Your ability to use Google Pay, and Google Pay's performance, may be affected by these factors. Such system requirements are your responsibility." (snapshot `google-payments-buyer-terms-us.html`).
+The same clause, word for word, is in the non-US Google Pay terms in both versions seen on 2026-10-27: last modified April 5, 2021 as served to the capture (snapshot `google-pay-terms-nonus.html`), and last modified December 10, 2025 as shown in the owner's browser the same day (not captured; the served version varies by session).
+None of these documents mentions rooted, jailbroken or modified devices, or circumvention; the US terms bind the user to the Google ToS, themselves, and the Google Payments User Policies, so the circumvention and misrepresentation rules in D3 come from those.
 ferros running an app correctly is a fair reading of "compatible software", but the "system and compatibility requirements" are the service's to publish, and a service applying them honestly against an honest ferros is the contract working as written, not a breach by anyone.
 
 **Cost:** None beyond D3's.
@@ -121,7 +124,8 @@ Code we cannot read does not hold keys we cannot replace.
 ferros's obligation is that everything it reports is true (D3, D5) and that it ships nothing built to defeat a service's checks.
 Whether a user may run a given app on a ferros device under their own agreement is between the user and that provider; ferros does not hide that question from them.
 
-**Why:** Some providers' agreements bar modified or unsupported devices outright (common wording in other banks' terms, not yet captured here); a ferros device falls under that wording whether or not it is honest, and ferros cannot change the user's contract.
+**Why:** Google's own US payment terms put it in so many words: "Such system requirements are your responsibility" (snapshot `google-payments-buyer-terms-us.html`), meaning the user's, not the platform's.
+Some providers' agreements bar modified or unsupported devices outright (common wording in other banks' terms, not yet captured here); a ferros device falls under that wording whether or not it is honest, and ferros cannot change the user's contract.
 Chase's own documents captured so far are narrower: the UK app licence speaks of "an operating system version we no longer support" and forbids using the app "on a device that contains or is open to viruses and other things that may cause damage" (snapshot `chase-uk-app-licence.html`, version 1.1.0), and the US trusted-device page, an educational page and not contract terms, lists "iOS 16.0 or later or Android 11 or later" (snapshot `chase-us-trusted-device.html`).
 Chase does check device integrity per feature: on GrapheneOS in July 2026 the credit-score feature alone refused with "For your security, the Chase Mobile app is unavailable on devices that have been 'rooted' or contain malware" while the rest of the app worked (snapshot `grapheneos-chase-thread.json`).
 Where the platform tells the truth, the platform's own exposure is close to none; where a platform spoofs its identity to get apps running, the platform becomes the party helping its users get around a check and breach their agreements, which is the exposure this decision exists to avoid.
@@ -156,7 +160,9 @@ Choice for the owner: relay a truthful hardware attestation with the secure worl
 If every owner's key differs, no app can allowlist "ferros" by key hash; GrapheneOS publishes one project key for this reason.
 Needs a design that lets an attestation say both "this is ferros" and "locked to this owner", or a decision that ferros gives up app allowlisting.
 
-**O4 — US Google Wallet terms.** Not yet read: the US Wallet terms URL returned HTTP 500 on 2026-10-27 (recorded in the snapshot `MANIFEST`). D3 and D4 rest on the Google ToS, the Play terms and the non-US Pay terms until it is captured. The original 2011 Google Wallet terms reportedly barred use on any OS "modified or customized in any way"; whether current US terms do is unknown.
+**O4 — US Google Wallet terms.** Resolved 2026-10-27.
+The dedicated Wallet terms URL returned HTTP 500, but Google Pay and Wallet payments in the US are governed by the Google Pay/Google Payments Additional Terms of Service (U.S.), last modified July 22, 2026 (snapshot `google-payments-buyer-terms-us.html`), with the Google Wallet User Policy (snapshot `google-wallet-user-policy.html`).
+Neither carries the original 2011 Google Wallet terms' reported bar on any OS "modified or customized in any way"; the device requirement is the "system and compatibility requirements" clause quoted in D4, and the conduct rules are quoted in D3.
 
 **O5 — Chase US Digital Services Agreement.** Not yet read; D7's Chase facts come from the UK licence and a US educational page.
 
@@ -186,4 +192,4 @@ The text is broad, though, and nobody has tested it against a non-Android platfo
 
 ## Snapshots
 
-`legal/snapshots/2026-10-27/` — Google ToS, Google Play terms, Google Pay terms (non-US), Google Voice Personal terms, Google Voice Additional Terms, Play Integrity improvements, Pixel binary transparency, Trusty (AOSP), Chase UK app licence, Chase US trusted-device page, GrapheneOS attestation compatibility guide, GrapheneOS forum thread on Chase. URLs and BLAKE3 hashes in its `MANIFEST`.
+`legal/snapshots/2026-10-27/` — Google ToS, Google Play terms, Google Pay terms (non-US), Google Pay/Google Payments Additional Terms (U.S.), Google Wallet User Policy, Google Voice Personal terms, Google Voice Additional Terms, Play Integrity improvements, Pixel binary transparency, Trusty (AOSP), Chase UK app licence, Chase US trusted-device page, GrapheneOS attestation compatibility guide, GrapheneOS forum thread on Chase. URLs and BLAKE3 hashes in its `MANIFEST`.
