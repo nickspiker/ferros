@@ -7,21 +7,24 @@
 //! Grant slots, as the kernel hands them to init (service.rs `start_home`, same order):
 //!   1 serve display, 2-7 decon0-main, decon0-win, decon0-wincon, dpu-dma0, dpp0, gpio-gpp0, 8-9 dma display-fb, display-heap, 10-13 dsim0, dphy0, sramc0, hdrcomm0,
 //!   14 serve touch, 15-16 usi2-spi, gpio-gpn0, 23 the touch interrupt line, 17 use display, 18 use touch, 19 settings (the map holds it: the device's settings are the back of the device's own circle), 20 the vault scope `map.` (the arrangement made by hand), 21 dma display-phases (the display's four temporal dither frames), 22 dma app-surface (the app in front draws there; the map passes it on). 26 dma display-sprites (the display's sprite cache), 27 dma display-canvas (its 16-bit back buffer).
-//!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp.
+//!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp,
+//!   46 serve photon, 47 use photon, 48 the vault scope `photon.`, 49 the ira key, 50 use udp (PHOTON.md).
 #![no_std]
 #![no_main]
 
 use ferros_sys::{console, exit, spawn};
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 5] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 6] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
-    (b"map", b"map", &[17, 18, 19, 20, 22]),
+    (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope (payloads/pcie1 header).
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43]),
     // 1 use wlan, 2 serve udp, 3 entropy (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41]),
+    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon (payloads/photon).
+    (b"photon", b"photon", &[50, 48, 49, 46]),
 ];
 
 #[unsafe(no_mangle)]

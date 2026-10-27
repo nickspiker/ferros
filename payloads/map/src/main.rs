@@ -15,7 +15,7 @@
 //!
 //! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic until the owner arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the app surface (handed to the app in front).
+//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the app surface (handed to the app in front), 6 the Photon client's endpoint (use: its state and pairing words for the Photon circle's front, PHOTON.md).
 
 #![no_std]
 #![no_main]
@@ -30,6 +30,7 @@ const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
 /// 5: the app surface, passed on to the app in front.
 const S_APPSURF: u64 = 5;
+const S_PHOTON_EP: u64 = 6;
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
 struct Spec {
@@ -57,6 +58,8 @@ const CIRCLES: [Spec; 8] = [
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;
+/// Photon: arrived at, its front shows the client's state and, until the phone is bound, the 23 pairing words for the sponsor's human (payloads/photon op 1).
+const PHOTON: usize = 1;
 const RAMPS: usize = 5;
 /// The light scope: arrived at, it is in focus (`Map::scope_drag`).
 const SCOPE: usize = 7;
@@ -770,6 +773,7 @@ impl Map {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
                 b.text(cx, cy + r + 64, 32, grey(), 1, "tap: fold \u{2022} drag across: time \u{2022} swipe up or down: channel \u{2022} two fingers: back");
             }
+            View::Front(PHOTON) => self.photon_front(&mut b),
             View::Front(i) => {
                 let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
                 b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[i].label);
@@ -780,6 +784,66 @@ impl Map {
         b.op(&self.cam.op(true));
         b.send(self.display);
         self.send_focus();
+    }
+
+    /// The Photon circle's front: the client's state line and, while unbound, the 23 pairing words in rows (op 1 of the `photon` endpoint → [state][fleet devices heard][words]). The client not running reads as "not running".
+    fn photon_front(&mut self, b: &mut Batch) {
+        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
+        b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[PHOTON].label);
+        let mut out = [0u8; 512];
+        let n = ferros_sys::call(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
+            b.text(cx, cy + r + 160, 32, grey(), 1, "the Photon client is not running \u{2022} two fingers for its back");
+            return;
+        }
+        let n = (n as usize).min(out.len());
+        let (state, heard) = (out[0], out[1]);
+        let line = match state {
+            0 => "not paired: the identity roots are not in the vault",
+            1 => "paired \u{2022} waiting to be added from one of your devices",
+            2 => "bound \u{2022} waiting for the fleet key",
+            _ => "a device of your fleet",
+        };
+        b.text(cx, cy + r + 160, 32, grey(), 1, line);
+        let mut heard_line = [0u8; 48];
+        let hl = {
+            let s = b"fleet devices heard on this network: ";
+            heard_line[..s.len()].copy_from_slice(s);
+            heard_line[s.len()] = b'0' + heard.min(9);
+            s.len() + 1
+        };
+        if let Ok(t) = core::str::from_utf8(&heard_line[..hl]) {
+            b.text(cx, cy + r + 208, 32, grey(), 1, t);
+        }
+        if state == 1 || state == 2 {
+            if let Ok(words) = core::str::from_utf8(&out[2..n]) {
+                b.text(cx, cy + r + 280, 32, grey(), 1, "type these on your other device (Settings \u{2022} Fleet \u{2022} Add device):");
+                // The words come camelCased in one run; six to a row, split at the capitals.
+                let mut rows: [[u8; 128]; 5] = [[0; 128]; 5];
+                let mut lens = [0usize; 5];
+                let (mut row, mut count) = (0usize, 0usize);
+                for (i, c) in words.bytes().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        count += 1;
+                        if count % 6 == 0 && row + 1 < rows.len() {
+                            row += 1;
+                        } else if lens[row] < 127 {
+                            rows[row][lens[row]] = b' ';
+                            lens[row] += 1;
+                        }
+                    }
+                    if lens[row] < 128 {
+                        rows[row][lens[row]] = c;
+                        lens[row] += 1;
+                    }
+                }
+                for k in 0..=row {
+                    if let Ok(t) = core::str::from_utf8(&rows[k][..lens[k]]) {
+                        b.text(cx, cy + r + 340 + 56 * k as i64, 44, white(), 1, t);
+                    }
+                }
+            }
+        }
     }
 
     /// The display told what is in focus (op 25): the scope or the clock when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; the scope's span and whether it is folded. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.

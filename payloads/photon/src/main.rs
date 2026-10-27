@@ -2,7 +2,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the phone. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Spawn: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients] --name photon --use udp --store photon --ira. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira. Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init at boot (payloads/init), or from the bridge: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `photon.sponsor` holds the same 19 bytes for the boot-started client] --name photon --use udp --store photon --ira --serve photon. The `photon` endpoint serves the map's Photon circle: op 1 → [state: 0 not paired, 1 paired, 2 bound, 3 member][fleet devices heard][the 23 pairing words, utf-8, while unbound]. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira. Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -35,6 +35,7 @@ static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
 const S_UDP: u64 = 1;
 const S_STORE: u64 = 2;
 const S_IRA: u64 = 3;
+const S_SERVE: u64 = 4;
 
 struct Log {
     grants: u64,
@@ -222,6 +223,14 @@ impl Client {
 
     fn load(&mut self) {
         let mut b = [0u8; 32];
+        if self.given.is_none() {
+            let mut g = [0u8; 19];
+            if self.store_get(b"sponsor", &mut g) == Some(19) && (g[0] == 4 || g[0] == 6) {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&g[1..17]);
+                self.given = Some(Addr { fam: g[0], ip, port: u16::from_be_bytes([g[17], g[18]]) });
+            }
+        }
         if self.store_get(b"identity_seed", &mut b) == Some(32) {
             self.identity_seed = Some(b);
         }
@@ -536,6 +545,26 @@ impl Client {
             }
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
+            // The map asking for the Photon circle's front.
+            let mut req = [0u8; 16];
+            let mut tok = [0u8; 32];
+            let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
+            if n != ERR && n != ferros_sys::NOTHING {
+                busy = true;
+                let mut reply = Vec::with_capacity(400);
+                let state: u8 = match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
+                    (false, _, _) => 0,
+                    (true, false, _) => 1,
+                    (true, true, false) => 2,
+                    (true, true, true) => 3,
+                };
+                reply.push(state);
+                reply.push(self.sponsors.len().min(255) as u8);
+                if let (Some(seed), false) = (self.identity_seed, self.bound) {
+                    reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
+                }
+                svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
+            }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();

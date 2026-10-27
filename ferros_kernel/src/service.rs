@@ -381,6 +381,12 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Store(b"wifi"),
         Use(b"wlan"),
         Serve(b"udp"),
+        // Photon (PHOTON.md): 46 serve photon (the client's endpoint the map asks for its state and pairing words), 47 use photon (the map's), 48 the vault scope `photon.`, 49 the ira-derived key, 50 use udp (the client's).
+        Serve(b"photon"),
+        Use(b"photon"),
+        Store(b"photon"),
+        Ira,
+        Use(b"udp"),
     ]
 }
 
@@ -390,9 +396,11 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
         b"touch" => &[14, 15, 16, 23],
-        b"map" => &[17, 18, 19, 20, 22],
+        b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
         b"ip" => &[44, 45, 41],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon (payloads/photon).
+        b"photon" => &[50, 48, 49, 46],
         _ => return None,
     };
     let all = home_grants();
