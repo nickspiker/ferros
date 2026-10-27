@@ -15,7 +15,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [UFS Linux handoff](ufs_linux_handoff.md) — chainload ferros from running Linux to inherit its live UFS link; WORKS once pKVM disabled (fastboot oem pkvm disable); DRAM scratch doesn't survive reset
 - [Pixel is a dedicated ferros dev device](pixel8_dedicated_dev_device.md) — no banking/daily-driver constraint; graphene.md is dead scaffolding; free to unlock/wipe
 - [Feedback: no web encodings](feedback_no_web_encodings.md) — no base64/JSON/URL forms anywhere ferros-side; hex/base36/EWE; bytes stay bytes (kete addresses go to the store as 32 bytes, 2026-10-27)
-- [Feedback: Photon cfg keeps Android](feedback_photon_cfg_keep_android.md) — gating Photon for ferros: not(android) becomes not(any(android, ferros)), never not(ferros); run desktop check + ferros build + Photon's Android check (2026-10-27 Android break)
+- [Feedback: Photon cfg keeps Android](feedback_photon_cfg_keep_android.md) — gating Photon for ferros: insert a twin ABOVE the original's cfg, never below it (it steals the cfg — broke Android + macOS 2026-10-27); original becomes not(any(<old>, ferros)); check desktop + ferros + Android + Mac
 - [Feedback: don't SSH](feedback_no_ssh.md) — never SSH into another machine unless explicitly told to
 - [Feedback: no manual line wraps](feedback_no_line_wraps.md) — write each sentence on one line in doc/block comments; editor handles wrapping
 - [Feedback: commit every good point](feedback_commit_every_good_point.md) — commit AND push at every verified step without asking; stage only your own hunks
