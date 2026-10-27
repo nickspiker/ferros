@@ -35,14 +35,21 @@ The first std program ran 2026-10-27: `println!`, a `.tdata` thread-local read b
 - `panic_immediate_abort` is a panic strategy now, not a std feature; `compiler-builtins-mem` must be in `build-std-features` or `memset` is undefined at link.
 - The handle-guard pre-commit hook takes the better part of an hour over the 58 MB first commit of the std fork.
 
+## The substrate, piece by piece (all 2026-10-27)
+
+- **tokio** multi-thread runtime (`rt`, `rt-multi-thread`, `sync`, `time`, `macros`; no `net`, which needs mio and socket2 and a libc): `std/probe` ran 8 tasks over 4 workers with timers in 71 ms. Photon's sockets will be a ferros socket type over the `ip` server, not tokio's.
+- **kete** over the kernel vault (`kete/src/ferros.rs`): the process's Store scope, a short prefix per vault, base64url addresses, values in 4 KiB pieces through the grown SYS_STORE (staged writes, delete, list). The probe wrote a 10 KB value, read it back exact, listed, deleted. No `dirs`, no files.
+- **getrandom** 0.2/0.3/0.4 custom backends in `ferros_rt` (`--cfg getrandom_backend="custom"` and the 0.2 `custom` feature from the program's side) — the kernel's entropy or an error, never the mixer.
+- **fluor** `host-ferros` (`fluor/src/host/ferros/mod.rs`): the Android shell's twin over the display server's app surface (op 22, 16-bit gamma-2 working values from fluor's gamma-2.2 darkness bytes through one table) and the touch server's contact records (the first finger is the pointer; pinch waits for the input work). `std/fluordemo` draws text and counts taps in a 448 × 996 frame; spawn it with `--use display --use touch --dma app-surface --entropy`.
+- **Memory**: `cachemap::POOL_BIG`, 512 MiB at G#A000_0000 in 2 MiB blocks (nothing in the device tree reserves G#9800_0000-G#C000_0000), a second buddy pool for arcs of 16 MiB and up (and small ones when the page pool is full); masked arcs stay in the page pool for their per-page W^X. The demo's 64 MiB arc (3.3 MB image + a 32 MiB heap by `--defsym __ferros_heap=`) is the first from it.
+- **C in the graph**: `tools/std-build.sh` points the cc crate at `aarch64-linux-gnu-gcc` freestanding, but that toolchain has no libc headers (`assert.h`), so blake3 must be `pure` on ferros and the PQClean suites wait for a header set; `rav1d` wants libc's types, so fluor's `icon` feature is off on ferros (`window_icon` is gated on it now).
+
 ## Order
 
 1. Kernel TPIDR_EL0 + the target JSON — done, flashed.
-2. `ferros_rt` + the std platform layer; a std hello on the phone — done 2026-10-27 (above).
-3. kete: a native-vault backend replacing its four `std::fs` uses.
-4. fluor host over the display server's app surface + touch.
-5. tokio over a ferros `mio`: the reactor over the `ip` server (UDP, client TCP).
-6. Photon with `cfg(target_os = "ferros")` leaving out reqwest/rustls/tungstenite/cpal/rav1e/rav1d/opus/winit; a process memory region large enough for it.
+2. `ferros_rt` + the std platform layer; a std hello on the phone — done.
+3. kete on the vault — done. 4. fluor host — done (the owner's eyes on the panel pending). 5. tokio — the runtime runs; a socket type over `ip` is next with Photon.
+6. Photon with `cfg(target_os = "ferros")`: its sockets over `ip`, and out go reqwest/rustls/tungstenite/cpal/rav1e/rav1d/opus/winit/softbuffer/arboard/thread-priority/libc/dirs/memmap2 and tokio's `net` (`cargo tree` on the target lists them all); the PQClean C suites need a freestanding libc header set or a Rust port.
 7. STOP at the input device: the owner goes over the text-input idea first.
 
 ## Encryption, as the owner laid it out

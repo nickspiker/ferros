@@ -58,6 +58,12 @@ pub const POOL: (usize, usize) = (0x8300_0000, 0x8400_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 
+/// The big arc pool (cold only): 512 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
+#[cfg(not(shim_handoff))]
+pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
+#[cfg(shim_handoff)]
+pub const POOL_BIG: (usize, usize) = (0, 0);
+
 /// Device DMA memory for driver processes (see the module doc): cold G#8180_0000, the 2 MiB above the pool, below the reload stub (G#8207_0000). None on the handoff path.
 #[cfg(not(shim_handoff))]
 pub const DMA_POOL: (usize, usize) = (0x8180_0000, 0x81A0_0000);
@@ -185,6 +191,7 @@ pub fn enable() -> bool {
     let (f0, f1) = DISPLAY_FB;
     let (h0, h1) = DISPLAY_HEAP;
     let (t0, t1) = DISPLAY_PHASES;
+    let (b0, b1) = POOL_BIG;
     let dma_ok = q0 == q1 || (q0 % MIB2 == 0 && q1 % MIB2 == 0 && q0 >= w0 && q1 <= w1 && (q1 <= p0 || q0 >= p1) && (q1 <= d0 || q0 >= d1));
     // The framebuffers and the display heap sit outside the window but in its GiB (so the level-2 table covers them), 2 MiB aligned, apart from each other.
     let outside = |a: usize, b: usize| a == b || (a % MIB2 == 0 && b % MIB2 == 0 && a / GIB == w0 / GIB && (b - 1) / GIB == w0 / GIB && (b <= w0 || a >= w1));
@@ -210,6 +217,8 @@ pub fn enable() -> bool {
                 dma_pool(vhe, a, BLOCK)
             } else if h0 != h1 && a >= h0 && a + MIB2 <= h1 {
                 pool(vhe, a, BLOCK) | UXN
+            } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
+                pool(vhe, a, BLOCK)
             } else if a + MIB2 <= w0 || a >= w1 {
                 device(vhe, a, BLOCK)
             } else if a >= p0 && a + MIB2 <= p1 {

@@ -1,0 +1,19 @@
+[package]
+name = "fluordemo"
+version = "0.1.0"
+edition = "2024"
+description = "The first fluor app on the phone: text and a tap counter through fluor's ferros host (STD-TARGET.md)"
+
+[dependencies]
+fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

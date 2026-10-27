@@ -126,6 +126,9 @@ fn enqueue_front(t: usize) {
 }
 
 static ARCS: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
+/// The big pool's buddy lists (cachemap POOL_BIG): arcs of 16 MiB and up, 2 MiB blocks, no per-page W^X.
+static ARCS_BIG: Global<Arcs> = Global(UnsafeCell::new(Arcs { free: [const { Vec::new() }; 32], init: false }));
+const BIG_FROM: usize = 16 << 20;
 
 fn arcs() -> &'static mut Arcs {
     let a = unsafe { &mut *ARCS.0.get() };
@@ -136,6 +139,41 @@ fn arcs() -> &'static mut Arcs {
         a.init = true;
     }
     a
+}
+
+fn arcs_big() -> &'static mut Arcs {
+    let a = unsafe { &mut *ARCS_BIG.0.get() };
+    if !a.init {
+        let (p0, p1) = crate::cachemap::POOL_BIG;
+        if p1 > p0 {
+            a.free[(p1 - p0).trailing_zeros() as usize].push(p0);
+        }
+        a.init = true;
+    }
+    a
+}
+
+/// Which pool an address is in.
+fn pool_of(base: usize) -> (&'static mut Arcs, (usize, usize)) {
+    let (b0, b1) = crate::cachemap::POOL_BIG;
+    if base >= b0 && base < b1 { (arcs_big(), (b0, b1)) } else { (arcs(), crate::cachemap::POOL) }
+}
+
+fn buddy_take(a: &mut Arcs, block: usize) -> Option<usize> {
+    let k = block.trailing_zeros() as usize;
+    let mut j = k;
+    while j < 32 && a.free[j].is_empty() {
+        j += 1;
+    }
+    if j >= 32 {
+        return None;
+    }
+    let base = a.free[j].pop()?;
+    while j > k {
+        j -= 1;
+        a.free[j].push(base + (1 << j));
+    }
+    Some(base)
 }
 
 /// An arc: `size` usable bytes at `base` (a power of two, base aligned to `size`), carved from a `block`-byte buddy block (= `size`, or `2 * size` for a guarded arc, whose upper half is unused guard so an in-arc immediate offset can't reach another arc — SANDBOX.md).
@@ -156,29 +194,22 @@ impl Arc {
 pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
     let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
     let block = if guard { want * 2 } else { want };
-    let k = block.trailing_zeros() as usize;
-    let a = arcs();
-    let mut j = k;
-    while j < 32 && a.free[j].is_empty() {
-        j += 1;
-    }
-    if j >= 32 {
-        return None;
-    }
-    let base = a.free[j].pop()?;
-    while j > k {
-        j -= 1;
-        a.free[j].push(base + (1 << j));
-    }
+    // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
+    let base = if guard {
+        buddy_take(arcs(), block)?
+    } else if block >= BIG_FROM {
+        buddy_take(arcs_big(), block).or_else(|| buddy_take(arcs(), block))?
+    } else {
+        buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
+    };
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, want) };
     Some(Arc { base, size: want, block })
 }
 
-/// Return an arc to the pool, merging buddies.
+/// Return an arc to its pool, merging buddies.
 pub fn arc_free(arc: Arc) {
     crate::cachemap::arc_reset(arc.base, arc.block);
-    let a = arcs();
-    let (p0, p1) = crate::cachemap::POOL;
+    let (a, (p0, p1)) = pool_of(arc.base);
     let mut base = arc.base;
     let mut k = arc.block.trailing_zeros() as usize;
     while (1usize << k) < p1 - p0 {
