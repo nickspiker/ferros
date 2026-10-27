@@ -43,6 +43,11 @@ impl DeviceKeys {
         self.ed.public.to_bytes()
     }
 
+    /// The Ed25519 half as a dalek signing key — what pings, pongs and PT SPECs are signed with (photon_core::wire, pt).
+    pub fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&self.ed.secret.to_bytes())
+    }
+
     /// The public bundle this device declares.
     pub fn public(&self) -> KeyBundle {
         KeyBundle::new(vec![(scheme::ED25519, self.ed.public.to_bytes().to_vec()), (scheme::FALCON512, self.falcon_vk.clone()), (scheme::SPHINCS_PLUS, self.sphincs_pk.to_vec())]).expect("a derived bundle is well-formed by construction")

@@ -911,8 +911,11 @@ dependencies = [
 name = "ferros-payload-photon"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "ferros_heap",
  "ferros_sys",
  "photon_core",
+ "vsf 0.10.2",
 ]
 
 [[package]]

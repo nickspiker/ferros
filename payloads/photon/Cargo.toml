@@ -10,4 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+ferros_heap = { path = "../../ferros_heap" }
 photon_core = { path = "../../photon_core" }
+ed25519-dalek = { version = "2", default-features = false }
+vsf = { path = "../../../vsf", default-features = false }
