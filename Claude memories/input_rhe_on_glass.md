@@ -42,4 +42,16 @@ A O E U I D H T N S
 ```
 Z lands below-between A and S, near its physical spot. Moving Q costs QWERTY users one key; Q is rare and nearly always precedes U (a distinctive trace). The grid can't hold the apostrophe, which in everyday writing outnumbers Q, Z, X, J: the trace decoder inserts it in contractions automatically (dont → don't); for tapping it goes in the first row of the scroll extent. Space, backspace, enter sit outside the 28.
 
+**Full extent (owner asked 9-10-9-10-9 vs symbols below / space placement — my recommendation, not yet decided):** stack the extent UPWARD from the letters like a physical keyboard, with a fixed control bar underneath that never scrolls:
+```
+        ... obscure symbols, emoji (scroll)
+   ' " ! ? - : ; ( )            9   symbols, most frequent first (scroll)
+  1 2 3 4 5 6 7 8 9 0          10   digits, visible by default
+   W E R T Y U I O P            9
+  A S D F G H J K L .          10
+   Z X C V B N M Q ,            9
+  [ shift ][   space   ][ bksp ][ enter ]   fixed bar
+```
+Why: most frequent nearest the thumb (bottom of screen) and rarer stacks above (depth ∝ rarity as physical distance); digits fill a 10-row exactly so the 9/10 alternation continues; three letter rows are ~20 mm so the digit row fits without scrolling (scroll starts at symbols); space/shift/backspace/enter must not scroll away (needed while picking symbols), so they live in the fixed bar; space doesn't need the centre — tracing inserts it between words, tapping (multi-word handles) gets the bottom bar; backspace right, shift left. The digit row follows `device.base`: base 10 fills the 10 cells; dozenal's two extra digits take the first two cells of the row above.
+
 **How to apply:** lead with shape writing on a honeycomb (the 36-stroke zone scheme is superseded); decide key count + layout with the owner, then the English optimisation pass; tap mode for attest's exact bytes; the scrolling extent with a scroll strip, 1:1 and unanimated.
