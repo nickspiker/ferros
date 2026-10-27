@@ -12,3 +12,20 @@ pub type time_t = i64;
 pub type clockid_t = i32;
 pub type pid_t = i32;
 pub type mode_t = u32;
+
+// errno values as Linux numbers them, for the crates that spell their errors through libc (rav1d). There is no errno on ferros; these are names for the codes they return.
+pub const ENOENT: ::c_int = 2;
+pub const EIO: ::c_int = 5;
+pub const EAGAIN: ::c_int = 11;
+pub const ENOMEM: ::c_int = 12;
+pub const EINVAL: ::c_int = 22;
+pub const ERANGE: ::c_int = 34;
+pub const ENOPROTOOPT: ::c_int = 92;
+
+// The C allocator: ferros_rt (the std runtime, linked into every std image) defines these over the process heap, for the C in the graph (PQClean) and the crates that call them by name (rav1d).
+extern "C" {
+    pub fn malloc(size: size_t) -> *mut ::c_void;
+    pub fn calloc(count: size_t, size: size_t) -> *mut ::c_void;
+    pub fn realloc(p: *mut ::c_void, size: size_t) -> *mut ::c_void;
+    pub fn free(p: *mut ::c_void);
+}
