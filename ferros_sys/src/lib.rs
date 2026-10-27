@@ -208,6 +208,44 @@ pub fn store_keys(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
+/// An entry kept by its 32-byte address rather than a name (SYS_STORE bit 5; kete's vaults on ferros): read up to `buf.len()` bytes of it; Some(the whole length) or None when absent or refused. Larger values come in pieces with `store_get_addr_at`.
+pub fn store_get_addr(cap: u64, addr: &[u8; 32], buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, 32 | (buf.len() as u64) << 8, off(addr.as_ptr()), 32, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+pub fn store_get_addr_at(cap: u64, addr: &[u8; 32], offset: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, 32 | 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(addr.as_ptr()), 32, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+/// Write a whole value under an address, in 4 KiB pieces when it is larger than one transfer. True when the kernel took it.
+pub fn store_set_addr(cap: u64, addr: &[u8; 32], value: &[u8]) -> bool {
+    if value.len() <= 4096 {
+        return svc(nr::STORE, cap, 32 | 1 | (value.len() as u64) << 8, off(addr.as_ptr()), 32, off(value.as_ptr())) == 0;
+    }
+    let pieces = value.len().div_ceil(4096);
+    value.chunks(4096).enumerate().all(|(i, piece)| {
+        let more = if i + 1 < pieces { 4 } else { 0 };
+        svc(nr::STORE, cap, 32 | 1 | 2 | more | (piece.len() as u64) << 8 | ((i * 4096) as u64) << 32, off(addr.as_ptr()), 32, off(piece.as_ptr())) == 0
+    })
+}
+
+/// Delete the entry under an address: Some(whether it was there), None if refused.
+pub fn store_delete_addr(cap: u64, addr: &[u8; 32]) -> Option<bool> {
+    match svc(nr::STORE, cap, 32 | 8, off(addr.as_ptr()), 32, 0) {
+        0 => Some(true),
+        NOTHING => Some(false),
+        _ => None,
+    }
+}
+
+/// The scope's addresses, 32 bytes each, concatenated: read like a large value from `offset`; returns the listing's whole length.
+pub fn store_addrs(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, 32 | 16 | 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(b"".as_ptr()), 0, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
 /// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.
 pub fn power(cap: u64, on: bool) -> bool {
     pin(CORES_BIG);

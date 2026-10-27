@@ -352,6 +352,17 @@ fn store_keys() -> Result<alloc::vec::Vec<alloc::string::String>, ()> {
     st.keys().map_err(|_| ())
 }
 
+fn store_addr(prefix: &str, addr: &[u8; 32], op: crate::process::AddrOp) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    use crate::process::AddrOp;
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    match op {
+        AddrOp::Get => st.get_addr(prefix, addr).map_err(|_| ()),
+        AddrOp::Set(v) => st.set_addr(prefix, addr, v).map(|_| None).map_err(|_| ()),
+        AddrOp::Remove => st.remove_addr(prefix, addr).map(|was| was.then_some(alloc::vec::Vec::new())).map_err(|_| ()),
+        AddrOp::List => st.addrs(prefix).map(Some).map_err(|_| ()),
+    }
+}
+
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
     match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k) } {
@@ -918,6 +929,7 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::STORE = Some(store_scoped);
         crate::process::STORE_REMOVE = Some(store_remove);
         crate::process::STORE_KEYS = Some(store_keys);
+        crate::process::STORE_ADDR = Some(store_addr);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();

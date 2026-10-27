@@ -1,7 +1,6 @@
 //! The first std program on ferros. Spawned as any payload: `ferros-bridge spawn stdhello.bin --name stdhello --entropy`; everything it prints is the console's.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,11 +46,15 @@ fn main() {
     }
     thread::sleep(Duration::from_millis(50));
 
-    let mut map = HashMap::new();
+    // A word count over a Vec: nine distinct words, a linear scan is the lookup.
+    let mut words: Vec<(&str, u32)> = Vec::new();
     for w in "the quick brown fox jumps over the lazy dog the end".split(' ') {
-        *map.entry(w).or_insert(0u32) += 1;
+        match words.iter_mut().find(|(k, _)| *k == w) {
+            Some((_, n)) => *n += 1,
+            None => words.push((w, 1)),
+        }
     }
-    println!("hashmap: 'the' A#{} times, A#{} words", map["the"], map.len());
+    println!("words: 'the' A#{} times, A#{} distinct", words.iter().find(|(k, _)| *k == "the").map_or(0, |(_, n)| *n), words.len());
 
     let before = Instant::now();
     thread::sleep(Duration::from_millis(100));

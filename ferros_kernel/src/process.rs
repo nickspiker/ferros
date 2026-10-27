@@ -885,10 +885,19 @@ pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, 
 /// Delete a key (true when it was there) and list every key of the vault (full names): what a std process's vault needs beyond get and set (kete on ferros, STD-TARGET.md).
 pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
 pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
-/// A value larger than one transfer arriving in pieces (SYS_STORE bit 1 + bit 2): assembled here until the piece without bit 2 commits it.
-static mut STORE_STAGE: Option<(alloc::string::String, Vec<u8>)> = None;
+/// An entry kept by 32-byte address rather than by name (SYS_STORE bit 5): kete on ferros keeps its vaults this way — the address is kete's, the kernel scopes it (kvault `addr_scoped`).
+pub enum AddrOp<'a> {
+    Get,
+    Set(&'a [u8]),
+    Remove,
+    /// The scope's addresses, concatenated.
+    List,
+}
+pub static mut STORE_ADDR: Option<fn(&str, &[u8; 32], AddrOp) -> Result<Option<Vec<u8>>, ()>> = None;
+/// A value larger than one transfer arriving in pieces (SYS_STORE bit 1 + bit 2): assembled here until the piece without bit 2 commits it. Keyed by the scope's prefix and the name, or the prefix, a 1 and the address.
+static mut STORE_STAGE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The last value read piecewise (key, value), so a large value is fetched from the vault once.
-static mut STORE_CACHE: Option<(alloc::string::String, Vec<u8>)> = None;
+static mut STORE_CACHE: Option<(Vec<u8>, Vec<u8>)> = None;
 /// The largest value `SYS_STORE` moves either way.
 pub const STORE_MAX: usize = 4096;
 
@@ -1193,36 +1202,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i),
                 _ => None,
             };
-            // x1: bit 0 set; bit 1 an offset (bits 32-63) into a value larger than one transfer — a read of that piece, or with bit 0 a write of it, staged until the piece without bit 2 (more follow) commits the whole; bit 3 delete; bit 4 list the scope's keys, read like a large value (the names relative to the scope, one per line). The length in bits 8-31.
-            let (set, more, del, list) = (f.x[1] & 1 != 0, f.x[1] & 4 != 0, f.x[1] & 8 != 0, f.x[1] & 16 != 0);
+            // x1: bit 0 set; bit 1 an offset (bits 32-63) into a value larger than one transfer — a read of that piece, or with bit 0 a write of it, staged until the piece without bit 2 (more follow) commits the whole; bit 3 delete; bit 4 list the scope's entries, read like a large value (names relative to the scope one per line, or with bit 5 the addresses, 32 bytes each); bit 5 the entry is named by a 32-byte address at x2 rather than a name. The length in bits 8-31.
+            let (set, more, del, list, raw) = (f.x[1] & 1 != 0, f.x[1] & 4 != 0, f.x[1] & 8 != 0, f.x[1] & 16 != 0, f.x[1] & 32 != 0);
             let at = if f.x[1] & 2 != 0 { Some((f.x[1] >> 32) as usize) } else { None };
             let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
-            let rel = p.read(f.x[2], (f.x[3] as usize).min(65));
-            let rel_ok = rel.len() <= 64 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list);
-            f.x[0] = match (scope, unsafe { STORE }) {
-                (Some(sc), Some(store)) if rel_ok && len <= STORE_MAX => {
-                    let mut key = alloc::string::String::from(sc.prefix);
-                    key.push_str(core::str::from_utf8(&rel).unwrap_or(""));
+            let rel = p.read(f.x[2], (f.x[3] as usize).min(97));
+            let rel_ok = if raw { rel.len() == 32 || list } else { rel.len() <= 96 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list) };
+            f.x[0] = match (scope, unsafe { STORE }, unsafe { STORE_ADDR }) {
+                (Some(sc), Some(store), Some(store_addr)) if rel_ok && len <= STORE_MAX => {
+                    // The entry's name for the kernel's own bookkeeping: prefix + name, or prefix + 1 + address.
+                    let mut key: Vec<u8> = sc.prefix.as_bytes().to_vec();
+                    if raw {
+                        key.push(1);
+                    }
+                    key.extend_from_slice(&rel);
+                    let addr: [u8; 32] = if raw && rel.len() == 32 { rel[..].try_into().unwrap() } else { [0; 32] };
+                    let name = alloc::string::String::from_utf8(key.clone()).unwrap_or_default();
+                    let fetch = |op: AddrOp| -> Result<Option<Vec<u8>>, ()> { if raw { store_addr(sc.prefix, &addr, op) } else { match op { AddrOp::Get => store(&name, None), AddrOp::Set(v) => store(&name, Some(v)), _ => Err(()) } } };
                     let cache = unsafe { &mut *(&raw mut STORE_CACHE) };
-                    if list {
-                        // The listing is served as a large value would be, under a name no key can have (a newline).
-                        let lk = alloc::format!("{}\n", sc.prefix);
-                        if cache.as_ref().map(|(k, _)| k != &lk).unwrap_or(true) {
-                            *cache = match unsafe { STORE_KEYS }.map(|keys| keys()) {
-                                Some(Ok(names)) => {
-                                    let mut out = alloc::string::String::new();
-                                    for n in names.iter().filter_map(|n| n.strip_prefix(sc.prefix)) {
-                                        out.push_str(n);
-                                        out.push('\n');
-                                    }
-                                    Some((lk, out.into_bytes()))
-                                }
-                                _ => None,
-                            };
-                        }
+                    // A listing or a large value is served piecewise from here: fetched once, kept until its last piece is read.
+                    let serve = |cache: &mut Option<(Vec<u8>, Vec<u8>)>, p: &Process, at: usize, absent: u64| -> u64 {
                         match cache {
                             Some((_, v)) => {
-                                let at = at.unwrap_or(0);
                                 let piece = &v[at.min(v.len())..(at + len).min(v.len())];
                                 p.write(f.x[4], piece);
                                 let total = v.len();
@@ -1231,14 +1232,37 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 }
                                 total as u64
                             }
-                            None => ERR,
+                            None => absent,
                         }
+                    };
+                    if list {
+                        let mut lk = sc.prefix.as_bytes().to_vec();
+                        lk.push(if raw { 2 } else { b'\n' });
+                        if cache.as_ref().map(|(k, _)| k != &lk).unwrap_or(true) {
+                            *cache = if raw {
+                                store_addr(sc.prefix, &addr, AddrOp::List).ok().flatten().map(|v| (lk, v))
+                            } else {
+                                match unsafe { STORE_KEYS }.map(|keys| keys()) {
+                                    Some(Ok(names)) => {
+                                        let mut out = alloc::string::String::new();
+                                        for n in names.iter().filter_map(|n| n.strip_prefix(sc.prefix)) {
+                                            out.push_str(n);
+                                            out.push('\n');
+                                        }
+                                        Some((lk, out.into_bytes()))
+                                    }
+                                    _ => None,
+                                }
+                            };
+                        }
+                        serve(cache, p, at.unwrap_or(0), ERR)
                     } else if del {
                         *cache = None;
-                        match unsafe { STORE_REMOVE }.map(|rm| rm(&key)) {
-                            Some(Ok(true)) => 0,
-                            Some(Ok(false)) => NOTHING,
-                            _ => ERR,
+                        let r = if raw { store_addr(sc.prefix, &addr, AddrOp::Remove).map(|v| v.is_some()) } else { unsafe { STORE_REMOVE }.map(|rm| rm(&name)).unwrap_or(Err(())) };
+                        match r {
+                            Ok(true) => 0,
+                            Ok(false) => NOTHING,
+                            Err(()) => ERR,
                         }
                     } else if set {
                         *cache = None;
@@ -1257,36 +1281,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                                 0
                             } else {
                                 let (_, whole) = stage.take().unwrap();
-                                if store(&key, Some(&whole)).is_ok() { 0 } else { ERR }
+                                if fetch(AddrOp::Set(&whole)).is_ok() { 0 } else { ERR }
                             }
-                        } else if store(&key, Some(&piece)).is_ok() {
+                        } else if fetch(AddrOp::Set(&piece)).is_ok() {
                             0
                         } else {
                             ERR
                         }
                     } else if let Some(at) = at {
-                        // A large value read piecewise: the whole value is kept once, for the reads that follow (a 250 KB replay is 62 of them).
                         if cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-                            *cache = match store(&key, None) {
+                            *cache = match fetch(AddrOp::Get) {
                                 Ok(Some(v)) => Some((key.clone(), v)),
                                 _ => None,
                             };
                         }
-                        match cache {
-                            Some((_, v)) => {
-                                let piece = &v[at.min(v.len())..(at + len).min(v.len())];
-                                p.write(f.x[4], piece);
-                                let total = v.len();
-                                // The last piece read: the copy goes (a 2.1 MB WiFi firmware need not sit in the heap for the rest of the boot).
-                                if at + len >= total {
-                                    *cache = None;
-                                }
-                                total as u64
-                            }
-                            None => NOTHING,
-                        }
+                        serve(cache, p, at, NOTHING)
                     } else {
-                        match store(&key, None) {
+                        match fetch(AddrOp::Get) {
                             Ok(Some(v)) => {
                                 p.write(f.x[4], &v[..v.len().min(len)]);
                                 v.len() as u64

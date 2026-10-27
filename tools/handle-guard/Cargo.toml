@@ -1,0 +1,13 @@
+[package]
+name = "handle-guard"
+version = "0.1.0"
+edition = "2024"
+description = "The fail-closed handle scanner behind every pre-commit and pre-push hook: reads the handle map in keys/ at run time, refuses any staged content carrying a handle, says where"
+
+[[bin]]
+name = "handle-guard"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+glob = "0.3"

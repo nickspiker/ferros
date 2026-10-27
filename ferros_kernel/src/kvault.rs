@@ -194,6 +194,54 @@ impl KVault {
     }
 
     /// Every name the kernel has stored, sorted.
+    /// Entries a process keeps by 32-byte address (kete on ferros, STD-TARGET.md): the address goes through the same keyed hash a name does, with the scope's prefix in front, so one scope cannot reach another's; the scope's address list is kept under a reserved name for listing, 32 bytes an entry.
+    fn addr_scoped(&self, prefix: &str, addr: &[u8; 32]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_keyed(&self.addr_key);
+        h.update(prefix.as_bytes());
+        h.update(addr);
+        *h.finalize().as_bytes()
+    }
+
+    fn addrs_name(prefix: &str) -> String {
+        alloc::format!("\0addrs.{prefix}")
+    }
+
+    pub fn get_addr(&mut self, prefix: &str, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, KvError> {
+        let a = self.addr_scoped(prefix, addr);
+        match self.vault.get(&a)? {
+            Some(s) => Ok(Some(self.unseal(s)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_addr(&mut self, prefix: &str, addr: &[u8; 32], value: &[u8]) -> Result<(), KvError> {
+        let a = self.addr_scoped(prefix, addr);
+        let sealed = self.seal(value)?;
+        self.vault.put(&a, &sealed, now())?;
+        let mut list = self.addrs(prefix)?;
+        if !list.chunks_exact(32).any(|c| c == addr) {
+            list.extend_from_slice(addr);
+            self.raw_put(&Self::addrs_name(prefix), &list)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_addr(&mut self, prefix: &str, addr: &[u8; 32]) -> Result<bool, KvError> {
+        let a = self.addr_scoped(prefix, addr);
+        let existed = self.vault.delete(&a, now())?;
+        let list = self.addrs(prefix)?;
+        if list.chunks_exact(32).any(|c| c == addr) {
+            let kept: Vec<u8> = list.chunks_exact(32).filter(|c| *c != addr).flatten().copied().collect();
+            self.raw_put(&Self::addrs_name(prefix), &kept)?;
+        }
+        Ok(existed)
+    }
+
+    /// The scope's addresses, 32 bytes each, concatenated.
+    pub fn addrs(&mut self, prefix: &str) -> Result<Vec<u8>, KvError> {
+        Ok(self.raw_get(&Self::addrs_name(prefix))?.unwrap_or_default())
+    }
+
     pub fn keys(&mut self) -> Result<Vec<String>, KvError> {
         match self.raw_get(NAMES)? {
             None => Ok(Vec::new()),

@@ -18,6 +18,7 @@ members = [
     "ferros_seed",
     "tools/mkimg",
     "tools/ferros-bridge",
+    "tools/handle-guard",
     "tools/ferros-mask",
     "tools/install",
     "payloads/hello",
