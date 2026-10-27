@@ -137,6 +137,22 @@ Where the platform tells the truth, the platform's own exposure is close to none
 
 **Revisit if:** a provider's agreement turns out to put obligations on the platform rather than the user.
 
+### D7 — Each device is itself to Google; the identity signs it in; nothing asks the user (2026-10-27)
+
+**Decision:** Every device in a fleet appears to Google (and to every service) as the device it is, under the identity's own account: its own check-in, its own device-bound tokens, its own push registration.
+The user's one action that brings a device into the fleet is the only action: ferros then installs every app on it (compiled and checked on that machine, D1), grants the identity's permissions, and signs it in to each service on the identity's behalf, with no per-service step of any kind.
+Sign-in uses the identity's passkey for each service, held by ferros as the identity's passkey provider and present on every fleet device.
+Sync is the default for every app and every account; the owner may uncheck an app or an account for a given device, and nothing else turns it off.
+
+**Why:** A device in the fleet is owned by the identity, so the fleet join is the owner's verification, and a passkey sign-in that follows from it honestly reports a verified user.
+Passkeys are built for exactly this: one person's credential synced across their own devices by a passkey provider (as Google Password Manager, iCloud Keychain and password managers do), with the service holding only the public key.
+Presenting several devices as one would break D4 (report the hardware as it is), and in practice breaks push (registrations collide) and trips account-takeover defences (one "device" in several places at once); copying one device's tokens to another adds a single point of compromise for the whole fleet.
+Google's own model is already one person with many devices under one account, so nothing about the fleet needs hiding.
+
+**Cost:** ferros must implement the Android credential-provider interface well enough that Google's sign-in (route B, O0) and every app take passkeys from it. A service can still issue its own "verify it's you" challenge when its risk system fires; ferros never creates a step, but cannot stop a third party from demanding one.
+
+**Revisit if:** a service refuses passkeys from providers other than its own, or its terms bar the account on more than some number of devices.
+
 ---
 
 ## App classes
