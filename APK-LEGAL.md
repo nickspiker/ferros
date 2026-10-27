@@ -141,17 +141,21 @@ Where the platform tells the truth, the platform's own exposure is close to none
 
 **Decision:** Every device in a fleet appears to Google (and to every service) as the device it is, under the identity's own account: its own check-in, its own device-bound tokens, its own push registration.
 The user's one action that brings a device into the fleet is the only action: ferros then installs every app on it (compiled and checked on that machine, D1), grants the identity's permissions, and signs it in to each service on the identity's behalf, with no per-service step of any kind.
-Sign-in uses the identity's passkey for each service, held by ferros as the identity's passkey provider and present on every fleet device.
+Sign-in follows TOKEN's legacy-credential chain (US provisional 64/098,084): each service's credential is derived on the device, on demand, by the provably-lossy one-way function over the identity's password nonce and the service's public identity (its domain), then formatted to the service's public password policy; it is never stored, and every fleet device derives the same one.
+Values a service assigns that the identity cannot derive (a second-factor seed, an account number) are kept as identity-bound encrypted objects replicated across the fleet and re-instated on every device (TOKEN's `serviceassigned` claim).
+Each device then holds its own tokens from the service; no device's tokens are copied to another.
 Sync is the default for every app and every account; the owner may uncheck an app or an account for a given device, and nothing else turns it off.
 
-**Why:** A device in the fleet is owned by the identity, so the fleet join is the owner's verification, and a passkey sign-in that follows from it honestly reports a verified user.
-Passkeys are built for exactly this: one person's credential synced across their own devices by a passkey provider (as Google Password Manager, iCloud Keychain and password managers do), with the service holding only the public key.
+**Why:** A device in the fleet is owned by the identity, so the fleet join is the owner's verification, and every sign-in that follows from it is the owner's own.
+Deriving rather than storing means there is no credential vault to breach: the nonce is the only secret, it is not the handle (so no contact can derive a password), it is held at rest under the device secret, and custodians recover it after the loss of every device; a breach at one service reveals nothing of any other (TOKEN, legacy credential derivation).
+Filling a service's own login form with the user's own credential is what every password manager does; nothing about it misrepresents the device or the user.
+ferros stays passless (VAULT-KEY.md: no passphrase, no PIN, no FIDO, no passkeys): the owner never types anything, and the derived credential is ferros's to present, not the owner's to remember.
 Presenting several devices as one would break D4 (report the hardware as it is), and in practice breaks push (registrations collide) and trips account-takeover defences (one "device" in several places at once); copying one device's tokens to another adds a single point of compromise for the whole fleet.
 Google's own model is already one person with many devices under one account, so nothing about the fleet needs hiding.
 
-**Cost:** ferros must implement the Android credential-provider interface well enough that Google's sign-in (route B, O0) and every app take passkeys from it. A service can still issue its own "verify it's you" challenge when its risk system fires; ferros never creates a step, but cannot stop a third party from demanding one.
+**Cost:** ferros must fill each service's sign-in (Google's inside route B, O0, and every app's) on the identity's behalf, and keep each service's password policy and its service-assigned values. A service can still issue its own "verify it's you" challenge when its risk system fires; ferros never creates a step, but cannot stop a third party from demanding one.
 
-**Revisit if:** a service refuses passkeys from providers other than its own, or its terms bar the account on more than some number of devices.
+**Revisit if:** a service drops password sign-in altogether (the same chain could derive a per-service key pair instead of a password, but that is a passkey, and VAULT-KEY's no-passkeys rule is the owner's to revisit), or a service's terms bar the account on more than some number of devices.
 
 ---
 
