@@ -83,6 +83,11 @@ fn main() {
     }
     let excluded = |pet: &str, path: &str| exclusions.iter().any(|(p, g)| p == pet && g.matches(path));
 
+    // Mask every handle in a string with its petname, longest handle first so one handle inside another is never half-replaced.
+    let mut by_len: Vec<&Handle> = handles.iter().collect();
+    by_len.sort_by(|a, b| b.handle.len().cmp(&a.handle.len()));
+    let mask = |s: &str| by_len.iter().fold(s.to_string(), |acc, h| acc.replace(h.handle.as_str(), &h.petname));
+
     let hunk = regex::Regex::new(r"^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,[0-9]+)? @@").unwrap();
     let commit = regex::Regex::new(r"^commit [0-9a-f]{40}").unwrap();
     let (mut file, mut line, mut in_diff, mut in_hdr) = ("stdin".to_string(), 0usize, false, false);
@@ -126,8 +131,9 @@ fn main() {
             if in_diff && !in_hdr && excluded(&h.petname, &file) {
                 continue;
             }
-            let shown = l.replace(h.handle.as_str(), &h.petname);
-            let where_ = if in_diff { format!("{file}:{line}") } else { format!("stdin:{line}") }.replace(h.handle.as_str(), &h.petname);
+            // Every handle on the line is masked, not only the one this report is about: a line holding several handles printed the others raw (2026-10-27, three handles reached a transcript that way).
+            let shown = mask(l);
+            let where_ = mask(&if in_diff { format!("{file}:{line}") } else { format!("stdin:{line}") });
             eprintln!("handle-guard: BLOCKED — handle of '{}' at {where_}", h.petname);
             eprintln!("    {shown}");
             eprintln!("    (shown with the handle already replaced by the petname — that is the edit)");
