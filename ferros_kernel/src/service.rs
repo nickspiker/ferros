@@ -927,6 +927,14 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::PREF_STORE = Some(store_pref);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
+        // The last boot's end, if the fault sink or the panic reporter recorded one, into the flash log: a reboot should never be silent.
+        {
+            let w = crate::platform::previous_end();
+            if w.iter().any(|&v| v != 0) {
+                let text: alloc::string::String = w[4].to_le_bytes().iter().chain(w[5].to_le_bytes().iter()).map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' }).collect();
+                crate::flashlog::line(&alloc::format!("previous boot ended: panic-num {} heap G#{:X} esr G#{:X} faults {} elr G#{:X} far G#{:X} text {:?}", w[0], w[1], w[2], w[3], w[4], w[5], text));
+            }
+        }
         crate::process::STORE_REMOVE = Some(store_remove);
         crate::process::STORE_KEYS = Some(store_keys);
         crate::process::STORE_ADDR = Some(store_addr);
@@ -1023,6 +1031,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut reload_size = 0usize;
     let mut run_ok = false;
     let mut run_size = 0usize;
+    // A capsule streamed straight into its arc (the spawn Write pieces): the arc, the capsule's length, the bytes received, the code's offset and length inside it.
+    let mut spawn_stage: Option<(crate::process::Arc, usize, usize, usize, usize)> = None;
 
     unsafe extern "C" {
         static __stack_top: u8;
@@ -3055,9 +3065,35 @@ pub fn run(mut b: Boot) -> ! {
                                                 );
                                             }
                                         }
+                                    } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Write {
+                                        // A capsule too large for the staging slot, streamed straight into its arc (STD-TARGET.md): [total u64][need u64][code offset u64][code length u64][piece offset u64][piece]. The first piece allocates the arc (zeroed, from the big pool past 16 MiB); each piece lands at the code offset plus its own; the reply is the bytes received so far. The Exec that follows builds the process in that arc.
+                                        let pr = cmd.params;
+                                        let w = |i: usize| u64::from_le_bytes(pr[i * 8..i * 8 + 8].try_into().unwrap()) as usize;
+                                        let mut received = 0usize;
+                                        if pr.len() >= 40 {
+                                            let (total, need, co, cl, off) = (w(0), w(1), w(2), w(3), w(4));
+                                            let piece = &pr[40..];
+                                            if off == 0 {
+                                                if let Some((a, ..)) = spawn_stage.take() {
+                                                    crate::process::arc_free(a);
+                                                }
+                                                if let Some(arc) = crate::process::arc_alloc(need, false) {
+                                                    spawn_stage = Some((arc, total, 0, co, cl));
+                                                }
+                                            }
+                                            if let Some((arc, t, r, _, _)) = spawn_stage.as_mut() {
+                                                if *t == total && off == *r && off + piece.len() <= total && crate::process::CODE + total + crate::process::STACK <= arc.size {
+                                                    unsafe { core::ptr::copy_nonoverlapping(piece.as_ptr(), (arc.base + crate::process::CODE + off) as *mut u8, piece.len()) };
+                                                    *r += piece.len();
+                                                    received = *r;
+                                                }
+                                            }
+                                        }
+                                        queue_pt_response(&mut pt_out_data, &(received as u32).to_le_bytes());
                                     } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
                                         // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
-                                        if run_ok && run_size > 0 {
+                                        let staged = spawn_stage.take();
+                                        if (run_ok && run_size > 0) || staged.is_some() {
                                             let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
                                             let pr = cmd.params;
                                             let mut at = 0usize;
@@ -3085,7 +3121,16 @@ pub fn run(mut b: Boot) -> ! {
                                             let input = &pr[at.min(pr.len())..];
                                             // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
                                             let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
-                                            match crate::process::spawn_capsule(if name.is_empty() { b"proc" } else { name }, code, input, &grants, &sealed) {
+                                            let nm = if name.is_empty() { b"proc" } else { name };
+                                            let spawned = match staged {
+                                                Some((arc, total, received, co, cl)) if received == total => crate::process::spawn_capsule_staged(nm, arc, total, co, cl, input, &grants),
+                                                Some((arc, ..)) => {
+                                                    crate::process::arc_free(arc);
+                                                    Err("spawn: the streamed capsule is incomplete")
+                                                }
+                                                None => crate::process::spawn_capsule(nm, code, input, &grants, &sealed),
+                                            };
+                                            match spawned {
                                                 Ok(o) => {
                                                     use crate::checklist::{mark, Item};
                                                     mark(Item::Arcs);

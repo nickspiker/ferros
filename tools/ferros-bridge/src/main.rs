@@ -643,6 +643,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         eprintln!("Failed to read {path}: {e}");
         std::process::exit(1);
     });
+    let raw = blob.clone();
     // spawn: the kernel only spawns signed capsules (the gate); run stays raw (dev payloads at EL2).
     let blob = if (exec_cap == ferros_pt::command::caps::SPAWN || exec_cap == ferros_pt::command::caps::SEAL) && std::env::var("FERROS_RAW_SPAWN").is_err() {
         let mut c = signed_capsule(&blob, masked, text_len);
@@ -679,7 +680,42 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
     };
 
     // Stage the payload
+    // A capsule past the kernel's 4 MiB staging slot streams straight into its arc in 1 MiB pieces (STD-TARGET.md): the kernel learns the arc it needs — code, the image's zeroed tail from its header, the input, the entry stack — and where the code lies inside the signed capsule.
+    let streamed = exec_cap == ferros_pt::command::caps::SPAWN && (blob.len() > (1 << 20) || std::env::var("FERROS_STREAM").is_ok());
+    if streamed {
+        let zeroed = if raw.len() >= 56 && &raw[8..16] == b"ferrosRT" { u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize + u64::from_le_bytes(raw[48..56].try_into().unwrap()) as usize } else { 0 };
+        let need = 4096 + raw.len() + zeroed + prefix.len() + input.len() + tail.len() + 65536;
+        let code_offset = (0..=blob.len() - raw.len()).find(|&i| blob[i..i + raw.len()] == raw[..]).expect("the code inside its capsule");
+        let t0 = std::time::Instant::now();
+        eprintln!("Streaming {} bytes into a {} byte arc (code at offset {code_offset})...", blob.len(), need);
+        for (k, piece) in blob.chunks(1 << 20).enumerate() {
+            let off = k << 20;
+            let mut params = Vec::with_capacity(40 + piece.len());
+            for v in [blob.len(), need, code_offset, raw.len(), off] {
+                params.extend_from_slice(&(v as u64).to_le_bytes());
+            }
+            params.extend_from_slice(piece);
+            let cmd = build_cmd(ferros_pt::command::caps::SPAWN, ferros_pt::Op::Write, &params);
+            match pt_send(&link, &cmd).await {
+                Ok(c) if c.success => {}
+                other => {
+                    eprintln!("Piece at {off} failed: {other:?}");
+                    std::process::exit(1);
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(15), pt_recv(&link)).await {
+                Ok(Ok(resp)) if resp.len() >= 4 && u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize == off + piece.len() => {}
+                other => {
+                    eprintln!("Piece at {off} not taken: {other:?}");
+                    std::process::exit(1);
+                }
+            }
+            eprint!("\r  {} of {} bytes, {} ms", off + piece.len(), blob.len(), t0.elapsed().as_millis());
+        }
+        eprintln!();
+    }
     let cmd = build_cmd(ferros_pt::command::caps::RUN, ferros_pt::Op::Write, &blob);
+    if !streamed {
     eprintln!("Staging payload ({} bytes)...", blob.len());
     match pt_send(&link, &cmd).await {
         Ok(c) if c.success => {}
@@ -705,6 +741,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
             eprintln!("No staged-size ack: {other:?}");
             std::process::exit(1);
         }
+    }
     }
 
     // Execute — Exec params become the payload's input

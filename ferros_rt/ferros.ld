@@ -1,4 +1,4 @@
-/* The linker script of a ferros std process (STD-TARGET.md), passed by the target spec targets/aarch64-unknown-ferros.json. PIE: the entry at offset 0, code PC-relative, every absolute address the linker would bake into data left as an R_AARCH64_RELATIVE entry in .rela.dyn for ferros_rt's relocate() to add the load address to. The kernel enters offset 0 with the RUN ABI, so .text.entry MUST come first; its header (offset 8: "ferrosRT", then the zeroed tail the kernel adds after the code, the TLS image size, the TLS block size, the TLS alignment, the heap size) is filled from the absolute symbols below. .bss is last and not in the flat image: the kernel zeroes the tail. Override the heap with --defsym __ferros_heap=<bytes>. */
+/* The linker script of a ferros std process (STD-TARGET.md), passed by the target spec targets/aarch64-unknown-ferros.json. PIE: the entry at offset 0, code PC-relative, every absolute address the linker would bake into data left as an R_AARCH64_RELATIVE entry in .rela.dyn for ferros_rt's relocate() to add the load address to. The kernel enters offset 0 with the RUN ABI, so .text.entry MUST come first; its header (offset 8: "ferrosRT", then .bss plus 16 — the kernel adds that and the heap word after the code — the TLS image size, the TLS block size, the TLS alignment, the heap size) is filled from the absolute symbols below. .bss is last and not in the flat image: the kernel zeroes the tail. Override the heap with --defsym __ferros_heap=<bytes>. */
 ENTRY(_entry)
 SECTIONS {
     . = 0;
@@ -31,4 +31,4 @@ __ferros_heap = DEFINED(__ferros_heap) ? __ferros_heap : 2M;
 __ferros_tdata_size = SIZEOF(.tdata);
 __ferros_tls_size = SIZEOF(.tdata) + SIZEOF(.tbss);
 __ferros_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
-__ferros_tail = SIZEOF(.bss) + 16 + __ferros_heap;
+__ferros_tail = SIZEOF(.bss) + 16;

@@ -1899,8 +1899,8 @@ pub struct Outcome {
 
 /// Arc layout: grants page, then code.
 const GRANTS: usize = 0;
-const CODE: usize = 0x1000;
-const STACK: usize = 64 * 1024;
+pub const CODE: usize = 0x1000;
+pub const STACK: usize = 64 * 1024;
 
 /// A capability to grant at spawn: a dev endpoint by name, to serve (receive) or to use (send).
 #[derive(Clone, Copy)]
@@ -1967,7 +1967,54 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
             return Err(e);
         }
     };
-    let (me, arc, in_off) = match build(name, code, input, &objects, ihi, guard, exec_len) {
+    let built = build(name, code, input, &objects, ihi, guard, exec_len);
+    launch(built, input.len())
+}
+
+/// A signed native capsule the bridge streamed straight into `arc` at the code offset (`service.rs`, the spawn Write pieces): the gate over it where it lies, the code moved down to the arc's code offset, the rest of the staging zeroed, and the process built in that arc (STD-TARGET.md: a std image is far past the 4 MiB staging slot). On any refusal the arc goes back to the pool.
+pub fn spawn_capsule_staged(name: &[u8], arc: Arc, capsule_len: usize, code_offset: usize, code_len: usize, input: &[u8], grants: &[Grant]) -> Result<Outcome, &'static str> {
+    let r = (|| {
+        if cfg!(ferros_production) {
+            return Err("gate: production refuses unmasked native code");
+        }
+        if !crate::cachemap::vhe() {
+            return Err("no VHE: processes need the EL2&0 regime");
+        }
+        if CODE + capsule_len + input.len() + STACK > arc.size || code_offset + code_len > capsule_len {
+            return Err("spawn: the staged capsule does not fit its arc");
+        }
+        let capsule = unsafe { core::slice::from_raw_parts_mut((arc.base + CODE) as *mut u8, capsule_len) };
+        let g = crate::oracle::gate_located(capsule, code_offset, code_len)?;
+        let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
+        unsafe {
+            core::ptr::copy((arc.base + CODE + code_offset) as *const u8, (arc.base + CODE) as *mut u8, code_len);
+            core::ptr::write_bytes((arc.base + CODE + code_len) as *mut u8, 0, capsule_len - code_len);
+        }
+        Ok(ihi)
+    })();
+    let ihi = match r {
+        Ok(i) => i,
+        Err(e) => {
+            arc_free(arc);
+            return Err(e);
+        }
+    };
+    lock();
+    let objects = match resolve(grants) {
+        Ok(o) => o,
+        Err(e) => {
+            arc_free(arc);
+            unlock();
+            return Err(e);
+        }
+    };
+    let built = build_from(name, arc, code_len, input, &objects, Some(ihi), false, code_len);
+    launch(built, input.len())
+}
+
+/// The second half of a spawn, entered with the lock held: the built process runs its first slice on this core and the outcome comes back.
+fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) -> Result<Outcome, &'static str> {
+    let (me, arc, in_off) = match built {
         Ok(b) => b,
         Err(e) => {
             unlock();
@@ -1983,7 +2030,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
     cur_set(Some(me));
     unlock();
     arm_slice();
-    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input.len() as u64) };
+    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input_len as u64) };
     disarm_slice();
     lock();
     let kk = k();
@@ -2036,8 +2083,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
 
 /// The zeroed memory a std image asks for after its code — its `.bss` and its heap — from the header `ferros_rt` puts at offset 8: the eight bytes `ferrosRT`, then the byte count (STD-TARGET.md). The flat image cannot carry `.bss` (the input used to land right after the code), so the image says how much the arc must grow and the input moves past it. A native payload has no header: 0.
 fn image_tail(code: &[u8]) -> usize {
-    if code.len() >= 24 && &code[8..16] == b"ferrosRT" {
-        (u64::from_le_bytes(code[16..24].try_into().unwrap()) as usize).min(1 << 30)
+    if code.len() >= 56 && &code[8..16] == b"ferrosRT" {
+        // Two words, summed here: .bss plus 16 (the linker script's own arithmetic) and the heap (a --defsym the script only forwards; summing them in the script took the default heap once, 2026-10-27).
+        let w = |at: usize| u64::from_le_bytes(code[at..at + 8].try_into().unwrap()) as usize;
+        (w(16) + w(48)).min(1 << 30)
     } else {
         0
     }
@@ -2049,6 +2098,14 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     let tail = image_tail(code);
     let arc = arc_alloc(CODE + code.len() + tail + inline + STACK, guard).ok_or("arc pool exhausted")?;
+    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
+    build_from(name, arc, code.len(), input, objects, ihi, guard, exec_len)
+}
+
+/// The process in an arc that already holds its code at the code offset (`build` copied it; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
+fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+    cap_key().ok_or("no wairua: refusing to mint capabilities")?;
+    let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len) });
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for &(object, rights) in objects {
@@ -2065,10 +2122,9 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
         p.write(IHI as u64, &i);
     }
     p.write(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
-    p.write(CODE as u64, code);
-    let in_off = CODE + code.len() + tail;
+    let in_off = CODE + code_len + tail;
     p.write(in_off as u64, input);
-    crate::cachemap::sync_code(arc.base + CODE, code.len());
+    crate::cachemap::sync_code(arc.base + CODE, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
     crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).

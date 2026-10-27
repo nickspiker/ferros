@@ -22,6 +22,8 @@ ferros_layout = { path = "../ferros_layout" }
 ferros_ext4 = { path = "../ferros_ext4" }
 ferros_f2fs = { path = "../ferros_f2fs" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
+# The in-place capsule gate (oracle::gate_located) verifies the Ed25519 signature over the arc itself; vsf's verifier copies the file to zero its signature field, which a 100 MB std image cannot afford in the kernel heap.
+ed25519-dalek = { version = "2", default-features = false }
 ferros_vault = { path = "../vault", default-features = false }
 # The storage engine (the owner's, shared with Photon and the rest of the stack): mirrored 4 KiB blocks, generation ring, plow-managed tract, COW HAMT. no_std core; the kernel backs its BlockDev with UFS (kvault.rs).
 manifestus = { path = "../../manifestus", default-features = false }

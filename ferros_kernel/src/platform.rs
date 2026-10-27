@@ -77,8 +77,20 @@ const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
 /// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
 /// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
 /// 2. Cluster watchdogs armed.
+/// What the result block held when this boot armed the sink: the last boot's end, if it ended in a fault or a panic — panic number, heap word, ESR, fault count, ELR (or the panic text's first 8 bytes), FAR (or the next 8). The service writes it to the flash log once that is up (`previous_end`), since the block is cleared here and a reboot is otherwise silent.
+pub static PREV_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static mut PREV_WORDS: [u64; 6] = [0; 6];
+
+/// The last boot's end words (see `PREV_END`), zero when it ended cleanly or nothing was recorded.
+pub fn previous_end() -> [u64; 6] {
+    unsafe { *(&raw const PREV_WORDS) }
+}
+
 pub fn arm_safety() {
     unsafe {
+        let r = |off: usize| read_volatile((RAMOOPS_RESULT + off) as *const u64);
+        *(&raw mut PREV_WORDS) = [r(0x08), r(0x10), r(0x20), r(0x28), r(0xA0), r(0xA8)];
+        PREV_END.store(r(0x20) | r(0x28) | r(0x08), core::sync::atomic::Ordering::Relaxed);
         for off in [0x08usize, 0x10, 0x20, 0x28, 0xA0, 0xA8] {
             write_volatile((RAMOOPS_RESULT + off) as *mut u64, 0);
         }
