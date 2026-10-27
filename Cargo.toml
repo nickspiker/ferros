@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["ferros_rt", "std/hello", "std/probe", "std/fluordemo"]
+exclude = ["ferros_rt", "std/hello", "std/probe", "std/fluordemo", "std/photon"]
 members = [
     "ferros_layout",
     "ferros_ext4",

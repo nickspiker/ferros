@@ -6,6 +6,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod alloc;
+pub mod cabi;
 pub mod console;
 pub mod futex;
 pub mod getrandom;
