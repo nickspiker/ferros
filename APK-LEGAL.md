@@ -173,7 +173,8 @@ Neither carries the original 2011 Google Wallet terms' reported bar on any OS "m
 **O4 — Chase US Digital Services Agreement.** Not yet read; D6's Chase facts come from the UK licence and a US educational page.
 
 **O5 — Emergency services.** Owner's rule (2026-10-27): ferros has no POTS, SMS, MMS or 911, ever; emergencies go through Photon EMS (photons, beams and waves), and calls to phone numbers go through Google Voice once route B (O0) runs.
-Still open: whether a phone with a cellular radio may lack 911 at all (the FCC's wireless 911 rules are aimed at carriers; handset requirements not yet read), and that ferros's rule means ferros provides no 911, not that ferros blocks an app such as Voice that offers it.
+No conflict with 911 law: the FCC's wireless 911 duties fall on providers of interconnected voice service, and a data-only device on a data-only plan (an LTE laptop or tablet today) is not one; ferros's target is the Glyph (GLYPH.md), which has no POTS capability at all, and husky runs it the same way, data only.
+Where an app brings its own interconnected calling (Google Voice), that app's provider carries the 911 duties for its service; ferros's rule means ferros provides no 911, not that ferros blocks an app's own emergency dialling.
 Google's two Voice documents disagree: the Voice Additional Terms say "Google Voice isn't capable of placing or receiving emergency services calls" (snapshot `google-voice-additional-terms.html`), while the Voice Personal terms, last modified June 9, 2026, say "Dialing to emergency services is supported by Google Voice Personal" with VoIP limitations (snapshot `google-voice-personal-terms.html`).
 If Photon EMS ever reaches public-safety answering points directly, FCC 911 rules for internet telephony (location, call-back) likely apply to it; that needs its own entry before Photon EMS ships.
 
