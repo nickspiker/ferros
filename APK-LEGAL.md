@@ -213,7 +213,7 @@ Chase UK's app licence forbids users to "copy, reproduce, publish, modify or tam
 Compiling before running is what every runtime does (JIT compiles before the code runs, and the compiled code exists in memory in a distinct form); compiling at install only does it earlier.
 The result is encrypted and keyed to one device with one key, never shared and never readable elsewhere, so nothing is copied, reproduced or published, and the app's meaning is unchanged (the checker refuses code, it does not rewrite it). The reasoning is now part of D1.
 
-**O7 — Counsel before release.** Proposed ship gate: before ferros runs banking or government identity apps for anyone but the owner, one paid review of this log by a technology lawyer, recorded here with the date.
+**O7 — Counsel before release.** Accepted by the owner 2026-10-27 as a ship gate (stays open until the review happens): before ferros runs banking or government identity apps for anyone but the owner, one paid review of this log by a technology lawyer, recorded here with the date.
 
 ---
 
