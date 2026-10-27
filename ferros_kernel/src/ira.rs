@@ -108,6 +108,22 @@ pub fn read_dvfs_version() -> u8 {
 /// - devinfo must yield psn, dsn and imei1.
 /// Any failure returns the failing source's bit (G#100 + index = reads disagreed, G#200 + index = degenerate, G#300 = devinfo missing records) and there is no ira, so the vault stays shut.
 /// Proven STABLE across boots and temperature (sources 0-4, IRA-ENTROPY-SOURCES.md; 5-6 are factory data), not proven high-entropy fleet-wide. Context v2 = this material set: a vault sealed under v1 won't reopen (open-or-genesis re-genesises).
+/// The ira as vault boot derived it, kept for `SYS_IRA` (process.rs): a process with an Ira capability gets `blake3::derive_key("ferros process ira v1 " ‖ its domain, ira)` — a per-purpose key rooted in the device that survives a factory reset ([[ira_network_owns_assignment]]: the Photon device key is one), never the ira itself, and never under a context the kernel's own derivations use.
+static IRA: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut IRA_BYTES: [u8; 32] = [0; 32];
+
+/// Set once by vault boot, before any process runs; read-only after.
+pub fn keep_ira(ira: [u8; 32]) {
+    if !IRA.load(core::sync::atomic::Ordering::Acquire) {
+        unsafe { IRA_BYTES = ira };
+        IRA.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn ira() -> Option<[u8; 32]> {
+    IRA.load(core::sync::atomic::Ordering::Acquire).then(|| unsafe { IRA_BYTES })
+}
+
 pub fn derive_ira() -> Result<[u8; 32], u32> {
     let reads = || -> Result<[alloc::vec::Vec<u8>; 7], u32> {
         Ok([

@@ -3045,6 +3045,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     6 => crate::process::Grant::Store(g),
                                                     7 => crate::process::Grant::Power(g),
                                                     8 => crate::process::Grant::Irq(g),
+                                                    9 => crate::process::Grant::Ira,
                                                     _ => crate::process::Grant::Use(g),
                                                 });
                                             }

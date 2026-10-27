@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod chain;
 pub mod h264;
+pub mod join;
 pub mod beam;
 pub mod pt;
 pub mod wave;

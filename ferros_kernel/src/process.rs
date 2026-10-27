@@ -214,6 +214,8 @@ pub enum Object {
     Dma(usize),
     /// Served by the kernel: the right to change the device's preferences (`SYS_SET_PREF`, SETTINGS.md). Reading them needs no capability: every process finds them in its own grants page.
     Settings,
+    /// Served by the kernel: a per-purpose key derived from the device's ira (`SYS_IRA`) — the Photon device key's root.
+    Ira,
     /// Served by the kernel: a scope of the device vault (index into `STORES`): get and set the keys under its prefix, named relative to it (`SYS_STORE`).
     Store(usize),
     /// An interrupt line (index into `IRQS`): `irq_wait` blocks a thread until it fires, `irq_ack` unmasks it again (KERNEL.md "Interrupts to user space").
@@ -255,6 +257,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Store(i) => (7, i as u64),
         Object::Irq(i) => (8, i as u64),
         Object::Power(i) => (9, i as u64),
+        Object::Ira => (10, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -594,6 +597,8 @@ const SYS_PIN: u64 = 20;
 const SYS_LIGHT: u64 = 21;
 /// A device's power: x0 the `Power` capability, x1 1 = on, 0 = off. Runs only on the kernel's core (the X3), where it cannot interleave with the service loop's own firmware calls (ACPM): a thread pins itself there first (`SYS_PIN` G#100, then any sleep). Returns 0, or ERR.
 const SYS_POWER: u64 = 22;
+/// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
+const SYS_IRA: u64 = 23;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -838,6 +843,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "gnss", prefix: "gnss." },
     // The WiFi driver's: its firmware (`wifi.fw`), NVRAM text (`wifi.nvram`), CLM blob (`wifi.clm`) and the network credential (`wifi.cred`; secret, never printed).
     StoreScope { name: "wifi", prefix: "wifi." },
+    // The Photon client's (payloads/photon): the identity roots pushed at pairing (`photon.identity_seed`, `photon.handle_proof`; secret), the fleet chain and key once bound (`photon.chain`, `photon.fleet_key`), the phonebook.
+    StoreScope { name: "photon", prefix: "photon." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
@@ -1200,6 +1207,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == MASK_BIG => {
                     if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
+                }
+                _ => ERR,
+            };
+            0
+        }
+        SYS_IRA => {
+            let token = p.read(f.x[0], 32);
+            let len = f.x[2] as usize;
+            f.x[0] = match (p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), crate::ira::ira()) {
+                (Some((Object::Ira, r)), Some(ira)) if r & RIGHT_SEND != 0 && (1..=64).contains(&len) => {
+                    let mut context = alloc::vec::Vec::with_capacity(32 + len);
+                    context.extend_from_slice(b"ferros process ira v1 ");
+                    context.extend_from_slice(&p.read(f.x[1], len));
+                    let key = match core::str::from_utf8(&context) {
+                        Ok(c) => blake3::derive_key(c, &ira),
+                        Err(_) => {
+                            f.x[0] = ERR;
+                            return 0;
+                        }
+                    };
+                    p.write(f.x[3], &key);
+                    32
                 }
                 _ => ERR,
             };
@@ -1781,6 +1810,8 @@ pub enum Grant<'a> {
     Store(&'a [u8]),
     /// An interrupt line from the registry, by name (syscalls 18, 19).
     Irq(&'a [u8]),
+    /// The ira-derived key right (syscall 23).
+    Ira,
     /// A device's power, by name (syscall 22).
     Power(&'a [u8]),
 }
@@ -1888,6 +1919,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 Some(i) => (Object::Power(i), RIGHT_SEND),
                 None => return Err("no such power switch"),
             },
+            Grant::Ira => (Object::Ira, RIGHT_SEND),
         });
     }
     Ok(v)

@@ -44,6 +44,9 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     use ferros_vault::anchor::AnchorKey;
 
     let ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
+    if let Ok(i) = ira {
+        crate::ira::keep_ira(i);
+    }
     let ira_fail = ira.err().unwrap_or(0);
     let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
     crumb(0xC1); // ira derived (or refused)

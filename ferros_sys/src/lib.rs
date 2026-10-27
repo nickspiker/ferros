@@ -39,6 +39,7 @@ pub mod nr {
     pub const PIN: u64 = 20;
     pub const LIGHT: u64 = 21;
     pub const POWER: u64 = 22;
+    pub const IRA: u64 = 23;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -194,6 +195,26 @@ pub fn power(cap: u64, on: bool) -> bool {
     let r = svc(nr::POWER, cap, on as u64, 0, 0, 0);
     pin(0);
     r == 0
+}
+
+/// A per-purpose 32-byte key rooted in the device's ira, through an Ira capability: `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)` — the same bytes on every boot and after a factory reset, never the ira itself. None when the kernel has no ira this boot.
+pub fn ira_key(cap: u64, domain: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let r = svc(nr::IRA, cap, off(domain.as_ptr()), domain.len() as u64, off(out.as_mut_ptr()), 0);
+    (r == 32).then_some(out)
+}
+
+/// UTC wall time: (seconds since 1970, the counter ticks into the current second, the counter's rate), or None until the kernel has read the PMIC's clock. `local_time` with the zone taken back out — for stamps that cross the network (Photon's eagle time).
+pub fn utc_time() -> Option<(i64, u64, u64)> {
+    let at = arc_base() + PREFS + 16;
+    let rd = |o: u64| unsafe { core::ptr::read_volatile((at + o) as *const u64) };
+    let base = rd(0);
+    if base == 0 {
+        return None;
+    }
+    let hz = freq();
+    let t = base.wrapping_add(now());
+    Some(((t / hz) as i64, t % hz, hz))
 }
 
 /// Write `value` under `key` in a Store capability's vault scope; true when the vault took it.
