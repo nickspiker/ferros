@@ -1,0 +1,25 @@
+[package]
+name = "stdprobe"
+version = "0.1.0"
+edition = "2024"
+description = "A compile probe: what of Photon's dependency graph builds for the ferros target (tokio without net, fluor, kete, fgtw, vsf)"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+fluor = { path = "../../../fluor", default-features = false, features = ["std", "text", "simd", "rayon"] }
+kete = { path = "../../../kete" }
+fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "fanout", "client"] }
+vsf = { path = "../../../vsf", default-features = false }
+blake3 = "1.5"
+# getrandom 0.2 takes its custom backend by feature (ferros_rt defines it).
+getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

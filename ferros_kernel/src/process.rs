@@ -851,6 +851,11 @@ pub static STORES: &[StoreScope] = &[
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
+/// Delete a key (true when it was there) and list every key of the vault (full names): what a std process's vault needs beyond get and set (kete on ferros, STD-TARGET.md).
+pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
+pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
+/// A value larger than one transfer arriving in pieces (SYS_STORE bit 1 + bit 2): assembled here until the piece without bit 2 commits it.
+static mut STORE_STAGE: Option<(alloc::string::String, Vec<u8>)> = None;
 /// The last value read piecewise (key, value), so a large value is fetched from the vault once.
 static mut STORE_CACHE: Option<(alloc::string::String, Vec<u8>)> = None;
 /// The largest value `SYS_STORE` moves either way.
@@ -1157,20 +1162,79 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Store(i), r)) if r & RIGHT_SEND != 0 => STORES.get(i),
                 _ => None,
             };
-            // x1: bit 0 set, bit 1 a read at an offset (bits 32-63) into a value larger than one transfer, the length in bits 8-31.
-            let (set, at, len) = (f.x[1] & 1 == 1, if f.x[1] & 2 != 0 { Some((f.x[1] >> 32) as usize) } else { None }, ((f.x[1] >> 8) & 0xFF_FFFF) as usize);
+            // x1: bit 0 set; bit 1 an offset (bits 32-63) into a value larger than one transfer — a read of that piece, or with bit 0 a write of it, staged until the piece without bit 2 (more follow) commits the whole; bit 3 delete; bit 4 list the scope's keys, read like a large value (the names relative to the scope, one per line). The length in bits 8-31.
+            let (set, more, del, list) = (f.x[1] & 1 != 0, f.x[1] & 4 != 0, f.x[1] & 8 != 0, f.x[1] & 16 != 0);
+            let at = if f.x[1] & 2 != 0 { Some((f.x[1] >> 32) as usize) } else { None };
+            let len = ((f.x[1] >> 8) & 0xFF_FFFF) as usize;
             let rel = p.read(f.x[2], (f.x[3] as usize).min(65));
+            let rel_ok = rel.len() <= 64 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && (!rel.is_empty() || list);
             f.x[0] = match (scope, unsafe { STORE }) {
-                (Some(sc), Some(store)) if !rel.is_empty() && rel.len() <= 64 && rel.iter().all(|&b| (0x21..0x7F).contains(&b)) && len <= STORE_MAX => {
+                (Some(sc), Some(store)) if rel_ok && len <= STORE_MAX => {
                     let mut key = alloc::string::String::from(sc.prefix);
                     key.push_str(core::str::from_utf8(&rel).unwrap_or(""));
-                    if set {
-                        let value = p.read(f.x[4], len);
-                        unsafe { *(&raw mut STORE_CACHE) = None };
-                        if store(&key, Some(&value)).is_ok() { 0 } else { ERR }
+                    let cache = unsafe { &mut *(&raw mut STORE_CACHE) };
+                    if list {
+                        // The listing is served as a large value would be, under a name no key can have (a newline).
+                        let lk = alloc::format!("{}\n", sc.prefix);
+                        if cache.as_ref().map(|(k, _)| k != &lk).unwrap_or(true) {
+                            *cache = match unsafe { STORE_KEYS }.map(|keys| keys()) {
+                                Some(Ok(names)) => {
+                                    let mut out = alloc::string::String::new();
+                                    for n in names.iter().filter_map(|n| n.strip_prefix(sc.prefix)) {
+                                        out.push_str(n);
+                                        out.push('\n');
+                                    }
+                                    Some((lk, out.into_bytes()))
+                                }
+                                _ => None,
+                            };
+                        }
+                        match cache {
+                            Some((_, v)) => {
+                                let at = at.unwrap_or(0);
+                                let piece = &v[at.min(v.len())..(at + len).min(v.len())];
+                                p.write(f.x[4], piece);
+                                let total = v.len();
+                                if at + len >= total {
+                                    *cache = None;
+                                }
+                                total as u64
+                            }
+                            None => ERR,
+                        }
+                    } else if del {
+                        *cache = None;
+                        match unsafe { STORE_REMOVE }.map(|rm| rm(&key)) {
+                            Some(Ok(true)) => 0,
+                            Some(Ok(false)) => NOTHING,
+                            _ => ERR,
+                        }
+                    } else if set {
+                        *cache = None;
+                        let piece = p.read(f.x[4], len);
+                        if let Some(at) = at {
+                            let stage = unsafe { &mut *(&raw mut STORE_STAGE) };
+                            if stage.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+                                *stage = Some((key.clone(), Vec::new()));
+                            }
+                            let buf = &mut stage.as_mut().unwrap().1;
+                            if buf.len() < at + piece.len() {
+                                buf.resize(at + piece.len(), 0);
+                            }
+                            buf[at..at + piece.len()].copy_from_slice(&piece);
+                            if more {
+                                0
+                            } else {
+                                let (_, whole) = stage.take().unwrap();
+                                if store(&key, Some(&whole)).is_ok() { 0 } else { ERR }
+                            }
+                        } else if store(&key, Some(&piece)).is_ok() {
+                            0
+                        } else {
+                            ERR
+                        }
                     } else if let Some(at) = at {
                         // A large value read piecewise: the whole value is kept once, for the reads that follow (a 250 KB replay is 62 of them).
-                        let cache = unsafe { &mut *(&raw mut STORE_CACHE) };
                         if cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
                             *cache = match store(&key, None) {
                                 Ok(Some(v)) => Some((key.clone(), v)),

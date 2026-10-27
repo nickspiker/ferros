@@ -1,0 +1,10 @@
+# A std program for the phone: the ferros target, std built from the ferros-rust fork (tools/std-build.sh sets __CARGO_TESTS_ONLY_SRC_ROOT to it). getrandom 0.3/0.4 take the custom backend ferros_rt defines.
+[build]
+target = "../../targets/aarch64-unknown-ferros.json"
+
+[target.aarch64-unknown-ferros]
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]
+
+[unstable]
+build-std = ["core", "alloc", "std", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]

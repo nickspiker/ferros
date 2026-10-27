@@ -188,6 +188,26 @@ pub fn store_get_at(cap: u64, key: &[u8], offset: usize, buf: &mut [u8]) -> Opti
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
+/// Write a value larger than one transfer in pieces: `piece` at `offset` of the value under `key`, `more` while pieces follow; the piece without `more` commits the whole (the kernel assembles it). True while the kernel takes them.
+pub fn store_set_at(cap: u64, key: &[u8], offset: usize, piece: &[u8], more: bool) -> bool {
+    svc(nr::STORE, cap, 1 | 2 | if more { 4 } else { 0 } | (piece.len() as u64) << 8 | (offset as u64) << 32, off(key.as_ptr()), key.len() as u64, off(piece.as_ptr())) == 0
+}
+
+/// Delete `key` from the scope: Some(whether it was there), None if refused.
+pub fn store_delete(cap: u64, key: &[u8]) -> Option<bool> {
+    match svc(nr::STORE, cap, 8, off(key.as_ptr()), key.len() as u64, 0) {
+        0 => Some(true),
+        NOTHING => Some(false),
+        _ => None,
+    }
+}
+
+/// The scope's keys, relative to it, one per line: read like a large value — `buf.len()` bytes (at most 4096) from `offset` of the listing; returns the listing's whole length.
+pub fn store_keys(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
+    let r = svc(nr::STORE, cap, 16 | 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(b"".as_ptr()), 0, off(buf.as_mut_ptr()));
+    if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
 /// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.
 pub fn power(cap: u64, on: bool) -> bool {
     pin(CORES_BIG);

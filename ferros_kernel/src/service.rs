@@ -341,6 +341,17 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     }
 }
 
+fn store_remove(key: &str) -> Result<bool, ()> {
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    crate::flashlog::line(&alloc::format!("store remove {key:?} (process)"));
+    st.remove_key(key).map_err(|_| ())
+}
+
+fn store_keys() -> Result<alloc::vec::Vec<alloc::string::String>, ()> {
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    st.keys().map_err(|_| ())
+}
+
 fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     let k = core::str::from_utf8(key).ok()?;
     match unsafe { (*(&raw mut SPAWN_STORE)).as_mut()?.as_mut()?.get_by_key(k) } {
@@ -905,6 +916,8 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::PREF_STORE = Some(store_pref);
         crate::process::FACTS = Some(facts);
         crate::process::STORE = Some(store_scoped);
+        crate::process::STORE_REMOVE = Some(store_remove);
+        crate::process::STORE_KEYS = Some(store_keys);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();

@@ -8,6 +8,7 @@
 pub mod alloc;
 pub mod console;
 pub mod futex;
+pub mod getrandom;
 pub mod heap;
 pub mod random;
 pub mod start;
