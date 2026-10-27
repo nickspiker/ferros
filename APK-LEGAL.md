@@ -1,0 +1,189 @@
+# APK-LEGAL — Running Android Apps on ferros: Decision Log
+**Version:** Zil (0)
+**Started:** 2026-10-27
+**Principle:** Replace, never impersonate. ferros tells the truth about what it is, and every app and service decides what to do with that truth.
+
+---
+
+## What this is
+
+ferros cannot ship without running APKs, including Google apps, banking apps and government identity apps.
+This file records every legal judgement the APK plan rests on: the question, the decision, the text it was made against, the reasoning, what it costs, and what would make us revisit it.
+Nobody who wrote this is a lawyer, and nothing here is legal advice.
+It is our best reading of the public terms and law available on the date of each entry, written down so the reasoning can be checked later, by us or by counsel.
+
+The repository is public, and so is this file.
+Every entry records a decision that stays on the right side of the line; if a question cannot be settled that way, it goes under Open questions, not into a decision.
+
+### How to use it
+
+- Each decision has a number (D1, D2, ...) that never changes or gets reused. A reversed decision is struck through and replaced by a new entry that says why.
+- Code that implements or depends on a decision says so in one comment line, e.g. `// APK-LEGAL D3: attestation answers truthfully`. Changing that code means revisiting the entry first.
+- Every terms document relied on is captured on the day it was read under `legal/snapshots/<date>/`, with its URL and BLAKE3 in that directory's `MANIFEST`. Terms change "from time to time"; what counts is what they said when we decided. A later re-read gets a new dated directory, never an overwrite.
+- Quotes below are verbatim from the snapshots (checked by text search on the capture date).
+
+---
+
+## Decisions
+
+### D1 — ferros replaces Android; it does not impersonate it (2026-10-27)
+
+**Decision:** ferros is not Android and does not run Android.
+APKs run on ferros's own implementation of the Android app interfaces (the framework APIs apps call, the bionic/Linux system-call personality their native code expects).
+ferros ships none of Google's code: no Google APKs, no Google Play Services, no Android system images.
+Apps come from the user's own sources under the user's own licences.
+
+**Why:** Reimplementing an interface so existing programs run on a new platform is the situation in *Google LLC v. Oracle America, Inc.*, 593 U.S. 1 (2021), where Google's own reimplementation of the Java API declarations was held to be fair use.
+Shipping none of Google's code keeps ferros out of Google's software licence entirely; the licence in the Google ToS is "personal" and "non-assignable" and forbids users to "copy, modify, distribute, sell, or lease any part of our services or software" (snapshot `google-terms.html`, effective July 30, 2026).
+
+**Cost:** Everything Google Play Services provides must be reimplemented or done without (see O1).
+
+**Revisit if:** a court narrows *Google v. Oracle* for platform reimplementation, or ferros ever wants to ship a Google component.
+
+### D2 — APKs are compiled on the device at install, sealed to it, never distributed (2026-10-27)
+
+**Decision:** An APK is never translated or interpreted at runtime.
+At install, the device compiles the APK (DEX bytecode and any arm64 native libraries) for itself alone; the compiler checks it (no jumps outside its arcs, no forbidden instructions) and the resulting capsule is sealed and keyed to that device's hardware.
+A compiled capsule never leaves the device it was compiled on: no capsule cache, no sharing between devices, no download of precompiled capsules.
+
+**Why:** Security first: runtime translation is the attack surface ferros exists to remove, and the seal proves the capsule passed the checker (SANDBOX.md, trust model A).
+Legally, compiling an app to native code on the device is what Android's own runtime has done since Android 5.0 (ART's install-time and profile-guided compilation), so on-device compilation is how every app developer already expects their code to run.
+Because the compiled output is personal to one device and never distributed, it stays inside a "personal" licence and outside the "copy, modify, distribute" prohibition in D1's quote.
+Emulating a platform so its software runs elsewhere was held lawful in *Sony Computer Entertainment v. Connectix*, 203 F.3d 596 (9th Cir. 2000); note that apps are licensed rather than sold (*Vernor v. Autodesk*, 621 F.3d 1102 (9th Cir. 2010)), so we lean on the licence terms and fair use, not on 17 U.S.C. §117.
+
+**Cost:** Every device compiles every app it installs; no shared compile cache, ever.
+
+**Revisit if:** a major app's licence explicitly forbids compilation by the platform. Not seen so far, but see O7: Chase UK's broad "modify or tamper" clause is the closest.
+
+### D3 — Attestation always tells the truth (2026-10-27)
+
+**Decision:** When an app or service asks ferros to attest to the device's state, the answer is true, even when the truth loses a feature.
+ferros never forges an attestation, never relays one from another device, never uses leaked or third-party attestation keys ("keyboxes"), and never extracts keys from the security hardware.
+ferros ships no tool that does any of these, and does not tell users how to.
+
+**Why:** The Google Play terms forbid any attempt "to, or assist, authorize or encourage others to circumvent, disable or defeat any of the security features or components that protect, obfuscate or otherwise restrict access to, or the manner or extent of use of, any Content or Google Play" (snapshot `google-play-terms.html`).
+The Google ToS forbids "bypassing our systems or protective measures" (snapshot `google-terms.html`).
+Under 17 U.S.C. §1201(a)(3)(A), circumvention means to "avoid, bypass, remove, deactivate, or impair a technological measure, without the authority of the copyright owner": the test is authorisation, not whether security went up overall, so "ferros is more secure" does not excuse a false attestation.
+Leaked keyboxes are misappropriated signing keys; using them adds trade-secret and access-device exposure on top of the contract breach.
+A truthful attestation defeats nothing: the security components keep working and report exactly what is running, and the service decides.
+
+**Cost:** Services that require Google certification refuse features on ferros. Known now: Google Wallet tap-to-pay (Play Integrity device integrity is built on hardware-backed key attestation on Android 13 and later since May 2025, snapshot `play-integrity-improvements.html`). Passes, tickets and loyalty cards are unaffected.
+
+**Revisit if:** never for the "no forgery" part. The route to the lost features is persuasion (services accepting ferros's attestation), not engineering around it.
+
+### D4 — Certification is the service's to declare, not ours (2026-10-27)
+
+**Decision:** ferros never claims to be Google-certified, Play Protect certified, or "supported" by any service unless that service says so.
+When a service decides ferros does not meet its requirements, that decision stands.
+
+**Why:** The terms themselves name no specific OS, certification or bootloader state; they defer to requirements the service sets and changes.
+Google Play: "a Device that meets the system and compatibility requirements for the relevant Content, working Internet access, and compatible software" (snapshot `google-play-terms.html`).
+Google Pay, non-US terms, last modified April 5, 2021: "a device that meets the Service's system and compatibility requirements, which may change from time to time; working Internet access; and compatible software" (snapshot `google-pay-terms-nonus.html`).
+ferros running an app correctly is a fair reading of "compatible software", but the "system and compatibility requirements" are the service's to publish, and a service applying them honestly against an honest ferros is the contract working as written, not a breach by anyone.
+
+**Cost:** None beyond D3's.
+
+**Revisit if:** a service's terms define compatibility in a way ferros meets on its face (then we can say so, with the quote).
+
+### D5 — What ferros reports about itself (2026-10-27)
+
+**Decision:** Every field an app can read about the device and OS is filled in truthfully, by kind:
+- hardware fields (manufacturer, model, board) report the hardware as it is: on husky, Google, Pixel 8 Pro;
+- API level fields report the Android API level ferros actually implements, as a statement of compatibility;
+- OS identity fields (build fingerprint, build display, OS name, version strings, user agents) say ferros, and never carry Google's or any vendor's build identity.
+
+**Why:** Hardware fields are facts about the hardware, which really is a Pixel 8 Pro.
+An API level is a claim about which interfaces are implemented, true if ferros implements them; this is the same convention as every web browser's user agent beginning "Mozilla/5.0" for compatibility, which has never been treated as deception.
+A build fingerprint identifies the operating system build; reporting Google's would be claiming to be stock Android, which is the impersonation D1 rules out and the misrepresentation D3 rules out.
+Honest identity also settles who decided: if an app can see exactly what ferros is and runs anyway, that choice is the app's.
+
+**Cost:** Apps that refuse on OS identity alone will refuse.
+
+**Revisit if:** a de-facto convention emerges for non-Android platforms implementing Android APIs (adopt it if it is honest).
+
+### D6 — Secure-world software never holds ferros's secrets (2026-10-27)
+
+**Decision:** Trusty, KeyMint, GSA and the Titan M2 never receive ferros's secrets: no ira, no wairua, no vault keys, no keys derived from them.
+ferros already uses the secure world where hardware requires it (the AoC starts only through Trusty), and treats it as untrusted vendor plumbing.
+
+**Why:** The secure-world images on husky ship as Google-signed binaries (`tzsw`, `gsa`, `bl31`, `ldfw`, ...).
+Generic Trusty source is public in AOSP (snapshot `trusty-aosp.html`, "open-source"), but Google states "Third-party app development isn't supported in Trusty", and no published source or reproducible build was found for the husky images themselves.
+Pixel binary transparency logs those images' hashes (snapshot `pixel-binary-transparency.html`), which proves everyone received the same image, not what it contains.
+Code we cannot read does not hold keys we cannot replace.
+
+**Cost:** Hardware-backed key storage for ferros's own secrets comes from ferros's design (ira, KOHI, the vault), not from the vendor TEE.
+
+**Revisit if:** the husky secure-world images become reproducible from published source.
+
+### D7 — The user's agreements are the user's; ferros's part ends at the truth (2026-10-27)
+
+**Decision:** ferros is not a party to the agreements between its user and a bank, a government agency or an app vendor.
+ferros's obligation is that everything it reports is true (D3, D5) and that it ships nothing built to defeat a service's checks.
+Whether a user may run a given app on a ferros device under their own agreement is between the user and that provider; ferros does not hide that question from them.
+
+**Why:** Some providers' agreements bar modified or unsupported devices outright (common wording in other banks' terms, not yet captured here); a ferros device falls under that wording whether or not it is honest, and ferros cannot change the user's contract.
+Chase's own documents captured so far are narrower: the UK app licence speaks of "an operating system version we no longer support" and forbids using the app "on a device that contains or is open to viruses and other things that may cause damage" (snapshot `chase-uk-app-licence.html`, version 1.1.0), and the US trusted-device page, an educational page and not contract terms, lists "iOS 16.0 or later or Android 11 or later" (snapshot `chase-us-trusted-device.html`).
+Chase does check device integrity per feature: on GrapheneOS in July 2026 the credit-score feature alone refused with "For your security, the Chase Mobile app is unavailable on devices that have been 'rooted' or contain malware" while the rest of the app worked (snapshot `grapheneos-chase-thread.json`).
+Where the platform tells the truth, the platform's own exposure is close to none; where a platform spoofs its identity to get apps running, the platform becomes the party helping its users get around a check and breach their agreements, which is the exposure this decision exists to avoid.
+
+**Cost:** Some users will not be able to use some apps they want, under their own agreements.
+
+**Revisit if:** a provider's agreement turns out to put obligations on the platform rather than the user.
+
+---
+
+## App classes
+
+The same platform behaviour carries different weight depending on who is on the other end.
+
+| Class | Examples | What governs | Line |
+|---|---|---|---|
+| Google apps | Voice, Wallet, Maps | Google ToS + Play terms + service terms (contract) | D1–D5; Wallet runs without tap-to-pay |
+| Banking and payments | Chase and other banks | Each bank's agreement with the user; banks answer to financial regulators and pursue misuse harder than app vendors do | D3, D5, D7 |
+| Government identity | state mobile driver's licences, Login.gov, ID.me | Agency terms, and statutes on identity documents and false statements to government | Truthful identity is a hard rule here, not a preference; misrepresenting the platform to one of these may be more than a contract matter |
+
+---
+
+## Open questions
+
+**O1 — Google Play Services.** Most Google apps and many others need it.
+The candidates are a clean reimplementation (the microG model) or Google's own Play Services package on an uncertified device; D1 as written rules out shipping Google's package, and running a user-supplied copy on a non-Android host is unread territory.
+
+**O2 — Attestation witness.** Apps that accept non-Google attestations (the route GrapheneOS asks app developers to take: check `verifiedBootState` = `SelfSigned` and a published `verifiedBootKey`, because "apps using it directly can support aftermarket operating systems", snapshot `grapheneos-attestation-guide.html`) need a hardware-signed statement, and the only keys banks already trust live in KeyMint/Titan behind the secure world.
+Choice for the owner: relay a truthful hardware attestation with the secure world as the bank's witness only (D6 still holds: it receives no ferros secret), or refuse attestation entirely and accept that apps requiring it will not run.
+
+**O3 — Release key and owner key.** BOOT.md plans boot integrity by relocking with the owner's key.
+If every owner's key differs, no app can allowlist "ferros" by key hash; GrapheneOS publishes one project key for this reason.
+Needs a design that lets an attestation say both "this is ferros" and "locked to this owner", or a decision that ferros gives up app allowlisting.
+
+**O4 — US Google Wallet terms.** Not yet read: the US Wallet terms URL returned HTTP 500 on 2026-10-27 (recorded in the snapshot `MANIFEST`). D3 and D4 rest on the Google ToS, the Play terms and the non-US Pay terms until it is captured. The original 2011 Google Wallet terms reportedly barred use on any OS "modified or customized in any way"; whether current US terms do is unknown.
+
+**O5 — Chase US Digital Services Agreement.** Not yet read; D7's Chase facts come from the UK licence and a US educational page.
+
+**O6 — Emergency services.** ferros's MVNO is data-only, and Photon will carry emergency photons, beams and waves.
+Google's two Voice documents disagree: the Voice Additional Terms say "Google Voice isn't capable of placing or receiving emergency services calls" (snapshot `google-voice-additional-terms.html`), while the Voice Personal terms, last modified June 9, 2026, say "Dialing to emergency services is supported by Google Voice Personal" with VoIP limitations (snapshot `google-voice-personal-terms.html`).
+If Photon EMS ever reaches public-safety answering points directly, FCC 911 rules for internet telephony (location, call-back) likely apply to it; that needs its own entry before Photon EMS ships.
+
+**O7 — Does install-time compilation "modify" an app?** Chase UK's app licence forbids users to "copy, reproduce, publish, modify or tamper with our app" (snapshot `chase-uk-app-licence.html`).
+Our reading: compiling the unchanged app for the device that runs it is how Android's own runtime executes every app, so it is running the app, not modifying it; the checker refuses code rather than rewriting its meaning.
+The text is broad, though, and nobody has tested it against a non-Android platform; this belongs in front of counsel at O8.
+
+**O8 — Counsel before release.** Proposed ship gate: before ferros runs banking or government identity apps for anyone but the owner, one paid review of this log by a technology lawyer, recorded here with the date.
+
+---
+
+## Cases and statutes cited
+
+- *Google LLC v. Oracle America, Inc.*, 593 U.S. 1 (2021) — reimplementing API declarations held fair use.
+- *Sony Computer Entertainment, Inc. v. Connectix Corp.*, 203 F.3d 596 (9th Cir. 2000) — copying during reverse engineering to build an emulator held fair use.
+- *Vernor v. Autodesk, Inc.*, 621 F.3d 1102 (9th Cir. 2010) — software under a restrictive licence is licensed, not sold.
+- *Bowers v. Baystate Technologies, Inc.*, 320 F.3d 1317 (Fed. Cir. 2003) — a contract term can waive what fair use would otherwise allow; read the terms, not just the statute.
+- *Van Buren v. United States*, 593 U.S. 374 (2021) — breaking terms of use alone is generally not "exceeding authorized access" under the CFAA.
+- 17 U.S.C. §1201(a)(3)(A) — the definition of circumvention ("without the authority of the copyright owner").
+- 17 U.S.C. §1201(f) — reverse engineering for interoperability of an independently created program.
+
+---
+
+## Snapshots
+
+`legal/snapshots/2026-10-27/` — Google ToS, Google Play terms, Google Pay terms (non-US), Google Voice Personal terms, Google Voice Additional Terms, Play Integrity improvements, Pixel binary transparency, Trusty (AOSP), Chase UK app licence, Chase US trusted-device page, GrapheneOS attestation compatibility guide, GrapheneOS forum thread on Chase. URLs and BLAKE3 hashes in its `MANIFEST`.

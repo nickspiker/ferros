@@ -12,5 +12,7 @@ Owner, 2026-10-26: "we cannot ship ferros without apk support, which is probably
 
 Framing agreed in that conversation: APK = DEX bytecode + optional arm64 JNI .so + bionic/Linux syscalls + the Android framework. The translator is how third-party arm64 native code can obey "device compiles everything" (machine code becomes one more source language, sandboxed by construction); its import/syscall boundary is the future bionic + Linux personality. The gpsd LTO lift is the small, byte-verifiable pilot of exactly that path.
 
+Owner correction, 2026-10-27: APKs are NEVER translated at runtime ("a massive security nightmare"). An APK is compiled on device at install, for that device only, and the capsule is sealed and keyed to the hardware, which proves it passed the checks (no jumps outside its arcs, no unsafe instructions). Compiled capsules are never distributed. Legal side of the APK plan: decisions get a dated log with hashed snapshots of the terms relied on, and code comments point at the log entries.
+
 **Why:** shipping requirement; shapes every runtime decision from here.
-**How to apply:** design the blob interpreter/translator for APK native libs from day one (shared decoder, interpreter tier then translation tier, imports and `svc` routed to ferros-provided shims/servers); keep it consistent with [[toka_pipeline_trust_model_a]] and userspace drivers ([[ferros_process_model_husky]]).
+**How to apply:** the translator is an install-time compiler stage (aarch64/DEX → toka → sealed capsule), not a runtime JIT or interpreter for APKs; imports and `svc` route to ferros-provided shims/servers; keep it consistent with [[toka_pipeline_trust_model_a]] and userspace drivers ([[ferros_process_model_husky]]).

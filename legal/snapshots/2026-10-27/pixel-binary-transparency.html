@@ -1,0 +1,2036 @@
+
+
+
+
+
+
+
+
+
+<!doctype html>
+<html 
+      lang="en"
+      dir="ltr">
+  <head>
+    <meta name="google-signin-client-id" content="721724668570-nbkv1cfusk7kk4eni4pjvepaus73b13t.apps.googleusercontent.com"><meta name="google-signin-scope"
+          content="profile email https://www.googleapis.com/auth/developerprofiles https://www.googleapis.com/auth/developerprofiles.award https://www.googleapis.com/auth/devprofiles.full_control.firstparty"><meta property="og:site_name" content="Google for Developers">
+    <meta property="og:type" content="website"><meta name="theme-color" content="#aed581"><meta charset="utf-8">
+    <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    
+
+    <link rel="manifest" href="/_pwa/developers/manifest.json"
+          crossorigin="use-credentials">
+    <link rel="preconnect" href="//www.gstatic.com" crossorigin>
+    <link rel="preconnect" href="//fonts.googleapis.com" crossorigin>
+    <link rel="preconnect" href="//www.google-analytics.com" crossorigin><link rel="stylesheet" href="//fonts.googleapis.com/css?family=Google+Sans:400,500|Roboto:400,400italic,500,500italic,700,700italic|Roboto+Mono:400,500,700&display=swap">
+      <link rel="stylesheet"
+            href="//fonts.googleapis.com/css2?family=Material+Icons&family=Material+Symbols+Outlined&display=block"><link rel="stylesheet" href="https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/css/app.css">
+      <link rel="shortcut icon" href="https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/images/favicon-new.png">
+    <link rel="apple-touch-icon" href="https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/images/touchicon-180-new.png"><link rel="canonical" href="https://developers.google.com/android/binary_transparency/pixel_verification"><link rel="search" type="application/opensearchdescription+xml"
+            title="Google for Developers" href="https://developers.google.com/s/opensearch.xml">
+      <link rel="alternate" hreflang="en"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification" /><link rel="alternate" hreflang="x-default" href="https://developers.google.com/android/binary_transparency/pixel_verification" /><link rel="alternate" hreflang="ar"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=ar" /><link rel="alternate" hreflang="bn"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=bn" /><link rel="alternate" hreflang="zh-Hans"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=zh-cn" /><link rel="alternate" hreflang="zh-Hant"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=zh-tw" /><link rel="alternate" hreflang="fa"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=fa" /><link rel="alternate" hreflang="fr"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=fr" /><link rel="alternate" hreflang="de"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=de" /><link rel="alternate" hreflang="he"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=he" /><link rel="alternate" hreflang="hi"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=hi" /><link rel="alternate" hreflang="id"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=id" /><link rel="alternate" hreflang="it"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=it" /><link rel="alternate" hreflang="ja"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=ja" /><link rel="alternate" hreflang="ko"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=ko" /><link rel="alternate" hreflang="pl"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=pl" /><link rel="alternate" hreflang="pt-BR"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=pt-br" /><link rel="alternate" hreflang="ru"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=ru" /><link rel="alternate" hreflang="es-419"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=es-419" /><link rel="alternate" hreflang="th"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=th" /><link rel="alternate" hreflang="tr"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=tr" /><link rel="alternate" hreflang="vi"
+          href="https://developers.google.com/android/binary_transparency/pixel_verification?hl=vi" /><title>Method of Verification &nbsp;|&nbsp; Android Binary Transparency &nbsp;|&nbsp; Google for Developers</title>
+
+<meta property="og:title" content="Method of Verification &nbsp;|&nbsp; Android Binary Transparency &nbsp;|&nbsp; Google for Developers"><meta property="og:url" content="https://developers.google.com/android/binary_transparency/pixel_verification"><meta property="og:image" content="https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/images/opengraph/light-green.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="675"><meta property="og:locale" content="en"><meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Article",
+    
+    "headline": "Method of Verification"
+  }
+</script><script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [{
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Android Binary Transparency",
+      "item": "https://developers.google.com/android/binary_transparency/overview"
+    },{
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Method of Verification",
+      "item": "https://developers.google.com/android/binary_transparency/pixel_verification"
+    }]
+  }
+  </script>
+  
+
+  
+
+  
+
+
+    </head>
+  <body class="color-scheme--light"
+        template="page"
+        theme="light-green"
+        type="article"
+        
+        
+        
+        layout="docs"
+        
+        
+        
+        
+        
+          
+            concierge='closed'
+          
+        
+        display-toc
+        pending>
+  
+    <devsite-progress type="indeterminate" id="app-progress"></devsite-progress>
+  
+  
+    <a href="#main-content" class="skip-link button">
+      
+      Skip to main content
+    </a>
+    <section class="devsite-wrapper">
+      <devsite-cookie-notification-bar></devsite-cookie-notification-bar>
+        <devsite-header role="banner">
+  
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="devsite-header--inner" data-nosnippet>
+  <div class="devsite-top-logo-row-wrapper-wrapper">
+    <div class="devsite-top-logo-row-wrapper">
+      <div class="devsite-top-logo-row">
+        <button type="button" id="devsite-hamburger-menu"
+          class="devsite-header-icon-button button-flat material-icons gc-analytics-event"
+          data-category="Site-Wide Custom Events"
+          data-label="Navigation menu button"
+          visually-hidden
+          aria-label="Open menu">
+        </button>
+        
+<div class="devsite-product-name-wrapper">
+
+  
+    
+  
+
+
+
+  
+  
+  <span class="devsite-product-name">
+    <ul class="devsite-breadcrumb-list"
+  >
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+    
+    
+      
+      
+        
+  <a href="https://developers.google.com/android/binary_transparency/overview"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Upper Header"
+      
+        data-value="1"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="1"
+      
+        track-metadata-eventdetail="Android Binary Transparency"
+      
+    >
+    
+          Android Binary Transparency
+        
+  </a>
+  
+      
+    
+  </li>
+  
+</ul>
+  </span>
+
+</div>
+        <div class="devsite-top-logo-row-middle">
+          <div class="devsite-header-upper-tabs">
+            
+           </div>
+          
+<devsite-search
+    enable-signin
+    enable-search
+    enable-suggestions
+      enable-query-completion
+    
+    enable-search-summaries
+    project-name="Android Binary Transparency"
+    tenant-name="Google for Developers"
+    project-scope="/android/binary_transparency/overview"
+    url-scoped="https://developers.google.com/s/results/android/binary_transparency/overview"
+    
+    
+    
+    >
+  <form class="devsite-search-form" action="https://developers.google.com/s/results" method="GET">
+    <div class="devsite-search-container">
+      <button type="button"
+              search-open
+              class="devsite-search-button devsite-header-icon-button button-flat material-icons"
+              
+              aria-label="Open search"></button>
+      <div class="devsite-searchbox">
+        <input
+          aria-activedescendant=""
+          aria-autocomplete="list"
+          
+          aria-label="Search"
+          aria-expanded="false"
+          aria-haspopup="listbox"
+          autocomplete="off"
+          class="devsite-search-field devsite-search-query"
+          name="q"
+          
+          placeholder="Search"
+          role="combobox"
+          type="text"
+          value=""
+          >
+          <div class="devsite-search-image material-icons" aria-hidden="true">
+            
+              <svg class="devsite-search-ai-image" width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <g clip-path="url(#clip0_6641_386)">
+                    <path d="M19.6 21L13.3 14.7C12.8 15.1 12.225 15.4167 11.575 15.65C10.925 15.8833 10.2333 16 9.5 16C7.68333 16 6.14167 15.375 4.875 14.125C3.625 12.8583 3 11.3167 3 9.5C3 7.68333 3.625 6.15 4.875 4.9C6.14167 3.63333 7.68333 3 9.5 3C10.0167 3 10.5167 3.05833 11 3.175C11.4833 3.275 11.9417 3.43333 12.375 3.65L10.825 5.2C10.6083 5.13333 10.3917 5.08333 10.175 5.05C9.95833 5.01667 9.73333 5 9.5 5C8.25 5 7.18333 5.44167 6.3 6.325C5.43333 7.19167 5 8.25 5 9.5C5 10.75 5.43333 11.8167 6.3 12.7C7.18333 13.5667 8.25 14 9.5 14C10.6667 14 11.6667 13.625 12.5 12.875C13.35 12.1083 13.8417 11.15 13.975 10H15.975C15.925 10.6333 15.7833 11.2333 15.55 11.8C15.3333 12.3667 15.05 12.8667 14.7 13.3L21 19.6L19.6 21ZM17.5 12C17.5 10.4667 16.9667 9.16667 15.9 8.1C14.8333 7.03333 13.5333 6.5 12 6.5C13.5333 6.5 14.8333 5.96667 15.9 4.9C16.9667 3.83333 17.5 2.53333 17.5 0.999999C17.5 2.53333 18.0333 3.83333 19.1 4.9C20.1667 5.96667 21.4667 6.5 23 6.5C21.4667 6.5 20.1667 7.03333 19.1 8.1C18.0333 9.16667 17.5 10.4667 17.5 12Z" fill="#5F6368"/>
+                  </g>
+                <defs>
+                <clipPath id="clip0_6641_386">
+                <rect width="24" height="24" fill="white"/>
+                </clipPath>
+                </defs>
+              </svg>
+            
+          </div>
+          <div class="devsite-search-shortcut-icon-container" aria-hidden="true">
+            <kbd class="devsite-search-shortcut-icon">/</kbd>
+          </div>
+      </div>
+    </div>
+  </form>
+  <button type="button"
+          search-close
+          class="devsite-search-button devsite-header-icon-button button-flat material-icons"
+          
+          aria-label="Close search"></button>
+</devsite-search>
+
+        </div>
+
+        
+
+          
+
+          
+
+          
+
+          
+
+          
+<devsite-language-selector>
+  <ul role="presentation">
+    
+    
+    <li role="presentation">
+      <a role="menuitem" lang="en"
+        >English</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="de"
+        >Deutsch</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es"
+        >Español</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es_419"
+        >Español – América Latina</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fr"
+        >Français</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="id"
+        >Indonesia</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="it"
+        >Italiano</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pl"
+        >Polski</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt_br"
+        >Português – Brasil</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="vi"
+        >Tiếng Việt</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="tr"
+        >Türkçe</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ru"
+        >Русский</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="he"
+        >עברית</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ar"
+        >العربيّة</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fa"
+        >فارسی</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="hi"
+        >हिंदी</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="bn"
+        >বাংলা</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="th"
+        >ภาษาไทย</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_cn"
+        >中文 – 简体</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_tw"
+        >中文 – 繁體</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ja"
+        >日本語</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ko"
+        >한국어</a>
+    </li>
+    
+  </ul>
+</devsite-language-selector>
+
+
+          
+
+        
+
+        
+          <devsite-user 
+                        
+                        
+                          enable-profiles
+                        
+                        
+                          fp-auth
+                        
+                        id="devsite-user">
+            
+              
+              <span class="button devsite-top-button" aria-hidden="true" visually-hidden>Sign in</span>
+            
+          </devsite-user>
+        
+        
+        
+      </div>
+    </div>
+  </div>
+
+
+
+  <div class="devsite-collapsible-section
+    
+      devsite-header-no-lower-tabs
+    ">
+    <div class="devsite-header-background">
+      
+        
+      
+      
+    </div>
+  </div>
+
+</div>
+
+
+
+  
+</devsite-header>
+        <devsite-book-nav scrollbars >
+          
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<div class="devsite-book-nav-filter"
+     >
+  <span class="filter-list-icon material-icons" aria-hidden="true"></span>
+  <input type="text"
+         placeholder="Filter"
+         
+         aria-label="Type to filter"
+         role="searchbox">
+  
+  <span class="filter-clear-button hidden"
+        data-title="Clear filter"
+        aria-label="Clear filter"
+        role="button"
+        tabindex="0"></span>
+</div>
+
+<nav class="devsite-book-nav devsite-nav nocontent" data-nosnippet
+     aria-label="Side menu">
+  <div class="devsite-mobile-header">
+    <button type="button"
+            id="devsite-close-nav"
+            class="devsite-header-icon-button button-flat material-icons gc-analytics-event"
+            data-category="Site-Wide Custom Events"
+            data-label="Close navigation"
+            aria-label="Close navigation">
+    </button>
+    <div class="devsite-product-name-wrapper">
+
+  
+    
+  
+
+
+  
+      <span class="devsite-product-name">
+        
+        
+        <ul class="devsite-breadcrumb-list"
+  >
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+    
+    
+      
+      
+        
+  <a href="https://developers.google.com/android/binary_transparency/overview"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Upper Header"
+      
+        data-value="1"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="1"
+      
+        track-metadata-eventdetail="Android Binary Transparency"
+      
+    >
+    
+          Android Binary Transparency
+        
+  </a>
+  
+      
+    
+  </li>
+  
+</ul>
+      </span>
+    
+
+</div>
+  </div>
+
+  <div class="devsite-book-nav-wrapper">
+    <div class="devsite-mobile-nav-top">
+      
+        <ul class="devsite-nav-list">
+          
+            
+<li class="devsite-nav-item">
+
+  
+  <a href="/android/binary_transparency/overview"
+    
+       class="devsite-nav-title gc-analytics-event
+              devsite-nav-has-children
+              devsite-nav-active"
+    
+
+    
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Tab: Guides"
+      
+        track-name="guides"
+      
+    
+     data-category="Site-Wide Custom Events"
+     data-label="Responsive Tab: Guides"
+     track-type="navMenu"
+     track-metadata-eventDetail="globalMenu"
+     track-metadata-position="nav">
+  
+    <span class="devsite-nav-text" tooltip >
+      Guides
+   </span>
+    
+    <span class="devsite-nav-icon material-icons" data-icon="forward"
+          >
+    </span>
+    
+  
+  </a>
+  
+
+</li>
+
+          
+          
+          
+        </ul>
+      
+    </div>
+    
+      <div class="devsite-mobile-nav-bottom">
+        
+          
+          <ul class="devsite-nav-list" menu="_book">
+            <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Android Binary Transparency</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/overview"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Pixel Firmware Transparency</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/pixel_overview"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/pixel_tech_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Log Details</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/pixel_verification"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Verification Guide</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Google System APK Code Transparency</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google1p/overview"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google1p/log_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Log Details</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google1p/verification_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Verification Guide</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google1p/errata"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Errata</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Google Product Application Transparency</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google_apk/overview"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google_apk/log_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Log Details</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/google_apk/verification_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Verification Guide</span></a></li>
+
+  <li class="devsite-nav-item
+           devsite-nav-heading"><div class="devsite-nav-title devsite-nav-title-no-path">
+        <span class="devsite-nav-text" tooltip>Android Mainline Modules Transparency</span>
+      </div></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/mainline_modules/overview"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Overview</span></a></li>
+
+  <li class="devsite-nav-item"><a href="/android/binary_transparency/mainline_modules/log_details"
+        class="devsite-nav-title"
+      ><span class="devsite-nav-text" tooltip>Log Details</span></a></li>
+          </ul>
+        
+        
+        
+          
+    
+  
+        
+      </div>
+    
+  </div>
+</nav>
+          
+        </devsite-book-nav>
+      
+      <section id="gc-wrapper">
+        <main role="main" id="main-content" class="devsite-main-content"
+            
+              has-book-nav
+              has-sidebar
+            >
+          <div class="devsite-sidebar">
+            <div class="devsite-sidebar-content">
+                
+                <devsite-toc class="devsite-nav"
+                            role="navigation"
+                            aria-label="On this page"
+                            depth="2"
+                            scrollbars
+                            data-nosnippet
+                  ></devsite-toc>
+                <devsite-recommendations-sidebar class="nocontent devsite-nav" data-nosnippet>
+                </devsite-recommendations-sidebar>
+            </div>
+          </div>
+          <devsite-content>
+            
+              
+
+
+
+
+
+
+
+
+
+
+<article class="devsite-article">
+  
+  
+  
+  
+  
+
+  <div class="devsite-article-meta nocontent" role="navigation" data-nosnippet>
+    
+    
+    <ul class="devsite-breadcrumb-list"
+  
+    aria-label="Breadcrumb">
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+    
+    
+      
+        
+  <a href="https://developers.google.com/"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Breadcrumbs"
+      
+        data-value="1"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="1"
+      
+        track-metadata-eventdetail=""
+      
+    >
+    
+          Home
+        
+  </a>
+  
+      
+    
+  </li>
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+      
+      <div class="devsite-breadcrumb-guillemet material-icons" aria-hidden="true"></div>
+    
+    
+    
+      
+        
+  <a href="https://developers.google.com/products"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Breadcrumbs"
+      
+        data-value="2"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="2"
+      
+        track-metadata-eventdetail=""
+      
+    >
+    
+          Products
+        
+  </a>
+  
+      
+    
+  </li>
+  
+  <li class="devsite-breadcrumb-item
+             ">
+    
+      
+      <div class="devsite-breadcrumb-guillemet material-icons" aria-hidden="true"></div>
+    
+    
+    
+      
+        
+  <a href="https://developers.google.com/android/binary_transparency/overview"
+      
+        class="devsite-breadcrumb-link gc-analytics-event"
+      
+        data-category="Site-Wide Custom Events"
+      
+        data-label="Breadcrumbs"
+      
+        data-value="3"
+      
+        track-type="globalNav"
+      
+        track-name="breadcrumb"
+      
+        track-metadata-position="3"
+      
+        track-metadata-eventdetail="Android Binary Transparency"
+      
+    >
+    
+          Android Binary Transparency
+        
+  </a>
+  
+      
+    
+  </li>
+  
+</ul>
+    
+      
+    <devsite-thumb-rating position="header">
+    </devsite-thumb-rating>
+  
+    
+  </div>
+  
+    <h1 class="devsite-page-title" tabindex="-1">
+      Method of Verification<devsite-actions hidden data-nosnippet><devsite-feature-tooltip
+      ack-key="AckCollectionsBookmarkTooltipDismiss"
+      analytics-category="Site-Wide Custom Events"
+      analytics-action-show="Callout Profile displayed"
+      analytics-action-close="Callout Profile dismissed"
+      analytics-label="Create Collection Callout"
+      class="devsite-page-bookmark-tooltip nocontent"
+      data-nosnippet
+      dismiss-button="true"
+      id="devsite-collections-dropdown"
+      
+      dismiss-button-text="Dismiss"
+
+      
+      close-button-text="Got it">
+
+    
+    
+      <devsite-bookmark></devsite-bookmark>
+    
+
+    <span slot="popout-heading">
+      
+      Stay organized with collections
+    </span>
+    <span slot="popout-contents">
+      
+      Save and categorize content based on your preferences.
+    </span>
+  </devsite-feature-tooltip>
+    <devsite-llm-tools></devsite-llm-tools></devsite-actions>
+  
+      
+    </h1>
+  <div class="devsite-page-title-meta"><devsite-view-release-notes></devsite-view-release-notes></div>
+  
+
+  <devsite-toc class="devsite-nav"
+    depth="2"
+    devsite-toc-embedded
+    >
+  </devsite-toc>
+  <div class="devsite-article-body clearfix
+  ">
+
+  
+    
+      <devsite-key-takeaways-panel role="region" aria-labelledby="key-takeaways-panel-title">
+  <div class="devsite-key-takeaways-panel-header" aria-labelledby="key-takeaways-panel-title" aria-expanded="false" role="button" tabindex="0">
+    
+    <img src="/_static/images/icons/spark.svg" alt="Spark icon" />
+    <div class="devsite-key-takeaways-panel-title">
+      
+      <h2 class="no-link hide-from-toc" id="key-takeaways-panel-title" data-tooltip="Generated with AI">Page Summary</h2>
+    </div>
+    <span
+      class="material-icons devsite-key-takeaways-panel-toggle-button" aria-hidden="true"></span>
+  </div>
+  <div class="devsite-key-takeaways-panel-content">
+    <devsite-feedback
+      product-id="5123748"
+      bucket="8963846920012181156"
+      disable-product-feedback>
+      <button
+        class="button-flat button-primary devsite-key-takeaways-report-button"
+        
+        data-title="Report Key Takeaways!"
+        
+        aria-label="Report Key Takeaways!">
+        <span
+          class="material-icons"
+          
+          aria-label="Report Key Takeaways!"
+          >outlined_flag</span
+        >
+      </button>
+    </devsite-feedback>
+    <ul class="devsite-key-takeaways-panel-list">
+      
+        <li>
+          <p>This page outlines a method to ensure you can run a legitimate version of a Pixel image on your Pixel device.</p>
+
+        </li>
+      
+        <li>
+          <p>The process involves downloading a factory image and performing a log inclusion proof on the downloaded artifact before flashing it.</p>
+
+        </li>
+      
+        <li>
+          <p>Prerequisites for verification include installing Golang, wget or curl, avbtool, the inclusion proof verifier, fbpacktool, and OpenSSL.</p>
+
+        </li>
+      
+        <li>
+          <p>The payload for verification is constructed from the build fingerprint and VBMeta digest, which can be extracted manually or automatically.</p>
+
+        </li>
+      
+        <li>
+          <p>Verifying image inclusion involves running a Go verifier tool with the constructed payload to check if the image is present in the transparency log.</p>
+
+        </li>
+      
+    </ul>
+  </div>
+</devsite-key-takeaways-panel>
+    
+    
+
+
+<p>This page outlines a method (with the highest degree of confidence) to ensure
+that you can run a legitimate version of Pixel image on your Pixel device. This
+involves downloading a factory image onto your computer, and
+<a href="https://research.swtch.com/tlog#verifying_a_log">performing a log inclusion proof</a>
+on the downloaded artifact before flashing it onto your device.</p>
+
+<h2 id="how-to-verify" data-text="How to Verify Your Pixel Factory Image" tabindex="-1">How to Verify Your Pixel Factory Image</h2>
+
+<h3 id="prerequisites-to-verifying" data-text="Verification Prerequisites" tabindex="-1">Verification Prerequisites</h3>
+
+<p>Before proceeding to verify that the artifact (firmware or APK) is in accordance
+with the claim, ensure that the following tools are available on a
+network-connected computer.
+Depending on the verification target, you might not need all of them.</p>
+
+<h4 id="golang" data-text="Golang" tabindex="-1">Golang</h4>
+
+<p>The <a href="https://github.com/android/android-binary-transparency/tree/main/verifier_tools/verify">verification tool</a>
+is written in Go. To build it, install Go 1.24 or later
+from the <a href="https://go.dev/doc/install">Go site</a>.</p>
+
+<h4 id="android-debug-bridge" data-text="Android Debug Bridge (ADB)" tabindex="-1">Android Debug Bridge (ADB)</h4>
+
+<p><code translate="no" dir="ltr">ADB</code> is a tool that communicates with an Android device to inspect the image or
+extract APKs, available on the Android SDK Platform Tools <a href="https://developer.android.com/tools/releases/platform-tools">website</a>.</p>
+
+<h4 id="inclusion-proof-verifier" data-text="Inclusion Proof verifier" tabindex="-1">Inclusion Proof verifier</h4>
+
+<p>The inclusion proof verifier is a Go module that queries the transparency log
+and outputs whether an artifact is included in the log.
+It&#39;s published in the <code translate="no" dir="ltr">android-binary-transparency</code> GitHub repository at
+<a href="https://github.com/android/android-binary-transparency/tree/main">https://github.com/android/android-binary-transparency/tree/main</a></p>
+
+<p>To clone the AOSP <code translate="no" dir="ltr">avb</code> repository:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:~$</strong> git clone https://android.googlesource.com/platform/external/avb
+</code></pre></devsite-code>
+<p>To clone the <code translate="no" dir="ltr">android-binary-transparency</code> GitHub repository:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:~$</strong> git clone https://github.com/android/android-binary-transparency
+</code></pre></devsite-code>
+<h4 id="aapt2" data-text="AAPT2" tabindex="-1">AAPT2</h4>
+
+<p>AAPT2 (Android Asset Packaging Tool) is a build tool used to compile and package
+an Android app&#39;s resources.
+It can be found as a standalone tool in <a href="https://developer.android.com/studio/releases/build-tools">Android SDK Build Tools</a>
+version 26.0.2 and higher.</p>
+
+<h4 id="bundletool" data-text="bundletool" tabindex="-1">bundletool</h4>
+
+<p><code translate="no" dir="ltr">bundletool</code> is a tool used to build an Android App Bundle (AAB). It can also be
+used to verify APK code signatures.
+It can be downloaded from <a href="https://github.com/google/bundletool/releases">GitHub</a>.</p>
+
+<h4 id="wget-or-curl" data-text="wget or curl" tabindex="-1">wget or curl</h4>
+
+<p><a href="https://www.gnu.org/software/wget/">wget</a> and
+<a href="https://curl.se/download.html">curl</a>
+are tools that can be used to retrieve or download files from the Internet.
+Be sure to have either of these tools installed, as the verification scripts may
+rely on them.</p>
+
+<h4 id="avbtool" data-text="Avbtool" tabindex="-1">Avbtool</h4>
+
+<p><a href="https://android.googlesource.com/platform/external/avb/+/master/avbtool.py">avbtool</a>
+is used to compute the VBMeta digest of the factory images and verification of
+binaries.
+After cloning the <code translate="no" dir="ltr">avb</code> repository (as shown in the Inclusion Proof verifier
+section), <code translate="no" dir="ltr">avbtool.py</code> can be found within the cloned <code translate="no" dir="ltr">avb</code> directory.
+You should add this directory to your <code translate="no" dir="ltr">$PATH</code> environment variable.</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:~$</strong> PATH=$PATH:<var translate="no">DIRECTORY_CONTAINING_AVBTOOL</var>
+</code></pre></devsite-code>
+<h4 id="fbpacktool" data-text="Fbpacktool" tabindex="-1">Fbpacktool</h4>
+
+<p><a href="https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpacktool.py">fbpacktool</a>
+is a Python script used to unpack individual components in Pixel&#39;s
+<code translate="no" dir="ltr">bootloader.img</code>.
+You don&#39;t need this if you are verifying APKs.
+This tool is important because it lets <code translate="no" dir="ltr">avbtool.py</code> discover the required
+images for verification.</p>
+
+<p><code translate="no" dir="ltr">fbpacktool</code> requires Python 3.6 or later and the
+<a href="https://pypi.org/project/PyYAML/">PyYAML</a> package
+(for example, <code translate="no" dir="ltr">python3 -m pip install pyyaml</code>).</p>
+
+<p>To make use of this tool, you should download the following six python scripts
+into the directory where your <code translate="no" dir="ltr">avbtool.py</code> lives,
+make <code translate="no" dir="ltr">fbpacktool.py</code> executable,
+and create a symlink named <code translate="no" dir="ltr">fbpacktool</code> to <code translate="no" dir="ltr">fbpacktool.py</code> for convenience.</p>
+
+<p>If you have <code translate="no" dir="ltr">wget</code>:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_to_avbtool$</strong> wget https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpacktool.py \
+https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpack.py \
+https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/packedstruct.py \
+https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/xmlparser.py \
+https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/xmlserializer.py \
+https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/yamlparser.py
+<strong>computer:dir_to_avbtool$</strong> chmod +x fbpacktool.py
+<strong>computer:dir_to_avbtool$</strong> ln -s fbpacktool.py fbpacktool
+</code></pre></devsite-code>
+<p>If you have <code translate="no" dir="ltr">curl</code>:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpacktool.py
+<strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpack.py
+<strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/packedstruct.py
+<strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/xmlparser.py
+<strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/xmlserializer.py
+<strong>computer:dir_to_avbtool$</strong> curl -LO https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/yamlparser.py
+<strong>computer:dir_to_avbtool$</strong> chmod +x fbpacktool.py
+<strong>computer:dir_to_avbtool$</strong> ln -s fbpacktool.py fbpacktool
+</code></pre></devsite-code>
+<h4 id="openssl" data-text="OpenSSL" tabindex="-1">OpenSSL</h4>
+
+<p><a href="https://www.openssl.org/source/">openssl</a> helps perform various cryptographic
+operations using the terminal in the verification workflow.
+Make sure it&#39;s installed on your system.
+You can check on your terminal by running the following command and making sure
+the returned result isn&#39;t empty:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:~$</strong> which openssl
+<em>/usr/bin/openssl</em>
+</code></pre></devsite-code>
+<h3 id="construct-the-payload-for-verification" data-text="Construct the Payload for Verification" tabindex="-1">Construct the Payload for Verification</h3>
+
+<p>To verify the image you have on your device or a download from the Pixel Factory
+Image website, you must first construct the payload corresponding to that image
+from the Build Fingerprint and VBMeta Digest. There are two options, manual or
+automatic, as described below.</p>
+
+<ul>
+<li>Build Fingerprint: A string identifier of the factory image
+<ul>
+<li>Example:
+<code translate="no" dir="ltr">google/oriole/oriole:12/SD1A.210817.015.A4/7697517:user/release-keys</code></li>
+</ul></li>
+<li>VBMeta Digest: A SHA-256 cryptographic digest that ties the different pieces
+of the factory images together
+<ul>
+<li>Example:
+<code translate="no" dir="ltr">4d5e41b7c675a821de81f7d2c744623fe808c8c2d3e19a83e894dab5d0829dbe</code></li>
+</ul></li>
+</ul>
+
+<h4 id="manual-payload-construction" data-text="Manual Payload Construction" tabindex="-1">Manual Payload Construction</h4>
+
+<p>To manually generate the payload for verification you need to create a text
+file, <code translate="no" dir="ltr">payload.txt</code> that contains the build fingerprint on one line and then the
+VBMeta digest on the next line, with an empty new line (please refer to the
+<a href="/android/binary_transparency/overview#log_content">Log Content section</a> for
+exact format).</p>
+
+<p>After following the steps from
+<a href="#extracting-the-vbmeta-digest-and-build-fingerprint-from-pixel-factory-image-website">Factory Image website</a>,
+the content of the <code translate="no" dir="ltr">payload.txt</code> file should look like this:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr">google/oriole/oriole:12/SD1A.210817.015.A4/7697517:user/release-keys
+4d5e41b7c675a821de81f7d2c744623fe808c8c2d3e19a83e894dab5d0829dbe
+</code></pre></devsite-code>
+<h5 id="extracting-the-vbmeta-digest-and-build-fingerprint-from-pixel-factory-image-website" data-text="Extracting the VBMeta Digest and Build Fingerprint from Pixel Factory Image website" tabindex="-1">Extracting the VBMeta Digest and Build Fingerprint from Pixel Factory Image website</h5>
+
+<p>When you download a factory image from
+<a href="https://developers.google.com/android/images">Pixel Factory Image website</a>, you
+will need to unzip the downloaded file, which will create another folder in
+place. Navigate to the newly created folder, and unzip the associated
+<code translate="no" dir="ltr">image-*.zip</code> file to obtain individual <code translate="no" dir="ltr">*.img</code> files. These binaries are
+partition images. Make sure that a <code translate="no" dir="ltr">vbmeta.img</code> file exists among the img files.
+You should see something like this:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:oriole-sd1a.210817.015.a4$</strong> unzip image-oriole-sd1a.210817.015.a4.zip
+<em>Archive:  image-oriole-sd1a.210817.015.a4.zip
+  inflating: android-info.txt
+  inflating: boot.img
+  inflating: vendor_boot.img
+  inflating: system.img
+  inflating: vendor.img
+  inflating: product.img
+  inflating: system_ext.img
+  inflating: system_other.img
+  inflating: dtbo.img
+  inflating: vbmeta_system.img
+  inflating: vbmeta.img
+  inflating: super_empty.img
+</em>
+</code></pre></devsite-code>
+<p>You can extract the build fingerprint and compute the VBMeta digest from all the
+downloaded files.</p>
+
+<p>After <code translate="no" dir="ltr">avbtool.py</code> has been made available to your <code translate="no" dir="ltr">$PATH</code>, you can then issue
+the following commands from your terminal to extract the device-specific build
+fingerprint and compute the VBMeta digest of the factory image that you have
+just downloaded:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_containing_unzipped_factory_image~$</strong> grep -a &#39;ro\.product\.build\.fingerprint=google/.*/release-keys&#39; product.img | cut -f2 -d&#39;=&#39;
+<em>google/oriole/oriole:12/SD1A.210817.015.A4/7697517:user/release-keys</em>
+</code></pre></devsite-code><aside class="note"><strong>Note:</strong><span> Starting in Android 17, Pixel factory images use a shared generic system
+image (<code translate="no" dir="ltr">system.img</code>) where <code translate="no" dir="ltr">ro.system.build.fingerprint</code> is set to
+<code translate="no" dir="ltr">google/generic_system_google/generic:17/...</code>, while the device-specific build
+fingerprint (<code translate="no" dir="ltr">google/&lt;device&gt;/&lt;device&gt;:17/...</code>) is stored in <code translate="no" dir="ltr">product.img</code>
+(<code translate="no" dir="ltr">ro.product.build.fingerprint</code>). Extracting <code translate="no" dir="ltr">ro.product.build.fingerprint</code> from
+<code translate="no" dir="ltr">product.img</code> returns the device-specific fingerprint across all supported
+Android versions.</span></aside><div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_containing_unzipped_factory_image$</strong> avbtool.py calculate_vbmeta_digest --image vbmeta.img
+<em>4d5e41b7c675a821de81f7d2c744623fe808c8c2d3e19a83e894dab5d0829dbe</em>
+</code></pre></devsite-code>
+<h5 id="manual-verification-downloaded-factory-image" data-text="Manual Verification of Downloaded Factory Image" tabindex="-1">Manual Verification of Downloaded Factory Image</h5>
+
+<p>In order to correctly verify the downloaded factory image, you will need to
+download
+<a href="https://developers.google.com/android/binary_transparency/tools/pixel/fbpacktool/fbpacktool.py">fbpacktool.py</a>
+and the other python files it depends on (see
+<a href="#fbpacktool">Fbpacktool</a> in the prerequisites for the full list and download
+commands)
+to unpack the components in <code translate="no" dir="ltr">bootloader.img</code>, as they are individually described
+in the VBMeta struct. Once you have the unpacker, you can make use of the
+<code translate="no" dir="ltr">fbpacktool.py</code> to unpack the bootloader image. For example:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_containing_unzipped_images$</strong> python3 fbpacktool.py unpack bootloader-oriole-slider-1.0-7683913.img
+</code></pre></devsite-code>
+<p>You should be able to see additional .img files appearing in that directory.
+Now, you can proceed to use <code translate="no" dir="ltr">avbtool.py</code> to manually verify that the signatures
+of the various partitions match.</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_containing_unzipped_images$</strong> avbtool.py verify_image --image vbmeta.img --follow_chain_partitions
+<em>Verifying image vbmeta.img using embedded public key
+vbmeta: Successfully verified SHA256_RSA4096 vbmeta struct in vbmeta.img
+vbmeta_system: Chained but ROLLBACK_SLOT (which is 1) and KEY (which has sha1 df529646b7225015196a714006346f0768b87fcf) not specified
+--
+Verifying image vbmeta_system.img using embedded public key
+vbmeta: Successfully verified SHA256_RSA4096 vbmeta struct in vbmeta_system.img
+product: Successfully verified sha256 hashtree of product.img for image of 2700468224 bytes
+system: Successfully verified sha256 hashtree of system.img for image of 878493696 bytes
+system_ext: Successfully verified sha256 hashtree of system_ext.img for image of 251334656 bytes
+vbmeta_vendor: Chained but ROLLBACK_SLOT (which is 3) and KEY (which has sha1 85322346680a860c091fa14a64cef1fe4a3ffe31) not specified
+--
+Verifying image vbmeta_vendor.img using embedded public key
+vbmeta: Successfully verified SHA256_RSA4096 vbmeta struct in vbmeta_vendor.img
+vendor: Successfully verified sha256 hashtree of vendor.img for image of 472940544 bytes
+boot: Chained but ROLLBACK_SLOT (which is 2) and KEY (which has sha1 85322346680a860c091fa14a64cef1fe4a3ffe31) not specified
+--
+Verifying image boot.img using embedded public key
+vbmeta: Successfully verified footer and SHA256_RSA4096 vbmeta struct in boot.img
+boot: Successfully verified sha256 hash of boot.img for image of 24481792 bytes
+abl: Successfully verified sha256 hash of abl.img for image of 1744896 bytes
+bl1: Successfully verified sha256 hash of bl1.img for image of 12288 bytes
+bl2: Successfully verified sha256 hash of bl2.img for image of 544768 bytes
+bl31: Successfully verified sha256 hash of bl31.img for image of 86016 bytes
+dtbo: Successfully verified sha256 hash of dtbo.img for image of 2152234 bytes
+gsa: Successfully verified sha256 hash of gsa.img for image of 262144 bytes
+ldfw: Successfully verified sha256 hash of ldfw.img for image of 4096000 bytes
+pbl: Successfully verified sha256 hash of pbl.img for image of 49152 bytes
+tzsw: Successfully verified sha256 hash of tzsw.img for image of 4304896 bytes
+vendor_boot: Successfully verified sha256 hash of vendor_boot.img for image of 25718784 bytes
+vendor_dlkm: Successfully verified sha256 hashtree of vendor_dlkm.img for image of 54505472 bytes
+</em>
+</code></pre></devsite-code>
+<p>If you don&#39;t see any error or failure messages, this means that the VBMeta of
+the downloaded image has now been successfully verified.</p>
+
+<h4 id="automatic-payload-construction" data-text="Automatic Payload Construction" tabindex="-1">Automatic Payload Construction</h4>
+
+<p>For your convenience, we have also provided a python script you can use. With
+this tool, rather than manually fetching and unzipping files, you only need to
+specify the URL to the factory image.</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:dir_to_avb_repo/tools/transparency$</strong> python3 ./pixel_factory_image_verify.py https://dl.google.com/dl/android/aosp/oriole-sd1a.210817.015.a4-factory-074b7f51.zip
+<em>Fetching file from: https://dl.google.com/dl/android/aosp/oriole-sd1a.210817.015.a4-factory-074b7f51.zip
+Successfully downloaded file.
+Successfully unpacked factory image.
+Successfully unpacked factory image partitions.
+Successfully unpacked bootloader image.
+Successfully verified VBmeta.
+Successfully extracted build fingerprint.
+Successfully calculated VBMeta Digest.
+The build fingerprint for factory image is: google/oriole/oriole:12/SD1A.210817.015.A4/7697517:user/release-keys
+The VBMeta Digest for factory image is: 4d5e41b7c675a821de81f7d2c744623fe808c8c2d3e19a83e894dab5d0829dbe
+
+A corresponding &#34;payload.txt&#34; file has been created.
+</em>
+</code></pre></devsite-code>
+<p>Executing the command above will download the factory image bundle, unzip the
+bundle, and verify the signatures of the signed partitions. Upon successful
+verification, it will create a new file named <code translate="no" dir="ltr">payload.txt</code>, and its content
+should look similar to below:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr">google/oriole/oriole:12/SD1A.210817.015.A4/7697517:user/release-keys
+4d5e41b7c675a821de81f7d2c744623fe808c8c2d3e19a83e894dab5d0829dbe
+</code></pre></devsite-code>
+<p>After your payload.txt is successfully created you can start the <a href="#verifying-image-inclusion-inclusion-proof">verification
+of image inclusion</a> steps.</p>
+
+<h3 id="verifying-image-inclusion-inclusion-proof" data-text="Verifying Image Inclusion (Inclusion Proof)" tabindex="-1">Verifying Image Inclusion (Inclusion Proof)</h3>
+
+<p>Once you&#39;ve constructed your payload, set a shell variable (e.g.
+<code translate="no" dir="ltr">$PAYLOAD_PATH</code>) to point to the path to the payload.</p>
+
+<p>An inclusion proof tool has been published in the
+<a href="https://cs.android.com/android/platform/superproject/main/+/main:external/avb/tools/transparency/verify/"><code translate="no" dir="ltr">avb</code> repository</a>
+within the Android Open Source Project. To run it:</p>
+<div></div><devsite-code><pre class="devsite-disable-click-to-copy devsite-click-to-copy" translate="no" dir="ltr" is-upgraded><code translate="no" dir="ltr"><strong>computer:external/avb/tools/transparency/verify$</strong> PAYLOAD_PATH=../payload.txt
+<strong>computer:external/avb/tools/transparency/verify$</strong> go build cmd/verifier/verifier.go
+<strong>computer:external/avb/tools/transparency/verify$</strong> ./verifier --payload_path=${PAYLOAD_PATH} --log_type=pixel
+</code></pre></devsite-code>
+<p>The verifier uses the checkpoint and the log contents (found at the
+<a href="https://developers.google.com/android/binary_transparency/tile">tile directory</a>) to check that your image payload is in the
+transparency log, that is, that it is published by Google.</p>
+
+<p>The output of the command is written to stdout:</p>
+
+<ul>
+<li><code translate="no" dir="ltr">OK. inclusion check success!</code> if the image is included in the log,</li>
+<li><code translate="no" dir="ltr">FAILURE</code> if it isn&#39;t.</li>
+</ul>
+
+  
+
+  
+</div>
+
+  
+    
+      <devsite-recommendations display="in-page" hidden yield>
+      </devsite-recommendations>
+    
+    
+      
+    <devsite-thumb-rating position="footer">
+    </devsite-thumb-rating>
+  
+       
+    
+    
+      <devsite-recommendations id="recommendations-link" yield></devsite-recommendations>
+    
+  
+
+  <div class="devsite-floating-action-buttons"></div></article>
+
+
+<devsite-content-footer class="nocontent" data-nosnippet>
+  <p>Except as otherwise noted, the content of this page is licensed under the <a href="https://creativecommons.org/licenses/by/4.0/">Creative Commons Attribution 4.0 License</a>, and code samples are licensed under the <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache 2.0 License</a>. For details, see the <a href="https://developers.google.com/site-policies">Google Developers Site Policies</a>. Java is a registered trademark of Oracle and/or its affiliates.</p>
+  <p>Last updated 2026-10-16 UTC.</p>
+</devsite-content-footer>
+
+
+<devsite-notification
+>
+</devsite-notification>
+
+
+  
+<div class="devsite-content-data">
+  
+  
+    <template class="devsite-content-data-template">
+      [[["Easy to understand","easyToUnderstand","thumb-up"],["Solved my problem","solvedMyProblem","thumb-up"],["Other","otherUp","thumb-up"]],[["Missing the information I need","missingTheInformationINeed","thumb-down"],["Too complicated / too many steps","tooComplicatedTooManySteps","thumb-down"],["Out of date","outOfDate","thumb-down"],["Samples / code issue","samplesCodeIssue","thumb-down"],["Other","otherDown","thumb-down"]],["Last updated 2026-10-16 UTC."],[],["To verify a Pixel factory image's legitimacy, download the image and essential tools like Go, wget/curl, avbtool, fbpacktool, and OpenSSL. Extract the build fingerprint and VBMeta digest from the image. Manually, create a `payload.txt` file with these details or use the provided Python script to automatically create it. Use the inclusion proof verifier, with the `payload.txt` path, to confirm if the image is published in the Pixel Factory Images transparency log. A successful verification will return \"OK\".\n"]]
+    </template>
+  
+</div>
+            
+          </devsite-content>
+        </main>
+        <devsite-footer-promos class="devsite-footer">
+          
+            
+          
+        </devsite-footer-promos>
+        <devsite-footer-linkboxes class="devsite-footer">
+          
+            
+<nav class="devsite-footer-linkboxes nocontent"
+     aria-label="Footer links"
+     data-nosnippet>
+  
+  <ul class="devsite-footer-linkboxes-list">
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Engage</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/program"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Google Developer Program
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Google Developer Groups
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/experts"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Google Developer Experts
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/accelerators"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            Accelerators
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/community/nvidia"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+              
+              
+            
+          
+            Google Cloud & NVIDIA
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Connect</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//googledevelopers.blogspot.com"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Blog
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://bsky.app/profile/developers.google.com"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Bluesky
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://www.instagram.com/googlefordevs/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Instagram
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://www.linkedin.com/showcase/googledevelopers/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            LinkedIn
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//twitter.com/googledevs"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+          
+            X (Twitter)
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="//www.youtube.com/user/GoogleDevelopers"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 6)"
+            >
+            
+              
+              
+            
+          
+            YouTube
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+    <li class="devsite-footer-linkbox ">
+    <h3 class="devsite-footer-linkbox-heading no-link">Build</h3>
+      <ul class="devsite-footer-linkbox-list">
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://developer.android.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 1)"
+            >
+            
+          
+            Android
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://developer.chrome.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 2)"
+            >
+            
+          
+            Chrome
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://firebase.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 3)"
+            >
+            
+          
+            Firebase
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://aistudio.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 4)"
+            >
+            
+          
+            Google AI Studio
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://antigravity.google/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 5)"
+            >
+            
+          
+            Google Antigravity
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://cloud.google.com/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 6)"
+            >
+            
+          
+            Google Cloud
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="https://play.google.com/console/about/"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 7)"
+            >
+            
+          
+            Google Play
+          
+          </a>
+          
+          
+        </li>
+        
+        <li class="devsite-footer-linkbox-item">
+          
+          <a href="/products"
+             class="devsite-footer-linkbox-link gc-analytics-event"
+             data-category="Site-Wide Custom Events"
+            
+             data-label="Footer Link (index 8)"
+            >
+            
+              
+              
+            
+          
+            View all
+          
+          </a>
+          
+          
+        </li>
+        
+      </ul>
+    </li>
+    
+  </ul>
+  
+</nav>
+          
+        </devsite-footer-linkboxes>
+        <devsite-footer-utility class="devsite-footer">
+          
+            
+
+<div class="devsite-footer-utility nocontent" data-nosnippet>
+  
+  
+  <nav class="devsite-footer-sites" aria-label="Other Google Developers websites">
+    <a href="https://developers.google.com/"
+       class="devsite-footer-sites-logo-link gc-analytics-event"
+       data-category="Site-Wide Custom Events"
+       data-label="Footer Google Developers Link">
+      <picture>
+        
+        <img class="devsite-footer-sites-logo"
+             src="https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/images/lockup-google-for-developers.svg"
+             loading="lazy"
+             alt="Google Developers">
+      </picture>
+    </a>
+    <ul class="devsite-footer-sites-list">
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//developer.android.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Android Link"
+         
+         >
+          Android
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//developer.chrome.com/home"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Chrome Link"
+         
+         >
+          Chrome
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//firebase.google.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Firebase Link"
+         
+         >
+          Firebase
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//cloud.google.com"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Google Cloud Platform Link"
+         
+         >
+          Google Cloud Platform
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="//ai.google.dev/"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer Google AI Link"
+         
+         >
+          Google AI
+        </a>
+      </li>
+      
+      <li class="devsite-footer-sites-item">
+        <a href="/products"
+           class="devsite-footer-sites-link
+                  gc-analytics-event"
+           data-category="Site-Wide Custom Events"
+         
+           data-label="Footer All products Link"
+         
+         >
+          All products
+        </a>
+      </li>
+      
+    </ul>
+  </nav>
+  
+
+  
+  <nav class="devsite-footer-utility-links" aria-label="Utility links">
+    
+    <ul class="devsite-footer-utility-list">
+      
+      <li class="devsite-footer-utility-item
+                 ">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="/terms/site-terms"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Terms link"
+         >
+          Terms
+        </a>
+        
+      </li>
+      
+      <li class="devsite-footer-utility-item
+                 ">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="//policies.google.com/privacy"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Privacy link"
+         >
+          Privacy
+        </a>
+        
+      </li>
+      
+      <li class="devsite-footer-utility-item
+                 glue-cookie-notification-bar-control">
+        
+        
+        <a class="devsite-footer-utility-link gc-analytics-event"
+           href="#"
+           data-category="Site-Wide Custom Events"
+           data-label="Footer Manage cookies link"
+         
+           aria-hidden="true"
+         >
+          Manage cookies
+        </a>
+        
+      </li>
+      
+    </ul>
+    
+    
+<devsite-language-selector>
+  <ul role="presentation">
+    
+    
+    <li role="presentation">
+      <a role="menuitem" lang="en"
+        >English</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="de"
+        >Deutsch</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es"
+        >Español</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="es_419"
+        >Español – América Latina</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fr"
+        >Français</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="id"
+        >Indonesia</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="it"
+        >Italiano</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pl"
+        >Polski</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="pt_br"
+        >Português – Brasil</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="vi"
+        >Tiếng Việt</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="tr"
+        >Türkçe</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ru"
+        >Русский</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="he"
+        >עברית</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ar"
+        >العربيّة</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="fa"
+        >فارسی</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="hi"
+        >हिंदी</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="bn"
+        >বাংলা</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="th"
+        >ภาษาไทย</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_cn"
+        >中文 – 简体</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="zh_tw"
+        >中文 – 繁體</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ja"
+        >日本語</a>
+    </li>
+    
+    <li role="presentation">
+      <a role="menuitem" lang="ko"
+        >한국어</a>
+    </li>
+    
+  </ul>
+</devsite-language-selector>
+
+  </nav>
+</div>
+          
+        </devsite-footer-utility>
+        <devsite-panel>
+          
+        </devsite-panel>
+        
+          <devsite-concierge
+  
+  
+    data-info-panel
+  
+  
+    data-ai-panel
+  
+  
+  
+  
+    data-api-explorer-panel
+  >
+</devsite-concierge>
+        
+      </section>
+      </section>
+    <devsite-sitemask></devsite-sitemask>
+    <devsite-snackbar></devsite-snackbar>
+    <devsite-tooltip ></devsite-tooltip>
+    <devsite-heading-link></devsite-heading-link>
+    <devsite-analytics>
+      
+        <script type="application/json" analytics>[{&#34;dimensions&#34;: {&#34;dimension4&#34;: &#34;Android Binary Transparency&#34;, &#34;dimension1&#34;: &#34;Signed out&#34;, &#34;dimension11&#34;: false, &#34;dimension5&#34;: &#34;en&#34;, &#34;dimension3&#34;: false, &#34;dimension6&#34;: &#34;en&#34;}, &#34;gaid&#34;: &#34;UA-24532603-1&#34;, &#34;metrics&#34;: {&#34;ratings_count&#34;: &#34;metric2&#34;, &#34;ratings_value&#34;: &#34;metric1&#34;}, &#34;purpose&#34;: 1}]</script>
+<script type="application/json" tag-management>{&#34;at&#34;: &#34;True&#34;, &#34;ga4&#34;: [{&#34;id&#34;: &#34;G-272J68FCRF&#34;, &#34;purpose&#34;: 1}], &#34;ga4p&#34;: [{&#34;id&#34;: &#34;G-272J68FCRF&#34;, &#34;purpose&#34;: 1}], &#34;gtm&#34;: [{&#34;id&#34;: &#34;GTM-T98GCPGN&#34;, &#34;purpose&#34;: 1}], &#34;parameters&#34;: {&#34;internalUser&#34;: &#34;False&#34;, &#34;language&#34;: {&#34;machineTranslated&#34;: &#34;False&#34;, &#34;requested&#34;: &#34;en&#34;, &#34;served&#34;: &#34;en&#34;}, &#34;pageType&#34;: &#34;article&#34;, &#34;projectName&#34;: &#34;Android Binary Transparency&#34;, &#34;signedIn&#34;: &#34;False&#34;, &#34;tenant&#34;: &#34;developers&#34;, &#34;recommendations&#34;: {&#34;sourcePage&#34;: &#34;&#34;, &#34;sourceType&#34;: 0, &#34;sourceRank&#34;: 0, &#34;sourceIdenticalDescriptions&#34;: 0, &#34;sourceTitleWords&#34;: 0, &#34;sourceDescriptionWords&#34;: 0, &#34;experiment&#34;: &#34;&#34;}, &#34;experiment&#34;: {&#34;ids&#34;: &#34;&#34;}}}</script>
+      
+    </devsite-analytics>
+    
+      <devsite-badger></devsite-badger>
+    
+    
+    
+    
+    
+<script nonce="vV+TuvzdvkN6nPLp0ITxmVZC4PIsrj">
+  
+  (function(d,e,v,s,i,t,E){d['GoogleDevelopersObject']=i;
+    t=e.createElement(v);t.async=1;t.src=s;E=e.getElementsByTagName(v)[0];
+    E.parentNode.insertBefore(t,E);})(window, document, 'script',
+    'https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/js/app_loader.js', '[1,"en",null,"/js/devsite_app_module.js","https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43","https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers","https://developers-dot-devsite-v2-prod.appspot.com",null,null,["/_pwa/developers/manifest.json","https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/images/video-placeholder.svg","https://www.gstatic.com/devrel-devsite/prod/v5a0f9ff8b593048661361a49e11ab98a8b1ac025e19e60e6189f2b56796f8a43/developers/images/favicon-new.png","https://fonts.googleapis.com/css?family=Google+Sans:400,500|Roboto:400,400italic,500,500italic,700,700italic|Roboto+Mono:400,500,700&display=swap"],1,null,[1,6,8,12,14,17,21,25,50,52,63,70,75,76,80,87,91,92,93,97,98,100,101,102,103,104,105,107,108,109,110,112,113,117,118,120,122,124,125,126,127,129,130,131,132,133,134,135,136,138,140,141,147,148,149,151,152,156,157,158,159,161,163,164,168,169,170,179,180,182,183,186,191,193,196],"AIzaSyAP-jjEJBzmIyKR4F-3XITp8yM9T1gEEI8","AIzaSyB6xiKGDR5O3Ak2okS4rLkauxGUG7XP0hg","developers.google.com","AIzaSyAQk0fBONSGUqCNznf6Krs82Ap1-NV6J4o","AIzaSyCCxcqdrZ_7QMeLCRY20bh_SXdAYqy70KY",null,null,null,["MiscFeatureFlags__developers_footer_dark_image","Concierge__enable_key_takeaways_new_ui","Cloud__cache_serialized_dynamic_content","Search__enable_ai_search_summaries_for_all","Profiles__enable_dashboard_curated_recommendations","TpcFeatures__proxy_prod_host","Profiles__enable_developer_profile_pages_as_content","DevPro__remove_eu_tax_intake_form","DevPro__enable_nvidia_credits_card","Profiles__enable_recognition_badges","AIStudioInteractionsToggle__interactions_are_default","MiscFeatureFlags__fix_lower_breadcrumbs","Cloud__fast_free_trial","DevPro__enable_developer_subscriptions","Concierge__enable_remove_info_panel_tags","Cloud__enable_cloud_shell_fte_user_flow","MiscFeatureFlags__gdp_dashboard_reskin_enabled","Profiles__require_profile_eligibility_for_signin","TpcFeatures__enable_unmirrored_page_left_nav","Cloud__enable_cloud_shell","MiscFeatureFlags__enable_framebox_badge_methods","Cloud__enable_free_trial_server_call","DevPro__enable_vertex_credit_card","Profiles__enable_playlist_community_acl","Search__enable_ai_eligibility_checks","Concierge__enable_key_takeaways","DevPro__enable_code_assist","Concierge__enable_concierge_restricted","DevPro__enable_embed_profile_creation","MiscFeatureFlags__enable_appearance_cookies","DevPro__enable_credits_banner","DevPro__enable_cloud_innovators_plus","Profiles__enable_stripe_subscription_management","Cloud__enable_legacy_calculator_redirect","MiscFeatureFlags__enable_firebase_utm","Search__enable_ai_search_summaries_restricted","Profiles__enable_purchase_prompts","Profiles__enable_awarding_url","Cloud__enable_cloudx_experiment_ids","BookNav__enable_tenant_cache_key","CloudShell__cloud_code_overflow_menu","MiscFeatureFlags__enable_explain_this_code","Search__enable_page_map","MiscFeatureFlags__developers_footer_image","Profiles__enable_targeted_hero","Significatio__enable_by_tenant","MiscFeatureFlags__enable_variable_operator_index_yaml","Search__enable_dynamic_content_confidential_banner","Search__enable_ai_search_summaries","Profiles__enable_developer_profiles_callout","Profiles__enable_auto_apply_credits","Profiles__enable_user_type","Concierge__enable_concierge","Profiles__enable_join_program_group_endpoint","Profiles__enable_completequiz_endpoint","DevPro__enable_devsite_captcha","DevPro__enable_g1_integration","Concierge__enable_devsite_llm_tools","MiscFeatureFlags__enable_project_variables","Analytics__enable_clearcut_logging","Profiles__enable_completecodelab_endpoint","SignIn__enable_l1_signup_flow","Profiles__enable_release_notes_notifications","Cloud__enable_cloud_dlp_service","DevPro__enable_free_benefits","Profiles__enable_callout_notifications","MiscFeatureFlags__enable_explicit_template_dependencies","MiscFeatureFlags__enable_view_transitions","MiscFeatureFlags__enable_variable_operator","Experiments__reqs_query_experiments","Profiles__enable_page_saving","MiscFeatureFlags__remove_cross_domain_tracking_params","DevPro__enable_devpro_offers","DevPro__enable_g1_ineligible_redirect","Concierge__enable_actions_menu","EngEduTelemetry__enable_engedu_telemetry","Analytics__enable_devpro_interaction_logging","Profiles__enable_complete_playlist_endpoint","Search__enable_suggestions_from_borg","Profiles__enable_public_developer_profiles","DevPro__enable_google_payments","Profiles__enable_developer_profile_benefits_ui_redesign","Profiles__enable_profile_collections","Concierge__enable_pushui","DevPro__enable_enterprise","DevPro__enable_google_payments_buyflow","DevPro__enable_google_one_card","CloudShell__cloud_shell_button","DevPro__enable_firebase_workspaces_card"],null,null,"AIzaSyBLEMok-5suZ67qRPzx0qUtbnLmyT_kCVE","https://developerscontentserving-pa.clients6.google.com","AIzaSyCM4QpTRSqP5qI4Dvjt4OAScIN8sOUlO-k","https://developerscontentsearch-pa.clients6.google.com",1,4,null,"https://developerprofiles-pa.clients6.google.com",[1,"developers","Google for Developers","developers.google.com",null,"developers-dot-devsite-v2-prod.appspot.com",null,null,[1,1,[1],null,null,null,null,null,null,null,null,[1],null,null,null,null,null,null,[1],[1,null,null,[1,20],"/recommendations/information"],null,null,null,[1,1,1],[1,1,null,1,1,null,null,["/meridian"]],[1,null,null,null,null,null,null,["/admob","/ad-manager/mobile-ads-sdk","/ml-kit"]],null,[null,["/meridian","/youtube/devices/"]],1,null,[1]],null,[null,null,null,null,null,null,"/images/lockup-new.svg","/images/touchicon-180-new.png",null,null,null,null,1,null,null,null,null,null,null,null,null,1,null,null,null,"/images/lockup-dark-theme-new.svg",[]],[],null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,[6,1,14,15,20,22,23,29,32,36],null,[[null,null,null,[3,7,10,2,39,17,4,32,24,11,12,13,34,15,25],null,null,[1,[["docType","Choose a content type",[["Tutorial",null,null,null,null,null,null,null,null,"Tutorial"],["Guide",null,null,null,null,null,null,null,null,"Guide"],["Sample",null,null,null,null,null,null,null,null,"Sample"]]],["product","Choose a product",[["Android",null,null,null,null,null,null,null,null,"Android"],["ARCore",null,null,null,null,null,null,null,null,"ARCore"],["ChromeOS",null,null,null,null,null,null,null,null,"ChromeOS"],["Firebase",null,null,null,null,null,null,null,null,"Firebase"],["Flutter",null,null,null,null,null,null,null,null,"Flutter"],["Assistant",null,null,null,null,null,null,null,null,"Google Assistant"],["GoogleCloud",null,null,null,null,null,null,null,null,"Google Cloud"],["GoogleMapsPlatform",null,null,null,null,null,null,null,null,"Google Maps Platform"],["GooglePay",null,null,null,null,null,null,null,null,"Google Pay & Google Wallet"],["GooglePlay",null,null,null,null,null,null,null,null,"Google Play"],["Tensorflow",null,null,null,null,null,null,null,null,"TensorFlow"]]],["category","Choose a topic",[["AiAndMachineLearning",null,null,null,null,null,null,null,null,"AI and Machine Learning"],["Data",null,null,null,null,null,null,null,null,"Data"],["Enterprise",null,null,null,null,null,null,null,null,"Enterprise"],["Gaming",null,null,null,null,null,null,null,null,"Gaming"],["Mobile",null,null,null,null,null,null,null,null,"Mobile"],["Web",null,null,null,null,null,null,null,null,"Web"]]]]]],[1,1],null,1],[[["UA-24532603-1"],["UA-22084204-5"],null,null,["UA-24532603-5"],["GTM-T98GCPGN"],null,[["G-272J68FCRF"],null,null,[["G-272J68FCRF",2]]],[["UA-24532603-1",2]],null,[["UA-24532603-5",2]],[["GTM-T98GCPGN",2]],1],[[4,3],[16,13],[14,11],[11,8],[5,4],[12,9],[3,2],[13,10],[6,5],[15,12],[1,1]],[[1,1],[2,2]]],null,4,null,null,null,null,null,null,null,null,null,null,null,null,null,"developers.devsite.google",null,null,null,null,null,[]],null,"pk_live_5170syrHvgGVmSx9sBrnWtA5luvk9BwnVcvIi7HizpwauFG96WedXsuXh790rtij9AmGllqPtMLfhe2RSwD6Pn38V00uBCydV4m",1,1,"https://developerscontentinsights-pa.clients6.google.com","AIzaSyCg-ZUslalsEbXMfIo9ZP8qufZgo3LSBDU","AIzaSyDxT0vkxnY_KeINtA4LSePJO-4MAZPMRsE","https://developers.clients6.google.com",["https://codeassist.google.com","https://code-assist-free-tier.corp.google.com"],null,"AIzaSyBQom12tzI-rybN7Sf-KfeL4nwm-Rf7PmI\n",null,null,"https://developers.googleapis.com"]')
+  
+</script>
+
+    <devsite-a11y-announce></devsite-a11y-announce>
+  </body>
+</html>
