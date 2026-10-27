@@ -29,7 +29,8 @@ const S_WLAN: u64 = 1;
 const S_UDP: u64 = 2;
 const S_ENTROPY: u64 = 3;
 
-const QN: usize = 8;
+/// Datagrams held for the apps: a Photon Transport blast is up to 256 chunks at once (photon_core::pt), and a fleet frame is 30-50 of them; 64 slots in `.data` (an arc's stack is 64 KiB, the queue 96 KB) — the oldest gives way when full, PT re-sends what was lost.
+const QN: usize = 64;
 
 struct Datagram {
     used: bool,
@@ -71,7 +72,7 @@ struct Ip {
     arp_n: usize,
     nd: [([u8; 16], [u8; 6]); 8],
     nd_n: usize,
-    q: [Datagram; QN],
+    q: &'static mut [Datagram; QN],
     frames: u32,
     dns: [u8; 4],
     ports: [u16; 8],
@@ -1034,7 +1035,10 @@ fn csum(data: &[u8], init: u32) -> u16 {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
-    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [0; 1472] };
+    // The queue lives in `.data` (a non-zero initializer keeps it out of `.bss`, which the flat image does not carry), not on the 64 KiB stack.
+    const EMPTY: Datagram = Datagram { used: false, fam: 0, addr: [0; 16], sport: 0, dport: 0, len: 0, seq: 0, data: [1; 1472] };
+    #[unsafe(link_section = ".data.queue")]
+    static mut QUEUE: [Datagram; QN] = [EMPTY; QN];
     let mut ip = Ip {
         grants,
         base,
@@ -1064,7 +1068,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         arp_n: 0,
         nd: [([0; 16], [0; 6]); 8],
         nd_n: 0,
-        q: [EMPTY; QN],
+        q: unsafe { &mut *(&raw mut QUEUE) },
         frames: 0,
         dns: [0; 4],
         ports: [0; 8],
