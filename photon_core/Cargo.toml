@@ -19,6 +19,8 @@ subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.7", default-features = false }
 raptorq = { version = "2.0.1", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# The fleet substrate without std (2026-10-26): the membership chain fold, the key bundle and egg verification, the bind request, the fan-out OPEN, the pairing words — the same code the desktop app and the worker run, so a chain the phone folds is the chain they fold.
+fgtw = { path = "../../fgtw", default-features = false, features = ["fanout"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
