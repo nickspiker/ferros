@@ -11,6 +11,12 @@ kete = { path = "../../../kete" }
 fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "fanout", "client"] }
 vsf = { path = "../../../vsf", default-features = false }
 blake3 = "1.5"
+# The house KEM suites, as Photon takes them: PQClean C through the cross gcc and tools/std-sysroot.
+pqcrypto-ntru = { version = "0.5.8", default-features = false }
+pqcrypto-ntruprime = { version = "0.1.6", default-features = false, features = ["std"] }
+pqcrypto-mlkem = { version = "0.1.1", default-features = false, features = ["std"] }
+pqcrypto-hqc = "0.2.2"
+pqcrypto-traits = "0.3.5"
 # getrandom 0.2 takes its custom backend by feature (ferros_rt defines it).
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 
@@ -23,3 +29,7 @@ panic = "abort"
 panic = "abort"
 
 [workspace]
+
+# libc with a ferros arm (the C scalar types, no functions) for the crates that spell their types through it.
+[patch.crates-io]
+libc = { path = "/mnt/Harbor/Code/ferros-libc" }

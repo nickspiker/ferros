@@ -20,6 +20,16 @@ fn main() {
     println!("tokio: sum of squares A#{n} (expect 140) in A#{} ms", t0.elapsed().as_millis());
     println!("blake3 of 'ferros': {}", &blake3::hash(b"ferros").to_hex()[..16]);
 
+    // The house KEMs round-trip: ML-KEM-768 through PQClean's C, built freestanding.
+    {
+        use pqcrypto_traits::kem::SharedSecret;
+        let t = std::time::Instant::now();
+        let (pk, sk) = pqcrypto_mlkem::mlkem768::keypair();
+        let (ss_a, ct) = pqcrypto_mlkem::mlkem768::encapsulate(&pk);
+        let ss_b = pqcrypto_mlkem::mlkem768::decapsulate(&ct, &sk);
+        println!("mlkem768: shared secrets {} in A#{} us", if ss_a.as_bytes() == ss_b.as_bytes() { "agree" } else { "DIFFER" }, t.elapsed().as_micros());
+    }
+
     let t1 = std::time::Instant::now();
     let app = kete::App { id: "stdprobe", dir: "stdprobe" };
     let store = match kete::FlatStorage::open_device_shared(app, [7u8; 32]) {

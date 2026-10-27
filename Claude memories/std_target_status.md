@@ -10,6 +10,7 @@ Where the std target stands (STD-TARGET.md in the ferros repo has the mechanics)
 - Build: `tools/std-build.sh std/hello` → `stdhello.bin`; `ferros-bridge spawn … --name stdhello --entropy`. First run 2026-10-27 passed everything (println, TLS, threads, Mutex/Condvar, HashMap, sleep, SystemTime).
 - kete on ferros keeps entries by their 32-byte addresses straight through SYS_STORE bit 5 (no names, no encoding); the kernel scopes an address through its keyed hash and keeps the scope's address list.
 - Kernel: trap Frame carries TPIDR_EL0; `process.rs image_tail` reads the `ferrosRT` header at image offset 8 and grows the arc by .bss + heap (2 MiB default, `--defsym __ferros_heap=`). The arc pool is 16 MiB: Photon will need an app memory region.
+- C deps: tools/std-sysroot/include + the cross gcc build PQClean (ML-KEM on the phone 572 µs); libc types from the fork /mnt/Harbor/Code/ferros-libc via [patch.crates-io] + `cargo update -p libc`.
 - Traps: cargo build-std does NOT rebuild `ferros_rt` on edit — clear `target/aarch64-unknown-ferros/release/{.fingerprint,deps}` of `ferros-rt-*` and `std-*`; under pic codegen `relocate()` must use `pc_rel!` (asm adrp) for its symbols; `compiler-builtins-mem` in build-std-features; `panic_immediate_abort` is gone.
 - Next per the owner: kete gets a native-vault backend (no std::fs ever), fluor host over the app surface, tokio over a ferros mio on the `ip` server, Photon with `cfg(target_os = "ferros")`; STOP at the input device (owner's text-input idea first).
 
