@@ -153,8 +153,11 @@ The same platform behaviour carries different weight depending on who is on the 
 
 ## Open questions
 
-**O0 — Google Play Services.** Most Google apps and many others need it.
-The candidates are a clean reimplementation (the microG model) or Google's own Play Services package on an uncertified device; D0 as written rules out shipping Google's package, and running a user-supplied copy on a non-Android host is unread territory.
+**O0 — Google Play Services.** Decided by the owner 2026-10-27; stays open until route B runs.
+Google apps never sign in themselves: they ask Play Services (package `com.google.android.gms`), which holds the account, fetches per-app tokens naming the app's package and signing certificate, and checks the device in with Google; many apps also verify that Play Services is signed by Google.
+- Route A, microG, is **out**. microG takes Google's package name and needs the OS to tell apps it carries Google's signature ("signature spoofing", which its own documentation describes as letting an app "pretend that it has been signed by a different developer than it actually was"). That is the misrepresentation D2 and D4 rule out; without the spoof, apps will not bind to it.
+- Route B, the target: Google's own unmodified Play Services and Play Store APKs run as ordinary sandboxed apps (GrapheneOS's GmsCompat model). The signature apps see is truly Google's; ferros ships none of it (D0); the user installs it; it is compiled, checked and sealed like any app (D1) and holds no ferros secret. Check-in reports the hardware and ferros honestly (D4); Google will see an uncertified device. Cost: Play Services assumes real Android underneath, so ferros's Android API layer must be deep enough for the hardest app there is.
+- Route C, now: apps that need no Google account. Google Voice is the first Google app planned, so it is the first real requirement for route B.
 
 **O1 — Attestation witness.** Apps that accept non-Google attestations (the route GrapheneOS asks app developers to take: check `verifiedBootState` = `SelfSigned` and a published `verifiedBootKey`, because "apps using it directly can support aftermarket operating systems", snapshot `grapheneos-attestation-guide.html`) need a hardware-signed statement, and the only keys banks already trust live in KeyMint/Titan behind the secure world.
 Choice for the owner: relay a truthful hardware attestation with the secure world as the bank's witness only (D5 still holds: it receives no ferros secret), or refuse attestation entirely and accept that apps requiring it will not run.
@@ -169,7 +172,8 @@ Neither carries the original 2011 Google Wallet terms' reported bar on any OS "m
 
 **O4 — Chase US Digital Services Agreement.** Not yet read; D6's Chase facts come from the UK licence and a US educational page.
 
-**O5 — Emergency services.** ferros's MVNO is data-only, and Photon will carry emergency photons, beams and waves.
+**O5 — Emergency services.** Owner's rule (2026-10-27): ferros has no POTS, SMS, MMS or 911, ever; emergencies go through Photon EMS (photons, beams and waves), and calls to phone numbers go through Google Voice once route B (O0) runs.
+Still open: whether a phone with a cellular radio may lack 911 at all (the FCC's wireless 911 rules are aimed at carriers; handset requirements not yet read), and that ferros's rule means ferros provides no 911, not that ferros blocks an app such as Voice that offers it.
 Google's two Voice documents disagree: the Voice Additional Terms say "Google Voice isn't capable of placing or receiving emergency services calls" (snapshot `google-voice-additional-terms.html`), while the Voice Personal terms, last modified June 9, 2026, say "Dialing to emergency services is supported by Google Voice Personal" with VoIP limitations (snapshot `google-voice-personal-terms.html`).
 If Photon EMS ever reaches public-safety answering points directly, FCC 911 rules for internet telephony (location, call-back) likely apply to it; that needs its own entry before Photon EMS ships.
 
