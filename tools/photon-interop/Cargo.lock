@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "fgtw"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -2158,7 +2158,7 @@ dependencies = [
  "num-bigint",
  "rand 0.8.8",
  "voca",
- "vsf 0.11.0",
+ "vsf 0.10.2",
  "x25519-dalek",
 ]
 
@@ -2205,8 +2205,9 @@ dependencies = [
 
 [[package]]
 name = "fluor"
-version = "0.0.4"
+version = "0.0.7"
 dependencies = [
+ "arboard",
  "block2 0.6.2",
  "cosmic-text",
  "jni 0.21.1",
@@ -2227,10 +2228,11 @@ dependencies = [
  "softbuffer",
  "swash",
  "unicode-script",
- "vsf 0.11.0",
+ "vsf 0.10.2",
  "wgpu",
  "wide 0.7.33",
  "windows 0.58.0",
+ "windows-core 0.58.0",
  "winit",
  "x11rb",
 ]
@@ -2616,7 +2618,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "log",
  "peniko",
- "png",
+ "png 0.18.1",
  "skrifa 0.44.0",
  "smallvec",
  "vello_common",
@@ -3190,7 +3192,7 @@ dependencies = [
  "image-webp",
  "moxcms",
  "num-traits",
- "png",
+ "png 0.18.1",
  "tiff",
  "zune-core",
  "zune-jpeg",
@@ -3640,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -3649,7 +3651,7 @@ dependencies = [
  "manifestus",
  "rand 0.8.8",
  "tohu",
- "vsf 0.11.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -3779,11 +3781,11 @@ dependencies = [
 
 [[package]]
 name = "limbus"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "rawler",
  "rayon",
- "vsf 0.11.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -3878,12 +3880,12 @@ dependencies = [
 
 [[package]]
 name = "manifestus"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
  "libc",
- "vsf 0.11.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -4872,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "opsin"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fluor",
  "image-webp",
@@ -4881,8 +4883,9 @@ dependencies = [
  "limbus",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
+ "png 0.17.16",
  "rayon",
- "vsf 0.11.0",
+ "vsf 0.10.2",
  "zune-core",
  "zune-jpeg",
 ]
@@ -5093,16 +5096,19 @@ dependencies = [
 name = "photon-interop"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek",
+ "fgtw",
  "photon-messenger",
  "photon_core",
- "vsf 0.11.0",
+ "tohu",
+ "vsf 0.10.2",
 ]
 
 [[package]]
 name = "photon-messenger"
-version = "0.120.1"
+version = "0.131.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -5194,7 +5200,7 @@ dependencies = [
  "tokio-tungstenite",
  "v4l",
  "voca",
- "vsf 0.11.0",
+ "vsf 0.10.2",
  "wgpu",
  "windows 0.58.0",
  "winit",
@@ -5211,11 +5217,16 @@ dependencies = [
  "chacha20 0.9.1",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek",
+ "fgtw",
+ "fips205",
+ "fn-dsa",
  "ihi 0.0.48",
  "poly1305 0.8.0",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
  "raptorq",
  "subtle",
- "vsf 0.11.0",
+ "vsf 0.10.2",
  "zeroize",
 ]
 
@@ -5286,6 +5297,19 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "png"
+version = "0.17.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
+dependencies = [
+ "bitflags 1.3.2",
+ "crc32fast",
+ "fdeflate",
+ "flate2",
+ "miniz_oxide 0.8.9",
+]
 
 [[package]]
 name = "png"
@@ -5792,7 +5816,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "kete",
- "vsf 0.11.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -6762,7 +6786,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spirix"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "i256",
  "num-complex",
@@ -7293,7 +7317,7 @@ checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
 name = "tohu"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -7301,7 +7325,7 @@ dependencies = [
  "ihi 0.0.48",
  "jni 0.21.1",
  "rand 0.8.8",
- "vsf 0.11.0",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -7737,7 +7761,7 @@ dependencies = [
  "guillotiere",
  "log",
  "peniko",
- "png",
+ "png 0.18.1",
  "smallvec",
  "thiserror 2.0.21",
 ]
@@ -7751,7 +7775,7 @@ dependencies = [
  "bytemuck",
  "glifo",
  "hashbrown 0.17.1",
- "png",
+ "png 0.18.1",
  "vello_common",
 ]
 
@@ -7775,9 +7799,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "voca"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e8d8f24210692b23219676beb53b7a9a24062db6b1e0e5d1795919d861be0e8"
+version = "0.0.1"
 dependencies = [
  "num-bigint",
  "num-integer",
@@ -7803,7 +7825,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.11.0"
+version = "0.10.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "bitvec",
@@ -7827,7 +7849,7 @@ dependencies = [
 
 [[package]]
 name = "vsf-derive"
-version = "0.1.0"
+version = "0.10.1"
 dependencies = [
  "proc-macro2",
  "quote",

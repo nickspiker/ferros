@@ -783,19 +783,19 @@ ferros_el0_resume:
     stp     d10, d11, [x9, #120]
     stp     d12, d13, [x9, #136]
     stp     d14, d15, [x9, #152]
-    sub     sp, sp, #816
+    sub     sp, sp, #832
     mov     x10, #0
 1:  ldr     x11, [x0, x10]
     str     x11, [sp, x10]
     add     x10, x10, #8
-    cmp     x10, #816
+    cmp     x10, #832
     b.lo    1b
     b       .Lel0_restore
 
 .balign 16
 // Synchronous exception from EL0 (a syscall or a fault): save the process's registers in a frame on SP_EL2, let process.rs decide (ferros_el0_trap: 0 = resume, 1 = the process ends).
 .Lel0_sync:
-    sub     sp, sp, #816
+    sub     sp, sp, #832
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -842,12 +842,14 @@ ferros_el0_resume:
     str     x9, [sp, #800]
     mrs     x9, fpsr
     str     x9, [sp, #808]
+    mrs     x9, tpidr_el0
+    str     x9, [sp, #816]
     mov     x0, sp
     bl      ferros_el0_trap
     b       .Lel0_tail
 // The time slice ran out while a process was at EL0 (the timer tick in .Lirq, scratch registers already restored): save its frame the same way and let process.rs park it runnable.
 .Lel0_preempt:
-    sub     sp, sp, #816
+    sub     sp, sp, #832
     stp     x0, x1, [sp, #0]
     stp     x2, x3, [sp, #16]
     stp     x4, x5, [sp, #32]
@@ -894,6 +896,8 @@ ferros_el0_resume:
     str     x9, [sp, #800]
     mrs     x9, fpsr
     str     x9, [sp, #808]
+    mrs     x9, tpidr_el0
+    str     x9, [sp, #816]
     mov     x0, sp
     bl      ferros_el0_preempt
 .Lel0_tail:
@@ -909,6 +913,8 @@ ferros_el0_resume:
     msr     fpcr, x9
     ldr     x9, [sp, #808]
     msr     fpsr, x9
+    ldr     x9, [sp, #816]
+    msr     tpidr_el0, x9
     ldp     q0, q1, [sp, #288]
     ldp     q2, q3, [sp, #320]
     ldp     q4, q5, [sp, #352]
@@ -941,7 +947,7 @@ ferros_el0_resume:
     ldp     x26, x27, [sp, #208]
     ldp     x28, x29, [sp, #224]
     ldr     x30, [sp, #240]
-    add     sp, sp, #816
+    add     sp, sp, #832
     eret
 // The process ended: return from ferros_el0_enter with its x0 (the exit value), kernel registers and SP restored.
 .Lel0_leave:

@@ -1,0 +1,31 @@
+{
+  "arch": "aarch64",
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "default-uwtable": true,
+  "disable-redzone": true,
+  "env": "",
+  "executables": true,
+  "features": "+v8a,+neon,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fp16,+fhm,+i8mm,+bf16,+rcpc,+jsconv,+fcma,+flagm,+sb,+ssbs,+frintts,+dit,+reserve-x24,+reserve-x25,+reserve-x26,+reserve-x27,+reserve-x28",
+  "has-thread-local": true,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "aarch64-unknown-none",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "ferros on husky: EL0 processes of the ferros kernel, with std over its syscalls (STD-TARGET.md)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "ferros",
+  "panic-strategy": "abort",
+  "position-independent-executables": true,
+  "static-position-independent-executables": true,
+  "relocation-model": "pic",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "target-pointer-width": 64,
+  "vendor": "unknown"
+}

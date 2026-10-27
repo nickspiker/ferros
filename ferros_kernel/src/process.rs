@@ -286,6 +286,9 @@ pub struct Frame {
     pub v: [u128; 32],
     pub fpcr: u64,
     pub fpsr: u64,
+    /// TPIDR_EL0, the thread pointer: each thread's own since 2026-10-27, for a std process's thread-locals (STD-TARGET.md) — the runtime points it at the thread's TLS block and the kernel carries it across every entry and slice.
+    pub tpidr: u64,
+    pub _pad: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1038,7 +1041,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_THREAD_SPAWN => {
             let (entry, stack, arg) = (f.x[0], f.x[1], f.x[2]);
             let m = p.arc.mask() as u64;
-            let mut frame = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
+            let mut frame = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
             frame.elr = p.arc.base as u64 + (entry & m);
             frame.sp_el0 = p.arc.base as u64 + (stack & m & !15);
             frame.x[28] = p.arc.base as u64;
@@ -1935,7 +1938,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     for &(object, rights) in objects {
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
-    let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0 };
+    let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec() };
     // Grants page: count, then the tokens in slot order. Then the code, then the input.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
