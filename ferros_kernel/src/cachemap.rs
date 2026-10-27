@@ -23,8 +23,8 @@ static mut L2: Table = Table([0; 512]);
 /// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except APP_SURFACE.
 static mut L2_HI: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
-/// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 8 MiB = 4 blocks, the shim pool 2 MiB = 1.
-static mut POOL_L3: [Table; 4] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
+/// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 16 MiB = 8 blocks, the shim pool 2 MiB = 1.
+static mut POOL_L3: [Table; 8] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
 
 unsafe extern "C" {
     static __dma_start: u8;
@@ -49,12 +49,12 @@ pub fn heap2_prepare() {
 
 /// The kernel heap's second region (cold only): the window's top above the staging slot (STAGE G#8208_0000 + its 4 MiB, to the next 2 MiB) up to the display framebuffer. The first 12 MiB heap sits between the image and the arc pool and cannot grow; storing a 2.78 MB value needs a vault working set several times its size, and ran the heap out (2026-10-26).
 #[cfg(not(shim_handoff))]
-pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8400_0000);
+pub const HEAP2: (usize, usize) = (0x8260_0000, 0x8300_0000);
 #[cfg(shim_handoff)]
 const WINDOW: (usize, usize) = (0x9240_0000, 0x9300_0000);
-/// The arc pool: EL0-accessible, a power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
+/// The arc pool: EL0-accessible, a power of two aligned to its size, clear of the kernel image/stack/heap and the staging slot. Cold: 16 MiB at G#8300_0000, the top of the window, taken from the heap's second region (2026-10-26: the 8 MiB at G#8100_0000 held four guarded 1 MiB arcs — display, map, WiFi, IP — and refused the fifth process; G#8100_0000-G#8180_0000 is free now). Was: 8 MiB at G#8100_0000 (heap ends below it; staging slot G#8208_0000) — big enough for a driver process carrying multi-MiB firmware. Handoff (oracle only): 2 MiB at G#92C0_0000 (slot G#92A0_0000, stub G#92E8_0000).
 #[cfg(not(shim_handoff))]
-pub const POOL: (usize, usize) = (0x8100_0000, 0x8180_0000);
+pub const POOL: (usize, usize) = (0x8300_0000, 0x8400_0000);
 #[cfg(shim_handoff)]
 pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 

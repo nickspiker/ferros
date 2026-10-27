@@ -26,13 +26,14 @@ impl DeviceKeys {
     pub fn derive(fingerprint: &[u8]) -> Self {
         use fips205::slh_dsa_sha2_128s;
         use fips205::traits::SerDes;
-        use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard, FN_DSA_LOGN_512};
+        use fn_dsa::{sign_key_size, vrfy_key_size, KeyPairGenerator, KeyPairGenerator512, FN_DSA_LOGN_512};
         let ed = fgtw::keys::derive_device_keypair(fingerprint);
         let seed_for = |domain: &str| -> [u8; 32] { blake3::derive_key(domain, fingerprint) };
         let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_FALCON512_v1"));
         let mut falcon_sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
         let mut falcon_vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
-        KeyPairGeneratorStandard::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut falcon_sk, &mut falcon_vk);
+        // The degree-512-only generator and signing key: the same bytes as the app's Standard ones for this degree, a third of the stack (a phone thread's stack is small).
+        KeyPairGenerator512::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut falcon_sk, &mut falcon_vk);
         let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_SPHINCS_PLUS_v1"));
         // Keygen from a seeded CSPRNG is deterministic; the only failure is an internal invariant, which is a bug, not a condition.
         let (pk, sk) = slh_dsa_sha2_128s::try_keygen_with_rng(&mut rng).expect("slh-dsa keygen from a seeded rng");
@@ -63,12 +64,12 @@ impl FleetSigner for DeviceKeys {
     fn eggs(&self, msg: &[u8], schemes: scheme::Mask) -> Vec<Egg> {
         let mut out = self.ed.eggs(msg, schemes);
         if scheme::covers(schemes, 1 << scheme::FALCON512) {
-            use fn_dsa::{signature_size, SigningKey, SigningKeyStandard, DOMAIN_NONE, HASH_ID_RAW};
+            use fn_dsa::{signature_size, SigningKey, SigningKey512, DOMAIN_NONE, HASH_ID_RAW};
             let mut h = blake3::Hasher::new_derive_key("PHOTON_FALCON512_SIGN_NONCE_v1");
             h.update(&self.falcon_sk);
             h.update(msg);
             let mut rng = ChaCha12Rng::from_seed(*h.finalize().as_bytes());
-            let mut sk = SigningKeyStandard::decode(&self.falcon_sk).expect("stored falcon key decodes");
+            let mut sk = SigningKey512::decode(&self.falcon_sk).expect("stored falcon key decodes");
             let mut sig = vec![0u8; signature_size(sk.get_logn())];
             sk.sign(&mut rng, &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut sig);
             out.push(Egg { scheme: scheme::FALCON512, sig });

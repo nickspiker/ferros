@@ -2,7 +2,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the phone. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Spawn: ferros-bridge spawn photon.bin --name photon --use udp --store photon --ira. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira. Runs on its own 512 KiB thread stack (Falcon's signing key is 116 KiB by value) over a 768 KiB heap in `.data`.
+//! Spawn: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients] --name photon --use udp --store photon --ira. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira. Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -16,8 +16,9 @@ use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
 
-const HEAP_BYTES: usize = 768 * 1024;
-const STACK_BYTES: usize = 512 * 1024;
+/// Sized to fit a 1 MiB arc beside 660 KB of code (the arc pool refused 2 MiB, 2026-10-26): enough for a small fleet's chain, the request and a transfer in flight; a kernel heap region for apps is the next step.
+const HEAP_BYTES: usize = 160 * 1024;
+const STACK_BYTES: usize = 128 * 1024;
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
@@ -138,11 +139,33 @@ impl Udp {
         out.copy_within(21..n, 0);
         Some((from, n - 21))
     }
+    /// Join a multicast group (op 8): the stack reports our membership so a snooping access point forwards the group to us.
+    fn join(&self, fam: u8, group: [u8; 16]) {
+        let mut m = [0u8; 18];
+        m[0] = 8;
+        m[1] = fam;
+        m[2..].copy_from_slice(&group);
+        let mut r = [0u8; 16];
+        let _ = self.call(&m, &mut r);
+    }
     /// INFO's flags byte (bit 0 IPv4 bound, bit 1 IPv6 global) and whether the stack answered at all.
     fn flags(&self) -> Option<u8> {
         let mut out = [0u8; 64];
         let n = self.call(&[3], &mut out);
         (n >= 51 && n != ERR).then_some(out[50])
+    }
+    /// Our IPv4 subnet's broadcast address (address | !mask), once bound.
+    fn subnet_broadcast(&self) -> Option<[u8; 4]> {
+        let mut out = [0u8; 64];
+        let n = self.call(&[3], &mut out);
+        if n < 51 || n == ERR || out[50] & 1 == 0 {
+            return None;
+        }
+        let mut b = [0u8; 4];
+        for k in 0..4 {
+            b[k] = out[6 + k] | !out[10 + k];
+        }
+        Some(b)
     }
 }
 
@@ -184,6 +207,9 @@ struct Client {
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
+    /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
+    given: Option<Addr>,
+    given_asked_t: i64,
 }
 
 impl Client {
@@ -245,6 +271,7 @@ impl Client {
         }
     }
 
+    /// The beacon to the app's two multicast groups and, as the app also does, to the subnet broadcast — many access points pass no multicast between wireless clients (this one, 2026-10-26).
     fn beacon(&mut self) {
         let Some(hp) = self.hp else { return };
         let frame = join::beacon(hp, join::PORT, self.me, eagle());
@@ -252,6 +279,23 @@ impl Client {
         v4[..4].copy_from_slice(&join::BEACON_V4);
         self.udp.send(&Addr { fam: 4, ip: v4, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
         self.udp.send(&Addr { fam: 6, ip: join::BEACON_V6, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
+        if let Some(b) = self.udp.subnet_broadcast() {
+            let mut ip = [0u8; 16];
+            ip[..4].copy_from_slice(&b);
+            self.udp.send(&Addr { fam: 4, ip, port: join::BEACON_PORT }, join::BEACON_PORT, &frame);
+        }
+        // A sponsor named at spawn: the request goes to it directly, once per stamp.
+        if let Some(to) = self.given {
+            if !self.bound && !self.request_frame.is_empty() && self.given_asked_t != self.request_t {
+                self.given_asked_t = self.request_t;
+                self.log.put(b"photon: handing our binding request to the sponsor named at spawn, ");
+                self.log.addr(&to);
+                self.log.line();
+                let f = self.request_frame.clone();
+                let out = self.pt.send(to, f, now_us(), eagle());
+                self.send_all(out);
+            }
+        }
     }
 
     /// A beacon on 4384: a device of our fleet on this network is a sponsor - remembered, and handed our binding request while we are unbound.
@@ -339,6 +383,11 @@ impl Client {
                 return;
             }
             Some(Frame::PtAck { .. }) => return,
+            // A beacon on the frame port (the app broadcasts its pt_disc there too).
+            Some(Frame::Other(ref name)) if name == "pt_disc" => {
+                self.on_beacon(from, bytes);
+                return;
+            }
             Some(Frame::Photon { .. }) | Some(Frame::Ack { .. }) => {
                 self.log.put(b"photon: a photon arrived - not read yet (lanes follow the join)");
                 self.log.line();
@@ -444,11 +493,15 @@ impl Client {
 
     fn run(&mut self) -> ! {
         let mut buf = alloc::vec![0u8; 2048];
-        // Open both ports before anything can arrive.
+        // Open both ports before anything can arrive, and join the app's beacon groups.
         for p in [join::PORT, join::BEACON_PORT] {
             let mut out = [0u8; 32];
             let _ = self.udp.call(&[2, (p >> 8) as u8, p as u8], &mut out);
         }
+        let mut v4 = [0u8; 16];
+        v4[..4].copy_from_slice(&join::BEACON_V4);
+        self.udp.join(4, v4);
+        self.udp.join(6, join::BEACON_V6);
         self.load();
         self.show_words();
         if !self.bound {
@@ -544,16 +597,28 @@ extern "C" fn work(_: u64) -> ! {
     log.line();
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0 };
+    let given = unsafe { GIVEN };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, given, given_asked_t: 0 };
     c.run()
 }
 
+static mut GIVEN: Option<Addr> = None;
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
+    if input_len >= 19 {
+        let mut b = [0u8; 19];
+        for (k, x) in b.iter_mut().enumerate() {
+            *x = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + k as u64) as *const u8) };
+        }
+        let mut ip = [0u8; 16];
+        ip.copy_from_slice(&b[1..17]);
+        unsafe { GIVEN = Some(Addr { fam: b[0], ip, port: u16::from_be_bytes([b[17], b[18]]) }) };
+    }
     let stack = unsafe { &mut *STACK.0.get() };
     ferros_sys::thread_spawn(work, stack, 0);
     ferros_sys::thread_exit(0)

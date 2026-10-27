@@ -2989,7 +2989,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
             // The frame rate, once a second while frames are coming (presents and flips both count), with the frame starts DECON reported through its interrupt: the two agree when every frame goes out.
             let fs = FRAME_STARTS.load(Ordering::Relaxed);
-            if frames != frames_last_tick && client_owned {
+            // The stats line every ten seconds rather than every one: at one a second it alone filled the kernel's console ring and hid every other process's lines (2026-10-26).
+            if frames != frames_last_tick && client_owned && secs % 10 == 0 {
                 tlog.s(b"display: ");
                 tlog.dec(frames - frames_last_tick);
                 tlog.s(b" frames/s, ");

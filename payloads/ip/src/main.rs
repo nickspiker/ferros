@@ -11,6 +11,7 @@
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
 //! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection.
 //! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on).
+//! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the phone until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
 //!
 //! TCP here: two connections, a 4 KiB receive window each (what the client has not yet taken; the window is the flow control), a 2 KiB send buffer, MSS 1200, go-back retransmission from the oldest unacknowledged byte (1 s, doubling to 8 s, six tries), no options but MSS on the SYN.
 //!
@@ -81,6 +82,9 @@ struct Ip {
     tcp: [Tcp; TCPN],
     eph: u16,
     seed: u32,
+    groups: [(u8, [u8; 16]); 8],
+    groups_n: usize,
+    groups_t: u64,
 }
 
 const TCPN: usize = 2;
@@ -198,6 +202,10 @@ impl Ip {
     // ---- IPv4 ----
 
     fn ipv4_send(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {
+        self.ipv4_send_ttl(dst_mac, src, dst, proto, payload, 64);
+    }
+
+    fn ipv4_send_ttl(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) {
         let mut p = [0u8; 1500];
         let total = 20 + payload.len();
         if total > p.len() {
@@ -205,7 +213,7 @@ impl Ip {
         }
         p[0] = 0x45;
         p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-        p[8] = 64;
+        p[8] = ttl;
         p[9] = proto;
         p[12..16].copy_from_slice(&src);
         p[16..20].copy_from_slice(&dst);
@@ -447,6 +455,41 @@ impl Ip {
 
     fn multicast_mac(dst: &[u8; 16]) -> [u8; 6] {
         [0x33, 0x33, dst[12], dst[13], dst[14], dst[15]]
+    }
+
+    /// Tell the network we listen to a multicast group: IGMPv2 membership report (type G#16, to the group, TTL 1) or MLDv1 listener report (ICMPv6 131 from our link-local, hop limit 1, behind the Router Alert hop-by-hop option RFC 2710 asks for).
+    fn group_report(&mut self, fam: u8, group: [u8; 16]) {
+        if fam == 4 {
+            if !self.bound {
+                return;
+            }
+            let g: [u8; 4] = group[..4].try_into().unwrap();
+            let mut r = [0x16u8, 0, 0, 0, g[0], g[1], g[2], g[3]];
+            let c = csum(&r, 0);
+            r[2..4].copy_from_slice(&c.to_be_bytes());
+            let mac = [0x01, 0x00, 0x5E, g[1] & 0x7F, g[2], g[3]];
+            let me = self.v4;
+            self.ipv4_send_ttl(mac, me, g, 2, &r, 1);
+        } else {
+            // Hop-by-hop header (next 58, one 8-byte unit): Router Alert (type 5, length 2, value 0 = MLD), PadN of two.
+            let mut p = [0u8; 8 + 24];
+            p[0] = 58;
+            p[2..8].copy_from_slice(&[5, 2, 0, 0, 1, 0]);
+            let m = &mut p[8..];
+            m[0] = 131;
+            m[8..24].copy_from_slice(&group);
+            let ll = self.ll;
+            let c = Self::sum6(&ll, &group, 58, &p[8..]);
+            p[10..12].copy_from_slice(&c.to_be_bytes());
+            self.ipv6_send(Self::multicast_mac(&group), ll, group, 0, &p, 1);
+        }
+    }
+
+    fn group_reports(&mut self) {
+        for i in 0..self.groups_n {
+            let (fam, g) = self.groups[i];
+            self.group_report(fam, g);
+        }
     }
 
     fn router_solicit(&mut self) {
@@ -985,6 +1028,16 @@ impl Ip {
                 }
                 1 + n
             }
+            Some(8) if m.len() >= 18 && (m[1] == 4 || m[1] == 6) => {
+                let g: [u8; 16] = m[2..18].try_into().unwrap();
+                if !self.groups[..self.groups_n].contains(&(m[1], g)) && self.groups_n < self.groups.len() {
+                    self.groups[self.groups_n] = (m[1], g);
+                    self.groups_n += 1;
+                }
+                self.group_report(m[1], g);
+                out[0] = 0;
+                1
+            }
             Some(7) if m.len() >= 2 => {
                 let i = m[1] as usize;
                 if i < TCPN && self.tcp[i].state != 0 {
@@ -1077,6 +1130,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         tcp: [TCP_FREE; TCPN],
         eph: 0,
         seed: 0,
+        groups: [(0, [0; 16]); 8],
+        groups_n: 0,
+        groups_t: 0,
     };
     // Who we are: the driver's MAC.
     let mut info = [0u8; 16];
@@ -1142,6 +1198,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             busy = true;
         }
         ip.tcp_tick();
+        // Membership refreshed every 60 s (a querier's interval is 125 s; an unsolicited report keeps the snooper's entry alive without one).
+        if ip.groups_n > 0 && now().wrapping_sub(ip.groups_t) > 60 * ip.freq {
+            ip.groups_t = now();
+            ip.group_reports();
+        }
         // Timers: DHCP retransmits every 2 s until bound; router solicitation every 4 s, three times, until a global address appears.
         let t = now();
         if !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {
