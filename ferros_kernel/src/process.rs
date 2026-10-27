@@ -1928,11 +1928,21 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
     Ok(v)
 }
 
+/// The zeroed memory a std image asks for after its code — its `.bss` and its heap — from the header `ferros_rt` puts at offset 8: the eight bytes `ferrosRT`, then the byte count (STD-TARGET.md). The flat image cannot carry `.bss` (the input used to land right after the code), so the image says how much the arc must grow and the input moves past it. A native payload has no header: 0.
+fn image_tail(code: &[u8]) -> usize {
+    if code.len() >= 24 && &code[8..16] == b"ferrosRT" {
+        (u64::from_le_bytes(code[16..24].try_into().unwrap()) as usize).min(1 << 30)
+    } else {
+        0
+    }
+}
+
 /// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
 fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
-    let arc = arc_alloc(CODE + code.len() + inline + STACK, guard).ok_or("arc pool exhausted")?;
+    let tail = image_tail(code);
+    let arc = arc_alloc(CODE + code.len() + tail + inline + STACK, guard).ok_or("arc pool exhausted")?;
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for &(object, rights) in objects {
@@ -1950,7 +1960,7 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     }
     p.write(PREFS as u64, unsafe { &*(&raw const PREFS_NOW) });
     p.write(CODE as u64, code);
-    let in_off = CODE + code.len();
+    let in_off = CODE + code.len() + tail;
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code.len());
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).

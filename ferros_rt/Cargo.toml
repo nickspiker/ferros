@@ -1,0 +1,16 @@
+[package]
+name = "ferros-rt"
+version = "0.1.0"
+edition = "2024"
+description = "The ferros runtime under Rust's std: syscalls, futex, threads and their TLS, time, allocator, console, entropy, the image entry (STD-TARGET.md)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+
+[features]
+rustc-dep-of-std = ["core"]
+
+[workspace]

@@ -1,0 +1,7 @@
+# A std program for the phone: the ferros target, std built from the ferros-rust fork (tools/std-build.sh sets __CARGO_TESTS_ONLY_SRC_ROOT to it).
+[build]
+target = "../../targets/aarch64-unknown-ferros.json"
+
+[unstable]
+build-std = ["core", "alloc", "std", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]

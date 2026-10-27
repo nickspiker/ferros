@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["ferros_rt", "std/hello"]
 members = [
     "ferros_layout",
     "ferros_ext4",
