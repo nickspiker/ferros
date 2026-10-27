@@ -14,10 +14,14 @@ grapheneos-attestation-guide.html  https://grapheneos.org/articles/attestation-c
 grapheneos-chase-thread.json  https://discuss.grapheneos.org/api/discussions/40289
 google-payments-buyer-terms-us.html  https://payments.google.com/payments/apis-secure/u/0/get_legal_document?ldt=buyertos&ldr=US
 google-wallet-user-policy.html  https://wallet.google/policy/
+aosp-key-attestation.html  https://source.android.com/docs/security/features/keystore/attestation
+aosp-verified-boot-flow.html  https://source.android.com/docs/security/features/verifiedboot/boot-flow
 # NOT captured: https://payments.google.com/payments/apis-secure/u/0/get_legal_document?ldo=0&ldt=googlewallettos&ldl=en-US (HTTP 500 on 2026-10-27)
 # NOTE: the owner's browser showed the non-US Google Pay terms as last modified December 10, 2025 on 2026-10-27, while this capture was served the April 5, 2021 version; the device clause quoted in APK-LEGAL.md D4 is identical in both.
 
 # BLAKE3
+be9a390f474f6419771d4fbb300dfc4fe94901e51891a820c92747c86be7314b  aosp-key-attestation.html
+e57e1ab0088096d25cbcb0c3f4ca2d59ed6c585717fda821b70b82a5971f49c3  aosp-verified-boot-flow.html
 772ca841ae6cd4672641b72fdbbc41bc08db4d72693ca7aeba629a49d1a0fd3d  chase-uk-app-licence.html
 3146b06d66e2133170aabdbae7b58df5ccd6f4bfdc45efd446f8c1abff145da7  chase-us-trusted-device.html
 f64f7e5a437b054b20ed69f4feed7ee4af50ac89ade275379bb83cfa0c9e7b06  google-pay-terms-nonus.html
