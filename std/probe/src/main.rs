@@ -30,6 +30,19 @@ fn main() {
         println!("mlkem768: shared secrets {} in A#{} us", if ss_a.as_bytes() == ss_b.as_bytes() { "agree" } else { "DIFFER" }, t.elapsed().as_micros());
     }
 
+    // The heap, end to end: a pattern written through 96 MiB and read back, so a bad region of the big arc pool shows here rather than as a mystery elsewhere (STD-TARGET.md).
+    {
+        let t = std::time::Instant::now();
+        let n = 96usize << 20;
+        let mut v: Vec<u64> = Vec::with_capacity(n / 8);
+        for i in 0..n / 8 {
+            v.push((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A_0F0F_F0F0);
+        }
+        let bad = v.iter().enumerate().filter(|&(i, &x)| x != (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A_0F0F_F0F0).count();
+        let at = v.as_ptr() as usize;
+        println!("memtest: 96 MiB at G#{at:X}, A#{bad} bad words, A#{} ms", t.elapsed().as_millis());
+    }
+
     let t1 = std::time::Instant::now();
     let app = kete::App { id: "stdprobe", dir: "stdprobe" };
     let store = match kete::FlatStorage::open_device_shared(app, [7u8; 32]) {

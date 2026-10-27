@@ -687,6 +687,24 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         let need = 4096 + raw.len() + zeroed + prefix.len() + input.len() + tail.len() + 65536;
         let code_offset = (0..=blob.len() - raw.len()).find(|&i| blob[i..i + raw.len()] == raw[..]).expect("the code inside its capsule");
         let t0 = std::time::Instant::now();
+        // What the kernel will hash: the capsule with its 64 signature bytes zeroed — printed so a refusal on the phone can be set against it.
+        if let Ok((h, header_end)) = vsf::file_format::VsfHeader::decode(&blob) {
+            if let Some(vsf::types::VsfType::ge(sig)) = &h.signature {
+                let hdr = header_end.min(blob.len());
+                match (0..=hdr.saturating_sub(64)).find(|&i| blob[i..i + 64] == sig[..]) {
+                    Some(at) => {
+                        let mut z = blob.clone();
+                        z[at..at + 64].fill(0);
+                        eprintln!("Signed: {} bytes, signature at {at} (header {hdr} bytes), hash {}", blob.len(), blake3::hash(&z).to_hex());
+                    }
+                    None => eprintln!("Signed: the signature is not in the first {hdr} header bytes"),
+                }
+            } else {
+                eprintln!("Signed: the header carries no Ed25519 signature (ge)");
+            }
+        } else {
+            eprintln!("Signed: the header does not decode");
+        }
         eprintln!("Streaming {} bytes into a {} byte arc (code at offset {code_offset})...", blob.len(), need);
         for (k, piece) in blob.chunks(1 << 20).enumerate() {
             let off = k << 20;

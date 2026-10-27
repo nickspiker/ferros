@@ -65,7 +65,11 @@ pub fn gate_located(capsule: &mut [u8], code_offset: usize, code_len: usize) -> 
     let hash = blake3::hash(capsule);
     capsule[at..at + 64].copy_from_slice(&sig);
     let key = VerifyingKey::from_bytes(&pubkey).map_err(|_| "gate: bad developer key")?;
-    key.verify(hash.as_bytes(), &Signature::from_bytes(&sig)).map_err(|_| "gate: signature does not verify")?;
+    if key.verify(hash.as_bytes(), &Signature::from_bytes(&sig)).is_err() {
+        // The flash log gets what was hashed: the bridge prints the same for the file it sent, so a mismatch names the piece of memory, not the code.
+        crate::flashlog::line(&alloc::format!("gate: signature does not verify over {} bytes, signature at {}, hash {}", capsule.len(), at, hash.to_hex()));
+        return Err("gate: signature does not verify");
+    }
     if code_len == 0 || code_offset < 3 || code_offset + code_len > capsule.len() {
         return Err("gate: the code is not inside the capsule");
     }
