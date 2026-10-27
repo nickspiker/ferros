@@ -49,13 +49,14 @@ A compiled capsule never leaves the device it was compiled on: no capsule cache,
 **Why:** Security first: runtime translation is the attack surface ferros exists to remove, and the seal proves the capsule passed the checker (SANDBOX.md, trust model A).
 Legally, compiling an app to native code on the device is what Android's own runtime has done since Android 5.0 (ART's install-time and profile-guided compilation), so on-device compilation is how every app developer already expects their code to run.
 Because the compiled output is personal to one device and never distributed, it stays inside a "personal" licence and outside the "copy, modify, distribute" prohibition in D0's quote.
+ferros does not modify or tamper with an app: it runs the app's code as is, after a safety check and an optimisation pass for the hardware, and what the app does is unchanged; turning code into the instructions of the machine that runs it is how all code runs, not a modification of it.
 Compiling at install and keeping the result is the same act as compiling at launch, only earlier: every platform that runs an app turns its code into a distinct native form in memory before executing it (ART's ahead-of-time and JIT compilers, and any JIT anywhere), so "compiled for this device" is not a modified app in any sense that running it is not.
 The stored form is encrypted and keyed to the one device, with one key that unlocks it, so it is never copied, reproduced or published: nobody but that device can read it, and it is never shared.
 Emulating a platform so its software runs elsewhere was held lawful in *Sony Computer Entertainment v. Connectix*, 203 F.3d 596 (9th Cir. 2000); note that apps are licensed rather than sold (*Vernor v. Autodesk*, 621 F.3d 1102 (9th Cir. 2010)), so we lean on the licence terms and fair use, not on 17 U.S.C. §117.
 
 **Cost:** Every device compiles every app it installs; no shared compile cache, ever.
 
-**Revisit if:** a major app's licence explicitly forbids the platform compiling it to run it, as distinct from the user modifying it. Not seen so far; Chase UK's "modify or tamper" clause was weighed and closed at O6.
+**Revisit if:** a major app's licence forbids running it anywhere but on Android itself. Not seen so far. Modification and tampering clauses (Chase UK's, O6) do not reach this, because ferros does not modify the app.
 
 ### D2 — Attestation always tells the truth (2026-10-27)
 
