@@ -3,9 +3,9 @@
 //! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. The device keeps a verifier, the seed under its ira's `ahau verifier` key, in the vault scope `ahau.`; matching it means the typed handle is this device's identity.
 //!
 //! - A device that knows its identity (a verifier, or the Photon roots pushed at pairing, `photon.identity_seed`): the handle is checked against it; the first match writes the verifier.
-//! - A device with no identity yet: the handle is typed twice, then its handle proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, and the roots go where the Photon client reads them (`photon.identity_seed`, `photon.handle_proof`) beside the verifier.
+//! - A device with no identity yet: enter shows what becomes the device's identity, enter again confirms, then its handle proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, and the roots go where the Photon client reads them (`photon.identity_seed`, `photon.handle_proof`) beside the verifier.
 //!
-//! The typed handle is masked (a dot a character); the bar's left key shows or hides it. It lives in one buffer, wiped after every attempt.
+//! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. A new identity is confirmed the way Photon confirms permanence: enter once to see what becomes the device's identity, enter again (the same text) to make it so. The buffer is wiped once attest succeeds.
 //!
 //! The scratch is this process's own .bss (25 MiB): the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds it (payload.ld).
 //!
@@ -111,7 +111,6 @@ struct Ahau {
     handle: [u8; 4 * MAX_CHARS],
     len: usize,
     chars: usize,
-    reveal: bool,
 }
 
 impl Ahau {
@@ -155,21 +154,13 @@ impl Ahau {
         self.centred(b, px, QUIET, t);
     }
 
-    /// The entry: a dot a character (or the characters, shown), a cursor, and a line under it.
+    /// The entry: the handle as typed, a cursor, and a line under it.
     fn entry(&self) {
         let (b, px) = self.entry_at();
         self.clear_rows(b - px * 3 / 2, b + px / 2);
         let mut t = [0u8; 4 * MAX_CHARS + 4];
-        let n = if self.reveal {
-            t[..self.len].copy_from_slice(&self.handle[..self.len]);
-            self.len
-        } else {
-            let dot = "•".as_bytes();
-            for k in 0..self.chars {
-                t[k * dot.len()..(k + 1) * dot.len()].copy_from_slice(dot);
-            }
-            self.chars * dot.len()
-        };
+        let n = self.len;
+        t[..n].copy_from_slice(&self.handle[..n]);
         t[n] = b'_';
         let shown = core::str::from_utf8(&t[..n + 1]).unwrap_or("_");
         self.centred(b, px, TEXT, shown);
@@ -178,8 +169,6 @@ impl Ahau {
         for row in y..y + (self.w / 448).max(1) {
             self.surf()[row * self.w + x0..row * self.w + x1].fill(grey(QUIET as u64));
         }
-        // The fixed text's copy goes; only the surface holds it until the next draw.
-        t.fill(0);
     }
 
     fn all(&self) {
@@ -197,7 +186,7 @@ impl Ahau {
         match self.mode {
             Mode::Known => "This device knows one identity. Type its handle.",
             Mode::Fresh => "No identity on this device yet. Type your handle.",
-            Mode::Confirm(_) => "Again, to confirm: it becomes this device's identity.",
+            Mode::Confirm(_) => "This becomes this device's identity. Enter again to confirm.",
         }
     }
 
@@ -226,12 +215,10 @@ impl Ahau {
         let seed = match core::str::from_utf8(&self.handle[..self.len]).ok().map(ahau_core::identity_seed) {
             Some(Ok(s)) => s,
             _ => {
-                self.wipe();
                 self.status("That handle has a character this keyboard cannot type.");
                 return;
             }
         };
-        self.wipe();
         let v = ahau_core::verifier(&self.device_key, &seed);
         match self.mode {
             Mode::Known => {
@@ -255,11 +242,8 @@ impl Ahau {
                 self.status(self.prompt());
             }
             Mode::Confirm(first) => {
-                if !ahau_core::same(&first, &seed) {
-                    self.mode = Mode::Fresh;
-                    self.status("The two did not match. Type your handle.");
-                    return;
-                }
+                // An edit since the first enter went back to Fresh; this is the same text.
+                debug_assert!(ahau_core::same(&first, &seed));
                 self.status("Deriving the handle's proof: about seven seconds.");
                 self.entry();
                 self.show();
@@ -287,7 +271,16 @@ impl Ahau {
         }
     }
 
-    fn attested(&self) -> ! {
+    /// An edit after the first enter of a new identity: the confirmation was for the text as it was.
+    fn unconfirm(&mut self) {
+        if let Mode::Confirm(_) = self.mode {
+            self.mode = Mode::Fresh;
+            self.status(self.prompt());
+        }
+    }
+
+    fn attested(&mut self) -> ! {
+        self.wipe();
         console(self.grants, b"ahau: attested\n");
         window::done(self.display, self.base);
         exit(0)
@@ -296,6 +289,7 @@ impl Ahau {
     fn tap(&mut self, key: Key) {
         match self.kb.tap(key) {
             Some(Event::Char(c)) => {
+                self.unconfirm();
                 let mut b = [0u8; 4];
                 let e = c.encode_utf8(&mut b).as_bytes();
                 if self.chars < MAX_CHARS {
@@ -306,6 +300,7 @@ impl Ahau {
                 self.entry();
             }
             Some(Event::Back) => {
+                self.unconfirm();
                 while self.len > 0 {
                     self.len -= 1;
                     let lead = self.handle[self.len] & 0xC0 != 0x80;
@@ -322,9 +317,8 @@ impl Ahau {
                 self.entry();
             }
             Some(Event::Leave) => {
-                self.reveal = !self.reveal;
-                self.kb.left = if self.reveal { "hide" } else { "show" };
-                self.kb.draw_key(self.surf(), Key::Bar(honeycomb::B_MAP), false, &mut self.label());
+                self.wipe();
+                self.unconfirm();
                 self.entry();
             }
             Some(Event::Redraw) => self.kb.draw(self.surf(), &mut self.label()),
@@ -412,8 +406,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let photon_seed = read32(S_PHOTON, b"identity_seed");
     let mode = if verifier.is_some() || photon_seed.is_some() { Mode::Known } else { Mode::Fresh };
     let mut kb = Keyboard::new(w, h);
-    kb.left = "show";
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, reveal: false };
+    kb.left = "clear";
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0 };
     a.all();
     a.show();
     console(grants, if mode == Mode::Known { b"ahau: waiting for this device's identity\n" } else { b"ahau: no identity on this device yet\n" });
@@ -440,6 +434,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
                 Touch::Unlight(key) => a.kb.draw_key(a.surf(), key, false, &mut a.label()),
                 Touch::Scrolled => a.kb.draw(a.surf(), &mut a.label()),
                 Touch::Tap(key) => a.tap(key),
+                // A handle is exact bytes, typed key by key: no shape writing here.
+                Touch::Trail(..) | Touch::Traced | Touch::TapAt(..) => {}
             }
         }
         if no > 0 {
