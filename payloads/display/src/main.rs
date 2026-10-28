@@ -1827,7 +1827,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -2558,8 +2558,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
-                // Text into the app surface for the app in front, in its 16-bit working values: [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…]. The surface is the whole screen (op 22's frame), so x and y are screen coordinates. Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black). The app publishes (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md).
-                Some(24) if m.len() >= 9 => {
+                // Text into the app surface for the app in front, in its 16-bit working values: [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…]. The surface is the whole screen (op 22's frame), so x and y are screen coordinates. Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black). The app publishes (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
+                Some(26) if m.len() >= 9 => {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
                     let (x0, base, px, val) = (i16le(1), i16le(3), u16::from_le_bytes([m[5], m[6]]) as f32, u16::from_le_bytes([m[7], m[8]]) as u32);
                     let surf_ok = unsafe { APP_SURF } > 1 && width * height * 8 <= 32 << 20;

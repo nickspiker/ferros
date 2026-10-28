@@ -1378,6 +1378,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
+    let mut last_app_check = 0u64;
     let mut last_dashboard = now();
     let mut last_pass = now();
     let mut draw_us = 0u64;
@@ -1417,6 +1418,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
 
+        // An app the map did not launch (a bridge spawn: Hive, for one) stands in front the same way: asked of the display eight times a second.
+        if !map.ramps && now().wrapping_sub(last_app_check) > freq() / 8 {
+            last_app_check = now();
+            let mut q = [0u8; 16];
+            if call(map.display, &[5], &mut q) >= 13 && q[12] == 1 {
+                map.ramps = true;
+                map.app_seen = true;
+            }
+        }
         // An app in front: it has the touches; the map only watches for it to hand the screen back.
         if map.ramps {
             if map.app_done() {

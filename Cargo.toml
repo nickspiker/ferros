@@ -35,6 +35,7 @@ members = [
     "payloads/map",
     "payloads/init",
     "payloads/ramps",
+    "payloads/hive",
     "payloads/threads",
     "payloads/echo_client",
     "payloads/spinner",

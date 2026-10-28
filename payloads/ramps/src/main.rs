@@ -1,6 +1,6 @@
 //! Ramps: the present stage's test screen, an app (SHELL.md: apps are places) — the first to draw its own pixels. It writes 16-bit working values (gamma 2, white = Q14) into the `app-surface` region and asks the display server to show them (op 22), which publishes them through the one table, E's gains and the dither at full precision. While it is in front it takes the touches itself: a tap shows the column under the finger alone (and a tap shows them all again); two fingers hand the screen back to the map (op 23) and end the app.
 //!
-//! The columns, left to right, each a ramp from black at the top to its brightest at the bottom, with 4-pixel white lines between them: grey to white dithered and undithered; near-black (light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over; the headroom (to 16× white) through the roll-off; red, green, blue to white. "Undithered" columns carry the surface's no-dither bit (48). A column alone is named in the black beside it (display op 24: the display's typeface, since apps have none), with what it tests; `PATTERNS` is the list, add a row and a `draw` arm for a new one.
+//! The columns, left to right, each a ramp from black at the top to its brightest at the bottom, with 4-pixel white lines between them: grey to white dithered and undithered; near-black (light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over; the headroom (to 16× white) through the roll-off; red, green, blue to white. "Undithered" columns carry the surface's no-dither bit (48). A column alone is named in the black beside it (display op 26: the display's typeface, since apps have none), with what it tests; `PATTERNS` is the list, add a row and a `draw` arm for a new one.
 //!
 //! Launched by the map (SYS_SPAWN) with its own capabilities. Grant slots: 0 console, 1 display (use), 2 touch (use), 3 app-surface.
 #![no_std]
@@ -29,10 +29,10 @@ const PATTERNS: [(&str, &str); COLS] = [
     ("blue", "to white"),
 ];
 
-/// A line of text into the surface (display op 24): screen coordinates, size in pixels, grey value Q14.
+/// A line of text into the surface (display op 26): screen coordinates, size in pixels, grey value Q14.
 fn label(display: u64, x: i16, baseline: i16, px: u16, value: u16, s: &str) {
     let mut m = [0u8; 160];
-    m[0] = 24;
+    m[0] = 26;
     m[1..3].copy_from_slice(&x.to_le_bytes());
     m[3..5].copy_from_slice(&baseline.to_le_bytes());
     m[5..7].copy_from_slice(&px.to_le_bytes());
