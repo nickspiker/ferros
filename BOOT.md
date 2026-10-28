@@ -322,6 +322,17 @@ LU7: enable 0 bootLunId 0 writeProtect none memType 0 blockSize 1 blocks 0 = 0 M
 
 What remains, in order of cost: (1) **signed and unlocked** — images signed with the owner's key so ABL *reports* tampering (orange/yellow), ferros re-flashed from fastboot when Android stomps on it; integrity by detection and recovery, never by prevention; the posture today minus the signing. (2) **A UFS command firewall at EL2** — ferros stays hypervisor, Android runs at EL1 with the hardware passed through, but the UFS doorbell is trapped and the 32-slot command list shadowed: every SCSI WRITE's LUN/LBA is checked against the protected set before the real doorbell rings. No virtual disk, one trap per command batch, the S2MPU fence already keeps the device's DMA out of ferros's memory. The only sandbox that holds against root inside Android; a bounded project, not pKVM. (3) **No Android.** Locking the bootloader before (2) exists is the one thing not to do.
 
+**Decided (owner, 2026-10-28): (2) gets built, after the signed vbmeta (signed-and-unlocked first), and the hv blocks Android's UFS device reset too.**
+- **Blocking the reset:** with it blocked, the `fPowerOnWPEn` the gate arms before starting Android stays armed for the whole session, so LU1/LU2 (Google's bootloader chain) are write-protected by the flash itself on top of the firewall. That is the owner's yes to arming it.
+- **Refused to Android:**
+  - writes and UNMAP to `boot_*`, `vbmeta_*`, `init_boot_*`, `vendor_boot_*`, `vendor_kernel_boot_*`, `dtbo_*`, `pvmfw_*`, `devinfo` and the `ferros` partition;
+  - any write to LU1/LU2;
+  - WRITE BUFFER (flash firmware);
+  - descriptor writes (the configuration descriptor would erase every LU);
+  - flag and attribute writes that change protection (`fPermanentWPEn` would freeze the flash for good).
+- **Allowed:** reads anywhere, and writes to the rest of LU0.
+- **Order of work:** the hv's direct-I/O hang and freeze (HV.md) come first, so the firewall is not debugged on an unstable path. It is also a prerequisite for locking, per (3).
+
 ## Genesis Boot (First Boot Ever)
 
 ```
