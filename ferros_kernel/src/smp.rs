@@ -130,6 +130,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
     UP.fetch_or(1 << k, Ordering::AcqRel);
     let mut last_look = 0u64;
     loop {
+        // `diag keyreg` asks worker 0 to probe its own registers (keyreg.rs).
+        crate::keyreg::serve(k);
         if STOP.load(Ordering::Acquire) != 0 {
             UP.fetch_and(!(1 << k), Ordering::AcqRel);
             OFF.fetch_add(1, Ordering::AcqRel);

@@ -109,6 +109,9 @@ mod kohi;
 // The performance monitors, open to EL0 on every core (pmu.rs).
 #[cfg(feature = "pixel8")]
 mod pmu;
+// Where the ira and wairua could live off DRAM: a probe of the unused CPU registers (keyreg.rs, KEY_REGISTERS.md).
+#[cfg(feature = "pixel8")]
+mod keyreg;
 // The gate and the oracle: signed capsules, ihi at spawn (ORACLE.md).
 #[cfg(feature = "pixel8")]
 mod oracle;

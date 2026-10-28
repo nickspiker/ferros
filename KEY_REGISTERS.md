@@ -161,6 +161,37 @@ M1 is the clean case and the active dev target. Pixel 8 Pro is PRIMARY but boxed
 
 ---
 
+## Off DRAM: where the ira and wairua can rest (measured 2026-10-28)
+
+The design above holds a secret in V-registers only for the length of one asm block. It does not say where the ira and wairua (64 bytes together) rest between uses for a whole boot, and NEON cannot hold them there: the kernel saves every process's V0–V31 on each trap, LLVM cannot reserve a V-register, and the kernel's own Rust uses them. So the resting place is system registers that nothing in ferros uses and EL0 cannot read. `diag keyreg` (ferros_kernel/src/keyreg.rs) measured the candidates on husky's X3 (MIDR G#411FD4E0) and an A715 (G#411FD4D0); both agree.
+
+**Bank 0: the pointer-authentication keys.** APIA, APIB, APDA and APDB are 128 bits each, 64 bytes exactly. Every bit holds, survives an SMC into EL3, and survives idle (`wfi`/`wfe`). ferros signs no pointers: SCTLR_EL2's EnIA/EnIB/EnDA/EnDB are 0, and with them clear PACIA left a pointer unchanged under a test key (measured at EL2; the same SCTLR_EL2 governs EL0 in the EL2&0 regime). The fifth key, APGA, has no enable bit: PACGA computes with it (measured). So APGA must never hold anything that is useful alone.
+
+**Bank 1: the EL1 bank, dead under VHE.** HCR_EL2 has TGE=1 and E2H=1: nothing runs at EL1 and no exception is taken there, so these registers are never written by hardware. Full width, holding through SMC and idle, read in ~3 cycles: TPIDR_EL1, SP_EL1, ELR_EL12, FAR_EL12, MAIR_EL12, TPIDR_EL2. The EL1 timer compares (CNTP_CVAL_EL02, CNTV_CVAL_EL02) hold too but read ~30× slower (95 cycles on the X3, 47 on the A715). Partial width: PAR_EL1, SPSR_EL12, ESR_EL12, CONTEXTIDR_EL12, VBAR_EL12. Hold nothing: AMAIR_EL12, AFSR0/1_EL12. `diag keyreg dbg` adds the breakpoint/watchpoint value registers; it has not been run, since EL3 may trap debug access.
+
+**Held split.** The proposed layout keeps each secret as two shares, so that a leak of one class of register (a fault report, a dump, a context EL3 saves) reveals nothing:
+
+| | share 0 (bank 0) | share 1 (bank 1) |
+|---|---|---|
+| ira | APIA, APIB | TPIDR_EL1, SP_EL1, ELR_EL12, FAR_EL12 |
+| wairua | APDA, APDB | MAIR_EL12, APGA, TPIDR_EL2 |
+
+A share is uniformly random on its own, so APGA's PACGA oracle can only ever compute over a random value. Using TPIDR_EL2 gives up the usual per-core pointer register; the slow timer compares are the alternative.
+
+**Cost** of fetching all 64 bytes, in the core's own cycles (G#10000 fetches each):
+
+| | RAM (L1-hot) | bank 0 alone | split |
+|---|---|---|---|
+| X3 | 10 | 8 | 24 |
+| A715 | 13 | 8 | 16 |
+
+24 cycles on the X3 is about 8 ns, against thousands of cycles for the BLAKE3 that consumes the key.
+
+**What it does not cover.**
+- Each core has its own registers, so each core that serves SYS_IRA or SYS_ENTROPY needs its own copy, and handing one over goes through memory (a cache line written, read and zeroed within microseconds).
+- Power-down wipes the registers. Husky's c2 (PSCI power_state G#10000, 160–220 µs exit) and system deep sleep both cut the core's power domain. The ira needs no carrying: it is re-derived from the fuses and UFS. The wairua is random and must be carried through sleep unchanged (owner, 2026-10-28), so it rests sealed outside the core while the core is off.
+- Every use must run in hand-checked assembly that never touches the stack (the workflow above), or the key spills while it is consumed.
+
 ## Open Questions (remaining)
 
 - ~~**Exact NEON pinning in Rust**~~ — **answered.** Tier 2 on rustc 1.94.0, `-O`, `aarch64-unknown-none`: no spill (see Proven Result). Re-verify on toolchain bump via the CI canary.

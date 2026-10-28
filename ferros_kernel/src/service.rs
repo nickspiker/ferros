@@ -1998,6 +1998,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
+                                            // `diag keyreg [dbg|check]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
+                                            crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"sched" {
                                             // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
                                             crate::process::sched_report(&mut resp);
