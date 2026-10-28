@@ -93,6 +93,21 @@ if [ "${FERROS_NO_SLOT_A:-0}" != 1 ]; then
     ( cd "$REPO" && tools/husky-hv.sh >/dev/null ) && HV_IMG=$REPO/target/hv/boot_a_hv.img || echo "== slot a gate image failed to build; slot a left as it is"
 fi
 
+# Signed with the owner's AVB key when it is there (BOOT.md, "Signed and unlocked"): the gate as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names that key, both made by one command from the installed build's Google images. Without the key (or with FERROS_UNSIGNED=1) the gate goes on bare, as before; ABL logs the verification error and boots it, unlocked.
+AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
+AVB_ZIP=${AVB_ZIP:-/mnt/Harbor/tmp/husky-factory/husky-cp1a.260505.005/image-husky-cp1a.260505.005.zip}
+SIGNED=""
+if [ -n "$HV_IMG" ] && [ -f "$AVB_KEY" ] && [ "${FERROS_UNSIGNED:-0}" != 1 ]; then
+    G=$(mktemp -d)
+    if unzip -q -o "$AVB_ZIP" vbmeta.img boot.img -d "$G" && ( cd "$REPO" && cargo build -q -p ferros-mkimg ) && mkdir -p "$REPO/target/avb" \
+        && OUT=$("$REPO/target/debug/ferros-mkimg" avb-sign --key "$AVB_KEY" --google-vbmeta "$G/vbmeta.img" --google-boot "$G/boot.img" --gate "$HV_IMG" --out-vbmeta "$REPO/target/avb/vbmeta.img" --out-boot "$REPO/target/avb/boot.img" 2>&1); then
+        SIGNED=1
+    fi
+    echo "${OUT:-}" | grep -E "^boot|^key|failed" | sed 's/^/   avb: /' || true
+    rm -rf "$G"
+    [ -n "$SIGNED" ] && HV_IMG=$REPO/target/avb/boot.img || echo "== signing failed; the gate goes on unsigned"
+fi
+
 to_fastboot
 # Both slots carry the same gate image (owner, 2026-10-23: identical slots, every boot lands on Ready?, Android is a jump from the gate — the gate rewrites bootconfig's slot suffix to _a, the one slot with an Android on it). FERROS_PURE_B=1 puts the bare cold ferros on slot b instead (no gate, no Android from it).
 if [ -n "$HV_IMG" ] && [ "${FERROS_PURE_B:-0}" != 1 ]; then
@@ -101,6 +116,9 @@ else
     fastboot flash boot_b "$IMG"
 fi
 [ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
+if [ -n "$SIGNED" ]; then
+    for s in a b; do fastboot flash "vbmeta_$s" "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed "s/^/   vbmeta $s: /"; done
+fi
 # No slot switch: ABL boots the UFS boot LUN's slot regardless, and `--set-active` marks the other slot "de-activated" (bit 3) — ABL then refuses it and sits in fastboot in 12 s (2026-10-23: four bounces, all this). Both slots carry the same image; the current one is re-written as active so a stray bit 3 is cleared.
 fastboot --set-active="$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')" >/dev/null 2>&1 || true
 t0=$(date +%s)
