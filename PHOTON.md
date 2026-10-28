@@ -17,7 +17,7 @@ The phone as a device of the owner's Photon fleet (Claude memories/photon_on_fer
 | key | what | from |
 |---|---|---|
 | ira-derived `photon device` | the device key's fingerprint | the kernel, every boot |
-| `photon.identity_seed`, `photon.handle_proof` | the identity roots | written by the attest screen (payloads/ahau) when the person who owns the phone types their handle on it, twice the first time; never pushed from another machine |
+| `photon.identity_seed`, `photon.handle_proof` | the identity roots | by default NOT on disk: the attest screen hands them to the client in RAM (op 4). Stored only when `device.unlock_at_boot` is on (opt-in, warned); wiped from disk whenever it is off. Never pushed from another machine. |
 | `photon.chain` | the fleet's membership chain as last adopted | a sponsor's `fleet_resp` |
 | `photon.fleet_key` | the fleet key | a sponsor's `fanout_resp`, opened with our ira |
 
@@ -35,6 +35,14 @@ The handle itself never reaches the phone: `ihi::handle_to_hash` runs over vsf's
 Done to step 3 on the first night; steps 4–6 need the phone's owner at one of their own fleet's devices.
 
 **2026-10-27: the roots must be the phone owner's, entered on the phone.** On 2026-10-26 a session pushed the desktop's own Photon roots (the owner's identity) onto the husky with `tools/photon-interop` `roots` + `store put`; the husky is the owner's wife's phone. The vault was wiped and the join is done properly: she attests on the phone with her own handle and binds it from one of her own devices. The `roots` tool stays for interop tests on the dev box only, never for a device that belongs to someone (Claude memories/feedback_identity_belongs_to_a_person.md).
+
+## Nothing on disk by default (2026-10-28)
+
+The owner's rule: no form of the handle on this phone. A stored identity seed is the identity's root key and a fast target — on a desktop Ryzen, a stolen seed checks `x`-encode + BLAKE3 at 45 M handle guesses/s across 32 threads (3.1 M on one), so a memorable two-word handle falls in seconds (the handle proof is the memory-hard wall, ~1 s/guess; the seed is not). The vault is sealed under the ira and ferros unseals it itself at boot, so a stored seed on a stolen phone IS the identity.
+
+So by default the phone stores nothing of the identity. The handle is typed each boot; the attest screen derives the seed and proof and hands them to the Photon client in RAM (the `photon` endpoint's op 4, `[4][seed 32][proof 32]`); the client looks the identity up, and the fleet key is recovered from the published fan-out into RAM (`recover_fleet_key`). Wiped or stolen, there are no keys anywhere, all derived again from the handle and the ira.
+
+Opt-in: `device.unlock_at_boot` (SETTINGS.md) stores the seed, proof, chain and fleet key, so the phone unlocks without the handle being typed. The attest screen's entry carries the toggle and, when on, warns "if this phone is lost, whoever holds it becomes you." Turning it off (or booting with it off) wipes every identity value from the vault (`Client::forget_disk`).
 
 ## The verdict and the seed (2026-10-28)
 

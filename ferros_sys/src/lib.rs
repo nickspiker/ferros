@@ -65,6 +65,8 @@ pub const PREF_SCOPE: u64 = 7;
 pub const PREF_PROX_WAKE: u64 = 6;
 /// Preference 12: the honeycomb keyboard's layout, 0 Dvorak (the default) or 1 QWERTY with Q on the bottom row (honeycomb::LAYOUTS).
 pub const PREF_LAYOUT: u64 = 12;
+/// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the phone unlocks without typing — a stolen phone then holds the identity).
+pub const PREF_UNLOCK_AT_BOOT: u64 = 13;
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

@@ -12,6 +12,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use ferros_sys::{cap, now, svc, ERR};
+use fgtw::pq::FleetSigner;
 use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
@@ -428,6 +429,8 @@ struct Client {
     last_words_us: u64,
     /// When the vault was last asked for the roots while there were none (the attest screen writes them once a person mints this device's identity).
     last_load_us: u64,
+    /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the phone unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set.
+    persist: bool,
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
     verdict: u8,
     last_lookup_us: u64,
@@ -444,6 +447,28 @@ impl Client {
     }
     fn store_set(&self, key: &[u8], value: &[u8]) -> bool {
         ferros_sys::store_set(cap(self.log.grants, S_STORE), key, value)
+    }
+
+    /// Read the unlock-at-boot preference (this process's own grants page).
+    fn read_persist(&mut self) {
+        self.persist = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
+    }
+
+    /// Store a value only when unlock-at-boot is on; otherwise make sure it is not on disk.
+    fn persist_set(&self, key: &[u8], value: &[u8]) -> bool {
+        if self.persist {
+            self.store_set(key, value)
+        } else {
+            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), key);
+            true
+        }
+    }
+
+    /// Everything of the identity gone from the vault (unlock-at-boot off, or a wipe): the seed, proof, chain and fleet key. The handle itself was never on disk.
+    fn forget_disk(&self) {
+        for key in [&b"identity_seed"[..], b"handle_proof", b"chain", b"fleet_key"] {
+            let _ = ferros_sys::store_delete(cap(self.log.grants, S_STORE), key);
+        }
     }
 
     fn load(&mut self) {
@@ -494,7 +519,7 @@ impl Client {
         self.log.put(b"photon: device key ");
         self.log.fp(&self.me);
         self.log.put(match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
-            (false, _, _) => b" - no identity on this device yet: waiting for the person to attest (the attest screen writes the roots)",
+            (false, _, _) => b" - no identity in hand: waiting for the attest screen to hand the roots over",
             (true, false, _) => b" - paired, waiting to be bound by a sponsor on this network",
             (true, true, false) => b" - bound, waiting for the fleet key",
             (true, true, true) => b" - a fleet member with the fleet key",
@@ -587,9 +612,8 @@ impl Client {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
         match join::adopt_chain(&hp, &seed, &self.me, chain) {
             Ok((_, true)) => {
-                if self.store_set(b"chain", chain) {
-                    self.bound = true;
-                }
+                self.persist_set(b"chain", chain);
+                self.bound = true;
                 self.bound
             }
             _ => false,
@@ -654,6 +678,25 @@ impl Client {
                         self.hold_chain(&bytes);
                     }
                 }
+                // A member with no key recovers it from the published fan-out, into RAM (the default; stored only if unlock-at-boot is on).
+                if self.bound && self.fleet_key.is_none() {
+                    if let Some(seed) = self.identity_seed {
+                        fgtw::set_clock(eagle());
+                        let kp = self.keys.keypair();
+                        let (recovered, ip) = {
+                            let t2 = self.seed();
+                            let r = fgtw::client::recover_fleet_key(&t2, &hp, kp, &seed).ok().flatten();
+                            (r, t2.ip.get())
+                        };
+                        self.seed_ip = ip;
+                        if let Some(k) = recovered {
+                            self.fleet_key = Some(k);
+                            self.persist_set(b"fleet_key", &k);
+                            self.log.put(b"photon: the fleet key recovered from the published fan-out");
+                            self.log.line();
+                        }
+                    }
+                }
                 V_JOIN
             }
             A::JoinOurs => V_JOIN,
@@ -702,11 +745,8 @@ impl Client {
                 match key {
                     Ok((_, k)) => {
                         self.fleet_key = Some(k);
-                        if self.store_set(b"fleet_key", &k) {
-                            self.log.put(b"photon: the fleet key is founded and ours");
-                        } else {
-                            self.log.put(b"photon: the fleet key is founded but the vault refused it");
-                        }
+                        self.persist_set(b"fleet_key", &k);
+                        self.log.put(b"photon: the fleet key is founded and ours");
                     }
                     Err(e) => {
                         self.log.put(b"photon: the fleet key was not founded: ");
@@ -821,10 +861,7 @@ impl Client {
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), THIS DEVICE IS BOUND" } else { b" op(s), not bound yet" });
                         self.log.line();
-                        if !self.store_set(b"chain", &chain) {
-                            self.log.put(b"photon: the vault did not take the chain");
-                            self.log.line();
-                        }
+                        self.persist_set(b"chain", &chain);
                         if bound && !self.bound {
                             self.bound = true;
                         }
@@ -853,10 +890,7 @@ impl Client {
                         self.log.line();
                         if self.fleet_key != Some(key) {
                             self.fleet_key = Some(key);
-                            if !self.store_set(b"fleet_key", &key) {
-                                self.log.put(b"photon: the vault did not take the fleet key");
-                                self.log.line();
-                            }
+                            self.persist_set(b"fleet_key", &key);
                         }
                     }
                     Ok(None) => {
@@ -908,6 +942,10 @@ impl Client {
         v4[..4].copy_from_slice(&join::BEACON_V4);
         self.udp.join(4, v4);
         self.udp.join(6, join::BEACON_V6);
+        self.read_persist();
+        if !self.persist {
+            self.forget_disk();
+        }
         self.load();
         if self.hp.is_some() {
             self.verdict = V_LOOKING;
@@ -942,8 +980,8 @@ impl Client {
             }
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
-            // The map asking for the Photon circle's front.
-            let mut req = [0u8; 16];
+            // The map asking for the Photon circle's front, or the attest screen setting roots (op 4, 69 bytes).
+            let mut req = [0u8; 72];
             let mut tok = [0u8; 32];
             let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
             if n != ERR && n != ferros_sys::NOTHING {
@@ -954,14 +992,35 @@ impl Client {
                     let r = self.mint();
                     reply.push(r);
                 }
-                // Op 3: the attest screen replaced the roots (a new handle on a device that was not yet bound): forget everything of the old identity and look the new one up.
+                // Op 3: the attest screen replaced the roots on disk (a new handle on a device that was not yet bound): forget the old identity and look the new one up from the vault.
                 if n >= 1 && req[0] == 3 {
                     self.forget_identity();
+                    self.read_persist();
                     self.load_saying(true);
                     if self.hp.is_some() {
                         self.verdict = V_LOOKING;
                         self.last_lookup_us = 0;
                     }
+                }
+                // Op 4: the attest screen hands the roots in RAM (`[4][seed 32][proof 32]`), the default — nothing of the identity written unless unlock-at-boot is on. Forget the old, take these, persist or wipe per the setting, look up.
+                if n >= 69 && req[0] == 4 {
+                    let mut seed = [0u8; 32];
+                    let mut hp = [0u8; 32];
+                    seed.copy_from_slice(&req[1..33]);
+                    hp.copy_from_slice(&req[33..65]);
+                    self.forget_identity();
+                    self.read_persist();
+                    if !self.persist {
+                        self.forget_disk();
+                    }
+                    self.persist_set(b"identity_seed", &seed);
+                    self.persist_set(b"handle_proof", &hp);
+                    self.identity_seed = Some(seed);
+                    self.hp = Some(hp);
+                    self.verdict = V_LOOKING;
+                    self.last_lookup_us = 0;
+                    self.log.put(if self.persist { b"photon: roots set in RAM and kept on disk (unlock at boot on)" } else { b"photon: roots set in RAM only (nothing of the identity on disk)" });
+                    self.log.line();
                 }
                 let state: u8 = match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
                     (false, _, _) => V_NONE,
@@ -1059,7 +1118,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

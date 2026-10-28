@@ -27,6 +27,7 @@ One spec VSF document in the vault under the key `device` (ferros_kernel `settin
 | `prox_wake` | unsigned | 0 off, 1 on | 0 |
 | `scope` | unsigned | 0 off, 1-6 the light scope's channel | 0 |
 | `layout` | unsigned | 0 Dvorak, 1 QWERTY with Q on the bottom row (honeycomb) | 0 |
+| `unlock_at_boot` | unsigned | 0 off (the handle is typed each boot, nothing of the identity on disk), 1 on (the seed is stored so the phone unlocks without typing) | 0 |
 | `tz` | signed | seconds east of UTC | 0 |
 
 - **Loaded** by the kernel right after the vault opens: the defaults, then every valid field, into every process's preferences block.
