@@ -267,7 +267,9 @@ mod real {
     fn against_rhe() {
         let Some(bytes) = rhe_lexicon() else { return };
         let lex = Lexicon(&bytes);
-        let kb = Keyboard::new(1344, 2992);
+        for layout in 0..crate::LAYOUTS {
+        let mut kb = Keyboard::new(1344, 2992);
+        kb.layout = layout;
         let (mut n, mut first, mut three) = (0, 0, 0);
         let t0 = std::time::Instant::now();
         for (rank, w) in lex.words().take(2048).filter(|(r, w)| w.len() >= 2 && r % 37 == 0) {
@@ -286,6 +288,7 @@ mod real {
             first += (out[0].0 == rank) as usize;
             three += out.iter().any(|o| o.0 == rank) as usize;
         }
-        std::eprintln!("{n} words: first {first}, in three {three}, {:?} a decode", t0.elapsed() / n as u32);
+        std::eprintln!("layout {layout}: {n} words: first {first}, in three {three}, {:?} a decode", t0.elapsed() / n as u32);
+        }
     }
 }

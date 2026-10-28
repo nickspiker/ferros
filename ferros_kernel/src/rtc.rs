@@ -1,6 +1,6 @@
 //! The wall clock: the main PMIC's real-time clock (s2mpg14, its RTC block at I2C address G#02 behind ACPM; rtc-s2mpg14.c). Binary, 24-hour (the bootloader and Android leave it so: RTC_CTRL bit MODEL24), counting UTC as Android keeps it. A read pulses the update register's read bit (RUDR, bit 0: clear, 50 µs, set, 1 ms) so the counters are latched into SEC..YEAR (G#06-G#0C), then reads those seven.
 //!
-//! The kernel reads it at service start and every hour after, and keeps the result as a base in counter ticks: unix seconds × frequency − the counter at the read, so a process gets wall time from its own counter with no syscall (SYS_FACTS slot 8; slot 9 the time zone, `device.tz`).
+//! The kernel reads it at service start and every hour after, and keeps the result as a base in counter ticks: unix seconds × frequency − the counter at the read, so a process gets wall time from its own counter with no syscall (SYS_FACTS slot 8; slot 9 the time zone, the settings document's `tz`).
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -12,7 +12,7 @@ const SEC: u32 = 0x06;
 pub static BASE: AtomicU64 = AtomicU64::new(0);
 /// When the base was taken (cntpct), for the hourly re-read.
 pub static READ_AT: AtomicU64 = AtomicU64::new(0);
-/// The local time zone, seconds east of UTC (`device.tz`, i32 LE; absent = 0).
+/// The local time zone, seconds east of UTC (the settings document's `tz`, settings.rs; absent = 0).
 pub static TZ: AtomicI64 = AtomicI64::new(0);
 
 /// A new zone: kept and handed to every process with the base.

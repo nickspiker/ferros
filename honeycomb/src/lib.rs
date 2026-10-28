@@ -24,11 +24,18 @@ const HALF_SQRT3: i64 = 56756;
 
 /// The page key's cell.
 pub const PAGE: char = '\u{0}';
-/// The extent, bottom row first, alternating 9 and 10 keys so the honeycomb stays flush at every scroll: the letters (QWERTY with Q moved to the bottom row, owner 2026-10-27), the digits from 0, then the symbols. On the symbol row the commonest sit at the ends, where a thumb reaches easiest, with the page key between them (owner: the most common symbols on the symbol row, placed by reach).
-pub const EXTENT: [&[char]; 8] = [
-    &['z', 'x', 'c', 'v', 'b', 'n', 'm', 'q', ','],
-    &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '.'],
-    &['w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
+/// The letter rows of each layout, bottom row first, 9, 10 and 9 keys on the flush honeycomb (the preference `device.layout`, ferros_sys::PREF_LAYOUT, numbers them):
+/// - 0 Dvorak, the default (owner, 2026-10-27): its letters fit the grid exactly, with Z where Dvorak's ; sits ("careful. z and ; get swapped") and ; and ' in the symbol rows.
+/// - 1 QWERTY with Q moved to the bottom row, so the 9-cell rows stay flush with the 10-cell one.
+pub const LETTERS: [[&[char]; 3]; 2] = [
+    [&['z', 'q', 'j', 'k', 'x', 'b', 'm', 'w', 'v'], &['a', 'o', 'e', 'u', 'i', 'd', 'h', 't', 'n', 's'], &[',', '.', 'p', 'y', 'f', 'g', 'c', 'r', 'l']],
+    [&['z', 'x', 'c', 'v', 'b', 'n', 'm', 'q', ','], &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '.'], &['w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p']],
+];
+/// How many layouts there are (the preference's valid range).
+pub const LAYOUTS: usize = LETTERS.len();
+
+/// The extent above the letters, bottom row first, alternating 10 and 9 keys so the honeycomb stays flush at every scroll: the digits from 0, then the symbols. On the symbol row the commonest sit at the ends, where a thumb reaches easiest, with the page key between them (owner: the most common symbols on the symbol row, placed by reach). The letters below it are the layout's (`LETTERS`).
+pub const EXTENT: [&[char]; 5] = [
     &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
     &['\'', '?', '-', '(', PAGE, ')', '/', '!', '"'],
     &[':', ';', '@', '#', '&', '*', '_', '+', '=', '%'],
@@ -37,8 +44,10 @@ pub const EXTENT: [&[char]; 8] = [
 ];
 /// Rows on show at once.
 pub const VIS: usize = 4;
+/// Rows in all: the layout's three letter rows and the extent above them.
+const ROWS: usize = 3 + EXTENT.len();
 /// The highest view: the extent's top row at the top.
-pub const MAX_VIEW: usize = EXTENT.len() - VIS;
+pub const MAX_VIEW: usize = ROWS - VIS;
 /// The bar's keys and their right edges in half columns (the bar is 20 half columns wide).
 pub const BAR_KEYS: [&str; 5] = ["map", "shift", "space", "del", "enter"];
 const BAR_EDGE: [i64; 5] = [3, 6, 14, 17, 20];
@@ -93,6 +102,8 @@ pub struct Keyboard {
     /// The extent row at the bottom of the view.
     pub view: usize,
     pub shift: bool,
+    /// The layout: an index into `LETTERS` (a value out of range is the caller's bug and panics on the first draw).
+    pub layout: usize,
     /// The bar's left key's label (the host decides what it does: `Event::Leave`).
     pub left: &'static str,
 }
@@ -115,7 +126,7 @@ impl Keyboard {
         let cy3 = bar0 - cell_r;
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, left: BAR_KEYS[B_MAP] }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, layout: 0, left: BAR_KEYS[B_MAP] }
     }
 
     /// The row pitch in pixels: a two-finger drag of this far scrolls one row.
@@ -125,7 +136,8 @@ impl Keyboard {
 
     /// Visible row `row` (0 at the top): its extent row.
     fn extent_row(&self, row: usize) -> &'static [char] {
-        EXTENT[self.view + VIS - 1 - row]
+        let r = self.view + VIS - 1 - row;
+        if r < 3 { LETTERS[self.layout][r] } else { EXTENT[r - 3] }
     }
 
     /// Hex `k` on show: its row and column.
@@ -474,7 +486,8 @@ mod tests {
         let (w, h) = (1344usize, 2992usize);
         let mut kb = Keyboard::new(w, h);
         let mut none = |_: i64, _: i64, _: u16, _: u16, _: &str| {};
-        for view in 0..=MAX_VIEW {
+        for (layout, view) in (0..LAYOUTS).flat_map(|l| (0..=MAX_VIEW).map(move |v| (l, v))) {
+            kb.layout = layout;
             kb.view = view;
             for k in 0..kb.hexes() + BAR_KEYS.len() {
                 let key = if k < kb.hexes() { Key::Hex(k) } else { Key::Bar(k - kb.hexes()) };
@@ -482,7 +495,7 @@ mod tests {
                 kb.draw_key(&mut one, key, false, &mut none);
                 for (i, &p) in one.iter().enumerate() {
                     if p != 0 {
-                        assert_eq!(kb.hit((i % w) as i64, (i / w) as i64), key, "view {view}");
+                        assert_eq!(kb.hit((i % w) as i64, (i / w) as i64), key, "layout {layout} view {view}");
                     }
                 }
             }

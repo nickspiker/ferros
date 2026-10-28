@@ -18,8 +18,8 @@ use ferros_sys::{console, exit, spawn};
 const SHELL: [(&[u8], &[u8], &[u64]); 7] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
-    // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key (payloads/ahau).
-    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49]),
+    // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout) (payloads/ahau).
+    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19]),
     (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope (payloads/pcie1 header).
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43]),

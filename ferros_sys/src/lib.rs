@@ -63,6 +63,8 @@ pub const PREF_THEME: u64 = 5;
 pub const PREF_SCOPE: u64 = 7;
 /// Preference 6: the proximity wake, 0 off or 1 on (the kernel refuses a wake press while proximity reads near).
 pub const PREF_PROX_WAKE: u64 = 6;
+/// Preference 12: the honeycomb keyboard's layout, 0 Dvorak (the default) or 1 QWERTY with Q on the bottom row (honeycomb::LAYOUTS).
+pub const PREF_LAYOUT: u64 = 12;
 
 /// A preference byte as this process's copy holds it now.
 pub fn pref(index: u64) -> u8 {

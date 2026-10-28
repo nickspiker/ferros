@@ -721,6 +721,10 @@ pub const PREF_THEME: usize = 5;
 pub const PREF_PROX_WAKE: usize = 6;
 /// Preference 7: the light scope, 0 off or 1–6 the VD6282 channel its 16 kHz trace follows (in the sensor's register order, VD6283 datasheet: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear — provisional for the VD6282) (usf.rs, the display's scope widget).
 pub const PREF_SCOPE: usize = 7;
+/// Preference 12: the keyboard layout on the honeycomb (honeycomb::Layout), 0 Dvorak (the default, owner 2026-10-27) or 1 QWERTY with Q on the bottom row. Bytes 8-11 are the surfaces' generations, 16-31 the wall clock; the language will take two bytes of 13-15 once vsf has a language type.
+pub const PREF_LAYOUT: usize = 12;
+/// How many layouts the honeycomb carries: the valid range of PREF_LAYOUT.
+pub const LAYOUTS: u8 = 2;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
 
@@ -838,8 +842,14 @@ fn pref_valid(index: usize, value: u8) -> bool {
         PREF_THEME => value < THEMES,
         PREF_PROX_WAKE => value <= 1,
         PREF_SCOPE => value <= 6,
+        PREF_LAYOUT => value < LAYOUTS,
         _ => false,
     }
+}
+
+/// Whether `value` is valid for preference `index` (settings.rs, reading a document).
+pub fn pref_ok(index: usize, value: u8) -> bool {
+    pref_valid(index, value)
 }
 
 /// Where `SYS_SPAWN` finds capsules: whoever owns the vault registers a reader (vault key -> bytes) while it is alive. Kernel-side only; a process never reads the vault through it, it only names a capsule to start, and the gate still checks the capsule's signature.

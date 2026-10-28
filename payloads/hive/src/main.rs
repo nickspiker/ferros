@@ -213,7 +213,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"hive: no surface\n");
         exit(2);
     }
-    let mut hive = Hive { display, base, w, h, kb: Keyboard::new(w, h), text: [0; 256], len: 0, word: None, cur: u32::MAX, alts: [u32::MAX; 3] };
+    let mut kb = Keyboard::new(w, h);
+    // The device's layout (SETTINGS.md); a value from a newer build falls back to the default.
+    let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
+    kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
+    let mut hive = Hive { display, base, w, h, kb, text: [0; 256], len: 0, word: None, cur: u32::MAX, alts: [u32::MAX; 3] };
     let t0 = now();
     hive.all();
     let drawn = ferros_sys::us_since(t0);
@@ -244,7 +248,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             outs[no] = t;
             no += 1;
         });
-        let dirty = no > 0;
+        // The device's layout changed (the attest screen's switch, `diag pref layout`): the keys follow.
+        let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
+        let relaid = l != hive.kb.layout && l < honeycomb::LAYOUTS;
+        if relaid {
+            hive.kb.layout = l;
+            hive.kb.draw(hive.surf(), &mut hive.label());
+        }
+        let dirty = no > 0 || relaid;
         for &t in &outs[..no] {
             match t {
                 Touch::Light(key) => hive.kb.draw_key(hive.surf(), key, true, &mut hive.label()),

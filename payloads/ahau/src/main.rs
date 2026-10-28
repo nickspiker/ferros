@@ -9,7 +9,9 @@
 //!
 //! The scratch is this process's own .bss (25 MiB): the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds it (payload.ld).
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key.
+//! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). The two names under the status line switch it, for a person whose layout the device does not have yet; the change is the device's setting, kept in its settings document.
+//!
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings.
 #![no_std]
 #![no_main]
 
@@ -26,6 +28,9 @@ const S_SURF: u64 = 3;
 const S_AHAU: u64 = 4;
 const S_PHOTON: u64 = 5;
 const S_IRA: u64 = 6;
+const S_SETTINGS: u64 = 7;
+/// The layouts' names, as the switch shows them (honeycomb::LETTERS order). Names, not words: the same in every language.
+const LAYOUT_NAMES: [&str; honeycomb::LAYOUTS] = ["Dvorak", "QWERTY"];
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
@@ -144,6 +149,49 @@ impl Ahau {
         let (t, ts) = self.title_at();
         (t + ts + self.w / 24, self.w / 34)
     }
+    /// The layout switch: the layouts' names side by side under the status line, the current one bright.
+    fn switch_at(&self) -> (usize, usize) {
+        let (b, _) = self.status_at();
+        (b + self.w / 10, self.w / 30)
+    }
+
+    fn switch(&self) {
+        let (b, px) = self.switch_at();
+        self.clear_rows(b - px * 3 / 2, b + px / 2);
+        let n = LAYOUT_NAMES.len();
+        for (i, name) in LAYOUT_NAMES.iter().enumerate() {
+            // Each name centred in its share of the middle half of the width.
+            let cx = self.w / 4 + self.w * (2 * i + 1) / (4 * n);
+            let x = cx as i64 - name.len() as i64 * px as i64 * 28 / 100;
+            window::text(self.display, self.base, x as i16, b as i16, px as u16, if i == self.kb.layout { TEXT } else { QUIET / 2 }, name.as_bytes());
+        }
+    }
+
+    /// A tap on no key: on the switch, the layout under it becomes the device's.
+    fn tap_at(&mut self, x: i64, y: i64) {
+        let (b, px) = self.switch_at();
+        if y < (b - px * 3 / 2) as i64 || y >= (b + px / 2) as i64 || x < (self.w / 4) as i64 || x >= (self.w * 3 / 4) as i64 {
+            return;
+        }
+        let i = (x as usize - self.w / 4) * LAYOUT_NAMES.len() / (self.w / 2);
+        if i != self.kb.layout && ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_LAYOUT, i as u8) == ferros_sys::ERR {
+            console(self.grants, b"ahau: the layout switch was refused\n");
+        }
+        // The kernel rewrites every process's preferences; `follow_layout` redraws on the next pass.
+    }
+
+    /// The device's layout changed (here, or from anywhere else): the keyboard and the switch follow.
+    fn follow_layout(&mut self) -> bool {
+        let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
+        if l == self.kb.layout || l >= honeycomb::LAYOUTS {
+            return false;
+        }
+        self.kb.layout = l;
+        self.kb.draw(self.surf(), &mut self.label());
+        self.switch();
+        true
+    }
+
     fn entry_at(&self) -> (usize, usize) {
         (self.kb.top - self.w / 8, self.w / 16)
     }
@@ -178,6 +226,7 @@ impl Ahau {
         let (tb, tpx) = self.title_at();
         self.centred(tb, tpx, TEXT, "attest");
         self.status(self.prompt());
+        self.switch();
         self.entry();
         self.kb.draw(self.surf(), &mut self.label());
     }
@@ -422,6 +471,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let mode = if verifier.is_some() || photon_seed.is_some() { Mode::Known } else { Mode::Fresh };
     let mut kb = Keyboard::new(w, h);
     kb.left = "clear";
+    // The device's layout; a value from a newer build than this one falls back to the default.
+    let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
+    kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0 };
     a.all();
     a.show();
@@ -451,11 +503,12 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
                 Touch::Unlight(key) => a.kb.draw_key(a.surf(), key, false, &mut a.label()),
                 Touch::Scrolled => a.kb.draw(a.surf(), &mut a.label()),
                 Touch::Tap(key) => a.tap(key),
+                Touch::TapAt(x, y) => a.tap_at(x, y),
                 // A handle is exact bytes, typed key by key: no shape writing here.
-                Touch::Trail(..) | Touch::Traced | Touch::TapAt(..) => {}
+                Touch::Trail(..) | Touch::Traced => {}
             }
         }
-        if no > 0 {
+        if a.follow_layout() || no > 0 {
             a.show();
         }
         sleep_until(now() + freq() / 240);

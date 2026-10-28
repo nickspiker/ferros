@@ -189,31 +189,9 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
             match store.set(&key, &params[2 + klen..]) {
                 Ok(h) => {
-                    // A preference set from the bridge applies at once, as one set from the device does (SYS_SET_PREF): every live process sees it on its next frame.
-                    if key == "device.base" && len == 1 && tatau::Base::from_code(params[2 + klen]).is_some() {
-                        crate::process::set_pref_held(crate::process::PREF_BASE, params[2 + klen]);
-                    }
-                    if key == "device.labels" && len == 1 && params[2 + klen] <= 1 {
-                        crate::process::set_pref_held(crate::process::PREF_LABELS, params[2 + klen]);
-                    }
-                    if key == "device.brightness" && len == 1 && params[2 + klen] <= 8 {
-                        crate::process::set_pref_held(crate::process::PREF_BRIGHTNESS, params[2 + klen]);
-                    }
-                    if key == "device.tz" && len == 4 {
-                        let b = &params[2 + klen..2 + klen + 4];
-                        crate::rtc::set_tz_held(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64);
-                    }
-                    if key == "device.dither" && len == 1 && params[2 + klen] <= 1 {
-                        crate::process::set_pref_held(crate::process::PREF_DITHER, params[2 + klen]);
-                    }
-                    if key == "device.theme" && len == 1 && params[2 + klen] < crate::process::THEMES {
-                        crate::process::set_pref_held(crate::process::PREF_THEME, params[2 + klen]);
-                    }
-                    if key == "device.scope" && len == 1 && params[2 + klen] <= 6 {
-                        crate::process::set_pref_held(crate::process::PREF_SCOPE, params[2 + klen]);
-                    }
-                    if key == "device.prox_wake" && len == 1 && params[2 + klen] <= 1 {
-                        crate::process::set_pref_held(crate::process::PREF_PROX_WAKE, params[2 + klen]);
+                    // The settings document set from the bridge applies at once, as a change on the device does (SYS_SET_PREF): every live process sees it on its next frame.
+                    if key == crate::settings::KEY {
+                        let _ = crate::settings::apply(&params[2 + klen..], true);
                     }
                     crate::flashlog::line(&alloc::format!("store set {key:?} ok: {}", store.describe()));
                     let mut r = alloc::vec![0u8];
@@ -316,17 +294,11 @@ static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 
 /// `SYS_SET_PREF`'s persistence: a preference into the device vault under its key (SETTINGS.md).
 fn store_pref(index: usize, value: u8) -> bool {
-    let key = match index {
-        crate::process::PREF_BASE => "device.base",
-        crate::process::PREF_LABELS => "device.labels",
-        crate::process::PREF_BRIGHTNESS => "device.brightness",
-        crate::process::PREF_DITHER => "device.dither",
-        crate::process::PREF_THEME => "device.theme",
-        crate::process::PREF_PROX_WAKE => "device.prox_wake",
-        crate::process::PREF_SCOPE => "device.scope",
-        _ => return false,
-    };
-    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(key, &[value]).is_ok()).unwrap_or(false) }
+    if !crate::settings::FIELDS.iter().any(|&(_, i)| i == index) {
+        return false;
+    }
+    let Some(doc) = crate::settings::document(Some((index, value))) else { return false };
+    unsafe { (*(&raw mut SPAWN_STORE)).as_mut().and_then(|s| s.as_mut()).map(|s| s.set(crate::settings::KEY, &doc).is_ok()).unwrap_or(false) }
 }
 
 /// `SYS_STORE`'s vault: the kernel has already checked the capability and prefixed the key with its scope.
@@ -425,8 +397,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ip" => &[44, 45, 41],
         // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon (payloads/photon).
         b"photon" => &[50, 48, 49, 46],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key (payloads/ahau).
-        b"ahau" => &[17, 18, 22, 51, 48, 49],
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch) (payloads/ahau).
+        b"ahau" => &[17, 18, 22, 51, 48, 49, 19],
         _ => return None,
     };
     let all = home_grants();
@@ -2040,6 +2012,30 @@ pub fn run(mut b: Boot) -> ! {
                                             resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
                                             let (ret, d, i, mpidr) = crate::x3::probe();
                                             resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        // `diag pref <name> <value>`: one device setting (settings.rs FIELDS, or `tz` in seconds east of UTC) set as a change on the device is, and the settings document written again. Unknown names and values out of range are refused, nothing written.
+                                        if let Some(rest) = cmd.params.strip_prefix(b"pref ") {
+                                            let text = core::str::from_utf8(rest).unwrap_or("");
+                                            let mut it = text.split_whitespace();
+                                            let (name, val) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse::<i64>().ok()));
+                                            let ok = match (name, val) {
+                                                ("tz", Some(z)) if z.abs() < 86_400 => {
+                                                    crate::rtc::set_tz(z);
+                                                    true
+                                                }
+                                                (n, Some(v)) => match crate::settings::FIELDS.iter().find(|f| f.0 == n) {
+                                                    Some(&(_, index)) if (0..=255).contains(&v) && crate::process::pref_ok(index, v as u8) => {
+                                                        crate::process::set_pref(index, v as u8);
+                                                        true
+                                                    }
+                                                    _ => false,
+                                                },
+                                                _ => false,
+                                            };
+                                            let kept = ok && crate::settings::document(None).is_some_and(|d| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok()));
+                                            resp.extend_from_slice(alloc::format!("pref {name}: {}\n", if !ok { "refused" } else if kept { "set and kept" } else { "set, NOT kept" }).as_bytes());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

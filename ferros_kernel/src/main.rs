@@ -25,6 +25,7 @@ use core::panic::PanicInfo;
 // Pixel 8 Pro (husky) modules shared by both boot paths: platform services, the USB/PT service, display adoption, the ira/wairua sources and the vault probe.
 #[cfg(feature = "pixel8")]
 mod platform;
+mod settings;
 // Vol Up + Vol Down → power off, as the key-press interrupt itself (KILLSWITCH.md).
 #[cfg(feature = "pixel8")]
 mod killswitch;
@@ -1915,44 +1916,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
     };
 
-    // The device's number base (SETTINGS.md): the person's own choice for this device, kept in the vault as one byte (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS) and loaded here so everything drawn from now on reads in it. An identity's preference replaces it when that identity attests; nothing here ever writes it back to an identity.
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.base").ok().flatten()) {
-        if let Some(b) = v.first().and_then(|&c| tatau::Base::from_code(c)) {
-            tatau::set_base(b);
-        }
+    // The device's settings (SETTINGS.md, settings.rs): one VSF document under `device`, loaded here so everything drawn from now on reads in them. Defaults first (DMS, tatau's house base; brightness 2, white about 147 cd/m²; Dvorak; everything else 0), then whatever the document carries. An identity's preferences replace them when that identity attests; nothing here ever writes them back to an identity.
+    process::set_pref(process::PREF_BASE, tatau::base().code());
+    process::set_pref(process::PREF_BRIGHTNESS, 2);
+    if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(settings::KEY).ok().flatten()) {
+        let _ = settings::apply(&doc, false);
     }
     platform::crumb(0xE5);
-    process::set_pref(process::PREF_BASE, tatau::base().code());
     checklist::base_known();
-    // Brightness (device.brightness, stops below the brightest white; absent = 2, white about 147 cd/m²).
-    let bright = store.as_mut().and_then(|s| s.get_by_key("device.brightness").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 8).unwrap_or(2);
-    process::set_pref(process::PREF_BRIGHTNESS, bright);
-    // The time zone (device.tz: seconds east of UTC, i32 LE; absent = UTC).
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.tz").ok().flatten()).filter(|v| v.len() == 4) {
-        rtc::TZ.store(i32::from_le_bytes([v[0], v[1], v[2], v[3]]) as i64, core::sync::atomic::Ordering::Relaxed);
-    }
-    // The dither (device.dither: 0 spatial and temporal, 1 spatial only; absent = 0).
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.dither").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
-        process::set_pref(process::PREF_DITHER, v);
-    }
-    // The light scope (device.scope: 0 off, 1–6 the flicker channel; absent = off).
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.scope").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 6) {
-        process::set_pref(process::PREF_SCOPE, v);
-    }
-    // The proximity wake (device.prox_wake: 0 off, 1 on; absent = off until tuned).
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.prox_wake").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v <= 1) {
-        process::set_pref(process::PREF_PROX_WAKE, v);
-    }
-    // The theme (device.theme: an index into ferros_sys::theme::THEMES; absent = 0, grey).
-    if let Some(v) = store.as_mut().and_then(|s| s.get_by_key("device.theme").ok().flatten()).and_then(|v| v.first().copied()).filter(|&v| v < process::THEMES) {
-        process::set_pref(process::PREF_THEME, v);
-    }
-    // Names under the map's circles (device.labels, one byte, 0 or 1; absent = off).
-    if let Some(&v) = store.as_mut().and_then(|s| s.get_by_key("device.labels").ok().flatten()).as_ref().and_then(|v| v.first()) {
-        if v <= 1 {
-            process::set_pref(process::PREF_LABELS, v);
-        }
-    }
 
     // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
     let init_exit = 0u32;
