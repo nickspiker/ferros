@@ -3,6 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
+//! For tuning, the window is split: the mark in the top half, and below it two locator strips — the whole Mandelbrot set with a crosshair where the picture came from (the c of a Julia family, the centre of a Mandelbrot zoom with a ring the size of its window), and a 2⁵× zoom around that point.
 //! The text is never printed or stored.
 
 mod mark;
@@ -58,12 +59,12 @@ impl App {
         }
     }
 
-    /// The textbox sits in the lower third, a little narrower than the window, sized from the span.
+    /// The textbox sits near the bottom of the mark (the top half), a little narrower than the window, sized from the span.
     fn layout(&mut self, vp: Viewport, text: &mut TextRenderer) {
         let (w, h) = (vp.width_px as Coord, vp.height_px as Coord);
         let span = vp.effective_span();
         let fs = span / (1 << 5) as Coord;
-        self.textbox.set_rect(w * 0.5, h * 0.75, w - span / (1 << 2) as Coord, fs * 1.6);
+        self.textbox.set_rect(w * 0.5, h * 0.4, w - span / (1 << 2) as Coord, fs * 1.6);
         self.textbox.set_font_size(fs, text);
     }
 
@@ -192,7 +193,14 @@ impl FluorApp for App {
         if key != self.mark_key {
             self.mark.resize(w * h, 0);
             let p = mark::Params::new(&self.salt, &self.text());
-            mark::render(&mut self.mark, w, h, &p);
+            // Top half: the mark; then the whole set, then a 2⁵× zoom around the locus, a quarter of the height each.
+            let (h0, h1) = (h / 2, h / 4);
+            let (top, rest) = self.mark.split_at_mut(w * h0);
+            let (whole, near) = rest.split_at_mut(w * h1);
+            mark::render(top, w, h0, &p);
+            mark::render_locator(whole, w, h1, &p, (-0.75, 0.), 1.25);
+            let (at, _) = mark::locus(&p);
+            mark::render_locator(near, w, h - h0 - h1, &p, at, 1. / (1 << 5) as f64);
             self.mark_key = key;
         }
 

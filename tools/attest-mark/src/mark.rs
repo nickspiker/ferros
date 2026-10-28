@@ -410,6 +410,43 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     });
 }
 
+/// Where this picture came from in the Mandelbrot set: the c of a Julia family, or the centre of a Mandelbrot zoom; and, for a zoom, its window's half-span.
+pub fn locus(p: &Params) -> ((f64, f64), Option<f64>) {
+    if p.kind == Kind::Plane { (p.centre, Some(p.half)) } else { (p.c, None) }
+}
+
+/// A locator pane: the Mandelbrot set around `centre` (half-span `half`), in this device's colouring, with a crosshair on the picture's locus and, for a zoom, a ring the size of its window.
+pub fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64, f64), half: f64) {
+    let q = Params { kind: Kind::Plane, power: 2, c: (0., 0.), centre, half, rot: (1., 0.), ..*p };
+    render(buf, w, h, &q);
+    let k = scale(&q, w, h);
+    let (at, window) = locus(p);
+    let (mx, my) = ((at.0 - centre.0) / k + w as f64 * 0.5, (at.1 - centre.1) / k + h as f64 * 0.5);
+    let white = pack_argb(255, 255, 255, 255);
+    // WHY/PROOF: the locus can lie anywhere in the plane, off this pane or near its edge, and the marker's pixels are computed from it; a write outside the pane would land in the neighbouring pane's rows or past the buffer.
+    let mut put = |x: f64, y: f64| {
+        if x >= 0. && y >= 0. && (x as usize) < w && (y as usize) < h {
+            buf[y as usize * w + x as usize] = white;
+        }
+    };
+    // Crosshair arms from 2² to 2⁴ pixels out, leaving the point itself clear.
+    for i in (1 << 2)..(1 << 4) {
+        let f = i as f64;
+        put(mx + f, my);
+        put(mx - f, my);
+        put(mx, my + f);
+        put(mx, my - f);
+    }
+    if let Some(wh) = window {
+        let r = wh / k;
+        let steps = (r * TAU) as u32 + (1 << 4);
+        for i in 0..steps {
+            let a = i as f64 * TAU / steps as f64;
+            put(mx + r * a.cos(), my + r * a.sin());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
