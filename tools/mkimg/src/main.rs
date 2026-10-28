@@ -35,6 +35,8 @@
 //! Tensor G3 ABL requires the kernel payload LZ4-compressed (legacy frame, magic G#02214C18) — see BOOT.md "Tensor G3 ABL facts".
 //! `--pad <MiB>` pads the flat binary and patches the ARM64 Image header image_size to match, for bisecting ABL's silent minimum-size rejection.
 
+mod avb;
+
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -58,6 +60,10 @@ fn main() {
         "sign-kernel" => cmd_sign_kernel(&args[2..]),
         "seed" => cmd_seed(&args[2..]),
         "anchor-key" => cmd_anchor_key(&args[2..]),
+        "avb-keygen" => cmd_avb_keygen(&args[2..]),
+        "vbmeta-info" => cmd_vbmeta_info(&args[2..]),
+        "avb-pubkey" => cmd_avb_pubkey(&args[2..]),
+        "avb-sign" => cmd_avb_sign(&args[2..]),
         "help" | "--help" | "-h" => usage(),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
@@ -77,6 +83,10 @@ fn usage() {
     eprintln!("  ferros-mkimg sign-kernel <kernel.elf> --key <secret> -o <kernel.signed>");
     eprintln!("  ferros-mkimg seed <seed.elf> --key <secret> [--pad <MiB>] -o <seed.img>");
     eprintln!("  ferros-mkimg anchor-key -o <anchor.img>");
+    eprintln!("  ferros-mkimg avb-keygen -o <keys dir>                 (RSA-4096 for avb_custom_key, as <dir>/avb.vsf: kgr + kvr)");
+    eprintln!("  ferros-mkimg avb-pubkey --key <avb.vsf> -o <avb_custom_key.bin>");
+    eprintln!("  ferros-mkimg vbmeta-info <vbmeta.img>");
+    eprintln!("  ferros-mkimg avb-sign --key <avb.vsf> --google-vbmeta <vbmeta.img> --google-boot <boot.img> --gate <gate.img> --out-vbmeta <vbmeta.img> --out-boot <boot.img>");
 }
 
 // ---------------------------------------------------------------------------
@@ -762,4 +772,119 @@ mod tests {
         }
         assert_eq!(out, data);
     }
+}
+
+fn arg(args: &[String], name: &str) -> String {
+    match args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)) {
+        Some(v) => v.clone(),
+        None => {
+            eprintln!("missing {name}");
+            process::exit(1)
+        }
+    }
+}
+
+fn die(what: &str, e: impl std::fmt::Display) -> ! {
+    eprintln!("{what}: {e}");
+    process::exit(1)
+}
+
+fn sha(b: &[u8]) -> String {
+    avb::hex(&<sha2::Sha256 as sha2::Digest>::digest(b))
+}
+
+/// The owner's AVB key (BOOT.md, "Locked-bootloader endgame"): RSA-4096 because ABL's avb_custom_key takes only RSA, as one VSF document. Refuses to overwrite a key already there.
+fn cmd_avb_keygen(args: &[String]) {
+    let path = format!("{}/avb.vsf", arg(args, "-o"));
+    if fs::metadata(&path).is_ok() {
+        die(&path, "exists: not overwriting a signing key");
+    }
+    let (key, doc) = avb::generate().unwrap_or_else(|e| die("keygen", e));
+    fs::write(&path, &doc).unwrap_or_else(|e| die(&path, e));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok();
+    }
+    // Read back: the document on disk must make the same key.
+    let again = avb::load(&fs::read(&path).unwrap()).unwrap_or_else(|e| die("the key read back", e));
+    if avb::public_key_blob(&again) != avb::public_key_blob(&key) {
+        die(&path, "the key read back is not the one generated: unusable");
+    }
+    eprintln!("Generated RSA-4096 AVB key: {path} ({} bytes, VSF)", doc.len());
+    eprintln!("  public-key blob sha256: {}", sha(&avb::public_key_blob(&key)));
+}
+
+/// The public-key blob for `fastboot flash avb_custom_key`.
+fn cmd_avb_pubkey(args: &[String]) {
+    let key = avb::load(&fs::read(arg(args, "--key")).unwrap_or_else(|e| die("key", e))).unwrap_or_else(|e| die("key", e));
+    let out = arg(args, "-o");
+    let blob = avb::public_key_blob(&key);
+    fs::write(&out, &blob).unwrap_or_else(|e| die(&out, e));
+    eprintln!("{out}: {} bytes, sha256 {}", blob.len(), sha(&blob));
+}
+
+fn cmd_vbmeta_info(args: &[String]) {
+    let file = fs::read(args.first().map(String::as_str).unwrap_or("")).unwrap_or_else(|e| die("read", e));
+    let (img, footer) = avb::find(&file).unwrap_or_else(|e| die("vbmeta", e));
+    let v = avb::parse(img).unwrap_or_else(|e| die("vbmeta", e));
+    if let Some(size) = footer {
+        println!("footer: image {size} bytes, vbmeta {} bytes", img.len());
+    }
+    println!("algorithm {}  rollback index {} at location {}  flags {}  libavb {}.{}  release \"{}\"", v.algorithm, v.rollback_index, v.rollback_index_location, v.flags, u32::from_be_bytes(v.header[4..8].try_into().unwrap()), u32::from_be_bytes(v.header[8..12].try_into().unwrap()), v.release);
+    println!("hash: {}   signature: {}", match avb::hash_ok(img) { Some(true) => "matches", Some(false) => "DOES NOT MATCH (patched after signing)", None => "none" }, match avb::signature_ok(img) { Ok(true) => "verifies".to_string(), Ok(false) => "DOES NOT VERIFY".to_string(), Err(e) => e });
+    println!("public key: {} bytes, sha256 {}", v.public_key.len(), sha(&v.public_key));
+    for d in &v.descriptors {
+        println!("  {}", avb::describe(d));
+    }
+}
+
+/// Both images a slot needs, made together so they cannot drift: the gate image as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names the same key. Each is checked as ABL will check it before anything is written.
+fn cmd_avb_sign(args: &[String]) {
+    let key = avb::load(&fs::read(arg(args, "--key")).unwrap_or_else(|e| die("key", e))).unwrap_or_else(|e| die("key", e));
+    let google_vbmeta = fs::read(arg(args, "--google-vbmeta")).unwrap_or_else(|e| die("google vbmeta", e));
+    let google_boot = fs::read(arg(args, "--google-boot")).unwrap_or_else(|e| die("google boot", e));
+    let gate = fs::read(arg(args, "--gate")).unwrap_or_else(|e| die("gate", e));
+    let (out_vbmeta, out_boot) = (arg(args, "--out-vbmeta"), arg(args, "--out-boot"));
+    let top = avb::parse(&google_vbmeta).unwrap_or_else(|e| die("google vbmeta", e));
+    let (gb, _) = avb::find(&google_boot).unwrap_or_else(|e| die("google boot", e));
+    let gb = avb::parse(gb).unwrap_or_else(|e| die("google boot", e));
+    // The boot partition is as large as Google's whole-partition boot image.
+    let salt: [u8; 32] = rand::random();
+    let boot = avb::boot_partition(&gate, google_boot.len(), &gb, &key, &salt).unwrap_or_else(|e| die("boot", e));
+    let vbmeta = avb::top_vbmeta(&top, &key).unwrap_or_else(|e| die("vbmeta", e));
+    // Check both as ABL will: hashes, signatures, the gate's digest, and the boot chain naming the key that signed the footer.
+    let blob = avb::public_key_blob(&key);
+    let (bv, size) = avb::find(&boot).unwrap_or_else(|e| die("boot (check)", e));
+    let bp = avb::parse(bv).unwrap();
+    let gate_ok = bp.descriptors.iter().filter_map(|d| avb::hash_of(d)).any(|(name, n, salt, digest)| {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, &salt);
+        sha2::Digest::update(&mut h, &boot[..n as usize]);
+        name == "boot" && Some(n) == size && sha2::Digest::finalize(h).as_slice() == digest.as_slice()
+    });
+    let tp = avb::parse(&vbmeta).unwrap();
+    let chain_ok = tp.descriptors.iter().filter_map(|d| avb::chain_of(d)).any(|(name, k)| name == "boot" && k == blob);
+    let checks = [
+        ("boot footer hash", avb::hash_ok(bv) == Some(true)),
+        ("boot footer signature", avb::signature_ok(bv).unwrap_or(false)),
+        ("boot footer key is ours", bp.public_key == blob),
+        ("gate digest", gate_ok),
+        ("vbmeta hash", avb::hash_ok(&vbmeta) == Some(true)),
+        ("vbmeta signature", avb::signature_ok(&vbmeta).unwrap_or(false)),
+        ("vbmeta key is ours", tp.public_key == blob),
+        ("boot chain names our key", chain_ok),
+        ("other descriptors Google's", tp.descriptors.len() == top.descriptors.len()),
+    ];
+    for (what, ok) in checks {
+        if !ok {
+            die("check failed, nothing written", what);
+        }
+    }
+    fs::write(&out_boot, &boot).unwrap_or_else(|e| die(&out_boot, e));
+    fs::write(&out_vbmeta, &vbmeta).unwrap_or_else(|e| die(&out_vbmeta, e));
+    eprintln!("boot:   {out_boot} ({} bytes: gate {} bytes + footer vbmeta {} bytes, rollback {} at location {})", boot.len(), gate.len(), bv.len(), bp.rollback_index, bp.rollback_index_location);
+    eprintln!("vbmeta: {out_vbmeta} ({} bytes, {} descriptors, rollback {} at location {})", vbmeta.len(), tp.descriptors.len(), tp.rollback_index, tp.rollback_index_location);
+    eprintln!("key:    sha256 {}", sha(&blob));
+    eprintln!("checked: {}", checks.iter().map(|(w, _)| *w).collect::<Vec<_>>().join(", "));
 }

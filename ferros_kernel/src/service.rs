@@ -2007,6 +2007,21 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(name) = cmd.params.strip_prefix(b"part avb ") {
+                                            // `diag part avb <partition>`: its AVB vbmeta (behind the footer, or at the start of a vbmeta partition) as one line of hex, read-only (partfs.rs): the installed build's own descriptors, for the owner's re-signed top-level vbmeta.
+                                            match crate::partfs::avb_vbmeta(core::str::from_utf8(name).unwrap_or("").trim()) {
+                                                Ok(v) => {
+                                                    resp.extend_from_slice(b"AVB ");
+                                                    for b in v {
+                                                        resp.extend_from_slice(alloc::format!("{b:02x}").as_bytes());
+                                                    }
+                                                    resp.push(b'\n');
+                                                }
+                                                Err(e) => resp.extend_from_slice(alloc::format!("part avb: {e}\n").as_bytes()),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" {
                                             // `diag keys [sleep|time|flip]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired (keys.rs).
                                             crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);

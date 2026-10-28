@@ -287,6 +287,19 @@ How a boot goes:
 - The two slots' `vbmeta` must be byte-identical. The gate hands Android slot suffix `_a` whichever slot ABL booted; locked, first-stage init re-verifies the `_a` vbmeta against the digest ABL passed, and a mismatch boot-loops (unlocked, it is tolerated). `tools/husky-mirror-slot-b.sh` already makes the partitions identical.
 - What Android sees when locked: verified-boot state yellow, the key's fingerprint on the boot warning, and an attestation root of the owner's key, so apps that demand Google's attestation (banking, Wallet) may refuse, as on GrapheneOS. A new Android kernel means repacking and re-signing the gate, as now.
 - Stock GrapheneOS (their key) still cannot share a locked device with ferros: one key per device, and their key cannot sign our gate.
+
+**Signed and unlocked: done (2026-10-28).** ABL verified slot b's whole chain under the owner's key, still unlocked: the next boot's record reads `Last AVB: avb_ret=OK`, `avb_veritymode=enforcing`, `avb_error_parts=` (none), and `boot_state: 160000:20260505:20260505` (OS 16, both security patch levels, which ABL could not find while verification was off).
+- **How it is built:** in Rust, `ferros-mkimg` (tools/mkimg/src/avb.rs), not avbtool.
+  - Google's top-level `vbmeta` does not hash `boot`: it *chains* to it (and to `init_boot`, `vbmeta_system`, `vbmeta_vendor`), each carrying its own signed `vbmeta`.
+  - So `avb-sign` gives the gate image its own footer `vbmeta`, signed with the owner's key: the gate's hash, Google's boot properties and rollback index carried over, the whole 64 MiB partition with the footer in its last 64 bytes.
+  - It re-points the top-level `boot` chain at the owner's key and signs the top level with it. The other 22 descriptors are Google's, byte for byte.
+  - Both images are made by one command, and are checked as ABL checks them before either is written.
+- **The key:** RSA-4096, `keys/avb.vsf` (VSF section `avb_key`: `kgr` = its primes, `kvr` = its modulus; types added to vsf for this, deprecated as legacy). `avb-pubkey` makes the blob for `fastboot flash avb_custom_key`, fingerprint sha256 `f066329b2b8a763f51dde7fd74d60b7250112a42afb0ea4a9c155f9080bfe3f0`. The blob builder reproduces Google's own keys' blobs byte for byte (a test).
+- **Reading the verdict:** ABL's log is in RAM at `G#FD80_0000` (512 KiB) and ferros reads it with `bridge read`. Each boot's log ends its AVB part with a `Last AVB:` record of the boot before.
+- **What it found about slot a:** its `init_boot`, `dtbo`, `vendor_boot` and `vendor_kernel_boot` do not match the build installed (CP1A.260505.005, the same build as the factory image). Their data was patched with the footers left stale or gone: root in `init_boot`, earlier hv and oracle tweaks in the rest. Slot b carries the stock images (`tools/husky-mirror-slot-b.sh`), so it verifies clean.
+- **For a locked dual boot, slot a must either be stock again, or have its patched images signed under the owner's key:** hashes in the top level for `dtbo`, `vendor_boot` and `vendor_kernel_boot`, and `init_boot` chained to the owner's key like `boot`. Root on Android under a locked bootloader means exactly that.
+- **`diag part avb <partition>`** reads any partition's own AVB metadata (behind its footer, or at the start of a `vbmeta_*`) over USB, read-only (ferros_kernel/src/partfs.rs).
+- Both slots now carry the signed gate and the owner-signed `vbmeta`, `avb_custom_key` holds the owner's key, and slot b is active.
 - Dev stays unlocked (orange state). **Never lock until the signed chain is proven** — and macOS/stock recovery escape hatches stay per the M1 rules.
 - Why lock at all, and why with the owner's own key: see Boot integrity under the "Ready?" gate (evil maid, trust-on-first-use, the on-screen key ID).
 

@@ -14,3 +14,8 @@ flate2 = "1.1.9"
 blake3 = "1"
 ed25519-compact = "2"
 lz4_flex = "0.11"
+# AVB (src/avb.rs): RSA-4096 and SHA-256 are what ABL verifies with; no Python, no avbtool.
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
+rand = "0.8"
+vsf = { path = "../../../vsf" }

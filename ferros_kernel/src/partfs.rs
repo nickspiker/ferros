@@ -149,3 +149,48 @@ impl Mount {
         self.fs.read(ino, offset, buf, &mut self.scratch).map_err(|e| alloc::format!("read: {e:?}"))
     }
 }
+
+/// A partition's AVB `vbmeta`, read-only (`diag part avb <name>`, BOOT.md "Locked-bootloader endgame"): behind the AVB footer in its last 64 bytes (a partition that carries its own, as `boot`, `vendor_boot`, `dtbo` do), or at its start (a `vbmeta_*` partition). What the owner's re-signed top-level `vbmeta` must copy, so it vouches for the build actually installed rather than a factory image's.
+pub fn avb_vbmeta(name: &str) -> Result<Vec<u8>, String> {
+    let part = find(name).ok_or_else(|| alloc::format!("no partition {name}"))?;
+    let ufs = UfsController::new(UFS_BASE);
+    let read = |lba: u64| -> Result<[u8; 4096], String> {
+        if lba > part.last || lba > u32::MAX as u64 || ufs.read_block_lun(part.lun, lba as u32) != 0 || ufs.last_response_status() != 0 {
+            return Err(alloc::format!("read of LBA {lba} failed"));
+        }
+        Ok(*ufs.data_buffer())
+    };
+    let span = |off: u64, len: usize| -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(len);
+        let mut at = off;
+        while out.len() < len {
+            let b = read(part.first + at / 4096)?;
+            let s = (at % 4096) as usize;
+            let n = (4096 - s).min(len - out.len());
+            out.extend_from_slice(&b[s..s + n]);
+            at += n as u64;
+        }
+        Ok(out)
+    };
+    let last = read(part.last)?;
+    let f = &last[4096 - 64..];
+    if &f[0..4] == b"AVBf" {
+        let be = |at: usize| u64::from_be_bytes(f[at..at + 8].try_into().unwrap());
+        let (off, size) = (be(20), be(28) as usize);
+        if size > 1 << 16 {
+            return Err(alloc::format!("footer's vbmeta is {size} bytes"));
+        }
+        return span(off, size);
+    }
+    let head = read(part.first)?;
+    if &head[0..4] == b"AVB0" {
+        // Header, then the two blocks it sizes (big-endian at 12 and 20).
+        let be = |at: usize| u64::from_be_bytes(head[at..at + 8].try_into().unwrap()) as usize;
+        let size = 256 + be(12) + be(20);
+        if size > 1 << 16 {
+            return Err(alloc::format!("vbmeta is {size} bytes"));
+        }
+        return span(0, size);
+    }
+    Err(alloc::format!("{name}: no AVB footer and no vbmeta at its start"))
+}
