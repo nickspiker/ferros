@@ -188,6 +188,13 @@ impl Ahau {
 
     /// A tap on no key: the button under the entry line acts; on the switch, the layout under it becomes the device's.
     fn tap_at(&mut self, x: i64, y: i64) {
+        if self.can_go_back() {
+            let (bx0, by0, bx1, by1) = self.back_at();
+            if (bx0 as i64..bx1 as i64).contains(&x) && (by0 as i64..by1 as i64).contains(&y) {
+                self.go_back();
+                return;
+            }
+        }
         let (x0, y0, x1, y1) = self.button_at();
         if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) {
             if self.button_label().is_some() {
@@ -221,11 +228,35 @@ impl Ahau {
         true
     }
 
-    /// The button under the entry line: its rectangle (x0, y0, x1, y1).
+    /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
+    fn can_go_back(&self) -> bool {
+        matches!(self.mode, Mode::Looking(_) | Mode::Join(_) | Mode::Mint(_) | Mode::Grey(_) | Mode::Wrong)
+    }
+
+    /// The button under the entry line: its rectangle (x0, y0, x1, y1). With a step back, it moves right and `back` takes the left.
     fn button_at(&self) -> (usize, usize, usize, usize) {
         let (b, px) = self.entry_at();
         let y0 = b + px;
-        (self.w * 5 / 16, y0, self.w * 11 / 16, y0 + self.w / 10)
+        if self.can_go_back() {
+            (self.w * 9 / 16, y0, self.w * 7 / 8, y0 + self.w / 10)
+        } else {
+            (self.w * 5 / 16, y0, self.w * 11 / 16, y0 + self.w / 10)
+        }
+    }
+
+    /// The `back` button, left of the main one.
+    fn back_at(&self) -> (usize, usize, usize, usize) {
+        let (_, y0, _, y1) = self.button_at();
+        (self.w / 8, y0, self.w * 7 / 16, y1)
+    }
+
+    /// Back to the entry: the pending roots stay (the client keeps at them); the same handle resumes, another replaces them.
+    fn go_back(&mut self) {
+        self.mode = Mode::Fresh;
+        self.status(self.prompt());
+        self.words();
+        self.entry();
+        self.button();
     }
 
     /// What the button does now, or nothing while the client is asked.
@@ -240,8 +271,22 @@ impl Ahau {
     }
 
     fn button(&self) {
-        let (x0, y0, x1, y1) = self.button_at();
+        // The whole row first, so a button that moved or went leaves nothing behind.
+        let (_, ry0, _, ry1) = self.button_at();
         let s = self.surf();
+        for y in ry0..ry1 {
+            s[y * self.w..(y + 1) * self.w].fill(0);
+        }
+        if self.can_go_back() {
+            let (bx0, by0, bx1, by1) = self.back_at();
+            for y in by0..by1 {
+                s[y * self.w + bx0..y * self.w + bx1].fill(grey(1800));
+            }
+            let px = self.w / 24;
+            let x = (bx0 + bx1) as i64 / 2 - 4 * px as i64 * 28 / 100;
+            window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
+        }
+        let (x0, y0, x1, y1) = self.button_at();
         for y in y0..y1 {
             s[y * self.w + x0..y * self.w + x1].fill(if self.button_label().is_some() { grey(2600) } else { 0 });
         }
