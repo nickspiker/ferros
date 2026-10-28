@@ -4,7 +4,7 @@
 //!
 //! Placement, the descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
 //! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
-//! c is the landing point raised by 2^−(4..10) back up the line it came down. Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
+//! c is the landing point raised by 2^−(4..12) back up the line it came down (see HEIGHT_STOPS). Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
 //!
 //! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
 //! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
@@ -30,6 +30,8 @@ const BAIL_SQ: f64 = (1 << 8) as f64;
 const JUMP: i32 = 1 << 2;
 /// A framing is kept when at least a quarter of the thumbnail is edge.
 const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
+/// Stops of height for c above its landing point, from 2⁻⁴ down: much above 2⁻⁴ J(c) thins into sparse dust, and below 2⁻¹² the landing's own tolerance (2⁻¹²) dominates, so the 2³ stops between are the ones that matter.
+const HEIGHT_STOPS: u32 = 1 << 3;
 /// Depths drawn for the self-similar copy: 0 to 2³ − 1. Each level shrinks the copy by about 2|z| ≈ 2, so past about 2³ levels the f32 floor (MIN_HALF) would bite on most draws and repeat the same framings.
 const DEPTHS: u32 = 1 << 3;
 /// The smallest window half-span kept, so the f32 render still has many representable steps per pixel.
@@ -343,7 +345,7 @@ impl Params {
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
-            let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * 6.)).exp2());
+            let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let (axis, along) = j_shape(c);
             // The copy at the drawn depth, or shallower until its window is still one the f32 render resolves.
             let mut depth = (unit(&t[0..4]) * DEPTHS as f64) as u32;
