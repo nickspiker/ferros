@@ -16,18 +16,44 @@ use photon_core::join::{self, DeviceKeys, Inbound};
 use photon_core::pt::{self, Addr, Event, Pt};
 use photon_core::wire::{self, Frame};
 
-/// Sized to fit a 1 MiB arc beside 660 KB of code (the arc pool refused 2 MiB, 2026-10-26): enough for a small fleet's chain, the request and a transfer in flight; a kernel heap region for apps is the next step.
-const HEAP_BYTES: usize = 160 * 1024;
-const STACK_BYTES: usize = 128 * 1024;
+/// The heap and the work thread's stack, in .bss: the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds them (payload.ld). Was 160 KiB in .data to fit a 1 MiB arc: a re-minted binding request (an SLH-DSA signature, 7856 B) then found no free run once the client had run a while, and the client panicked (2026-10-28).
+const HEAP_BYTES: usize = 2 << 20;
+/// The work thread's stack. 128 KiB was not enough: minting the binding request (Falcon-512 and SLH-DSA-128s signatures) ran past its base. In .data that landed on the unused top of the heap; in .bss it landed on the allocator's lock byte, which then never cleared (2026-10-28: the client spun in `LockedHeap::alloc`). The stack is painted at start, and each minting logs how deep it went (`stack_used`).
+const STACK_BYTES: usize = 1 << 20;
+/// What an untouched stack byte holds.
+const STACK_PAINT: u8 = 0xA5;
+
+/// How much of the work thread's stack has been written: from the base, the first byte that is no longer the paint.
+fn stack_used() -> usize {
+    let s = unsafe { &*STACK.0.get() };
+    STACK_BYTES - s.iter().position(|&b| b != STACK_PAINT).unwrap_or(STACK_BYTES)
+}
 
 #[repr(C, align(16))]
 struct Region<const N: usize>(UnsafeCell<[u8; N]>);
 unsafe impl<const N: usize> Sync for Region<N> {}
-/// Both in `.data` (a non-zero initializer keeps them out of `.bss`, which the flat image does not carry).
-#[unsafe(link_section = ".data.heap")]
-static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([1; HEAP_BYTES]));
-#[unsafe(link_section = ".data.stack")]
-static STACK: Region<STACK_BYTES> = Region(UnsafeCell::new([1; STACK_BYTES]));
+/// Both zero-initialised, so in `.bss`: the kernel zeroes the tail the header names.
+static HEAP: Region<HEAP_BYTES> = Region(UnsafeCell::new([0; HEAP_BYTES]));
+static STACK: Region<STACK_BYTES> = Region(UnsafeCell::new([0; STACK_BYTES]));
+
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym photon_main
+);
 
 #[global_allocator]
 static ALLOC: ferros_heap::LockedHeap = ferros_heap::LockedHeap::empty();
@@ -446,8 +472,11 @@ impl Client {
         }
         // The chain we hold, if bound before: folded again against our roots, so a bad write never binds us.
         if let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) {
-            let mut chain = alloc::vec![0u8; 128 * 1024];
-            if let Some(n) = self.store_get(b"chain", &mut chain) {
+            // The chain's own size first (a get returns the value's whole length), then exactly that: a 128 KiB buffer asked of a 160 KiB heap that has been running a while need not find one free run.
+            let mut probe = [0u8; 1];
+            let size = self.store_get(b"chain", &mut probe).unwrap_or(0);
+            let mut chain = alloc::vec![0u8; size];
+            if let Some(n) = (size > 0).then(|| self.store_get(b"chain", &mut chain)).flatten() {
                 if n <= chain.len() {
                     if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain[..n]) {
                         self.bound = bound;
@@ -591,11 +620,27 @@ impl Client {
             return;
         }
         let heard = !self.sponsors.is_empty();
+        self.log.put(b"photon: lookup: asking fgtw.org");
+        self.log.line();
+        let t0 = now();
         fgtw::set_clock(eagle());
         let t = self.seed();
         let fetched = fgtw::client::fetch(&t, &hp);
         let ip = t.ip.get();
         self.seed_ip = ip;
+        self.log.put(b"photon: lookup: fgtw.org answered in ");
+        self.log.dec(ferros_sys::us_since(t0) / 1000);
+        self.log.put(match &fetched {
+            Ok(Some(_)) => b" ms: a chain".as_slice(),
+            Ok(None) => b" ms: not_found",
+            Err(_) => b" ms: an error",
+        });
+        if let Err(e) = &fetched {
+            self.log.put(b" (");
+            self.log.put(e.as_bytes());
+            self.log.put(b")");
+        }
+        self.log.line();
         let answer = match &fetched {
             Ok(Some(b)) => fgtw::attest::SeedAnswer::Chain(b),
             Ok(None) => fgtw::attest::SeedAnswer::NotFound,
@@ -688,14 +733,24 @@ impl Client {
     fn mint_request(&mut self) {
         let (Some(seed), Some(hp)) = (self.identity_seed, self.hp) else { return };
         let t = eagle();
+        let t0 = now();
+        self.log.put(b"photon: minting the binding request");
+        self.log.line();
         let req = join::make_bind_request(&self.keys, &seed, &hp, t);
-        match join::bind_req_vsf(&req, &hp, &self.keys, t) {
+        let framed = join::bind_req_vsf(&req, &hp, &self.keys, t);
+        let ms = ferros_sys::us_since(t0) / 1000;
+        match framed {
             Ok(f) => {
                 self.request_t = t;
                 self.request_frame = f;
                 self.log.put(b"photon: binding request minted (");
                 self.log.dec(self.request_frame.len() as u64);
-                self.log.put(b" B)");
+                self.log.put(b" B) in ");
+                self.log.dec(ms);
+                self.log.put(b" ms; stack used ");
+                self.log.dec(stack_used() as u64 / 1024);
+                self.log.put(b" KiB of ");
+                self.log.dec(STACK_BYTES as u64 / 1024);
                 self.log.line();
             }
             Err(e) => {
@@ -858,9 +913,6 @@ impl Client {
             self.verdict = V_LOOKING;
         }
         self.show_words();
-        if !self.bound {
-            self.mint_request();
-        }
         loop {
             let t = now_us();
             let mut busy = false;
@@ -909,9 +961,6 @@ impl Client {
                     if self.hp.is_some() {
                         self.verdict = V_LOOKING;
                         self.last_lookup_us = 0;
-                        if !self.bound {
-                            self.mint_request();
-                        }
                     }
                 }
                 let state: u8 = match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
@@ -935,9 +984,6 @@ impl Client {
                     self.verdict = V_LOOKING;
                     self.last_lookup_us = 0;
                     self.show_words();
-                    if !self.bound {
-                        self.mint_request();
-                    }
                 }
             }
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
@@ -946,6 +992,10 @@ impl Client {
                 if self.udp.flags().is_some_and(|f| f & 1 != 0) {
                     self.lookup();
                 }
+            }
+            // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
+            if !self.bound && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
+                self.mint_request();
             }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
@@ -961,7 +1011,7 @@ impl Client {
                     self.show_words();
                 }
                 // The app re-posts its request before the registry's 5-minute freshness lapses; the same stamp discipline here, so a sponsor's candidate stays fresh.
-                if self.request_t != 0 && (eagle() - self.request_t) > 210 * vsf::OSCILLATIONS_PER_SECOND as i64 {
+                if self.verdict == V_JOIN && self.request_t != 0 && (eagle() - self.request_t) > 210 * vsf::OSCILLATIONS_PER_SECOND as i64 {
                     self.mint_request();
                     for s in self.sponsors.iter_mut() {
                         s.asked_t = 0;
@@ -1016,8 +1066,7 @@ extern "C" fn work(_: u64) -> ! {
 static mut GIVEN: Option<Addr> = None;
 
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn photon_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
@@ -1032,11 +1081,33 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         unsafe { GIVEN = Some(Addr { fam: b[0], ip, port: u16::from_be_bytes([b[17], b[18]]) }) };
     }
     let stack = unsafe { &mut *STACK.0.get() };
+    stack.fill(STACK_PAINT);
     ferros_sys::thread_spawn(work, stack, 0);
     ferros_sys::thread_exit(0)
 }
 
+/// A panic says what and where on the console before the process ends (nothing allocated: the heap may be why).
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    struct Buf {
+        b: [u8; 256],
+        n: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let k = s.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+            self.n += k;
+            Ok(())
+        }
+    }
+    let mut b = Buf { b: [0; 256], n: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut b, format_args!("photon: PANIC {}", info.message()));
+    if let Some(l) = info.location() {
+        let _ = core::fmt::Write::write_fmt(&mut b, format_args!(" at {}:{}", l.file(), l.line()));
+    }
+    let _ = core::fmt::Write::write_str(&mut b, "\n");
+    let mut r = [0u8; 16];
+    ferros_sys::call(cap(unsafe { GRANTS }, 0), &b.b[..b.n], &mut r);
     ferros_sys::panic_exit()
 }

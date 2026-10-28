@@ -1687,6 +1687,21 @@ fn add_thread(t: Thread) -> usize {
 }
 
 /// End process `pi` from thread `cur` (exit, a fault, the last thread leaving): every thread of it removed from the tables and the endpoints, every reply capability pointing at any of them dropped, its exit said on the console, its arc freed.
+/// Every caller whose reply token a process still holds, woken with ERR: that process will never answer it (it ended, or was killed). Without this a client blocked in a call to a server that died stayed in `Calling` for good (ahau in the Photon client's op 3, 2026-10-28). Under the lock.
+fn fail_callers(cspace: &[CapEntry]) {
+    for c in cspace {
+        if let Object::Reply(caller) = c.object {
+            if let Some(ct) = th(caller) {
+                if matches!(ct.state, State::Calling(..)) {
+                    ct.frame.x[0] = ERR;
+                    ct.state = State::Runnable;
+                    enqueue_back(caller);
+                }
+            }
+        }
+    }
+}
+
 fn end_process(pi: usize, cur: usize, value: u64) {
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
@@ -1716,6 +1731,8 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         let name = p.name.clone();
         surfaces_free(p.epoch);
+        fail_callers(&p.cspace);
+        p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
         kk.console.extend_from_slice(&name);
         kk.console.extend_from_slice(b": exit G#");
         for i in (0..16).rev() {
@@ -1904,6 +1921,11 @@ fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
+    {
+        let p = kk.procs[i].as_mut().unwrap();
+        fail_callers(&p.cspace);
+        p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
+    }
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
     // A thread of it running on another core leaves at its next trap (`drain_dying`); the arc goes with the last of them.
     let elsewhere = mine.iter().any(|&t| on_a_core(t));

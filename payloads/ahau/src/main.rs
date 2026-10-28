@@ -505,7 +505,7 @@ impl Ahau {
                     let _ = ferros_sys::store_delete(cap(self.grants, S_AHAU), b"verifier");
                     self.verifier = None;
                 }
-                self.status("Deriving the handle's proof: about seven seconds.");
+                self.status("Deriving the handle's proof: about five seconds.");
                 self.entry();
                 self.show();
                 // Let the display put the status up before the proof holds this core.
