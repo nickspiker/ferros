@@ -1530,6 +1530,10 @@ static mut PUB_TICKS: [u64; 3] = [1; 3];
 /// Content changed inside `r`: every phase owes it; the one on the layer is paid now (with whatever it already owed).
 /// A frame into the ring: the next phase in turn, never the one on the layer (which the panel may still be reading), and it becomes the current one. Every frame goes this way — a camera op, an app's frame, the status line — so the frame after can be armed at once (the buffer it writes was on screen three frames before) and consecutive frames carry consecutive phases' thresholds: the temporal dither at whatever rate frames come, 120 Hz under a finger, 10 Hz at rest (the flip below, which publishes nothing once the ring holds the image).
 fn publish_next(back: &[Px], width: usize, height: usize, tabs: &neon::Odt, r: draw::Rect) {
+    // The glass is the app's while one is in front (op 22 to op 23). The map's frames still draw into the back buffer but reach no phase: one that did put the map in one phase of four and the app in the rest, and the 10 Hz flips showed both (2026-10-27). Op 23 marks every phase dirty, so the map's next frame repaints all of it.
+    if unsafe { (*(&raw const APP)).is_some() } {
+        return;
+    }
     unsafe {
         for k in 0..PHASES {
             PHASE_DIRTY[k] = PHASE_DIRTY[k].union(r);
