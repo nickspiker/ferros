@@ -1,19 +1,18 @@
 //! The mark: a view into an escape-time fractal, chosen by the device's salt and moved by what is in the textbox.
 //!
-//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the device's look: the formula family, its power, the colouring method, the palette and the family's own seed.
-//! The families:
-//! 0. quadratic Julia sets, c chosen symbolically: a bulb p/q on the main cardioid (q from 2 to 2⁴; J(c) near it spirals with q arms), sometimes a sub-bulb p′/q′ of it (spirals of spirals), and a point just OUTSIDE that disc, so J(c) is a Cantor dust with no inside to go flat; bulbs are taken as discs of radius sin(πp/q)/q², sub-bulbs at angle 2πp′/q′ from the root;
-//! 1. Julia sets of z^d + c, d from 3 to 6, with d-fold symmetry: c just outside the main body, in closed form from its multiplier λ (fixed point z with d·z^(d−1) = λ, c = z − z^d), at an angle near a rational p/q;
-//! 2. quadratic Julia sets with c from the descent (below), a little above the boundary point it lands on — near the boundary J(c) resembles the Mandelbrot set around c, so the two rhyme;
-//! 3. zooms into the parameter plane of z^d + c itself, d from 2 to 4 (the Mandelbrot set and its multibrot cousins), centred on the descent's landing point.
+//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the device's look: the family, the colouring method, the palette and the family's own seed.
+//! Only the quadratic map z² + c, in three families:
+//! 0. Julia sets with c chosen symbolically: a bulb p/q on the main cardioid (q from 2 to 2⁴; J(c) near it spirals with q arms), sometimes a sub-bulb p′/q′ of it (spirals of spirals), and a point just OUTSIDE that disc, so J(c) is a Cantor dust with no inside to go flat; bulbs are taken as discs of radius sin(πp/q)/q², sub-bulbs at angle 2πp′/q′ from the root;
+//! 1. Julia sets with c from the descent (below), a little above the boundary point it lands on — near the boundary J(c) resembles the Mandelbrot set around c, so the two rhyme;
+//! 2. zooms into the Mandelbrot set itself, centred on the descent's landing point.
 //!
-//! The descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step as long as the distance estimate says the set is away (it never overshoots), until the steps shrink onto the boundary — the set's skyline seen from above, one dial from the antenna through the bulb tops and seahorse valley to the cusp.
-//! For x past the cusp (0.25) the line misses the set and lands on the real axis just outside it, in the parabolic-implosion region, which is kept.
+//! The descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step half the distance estimate (it never overshoots), until within 2⁻¹² of the set — the set's skyline seen from above, one dial from the antenna through the bulb tops and seahorse valley to the cusp.
+//! For x past the cusp (0.25) the line misses the set and lands on the real axis just outside it, in the parabolic-implosion region, which is kept for the Julia family.
 //!
 //! The textbox changes both the shape and the view, so every key looks new while the device's look stays:
 //! in family 0 the key moves c around the device's bulb (the angle away from its root and how far outside), and the view lands on J(c) by its symbolic address: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so a hash read as a 256-bit address names one point of J, built by inverse iteration (z → ±√(z − c)) with the coarsest bit applied last; uniform bits give the balanced measure (Brolin), so every key lands independently over the whole set;
-//! in family 1 the key moves c's angle and depth, and the view lands by a spray: 2⁶ points drawn from the key's hash across the region, and the one that escapes latest, the one nearest the boundary, is the centre;
-//! in family 2 the key nudges the descent's x and sets how far above the boundary c sits, and the view lands by a spray; in family 3 the key nudges x and picks the zoom depth.
+//! in family 1 the key nudges the descent's x and sets how far above the boundary c sits, and the view lands by a spray: 2⁶ points drawn from the key's hash across the region, and the one that escapes latest, the one nearest the boundary, is the centre;
+//! in family 2 the key nudges x and picks the zoom depth, and a fine spray at that zoom picks the centre.
 //! Every family then takes a log-uniform zoom, a rotation and a Gaussian offset of the centre from the key, and a thumbnail rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Shading: the distance estimate (|z|·ln|z| over the derivative's magnitude, in pixels) separates the set from the field around it, because near the set the escape count changes chaotically from pixel to pixel and reads as static.
@@ -38,7 +37,7 @@ const SPRAY: u32 = 1 << 6;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
-    /// Julia set of z^power + c (family 0 at power 2, family 1 above it).
+    /// Julia set of z^power + c.
     Julia,
     /// The parameter plane of z^power + c, z starting at 0.
     Plane,
@@ -250,18 +249,6 @@ fn outside_bulb(b: ((f64, f64), f64, (f64, f64)), t: &[u8; 32]) -> (f64, f64) {
     (centre.0 + away.0 * out, centre.1 + away.1 * out)
 }
 
-/// c just outside the main body of z^d + c: the fixed point z with d·z^(d−1) = λ, c = z − z^d, λ = ρ·e^{iθ} with ρ = 1 + 2^−(3..7).
-fn multi_c(d: u32, theta: f64, t: &[u8; 32]) -> (f64, f64) {
-    let rho = 1. + (-(3. + unit(&t[0..4]) * 4.)).exp2();
-    let lam = (rho * theta.cos() / d as f64, rho * theta.sin() / d as f64);
-    // z = (λ/d)^(1/(d−1)), principal root.
-    let (r, a) = ((lam.0 * lam.0 + lam.1 * lam.1).sqrt(), lam.1.atan2(lam.0));
-    let e = 1. / (d - 1) as f64;
-    let z = (r.powf(e) * (a * e).cos(), r.powf(e) * (a * e).sin());
-    let zd = cpow(z, d);
-    (z.0 - zd.0, z.1 - zd.1)
-}
-
 /// The descent: down the line Re c = x from Im c = 2 in the parameter plane of z^d + c, each step the distance estimate, until within 2⁻¹² of the set or on the real axis; at most 2⁹ steps.
 /// Returns the landing point and whether it is on the set (false when the line missed it and reached the axis).
 fn descend(x: f64, power: u32) -> ((f64, f64), bool) {
@@ -292,7 +279,7 @@ impl Params {
         let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let family = f[13] % 4;
+        let family = f[13] % 3;
         let base = Params { kind: Kind::Julia, power: 2, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap };
 
         // Family 0's device bulb: the first whose J(c), at the bulb's central exit, shows enough of the set at 2³× zoom in at least half of 2² trial landings (a thin dendrite fails at every zoom and is passed over).
@@ -309,21 +296,14 @@ impl Params {
                 }
             }
         };
-        // Family 1's power and rational angle.
-        let power_multi = 3 + (f[14] % 4) as u32;
-        let theta = {
-            let q = 2 + (f[15] % 7) as u32;
-            TAU * coprime(q, f[24]) as f64 / q as f64
-        };
-        // Families 2 and 3: the descent's x for this device. The Julia family takes the whole quadratic span, misses past the cusp included; a parameter-plane zoom needs a line that hits its own set (the cubic and quartic sets are much narrower), so its x is redrawn until the descent lands.
-        let plane_power = 2 + (f[14] % 3) as u32;
-        let x0 = if family == 3 {
+        // Families 1 and 2: the descent's x for this device. The Julia family takes the whole span, misses past the cusp included; a zoom needs a line that hits the set, so its x is redrawn until the descent lands.
+        let x0 = if family == 2 {
             let mut counter = 0;
             loop {
                 let h = draw(salt, 7, counter, &[]);
                 counter += 1;
                 let x = -2. + unit(&h[0..4]) * 2.375;
-                if descend(x, plane_power).1 {
+                if descend(x, 2).1 {
                     break x;
                 }
             }
@@ -333,9 +313,8 @@ impl Params {
         let bulb_b = if family == 0 { Some(device_bulb()) } else { None };
         let fixed = match family {
             0 => base,
-            1 => Params { power: power_multi, ..base },
-            2 => base,
-            _ => Params { kind: Kind::Plane, power: plane_power, ..base },
+            1 => base,
+            _ => Params { kind: Kind::Plane, ..base },
         };
 
         // Each try draws a fresh shape and view from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
@@ -345,19 +324,15 @@ impl Params {
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
             let mut p = fixed;
-            let zoom_stops = if family == 3 { 2. + unit(&t[0..4]) * 10. } else { unit(&t[0..4]) * 6. };
+            let zoom_stops = if family == 2 { 2. + unit(&t[0..4]) * 10. } else { unit(&t[0..4]) * 6. };
             p.half = 2. / zoom_stops.exp2();
             let point = match family {
                 0 => {
                     p.c = outside_bulb(bulb_b.expect("family 0 has a bulb"), &a);
                     address_point(p.c, &a)
                 }
-                1 => {
-                    p.c = multi_c(p.power, theta + (unit(&a[8..12]) - 0.5) * TAU / (1 << 4) as f64, &a);
-                    spray(&p, &a, (0., 0.), 1.5)
-                }
                 // c a little above the descent's landing point: 2^−(4..10) on up the line it came down.
-                2 => {
+                1 => {
                     let (b, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64, 2);
                     p.c = (b.0, b.1 + (-(4. + unit(&a[12..16]) * 6.)).exp2());
                     spray(&p, &a, (0., 0.), 2.)
