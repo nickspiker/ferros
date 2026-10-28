@@ -1,12 +1,12 @@
 //! The mark: a view into the Julia set of z² + c, with c placed by the device's salt and the view moved by what is in the textbox.
 //!
-//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the device's look: the descent's x, the colouring method and the palette.
+//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the device's look: the colouring method and the palette.
 //!
 //! Placement, the descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
 //! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
 //! c is the landing point raised by 2^−(4..10) back up the line it came down. Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
 //!
-//! The textbox changes both the shape and the view, so every key looks new while the device's look stays: the key nudges x by up to 2⁻⁶ either way and picks the height, and the view lands on J(c) by its symbolic address — for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so a hash read as a 256-bit address names one point of J, built by inverse iteration (z → ±√(z − c)) with the coarsest bit applied last; uniform bits give the balanced measure (Brolin), so every key lands independently over the whole set.
+//! Every hash of (salt, text) places its own c: it draws x anywhere in [−2, 0.375] and the height, so every key lands somewhere new on the skyline while the device's colouring stays; and the view lands on J(c) by its symbolic address — for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so a hash read as a 256-bit address names one point of J, built by inverse iteration (z → ±√(z − c)) with the coarsest bit applied last; uniform bits give the balanced measure (Brolin), so every key lands independently over the whole set.
 //! The key then takes a log-uniform zoom (1× to 2⁶×), a rotation and a Gaussian offset of the centre, and a thumbnail rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Shading: the distance estimate (|z|·ln|z| over the derivative's magnitude, in pixels) separates the set from the field around it, because near the set the escape count changes chaotically from pixel to pixel and reads as static.
@@ -274,7 +274,6 @@ impl Params {
         let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let x0 = -2. + unit(&f[25..29]) * 2.375;
         let base = Params { kind: Kind::Julia, power: 2, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap };
 
         // Each try draws a fresh c and view from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
@@ -283,7 +282,7 @@ impl Params {
             let a = draw(salt, 2, n, text.as_bytes());
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
-            let (land, _, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64);
+            let (land, _, _) = descend(-2. + unit(&a[8..12]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&a[12..16]) * 6.)).exp2());
             let point = address_point(c, &a);
             let half = 2. / (unit(&t[0..4]) * 6.).exp2();
