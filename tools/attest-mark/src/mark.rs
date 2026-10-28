@@ -249,7 +249,9 @@ fn outside_bulb(b: ((f64, f64), f64, (f64, f64)), t: &[u8; 32]) -> (f64, f64) {
     (centre.0 + away.0 * out, centre.1 + away.1 * out)
 }
 
-/// The descent: down the line Re c = x from Im c = 2 in the parameter plane of z^d + c, each step the distance estimate, until within 2⁻¹² of the set or on the real axis; at most 2⁹ steps.
+/// The descent: down the line Re c = x from Im c = 2 in the parameter plane of z² + c, until within 2⁻¹² of the set or on the real axis; at most 2⁹ steps.
+/// Each step is the PROVEN lower bound on the distance to the set (Koebe, via Milnor): with G = ln|z|/2ⁿ the Green's function and d = |z|·ln|z|/|dc| the estimate (= G/|G′|), the true distance is at least sinh G / (2·e^G·|G′|) = d·(1 − e^(−2G))/(4G).
+/// That factor is ½ next to the set and smaller far out (about 0.22 at G = 1), so the step never jumps past anything, not even a hair-thin filament, and the descent stops at the first, outermost contact along the line.
 /// Returns the landing point and whether it is on the set (false when the line missed it and reached the axis).
 fn descend(x: f64, power: u32) -> ((f64, f64), bool) {
     let probe = Params { kind: Kind::Plane, power, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase: [0.; 3], mode: 0, trap: (0., 0.) };
@@ -264,7 +266,10 @@ fn descend(x: f64, power: u32) -> ((f64, f64), bool) {
         if d < 1. / (1 << 12) as f64 {
             break;
         }
-        y -= d * 0.5;
+        // G underflows to 0 for orbits longer than about 2¹⁰ steps, where the factor's limit, ½, is exact enough.
+        let g = r.ln() * (-(o.n as f64)).exp2();
+        let factor = if g > 0. { -(-2. * g).exp_m1() / (4. * g) } else { 0.5 };
+        y -= d * factor;
         if y <= 0. {
             return ((x, 0.), false);
         }
