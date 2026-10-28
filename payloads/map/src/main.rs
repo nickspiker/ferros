@@ -28,7 +28,7 @@ const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
-/// 5: the app surface, passed on to the app in front.
+/// 5: the `surfaces` region (WINDOWS.md); passed to an app it starts, the kernel gives that app one surface of it, its own.
 const S_APPSURF: u64 = 5;
 const S_PHOTON_EP: u64 = 6;
 

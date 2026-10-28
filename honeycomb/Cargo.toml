@@ -1,0 +1,8 @@
+[package]
+name = "honeycomb"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The ferros honeycomb keyboard: geometry, drawing into a 64-bit surface, hit testing and key events; no I/O (the host draws the labels and talks to the display)"
+
+[dependencies]

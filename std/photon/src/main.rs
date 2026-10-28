@@ -1,4 +1,4 @@
-//! Photon on ferros: the app Photon's library builds, run through fluor's ferros host over the display server's app surface and the touch server. Spawned by the shell with (slot order) the display and touch endpoints, the app surface, the udp endpoint, the photon vault scope, the ira and entropy: `--use display --use touch --dma app-surface --use udp --store photon --ira --entropy`. The desktop main (photon's src/main.rs) does the winit things; this one does the ferros things.
+//! Photon on ferros: the app Photon's library builds, run through fluor's ferros host over the display server's app surface and the touch server. Spawned by the shell with (slot order) the display and touch endpoints, the app surface, the udp endpoint, the photon vault scope, the ira and entropy: `--use display --use touch --dma surface --use udp --store photon --ira --entropy`. The desktop main (photon's src/main.rs) does the winit things; this one does the ferros things.
 
 use photon_messenger::ui::photon_app::PhotonApp;
 

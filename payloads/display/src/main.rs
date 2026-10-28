@@ -96,7 +96,7 @@ const S_SRAMC0: u64 = 12;
 const S_HDRCOMM0: u64 = 13;
 /// 14: the `display-phases` region (64 MiB, non-cacheable): the four temporal dither frames.
 const S_PHASES: u64 = 14;
-/// 15: the `app-surface` region (32 MiB, cacheable): the app in front draws its 16-bit pixels there.
+/// 15: the `surfaces` region (128 MiB, cacheable): the four apps' surfaces, each a full screen of 64-bit pixels (WINDOWS.md).
 const S_APPSURF: u64 = 15;
 /// DECON0's frame-start interrupt line (kernel `decon0-frame-start`): the `vsync` thread waits on it and moves FRAME_STARTS, which `settle` and `present` wait on instead of polling FRAME_COUNT.
 const S_IRQ_FS: u64 = 16;
@@ -1639,12 +1639,95 @@ fn blit(px: &mut [Px], width: usize, height: usize, spr: &[Px], ext: &[Px], d: u
     }
 }
 
-/// The app in front, if any: its frame in the surface (x, y, w, h on screen; the surface holds w × h pixels, row by row), published from there — every phase, the idle fill included — until it says it is done (op 23).
+/// Whether any window is up (WINDOWS.md): the whole screen while one is, `None` while the map has it. The widgets and the map's frames check it.
 static mut APP: Option<draw::Rect> = None;
-static mut APP_SURF: usize = 1;
+/// The four surfaces' base (the `surfaces` region): surface k is the `SURFACE_BYTES` from `SURFS + k * SURFACE_BYTES`, a full screen of 64-bit pixels laid out at the screen's width.
+static mut SURFS: usize = 1;
+const SURFACES: usize = 4;
+const SURFACE_BYTES: usize = 32 << 20;
+/// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
+#[derive(Clone, Copy)]
+struct Win {
+    generation: u8,
+    level: u8,
+    order: u32,
+    rect: draw::Rect,
+}
+static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
+static mut RAISES: u32 = 0;
+/// Bit 63 of a surface pixel: see-through.
+const CLEAR: u64 = 1 << 63;
+/// The corners outside the circle (the system's: the clock now, signal and navigation later): the top and bottom `CHROME_ROWS` rows, 64-bit pixels like a surface. Drawn by `chrome_draw`.
+static mut CHROME: usize = 1;
+static mut CHROME_ROWS: usize = 0;
+/// The minute the corners' clock last drew, so it redraws once a minute.
+static mut CHROME_KEY: i64 = -1;
 
-/// The app's 16-bit pixels into phase `k` over `r` (screen coordinates, inside the app's frame `f`): each pixel's R, G, B (bits 0-15, 16-31, 32-47) are working values — gamma 2, white = Q14 — through the one table, E's gains and the dither; bit 48 set = no dither for that pixel (the ramps' comparison columns). Outside the app's frame: black.
-fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
+/// Surface k's pixels.
+fn surface(k: usize, width: usize, height: usize) -> &'static mut [u64] {
+    unsafe { core::slice::from_raw_parts_mut((SURFS + k * SURFACE_BYTES) as *mut u64, width * height) }
+}
+
+/// The surface a client names by its base (its own `dma` of the surface it was given). A message from another process: the base is checked, not trusted.
+fn surface_of(base: u64) -> Option<usize> {
+    let off = base.wrapping_sub(unsafe { SURFS } as u64) as usize;
+    if off % SURFACE_BYTES == 0 && off / SURFACE_BYTES < SURFACES { Some(off / SURFACE_BYTES) } else { None }
+}
+
+/// The windows up, frontmost first: (surface, window), at most four.
+fn front_order() -> ([(usize, Win); SURFACES], usize) {
+    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY }); SURFACES];
+    let mut n = 0;
+    for k in 0..SURFACES {
+        if let Some(w) = unsafe { WINS[k] } {
+            // Insertion by (level, order), highest first.
+            let mut at = n;
+            while at > 0 && (v[at - 1].1.level, v[at - 1].1.order) < (w.level, w.order) {
+                v[at] = v[at - 1];
+                at -= 1;
+            }
+            v[at] = (k, w);
+            n += 1;
+        }
+    }
+    (v, n)
+}
+
+/// The circle an app lives in (owner, 2026-10-27): tangent to the top and bottom of the screen, centred, so the four corners outside it belong to the system. Its radius and centre, in pixels.
+fn circle(width: usize, height: usize) -> (f32, f32, f32) {
+    (width as f32 * 0.5, height as f32 * 0.5, height as f32 * 0.5)
+}
+
+/// How many rows at the top (and at the bottom) reach outside the circle: where the circle's chord is narrower than the screen.
+fn chrome_rows(width: usize, height: usize) -> usize {
+    let (cx, _, r) = circle(width, height);
+    (r - libm::sqrtf(r * r - cx * cx)) as usize + 1
+}
+
+/// Whether the screen point is inside the circle.
+fn in_circle(x: i64, y: i64, width: usize, height: usize) -> bool {
+    let (cx, cy, r) = circle(width, height);
+    let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+    dx * dx + dy * dy <= r * r
+}
+
+/// The window that owns a screen point: the frontmost whose rectangle holds it and whose pixel there is not see-through, inside the circle (the corners are the system's).
+fn owner_at(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
+    if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 || !in_circle(x, y, width, height) {
+        return None;
+    }
+    let (ord, n) = front_order();
+    for &(k, w) in &ord[..n] {
+        let r = w.rect;
+        if (x as i32) >= r.x0 && (x as i32) < r.x1 && (y as i32) >= r.y0 && (y as i32) < r.y1 && surface(k, width, height)[y as usize * width + x as usize] & CLEAR == 0 {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), cut to the circle with its edge antialiased, the corners from the chrome; then each pixel's R, G, B (bits 0-15, 16-31, 32-47, working values: gamma 2, white = Q14) through the one table, E's gains and the dither, bit 48 set = no dither for that pixel.
+fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize) {
     let r = r.clip(width, height);
     if r.is_empty() {
         return;
@@ -1653,38 +1736,121 @@ fn publish_app(f: draw::Rect, r: draw::Rect, tabs: &neon::Odt, k: usize, width: 
     unsafe {
         PHASE_CLOCK[k] = None;
     }
-    let fw = (f.x1 - f.x0) as usize;
-    let surf = unsafe { core::slice::from_raw_parts(APP_SURF as *const u64, fw * (f.y1 - f.y0).max(0) as usize) };
+    let (ord, n) = front_order();
+    let (cx, cy, rad) = circle(width, height);
+    let (rin, rout) = ((rad - 0.5) * (rad - 0.5), (rad + 0.5) * (rad + 0.5));
+    let rows = unsafe { CHROME_ROWS };
+    let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, 2 * rows * width) };
     let mut row = [3u32; 1344];
+    let mut px = [0u64; 1344];
+    let (xa, xb) = (r.x0 as usize, r.x1 as usize);
     for y in r.y0 as usize..r.y1 as usize {
-        row[r.x0 as usize..r.x1 as usize].fill(3);
-        // The frame's part of this row: 16 pixels a step through the ODT (neon.rs `sixteen_app`), the last step through a padded copy.
-        let (xa, xb) = ((r.x0.max(f.x0)) as usize, (r.x1.min(f.x1)) as usize);
-        if (y as i32) >= f.y0 && (y as i32) < f.y1 && xa < xb {
-            let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
-            let src = &surf[(y - f.y0 as usize) * fw..];
-            unsafe {
-                let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
-                let mut x = xa;
-                while x + 16 <= xb {
-                    neon::sixteen_app(tabs, src.as_ptr().add(x - f.x0 as usize), row.as_mut_ptr().add(x), neon::thresholds_at(base, x));
-                    x += 16;
-                }
-                if x < xb {
-                    let n = xb - x;
-                    let mut pin = [0u64; 16];
-                    let mut pout = [0u32; 16];
-                    pin[..n].copy_from_slice(&src[x - f.x0 as usize..x - f.x0 as usize + n]);
-                    neon::sixteen_app(tabs, pin.as_ptr(), pout.as_mut_ptr(), neon::thresholds_at(base, x));
-                    row[x..xb].copy_from_slice(&pout[..n]);
+        px[xa..xb].fill(CLEAR);
+        for &(s, w) in &ord[..n] {
+            let wr = w.rect;
+            if (y as i32) < wr.y0 || (y as i32) >= wr.y1 {
+                continue;
+            }
+            let (a, b) = ((wr.x0 as usize).max(xa), (wr.x1 as usize).min(xb));
+            if a >= b {
+                continue;
+            }
+            let src = &surface(s, width, height)[y * width..(y + 1) * width];
+            // Branchless: an uncovered pixel (bit 63) takes this window's, a covered one keeps its own.
+            for x in a..b {
+                let p = px[x];
+                let m = (p >> 63).wrapping_neg();
+                px[x] = (p & !m) | (src[x] & m);
+            }
+        }
+        // Still see-through after every window: black.
+        for p in &mut px[xa..xb] {
+            *p &= ((*p >> 63) ^ 1).wrapping_neg();
+        }
+        // The circle: only the rows that reach the corners have anything outside it.
+        if y < rows || y >= height - rows {
+            let crow = if y < rows { &chrome[y * width..(y + 1) * width] } else { &chrome[(rows + y - (height - rows)) * width..(rows + y - (height - rows) + 1) * width] };
+            let dy = y as f32 + 0.5 - cy;
+            let dy2 = dy * dy;
+            for x in xa..xb {
+                let dx = x as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy2;
+                if d2 >= rout {
+                    px[x] = crow[x];
+                } else if d2 > rin {
+                    // The edge: coverage is how far inside the edge the pixel's centre is, 0 to 1 across the one-pixel band; the light scales with it, so the working value with its root (the corners are black at the edge).
+                    let cov = rad + 0.5 - libm::sqrtf(d2);
+                    let f = (libm::sqrtf(cov) * 65536.0) as u64;
+                    let p = px[x];
+                    let ch = |sh: u32| ((p >> sh & 0xFFFF) * f >> 16) << sh;
+                    px[x] = (p & 1 << 48) | ch(0) | ch(16) | ch(32);
                 }
             }
         }
-        dst[y * width + r.x0 as usize..y * width + r.x1 as usize].copy_from_slice(&row[r.x0 as usize..r.x1 as usize]);
+        let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
+        unsafe {
+            let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
+            let mut x = xa;
+            while x + 16 <= xb {
+                neon::sixteen_app(tabs, px.as_ptr().add(x), row.as_mut_ptr().add(x), neon::thresholds_at(base, x));
+                x += 16;
+            }
+            if x < xb {
+                let n = xb - x;
+                let mut pin = [0u64; 16];
+                let mut pout = [0u32; 16];
+                pin[..n].copy_from_slice(&px[x..xb]);
+                neon::sixteen_app(tabs, pin.as_ptr(), pout.as_mut_ptr(), neon::thresholds_at(base, x));
+                row[x..xb].copy_from_slice(&pout[..n]);
+            }
+        }
+        dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
     }
     fps_dot(1 << k, width, height);
 }
 
+/// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
+fn windows_changed(width: usize, height: usize) {
+    let full = draw::Rect::full(width, height);
+    unsafe {
+        PHASE_DIRTY = [full; PHASES];
+        if (*(&raw const WINS)).iter().all(|w| w.is_none()) {
+            APP = None;
+            PREV_DMG = full;
+        }
+    }
+}
+
+/// The corners' clock into the chrome when the minute changed (or `force`): the time, top left, in the device's base. Returns whether it drew.
+fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
+    let mut tb = [0u8; 32];
+    let (_, _, tn, key, _) = clock_state(&mut tb);
+    let minute = key / 60;
+    if !force && minute == unsafe { CHROME_KEY } {
+        return false;
+    }
+    unsafe { CHROME_KEY = minute };
+    let rows = unsafe { CHROME_ROWS };
+    let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, 2 * rows * width) };
+    chrome[..rows * width].fill(0);
+    // Hours and minutes: the first two places of the time's first line.
+    let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
+    let mut colons = 0;
+    let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
+    let t = core::str::from_utf8(&line[..end]).unwrap_or("");
+    // Sized and placed from the screen: inside the top-left corner, clear of the circle's edge.
+    let (px, x0, base) = (height as f32 / 64.0, width as f32 / 48.0, height as f32 / 48.0);
+    let v = 9000u64;
+    glyph_engine().cover(t, x0, base, px, (1.0, 0.0), |x, y, a| {
+        if x < 0 || y < 0 || x >= width as i64 || y >= rows as i64 {
+            return;
+        }
+        let g = v * a as u64 / 255;
+        chrome[y as usize * width + x as usize] = g | g << 16 | g << 32;
+    });
+    ALLOC.reset();
+    true
+}
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
 static mut PREV_DMG: draw::Rect = draw::Rect { x0: 0, y0: 0, x1: 4096, y1: 4096 };
 static mut CUR_DMG: draw::Rect = draw::Rect::EMPTY;
@@ -1856,6 +2022,15 @@ extern "C" fn receive(grants: u64) -> ! {
             ferros_sys::reply(&tok, &out);
             continue;
         }
+        if op == 27 && n >= 13 {
+            // Whose is this point (WINDOWS.md): [base u64][x u16][y u16] → 1 if the caller's window is the frontmost that covers it (inside the circle, not see-through there), else 0. Answered here: a client asks it on every finger down.
+            let (w, h) = unsafe { SCREEN_WH };
+            let mine = surface_of(u64::from_le_bytes(msg[1..9].try_into().unwrap()));
+            let (x, y) = (u16::from_le_bytes([msg[9], msg[10]]) as i64, u16::from_le_bytes([msg[11], msg[12]]) as i64);
+            let yes = mine.is_some() && owner_at(x, y, w as usize, h as usize) == mine;
+            ferros_sys::reply(&tok, &[yes as u8]);
+            continue;
+        }
         if op == 24 {
             // Answered here, never queued: the wait is the reply (op 24 above). Another client's call waits behind it at most a refresh.
             let seen = FRAME_STARTS.load(Ordering::Acquire);
@@ -2007,6 +2182,9 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             ARENA = alloc::vec![0u64; ARENA_WORDS].leak().as_mut_ptr() as usize;
         }
         ARENA_NEXT = 0;
+        // The corners' chrome, kept across calls (before the mark).
+        CHROME_ROWS = chrome_rows(width, height);
+        CHROME = alloc::vec![0u64; 2 * CHROME_ROWS * width].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -2096,7 +2274,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     log.flush();
     let surf = ferros_sys::dma(cap(grants, S_APPSURF)) as usize;
     if surf != 0 && surf != u64::MAX as usize {
-        unsafe { APP_SURF = surf };
+        unsafe { SURFS = surf };
     }
     let mut next_flip = now() + freq() / 10;
     // In focus, when the clock is next drawn (10 Hz).
@@ -2531,59 +2709,65 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         out[0] = 3;
                     }
                 }
-                Some(22) if m.len() >= 9 => {
-                    // An app's frame: [x u16][y u16][w u16][h u16] on screen, its pixels in the surface. Into the next phase now, the others from the surface while idle; the map's screen comes back after op 23.
+                Some(22) if m.len() >= 18 => {
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system. It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     last_interaction = now();
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
-                    let f = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
-                    let surf_ok = unsafe { APP_SURF } > 1 && (v(5) as usize) * (v(7) as usize) * 8 <= 32 << 20;
-                    if ten && unsafe { TEMPORAL } && surf_ok {
-                        let full = draw::Rect::full(width, height);
-                        unsafe {
-                            APP = Some(f);
-                            PHASE_DIRTY = [full; PHASES];
+                    let rect = draw::Rect { x0: v(1), y0: v(3), x1: v(1) + v(5), y1: v(3) + v(7) };
+                    let base = u64::from_le_bytes(m[9..17].try_into().unwrap());
+                    match surface_of(base) {
+                        Some(sk) if ten && unsafe { TEMPORAL } && ferros_sys::pref(8 + sk as u64) != 0 => {
+                            let full = draw::Rect::full(width, height);
+                            unsafe {
+                                if { APP }.is_none() {
+                                    chrome_draw(width, height, true);
+                                }
+                                RAISES += 1;
+                                WINS[sk] = Some(Win { generation: ferros_sys::pref(8 + sk as u64), level: m[17], order: RAISES, rect });
+                                APP = Some(full);
+                                PHASE_DIRTY = [full; PHASES];
+                            }
+                            pipe.settle(&mut armed, true);
+                            let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                            publish_app(full, &tabs, k, width, height);
+                            unsafe {
+                                PHASE_DIRTY[k] = draw::Rect::EMPTY;
+                                CUR_PHASE = k;
+                                // When the windows are gone, the map's next frame starts from a clear screen.
+                                PREV_DMG = full;
+                            }
+                            ferros_sys::dma_barrier();
+                            pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
+                            armed = Some(pipe.arm(win));
+                            frames += 1;
+                            FRAMES.store(frames, Ordering::Relaxed);
                         }
-                        pipe.settle(&mut armed, true);
-                        let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                        publish_app(f, full, &tabs, k, width, height);
-                        unsafe {
-                            PHASE_DIRTY[k] = draw::Rect::EMPTY;
-                            CUR_PHASE = k;
-                            // When the app is done, the map's next frame starts from a clear screen.
-                            PREV_DMG = full;
-                        }
-                        ferros_sys::dma_barrier();
-                        pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
-                        armed = Some(pipe.arm(win));
-                        frames += 1;
-                        FRAMES.store(frames, Ordering::Relaxed);
-                    } else {
-                        out[0] = 3;
+                        _ => out[0] = 3,
                     }
                 }
-                // Text into the app surface for the app in front, in its 16-bit working values: [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…]. The surface is the whole screen (op 22's frame), so x and y are screen coordinates. Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black). The app publishes (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
-                Some(26) if m.len() >= 9 => {
+                // Text into a window's surface, in its 16-bit working values: [base u64] the surface, [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…] in screen coordinates (a surface is the whole screen). Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black), and clearing the see-through bit where it draws. The app shows the window (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
+                Some(26) if m.len() >= 17 => {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
-                    let (x0, base, px, val) = (i16le(1), i16le(3), u16::from_le_bytes([m[5], m[6]]) as f32, u16::from_le_bytes([m[7], m[8]]) as u32);
-                    let surf_ok = unsafe { APP_SURF } > 1 && width * height * 8 <= 32 << 20;
-                    if surf_ok && px >= 4.0 && px <= 512.0 {
-                        let surf = unsafe { core::slice::from_raw_parts_mut(APP_SURF as *mut u64, width * height) };
-                        let t = core::str::from_utf8(&m[9..]).unwrap_or("");
-                        glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
-                            if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
-                                return;
-                            }
-                            let v = (val * a / 255).min(0xFFFF) as u64;
-                            let d = &mut surf[y as usize * width + x as usize];
-                            let have = *d & 0xFFFF;
-                            if v > have {
-                                *d = (*d & 1 << 48) | v | v << 16 | v << 32;
-                            }
-                        });
-                        ALLOC.reset();
-                    } else {
-                        out[0] = 3;
+                    let (x0, base, px, val) = (i16le(9), i16le(11), u16::from_le_bytes([m[13], m[14]]) as f32, u16::from_le_bytes([m[15], m[16]]) as u32);
+                    match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
+                        Some(sk) if px >= 4.0 && px <= 512.0 => {
+                            let surf = surface(sk, width, height);
+                            let t = core::str::from_utf8(&m[17..]).unwrap_or("");
+                            glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
+                                if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
+                                    return;
+                                }
+                                let v = (val * a / 255).min(0xFFFF) as u64;
+                                let d = &mut surf[y as usize * width + x as usize];
+                                let have = if *d & CLEAR != 0 { 0 } else { *d & 0xFFFF };
+                                if v > have {
+                                    *d = (*d & 1 << 48) | v | v << 16 | v << 32;
+                                }
+                            });
+                            ALLOC.reset();
+                        }
+                        _ => out[0] = 3,
                     }
                 }
                 // Focus: [icon u8, 0 none][span µs u32][mode u8: bit 0 fold]. The focused widget is redrawn and flipped every frame; the span is the time the scope shows (2^-6 s to 4 s).
@@ -2594,12 +2778,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                         SCOPE_FOLD = m.get(6).copied().unwrap_or(0) & 1 == 1;
                     }
                 }
-                Some(23) => {
-                    // The app is done: the screen is the map's again (its next frame repaints everything).
-                    unsafe {
-                        APP = None;
-                        PHASE_DIRTY = [draw::Rect::full(width, height); PHASES];
-                        PREV_DMG = draw::Rect::full(width, height);
+                Some(23) if m.len() >= 9 => {
+                    // A window is done: [base u64] its surface. The windows behind it show (the idle fill republishes every phase), or with none left the screen is the map's again (its next frame repaints everything).
+                    match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
+                        Some(sk) => unsafe {
+                            WINS[sk] = None;
+                            windows_changed(width, height);
+                            last_interaction = 0;
+                        },
+                        None => out[0] = 3,
                     }
                 }
                 Some(16) if m.len() >= 11 => {
@@ -2866,6 +3053,28 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                 }
             }
         }
+        // Windows whose process ended (the kernel cleared or renewed its surface's generation byte): gone, and what was behind them shows. Then the corners' clock, once a minute while windows are up, into every phase over its corner.
+        unsafe {
+            let mut gone = false;
+            for sk in 0..SURFACES {
+                if let Some(w) = WINS[sk] {
+                    if ferros_sys::pref(8 + sk as u64) != w.generation {
+                        WINS[sk] = None;
+                        gone = true;
+                    }
+                }
+            }
+            if gone {
+                // The idle fill republishes every phase within an eighth of a second of the last window op.
+                windows_changed(width, height);
+            }
+            if { APP }.is_some() && chrome_draw(width, height, false) {
+                let corner = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_ROWS as i32 };
+                for k in 0..PHASES {
+                    publish_app(corner, &tabs, k, width, height);
+                }
+            }
+        }
         // Clients first: every request the receive thread has queued, oldest first. The slot is copied out and released before it is run, so the receive thread can refill it meanwhile.
         loop {
             let head = RING_HEAD.load(Ordering::Relaxed);
@@ -3119,7 +3328,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
             if unsafe { !PHASE_DIRTY[k].is_empty() } {
                 match unsafe { APP } {
-                    Some(f) => publish_app(f, unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height),
+                    Some(_) => publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height),
                     None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),
                 }
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };

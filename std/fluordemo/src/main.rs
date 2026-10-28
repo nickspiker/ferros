@@ -1,4 +1,4 @@
-//! fluor on the phone: a FluorApp through fluor's ferros host. Spawn: `ferros-bridge spawn fluordemo.bin --name fluordemo --use display --use touch --dma app-surface --entropy` (grant slots 1, 2, 3). Taps count; the sixteenth closes the app and hands the screen back to the map.
+//! fluor on the phone: a FluorApp through fluor's ferros host. Spawn: `ferros-bridge spawn fluordemo.bin --name fluordemo --use display --use touch --dma surface --entropy` (grant slots 1, 2, 3). Taps count; the sixteenth closes the app and hands the screen back to the map.
 
 use fluor::canvas::Canvas;
 use fluor::coord::Coord;

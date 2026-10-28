@@ -1,12 +1,12 @@
-//! Ramps: the present stage's test screen, an app (SHELL.md: apps are places) — the first to draw its own pixels. It writes 16-bit working values (gamma 2, white = Q14) into the `app-surface` region and asks the display server to show them (op 22), which publishes them through the one table, E's gains and the dither at full precision. While it is in front it takes the touches itself: a tap shows the column under the finger alone (and a tap shows them all again); two fingers hand the screen back to the map (op 23) and end the app.
+//! Ramps: the present stage's test screen, an app (SHELL.md: apps are places) — the first to draw its own pixels. It writes 16-bit working values (gamma 2, white = Q14) into its own surface and asks the display server to show them (op 22), which publishes them through the one table, E's gains and the dither at full precision. While it is in front it takes the touches itself: a tap shows the column under the finger alone (and a tap shows them all again); two fingers hand the screen back to the map (op 23) and end the app.
 //!
 //! The columns, left to right, each a ramp from black at the top to its brightest at the bottom, with 4-pixel white lines between them: grey to white dithered and undithered; near-black (light to 1/64 of white) dithered, undithered, and as an 8-bit canvas would hand it over; the headroom (to 16× white) through the roll-off; red, green, blue to white. "Undithered" columns carry the surface's no-dither bit (48). A column alone is named in the black beside it (display op 26: the display's typeface, since apps have none), with what it tests; `PATTERNS` is the list, add a row and a `draw` arm for a new one.
 //!
-//! Launched by the map (SYS_SPAWN) with its own capabilities. Grant slots: 0 console, 1 display (use), 2 touch (use), 3 app-surface.
+//! Launched by the map (SYS_SPAWN) with its own capabilities. Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface (WINDOWS.md).
 #![no_std]
 #![no_main]
 
-use ferros_sys::{call, cap, console, exit, freq, now, sleep_until};
+use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
@@ -31,17 +31,11 @@ const PATTERNS: [(&str, &str); COLS] = [
 
 /// A line of text into the surface (display op 26): screen coordinates, size in pixels, grey value Q14.
 fn label(display: u64, x: i16, baseline: i16, px: u16, value: u16, s: &str) {
-    let mut m = [0u8; 160];
-    m[0] = 26;
-    m[1..3].copy_from_slice(&x.to_le_bytes());
-    m[3..5].copy_from_slice(&baseline.to_le_bytes());
-    m[5..7].copy_from_slice(&px.to_le_bytes());
-    m[7..9].copy_from_slice(&value.to_le_bytes());
-    let n = s.len().min(m.len() - 9);
-    m[9..9 + n].copy_from_slice(&s.as_bytes()[..n]);
-    let mut r = [0u8; 4];
-    call(display, &m[..9 + n], &mut r);
+    window::text(display, unsafe { SURF }, x, baseline, px, value, s.as_bytes());
 }
+
+/// This app's surface's base (its own, given at spawn).
+static mut SURF: u64 = 0;
 
 /// The labels beside a lone column: its name large, what it tests under it, a third of the way down the left black margin; and the column's number so a tap can be matched to the list.
 fn labels(display: u64, w: usize, h: usize, k: usize) {
@@ -107,13 +101,7 @@ fn draw(surf: &mut [u64], w: usize, h: usize, only: Option<usize>) {
 }
 
 fn show(display: u64, w: usize, h: usize) -> bool {
-    let mut m = [0u8; 9];
-    m[0] = 22;
-    m[5..7].copy_from_slice(&(w as u16).to_le_bytes());
-    m[7..9].copy_from_slice(&(h as u16).to_le_bytes());
-    let mut r = [0u8; 4];
-    call(display, &m, &mut r);
-    r[0] == 0
+    window::show(display, unsafe { SURF }, 0, 0, w as u16, h as u16, window::APP)
 }
 
 #[unsafe(no_mangle)]
@@ -132,6 +120,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"ramps: no app surface\n");
         exit(2);
     }
+    unsafe { SURF = base };
     let surf = unsafe { core::slice::from_raw_parts_mut(base as *mut u64, w * h) };
     let mut only: Option<usize> = None;
     draw(surf, w, h, only);
@@ -173,8 +162,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if held == 0 && down {
             down = false;
             if !moved && most == 2 {
-                let mut q = [0u8; 4];
-                call(display, &[23], &mut q);
+                window::done(display, unsafe { SURF });
                 console(grants, b"ramps: back to the map\n");
                 exit(0);
             }

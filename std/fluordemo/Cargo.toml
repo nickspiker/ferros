@@ -17,3 +17,7 @@ panic = "abort"
 panic = "abort"
 
 [workspace]
+
+[patch.crates-io]
+# libc with a ferros arm: the C scalar types, for the crates that spell their types through it (fluor now pulls rav1d).
+libc = { path = "/mnt/Harbor/Code/ferros-libc" }

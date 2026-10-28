@@ -613,3 +613,72 @@ pub mod theme {
         (super::pref(super::PREF_THEME) as usize).min(THEMES.len() - 1)
     }
 }
+
+/// A window on the display server (WINDOWS.md): an app draws its own full-screen surface (the `surface` it was given at spawn; 64-bit pixels: R, G, B working values in bits 0-15, 16-31, 32-47, bit 48 no dither, bit 63 see-through) and the display composes the windows frontmost first, inside the circle tangent to the screen's top and bottom.
+pub mod window {
+    use super::call;
+
+    /// Window levels: an app, the keyboard, the system (attest). Higher is in front.
+    pub const APP: u8 = 0;
+    pub const INPUT: u8 = 1;
+    pub const SYSTEM: u8 = 2;
+    /// A surface pixel that shows what is behind it.
+    pub const CLEAR: u64 = 1 << 63;
+
+    /// Show (or redraw) the window: the part of the screen it covers, its surface's base, its level. True when the display took it.
+    pub fn show(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8) -> bool {
+        let mut m = [0u8; 18];
+        m[0] = 22;
+        m[1..3].copy_from_slice(&x.to_le_bytes());
+        m[3..5].copy_from_slice(&y.to_le_bytes());
+        m[5..7].copy_from_slice(&w.to_le_bytes());
+        m[7..9].copy_from_slice(&h.to_le_bytes());
+        m[9..17].copy_from_slice(&base.to_le_bytes());
+        m[17] = level;
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r);
+        r[0] == 0
+    }
+
+    /// The window is done: what is behind it shows.
+    pub fn done(display: u64, base: u64) {
+        let mut m = [0u8; 9];
+        m[0] = 23;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r);
+    }
+
+    /// A line of text into the surface (the display's typeface): screen coordinates, size in pixels, grey value Q14 (white 16384).
+    pub fn text(display: u64, base: u64, x: i16, baseline: i16, px: u16, value: u16, s: &[u8]) {
+        let mut m = [0u8; 256];
+        m[0] = 26;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        m[9..11].copy_from_slice(&x.to_le_bytes());
+        m[11..13].copy_from_slice(&baseline.to_le_bytes());
+        m[13..15].copy_from_slice(&px.to_le_bytes());
+        m[15..17].copy_from_slice(&value.to_le_bytes());
+        let n = s.len().min(m.len() - 17);
+        m[17..17 + n].copy_from_slice(&s[..n]);
+        let mut r = [0u8; 4];
+        call(display, &m[..17 + n], &mut r);
+    }
+
+    /// Whether the screen point belongs to this window: the frontmost window covering it, inside the circle. Ask on each finger down; a finger that lands on another window (or in a corner) is not this app's.
+    pub fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
+        let mut m = [0u8; 13];
+        m[0] = 27;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        m[9..11].copy_from_slice(&x.to_le_bytes());
+        m[11..13].copy_from_slice(&y.to_le_bytes());
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r) >= 1 && r[0] == 1
+    }
+
+    /// The circle an app lives in: its centre and radius in pixels, and how many rows at the top and bottom reach the corners outside it (the circle is tangent to the screen's top and bottom).
+    pub fn circle(w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let (cx, r) = (w / 2, h / 2);
+        let chord = (r * r - cx * cx).isqrt();
+        (cx, h / 2, r, r - chord + 1)
+    }
+}

@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+honeycomb = { path = "../../honeycomb" }

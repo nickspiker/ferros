@@ -36,6 +36,7 @@ members = [
     "payloads/init",
     "payloads/ramps",
     "payloads/hive",
+    "honeycomb",
     "payloads/threads",
     "payloads/echo_client",
     "payloads/spinner",

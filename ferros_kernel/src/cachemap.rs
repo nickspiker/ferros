@@ -20,7 +20,7 @@ struct Table([u64; 512]);
 
 static mut L1: Table = Table([0; 512]);
 static mut L2: Table = Table([0; 512]);
-/// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except APP_SURFACE.
+/// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except the surfaces, sprites and canvas.
 static mut L2_HI: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
 /// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 16 MiB = 8 blocks, the shim pool 2 MiB = 1.
@@ -88,12 +88,13 @@ pub const DISPLAY_PHASES: (usize, usize) = (0x8C00_0000, 0x9000_0000);
 #[cfg(shim_handoff)]
 pub const DISPLAY_PHASES: (usize, usize) = (0, 0);
 
-/// The apps' surface (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory at the bottom of the GiB above the window — a full panel's 16-bit pixels (1344 × 2992 × 8 bytes), which an app draws and the display server publishes (SHELL.md, apps as places). Free on a cold boot: Android's reserved carveouts in this GiB start at G#E800_0000 (zuma-rmem.dtsi). Granted as the region `app-surface` to the display server and, through the map, to the app in front.
+/// The apps' surfaces (cold only): 128 MiB of Normal write-back, EL0 read/write, never executable memory, four full-panel surfaces of 32 MiB (1344 × 2992 pixels of 64 bits each). Each app is given one at spawn and draws there as it wishes; the display server holds all four and composes the windows frontmost first (WINDOWS.md). Free per the device tree: above the display's canvas (G#CA00_0000) and below the debug snapshot (G#D810_0000; the modem's carveouts are G#E800_0000 up). Replaced the single `app-surface` at G#C000_0000 (2026-10-27), which overlapped the modem image ABL loads there.
 #[cfg(not(shim_handoff))]
-/// Overlaps the modem's reserved memory (cp_rmem, where the bootloader loads modem firmware: machine code found at G#C1FF_0000 after every cold boot, 2026-10-23). Harmless while the modem is held in reset; must move before cellular comes up.
-pub const APP_SURFACE: (usize, usize) = (0xC000_0000, 0xC200_0000);
+pub const SURFACES: (usize, usize) = (0xCA00_0000, 0xD200_0000);
 #[cfg(shim_handoff)]
-pub const APP_SURFACE: (usize, usize) = (0, 0);
+pub const SURFACES: (usize, usize) = (0, 0);
+/// One surface's size: a power of two that holds a full panel.
+pub const SURFACE_SIZE: usize = 32 << 20;
 
 /// The display's sprite cache (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory in the same GiB, 32 MiB clear of the apps' surface (in case the bootloader's modem image runs past it): every circle's drawn pixels, kept while its size and turn stay, so a pan blits rather than redraws. A screen packed with circles needs ~20 MB of square sprites; the 6 MiB the display's heap could spare thrashed at 200 circles (2026-10-24: every icon redrawn every frame, 11 ms). Free per the device tree (the first carveout in this GiB is G#E800_0000). Granted as the region `display-sprites`.
 #[cfg(not(shim_handoff))]
@@ -243,8 +244,8 @@ pub fn enable() -> bool {
                 normal(vhe, a, BLOCK)
             };
         }
-        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surface and the display's sprites Normal.
-        let (s0, s1) = APP_SURFACE;
+        // The GiB above: Device blocks as before (the ramoops block, ABL's splash, the carveouts all live there), the apps' surfaces and the display's sprites and canvas Normal.
+        let (s0, s1) = SURFACES;
         let (p0, p1) = DISPLAY_SPRITES;
         let (q0, q1) = DISPLAY_CANVAS;
         if s0 != s1 && s0 / GIB == w0 / GIB + 1 && s0 % MIB2 == 0 && s1 % MIB2 == 0 && (s1 - 1) / GIB == s0 / GIB {

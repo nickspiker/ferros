@@ -1,6 +1,6 @@
 # Windows on ferros
 
-The design for putting more than one thing on the glass: the map, an app in front, the keyboard over it, and the attest screen over everything. Written 2026-10-27 after the owner called the present path "a glitchy hot mess". It is a proposal: the knobs below are the owner's to pick before the display server's code changes shape (Claude memories/display_driver_design_first.md).
+The design for putting more than one thing on the glass: the map, an app in front, the keyboard over it, and the attest screen over everything. Written 2026-10-27 after the owner called the present path "a glitchy hot mess". The owner decided on 2026-10-27: every window is full screen for ownership and layering; each app gets its own full-screen buffer to draw as it wishes, and the display draws them in order, frontmost first; an app in front lives in a full-screen circle tangent to the screen's top and bottom, the four corners left for the system (clock, signal, navigation). How widgets fit is still open. "Built" below says what runs.
 
 ## What goes wrong today, and why
 
@@ -56,6 +56,17 @@ Per window, keyed by the caller's badge:
 - **frame wait** keeps op 24.
 
 The map is a window like any other, on layer 0, with the camera ops it has today.
+
+## Built (2026-10-27)
+
+- **Surfaces.** Four full-screen surfaces of 32 MiB at G#CA00_0000 (cachemap SURFACES), between the display's canvas and the debug snapshot. The display holds the `surfaces` region; an app gets one surface of its own at spawn: the map passes the region (SYS_SPAWN turns it into one fresh surface) and `bridge spawn --dma surface` asks for one. The old shared `app-surface` (over the modem image at G#C000_0000) is gone.
+- **Death notices, without messages.** Bytes 8-11 of every process's preferences block hold each surface's generation (0 free). The kernel frees a surface when its process ends or is killed (`diag kill <name>`), and the display drops a window whose byte changed on its next pass. Badges are not built: the window is named by its surface's base, which the display checks. There is no per-process memory isolation yet anyway (KERNEL.md: no compiled masking), so nothing stronger would hold.
+- **Composing.** Each row frontmost first (level, then the last shown): a pixel comes from the first window whose rectangle covers it and whose bit 63 (see-through) is clear, branchless; black behind them all. Then the circle: rows that reach the corners take the chrome outside it, and the one-pixel band along the edge is antialiased (a root only there). Then the one table and the dither, as before.
+- **Ops.** 22 show `[x][y][w][h][base u64][level]`, 23 done `[base]`, 26 text `[base][x][baseline][size][value][utf8]` (synchronous), 27 whose point `[base][x][y]` (answered by the receive thread). ferros_sys::window wraps them; fluor's ferros host speaks them.
+- **The corners.** The time, top left, in the device's base, redrawn each minute into every phase. Signal, navigation and taps in the corners are not built.
+- **Touches** still go to every client; each asks op 27 on a finger down and drops fingers that are not its own. Routing through the display is still the plan.
+
+Verified on the phone by reading the dither phases back over USB: Hive alone; Ramps in front of Hive, cut to the circle; Ramps killed and Hive back; fluor's half-size frame over Hive with Hive around it.
 
 ## Order of work
 

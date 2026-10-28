@@ -253,6 +253,8 @@ pub enum Object {
     Irq(usize),
     /// Served by the kernel: a device's power (index into `POWERS`): rails, clocks and pin modes the driver cannot set itself (`SYS_POWER`).
     Power(usize),
+    /// A surface to be: a spawn turns it into one free surface of `surfaces`, the child's own (`Dma` of `surface-k`), at build. Never held: a parent that passes the whole `surfaces` region passes this instead (SYS_SPAWN), and `bridge spawn --dma surface` asks for it by name.
+    NewSurface,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -289,6 +291,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Irq(i) => (8, i as u64),
         Object::Power(i) => (9, i as u64),
         Object::Ira => (10, 0),
+        Object::NewSurface => (11, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -858,13 +861,53 @@ pub static DMA: &[Dma] = &[
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
     // The display's four temporal dither phases (cachemap DISPLAY_PHASES), non-cacheable like the framebuffer.
     Dma { name: "display-phases", base: crate::cachemap::DISPLAY_PHASES.0, size: crate::cachemap::DISPLAY_PHASES.1 - crate::cachemap::DISPLAY_PHASES.0 },
-    // The apps' 16-bit surface (cachemap APP_SURFACE): cacheable, shared by the display server and the app in front.
-    Dma { name: "app-surface", base: crate::cachemap::APP_SURFACE.0, size: crate::cachemap::APP_SURFACE.1 - crate::cachemap::APP_SURFACE.0 },
+    // The apps' surfaces (cachemap SURFACES): all four, the display server's (it composes them) and the map's (it passes one to each app it starts).
+    Dma { name: "surfaces", base: crate::cachemap::SURFACES.0, size: crate::cachemap::SURFACES.1 - crate::cachemap::SURFACES.0 },
+    // Each surface alone: what an app holds. Given out by `NewSurface`, freed when its process ends (`SURFACE_OWNER`). Must stay consecutive and in order: `SURFACE0 + k` is surface k.
+    Dma { name: "surface-0", base: crate::cachemap::SURFACES.0, size: crate::cachemap::SURFACE_SIZE },
+    Dma { name: "surface-1", base: crate::cachemap::SURFACES.0 + crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
+    Dma { name: "surface-2", base: crate::cachemap::SURFACES.0 + 2 * crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
+    Dma { name: "surface-3", base: crate::cachemap::SURFACES.0 + 3 * crate::cachemap::SURFACE_SIZE, size: crate::cachemap::SURFACE_SIZE },
     // The display's sprite cache (cachemap DISPLAY_SPRITES): cacheable, the display server's alone.
     Dma { name: "display-sprites", base: crate::cachemap::DISPLAY_SPRITES.0, size: crate::cachemap::DISPLAY_SPRITES.1 - crate::cachemap::DISPLAY_SPRITES.0 },
     // The display's 16-bit canvas (cachemap DISPLAY_CANVAS): its back buffer.
     Dma { name: "display-canvas", base: crate::cachemap::DISPLAY_CANVAS.0, size: crate::cachemap::DISPLAY_CANVAS.1 - crate::cachemap::DISPLAY_CANVAS.0 },
 ];
+
+/// The surfaces a spawn can give out, and where the first is in `DMA`.
+pub const SURFACE_COUNT: usize = 4;
+fn surface0() -> usize {
+    DMA.iter().position(|r| r.name == "surface-0").unwrap()
+}
+/// Each surface's owner, by process epoch (0: free). Under the kernel lock.
+static mut SURFACE_OWNER: [u64; SURFACE_COUNT] = [0; SURFACE_COUNT];
+/// Bytes 8-11 of the preferences block: each surface's generation, 0 while it is free and a new nonzero value each time it is given out. The display server reads them on every pass: a window whose surface's byte changed or went to 0 belongs to a process that has ended (WINDOWS.md: the death notice, with no message to send).
+pub const PREF_SURFACES: usize = 8;
+static mut SURFACE_GEN: u8 = 0;
+
+/// Give surface k to the process with `epoch`: the first free one, its generation byte to every process. Under the lock.
+fn surface_take(epoch: u64) -> Option<usize> {
+    let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
+    let k = owners.iter().position(|&o| o == 0)?;
+    owners[k] = epoch;
+    // The generation cycles 1-255: 0 means free.
+    let g = unsafe { SURFACE_GEN = SURFACE_GEN % 255 + 1; SURFACE_GEN };
+    unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = g };
+    write_pref_all(PREF_SURFACES + k, g);
+    Some(k)
+}
+
+/// The surfaces of the process with `epoch` back to free. Under the lock.
+fn surfaces_free(epoch: u64) {
+    let owners = unsafe { &mut *(&raw mut SURFACE_OWNER) };
+    for k in 0..SURFACE_COUNT {
+        if owners[k] == epoch {
+            owners[k] = 0;
+            unsafe { (*(&raw mut PREFS_NOW))[PREF_SURFACES + k] = 0 };
+            write_pref_all(PREF_SURFACES + k, 0);
+        }
+    }
+}
 /// A named scope of the device vault a spawn can grant: every key under `prefix`. A process names keys relative to its scope and cannot reach outside it (no `/`-style escapes exist: the kernel only ever prepends).
 pub struct StoreScope {
     pub name: &'static str,
@@ -1395,6 +1438,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 let tok = take(32);
                 match p.lookup(&tok).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                     Some((Object::Reply(_), _)) | Some((Object::Console, _)) | None => bad = true,
+                    // The whole surfaces region passes as one surface of it, the child's own.
+                    Some((Object::Dma(i), r)) if DMA[i].name == "surfaces" => objects.push((Object::NewSurface, r)),
                     Some(o) => objects.push(o),
                 }
             }
@@ -1658,6 +1703,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
             kk.console.push(b'\n');
         }
         let name = p.name.clone();
+        surfaces_free(p.epoch);
         kk.console.extend_from_slice(&name);
         kk.console.extend_from_slice(b": exit G#");
         for i in (0..16).rev() {
@@ -1845,6 +1891,7 @@ pub fn kill(name: &[u8]) -> bool {
 fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
+    surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == i)).map(|(k, _)| k).collect();
     // A thread of it running on another core leaves at its next trap (`drain_dying`); the arc goes with the last of them.
     let elsewhere = mine.iter().any(|&t| on_a_core(t));
@@ -2057,6 +2104,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 None => return Err("no such hardware block"),
             },
             Grant::Entropy => (Object::Entropy, RIGHT_SEND),
+            Grant::Dma(b"surface") => (Object::NewSurface, RIGHT_SEND | RIGHT_RECV),
             Grant::Dma(n) => match DMA.iter().position(|r| r.name.as_bytes() == *n) {
                 Some(i) => (Object::Dma(i), RIGHT_SEND | RIGHT_RECV),
                 None => return Err("no such DMA region"),
@@ -2109,6 +2157,10 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     let mut cspace = alloc::vec![CapEntry { token: mint(Object::Console, RIGHT_SEND, epoch), object: Object::Console, rights: RIGHT_SEND }];
     for &(object, rights) in objects {
+        let object = match object {
+            Object::NewSurface => Object::Dma(surface0() + surface_take(epoch).ok_or("no free surface (four are in use)")?),
+            o => o,
+        };
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };

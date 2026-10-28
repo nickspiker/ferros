@@ -388,7 +388,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Settings,
         Store(b"map"),
         Dma(b"display-phases"),
-        Dma(b"app-surface"),
+        Dma(b"surfaces"),
         // 23 the touch controller's interrupt line, 24 DECON0's frame-done, 25 its frame-start (KERNEL.md "Interrupts to user space").
         Irq(b"touch-int"), Irq(b"decon0-frame-done"), Irq(b"decon0-frame-start"),
         // 26 the display's sprite cache, 27 its canvas.
@@ -2036,6 +2036,16 @@ pub fn run(mut b: Boot) -> ! {
                                             resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
                                             let (ret, d, i, mpidr) = crate::x3::probe();
                                             resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        // `diag kill <name>…`: each named process ended, its arc and surface freed (development: a bridge-spawned app has no other way out).
+                                        if let Some(names) = cmd.params.strip_prefix(b"kill ") {
+                                            for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                                                let killed = crate::process::kill(name);
+                                                resp.extend_from_slice(name);
+                                                resp.extend_from_slice(if killed { b" killed\n" } else { b" was not running\n" });
+                                            }
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
