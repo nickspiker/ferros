@@ -347,8 +347,33 @@ fn ask_worker(what: u32) -> bool {
     true
 }
 
-/// `diag keyreg [dbg]` and `diag keyreg check`: the probe on this core (the X3) and on worker 0, reported.
+/// The PMU's information cells (pmu_alive G#1546_0000): INFORM0 at G#800 (Linux's c2 allow, exynos-cpupm.h), SYSIP_DAT0 at G#810 (the reboot mode), the rest undocumented. Always-on: they live through deep sleep. Whether a reset (or the bootloader after it) clears any of them is what this window is read for.
+const PMU_INFORM: u64 = 0x1546_0800;
+const PMU_INFORM_CELLS: usize = 64;
+
+/// `diag keyreg ao`: read only. Every cell of the window through the EL3 monitor (a direct PMU read on husky hangs the next EL3 call), eight to a line; ERR where the monitor refused.
+fn ao_survey(out: &mut alloc::vec::Vec<u8>) {
+    for row in 0..PMU_INFORM_CELLS / 8 {
+        let base = PMU_INFORM + (row * 32) as u64;
+        out.extend_from_slice(alloc::format!("G#{:04X}:", base & 0xFFFF).as_bytes());
+        for c in 0..8 {
+            let v = crate::platform::priv_reg(base + c * 4, false, 0);
+            if (v as i64) < 0 {
+                out.extend_from_slice(b" ERR     ");
+            } else {
+                out.extend_from_slice(alloc::format!(" {:08X}", v as u32).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
+}
+
+/// `diag keyreg [dbg]` and `diag keyreg check`: the probe on this core (the X3) and on worker 0, reported. `diag keyreg ao`: the always-on survey above.
 pub fn diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
+    if params == b"ao" {
+        ao_survey(out);
+        return;
+    }
     let check = params == b"check";
     let dbg = params == b"dbg";
     if check {

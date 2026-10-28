@@ -1999,7 +1999,7 @@ pub fn run(mut b: Boot) -> ! {
                                             continue;
                                         }
                                         if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
-                                            // `diag keyreg [dbg|check]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
+                                            // `diag keyreg [dbg|check|ao]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
                                             crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
