@@ -97,3 +97,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Windows](windows_design_pending.md) — built 2026-10-27: a full-screen surface per app (`--dma surface`), composed frontmost first inside a circle tangent to top/bottom (corners = system clock etc), death = generation byte; ops in WINDOWS.md
 - [Feedback: a handle is not a password](feedback_handle_not_password.md) — never mask a handle; show as typed; minting (only) asks for it twice, visibly; attest is one entry
 - [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) — never put identity roots on a device without asking whose device and which identity; the 2026-10-26 roots push put the owner's identity on his wife's phone
+- [fgtw.org serves plain HTTP for ferros](fgtw_plain_http_for_ferros.md) — port 80 works, no redirect (2026-10-28); ferros reaches the seed without TLS via ip's TCP + DNS; never enable Cloudflare Always Use HTTPS on fgtw.org
