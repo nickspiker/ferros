@@ -17,7 +17,7 @@ The phone as a device of the owner's Photon fleet (Claude memories/photon_on_fer
 | key | what | from |
 |---|---|---|
 | ira-derived `photon device` | the device key's fingerprint | the kernel, every boot |
-| `photon.identity_seed`, `photon.handle_proof` | the identity roots | pushed over USB at pairing: `tools/photon-interop/target/debug/roots <dir>` on the dev box (this machine's own Photon session, so the handle is never typed) then `ferros-bridge store put photon.identity_seed @…` and `photon.handle_proof @…` |
+| `photon.identity_seed`, `photon.handle_proof` | the identity roots | written by the attest screen (payloads/ahau) when the person who owns the phone types their handle on it, twice the first time; never pushed from another machine |
 | `photon.chain` | the fleet's membership chain as last adopted | a sponsor's `fleet_resp` |
 | `photon.fleet_key` | the fleet key | a sponsor's `fanout_resp`, opened with our ira |
 
@@ -25,14 +25,16 @@ The handle itself never reaches the phone: `ihi::handle_to_hash` runs over vsf's
 
 ## The join, as built
 
-1. Pair: roots into the vault (above). Spawn: `ferros-bridge spawn photon.bin --name photon --use udp --store photon --ira`.
+1. The person attests on the phone (payloads/ahau, at boot): their handle, twice the first time, then the handle proof (6.5 s on the X3). The roots go into the vault; the client, started by init, finds them within two seconds.
 2. The client prints its 23 pairing words on the console (device key masked to the fleet; public) and beacons every 3 s.
 3. A fleet device heard beaconing → the client hands it the binding request (`bind_req`, about 10.7 KB over PT), re-minted every 210 s as the app re-posts.
 4. The sponsor (a desktop on today's Photon) keeps the request, shows a toast, and lists the device on Settings → Fleet → Add device as a nearby candidate. The human types the words (or taps the candidate: the two-phase confirm).
 5. The sponsor binds into the chain it holds and pushes `fleet_resp`; the client folds it against its roots and finds itself: bound. The sponsor grows the fan-out and pushes `fanout_resp`; the client opens it: the fleet key.
 6. Bound, the client pings the fleet's devices every 10 s and answers pings with tail-less pongs.
 
-Done to step 3 on the first night; steps 4–6 need the owner at the desktop.
+Done to step 3 on the first night; steps 4–6 need the phone's owner at one of their own fleet's devices.
+
+**2026-10-27: the roots must be the phone owner's, entered on the phone.** On 2026-10-26 a session pushed the desktop's own Photon roots (the owner's identity) onto the husky with `tools/photon-interop` `roots` + `store put`; the husky is the owner's wife's phone. The vault was wiped and the join is done properly: she attests on the phone with her own handle and binds it from one of her own devices. The `roots` tool stays for interop tests on the dev box only, never for a device that belongs to someone (Claude memories/feedback_identity_belongs_to_a_person.md).
 
 ## Findings
 

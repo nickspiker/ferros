@@ -208,6 +208,8 @@ struct Client {
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
+    /// When the vault was last asked for the roots while there were none (the attest screen writes them once a person mints this device's identity).
+    last_load_us: u64,
     /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
     given: Option<Addr>,
     given_asked_t: i64,
@@ -222,6 +224,11 @@ impl Client {
     }
 
     fn load(&mut self) {
+        self.load_saying(true);
+    }
+
+    /// `load`, saying where the client stands only when `say` (the two-second look for roots is quiet until they appear).
+    fn load_saying(&mut self, say: bool) {
         let mut b = [0u8; 32];
         if self.given.is_none() {
             let mut g = [0u8; 19];
@@ -255,10 +262,13 @@ impl Client {
                 }
             }
         }
+        if !say && self.hp.is_none() {
+            return;
+        }
         self.log.put(b"photon: device key ");
         self.log.fp(&self.me);
         self.log.put(match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
-            (false, _, _) => b" - not paired: push photon.identity_seed and photon.handle_proof into the vault (tools/photon-interop roots)",
+            (false, _, _) => b" - no identity on this device yet: waiting for the person to attest (the attest screen writes the roots)",
             (true, false, _) => b" - paired, waiting to be bound by a sponsor on this network",
             (true, true, false) => b" - bound, waiting for the fleet key",
             (true, true, true) => b" - a fleet member with the fleet key",
@@ -565,6 +575,17 @@ impl Client {
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
             }
+            // No roots yet: the person has not attested on this device. Look again every two seconds; the attest screen (payloads/ahau) writes them, and the join starts from there without a restart.
+            if self.hp.is_none() && t.saturating_sub(self.last_load_us) >= 2_000_000 {
+                self.last_load_us = t;
+                self.load_saying(false);
+                if self.hp.is_some() {
+                    self.show_words();
+                    if !self.bound {
+                        self.mint_request();
+                    }
+                }
+            }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();
@@ -627,7 +648,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, given, given_asked_t: 0 };
     c.run()
 }
 
