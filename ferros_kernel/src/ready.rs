@@ -2,11 +2,9 @@
 //!
 //! Before the press only what it takes to ask runs — the killswitch, the cache map, the panel, the buttons. The USB controller is held stopped, so nothing listens on any interface; the disk and the identity are untouched. Gathering entropy is neither, so KOHI runs during the wait and the human hides its cost.
 //!
-//! The screen: black, "Ready?" in thin Oxanium (rasterised at build time, build.rs) in the top third, and a green triangle on the right edge pointing at the power button. The press — not the release — is the power key's falling-edge interrupt (killswitch.rs `arm_power_key`, `.Lirq_power`).
+//! The screen: black, a green triangle on the right edge pointing at the power button, and the Google-coloured chevron at volume down. No words: the gate is drawn before the vault opens, so it cannot know the person's language; a symbol reads in every one (owner, 2026-10-27: "wordless"). It was "Ready?" until then; the gate keeps the name. The press — not the release — is the power key's falling-edge interrupt (killswitch.rs `arm_power_key`, `.Lirq_power`).
 //!
 //! Dev builds proceed as if pressed after one second, so unattended loops keep working and every line after the gate is the same code — unless a volume key goes down during that second, which cancels the timer: the gate then waits for the power key like a production build (FERROS_PRODUCTION set at build time), which always waits. There is no remote press: USB does not exist before the press.
-
-static READY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ready.bin"));
 
 /// Panel row the power button sits beside (the triangle's tip points here). Calibrated by eye on husky.
 const POWER_Y: usize = 1050;
@@ -28,12 +26,8 @@ fn px(p: &crate::display::Panel, x: usize, y: usize, c: u32) {
     }
 }
 
-/// Black over exactly what `draw` put on the screen (the word, the triangle, the chevron), so the boot ring starts from black without rewriting all four million pixels: the full clear cost ~370 ms of the press-to-ready time on the uncached surface (2026-10-22).
+/// Black over exactly what `draw` put on the screen (the triangle and the chevron), so the boot ring starts from black without rewriting all four million pixels: the full clear cost ~370 ms of the press-to-ready time on the uncached surface (2026-10-22).
 pub fn erase(p: &crate::display::Panel) {
-    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
-    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
-    let x0 = p.width.saturating_sub(w) / 2;
-    let y0 = (p.rows / 6).saturating_sub(h / 2);
     let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
         for y in ya..yb.min(p.rows) {
             for x in xa..xb.min(p.width) {
@@ -41,27 +35,12 @@ pub fn erase(p: &crate::display::Panel) {
             }
         }
     };
-    rect(x0, y0, x0 + w, y0 + h);
     let tip = p.width - 28;
     rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
     rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
 }
 
 fn draw(p: &crate::display::Panel) {
-    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
-    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
-    let alpha = &READY[8..];
-    let x0 = p.width.saturating_sub(w) / 2;
-    let y0 = (p.rows / 6).saturating_sub(h / 2);
-    for y in 0..h {
-        for x in 0..w {
-            let a = alpha[y * w + x] as u32;
-            if a != 0 {
-                // White over black: each channel is just the coverage.
-                px(p, x0 + x, y0 + y, a << 16 | a << 8 | a);
-            }
-        }
-    }
     let _ = WHITE;
     // Triangle pointing right, tip near the right edge at the power button's height.
     let (tip, half, len) = (p.width - 28, 90usize, 140usize);
@@ -117,9 +96,9 @@ pub fn wait(mut usb: Option<&mut ferros_hal::usb::Dwc3Dev>) -> (u64, Choice) {
     if let Some(panel) = crate::display::adopt_once(freq, &mut rep) {
         crate::checklist::at("gate: panel adopted");
         draw(&panel);
-        crate::checklist::at("gate: Ready? drawn");
+        crate::checklist::at("gate: drawn");
         panel.present(&mut rep);
-        crate::checklist::at("gate: Ready? on screen");
+        crate::checklist::at("gate: on screen");
     }
     crate::killswitch::arm_power_key();
     crate::killswitch::enable_ppi(26);

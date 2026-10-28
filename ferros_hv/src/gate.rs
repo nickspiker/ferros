@@ -1,13 +1,12 @@
 //! The boot gate in the hv (BOOT.md "Dual Boot"): ABL has prepared Android completely (kernel, ramdisks, bootconfig, DTB, and the secure world's boot state, which only the bootloader can set), and before Linux runs the hv asks.
 //!
-//! Screen: ABL's splash surface, saved first, then black with "Ready?", a green triangle at the power key and a Google-coloured chevron at volume down (the same picture as ferros's own gate, ready.rs).
+//! Screen: ABL's splash surface, saved first, then black with a green triangle at the power key and a Google-coloured chevron at volume down (the same picture as ferros's own gate, ready.rs). No words: nothing here can know the person's language (owner, 2026-10-27: "wordless").
 //! Keys: power = ferros; volume down = Android; volume up = hold (cancels the one-second auto-choice of dev builds); both volume keys = the kill chord.
 //! Android: the splash pixels and the layer registers are put back exactly as ABL left them, and the hv carries on to Linux as before. ferros: the cold ferros image packed at the end of the boot blob is copied to its link address and entered at EL2 with ABL's DTB, the way ABL would; a marker in the hv's report page tells it the gate has been answered so it doesn't ask again.
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
-static READY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ready.bin"));
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
@@ -213,18 +212,6 @@ fn px(p: &Panel, x: usize, y: usize, c: u32) {
 fn draw(p: &Panel) {
     const POWER_Y: usize = 1050;
     const VOL_DOWN_Y: usize = 1700;
-    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
-    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
-    let alpha = &READY[8..];
-    let (x0, y0) = (p.width.saturating_sub(w) / 2, (p.height / 6).saturating_sub(h / 2));
-    for y in 0..h {
-        for x in 0..w {
-            let a = alpha[y * w + x] as u32;
-            if a != 0 {
-                px(p, x0 + x, y0 + y, a << 16 | a << 8 | a);
-            }
-        }
-    }
     let (tip, half, len) = (p.width - 28, 90usize, 140usize);
     for dx in 0..len {
         let reach = half * dx / len;
@@ -250,9 +237,6 @@ fn draw(p: &Panel) {
 fn answered(p: &Panel) {
     const POWER_Y: usize = 1050;
     const VOL_DOWN_Y: usize = 1700;
-    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
-    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
-    let (x0, y0) = (p.width.saturating_sub(w) / 2, (p.height / 6).saturating_sub(h / 2));
     let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
         for y in ya..yb {
             for x in xa..xb {
@@ -260,7 +244,6 @@ fn answered(p: &Panel) {
             }
         }
     };
-    rect(x0, y0, x0 + w, y0 + h);
     let tip = p.width - 28;
     rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
     rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
