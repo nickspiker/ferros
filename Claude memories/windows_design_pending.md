@@ -1,6 +1,6 @@
 ---
 name: windows_design_pending
-description: WINDOWS.md (2026-10-27) is the window manager proposal awaiting the owner's picks; the present app path's glitches all trace to one APP slot, one shared app-surface, no caller identity, no death notices, unrouted touches
+description: WINDOWS.md — owner picked full-screen windows, a full-screen buffer per app drawn frontmost first, apps inside a circle tangent to the screen's top and bottom (corners = system); built 2026-10-27 (4 surfaces, generation bytes as death notices, op 22/23/26/27 with the surface base)
 metadata:
   type: project
 ---
@@ -9,4 +9,6 @@ The owner asked to sort the window manager (2026-10-27: "a glitchy hot mess"). W
 
 **Why:** the display server's code shape depends on those picks, and display work is design-first ([[display_driver_design_first]]).
 
-**How to apply:** don't build steps 2 onward of WINDOWS.md's order of work until the owner has picked the knobs; step 1 (map frames off the glass under an app, text at op 26) is done. Related: [[input_rhe_on_glass]] (the keyboard becomes layer 2).
+**Built 2026-10-27:** see WINDOWS.md "Built". Owner's picks: full screen for ownership and layering, an app gets a full-screen buffer to do as it wishes and the display draws them in order frontmost first; an app in front is a full-screen circle tangent to the top and bottom, the four corners for clock, signal, navigation. Open: how widgets fit; touch routing through the display; navigation in the corners; badges once memory isolation exists.
+
+**How to apply:** new apps spawn with `--dma surface` and use ferros_sys::window (show/done/text/mine); keep content inside the circle (honeycomb::corner_rows); check WINDOWS.md before changing the display's ops. Related: [[input_rhe_on_glass]] (the keyboard becomes layer 2).

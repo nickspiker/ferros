@@ -409,6 +409,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Store(b"photon"),
         Ira,
         Use(b"udp"),
+        // 51 the attest screen's vault scope `ahau.` (payloads/ahau).
+        Store(b"ahau"),
     ]
 }
 
@@ -423,6 +425,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ip" => &[44, 45, 41],
         // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon (payloads/photon).
         b"photon" => &[50, 48, 49, 46],
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key (payloads/ahau).
+        b"ahau" => &[17, 18, 22, 51, 48, 49],
         _ => return None,
     };
     let all = home_grants();

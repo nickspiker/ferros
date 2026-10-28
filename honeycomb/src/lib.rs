@@ -64,7 +64,7 @@ pub enum Event {
     /// Delete the last character.
     Back,
     Enter,
-    /// The map key: the host leaves.
+    /// The bar's left key (`Keyboard::left` names it: map in Hive, where the host leaves; show in the attest screen).
     Leave,
     /// The keys changed (shift, a page): the host redraws the keyboard.
     Redraw,
@@ -90,6 +90,8 @@ pub struct Keyboard {
     /// The extent row at the bottom of the view.
     pub view: usize,
     pub shift: bool,
+    /// The bar's left key's label (the host decides what it does: `Event::Leave`).
+    pub left: &'static str,
 }
 
 /// The rows of the circle's corners: how far the circle (tangent to the screen's top and bottom) stays narrower than the screen at the bottom.
@@ -110,7 +112,7 @@ impl Keyboard {
         let cy3 = bar0 - cell_r;
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, left: BAR_KEYS[B_MAP] }
     }
 
     /// The row pitch in pixels: a two-finger drag of this far scrolls one row.
@@ -261,9 +263,92 @@ impl Keyboard {
                 let (x0, x1) = self.bar_x(b);
                 let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2);
                 shape(s, self.w, x0, x1, if on { LIT } else { BAR_KEY }, |_| (y0, y1));
-                centred((x0 + x1) / 2, (self.bar0 + self.bar1) / 2, size * 5 / 7, BAR_KEYS[b], label);
+                centred((x0 + x1) / 2, (self.bar0 + self.bar1) / 2, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
             }
             Key::None => {}
+        }
+    }
+}
+
+/// What the fingers did to the keyboard in one poll.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Touch {
+    /// A finger landed on this key: draw it lit.
+    Light(Key),
+    /// The finger left the key or moved off as a drag: draw it at rest.
+    Unlight(Key),
+    /// A finger lifted from this key without moving and outside a scroll: a tap (pass it to `Keyboard::tap`).
+    Tap(Key),
+    /// A two-finger drag moved the view: redraw the keyboard.
+    Scrolled,
+}
+
+/// Fingers on the keyboard, each on its own (owner, 2026-10-27): a second finger landing before the first lifts is two taps, not a gesture; a key is lit while a finger is on it and is a tap when that finger lifts without moving past the slop; two of the host's fingers moving together scroll the extent a row per row pitch. A finger that moves alone does nothing yet: shape writing goes there.
+pub struct Touches {
+    /// Per contact id: down, where it landed, the key under it, moved past the slop, the host's (not another window's).
+    f: [(bool, i64, i64, Key, bool, bool); 16],
+    /// A scroll: the view and the fingers' mean height when it began.
+    scroll: Option<(usize, i64)>,
+    slop: i64,
+}
+
+impl Touches {
+    /// For a screen `w` pixels wide: the slop is a 56th of it (the map's 24 pixels on this panel).
+    pub fn new(w: usize) -> Touches {
+        Touches { f: [(false, 0, 0, Key::None, false, false); 16], scroll: None, slop: (w / 56) as i64 }
+    }
+
+    /// One poll: `held` is every contact down now (id, x, y). `mine` is asked once per contact as it lands (is the point the host's window's?). Each change goes to `out`.
+    pub fn poll(&mut self, kb: &mut Keyboard, held: &[(u8, i64, i64)], mine: &mut dyn FnMut(i64, i64) -> bool, out: &mut dyn FnMut(Touch)) {
+        let mut here = 0u16;
+        let (mut sum_y, mut ours) = (0i64, 0i64);
+        for &(id, x, y) in held {
+            let id = (id & 15) as usize;
+            here |= 1 << id;
+            let f = &mut self.f[id];
+            if !f.0 {
+                let m = mine(x, y);
+                *f = (true, x, y, if m { kb.hit(x, y) } else { Key::None }, false, m);
+                if f.3 != Key::None {
+                    out(Touch::Light(f.3));
+                }
+            } else if !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > self.slop * self.slop {
+                f.4 = true;
+                if f.3 != Key::None {
+                    out(Touch::Unlight(f.3));
+                }
+            }
+            if f.5 {
+                sum_y += y;
+                ours += 1;
+            }
+        }
+        // Two of the host's fingers: a scroll from where they stood when the second landed; dragging down shows the rows above.
+        if ours == 2 {
+            let mean = sum_y / 2;
+            match self.scroll {
+                None => self.scroll = Some((kb.view, mean)),
+                Some((v0, y0)) => {
+                    if kb.scroll_to(v0 as i64 + (mean - y0) / kb.row_pitch()) {
+                        out(Touch::Scrolled);
+                    }
+                }
+            }
+        }
+        for id in 0..16 {
+            let f = self.f[id];
+            if f.0 && here >> id & 1 == 0 {
+                self.f[id].0 = false;
+                if f.3 != Key::None && !f.4 {
+                    out(Touch::Unlight(f.3));
+                    if self.scroll.is_none() {
+                        out(Touch::Tap(f.3));
+                    }
+                }
+            }
+        }
+        if self.f.iter().all(|f| !f.0) {
+            self.scroll = None;
         }
     }
 }

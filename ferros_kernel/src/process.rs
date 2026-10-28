@@ -922,6 +922,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "wifi", prefix: "wifi." },
     // The Photon client's (payloads/photon): the identity roots pushed at pairing (`photon.identity_seed`, `photon.handle_proof`; secret), the fleet chain and key once bound (`photon.chain`, `photon.fleet_key`), the phonebook.
     StoreScope { name: "photon", prefix: "photon." },
+    // The attest screen's (payloads/ahau): the device's verifier for its identity (`ahau.verifier`), the identity seed under the device's ira key.
+    StoreScope { name: "ahau", prefix: "ahau." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;

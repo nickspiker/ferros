@@ -9,7 +9,7 @@
 #![no_main]
 
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
-use honeycomb::{Event, Key, Keyboard, NONE_KEY};
+use honeycomb::{Event, Key, Keyboard, Touch, Touches};
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
@@ -145,74 +145,32 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("hive: on the panel ({w}x{h}; drawn in {drawn} us)\n"));
         console(grants, l.as_bytes());
     }
-    // Each finger on its own: where it landed, the key under it, whether it moved past the slop, whether it is ours at all. The slop is the map's, scaled: a 56th of the screen's width.
-    let slop = (w / 56) as i64;
-    let mut fingers = [(false, 0i64, 0i64, NONE_KEY, false, false); 16];
-    // A two-finger scroll: the view and the fingers' mean height when it began.
-    let mut scroll: Option<(usize, i64)> = None;
+    let mut touches = Touches::new(w);
+    let mut held = [(0u8, 0i64, 0i64); 16];
     loop {
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
-        let mut here = [false; 16];
-        let mut dirty = false;
-        let (mut sum_y, mut ours) = (0i64, 0i64);
-        for k in 0..count {
-            if 1 + (k + 1) * 12 > n {
-                break;
-            }
+        let mut k = 0;
+        while k < count && 1 + (k + 1) * 12 <= n {
             let rec = &r[1 + k * 12..1 + (k + 1) * 12];
-            let id = (rec[0] as usize) & 15;
-            let (x, y) = (u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
-            here[id] = true;
-            let f = &mut fingers[id];
-            if !f.0 {
-                let mine = window::mine(display, base, x as u16, y as u16);
-                *f = (true, x, y, if mine { hive.kb.hit(x, y) } else { NONE_KEY }, false, mine);
-                if f.3 != NONE_KEY {
-                    hive.kb.draw_key(hive.surf(), f.3, true, &mut hive.label());
-                    dirty = true;
-                }
-            } else if !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > slop * slop {
-                f.4 = true;
-                if f.3 != NONE_KEY {
-                    hive.kb.draw_key(hive.surf(), f.3, false, &mut hive.label());
-                    dirty = true;
-                }
-            }
-            if f.5 {
-                sum_y += y;
-                ours += 1;
-            }
+            held[k] = (rec[0], u16::from_le_bytes([rec[4], rec[5]]) as i64, u16::from_le_bytes([rec[6], rec[7]]) as i64);
+            k += 1;
         }
-        // Two of our fingers: a scroll from where they stood when the second landed; dragging down shows the rows above.
-        if ours == 2 {
-            let mean = sum_y / 2;
-            match scroll {
-                None => scroll = Some((hive.kb.view, mean)),
-                Some((v0, y0)) => {
-                    if hive.kb.scroll_to(v0 as i64 + (mean - y0) / hive.kb.row_pitch()) {
-                        hive.kb.draw(hive.surf(), &mut hive.label());
-                        dirty = true;
-                    }
-                }
+        // The poll's changes first (it holds the keyboard), then drawn.
+        let mut outs = [Touch::Scrolled; 48];
+        let mut no = 0;
+        touches.poll(&mut hive.kb, &held[..k], &mut |x, y| window::mine(display, base, x as u16, y as u16), &mut |t| {
+            outs[no] = t;
+            no += 1;
+        });
+        let dirty = no > 0;
+        for &t in &outs[..no] {
+            match t {
+                Touch::Light(key) => hive.kb.draw_key(hive.surf(), key, true, &mut hive.label()),
+                Touch::Unlight(key) => hive.kb.draw_key(hive.surf(), key, false, &mut hive.label()),
+                Touch::Scrolled => hive.kb.draw(hive.surf(), &mut hive.label()),
+                Touch::Tap(key) => hive.tap(grants, key),
             }
-        }
-        for id in 0..16 {
-            let f = fingers[id];
-            if f.0 && !here[id] {
-                fingers[id].0 = false;
-                if f.3 != NONE_KEY {
-                    hive.kb.draw_key(hive.surf(), f.3, false, &mut hive.label());
-                    dirty = true;
-                }
-                // A tap: it did not move, and no scroll ran while it was down.
-                if f.3 != NONE_KEY && !f.4 && scroll.is_none() {
-                    hive.tap(grants, f.3);
-                }
-            }
-        }
-        if fingers.iter().all(|f| !f.0) {
-            scroll = None;
         }
         if dirty {
             hive.show();

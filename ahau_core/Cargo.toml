@@ -1,0 +1,13 @@
+[package]
+name = "ahau_core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "ahau's identity derivation without std: a handle typed on the honeycomb keyboard to vsf's x bytes (byte-exact with vsf 0.6.42 for every character the keyboard has), its BLAKE3 (ihi's identity seed), and the device's verifier for it"
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+
+[dev-dependencies]
+vsf = { version = "=0.6.42", default-features = false, features = ["text-encode"] }
+ihi = { path = "../../ihi" }

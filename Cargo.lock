@@ -70,6 +70,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahau_core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ihi 0.0.48",
+ "vsf 0.6.42",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,6 +787,17 @@ dependencies = [
  "ed25519-compact",
  "flate2",
  "lz4_flex",
+]
+
+[[package]]
+name = "ferros-payload-ahau"
+version = "0.1.0"
+dependencies = [
+ "ahau_core",
+ "blake3",
+ "ferros_sys",
+ "honeycomb",
+ "ihi 0.0.48",
 ]
 
 [[package]]
@@ -1628,6 +1648,7 @@ dependencies = [
  "i256",
  "sha2",
  "sha3",
+ "vsf 0.6.42",
 ]
 
 [[package]]
@@ -2833,6 +2854,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2895,6 +2922,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-width"
@@ -2973,6 +3009,23 @@ dependencies = [
  "num-traits",
  "rand",
  "x25519-dalek",
+]
+
+[[package]]
+name = "vsf"
+version = "0.6.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "unicode-normalization",
 ]
 
 [[package]]
