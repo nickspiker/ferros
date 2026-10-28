@@ -38,9 +38,9 @@ A S D F G H J K L .         (10)
 ```
  , . P Y F G C R L
 A O E U I D H T N S
- Q J K X B M W V Z
+ Z Q J K X B M W V
 ```
-Z lands below-between A and S, near its physical spot. Moving Q costs QWERTY users one key; Q is rare and nearly always precedes U (a distinctive trace). The grid can't hold the apostrophe, which in everyday writing outnumbers Q, Z, X, J: the trace decoder inserts it in contractions automatically (dont → don't); for tapping it goes in the first row of the scroll extent. Space, backspace, enter sit outside the 28.
+Z and ; swap (owner, 2026-10-27: "careful. z and ; get swapped"): Z takes ;'s place at the left of the bottom row, below-between A and O, near its physical spot, and ; goes to the scroll extent with '. The drawing before that day had Z at the right end of the row, which was wrong. Moving Q costs QWERTY users one key; Q is rare and nearly always precedes U (a distinctive trace). The grid can't hold the apostrophe, which in everyday writing outnumbers Q, Z, X, J: the trace decoder inserts it in contractions automatically (dont → don't); for tapping it goes in the first row of the scroll extent. Space, backspace, enter sit outside the 28.
 
 **Full extent (owner asked 9-10-9-10-9 vs symbols below / space placement — my recommendation, not yet decided):** stack the extent UPWARD from the letters like a physical keyboard, with a fixed control bar underneath that never scrolls:
 ```
