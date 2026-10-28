@@ -176,32 +176,95 @@ fn address_point(c: (f64, f64), bits: &[u8; 32]) -> (f64, f64) {
     (x, y)
 }
 
-/// The descent: down the line Re c = x from Im c = 2 in the parameter plane of z² + c, until within 2⁻¹² of the set or on the real axis; at most 2⁹ steps.
+/// Newton steps when solving for an attracting cycle.
+const NEWTON_STEPS: u32 = 1 << 5;
+/// Iteration cap for classifying a point of the parameter plane.
+const CLASSIFY_ITER: u32 = 1 << 12;
+
+/// Is there an attracting cycle of period `period` near `guess`? Newton on f^period(w) = w; a converged cycle with |multiplier| < 1 proves c is inside the set.
+/// Ported from mandelbrot-exploder (compute/mandelbrot_f64.rs, find_interior_attractor).
+fn attracting_cycle(c: (f64, f64), guess: (f64, f64), period: u32) -> bool {
+    let mut w = guess;
+    for _ in 0..NEWTON_STEPS {
+        let (mut u, mut du) = (w, (1., 0.));
+        for _ in 0..period {
+            du = cmul((2. * du.0, 2. * du.1), u);
+            let uu = cmul(u, u);
+            u = (uu.0 + c.0, uu.1 + c.1);
+        }
+        // Newton step: w ← w − (u − w) / (du − 1).
+        let (nr, ni) = (u.0 - w.0, u.1 - w.1);
+        let (dr, di) = (du.0 - 1., du.1);
+        let dd = dr * dr + di * di;
+        let step = ((nr * dr + ni * di) / dd, (ni * dr - nr * di) / dd);
+        w = (w.0 - step.0, w.1 - step.1);
+        if step.0 * step.0 + step.1 * step.1 < (-53f64).exp2() {
+            return du.0 * du.0 + du.1 * du.1 < 1.;
+        }
+    }
+    false
+}
+
+/// Where c is with respect to the Mandelbrot set.
+enum Class {
+    /// Escaped at iteration n with |z| = r and |dz/dc| = dm.
+    Outside { n: u32, r: f64, dm: f64 },
+    /// Proven inside: an attracting cycle was found.
+    Inside,
+    /// Neither within the cap.
+    Undecided,
+}
+
+/// Classify c, ported from mandelbrot-exploder's classify_point: iterate from z = c, and whenever |z|² falls below a quarter of its previous minimum, try Newton for an attracting cycle of the period reached so far.
+fn classify(c: (f64, f64)) -> Class {
+    let (mut z, mut dz) = (c, (1f64, 0f64));
+    let mut smallest = f64::MAX;
+    for n in 1..CLASSIFY_ITER {
+        let r2 = z.0 * z.0 + z.1 * z.1;
+        if r2 > BAIL_SQ {
+            return Class::Outside { n, r: r2.sqrt(), dm: (dz.0 * dz.0 + dz.1 * dz.1).sqrt() };
+        }
+        if r2 < smallest {
+            let ratio = r2 / smallest;
+            smallest = r2;
+            if ratio < 0.25 && attracting_cycle(c, z, n) {
+                return Class::Inside;
+            }
+        }
+        let zdz = cmul(z, dz);
+        dz = (2. * zdz.0 + 1., 2. * zdz.1);
+        let zz = cmul(z, z);
+        z = (zz.0 + c.0, zz.1 + c.1);
+    }
+    Class::Undecided
+}
+
+/// The descent: down the line Re c = x from Im c = 2, until within 2⁻¹² of the set, onto it (proven inside or undecided), or onto the real axis; at most 2⁹ steps.
 /// Each step is the PROVEN lower bound on the distance to the set (Koebe, via Milnor): with G = ln|z|/2ⁿ the Green's function and d = |z|·ln|z|/|dc| the estimate (= G/|G′|), the true distance is at least sinh G / (2·e^G·|G′|) = d·(1 − e^(−2G))/(4G).
 /// That factor is ½ next to the set and smaller far out (about 0.22 at G = 1), so the step never jumps past anything, not even a hair-thin filament, and the descent stops at the first, outermost contact along the line.
-/// Returns the landing point and whether it is on the set (false when the line missed it and reached the axis).
-fn descend(x: f64, power: u32) -> ((f64, f64), bool) {
-    let probe = Params { kind: Kind::Plane, power, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase: [0.; 3], mode: 0, trap: (0., 0.) };
+/// Returns the landing point, whether it is on the set (false when the line missed it and reached the axis), and every point it checked, in order.
+pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
     let mut y = 2.;
+    let mut trail = Vec::new();
     for _ in 0..(1 << 9) {
-        let o = orbit(x, y, &probe);
-        if o.n == MAX_ITER {
+        trail.push((x, y));
+        let Class::Outside { n, r, dm } = classify((x, y)) else {
             break;
-        }
-        let r = (o.x * o.x + o.y * o.y).sqrt();
-        let d = r * r.ln() / o.dm;
+        };
+        let d = r * r.ln() / dm;
         if d < 1. / (1 << 12) as f64 {
             break;
         }
         // G underflows to 0 for orbits longer than about 2¹⁰ steps, where the factor's limit, ½, is exact enough.
-        let g = r.ln() * (-(o.n as f64)).exp2();
+        let g = r.ln() * (-(n as f64)).exp2();
         let factor = if g > 0. { -(-2. * g).exp_m1() / (4. * g) } else { 0.5 };
         y -= d * factor;
         if y <= 0. {
-            return ((x, 0.), false);
+            trail.push((x, 0.));
+            return ((x, 0.), false, trail);
         }
     }
-    ((x, y), true)
+    ((x, y), true, trail)
 }
 
 impl Params {
@@ -220,7 +283,7 @@ impl Params {
             let a = draw(salt, 2, n, text.as_bytes());
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
-            let (land, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64, 2);
+            let (land, _, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64);
             let c = (land.0, land.1 + (-(4. + unit(&a[12..16]) * 6.)).exp2());
             let point = address_point(c, &a);
             let half = 2. / (unit(&t[0..4]) * 6.).exp2();
@@ -285,40 +348,60 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     });
 }
 
-/// Where this picture came from in the Mandelbrot set: the c of a Julia family, or the centre of a Mandelbrot zoom; and, for a zoom, its window's half-span.
-pub fn locus(p: &Params) -> ((f64, f64), Option<f64>) {
-    if p.kind == Kind::Plane { (p.centre, Some(p.half)) } else { (p.c, None) }
+/// Where this picture came from in the Mandelbrot set: the Julia set's c.
+pub fn locus(p: &Params) -> (f64, f64) {
+    p.c
 }
 
-/// A locator pane: the Mandelbrot set around `centre` (half-span `half`), in this device's colouring, with a crosshair on the picture's locus and, for a zoom, a ring the size of its window.
-pub fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64, f64), half: f64) {
-    let q = Params { kind: Kind::Plane, power: 2, c: (0., 0.), centre, half, rot: (1., 0.), ..*p };
+/// The whole-set locator: the Mandelbrot set from Re −2.25 to 0.75 and Im −1.3 to 2.1 (high enough to show where the descent starts), fitted to the pane on both axes.
+pub fn render_whole(buf: &mut [u32], w: usize, h: usize, p: &Params) {
+    let (ext_w, ext_h) = (3., 3.4);
+    // The larger of the two scales is the one at which both extents fit the pane; this picks a fit, it does not clamp anything.
+    let k = (ext_w / w as f64).max(ext_h / h as f64);
+    render_locator(buf, w, h, p, (-0.75, 0.4), k);
+}
+
+/// The near locator: a 2⁵× zoom around the picture's c, 2⁻⁴ across the pane's span.
+pub fn render_near(buf: &mut [u32], w: usize, h: usize, p: &Params) {
+    let span = 2. * (w * h) as f64 / (w + h) as f64;
+    render_locator(buf, w, h, p, locus(p), (1. / (1 << 5) as f64) / (span * 0.5));
+}
+
+/// A locator pane at `k` plane units per pixel about `centre`, imaginary axis up, in this device's colouring: every point the descent checked as a pixel in its own random colour, and a crosshair on c.
+fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64, f64), k: f64) {
+    let span = 2. * (w * h) as f64 / (w + h) as f64;
+    let q = Params { kind: Kind::Plane, power: 2, c: (0., 0.), centre, half: k * span * 0.5, rot: (1., 0.), ..*p };
     render(buf, w, h, &q);
-    let k = scale(&q, w, h);
-    let (at, window) = locus(p);
-    let (mx, my) = ((at.0 - centre.0) / k + w as f64 * 0.5, (at.1 - centre.1) / k + h as f64 * 0.5);
-    let white = pack_argb(255, 255, 255, 255);
-    // WHY/PROOF: the locus can lie anywhere in the plane, off this pane or near its edge, and the marker's pixels are computed from it; a write outside the pane would land in the neighbouring pane's rows or past the buffer.
-    let mut put = |x: f64, y: f64| {
+    // Rows run downward and the imaginary axis runs up: flip.
+    let (top, bottom) = buf.split_at_mut(w * (h / 2));
+    for row in 0..h / 2 {
+        let b = (h - h / 2 - 1 - row) * w;
+        top[row * w..(row + 1) * w].swap_with_slice(&mut bottom[b..b + w]);
+    }
+    let at = locus(p);
+    let to_px = |c: (f64, f64)| ((c.0 - centre.0) / k + w as f64 * 0.5 - 0.5, h as f64 * 0.5 - 0.5 - (c.1 - centre.1) / k);
+    // WHY/PROOF: the points come from the plane and can lie off this pane or on its edge; a write outside it would land in the neighbouring pane's rows or past the buffer.
+    let mut put = |x: f64, y: f64, colour: u32| {
         if x >= 0. && y >= 0. && (x as usize) < w && (y as usize) < h {
-            buf[y as usize * w + x as usize] = white;
+            buf[y as usize * w + x as usize] = colour;
         }
     };
+    let (_, _, trail) = descend(at.0);
+    for (i, &pt) in trail.iter().enumerate() {
+        let hsh = blake3::hash(&(i as u32).to_le_bytes());
+        let b = hsh.as_bytes();
+        let (x, y) = to_px(pt);
+        put(x, y, pack_argb(b[0] | (1 << 6), b[1] | (1 << 6), b[2] | (1 << 6), 255));
+    }
+    let (mx, my) = to_px(at);
+    let white = pack_argb(255, 255, 255, 255);
     // Crosshair arms from 2² to 2⁴ pixels out, leaving the point itself clear.
     for i in (1 << 2)..(1 << 4) {
         let f = i as f64;
-        put(mx + f, my);
-        put(mx - f, my);
-        put(mx, my + f);
-        put(mx, my - f);
-    }
-    if let Some(wh) = window {
-        let r = wh / k;
-        let steps = (r * TAU) as u32 + (1 << 4);
-        for i in 0..steps {
-            let a = i as f64 * TAU / steps as f64;
-            put(mx + r * a.cos(), my + r * a.sin());
-        }
+        put(mx + f, my, white);
+        put(mx - f, my, white);
+        put(mx, my + f, white);
+        put(mx, my - f, white);
     }
 }
 

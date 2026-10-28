@@ -3,7 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
-//! For tuning, the window is split: the mark in the top half, and below it two locator strips — the whole Mandelbrot set with a crosshair where the picture came from (the c of a Julia family, the centre of a Mandelbrot zoom with a ring the size of its window), and a 2⁵× zoom around that point.
+//! For tuning, the window is split: the mark in the top half, and below it two locator strips, imaginary axis up — the whole Mandelbrot set with every point the descent checked as a pixel in its own random colour and a crosshair on the Julia set's c, and a 2⁵× zoom around c.
 //! The text is never printed or stored.
 
 mod mark;
@@ -198,9 +198,8 @@ impl FluorApp for App {
             let (top, rest) = self.mark.split_at_mut(w * h0);
             let (whole, near) = rest.split_at_mut(w * h1);
             mark::render(top, w, h0, &p);
-            mark::render_locator(whole, w, h1, &p, (-0.75, 0.), 1.25);
-            let (at, _) = mark::locus(&p);
-            mark::render_locator(near, w, h - h0 - h1, &p, at, 1. / (1 << 5) as f64);
+            mark::render_whole(whole, w, h1, &p);
+            mark::render_near(near, w, h - h0 - h1, &p);
             self.mark_key = key;
         }
 
