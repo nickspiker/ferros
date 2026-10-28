@@ -246,6 +246,39 @@ fn draw(p: &Panel) {
     unsafe { asm!("dsb sy") };
 }
 
+/// The moment ferros is chosen: the gate's picture off (the rectangles ferros's ready.rs `erase` clears) and the boot ring's first frame, its dark-brick disc (checklist.rs `ring_start`: the same centre, radius and colour), so the press answers on the glass within a frame while ferros boots behind it. ferros then adopts the panel without clearing it (the hv left it black) and draws the same disc again. Owner, 2026-10-27: a third of a second from the press to black was "kind of embarrassing"; it was ferros's whole entry, the cache map and a 16 MB uncached clear, before anything moved.
+fn answered(p: &Panel) {
+    const POWER_Y: usize = 1050;
+    const VOL_DOWN_Y: usize = 1700;
+    let w = u32::from_le_bytes([READY[0], READY[1], READY[2], READY[3]]) as usize;
+    let h = u32::from_le_bytes([READY[4], READY[5], READY[6], READY[7]]) as usize;
+    let (x0, y0) = (p.width.saturating_sub(w) / 2, (p.height / 6).saturating_sub(h / 2));
+    let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
+        for y in ya..yb {
+            for x in xa..xb {
+                px(p, x, y, 0);
+            }
+        }
+    };
+    rect(x0, y0, x0 + w, y0 + h);
+    let tip = p.width - 28;
+    rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
+    rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
+    // The ring's disc: centred, in the top half's middle on a dev build (checklist.rs `centre`), radius 230, dark brick.
+    const R_DISC: i64 = 230;
+    const DISC: u32 = 0x003C_0200;
+    let (cx, cy) = ((p.width / 2) as i64, if option_env!("FERROS_PRODUCTION").is_some() { (p.height / 2) as i64 } else { (p.height / 4) as i64 });
+    for y in -R_DISC..=R_DISC {
+        for x in -R_DISC..=R_DISC {
+            if x * x + y * y <= R_DISC * R_DISC {
+                px(p, (cx + x) as usize, (cy + y) as usize, DISC);
+            }
+        }
+    }
+    unsafe { asm!("dsb sy") };
+    present(p);
+}
+
 /// Put back what `adopt` changed: the pixels, the layer format, the windows; one frame so the DPU holds ABL's state again; the trigger as ABL left it.
 fn restore(p: &Panel) {
     if p.saved {
@@ -351,9 +384,10 @@ pub fn ask() -> Choice {
         let t = now();
         while now().wrapping_sub(t) < f / 100 {}
     };
-    if choice == Choice::Android {
-        if let Some(p) = &panel {
-            restore(p);
+    if let Some(p) = &panel {
+        match choice {
+            Choice::Android => restore(p),
+            Choice::Ferros => answered(p),
         }
     }
     choice

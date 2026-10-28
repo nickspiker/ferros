@@ -303,12 +303,14 @@ pub struct Touches {
     tracer: Option<usize>,
     trace: [(i64, i64); 256],
     traced: usize,
+    /// Whether a moving finger traces a word (Hive). Off (the attest screen, where every key is exact): a finger that rolls past the slop still types the key it landed on, since there is no gesture for the movement to mean (2026-10-27: the attest screen dropped letters a rolling tap moved off).
+    pub trace_words: bool,
 }
 
 impl Touches {
     /// For a screen `w` pixels wide: the slop is a 56th of it (the map's 24 pixels on this panel).
     pub fn new(w: usize) -> Touches {
-        Touches { f: [(false, 0, 0, Key::None, false, false); 16], scroll: None, slop: (w / 56) as i64, tracer: None, trace: [(0, 0); 256], traced: 0 }
+        Touches { f: [(false, 0, 0, Key::None, false, false); 16], scroll: None, slop: (w / 56) as i64, tracer: None, trace: [(0, 0); 256], traced: 0, trace_words: true }
     }
 
     /// The last trace's path.
@@ -330,7 +332,7 @@ impl Touches {
                 if f.3 != Key::None {
                     out(Touch::Light(f.3));
                 }
-            } else if !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > self.slop * self.slop {
+            } else if self.trace_words && !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > self.slop * self.slop {
                 f.4 = true;
                 if f.3 != Key::None {
                     out(Touch::Unlight(f.3));

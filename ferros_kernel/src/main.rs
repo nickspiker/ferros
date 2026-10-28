@@ -1739,6 +1739,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     killswitch::arm();
     // Boot timing starts here: everything after this is ferros's own time (`diag boot`).
     checklist::ENTRY.store(platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // The I-cache before the cache map: with the MMU off and the I-cache off every instruction is a DRAM read, and building the tables plus discarding the window's stale lines ran 317 ms that way (`diag boot`, 2026-10-27). With SCTLR.I set and the MMU off, instruction fetches are cacheable; `enable_icache` invalidates first.
+    platform::enable_icache();
     let cached = cachemap::enable();
     checklist::at("cache map on");
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
@@ -1748,7 +1750,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     unsafe { KERNEL_HEAP.init(heap_base, HEAP_SIZE) };
     // The heap's second region joins later, from the service loop (`heap2_join`): its stale lines must be discarded first, and that takes ~235 ms the boot should not wait for.
     HEAP2_CACHED.store(cached, Ordering::Relaxed);
-    platform::enable_icache();
     platform::canary_init();
     platform::stack_paint();
     platform::notes_rotate();
@@ -1767,9 +1768,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
     let hv_answered = ready::answered_by_hv();
     let real_boot = dtb_addr != 0 && dtb_addr & 1 == 0;
-    // The board's CDT and MLB for the sensor registry scripts (usf.rs), while ABL's device tree is still where it put it.
-    if real_boot {
-        usf::read_board(dtb_addr);
+    // The hv's gate cleared the panel and drew only the gate's picture: adopting it need not clear it again.
+    if hv_answered {
+        display::KEEP_PIXELS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     // Dev builds bring USB up before the gate, so the host can answer it (`ferros-bridge gate ferros|android|hold`) as the keys do; the service takes the controller over after the press. Release builds have no USB until the press (owner, 2026-10-22).
     let mut gate_usb: Option<ferros_hal::usb::Dwc3Dev> = None;
@@ -1824,6 +1825,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
     checklist::at("checklist drawn");
+    // The board's CDT and MLB for the sensor registry scripts (usf.rs), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
+    if real_boot {
+        usf::read_board(dtb_addr);
+    }
+    checklist::at("board read");
     if cached {
         checklist::mark(checklist::Item::CacheMap);
     }

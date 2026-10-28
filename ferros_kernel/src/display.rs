@@ -390,6 +390,9 @@ pub fn dpu_on() -> bool {
 static mut ADOPTED: Option<Panel> = None;
 
 /// `adopt` once per boot: the first call adopts, every later one hands back the same panel.
+/// Set when the screen is known black but for the gate's picture (the hv's gate answered): `adopt` leaves the pixels alone.
+pub static KEEP_PIXELS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn adopt_once(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     unsafe {
         let a = &raw mut ADOPTED;
@@ -539,10 +542,12 @@ pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
     // Pixels: the whole surface to black — the contiguous prefix directly, the rest through the mapping.
     const BG: u32 = 0x0000_0000;
     let contig_rows = contig / (stride * 4);
-    for i in 0..contig_rows * stride {
+    // Already black (the hv's gate cleared it and drew only what ready.rs `erase` takes off): the clear is skipped. It is 16 MB of uncached word writes, ~420 ms of the press-to-ring time on the hv path (`diag boot`, 2026-10-27).
+    let keep = KEEP_PIXELS.load(core::sync::atomic::Ordering::Relaxed);
+    for i in 0..if keep { 0 } else { contig_rows * stride } {
         wr(phys0 as usize + i * 4, BG);
     }
-    let mut off = contig_rows * stride * 4;
+    let mut off = if keep { fb_bytes } else { contig_rows * stride * 4 };
     while off < fb_bytes {
         if let Some(p) = iova_to_phys(sysmmu, iova + off as u64) {
             let page_left = 0x1000 - (off & 0xFFF);

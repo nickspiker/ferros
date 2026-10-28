@@ -373,7 +373,7 @@ fn mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
 pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     // Spawned with any input: the handle proof's time on this phone over a fixed seed, on the core it lands on and on the X3, then exit (a development measurement; nothing is read or kept).
-    if input_len > 0 {
+    if input_len > 0 && unsafe { *((ferros_sys::arc_base() + _input) as *const u8) } != b'c' {
         for (name, mask) in [("a worker", ferros_sys::CORES_WORKERS), ("the X3", ferros_sys::CORES_BIG)] {
             ferros_sys::pin(mask);
             sleep_until(now() + freq() / 1000);
@@ -407,6 +407,18 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     };
     let verifier = read32(S_AHAU, b"verifier");
     let photon_seed = read32(S_PHOTON, b"identity_seed");
+    // Spawned with input "c": does the kept verifier belong to the paired seed under this device's key? Yes or no and nothing else (a development check; no handle involved).
+    if input_len == 1 && unsafe { *((ferros_sys::arc_base() + _input) as *const u8) } == b'c' {
+        let line: &[u8] = match (verifier, photon_seed) {
+            (Some(v), Some(ps)) if ahau_core::same(&v, &ahau_core::verifier(&device_key, &ps)) => b"ahau check: the verifier belongs to the paired seed\n",
+            (Some(_), Some(_)) => b"ahau check: the verifier does NOT belong to the paired seed\n",
+            (None, Some(_)) => b"ahau check: no verifier yet; the paired seed is there\n",
+            (Some(_), None) => b"ahau check: a verifier but no paired seed\n",
+            (None, None) => b"ahau check: neither\n",
+        };
+        console(grants, line);
+        exit(0);
+    }
     let mode = if verifier.is_some() || photon_seed.is_some() { Mode::Known } else { Mode::Fresh };
     let mut kb = Keyboard::new(w, h);
     kb.left = "clear";
@@ -415,6 +427,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     a.show();
     console(grants, if mode == Mode::Known { b"ahau: waiting for this device's identity\n" } else { b"ahau: no identity on this device yet\n" });
     let mut touches = Touches::new(w);
+    // Every key exact: a rolling finger still types where it landed.
+    touches.trace_words = false;
     let mut held = [(0u8, 0i64, 0i64); 16];
     loop {
         let n = call(touch, &[1], &mut r) as usize;
