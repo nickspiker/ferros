@@ -3,9 +3,9 @@
 //! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. The device keeps a verifier, the seed under its ira's `ahau verifier` key, in the vault scope `ahau.`; matching it means the typed handle is this device's identity.
 //!
 //! - A device that knows its identity (a verifier, or the Photon roots pushed at pairing, `photon.identity_seed`): the handle is checked against it; the first match writes the verifier.
-//! - A device with no identity yet: enter shows what becomes the device's identity, enter again confirms, then its handle proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, and the roots go where the Photon client reads them (`photon.identity_seed`, `photon.handle_proof`) beside the verifier.
+//! - A device with no identity yet: the handle is typed, then typed again (minting happens once, so a typo would be permanent), then its handle proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, and the roots go where the Photon client reads them (`photon.identity_seed`, `photon.handle_proof`) beside the verifier.
 //!
-//! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. A new identity is confirmed the way Photon confirms permanence: enter once to see what becomes the device's identity, enter again (the same text) to make it so. The buffer is wiped once attest succeeds.
+//! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. Minting a new identity asks for the handle a second time, shown as typed like the first, the first cleared so a typo is not simply copied (owner, 2026-10-27: "you only do that once"); clear during the second goes back to the first. The buffer is wiped once attest succeeds.
 //!
 //! The scratch is this process's own .bss (25 MiB): the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds it (payload.ld).
 //!
@@ -186,7 +186,7 @@ impl Ahau {
         match self.mode {
             Mode::Known => "This device knows one identity. Type its handle.",
             Mode::Fresh => "No identity on this device yet. Type your handle.",
-            Mode::Confirm(_) => "This becomes this device's identity. Enter again to confirm.",
+            Mode::Confirm(_) => "Type it again: it becomes this device's identity.",
         }
     }
 
@@ -239,11 +239,16 @@ impl Ahau {
             }
             Mode::Fresh => {
                 self.mode = Mode::Confirm(seed);
+                self.wipe();
                 self.status(self.prompt());
             }
             Mode::Confirm(first) => {
-                // An edit since the first enter went back to Fresh; this is the same text.
-                debug_assert!(ahau_core::same(&first, &seed));
+                if !ahau_core::same(&first, &seed) {
+                    // The second stays on screen; corrected and entered, it is the first of a new pair.
+                    self.mode = Mode::Fresh;
+                    self.status("The two did not match. Fix it and enter, then type it again.");
+                    return;
+                }
                 self.status("Deriving the handle's proof: about seven seconds.");
                 self.entry();
                 self.show();
@@ -271,7 +276,7 @@ impl Ahau {
         }
     }
 
-    /// An edit after the first enter of a new identity: the confirmation was for the text as it was.
+    /// Back to the first entry of a new identity (clear during the second).
     fn unconfirm(&mut self) {
         if let Mode::Confirm(_) = self.mode {
             self.mode = Mode::Fresh;
@@ -289,7 +294,6 @@ impl Ahau {
     fn tap(&mut self, key: Key) {
         match self.kb.tap(key) {
             Some(Event::Char(c)) => {
-                self.unconfirm();
                 let mut b = [0u8; 4];
                 let e = c.encode_utf8(&mut b).as_bytes();
                 if self.chars < MAX_CHARS {
@@ -300,7 +304,6 @@ impl Ahau {
                 self.entry();
             }
             Some(Event::Back) => {
-                self.unconfirm();
                 while self.len > 0 {
                     self.len -= 1;
                     let lead = self.handle[self.len] & 0xC0 != 0x80;
