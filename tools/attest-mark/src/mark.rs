@@ -4,13 +4,16 @@
 //! The families:
 //! 0. quadratic Julia sets, c chosen symbolically: a bulb p/q on the main cardioid (q from 2 to 2⁴; J(c) near it spirals with q arms), sometimes a sub-bulb p′/q′ of it (spirals of spirals), and a point just OUTSIDE that disc, so J(c) is a Cantor dust with no inside to go flat; bulbs are taken as discs of radius sin(πp/q)/q², sub-bulbs at angle 2πp′/q′ from the root;
 //! 1. Julia sets of z^d + c, d from 3 to 6, with d-fold symmetry: c just outside the main body, in closed form from its multiplier λ (fixed point z with d·z^(d−1) = λ, c = z − z^d), at an angle near a rational p/q;
-//! 2. Burning Ship Julia sets (z → (|Re z| + i|Im z|)² + c), angular and crystalline, c sampled until it escapes and shows enough of the set;
-//! 3. zooms into the parameter plane of z^d + c itself, d from 2 to 4 (the Mandelbrot set and its multibrot cousins).
+//! 2. quadratic Julia sets with c from the descent (below), a little above the boundary point it lands on — near the boundary J(c) resembles the Mandelbrot set around c, so the two rhyme;
+//! 3. zooms into the parameter plane of z^d + c itself, d from 2 to 4 (the Mandelbrot set and its multibrot cousins), centred on the descent's landing point.
+//!
+//! The descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step as long as the distance estimate says the set is away (it never overshoots), until the steps shrink onto the boundary — the set's skyline seen from above, one dial from the antenna through the bulb tops and seahorse valley to the cusp.
+//! For x past the cusp (0.25) the line misses the set and lands on the real axis just outside it, in the parabolic-implosion region, which is kept.
 //!
 //! The textbox changes both the shape and the view, so every key looks new while the device's look stays:
 //! in family 0 the key moves c around the device's bulb (the angle away from its root and how far outside), and the view lands on J(c) by its symbolic address: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so a hash read as a 256-bit address names one point of J, built by inverse iteration (z → ±√(z − c)) with the coarsest bit applied last; uniform bits give the balanced measure (Brolin), so every key lands independently over the whole set;
-//! in family 1 the key moves c's angle and depth; in family 2 it nudges c; in family 3 the key picks the zoom depth;
-//! in families 1 to 3 the view lands by a spray: 2⁶ points drawn from the key's hash across the region, and the one that escapes latest, the one nearest the boundary, is the centre.
+//! in family 1 the key moves c's angle and depth, and the view lands by a spray: 2⁶ points drawn from the key's hash across the region, and the one that escapes latest, the one nearest the boundary, is the centre;
+//! in family 2 the key nudges the descent's x and sets how far above the boundary c sits, and the view lands by a spray; in family 3 the key nudges x and picks the zoom depth.
 //! Every family then takes a log-uniform zoom, a rotation and a Gaussian offset of the centre from the key, and a thumbnail rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Shading: the distance estimate (|z|·ln|z| over the derivative's magnitude, in pixels) separates the set from the field around it, because near the set the escape count changes chaotically from pixel to pixel and reads as static.
@@ -37,8 +40,6 @@ const SPRAY: u32 = 1 << 6;
 enum Kind {
     /// Julia set of z^power + c (family 0 at power 2, family 1 above it).
     Julia,
-    /// Burning Ship Julia set.
-    Ship,
     /// The parameter plane of z^power + c, z starting at 0.
     Plane,
 }
@@ -116,7 +117,7 @@ struct Orbit {
 }
 
 /// Iterate the family's map from the plane point (px, py).
-/// The derivative is tracked by magnitude only (|dz| ← d·|z|^(d−1)·|dz|, plus 1 in the parameter plane): exact for the analytic families, and for the Burning Ship's folds it is the standard approximation, since folding keeps |z|.
+/// The derivative is tracked by magnitude only (|dz| ← d·|z|^(d−1)·|dz|, plus 1 in the parameter plane), which is all the distance estimate needs.
 /// It can overflow to infinity near the set, which the distance estimate reads, correctly, as "on the set".
 #[inline]
 fn orbit(px: f64, py: f64, p: &Params) -> Orbit {
@@ -135,9 +136,6 @@ fn orbit(px: f64, py: f64, p: &Params) -> Orbit {
         let (tx, ty) = (z.0 - p.trap.0, z.1 - p.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
         dm = d * r2.sqrt().powi(p.power as i32 - 1) * dm + plus;
-        if p.kind == Kind::Ship {
-            z = (z.0.abs(), z.1.abs());
-        }
         let zp = cpow(z, p.power);
         z = (zp.0 + c.0, zp.1 + c.1);
     }
@@ -264,6 +262,29 @@ fn multi_c(d: u32, theta: f64, t: &[u8; 32]) -> (f64, f64) {
     (z.0 - zd.0, z.1 - zd.1)
 }
 
+/// The descent: down the line Re c = x from Im c = 2 in the parameter plane of z^d + c, each step the distance estimate, until within 2⁻¹² of the set or on the real axis; at most 2⁹ steps.
+/// Returns the landing point and whether it is on the set (false when the line missed it and reached the axis).
+fn descend(x: f64, power: u32) -> ((f64, f64), bool) {
+    let probe = Params { kind: Kind::Plane, power, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase: [0.; 3], mode: 0, trap: (0., 0.) };
+    let mut y = 2.;
+    for _ in 0..(1 << 9) {
+        let o = orbit(x, y, &probe);
+        if o.n == MAX_ITER {
+            break;
+        }
+        let r = (o.x * o.x + o.y * o.y).sqrt();
+        let d = r * r.ln() / o.dm;
+        if d < 1. / (1 << 12) as f64 {
+            break;
+        }
+        y -= d * 0.5;
+        if y <= 0. {
+            return ((x, 0.), false);
+        }
+    }
+    ((x, y), true)
+}
+
 impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
@@ -294,25 +315,27 @@ impl Params {
             let q = 2 + (f[15] % 7) as u32;
             TAU * coprime(q, f[24]) as f64 / q as f64
         };
-        // Family 2's c: sampled until 0 escapes (c outside the ship's connectedness locus, so the Julia set is a dust) and the whole view shows enough of the set.
-        let ship_c = || {
+        // Families 2 and 3: the descent's x for this device. The Julia family takes the whole quadratic span, misses past the cusp included; a parameter-plane zoom needs a line that hits its own set (the cubic and quartic sets are much narrower), so its x is redrawn until the descent lands.
+        let plane_power = 2 + (f[14] % 3) as u32;
+        let x0 = if family == 3 {
             let mut counter = 0;
             loop {
-                let h = draw(salt, 6, counter, &[]);
+                let h = draw(salt, 7, counter, &[]);
                 counter += 1;
-                let c = (-2. + unit(&h[0..4]) * 2.5, -2. + unit(&h[4..8]) * 2.5);
-                let p = Params { kind: Kind::Ship, c, ..base };
-                if orbit(0., 0., &p).n < MAX_ITER && framed(&p) {
-                    return c;
+                let x = -2. + unit(&h[0..4]) * 2.375;
+                if descend(x, plane_power).1 {
+                    break x;
                 }
             }
+        } else {
+            -2. + unit(&f[25..29]) * 2.375
         };
         let bulb_b = if family == 0 { Some(device_bulb()) } else { None };
         let fixed = match family {
             0 => base,
             1 => Params { power: power_multi, ..base },
-            2 => Params { kind: Kind::Ship, c: ship_c(), ..base },
-            _ => Params { kind: Kind::Plane, power: 2 + (f[14] % 3) as u32, ..base },
+            2 => base,
+            _ => Params { kind: Kind::Plane, power: plane_power, ..base },
         };
 
         // Each try draws a fresh shape and view from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
@@ -333,14 +356,16 @@ impl Params {
                     p.c = multi_c(p.power, theta + (unit(&a[8..12]) - 0.5) * TAU / (1 << 4) as f64, &a);
                     spray(&p, &a, (0., 0.), 1.5)
                 }
+                // c a little above the descent's landing point: 2^−(4..10) on up the line it came down.
                 2 => {
-                    p.c = (p.c.0 + (unit(&a[8..12]) - 0.5) / (1 << 6) as f64, p.c.1 + (unit(&a[12..16]) - 0.5) / (1 << 6) as f64);
+                    let (b, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64, 2);
+                    p.c = (b.0, b.1 + (-(4. + unit(&a[12..16]) * 6.)).exp2());
                     spray(&p, &a, (0., 0.), 2.)
                 }
-                // The parameter plane: a coarse spray over the whole set, then a fine one at the zoom about the coarse winner.
+                // The parameter plane: the descent's landing point, then a fine spray at the zoom about it.
                 _ => {
-                    let coarse = spray(&p, &a, (-0.5, 0.), 1.5);
-                    spray(&p, &draw(salt, 5, n, text.as_bytes()), coarse, p.half)
+                    let (b, _) = descend(x0 + (unit(&a[8..12]) - 0.5) / (1 << 5) as f64, p.power);
+                    spray(&p, &draw(salt, 5, n, text.as_bytes()), b, p.half)
                 }
             };
             let turn = unit(&t[4..8]) * TAU;
