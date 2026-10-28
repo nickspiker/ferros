@@ -567,6 +567,18 @@ impl Client {
         }
     }
 
+    /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
+    fn forget_identity(&mut self) {
+        self.identity_seed = None;
+        self.hp = None;
+        self.bound = false;
+        self.fleet_key = None;
+        self.sponsors.clear();
+        self.request_t = 0;
+        self.request_frame.clear();
+        self.verdict = V_NONE;
+    }
+
     /// fgtw's transport for this call, starting from the address resolved last.
     fn seed(&self) -> SeedHttp<'_> {
         SeedHttp { udp: &self.udp, ip: core::cell::Cell::new(self.seed_ip) }
@@ -889,6 +901,18 @@ impl Client {
                 if n >= 1 && req[0] == 2 {
                     let r = self.mint();
                     reply.push(r);
+                }
+                // Op 3: the attest screen replaced the roots (a new handle on a device that was not yet bound): forget everything of the old identity and look the new one up.
+                if n >= 1 && req[0] == 3 {
+                    self.forget_identity();
+                    self.load_saying(true);
+                    if self.hp.is_some() {
+                        self.verdict = V_LOOKING;
+                        self.last_lookup_us = 0;
+                        if !self.bound {
+                            self.mint_request();
+                        }
+                    }
                 }
                 let state: u8 = match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
                     (false, _, _) => V_NONE,

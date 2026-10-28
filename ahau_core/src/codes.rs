@@ -1,5 +1,6 @@
-//! The Huffman codes vsf 0.6.42's `x` text encoder gives every character the honeycomb keyboard can type (its extent, capitals by shift, and space): (character, code bits, length). Taken from that crate's `huffman_codes.bin` (BLAKE3 523769a934a407aa87d9ddef37ad186c546e205cb1280b0e9300d6e98c6dad0e, ihi's frozen encoder lane); the host test `matches_vsf` checks every entry and random strings against vsf itself. Sorted by character for a binary search.
-pub const CODES: [(char, u32, u8); 102] = [
+//! The Huffman codes vsf 0.6.42's `x` text encoder gives every character the honeycomb keyboard can type (its extent, capitals by shift, space, and the newline its enter key types: a handle may hold one, owner 2026-10-28): (character, code bits, length). Taken from that crate's `huffman_codes.bin` (BLAKE3 523769a934a407aa87d9ddef37ad186c546e205cb1280b0e9300d6e98c6dad0e, ihi's frozen encoder lane); the host test `matches_vsf` checks every entry and random strings against vsf itself. Sorted by character for a binary search.
+pub const CODES: [(char, u32, u8); 103] = [
+    ('\n', 0b1011110, 7),
     (' ', 0b001, 3),
     ('!', 0b111000000, 9),
     ('"', 0b01010011, 8),

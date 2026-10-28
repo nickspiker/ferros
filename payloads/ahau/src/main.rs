@@ -97,7 +97,9 @@ static ALLOC: Bump = Bump;
 /// What the screen is waiting for.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// The device knows its identity: check the handle against it.
+    /// Roots are in the vault: waiting for the Photon client to say whether this device is a member of their identity's fleet (up to 10 s; then the verifier decides).
+    Starting,
+    /// The device is a member of its identity's fleet: check the handle against it.
     Known,
     /// No identity yet: the first entry.
     Fresh,
@@ -128,6 +130,8 @@ struct Ahau {
     handle: [u8; 4 * MAX_CHARS],
     len: usize,
     chars: usize,
+    /// When the screen came up (the Starting wait's 10 s).
+    started: u64,
     /// The Photon client's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
@@ -182,8 +186,18 @@ impl Ahau {
         }
     }
 
-    /// A tap on no key: on the switch, the layout under it becomes the device's.
+    /// A tap on no key: the button under the entry line acts; on the switch, the layout under it becomes the device's.
     fn tap_at(&mut self, x: i64, y: i64) {
+        let (x0, y0, x1, y1) = self.button_at();
+        if (x0 as i64..x1 as i64).contains(&x) && (y0 as i64..y1 as i64).contains(&y) {
+            if self.button_label().is_some() {
+                self.attest();
+                self.entry();
+                self.button();
+                self.words();
+            }
+            return;
+        }
         let (b, px) = self.switch_at();
         if y < (b - px * 3 / 2) as i64 || y >= (b + px / 2) as i64 || x < (self.w / 4) as i64 || x >= (self.w * 3 / 4) as i64 {
             return;
@@ -207,8 +221,39 @@ impl Ahau {
         true
     }
 
+    /// The button under the entry line: its rectangle (x0, y0, x1, y1).
+    fn button_at(&self) -> (usize, usize, usize, usize) {
+        let (b, px) = self.entry_at();
+        let y0 = b + px;
+        (self.w * 5 / 16, y0, self.w * 11 / 16, y0 + self.w / 10)
+    }
+
+    /// What the button does now, or nothing while the client is asked.
+    fn button_label(&self) -> Option<&'static str> {
+        match self.mode {
+            Mode::Known | Mode::Fresh => Some("attest"),
+            Mode::Join(_) | Mode::Grey(_) => Some("go on"),
+            Mode::Mint(_) => Some("mint"),
+            Mode::Wrong => Some("start over"),
+            Mode::Starting | Mode::Looking(_) => None,
+        }
+    }
+
+    fn button(&self) {
+        let (x0, y0, x1, y1) = self.button_at();
+        let s = self.surf();
+        for y in y0..y1 {
+            s[y * self.w + x0..y * self.w + x1].fill(if self.button_label().is_some() { grey(2600) } else { 0 });
+        }
+        if let Some(t) = self.button_label() {
+            let px = self.w / 24;
+            let x = (x0 + x1) as i64 / 2 - t.len() as i64 * px as i64 * 28 / 100;
+            window::text(self.display, self.base, x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
+        }
+    }
+
     fn entry_at(&self) -> (usize, usize) {
-        (self.kb.top - self.w / 8, self.w / 16)
+        (self.kb.top - self.w * 5 / 16, self.w / 16)
     }
 
     /// The status: a line, or two split at a newline.
@@ -271,8 +316,26 @@ impl Ahau {
         Some(out[0])
     }
 
+    /// At start, with roots in the vault: a member (state 2 or 3) checks the handle against the device's identity; anything else is a pending identity that does not lock the device, and a handle typed now replaces it. No answer in 10 s: the verifier decides.
+    fn follow_start(&mut self) -> bool {
+        let next = match self.client_state() {
+            Some(2) | Some(3) => Mode::Known,
+            Some(_) => Mode::Fresh,
+            None if now().wrapping_sub(self.started) > 10 * freq() => if self.verifier.is_some() { Mode::Known } else { Mode::Fresh },
+            None => return false,
+        };
+        console(self.grants, if next == Mode::Known { b"ahau: this device belongs to its identity\n" } else { b"ahau: no identity of this device yet (roots pending, not a member)\n" });
+        self.mode = next;
+        self.status(self.prompt());
+        self.button();
+        true
+    }
+
     /// While the identity is being looked up or joined: follow the client. Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
+        if self.mode == Mode::Starting {
+            return self.follow_start();
+        }
         let seed = match self.mode {
             Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
             _ => return false,
@@ -297,6 +360,7 @@ impl Ahau {
         self.mode = next;
         if changed {
             self.status(self.prompt());
+            self.button();
         }
         self.words();
         true
@@ -313,9 +377,18 @@ impl Ahau {
     fn entry(&self) {
         let (b, px) = self.entry_at();
         self.clear_rows(b - px * 3 / 2, b + px / 2);
+        // A newline shows as ¶ (the typeface has no return arrow): the handle stays on one line as typed.
         let mut t = [0u8; 4 * MAX_CHARS + 4];
-        let n = self.len;
-        t[..n].copy_from_slice(&self.handle[..n]);
+        let mut n = 0;
+        for &c in &self.handle[..self.len] {
+            if c == b'\n' {
+                t[n..n + 2].copy_from_slice("¶".as_bytes());
+                n += 2;
+            } else {
+                t[n] = c;
+                n += 1;
+            }
+        }
         t[n] = b'_';
         let shown = core::str::from_utf8(&t[..n + 1]).unwrap_or("_");
         self.centred(b, px, TEXT, shown);
@@ -335,18 +408,20 @@ impl Ahau {
         self.status(self.prompt());
         self.switch();
         self.entry();
+        self.button();
         self.kb.draw(self.surf(), &mut self.label());
     }
 
     fn prompt(&self) -> &'static str {
         match self.mode {
-            Mode::Known => "This device knows one identity. Type its handle.",
+            Mode::Starting => "One moment: asking this device's Photon client where it stands.",
+            Mode::Known => "This device belongs to one identity. Type its handle.",
             Mode::Fresh => "No identity on this device yet. Type your handle.",
             Mode::Looking(_) => "Looking this identity up: its devices nearby, then fgtw.org.",
-            Mode::Join(_) => "This identity has a fleet. On one of its devices: Fleet, Add device,\nand type the words below. Enter goes on meanwhile.",
-            Mode::Mint(_) => "No fleet holds this handle. Minting makes it yours for good:\nno reset, no recovery. Type it again to mint.",
-            Mode::Grey(_) => "No device of this identity and no fgtw.org answers: nothing decided.\nStill looking. Enter goes on meanwhile.",
-            Mode::Wrong => "fgtw.org's chain for this handle is another identity's.\nEnter starts over.",
+            Mode::Join(_) => "This identity has a fleet. On one of its devices: Fleet, Add device,\nand type the words below. Go on meanwhile if you like.",
+            Mode::Mint(_) => "No fleet holds this handle. Minting makes it yours for good:\nno reset, no recovery. Type it again, then mint.",
+            Mode::Grey(_) => "No device of this identity and no fgtw.org answers: nothing decided.\nStill looking. Go on meanwhile if you like.",
+            Mode::Wrong => "fgtw.org's chain for this handle claims another slot.\nStart over to type another.",
         }
     }
 
@@ -384,7 +459,7 @@ impl Ahau {
                 self.words();
                 return;
             }
-            Mode::Looking(_) => return,
+            Mode::Looking(_) | Mode::Starting => return,
             _ => {}
         }
         if self.chars == 0 {
@@ -415,7 +490,21 @@ impl Ahau {
                 }
                 self.attested();
             }
+            Mode::Fresh if self.photon_seed.is_some_and(|ps| ahau_core::same(&ps, &seed)) => {
+                // The pending identity's own handle: its lookup (or join) goes on.
+                self.wipe();
+                self.mode = Mode::Looking(seed);
+                self.status(self.prompt());
+            }
             Mode::Fresh => {
+                // Another identity's roots were pending (never a member): its leftovers go, so nothing of it is mistaken for this one's.
+                if self.photon_seed.is_some() {
+                    for key in [&b"chain"[..], b"fleet_key", b"identity_seed", b"handle_proof"] {
+                        let _ = ferros_sys::store_delete(cap(self.grants, S_PHOTON), key);
+                    }
+                    let _ = ferros_sys::store_delete(cap(self.grants, S_AHAU), b"verifier");
+                    self.verifier = None;
+                }
                 self.status("Deriving the handle's proof: about seven seconds.");
                 self.entry();
                 self.show();
@@ -436,6 +525,10 @@ impl Ahau {
                     return;
                 }
                 console(self.grants, b"ahau: roots kept; the Photon client looks the identity up\n");
+                self.photon_seed = Some(seed);
+                // The client reloads them (op 3) and forgets whatever it held of the old ones.
+                let mut out = [0u8; 600];
+                let _ = call(cap(self.grants, S_PHOTON_EP), &[3], &mut out);
                 self.wipe();
                 self.mode = Mode::Looking(seed);
                 self.status(self.prompt());
@@ -486,18 +579,20 @@ impl Ahau {
         exit(0)
     }
 
+    fn type_char(&mut self, c: char) {
+        let mut b = [0u8; 4];
+        let e = c.encode_utf8(&mut b).as_bytes();
+        if self.chars < MAX_CHARS {
+            self.handle[self.len..self.len + e.len()].copy_from_slice(e);
+            self.len += e.len();
+            self.chars += 1;
+        }
+        self.entry();
+    }
+
     fn tap(&mut self, key: Key) {
         match self.kb.tap(key) {
-            Some(Event::Char(c)) => {
-                let mut b = [0u8; 4];
-                let e = c.encode_utf8(&mut b).as_bytes();
-                if self.chars < MAX_CHARS {
-                    self.handle[self.len..self.len + e.len()].copy_from_slice(e);
-                    self.len += e.len();
-                    self.chars += 1;
-                }
-                self.entry();
-            }
+            Some(Event::Char(c)) => self.type_char(c),
             Some(Event::Back) => {
                 while self.len > 0 {
                     self.len -= 1;
@@ -510,10 +605,8 @@ impl Ahau {
                 }
                 self.entry();
             }
-            Some(Event::Enter) => {
-                self.attest();
-                self.entry();
-            }
+            // Enter is a character of the handle (owner, 2026-10-28: "enter is a valid char"); the button under the entry line attests.
+            Some(Event::Enter) => self.type_char('\n'),
             Some(Event::Leave) => {
                 self.wipe();
                 self.unconfirm();
@@ -614,16 +707,17 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
         console(grants, line);
         exit(0);
     }
-    let mode = if verifier.is_some() || photon_seed.is_some() { Mode::Known } else { Mode::Fresh };
+    // Roots in the vault are not an identity of this device until it is a member of that identity's fleet: the client says (Mode::Starting).
+    let mode = if verifier.is_some() || photon_seed.is_some() { Mode::Starting } else { Mode::Fresh };
     let mut kb = Keyboard::new(w, h);
     kb.left = "clear";
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
     a.all();
     a.show();
-    console(grants, if mode == Mode::Known { b"ahau: waiting for this device's identity\n" } else { b"ahau: no identity on this device yet\n" });
+    console(grants, if mode == Mode::Starting { b"ahau: roots in the vault: asking the Photon client whether this device is a member\n" } else { b"ahau: no identity on this device yet\n" });
     let mut polls = 0u32;
     let mut touches = Touches::new(w);
     // Every key exact: a rolling finger still types where it landed.
