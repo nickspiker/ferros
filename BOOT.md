@@ -280,8 +280,13 @@ How a boot goes:
 
 ### Locked-bootloader endgame (much later)
 
-- Pixel supports one `avb_custom_key` — a re-locked dual boot requires ferros seed and the Android build signed by the **same** key.
-  Stock GrapheneOS (their key) cannot share a locked device with ferros (our key); a self-signed Graphene build can.
+- Pixel supports one `avb_custom_key`. With the mirrored gates (both slots carry the same image: the hv, Google's own Android kernel and ferros, from `tools/husky-hv.sh`), nothing of Android is rebuilt or re-signed (corrected 2026-10-28; this line used to say the Android build must be signed by our key, which was true only of the old chainload design). The owner's key signs each slot's top-level `vbmeta`, which holds:
+  - the hash of our gate image (Google's kernel rides under it, packed inside);
+  - Google's own hash descriptors for `init_boot`, `vendor_boot`, `vendor_kernel_boot`, `dtbo` and `pvmfw`, copied as they are;
+  - chain descriptors to Google-signed `vbmeta_system`/`vbmeta_vendor`, with Google's public keys, so Android's system and vendor verify under Google's keys as today.
+- The two slots' `vbmeta` must be byte-identical. The gate hands Android slot suffix `_a` whichever slot ABL booted; locked, first-stage init re-verifies the `_a` vbmeta against the digest ABL passed, and a mismatch boot-loops (unlocked, it is tolerated). `tools/husky-mirror-slot-b.sh` already makes the partitions identical.
+- What Android sees when locked: verified-boot state yellow, the key's fingerprint on the boot warning, and an attestation root of the owner's key, so apps that demand Google's attestation (banking, Wallet) may refuse, as on GrapheneOS. A new Android kernel means repacking and re-signing the gate, as now.
+- Stock GrapheneOS (their key) still cannot share a locked device with ferros: one key per device, and their key cannot sign our gate.
 - Dev stays unlocked (orange state). **Never lock until the signed chain is proven** — and macOS/stock recovery escape hatches stay per the M1 rules.
 - Why lock at all, and why with the owner's own key: see Boot integrity under the "Ready?" gate (evil maid, trust-on-first-use, the on-screen key ID).
 
