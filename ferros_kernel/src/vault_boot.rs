@@ -43,9 +43,10 @@ pub type ShimStore = crate::kvault::KVault;
 pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     use ferros_vault::anchor::AnchorKey;
 
-    let ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
-    if let Ok(i) = ira {
-        crate::ira::keep_ira(i);
+    let mut ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
+    if let Ok(mut i) = ira {
+        // Into the registers (keys.rs); this copy is wiped there, the one in `ira` at the end of the probe.
+        crate::ira::keep_ira(&mut i);
     }
     let ira_fail = ira.err().unwrap_or(0);
     let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
@@ -70,11 +71,11 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     };
 
     // No valid ira, no vault (PIPE: refuse to operate). The probe reports why.
-    let Ok(ira) = ira else {
+    let Ok(ira) = ira.as_mut() else {
         return (p, None);
     };
-    let key: AnchorKey = AnchorKey::from_ira(&ira); // the ira-rooted vault key
-    crate::oracle::set_system_secret(&ira);
+    let key: AnchorKey = AnchorKey::from_ira(ira); // the ira-rooted vault key
+    crate::oracle::set_system_secret(ira);
     let _ = key;
 
     const LKEY: &str = "genesis";
@@ -82,7 +83,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let mut kept: Option<ShimStore> = None;
     let t_open = crate::platform::cntpct();
     crumb(0xE0); // before KVault::open (manifestus open ladder: bootstrap the spine, or genesis a blank pair of regions)
-    match crate::kvault::KVault::open(&ira) {
+    match crate::kvault::KVault::open(ira) {
         Ok(mut store) => {
             p.opened = 1;
             crate::flashlog::line(&alloc::format!("kvault open ok in {} ms: {}", (crate::platform::cntpct() - t_open) / (crate::platform::cntfrq() / 1000), store.describe()));
@@ -115,6 +116,8 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
             p.stage = 1
         }
     }
+    // The vault is open; the registers hold the ira from here (keys.rs).
+    crate::keys::wipe(ira);
     crumb(0xE3); // vault path returned
     (p, kept)
 }
@@ -122,15 +125,15 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
 /// Write the vault probe into the kernel's HARDCODED ramoops print slots (ferros_handoff.c ferros_ramoops_read; see husky_ferros_probe_boot memory).
 /// r[1]/0x08 `link_up=` := the wairua's fingerprint if KOHI has run, else 0 (differs each boot; never the wairua itself — this block is printed by Android's kernel); r[2]/0x10 bytes := opened|verified<<1|sealed<<2|wairua drawn<<3|link_up<<4, then stage, then ap_nz|asv_nz<<1|hpm_nz<<2; r[3]/0x18 `mbr_sig` := exit | dvfs<<8 (exit 0 = vault run done, G#Bx = USB service exit reason); r[4]/0x20 := ap_hw_tune[0..5]; r[5]/0x28 := sync exception count; r[20..24]/0xA0 `pattern-readback` := root_commit hash[0..16] — non-zero + stable across boots == the vault booted from the ira.
 pub fn report_vault(p: &VaultProbe, exit: u8) {
-    let wairua = crate::wairua::peek().and_then(|s| s.0);
-    let f_open = (p.opened as u64) | ((p.verified as u64) << 1) | ((p.sealed as u64) << 2) | ((wairua.is_some() as u64) << 3) | ((p.link_up as u64) << 4);
+    let wairua = crate::wairua::peek().is_some_and(|s| s.0);
+    let f_open = (p.opened as u64) | ((p.verified as u64) << 1) | ((p.sealed as u64) << 2) | ((wairua as u64) << 3) | ((p.link_up as u64) << 4);
     let ap_nz = p.ap_tune.iter().any(|&x| x != 0) as u64;
     let flags = f_open | ((p.stage as u64) << 8) | ((ap_nz | ((p.asv_nz as u64) << 1) | ((p.hpm_nz as u64) << 2)) << 16);
     LAST_CRUMB.store(exit as u64, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         let w = |off: usize, v: u64| write_volatile((RAMOOPS_RESULT + off) as *mut u64, v);
         w(0x00, RESULT_MAGIC);
-        w(0x08, wairua.map(|w| u64::from_le_bytes(crate::wairua::fingerprint(&w))).unwrap_or(0));
+        w(0x08, if wairua { crate::wairua::fingerprint().map(u64::from_le_bytes).unwrap_or(0) } else { 0 });
         w(0x10, flags);
         w(0x18, (exit as u64) | ((p.dvfs as u64) << 8));
         core::ptr::copy_nonoverlapping(p.ap_tune.as_ptr(), (RAMOOPS_RESULT + 0x20) as *mut u8, 5);

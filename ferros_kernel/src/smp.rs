@@ -132,6 +132,8 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
     loop {
         // `diag keyreg` asks worker 0 to probe its own registers (keyreg.rs).
         crate::keyreg::serve(k);
+        // The ira and wairua into this core's registers when a sealed copy is meant for it (keys.rs): before any slice runs here.
+        crate::keys::serve();
         if STOP.load(Ordering::Acquire) != 0 {
             UP.fetch_and(!(1 << k), Ordering::AcqRel);
             OFF.fetch_add(1, Ordering::AcqRel);

@@ -169,7 +169,7 @@ The design above holds a secret in V-registers only for the length of one asm bl
 
 **Bank 1: the EL1 bank, dead under VHE.** HCR_EL2 has TGE=1 and E2H=1: nothing runs at EL1 and no exception is taken there, so these registers are never written by hardware. Full width, holding through SMC and idle, read in ~3 cycles: TPIDR_EL1, SP_EL1, ELR_EL12, FAR_EL12, MAIR_EL12, TPIDR_EL2. The EL1 timer compares (CNTP_CVAL_EL02, CNTV_CVAL_EL02) hold too but read ~30× slower (95 cycles on the X3, 47 on the A715). Partial width: PAR_EL1, SPSR_EL12, ESR_EL12, CONTEXTIDR_EL12, VBAR_EL12. Hold nothing: AMAIR_EL12, AFSR0/1_EL12. `diag keyreg dbg` adds the breakpoint/watchpoint value registers; it has not been run, since EL3 may trap debug access.
 
-**Held split.** The proposed layout keeps each secret as two shares, so that a leak of one class of register (a fault report, a dump, a context EL3 saves) reveals nothing:
+**Held split.** The layout (built, below) keeps each secret as two shares, so that a leak of one class of register (a fault report, a dump, a context EL3 saves) reveals nothing:
 
 | | share 0 (bank 0) | share 1 (bank 1) |
 |---|---|---|
@@ -198,6 +198,29 @@ A share is uniformly random on its own, so APGA's PACGA oracle can only ever com
 - G#840-85C hold boot information (G#840 went 1 to 0 across a reset).
 
 So on stock silicon the wairua crosses deep sleep sealed in DRAM under a key re-derived from the fuses at wake (microseconds, no disk), and the reset-and-dump gap stays open until PIPE holds the wairua on its own power. That is still strictly better than now, where the wairua sits in DRAM in the clear for the whole session.
+
+## Built: the ira and wairua in registers (2026-10-28)
+
+Neither secret has a RAM copy any more. KOHI and vault boot hand theirs over the moment they exist, and their copies are wiped.
+- **The code that touches them** is keyreg/keys.rs: safe Rust except the system-register access, with BLAKE3's compression as NEON intrinsics. `tools/keyreg-lift.sh` compiles it with the kernel's own flags and freezes the output as keyreg/keys.s, which the kernel links (ferros_kernel/src/keys.rs). The lift refuses any output that names `sp`, uses v8–v15, or calls out; `--check` regenerates and diffs, for CI. Getting there took three refusals:
+  - helpers that were not inlined passed state through the stack;
+  - a strict-align target bounced vector rows off the stack (fixed by 16-byte-aligned outputs);
+  - at -O3 the seven unrolled rounds ran out of registers.
+
+  At -O2 the round loop stays rolled: 459 instructions, no stack.
+- **Calls:** each runs with interrupts masked and ends in `keyreg_scrub`, which zeroes the caller-saved registers before they unmask.
+- **What uses them:** `SYS_IRA`, `SYS_ENTROPY` (the same stream as before, now computed where the wairua is held), the capability key, the vault nonce seed and the wairua's fingerprint. All derive through `keyreg_derive`/`keyreg_stream` and get back only the derived bytes.
+- **Self-test:** a known-answer check against the blake3 crate runs before the first secret is set; a failure means no secret is held at all.
+- **Cores:** CPU0 seals both secrets for the X3 and the workers at the hop and clears its own registers. Each core takes the sealed blob in its loop before running a slice, and the blob is wiped when the last one has it (`diag keys`: X3 and all four workers at the current generation, blob waiting for none).
+- **Power-down:** `keys::leave` seals and clears; `serve`/`ensure` unseal on return. `diag keys sleep` rehearses it on the X3: the wairua's fingerprint is unchanged. Seal and clear take 130 µs, the unseal 128 µs. Nearly all of that is reading the fuses for the seal key, since unsealing takes its masks from the seal and re-splits from the wairua's stream instead of calling the firmware TRNG, which costs about 1.3 ms a call. ferros does not power cores down yet; the c2 and deep-sleep paths call these when they land.
+- **Verified from EL0** (payloads/keytest): two entropy draws differ, the ira key for a domain is the same twice, and another domain gives another key.
+
+**Still in DRAM:**
+- keys *derived* from the ira and wairua and kept by their users: the vault's AnchorKey and the oracle's system secret (from the ira at vault boot), and the capability key and nonce seed (each derived per use);
+- residue inside blake3 and KOHI's own frames at the moment of derivation;
+- the sealed blob, during a handoff or a sleep.
+
+Not yet built: the inverted-pair check of §2 (a bit flipped in a share goes unnoticed until a derived key is wrong; the blob's MAC covers only handoffs).
 
 ## Open Questions (remaining)
 

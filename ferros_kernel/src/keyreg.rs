@@ -374,6 +374,11 @@ pub fn diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         ao_survey(out);
         return;
     }
+    // Since 2026-10-28 these registers hold the ira and wairua (keys.rs): writing test patterns would destroy them.
+    if crate::keys::in_use() {
+        out.extend_from_slice(b"keyreg: the registers hold the ira and wairua now (diag keys); the probe would overwrite them, so it does not run\n");
+        return;
+    }
     let check = params == b"check";
     let dbg = params == b"dbg";
     if check {

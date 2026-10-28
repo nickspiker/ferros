@@ -98,7 +98,7 @@ pub fn health(buf: &[u64]) -> Health {
 
 const SMCCC_TRNG_RND64: u64 = 0xC400_0053;
 
-fn trng_words(out: &mut [u64]) -> bool {
+pub(crate) fn trng_words(out: &mut [u64]) -> bool {
     let mut i = 0;
     while i < out.len() {
         let (status, x1, x2, x3): (u64, u64, u64, u64);

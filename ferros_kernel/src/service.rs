@@ -283,7 +283,7 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
         t.push(hex[(b & 0xF) as usize]);
     }
     t.extend_from_slice(b"\nwairua: ");
-    t.extend_from_slice(match crate::wairua::peek() { None => b"not drawn yet".as_slice(), Some((Some(_), _)) => b"live", Some((None, _)) => b"KOHI FAILED" });
+    t.extend_from_slice(match crate::wairua::peek() { None => b"not drawn yet".as_slice(), Some((true, _)) => b"live", Some((false, _)) => b"KOHI FAILED" });
     t.extend_from_slice(b"\n\nusb: serving Photon Transport\n     1209:4665\n\nboth volume keys\n= power off\n");
     t
 }
@@ -1031,8 +1031,17 @@ pub fn run(mut b: Boot) -> ! {
     // The gate's own press is spent; from here a press is the screen's (below).
     unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
 
+    // The ira and wairua (keys.rs): take what CPU0 sealed at the hop now, before the first slice; a quarter second on, stop waiting for workers that never came up, so the blob leaves DRAM.
+    crate::keys::serve();
+    let keys_settle = cntpct() + cntfrq() / 4;
+    let mut keys_settled = false;
     loop {
         platform::pet_watchdogs();
+        crate::keys::serve();
+        if !keys_settled && cntpct() > keys_settle {
+            crate::keys::forget_missing();
+            keys_settled = true;
+        }
         // The killswitch needs IRQs unmasked whenever the kernel isn't deliberately masking them (only the RELOAD handover does): re-assert it every pass, so no path back from a process or a fault can leave it disarmed.
         unsafe { core::arch::asm!("msr daifclr, #2") };
         // The power key turns the screen off and on (owner, 2026-10-22): a preference every process sees at once (process.rs PREF_SCREEN_OFF); the display server darkens the panel. The wake policy (proximity) comes later.
@@ -1998,6 +2007,12 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"keys" || cmd.params == b"keys sleep" {
+                                            // `diag keys [sleep]`: where the ira and wairua are held, the self-test, and a power-down rehearsal on this core (keys.rs).
+                                            crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
                                             // `diag keyreg [dbg|check|ao]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
                                             crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
@@ -2587,7 +2602,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 key.extend_from_slice(b"_US=");
                                                 append_hex(&mut resp, &key, h.us);
                                             }
-                                            append_hex(&mut resp, b"KOHI_OK=", kohi.map(|k| k.0.is_some()).unwrap_or(false) as u32);
+                                            append_hex(&mut resp, b"KOHI_OK=", kohi.is_some_and(|k| k.0) as u32);
                                             append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
                                             append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
                                             #[cfg(all(feature = "pixel8", not(shim_handoff)))]
@@ -2623,7 +2638,7 @@ pub fn run(mut b: Boot) -> ! {
                                                 let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
                                                 append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
                                             }
-                                            append_hex(&mut resp, b"WAIRUA_OK=", crate::wairua::peek().map(|k| k.0.is_some()).unwrap_or(false) as u32);
+                                            append_hex(&mut resp, b"WAIRUA_OK=", crate::wairua::peek().is_some_and(|k| k.0) as u32);
                                             append_hex(&mut resp, b"IRA_FAIL=", probe.ira_fail);
                                         }
                                         if let Some(prev) = &b.prev {

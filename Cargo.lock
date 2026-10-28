@@ -908,6 +908,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-keytest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-map"
 version = "0.1.0"
 dependencies = [

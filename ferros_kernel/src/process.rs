@@ -274,7 +274,7 @@ static NONCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 
 /// The per-session key every token is MACed under (derived from the wairua, so spawning is the first thing that needs KOHI). None = no wairua: refuse to spawn.
 fn cap_key() -> Option<[u8; 32]> {
-    crate::wairua::draw().map(|w| blake3::derive_key(CAP_KEY_CONTEXT, &w))
+    crate::wairua::derive(CAP_KEY_CONTEXT)
 }
 
 fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
@@ -1382,20 +1382,19 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_IRA => {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
-            f.x[0] = match (p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), crate::ira::ira()) {
-                (Some((Object::Ira, r)), Some(ira)) if r & RIGHT_SEND != 0 && (1..=64).contains(&len) => {
+            f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Ira, r)) if r & RIGHT_SEND != 0 && (1..=64).contains(&len) => {
                     let mut context = alloc::vec::Vec::with_capacity(32 + len);
                     context.extend_from_slice(b"ferros process ira v1 ");
                     context.extend_from_slice(&p.read(f.x[1], len));
-                    let key = match core::str::from_utf8(&context) {
-                        Ok(c) => blake3::derive_key(c, &ira),
-                        Err(_) => {
-                            f.x[0] = ERR;
-                            return 0;
+                    // Derived where the ira is held (keys.rs): the ira itself never leaves the registers.
+                    match core::str::from_utf8(&context).ok().and_then(crate::ira::derive) {
+                        Some(key) => {
+                            p.write(f.x[3], &key);
+                            32
                         }
-                    };
-                    p.write(f.x[3], &key);
-                    32
+                        None => ERR,
+                    }
                 }
                 _ => ERR,
             };
@@ -1611,15 +1610,17 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_ENTROPY => {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
-            f.x[0] = match (p.lookup(&token).map(|i| p.cspace[i].object), crate::wairua::draw()) {
-                (Some(Object::Entropy), Some(w)) if len <= 4096 => {
+            f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
+                Some(Object::Entropy) if len <= 4096 && crate::wairua::draw() => {
                     let n = ENTROPY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    let mut h = blake3::Hasher::new_keyed(&blake3::derive_key(ENTROPY_CONTEXT, &w));
-                    h.update(&n.to_le_bytes());
+                    // The same stream as before (BLAKE3 keyed by derive_key(ENTROPY_CONTEXT, wairua), over the counter, as an XOF), computed where the wairua is held: neither it nor the derived key leaves the registers.
                     let mut out = alloc::vec![0u8; len];
-                    h.finalize_xof().fill(&mut out);
-                    p.write(f.x[1], &out);
-                    len as u64
+                    if crate::keys::stream(ENTROPY_CONTEXT, &n.to_le_bytes(), &mut out) {
+                        p.write(f.x[1], &out);
+                        len as u64
+                    } else {
+                        ERR
+                    }
                 }
                 _ => ERR,
             };

@@ -112,6 +112,9 @@ mod pmu;
 // Where the ira and wairua could live off DRAM: a probe of the unused CPU registers (keyreg.rs, KEY_REGISTERS.md).
 #[cfg(feature = "pixel8")]
 mod keyreg;
+// The ira and wairua held in CPU registers, never DRAM (keys.rs; the code that touches them is lifted from keyreg/keys.rs).
+#[cfg(feature = "pixel8")]
+mod keys;
 // The gate and the oracle: signed capsules, ihi at spawn (ORACLE.md).
 #[cfg(feature = "pixel8")]
 mod oracle;
@@ -1838,8 +1841,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         checklist::mark(checklist::Item::CacheMap);
     }
     // KOHI ran during the "Ready?" wait: light the wairua line now that the checklist exists.
-    if let Some((Some(w), _)) = wairua::peek() {
-        let fp = wairua::fingerprint(w);
+    if let Some(fp) = wairua::peek().filter(|s| s.0).and_then(|_| wairua::fingerprint()) {
         let hex = b"0123456789ABCDEF";
         checklist::mark_interim(checklist::Item::Wairua);
         checklist::suffix(checklist::Item::Wairua, &[hex[(fp[0] >> 4) as usize], hex[(fp[0] & 15) as usize], hex[(fp[1] >> 4) as usize], hex[(fp[1] & 15) as usize]]);
@@ -1971,6 +1973,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         usb: gate_usb,
     };
     // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
+    // CPU0 is about to park: the ira and wairua it holds go sealed to the X3 and the workers, and its own registers are cleared (keys.rs).
+    if option_env!("FERROS_X3") != Some("0") && x3::parked() {
+        keys::leave(keys::AFTER_HOP);
+    }
     let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };
     platform::crumb(0xE7);
     service::run(boot)

@@ -38,6 +38,7 @@ members = [
     "payloads/hive",
     "payloads/ahau",
     "payloads/epcall",
+    "payloads/keytest",
     "honeycomb",
     "ahau_core",
     "payloads/threads",
