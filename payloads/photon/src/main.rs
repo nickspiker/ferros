@@ -155,6 +155,151 @@ impl Udp {
         let n = self.call(&[3], &mut out);
         (n >= 51 && n != ERR).then_some(out[50])
     }
+    /// The A record for `host` from the DHCP-given DNS server (payloads/httptest's resolver), or None.
+    fn resolve(&self, host: &[u8]) -> Option<[u8; 4]> {
+        let mut info = [0u8; 64];
+        let n = self.call(&[3], &mut info);
+        if n < 55 || n == ERR || info[50] & 1 == 0 || info[51..55] == [0; 4] {
+            return None;
+        }
+        let mut q = Vec::with_capacity(300);
+        q.extend_from_slice(&[1, 4]);
+        let mut dst = [0u8; 16];
+        dst[..4].copy_from_slice(&info[51..55]);
+        q.extend_from_slice(&dst);
+        q.extend_from_slice(&53u16.to_be_bytes());
+        q.extend_from_slice(&DNS_PORT.to_be_bytes());
+        let id = (now() as u16) | 1;
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for label in host.split(|&c| c == b'.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label);
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let mut r = [0u8; 16];
+        let mut out = [0u8; 1024];
+        for _ in 0..3 {
+            for _ in 0..50 {
+                if self.call(&q, &mut r) == 1 && r[0] != 1 {
+                    break;
+                }
+                ferros_sys::sleep_until(now() + ferros_sys::freq() / 500);
+            }
+            let t = now();
+            while now() - t < ferros_sys::freq() {
+                let n = self.call(&[2, (DNS_PORT >> 8) as u8, DNS_PORT as u8], &mut out);
+                if n == 0 || n == ERR || n < 33 {
+                    ferros_sys::sleep_until(now() + ferros_sys::freq() / 500);
+                    continue;
+                }
+                let m = &out[21..(n as usize).min(out.len())];
+                if m[0..2] != id.to_be_bytes() {
+                    continue;
+                }
+                let skip = |m: &[u8], mut i: usize| -> usize {
+                    while i < m.len() {
+                        if m[i] == 0 {
+                            return i + 1;
+                        }
+                        if m[i] & 0xC0 == 0xC0 {
+                            return i + 2;
+                        }
+                        i += 1 + m[i] as usize;
+                    }
+                    m.len()
+                };
+                let an = u16::from_be_bytes([m[6], m[7]]);
+                let mut i = skip(m, 12) + 4;
+                for _ in 0..an {
+                    i = skip(m, i);
+                    if i + 10 > m.len() {
+                        break;
+                    }
+                    let (ty, len) = (u16::from_be_bytes([m[i], m[i + 1]]), u16::from_be_bytes([m[i + 8], m[i + 9]]) as usize);
+                    i += 10;
+                    if ty == 1 && len == 4 && i + 4 <= m.len() {
+                        return Some([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+                    }
+                    i += len;
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// One HTTP POST of `body` to `/` on `ip:80` (the `ip` process's client TCP, ops 4-7), as (status, body); None when the connection or the exchange fails, or takes longer than 16 s.
+    fn post(&self, ip: [u8; 4], host: &[u8], body: &[u8]) -> Option<(u16, Vec<u8>)> {
+        let f = ferros_sys::freq();
+        let deadline = now() + 16 * f;
+        let mut c = [0u8; 20];
+        c[0] = 4;
+        c[1] = 4;
+        c[2..6].copy_from_slice(&ip);
+        c[18..20].copy_from_slice(&80u16.to_be_bytes());
+        let mut r = [0u8; 16];
+        if self.call(&c, &mut r) != 2 || r[0] != 0 {
+            return None;
+        }
+        let h = r[1];
+        let mut req = Vec::with_capacity(160 + body.len());
+        req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: ");
+        req.extend_from_slice(host);
+        req.extend_from_slice(b"\r\nUser-Agent: ferros\r\nContent-Type: application/octet-stream\r\nConnection: close\r\nContent-Length: ");
+        let mut digits = [0u8; 20];
+        let mut k = digits.len();
+        let mut v = body.len();
+        loop {
+            k -= 1;
+            digits[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        req.extend_from_slice(&digits[k..]);
+        req.extend_from_slice(b"\r\n\r\n");
+        req.extend_from_slice(body);
+        let (mut sent, mut connected) = (0usize, false);
+        let mut got = Vec::new();
+        let mut out = alloc::vec![0u8; 4096];
+        let mut state = 0u8;
+        while now() < deadline {
+            if connected && sent < req.len() {
+                let n = (req.len() - sent).min(1400);
+                let mut s = Vec::with_capacity(2 + n);
+                s.extend_from_slice(&[5, h]);
+                s.extend_from_slice(&req[sent..sent + n]);
+                if self.call(&s, &mut r) == 3 && r[0] == 0 {
+                    sent += u16::from_be_bytes([r[1], r[2]]) as usize;
+                }
+            }
+            let n = self.call(&[6, h], &mut out);
+            if n == 0 || n == ERR {
+                break;
+            }
+            let n = (n as usize).min(out.len());
+            state = out[0];
+            connected |= state >= 2;
+            got.extend_from_slice(&out[1..n]);
+            if state >= 3 && n == 1 {
+                break;
+            }
+            if n == 1 {
+                ferros_sys::sleep_until(now() + f / 1000);
+            }
+        }
+        let _ = self.call(&[7, h], &mut r);
+        if state != 3 {
+            return None;
+        }
+        // The status line's code, then everything after the blank line (the worker answers with a Content-Length and closes, as asked).
+        let end = got.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let code = got.get(9..12).and_then(|c| core::str::from_utf8(c).ok()).and_then(|c| c.parse::<u16>().ok())?;
+        Some((code, got[end + 4..].to_vec()))
+    }
+
     /// Our IPv4 subnet's broadcast address (address | !mask), once bound.
     fn subnet_broadcast(&self) -> Option<[u8; 4]> {
         let mut out = [0u8; 64];
@@ -168,6 +313,27 @@ impl Udp {
         }
         Some(b)
     }
+}
+
+/// Where this device stands with the identity whose roots it holds (the `photon` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict).
+const V_NONE: u8 = 0;
+const V_JOIN: u8 = 1;
+const V_LOOKING: u8 = 4;
+const V_FRESH: u8 = 5;
+const V_WRONG: u8 = 6;
+const V_UNREACHABLE: u8 = 7;
+
+/// The seed (photon docs/peers-are-fgtw.md: peers first, the seed last). Plain HTTP on port 80, which fgtw.org serves (checked 2026-10-28; Claude memories/fgtw_plain_http_for_ferros.md): every call is one POST of a signed VSF document, and every answer is verified and folded here, so the transport carries no trust.
+const SEED_HOST: &[u8] = b"fgtw.org";
+const DNS_PORT: u16 = 53054;
+
+/// What the seed said about a handle's chain.
+enum Seed {
+    Chain(Vec<u8>),
+    NotFound,
+    /// Another `error` reason.
+    Refused,
+    Unreachable,
 }
 
 /// Eagle oscillations now, from the kernel's UTC wall clock (0 until it has one; the app treats a zero stamp as a frame from a clockless device).
@@ -210,6 +376,11 @@ struct Client {
     last_words_us: u64,
     /// When the vault was last asked for the roots while there were none (the attest screen writes them once a person mints this device's identity).
     last_load_us: u64,
+    /// Where this device stands with the identity (V_*), and when the seed was last asked.
+    verdict: u8,
+    last_lookup_us: u64,
+    /// The seed's address, once resolved.
+    seed_ip: Option<[u8; 4]>,
     /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
     given: Option<Addr>,
     given_asked_t: i64,
@@ -338,6 +509,10 @@ impl Client {
                 self.log.addr(&addr);
                 self.log.line();
                 self.sponsors.push(Sponsor { key, addr, asked_t: 0, heard_us: t, online: false });
+                // A device beaconing under our handle: the identity has a fleet, whatever the seed said.
+                if matches!(self.verdict, V_LOOKING | V_FRESH | V_UNREACHABLE) {
+                    self.verdict = V_JOIN;
+                }
                 self.sponsors.len() - 1
             }
         };
@@ -349,6 +524,121 @@ impl Client {
             let frame = self.request_frame.clone();
             let out = self.pt.send(addr, frame, t, eagle());
             self.send_all(out);
+        }
+    }
+
+    /// One POST to the seed: resolved once (again after a failure), plain HTTP.
+    fn seed_post(&mut self, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+        if self.seed_ip.is_none() {
+            self.seed_ip = self.udp.resolve(SEED_HOST);
+        }
+        let r = self.udp.post(self.seed_ip?, SEED_HOST, body);
+        if r.is_none() {
+            self.seed_ip = None;
+        }
+        r
+    }
+
+    /// The seed's `error` frame reason, if the body is one (fgtw client `error_frame`: an ASCII `reason` in a section named `error`, at HTTP 200).
+    fn seed_error(body: &[u8]) -> Option<alloc::string::String> {
+        let (header, end) = vsf::verification::read_verified(body, None).ok()?;
+        let section = header.primary_section(body, end).ok()?;
+        if section.name != "error" {
+            return None;
+        }
+        match section.get_field("reason").and_then(|f| f.values.first()) {
+            Some(vsf::VsfType::a(r)) => Some(r.clone()),
+            _ => Some(alloc::string::String::new()),
+        }
+    }
+
+    /// This handle's chain from the seed (`fleet_get`, as fgtw client `fetch` builds it; here until fgtw's client builds without std).
+    fn seed_fetch(&mut self, hp: &[u8; 32]) -> Seed {
+        let mut section = vsf::file_format::VsfSection::new("fleet_get");
+        section.add_field("hp", vsf::VsfType::hP(hp.to_vec()));
+        let Ok(req) = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() else { return Seed::Unreachable };
+        match self.seed_post(&req) {
+            None => Seed::Unreachable,
+            Some((_, body)) => match Self::seed_error(&body) {
+                Some(r) if r == "not_found" => Seed::NotFound,
+                Some(_) => Seed::Refused,
+                None => Seed::Chain(body),
+            },
+        }
+    }
+
+    /// A chain this device should hold: kept, and the device is a member when the fold names it.
+    fn hold_chain(&mut self, chain: &[u8]) -> bool {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
+        match join::adopt_chain(&hp, &seed, &self.me, chain) {
+            Ok((_, true)) => {
+                if self.store_set(b"chain", chain) {
+                    self.bound = true;
+                }
+                self.bound
+            }
+            _ => false,
+        }
+    }
+
+    /// Look the identity up (pairing-v2: peers first, the seed last): a fleet device heard beaconing under our handle already said the fleet exists; otherwise the seed's chain decides join, member or wrong fleet, its `not_found` says fresh, and no answer is GREY.
+    fn lookup(&mut self) {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        if self.bound {
+            return;
+        }
+        let heard = !self.sponsors.is_empty();
+        let v = match self.seed_fetch(&hp) {
+            Seed::Chain(chain) => match join::adopt_chain(&hp, &seed, &self.me, &chain) {
+                Ok((_, true)) => {
+                    self.hold_chain(&chain);
+                    V_JOIN
+                }
+                Ok((_, false)) => V_JOIN,
+                Err(e) if e.contains("not this identity") => V_WRONG,
+                Err(_) => if heard { V_JOIN } else { V_UNREACHABLE },
+            },
+            Seed::NotFound => if heard { V_JOIN } else { V_FRESH },
+            Seed::Refused | Seed::Unreachable => if heard { V_JOIN } else { V_UNREACHABLE },
+        };
+        if v != self.verdict {
+            self.log.put(match v {
+                V_JOIN => b"photon: this identity has a fleet: waiting to be added from one of its devices".as_slice(),
+                V_FRESH => b"photon: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
+                V_WRONG => b"photon: the seed's chain for this handle has another identity's genesis",
+                _ => b"photon: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
+            });
+            self.log.line();
+        }
+        self.verdict = v;
+    }
+
+    /// Mint this identity (the attest screen asks, after the permanence warning and the retype): genesis signed by this device and the identity (fgtw `MembershipBlob::genesis_v2`), published to the seed, then fetched back — the seed's slot settles on one genesis, so only a chain that names this device makes it a member. Only on a fresh verdict. The fleet key follows once fgtw's key minting builds without std.
+    fn mint(&mut self) -> u8 {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return 1 };
+        if self.verdict != V_FRESH {
+            return 2;
+        }
+        let blob = fgtw::fleet::MembershipBlob::genesis_v2(&self.keys, hp, &seed, eagle());
+        let Ok(bytes) = blob.to_vsf_bytes() else { return 3 };
+        let published = self.seed_post(&bytes).map(|(_, b)| Self::seed_error(&b));
+        if let Some(Some(reason)) = &published {
+            self.log.put(b"photon: the seed refused the genesis: ");
+            self.log.put(reason.as_bytes());
+            self.log.line();
+        }
+        match self.seed_fetch(&hp) {
+            Seed::Chain(chain) if self.hold_chain(&chain) => {
+                self.log.put(b"photon: MINTED: this device is the identity's first member");
+                self.log.line();
+                0
+            }
+            Seed::Chain(_) => {
+                // Another device's genesis won the slot first: this identity has a fleet now.
+                self.verdict = V_JOIN;
+                4
+            }
+            _ => 5,
         }
     }
 
@@ -522,6 +812,9 @@ impl Client {
         self.udp.join(4, v4);
         self.udp.join(6, join::BEACON_V6);
         self.load();
+        if self.hp.is_some() {
+            self.verdict = V_LOOKING;
+        }
         self.show_words();
         if !self.bound {
             self.mint_request();
@@ -562,15 +855,20 @@ impl Client {
             if n != ERR && n != ferros_sys::NOTHING {
                 busy = true;
                 let mut reply = Vec::with_capacity(400);
+                // Op 2: mint (the attest screen, after the permanence warning and the retype) → [result: 0 minted, else why not], then the state as op 1 gives it.
+                if n >= 1 && req[0] == 2 {
+                    let r = self.mint();
+                    reply.push(r);
+                }
                 let state: u8 = match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
-                    (false, _, _) => 0,
-                    (true, false, _) => 1,
+                    (false, _, _) => V_NONE,
+                    (true, false, _) => self.verdict,
                     (true, true, false) => 2,
                     (true, true, true) => 3,
                 };
                 reply.push(state);
                 reply.push(self.sponsors.len().min(255) as u8);
-                if let (Some(seed), false) = (self.identity_seed, self.bound) {
+                if let (Some(seed), false, V_JOIN) = (self.identity_seed, self.bound, self.verdict) {
                     reply.extend_from_slice(join::pair_words(&self.me, &seed).as_bytes());
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
@@ -580,10 +878,19 @@ impl Client {
                 self.last_load_us = t;
                 self.load_saying(false);
                 if self.hp.is_some() {
+                    self.verdict = V_LOOKING;
+                    self.last_lookup_us = 0;
                     self.show_words();
                     if !self.bound {
                         self.mint_request();
                     }
+                }
+            }
+            // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
+            if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) && t.saturating_sub(self.last_lookup_us) >= if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 } {
+                self.last_lookup_us = t;
+                if self.udp.flags().is_some_and(|f| f & 1 != 0) {
+                    self.lookup();
                 }
             }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
@@ -648,7 +955,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

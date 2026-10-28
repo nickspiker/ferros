@@ -12,5 +12,6 @@ path = "src/main.rs"
 ferros_sys = { path = "../../ferros_sys" }
 ferros_heap = { path = "../../ferros_heap" }
 photon_core = { path = "../../photon_core" }
+fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout"] }
 ed25519-dalek = { version = "2", default-features = false }
 vsf = { path = "../../../vsf", default-features = false }

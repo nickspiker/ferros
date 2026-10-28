@@ -11,7 +11,9 @@
 //!
 //! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). The two names under the status line switch it, for a person whose layout the device does not have yet; the change is the device's setting, kept in its settings document.
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings.
+//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the Photon client looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
+//!
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings, 8 the Photon client (use).
 #![no_std]
 #![no_main]
 
@@ -29,6 +31,8 @@ const S_AHAU: u64 = 4;
 const S_PHOTON: u64 = 5;
 const S_IRA: u64 = 6;
 const S_SETTINGS: u64 = 7;
+/// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
+const S_PHOTON_EP: u64 = 8;
 /// The layouts' names, as the switch shows them (honeycomb::LETTERS order). Names, not words: the same in every language.
 const LAYOUT_NAMES: [&str; honeycomb::LAYOUTS] = ["Dvorak", "QWERTY"];
 /// The longest handle the screen takes, in characters.
@@ -97,8 +101,16 @@ enum Mode {
     Known,
     /// No identity yet: the first entry.
     Fresh,
-    /// No identity yet: the same handle again, whose seed is this.
-    Confirm([u8; 32]),
+    /// The roots of this seed are in the vault; the Photon client is looking the identity up.
+    Looking([u8; 32]),
+    /// The identity has a fleet: one of its devices adds this one with the words shown; enter goes on.
+    Join([u8; 32]),
+    /// No fleet holds the handle: the permanence warning, and the handle again to mint.
+    Mint([u8; 32]),
+    /// No fleet device and no fgtw.org answer: nothing decided, the client keeps looking; enter goes on.
+    Grey([u8; 32]),
+    /// fgtw.org's chain for the handle is another identity's: enter starts over.
+    Wrong,
 }
 
 struct Ahau {
@@ -116,6 +128,9 @@ struct Ahau {
     handle: [u8; 4 * MAX_CHARS],
     len: usize,
     chars: usize,
+    /// The Photon client's pairing words while this device joins its identity's fleet.
+    word_buf: [u8; 512],
+    word_len: usize,
 }
 
 impl Ahau {
@@ -196,10 +211,102 @@ impl Ahau {
         (self.kb.top - self.w / 8, self.w / 16)
     }
 
+    /// The status: a line, or two split at a newline.
     fn status(&self, t: &str) {
         let (b, px) = self.status_at();
-        self.clear_rows(b - px * 3 / 2, b + px / 2);
-        self.centred(b, px, QUIET, t);
+        self.clear_rows(b - px * 3 / 2, b + px * 2);
+        for (k, line) in t.split('\n').enumerate() {
+            self.centred(b + k * px * 13 / 10, px, QUIET, line);
+        }
+    }
+
+    /// The pairing words while joining, six to a row under the layout switch, split at the capitals they come camelCased with; cleared otherwise.
+    fn words(&self) {
+        let (sb, spx) = self.switch_at();
+        let px = self.w / 30;
+        let top = sb + spx;
+        self.clear_rows(top, top + px * 9);
+        if !matches!(self.mode, Mode::Join(_)) {
+            return;
+        }
+        let w = &self.word_buf[..self.word_len];
+        let mut row = [0u8; 160];
+        let (mut n, mut count, mut line) = (0usize, 0usize, 0usize);
+        let flush = |row: &[u8], line: usize| {
+            if let Ok(t) = core::str::from_utf8(row) {
+                self.centred(top + px * 3 / 2 + line * px * 3 / 2, px, TEXT, t);
+            }
+        };
+        for (i, &c) in w.iter().enumerate() {
+            if c.is_ascii_uppercase() && i > 0 {
+                count += 1;
+                if count % 6 == 0 {
+                    flush(&row[..n], line);
+                    line += 1;
+                    n = 0;
+                } else if n < row.len() {
+                    row[n] = b' ';
+                    n += 1;
+                }
+            }
+            if n < row.len() {
+                row[n] = c;
+                n += 1;
+            }
+        }
+        flush(&row[..n], line);
+    }
+
+    /// The Photon client's state (op 1): its state byte, with the pairing words kept while it joins.
+    fn client_state(&mut self) -> Option<u8> {
+        let mut out = [0u8; 600];
+        let n = call(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
+        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
+            return None;
+        }
+        let n = (n as usize).min(out.len());
+        let k = (n - 2).min(self.word_buf.len());
+        self.word_buf[..k].copy_from_slice(&out[2..2 + k]);
+        self.word_len = k;
+        Some(out[0])
+    }
+
+    /// While the identity is being looked up or joined: follow the client. Returns whether the screen changed.
+    fn follow_client(&mut self) -> bool {
+        let seed = match self.mode {
+            Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
+            _ => return false,
+        };
+        let Some(state) = self.client_state() else { return false };
+        let next = match state {
+            1 => Mode::Join(seed),
+            2 | 3 => {
+                console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
+                self.keep_verifier(&seed);
+                self.attested();
+            }
+            5 => Mode::Mint(seed),
+            6 => Mode::Wrong,
+            7 => Mode::Grey(seed),
+            _ => return false,
+        };
+        if next == self.mode && !matches!(next, Mode::Join(_)) {
+            return false;
+        }
+        let changed = next != self.mode;
+        self.mode = next;
+        if changed {
+            self.status(self.prompt());
+        }
+        self.words();
+        true
+    }
+
+    fn keep_verifier(&self, seed: &[u8; 32]) {
+        let v = ahau_core::verifier(&self.device_key, seed);
+        if !self.put(S_AHAU, b"verifier", &v) {
+            console(self.grants, b"ahau: could not keep the verifier\n");
+        }
     }
 
     /// The entry: the handle as typed, a cursor, and a line under it.
@@ -235,7 +342,11 @@ impl Ahau {
         match self.mode {
             Mode::Known => "This device knows one identity. Type its handle.",
             Mode::Fresh => "No identity on this device yet. Type your handle.",
-            Mode::Confirm(_) => "Type it again: it becomes this device's identity.",
+            Mode::Looking(_) => "Looking this identity up: its devices nearby, then fgtw.org.",
+            Mode::Join(_) => "This identity has a fleet. On one of its devices: Fleet, Add device,\nand type the words below. Enter goes on meanwhile.",
+            Mode::Mint(_) => "No fleet holds this handle. Minting makes it yours for good:\nno reset, no recovery. Type it again to mint.",
+            Mode::Grey(_) => "No device of this identity and no fgtw.org answers: nothing decided.\nStill looking. Enter goes on meanwhile.",
+            Mode::Wrong => "fgtw.org's chain for this handle is another identity's.\nEnter starts over.",
         }
     }
 
@@ -257,7 +368,25 @@ impl Ahau {
     }
 
     /// Enter: the handle against what the device knows, or the first identity's two entries.
+    /// Enter: the handle against what the device knows; or a first entry's roots into the vault and the lookup; or the mint's second entry; or going on.
     fn attest(&mut self) {
+        match self.mode {
+            Mode::Join(seed) | Mode::Grey(seed) => {
+                // Going on: the client keeps joining (or looking); the next boot asks for this handle.
+                self.keep_verifier(&seed);
+                self.attested();
+            }
+            Mode::Wrong => {
+                let _ = ferros_sys::store_delete(cap(self.grants, S_PHOTON), b"identity_seed");
+                let _ = ferros_sys::store_delete(cap(self.grants, S_PHOTON), b"handle_proof");
+                self.mode = Mode::Fresh;
+                self.status(self.prompt());
+                self.words();
+                return;
+            }
+            Mode::Looking(_) => return,
+            _ => {}
+        }
         if self.chars == 0 {
             return;
         }
@@ -281,23 +410,12 @@ impl Ahau {
                     self.status("That is not this device's identity.");
                     return;
                 }
-                if self.verifier.is_none() && !self.put(S_AHAU, b"verifier", &v) {
-                    console(self.grants, b"ahau: could not keep the verifier\n");
+                if self.verifier.is_none() {
+                    self.keep_verifier(&seed);
                 }
                 self.attested();
             }
             Mode::Fresh => {
-                self.mode = Mode::Confirm(seed);
-                self.wipe();
-                self.status(self.prompt());
-            }
-            Mode::Confirm(first) => {
-                if !ahau_core::same(&first, &seed) {
-                    // The second stays on screen; corrected and entered, it is the first of a new pair.
-                    self.mode = Mode::Fresh;
-                    self.status("The two did not match. Fix it and enter, then type it again.");
-                    return;
-                }
                 self.status("Deriving the handle's proof: about seven seconds.");
                 self.entry();
                 self.show();
@@ -312,26 +430,54 @@ impl Ahau {
                 let mut l = Line::new();
                 let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms\n"));
                 console(self.grants, l.as_bytes());
-                let kept = self.put(S_PHOTON, b"identity_seed", &seed) && self.put(S_PHOTON, b"handle_proof", proof.as_bytes()) && self.put(S_AHAU, b"verifier", &v);
-                if !kept {
-                    console(self.grants, b"ahau: could not keep the identity\n");
-                    self.mode = Mode::Fresh;
-                    self.status("The vault refused the identity. Type your handle.");
+                if !(self.put(S_PHOTON, b"identity_seed", &seed) && self.put(S_PHOTON, b"handle_proof", proof.as_bytes())) {
+                    console(self.grants, b"ahau: the vault refused the roots\n");
+                    self.status("The vault refused the roots. Type your handle.");
                     return;
                 }
-                console(self.grants, b"ahau: a new identity on this device\n");
-                self.attested();
+                console(self.grants, b"ahau: roots kept; the Photon client looks the identity up\n");
+                self.wipe();
+                self.mode = Mode::Looking(seed);
+                self.status(self.prompt());
             }
+            Mode::Mint(first) => {
+                if !ahau_core::same(&first, &seed) {
+                    self.status("The two did not match. Fix it and enter.");
+                    return;
+                }
+                self.status("Minting: the genesis goes to fgtw.org.");
+                self.entry();
+                self.show();
+                let mut out = [0u8; 600];
+                let n = call(cap(self.grants, S_PHOTON_EP), &[2], &mut out);
+                let r = if n == ferros_sys::ERR || n == 0 { 255 } else { out[0] };
+                match r {
+                    0 => {
+                        console(self.grants, b"ahau: minted; this device is the identity's first member\n");
+                        self.keep_verifier(&seed);
+                        self.attested();
+                    }
+                    4 => {
+                        // Another device's genesis won the handle first: it has a fleet now.
+                        self.mode = Mode::Join(seed);
+                        self.status(self.prompt());
+                        let _ = self.client_state();
+                        self.words();
+                    }
+                    _ => {
+                        let mut l = Line::new();
+                        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: mint refused, client says {r}\n"));
+                        console(self.grants, l.as_bytes());
+                        self.status("fgtw.org did not take the genesis.\nEnter tries again.");
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Back to the first entry of a new identity (clear during the second).
-    fn unconfirm(&mut self) {
-        if let Mode::Confirm(_) = self.mode {
-            self.mode = Mode::Fresh;
-            self.status(self.prompt());
-        }
-    }
+    /// Clear during the mint's second entry only clears it: the verdict stands.
+    fn unconfirm(&mut self) {}
 
     fn attested(&mut self) -> ! {
         self.wipe();
@@ -474,10 +620,11 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0 };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, verifier, photon_seed, device_key, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
     a.all();
     a.show();
     console(grants, if mode == Mode::Known { b"ahau: waiting for this device's identity\n" } else { b"ahau: no identity on this device yet\n" });
+    let mut polls = 0u32;
     let mut touches = Touches::new(w);
     // Every key exact: a rolling finger still types where it landed.
     touches.trace_words = false;
@@ -508,7 +655,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
                 Touch::Trail(..) | Touch::Traced => {}
             }
         }
-        if a.follow_layout() || no > 0 {
+        // Following the Photon client's verdict while the identity is looked up or joined: about four times a second.
+        polls += 1;
+        let followed = polls % 64 == 0 && a.follow_client();
+        if a.follow_layout() || no > 0 || followed {
             a.show();
         }
         sleep_until(now() + freq() / 240);

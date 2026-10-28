@@ -799,10 +799,14 @@ impl Map {
         let n = (n as usize).min(out.len());
         let (state, heard) = (out[0], out[1]);
         let line = match state {
-            0 => "not paired: the identity roots are not in the vault",
-            1 => "paired \u{2022} waiting to be added from one of your devices",
+            0 => "no identity on this device yet: attest at boot",
+            1 => "this identity has a fleet \u{2022} add this device from one of its devices",
             2 => "bound \u{2022} waiting for the fleet key",
-            _ => "a device of your fleet",
+            3 => "a device of your fleet",
+            4 => "looking the identity up",
+            5 => "no fleet holds this handle \u{2022} it can be minted from the attest screen",
+            6 => "fgtw.org's chain for this handle is another identity's",
+            _ => "no fleet device and no fgtw.org answer \u{2022} nothing decided yet",
         };
         b.text(cx, cy + r + 160, 32, grey(), 1, line);
         let mut heard_line = [0u8; 48];
@@ -815,7 +819,7 @@ impl Map {
         if let Ok(t) = core::str::from_utf8(&heard_line[..hl]) {
             b.text(cx, cy + r + 208, 32, grey(), 1, t);
         }
-        if state == 1 || state == 2 {
+        if state == 1 {
             if let Ok(words) = core::str::from_utf8(&out[2..n]) {
                 b.text(cx, cy + r + 280, 32, grey(), 1, "type these on your other device (Settings \u{2022} Fleet \u{2022} Add device):");
                 // The words come camelCased in one run; six to a row, split at the capitals.

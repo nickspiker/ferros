@@ -36,6 +36,14 @@ Done to step 3 on the first night; steps 4–6 need the phone's owner at one of 
 
 **2026-10-27: the roots must be the phone owner's, entered on the phone.** On 2026-10-26 a session pushed the desktop's own Photon roots (the owner's identity) onto the husky with `tools/photon-interop` `roots` + `store put`; the husky is the owner's wife's phone. The vault was wiped and the join is done properly: she attests on the phone with her own handle and binds it from one of her own devices. The `roots` tool stays for interop tests on the dev box only, never for a device that belongs to someone (Claude memories/feedback_identity_belongs_to_a_person.md).
 
+## The verdict and the seed (2026-10-28)
+
+The attest screen no longer decides anything about an identity. A first entry derives the roots and writes them; the client looks the identity up (pairing-v2: peers first, the seed last) and says where the device stands, the `photon` endpoint's state byte: 0 no roots, 1 joining (the identity has a fleet; words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking, 5 fresh (fgtw.org holds no chain and no fleet device is heard), 6 wrong fleet (the seed's chain for the handle has another identity's genesis), 7 GREY (nothing answers; never a verdict).
+- **The seed over plain HTTP.** fgtw.org serves port 80 (Claude memories/fgtw_plain_http_for_ferros.md). The client resolves it through the DHCP-given DNS server and POSTs signed VSF documents over the `ip` process's TCP (ops 4-7), as payloads/httptest does. `fleet_get` and the genesis publish are built here until fgtw's client builds without std (asked of the Photon session, 2026-10-28); every answer is verified and folded against the roots, so the transport carries no trust.
+- **A beacon under our handle** proves the fleet exists, whatever the seed said: the verdict becomes joining.
+- **Mint** (op 2, the attest screen's after the permanence warning and the retype): `MembershipBlob::genesis_v2` signed by this device and the identity, published, fetched back; only a chain naming this device makes it a member (the seed's slot settles on one genesis). The fleet key waits for fgtw's key minting without std.
+- **Checked live 2026-10-28** on the husky with its owner's roots and no fleet device heard: the client resolved fgtw.org, fetched her chain over plain HTTP, verified and folded it, and said "this identity has a fleet". Mint is not tested against fgtw.org: a test mint is a permanent identity.
+
 ## Findings
 
 - **Multicast needs a join.** The phone heard another LAN device's beacons but never the dev box's; broadcast arrived, IPv4 multicast did not. The WiFi firmware passes all multicast; the access point's IGMP snooping was the filter. `ip` op 8 JOIN sends an IGMPv2 membership report (IPv4) or an MLDv1 listener report with the Router Alert option (IPv6) now and every 60 s; the client joins both beacon groups at start.
