@@ -193,6 +193,10 @@ impl FluorApp for App {
         if key != self.mark_key {
             self.mark.resize(w * h, 0);
             let p = mark::Params::new(&self.salt, &self.text());
+            // For tuning: where this picture came from (coordinates only, never the text).
+            let c = mark::locus(&p);
+            let (land, hit, trail) = mark::descend(c.0);
+            println!("device {:2}  x {:+.6}  landing {:+.6} {:+.6}i ({} after {} checks)  c {:+.6} {:+.6}i", self.device, c.0, land.0, land.1, if hit { "on the set" } else { "missed, on the axis" }, trail.len(), c.0, c.1);
             // Top half: the mark; then the whole set, then a 2⁵× zoom around the locus, a quarter of the height each.
             let (h0, h1) = (h / 2, h / 4);
             let (top, rest) = self.mark.split_at_mut(w * h0);
