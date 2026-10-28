@@ -395,8 +395,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
         b"ip" => &[44, 45, 41],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon (payloads/photon).
-        b"photon" => &[50, 48, 49, 46],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
+        b"photon" => &[50, 48, 49, 46, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint) (payloads/ahau).
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47],
         _ => return None,

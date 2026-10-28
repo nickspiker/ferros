@@ -36,6 +36,8 @@ const S_UDP: u64 = 1;
 const S_STORE: u64 = 2;
 const S_IRA: u64 = 3;
 const S_SERVE: u64 = 4;
+/// Grant slot 5: entropy (the kernel's KOHI stream), for fgtw's fleet-key minting (fgtw::set_entropy).
+const S_ENTROPY: u64 = 5;
 
 struct Log {
     grants: u64,
@@ -327,13 +329,37 @@ const V_UNREACHABLE: u8 = 7;
 const SEED_HOST: &[u8] = b"fgtw.org";
 const DNS_PORT: u16 = 53054;
 
-/// What the seed said about a handle's chain.
-enum Seed {
-    Chain(Vec<u8>),
-    NotFound,
-    /// Another `error` reason.
-    Refused,
-    Unreachable,
+/// fgtw's transport on ferros: one plain-HTTP POST of a request to fgtw.org through the `ip` process (Udp::post), the address resolved once and again after a failure. fgtw (feature `protocol`) builds every request and reads every answer; this only carries bytes.
+struct SeedHttp<'a> {
+    udp: &'a Udp,
+    ip: core::cell::Cell<Option<[u8; 4]>>,
+}
+
+impl fgtw::client::FgtwTransport for SeedHttp<'_> {
+    fn post(&self, body: Vec<u8>) -> Result<fgtw::client::FgtwResponse, alloc::string::String> {
+        let ip = match self.ip.get() {
+            Some(ip) => ip,
+            None => {
+                let ip = self.udp.resolve(SEED_HOST).ok_or_else(|| alloc::string::String::from("fgtw.org does not resolve"))?;
+                self.ip.set(Some(ip));
+                ip
+            }
+        };
+        match self.udp.post(ip, SEED_HOST, &body) {
+            Some((status, body)) => Ok(fgtw::client::FgtwResponse { status, body }),
+            None => {
+                self.ip.set(None);
+                Err("fgtw.org did not answer".into())
+            }
+        }
+    }
+}
+
+/// fgtw's entropy (fleet-key minting): the kernel's stream, through this process's entropy grant.
+fn kernel_entropy(buf: &mut [u8]) {
+    for chunk in buf.chunks_mut(4096) {
+        ferros_sys::entropy(cap(unsafe { GRANTS }, S_ENTROPY), chunk);
+    }
 }
 
 /// Eagle oscillations now, from the kernel's UTC wall clock (0 until it has one; the app treats a zero stamp as a frame from a clockless device).
@@ -527,46 +553,6 @@ impl Client {
         }
     }
 
-    /// One POST to the seed: resolved once (again after a failure), plain HTTP.
-    fn seed_post(&mut self, body: &[u8]) -> Option<(u16, Vec<u8>)> {
-        if self.seed_ip.is_none() {
-            self.seed_ip = self.udp.resolve(SEED_HOST);
-        }
-        let r = self.udp.post(self.seed_ip?, SEED_HOST, body);
-        if r.is_none() {
-            self.seed_ip = None;
-        }
-        r
-    }
-
-    /// The seed's `error` frame reason, if the body is one (fgtw client `error_frame`: an ASCII `reason` in a section named `error`, at HTTP 200).
-    fn seed_error(body: &[u8]) -> Option<alloc::string::String> {
-        let (header, end) = vsf::verification::read_verified(body, None).ok()?;
-        let section = header.primary_section(body, end).ok()?;
-        if section.name != "error" {
-            return None;
-        }
-        match section.get_field("reason").and_then(|f| f.values.first()) {
-            Some(vsf::VsfType::a(r)) => Some(r.clone()),
-            _ => Some(alloc::string::String::new()),
-        }
-    }
-
-    /// This handle's chain from the seed (`fleet_get`, as fgtw client `fetch` builds it; here until fgtw's client builds without std).
-    fn seed_fetch(&mut self, hp: &[u8; 32]) -> Seed {
-        let mut section = vsf::file_format::VsfSection::new("fleet_get");
-        section.add_field("hp", vsf::VsfType::hP(hp.to_vec()));
-        let Ok(req) = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build() else { return Seed::Unreachable };
-        match self.seed_post(&req) {
-            None => Seed::Unreachable,
-            Some((_, body)) => match Self::seed_error(&body) {
-                Some(r) if r == "not_found" => Seed::NotFound,
-                Some(_) => Seed::Refused,
-                None => Seed::Chain(body),
-            },
-        }
-    }
-
     /// A chain this device should hold: kept, and the device is a member when the fold names it.
     fn hold_chain(&mut self, chain: &[u8]) -> bool {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
@@ -581,31 +567,48 @@ impl Client {
         }
     }
 
-    /// Look the identity up (pairing-v2: peers first, the seed last): a fleet device heard beaconing under our handle already said the fleet exists; otherwise the seed's chain decides join, member or wrong fleet, its `not_found` says fresh, and no answer is GREY.
+    /// fgtw's transport for this call, starting from the address resolved last.
+    fn seed(&self) -> SeedHttp<'_> {
+        SeedHttp { udp: &self.udp, ip: core::cell::Cell::new(self.seed_ip) }
+    }
+
+    /// Look the identity up (pairing-v2: peers first, the seed last) and take fgtw's verdict on it (`fgtw::attest::attest_verdict`, the same function Photon's probe runs). A fleet device heard beaconing under our handle already said the fleet exists, so an undecided verdict becomes joining.
     fn lookup(&mut self) {
-        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        let Some(hp) = self.hp else { return };
         if self.bound {
             return;
         }
         let heard = !self.sponsors.is_empty();
-        let v = match self.seed_fetch(&hp) {
-            Seed::Chain(chain) => match join::adopt_chain(&hp, &seed, &self.me, &chain) {
-                Ok((_, true)) => {
-                    self.hold_chain(&chain);
-                    V_JOIN
+        fgtw::set_clock(eagle());
+        let t = self.seed();
+        let fetched = fgtw::client::fetch(&t, &hp);
+        let ip = t.ip.get();
+        self.seed_ip = ip;
+        let answer = match &fetched {
+            Ok(Some(b)) => fgtw::attest::SeedAnswer::Chain(b),
+            Ok(None) => fgtw::attest::SeedAnswer::NotFound,
+            Err(_) => fgtw::attest::SeedAnswer::Unreachable,
+        };
+        use fgtw::attest::AttestVerdict as A;
+        let v = match fgtw::attest::attest_verdict(&hp, &self.me, None, &[], answer) {
+            A::Member => {
+                if let Ok(Some(b)) = &fetched {
+                    if let Ok(bytes) = b.to_vsf_bytes() {
+                        self.hold_chain(&bytes);
+                    }
                 }
-                Ok((_, false)) => V_JOIN,
-                Err(e) if e.contains("not this identity") => V_WRONG,
-                Err(_) => if heard { V_JOIN } else { V_UNREACHABLE },
-            },
-            Seed::NotFound => if heard { V_JOIN } else { V_FRESH },
-            Seed::Refused | Seed::Unreachable => if heard { V_JOIN } else { V_UNREACHABLE },
+                V_JOIN
+            }
+            A::JoinOurs => V_JOIN,
+            A::WrongFleet => V_WRONG,
+            A::Fresh => if heard { V_JOIN } else { V_FRESH },
+            A::Unreachable | A::Unverifiable(_) => if heard { V_JOIN } else { V_UNREACHABLE },
         };
         if v != self.verdict {
             self.log.put(match v {
                 V_JOIN => b"photon: this identity has a fleet: waiting to be added from one of its devices".as_slice(),
                 V_FRESH => b"photon: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
-                V_WRONG => b"photon: the seed's chain for this handle has another identity's genesis",
+                V_WRONG => b"photon: fgtw.org's chain for this handle claims another slot",
                 _ => b"photon: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
             });
             self.log.line();
@@ -613,32 +616,59 @@ impl Client {
         self.verdict = v;
     }
 
-    /// Mint this identity (the attest screen asks, after the permanence warning and the retype): genesis signed by this device and the identity (fgtw `MembershipBlob::genesis_v2`), published to the seed, then fetched back — the seed's slot settles on one genesis, so only a chain that names this device makes it a member. Only on a fresh verdict. The fleet key follows once fgtw's key minting builds without std.
+    /// Mint this identity (the attest screen asks, after the permanence warning and the retype), only on a fresh verdict: fgtw's `ensure_member` (genesis signed by this device and the identity, published, fetched back: the seed's slot settles on one genesis, and only a chain naming this device counts), then the fleet key, founded by this device as the only member (`mint_fleet_key`, from the kernel's entropy). Returns 0 minted, 2 not fresh, 4 another genesis won the handle (it has a fleet now), 5 the seed refused or did not answer.
     fn mint(&mut self) -> u8 {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return 1 };
         if self.verdict != V_FRESH {
             return 2;
         }
-        let blob = fgtw::fleet::MembershipBlob::genesis_v2(&self.keys, hp, &seed, eagle());
-        let Ok(bytes) = blob.to_vsf_bytes() else { return 3 };
-        let published = self.seed_post(&bytes).map(|(_, b)| Self::seed_error(&b));
-        if let Some(Some(reason)) = &published {
-            self.log.put(b"photon: the seed refused the genesis: ");
-            self.log.put(reason.as_bytes());
-            self.log.line();
-        }
-        match self.seed_fetch(&hp) {
-            Seed::Chain(chain) if self.hold_chain(&chain) => {
+        fgtw::set_clock(eagle());
+        let t = self.seed();
+        let member = fgtw::client::ensure_member(&t, &self.keys, &hp, &seed);
+        let (chain, key) = match &member {
+            Ok(()) => {
+                fgtw::set_clock(eagle());
+                let chain = fgtw::client::fetch(&t, &hp).ok().flatten().and_then(|b| b.to_vsf_bytes().ok());
+                fgtw::set_clock(eagle());
+                (chain, fgtw::client::mint_fleet_key(&t, &hp, &self.keys, &[self.me], &seed))
+            }
+            Err(_) => (None, Err(alloc::string::String::new())),
+        };
+        self.seed_ip = t.ip.get();
+        match member {
+            Ok(()) => {
+                if let Some(c) = chain {
+                    self.hold_chain(&c);
+                }
                 self.log.put(b"photon: MINTED: this device is the identity's first member");
+                self.log.line();
+                match key {
+                    Ok((_, k)) => {
+                        self.fleet_key = Some(k);
+                        if self.store_set(b"fleet_key", &k) {
+                            self.log.put(b"photon: the fleet key is founded and ours");
+                        } else {
+                            self.log.put(b"photon: the fleet key is founded but the vault refused it");
+                        }
+                    }
+                    Err(e) => {
+                        self.log.put(b"photon: the fleet key was not founded: ");
+                        self.log.put(e.as_bytes());
+                    }
+                }
                 self.log.line();
                 0
             }
-            Seed::Chain(_) => {
-                // Another device's genesis won the slot first: this identity has a fleet now.
+            Err(e) if e.contains("not in the fleet") => {
                 self.verdict = V_JOIN;
                 4
             }
-            _ => 5,
+            Err(e) => {
+                self.log.put(b"photon: the genesis did not land: ");
+                self.log.put(e.as_bytes());
+                self.log.line();
+                5
+            }
         }
     }
 
@@ -967,6 +997,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
+    fgtw::set_entropy(kernel_entropy);
     if input_len >= 19 {
         let mut b = [0u8; 19];
         for (k, x) in b.iter_mut().enumerate() {

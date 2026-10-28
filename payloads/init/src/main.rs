@@ -25,8 +25,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 7] = [
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43]),
     // 1 use wlan, 2 serve udp, 3 entropy (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41]),
-    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon (payloads/photon).
-    (b"photon", b"photon", &[50, 48, 49, 46]),
+    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
+    (b"photon", b"photon", &[50, 48, 49, 46, 41]),
 ];
 
 #[unsafe(no_mangle)]
