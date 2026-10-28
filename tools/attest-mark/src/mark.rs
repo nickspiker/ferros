@@ -1,29 +1,29 @@
 //! The mark: a view into a Julia set, chosen by the device's salt and moved by what is in the textbox.
 //!
-//! Seeding is generated, not curated, and every step is a deterministic function of the salt:
-//! 0. c is sampled from the plane until it lies just OUTSIDE the Mandelbrot set (its distance estimate between 2⁻¹⁰ and 2⁻⁶), so the Julia set is a dust of spirals and dendrites with no inside to go flat;
-//! 1. the view centres on a point OF that Julia set, reached by inverse iteration (z → ±√(z − c)) with salt-chosen branches, at a salt-chosen zoom and rotation;
-//! 2. a thumbnail scores how much of the view lies near the set, and a framing that is too empty or too full is resampled with the next counter.
-//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) therefore fixes the family: the texture, the palette and roughly where the view sits.
-//! The textbox then moves the view a little — a pan of up to a quarter of the window, a turn of up to an eighth, half a stop of zoom — rescored the same way, so each change in the box visibly moves the picture while the device's look stays.
+//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the family: c and the palette.
+//! c is sampled from the plane until it lies just OUTSIDE the Mandelbrot set (distance estimate between 2⁻¹⁰ and 2⁻⁶), so J(c) is a Cantor dust of spirals and dendrites with no inside to go flat, and until trial views of J(c) show enough of the set, so a thin dendrite is passed over.
+//!
+//! The textbox picks where on J(c) the view lands, with maximum diffusion: for c outside the Mandelbrot set, f(z) = z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J(c) has an address, an infinite string of bits (which half of J each forward iterate falls in), and every string names exactly one point.
+//! Reading a hash of (salt, text) as that address lands on a point of J(c) deterministically; inverse iteration (z → ±√(z − c)) builds it, the last branch applied being the address's first and coarsest bit.
+//! Uniform bits give the balanced (harmonic) measure on J, Brolin's equidistribution: each bit halves the measure, so every change in the box lands somewhere new on the whole set, independent of where the last one landed.
+//! The same hash then sets the zoom (1× to 2⁶×, log-uniform), the rotation, and a Gaussian offset of the view's centre (σ a quarter window), and a thumbnail rejects framings that show too little of the set, redrawing with the next counter.
 //! Nothing compares the text against anything, so the picture says nothing about whether the text is right.
 
 use fluor::paint::pack_argb;
 use rayon::prelude::*;
 use std::f64::consts::TAU;
 
-/// Iteration cap: deep enough for the zooms used here (up to 2⁵).
+/// Iteration cap: deep enough for the zooms used here (up to 2⁶).
 const MAX_ITER: u32 = 1 << 10;
 /// Escape when |z|² passes 2⁸ (|z| = 16), far enough out for smooth colouring.
 const BAIL_SQ: f64 = (1 << 8) as f64;
 /// c is accepted when its distance to the Mandelbrot set lies in [2⁻¹⁰, 2⁻⁶].
 const DE_NEAR: f64 = 1. / (1 << 10) as f64;
 const DE_FAR: f64 = 1. / (1 << 6) as f64;
-/// A thumbnail pixel counts as near the set once its orbit survives 2⁴ iterations.
-const NEAR_ITER: u32 = 1 << 4;
-/// A framing is kept when between 3/8 and 7/8 of the thumbnail lies near the set.
-const FILL_LO: f64 = 3. / (1 << 3) as f64;
-const FILL_HI: f64 = 7. / (1 << 3) as f64;
+/// A jump of 2² iterations between neighbouring thumbnail pixels marks an edge of the set.
+const JUMP: i32 = 1 << 2;
+/// A framing is kept when at least a quarter of the thumbnail is edge.
+const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 
 /// Everything one picture needs, in the plane's terms.
 #[derive(Clone, Copy)]
@@ -64,36 +64,55 @@ fn m_distance(c: (f64, f64)) -> Option<f64> {
     None
 }
 
-/// The salt's framing number `counter`: c, the point of J(c) to centre on, the zoom, the rotation and the palette.
-fn framing(salt: &[u8; 32], counter: &mut u32) -> Params {
-    let c = loop {
-        let h = draw(salt, 0, *counter, &[]);
-        *counter += 1;
+/// The device's c: the first sample of the plane that lies just outside the Mandelbrot set.
+fn family_c(salt: &[u8; 32]) -> (f64, f64) {
+    let mut counter = 0;
+    loop {
+        let h = draw(salt, 0, counter, &[]);
+        counter += 1;
         let c = (-2. + unit(&h[0..4]) * 2.5, -1.25 + unit(&h[4..8]) * 2.5);
         if let Some(d) = m_distance(c) {
-            if d > DE_NEAR && d < DE_FAR {
-                break c;
+            if d > DE_NEAR && d < DE_FAR && full_bodied(salt, c) {
+                return c;
             }
         }
-    };
-    let f = draw(salt, 1, *counter, &[]);
-    // Inverse iteration lands on J(c) whatever it starts from; 2⁷ steps, each branch from one bit of the hash.
+    }
+}
+
+/// Is J(c) full enough to fill a view? Of 2² trial landings at 2³× zoom, at least half must show enough of the set; a thin dendrite fails at every zoom and is passed over.
+fn full_bodied(salt: &[u8; 32], c: (f64, f64)) -> bool {
+    let mut good = 0;
+    for n in 0..(1 << 2) {
+        let a = draw(salt, 4, n, &[]);
+        let half = 2. / (1 << 3) as f64;
+        let p = Params { c, centre: address_point(c, &a), half, rot: (1., 0.), phase: [0.; 3] };
+        good += framed(&p) as u32;
+    }
+    good >= 1 << 1
+}
+
+/// The point of J(c) whose address is `bits`: inverse iteration applies the branches finest first, so `bits[0]`'s low bit, applied last, picks the half of J.
+fn address_point(c: (f64, f64), bits: &[u8; 32]) -> (f64, f64) {
     let (mut x, mut y) = (0.5f64, 0.);
-    for i in 0..(1 << 7) {
+    for i in (0..(1 << 8)).rev() {
         let (ax, ay) = (x - c.0, y - c.1);
         let r = (ax * ax + ay * ay).sqrt();
         let (mut sx, mut sy) = (((r + ax) * 0.5).sqrt(), ((r - ax) * 0.5).sqrt());
         if ay < 0. {
             sy = -sy;
         }
-        if (f[(i >> 3) & 31] >> (i & 7)) & 1 == 1 {
+        if (bits[i >> 3] >> (i & 7)) & 1 == 1 {
             (sx, sy) = (-sx, -sy);
         }
         (x, y) = (sx, sy);
     }
-    let zoom = (unit(&f[0..4]) * 5.).exp2();
-    let a = unit(&f[4..8]) * TAU;
-    Params { c, centre: (x, y), half: 2. / zoom, rot: (a.cos(), a.sin()), phase: [unit(&f[8..12]), unit(&f[12..16]), unit(&f[16..20])] }
+    (x, y)
+}
+
+/// A standard normal pair from two uniforms (Box–Muller).
+fn gauss(u0: f64, u1: f64) -> (f64, f64) {
+    let r = (-2. * (1. - u0).ln()).sqrt();
+    (r * (TAU * u1).cos(), r * (TAU * u1).sin())
 }
 
 /// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel.
@@ -123,46 +142,52 @@ fn scale(p: &Params, w: usize, h: usize) -> f64 {
     p.half / (span * 0.5)
 }
 
-/// How much of a 2⁵ × 2⁶ thumbnail lies near the set.
-fn fill(p: &Params) -> f64 {
-    let (w, h) = (1usize << 5, 1usize << 6);
-    let k = scale(p, w, h);
-    let mut near = 0;
-    for py in 0..h {
-        for px in 0..w {
-            let (x, y) = plane(p, px, py, w, h, k);
-            near += (orbit(x, y, p.c).0 >= NEAR_ITER) as u32;
+/// How much edge a 2⁵ × 2⁶ thumbnail shows: the share of pixels whose iteration count jumps by at least 2² to the neighbour on the right or below.
+/// Only filaments of the set make such jumps; the smooth glow between them makes none, so the score reads "how much of the view is set" at every zoom.
+fn detail(p: &Params) -> f64 {
+    const W: usize = 1 << 5;
+    const H: usize = 1 << 6;
+    let k = scale(p, W, H);
+    let mut n = [0i32; W * H];
+    for py in 0..H {
+        for px in 0..W {
+            let (x, y) = plane(p, px, py, W, H, k);
+            n[py * W + px] = orbit(x, y, p.c).0 as i32;
         }
     }
-    near as f64 / (w * h) as f64
+    let mut edges = 0;
+    for py in 0..H - 1 {
+        for px in 0..W - 1 {
+            let i = py * W + px;
+            edges += ((n[i] - n[i + 1]).abs().max((n[i] - n[i + W]).abs()) >= JUMP) as u32;
+        }
+    }
+    edges as f64 / ((W - 1) * (H - 1)) as f64
 }
 
 fn framed(p: &Params) -> bool {
-    let s = fill(p);
-    s >= FILL_LO && s <= FILL_HI
+    detail(p) >= DETAIL_MIN
 }
 
 impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
-        let mut counter = 0;
-        let mut base = framing(salt, &mut counter);
-        while !framed(&base) {
-            base = framing(salt, &mut counter);
-        }
-        // The text's move, rescored like a framing; the first move that keeps the view full enough is taken, and after 2⁴ tries the last one stands.
+        let c = family_c(salt);
+        let f = draw(salt, 1, 0, &[]);
+        let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
+        // Each try draws a fresh address, zoom, turn and offset from (salt, text, counter); the first framing full enough is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
         loop {
-            let t = draw(salt, 2, n, text.as_bytes());
+            let a = draw(salt, 2, n, text.as_bytes());
+            let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
-            let mut p = base;
-            let (ox, oy) = ((unit(&t[0..4]) - 0.5) * base.half * 0.5, (unit(&t[4..8]) - 0.5) * base.half * 0.5);
-            let turn = (unit(&t[8..12]) - 0.5) * TAU * 0.25;
-            let (c1, s1) = (turn.cos(), turn.sin());
-            p.rot = (base.rot.0 * c1 - base.rot.1 * s1, base.rot.0 * s1 + base.rot.1 * c1);
-            p.centre = (base.centre.0 + ox, base.centre.1 + oy);
-            p.half = base.half * (unit(&t[12..16]) - 0.5).exp2();
-            if framed(&p) || n >= 1 << 4 {
+            let point = address_point(c, &a);
+            let half = 2. / (unit(&t[0..4]) * 6.).exp2();
+            let turn = unit(&t[4..8]) * TAU;
+            let (gx, gy) = gauss(unit(&t[8..12]), unit(&t[12..16]));
+            let sigma = half * 0.25;
+            let p = Params { c, centre: (point.0 + gx * sigma, point.1 + gy * sigma), half, rot: (turn.cos(), turn.sin()), phase };
+            if framed(&p) || n >= 1 << 5 {
                 return p;
             }
         }
