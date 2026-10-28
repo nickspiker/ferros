@@ -192,6 +192,13 @@ A share is uniformly random on its own, so APGA's PACGA oracle can only ever com
 - Power-down wipes the registers. Husky's c2 (PSCI power_state G#10000, 160–220 µs exit) and system deep sleep both cut the core's power domain. The ira needs no carrying: it is re-derived from the fuses and UFS. The wairua is random and must be carried through sleep unchanged (owner, 2026-10-28), so it rests sealed outside the core while the core is off.
 - Every use must run in hand-checked assembly that never touches the stack (the workflow above), or the key spills while it is consumed.
 
+**Storage that survives sleep but dies on reset: none found (2026-10-28).** Such a place would close the one gap a DRAM seal leaves: someone who resets the phone into their own code before DRAM fades and re-derives the seal key. The always-on PMU was the candidate (`diag keyreg ao`, read through the EL3 monitor, which refuses 44 of the 64 cells at G#1546_0800-08FC):
+- G#860-880 are CPU_INFORM 0-8 (flexpmu_cal_cpu_zuma.h): each core's requested power mode for the firmware (1 c2, 2 CPD, 3 SICD, 4 sleep). Tags written to CPU4's and CPU5's cells (owner's go) read back whole, were gone after a plain reset, and survived a kernel reload except one bit of CPU4's, cleared when the reload cycled that core. Live firmware state, rewritten at boot and by every power transition, deep sleep included. Restored to zero.
+- G#800 (INFORM0, Linux's c2 allow), G#810 (the reboot mode) and the other INFORM cells exist to carry information across a reset, and the allow-list is by address, not by caller: an attacker's code after a reset reads them just as ferros does. On Samsung's older parts INFORM3 (G#80C) carried the upload-mode cause, so it was not written.
+- G#840-85C hold boot information (G#840 went 1 to 0 across a reset).
+
+So on stock silicon the wairua crosses deep sleep sealed in DRAM under a key re-derived from the fuses at wake (microseconds, no disk), and the reset-and-dump gap stays open until PIPE holds the wairua on its own power. That is still strictly better than now, where the wairua sits in DRAM in the clear for the whole session.
+
 ## Open Questions (remaining)
 
 - ~~**Exact NEON pinning in Rust**~~ — **answered.** Tier 2 on rustc 1.94.0, `-O`, `aarch64-unknown-none`: no spill (see Proven Result). Re-verify on toolchain bump via the CI canary.

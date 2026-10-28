@@ -347,7 +347,7 @@ fn ask_worker(what: u32) -> bool {
     true
 }
 
-/// The PMU's information cells (pmu_alive G#1546_0000): INFORM0 at G#800 (Linux's c2 allow, exynos-cpupm.h), SYSIP_DAT0 at G#810 (the reboot mode), the rest undocumented. Always-on: they live through deep sleep. Whether a reset (or the bootloader after it) clears any of them is what this window is read for.
+/// The PMU's information cells (pmu_alive G#1546_0000): INFORM0 at G#800 (Linux's c2 allow, exynos-cpupm.h), SYSIP_DAT0 at G#810 (the reboot mode), CPU_INFORM 0-8 at G#860-880 (each core's requested power mode for the firmware, flexpmu_cal_cpu_zuma.h). Read only: G#860-880 are live firmware state (a tag written to CPU4's cell lost a bit when the core was cycled, 2026-10-28) and the INFORM cells exist to survive resets, so none is a home for a secret (KEY_REGISTERS.md).
 const PMU_INFORM: u64 = 0x1546_0800;
 const PMU_INFORM_CELLS: usize = 64;
 
