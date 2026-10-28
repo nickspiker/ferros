@@ -13,7 +13,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Pixel 8 Boot Findings](pixel8_boot_findings.md) — ABL behavior, entry code crash, display pipeline, what works/doesn't
 - [UFS husky wall — SOLVED](ufs_husky_wall.md) — cold UFS wall was ABL switching the flash VCC (gpp0-1) OFF before the kernel jump; drive it high + per-command nexus → cold link + LBA0 read work (2026-10-14). History kept.
 - [UFS Linux handoff](ufs_linux_handoff.md) — chainload ferros from running Linux to inherit its live UFS link; WORKS once pKVM disabled (fastboot oem pkvm disable); DRAM scratch doesn't survive reset
-- [Pixel is a dedicated ferros dev device](pixel8_dedicated_dev_device.md) — no banking/daily-driver constraint; graphene.md is dead scaffolding; free to unlock/wipe
+- [Pixel is the wife's phone, used for ferros dev](pixel8_dedicated_dev_device.md) — free to unlock/wipe for ferros, but HER device: no identity on it without asking; graphene.md is dead scaffolding
 - [Feedback: no web encodings](feedback_no_web_encodings.md) — no base64/JSON/URL forms anywhere ferros-side; hex/base36/EWE; bytes stay bytes (kete addresses go to the store as 32 bytes, 2026-10-27)
 - [Feedback: Photon cfg keeps Android](feedback_photon_cfg_keep_android.md) — gating Photon for ferros: insert a twin ABOVE the original's cfg, never below it (it steals the cfg — broke Android + macOS 2026-10-27); original becomes not(any(<old>, ferros)); check desktop + ferros + Android + Mac
 - [Feedback: don't SSH](feedback_no_ssh.md) — never SSH into another machine unless explicitly told to
@@ -96,3 +96,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: count from zero](feedback_count_from_zero.md) — every numbered thing in ferros starts at 0: levels, Zil versions, doc IDs (APK-LEGAL D0/O0); never start IDs at 1
 - [Windows](windows_design_pending.md) — built 2026-10-27: a full-screen surface per app (`--dma surface`), composed frontmost first inside a circle tangent to top/bottom (corners = system clock etc), death = generation byte; ops in WINDOWS.md
 - [Feedback: a handle is not a password](feedback_handle_not_password.md) — never mask a handle; show as typed; minting (only) asks for it twice, visibly; attest is one entry
+- [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) — never put identity roots on a device without asking whose device and which identity; the 2026-10-26 roots push put the owner's identity on his wife's phone
