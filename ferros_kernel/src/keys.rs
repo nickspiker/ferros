@@ -48,6 +48,15 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// Words to bytes without the heap (the hot paths: derive and stream).
+fn le<const N: usize, const B: usize>(w: &[u64; N]) -> [u8; B] {
+    let mut b = [0u8; B];
+    for (k, x) in w.iter().enumerate() {
+        b[k * 8..k * 8 + 8].copy_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
 fn bytes(w: &[u64]) -> alloc::vec::Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -118,6 +127,74 @@ static TEST: AtomicU32 = AtomicU32::new(0);
 pub static WEAK_MASKS: AtomicU32 = AtomicU32::new(0);
 pub static BAD_BLOBS: AtomicU32 = AtomicU32::new(0);
 
+/// The check (KEY_REGISTERS.md §2, across cores): per secret, a one-way tag, the first 64 bits of derive_key(CHECK, secret), kept in RAM like the wairua's fingerprint (it reveals nothing about the secret). Every core checks its copy against the tags about every quarter second and before every derive (about 400 cycles a secret on the X3). A core whose copy disagrees asks the others: if the cores that checked lately agree with it, the tag is what flipped and is replaced; otherwise its copy is cleared and it takes a fresh sealed one from a core that passes. Five register files flipping alike is not a failure mode; a bit flipped in one core's registers is caught and repaired. A random flip escapes the check with odds 2^-64.
+const CHECK: &str = "ferros keyreg check v0";
+static TAG: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+static CORE_TAG: [[core::sync::atomic::AtomicU64; 2]; CORES] = [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; CORES];
+static LAST_CHECK: [core::sync::atomic::AtomicU64; CORES] = [const { core::sync::atomic::AtomicU64::new(0) }; CORES];
+pub static CHECK_FAILS: AtomicU32 = AtomicU32::new(0);
+pub static TAG_FIXES: AtomicU32 = AtomicU32::new(0);
+
+/// This core's tag for the secret in `slot`, from its registers as they are.
+fn tag_here(slot: u32) -> u64 {
+    let ck = context_key(CHECK);
+    let mut o = Out4([0; 4]);
+    sealed(|| unsafe { keyreg_derive(slot, &ck, &mut o) });
+    let t = o.0[0];
+    wipe_words(&mut o.0);
+    t
+}
+
+/// Check this core's copies of the secrets in `which` (bit 0 ira, bit 1 wairua) against the tags. False = this core's copy was bad: it is cleared and the core has asked for a fresh one. Caller holds LOCK and this core holds the current generation.
+fn check_here(which: u32) -> bool {
+    let k = me();
+    let now = crate::platform::cntpct();
+    let fresh = crate::platform::cntfrq();
+    let g = GEN.load(Ordering::Acquire);
+    let present = PRESENT.load(Ordering::Acquire) & which;
+    let mut ok = true;
+    for slot in 0..2u32 {
+        if present & (1 << slot) == 0 {
+            continue;
+        }
+        let t = tag_here(slot);
+        CORE_TAG[k][slot as usize].store(t, Ordering::Release);
+        let stored = TAG[slot as usize].load(Ordering::Acquire);
+        if t == stored {
+            continue;
+        }
+        // Disagreement: the cores that hold this generation and checked within the last second decide.
+        let (mut with_me, mut with_tag) = (0, 0);
+        for j in 0..CORES {
+            if j == k || HELD[j].load(Ordering::Acquire) != g || now.wrapping_sub(LAST_CHECK[j].load(Ordering::Acquire)) > fresh {
+                continue;
+            }
+            let o = CORE_TAG[j][slot as usize].load(Ordering::Acquire);
+            if o == t {
+                with_me += 1;
+            } else if o == stored {
+                with_tag += 1;
+            }
+        }
+        if with_me > with_tag {
+            TAG[slot as usize].store(t, Ordering::Release);
+            TAG_FIXES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ok = false;
+        }
+    }
+    LAST_CHECK[k].store(now, Ordering::Release);
+    if !ok {
+        // Fail closed: this core's copy never derives anything again; another core's replaces it.
+        CHECK_FAILS.fetch_add(1, Ordering::Relaxed);
+        sealed(|| unsafe { keyreg_clear() });
+        HELD[k].store(0, Ordering::Release);
+        ASKING.fetch_or(1 << k, Ordering::AcqRel);
+        crate::process::kick(0xFFFF);
+    }
+    ok
+}
+
 struct Blob {
     nonce: [u8; 32],
     ct: Out8,
@@ -144,9 +221,44 @@ fn unlock() {
     LOCK.store(false, Ordering::Release);
 }
 
-/// The public context key for a derive_key context string.
+/// The public context key for a derive_key context string, from a small cache: hashing the context cost about 1,100 of a derive's 1,500 cycles on the X3 (2026-10-28). Sixteen entries searched in order and replaced round-robin; a context longer than an entry holds (none today: SYS_IRA's are at most 86 bytes) is hashed every time.
+const CTX_LEN: usize = 96;
+struct CtxCache {
+    text: [[u8; CTX_LEN]; 16],
+    len: [usize; 16],
+    key: [[u64; 4]; 16],
+    next: usize,
+}
+struct CtxCell(UnsafeCell<CtxCache>);
+// SAFETY: every access is under CTX_LOCK.
+unsafe impl Sync for CtxCell {}
+static CTX: CtxCell = CtxCell(UnsafeCell::new(CtxCache { text: [[0; CTX_LEN]; 16], len: [usize::MAX; 16], key: [[0; 4]; 16], next: 0 }));
+static CTX_LOCK: AtomicBool = AtomicBool::new(false);
+
 fn context_key(context: &str) -> [u64; 4] {
-    words(&blake3::hazmat::hash_derive_key_context(context))
+    let c = context.as_bytes();
+    if c.len() > CTX_LEN {
+        return words(&blake3::hazmat::hash_derive_key_context(context));
+    }
+    while CTX_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let cache = unsafe { &mut *CTX.0.get() };
+    let hit = (0..16).find(|&k| cache.len[k] == c.len() && cache.text[k][..c.len()] == *c);
+    let key = match hit {
+        Some(k) => cache.key[k],
+        None => {
+            let key = words(&blake3::hazmat::hash_derive_key_context(context));
+            let k = cache.next;
+            cache.next = (k + 1) % 16;
+            cache.text[k][..c.len()].copy_from_slice(c);
+            cache.len[k] = c.len();
+            cache.key[k] = key;
+            key
+        }
+    };
+    CTX_LOCK.store(false, Ordering::Release);
+    key
 }
 
 /// Fresh random words. With the wairua held: its keyed stream over a counter and the clock (microseconds). Before that: the firmware TRNG (about 1.3 ms a call on husky, 2026-10-28), else (counted in WEAK_MASKS) the counter. Masks and nonces only have to be unknown to someone who sees one share or the blob.
@@ -279,6 +391,8 @@ fn adopt() -> bool {
             keyreg_remask(IRA, &[m[0], m[1], m[2], m[3]]);
             keyreg_remask(WAIRUA, &[m[4], m[5], m[6], m[7]]);
         });
+        // A blob sealed from a bad copy would verify (its MAC covers the sealing, not the secret): the tags catch that too.
+        check_here(3);
     } else {
         // Fail closed: a blob that does not verify is never loaded (a flipped bit would be a wrong key, silently).
         BAD_BLOBS.fetch_add(1, Ordering::Relaxed);
@@ -308,6 +422,14 @@ fn ensure() -> bool {
 
 /// From each core's loop (the X3's service loop, each worker's idle loop): take a blob meant for this core, or seal one for cores that asked.
 pub fn serve() {
+    // The quarter-second check of this core's copies.
+    if held() != 0 && crate::platform::cntpct().wrapping_sub(LAST_CHECK[me()].load(Ordering::Acquire)) > crate::platform::cntfrq() / 4 {
+        lock();
+        if held() != 0 {
+            check_here(3);
+        }
+        unlock();
+    }
     let want = WANT.load(Ordering::Acquire);
     let asking = ASKING.load(Ordering::Acquire);
     if want & (1 << me()) == 0 && asking == 0 {
@@ -317,8 +439,9 @@ pub fn serve() {
     if WANT.load(Ordering::Acquire) & (1 << me()) != 0 {
         adopt();
     }
+    // Seal for cores that asked, only from a copy that passes its check now.
     let asking = ASKING.load(Ordering::Acquire);
-    if asking != 0 && WANT.load(Ordering::Acquire) == 0 && held() != 0 {
+    if asking != 0 && WANT.load(Ordering::Acquire) == 0 && held() != 0 && check_here(3) {
         ASKING.store(0, Ordering::Release);
         publish(asking);
     }
@@ -346,6 +469,7 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     wipe_words(&mut m);
     wipe(value);
     PRESENT.fetch_or(1 << slot, Ordering::AcqRel);
+    TAG[slot as usize].store(tag_here(slot), Ordering::Release);
     let g = GEN.fetch_add(1, Ordering::AcqRel) + 1;
     HELD[me()].store(g, Ordering::Release);
     publish(running() & !(1 << me()));
@@ -358,11 +482,25 @@ pub fn derive(slot: u32, context: &str) -> Option<[u8; 32]> {
     if !ensure() || held() & (1 << slot) == 0 {
         return None;
     }
+    // Checked before every derive (they are rare: process ira keys, the capability key, the nonce seed, the fingerprint); a bad copy gives nothing, never a wrong key.
+    lock();
+    let ok = held() & (1 << slot) != 0 && check_here(1 << slot);
+    unlock();
+    if !ok {
+        // Repaired from another core in microseconds when one is awake; a sixty-fourth of a second at most, then nothing.
+        let until = crate::platform::cntpct() + crate::platform::cntfrq() / 64;
+        while held() & (1 << slot) == 0 && crate::platform::cntpct() < until {
+            serve();
+            core::hint::spin_loop();
+        }
+        if held() & (1 << slot) == 0 {
+            return None;
+        }
+    }
     let ck = context_key(context);
     let mut out = Out4([0; 4]);
     sealed(|| unsafe { keyreg_derive(slot, &ck, &mut out) });
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&bytes(&out.0));
+    let k: [u8; 32] = le(&out.0);
     wipe_words(&mut out.0);
     Some(k)
 }
@@ -387,7 +525,8 @@ pub fn stream(context: &str, msg: &[u8], out: &mut [u8]) -> bool {
     }
     for (block, chunk) in out.chunks_mut(64).enumerate() {
         let b = stream_block(&ck, &mw, msg.len() as u32, block as u64);
-        chunk.copy_from_slice(&bytes(&b.0)[..chunk.len()]);
+        let bb: [u8; 64] = le(&b.0);
+        chunk.copy_from_slice(&bb[..chunk.len()]);
     }
     true
 }
@@ -493,8 +632,46 @@ pub fn diag(params: &[u8], out: &mut alloc::vec::Vec<u8>) {
         let e = crate::platform::cntpct();
         out.extend_from_slice(alloc::format!("  random 4 words A#{} us, 8 words A#{} us, seal keys A#{} us, stack scrub A#{} us\n", us(b - a), us(c - b), us(d - c), us(e - d)).as_bytes());
     }
+    if params == b"flip" && held() & 2 != 0 {
+        // One bit of this core's wairua share 0 flipped, as a particle would: the next derive must notice, take a good copy from another core, and give the same key.
+        let before = derive(WAIRUA, FP);
+        let fails = CHECK_FAILS.load(Ordering::Relaxed);
+        unsafe { core::arch::asm!("mrs {t}, S3_0_C2_C2_0", "eor {t}, {t}, #1", "msr S3_0_C2_C2_0, {t}", t = out(reg) _, options(nomem, nostack)) };
+        let t0 = crate::platform::cntpct();
+        let after = derive(WAIRUA, FP);
+        let t1 = crate::platform::cntpct();
+        out.extend_from_slice(alloc::format!("flip on core {}: caught {}, repaired in A#{} us, wairua {}\n", me(), CHECK_FAILS.load(Ordering::Relaxed) > fails, (t1 - t0) * 1_000_000 / crate::platform::cntfrq(), match (before, after) { (Some(a), Some(b)) if a[..8] == b[..8] => "SAME", (_, None) => "NOT HELD", _ => "CHANGED" }).as_bytes());
+    }
+    if params == b"time" && held() & 2 != 0 {
+        // The cost of a use, in this core's cycles: the lifted derive alone (shares joined + one compression), and the whole `derive` (interrupts masked, scrub, context key).
+        let cyc = || -> u64 {
+            let c: u64;
+            unsafe { core::arch::asm!("isb", "mrs {}, pmccntr_el0", out(reg) c, options(nomem, nostack)) };
+            c
+        };
+        let ck = context_key("ferros keyreg timing v0");
+        let mut o = Out4([0; 4]);
+        const N: u64 = 1 << 12;
+        let t0 = cyc();
+        for _ in 0..N {
+            sealed(|| unsafe { keyreg_derive(WAIRUA, &ck, &mut o) });
+        }
+        let t1 = cyc();
+        for _ in 0..N {
+            let _ = derive(WAIRUA, "ferros keyreg timing v0");
+        }
+        let t2 = cyc();
+        let mut s = Out8([0; 8]);
+        for _ in 0..N {
+            sealed(|| unsafe { keyreg_stream(&ck, &[1, 0, 0, 0, 0, 0, 0, 0], 8, 0, &mut s) });
+        }
+        let t3 = cyc();
+        wipe_words(&mut o.0);
+        wipe_words(&mut s.0);
+        out.extend_from_slice(alloc::format!("core {}: cycles per call: lifted derive A#{}, whole derive A#{}, stream block A#{}\n", me(), (t1 - t0) / N, (t2 - t1) / N, (t3 - t2) / N).as_bytes());
+    }
     let test = TEST.load(Ordering::Acquire);
-    out.extend_from_slice(alloc::format!("self-test {}  generation {}  present {}{}  blob waits for G#{:X}  asking G#{:X}  weak masks {}  bad blobs {}\n", match test { 0 => "not run".into(), 1 => "passed".into(), f => alloc::format!("FAILED at {}", f - 1) }, GEN.load(Ordering::Acquire), if PRESENT.load(Ordering::Acquire) & 1 != 0 { "ira " } else { "" }, if PRESENT.load(Ordering::Acquire) & 2 != 0 { "wairua" } else { "" }, WANT.load(Ordering::Acquire), ASKING.load(Ordering::Acquire), WEAK_MASKS.load(Ordering::Relaxed), BAD_BLOBS.load(Ordering::Relaxed)).as_bytes());
+    out.extend_from_slice(alloc::format!("self-test {}  generation {}  present {}{}  blob waits for G#{:X}  asking G#{:X}  weak masks {}  bad blobs {}  check fails {}  tag fixes {}\n", match test { 0 => "not run".into(), 1 => "passed".into(), f => alloc::format!("FAILED at {}", f - 1) }, GEN.load(Ordering::Acquire), if PRESENT.load(Ordering::Acquire) & 1 != 0 { "ira " } else { "" }, if PRESENT.load(Ordering::Acquire) & 2 != 0 { "wairua" } else { "" }, WANT.load(Ordering::Acquire), ASKING.load(Ordering::Acquire), WEAK_MASKS.load(Ordering::Relaxed), BAD_BLOBS.load(Ordering::Relaxed), CHECK_FAILS.load(Ordering::Relaxed), TAG_FIXES.load(Ordering::Relaxed)).as_bytes());
     for (k, h) in HELD.iter().enumerate() {
         let g = h.load(Ordering::Acquire);
         if g != 0 {

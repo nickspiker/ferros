@@ -220,7 +220,17 @@ Neither secret has a RAM copy any more. KOHI and vault boot hand theirs over the
 - residue inside blake3 and KOHI's own frames at the moment of derivation;
 - the sealed blob, during a handoff or a sleep.
 
-Not yet built: the inverted-pair check of §2 (a bit flipped in a share goes unnoticed until a derived key is wrong; the blob's MAC covers only handoffs).
+**The check (2026-10-28), §2 rebuilt across cores.** The inverted pair needs a third register a word, and there are none left. A parity word in a spare register would be a linear function of the secret, so it would leak part of the key if that register leaked, and it misses some two-bit flips. So the check is a one-way tag instead:
+- **The tag:** per secret, 64 bits of `derive_key("ferros keyreg check v0", secret)`, kept in RAM. Like the wairua's fingerprint, it reveals nothing about the secret.
+- **When it runs:** each core checks its copy about every quarter second in its loop, and before every derive (only the secret being used). One check costs a compression, about 420 cycles on the X3.
+- **On a disagreement:** the cores that checked within the last second decide. If they agree with this core, the tag is what flipped and is replaced. Otherwise this core's copy is cleared and it takes a sealed copy from a core that passes; a holder checks itself before sealing.
+- **Why repair is trustworthy here:** §2 dropped quorum repair because one core's registers can fail together. Five separate register files with different masks don't flip alike.
+- **Fail closed:** if no core passes, the secret gives nothing, never a wrong key.
+- **Odds:** a random flip escapes the check with odds 2⁻⁶⁴.
+- **Measured:** `diag keys flip` flips one bit of the X3's wairua share. Every time, it was caught and repaired from a worker in 270–280 µs, with the wairua unchanged.
+- **Cost:** the context-key cache (hashing the context had been ~1,100 cycles of each derive) more than pays for it. A checked derive costs 1,245 cycles; an unchecked one cost 1,461–1,616 before.
+
+`SYS_ENTROPY` blocks are not checked one by one; the quarter-second check covers them.
 
 ## Open Questions (remaining)
 

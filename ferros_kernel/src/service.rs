@@ -2007,8 +2007,8 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"keys" || cmd.params == b"keys sleep" {
-                                            // `diag keys [sleep]`: where the ira and wairua are held, the self-test, and a power-down rehearsal on this core (keys.rs).
+                                        if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" {
+                                            // `diag keys [sleep|time|flip]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired (keys.rs).
                                             crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
