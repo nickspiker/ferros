@@ -1,4 +1,4 @@
-//! Hive (a working name): the honeycomb keyboard as an app (honeycomb has the keyboard itself; Claude memories/input_rhe_on_glass.md the design). A tap types into a line above the keys and to the console; enter prints the line; two fingers dragged up or down scroll the extent (digits, symbols) a row per row pitch; map hands the screen back.
+//! Hive (a working name): the honeycomb keyboard as an app (honeycomb has the keyboard itself; Claude memories/input_rhe_on_glass.md the design). A tap types into a line above the keys and to the console; one finger sliding through a word's letters types the word (shape writing, honeycomb::shape, over rhe's English list), with three alternatives in a strip above the keys, a tap on one swapping it in; enter prints the line; two fingers dragged up or down scroll the extent (digits, symbols) a row per row pitch; map hands the screen back.
 //!
 //! A window (WINDOWS.md): it draws its own surface, shows it at the app level, and takes a finger only where the display says the point is its own (the corners outside the circle are the system's).
 //!
@@ -9,7 +9,10 @@
 #![no_main]
 
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
-use honeycomb::{Event, Key, Keyboard, Touch, Touches};
+use honeycomb::{Event, Key, Keyboard, Lexicon, Touch, Touches};
+
+/// The shape-writing lexicon, built from rhe's list (build.rs).
+static LEXICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lexicon.bin"));
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
@@ -23,6 +26,10 @@ struct Hive {
     kb: Keyboard,
     text: [u8; 256],
     len: usize,
+    /// The last traced word: where it starts in the text and how long it is, and the alternatives offered for it (lexicon ranks, u32::MAX for none).
+    word: Option<(usize, usize)>,
+    cur: u32,
+    alts: [u32; 3],
 }
 
 impl Hive {
@@ -39,7 +46,7 @@ impl Hive {
         let s = self.surf();
         let w = self.w;
         let size = self.w / 21;
-        let base = self.kb.top - size * 3 / 2;
+        let base = self.strip().0 - size;
         s[(base - size * 3 / 2) * w..(base + size / 2) * w].fill(0);
         // The tail that fits: a whole number of UTF-8 characters, about 30 of them.
         let mut from = self.len;
@@ -55,6 +62,80 @@ impl Hive {
         t[..k].copy_from_slice(&self.text[from..self.len]);
         t[k] = b'_';
         window::text(self.display, self.base, (w / 28) as i16, base as i16, size as u16, honeycomb::WHITE as u16, &t[..k + 1]);
+    }
+
+    /// The strip of alternatives between the typed line and the keys: three slots across.
+    fn strip(&self) -> (usize, usize) {
+        let h = self.w / 10;
+        (self.kb.top - h, self.kb.top)
+    }
+
+    fn draw_strip(&self) {
+        let (y0, y1) = self.strip();
+        let s = self.surf();
+        s[y0 * self.w..y1 * self.w].fill(0);
+        let lex = Lexicon(LEXICON);
+        let size = self.w / 28;
+        for (k, &r) in self.alts.iter().enumerate() {
+            let Some(word) = (r != u32::MAX).then(|| lex.word(r)).flatten() else { continue };
+            let cx = self.w * (2 * k + 1) / 6;
+            let x = cx as i64 - word.len() as i64 * size as i64 * 28 / 100;
+            window::text(self.display, self.base, x as i16, ((y0 + y1) / 2 + size * 35 / 100) as i16, size as u16, 9000, word);
+        }
+    }
+
+    /// A trace decoded: the best word typed (a space before it after another word, a capital if shift is on), the next three offered in the strip.
+    fn traced(&mut self, trace: &[(i64, i64)]) {
+        let lex = Lexicon(LEXICON);
+        let mut best = [(0u32, 0i64); 4];
+        self.kb.decode(trace, lex, &mut best);
+        if best[0].0 == u32::MAX {
+            return;
+        }
+        let word = lex.word(best[0].0).unwrap_or(b"");
+        if self.len > 0 && self.text[self.len - 1] != b' ' {
+            self.push(' ');
+        }
+        let start = self.len;
+        for (i, &c) in word.iter().enumerate() {
+            let c = c as char;
+            self.push(if i == 0 && self.kb.shift { c.to_ascii_uppercase() } else { c });
+        }
+        if self.kb.shift {
+            self.kb.shift = false;
+        }
+        self.word = Some((start, self.len - start));
+        self.cur = best[0].0;
+        self.alts = [best[1].0, best[2].0, best[3].0];
+        self.draw_strip();
+        self.line();
+    }
+
+    /// A tap above the keys: on an alternative, it replaces the last traced word.
+    fn tap_at(&mut self, x: i64, y: i64) {
+        let (y0, y1) = self.strip();
+        if (y as usize) < y0 || (y as usize) >= y1 {
+            return;
+        }
+        // The touch server's x is a panel pixel, under the width: 0, 1 or 2.
+        let slot = x as usize * 3 / self.w;
+        let (Some((start, n)), r) = (self.word, self.alts[slot]) else { return };
+        if r == u32::MAX || start + n != self.len {
+            return;
+        }
+        let lex = Lexicon(LEXICON);
+        let Some(word) = lex.word(r) else { return };
+        let cap = self.text[start].is_ascii_uppercase();
+        self.len = start;
+        for (i, &c) in word.iter().enumerate() {
+            self.push(if i == 0 && cap { (c as char).to_ascii_uppercase() } else { c as char });
+        }
+        // The replaced word takes the alternative's place in the strip.
+        self.alts[slot] = self.cur;
+        self.cur = r;
+        self.word = Some((start, self.len - start));
+        self.draw_strip();
+        self.line();
     }
 
     fn all(&self) {
@@ -132,7 +213,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"hive: no surface\n");
         exit(2);
     }
-    let mut hive = Hive { display, base, w, h, kb: Keyboard::new(w, h), text: [0; 256], len: 0 };
+    let mut hive = Hive { display, base, w, h, kb: Keyboard::new(w, h), text: [0; 256], len: 0, word: None, cur: u32::MAX, alts: [u32::MAX; 3] };
     let t0 = now();
     hive.all();
     let drawn = ferros_sys::us_since(t0);
@@ -169,7 +250,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 Touch::Light(key) => hive.kb.draw_key(hive.surf(), key, true, &mut hive.label()),
                 Touch::Unlight(key) => hive.kb.draw_key(hive.surf(), key, false, &mut hive.label()),
                 Touch::Scrolled => hive.kb.draw(hive.surf(), &mut hive.label()),
-                Touch::Tap(key) => hive.tap(grants, key),
+                Touch::Tap(key) => {
+                    // A tapped character ends the traced word's chance to be swapped.
+                    hive.word = None;
+                    hive.tap(grants, key);
+                }
+                Touch::Trail(x, y) => honeycomb::dot(hive.surf(), w, x, y, (w / 96) as i64, honeycomb::WHITE / 2),
+                Touch::Traced => {
+                    let mut tr = [(0i64, 0i64); 256];
+                    let t = touches.trace();
+                    tr[..t.len()].copy_from_slice(t);
+                    let n = t.len();
+                    hive.traced(&tr[..n]);
+                    // The trail off the keys.
+                    hive.kb.draw(hive.surf(), &mut hive.label());
+                }
+                Touch::TapAt(x, y) => hive.tap_at(x, y),
             }
         }
         if dirty {

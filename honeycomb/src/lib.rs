@@ -7,6 +7,9 @@
 //! The extent scrolls in whole rows (no animation, owner 2026-10-22): two fingers drag it 1:1, a row per row pitch, and the page key on the symbol row moves it a page (four rows) at a time, back to the letters after the last. The whole keyboard sits inside the circle an app lives in (owner, 2026-10-27): the bar's bottom is where the circle's chord first spans the screen, so the corners stay the system's.
 #![no_std]
 
+pub mod shape;
+pub use shape::Lexicon;
+
 /// White, as a working value (gamma 2, Q14).
 pub const WHITE: u64 = 16384;
 /// A key at rest, lit by a finger, and the bar's keys at rest (working values: about 2.5 %, 18 % and 1.2 % of white's light).
@@ -281,6 +284,12 @@ pub enum Touch {
     Tap(Key),
     /// A two-finger drag moved the view: redraw the keyboard.
     Scrolled,
+    /// A finger tracing a word is here now: draw the trail.
+    Trail(i64, i64),
+    /// The tracing finger lifted: decode `Touches::trace` (`Keyboard::decode`), then redraw the keys under the trail.
+    Traced,
+    /// A finger lifted without moving where there is no key (above the keyboard, on the host's own things).
+    TapAt(i64, i64),
 }
 
 /// Fingers on the keyboard, each on its own (owner, 2026-10-27): a second finger landing before the first lifts is two taps, not a gesture; a key is lit while a finger is on it and is a tap when that finger lifts without moving past the slop; two of the host's fingers moving together scroll the extent a row per row pitch. A finger that moves alone does nothing yet: shape writing goes there.
@@ -290,12 +299,21 @@ pub struct Touches {
     /// A scroll: the view and the fingers' mean height when it began.
     scroll: Option<(usize, i64)>,
     slop: i64,
+    /// The finger tracing a word, if one is, and its path in pixels (at most 256 points; a longer trace keeps its first 256).
+    tracer: Option<usize>,
+    trace: [(i64, i64); 256],
+    traced: usize,
 }
 
 impl Touches {
     /// For a screen `w` pixels wide: the slop is a 56th of it (the map's 24 pixels on this panel).
     pub fn new(w: usize) -> Touches {
-        Touches { f: [(false, 0, 0, Key::None, false, false); 16], scroll: None, slop: (w / 56) as i64 }
+        Touches { f: [(false, 0, 0, Key::None, false, false); 16], scroll: None, slop: (w / 56) as i64, tracer: None, trace: [(0, 0); 256], traced: 0 }
+    }
+
+    /// The last trace's path.
+    pub fn trace(&self) -> &[(i64, i64)] {
+        &self.trace[..self.traced]
     }
 
     /// One poll: `held` is every contact down now (id, x, y). `mine` is asked once per contact as it lands (is the point the host's window's?). Each change goes to `out`.
@@ -317,6 +335,17 @@ impl Touches {
                 if f.3 != Key::None {
                     out(Touch::Unlight(f.3));
                 }
+                // A word being traced: one of the host's fingers, alone, that started on a key, with no scroll running.
+                if f.5 && f.3 != Key::None && self.scroll.is_none() && self.tracer.is_none() {
+                    self.tracer = Some(id);
+                    self.trace[0] = (f.1, f.2);
+                    self.traced = 1;
+                }
+            }
+            if self.tracer == Some(id) && self.traced < self.trace.len() {
+                self.trace[self.traced] = (x, y);
+                self.traced += 1;
+                out(Touch::Trail(x, y));
             }
             if f.5 {
                 sum_y += y;
@@ -325,6 +354,11 @@ impl Touches {
         }
         // Two of the host's fingers: a scroll from where they stood when the second landed; dragging down shows the rows above.
         if ours == 2 {
+            // A second finger ends a trace: it was a scroll.
+            if self.tracer.take().is_some() {
+                self.traced = 0;
+                out(Touch::Traced);
+            }
             let mean = sum_y / 2;
             match self.scroll {
                 None => self.scroll = Some((kb.view, mean)),
@@ -344,6 +378,12 @@ impl Touches {
                     if self.scroll.is_none() {
                         out(Touch::Tap(f.3));
                     }
+                } else if f.3 == Key::None && f.5 && !f.4 && self.scroll.is_none() {
+                    out(Touch::TapAt(f.1, f.2));
+                }
+                if self.tracer == Some(id) {
+                    self.tracer = None;
+                    out(Touch::Traced);
                 }
             }
         }
@@ -357,6 +397,35 @@ impl Touches {
 fn centred(cx: i64, cy: i64, px: u16, s: &str, label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
     let (cx, cy, p) = (cx >> 8, cy >> 8, px as i64);
     label(cx - s.chars().count() as i64 * p * 28 / 100, cy + p * 35 / 100, px, LABEL, s);
+}
+
+/// A round dot of radius `r` pixels at (x, y) (a tracing finger's trail): coverage from the squared distance, a root only on the one-pixel edge band. The caller keeps it on the surface.
+pub fn dot(s: &mut [u64], w: usize, x: i64, y: i64, r: i64, v: u64) {
+    let (cx, cy, rq) = ((x << 8) + 128, (y << 8) + 128, r << 8);
+    let (lo, hi) = (rq - 128, rq + 128);
+    for py in y - r - 1..=y + r + 1 {
+        for px in x - r - 1..=x + r + 1 {
+            let (dx, dy) = ((px << 8) + 128 - cx, (py << 8) + 128 - cy);
+            let d2 = dx * dx + dy * dy;
+            let cov = if d2 <= lo * lo {
+                256
+            } else if d2 >= hi * hi {
+                continue;
+            } else {
+                hi - (d2 as u64).isqrt() as i64
+            };
+            // A finger near the glass's edge puts part of its dot off the screen: those pixels do not exist (the position is the touch controller's, not ours).
+            if px < 0 || py < 0 || px >= w as i64 || (py as usize + 1) * w > s.len() {
+                continue;
+            }
+            let p = &mut s[py as usize * w + px as usize];
+            let g = grey(v * ((cov as u64) << 8).isqrt() >> 8);
+            // Over whatever is there, the brighter channel wins (the trail sits on the keys).
+            if g & 0xFFFF > *p & 0xFFFF {
+                *p = g;
+            }
+        }
+    }
 }
 
 fn grey(v: u64) -> u64 {
