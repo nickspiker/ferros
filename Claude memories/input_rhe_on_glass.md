@@ -46,12 +46,12 @@ Z lands below-between A and S, near its physical spot. Moving Q costs QWERTY use
 ```
         ... obscure symbols, emoji (scroll)
    ' " ! ? - : ; ( )            9   symbols, most frequent first (scroll)
-  1 2 3 4 5 6 7 8 9 0          10   digits, visible by default
+  0 1 2 3 4 5 6 7 8 9          10   digits, visible by default — 0 FIRST (owner: 0 is the first number)
    W E R T Y U I O P            9
   A S D F G H J K L .          10
    Z X C V B N M Q ,            9
   [ shift ][   space   ][ bksp ][ enter ]   fixed bar
 ```
-Why: most frequent nearest the thumb (bottom of screen) and rarer stacks above (depth ∝ rarity as physical distance); digits fill a 10-row exactly so the 9/10 alternation continues; three letter rows are ~20 mm so the digit row fits without scrolling (scroll starts at symbols); space/shift/backspace/enter must not scroll away (needed while picking symbols), so they live in the fixed bar; space doesn't need the centre — tracing inserts it between words, tapping (multi-word handles) gets the bottom bar; backspace right, shift left. The digit row follows `device.base`: base 10 fills the 10 cells; dozenal's two extra digits take the first two cells of the row above.
+Why: most frequent nearest the thumb (bottom of screen) and rarer stacks above (depth ∝ rarity as physical distance); digits fill a 10-row exactly so the 9/10 alternation continues; three letter rows are ~20 mm so the digit row fits without scrolling (scroll starts at symbols); space/shift/backspace/enter must not scroll away (needed while picking symbols), so they live in the fixed bar; space doesn't need the centre — tracing inserts it between words, tapping (multi-word handles) gets the bottom bar; backspace right, shift left. **Owner refinements:** ordering agreed; within the symbol row the most common symbols go where they are easiest to reach (the left and right), not simply sorted most-common-first from the left; a **page button on the symbol row** does the two-finger swipe's job one press at a time (next page, then the next) — the one-handed answer. **Owner: close enough to build** (2026-10-27). The digit row follows `device.base`: base 10 fills the 10 cells; dozenal's two extra digits take the first two cells of the row above.
 
 **How to apply:** lead with shape writing on a honeycomb (the 36-stroke zone scheme is superseded); decide key count + layout with the owner, then the English optimisation pass; tap mode for attest's exact bytes; the scrolling extent with a scroll strip, 1:1 and unanimated.
