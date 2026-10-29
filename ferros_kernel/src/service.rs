@@ -2340,7 +2340,7 @@ pub fn run(mut b: Boot) -> ! {
                                             continue;
                                         }
                                         if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_digit() {
-                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot.
+                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch (data only: owner, 2026-10-26).
                                             crate::modem::stages(&mut resp, cmd.params[7] - b'0');
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;

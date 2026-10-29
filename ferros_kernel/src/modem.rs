@@ -697,7 +697,11 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     if n < 6 || rd(BOOT_STAGE) != 0x3FFF || !link_cycle(rep) || n < 7 {
         return;
     }
-    download(rep);
+    let mut seq = None;
+    download(rep, &mut seq);
+    if let (true, Some(s)) = (n >= 8, seq) {
+        start_and_watch(rep, s);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,7 +964,7 @@ fn send_data<F: FnMut(u64, &mut [u8]) -> Result<(), alloc::string::String>>(seq:
 }
 
 /// Stage 7: the boot-channel download. MAIN, VSS and APM come out of `modem.bin`, the three NV sections out of the per-unit files on f2fs (efs, modem_userdata); START is not sent.
-fn download(rep: &mut Vec<u8>) {
+fn download(rep: &mut Vec<u8>, seq_out: &mut Option<u16>) {
     let mut m = match crate::partfs::mount(MODEM_PART) {
         Ok(m) => m,
         Err(e) => return line(rep, alloc::format!("{e}\n")),
@@ -1056,7 +1060,70 @@ fn download(rep: &mut Vec<u8>) {
             return;
         }
     }
-    // Stopped here on purpose: G#A400 starts the CP's main firmware, which puts this phone on the air under its own identity. That waits for the owner's go-ahead.
-    line(rep, alloc::format!("MAIN, VSS, APM and the three NV sections loaded; stopped before START (G#A400), which waits for the owner\n"));
+    // Stage 7 stops here; stage 8 sends START (G#A400, the owner's go 2026-10-26: data only) from the frame counter left here.
+    *seq_out = Some(seq);
+    line(rep, alloc::format!("MAIN, VSS, APM and the three NV sections loaded\n"));
     line(rep, alloc::format!("cp2ap_msg G#{:X}, cp2ap_status G#{:X}, boot_stage G#{:X}\n", rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE)));
+}
+
+/// Stage 8: START, then ten seconds of watching what the CP's main firmware does, answering nothing (MODEM-BOOT-RECON.md: after G#C400 the CP raises INIT_START, then PHONE_START, then opens channel G#29, the remote-file service). The owner cleared START and data bring-up on 2026-10-26; voice, SMS, MMS and emergency calls stay untouched. This is the first look, to measure before answering: every change of the CP's message and status words, its two GPIO lines and the boot stage, and every frame on the RAW and FMT rings (channel, length, first bytes; the paths the CP asks for are not per-unit data), each with its time since START.
+fn start_and_watch(rep: &mut Vec<u8>, mut seq: u16) {
+    match command(&mut seq, 0xA400, &[0, 0], 4000) {
+        Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
+        Err(e) => return line(rep, alloc::format!("START: {e}\n")),
+    }
+    let t0 = now();
+    let sample = || [rd(IPC + 0x804), rd(IPC + 0x80C), rd(BOOT_STAGE), PHONE_ACTIVE.get() as u32, CP2AP_WAKEUP.get() as u32];
+    let names = ["cp2ap_msg", "cp2ap_status", "boot_stage", "PHONE_ACTIVE", "CP2AP_WAKEUP"];
+    let mut last = sample();
+    line(rep, alloc::format!("t=0: cp2ap_msg G#{:X} cp2ap_status G#{:X} boot_stage G#{:X} PHONE_ACTIVE {} CP2AP_WAKEUP {}\n", last[0], last[1], last[2], last[3], last[4]));
+    let (mut changes, mut frames) = (0u32, 0u32);
+    while since_us(t0) < 10_000_000 {
+        crate::platform::pet_watchdogs();
+        let now_s = sample();
+        for k in 0..5 {
+            if now_s[k] != last[k] && changes < 64 {
+                line(rep, alloc::format!("t={} ms: {} G#{:X} -> G#{:X}\n", since_us(t0) / 1000, names[k], last[k], now_s[k]));
+                changes += 1;
+            }
+        }
+        last = now_s;
+        for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
+            let head = rd(headr);
+            let tail = rd(tailr);
+            // The CP resets the rings at START; a cursor outside its ring is not ours to walk, only to report once.
+            if head >= len_max || tail >= len_max || head == tail {
+                continue;
+            }
+            let at = |o: u32| rd8(base + ((tail + o) % len_max) as usize);
+            if at(0) != 0xCD || at(1) != 0xAB {
+                if frames < 64 {
+                    line(rep, alloc::format!("t={} ms: {name} head {head} tail {tail}, no frame header (G#{:02X}{:02X}); left as is\n", since_us(t0) / 1000, at(1), at(0)));
+                    frames += 1;
+                }
+                continue;
+            }
+            let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
+            let ch = at(8);
+            if frames < 64 {
+                let n = (flen - 12).min(32);
+                let mut hex = alloc::string::String::new();
+                let mut txt = alloc::string::String::new();
+                for i in 0..n {
+                    let b = at(12 + i);
+                    hex.push_str(&alloc::format!("{b:02X}"));
+                    txt.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                }
+                line(rep, alloc::format!("t={} ms: {name} frame ch G#{ch:02X} len A#{flen}: {hex} |{txt}|\n", since_us(t0) / 1000));
+                frames += 1;
+            }
+            wr(tailr, (tail + ((flen + 7) & !7)) % len_max);
+            let msi = rd(DBI + 0x830);
+            if msi != 0 {
+                wr(DBI + 0x830, msi);
+            }
+        }
+        us(500);
+    }
+    line(rep, alloc::format!("watched 10 s: A#{changes} changes, A#{frames} frames logged; nothing answered (diag modem off powers the CP down)\n"));
 }
