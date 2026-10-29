@@ -1,6 +1,6 @@
 //! The mark: the Julia set of z² + c seen through an inversion about its root spiral's eye, with c placed by the descent and the eye found on J(c), both drawn from a hash of (salt, text).
 //!
-//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the theme: one pastel scheme for every device, varied by base hue, hue spread, lightness and chroma.
+//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the theme: one soft, low-contrast scheme for every device, varied widely in tone, polarity, edge, hue relations and saturation (see `Theme`).
 //!
 //! Placement, the descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
 //! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
@@ -60,7 +60,7 @@ pub struct Params {
     half: f64,
     /// The view's rotation as (cos, sin): plane = centre + rot·(u + iv) for screen offsets (u, v), v downward.
     rot: (f64, f64),
-    /// The device's theme within the one pastel scheme (see `Theme`), from the salt.
+    /// The device's theme within the one soft scheme (see `Theme`), from the salt.
     theme: Theme,
     /// Colouring method: 0 smooth bands, 1 escape angle, 2 orbit trap.
     mode: u8,
@@ -415,12 +415,7 @@ impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
         let f = draw(salt, 1, 0, &[]);
-        let theme = Theme {
-            hue: unit(&f[0..4]) as f32 * TAU as f32,
-            spread: (0.125 + unit(&f[4..8]) * 0.5) as f32,
-            lift: ((unit(&f[8..12]) - 0.5) * 0.0625) as f32,
-            chroma: (0.75 + unit(&f[24..28]) * 0.5) as f32,
-        };
+        let theme = Theme::from_bytes(&f);
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
         let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, radius: 1. };
@@ -486,21 +481,65 @@ impl Params {
     }
 }
 
-/// A device's theme within the one pastel scheme: every colour is OKLab lightness L and chroma C at a hue, kept light and soft (L about 0.67 to 0.99, C at most about 0.1), so all devices share one calm, low-contrast look and differ only in these.
+/// A device's theme within the one soft scheme: every colour is OKLab lightness L at a hue with chroma C = sat·L, sat at most 2⁻³ + 2⁻⁵ (0.156), which keeps it soft and inside the sRGB gamut at every lightness (no hue goes negative below about 0.17·L; `soft_colours_stay_in_gamut` checks it).
+/// The salt varies far more than the colours: the ground's tone (pale, light, mid or dusk), which way the set sits against it (darker on pale grounds, lighter on dusk ones, either on mid), how strongly, whether its edge glows or is inked, how far the set's hue turns from the ground's (none, a sixth, a quarter, a third, a half, either way), how far the ground's hue drifts from the centre to the far field, and how saturated each layer is.
 #[derive(Clone, Copy)]
 struct Theme {
-    /// Base hue, radians.
+    /// The ground's base hue, radians.
     hue: f32,
-    /// How far the colouring swings the hue either side of the base, radians (2⁻³ to 2⁻³ + ½): from nearly monochrome to a gentle two-tone.
+    /// How far the colouring swings the hue either side of the base, radians.
     spread: f32,
-    /// A shift of every lightness, ±2⁻⁵.
-    lift: f32,
-    /// A scale of every chroma, ¾ to 1¼.
-    chroma: f32,
+    /// The set's hue turn from the ground's, radians.
+    accent: f32,
+    /// The ground's hue drift from near the set to the far field, radians.
+    drift: f32,
+    /// Lightness of the ground, the set's body and its edge.
+    ground_l: f32,
+    body_l: f32,
+    rim_l: f32,
+    /// Saturation (C/L) of the ground, the body and the edge.
+    ground_s: f32,
+    body_s: f32,
+    rim_s: f32,
+}
+
+impl Theme {
+    /// The theme a salt's bytes give.
+    fn from_bytes(f: &[u8; 32]) -> Self {
+        let u = |i: usize| unit(&f[i..i + 4]) as f32;
+        let tau = TAU as f32;
+        // Ground tone: pale, light, mid or dusk.
+        let ground_l = [0.9, 0.82, 0.64, 0.44][(f[28] & 3) as usize];
+        // The set against it: darker on pale and light grounds, lighter on dusk, either way on mid; by 2⁻⁴ to 2⁻³ + 2⁻⁴ of lightness, low contrast.
+        let contrast = 0.0625 + u(8) * 0.125;
+        let lighter = match f[28] & 3 {
+            0 | 1 => false,
+            3 => true,
+            _ => f[29] & 1 == 1,
+        };
+        let body_l = if lighter { ground_l + contrast } else { ground_l - contrast };
+        // The edge: a glow lighter than both, or an ink line darker than both (the lightest a glow gets is 0.9 + 2⁻⁴ ≈ 0.96, the darkest ink 0.44 − 2⁻⁴ ≈ 0.38).
+        let (hi, lo) = if lighter { (body_l, ground_l) } else { (ground_l, body_l) };
+        let rim_l = if f[29] & 2 == 2 { lo - 0.0625 } else { hi + 0.0625 };
+        // The set's hue turn: none, ±⅙, ±¼, ±⅓ or ½ of a turn.
+        let accent = [0., 1. / 6., -1. / 6., 0.25, -0.25, 1. / 3., -1. / 3., 0.5][(f[30] & 7) as usize] * tau;
+        Theme {
+            hue: u(0) * tau,
+            spread: 0.0625 + u(4) * 0.5,
+            accent,
+            drift: (u(12) - 0.5) * 1.25,
+            ground_l,
+            body_l,
+            rim_l,
+            ground_s: 0.015 + u(16) * 0.0625,
+            body_s: 0.03 + u(20) * 0.09375,
+            rim_s: 0.015 + u(24) * 0.125,
+        }
+    }
 }
 
 /// OKLab (L, a, b) to display RGB in [0, 1]: OKLab's own matrices (Björn Ottosson's published constants, not tuning knobs) to linear sRGB, then gamma 2 (√) for display.
-/// The theme's lightness and chroma ranges keep every colour inside the sRGB gamut, so no channel goes negative (`pastels_stay_in_gamut` checks every hue at the extremes).
+/// Chroma held at most 0.156·L keeps every colour inside the sRGB gamut, so no channel goes negative (`soft_colours_stay_in_gamut` checks every hue).
 #[inline]
 fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
     let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
@@ -515,11 +554,11 @@ fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
     .map(|c| c.sqrt())
 }
 
-/// The pastel at lightness `l`, chroma `c` (before the theme's scale and lift) and hue offset `dh` from the theme's base.
+/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l) and hue offset `dh` from the theme's base.
 #[inline]
-fn pastel(th: &Theme, l: f32, c: f32, dh: f32) -> [f32; 3] {
-    let (h, c) = (th.hue + dh, c * th.chroma);
-    oklab(l + th.lift, c * h.cos(), c * h.sin())
+fn soft(th: &Theme, l: f32, sat: f32, dh: f32) -> [f32; 3] {
+    let (h, c) = (th.hue + dh, sat * l);
+    oklab(l, c * h.cos(), c * h.sin())
 }
 
 /// The look's tweaks, applied at render time: `offset` is a complex offset of the colouring coordinate (see `shade`); `light` is the direction the disc is lit from, (x right, y down, z toward the viewer), normalised by the renderer.
@@ -549,7 +588,7 @@ impl Look {
 }
 
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
-/// One pastel scheme, low contrast: the field is a light ground, the set's body a soft deeper tone, its rim the lightest and most coloured; nothing goes near black or white.
+/// One soft scheme, low contrast: the field is the theme's ground, the set's body its second tone, the edge a glow or an ink line; nothing goes near black or white, and nothing is saturated.
 /// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u swings the hue either side of the theme's base (by the theme's spread) and Im u breathes the lightness a little, so both halves of the offset move every method.
 /// Relief: the outside of the set is lit as a surface whose slope is the escape potential's — normal (u, h), u = z/(dz/dz₀) the level line's outward direction, h = `look.height` — by a light from `look.light`: ((1 + (u·l + h)/(1 + h))/2)², smooth and never clipped, which here lifts or lowers the lightness by up to 2⁻⁴ so the filaments' top-left faces are lit.
 #[inline]
@@ -589,12 +628,13 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32;
     // Sheen: a soft highlight on the faces turned squarely to the light, near the rim, ((1 + u·l)/2)^2³.
     let face = 0.5 + 0.5 * ul;
     let sheen = if v.kind == Kind::Julia { face.powi(1 << 3) * rim * (1. - body) } else { 0. };
-    // The body takes its own hue, a quarter turn round from the theme's, so the set reads as a second, harmonising colour rather than a darker shade of the ground.
-    let accent = 0.25 * TAU as f32 * body;
-    // Lightness and chroma: the ground at 0.86 with little colour, deeper and a touch more coloured toward the body (0.72), lightest and most coloured on the rim (0.92), settling toward the ground far out; the sheen lifts the lit faces a little further and pales them.
-    let lightness = 0.86 - 0.14 * body + 0.06 * rim * (1. - body) + 0.0625 * relief * (1. - body) * (1. - far) + 0.0625 * sheen + breathe;
-    let chroma = 0.035 + 0.025 * body + 0.035 * rim * (1. - body) - 0.015 * far - 0.02 * sheen;
-    pastel(&v.theme, lightness, chroma, v.theme.spread * swing + nacre + accent)
+    let th = &v.theme;
+    let edge = rim * (1. - body);
+    // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; relief raises the lit faces and lowers the shaded ones by up to 2⁻⁴, the sheen lifts the faces squarely to the light a little more.
+    let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + 0.0625 * relief * (1. - body) * (1. - far) + 0.0625 * sheen + breathe;
+    let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
+    // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
+    soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body)
 }
 
 
@@ -638,7 +678,7 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             let q2 = qx * qx + qy * qy;
             // At and past the rim (inside the anti-aliasing band) the plane is at infinity: the field's farthest, the theme's ground.
             if q2 >= 1. {
-                row[px] = pack(pastel(&v.theme, 0.86, 0.02, 0.), cover);
+                row[px] = pack(soft(&v.theme, v.theme.ground_l, v.theme.ground_s, v.theme.drift), cover);
                 continue;
             }
             let g = rad / (1. - q2).sqrt();
@@ -730,14 +770,17 @@ mod tests {
         }
     }
 
-    /// Every pastel the shading can ask for has no negative channel, at every hue: the extremes of lightness (0.72 − 2⁻⁵ − 2⁻⁶ ≈ 0.67 up to past 0.92 + 2⁻⁵ + 2⁻⁴ + 2⁻⁶) and chroma (up to 0.08 before the theme's 1¼, tested at 0.08 · 1¼). A channel past 1 is fine: the pack saturates it.
+    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground less the relief and breathing (0.44 − 2⁻⁴ − 2⁻⁴ − 2⁻⁶ ≈ 0.30) up to 1, at the most saturation any layer gets (0.015 + 0.125 ≈ 0.14 ≤ 2⁻³ + 2⁻⁵). A channel past 1 is fine: the pack saturates it.
     #[test]
-    fn pastels_stay_in_gamut() {
+    fn soft_colours_stay_in_gamut() {
+        let mut th = Theme::from_bytes(&[0; 32]);
         for i in 0..(1 << 8) {
-            let th = Theme { hue: i as f32 / (1 << 8) as f32 * TAU as f32, spread: 0., lift: 0., chroma: 1.25 };
-            for &(l, c) in &[(0.67, 0.08f32), (0.67, 0.), (1.0, 0.08), (1.0, 0.), (0.86, 0.08)] {
-                let rgb = pastel(&th, l, c, 0.);
-                assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, C {c}: {rgb:?}");
+            th.hue = i as f32 / (1 << 8) as f32 * TAU as f32;
+            for l in [0.3f32, 0.4, 0.5, 0.7, 0.9, 1.] {
+                for sat in [0f32, 0.07, 0.156] {
+                    let rgb = soft(&th, l, sat, 0.);
+                    assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, sat {sat}: {rgb:?}");
+                }
             }
         }
     }
