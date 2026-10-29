@@ -699,8 +699,10 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     }
     let mut seq = None;
     download(rep, &mut seq);
-    if let (true, Some(s)) = (n >= 8, seq) {
-        start_and_watch(rep, s);
+    match (n, seq) {
+        (8, Some(s)) => start_and_watch(rep, s),
+        (n, Some(s)) if n >= 9 => start_and_handshake(rep, s),
+        _ => {}
     }
 }
 
@@ -1126,4 +1128,84 @@ fn start_and_watch(rep: &mut Vec<u8>, mut seq: u16) {
         us(500);
     }
     line(rep, alloc::format!("watched 10 s: A#{changes} changes, A#{frames} frames logged; nothing answered (diag modem off powers the CP down)\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 9: the post-START IPC handshake (MODEM-BOOT-RECON.md step 5-7; link_device.c cmd_init_start_handler 457-520, cmd_phone_start_handler 526-640).
+//
+// After START the CP's main firmware raises INIT_START on cp2ap_msg (observed G#83 -> G#C1 ~370 ms in). On husky the link has no LINK_ATTR_SBD_IPC, so the INIT_START handler skips the whole SBD link and is just: set the AP capabilities, answer PIF_INIT_DONE. The CP then raises PHONE_START (G#C8); the AP checks capabilities (AP caps that the CP lacks crash it — so claim nothing, 0, which passes), re-inits the legacy link and answers INIT_END (G#C2). rild_ready gates INIT_END on Linux (the RIL daemon must have the channels open); ferros is the RIL, so it answers unconditionally. This first cut does NOT set up pktproc (the DL direct ring in G#E800_0000) — it is a measure-first step to see whether the CP reaches ONLINE on the handshake alone or needs the ring before it will proceed; pktproc and the data path come next.
+
+const CP2AP_MSG: usize = IPC + 0x804;
+const CAP_AP: usize = IPC + 0xA0;
+
+/// cmd2int (link_device_memory.h): INT_VALID (G#80) | CMD_VALID (G#40) | cmd — matches the observed INIT_START G#C1.
+const fn cmd2int(cmd: u16) -> u16 {
+    0xC0 | (cmd & 0x3F)
+}
+const INIT_START: u16 = cmd2int(0x01);
+const INIT_END: u16 = cmd2int(0x02);
+const PHONE_START: u16 = cmd2int(0x08);
+const CRASH_EXIT: u16 = cmd2int(0x09);
+const PIF_INIT_DONE: u16 = cmd2int(0x0D);
+
+/// Send an IPC command to the CP (pcie_send_ap2cp_irq, link_device.c:2686): the command word into ap2cp_msg, then the message doorbell. Unlike the boot channel, the IPC handshake is driven entirely by this msg + doorbell, not the RAW ring.
+fn ap2cp_cmd(cmd: u16) {
+    wr(AP2CP_MSG, cmd as u32);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
+/// A CP->AP value on cp2ap_msg carries a command when CMD_VALID (G#40) is set (G#83 data-signals do not); the command byte is the low six bits.
+fn is_cmd(v: u16) -> bool {
+    v & 0x40 != 0
+}
+
+fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16) {
+    match command(&mut seq, 0xA400, &[0, 0], 4000) {
+        Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
+        Err(e) => return line(rep, alloc::format!("START: {e}\n")),
+    }
+    let t0 = now();
+    let mut answered_init_start = false;
+    let mut phone_started = false;
+    let mut last_cmd = 0u16;
+    while since_us(t0) < 12_000_000 {
+        crate::platform::pet_watchdogs();
+        let v = rd(CP2AP_MSG) as u16;
+        let msi = rd(DBI + 0x830);
+        if msi != 0 {
+            wr(DBI + 0x830, msi);
+        }
+        if is_cmd(v) && v != last_cmd {
+            last_cmd = v;
+            line(rep, alloc::format!("t={} ms: cp2ap_msg command G#{v:X}\n", since_us(t0) / 1000));
+            match v {
+                INIT_START if !answered_init_start => {
+                    // Claim no capabilities: (ap ^ cp) & ap == 0 passes the CP's check whatever it supports (link_device.c:585). No pktproc yet.
+                    wr(CAP_AP, 0);
+                    wr(CAP_AP + 4, 0);
+                    unsafe { core::arch::asm!("dsb sy") };
+                    ap2cp_cmd(PIF_INIT_DONE);
+                    answered_init_start = true;
+                    line(rep, alloc::format!("  -> PIF_INIT_DONE (G#{PIF_INIT_DONE:X}) sent, caps 0\n"));
+                }
+                PHONE_START if !phone_started => {
+                    ap2cp_cmd(INIT_END);
+                    phone_started = true;
+                    line(rep, alloc::format!("  -> INIT_END (G#{INIT_END:X}) sent; PHONE_ACTIVE {}\n", PHONE_ACTIVE.get() as u32));
+                }
+                CRASH_EXIT => {
+                    line(rep, alloc::format!("  CP raised CRASH_EXIT (G#{CRASH_EXIT:X}): the handshake was refused; see the FMT ring and cp2ap_status\n"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        us(500);
+    }
+    line(rep, alloc::format!("handshake over: INIT_START {}, PHONE_START {}, cp2ap_msg G#{:X} cp2ap_status G#{:X} PHONE_ACTIVE {} CP2AP_WAKEUP {}\n",
+        if answered_init_start { "answered" } else { "never seen" },
+        if phone_started { "answered with INIT_END" } else { "never seen" },
+        rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get() as u32, CP2AP_WAKEUP.get() as u32));
 }
