@@ -6,25 +6,14 @@
 # Usage: tools/husky-hv.sh [--image <Linux Image>] [--no-ferros] [--flash]
 set -eu
 cd "$(dirname "$0")/.."
-MKB=/mnt/Harbor/husky-kernel/tools/mkbootimg
 BACKUP=/mnt/Harbor/tmp/husky-backup-2026-10-13/boot_a.img
 W=target/hv; mkdir -p $W
 IMAGE=""; FLASH=0; FERROS=1
 while [ $# -gt 0 ]; do case $1 in --image) IMAGE=$2; shift 2;; --flash) FLASH=1; shift;; --no-ferros) FERROS=0; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
+cargo build -q -p ferros-mkimg
+MKIMG=target/debug/ferros-mkimg
 if [ -z "$IMAGE" ]; then
-  if [ ! -f $W/Image ]; then
-    python3 $MKB/unpack_bootimg.py --boot_img $BACKUP --out $W/unpacked >/dev/null
-    python3 - $W/unpacked/kernel $W/Image <<'PY'
-import lz4.block, struct, sys
-d=open(sys.argv[1],'rb').read(); assert d[:4]==b'\x02\x21\x4c\x18', "not LZ4 legacy"
-out=bytearray(); p=4
-while p+4<=len(d):
-    n=struct.unpack_from('<I',d,p)[0]; p+=4
-    if n==0x184C2102: continue
-    out+=lz4.block.decompress(d[p:p+n],uncompressed_size=8<<20); p+=n
-open(sys.argv[2],'wb').write(out)
-PY
-  fi
+  [ -f $W/Image ] || $MKIMG unpack-kernel --boot $BACKUP -o $W/Image
   IMAGE=$W/Image
 fi
 cargo build -q -p ferros_hv --target aarch64-unknown-none-softfloat --release
@@ -38,29 +27,9 @@ if [ $FERROS = 1 ]; then
   aarch64-linux-gnu-objcopy -O binary target/aarch64-unknown-none/release/ferros_kernel $W/ferros.bin
   FERROS_BIN=$W/ferros.bin
 fi
-python3 - $W/hv.bin $IMAGE $W/kernel.lz4 $PAD $FERROS_BIN <<'PY'
-import lz4.block, struct, sys
-hv=open(sys.argv[1],'rb').read(); img=open(sys.argv[2],'rb').read(); pad=int(sys.argv[4])
-to,isz,flags=struct.unpack_from('<QQQ',img,8); assert img[56:60]==b'ARMd' and to==0 and flags&8, "Image header"
-blob=hv+b'\0'*(pad-len(hv))+img
-if len(sys.argv) > 5 and sys.argv[5]:
-    fer=open(sys.argv[5],'rb').read()
-    # gate.rs finds it at Linux's entry + image_size rounded up to 2 MiB: past Linux's bss, below ABL's ramdisks at G#8600_0000.
-    at=pad+((isz+0x1FFFFF)&~0x1FFFFF)
-    assert 0x80080000+at+0x1000+len(fer) < 0x86000000, "ferros image would reach ABL's ramdisks"
-    blob+=b'\0'*(at-len(blob))
-    blob+=(b'FERROSGT'+struct.pack('<Q',len(fer))).ljust(0x1000,b'\0')+fer
-    print(f"ferros {len(fer)} B packed at G#{0x80080000+at:X}")
-out=bytearray(b'\x02\x21\x4c\x18')
-for i in range(0,len(blob),8<<20):
-    c=lz4.block.compress(blob[i:i+(8<<20)],store_size=False,mode='high_compression')
-    out+=struct.pack('<I',len(c))+c
-open(sys.argv[3],'wb').write(out)
-print(f"hv {len(hv)} B, Image {len(img)} B (image_size G#{isz:X}), blob {len(blob)} B, lz4 {len(out)} B")
-PY
-: > $W/ramdisk.empty
+# The blob and the boot image in Rust (ferros-mkimg gate, 2026-10-28; Python is not allowed here): the same bytes before compression as the old Python packer and mkbootimg.py made, checked byte for byte.
 # HV_CMDLINE: extra kernel command line in the boot image header (ABL appends it). Oracle captures of boot-time drivers use HV_CMDLINE=loglevel=4 so the kernel's boot log stays out of the pstore console ring the captures travel through.
-python3 $MKB/mkbootimg.py --header_version 4 --kernel $W/kernel.lz4 --ramdisk $W/ramdisk.empty --cmdline "${HV_CMDLINE:-}" -o $W/boot_a_hv.img
+$MKIMG gate --hv $W/hv.bin --image $IMAGE ${FERROS_BIN:+--ferros $FERROS_BIN} --cmdline "${HV_CMDLINE:-}" -o $W/boot_a_hv.img
 echo "== image: $W/boot_a_hv.img ($(stat -c %s $W/boot_a_hv.img) bytes)"
 [ $FLASH = 1 ] || { echo "not flashing (add --flash). Then: fastboot flash boot_a $W/boot_a_hv.img; fastboot --set-active=a; fastboot reboot"; exit 0; }
 # Decide from the USB bus, not from `adb devices`: phones reachable over the LAN show up there too, and then a bare `adb reboot bootloader` fails.

@@ -6,7 +6,7 @@
 # No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). `--android` is the only way back to slot a: slot b no longer falls back on its own.
 #
 # Usage:
-#   tools/husky-cold.sh            build, flash boot_b (and boot_a with the hv gate + the same ferros), make b active, boot, wait for ferros on USB, print DIAG
+#   tools/husky-cold.sh            build, flash slot b (the gate + this ferros, signed), boot it, and only once slot b boots ferros flash slot a and boot the home slot (FERROS_BOTH_AT_ONCE=1: both at once, as before)
 #   tools/husky-cold.sh <img>      same with a prebuilt boot image
 #   tools/husky-cold.sh --android  leave ferros: fastboot, make a active, reboot into Android
 #   tools/husky-cold.sh --read     last ferros report, from Android's dmesg (slot a handoff kernel prints the ramoops block)
@@ -109,39 +109,82 @@ if [ -n "$HV_IMG" ] && [ -f "$AVB_KEY" ] && [ "${FERROS_UNSIGNED:-0}" != 1 ]; th
 fi
 
 to_fastboot
-# Both slots carry the same gate image (owner, 2026-10-23: identical slots, every boot lands on Ready?, Android is a jump from the gate — the gate rewrites bootconfig's slot suffix to _a, the one slot with an Android on it). FERROS_PURE_B=1 puts the bare cold ferros on slot b instead (no gate, no Android from it).
-if [ -n "$HV_IMG" ] && [ "${FERROS_PURE_B:-0}" != 1 ]; then
-    fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
-else
-    fastboot flash boot_b "$IMG"
-fi
-[ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
-if [ -n "$SIGNED" ]; then
-    for s in a b; do fastboot flash "vbmeta_$s" "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed "s/^/   vbmeta $s: /"; done
-fi
-# No slot switch: ABL boots the UFS boot LUN's slot regardless, and `--set-active` marks the other slot "de-activated" (bit 3) — ABL then refuses it and sits in fastboot in 12 s (2026-10-23: four bounces, all this). Both slots carry the same image; the current one is re-written as active so a stray bit 3 is cleared.
-fastboot --set-active="$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')" >/dev/null 2>&1 || true
-t0=$(date +%s)
-fastboot reboot
-while :; do
-    if lsusb -d 1209:4665 >/dev/null 2>&1; then
-        echo "== ferros on USB after $(( $(date +%s) - t0 ))s (cold boot, the boot LUN's slot)"
+HOME_SLOT=$(fastboot getvar current-slot 2>&1 | awk '/current-slot/ {print $2}')
+
+# Wait for the boot after a `fastboot reboot`: 0 = ferros on USB, 1 = fastboot, 2 = Android, 3 = nothing for $1 seconds.
+wait_boot() {
+    local t0 limit=$1
+    t0=$(date +%s)
+    while :; do
+        if lsusb -d 1209:4665 >/dev/null 2>&1; then
+            echo "== ferros on USB after $(( $(date +%s) - t0 ))s"
+            return 0
+        fi
+        if [ $(( $(date +%s) - t0 )) -gt 20 ] && fastboot devices | grep -q .; then
+            echo "== landed in fastboot after $(( $(date +%s) - t0 ))s"
+            return 1
+        fi
+        husky
+        # `adb get-state` can answer for a moment after `fastboot reboot` (2026-10-23: "Android came up after 0s" while ferros was booting); only a real adb device on the bus counts.
+        if [ "$(adb get-state 2>/dev/null)" = device ] && lsusb | grep -q "18d1:4ee[1-9a-f]"; then
+            echo "== Android came up after $(( $(date +%s) - t0 ))s"
+            return 2
+        fi
+        [ $(( $(date +%s) - t0 )) -gt "$limit" ] && { echo "== nothing on USB after ${limit}s"; return 3; }
+        "$REPO/tools/usb-kick.sh" --if-wedged
         sleep 1
-        "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"
-        exit 0
+    done
+}
+
+# The slot ABL booted, from its own log in RAM (G#FD80_0000): "[RIPCURRENT] boot slot: a|b".
+booted_slot() {
+    local f
+    f=$(mktemp)
+    for _ in $(seq 20); do timeout 5 "$BRIDGE" status >/dev/null 2>&1 && break; sleep 1; done
+    timeout 60 "$BRIDGE" read FD800000 10000 "$f" >/dev/null 2>&1 || true
+    strings "$f" | awk '/boot slot:/ {s=$NF} END {print s}'
+    rm -f "$f"
+}
+
+if [ -z "$HV_IMG" ] || [ "${FERROS_PURE_B:-0}" = 1 ] || [ "${FERROS_BOTH_AT_ONCE:-0}" = 1 ]; then
+    # One pass, both slots at once (FERROS_BOTH_AT_ONCE=1, or a slot-b-only bare image): the old flow.
+    if [ -n "$HV_IMG" ] && [ "${FERROS_PURE_B:-0}" != 1 ]; then
+        fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
+    else
+        fastboot flash boot_b "$IMG"
     fi
-    if fastboot devices | grep -q .; then
-        echo "== landed in fastboot after $(( $(date +%s) - t0 ))s — ferros left (or never enumerated); boot Android with: $0 --android"
-        exit 1
+    [ -n "$HV_IMG" ] && fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
+    if [ -n "$SIGNED" ]; then
+        for s in a b; do fastboot flash "vbmeta_$s" "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed "s/^/   vbmeta $s: /"; done
     fi
-    husky
-    # `adb get-state` can answer for a moment after `fastboot reboot` (2026-10-23: "Android came up after 0s" while ferros was booting); only a real adb device on the bus counts.
-    if [ "$(adb get-state 2>/dev/null)" = device ] && lsusb | grep -q "18d1:4ee[1-9a-f]"; then
-        echo "== Android came up after $(( $(date +%s) - t0 ))s — ABL fell back to slot a"
-        read_report
-        exit 1
-    fi
-    [ $(( $(date +%s) - t0 )) -gt 600 ] && { echo "nothing on USB after 10 min — phone needs hands (Power+VolDown)" >&2; exit 1; }
-    "$REPO/tools/usb-kick.sh" --if-wedged
+    # Re-written as active so a stray de-activated bit on it is cleared (the other slot's is cleared by ferros when it marks, slot.rs).
+    fastboot --set-active="$HOME_SLOT" >/dev/null 2>&1 || true
+    fastboot reboot
+    if wait_boot 600; then sleep 1; "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"; exit 0; fi
+    exit 1
+fi
+
+# Slot b first, slot a only once b has booted (BOOT.md "write slot B, verify, only then slot A"): a build that dies early stops here, with slot a still the last good one. If b fails, ABL counts its retries down and falls back to slot a by itself (the A/B fallback, proven 2026-10-28), so no hands are needed either way.
+fastboot flash boot_b "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot b: /'
+[ -n "$SIGNED" ] && fastboot flash vbmeta_b "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   vbmeta b: /'
+fastboot --set-active=b >/dev/null 2>&1
+fastboot reboot
+wait_boot 900 || true
+SLOT=$(booted_slot)
+if [ "$SLOT" != b ]; then
+    echo "== slot b did not boot ferros (ABL booted slot '${SLOT:-?}'); slot a left as it was" >&2
+    exit 1
+fi
+echo "== slot b boots this build; now slot a"
+to_fastboot
+fastboot flash boot_a "$HV_IMG" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   slot a: /'
+[ -n "$SIGNED" ] && fastboot flash vbmeta_a "$REPO/target/avb/vbmeta.img" 2>&1 | grep -E "Writing|FAIL" | sed 's/^/   vbmeta a: /'
+fastboot --set-active="$HOME_SLOT" >/dev/null 2>&1 || true
+fastboot reboot
+if wait_boot 600; then
+    echo "== both slots carry this build; slot $(booted_slot) booted"
     sleep 1
-done
+    "$BRIDGE" diag 2>/dev/null || echo "(diag failed — retry: $BRIDGE diag)"
+    exit 0
+fi
+exit 1

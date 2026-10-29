@@ -64,6 +64,8 @@ fn main() {
         "vbmeta-info" => cmd_vbmeta_info(&args[2..]),
         "avb-pubkey" => cmd_avb_pubkey(&args[2..]),
         "avb-sign" => cmd_avb_sign(&args[2..]),
+        "gate" => cmd_gate(&args[2..]),
+        "unpack-kernel" => cmd_unpack_kernel(&args[2..]),
         "help" | "--help" | "-h" => usage(),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
@@ -86,6 +88,8 @@ fn usage() {
     eprintln!("  ferros-mkimg avb-keygen -o <keys dir>                 (RSA-4096 for avb_custom_key, as <dir>/avb.vsf: kgr + kvr)");
     eprintln!("  ferros-mkimg avb-pubkey --key <avb.vsf> -o <avb_custom_key.bin>");
     eprintln!("  ferros-mkimg vbmeta-info <vbmeta.img>");
+    eprintln!("  ferros-mkimg gate --hv <hv.bin> --image <Linux Image> [--ferros <ferros.bin>] [--cmdline <s>] -o <boot.img>");
+    eprintln!("  ferros-mkimg unpack-kernel --boot <boot.img> -o <Image>");
     eprintln!("  ferros-mkimg avb-sign --key <avb.vsf> --google-vbmeta <vbmeta.img> --google-boot <boot.img> --gate <gate.img> --out-vbmeta <vbmeta.img> --out-boot <boot.img>");
 }
 
@@ -309,6 +313,15 @@ fn cmd_anchor_key(args: &[String]) {
 ///
 /// boot_img_hdr_v0/v1/v2 layout: 0x000  8     magic "ANDROID!" 0x008  4     kernel_size 0x00C  4     kernel_addr (base + kernel_offset) 0x010  4     ramdisk_size (0) 0x014  4     ramdisk_addr 0x018  4     second_size (0) 0x01C  4     second_addr 0x020  4     tags_addr 0x024  4     page_size (4096) 0x028  4     header_version (2) 0x02C  4     os_version (0) 0x030  16    name 0x040  512   cmdline 0x240  32    id 0x260  1024  extra_cmdline -- v1 fields -- 0x660  4     recovery_dtbo_size (0) 0x664  8     recovery_dtbo_offset (0) 0x66C  4     header_size -- v2 fields -- 0x670  4     dtb_size (0) 0x674  8     dtb_addr (0)
 fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
+    // The cold ferros image: os_version as GrapheneOS wrote it, no command line.
+    eprintln!("  Kernel: {} bytes (uncompressed)", kernel.len());
+    let kernel = lz4_legacy_compress(kernel);
+    eprintln!("  Kernel: {} bytes (LZ4 legacy)", kernel.len());
+    boot_img_v4(&kernel, 0x200001A3, "")
+}
+
+/// A boot image v4 around an already LZ4-legacy kernel, no ramdisk: the header (magic, kernel_size, ramdisk_size 0, os_version, header_size 1584, header_version 4, cmdline, signature_size 0) padded to a 4 KiB page, then the kernel padded to a page.
+fn boot_img_v4(kernel: &[u8], os_version: u32, cmdline: &str) -> Vec<u8> {
     // Pixel 8 ABL requires boot image header v4 (GKI 2.0 format). v4 extends v3 with a signature_size field at the end.
     //
     // boot_img_hdr_v4 layout: 0x000  8     magic "ANDROID!" 0x008  4     kernel_size 0x00C  4     ramdisk_size (0) 0x010  4     os_version 0x014  4     header_size (1584) 0x018  16    reserved (zeros) 0x028  4     header_version (4) 0x02C  1536  cmdline (zeros) 0x62C  4     signature_size (0 — v4 addition) Total header: 1584 bytes, padded to 4096
@@ -316,10 +329,7 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     const HEADER_VERSION: u32 = 4;
     const HEADER_SIZE: u32 = 1584;
 
-    // Tensor G3 ABL requires the kernel LZ4-compressed (legacy frame) — it decompresses, then jumps to the ARM64 Image entry (BOOT.md "Tensor G3 ABL facts").
-    eprintln!("  Kernel: {} bytes (uncompressed)", kernel.len());
-    let kernel = lz4_legacy_compress(kernel);
-    eprintln!("  Kernel: {} bytes (LZ4 legacy)", kernel.len());
+    // Tensor G3 ABL requires the kernel LZ4-compressed (legacy frame): it decompresses, then jumps to the ARM64 Image entry (BOOT.md "Tensor G3 ABL facts").
 
     // Build the header (padded to page_size)
     let mut header = vec![0u8; PAGE_SIZE];
@@ -327,11 +337,13 @@ fn make_boot_img(kernel: &[u8]) -> Vec<u8> {
     header[0..8].copy_from_slice(b"ANDROID!");
     write_le32(&mut header, 0x008, kernel.len() as u32);      // kernel_size
     write_le32(&mut header, 0x00C, 0);                        // ramdisk_size
-    write_le32(&mut header, 0x010, 0x200001A3);                // os_version (match GrapheneOS)
+    write_le32(&mut header, 0x010, os_version);
     write_le32(&mut header, 0x014, HEADER_SIZE);               // header_size
     // 0x018..0x028: reserved (zeros)
     write_le32(&mut header, 0x028, HEADER_VERSION);            // header_version = 4
-    // 0x02C..0x62C: cmdline (zeros)
+    // 0x02C..0x62C: cmdline (1536 bytes, NUL-terminated)
+    assert!(cmdline.len() < 1536, "cmdline over 1535 bytes");
+    header[0x02C..0x02C + cmdline.len()].copy_from_slice(cmdline.as_bytes());
     write_le32(&mut header, 0x62C, 0);                        // signature_size = 0
 
     // Pad kernel to page boundary
@@ -887,4 +899,84 @@ fn cmd_avb_sign(args: &[String]) {
     eprintln!("vbmeta: {out_vbmeta} ({} bytes, {} descriptors, rollback {} at location {})", vbmeta.len(), tp.descriptors.len(), tp.rollback_index, tp.rollback_index_location);
     eprintln!("key:    sha256 {}", sha(&blob));
     eprintln!("checked: {}", checks.iter().map(|(w, _)| *w).collect::<Vec<_>>().join(", "));
+}
+
+/// LZ4 legacy frame to its bytes: magic, then per block a u32 LE compressed size and a raw LZ4 block of at most 8 MiB out (a repeated magic between blocks is skipped, as concatenated frames carry one).
+fn lz4_legacy_decompress(d: &[u8]) -> Result<Vec<u8>, String> {
+    const MAGIC: u32 = 0x184C2102;
+    if d.len() < 4 || u32::from_le_bytes(d[0..4].try_into().unwrap()) != MAGIC {
+        return Err("not an LZ4 legacy frame".into());
+    }
+    let mut out = Vec::new();
+    let mut p = 4;
+    while p + 4 <= d.len() {
+        let n = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if n as u32 == MAGIC {
+            continue;
+        }
+        if n == 0 || p + n > d.len() {
+            break;
+        }
+        out.extend_from_slice(&lz4_flex::block::decompress(&d[p..p + n], 8 << 20).map_err(|e| e.to_string())?);
+        p += n;
+    }
+    Ok(out)
+}
+
+/// `unpack-kernel --boot <boot.img> -o <Image>`: the kernel of a boot image v4, out of its LZ4 legacy frame (what husky-hv.sh used Google's unpack_bootimg.py and Python's lz4 for).
+fn cmd_unpack_kernel(args: &[String]) {
+    let boot = fs::read(arg(args, "--boot")).unwrap_or_else(|e| die("boot", e));
+    let out = arg(args, "-o");
+    if boot.len() < 4096 || &boot[0..8] != b"ANDROID!" || u32::from_le_bytes(boot[0x28..0x2C].try_into().unwrap()) != 4 {
+        die("boot", "not a boot image v4");
+    }
+    let ks = u32::from_le_bytes(boot[8..12].try_into().unwrap()) as usize;
+    if 4096 + ks > boot.len() {
+        die("boot", "kernel_size runs past the image");
+    }
+    let img = lz4_legacy_decompress(&boot[4096..4096 + ks]).unwrap_or_else(|e| die("kernel", e));
+    fs::write(&out, &img).unwrap_or_else(|e| die(&out, e));
+    eprintln!("{out}: {} bytes (kernel {} bytes LZ4 legacy)", img.len(), ks);
+}
+
+/// `gate --hv <hv.bin> --image <Linux Image> [--ferros <ferros.bin>] [--cmdline <s>] -o <boot.img>`: the boot gate's image (tools/husky-hv.sh, HV.md), in Rust. The blob is the hv padded to G#18_0000, then the Linux Image (2 MiB aligned at G#8020_0000 once ABL loads the blob at G#8008_0000), then optionally the cold ferros image past Linux's image_size rounded up to 2 MiB, behind a 4 KiB header {"FERROSGT", u64 length} that gate.rs finds. LZ4 legacy, in a boot image v4 with no ramdisk, os_version 0 and the command line given (what mkbootimg.py wrote).
+fn cmd_gate(args: &[String]) {
+    const PAD: usize = 0x18_0000;
+    const LOAD: usize = 0x8008_0000;
+    const RAMDISKS: usize = 0x8600_0000;
+    let hv = fs::read(arg(args, "--hv")).unwrap_or_else(|e| die("hv", e));
+    let img = fs::read(arg(args, "--image")).unwrap_or_else(|e| die("image", e));
+    let out = arg(args, "-o");
+    let cmdline = args.iter().position(|a| a == "--cmdline").and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
+    let ferros = args.iter().position(|a| a == "--ferros").and_then(|i| args.get(i + 1)).map(|p| fs::read(p).unwrap_or_else(|e| die("ferros", e)));
+    if hv.len() > PAD {
+        die("hv", format!("{} bytes, over the G#18_0000 pad", hv.len()));
+    }
+    // The ARM64 Image header: text_offset 0, image_size, flags with bit 3 (4 KiB pages anywhere), magic "ARM\x64".
+    let le64 = |at: usize| u64::from_le_bytes(img[at..at + 8].try_into().unwrap()) as usize;
+    if img.len() < 64 || &img[56..60] != b"ARM\x64" || le64(8) != 0 || le64(24) & 8 == 0 {
+        die("image", "not an ARM64 Image with text_offset 0 and flags bit 3");
+    }
+    let image_size = le64(16);
+    let mut blob = hv.clone();
+    blob.resize(PAD, 0);
+    blob.extend_from_slice(&img);
+    if let Some(fer) = &ferros {
+        let at = PAD + ((image_size + 0x1F_FFFF) & !0x1F_FFFF);
+        if LOAD + at + 0x1000 + fer.len() >= RAMDISKS {
+            die("ferros", "the image would reach ABL's ramdisks at G#8600_0000");
+        }
+        blob.resize(at, 0);
+        let mut hdr = vec![0u8; 0x1000];
+        hdr[0..8].copy_from_slice(b"FERROSGT");
+        hdr[8..16].copy_from_slice(&(fer.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&hdr);
+        blob.extend_from_slice(fer);
+        eprintln!("ferros {} B packed at G#{:X}", fer.len(), LOAD + at);
+    }
+    let kernel = lz4_legacy_compress(&blob);
+    let boot = boot_img_v4(&kernel, 0, &cmdline);
+    fs::write(&out, &boot).unwrap_or_else(|e| die(&out, e));
+    eprintln!("hv {} B, Image {} B (image_size G#{:X}), blob {} B, lz4 {} B, boot {} B", hv.len(), img.len(), image_size, blob.len(), kernel.len(), boot.len());
 }
