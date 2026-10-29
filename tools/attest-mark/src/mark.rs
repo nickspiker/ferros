@@ -9,7 +9,8 @@
 //! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
 //! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
 //! The copy's long axis is J's principal axis (from 2⁷ address points) turned by −arg (f^k)′; a hash bit flips it end for end, and a small Gaussian offset (σ an eighth of the window) keeps the framing from looking machine-centred.
-//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats — zooming by |λ| and turning by arg λ maps it onto itself — and it is a VISIBLE whorl only when it turns a lot per unit of growth (|arg λ| / ln|λ|, the pitch). So 2⁴ cycles are tried (periods 1 to 2³, found by Newton from repeating addresses) and the most spiral one wins; the view sits dead on a drawn preimage of it (0 to 3 levels in, an exact smaller copy of the same whorl), with no offset, at 2⁻¹ to 2⁻³ of J's half-extent shrunk by the preimage's derivative.
+//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats (zooming by |λ| and turning by arg λ maps it onto itself), and the ROOT whorl, the largest, is the cycle closest to neutral (smallest ln|λ|).
+//! Candidates: the cycle that is attracting in the Mandelbrot component beneath the descent's landing, Newton-closed at c (near-neutral when that component is close); the α fixed point in closed form; and 2⁵ sprayed cycles. The view sits dead on one of the winner's own points (the hash picks which), never on a preimage, which would be a sub-spiral.
 //! A thumbnail still rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Precision: placement and framing are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the deepest window kept is 2⁻⁸ across, about 2⁻¹⁸ a pixel, many f32 steps even at |z| = 2).
@@ -35,12 +36,10 @@ const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 const HEIGHT_STOPS: u32 = 1 << 3;
 /// Depths drawn for the self-similar copy: 0 to 2³ − 1. Each level shrinks the copy by about 2|z| ≈ 2, so past about 2³ levels the f32 floor (MIN_HALF) would bite on most draws and repeat the same framings.
 const DEPTHS: u32 = 1 << 3;
-/// Periods drawn for a spiral's cycle: 1 to 2³.
-const PERIODS: u32 = 1 << 3;
-/// Cycles tried for a spiral; the most spiral one wins.
-const SPIRAL_TRIES: u32 = 1 << 4;
-/// Preimage levels of the winning eye: 0 to 2² − 1.
-const EYE_DEPTHS: u32 = 1 << 2;
+/// Periods sprayed for a spiral's cycle: 1 to 2⁴.
+const PERIODS: u32 = 1 << 4;
+/// Cycles sprayed as candidates for the root whorl.
+const SPIRAL_TRIES: u32 = 1 << 5;
 /// The smallest window half-span kept, so the f32 render still has many representable steps per pixel.
 const MIN_HALF: f64 = 1. / (1 << 8) as f64;
 
@@ -245,17 +244,8 @@ fn piece(c: (f64, f64), bits: &[u8; 32], k: u32) -> ((f64, f64), f64, f64) {
     (*chain.last().expect("chain starts non-empty"), ln_mag, arg)
 }
 
-/// A repelling cycle point of J(c) of period dividing `period`, near the point whose address repeats the first `period` bits of `bits`, with ln|λ| and arg λ of the cycle's multiplier λ = (f^period)′ there.
-/// The repeated address is only the starting guess: the bits choose principal or negated square roots, and the principal root's cut can cross J, so a repeating bit pattern is not a true itinerary there. Newton on f^period(w) = w finds the cycle itself, and it is kept only if f^period carries it back onto itself.
-/// It is the eye of a spiral: zooming by |λ| and turning by arg λ about it maps J(c) onto itself.
-fn cycle_point(c: (f64, f64), bits: &[u8; 32], period: u32) -> Option<((f64, f64), f64, f64)> {
-    let mut rep = [0u8; 32];
-    for i in 0..(1usize << 8) {
-        if bit(bits, i % period as usize) {
-            rep[i >> 3] |= 1 << (i & 7);
-        }
-    }
-    let mut w = address_point(c, &rep);
+/// Newton on f^period(w) = w from `guess`: the cycle point it closes on, with ln|λ| and arg λ of the multiplier λ = (f^period)′ there, kept only if f^period carries it back onto itself and it repels (every cycle of a Cantor Julia set does; a non-finite derivative means Newton wandered off to infinity).
+fn close_cycle(c: (f64, f64), guess: (f64, f64), period: u32) -> Option<((f64, f64), f64, f64)> {
     // f^period and its derivative at w.
     let run = |w: (f64, f64)| {
         let (mut u, mut du) = (w, (1f64, 0f64));
@@ -266,6 +256,7 @@ fn cycle_point(c: (f64, f64), bits: &[u8; 32], period: u32) -> Option<((f64, f64
         }
         (u, du)
     };
+    let mut w = guess;
     for _ in 0..NEWTON_STEPS {
         let (u, du) = run(w);
         // Newton step: w ← w − (u − w) / (du − 1).
@@ -281,8 +272,58 @@ fn cycle_point(c: (f64, f64), bits: &[u8; 32], period: u32) -> Option<((f64, f64
     let (u, du) = run(w);
     let closed = (u.0 - w.0).abs() + (u.1 - w.1).abs() < 1. / (1 << 24) as f64;
     let mag_sq = du.0 * du.0 + du.1 * du.1;
-    // Kept only when it closed and repels (every cycle of a Cantor Julia set does; a non-finite derivative means Newton wandered off to infinity).
     (closed && mag_sq > 1. && mag_sq.is_finite()).then(|| (w, 0.5 * mag_sq.ln(), du.1.atan2(du.0)))
+}
+
+/// A repelling cycle point of J(c) of period dividing `period`, Newton-closed from the point whose address repeats the first `period` bits of `bits`.
+/// The repeated address is only the starting guess: the bits choose principal or negated square roots, and the principal root's cut can cross J, so a repeating bit pattern is not a true itinerary there.
+fn cycle_point(c: (f64, f64), bits: &[u8; 32], period: u32) -> Option<((f64, f64), f64, f64)> {
+    let mut rep = [0u8; 32];
+    for i in 0..(1usize << 8) {
+        if bit(bits, i % period as usize) {
+            rep[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    close_cycle(c, address_point(c, &rep), period)
+}
+
+/// The root whorl of J(c): the cycle that is attracting inside the hyperbolic component beneath c's landing, now just repelling at c (|λ| a little over 1, arg λ near the component's internal angle), which makes it the slowest and largest spiral in the picture.
+/// Found from the Mandelbrot side: keep going down the descent's line past the landing, which is usually a hair or decoration, until the Newton classifier proves a point inside; the component found is the one the hairs hang from. Below the landing the line crosses gaps (stepped by the same proven distance bound as the descent, at least 2⁻¹²) and hair the classifier cannot decide (stepped 2⁻¹⁰); at most 2¹⁰ steps, and not past the real axis.
+/// The attracting cycle the classifier finds there is then Newton-closed at c itself. None when nothing inside is reached.
+pub fn root_cycle(c: (f64, f64), land: (f64, f64)) -> Option<((f64, f64), f64, f64, u32)> {
+    let x = land.0;
+    let mut y = land.1;
+    for _ in 0..(1 << 10) {
+        match classify((x, y)) {
+            Class::Inside { period, attractor } => {
+                let (w, ln_mag, arg) = close_cycle(c, attractor, period)?;
+                // The classifier's period can be a multiple of the cycle's own: walk the cycle until it returns.
+                let mut z = w;
+                let mut own = period;
+                for q in 1..=period {
+                    let zz = cmul(z, z);
+                    z = (zz.0 + c.0, zz.1 + c.1);
+                    if (z.0 - w.0).abs() + (z.1 - w.1).abs() < 1. / (1 << 20) as f64 {
+                        own = q;
+                        break;
+                    }
+                }
+                return Some((w, ln_mag, arg, own));
+            }
+            Class::Outside { n, r, dm } => {
+                let d = r * r.ln() / dm;
+                let g = r.ln() * (-(n as f64)).exp2();
+                let factor = if g > 0. { -(-2. * g).exp_m1() / (4. * g) } else { 0.5 };
+                // WHY/PROOF: below the landing the line runs between hairs, where the proven step can shrink without bound; the floor keeps the probe moving, and at 2⁻¹² it is the descent's own landing tolerance.
+                y -= (d * factor).max(1. / (1 << 12) as f64);
+            }
+            Class::Undecided => y -= 1. / (1 << 10) as f64,
+        }
+        if y < 0. {
+            return None;
+        }
+    }
+    None
 }
 
 /// Newton steps when solving for an attracting cycle.
@@ -292,7 +333,7 @@ const CLASSIFY_ITER: u32 = 1 << 12;
 
 /// Is there an attracting cycle of period `period` near `guess`? Newton on f^period(w) = w; a converged cycle with |multiplier| < 1 proves c is inside the set.
 /// Ported from mandelbrot-exploder (compute/mandelbrot_f64.rs, find_interior_attractor).
-fn attracting_cycle(c: (f64, f64), guess: (f64, f64), period: u32) -> bool {
+fn attracting_cycle(c: (f64, f64), guess: (f64, f64), period: u32) -> Option<(f64, f64)> {
     let mut w = guess;
     for _ in 0..NEWTON_STEPS {
         let (mut u, mut du) = (w, (1., 0.));
@@ -308,18 +349,18 @@ fn attracting_cycle(c: (f64, f64), guess: (f64, f64), period: u32) -> bool {
         let step = ((nr * dr + ni * di) / dd, (ni * dr - nr * di) / dd);
         w = (w.0 - step.0, w.1 - step.1);
         if step.0 * step.0 + step.1 * step.1 < (-53f64).exp2() {
-            return du.0 * du.0 + du.1 * du.1 < 1.;
+            return (du.0 * du.0 + du.1 * du.1 < 1.).then_some(w);
         }
     }
-    false
+    None
 }
 
 /// Where c is with respect to the Mandelbrot set.
 enum Class {
     /// Escaped at iteration n with |z| = r and |dz/dc| = dm.
     Outside { n: u32, r: f64, dm: f64 },
-    /// Proven inside: an attracting cycle was found.
-    Inside,
+    /// Proven inside: an attracting cycle of this period was found, through this point.
+    Inside { period: u32, attractor: (f64, f64) },
     /// Neither within the cap.
     Undecided,
 }
@@ -336,8 +377,10 @@ fn classify(c: (f64, f64)) -> Class {
         if r2 < smallest {
             let ratio = r2 / smallest;
             smallest = r2;
-            if ratio < 0.25 && attracting_cycle(c, z, n) {
-                return Class::Inside;
+            if ratio < 0.25 {
+                if let Some(attractor) = attracting_cycle(c, z, n) {
+                    return Class::Inside { period: n, attractor };
+                }
             }
         }
         let zdz = cmul(z, dz);
@@ -394,34 +437,47 @@ impl Params {
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let (axis, along) = j_shape(c);
-            // Spiral framing, for half the keys: dead centre, no offset, on a visible whorl. A cycle's eye is a visible spiral only when its multiplier turns a lot per unit of growth (large |arg λ| / ln|λ|, the spiral's pitch): most cycles have large |λ| and little turn and sit on tips and junctions. So 2⁴ cycles are tried and the most spiral one wins, and the view sits on a drawn preimage of it (0 to 3 levels in: an exact, smaller copy of the same whorl), at 2⁻¹ to 2⁻³ of J's half-extent, shrunk by the preimage's derivative. A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
+            // Spiral framing, for half the keys: dead centre, no offset, on the ROOT whorl, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
+            // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
+            // The hash picks which of the cycle's own points to sit on: each is a root, mapped onto the next by f.
+            // A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
             let spiral = if t[5] & 1 == 1 {
-                (0..SPIRAL_TRIES)
-                    .filter_map(|i| cycle_point(c, &draw(salt, 4, (n << 4) | i, text.as_bytes()), 1 + (i & (PERIODS - 1))))
-                    .map(|(eye, ln_mag, arg)| (eye, ln_mag, arg.abs() / ln_mag))
-                    .fold(None, |best: Option<((f64, f64), f64, f64)>, e| if best.map_or(true, |b| e.2 > b.2) { Some(e) } else { best })
+                // The α fixed point, z = (1 − √(1 − 4c))/2 with λ = 2z: the root near the main cardioid.
+                let alpha = {
+                    let s = {
+                        let (ax, ay) = (1. - 4. * c.0, -4. * c.1);
+                        let r = (ax * ax + ay * ay).sqrt();
+                        let (sx, sy) = (((r + ax) * 0.5).sqrt(), ((r - ax) * 0.5).sqrt());
+                        (sx, if ay < 0. { -sy } else { sy })
+                    };
+                    let z = ((1. - s.0) * 0.5, -s.1 * 0.5);
+                    close_cycle(c, z, 1).map(|(w, l, g)| (w, l, g, 1))
+                };
+                let sprayed = (0..SPIRAL_TRIES).filter_map(|i| {
+                    let period = 1 + (i & (PERIODS - 1));
+                    cycle_point(c, &draw(salt, 4, (n << 5) | i, text.as_bytes()), period).map(|(w, l, g)| (w, l, g, period))
+                });
+                root_cycle(c, land).into_iter().chain(alpha).chain(sprayed).fold(None, |best: Option<((f64, f64), f64, f64, u32)>, e| if best.map_or(true, |b| e.1 < b.1) { Some(e) } else { best })
             } else {
                 None
             };
-            if let Some((eye, _, _)) = spiral {
-                // A drawn preimage of the eye, k inverse branches in, and the derivative of f^k there (the whorl's copy shrinks by it).
-                let mut k = t[6] as u32 & (EYE_DEPTHS - 1);
-                let (centre, half) = loop {
-                    let mut chain = vec![eye];
-                    for i in 0..k as usize {
-                        let w = inverse(c, *chain.last().expect("chain starts non-empty"), bit(&a, i));
-                        chain.push(w);
+            if let Some((first, _, _, period)) = spiral {
+                let mut eye = first;
+                for _ in 0..(t[6] as u32 % period) {
+                    let ee = cmul(eye, eye);
+                    eye = (ee.0 + c.0, ee.1 + c.1);
+                }
+                // The whorl at 2⁻¹ to 2⁻³ of J's half-extent, or shallower until the f32 render resolves it.
+                let mut stops = 1. + unit(&t[24..28]) * 2.;
+                let half = loop {
+                    let half = along * (-stops).exp2();
+                    if half >= MIN_HALF || stops <= 1. {
+                        break half;
                     }
-                    let ln_d: f64 = chain.iter().skip(1).map(|w| (2. * (w.0 * w.0 + w.1 * w.1).sqrt()).ln()).sum();
-                    // The whorl at 2⁻¹ to 2⁻³ of J's half-extent, shrunk by the preimage's derivative so a preimage shows the same few turns as the eye itself.
-                    let half = along * (-(1. + unit(&t[24..28]) * 2.)).exp2() * (-ln_d).exp();
-                    if half >= MIN_HALF || k == 0 {
-                        break (*chain.last().expect("chain starts non-empty"), half);
-                    }
-                    k -= 1;
+                    stops -= 1.;
                 };
                 let turn = unit(&t[28..32]) * TAU;
-                let p = Params { c, centre, half, rot: (turn.cos(), turn.sin()), ..base };
+                let p = Params { c, centre: eye, half, rot: (turn.cos(), turn.sin()), ..base };
                 if framed(&p) || n >= 1 << 5 {
                     return p;
                 }
