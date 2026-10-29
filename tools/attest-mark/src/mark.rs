@@ -9,6 +9,7 @@
 //! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
 //! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
 //! The copy's long axis is J's principal axis (from 2⁷ address points) turned by −arg (f^k)′; a hash bit flips it end for end, and a small Gaussian offset (σ an eighth of the window) keeps the framing from looking machine-centred.
+//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral, and the address that repeats p hash bits forever (p from 1 to 2³) names exactly one; the view sits dead on it, with no offset, zoomed by |λ|^−m (m from 0 to 2² − 1), where λ = ∏ 2·z over the cycle is the multiplier by which the spiral repeats itself.
 //! A thumbnail still rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Precision: placement and framing are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the deepest window kept is 2⁻⁸ across, about 2⁻¹⁸ a pixel, many f32 steps even at |z| = 2).
@@ -34,6 +35,10 @@ const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 const HEIGHT_STOPS: u32 = 1 << 3;
 /// Depths drawn for the self-similar copy: 0 to 2³ − 1. Each level shrinks the copy by about 2|z| ≈ 2, so past about 2³ levels the f32 floor (MIN_HALF) would bite on most draws and repeat the same framings.
 const DEPTHS: u32 = 1 << 3;
+/// Periods drawn for a spiral's cycle: 1 to 2³.
+const PERIODS: u32 = 1 << 3;
+/// Self-similar zoom steps into a spiral: |λ|^−m for m from 0 to 2² − 1.
+const SPIRAL_STEPS: u32 = 1 << 2;
 /// The smallest window half-span kept, so the f32 render still has many representable steps per pixel.
 const MIN_HALF: f64 = 1. / (1 << 8) as f64;
 
@@ -238,6 +243,46 @@ fn piece(c: (f64, f64), bits: &[u8; 32], k: u32) -> ((f64, f64), f64, f64) {
     (*chain.last().expect("chain starts non-empty"), ln_mag, arg)
 }
 
+/// A repelling cycle point of J(c) of period dividing `period`, near the point whose address repeats the first `period` bits of `bits`, with ln|λ| and arg λ of the cycle's multiplier λ = (f^period)′ there.
+/// The repeated address is only the starting guess: the bits choose principal or negated square roots, and the principal root's cut can cross J, so a repeating bit pattern is not a true itinerary there. Newton on f^period(w) = w finds the cycle itself, and it is kept only if f^period carries it back onto itself.
+/// It is the eye of a spiral: zooming by |λ| and turning by arg λ about it maps J(c) onto itself.
+fn cycle_point(c: (f64, f64), bits: &[u8; 32], period: u32) -> Option<((f64, f64), f64, f64)> {
+    let mut rep = [0u8; 32];
+    for i in 0..(1usize << 8) {
+        if bit(bits, i % period as usize) {
+            rep[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    let mut w = address_point(c, &rep);
+    // f^period and its derivative at w.
+    let run = |w: (f64, f64)| {
+        let (mut u, mut du) = (w, (1f64, 0f64));
+        for _ in 0..period {
+            du = cmul((2. * du.0, 2. * du.1), u);
+            let uu = cmul(u, u);
+            u = (uu.0 + c.0, uu.1 + c.1);
+        }
+        (u, du)
+    };
+    for _ in 0..NEWTON_STEPS {
+        let (u, du) = run(w);
+        // Newton step: w ← w − (u − w) / (du − 1).
+        let (nr, ni) = (u.0 - w.0, u.1 - w.1);
+        let (dr, di) = (du.0 - 1., du.1);
+        let dd = dr * dr + di * di;
+        let step = ((nr * dr + ni * di) / dd, (ni * dr - nr * di) / dd);
+        w = (w.0 - step.0, w.1 - step.1);
+        if step.0 * step.0 + step.1 * step.1 < (-80f64).exp2() {
+            break;
+        }
+    }
+    let (u, du) = run(w);
+    let closed = (u.0 - w.0).abs() + (u.1 - w.1).abs() < 1. / (1 << 24) as f64;
+    let mag_sq = du.0 * du.0 + du.1 * du.1;
+    // Kept only when it closed and repels (every cycle of a Cantor Julia set does; a non-finite derivative means Newton wandered off to infinity).
+    (closed && mag_sq > 1. && mag_sq.is_finite()).then(|| (w, 0.5 * mag_sq.ln(), du.1.atan2(du.0)))
+}
+
 /// Newton steps when solving for an attracting cycle.
 const NEWTON_STEPS: u32 = 1 << 5;
 /// Iteration cap for classifying a point of the parameter plane.
@@ -347,7 +392,25 @@ impl Params {
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let (axis, along) = j_shape(c);
-            // The copy at the drawn depth, or shallower until its window is still one the f32 render resolves.
+            // Spiral framing, for half the keys: dead centre on a repelling cycle's eye, zoomed by |λ|^−m (backing off m to the f32 floor), at a drawn turn. A cycle Newton could not close falls through to copy framing, so every try still ends in a framing and the 2⁵-try exit always applies.
+            let spiral = if t[5] & 1 == 1 { cycle_point(c, &a, 1 + (t[6] as u32 & (PERIODS - 1))) } else { None };
+            if let Some((eye, ln_mag, _)) = spiral {
+                let mut m = t[7] as u32 & (SPIRAL_STEPS - 1);
+                let half = loop {
+                    let half = along * 1.125 * (-(m as f64) * ln_mag).exp();
+                    if half >= MIN_HALF || m == 0 {
+                        break half;
+                    }
+                    m -= 1;
+                };
+                let turn = unit(&t[24..28]) * TAU;
+                let p = Params { c, centre: eye, half, rot: (turn.cos(), turn.sin()), ..base };
+                if framed(&p) || n >= 1 << 5 {
+                    return p;
+                }
+                continue;
+            }
+            // Copy framing, the other half: the copy at the drawn depth, or shallower until its window is still one the f32 render resolves.
             let mut depth = (unit(&t[0..4]) * DEPTHS as f64) as u32;
             let (centre, half, turn) = loop {
                 let (centre, ln_mag, arg) = piece(c, &a, depth);
@@ -498,6 +561,22 @@ mod tests {
             seen.dedup();
             assert!(seen.len() > 1 << 6, "device {device}: only {} distinct pixels", seen.len());
             assert!(a != b, "device {device}: the text did not change the picture");
+        }
+    }
+
+    /// A spiral's eye really is periodic: f^p carries it back onto itself.
+    #[test]
+    fn a_spiral_eye_is_periodic() {
+        let c = (-0.8, 0.2);
+        let bits = *blake3::hash(b"eye").as_bytes();
+        for p in 1..=PERIODS {
+            let (eye, _, _) = cycle_point(c, &bits, p).expect("Newton closes a cycle from the repeated address");
+            let mut z = eye;
+            for _ in 0..p {
+                let zz = cmul(z, z);
+                z = (zz.0 + c.0, zz.1 + c.1);
+            }
+            assert!((z.0 - eye.0).abs() + (z.1 - eye.1).abs() < 1. / (1 << 16) as f64, "period {p}: f^p(eye) − eye = {:?}", (z.0 - eye.0, z.1 - eye.1));
         }
     }
 
