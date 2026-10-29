@@ -583,10 +583,18 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32;
     let ul = o.ux * lp.0 + o.uy * lp.1;
     let h = look.height;
     let relief = if v.kind == Kind::Julia { let t = 0.5 + 0.5 * (ul + h) / (1. + h); t * t - 0.5 } else { 0. };
-    // Lightness and chroma: the ground at 0.86 with little colour, deeper and a touch more coloured toward the body (0.72), lightest and most coloured on the rim (0.92), settling toward the ground far out.
-    let lightness = 0.86 - 0.14 * body + 0.06 * rim * (1. - body) + 0.0625 * relief * (1. - body) * (1. - far) + breathe;
-    let chroma = 0.035 + 0.02 * body + 0.035 * rim * (1. - body) - 0.015 * far;
-    pastel(&v.theme, lightness, chroma, v.theme.spread * swing)
+    // Nacre: the hue turns with the surface's facing across the light (the normal's cross product with it, in [−1, 1]), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; strongest near the set, where the relief is.
+    let cross = if v.kind == Kind::Julia { o.ux * lp.1 - o.uy * lp.0 } else { 0. };
+    let nacre = 0.25 * cross * (1. - far);
+    // Sheen: a soft highlight on the faces turned squarely to the light, near the rim, ((1 + u·l)/2)^2³.
+    let face = 0.5 + 0.5 * ul;
+    let sheen = if v.kind == Kind::Julia { face.powi(1 << 3) * rim * (1. - body) } else { 0. };
+    // The body takes its own hue, a quarter turn round from the theme's, so the set reads as a second, harmonising colour rather than a darker shade of the ground.
+    let accent = 0.25 * TAU as f32 * body;
+    // Lightness and chroma: the ground at 0.86 with little colour, deeper and a touch more coloured toward the body (0.72), lightest and most coloured on the rim (0.92), settling toward the ground far out; the sheen lifts the lit faces a little further and pales them.
+    let lightness = 0.86 - 0.14 * body + 0.06 * rim * (1. - body) + 0.0625 * relief * (1. - body) * (1. - far) + 0.0625 * sheen + breathe;
+    let chroma = 0.035 + 0.025 * body + 0.035 * rim * (1. - body) - 0.015 * far - 0.02 * sheen;
+    pastel(&v.theme, lightness, chroma, v.theme.spread * swing + nacre + accent)
 }
 
 
