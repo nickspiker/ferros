@@ -1,6 +1,6 @@
 //! ahau: the attest screen (Claude memories/ferros_attest_os_level.md; the capsule the owner named, Māori "I, me"). The first thing on the glass at boot: init starts it before the map, at the system level, so it covers everything until the person proves who they are by typing their handle on the honeycomb keyboard. Then its window goes and the map is there.
 //!
-//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the Photon client in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the phone unlocks without the handle being typed — a stolen phone then holds the identity, and the screen warns it.
+//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the Photon client in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the phone unlocks without the handle being typed — a stolen phone then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
 //!
 //! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the Photon client in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
 //! - Opt-in (unlock at boot): the seed is stored, the client loads it from the vault at boot, and the screen unlocks as soon as the client reports membership, with no handle typed.
@@ -177,48 +177,9 @@ impl Ahau {
         (cy + r + self.w / 16, self.w / 34)
     }
 
-    /// The unlock-at-boot toggle row (shown on the entry only), under the status line: its baseline and size.
-    fn unlock_at(&self) -> (usize, usize) {
-        let (b, _) = self.status_at();
-        (b + self.w / 10 + self.w / 15, self.w / 30)
-    }
 
-    /// The toggle: "unlock at boot:  off  on", the chosen one bright, and when on a warning under it. Cleared outside the entry.
-    fn unlock_row(&self) {
-        let (b, px) = self.unlock_at();
-        self.clear_rows(b - px * 3 / 2, b + px * 2);
-        if self.mode != Mode::Fresh {
-            return;
-        }
-        window::text(self.display, self.base, (self.w / 8) as i16, b as i16, px as u16, QUIET, b"unlock at boot:");
-        for (i, name) in ["off", "on"].iter().enumerate() {
-            let cx = self.w * 9 / 16 + self.w * i / 6;
-            let on = (i == 1) == self.unlock_at_boot;
-            window::text(self.display, self.base, cx as i16, b as i16, px as u16, if on { TEXT } else { QUIET / 2 }, name.as_bytes());
-        }
-        if self.unlock_at_boot {
-            self.centred(b + px * 5 / 4, px * 4 / 5, 11000, "if this phone is lost, whoever holds it becomes you");
-        }
-    }
-
-    /// A tap on no key: the button under the entry line acts, or the unlock-at-boot toggle.
+    /// A tap on no key: the button under the entry line acts (or `back` beside it).
     fn tap_at(&mut self, x: i64, y: i64) {
-        // The unlock-at-boot toggle (entry only).
-        if self.mode == Mode::Fresh {
-            let (b, px) = self.unlock_at();
-            if (b as i64 - px as i64 * 3 / 2..b as i64 + px as i64 / 2).contains(&y) && x >= (self.w / 2) as i64 {
-                let want = x >= (self.w * 2 / 3) as i64;
-                if want != self.unlock_at_boot {
-                    if ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_UNLOCK_AT_BOOT, want as u8) != ferros_sys::ERR {
-                        self.unlock_at_boot = want;
-                        self.unlock_row();
-                    } else {
-                        console(self.grants, b"ahau: the unlock-at-boot toggle was refused\n");
-                    }
-                }
-                return;
-            }
-        }
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
             if (bx0 as i64..bx1 as i64).contains(&x) && (by0 as i64..by1 as i64).contains(&y) {
@@ -276,7 +237,6 @@ impl Ahau {
         self.mode = Mode::Fresh;
         self.status(self.prompt());
         self.words();
-        self.unlock_row();
         self.entry();
         self.button();
     }
@@ -334,9 +294,8 @@ impl Ahau {
 
     /// The pairing words while joining, six to a row under the status line, split at the capitals they come camelCased with; cleared otherwise.
     fn words(&self) {
-        let (ub, upx) = self.unlock_at();
         let px = self.w / 30;
-        let top = ub - upx;
+        let top = self.status_at().0 + self.w / 8;
         self.clear_rows(top, top + px * 9);
         if !matches!(self.mode, Mode::Join(_)) {
             return;
@@ -430,7 +389,6 @@ impl Ahau {
         if changed {
             self.status(self.prompt());
             self.button();
-            self.unlock_row();
         }
         self.words();
         true
@@ -479,7 +437,6 @@ impl Ahau {
         let (cx, cy, r) = self.mark_at();
         draw_mark(self.surf(), self.w, cx, cy, r);
         self.status(self.prompt());
-        self.unlock_row();
         self.entry();
         self.button();
         self.kb.draw(self.surf(), &mut self.label());
@@ -525,7 +482,6 @@ impl Ahau {
                 self.mode = Mode::Fresh;
                 self.status(self.prompt());
                 self.words();
-                self.unlock_row();
                 return;
             }
             Mode::Looking(_) | Mode::Starting => return,
