@@ -1742,6 +1742,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 #[cfg(all(feature = "pixel8", not(shim_handoff)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // FERROS_TEST_HANG=1 builds: stop here, before the watchdog is petted or the slot marked, as a broken build would. ABL's watchdog then resets the phone, the slot's retries count down, and ABL should fall back to the other slot (the A/B fallback test, BOOT.md). Never in a build that ships.
+    if option_env!("FERROS_TEST_HANG") == Some("1") {
+        loop {
+            unsafe { core::arch::asm!("wfe") };
+        }
+    }
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
     // Boot timing starts here: everything after this is ferros's own time (`diag boot`).

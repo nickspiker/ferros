@@ -109,6 +109,14 @@ Pixel 8 / Tensor G3 (primary):
 - On watchdog reset ABL silently retries the active slot (decrementing its retry counter) — the visible symptom is a frozen Google splash cycling every ~70s until retries exhaust and it falls back to the other slot.
 - AVB verification of an unsigned image logs `avb_ret=ERROR_VERIFICATION, avb_error_parts=boot` and **boots it anyway** while the bootloader is unlocked. Signing (avb_custom_key) is only needed for the locked endgame.
 - A/B rollback observed working: a failing slot is marked and ABL falls back to the other slot or fastboot.
+- **The A/B fallback test (2026-10-28, signed slots, identical boot chains):**
+  - **Setup:** slot a was given a gate whose ferros stops at entry (`FERROS_TEST_HANG=1`: before the watchdog is petted or the slot marked, as a broken build would), and the slot words were set to a = 2 retries, active, not successful; b = a clean spare, successful, not de-activated, 7 retries (`diag slot word`).
+  - **What ABL did:** with no hands on the phone it tried slot a until its retries ran out. Each attempt ended in "APC Watchdog Early"; the last read `slot data a: 0x00000c00` and "decrement active slot boot retry". Then it booted slot b (`boot slot: b`, "active slot boot ok"), left a as `0x0800` (no retries, de-activated), and ferros came up on b 366 s after the first reboot and marked it.
+  - **Cost:** each failed attempt is about 1.5 to 2 minutes (the watchdog plus ABL), so a dead slot with the usual 7 retries falls over in about 12 to 15.
+  - **Restored:** the normal gate went back on both slots; a is active and successful, b a clean spare.
+- **The spare re-arms itself.** A slot switch (fastboot's or ferros's `set_active`) leaves the other slot de-activated, and the fallback above is proven only onto a slot without that flag. So `slot::mark_booted_slot` now clears the other slot's de-activated flag whenever that slot has booted successfully before. Tested: b set to `0x0A07`, a plain reboot on a, and b came back `0x0207`.
+- **What the redundancy covers:** a slot that goes bad, not a bad build. `tools/husky-cold.sh` writes both slots at once, so a build that dies before the vault fails on a, falls back, and fails on b too, which ends in fastboot (recoverable, but no ferros). The protocol above ("write slot B, verify, only then slot A") is the guard against that.
+- `diag slot` reads both slot words; `diag slot word <a|b> <retries> <flags>` sets one (development).
 
 ### Current husky layout (2026-10-14): slot b boots ferros, slot a is Android
 

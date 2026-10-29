@@ -2007,6 +2007,26 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
+                                            // `diag slot`: both A/B slot words from devinfo (retries | flags << 8; flags b0 unbootable, b1 successful, b2 active, b3 de-activated). `diag slot word <a|b> <retries hex> <flags hex>` sets one (slot.rs set_word: the A/B fallback test, a spare's flags).
+                                            if let Some(rest) = cmd.params.strip_prefix(b"slot word ") {
+                                                let t = core::str::from_utf8(rest).unwrap_or("");
+                                                let mut it = t.split_whitespace();
+                                                let slot = match it.next() { Some("a") => Some(0usize), Some("b") => Some(1), _ => None };
+                                                let r = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
+                                                let f = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
+                                                match (slot, r, f) {
+                                                    (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::slot::set_word(s, r, f)).as_bytes()),
+                                                    _ => resp.extend_from_slice(b"slot word <a|b> <retries hex> <flags hex>\n"),
+                                                }
+                                            }
+                                            match crate::slot::words() {
+                                                Some([a, b]) => resp.extend_from_slice(alloc::format!("slot a G#{a:04X}  slot b G#{b:04X}\n").as_bytes()),
+                                                None => resp.extend_from_slice(b"devinfo not readable\n"),
+                                            }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if let Some(name) = cmd.params.strip_prefix(b"part avb ") {
                                             // `diag part avb <partition>`: its AVB vbmeta (behind the footer, or at the start of a vbmeta partition) as one line of hex, read-only (partfs.rs): the installed build's own descriptors, for the owner's re-signed top-level vbmeta.
                                             match crate::partfs::avb_vbmeta(core::str::from_utf8(name).unwrap_or("").trim()) {

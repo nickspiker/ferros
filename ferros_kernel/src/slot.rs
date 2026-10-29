@@ -111,12 +111,17 @@ pub fn mark_booted_slot(dtb_addr: u64) -> SlotMark {
         m.result = NOT_ACTIVE;
         return m;
     }
-    if flags[slot] & FLAG_SUCCESSFUL != 0 {
+    // The other slot stays a spare (owner, 2026-10-28: "if a fails 7 times it goes to b"). A switch leaves it de-activated, and ABL's fallback when this slot's retries run out is proven only onto a slot without that flag (BOOT.md, the A/B fallback test). So once it has booted successfully before, the flag is cleared here, on every boot of this slot, and the spare stays armed.
+    let rearm = flags[1 - slot] & FLAG_SUCCESSFUL != 0 && flags[1 - slot] & FLAG_DEACTIVATED != 0;
+    if flags[slot] & FLAG_SUCCESSFUL != 0 && !rearm {
         m.result = ALREADY;
         return m;
     }
     let mut want = block.clone();
     want[SLOT_WORDS + 4 * slot + 1] |= FLAG_SUCCESSFUL;
+    if rearm {
+        want[SLOT_WORDS + 4 * (1 - slot) + 1] &= !FLAG_DEACTIVATED;
+    }
     ufs.data_buffer_mut().copy_from_slice(&want);
     if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
         m.result = WRITE_FAILED;
@@ -129,6 +134,36 @@ pub fn mark_booted_slot(dtb_addr: u64) -> SlotMark {
     m.after = word(&back, slot);
     m.result = if back == want { MARKED } else { VERIFY_FAILED };
     m
+}
+
+/// Set one slot's word as ABL reads it (`diag slot word`, the A/B fallback test): retries left and flags, nothing else in devinfo touched. Refuses unknown flags; read back after writing. Development: what Android's boot control and ferros's marking do in steps, done in one.
+pub fn set_word(slot: usize, retries: u8, flags: u8) -> u32 {
+    if slot > 1 || flags & !FLAG_KNOWN != 0 {
+        return BAD_FORMAT;
+    }
+    let ufs = UfsController::new(UFS_BASE);
+    let Some(block) = read_devinfo(&ufs) else { return READ_FAILED };
+    if &block[0..4] != b"DEVI" || u16::from_le_bytes([block[4], block[5]]) != 3 {
+        return BAD_FORMAT;
+    }
+    let mut want = block.clone();
+    want[SLOT_WORDS + 4 * slot] = retries;
+    want[SLOT_WORDS + 4 * slot + 1] = flags;
+    ufs.data_buffer_mut().copy_from_slice(&want);
+    if ufs.write_block_lun(DEVINFO_LUN, DEVINFO_LBA) != 0 || ufs.last_response_status() != 0 {
+        return WRITE_FAILED;
+    }
+    if !matches!(read_devinfo(&ufs), Some(back) if back == want) {
+        return VERIFY_FAILED;
+    }
+    MARKED
+}
+
+/// Both slots' words as they are now (retries | flags << 8), for `diag slot`.
+pub fn words() -> Option<[u32; 2]> {
+    let ufs = UfsController::new(UFS_BASE);
+    let b = read_devinfo(&ufs)?;
+    Some([b[SLOT_WORDS] as u32 | (b[SLOT_WORDS + 1] as u32) << 8, b[SLOT_WORDS + 4] as u32 | (b[SLOT_WORDS + 5] as u32) << 8])
 }
 
 /// Make `slot` (0 = a, 1 = b) the one ABL boots next: its active flag set with 3 retries (what `fastboot --set-active` writes), the other slot's active flag cleared, everything else byte for byte; verified by reading back. The gate's Android choice (ready.rs) uses it for slot a before a reset. Returns a result code as `mark_booted_slot` does.
