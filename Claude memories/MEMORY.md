@@ -98,7 +98,8 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: a handle is not a password](feedback_handle_not_password.md) — never mask a handle; show as typed; minting (only) asks for it twice, visibly; attest is one entry
 - [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) — never put identity roots on a device without asking whose device and which identity; the 2026-10-26 roots push put the owner's identity on his wife's phone
 - [fgtw.org serves plain HTTP for ferros](fgtw_plain_http_for_ferros.md) — port 80 works, no redirect (2026-10-28); ferros reaches the seed without TLS via ip's TCP + DNS; never enable Cloudflare Always Use HTTPS on fgtw.org
-- [Identity not on disk by default](identity_not_on_disk_default.md) — no handle/seed stored by default (typed each boot, seed+proof to the Photon client in RAM via op 4, fleet key recovered from the fan-out); opt-in device.unlock_at_boot stores it with a theft warning; blake guess rates measured 2026-10-28
-- [Keys in registers](keys_in_registers.md) — since 2026-10-28 the ira+wairua live only in CPU registers (pointer-auth keys XOR dead EL1 regs), lifted from safe Rust (keyreg/keys.rs → keys.s); those registers are taken; TRNG 1.3 ms, keep off wake paths
-- [UFS firewall decided](ufs_firewall_decided.md) — owner 2026-10-28: the hv refuses Android's writes to the boot chain and blocks its UFS device reset (keeps fPowerOnWPEn armed); after signed vbmeta + hv I/O fix; prerequisite for locking
-- [AVB signed, unlocked](avb_signed_unlocked.md) — since 2026-10-28 the gate is signed with the owner's RSA-4096 key (keys/avb.vsf), ABL avb_ret=OK on slot b; husky-cold.sh signs every flash; slot a's patched images fail; read ABL's verdict at G#FD80_0000
+- [Identity not on disk by default](identity_not_on_disk_default.md) — handle typed each boot, roots in RAM; opt-in unlock-at-boot with theft warning
+- [Keys in registers](keys_in_registers.md) — ira+wairua only in CPU registers since 2026-10-28; those registers are taken; lift rules
+- [UFS firewall decided](ufs_firewall_decided.md) — hv refuses Android boot-chain writes + blocks UFS reset; prerequisite for locking
+- [AVB signed, unlocked](avb_signed_unlocked.md) — owner-key signed gate, avb_ret=OK; both slots run Android; A/B fallback proven
+- [Feedback: AVB key freedom](feedback_avb_key_freedom.md) — use keys/avb.vsf freely while it stays VSF in Code/keys
