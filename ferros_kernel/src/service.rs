@@ -1399,9 +1399,9 @@ pub fn run(mut b: Boot) -> ! {
                                         }
                                         // The handoff build has no `slot`: marking an A/B slot is a cold-boot job, and a ferros chainloaded out of a running Android must not rewrite devinfo under it.
                                         #[cfg(not(shim_handoff))]
-                                        if cmd.params == b"android" {
-                                            // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot.
-                                            let r = crate::slot::set_active(0);
+                                        if cmd.params == b"android" || cmd.params == b"android here" {
+                                            // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
+                                            let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
                                             // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
                                             unsafe {
                                                 let p = 0xFD60_0FF8usize as *mut u64;

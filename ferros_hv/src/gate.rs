@@ -450,21 +450,26 @@ pub fn android_from_slot_a(dtb: usize) -> bool {
         return false;
     }
     let data = foot - 8 - size;
-    let key = b"androidboot.slot_suffix = \"_b\"";
+    // Every assignment of slot b, in each form bootconfig allows. ABL writes the override form, `androidboot.slot_suffix:=_b`, after an `_a` from vendor_boot's own bootconfig, and the last assignment wins (read from RAM after an Android boot, 2026-10-28: the gate had matched only `= "_b"`, so Android launched from slot b ran on slot b's partitions). The `_b` is the key's last byte but one or its last byte.
+    let keys: [(&[u8], usize); 3] = [(b"androidboot.slot_suffix = \"_b\"", 2), (b"androidboot.slot_suffix:=_b", 1), (b"androidboot.slot_suffix=_b", 1)];
+    let mut rewritten = false;
     let mut at = data;
-    while at + key.len() <= data + size {
-        if name_is_n(at, key) {
-            let b_at = at + key.len() - 2;
-            unsafe {
-                write_volatile(b_at as *mut u8, b'a');
-                write_volatile(csum_at as *mut u32, le32(csum_at).wrapping_sub(1));
-                asm!("dc civac, {a}", "dc civac, {c}", "dsb sy", a = in(reg) b_at as u64, c = in(reg) csum_at as u64);
+    while at < data + size {
+        for (key, back) in keys {
+            if at + key.len() <= data + size && name_is_n(at, key) {
+                let b_at = at + key.len() - back;
+                unsafe {
+                    write_volatile(b_at as *mut u8, b'a');
+                    // The checksum is a byte sum: 'b' to 'a' lowers it by one.
+                    write_volatile(csum_at as *mut u32, le32(csum_at).wrapping_sub(1));
+                    asm!("dc civac, {a}", "dc civac, {c}", "dsb sy", a = in(reg) b_at as u64, c = in(reg) csum_at as u64);
+                }
+                rewritten = true;
             }
-            return true;
         }
         at += 1;
     }
-    false
+    rewritten
 }
 
 fn name_is_n(a: usize, want: &[u8]) -> bool {
