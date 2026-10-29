@@ -565,34 +565,44 @@ fn soft(th: &Theme, l: f32, sat: f32, dh: f32) -> [f32; 3] {
 #[derive(Clone, Copy)]
 pub struct Look {
     pub offset: (f32, f32),
-    /// The light's direction across the screen as a complex number (x right, y down), normalised by the renderer.
-    pub light: (f32, f32),
-    /// How steep the relief reads: the light's height above the picture, in units of the normal's length (0 = grazing, large = flat).
-    pub height: f32,
+    /// Where the light comes from: x right, y down (across the screen), z up out of the picture; normalised by the renderer.
+    pub light: (f32, f32, f32),
+    /// The relief's scale s, in pixels: the surface is H = −s·ln G (G the escape potential), so its slope at a point d pixels from the set is s/d, steep at the set's edge and flattening into the field.
+    pub relief: f32,
 }
 
 impl Default for Look {
-    /// No offset, lit from the top left at a moderate height.
+    /// No offset, lit from the top left at 45° up, relief 2¹ pixels.
     fn default() -> Self {
-        Look { offset: (0., 0.), light: (-1., -1.), height: 1. }
+        Look { offset: (0., 0.), light: (-1., -1., 2f32.sqrt()), relief: 2. }
     }
 }
 
+/// The light in the plane: its horizontal part turned by the view's `rot` (plane = centre + rot·screen) and its height, as a unit vector.
+#[derive(Clone, Copy)]
+struct PlaneLight {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
 impl Look {
-    /// The light's direction in the plane for a view turned by `rot` (plane = centre + rot·screen), as a unit complex number.
-    fn plane_light(&self, rot: (f32, f32)) -> (f32, f32) {
-        let l = (self.light.0 * self.light.0 + self.light.1 * self.light.1).sqrt();
-        let (a, b) = (self.light.0 / l, self.light.1 / l);
-        (a * rot.0 - b * rot.1, a * rot.1 + b * rot.0)
+    fn plane_light(&self, rot: (f32, f32)) -> PlaneLight {
+        let (a, b, c) = self.light;
+        let l = (a * a + b * b + c * c).sqrt();
+        let (a, b, c) = (a / l, b / l, c / l);
+        PlaneLight { x: a * rot.0 - b * rot.1, y: a * rot.1 + b * rot.0, z: c }
     }
 }
 
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
 /// One soft scheme, low contrast: the field is the theme's ground, the set's body its second tone, the edge a glow or an ink line; nothing goes near black or white, and nothing is saturated.
 /// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u swings the hue either side of the theme's base (by the theme's spread) and Im u breathes the lightness a little, so both halves of the offset move every method.
-/// Relief: the outside of the set is lit as a surface whose slope is the escape potential's — normal (u, h), u = z/(dz/dz₀) the level line's outward direction, h = `look.height` — by a light from `look.light`: ((1 + (u·l + h)/(1 + h))/2)², smooth and never clipped, which here lifts or lowers the lightness by up to 2⁻⁴ so the filaments' top-left faces are lit.
+/// Lighting, from the slope itself: the picture is the surface H = −s·ln G (s = `look.relief` pixels, G the escape potential), a ridge along the set falling away into the field.
+/// Its gradient points along u = z/(dz/dz₀) (the potential's own direction, outward) with magnitude s/d per pixel at d pixels from the set (d being the distance estimate, G/|∇G| up to a constant), so its unit normal is (sin α·u, cos α) with sin α = s/√(s² + d²), cos α = d/√(s² + d²), exact and finite even on the set (d = 0).
+/// Lambert's n·l against the light, taken relative to a flat surface (which sees l_z), moves the lightness by 2⁻³·(n·l − l_z): faces turned to the light rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped or faked.
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32; 3] {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: PlaneLight) -> [f32; 3] {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -619,19 +629,19 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32;
     // Far: how far out in the field, 0 near the set to 1 far away (the disc's own rim, the plane's infinity, is fully far).
     let far = (-nu * 0.125).exp2();
     // Relief, in [((h − 1)/(h + 1) + 1)²/4, 1], centred on ½ so it lifts and lowers about the ground.
-    let ul = o.ux * lp.0 + o.uy * lp.1;
-    let h = look.height;
-    let relief = if v.kind == Kind::Julia { let t = 0.5 + 0.5 * (ul + h) / (1. + h); t * t - 0.5 } else { 0. };
-    // Nacre: the hue turns with the surface's facing across the light (the normal's cross product with it, in [−1, 1]), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; strongest near the set, where the relief is.
-    let cross = if v.kind == Kind::Julia { o.ux * lp.1 - o.uy * lp.0 } else { 0. };
-    let nacre = 0.25 * cross * (1. - far);
-    // Sheen: a soft highlight on the faces turned squarely to the light, near the rim, ((1 + u·l)/2)^2³.
-    let face = 0.5 + 0.5 * ul;
-    let sheen = if v.kind == Kind::Julia { face.powi(1 << 3) * rim * (1. - body) } else { 0. };
+    // The surface's tilt from the slope (the parameter plane has no u, so it lights flat).
+    let sr = look.relief;
+    let hyp = (sr * sr + dist_px * dist_px).sqrt();
+    let (sin_a, cos_a) = (sr / hyp, dist_px / hyp);
+    let (ul, cross) = (o.ux * lp.x + o.uy * lp.y, o.ux * lp.y - o.uy * lp.x);
+    let n_dot_l = if v.kind == Kind::Julia { sin_a * ul + cos_a * lp.z } else { lp.z };
+    let shading = 0.125 * (n_dot_l - lp.z);
+    // Nacre: the hue turns with the surface's facing across the light (the normal's horizontal part crossed with it), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; only where the surface tilts.
+    let nacre = if v.kind == Kind::Julia { 0.25 * sin_a * cross } else { 0. };
     let th = &v.theme;
     let edge = rim * (1. - body);
-    // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; relief raises the lit faces and lowers the shaded ones by up to 2⁻⁴, the sheen lifts the faces squarely to the light a little more.
-    let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + 0.0625 * relief * (1. - body) * (1. - far) + 0.0625 * sheen + breathe;
+    // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
+    let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
     let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
     // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
     soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body)
@@ -770,13 +780,13 @@ mod tests {
         }
     }
 
-    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground less the relief and breathing (0.44 − 2⁻⁴ − 2⁻⁴ − 2⁻⁶ ≈ 0.30) up to 1, at the most saturation any layer gets (0.015 + 0.125 ≈ 0.14 ≤ 2⁻³ + 2⁻⁵). A channel past 1 is fine: the pack saturates it.
+    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground in the deepest shade (0.38 − 2⁻³·(1 + l_z) − 2⁻⁶ ≈ 0.14) up to 1, at the most saturation any layer gets (0.015 + 0.125 ≈ 0.14 ≤ 2⁻³ + 2⁻⁵). A channel past 1 is fine: the pack saturates it.
     #[test]
     fn soft_colours_stay_in_gamut() {
         let mut th = Theme::from_bytes(&[0; 32]);
         for i in 0..(1 << 8) {
             th.hue = i as f32 / (1 << 8) as f32 * TAU as f32;
-            for l in [0.3f32, 0.4, 0.5, 0.7, 0.9, 1.] {
+            for l in [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.] {
                 for sat in [0f32, 0.07, 0.156] {
                     let rgb = soft(&th, l, sat, 0.);
                     assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, sat {sat}: {rgb:?}");
