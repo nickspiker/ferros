@@ -57,8 +57,8 @@ impl App {
             hit_counter,
             textbox,
             device: 0,
-            // ferros attest: the rim vignette √(1 − |p|⁴), black in a tighter band at the rim.
-            look: mark::Look { vignette: 4, ..mark::Look::default() },
+            // ferros attest: the rim vignette √(1 − |p|¹²), flat almost to the rim and black in a narrow band there.
+            look: mark::Look { vignette: 12, ..mark::Look::default() },
             progressive: true,
             salt: salt_for(0),
             mark: Vec::new(),
