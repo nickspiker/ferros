@@ -87,3 +87,7 @@ panic = "abort"
 # The display server's per-pixel paths are measured for speed, not size (the ODT timing, 2026-10-24).
 [profile.release.package.ferros-payload-display]
 opt-level = 3
+
+# The attest screen's mark (tapuwae, four samples at a time): at "s" LLVM's vectoriser is off and it runs on scalar float, so it builds for speed (2026-10-29: no `.4s` ops at "s", 1850 at 3).
+[profile.release.package.ferros-payload-ahau]
+opt-level = 3
