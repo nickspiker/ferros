@@ -305,3 +305,43 @@ Measured: TOC acked; MAIN G#5DA0C00 bytes in 1998 frames, 12.6 s, its CRC accept
 - **Afterwards:** `diag modem off` powers the CP down.
 
 **Next:** pktproc's ring layout and init from the GPL cpif source, then PIF_INIT_DONE. Then PHONE_START → INIT_END (link_device.c 526-640), then the channel-41 remote-file service.
+
+### What the AP owes the CP after INIT_START (read from the GPL source, 2026-10-28)
+
+**Sources:** the zuma driver is `radio-s5300/` in the reference tree (built as `s5300:cpif`, kdev-shusky/BUILD.bazel:104), not the older soc-gs cpif. The DT is `kdev-zuma/dts/zuma-cp-s5300-sit.dtsi`. Line references below are into those two. Spot-checked: the INIT_START handler, the capability bits, the DT's pktproc values.
+
+**INIT_START (G#C1) → PIF_INIT_DONE (G#CD), `cmd_init_start_handler` (link_device.c 457-522):**
+1. `pktproc_init`: the four DL queues. Per queue: descriptors cleared, `fore_ptr = rear_ptr = 0`; `cp_desc_pbase`, `cp_buff_pbase` and `num_desc` written into the queue's info entry (32-bit addresses, `pktproc_use_36bit_addr` 0); empty buffers pre-posted, `fore_ptr` advanced. No doorbell.
+2. Capabilities: `ap_cap[0]` = G#3 (bit 0 PKTPROC_UL, bit 1 CH_EXTENSION) at IPC+G#A0, `ap_cap[1]` = 0 at IPC+G#A8. The CP's own are at IPC+G#A4 and +G#AC. Already done once at probe: IPC+G#70 = G#A0 (the capability pointer), IPC+G#64 = G#40_0000 (srinfo).
+3. PIF_INIT_DONE: `ap2cp_msg` = G#CD, then the message doorbell (G#1_0000).
+
+**The DL info header** at G#E800_0000 (`struct pktproc_info_v2`, little-endian, link_rx_pktproc.h 51-72):
+
+| field | value / layout |
+|---|---|
+| word 0 | `num_queues`[3:0] 4, `desc_mode`[5:4] 1 (sktbuf), `irq_mode`[7:6], `max_packet_size`[23:8] 1584 |
+| `q_info[i]`, i = 0..3, 20 bytes each from +4 | {`cp_desc_pbase`, `num_desc`, `cp_buff_pbase`, `fore_ptr`, `rear_ptr`} |
+
+- **Layout:** info at +0 (G#1000), descriptors from +G#1000, buffers from +G#10_0000 (G#1B0_0000, G#6C_0000 a queue).
+- **Addresses:** the CP sees the region at G#2000_0000 (`pktproc_cp_base`): AP physical = CP address − G#2000_0000 + G#E800_0000.
+- **Sktbuf descriptor** (16 bytes): u64 {`cp_data_paddr`[35:0], `control` byte 5 (b7 HEAD on the first, b3 RINGEND on the last), `status` byte 6 (b0 DONE)}, u16 length @8, u16 filter @10, u16 info @12, u8 `channel_id` @14, u8 itg @15.
+- **Who moves what:** the AP owns `fore_ptr` (it posts empty buffers), the CP owns `rear_ptr` (it advances past filled ones). A per-queue MSI tells the AP data is there.
+- **Size estimate:** about 3456 descriptors a queue at a 2048-byte stride. This assumes Linux's skb padding: 1584 plus the skb overhead, rounded to a power of two. Not confirmed (kernel headers are not in the tree); on bare metal the stride is ours to choose.
+
+**PHONE_START (G#C8) → INIT_END (G#C2) (link_device.c 526-647):**
+1. **The capability check:** `(ap ^ cp) & ap` must be 0, so the CP must report at least G#3.
+2. **`pktproc_init_ul`:** UL info at CP G#21C0_0000, two queues (q0 1024-byte, 1760 descriptors; q1 2048-byte, 880). The AP writes the queue entries and *reads* `end_bit_owner` and `cp_quota`, which the CP has filled.
+3. **`init_legacy_link`:** IPC magic G#AA, mem_access 1, the FMT and RAW cursors zeroed.
+4. **INIT_END:** G#C2.
+
+**Channels:**
+- **Data, pktproc only:** PS channels G#B5-G#D3 (181-211, `rmnet`). Raw IP, the channel in the descriptor.
+- **Legacy RAW ring:** channel 41 (`umts_rfs0`, the remote-file service), as are DUN 21, DM 81 and loopback 82.
+- **Legacy FMT ring:** FMT 245/246.
+
+**Open:** how the CP maps its G#2000_0000 window onto G#E800_0000 (`use_dedicated_baaw` is 0 on husky, so probably fixed in the CP firmware); which MSI data value the CP uses per DL queue (the AP never tells it); whether the DL info header must be rewritten at INIT_START (Linux writes it once, at probe).
+
+**Next on the bench:**
+1. Write the DL info and descriptors.
+2. Answer PIF_INIT_DONE, and watch for PHONE_START and the CP's capability words.
+3. Answer INIT_END; the channel-41 requests then arrive on the RAW ring.
