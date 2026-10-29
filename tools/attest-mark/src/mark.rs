@@ -34,6 +34,8 @@ const JUMP: i32 = 1 << 2;
 const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 /// Stops of height for c above its landing point, from 2⁻⁴ down: much above 2⁻⁴ J(c) thins into sparse dust, and below 2⁻¹² the landing's own tolerance (2⁻¹²) dominates, so the 2³ stops between are the ones that matter.
 const HEIGHT_STOPS: u32 = 1 << 3;
+/// The designed core's radius under `Proj::Invert`, in window units: with s = R/2³, the open field gathers within about |w| = 2⁻⁵ (everything beyond 2²·R of the eye), and the core's glow reaches four times that so it reads as a shape, not a speck.
+const CORE: f32 = 1. / (1 << 3) as f32;
 /// Periods sprayed for a spiral's cycle: 1 to 2⁴.
 const PERIODS: u32 = 1 << 4;
 /// Cycles sprayed as candidates for the root whorl.
@@ -65,10 +67,23 @@ pub struct Params {
     mode: u8,
     /// The orbit trap's point, for mode 2.
     trap: (f64, f64),
-    /// Seen through the inversion w = s/(z − centre), s = `inv_scale`: the window is on the w-plane, half-span `half`.
-    invert: bool,
-    /// The inversion's scale s: the ring |z − centre| = s is |w| = 1.
-    inv_scale: f64,
+    /// How the window maps onto the plane (see `Proj`).
+    proj: Proj,
+    /// The projection's scale: s for `Proj::Invert`, a for `Proj::Mobius`.
+    proj_scale: f64,
+    /// The root whorl's radius in the plane, which every projection frames.
+    radius: f64,
+}
+
+/// How the screen looks at J(c) around the root whorl's eye e.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Proj {
+    /// The plane itself: z = e + w·R, the whorl filling the window.
+    Plain,
+    /// The inversion w = s/(z − e), s = R/2³: e goes to infinity and the outer field to the centre, which is lit as a designed core.
+    Invert,
+    /// The Möbius map w = a·(z − e)/(z + e): e sits at the centre and its mirror twin −e (J = −J) goes to infinity, so the picture is a double spiral streaming off the screen toward the twin; the outer field lands at w = a, off screen. On the Riemann sphere the two eyes are the poles.
+    Mobius,
 }
 
 /// The same picture in the render's precision (f32).
@@ -81,14 +96,16 @@ struct View {
     phase: [f32; 3],
     mode: u8,
     trap: (f32, f32),
-    invert: bool,
-    inv_scale: f32,
+    proj: Proj,
+    proj_scale: f32,
+    /// The designed core's radius in window units (`Proj::Invert`), 0 when there is none.
+    core: f32,
 }
 
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), phase: [self.phase[0] as f32, self.phase[1] as f32, self.phase[2] as f32], mode: self.mode, trap: f(self.trap), invert: self.invert, inv_scale: self.inv_scale as f32 }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), phase: [self.phase[0] as f32, self.phase[1] as f32, self.phase[2] as f32], mode: self.mode, trap: f(self.trap), proj: self.proj, proj_scale: self.proj_scale as f32, core: if self.proj == Proj::Invert { CORE } else { 0. } }
     }
 }
 
@@ -140,18 +157,38 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
     Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, trap_sq }
 }
 
-/// The plane point under pixel (px, py) of a `w × h` window, `k` window units per pixel, and the plane units per pixel there; None for the point at infinity.
-/// Straight: z = centre + rot·(u + is). Inverted: w = rot·(u + is) and z = centre + s/w, whose local scale is |dz/dw| = s/|w|²; the pixel exactly at w = 0 (only on a window of odd width and height) is z = ∞.
+/// The plane point under pixel (px, py) of a `w × h` window, `k` window units per pixel, the plane units per pixel there, and |w| (the pixel's distance from the window's centre, in window units); None for the point at infinity.
+/// With w = rot·(u + is):
+/// Plain: z = e + w, local scale 1.
+/// Invert: z = e + s/w, local scale |dz/dw| = s/|w|²; w = 0 is z = ∞.
+/// Mobius: with q = w/a, z = e·(1 + q)/(1 − q), local scale |dz/dw| = 2|e|/(a·|1 − q|²); w = a is z = ∞.
 #[inline]
-fn pixel(v: &View, px: usize, py: usize, w: usize, h: usize, k: f32) -> Option<(f32, f32, f32)> {
+fn pixel(v: &View, px: usize, py: usize, w: usize, h: usize, k: f32) -> Option<(f32, f32, f32, f32)> {
     let (u, s) = ((px as f32 + 0.5 - w as f32 * 0.5) * k, (py as f32 + 0.5 - h as f32 * 0.5) * k);
     let (a, b) = (u * v.rot.0 - s * v.rot.1, u * v.rot.1 + s * v.rot.0);
-    if !v.invert {
-        return Some((v.centre.0 + a, v.centre.1 + b, k));
-    }
     let m = a * a + b * b;
-    let sm = v.inv_scale / m;
-    (m > 0.).then(|| (v.centre.0 + a * sm, v.centre.1 - b * sm, k * sm))
+    let wm = m.sqrt();
+    match v.proj {
+        Proj::Plain => Some((v.centre.0 + a, v.centre.1 + b, k, wm)),
+        Proj::Invert => {
+            let sm = v.proj_scale / m;
+            (m > 0.).then(|| (v.centre.0 + a * sm, v.centre.1 - b * sm, k * sm, wm))
+        }
+        Proj::Mobius => {
+            let (qa, qb) = (a / v.proj_scale, b / v.proj_scale);
+            let (dr, di) = (1. - qa, -qb);
+            let dd = dr * dr + di * di;
+            if dd <= 0. {
+                return None;
+            }
+            // (1 + q)/(1 − q), then times e.
+            let (nr, ni) = (1. + qa, qb);
+            let r = ((nr * dr + ni * di) / dd, (ni * dr - nr * di) / dd);
+            let e = v.centre;
+            let em = (e.0 * e.0 + e.1 * e.1).sqrt();
+            Some((e.0 * r.0 - e.1 * r.1, e.0 * r.1 + e.1 * r.0, k * 2. * em / (v.proj_scale * dd), wm))
+        }
+    }
 }
 
 /// Plane units per pixel for a `w × h` window: half the span covers `half`.
@@ -170,7 +207,7 @@ fn detail(p: &Params) -> f64 {
     let mut n = [0i32; W * H];
     for py in 0..H {
         for px in 0..W {
-            n[py * W + px] = pixel(&v, px, py, W, H, k).map_or(0, |(x, y, _)| orbit(x, y, &v).n as i32);
+            n[py * W + px] = pixel(&v, px, py, W, H, k).map_or(0, |(x, y, _, _)| orbit(x, y, &v).n as i32);
         }
     }
     let mut edges = 0;
@@ -411,7 +448,7 @@ impl Params {
         let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap, invert: true, inv_scale: 1. };
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap, proj: Proj::Plain, proj_scale: 1., radius: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
@@ -445,7 +482,7 @@ impl Params {
             // α always closes for c outside the set (it repels there); if even that failed, the next try draws a new c, and after 2⁵ tries the whole of J(c), straight, stands.
             let Some((first, _, _, period)) = spiral else {
                 if n >= 1 << 5 {
-                    return Params { c, half: along * 1.125, invert: false, ..base };
+                    return Params { c, radius: along * 1.125, ..base };
                 }
                 continue;
             };
@@ -455,7 +492,7 @@ impl Params {
                     let ee = cmul(eye, eye);
                     eye = (ee.0 + c.0, ee.1 + c.1);
                 }
-                // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it. The inversion's scale is s = R/2³ and the w-window's half-span is 1, so inversion space has unit scale for every key and the screen's edge is the ring |z − eye| = R/2³, deep in the whorl.
+                // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it. The view is plain here; `project` puts it through another projection, with the window's half-span 1 in every one.
                 let mut stops = 1. + unit(&t[24..28]) * 2.;
                 let radius = loop {
                     let radius = along * (-stops).exp2();
@@ -465,12 +502,36 @@ impl Params {
                     stops -= 1.;
                 };
                 let turn = unit(&t[28..32]) * TAU;
-                let p = Params { c, centre: eye, half: 1., inv_scale: radius / (1 << 3) as f64, rot: (turn.cos(), turn.sin()), ..base };
+                let p = Params { c, centre: eye, half: radius, radius, rot: (turn.cos(), turn.sin()), ..base };
                 if framed(&p) || n >= 1 << 5 {
                     return p;
                 }
             }
         }
+    }
+}
+
+impl Params {
+    /// The same picture through another projection, its window always of half-span 1 in projected units.
+    /// Plain: z = e + R·w, the whorl filling the window. Invert: s = R/2³, so the window's edge is the ring |z − e| = R/2³ deep in the whorl. Mobius: a = 2 (see below).
+    pub fn project(mut self, proj: Proj) -> Self {
+        self.proj = proj;
+        match proj {
+            Proj::Plain => {
+                self.half = self.radius;
+                self.proj_scale = 1.;
+            }
+            Proj::Invert => {
+                self.half = 1.;
+                self.proj_scale = self.radius / (1 << 3) as f64;
+            }
+            Proj::Mobius => {
+                // a = 2: the outer field sits at |w| = 2, just off a tall window's corners (about 1.6 in these units), and the window spans from the eye out past the whole of J toward the twin; a larger a only zooms in on the eye, where the map is nearly linear and looks plain.
+                self.half = 1.;
+                self.proj_scale = 2.;
+            }
+        }
+        self
     }
 }
 
@@ -487,7 +548,7 @@ fn palette(t: f32, phase: &[f32; 3]) -> [f32; 3] {
 
 /// One point of the plane, as an opaque α + darkness pixel; `k` is plane units per pixel.
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32) -> u32 {
+fn shade(x: f32, y: f32, v: &View, k: f32, wm: f32) -> u32 {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -510,7 +571,10 @@ fn shade(x: f32, y: f32, v: &View, k: f32) -> u32 {
     let rim = (-(l * l)).exp2();
     // Field: the colouring, dimmed, fading to black far from the set.
     let field = (1. - (-nu * 0.125).exp2()) * 0.375;
-    let ch = |i: usize| (col[i] * (body * 0.1875 + rim * 0.875 + (1. - body) * field) * 255.) as u8;
+    // The designed core (Invert only): a smooth (C∞) glow of the palette's own light over the outer field where it gathers at the centre.
+    let core = if v.core > 0. { let q = wm / v.core; (-(q * q)).exp2() } else { 0. };
+    let lit = palette(0.5 + nu * (1. / (1 << 6) as f32), &v.phase);
+    let ch = |i: usize| ((col[i] * (body * 0.1875 + rim * 0.875 + (1. - body) * field) + lit[i] * core) * 255.) as u8;
     pack_argb(ch(0), ch(1), ch(2), 255)
 }
 
@@ -521,8 +585,12 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             row[px] = match pixel(&v, px, py, w, h, k) {
-                Some((x, y, kl)) => shade(x, y, &v, kl),
-                // The point at infinity: the outer field at its farthest, black.
+                Some((x, y, kl, wm)) => shade(x, y, &v, kl, wm),
+                // The point at infinity: the outer field at its farthest; under Invert it is the core's centre, at full light.
+                None if v.core > 0. => {
+                    let l = palette(0.5, &v.phase);
+                    pack_argb((l[0] * 255.) as u8, (l[1] * 255.) as u8, (l[2] * 255.) as u8, 255)
+                }
                 None => pack_argb(0, 0, 0, 255),
             };
         }
@@ -551,7 +619,7 @@ pub fn render_near(buf: &mut [u32], w: usize, h: usize, p: &Params) {
 /// A locator pane at `k` plane units per pixel about `centre`, imaginary axis up, in this device's colouring: every point the descent checked as a pixel in its own random colour, and a crosshair on c.
 fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64, f64), k: f64) {
     let span = 2. * (w * h) as f64 / (w + h) as f64;
-    let q = Params { kind: Kind::Plane, c: (0., 0.), centre, half: k * span * 0.5, rot: (1., 0.), invert: false, ..*p };
+    let q = Params { kind: Kind::Plane, c: (0., 0.), centre, half: k * span * 0.5, rot: (1., 0.), proj: Proj::Plain, proj_scale: 1., ..*p };
     render(buf, w, h, &q);
     // Rows run downward and the imaginary axis runs up: flip.
     let (top, bottom) = buf.split_at_mut(w * (h / 2));
