@@ -29,6 +29,12 @@ const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
 const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
+/// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
+const S_IRA: u64 = 6;
+/// The attest mark's pixels as tapuwae renders them (α + darkness, 8 bits a channel), drawn once at start into this buffer and blitted at every redraw; its side is FRESH_SIDE (0 until drawn, or when there is no mark and the ring stands in).
+/// 2¹⁷ pixels holds a mark of radius up to 179 (side 2r + 4): w/8 on panels up to 1432 wide.
+static mut FRESH: [u32; 1 << 17] = [0; 1 << 17];
+static mut FRESH_SIDE: usize = 0;
 /// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_PHOTON_EP: u64 = 8;
 /// The layouts' names, as the switch shows them (honeycomb::LETTERS order). Names, not words: the same in every language.
@@ -493,7 +499,9 @@ impl Ahau {
     fn all(&self) {
         self.surf().fill(0);
         let (cx, cy, r) = self.mark_at();
-        mark(self.surf(), self.w, cx, cy, r);
+        if !blit_fresh(self.surf(), self.w, cx, cy) {
+            mark(self.surf(), self.w, cx, cy, r);
+        }
         let (tb, tpx) = self.title_at();
         self.centred(tb, tpx, TEXT, "attest");
         self.status(self.prompt());
@@ -710,6 +718,54 @@ fn mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     }
 }
 
+/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's. Drawn once, on the X3 (the one big core: a few hundred milliseconds there), into FRESH, with the time on the console.
+/// Without the ira grant, or on a panel too wide for the buffer, FRESH_SIDE stays 0 and the ring stands in.
+fn render_fresh_mark(grants: u64, r: usize) {
+    let side = 2 * r + 4;
+    // WHY: r comes from the display server's panel width; a wider panel than this buffer was sized for falls back to the drawn ring instead of rendering past FRESH's end.
+    if side * side > unsafe { (&*(&raw const FRESH)).len() } {
+        console(grants, b"ahau: the panel is too wide for the mark's buffer; the ring stands in\n");
+        return;
+    }
+    let Some(salt) = ferros_sys::ira_key(cap(grants, S_IRA), "attest mark") else {
+        console(grants, b"ahau: no ira key; the ring stands in\n");
+        return;
+    };
+    ferros_sys::pin(ferros_sys::CORES_BIG);
+    sleep_until(now() + freq() / 1000);
+    let t0 = now();
+    let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
+    let mid = side as f32 * 0.5;
+    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, 2);
+    let mut l = Line::new();
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark ({side} px, 2x2) in {} ms on the X3\n", ferros_sys::us_since(t0) / 1000));
+    console(grants, l.as_bytes());
+    ferros_sys::pin(0);
+    unsafe { FRESH_SIDE = side };
+}
+
+/// The rendered mark centred at (cx, cy) on the surface: tapuwae's α + darkness over black is α − darkness a channel (8 bits), widened to the surface's gamma-2 values (white = Q14), red in the low 16 bits as the display server reads them. False when there is no rendered mark.
+fn blit_fresh(s: &mut [u64], w: usize, cx: usize, cy: usize) -> bool {
+    let side = unsafe { FRESH_SIDE };
+    if side == 0 {
+        return false;
+    }
+    let buf = unsafe { &(&*(&raw const FRESH))[..side * side] };
+    let (x0, y0) = (cx - side / 2, cy - side / 2);
+    for y in 0..side {
+        for x in 0..side {
+            let d = buf[y * side + x];
+            let a = (d >> 24) as u64;
+            if a == 0 {
+                continue;
+            }
+            let ch = |sh: u32| (a - (d >> sh & 255) as u64) * 16384 / 255;
+            s[(y0 + y) * w + x0 + x] = ch(16) | ch(8) << 16 | ch(0) << 32;
+        }
+    }
+    true
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
@@ -747,6 +803,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
+    render_fresh_mark(grants, w / 8);
     a.all();
     a.show();
     console(grants, if mode == Mode::Starting { b"ahau: unlock at boot: the client loaded the stored seed; waiting for membership\n" } else { b"ahau: no identity in hand; type the handle\n" });

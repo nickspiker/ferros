@@ -14,3 +14,5 @@ honeycomb = { path = "../../honeycomb" }
 ahau_core = { path = "../../ahau_core" }
 ihi = { path = "../../../ihi", default-features = false, features = ["proof"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
+# The attest mark (tapuwae), without std: rows one after another on this thread, float maths from libm.
+tapuwae = { path = "../../../tapuwae", default-features = false }
