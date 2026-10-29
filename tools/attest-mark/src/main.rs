@@ -3,7 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
-//! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free. Ctrl+M, Ctrl+E and Ctrl+F step the material, the engraving and the mirror through every kind and back to the device's own.
+//! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free. Ctrl+M, Ctrl+E, Ctrl+F and Ctrl+S step the material, the engraving, the mirror and the style (soft, medal, enamel, lacquer) through every kind and back to the device's own; Ctrl+O toggles the button's wrapping.
 //! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
 
@@ -206,6 +206,14 @@ impl FluorApp for App {
                 EventResponse::StartWindowDrag
             }
             Event::KeyboardInput { event: kev } if kev.state == ElementState::Pressed => {
+                // Ctrl+O: the button's wrapping on or off.
+                if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("o")) {
+                    self.look.button = !self.look.button;
+                    println!("button: {}", if self.look.button { "on" } else { "off" });
+                    self.mark_key.2 = [0; 32];
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // Ctrl+L: one fixed light or each device's own. Ctrl+B: progressive keys or free.
                 if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l") || s.eq_ignore_ascii_case("b")) {
                     if matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l")) {
@@ -219,22 +227,23 @@ impl FluorApp for App {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                // Ctrl+M / Ctrl+E / Ctrl+F: the material, the engraving, the mirror, each stepping from the device's own through every kind and back.
+                // Ctrl+M / Ctrl+E / Ctrl+F / Ctrl+S: the material (soft style only), the engraving, the mirror, the style, each stepping from the device's own through every kind and back.
                 if ctx.modifiers.control_key() {
                     let which = match &kev.logical_key {
                         Key::Character(s) if s.eq_ignore_ascii_case("m") => Some((0, ["matte", "satin", "gloss", "glass"].as_slice())),
                         Key::Character(s) if s.eq_ignore_ascii_case("e") => Some((1, ["none", "level lines", "rays", "net"].as_slice())),
                         Key::Character(s) if s.eq_ignore_ascii_case("f") => Some((2, ["plain", "mirrored"].as_slice())),
+                        Key::Character(s) if s.eq_ignore_ascii_case("s") => Some((3, ["soft (the avatars')", "medal", "enamel", "lacquer"].as_slice())),
                         _ => None,
                     };
                     if let Some((i, names)) = which {
-                        let pick = [&mut self.look.material, &mut self.look.engrave, &mut self.look.mirror].into_iter().nth(i).unwrap();
+                        let pick = [&mut self.look.material, &mut self.look.engrave, &mut self.look.mirror, &mut self.look.style].into_iter().nth(i).unwrap();
                         *pick = match *pick {
                             mark::Pick::Force(k) if k as usize + 1 < names.len() => mark::Pick::Force(k + 1),
                             mark::Pick::Force(_) => mark::Pick::Device,
                             _ => mark::Pick::Force(0),
                         };
-                        let label = ["material", "engraving", "mirror"][i];
+                        let label = ["material", "engraving", "mirror", "style"][i];
                         match *pick {
                             mark::Pick::Force(k) => println!("{label}: {}", names[k as usize]),
                             _ => println!("{label}: the device's own"),
