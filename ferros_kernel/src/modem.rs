@@ -823,7 +823,9 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         (10, Some(s)) => start_and_handshake(rep, s, true, 0),
         (11, Some(s)) => start_and_handshake(rep, s, true, 1),
         (12, Some(s)) => start_and_handshake(rep, s, true, 2),
-        (n, Some(s)) if n >= 13 => start_and_handshake(rep, s, true, 3),
+        (13, Some(s)) => start_and_handshake(rep, s, true, 3),
+        (14, Some(s)) => start_and_handshake(rep, s, true, 4),
+        (n, Some(s)) if n >= 15 => start_and_handshake(rep, s, true, 5),
         _ => {}
     }
 }
@@ -1450,6 +1452,24 @@ const INT_SEND_FMT: u32 = 0x82;
 const SIT_GET_RADIO_POWER: u16 = 0x0801;
 const SIT_SET_RADIO_POWER: u16 = 0x0800;
 const SIT_GET_PS_REG_STATE: u16 = 0x0701;
+const SIT_GET_SIM_STATUS: u16 = 0x0200;
+const SIT_SET_PS_SERVICE: u16 = 0x0710;
+const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
+/// The APN the data SIM attaches with. Verizon's public internet APN, the one its data-only devices attach on (stack 1's confpack is us_vzw); not IMS, so nothing voice comes up. A per-carrier choice ferros will take from settings later.
+const ATTACH_APN: &[u8] = b"VZWINTERNET";
+
+/// SIT_SET_INITIAL_ATTACH_APN's 239 parameter bytes (ProtocolPsBuilder::BuildSetInitialAttachApn, 251 bytes with the header), as offsets into the whole message: G#C profile id 0, G#D 14 (22 when a PDP type is 5), G#E 0, G#F APN type 0 (default; 1 IMS, 2 emergency), G#10 the APN [101], G#75 user [50], G#A7 password [50], G#D9 auth 0 (none), G#DA PDP type 3 (IPV4V6; 1 IP, 2 IPV6), G#DB P-CSCF request 0, G#F8 the roaming PDP type 3, G#F9 the roaming P-CSCF request 0, the rest 0.
+fn initial_attach_params(apn: &[u8]) -> Vec<u8> {
+    let mut m = alloc::vec![0u8; 0xFB];
+    m[0xD] = 14;
+    // The APN field is 101 bytes with its NUL; the name is our own constant, so one too long is a bug: fail loud.
+    assert!(apn.len() <= 100);
+    m[0x10..0x10 + apn.len()].copy_from_slice(apn);
+    m[0xDA] = 3;
+    m[0xF8] = 3;
+    m[12..].to_vec()
+}
+const SIT_SET_PREFERRED_DATA_MODEM: u16 = 0x0740;
 
 /// Names for the ids the data path meets (rcmMsgToString); others print as their number.
 fn sit_name(id: u16) -> &'static str {
@@ -1472,6 +1492,7 @@ fn sit_name(id: u16) -> &'static str {
         0x0700 => "GET_CS_REG_STATE",
         0x0701 => "GET_PS_REG_STATE",
         0x0710 => "SET_PS_SERVICE",
+        0x0740 => "SET_PREFERRED_DATA_MODEM",
         0x0800 => "SET_RADIO_POWER",
         0x0801 => "GET_RADIO_POWER",
         0x0802 => "IND_RADIO_STATE_CHANGED",
@@ -1488,7 +1509,7 @@ fn sit_name(id: u16) -> &'static str {
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
     // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code.
-    matches!(id, 0x0210 | 0x0604 | 0x0609 | 0x0717 | 0x072C | 0x074A | 0x0800..=0x0805 | 0x0906)
+    matches!(id, 0x0210 | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0800..=0x0805 | 0x0906)
 }
 
 /// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
@@ -1500,14 +1521,20 @@ struct SitLink {
 
 /// One single-frame message into the FMT TX ring (cfg G#C000, 8-byte padding as on RAW), then the SEND_FMT message and the doorbell (link_device.c 860-880).
 fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::string::String> {
+    ring_send(link, false, ch, payload)
+}
+
+/// One single-frame message into the FMT or the RAW TX ring, then that ring's SEND message and the doorbell. The RAW ring is the boot channel's and, after START, the remote-file service's.
+fn ring_send(link: &mut SitLink, raw: bool, ch: u8, payload: &[u8]) -> Result<(), alloc::string::String> {
+    let (ring, len, headr, tailr, int) = if raw { (TX_RING, TX_RING_LEN, TXQ_HEAD, TXQ_TAIL, INT_SEND_DATA) } else { (FMT_TX_RING, FMT_TX_RING_LEN, FMT_TXQ_HEAD, FMT_TXQ_TAIL, INT_SEND_FMT) };
     let total = 12 + payload.len();
     let padded = (total + 7) & !7;
-    let head = rd(FMT_TXQ_HEAD);
-    let tail = rd(FMT_TXQ_TAIL);
+    let head = rd(headr);
+    let tail = rd(tailr);
     // The cursors live in shared memory the CP also writes: out of range, or too little room, and nothing is written.
-    let free = (tail + FMT_TX_RING_LEN - head - 1) % FMT_TX_RING_LEN;
-    if head >= FMT_TX_RING_LEN || tail >= FMT_TX_RING_LEN || (free as usize) < padded {
-        return Err(alloc::format!("fmt tx ring full or bad: head {head} tail {tail} need {padded}"));
+    let free = (tail + len - head - 1) % len;
+    if head >= len || tail >= len || (free as usize) < padded {
+        return Err(alloc::format!("tx ring full or bad: head {head} tail {tail} need {padded}"));
     }
     link.frame[ch as usize] = link.frame[ch as usize].wrapping_add(1);
     link.ch[ch as usize] = link.ch[ch as usize].wrapping_add(1);
@@ -1516,17 +1543,17 @@ fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::str
     let mut pos = head;
     let mut put = |b: &[u8]| {
         for &x in b {
-            wr8(FMT_TX_RING + pos as usize, x);
-            pos = (pos + 1) % FMT_TX_RING_LEN;
+            wr8(ring + pos as usize, x);
+            pos = (pos + 1) % len;
         }
     };
     put(&hdr);
     put(payload);
     put(&[0u8; 8][..padded - total]);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(FMT_TXQ_HEAD, pos);
+    wr(headr, pos);
     unsafe { core::arch::asm!("dsb sy") };
-    wr(AP2CP_MSG, INT_SEND_FMT);
+    wr(AP2CP_MSG, int);
     unsafe { core::arch::asm!("dsb sy") };
     wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
     Ok(())
@@ -1635,6 +1662,30 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
         line(rep, alloc::format!("t={t_ms} ms: modem_svc log (id A#{}): {}\n", id.unwrap_or(0), txt(log.bytes).trim_matches(|c: char| !c.is_ascii_graphic())));
         return None;
     }
+    // A UE-capability file read (payload 12, `UecapFileMessage` {1 read_request {1 size, 2 block_size, 3 file_dir, 4 file_name}, 2 read_response {1 offset, 2 data, 3 result, 4 last_block}}): logged, and for now answered with one final block, result 1 (UFM_INTERNAL_ERROR), so the CP stops waiting for it.
+    if let (Some(1), Some(id), Some(uc)) = (ty, id, get(12)) {
+        let req = pb_fields(uc.bytes)?;
+        let rr = req.iter().find(|f| f.num == 1)?;
+        let rf = pb_fields(rr.bytes)?;
+        let g = |n: u32| rf.iter().find(|f| f.num == n);
+        line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {} (dir {}, size A#{}, block A#{}, token A#{token}) -> not available\n", txt(g(4).map(|f| f.bytes).unwrap_or(&[])), g(3).map(|f| f.val).unwrap_or(0), g(1).map(|f| f.val).unwrap_or(0), g(2).map(|f| f.val).unwrap_or(0)));
+        let mut resp = Vec::new();
+        pb_put_varint(&mut resp, 1 << 3);
+        pb_put_varint(&mut resp, 0);
+        pb_put_bytes(&mut resp, 2, &[]);
+        pb_put_varint(&mut resp, 3 << 3);
+        pb_put_varint(&mut resp, 1);
+        pb_put_varint(&mut resp, 4 << 3);
+        pb_put_varint(&mut resp, 1);
+        let mut inner = Vec::new();
+        pb_put_bytes(&mut inner, 2, &resp);
+        let mut out = alloc::vec![0x08, 0x02, 0x15];
+        out.extend_from_slice(&id.to_le_bytes());
+        out.push(0x1D);
+        out.extend_from_slice(&token.to_le_bytes());
+        pb_put_bytes(&mut out, 12, &inner);
+        return Some(out);
+    }
     let (Some(1), Some(id), Some(prop)) = (ty, id, get(7)) else {
         line(rep, alloc::format!("t={t_ms} ms: modem_svc: type {:?} id {:?}, payload {:?}, not answered\n", ty, id, top.iter().filter(|f| f.num >= 5).map(|f| f.num).collect::<Vec<_>>()));
         return None;
@@ -1675,13 +1726,113 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// The remote-file service on RAW channel 41 (`umts_rfs0`, Android's /vendor/bin/rfsd; decoded 2026-10-29 from rfsd's handlers and the Android capture's own channel-41 conversation). Each message: u16 cmd, u16 transaction, u32 body length, then the body as u32 words. The CP opens a file into a slot (OPEN 4: slot, path length, path; slots 1-2 are the NV files, 3 the protected NV, 4 up files by path), asks for I/O (IO_REQUEST 6: slot, offset, size, direction 1 read / 2 write), queries (OP_STATUS 7: slot) and closes (CLOSE 5: slot). The AP answers each with STATUS (3: status, slot) and the CP acks every STATUS with its own. A read streams DATA (1: slot, offset, size, bytes) chunks the CP acks; a write is pulled by the AP, a cmd 2 {slot, offset, size} per chunk answered by the CP's cmd 2 {0, slot, size, bytes}, then STATUS. Chunks are G#7DC bytes, as rfsd's.
+// ferros never writes the phone's NV or files: a write is pulled to the end and acknowledged, and its bytes are dropped (the CP keeps its NV in RAM; the next boot loads the NV on flash, as before). Opens of files ferros cannot serve yet are logged and left unanswered.
+
+const CH_RFS: u8 = 41;
+const RFS_CHUNK: u32 = 0x7DC;
+
+/// A write the CP asked for, being pulled chunk by chunk.
+struct RfsPull {
+    tid: u16,
+    slot: u32,
+    off: u32,
+    end: u32,
+}
+
+fn rfs_status(link: &mut SitLink, tid: u16, slot: u32) -> Result<(), alloc::string::String> {
+    let mut m = alloc::vec![3u8, 0, tid as u8, (tid >> 8) as u8, 8, 0, 0, 0];
+    for w in [0u32, slot, 0] {
+        m.extend_from_slice(&w.to_le_bytes());
+    }
+    ring_send(link, true, CH_RFS, &m)
+}
+
+fn rfs_pull(link: &mut SitLink, p: &RfsPull) -> Result<(), alloc::string::String> {
+    let mut m = alloc::vec![2u8, 0, p.tid as u8, (p.tid >> 8) as u8, 0xC, 0, 0, 0];
+    for w in [p.slot, p.off, (p.end - p.off).min(RFS_CHUNK)] {
+        m.extend_from_slice(&w.to_le_bytes());
+    }
+    ring_send(link, true, CH_RFS, &m)
+}
+
+/// One remote-file message from the CP: answered as rfsd answers it, writes pulled and dropped.
+fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, pull: &mut Option<RfsPull>) {
+    // The CP's bytes: every word read is checked to lie inside the message.
+    let w = |i: usize| if b.len() >= i + 4 { Some(u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])) } else { None };
+    let (Some(head), Some(_len)) = (w(0), w(4)) else {
+        return line(rep, alloc::format!("t={t_ms} ms: rfs: short message (A#{} bytes)\n", b.len()));
+    };
+    let (cmd, tid) = (head as u16, (head >> 16) as u16);
+    let r = match (cmd, w(8)) {
+        (3, _) => Ok(()),
+        (7, Some(slot)) => {
+            line(rep, alloc::format!("t={t_ms} ms: rfs OP_STATUS slot A#{slot} (tid A#{tid}) -> status 0\n"));
+            rfs_status(link, tid, slot)
+        }
+        (5, Some(slot)) => {
+            line(rep, alloc::format!("t={t_ms} ms: rfs CLOSE slot A#{slot} (tid A#{tid}) -> status 0\n"));
+            rfs_status(link, tid, slot)
+        }
+        (4, Some(slot)) => {
+            let n = w(12).unwrap_or(0) as usize;
+            let path = if b.len() >= 16 + n { alloc::string::String::from_utf8_lossy(&b[16..16 + n]).into_owned() } else { alloc::string::String::from("?") };
+            line(rep, alloc::format!("t={t_ms} ms: rfs OPEN slot A#{slot} {} (tid A#{tid}): not served yet\n", path.trim_end_matches('\0')));
+            Ok(())
+        }
+        (6, Some(slot)) => match (w(12), w(16), w(20)) {
+            (Some(off), Some(size), Some(2)) => {
+                line(rep, alloc::format!("t={t_ms} ms: rfs write slot A#{slot} G#{size:X} bytes at G#{off:X} (tid A#{tid}): pulled, not stored\n"));
+                // Offset and size are the CP's: wrapping keeps a hostile pair from panicking the kernel; the pull then simply ends early.
+                let p = RfsPull { tid, slot, off, end: off.wrapping_add(size) };
+                let r = if size == 0 { rfs_status(link, tid, slot) } else { rfs_pull(link, &p) };
+                if size != 0 {
+                    *pull = Some(p);
+                }
+                r
+            }
+            (off, size, dir) => {
+                line(rep, alloc::format!("t={t_ms} ms: rfs IO_REQUEST slot A#{slot} offset {off:?} size {size:?} direction {dir:?} (tid A#{tid}): not served yet\n"));
+                Ok(())
+            }
+        },
+        (2, _) => match (pull.as_mut(), w(16)) {
+            (Some(p), Some(n)) if p.tid == tid => {
+                p.off = p.off.wrapping_add(n);
+                if n == 0 || p.off >= p.end {
+                    let (tid, slot) = (p.tid, p.slot);
+                    *pull = None;
+                    line(rep, alloc::format!("t={t_ms} ms: rfs write slot A#{slot} pulled to the end -> status 0\n"));
+                    rfs_status(link, tid, slot)
+                } else {
+                    rfs_pull(link, p)
+                }
+            }
+            _ => {
+                line(rep, alloc::format!("t={t_ms} ms: rfs data (tid A#{tid}) with no write pending, dropped\n"));
+                Ok(())
+            }
+        },
+        _ => {
+            line(rep, alloc::format!("t={t_ms} ms: rfs cmd A#{cmd} (tid A#{tid}): not handled\n"));
+            Ok(())
+        }
+    };
+    if let Err(e) = r {
+        line(rep, alloc::format!("  rfs reply not sent: {e}\n"));
+    }
+}
+
 /// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
 fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut done = [0u32; PP_QUEUES as usize];
     let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
     let (mut probed, mut powered) = (false, false);
     let mut next_reg = 5_000_000u64;
+    let (mut sim_asked, mut data_on, mut ia_set) = (false, false, false);
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut pull: Option<RfsPull> = None;
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
     let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
@@ -1710,6 +1861,34 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             match sit_request(&mut link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        // Stage e: what Android's telephony does for its data SIM once the SIM is ready — the preferred data modem (one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem), then allow data (SIT_SET_PS_SERVICE, one byte 1: ProtocolNetworkBuilder::BuildAllowData), both on that stack's channel. The SIM sits on stack 1 here (its confpack is us_vzw).
+        // Stage f: the initial-attach APN on the data SIM's stack before data is allowed, as Android's telephony sets it once the SIM is ready.
+        if probe >= 5 && !ia_set && since_us(t0) > 6_500_000 {
+            ia_set = true;
+            let ch = CH_FMT0 + 1;
+            match sit_request(&mut link, ch, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN)) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_INITIAL_ATTACH_APN {} IPV4V6 ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(ATTACH_APN))),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_INITIAL_ATTACH_APN not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        if probe >= 4 && !data_on && since_us(t0) > 7_000_000 {
+            data_on = true;
+            let ch = CH_FMT0 + 1;
+            for (id, v, name) in [(SIT_SET_PREFERRED_DATA_MODEM, 1u8, "SIT_SET_PREFERRED_DATA_MODEM 1"), (SIT_SET_PS_SERVICE, 1, "SIT_SET_PS_SERVICE on")] {
+                match sit_request(&mut link, ch, id, &[v]) {
+                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> {name} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
+                    Err(e) => line(rep, alloc::format!("t={} ms: {name} not sent: {e}\n", since_us(t0) / 1000)),
+                }
+            }
+        }
+        if probe >= 3 && !sim_asked && since_us(t0) > 6_000_000 {
+            sim_asked = true;
+            for ch in [CH_FMT0, CH_FMT0 + 1] {
+                if let Err(e) = sit_request(&mut link, ch, SIT_GET_SIM_STATUS, &[]) {
+                    line(rep, alloc::format!("t={} ms: SIT_GET_SIM_STATUS not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
+                }
             }
         }
         if probe >= 3 && since_us(t0) > next_reg {
@@ -1752,11 +1931,17 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                     }
                 }
             }
+            // The remote-file service answers for itself (rfs logs each request, never the data); its frames are not logged raw.
+            let served_rfs = probe >= 1 && name == "raw" && ch == CH_RFS;
+            if served_rfs {
+                let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
+                rfs(rep, since_us(t0) / 1000, &body, &mut link, &mut pull);
+            }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
             // The SIM's file-data and status chatter (G#210, G#246, G#248, G#24F) is counted, not logged: it is long, frequent and identity.
-            let quiet = ril && flen >= 16 && matches!(at(14) as u16 | (at(15) as u16) << 8, 0x0210 | 0x0246 | 0x0248 | 0x024F);
+            let quiet = served_rfs || ril && flen >= 16 && matches!(at(14) as u16 | (at(15) as u16) << 8, 0x0210 | 0x0246 | 0x0248 | 0x024F);
             if quiet {
                 // Counted in per_ch only.
             } else if ril && flen >= 12 + rcm_hdr && frames < 256 {
@@ -1773,6 +1958,17 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 // Parameters only for messages that carry no identity (sit_shown); the rest by header alone.
                 // Registration replies: the state, reject cause and radio technology (the first 4 bytes); the area and cell ids after them are location and stay hidden.
                 let np = if id == 0x0700 || id == 0x0701 { (flen - 12 - rcm_hdr).min(4) } else if sit_shown(id) { (flen - 12 - rcm_hdr).min(16) } else { 0 };
+                // SIM status (G#200): the card state, the application count, and each application's first 5 bytes (type, state, personalisation, PIN states); the AIDs and labels after them stay hidden.
+                if id == 0x0200 && ty == 1 && flen - 12 >= rcm_hdr + 3 {
+                    let apps = params(2) as u32;
+                    let mut s = alloc::format!("card G#{:X} apps A#{apps}", params(0));
+                    for k in 0..apps.min(4) {
+                        if flen - 12 >= rcm_hdr + 3 + 63 * k + 5 {
+                            s.push_str(&alloc::format!(" [{}]", hex(&|i| params(3 + 63 * k + i), 5)));
+                        }
+                    }
+                    line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIM status: {s}\n", since_us(t0) / 1000));
+                }
                 let resp = if ty == 1 { alloc::format!(" token A#{tok} error G#{:X}", b(10)) } else { alloc::string::String::new() };
                 line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} {} len A#{len}{resp}: {}\n", since_us(t0) / 1000, sit_name(id), hex(&params, np)));
                 frames += 1;
