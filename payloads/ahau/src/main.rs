@@ -64,6 +64,11 @@ const MAX_CHARS: usize = 64;
 const MARK: u64 = 9000;
 const TEXT: u16 = 16384;
 const QUIET: u16 = 7000;
+/// The entry's line: a quarter of white in gamma 2 (Q14).
+const LINE: u64 = 1 << 12;
+/// The button: Photon's attest button in grey (fluor's Button: the squircle of power 3, corners h/2 and h/4 by turns, a two-tone hairline of a 32nd of the label's size plus a pixel, shadow above the anti-diagonal and light below, so it reads raised). The fill as the back and attest buttons always were; the edges fluor's textbox edges as greys.
+const PILL_SHADOW: u64 = 3100;
+const PILL_LIGHT: u64 = 4096;
 
 global_asm!(
     r#"
@@ -274,16 +279,14 @@ impl Ahau {
         }
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
-            for y in by0..by1 {
-                s[y * self.w + bx0..y * self.w + bx1].fill(grey(1800));
-            }
+            pill(s, self.w, bx0, by0, bx1, by1, 1800, self.w / 24);
             let px = self.w / 24;
             let x = (bx0 + bx1) as i64 / 2 - 4 * px as i64 * 28 / 100;
             window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         let (x0, y0, x1, y1) = self.button_at();
-        for y in y0..y1 {
-            s[y * self.w + x0..y * self.w + x1].fill(if self.button_label().is_some() { grey(2600) } else { 0 });
+        if self.button_label().is_some() {
+            pill(s, self.w, x0, y0, x1, y1, 2600, self.w / 24);
         }
         if let Some(t) = self.button_label() {
             let px = self.w / 24;
@@ -439,11 +442,9 @@ impl Ahau {
         t[n] = b'_';
         let shown = core::str::from_utf8(&t[..n + 1]).unwrap_or("_");
         self.centred(b, px, TEXT, shown);
-        // The line: three quarters of the width, a 448th of it thick.
+        // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
         let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
-        for row in y..y + (self.w / 448).max(1) {
-            self.surf()[row * self.w + x0..row * self.w + x1].fill(grey(QUIET as u64));
-        }
+        self.surf()[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
     }
 
     fn all(&self) {
@@ -652,8 +653,89 @@ impl Ahau {
                 self.unconfirm();
                 self.entry();
             }
-            Some(Event::Redraw) => self.kb.draw(self.surf(), &mut self.label()),
-            None => {}
+            Some(Event::Redraw) => {
+                self.kb.draw(self.surf(), &mut self.label());
+                return;
+            }
+            None => return,
+        }
+        // Every stroke: the keys take the new handle's rainbow.
+        self.retint();
+        self.kb.draw(self.surf(), &mut self.label());
+    }
+
+    /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear light the grey mixed a quarter of the way to a hue of the same luminance (Rec. 709 weights), back to gamma 2 as a multiplier per channel.
+    fn retint(&mut self) {
+        let salt = unsafe { FRESH_JOB.2 };
+        let mut deal = [0u8; 64];
+        blake3::Hasher::new_keyed(&salt).update(b"attest keys").update(&self.handle[..self.len]).finalize_xof().fill(&mut deal);
+        let hexes = self.kb.hexes();
+        let n = hexes + honeycomb::BAR_KEYS.len();
+        // A shuffle of the slots 0..n (Fisher-Yates on the hash's bytes; the small modulo bias does not show in a hue).
+        let mut order = [0u8; 64];
+        for (i, o) in order[..n].iter_mut().enumerate() {
+            *o = i as u8;
+        }
+        for i in (1..n).rev() {
+            order.swap(i, deal[i] as usize % (i + 1));
+        }
+        let turn = deal[0] as f32 * (1. / (1 << 8) as f32);
+        let quarter = 1. / (1 << 2) as f32;
+        let mut tint = [[1u16 << 14; 3]; 64];
+        for k in 0..n {
+            let hue = (order[k] as f32 + turn) / n as f32;
+            // A smooth rainbow in linear light: each channel a raised cosine a third of a turn from the next.
+            let lin = [0, 1, 2].map(|c| {
+                let v = 0.5 + 0.5 * libm::cosf(core::f32::consts::TAU * (hue - c as f32 / 3.));
+                v * v
+            });
+            let luma = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+            let slot = if k < hexes { k } else { 48 + k - hexes };
+            tint[slot] = lin.map(|l| (libm::sqrtf(1. - quarter + quarter * l / luma) * (1u32 << 14) as f32) as u16);
+        }
+        self.kb.tint = Some(tint);
+    }
+}
+
+/// Photon's attest button in grey (`PILL_*`), filling (x0, y0)–(x1, y1) on the surface: the outer squircle rounded rectangle in the two edge greys, the inner one (inset by the hairline) in `fill`, each corner a superellipse of power 3 with fluor's asymmetric radii (h/2 at the top left and bottom right, h/4 at the others), every edge anti-aliased by its distance across the curve. `label_px` sizes the hairline as fluor's Button does: a 32nd of the label's size, plus a pixel.
+fn pill(s: &mut [u64], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, fill: u64, label_px: usize) {
+    let (bw, bh) = ((x1 - x0) as f32, (y1 - y0) as f32);
+    let stroke = (label_px / (1 << 5) + 1) as f32;
+    let big = bh * 0.5;
+    // Coverage of the rounded rectangle inset by `inset` at (fx, fy) from the box's corner: inside its straight edges whole; in a corner square, the superellipse |u/r|³ + |v/r|³ = 1, by the distance across it along the ray from the corner's centre (its own length scaled by f^(−1/3), f the superellipse's value there), half a pixel either side.
+    let cover = |fx: f32, fy: f32, inset: f32| -> f32 {
+        let (x, y, w, h) = (fx - inset, fy - inset, bw - 2. * inset, bh - 2. * inset);
+        if x <= 0. || y <= 0. || x >= w || y >= h {
+            return 0.;
+        }
+        let r_big = big - inset;
+        let radii = [r_big, r_big * 0.5, r_big, r_big * 0.5];
+        // The corner this point is in, if any: its radius and the point's distances in from the corner square's inner edges.
+        let corner = [(x, y, radii[0]), (w - x, y, radii[1]), (w - x, h - y, radii[2]), (x, h - y, radii[3])];
+        for (dx, dy, r) in corner {
+            if dx < r && dy < r {
+                let (u, v) = (r - dx, r - dy);
+                let rho = libm::sqrtf(u * u + v * v);
+                let f = (u * u * u + v * v * v) / (r * r * r);
+                let to_edge = rho / libm::cbrtf(f) - rho;
+                // WHY: a coverage is a fraction of the pixel, 0 to 1 by what it means; the edge's one-pixel ramp is held to that.
+                return (to_edge + 0.5).max(0.).min(1.);
+            }
+        }
+        1.
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (fx, fy) = ((x - x0) as f32 + 0.5, (y - y0) as f32 + 0.5);
+            let outer = cover(fx, fy, 0.);
+            if outer <= 0. {
+                continue;
+            }
+            let inner = cover(fx, fy, stroke);
+            // The hairline's tone by the box's anti-diagonal: shadow above it, light below (fluor's raised bevel).
+            let edge = if fx / bw + fy / bh <= 1. { PILL_SHADOW } else { PILL_LIGHT };
+            let v = fill as f32 * inner + edge as f32 * outer * (1. - inner);
+            s[y * w + x] = grey(v as u64);
         }
     }
 }
@@ -877,6 +959,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
     start_fresh_mark(grants, w / 3);
+    a.retint();
     a.all();
     a.show();
     console(grants, if mode == Mode::Starting { b"ahau: unlock at boot: the client loaded the stored seed; waiting for membership\n" } else { b"ahau: no identity in hand; type the handle\n" });

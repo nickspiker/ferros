@@ -107,6 +107,8 @@ pub struct Keyboard {
     pub layout: usize,
     /// The bar's left key's label (the host decides what it does: `Event::Leave`).
     pub left: &'static str,
+    /// Per-key tints (owner, 2026-10-29: the attest screen's keys each their own colour, a rainbow that changes with every stroke): a multiplier per channel (Q14, 2¹⁴ = as drawn) on a key's grey, at rest and lit alike, indexed by `tint_index`; None draws every key grey.
+    pub tint: Option<[[u16; 3]; 64]>,
 }
 
 /// The rows of the circle's corners: how far the circle (tangent to the screen's top and bottom) stays narrower than the screen at the bottom.
@@ -127,7 +129,7 @@ impl Keyboard {
         let cy3 = bar0 - cell_r;
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, layout: 0, left: BAR_KEYS[B_MAP] }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
     }
 
     /// The row pitch in pixels: a two-finger drag of this far scrolls one row.
@@ -257,6 +259,23 @@ impl Keyboard {
         }
     }
 
+    /// A key's slot in `tint`: the hexes by index, the bar's keys from 48.
+    pub fn tint_index(key: Key) -> usize {
+        match key {
+            Key::Hex(k) => k,
+            Key::Bar(b) => 48 + b,
+            Key::None => 0,
+        }
+    }
+
+    /// A key's colour from its grey `v`: the grey itself, or tinted channel by channel.
+    fn colour(&self, key: Key, v: u64) -> [u64; 3] {
+        match &self.tint {
+            Some(t) => t[Self::tint_index(key)].map(|f| v * f as u64 >> 14),
+            None => [v; 3],
+        }
+    }
+
     /// One key, lit or at rest, with its label.
     pub fn draw_key(&self, s: &mut [u64], key: Key, lit: bool, label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
         let size = (self.px * 107 >> 16) as u16;
@@ -265,7 +284,7 @@ impl Keyboard {
                 let (row, col) = self.place(k);
                 let (cx, cy) = self.centre(row, col);
                 let (a, r) = (self.a, self.r);
-                shape(s, self.w, cx - a, cx + a, if lit { LIT } else { KEY }, |fx| {
+                shape(s, self.w, cx - a, cx + a, self.colour(key, if lit { LIT } else { KEY }), |fx| {
                     let t = (fx - cx).abs() * INV_SQRT3 >> 16;
                     (cy - r + t, cy + r - t)
                 });
@@ -278,7 +297,7 @@ impl Keyboard {
                 let on = lit || (b == B_SHIFT && self.shift);
                 let (x0, x1) = self.bar_x(b);
                 let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2);
-                shape(s, self.w, x0, x1, if on { LIT } else { BAR_KEY }, |_| (y0, y1));
+                shape(s, self.w, x0, x1, self.colour(key, if on { LIT } else { BAR_KEY }), |_| (y0, y1));
                 centred((x0 + x1) / 2, (self.bar0 + self.bar1) / 2, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
             }
             Key::None => {}
@@ -448,11 +467,12 @@ fn grey(v: u64) -> u64 {
 }
 
 /// One column of a shape: pixel column `x`, covered from `top` to `bot` (Q8), `cov_x` of its width (0 to 256). The ends get the value times √coverage; the span between them the column's value flat.
-fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: u64) {
+fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: [u64; 3]) {
     let (yt, yb) = ((top >> 8) as usize, ((bot - 1) >> 8) as usize);
     let (ct, cb) = (256 - (top & 255) as u32, ((bot - 1) & 255) as u32 + 1);
-    let shade = |c: u32| grey(v * (c * cov_x).isqrt() as u64 >> 8);
-    let flat = grey(v * (cov_x << 8).isqrt() as u64 >> 8);
+    let rgb = |cov: u64| v[0] * cov >> 8 | (v[1] * cov >> 8) << 16 | (v[2] * cov >> 8) << 32;
+    let shade = |c: u32| rgb((c * cov_x).isqrt() as u64);
+    let flat = rgb((cov_x << 8).isqrt() as u64);
     s[yt * w + x] = shade(ct);
     for y in yt + 1..yb {
         s[y * w + x] = flat;
@@ -461,7 +481,7 @@ fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: 
 }
 
 /// A shape `left` to `right` (Q8) wide, each pixel column's top and bottom from `span` at the column's centre.
-fn shape(s: &mut [u64], w: usize, left: i64, right: i64, v: u64, span: impl Fn(i64) -> (i64, i64)) {
+fn shape(s: &mut [u64], w: usize, left: i64, right: i64, v: [u64; 3], span: impl Fn(i64) -> (i64, i64)) {
     let (xl, xr) = ((left >> 8) as usize, ((right - 1) >> 8) as usize);
     for x in xl..=xr {
         let cov_x = if x == xl {

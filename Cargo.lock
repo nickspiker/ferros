@@ -813,6 +813,7 @@ dependencies = [
  "ferros_sys",
  "honeycomb",
  "ihi 0.0.48",
+ "libm",
  "tapuwae",
 ]
 

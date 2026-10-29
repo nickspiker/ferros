@@ -16,3 +16,5 @@ ihi = { path = "../../../ihi", default-features = false, features = ["proof"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The attest mark (tapuwae), without std: rows one after another on this thread, float maths from libm.
 tapuwae = { path = "../../../tapuwae", default-features = false }
+# The attest button's squircle edge (a cube root) and the keys' hues (a cosine).
+libm = "0.2"
