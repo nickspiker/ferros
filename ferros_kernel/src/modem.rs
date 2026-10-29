@@ -1457,6 +1457,7 @@ const SIT_GET_SIM_STATUS: u16 = 0x0200;
 const SIT_SET_PS_SERVICE: u16 = 0x0710;
 const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
 const SIT_GET_STACK_STATUS: u16 = 0x0810;
+const SIT_SET_UICC_SUBSCRIPTION: u16 = 0x0249;
 const SIT_GET_CARRIER_RESTRICTIONS_V2: u16 = 0x0767;
 const SIT_OEM_SET_CARRIER_CONFIG_MANIFEST: u16 = 0x4600;
 /// The carrier-config root the CP opens its manifest and confseqs under, over the remote-file service (libsitril's CarrierConfigManager path; the Android capture's first remote-file open is `<root>/manifests/<id>`).
@@ -1500,6 +1501,8 @@ fn sit_name(id: u16) -> &'static str {
     match id {
         0x0200 => "GET_SIM_STATUS",
         0x0210 => "IND_SIM_STATUS_CHANGED",
+        0x0249 => "SET_UICC_SUBSCRIPTION",
+        0x024A => "IND_UICC_SUBSCRIPTION_STATE_CHANGED",
         0x024E => "IND_SIM_SLOT_STATUS_CHANGED",
         0x0600 => "SETUP_DATA_CALL",
         0x0603 => "SET_INITIAL_ATTACH_APN",
@@ -1515,7 +1518,12 @@ fn sit_name(id: u16) -> &'static str {
         0x074A => "IND_REG_FAILED",
         0x0700 => "GET_CS_REG_STATE",
         0x0701 => "GET_PS_REG_STATE",
+        0x0703 => "GET_NTW_MODE",
+        0x0704 => "SET_NTW_MODE_AUTO",
+        0x070B => "GET_PREFERRED_NTW_TYPE",
         0x0710 => "SET_PS_SERVICE",
+        0x0711 => "GET_PS_SERVICE",
+        0x0750 => "GET_ALLOW_NETWORK",
         0x0740 => "SET_PREFERRED_DATA_MODEM",
         0x0767 => "GET_CARRIER_RESTRICTIONS_V2",
         0x0800 => "SET_RADIO_POWER",
@@ -1538,7 +1546,7 @@ fn sit_name(id: u16) -> &'static str {
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
     // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code. G#4602 (the carrier-config manifest indication) starts with the SIM's ICCID.
-    matches!(id, 0x0210 | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
+    matches!(id, 0x0210 | 0x0249 | 0x024A | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0703 | 0x070B | 0x0711 | 0x0750 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
 }
 
 /// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
@@ -1967,7 +1975,8 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
     let (mut probed, mut powered) = (false, false);
     let mut next_reg = 5_000_000u64;
-    let (mut sim_asked, mut data_on, mut ia_set, mut queried) = (false, false, false, false);
+    let (mut sim_asked, mut data_on, mut ia_set, mut queried, mut uicc_on) = (false, false, false, false, false);
+    let mut cycled = 0u8;
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut rfs_st = Rfs { pull: None, read: None, files: Vec::new() };
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
@@ -2002,13 +2011,30 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
         }
         // Stage e: what Android's telephony does for its data SIM once the SIM is ready — the preferred data modem (one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem), then allow data (SIT_SET_PS_SERVICE, one byte 1: ProtocolNetworkBuilder::BuildAllowData), both on that stack's channel. The SIM sits on stack 1 here (its confpack is us_vzw).
         // Stage f: the initial-attach APN on the data SIM's stack before data is allowed, as Android's telephony sets it once the SIM is ready.
-        // Stage g: read-only queries for what else keeps the data SIM at emergency-only — the stack's enabled state and the carrier-restriction (SIM lock) policy.
+        // Stage G#10: read-only queries for what else keeps the data SIM off the network: the stack's enabled state, the carrier-restriction (SIM lock) policy, the voice registration, the network-selection mode, the preferred network type, packet service and the allowed networks.
         if probe >= 6 && !queried && since_us(t0) > 8_000_000 {
             queried = true;
-            for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2] {
+            for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2, 0x0700, 0x0703, 0x070B, 0x0711, 0x0750] {
                 if let Err(e) = sit_request(&mut link, CH_FMT0 + 1, id, &[]) {
                     line(rep, alloc::format!("t={} ms: G#{id:X} not sent: {e}\n", since_us(t0) / 1000));
                 }
+            }
+        }
+        // Stage G#10: the data stack's radio cycled once the carrier pack is in (off at 9 s, on at 9.5 s): the first power-on went out before the manifest swapped the pack.
+        if probe >= 6 && cycled < 2 && since_us(t0) > 9_000_000 + 500_000 * cycled as u64 {
+            let v = if cycled == 0 { 1u8 } else { 2 };
+            cycled += 1;
+            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[v, 0, 0, 0, 0, 0]) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER {} ch A#{} token A#{tok}\n", since_us(t0) / 1000, if v == 1 { "off" } else { "on" }, CH_FMT0 + 1)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        // Stage G#10: the SIM's applications enabled (SIT_SET_UICC_SUBSCRIPTION, one byte 1: ProtocolSimBuilder::BuildSetUicc), what Android's enableUiccApplications(true) sends for each SIM at boot.
+        if probe >= 6 && !uicc_on && since_us(t0) > 6_200_000 {
+            uicc_on = true;
+            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_UICC_SUBSCRIPTION, &[1]) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_UICC_SUBSCRIPTION 1 ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_UICC_SUBSCRIPTION not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         if probe >= 5 && !ia_set && since_us(t0) > 6_500_000 {
