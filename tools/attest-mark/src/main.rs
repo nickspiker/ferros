@@ -57,7 +57,7 @@ impl App {
             hit_counter,
             textbox,
             device: 0,
-            // ferros attest: the rim vignette to the 4th power.
+            // ferros attest: the rim vignette √(1 − |p|⁴), black in a tighter band at the rim.
             look: mark::Look { vignette: 4, ..mark::Look::default() },
             progressive: true,
             salt: salt_for(0),
