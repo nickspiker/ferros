@@ -1577,6 +1577,8 @@ fn sit_request(link: &mut SitLink, ch: u8, id: u16, params: &[u8]) -> Result<u32
 // Protobuf is the modem's wire, not a ferros format: read strictly (a malformed message is dropped and logged), written by hand.
 
 const CH_MODEM_SVC: u8 = 130;
+/// UE-capability file blocks: 1 KiB of data a message keeps each one a single SIT frame (under 2 KiB with its headers) and leaves room in the 4 KiB FMT ring.
+const UECAP_BLOCK: usize = 1 << 10;
 
 /// One protobuf field: number, wire type, the varint/fixed value, and for a length-delimited field its bytes.
 struct PbField<'a> {
@@ -1649,7 +1651,7 @@ fn pb_put_bytes(v: &mut Vec<u8>, num: u32, b: &[u8]) {
 }
 
 /// Answer one ModemSvcMessage: property writes are acknowledged and kept, property reads answered from what was written (empty otherwise, as an unset Android property reads), anything else logged and left unanswered. Returns the reply's bytes.
-fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Option<Vec<u8>> {
+fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Option<Vec<Vec<u8>>> {
     let Some(top) = pb_fields(body) else {
         line(rep, alloc::format!("t={t_ms} ms: modem_svc: malformed message, dropped\n"));
         return None;
@@ -1662,29 +1664,53 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
         line(rep, alloc::format!("t={t_ms} ms: modem_svc log (id A#{}): {}\n", id.unwrap_or(0), txt(log.bytes).trim_matches(|c: char| !c.is_ascii_graphic())));
         return None;
     }
-    // A UE-capability file read (payload 12, `UecapFileMessage` {1 read_request {1 size, 2 block_size, 3 file_dir, 4 file_name}, 2 read_response {1 offset, 2 data, 3 result, 4 last_block}}): logged, and for now answered with one final block, result 1 (UFM_INTERNAL_ERROR), so the CP stops waiting for it.
+    // A UE-capability file read (payload 12, `UecapFileMessage` {1 read_request {1 size, 2 block_size, 3 file_dir, 4 file_name}, 2 read_response {1 offset, 2 data, 3 result, 4 last_block}}). The directory is UECAP_PATH (3), the modem image's /images/default/uecap; the file is served in blocks of UECAP_BLOCK bytes, each a RESPONSE with the request's id and token and its own offset, the last one flagged. A file that is not there gets one final block with result 1 (UFM_INTERNAL_ERROR).
     if let (Some(1), Some(id), Some(uc)) = (ty, id, get(12)) {
         let req = pb_fields(uc.bytes)?;
         let rr = req.iter().find(|f| f.num == 1)?;
         let rf = pb_fields(rr.bytes)?;
         let g = |n: u32| rf.iter().find(|f| f.num == n);
-        line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {} (dir {}, size A#{}, block A#{}, token A#{token}) -> not available\n", txt(g(4).map(|f| f.bytes).unwrap_or(&[])), g(3).map(|f| f.val).unwrap_or(0), g(1).map(|f| f.val).unwrap_or(0), g(2).map(|f| f.val).unwrap_or(0)));
-        let mut resp = Vec::new();
-        pb_put_varint(&mut resp, 1 << 3);
-        pb_put_varint(&mut resp, 0);
-        pb_put_bytes(&mut resp, 2, &[]);
-        pb_put_varint(&mut resp, 3 << 3);
-        pb_put_varint(&mut resp, 1);
-        pb_put_varint(&mut resp, 4 << 3);
-        pb_put_varint(&mut resp, 1);
-        let mut inner = Vec::new();
-        pb_put_bytes(&mut inner, 2, &resp);
-        let mut out = alloc::vec![0x08, 0x02, 0x15];
-        out.extend_from_slice(&id.to_le_bytes());
-        out.push(0x1D);
-        out.extend_from_slice(&token.to_le_bytes());
-        pb_put_bytes(&mut out, 12, &inner);
-        return Some(out);
+        let name = txt(g(4).map(|f| f.bytes).unwrap_or(&[]));
+        let file = if name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.') && !name.is_empty() {
+            crate::partfs::mount(MODEM_PART).and_then(|mut m| {
+                let ino = m.open(&alloc::format!("/images/default/uecap/{name}"))?;
+                let mut v = alloc::vec![0u8; (ino.size as usize + 4095) & !4095];
+                m.read(&ino, 0, &mut v)?;
+                v.truncate(ino.size as usize);
+                Ok(v)
+            })
+        } else {
+            Err(alloc::format!("not a plain file name"))
+        };
+        let block = |off: u32, data: &[u8], result: u64, last: bool| {
+            let mut resp = Vec::new();
+            pb_put_varint(&mut resp, 1 << 3);
+            pb_put_varint(&mut resp, off as u64);
+            pb_put_bytes(&mut resp, 2, data);
+            pb_put_varint(&mut resp, 3 << 3);
+            pb_put_varint(&mut resp, result);
+            pb_put_varint(&mut resp, 4 << 3);
+            pb_put_varint(&mut resp, last as u64);
+            let mut inner = Vec::new();
+            pb_put_bytes(&mut inner, 2, &resp);
+            let mut out = alloc::vec![0x08, 0x02, 0x15];
+            out.extend_from_slice(&id.to_le_bytes());
+            out.push(0x1D);
+            out.extend_from_slice(&token.to_le_bytes());
+            pb_put_bytes(&mut out, 12, &inner);
+            out
+        };
+        return Some(match file {
+            Ok(v) => {
+                line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {name} (token A#{token}) -> A#{} bytes from {MODEM_PART}\n", v.len()));
+                let n = v.len().div_ceil(UECAP_BLOCK).max(1);
+                (0..n).map(|k| block((k * UECAP_BLOCK) as u32, &v[k * UECAP_BLOCK..((k + 1) * UECAP_BLOCK).min(v.len())], 0, k + 1 == n)).collect()
+            }
+            Err(e) => {
+                line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {name} (token A#{token}) -> not available ({e})\n"));
+                alloc::vec![block(0, &[], 1, true)]
+            }
+        });
     }
     let (Some(1), Some(id), Some(prop)) = (ty, id, get(7)) else {
         line(rep, alloc::format!("t={t_ms} ms: modem_svc: type {:?} id {:?}, payload {:?}, not answered\n", ty, id, top.iter().filter(|f| f.num >= 5).map(|f| f.num).collect::<Vec<_>>()));
@@ -1723,7 +1749,7 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
     out.push(0x1D);
     out.extend_from_slice(&token.to_le_bytes());
     pb_put_bytes(&mut out, 7, &inner);
-    Some(out)
+    Some(alloc::vec![out])
 }
 
 // ---------------------------------------------------------------------------
@@ -1925,9 +1951,19 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             per_ch[ch as usize] += 1;
             if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
-                if let Some(reply) = modem_svc(rep, since_us(t0) / 1000, &body, &mut props) {
-                    if let Err(e) = fmt_send(&mut link, CH_MODEM_SVC, &reply) {
-                        line(rep, alloc::format!("  modem_svc reply not sent: {e}\n"));
+                if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut props) {
+                    for reply in replies {
+                        // The FMT ring is 4 KiB: a burst of replies waits for the CP to drain it, up to 200 ms a frame.
+                        let t1 = now();
+                        let mut r = fmt_send(&mut link, CH_MODEM_SVC, &reply);
+                        while r.is_err() && since_us(t1) < 200_000 {
+                            us(100);
+                            r = fmt_send(&mut link, CH_MODEM_SVC, &reply);
+                        }
+                        if let Err(e) = r {
+                            line(rep, alloc::format!("  modem_svc reply not sent: {e}\n"));
+                            break;
+                        }
                     }
                 }
             }
