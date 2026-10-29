@@ -9,7 +9,7 @@
 //! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
 //! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
 //! The copy's long axis is J's principal axis (from 2⁷ address points) turned by −arg (f^k)′; a hash bit flips it end for end, and a small Gaussian offset (σ an eighth of the window) keeps the framing from looking machine-centred.
-//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats — zooming by |λ| and turning by arg λ maps it onto itself — and it is a VISIBLE whorl only when it turns a lot per unit of growth (|arg λ| / ln|λ|, the pitch). So 2⁴ cycles are tried (periods 1 to 2³, found by Newton from repeating addresses) and the most spiral one wins; the view sits dead on a drawn preimage of it (0 to 3 levels in, an exact smaller copy of the same whorl), with no offset, a few turns across the window.
+//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats — zooming by |λ| and turning by arg λ maps it onto itself — and it is a VISIBLE whorl only when it turns a lot per unit of growth (|arg λ| / ln|λ|, the pitch). So 2⁴ cycles are tried (periods 1 to 2³, found by Newton from repeating addresses) and the most spiral one wins; the view sits dead on a drawn preimage of it (0 to 3 levels in, an exact smaller copy of the same whorl), with no offset, at 2⁻¹ to 2⁻³ of J's half-extent shrunk by the preimage's derivative.
 //! A thumbnail still rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Precision: placement and framing are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the deepest window kept is 2⁻⁸ across, about 2⁻¹⁸ a pixel, many f32 steps even at |z| = 2).
@@ -394,7 +394,7 @@ impl Params {
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let (axis, along) = j_shape(c);
-            // Spiral framing, for half the keys: dead centre, no offset, on a visible whorl. A cycle's eye is a visible spiral only when its multiplier turns a lot per unit of growth (large |arg λ| / ln|λ|, the spiral's pitch): most cycles have large |λ| and little turn and sit on tips and junctions. So 2⁴ cycles are tried and the most spiral one wins, and the view sits on a drawn preimage of it (0 to 3 levels in: an exact, smaller copy of the same whorl), scaled so a few turns fill the window. A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
+            // Spiral framing, for half the keys: dead centre, no offset, on a visible whorl. A cycle's eye is a visible spiral only when its multiplier turns a lot per unit of growth (large |arg λ| / ln|λ|, the spiral's pitch): most cycles have large |λ| and little turn and sit on tips and junctions. So 2⁴ cycles are tried and the most spiral one wins, and the view sits on a drawn preimage of it (0 to 3 levels in: an exact, smaller copy of the same whorl), at 2⁻¹ to 2⁻³ of J's half-extent, shrunk by the preimage's derivative. A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
             let spiral = if t[5] & 1 == 1 {
                 (0..SPIRAL_TRIES)
                     .filter_map(|i| cycle_point(c, &draw(salt, 4, (n << 4) | i, text.as_bytes()), 1 + (i & (PERIODS - 1))))
@@ -403,7 +403,7 @@ impl Params {
             } else {
                 None
             };
-            if let Some((eye, ln_mag, _)) = spiral {
+            if let Some((eye, _, _)) = spiral {
                 // A drawn preimage of the eye, k inverse branches in, and the derivative of f^k there (the whorl's copy shrinks by it).
                 let mut k = t[6] as u32 & (EYE_DEPTHS - 1);
                 let (centre, half) = loop {
@@ -413,8 +413,8 @@ impl Params {
                         chain.push(w);
                     }
                     let ln_d: f64 = chain.iter().skip(1).map(|w| (2. * (w.0 * w.0 + w.1 * w.1).sqrt()).ln()).sum();
-                    // A few turns of the whorl: 2² repeats of its growth factor |λ| across the window's half-span.
-                    let half = ((ln_mag * 4.) - ln_d).exp() * (-(1. + unit(&t[24..28]) * 2.)).exp2() * along * (-ln_mag * 4.).exp();
+                    // The whorl at 2⁻¹ to 2⁻³ of J's half-extent, shrunk by the preimage's derivative so a preimage shows the same few turns as the eye itself.
+                    let half = along * (-(1. + unit(&t[24..28]) * 2.)).exp2() * (-ln_d).exp();
                     if half >= MIN_HALF || k == 0 {
                         break (*chain.last().expect("chain starts non-empty"), half);
                     }
