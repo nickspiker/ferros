@@ -45,6 +45,8 @@ static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
+/// The mark's map (tapuwae::FreshCell, 6 bytes a sample): where each sample of the masked pixels falls in the set, worked out once, so a new handle costs the balls' shading alone. 2²⁰ cells (6 MiB) hold the 900 px mark's 171 643 masked pixels at 2 × 2 (687 k) with room; past it tapuwae works the rest out again.
+static mut FRESH_MAP: [tapuwae::FreshCell; 1 << 20] = [[0; 3]; 1 << 20];
 /// The handle as published for the mark (bytes, length), under FRESH_LOCK; FRESH_GEN counts publications, FRESH_DONE is one past the generation of the last finished frame (0 = none yet).
 static mut FRESH_TEXT: ([u8; 4 * MAX_CHARS], usize) = ([0; 4 * MAX_CHARS], 0);
 static FRESH_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -710,7 +712,8 @@ fn render_fresh_mark(full: bool) {
     let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
     let mask = unsafe { &mut (&mut *(&raw mut FRESH_MASK))[..(side * side).div_ceil(64)] };
     let mid = side as f32 * 0.5;
-    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 2, mask, full);
+    let map = unsafe { &mut *(&raw mut FRESH_MAP) };
+    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 2, mask, map, full);
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
