@@ -45,8 +45,8 @@ static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
-/// The mark's map (tapuwae::FreshCell, 6 bytes a sample): where each sample of the masked pixels falls in the set, worked out once, so a new handle costs the balls' shading alone. 2²⁰ cells (6 MiB) hold the 900 px mark's 171 643 masked pixels at 2 × 2 (687 k) with room; past it tapuwae works the rest out again.
-static mut FRESH_MAP: [tapuwae::FreshCell; 1 << 20] = [[0; 3]; 1 << 20];
+/// The mark's map (tapuwae::FreshCell, 6 bytes a sample): where each sample of the masked pixels falls in the set, worked out once, so a new handle costs the balls' shading alone. 3·2²⁰ cells (18 MiB) hold the 900 px mark's 171 643 masked pixels at 4 × 4 (2.75 M) with room; past it tapuwae works the rest out again.
+static mut FRESH_MAP: [tapuwae::FreshCell; 3 << 20] = [[0; 3]; 3 << 20];
 /// The handle as published for the mark (bytes, length), under FRESH_LOCK; FRESH_GEN counts publications, FRESH_DONE is one past the generation of the last finished frame (0 = none yet).
 static mut FRESH_TEXT: ([u8; 4 * MAX_CHARS], usize) = ([0; 4 * MAX_CHARS], 0);
 static FRESH_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -679,28 +679,34 @@ fn start_fresh_mark(grants: u64, r: usize) {
     if ferros_sys::thread_spawn(fresh_thread, stack, 0) == ferros_sys::ERR {
         // No thread: the whole mark here, once, before the screen comes up; it then does not follow the handle.
         console(grants, b"ahau: no thread for the mark; rendering it once, first\n");
-        render_fresh_mark(true);
+        render_fresh_mark(true, false, 0);
+        FRESH_DONE.store(1, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// The mark's thread: the whole mark, then each new handle's components, waiting on FRESH_GEN between.
+/// The mark's thread: the whole mark, then each new handle's components, waiting on FRESH_GEN between. Each time two passes (owner, 2026-10-29): a coarse one, a sample a pixel, on the glass at once; then a fine one, 4 × 4 a pixel, a moment later, which a newer handle stops at the next row. FRESH_DONE counts the frames finished, for the main loop to put up.
 extern "C" fn fresh_thread(_: u64) -> ! {
     ferros_sys::pin(ferros_sys::CORES_BIG);
     sleep_until(now() + freq() / 1000);
     let mut full = true;
+    let mut frames = 0u64;
     loop {
         let g = FRESH_GEN.load(core::sync::atomic::Ordering::Acquire);
-        render_fresh_mark(full);
-        FRESH_DONE.store(g + 1, core::sync::atomic::Ordering::Release);
-        full = false;
+        for fine in [false, true] {
+            if render_fresh_mark(full, fine, g) {
+                frames += 1;
+                FRESH_DONE.store(frames, core::sync::atomic::Ordering::Release);
+            }
+            full = false;
+        }
         while FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) == g {
             ferros_sys::wait(&FRESH_GEN, g, 0);
         }
     }
 }
 
-/// One render for the handle as last published (the whole mark when `full`, else the components), with its time on the console (never the handle); then READY. The thread's copy of the handle is wiped when it is done with it.
-fn render_fresh_mark(full: bool) {
+/// One pass for the handle as published at generation `g` (the whole mark when `full`, else the components; coarse or `fine`), with its time on the console (never the handle); then READY. A fine pass stops when the handle has moved on, and returns false. The thread's copy of the handle is wiped when it is done with it.
+fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let (grants, r, salt) = unsafe { FRESH_JOB };
     let side = 2 * r + 4;
     let mut text = [0u8; 4 * MAX_CHARS];
@@ -713,15 +719,23 @@ fn render_fresh_mark(full: bool) {
     let mask = unsafe { &mut (&mut *(&raw mut FRESH_MASK))[..(side * side).div_ceil(64)] };
     let mid = side as f32 * 0.5;
     let map = unsafe { &mut *(&raw mut FRESH_MAP) };
-    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 2, mask, map, full);
+    let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
+    let done = tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 4, mask, map, full, fine, &moved_on);
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
     let mut l = Line::new();
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {} ({side} px, 2x2) in {} ms on the X3\n", if full { "drawn" } else { "follows the handle" }, ferros_sys::us_since(t0) / 1000));
+    let what = match (full, fine, done) {
+        (true, _, _) => "drawn",
+        (_, false, _) => "follows the handle",
+        (_, true, true) => "cleared up",
+        (_, true, false) => "refine stopped for a newer handle",
+    };
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms on the X3\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
+    done
 }
 
 /// The handle as the mark's thread is to draw it, under FRESH_LOCK (held only for a copy of at most 4·MAX_CHARS bytes, so a spin).
