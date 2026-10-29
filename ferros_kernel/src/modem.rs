@@ -822,7 +822,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         (9, Some(s)) => start_and_handshake(rep, s, false, 0),
         (10, Some(s)) => start_and_handshake(rep, s, true, 0),
         (11, Some(s)) => start_and_handshake(rep, s, true, 1),
-        (n, Some(s)) if n >= 12 => start_and_handshake(rep, s, true, 2),
+        (12, Some(s)) => start_and_handshake(rep, s, true, 2),
+        (n, Some(s)) if n >= 13 => start_and_handshake(rep, s, true, 3),
         _ => {}
     }
 }
@@ -1448,6 +1449,7 @@ const CH_FMT0: u8 = 245;
 const INT_SEND_FMT: u32 = 0x82;
 const SIT_GET_RADIO_POWER: u16 = 0x0801;
 const SIT_SET_RADIO_POWER: u16 = 0x0800;
+const SIT_GET_PS_REG_STATE: u16 = 0x0701;
 
 /// Names for the ids the data path meets (rcmMsgToString); others print as their number.
 fn sit_name(id: u16) -> &'static str {
@@ -1467,6 +1469,9 @@ fn sit_name(id: u16) -> &'static str {
         0x0737 => "IND_RADIO_CAPABILITY",
         0x0742 => "IND_PHYSICAL_CHANNEL_CONFIG",
         0x074A => "IND_REG_FAILED",
+        0x0700 => "GET_CS_REG_STATE",
+        0x0701 => "GET_PS_REG_STATE",
+        0x0710 => "SET_PS_SERVICE",
         0x0800 => "SET_RADIO_POWER",
         0x0801 => "GET_RADIO_POWER",
         0x0802 => "IND_RADIO_STATE_CHANGED",
@@ -1482,7 +1487,8 @@ fn sit_name(id: u16) -> &'static str {
 
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
-    matches!(id, 0x0210 | 0x0604 | 0x0609 | 0x070E | 0x0717 | 0x072C | 0x074A | 0x0800..=0x0805 | 0x0906)
+    // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code.
+    matches!(id, 0x0210 | 0x0604 | 0x0609 | 0x0717 | 0x072C | 0x074A | 0x0800..=0x0805 | 0x0906)
 }
 
 /// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
@@ -1526,8 +1532,8 @@ fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::str
     Ok(())
 }
 
-/// A RIL request with the next token on channel 245; returns the token.
-fn sit_request(link: &mut SitLink, id: u16, params: &[u8]) -> Result<u32, alloc::string::String> {
+/// A RIL request with the next token on RIL channel `ch` (245 or 246, one per stack); returns the token.
+fn sit_request(link: &mut SitLink, ch: u8, id: u16, params: &[u8]) -> Result<u32, alloc::string::String> {
     let tok = link.token;
     link.token = link.token.wrapping_add(1);
     let len = 12 + params.len();
@@ -1535,7 +1541,7 @@ fn sit_request(link: &mut SitLink, id: u16, params: &[u8]) -> Result<u32, alloc:
     m.extend_from_slice(&tok.to_le_bytes());
     m.extend_from_slice(&[0, 0]);
     m.extend_from_slice(params);
-    fmt_send(link, CH_FMT0, &m)?;
+    fmt_send(link, ch, &m)?;
     Ok(tok)
 }
 
@@ -1674,6 +1680,7 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut done = [0u32; PP_QUEUES as usize];
     let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
     let (mut probed, mut powered) = (false, false);
+    let mut next_reg = 5_000_000u64;
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
@@ -1700,17 +1707,27 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
         last = now_s;
         if probe >= 1 && !probed && since_us(t0) > 2_000_000 {
             probed = true;
-            match sit_request(&mut link, SIT_GET_RADIO_POWER, &[]) {
+            match sit_request(&mut link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
+        if probe >= 3 && since_us(t0) > next_reg {
+            next_reg += 5_000_000;
+            for ch in [CH_FMT0, CH_FMT0 + 1] {
+                if let Err(e) = sit_request(&mut link, ch, SIT_GET_PS_REG_STATE, &[]) {
+                    line(rep, alloc::format!("t={} ms: SIT_GET_PS_REG_STATE not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
+                }
+            }
+        }
         if probe >= 2 && !powered && since_us(t0) > 3_000_000 {
             powered = true;
-            // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data.
-            match sit_request(&mut link, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER on (G#{SIT_SET_RADIO_POWER:X}) token A#{tok}\n", since_us(t0) / 1000)),
-                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
+            // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data. Each stack has its own RIL channel (245 the first SIM slot, 246 the second) and is powered on its own, as each Android RIL instance does.
+            for ch in [CH_FMT0, CH_FMT0 + 1] {
+                match sit_request(&mut link, ch, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
+                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER on (G#{SIT_SET_RADIO_POWER:X}) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
+                    Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000)),
+                }
             }
         }
         for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
@@ -1738,7 +1755,11 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
-            if ril && flen >= 12 + rcm_hdr && frames < 48 {
+            // The SIM's file-data and status chatter (G#210, G#246, G#248, G#24F) is counted, not logged: it is long, frequent and identity.
+            let quiet = ril && flen >= 16 && matches!(at(14) as u16 | (at(15) as u16) << 8, 0x0210 | 0x0246 | 0x0248 | 0x024F);
+            if quiet {
+                // Counted in per_ch only.
+            } else if ril && flen >= 12 + rcm_hdr && frames < 256 {
                 let b = |i: u32| at(12 + i);
                 let (ty, id, len) = (b(0), b(2) as u16 | (b(3) as u16) << 8, b(4) as u32 | (b(5) as u32) << 8);
                 let kind = match ty {
@@ -1750,11 +1771,12 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 let tok = b(6) as u32 | (b(7) as u32) << 8 | (b(8) as u32) << 16 | (b(9) as u32) << 24;
                 let params = |i: u32| b(rcm_hdr + i);
                 // Parameters only for messages that carry no identity (sit_shown); the rest by header alone.
-                let np = if sit_shown(id) { (flen - 12 - rcm_hdr).min(16) } else { 0 };
+                // Registration replies: the state, reject cause and radio technology (the first 4 bytes); the area and cell ids after them are location and stay hidden.
+                let np = if id == 0x0700 || id == 0x0701 { (flen - 12 - rcm_hdr).min(4) } else if sit_shown(id) { (flen - 12 - rcm_hdr).min(16) } else { 0 };
                 let resp = if ty == 1 { alloc::format!(" token A#{tok} error G#{:X}", b(10)) } else { alloc::string::String::new() };
                 line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} {} len A#{len}{resp}: {}\n", since_us(t0) / 1000, sit_name(id), hex(&params, np)));
                 frames += 1;
-            } else if frames < 48 {
+            } else if frames < 256 {
                 let named = ch == 41 || (129..=136).contains(&ch);
                 let n = (flen - 12).min(if named { 160 } else { 32 });
                 let body = |i: u32| at(12 + i);
