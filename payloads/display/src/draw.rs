@@ -225,13 +225,14 @@ pub fn glow_log(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r:
                 return false;
             }
             let t = (log2_q16(q as u64) - l0).clamp(0, span);
-            let i = peak * (span - t) >> (16 + oct_log2);
+            // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients.
+            let i = (peak << 8) * (span - t) >> (16 + oct_log2);
             let p = &mut px[rowb + x as usize];
             let room = 0xFFFF - (*p >> 48) as i64;
             // Added into the room the pixel has left, held at white (the glow does not reach above it).
             let add = |c: i64, sh: u32| -> u64 {
                 let have = (*p >> sh & 0xFFFF) as i64;
-                ((have + c * i * room / (255 * 0xFFFF)).min(have.max(16384)) as u64) << sh
+                ((have + c * i * room / (255 * 256 * 0xFFFF)).min(have.max(16384)) as u64) << sh
             };
             *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
             true
@@ -290,12 +291,13 @@ pub fn glow(px: &mut [Px], width: usize, height: usize, cx: i64, cy: i64, r: i64
             if a == 0xFFFF {
                 return true;
             }
-            let i = (num / q).min(peak as i64);
+            // The intensity in 2⁻⁸ steps of `peak`'s (16 bits, as the canvas): whole steps of 1/255 banded the glows' long gradients.
+            let i = ((num << 8) / q).min((peak as i64) << 8);
             // Into the room the pixel has left (opaque − alpha), added per channel and held at white; alpha untouched.
             let room = 0xFFFF - a;
             let add = |c: i64, sh: u32| -> u64 {
                 let have = (*p >> sh & 0xFFFF) as i64;
-                ((have + c * i * room / (255 * 0xFFFF)).min(have.max(16384)) as u64) << sh
+                ((have + c * i * room / (255 * 256 * 0xFFFF)).min(have.max(16384)) as u64) << sh
             };
             *p = (*p & ALPHA) | add(cr, 0) | add(cg, 16) | add(cb, 32);
             true
