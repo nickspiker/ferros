@@ -31,9 +31,9 @@ const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
 const S_IRA: u64 = 6;
-/// The attest mark's pixels as tapuwae renders them (α + darkness, 8 bits a channel), drawn once by the mark's own thread and blitted at every redraw after; its side is FRESH_SIDE.
+/// The attest mark's pixels as tapuwae renders them (tapuwae::pack16: the surface's own 16-bit gamma-2 light, white = Q14, coverage in the top 16 bits), drawn by the mark's own thread and blitted at every redraw after; its side is FRESH_SIDE.
 /// 2²⁰ pixels holds a mark of radius up to 510 (side 2r + 4): w/3 on panels up to 1530 wide.
-static mut FRESH: [u32; 1 << 20] = [0; 1 << 20];
+static mut FRESH: [u64; 1 << 20] = [0; 1 << 20];
 static mut FRESH_SIDE: usize = 0;
 /// Where the mark stands: PENDING while its thread renders (the screen shows nothing there yet), READY once FRESH holds it, RING when there is none (no ira key, a panel too wide) and the drawn ring stands in.
 static FRESH_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(PENDING);
@@ -770,7 +770,7 @@ fn publish_fresh_text(handle: &[u8]) {
     }
 }
 
-/// The mark centred at (cx, cy) on the surface, as it stands: the rendered mark when READY (tapuwae's α + darkness over black is α − darkness a channel, 8 bits, widened to the surface's gamma-2 values, white = Q14, red in the low 16 bits as the display server reads them), the ring when RING, nothing while PENDING.
+/// The mark centred at (cx, cy) on the surface, as it stands: the rendered mark when READY (already the surface's 16-bit light, copied), the ring when RING, nothing while PENDING.
 fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     match FRESH_STATE.load(core::sync::atomic::Ordering::Acquire) {
         READY => {}
@@ -786,12 +786,11 @@ fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     for y in 0..side {
         for x in 0..side {
             let d = buf[y * side + x];
-            let a = (d >> 24) as u64;
-            if a == 0 {
+            if d >> 48 == 0 {
                 continue;
             }
-            let ch = |sh: u32| (a - (d >> sh & 255) as u64) * 16384 / 255;
-            s[(y0 + y) * w + x0 + x] = ch(16) | ch(8) << 16 | ch(0) << 32;
+            // The colour channels as they are (light over black, the surface's own scale); the surface keeps its own alpha.
+            s[(y0 + y) * w + x0 + x] = d & ((1 << 48) - 1);
         }
     }
 }
