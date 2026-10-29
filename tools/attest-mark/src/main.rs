@@ -167,7 +167,7 @@ impl FluorApp for App {
                         Key::Named(NamedKey::ArrowDown) => Some((0., -step)),
                         _ => None,
                     };
-                    // Ctrl+PageUp / PageDown: the relief twice or half as deep.
+                    // Ctrl+PageUp / PageDown: the relief twice or half as deep as the device's own.
                     let height = match &kev.logical_key {
                         Key::Named(NamedKey::PageUp) => Some(2f32),
                         Key::Named(NamedKey::PageDown) => Some(0.5),
@@ -175,7 +175,7 @@ impl FluorApp for App {
                     };
                     if let Some(f) = height {
                         self.look.relief *= f;
-                        println!("relief {} px", self.look.relief);
+                        println!("relief × {}", self.look.relief);
                         self.mark_key.2 = [0; 32];
                         ctx.window.request_redraw();
                         return EventResponse::Handled;

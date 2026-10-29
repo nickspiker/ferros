@@ -501,6 +501,60 @@ struct Theme {
     ground_s: f32,
     body_s: f32,
     rim_s: f32,
+    /// The device's lighting (see `Lighting`).
+    lighting: Lighting,
+}
+
+/// One lamp: where it shines from (x right, y down across the screen, z up out of the picture, a unit vector), how strongly it moves the lightness, and the tint it gives the faces it lights (an OKLab (a, b) direction, unit length, scaled at use).
+#[derive(Clone, Copy)]
+struct Lamp {
+    dir: (f32, f32, f32),
+    strength: f32,
+    tint: (f32, f32),
+}
+
+/// A device's lighting, all from its salt: a key lamp somewhere in the top-left quarter (from straight left to straight above, 2⁻² to ¾ of the way up), an optional fill lamp from roughly the opposite side, weaker and lower, a tint for each, a tint for the shadows, and how deep the relief is.
+#[derive(Clone, Copy)]
+struct Lighting {
+    key: Lamp,
+    fill: Lamp,
+    shadow: (f32, f32),
+    /// The relief's scale s in pixels (2⁰ to 2³): the surface is H = −s·ln G.
+    relief: f32,
+}
+
+impl Lighting {
+    fn from_bytes(f: &[u8; 32]) -> Self {
+        let u = |i: usize| unit(&f[i..i + 4]) as f32;
+        // A second 32 bytes for the rest.
+        let g = *blake3::hash(f).as_bytes();
+        let u2 = |i: usize| unit(&g[i..i + 4]) as f32;
+        let quarter = TAU as f32 * 0.25;
+        let tint = |h: f32| (h.cos(), h.sin());
+        let lamp = |azimuth: f32, elevation: f32, strength: f32, hue: f32| Lamp {
+            dir: (azimuth.cos() * elevation.cos(), azimuth.sin() * elevation.cos(), elevation.sin()),
+            strength,
+            tint: tint(hue),
+        };
+        // Screen angles run clockwise from +x (y is down): straight left is half a turn, straight above is three quarters.
+        let key_az = 2. * quarter + u(0) * quarter;
+        let key_el = quarter * (0.25 + u(4) * 0.5);
+        let key_s = 0.0625 + u(8) * 0.0375;
+        let key_hue = u(12) * TAU as f32;
+        // The fill: from the opposite side ± ⅙ of a turn, 2⁻³ to ½ of the way up, a quarter to a half the key's strength (none for a quarter of devices), its hue near the key's complement.
+        let fill_az = key_az + 2. * quarter + (u(16) - 0.5) * quarter * (4. / 3.);
+        let fill_el = quarter * (0.125 + u(20) * 0.375);
+        let fill_s = if f[24] & 3 == 0 { 0. } else { key_s * (0.25 + u(25) * 0.25) };
+        let fill_hue = key_hue + 2. * quarter + (u2(0) - 0.5) * quarter;
+        // Shadows lean toward the key's complement or the fill's hue.
+        let shadow_hue = if f[24] & 4 == 4 { key_hue + 2. * quarter } else { fill_hue };
+        Lighting {
+            key: lamp(key_az, key_el, key_s, key_hue),
+            fill: lamp(fill_az, fill_el, fill_s, fill_hue),
+            shadow: tint(shadow_hue),
+            relief: (u2(4) * 3.).exp2(),
+        }
+    }
 }
 
 impl Theme {
@@ -533,7 +587,8 @@ impl Theme {
             rim_l,
             ground_s: 0.015 + u(16) * 0.0625,
             body_s: 0.03 + u(20) * 0.09375,
-            rim_s: 0.015 + u(24) * 0.125,
+            rim_s: 0.015 + u(24) * 0.09375,
+            lighting: Lighting::from_bytes(blake3::hash(f).as_bytes()),
         }
     }
 }
@@ -554,45 +609,40 @@ fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
     .map(|c| c.sqrt())
 }
 
-/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l) and hue offset `dh` from the theme's base.
+/// The soft colour at lightness `l`, saturation `sat` (chroma = sat·l), hue offset `dh` from the theme's base, plus a tint (an OKLab (a, b) offset in units of l).
+/// The theme's saturations stay at most 0.124 and the tints add at most 0.04, so the chroma stays under 0.164·l, inside the gamut at every lightness (its all-hue limit is about 0.17·l).
 #[inline]
-fn soft(th: &Theme, l: f32, sat: f32, dh: f32) -> [f32; 3] {
+fn soft(th: &Theme, l: f32, sat: f32, dh: f32, tint: (f32, f32)) -> [f32; 3] {
     let (h, c) = (th.hue + dh, sat * l);
-    oklab(l, c * h.cos(), c * h.sin())
+    oklab(l, c * h.cos() + tint.0 * l, c * h.sin() + tint.1 * l)
+}
+
+/// A smooth (C∞) split of a signed amount into its positive part, (x + √(x² + δ²))/2 with δ = 2⁻⁶: about x when well positive, about 0 when well negative, and no corner at 0.
+#[inline]
+fn positive_part(x: f32) -> f32 {
+    let d = 1. / (1 << 6) as f32;
+    0.5 * (x + (x * x + d * d).sqrt())
 }
 
 /// The look's tweaks, applied at render time: `offset` is a complex offset of the colouring coordinate (see `shade`); `light` is the direction the disc is lit from, (x right, y down, z toward the viewer), normalised by the renderer.
 #[derive(Clone, Copy)]
 pub struct Look {
     pub offset: (f32, f32),
-    /// Where the light comes from: x right, y down (across the screen), z up out of the picture; normalised by the renderer.
-    pub light: (f32, f32, f32),
-    /// The relief's scale s, in pixels: the surface is H = −s·ln G (G the escape potential), so its slope at a point d pixels from the set is s/d, steep at the set's edge and flattening into the field.
+    /// A multiplier on the device's relief depth (1 = as the salt chose it).
     pub relief: f32,
 }
 
 impl Default for Look {
-    /// No offset, lit from the top left at 45° up, relief 2¹ pixels.
+    /// No offset, the device's own relief.
     fn default() -> Self {
-        Look { offset: (0., 0.), light: (-1., -1., 2f32.sqrt()), relief: 2. }
+        Look { offset: (0., 0.), relief: 1. }
     }
 }
 
-/// The light in the plane: its horizontal part turned by the view's `rot` (plane = centre + rot·screen) and its height, as a unit vector.
-#[derive(Clone, Copy)]
-struct PlaneLight {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-impl Look {
-    fn plane_light(&self, rot: (f32, f32)) -> PlaneLight {
-        let (a, b, c) = self.light;
-        let l = (a * a + b * b + c * c).sqrt();
-        let (a, b, c) = (a / l, b / l, c / l);
-        PlaneLight { x: a * rot.0 - b * rot.1, y: a * rot.1 + b * rot.0, z: c }
-    }
+/// A lamp's direction in the plane: its horizontal part turned by the view's `rot` (plane = centre + rot·screen), its height unchanged.
+#[inline]
+fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
+    (d.0 * rot.0 - d.1 * rot.1, d.0 * rot.1 + d.1 * rot.0, d.2)
 }
 
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
@@ -600,9 +650,9 @@ impl Look {
 /// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u swings the hue either side of the theme's base (by the theme's spread) and Im u breathes the lightness a little, so both halves of the offset move every method.
 /// Lighting, from the slope itself: the picture is the surface H = −s·ln G (s = `look.relief` pixels, G the escape potential), a ridge along the set falling away into the field.
 /// Its gradient points along u = z/(dz/dz₀) (the potential's own direction, outward) with magnitude s/d per pixel at d pixels from the set (d being the distance estimate, G/|∇G| up to a constant), so its unit normal is (sin α·u, cos α) with sin α = s/√(s² + d²), cos α = d/√(s² + d²), exact and finite even on the set (d = 0).
-/// Lambert's n·l against the light, taken relative to a flat surface (which sees l_z), moves the lightness by 2⁻³·(n·l − l_z): faces turned to the light rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped or faked.
+/// Each lamp's Lambert n·l, taken relative to a flat surface (which sees l_z), moves the lightness by strength·(n·l − l_z): faces turned to it rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped. The faces a lamp lights take its tint, and the faces left in shade take the shadow tint, each split off smoothly (`positive_part`).
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: PlaneLight) -> [f32; 3] {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -628,23 +678,38 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: PlaneLight) -> [f32;
     let rim = (-(ll * ll)).exp2();
     // Far: how far out in the field, 0 near the set to 1 far away (the disc's own rim, the plane's infinity, is fully far).
     let far = (-nu * 0.125).exp2();
-    // Relief, in [((h − 1)/(h + 1) + 1)²/4, 1], centred on ½ so it lifts and lowers about the ground.
+    let th = &v.theme;
+    let lt = &th.lighting;
     // The surface's tilt from the slope (the parameter plane has no u, so it lights flat).
-    let sr = look.relief;
+    let sr = lt.relief * look.relief;
     let hyp = (sr * sr + dist_px * dist_px).sqrt();
     let (sin_a, cos_a) = (sr / hyp, dist_px / hyp);
-    let (ul, cross) = (o.ux * lp.x + o.uy * lp.y, o.ux * lp.y - o.uy * lp.x);
-    let n_dot_l = if v.kind == Kind::Julia { sin_a * ul + cos_a * lp.z } else { lp.z };
-    let shading = 0.125 * (n_dot_l - lp.z);
-    // Nacre: the hue turns with the surface's facing across the light (the normal's horizontal part crossed with it), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; only where the surface tilts.
-    let nacre = if v.kind == Kind::Julia { 0.25 * sin_a * cross } else { 0. };
-    let th = &v.theme;
+    let julia = v.kind == Kind::Julia;
+    let lit = |lamp: &Lamp| {
+        let d = in_plane(lamp.dir, v.rot);
+        let n_dot_l = if julia { sin_a * (o.ux * d.0 + o.uy * d.1) + cos_a * d.2 } else { d.2 };
+        lamp.strength * (n_dot_l - d.2)
+    };
+    let (key, fill) = (lit(&lt.key), lit(&lt.fill));
+    let shading = key + fill;
+    // Tints: each lamp's on the faces it lights, the shadow's on the faces in shade, each at most 2⁻⁶ of chroma per unit lightness (4 · 2⁻⁶ for the key) and saturating smoothly as w/(w + 2⁻⁵).
+    let soft_w = |w: f32| w / (w + 1. / (1 << 5) as f32);
+    let (kw, fw, sw) = (soft_w(positive_part(key)), soft_w(positive_part(fill)), soft_w(positive_part(-shading)));
+    let (k_t, f_t, s_t) = (0.02, 0.01, 0.01);
+    let tint = (
+        lt.key.tint.0 * kw * k_t + lt.fill.tint.0 * fw * f_t + lt.shadow.0 * sw * s_t,
+        lt.key.tint.1 * kw * k_t + lt.fill.tint.1 * fw * f_t + lt.shadow.1 * sw * s_t,
+    );
+    // Nacre: the hue turns with the surface's facing across the key lamp (the normal's horizontal part crossed with it), up to ¼ rad either way, the way mother-of-pearl shifts colour with angle; only where the surface tilts.
+    let kd = in_plane(lt.key.dir, v.rot);
+    let kh = (kd.0 * kd.0 + kd.1 * kd.1).sqrt();
+    let nacre = if julia { 0.25 * sin_a * (o.ux * kd.1 - o.uy * kd.0) / kh } else { 0. };
     let edge = rim * (1. - body);
     // Lightness and saturation: the ground's, moving to the body's on the set and the edge's around it, settling back to the ground far out; the slope's shading on top, everywhere it tilts.
     let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
     let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
     // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-    soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body)
+    soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint)
 }
 
 
@@ -663,7 +728,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k, &Look::default(), Look::default().plane_light(v.rot)), 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default()), 1.);
         }
     });
 }
@@ -674,7 +739,6 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
 pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
     let v = p.view();
     let rad = p.radius as f32;
-    let lp = look.plane_light(v.rot);
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
@@ -688,7 +752,7 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             let q2 = qx * qx + qy * qy;
             // At and past the rim (inside the anti-aliasing band) the plane is at infinity: the field's farthest, the theme's ground.
             if q2 >= 1. {
-                row[px] = pack(soft(&v.theme, v.theme.ground_l, v.theme.ground_s, v.theme.drift), cover);
+                row[px] = pack(soft(&v.theme, v.theme.ground_l, v.theme.ground_s, v.theme.drift, (0., 0.)), cover);
                 continue;
             }
             let g = rad / (1. - q2).sqrt();
@@ -696,7 +760,7 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
             // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
             let k = rad / (r * (1. - q2));
-            row[px] = pack(shade(x, y, &v, k, look, lp), cover);
+            row[px] = pack(shade(x, y, &v, k, look), cover);
         }
     });
 }
@@ -780,15 +844,15 @@ mod tests {
         }
     }
 
-    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground in the deepest shade (0.38 − 2⁻³·(1 + l_z) − 2⁻⁶ ≈ 0.14) up to 1, at the most saturation any layer gets (0.015 + 0.125 ≈ 0.14 ≤ 2⁻³ + 2⁻⁵). A channel past 1 is fine: the pack saturates it.
+    /// Every colour the shading can ask for has no negative channel, at every hue: lightness from the darkest ink line on the darkest ground under both lamps' deepest shade (0.38 − (0.1 + 0.05)·(1 + 0.92) − 2⁻⁶ ≈ 0.08) up to 1, at the most saturation any layer gets (0.124) with the most tint (0.04) added in the same direction. A channel past 1 is fine: the pack saturates it.
     #[test]
     fn soft_colours_stay_in_gamut() {
         let mut th = Theme::from_bytes(&[0; 32]);
         for i in 0..(1 << 8) {
             th.hue = i as f32 / (1 << 8) as f32 * TAU as f32;
-            for l in [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.] {
-                for sat in [0f32, 0.07, 0.156] {
-                    let rgb = soft(&th, l, sat, 0.);
+            for l in [0.05f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.] {
+                for sat in [0f32, 0.07, 0.124] {
+                    let rgb = soft(&th, l, sat, 0., (0.04 * th.hue.cos(), 0.04 * th.hue.sin()));
                     assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, sat {sat}: {rgb:?}");
                 }
             }
