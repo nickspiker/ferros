@@ -57,7 +57,8 @@ impl App {
             hit_counter,
             textbox,
             device: 0,
-            look: mark::Look::default(),
+            // ferros attest: the rim vignette to the 4th power.
+            look: mark::Look { vignette: 4, ..mark::Look::default() },
             progressive: true,
             salt: salt_for(0),
             mark: Vec::new(),
