@@ -631,7 +631,17 @@ pub mod window {
 
     /// Show (or redraw) the window: the part of the screen it covers, its surface's base, its level. True when the display took it.
     pub fn show(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8) -> bool {
-        let mut m = [0u8; 18];
+        show_as(display, base, x, y, w, h, level, WORKING)
+    }
+
+    /// A surface of the display's own working values (gamma 2, white = Q14, bit 63 see-through).
+    pub const WORKING: u8 = 0;
+    /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`: α and darkness of VSF `g2t` codes), which the display decodes itself.
+    pub const G2T16: u8 = 1;
+
+    /// As `show`, saying what the surface's pixels are (`WORKING` or `G2T16`).
+    pub fn show_as(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8, format: u8) -> bool {
+        let mut m = [0u8; 19];
         m[0] = 22;
         m[1..3].copy_from_slice(&x.to_le_bytes());
         m[3..5].copy_from_slice(&y.to_le_bytes());
@@ -639,6 +649,7 @@ pub mod window {
         m[7..9].copy_from_slice(&h.to_le_bytes());
         m[9..17].copy_from_slice(&base.to_le_bytes());
         m[17] = level;
+        m[18] = format;
         let mut r = [0u8; 4];
         call(display, &m, &mut r);
         r[0] == 0

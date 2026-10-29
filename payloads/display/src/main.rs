@@ -1646,12 +1646,34 @@ static mut SURFS: usize = 1;
 const SURFACES: usize = 4;
 const SURFACE_BYTES: usize = 32 << 20;
 /// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
+/// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through).
 #[derive(Clone, Copy)]
 struct Win {
     generation: u8,
     level: u8,
     order: u32,
     rect: draw::Rect,
+    format: u8,
+}
+/// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
+const G2T16: u8 = 1;
+/// A 16-bit `g2t` code's working value, `16384 × atanh(code / 2¹⁶)` (VSF: light = atanh(code / 2ⁿ)², and gamma 2 is its root), every code, built once at start; the top 79 codes decode past the working value's 4.0 and stop there. Fluor's own present for the display (fluor host/panel.rs `q14_from_g2t16`) is this table.
+static mut G2T16_Q14: *const u16 = core::ptr::null();
+
+/// A surface pixel as the display's working value, by its window's format: its own unchanged; a G2T16 one composited over black as fluor's present does (each channel's visible code, the top code less its darkness, scaled by α), thru `G2T16_Q14`, and α 0 see-through.
+#[inline]
+fn working(p: u64, format: u8) -> u64 {
+    if format != G2T16 {
+        return p;
+    }
+    let a = p >> 48;
+    if a == 0 {
+        return CLEAR;
+    }
+    let t = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
+    // (65535 − d) × α + 32767 stays under 2³², as fluor's present computes it.
+    let ch = |sh: u32| t[((((0xFFFF - (p >> sh & 0xFFFF)) * a + 0x7FFF) / 0xFFFF) as usize)] as u64;
+    ch(32) | ch(16) << 16 | ch(0) << 32
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
@@ -1676,7 +1698,7 @@ fn surface_of(base: u64) -> Option<usize> {
 
 /// The windows up, frontmost first: (surface, window), at most four.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
-    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY }); SURFACES];
+    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0 }); SURFACES];
     let mut n = 0;
     for k in 0..SURFACES {
         if let Some(w) = unsafe { WINS[k] } {
@@ -1719,7 +1741,7 @@ fn owner_at(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
     let (ord, n) = front_order();
     for &(k, w) in &ord[..n] {
         let r = w.rect;
-        if (x as i32) >= r.x0 && (x as i32) < r.x1 && (y as i32) >= r.y0 && (y as i32) < r.y1 && surface(k, width, height)[y as usize * width + x as usize] & CLEAR == 0 {
+        if (x as i32) >= r.x0 && (x as i32) < r.x1 && (y as i32) >= r.y0 && (y as i32) < r.y1 && working(surface(k, width, height)[y as usize * width + x as usize], w.format) & CLEAR == 0 {
             return Some(k);
         }
     }
@@ -1756,11 +1778,19 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 continue;
             }
             let src = &surface(s, width, height)[y * width..(y + 1) * width];
-            // Branchless: an uncovered pixel (bit 63) takes this window's, a covered one keeps its own.
-            for x in a..b {
-                let p = px[x];
-                let m = (p >> 63).wrapping_neg();
-                px[x] = (p & !m) | (src[x] & m);
+            // Branchless: an uncovered pixel (bit 63) takes this window's, a covered one keeps its own. A fluor window's pixels are decoded on the way in (`working`); the format is the window's, so the loop is chosen once per window.
+            if w.format == G2T16 {
+                for x in a..b {
+                    let p = px[x];
+                    let m = (p >> 63).wrapping_neg();
+                    px[x] = (p & !m) | (working(src[x], G2T16) & m);
+                }
+            } else {
+                for x in a..b {
+                    let p = px[x];
+                    let m = (p >> 63).wrapping_neg();
+                    px[x] = (p & !m) | (src[x] & m);
+                }
             }
         }
         // Still see-through after every window: black.
@@ -2156,6 +2186,15 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // The present stage's table and its 8-bit slice, built before the mark so they live for the process.
     let t_lut = now();
     let lut: &'static mut [u16] = alloc::vec![0u16; 65536].leak();
+    // fluor's 16-bit g2t codes to working values (`G2T16_Q14`).
+    {
+        let g2t: &'static mut [u16] = alloc::vec![0u16; 1 << 16].leak();
+        for (c, v) in g2t.iter_mut().enumerate() {
+            // WHY/PROOF: the working value is 16 bits (4.0); the top 79 codes decode past it (atanh(65535/65536) × 2¹⁴ ≈ 90 850), and `as u16` alone would also stop them there — the min names the ceiling.
+            *v = (16384. * libm::atanh(c as f64 / 65536.) + 0.5).min(65535.) as u16;
+        }
+        unsafe { G2T16_Q14 = g2t.as_ptr() };
+    }
     let mut bright = ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS);
     let (white0, peak0, hbm0, dbv0) = brightness(bright);
     build_lut(lut, white0, peak0);
@@ -2710,7 +2749,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     }
                 }
                 Some(22) if m.len() >= 18 => {
-                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system. It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
+                    // A window shown or redrawn (WINDOWS.md): [x u16][y u16][w u16][h u16] the part of the screen it covers, [base u64] its surface (the client's own `dma` of it), [level u8] 0 an app, 1 input, 2 the system, and optionally [format u8] its pixels (`Win::format`: 0, the default, the display's working values; 1 fluor's 16-bit g2t). It goes in front of its level; every phase owes the whole screen; the next one is published now, the others while idle.
                     client_owned = true;
                     last_interaction = now();
                     let v = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]) as i32;
@@ -2724,7 +2763,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                                     chrome_draw(width, height, true);
                                 }
                                 RAISES += 1;
-                                WINS[sk] = Some(Win { generation: ferros_sys::pref(8 + sk as u64), level: m[17], order: RAISES, rect });
+                                WINS[sk] = Some(Win { generation: ferros_sys::pref(8 + sk as u64), level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 } });
                                 APP = Some(full);
                                 PHASE_DIRTY = [full; PHASES];
                             }
