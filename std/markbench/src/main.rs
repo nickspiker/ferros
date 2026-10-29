@@ -29,15 +29,15 @@ fn main() {
     let all = rayon::current_num_threads();
     println!("markbench: {all} threads");
     let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-    let schemes: [(&str, Aa); 4] = [("linear (now)", Aa::Linear), ("fixed 4", Aa::Fixed(4)), ("fixed 16", Aa::Fixed(16)), ("fixed 64", Aa::Fixed(64))];
+    let schemes: [(&str, Aa); 4] = [("linear (now)", Aa::Linear), ("grid 2x2", Aa::Stratified(2)), ("grid 4x4", Aa::Stratified(4)), ("grid 8x8", Aa::Stratified(8))];
     // Device 9 sparse (long arcs), 6 a dense web.
     for dev in [9u32, 6] {
         let p = Params::new(&salt(dev), "ab");
         for size in [1usize << 8, 384, 1 << 10] {
             for (name, aa) in &schemes {
                 let look = Look { aa: *aa, ..Look::attest() };
-                // Fixed 64 at the full size takes long on one core: all cores only.
-                let single = if size >= 1 << 10 && *aa == Aa::Fixed(64) { None } else { Some(one.install(|| time(size, &p, &look))) };
+                // An 8 × 8 grid at the full size takes long on one core: all cores only.
+                let single = if size >= 1 << 10 && *aa == Aa::Stratified(8) { None } else { Some(one.install(|| time(size, &p, &look))) };
                 let (ms_all, spp) = time(size, &p, &look);
                 match single {
                     Some((ms1, _)) => println!("dev {dev} {size:>4}px {name:<13} spp {spp:>6.2}  1 core {ms1:>9.1} ms  {all} cores {ms_all:>8.1} ms  ({:.1}x)", ms1 / ms_all),
