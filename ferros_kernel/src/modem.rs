@@ -94,6 +94,120 @@ pub fn files(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("A#{ms} ms\n"));
 }
 
+// ---------------------------------------------------------------------------
+// The handover block: `struct t_handover_block_info` (modem_prj.h 179-196), G#A1 bytes at ap2cp_handover_block_info (IPC+G#82C), which cbd fills before the boot (`update_handover_block_info`, decoded from cbd's own symbols 2026-10-29; both captures show its memcpy first of all). It tells the CP which board it is in, so it can pick its RF configuration. Layout and sources, for a normal boot of a user build:
+//   G#00 version 1 · G#04 project_id = cdt[0] (platform) · G#08 revision = `hwinfo` from hardware_config.json · G#0C major_id = cdt[3] · G#10 minor_id = cdt[4] · G#14 modem_sku = cdt[6] · G#18 modem_hw = cdt[7] · G#1C cpinfo0 = 0 (set only for factory boot modes) · G#20 cpinfo1 = 0 (set only after an EFS clear) · G#24 cpinfo2 = /chosen/config/modem_flag · G#28 rf_sub = cdt[8] · G#2C rf_config = `rfid` from hardware_config.json, else /chosen/plat/rfid · G#30, G#34, G#38 reserved = cdt[1], cdt[2], cdt[5] · G#3C reserved = 0 (user build) · G#40, G#50 cpid = /chosen/config/imei1, imei2 (16 bytes each) · G#60 cpsig = /mnt/vendor/persist/modem/cpsha (64 bytes), then a NUL.
+// cdt[] is the bootconfig's `androidboot.cdt_hwid`, read by cbd as "0x%04x%02x%02x%04x%02x%02x%02x%02x%04x%08x". husky's radio build carries no hardware_config.json (its /images/default holds modem.bin, uecap, pw_token_db and confpack), so cbd's lookup finds nothing: revision stays 0 and rf_config comes from the device tree, as here.
+// The block is assembled in place at a real boot (`read_board`), while ABL's tree is still there: a RELOAD has no tree, and the IPC page keeps the block across reloads. cpsig is added by the ROM stage, which has the disk. The two IMEIs are this phone's identity: they go from ABL's device tree to the CP's own memory and are never printed, logged or stored.
+
+const HANDOVER: usize = IPC + 0x82C;
+const HANDOVER_LEN: usize = 0xA1;
+const CPSHA: &str = "/modem/cpsha";
+
+/// The bootconfig ABL appends to the initrd (slot.rs: the text, then its size and checksum, then "#BOOTCONFIG\n", ending at /chosen/linux,initrd-end).
+fn bootconfig(dtb: &ferros_hal::dtb::Dtb) -> Option<&'static [u8]> {
+    let prop = dtb.find_node_prop(b"chosen", b"linux,initrd-end")?;
+    let end = if prop.data.len() >= 8 { prop.as_u64() } else { prop.as_u32().map(|v| v as u64) }? as usize;
+    if end < 20 {
+        return None;
+    }
+    let tail = unsafe { core::slice::from_raw_parts((end - 20) as *const u8, 20) };
+    if &tail[8..] != b"#BOOTCONFIG\n" {
+        return None;
+    }
+    let size = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
+    // External data (ABL's): a size past the initrd's own end would read below it.
+    if size == 0 || size > 64 * 1024 || size > end - 20 {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts((end - 20 - size) as *const u8, size) })
+}
+
+/// The last `key = value` in the bootconfig (`:=` overrides, last wins), quotes and spaces dropped.
+fn bootconfig_value(text: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let at = text.windows(key.len()).rposition(|w| w == key)?;
+    let line = &text[at + key.len()..];
+    let line = &line[..line.iter().position(|&c| c == b'\n').unwrap_or(line.len())];
+    let eq = line.iter().position(|&c| c == b'=')?;
+    Some(line[eq + 1..].iter().filter(|&&c| c != b' ' && c != b'"').copied().collect())
+}
+
+fn hex_digit(c: u8) -> Option<u32> {
+    (c as char).to_digit(16)
+}
+
+/// Assemble the handover block at IPC+G#82C from ABL's device tree and bootconfig (a real boot only). Every field cbd leaves at 0 on a normal boot is 0; cpsig is zero until the ROM stage fills it.
+pub fn read_board(dtb_addr: u64) {
+    let Some(dtb) = (unsafe { ferros_hal::dtb::Dtb::from_ptr(dtb_addr as *const u8) }) else {
+        return;
+    };
+    let mut b = [0u8; HANDOVER_LEN];
+    let mut put = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put(0x00, 1);
+    if let Some(v) = bootconfig(&dtb).and_then(|t| bootconfig_value(t, b"androidboot.cdt_hwid")) {
+        // "0x" then the ten fields at their fixed widths (cbd's sscanf format): 4 2 2 4 2 2 2 2 4 8 hex digits.
+        let digits = v.strip_prefix(b"0x").unwrap_or(&v);
+        let widths = [4usize, 2, 2, 4, 2, 2, 2, 2, 4, 8];
+        if digits.len() == widths.iter().sum::<usize>() && digits.iter().all(|&c| hex_digit(c).is_some()) {
+            let mut cdt = [0u32; 10];
+            let mut at = 0;
+            for (k, w) in widths.iter().enumerate() {
+                cdt[k] = digits[at..at + w].iter().fold(0u32, |a, &c| a << 4 | hex_digit(c).unwrap());
+                at += w;
+            }
+            for (off, k) in [(0x04, 0), (0x0C, 3), (0x10, 4), (0x14, 6), (0x18, 7), (0x28, 8), (0x30, 1), (0x34, 2), (0x38, 5)] {
+                put(off, cdt[k]);
+            }
+        }
+    }
+    if let Some(v) = dtb.find_node_prop(b"plat", b"rfid").and_then(|p| p.as_u32()) {
+        put(0x2C, v);
+    }
+    if let Some(p) = dtb.find_node_prop(b"config", b"modem_flag") {
+        // fscanf "%x": optional spaces, an optional 0x, then hex digits up to the first other byte.
+        let s = p.data.iter().skip_while(|&&c| c == b' ').copied().collect::<Vec<u8>>();
+        let s = s.strip_prefix(b"0x").unwrap_or(&s);
+        let n = s.iter().take_while(|&&c| hex_digit(c).is_some()).count();
+        put(0x24, s[..n].iter().fold(0u32, |a, &c| a << 4 | hex_digit(c).unwrap()));
+    }
+    for (off, name) in [(0x40, b"imei1"), (0x50, b"imei2")] {
+        if let Some(p) = dtb.find_node_prop(b"config", name) {
+            // The property's length is ABL's; the block field is 16 bytes and cbd reads exactly 16, so a longer property is cut there and a shorter one zero-filled.
+            let n = p.data.len().min(16);
+            b[off..off + n].copy_from_slice(&p.data[..n]);
+        }
+    }
+    for (i, &x) in b.iter().enumerate() {
+        wr8(HANDOVER + i, x);
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
+/// cpsig: the 64 bytes of persist's /modem/cpsha into the block (zero when the file is absent, as cbd leaves it), before the ROM boot.
+fn handover_cpsig(rep: &mut Vec<u8>) {
+    match crate::partfs::read_f2fs("persist", CPSHA) {
+        Ok(v) if v.len() >= 64 => {
+            for (i, &x) in v[..64].iter().enumerate() {
+                wr8(HANDOVER + 0x60 + i, x);
+            }
+            wr8(HANDOVER + 0xA0, 0);
+            line(rep, alloc::format!("handover block: version A#{}, cpsig from persist{CPSHA}\n", rd(HANDOVER)));
+        }
+        Ok(v) => line(rep, alloc::format!("handover block: persist{CPSHA} holds A#{} bytes, cpsig left zero\n", v.len())),
+        Err(e) => line(rep, alloc::format!("handover block: {e}, cpsig left zero\n")),
+    }
+}
+
+/// `diag modem hwcfg`: the handover block as it stands at IPC+G#82C — its board words in full, the IMEI and cpsig fields only as set or zero.
+pub fn hwcfg(rep: &mut Vec<u8>) {
+    let names = ["version", "project_id", "revision", "major_id", "minor_id", "modem_sku", "modem_hw", "cpinfo0", "cpinfo1", "cpinfo2", "rf_sub", "rf_config", "reserved0", "reserved1", "reserved2", "reserved3"];
+    for (k, n) in names.iter().enumerate() {
+        line(rep, alloc::format!("{n}: G#{:X}\n", rd(HANDOVER + 4 * k)));
+    }
+    let set = |off: usize, len: usize| (0..len).any(|i| rd8(HANDOVER + off + i) != 0);
+    line(rep, alloc::format!("cpid 0, cpid 1, cpsig: {}, {}, {} (not shown)\n", ["zero", "set"][set(0x40, 16) as usize], ["zero", "set"][set(0x50, 16) as usize], ["zero", "set"][set(0x60, 64) as usize]));
+}
+
 /// `diag modem readmain`: read all of MAIN out of modem.bin through ext4 and hash it (BLAKE3), timing it: the read path the boot download will use. Compare the hash with the host's over the same slice of modem.bin (the TOC's CRC is not plain CRC-32, and the boot channel only forwards it, so it is not recomputed).
 pub fn read_main(rep: &mut Vec<u8>) {
     let mut m = match crate::partfs::mount(MODEM_PART) {
@@ -639,9 +753,13 @@ fn rom_boot(rep: &mut Vec<u8>) {
     for off in [0xA0, 0xA4, 0xA8, 0xAC] {
         wr(IPC + off, 0);
     }
-    // ap2cp_united_status: zero, as the Android capture shows Linux writing it (the DS-detect field in bits [15:14] stays clear there).
+    // ap2cp_united_status: zeroed, then the dual-SIM detect field (bits [15:14], sbi_ds_det_pos 14) set to `ds_detect - 1` = 1, Linux's default of two SIMs (modem_ctrl_s5100.c get_ds_detect) — both captures show the pair, G#0 then G#4000 (an earlier reading of them missed the second write).
     wr(IPC + 0x808, 0);
     wr(IPC + 0x80C, 0);
+    wr(IPC + 0x808, 1 << 14);
+    // ap2cp_kerneltime (G#824): on a cold boot whatever the DRAM held (measured G#FF with flipped bits); zero. The handover block after it was assembled at boot (`read_board`); its cpsig comes from the disk now.
+    wr(IPC + 0x824, 0);
+    handover_cpsig(rep);
     // `init_legacy_link` (link_device_memory_legacy.c:228): magic and mem_access to 0, every ring's head and tail to 0, then the magic and mem_access = 1, both read back. On a cold boot the cursors are whatever the DRAM held (measured G#FFFF_FFFF), and the first frame has nowhere to go.
     wr(IPC, 0);
     wr(IPC + 0x4, 0);
@@ -701,7 +819,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     download(rep, &mut seq);
     match (n, seq) {
         (8, Some(s)) => start_and_watch(rep, s),
-        (n, Some(s)) if n >= 9 => start_and_handshake(rep, s),
+        (9, Some(s)) => start_and_handshake(rep, s, false),
+        (n, Some(s)) if n >= 10 => start_and_handshake(rep, s, true),
         _ => {}
     }
 }
@@ -1136,7 +1255,9 @@ fn start_and_watch(rep: &mut Vec<u8>, mut seq: u16) {
 // After START the CP's main firmware raises INIT_START on cp2ap_msg (observed G#83 -> G#C1 ~370 ms in). On husky the link has no LINK_ATTR_SBD_IPC, so the INIT_START handler skips the whole SBD link and is just: set the AP capabilities, answer PIF_INIT_DONE. The CP then raises PHONE_START (G#C8); the AP checks capabilities (AP caps that the CP lacks crash it — so claim nothing, 0, which passes), re-inits the legacy link and answers INIT_END (G#C2). rild_ready gates INIT_END on Linux (the RIL daemon must have the channels open); ferros is the RIL, so it answers unconditionally. This first cut does NOT set up pktproc (the DL direct ring in G#E800_0000) — it is a measure-first step to see whether the CP reaches ONLINE on the handshake alone or needs the ring before it will proceed; pktproc and the data path come next.
 
 const CP2AP_MSG: usize = IPC + 0x804;
+/// The capability words (link_device.c 3922-3928): per part, the AP's then the CP's, 4 bytes each — AP part 0 at G#A0, CP part 0 at G#A4, AP part 1 at G#A8, CP part 1 at G#AC.
 const CAP_AP: usize = IPC + 0xA0;
+const CAP_CP: usize = IPC + 0xA4;
 
 /// cmd2int (link_device_memory.h): INT_VALID (G#80) | CMD_VALID (G#40) | cmd — matches the observed INIT_START G#C1.
 const fn cmd2int(cmd: u16) -> u16 {
@@ -1161,7 +1282,8 @@ fn is_cmd(v: u16) -> bool {
     v & 0x40 != 0
 }
 
-fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16) {
+/// Stage 9 answers the handshake bare; stage 10 (`full`) does what Linux does around it — the pktproc DL rings at INIT_START, the legacy-link reset at PHONE_START — and then watches.
+fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool) {
     match command(&mut seq, 0xA400, &[0, 0], 4000) {
         Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
         Err(e) => return line(rep, alloc::format!("START: {e}\n")),
@@ -1170,7 +1292,8 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16) {
     let mut answered_init_start = false;
     let mut phone_started = false;
     let mut last_cmd = 0u16;
-    while since_us(t0) < 12_000_000 {
+    // Stage 10 stops answering at INIT_END and hands over to the watch; stage 9 keeps polling its 12 s.
+    while since_us(t0) < 12_000_000 && !(full && phone_started) {
         crate::platform::pet_watchdogs();
         let v = rd(CP2AP_MSG) as u16;
         let msi = rd(DBI + 0x830);
@@ -1182,15 +1305,23 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16) {
             line(rep, alloc::format!("t={} ms: cp2ap_msg command G#{v:X}\n", since_us(t0) / 1000));
             match v {
                 INIT_START if !answered_init_start => {
-                    // Claim no capabilities: (ap ^ cp) & ap == 0 passes the CP's check whatever it supports (link_device.c:585). No pktproc yet.
+                    if full {
+                        pktproc_init();
+                        line(rep, alloc::format!("  pktproc: A#{PP_QUEUES} DL queues of A#{PP_NUM_DESC} descriptors, A#{} buffers posted each\n", PP_NUM_DESC - 1));
+                    }
+                    // Claim no capabilities, as husky's own DT does (ap_capability_0/1 = 0): (ap ^ cp) & ap == 0 passes the CP's check whatever it supports (link_device.c:585).
                     wr(CAP_AP, 0);
-                    wr(CAP_AP + 4, 0);
+                    wr(CAP_AP + 8, 0);
                     unsafe { core::arch::asm!("dsb sy") };
                     ap2cp_cmd(PIF_INIT_DONE);
                     answered_init_start = true;
                     line(rep, alloc::format!("  -> PIF_INIT_DONE (G#{PIF_INIT_DONE:X}) sent, caps 0\n"));
                 }
                 PHONE_START if !phone_started => {
+                    if full {
+                        line(rep, alloc::format!("  CP capabilities: part 0 G#{:X}, part 1 G#{:X}\n", rd(CAP_CP), rd(CAP_CP + 8)));
+                        legacy_init();
+                    }
                     ap2cp_cmd(INIT_END);
                     phone_started = true;
                     line(rep, alloc::format!("  -> INIT_END (G#{INIT_END:X}) sent; PHONE_ACTIVE {}\n", PHONE_ACTIVE.get() as u32));
@@ -1208,4 +1339,192 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16) {
         if answered_init_start { "answered" } else { "never seen" },
         if phone_started { "answered with INIT_END" } else { "never seen" },
         rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get() as u32, CP2AP_WAKEUP.get() as u32));
+    if full && phone_started {
+        watch_online(rep, now());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 10: the DL packet rings (pktproc), the legacy link, and the first look at what an online CP says.
+//
+// pktproc (link_rx_pktproc.c pktproc_create / pktproc_init; DT zuma-cp-s5300-sit.dtsi 139-183): G#E800_0000 holds a G#1000 info region, then the sktbuf descriptors, then from +G#10_0000 the G#1B0_0000 of packet buffers, four queues a quarter each. The CP sees the region at G#2000_0000. Linux maps each queue's buffers through the HSI1 SysMMU at IOVA = the buffer's own place in this region (cpif_pcie_iommu_map_va: src_pa = q_buff_pbase + stride × index); with the SysMMU in bypass that IOVA is the physical address, so ferros posts the region's own buffers in place. The region is Device memory in the cache map (cachemap.rs: every block of that GiB outside the surfaces), so the CP's writes need no maintenance.
+
+const PKTPROC: usize = 0xE800_0000;
+const PP_CP_BASE: u32 = 0x2000_0000;
+const PP_DESC: u32 = 0x1000;
+const PP_BUFF: u32 = 0x10_0000;
+const PP_BUFF_LEN: u32 = 0x1B0_0000;
+const PP_QUEUES: u32 = 4;
+const PP_MAX_PACKET: u32 = 1584;
+/// One buffer per descriptor, 2 KiB apart: Linux's stride is 1584 plus the skb front padding and shared info, rounded up to a power of two (pktproc_adjust_size), which is this; on bare metal it is ours to pick, and a power of two keeps the index a shift.
+const PP_STRIDE: u32 = 1 << 11;
+const PP_Q_BUFF: u32 = PP_BUFF_LEN / PP_QUEUES;
+const PP_NUM_DESC: u32 = PP_Q_BUFF / PP_STRIDE;
+const PP_DESC_LEN: u32 = 16;
+/// Sktbuf descriptor control bits (byte 5 of the first u64) and status (byte 6).
+const PP_HEAD: u64 = 0x80 << 40;
+const PP_RINGEND: u64 = 0x08 << 40;
+const PP_DONE: u64 = 0x01 << 48;
+
+fn wr64(a: usize, v: u64) {
+    unsafe { core::ptr::write_volatile(a as *mut u64, v) }
+}
+fn rd64(a: usize) -> u64 {
+    unsafe { core::ptr::read_volatile(a as *const u64) }
+}
+/// `pktproc_q_info` i: 20 bytes from +4 — cp_desc_pbase, num_desc, cp_buff_pbase, fore_ptr, rear_ptr.
+const fn pp_qinfo(q: u32) -> usize {
+    PKTPROC + 4 + 20 * q as usize
+}
+const fn pp_desc(q: u32, i: u32) -> usize {
+    PKTPROC + (PP_DESC + (q * PP_NUM_DESC + i) * PP_DESC_LEN) as usize
+}
+/// The CP's address of queue q's buffer i (the descriptor's cp_data_paddr) and where the AP reads it.
+const fn pp_buf_cp(q: u32, i: u32) -> u32 {
+    PP_CP_BASE + PP_BUFF + q * PP_Q_BUFF + i * PP_STRIDE
+}
+const fn pp_buf_ap(q: u32, i: u32) -> usize {
+    PKTPROC + (PP_BUFF + q * PP_Q_BUFF + i * PP_STRIDE) as usize
+}
+
+/// Post queue q's buffer i: its address, HEAD on the first, RINGEND on the last; status and length cleared.
+fn pp_post(q: u32, i: u32) {
+    let mut d = pp_buf_cp(q, i) as u64;
+    if i == 0 {
+        d |= PP_HEAD;
+    }
+    if i == PP_NUM_DESC - 1 {
+        d |= PP_RINGEND;
+    }
+    wr64(pp_desc(q, i) + 8, 0);
+    wr64(pp_desc(q, i), d);
+}
+
+/// pktproc_create's info header plus pktproc_init: every descriptor cleared, each queue's entry written, every buffer but one posted (a ring of n holds n - 1, `circ_get_space`), fore_ptr after them. No doorbell — the CP reads the header when it starts the rings.
+fn pktproc_init() {
+    for a in (PKTPROC..PKTPROC + (PP_DESC + PP_QUEUES * PP_NUM_DESC * PP_DESC_LEN) as usize).step_by(8) {
+        wr64(a, 0);
+    }
+    // num_queues[3:0], desc_mode[5:4] 1 = sktbuf, irq_mode[7:6] 1 = a vector per queue (pktproc_dl_use_exclusive_irq), max_packet_size[23:8].
+    wr(PKTPROC, PP_QUEUES | 1 << 4 | 1 << 6 | PP_MAX_PACKET << 8);
+    for q in 0..PP_QUEUES {
+        wr(pp_qinfo(q), PP_CP_BASE + PP_DESC + q * PP_NUM_DESC * PP_DESC_LEN);
+        wr(pp_qinfo(q) + 4, PP_NUM_DESC);
+        wr(pp_qinfo(q) + 8, pp_buf_cp(q, 0));
+        wr(pp_qinfo(q) + 16, 0);
+        for i in 0..PP_NUM_DESC - 1 {
+            pp_post(q, i);
+        }
+        unsafe { core::arch::asm!("dsb sy") };
+        wr(pp_qinfo(q) + 12, PP_NUM_DESC - 1);
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
+/// init_legacy_link (link_device_memory_legacy.c 228-268): magic and mem_access dropped, the FMT and RAW cursors (IPC+G#8..G#24) zeroed, then magic G#AA (MEM_IPC_MAGIC) and mem_access 1.
+fn legacy_init() {
+    wr(IPC, 0);
+    wr(IPC + 4, 0);
+    for a in (IPC + 0x8..IPC + 0x28).step_by(4) {
+        wr(a, 0);
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(IPC, 0xAA);
+    wr(IPC + 4, 1);
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
+/// After INIT_END: 30 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, the first 32 bytes; RFS path names are not per-unit data, FMT payloads may carry SIM identity, so only their first bytes), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
+fn watch_online(rep: &mut Vec<u8>, t0: u64) {
+    let mut done = [0u32; PP_QUEUES as usize];
+    let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
+    let mut per_ch = [0u32; 256];
+    let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
+    line(rep, alloc::format!("online: magic G#{:X} mem_access {}, watching 30 s\n", rd(IPC), rd(IPC + 4)));
+    let hex = |at: &dyn Fn(u32) -> u8, n: u32| {
+        let mut h = alloc::string::String::new();
+        for i in 0..n {
+            h.push_str(&alloc::format!("{:02X}", at(i)));
+        }
+        h
+    };
+    while since_us(t0) < 30_000_000 {
+        crate::platform::pet_watchdogs();
+        let now_s = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
+        if now_s != last && changes < 32 {
+            line(rep, alloc::format!("t={} ms: cp2ap_msg G#{:X} cp2ap_status G#{:X} PHONE_ACTIVE {}\n", since_us(t0) / 1000, now_s.0, now_s.1, now_s.2 as u32));
+            changes += 1;
+            if now_s.0 as u16 == CRASH_EXIT {
+                line(rep, alloc::format!("  CRASH_EXIT: the CP gave up\n"));
+                break;
+            }
+        }
+        last = now_s;
+        for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
+            let head = rd(headr);
+            let tail = rd(tailr);
+            if head >= len_max || tail >= len_max || head == tail {
+                continue;
+            }
+            let at = |o: u32| rd8(base + ((tail + o) % len_max) as usize);
+            if at(0) != 0xCD || at(1) != 0xAB {
+                line(rep, alloc::format!("t={} ms: {name} head {head} tail {tail}: no frame header (G#{:02X}{:02X}), ring left\n", since_us(t0) / 1000, at(1), at(0)));
+                return;
+            }
+            let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
+            let ch = at(8);
+            per_ch[ch as usize] += 1;
+            if frames < 48 {
+                let n = (flen - 12).min(32);
+                let body = |i: u32| at(12 + i);
+                let mut txt = alloc::string::String::new();
+                if name == "raw" {
+                    for i in 0..n {
+                        let b = body(i);
+                        txt.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                    }
+                }
+                line(rep, alloc::format!("t={} ms: {name} ch A#{ch} cfg G#{:02X}{:02X} len A#{flen}: {} |{txt}|\n", since_us(t0) / 1000, at(5), at(4), hex(&body, n)));
+                frames += 1;
+            }
+            wr(tailr, (tail + ((flen + 7) & !7)) % len_max);
+        }
+        for q in 0..PP_QUEUES {
+            let rear = rd(pp_qinfo(q) + 16);
+            if rear >= PP_NUM_DESC {
+                line(rep, alloc::format!("t={} ms: pktproc q{q} rear_ptr A#{rear} out of range, queue left\n", since_us(t0) / 1000));
+                return;
+            }
+            while done[q as usize] != rear {
+                let i = done[q as usize];
+                let d = rd64(pp_desc(q, i));
+                let w = rd64(pp_desc(q, i) + 8);
+                let (len, ch) = (w as u16 as u32, (w >> 48) as u8);
+                if packets < 32 {
+                    let b = pp_buf_ap(q, i);
+                    let body = |o: u32| rd8(b + o as usize);
+                    line(rep, alloc::format!("t={} ms: pktproc q{q} desc A#{i} ch A#{ch} len A#{len} done {} addr G#{:X}: {}\n", since_us(t0) / 1000, (d & PP_DONE != 0) as u32, d & 0xF_FFFF_FFFF, hex(&body, len.min(40))));
+                }
+                packets += 1;
+                // Repost at fore (Linux's refill): the slot one behind the rear is free now that its packet is read.
+                let fore = rd(pp_qinfo(q) + 12);
+                pp_post(q, fore);
+                unsafe { core::arch::asm!("dsb sy") };
+                wr(pp_qinfo(q) + 12, (fore + 1) % PP_NUM_DESC);
+                done[q as usize] = (i + 1) % PP_NUM_DESC;
+            }
+        }
+        let msi = rd(DBI + 0x830);
+        if msi != 0 {
+            wr(DBI + 0x830, msi);
+        }
+        us(500);
+    }
+    let mut chs = alloc::string::String::new();
+    for (ch, &n) in per_ch.iter().enumerate() {
+        if n != 0 {
+            chs.push_str(&alloc::format!(" ch A#{ch}: A#{n}"));
+        }
+    }
+    line(rep, alloc::format!("watched: A#{frames} frames logged ({}), A#{packets} DL packets; cp2ap_msg G#{:X} PHONE_ACTIVE {}\n", if chs.is_empty() { " none" } else { &chs }, rd(CP2AP_MSG), PHONE_ACTIVE.get() as u32));
 }

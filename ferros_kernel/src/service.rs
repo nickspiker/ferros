@@ -2354,9 +2354,10 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_digit() {
-                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END) (data only: owner, 2026-10-26).
-                                            crate::modem::stages(&mut resp, cmd.params[7] - b'0');
+                                        if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_hexdigit() && !cmd.params[7].is_ascii_uppercase() {
+                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N, N one hex digit (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the bare IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END), a the handshake with the pktproc DL rings and the legacy link, then 30 s watching what the online CP sends (data only: owner, 2026-10-26).
+                                            let c = cmd.params[7];
+                                            crate::modem::stages(&mut resp, if c.is_ascii_digit() { c - b'0' } else { c - b'a' + 10 });
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
@@ -2459,6 +2460,12 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"modem files" {
                                             // `diag modem files`: the modem's images on the flash (modem.bin's TOC, NV file sizes), read only (modem.rs).
                                             crate::modem::files(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem hwcfg" {
+                                            // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
+                                            crate::modem::hwcfg(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

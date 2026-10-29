@@ -1842,6 +1842,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The board's CDT and MLB for the sensor registry scripts (usf.rs), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
     if real_boot {
         usf::read_board(dtb_addr);
+        modem::read_board(dtb_addr);
     }
     checklist::at("board read");
     if cached {
