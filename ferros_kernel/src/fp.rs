@@ -130,3 +130,19 @@ pub fn report(out: &mut Vec<u8>) {
         out.extend_from_slice(b"no unclaimed SPI controller is visible - the fingerprint's USI is either idle right now or secure-hidden (its SW_CONF reads 0 from NS-EL2); a logic analyser on the flex is then the only way to find the bus\n");
     }
 }
+
+/// Write the USI personality scan into the ramoops report block for the handoff path, where USB does not come up to answer `diag fp` interactively (2026-10-29: the handoff watchdog-resets during the USB bring-up). Each USI's SW_CONF (low 3 bits) is packed one byte per USI into r[6..9] (RAMOOPS_RESULT + 0x30/0x38/0x40, the order of the USIS table above, 0xFF = the read faulted). Run early, right after arm_safety, so it survives the watchdog reset; the next Android boot prints it as the "ferros: r[06..08]" dump, decoded against USIS. SW_CONF is a syscon read (always clocked, safe this early); the SPI blocks are not touched here.
+pub fn scan_to_report() {
+    let mut w = [0u64; 3];
+    for (i, &(_, swconf, _, _)) in USIS.iter().enumerate() {
+        let v = probe(swconf).map(|x| x & 0x7).unwrap_or(0xFF) as u64;
+        w[i / 8] |= v << ((i % 8) * 8);
+    }
+    unsafe {
+        core::ptr::write_volatile((crate::platform::RAMOOPS_RESULT + 0x00) as *mut u64, crate::platform::RESULT_MAGIC);
+        core::ptr::write_volatile((crate::platform::RAMOOPS_RESULT + 0x30) as *mut u64, w[0]);
+        core::ptr::write_volatile((crate::platform::RAMOOPS_RESULT + 0x38) as *mut u64, w[1]);
+        core::ptr::write_volatile((crate::platform::RAMOOPS_RESULT + 0x40) as *mut u64, w[2]);
+        ferros_hal::mmio::cache_clean(crate::platform::RAMOOPS_RESULT, 0x180);
+    }
+}

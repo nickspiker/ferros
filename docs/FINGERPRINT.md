@@ -65,3 +65,12 @@ That is the prize: not reading Google's sensor, but owning the whole biometric.
 ## The real wall
 Even with the bus up, the sensor speaks a proprietary Goodix command set that lives only in the TA and the sensor firmware, with no datasheet.
 Getting raw frames means reversing that protocol (logic analyser or careful register work), which is the long part of the project; the bus bring-up is the short part.
+
+## Result (2026-10-29, scan run with Trusty + Android live)
+The handoff USB service watchdog-resets during bring-up (it never enumerates to answer `diag fp` interactively), so the scan was carried out in the ramoops report block instead: `fp::scan_to_report` (behind `FERROS_FP_SCAN`) writes each USI's SW_CONF into r[6..8] early in `entry_usb`, and the watchdog bounce back to Android prints it.
+
+The scan validated against all eleven known controllers: the camera's I2C (spi_1/2/3/4/14) read I2C, and the eSE (spi_12), UWB (spi_18), amps (spi_19), touch (spi_20), GNSS (spi_21) read SPI.
+
+**No unclaimed USI is in SPI mode, even with the secure world live.** The unclaimed controllers read: spi_5/6/13/15/22 reset/none; spi_0/9/11 I2C (other buses); and spi_10 (PERIC1, gpp20) **faulted** — its SW_CONF at sysreg_peric1+0x08 is not readable from NS-EL2 while its neighbours (spi_0 +0x00, spi_9 +0x04) read fine.
+
+So software elimination is exhausted: the fingerprint's SPI controller does not surface as an SPI-mode USI the normal world can read. The one lead is **spi_10 / gpp20** — the only controller whose personality register is walled from NS, which is what a secure-world-owned peripheral looks like. It is the first place to point a logic analyser on the flex; confirming it is SPI (and the fingerprint's) cannot be done from software. This is the conclusive form of the original answer: no, ferros cannot reach the sensor's bus from the normal world.
