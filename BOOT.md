@@ -296,6 +296,10 @@ How a boot goes:
 - What Android sees when locked: verified-boot state yellow, the key's fingerprint on the boot warning, and an attestation root of the owner's key, so apps that demand Google's attestation (banking, Wallet) may refuse, as on GrapheneOS. A new Android kernel means repacking and re-signing the gate, as now.
 - Stock GrapheneOS (their key) still cannot share a locked device with ferros: one key per device, and their key cannot sign our gate.
 
+**The USB development doors close in a production build (2026-10-28).** With `FERROS_PRODUCTION=1`, the PT dispatch answers only a reboot and a plain DIAG (status, no secrets), and refuses everything else: reload, run, memory read and poke, the vault store, the display read, spawn, seal, and every DIAG subcommand. ABL checks only what it boots, so without this a cable could replace the running kernel of a locked phone. One gate at the top of the dispatch (service.rs); dev builds compile it out. The portal (STATUS.md 7) will grant those verbs back to the owner's identity.
+- **Tested** by hot-loading a production kernel into RAM: the plain DIAG answered, `diag keys` and a memory read got the refusal, a reload was refused (the phone stayed on it), and a reboot brought back the flashed dev build. The bridge does not expect a refusal mid-transfer and lost step after the refused reload; the next command was fine.
+- **Do not flash a production build unattended:** its "Ready?" gate waits for the power key (dev builds auto-choose after a second).
+
 **Signed and unlocked: done (2026-10-28).** ABL verified slot b's whole chain under the owner's key, still unlocked: the next boot's record reads `Last AVB: avb_ret=OK`, `avb_veritymode=enforcing`, `avb_error_parts=` (none), and `boot_state: 160000:20260505:20260505` (OS 16, both security patch levels, which ABL could not find while verification was off).
 - **How it is built:** in Rust, `ferros-mkimg` (tools/mkimg/src/avb.rs), not avbtool.
   - Google's top-level `vbmeta` does not hash `boot`: it *chains* to it (and to `init_boot`, `vbmeta_system`, `vbmeta_vendor`), each carrying its own signed `vbmeta`.

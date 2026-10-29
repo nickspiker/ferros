@@ -1337,7 +1337,11 @@ pub fn run(mut b: Boot) -> ! {
                                 pt_done = true;
                                 if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
                                     st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
-                                    if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                                    // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
+                                    let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty());
+                                    if !open {
+                                        queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot and a plain DIAG over USB\n");
+                                    } else if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                                         let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                                         // The camera's and the TPU's power domains are gated after boot (pd.rs). Their diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
                                         if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else if cmd.params.starts_with(b"tpu") { Some("tpu") } else { None } {
