@@ -825,7 +825,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         (12, Some(s)) => start_and_handshake(rep, s, true, 2),
         (13, Some(s)) => start_and_handshake(rep, s, true, 3),
         (14, Some(s)) => start_and_handshake(rep, s, true, 4),
-        (n, Some(s)) if n >= 15 => start_and_handshake(rep, s, true, 5),
+        (15, Some(s)) => start_and_handshake(rep, s, true, 5),
+        (n, Some(s)) if n >= 16 => start_and_handshake(rep, s, true, 6),
         _ => {}
     }
 }
@@ -1455,6 +1456,26 @@ const SIT_GET_PS_REG_STATE: u16 = 0x0701;
 const SIT_GET_SIM_STATUS: u16 = 0x0200;
 const SIT_SET_PS_SERVICE: u16 = 0x0710;
 const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
+const SIT_GET_STACK_STATUS: u16 = 0x0810;
+const SIT_GET_CARRIER_RESTRICTIONS_V2: u16 = 0x0767;
+const SIT_OEM_SET_CARRIER_CONFIG_MANIFEST: u16 = 0x4600;
+/// The carrier-config root the CP opens its manifest and confseqs under, over the remote-file service (libsitril's CarrierConfigManager path; the Android capture's first remote-file open is `<root>/manifests/<id>`).
+const CARRIER_CONFIG_ROOT: &str = "/vendor/firmware/carrierconfig";
+/// Verizon's carrier manifest, as Android chose it for this SIM (the capture's open; a 4107-byte file in the vendor image's manifests, one per carrier, 269 of them). Android picks it from cfg.db by the SIM's ICCID, MCC-MNC and SIM info; until ferros reads cfg.db this one carrier is fixed here.
+const VZW_MANIFEST: &str = "822bc2aa697b011c516ad97bd29093a1c77b28a2";
+
+/// SIT_OEM_SET_CARRIER_CONFIG_MANIFEST's parameters (ProtocolMiscBuilder::BuildSetCpCarrierConfig, 532 bytes with the header): u32 root length, the root [256], u32 manifest length, the manifest id as bytes [256] (CarrierManifest::getEncodedManifest: the hex name, two digits a byte).
+fn carrier_manifest_params() -> Vec<u8> {
+    let mut m = alloc::vec![0u8; 0x214 - 12];
+    let root = CARRIER_CONFIG_ROOT.as_bytes();
+    m[0..4].copy_from_slice(&(root.len() as u32).to_le_bytes());
+    m[4..4 + root.len()].copy_from_slice(root);
+    let hexd = VZW_MANIFEST.as_bytes();
+    let id: Vec<u8> = hexd.chunks(2).map(|p| (hex_digit(p[0]).unwrap() << 4 | hex_digit(p[1]).unwrap()) as u8).collect();
+    m[0x104..0x108].copy_from_slice(&(id.len() as u32).to_le_bytes());
+    m[0x108..0x108 + id.len()].copy_from_slice(&id);
+    m
+}
 /// The APN the data SIM attaches with. Verizon's public internet APN, the one its data-only devices attach on (stack 1's confpack is us_vzw); not IMS, so nothing voice comes up. A per-carrier choice ferros will take from settings later.
 const ATTACH_APN: &[u8] = b"VZWINTERNET";
 
@@ -1493,12 +1514,17 @@ fn sit_name(id: u16) -> &'static str {
         0x0701 => "GET_PS_REG_STATE",
         0x0710 => "SET_PS_SERVICE",
         0x0740 => "SET_PREFERRED_DATA_MODEM",
+        0x0767 => "GET_CARRIER_RESTRICTIONS_V2",
         0x0800 => "SET_RADIO_POWER",
         0x0801 => "GET_RADIO_POWER",
         0x0802 => "IND_RADIO_STATE_CHANGED",
         0x0803 => "IND_RADIO_READY",
         0x0804 => "IND_PHONE_RESET",
         0x0805 => "IND_MODEM_RESTART",
+        0x0810 => "GET_STACK_STATUS",
+        0x4600 => "OEM_SET_CARRIER_CONFIG_MANIFEST",
+        0x4601 => "OEM_IND_4601",
+        0x4602 => "OEM_IND_4602",
         0x0905 => "IND_NITZ_TIME_RECEIVED",
         0x0906 => "IND_SIGNAL_STRENGTH",
         0x0D05 => "IND_AIMS_REGISTRATION",
@@ -1508,8 +1534,8 @@ fn sit_name(id: u16) -> &'static str {
 
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
-    // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code.
-    matches!(id, 0x0210 | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0800..=0x0805 | 0x0906)
+    // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code. G#4602 (the carrier-config manifest indication) starts with the SIM's ICCID.
+    matches!(id, 0x0210 | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
 }
 
 /// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
@@ -1856,7 +1882,7 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
     let (mut probed, mut powered) = (false, false);
     let mut next_reg = 5_000_000u64;
-    let (mut sim_asked, mut data_on, mut ia_set) = (false, false, false);
+    let (mut sim_asked, mut data_on, mut ia_set, mut queried) = (false, false, false, false);
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut pull: Option<RfsPull> = None;
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
@@ -1891,6 +1917,15 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
         }
         // Stage e: what Android's telephony does for its data SIM once the SIM is ready — the preferred data modem (one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem), then allow data (SIT_SET_PS_SERVICE, one byte 1: ProtocolNetworkBuilder::BuildAllowData), both on that stack's channel. The SIM sits on stack 1 here (its confpack is us_vzw).
         // Stage f: the initial-attach APN on the data SIM's stack before data is allowed, as Android's telephony sets it once the SIM is ready.
+        // Stage g: read-only queries for what else keeps the data SIM at emergency-only — the stack's enabled state and the carrier-restriction (SIM lock) policy.
+        if probe >= 6 && !queried && since_us(t0) > 8_000_000 {
+            queried = true;
+            for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2] {
+                if let Err(e) = sit_request(&mut link, CH_FMT0 + 1, id, &[]) {
+                    line(rep, alloc::format!("t={} ms: G#{id:X} not sent: {e}\n", since_us(t0) / 1000));
+                }
+            }
+        }
         if probe >= 5 && !ia_set && since_us(t0) > 6_500_000 {
             ia_set = true;
             let ch = CH_FMT0 + 1;
@@ -1975,6 +2010,13 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
+            // The carrier-config handshake (stage G#10 on): the CP's G#4602 indication (the SIM's identity for the carrier lookup) is answered with SIT_OEM_SET_CARRIER_CONFIG_MANIFEST on the same stack.
+            if probe >= 6 && ril && flen >= 12 + 8 && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x4602 {
+                match sit_request(&mut link, ch, SIT_OEM_SET_CARRIER_CONFIG_MANIFEST, &carrier_manifest_params()) {
+                    Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_OEM_SET_CARRIER_CONFIG_MANIFEST {} manifest {} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, CARRIER_CONFIG_ROOT, VZW_MANIFEST)),
+                    Err(e) => line(rep, alloc::format!("t={} ms: carrier manifest not sent: {e}\n", since_us(t0) / 1000)),
+                }
+            }
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
             // The SIM's file-data and status chatter (G#210, G#246, G#248, G#24F) is counted, not logged: it is long, frequent and identity.
             let quiet = served_rfs || ril && flen >= 16 && matches!(at(14) as u16 | (at(15) as u16) << 8, 0x0210 | 0x0246 | 0x0248 | 0x024F);

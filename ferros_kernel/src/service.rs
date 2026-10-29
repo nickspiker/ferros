@@ -2354,10 +2354,16 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params.len() == 8 && cmd.params.starts_with(b"modem s") && cmd.params[7].is_ascii_hexdigit() && !cmd.params[7].is_ascii_uppercase() {
-                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N, N one hex digit (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the bare IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END), a the handshake with the pktproc DL rings and the legacy link, then 90 s watching what the online CP sends, b the same with one RIL probe (SIT_GET_RADIO_POWER on channel 245), c also the radio on (SIT_SET_RADIO_POWER, not for emergency), d also the data registration polled every 5 s (SIT_GET_PS_REG_STATE) and the SIM status read once, e also the preferred data modem and allow-data on stack 1, f also the initial-attach APN; from b on, the modem service on channel 130 (properties, a not-available answer to UE-capability reads) and the remote-file service on channel 41 (writes pulled and dropped) are answered (property writes and reads) (data only: owner, 2026-10-26).
-                                            let c = cmd.params[7];
-                                            crate::modem::stages(&mut resp, if c.is_ascii_digit() { c - b'0' } else { c - b'a' + 10 });
+                                        let hex_stage = |p: &[u8]| -> Option<u8> {
+                                            let d = p.strip_prefix(b"modem s")?;
+                                            if d.is_empty() || d.len() > 2 {
+                                                return None;
+                                            }
+                                            d.iter().try_fold(0u8, |a, &c| Some(a << 4 | (c as char).to_digit(16).filter(|_| !c.is_ascii_uppercase())? as u8))
+                                        };
+                                        if let Some(n) = hex_stage(&cmd.params) {
+                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N, N one or two hex digits (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the bare IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END), a the handshake with the pktproc DL rings and the legacy link, then 90 s watching what the online CP sends, b the same with one RIL probe (SIT_GET_RADIO_POWER on channel 245), c also the radio on (SIT_SET_RADIO_POWER, not for emergency), d also the data registration polled every 5 s (SIT_GET_PS_REG_STATE) and the SIM status read once, e also the preferred data modem and allow-data on stack 1, f also the initial-attach APN, 10 also the stack-status and carrier-restriction queries; from b on, the modem service on channel 130 (properties, UE-capability files from the modem image) and the remote-file service on channel 41 (writes pulled and dropped) are answered (the whole radio is open during experimentation: owner, 2026-10-29).
+                                            crate::modem::stages(&mut resp, n);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
