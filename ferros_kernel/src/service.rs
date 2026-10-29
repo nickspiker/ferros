@@ -918,13 +918,16 @@ pub fn run(mut b: Boot) -> ! {
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
     let exc_start = crate::exception_count();
+    platform::mark(0x34);
 
     // Boot screen: after a --live handoff DECON is still running, so show where this generation stands before USB even comes up (show() touches nothing when the DPU is powered down).
     if !crate::checklist::active() {
         let _ = crate::display::show(&status_text(b.kind, generation, b.probe.as_ref()), cntfrq());
     }
+    platform::mark(0x35);
 
     let dma = open_usb_dma_path();
+    platform::mark(0x36);
     platform::crumb(0xA1);
     crate::checklist::at("usb: dma path open");
     let mut usb = match b.usb.take() {
@@ -935,6 +938,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         None => {
             crate::pixel8_eusb_phy_init();
+            platform::mark(0x37);
             platform::crumb(0xA2);
             crate::checklist::at("usb: phy up");
             ferros_hal::usb::set_dwc3_base(DWC3);
@@ -944,11 +948,13 @@ pub fn run(mut b: Boot) -> ! {
             }
         }
     };
+    platform::mark(0x38);
     platform::crumb(0xA3);
     crate::checklist::at("usb: controller up");
 
     // The worker cores (smp.rs): up once the kernel is settled on its own core, before the first slice is handed out.
     crate::smp::launch_all();
+    platform::mark(0x39);
     // The wall clock (rtc.rs): read now, so the first process to ask has it.
     let _ = crate::rtc::sync();
     let freq = cntfrq();
@@ -1035,6 +1041,7 @@ pub fn run(mut b: Boot) -> ! {
     crate::keys::serve();
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
+    platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
         crate::keys::serve();

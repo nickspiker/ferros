@@ -68,9 +68,9 @@ SECTIONS
     __kernel_end = .;
     __kernel_size = __kernel_end - _start;
 
-    /* Stack: 64KB, placed after kernel image */
+    /* Stack: 256 KiB, placed after the kernel image. 64 KiB overflowed into .bss: the service loop needs ~95 KiB and a vault write or a spawn under load spikes ~22 KiB more (the cold path's aarch64-pixel8.ld was raised to 512 KiB for this on 2026-10-23, but this handoff script was left at 64 KiB — the handoff then overflowed nondeterministically, which is the watchdog resets and flaky USB enumeration of 2026-10-29). 256 KiB clears it with margin inside the 12 MiB carveout (heap is 4 MiB above __stack_top, well below the result scratch at 0x92F00000). DIAG's STACK_USED_MAX reports the measured depth. */
     __stack_bottom = .;
-    . = . + 0x10000;
+    . = . + 0x40000;
     __stack_top = .;
 
     /DISCARD/ : {

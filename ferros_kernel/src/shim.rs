@@ -339,6 +339,8 @@ pub fn entry_vault(x0: u64) -> ! {
 
 /// Handoff entry with the USB service: adopt UFS, arm the safety nets, probe the vault, then serve PT over USB until told to leave (service.rs). Linked at the 0x92400000 carveout; RELOAD stages past this generation's image + stack + 4 MiB heap and runs its copy stub below the 0x92F00000 result scratch.
 pub fn entry_usb(x0: u64) -> ! {
+    // Paint the stack so DIAG's STACK_USED_MAX measures the handoff's depth too (the cold path paints at kernel_main; the handoff never did, so the metric read a meaningless full-size and hid that 64 KiB was overflowing — 2026-10-29).
+    crate::platform::stack_paint();
     // FERROS_FP_SCAN: localize where the handoff watchdog-resets (2026-10-29) and carry the fingerprint USI scan out in the report block, since USB never comes up to answer diag fp. Last surviving crumb says the hang region: E0 adopt_ufs, E1 vault_probe, E2 run() pre-USB, then A1/A2/A3 in the USB bring-up. The scan lands in r[6..8] after arm_safety (which zeroes the block), so it survives any hang past that point.
     let scan = option_env!("FERROS_FP_SCAN").is_some();
     if scan {
@@ -351,7 +353,9 @@ pub fn entry_usb(x0: u64) -> ! {
         crate::platform::crumb(0xE1);
         crate::fp::scan_to_report();
     }
+    crate::platform::mark(0x32);
     let (probe, store) = vault_probe(link_up);
+    crate::platform::mark(0x33);
     if scan {
         crate::platform::crumb(0xE2);
     }

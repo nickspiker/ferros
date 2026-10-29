@@ -148,6 +148,17 @@ pub fn notes_rotate() {
     }
 }
 
+/// Handoff hang localizer (behind FERROS_FP_SCAN): a monotonic step written to r[9] (RAMOOPS_RESULT + 0x48), a slot nothing else writes, cleaned so it survives the watchdog reset. The furthest step printed in the next Android boot's "ferros: r[08..11]" dump (the second word) is the last point the handoff reached; it hung in the step after it. A no-op unless FERROS_FP_SCAN is set, so normal builds are untouched.
+pub fn mark(step: u64) {
+    if option_env!("FERROS_FP_SCAN").is_none() {
+        return;
+    }
+    unsafe {
+        write_volatile((RAMOOPS_RESULT + 0x48) as *mut u64, step);
+        ferros_hal::mmio::cache_clean(RAMOOPS_RESULT, 0x80);
+    }
+}
+
 pub fn crumb(c: u64) {
     LAST_CRUMB.store(c, core::sync::atomic::Ordering::Relaxed);
     let mpidr: u64;
