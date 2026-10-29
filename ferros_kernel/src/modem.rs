@@ -819,9 +819,10 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     download(rep, &mut seq);
     match (n, seq) {
         (8, Some(s)) => start_and_watch(rep, s),
-        (9, Some(s)) => start_and_handshake(rep, s, false, false),
-        (10, Some(s)) => start_and_handshake(rep, s, true, false),
-        (n, Some(s)) if n >= 11 => start_and_handshake(rep, s, true, true),
+        (9, Some(s)) => start_and_handshake(rep, s, false, 0),
+        (10, Some(s)) => start_and_handshake(rep, s, true, 0),
+        (11, Some(s)) => start_and_handshake(rep, s, true, 1),
+        (n, Some(s)) if n >= 12 => start_and_handshake(rep, s, true, 2),
         _ => {}
     }
 }
@@ -1284,7 +1285,7 @@ fn is_cmd(v: u16) -> bool {
 }
 
 /// Stage 9 answers the handshake bare; stage 10 (`full`) does what Linux does around it — the pktproc DL rings at INIT_START, the legacy-link reset at PHONE_START — and then watches.
-fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: bool) {
+fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: u8) {
     match command(&mut seq, 0xA400, &[0, 0], 4000) {
         Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
         Err(e) => return line(rep, alloc::format!("START: {e}\n")),
@@ -1446,11 +1447,48 @@ const CH_FMT0: u8 = 245;
 /// `mask2int(MASK_SEND_FMT)` (link_device_memory.h: SEND_FMT G#2, SEND_RAW G#1, INT_VALID G#80): what the AP writes to ap2cp_msg after putting frames in the FMT ring.
 const INT_SEND_FMT: u32 = 0x82;
 const SIT_GET_RADIO_POWER: u16 = 0x0801;
+const SIT_SET_RADIO_POWER: u16 = 0x0800;
 
-/// The AP's side of the SIT link on the RIL channel: the per-io-device frame counter, the channel's own counter (both start at 1, `exynos_build_header`), the RCM token.
+/// Names for the ids the data path meets (rcmMsgToString); others print as their number.
+fn sit_name(id: u16) -> &'static str {
+    match id {
+        0x0200 => "GET_SIM_STATUS",
+        0x0210 => "IND_SIM_STATUS_CHANGED",
+        0x024E => "IND_SIM_SLOT_STATUS_CHANGED",
+        0x0600 => "SETUP_DATA_CALL",
+        0x0603 => "SET_INITIAL_ATTACH_APN",
+        0x0604 => "IND_DATA_CALL_LIST_CHANGED",
+        0x0609 => "IND_DATA_STATE_CHANGE",
+        0x070E => "IND_NTW_STATE_CHANGED",
+        0x070F => "IND_CELL_INFO_LIST",
+        0x0717 => "IND_NET_CURRENT_LTE_MODE",
+        0x072C => "IND_TOTAL_OOS",
+        0x072D => "IND_MCC",
+        0x0737 => "IND_RADIO_CAPABILITY",
+        0x0742 => "IND_PHYSICAL_CHANNEL_CONFIG",
+        0x074A => "IND_REG_FAILED",
+        0x0800 => "SET_RADIO_POWER",
+        0x0801 => "GET_RADIO_POWER",
+        0x0802 => "IND_RADIO_STATE_CHANGED",
+        0x0803 => "IND_RADIO_READY",
+        0x0804 => "IND_PHONE_RESET",
+        0x0805 => "IND_MODEM_RESTART",
+        0x0905 => "IND_NITZ_TIME_RECEIVED",
+        0x0906 => "IND_SIGNAL_STRENGTH",
+        0x0D05 => "IND_AIMS_REGISTRATION",
+        _ => "",
+    }
+}
+
+/// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
+fn sit_shown(id: u16) -> bool {
+    matches!(id, 0x0210 | 0x0604 | 0x0609 | 0x070E | 0x0717 | 0x072C | 0x074A | 0x0800..=0x0805 | 0x0906)
+}
+
+/// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
 struct SitLink {
-    frame: u16,
-    ch: u8,
+    frame: [u16; 256],
+    ch: [u8; 256],
     token: u32,
 }
 
@@ -1465,9 +1503,10 @@ fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::str
     if head >= FMT_TX_RING_LEN || tail >= FMT_TX_RING_LEN || (free as usize) < padded {
         return Err(alloc::format!("fmt tx ring full or bad: head {head} tail {tail} need {padded}"));
     }
-    link.frame = link.frame.wrapping_add(1);
-    link.ch = link.ch.wrapping_add(1);
-    let hdr = [0xCD, 0xAB, link.frame as u8, (link.frame >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, ch, link.ch, 0, 0];
+    link.frame[ch as usize] = link.frame[ch as usize].wrapping_add(1);
+    link.ch[ch as usize] = link.ch[ch as usize].wrapping_add(1);
+    let (frame, chseq) = (link.frame[ch as usize], link.ch[ch as usize]);
+    let hdr = [0xCD, 0xAB, frame as u8, (frame >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, ch, chseq, 0, 0];
     let mut pos = head;
     let mut put = |b: &[u8]| {
         for &x in b {
@@ -1500,11 +1539,142 @@ fn sit_request(link: &mut SitLink, id: u16, params: &[u8]) -> Result<u32, alloc:
     Ok(tok)
 }
 
+// ---------------------------------------------------------------------------
+// The modem service on oem_ipc1 (channel 130), Android's /vendor/bin/shared_modem_platform. Its messages are protobuf `modem_svc_message.ModemSvcMessage` (decoded 2026-10-29 from the descriptors embedded in the vendor image's libmodem_svc_proto_legacy_soong.so): {1 type (1 request, 2 response, 3 indication), 2 message_id fixed32, 3 token fixed32, 4 result (0 success), then one payload: 5 modemstat, 6 extendedlog, 7 property, 8 userspacelog, 9 file, 10 temperature, 11 test, 12 uecap_file, 13 push_events}. property_message = {1 read_request {1 property}, 2 read_response {1 value}, 3 write_request {1 property, 2 value}, 4 write_response {}}. A response repeats the request's message_id and token.
+// Protobuf is the modem's wire, not a ferros format: read strictly (a malformed message is dropped and logged), written by hand.
+
+const CH_MODEM_SVC: u8 = 130;
+
+/// One protobuf field: number, wire type, the varint/fixed value, and for a length-delimited field its bytes.
+struct PbField<'a> {
+    num: u32,
+    wire: u8,
+    val: u64,
+    bytes: &'a [u8],
+}
+
+fn pb_varint(b: &[u8], p: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    for s in 0..10 {
+        // The CP's bytes: a varint running off the end of the message is malformed.
+        let x = *b.get(*p)?;
+        *p += 1;
+        v |= ((x & 0x7F) as u64) << (7 * s);
+        if x & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Every top-level field of a message, or None when it is malformed. Lengths are the CP's, so each is checked against what is left before it is sliced.
+fn pb_fields(b: &[u8]) -> Option<Vec<PbField<'_>>> {
+    let mut p = 0;
+    let mut out = Vec::new();
+    while p < b.len() {
+        let k = pb_varint(b, &mut p)?;
+        let (num, wire) = ((k >> 3) as u32, (k & 7) as u8);
+        let f = match wire {
+            0 => PbField { num, wire, val: pb_varint(b, &mut p)?, bytes: &[] },
+            2 => {
+                let n = pb_varint(b, &mut p)? as usize;
+                if n > b.len() - p {
+                    return None;
+                }
+                p += n;
+                PbField { num, wire, val: 0, bytes: &b[p - n..p] }
+            }
+            1 | 5 => {
+                let n = if wire == 1 { 8 } else { 4 };
+                if n > b.len() - p {
+                    return None;
+                }
+                let mut v = [0u8; 8];
+                v[..n].copy_from_slice(&b[p..p + n]);
+                p += n;
+                PbField { num, wire, val: u64::from_le_bytes(v), bytes: &[] }
+            }
+            _ => return None,
+        };
+        out.push(f);
+    }
+    Some(out)
+}
+
+fn pb_put_varint(v: &mut Vec<u8>, mut x: u64) {
+    while x >= 0x80 {
+        v.push(x as u8 | 0x80);
+        x >>= 7;
+    }
+    v.push(x as u8);
+}
+
+fn pb_put_bytes(v: &mut Vec<u8>, num: u32, b: &[u8]) {
+    pb_put_varint(v, (num as u64) << 3 | 2);
+    pb_put_varint(v, b.len() as u64);
+    v.extend_from_slice(b);
+}
+
+/// Answer one ModemSvcMessage: property writes are acknowledged and kept, property reads answered from what was written (empty otherwise, as an unset Android property reads), anything else logged and left unanswered. Returns the reply's bytes.
+fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Option<Vec<u8>> {
+    let Some(top) = pb_fields(body) else {
+        line(rep, alloc::format!("t={t_ms} ms: modem_svc: malformed message, dropped\n"));
+        return None;
+    };
+    let get = |n: u32| top.iter().find(|f| f.num == n);
+    let (ty, id, token) = (get(1).map(|f| f.val), get(2).map(|f| f.val as u32), get(3).map(|f| f.val as u32).unwrap_or(0));
+    let txt = |b: &[u8]| alloc::string::String::from_utf8_lossy(b).into_owned();
+    // A userspace log line (payload 8, `UserspaceLogMessage`): shown, not answered.
+    if let Some(log) = get(8) {
+        line(rep, alloc::format!("t={t_ms} ms: modem_svc log (id A#{}): {}\n", id.unwrap_or(0), txt(log.bytes).trim_matches(|c: char| !c.is_ascii_graphic())));
+        return None;
+    }
+    let (Some(1), Some(id), Some(prop)) = (ty, id, get(7)) else {
+        line(rep, alloc::format!("t={t_ms} ms: modem_svc: type {:?} id {:?}, payload {:?}, not answered\n", ty, id, top.iter().filter(|f| f.num >= 5).map(|f| f.num).collect::<Vec<_>>()));
+        return None;
+    };
+    let op = pb_fields(prop.bytes)?;
+    let mut inner = Vec::new();
+    for f in op.iter() {
+        let kv = pb_fields(f.bytes)?;
+        let key = kv.iter().find(|x| x.num == 1).map(|x| x.bytes).unwrap_or(&[]);
+        match f.num {
+            3 => {
+                let val = kv.iter().find(|x| x.num == 2).map(|x| x.bytes).unwrap_or(&[]);
+                line(rep, alloc::format!("t={t_ms} ms: modem_svc property write {} = {} (token A#{token})\n", txt(key), txt(val)));
+                match props.iter_mut().find(|(k, _)| k.as_slice() == key) {
+                    Some(e) => e.1 = val.to_vec(),
+                    None => props.push((key.to_vec(), val.to_vec())),
+                }
+                pb_put_bytes(&mut inner, 4, &[]);
+            }
+            1 => {
+                let val = props.iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v.clone()).unwrap_or_default();
+                line(rep, alloc::format!("t={t_ms} ms: modem_svc property read {} -> \"{}\" (token A#{token})\n", txt(key), txt(&val)));
+                let mut r = Vec::new();
+                pb_put_bytes(&mut r, 1, &val);
+                pb_put_bytes(&mut inner, 2, &r);
+            }
+            _ => {}
+        }
+    }
+    if inner.is_empty() {
+        return None;
+    }
+    let mut out = alloc::vec![0x08, 0x02, 0x15];
+    out.extend_from_slice(&id.to_le_bytes());
+    out.push(0x1D);
+    out.extend_from_slice(&token.to_le_bytes());
+    pb_put_bytes(&mut out, 7, &inner);
+    Some(out)
+}
+
 /// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
-fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: bool) {
+fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut done = [0u32; PP_QUEUES as usize];
-    let mut link = SitLink { frame: 0, ch: 0, token: 0 };
-    let mut probed = false;
+    let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
+    let (mut probed, mut powered) = (false, false);
+    let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
     let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
@@ -1528,11 +1698,19 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: bool) {
             }
         }
         last = now_s;
-        if probe && !probed && since_us(t0) > 2_000_000 {
+        if probe >= 1 && !probed && since_us(t0) > 2_000_000 {
             probed = true;
             match sit_request(&mut link, SIT_GET_RADIO_POWER, &[]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        if probe >= 2 && !powered && since_us(t0) > 3_000_000 {
+            powered = true;
+            // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data.
+            match sit_request(&mut link, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER on (G#{SIT_SET_RADIO_POWER:X}) token A#{tok}\n", since_us(t0) / 1000)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
@@ -1549,6 +1727,14 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: bool) {
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
             per_ch[ch as usize] += 1;
+            if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
+                let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
+                if let Some(reply) = modem_svc(rep, since_us(t0) / 1000, &body, &mut props) {
+                    if let Err(e) = fmt_send(&mut link, CH_MODEM_SVC, &reply) {
+                        line(rep, alloc::format!("  modem_svc reply not sent: {e}\n"));
+                    }
+                }
+            }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
@@ -1563,8 +1749,10 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: bool) {
                 };
                 let tok = b(6) as u32 | (b(7) as u32) << 8 | (b(8) as u32) << 16 | (b(9) as u32) << 24;
                 let params = |i: u32| b(rcm_hdr + i);
+                // Parameters only for messages that carry no identity (sit_shown); the rest by header alone.
+                let np = if sit_shown(id) { (flen - 12 - rcm_hdr).min(16) } else { 0 };
                 let resp = if ty == 1 { alloc::format!(" token A#{tok} error G#{:X}", b(10)) } else { alloc::string::String::new() };
-                line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} len A#{len}{resp}: {}\n", since_us(t0) / 1000, hex(&params, (flen - 12 - rcm_hdr).min(16))));
+                line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} {} len A#{len}{resp}: {}\n", since_us(t0) / 1000, sit_name(id), hex(&params, np)));
                 frames += 1;
             } else if frames < 48 {
                 let named = ch == 41 || (129..=136).contains(&ch);
