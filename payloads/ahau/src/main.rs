@@ -43,6 +43,9 @@ const RING: u64 = 2;
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
+/// The keyboard as drawn untinted, keys and labels (one channel: it is all grey), its rows from `kb.top` to the bar's foot, and each pixel's key (`Keyboard::tint_index`, 255 for none): a stroke's rainbow is one pass over these (owner, 2026-10-29: a mask and an index to fill), with nothing cleared and no label drawn again, where a whole redraw took 33 label calls to the display and showed the board half drawn. 2²⁰ pixels hold the 1344-wide board's 621 rows.
+static mut KB_BASE: [u16; 1 << 20] = [0; 1 << 20];
+static mut KB_INDEX: [u8; 1 << 20] = [0; 1 << 20];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
 /// The mark's two maps (tapuwae::FreshCell, 8 bytes a sample): where the masked pixels' samples fall in the set, worked out once, so a new handle costs the balls' shading alone. Independent, so the coarse pass is a sixteenth of the fine one at boot too: the coarse map, a pixel's centre (2¹⁸ cells, 2 MiB, for the 900 px mark's 171 643 masked pixels); the fine map, 4 × 4 a pixel, filled by the first fine pass to reach each (3·2²⁰ cells, 24 MiB, for 2.75 M). Past either tapuwae works the rest out again.
@@ -224,7 +227,7 @@ impl Ahau {
             return false;
         }
         self.kb.layout = l;
-        self.kb.draw(self.surf(), &mut self.label());
+        self.redraw_keys();
         true
     }
 
@@ -454,7 +457,63 @@ impl Ahau {
         self.status(self.prompt());
         self.entry();
         self.button();
-        self.kb.draw(self.surf(), &mut self.label());
+        self.redraw_keys();
+    }
+
+    /// The keyboard's rows: from its top to the bar's foot.
+    fn kb_rows(&self) -> (usize, usize) {
+        (self.kb.top, self.h - honeycomb::corner_rows(self.w, self.h))
+    }
+
+    /// The whole keyboard drawn again (at start, and for a new view, a shift or a layout): untinted, from a copy with the tint off; its pixels kept as the base with each one's key; then the rainbow laid on from them.
+    fn redraw_keys(&self) {
+        let mut plain = self.kb.clone();
+        plain.tint = None;
+        plain.draw(self.surf(), &mut self.label());
+        let (top, bottom) = self.kb_rows();
+        // WHY: the board's size follows the panel's; one too big for the base draws tinted the slow way (every key and label again) instead of indexing past it.
+        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE)).len() } {
+            self.kb.draw(self.surf(), &mut self.label());
+            return;
+        }
+        let s = self.surf();
+        let (base, index) = unsafe { (&mut *(&raw mut KB_BASE), &mut *(&raw mut KB_INDEX)) };
+        for y in top..bottom {
+            for x in 0..self.w {
+                let i = (y - top) * self.w + x;
+                base[i] = (s[y * self.w + x] & 0xFFFF) as u16;
+                index[i] = match self.kb.hit(x as i64, y as i64) {
+                    Key::None => 255,
+                    k => honeycomb::Keyboard::tint_index(k) as u8,
+                };
+            }
+        }
+        self.apply_tint();
+    }
+
+    /// The rainbow laid on the board from its base, every pixel in one pass: each key's tint weighted by how near the pixel is to the key's own grey, whole on the key and its edge (at or below the grey), none on the label (at its grey, LABEL), in between across the label's anti-aliased edge, so the labels stay white.
+    fn apply_tint(&self) {
+        let Some(t) = &self.kb.tint else { return };
+        let (top, bottom) = self.kb_rows();
+        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE)).len() } {
+            return;
+        }
+        let s = self.surf();
+        let (base, index) = unsafe { (&*(&raw const KB_BASE), &*(&raw const KB_INDEX)) };
+        let label = honeycomb::LABEL as u64;
+        let one = 1i64 << 14;
+        for i in 0..(bottom - top) * self.w {
+            let k = index[i];
+            if k == 255 {
+                continue;
+            }
+            let p = base[i] as u64;
+            let f = if k < 48 { honeycomb::KEY } else { honeycomb::BAR_KEY };
+            let weight = if p <= f { one } else if p >= label { 0 } else { (((label - p) << 14) / (label - f)) as i64 };
+            let tint = t[k as usize];
+            let ch = |c: usize| (p as i64 * (one + (weight * (tint[c] as i64 - one) >> 14)) >> 14) as u64;
+            s[top * self.w + i] = ch(0) | ch(1) << 16 | ch(2) << 32;
+        }
     }
 
     fn prompt(&self) -> &'static str {
@@ -654,14 +713,14 @@ impl Ahau {
                 self.entry();
             }
             Some(Event::Redraw) => {
-                self.kb.draw(self.surf(), &mut self.label());
+                self.redraw_keys();
                 return;
             }
             None => return,
         }
-        // Every stroke: the keys take the new handle's rainbow.
+        // Every stroke: the keys take the new handle's rainbow, laid on from the base in one pass.
         self.retint();
-        self.kb.draw(self.surf(), &mut self.label());
+        self.apply_tint();
     }
 
     /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear light the grey mixed a quarter of the way to a hue of the same luminance (Rec. 709 weights), back to gamma 2 as a multiplier per channel.
@@ -1005,7 +1064,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
                     a.kb.draw_key(a.surf(), key, false, &mut a.label());
                     slid = true;
                 }
-                Touch::Scrolled => a.kb.draw(a.surf(), &mut a.label()),
+                Touch::Scrolled => a.redraw_keys(),
                 Touch::Tap(key) => {
                     a.tap(key);
                     slid = false;
