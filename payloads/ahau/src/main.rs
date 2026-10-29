@@ -9,7 +9,7 @@
 //!
 //! The scratch is this process's own .bss (25 MiB): the entry's header (`ferrosRT`, ferros_rt's) tells the kernel how much zeroed memory follows the code, so the arc holds it (payload.ld).
 //!
-//! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). The two names under the status line switch it, for a person whose layout the device does not have yet; the change is the device's setting, kept in its settings document.
+//! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). There is no switch on this screen (owner, 2026-10-29: the room went to the mark); the layout is set from the identity's settings or `diag pref`, and the keyboard follows it.
 //!
 //! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the Photon client looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
 //!
@@ -31,14 +31,20 @@ const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
 const S_IRA: u64 = 6;
-/// The attest mark's pixels as tapuwae renders them (α + darkness, 8 bits a channel), drawn once at start into this buffer and blitted at every redraw; its side is FRESH_SIDE (0 until drawn, or when there is no mark and the ring stands in).
-/// 2¹⁷ pixels holds a mark of radius up to 179 (side 2r + 4): w/8 on panels up to 1432 wide.
-static mut FRESH: [u32; 1 << 17] = [0; 1 << 17];
+/// The attest mark's pixels as tapuwae renders them (α + darkness, 8 bits a channel), drawn once by the mark's own thread and blitted at every redraw after; its side is FRESH_SIDE.
+/// 2²⁰ pixels holds a mark of radius up to 510 (side 2r + 4): w/3 on panels up to 1530 wide.
+static mut FRESH: [u32; 1 << 20] = [0; 1 << 20];
 static mut FRESH_SIDE: usize = 0;
+/// Where the mark stands: PENDING while its thread renders (the screen shows nothing there yet), READY once FRESH holds it, RING when there is none (no ira key, a panel too wide) and the drawn ring stands in.
+static FRESH_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(PENDING);
+const PENDING: u64 = 0;
+const READY: u64 = 1;
+const RING: u64 = 2;
+/// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
+static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
+static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_PHOTON_EP: u64 = 8;
-/// The layouts' names, as the switch shows them (honeycomb::LETTERS order). Names, not words: the same in every language.
-const LAYOUT_NAMES: [&str; honeycomb::LAYOUTS] = ["Dvorak", "QWERTY"];
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
@@ -160,39 +166,21 @@ impl Ahau {
     }
 
     /// Where things go, from the screen's size: the mark's centre and radius, the title's and status line's baselines and sizes, the entry's baseline and size.
+    /// The mark: two thirds of the width across (owner, 2026-10-29), its top just under the front camera. The camera's hole is centred 75 px down a 1344-wide panel with a 43.25 px radius (husky's display cutout, Android's device overlay config_mainBuiltInDisplayCutout), so its lower edge is 118.25/1344 = 473/5376 of the width down; the mark starts 2⁻⁶ of the width below that.
     fn mark_at(&self) -> (usize, usize, usize) {
-        (self.w / 2, self.h / 5, self.w / 8)
-    }
-    fn title_at(&self) -> (usize, usize) {
-        let (_, cy, r) = self.mark_at();
-        (cy + r + self.w / 6, self.w / 14)
+        let r = self.w / 3;
+        let top = self.w * 473 / 5376 + self.w / 64;
+        (self.w / 2, top + r, r)
     }
     fn status_at(&self) -> (usize, usize) {
-        let (t, ts) = self.title_at();
-        (t + ts + self.w / 24, self.w / 34)
-    }
-    /// The layout switch: the layouts' names side by side under the status line, the current one bright.
-    fn switch_at(&self) -> (usize, usize) {
-        let (b, _) = self.status_at();
-        (b + self.w / 10, self.w / 30)
+        let (_, cy, r) = self.mark_at();
+        (cy + r + self.w / 16, self.w / 34)
     }
 
-    fn switch(&self) {
-        let (b, px) = self.switch_at();
-        self.clear_rows(b - px * 3 / 2, b + px / 2);
-        let n = LAYOUT_NAMES.len();
-        for (i, name) in LAYOUT_NAMES.iter().enumerate() {
-            // Each name centred in its share of the middle half of the width.
-            let cx = self.w / 4 + self.w * (2 * i + 1) / (4 * n);
-            let x = cx as i64 - name.len() as i64 * px as i64 * 28 / 100;
-            window::text(self.display, self.base, x as i16, b as i16, px as u16, if i == self.kb.layout { TEXT } else { QUIET / 2 }, name.as_bytes());
-        }
-    }
-
-    /// The unlock-at-boot toggle row (shown on the entry only), under the layout switch: its baseline and size.
+    /// The unlock-at-boot toggle row (shown on the entry only), under the status line: its baseline and size.
     fn unlock_at(&self) -> (usize, usize) {
-        let (b, px) = self.switch_at();
-        (b + px * 2, px)
+        let (b, _) = self.status_at();
+        (b + self.w / 10 + self.w / 15, self.w / 30)
     }
 
     /// The toggle: "unlock at boot:  off  on", the chosen one bright, and when on a warning under it. Cleared outside the entry.
@@ -213,7 +201,7 @@ impl Ahau {
         }
     }
 
-    /// A tap on no key: the button under the entry line acts; the layout switch, or the unlock-at-boot toggle.
+    /// A tap on no key: the button under the entry line acts, or the unlock-at-boot toggle.
     fn tap_at(&mut self, x: i64, y: i64) {
         // The unlock-at-boot toggle (entry only).
         if self.mode == Mode::Fresh {
@@ -248,18 +236,9 @@ impl Ahau {
             }
             return;
         }
-        let (b, px) = self.switch_at();
-        if y < (b - px * 3 / 2) as i64 || y >= (b + px / 2) as i64 || x < (self.w / 4) as i64 || x >= (self.w * 3 / 4) as i64 {
-            return;
-        }
-        let i = (x as usize - self.w / 4) * LAYOUT_NAMES.len() / (self.w / 2);
-        if i != self.kb.layout && ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_LAYOUT, i as u8) == ferros_sys::ERR {
-            console(self.grants, b"ahau: the layout switch was refused\n");
-        }
-        // The kernel rewrites every process's preferences; `follow_layout` redraws on the next pass.
     }
 
-    /// The device's layout changed (here, or from anywhere else): the keyboard and the switch follow.
+    /// The device's layout changed (from anywhere: the identity's settings, `diag pref`): the keyboard follows.
     fn follow_layout(&mut self) -> bool {
         let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
         if l == self.kb.layout || l >= honeycomb::LAYOUTS {
@@ -267,7 +246,6 @@ impl Ahau {
         }
         self.kb.layout = l;
         self.kb.draw(self.surf(), &mut self.label());
-        self.switch();
         true
     }
 
@@ -354,11 +332,11 @@ impl Ahau {
         }
     }
 
-    /// The pairing words while joining, six to a row under the layout switch, split at the capitals they come camelCased with; cleared otherwise.
+    /// The pairing words while joining, six to a row under the status line, split at the capitals they come camelCased with; cleared otherwise.
     fn words(&self) {
-        let (sb, spx) = self.switch_at();
+        let (ub, upx) = self.unlock_at();
         let px = self.w / 30;
-        let top = sb + spx;
+        let top = ub - upx;
         self.clear_rows(top, top + px * 9);
         if !matches!(self.mode, Mode::Join(_)) {
             return;
@@ -499,13 +477,8 @@ impl Ahau {
     fn all(&self) {
         self.surf().fill(0);
         let (cx, cy, r) = self.mark_at();
-        if !blit_fresh(self.surf(), self.w, cx, cy) {
-            mark(self.surf(), self.w, cx, cy, r);
-        }
-        let (tb, tpx) = self.title_at();
-        self.centred(tb, tpx, TEXT, "attest");
+        draw_mark(self.surf(), self.w, cx, cy, r);
         self.status(self.prompt());
-        self.switch();
         self.unlock_row();
         self.entry();
         self.button();
@@ -718,19 +691,40 @@ fn mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     }
 }
 
-/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's. Drawn once, on the X3 (the one big core: a few hundred milliseconds there), into FRESH, with the time on the console.
-/// Without the ira grant, or on a panel too wide for the buffer, FRESH_SIDE stays 0 and the ring stands in.
-fn render_fresh_mark(grants: u64, r: usize) {
+/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's.
+/// Rendered on a thread of its own pinned to the X3 (the one big core: about a second at two thirds of the width), so the screen and the keyboard are up at once and the mark appears when it is done; the main loop blits it when FRESH_STATE turns READY.
+/// Without the ira grant, or on a panel too wide for the buffer, the state is RING and the drawn ring stands in.
+fn start_fresh_mark(grants: u64, r: usize) {
     let side = 2 * r + 4;
     // WHY: r comes from the display server's panel width; a wider panel than this buffer was sized for falls back to the drawn ring instead of rendering past FRESH's end.
     if side * side > unsafe { (&*(&raw const FRESH)).len() } {
         console(grants, b"ahau: the panel is too wide for the mark's buffer; the ring stands in\n");
+        FRESH_STATE.store(RING, core::sync::atomic::Ordering::Release);
         return;
     }
     let Some(salt) = ferros_sys::ira_key(cap(grants, S_IRA), "attest mark") else {
         console(grants, b"ahau: no ira key; the ring stands in\n");
+        FRESH_STATE.store(RING, core::sync::atomic::Ordering::Release);
         return;
     };
+    unsafe { FRESH_JOB = (grants, r, salt) };
+    let stack = unsafe { &mut *(&raw mut FRESH_STACK) };
+    if ferros_sys::thread_spawn(fresh_thread, stack, 0) == ferros_sys::ERR {
+        // No thread: render here, before the screen comes up.
+        console(grants, b"ahau: no thread for the mark; rendering it first\n");
+        render_fresh_mark();
+    }
+}
+
+extern "C" fn fresh_thread(_: u64) -> ! {
+    render_fresh_mark();
+    ferros_sys::thread_exit(0)
+}
+
+/// The render itself, on the X3, with its time on the console; then READY.
+fn render_fresh_mark() {
+    let (grants, r, salt) = unsafe { FRESH_JOB };
+    let side = 2 * r + 4;
     ferros_sys::pin(ferros_sys::CORES_BIG);
     sleep_until(now() + freq() / 1000);
     let t0 = now();
@@ -740,16 +734,21 @@ fn render_fresh_mark(grants: u64, r: usize) {
     let mut l = Line::new();
     let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark ({side} px, 2x2) in {} ms on the X3\n", ferros_sys::us_since(t0) / 1000));
     console(grants, l.as_bytes());
-    ferros_sys::pin(0);
     unsafe { FRESH_SIDE = side };
+    FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
 }
 
-/// The rendered mark centred at (cx, cy) on the surface: tapuwae's α + darkness over black is α − darkness a channel (8 bits), widened to the surface's gamma-2 values (white = Q14), red in the low 16 bits as the display server reads them. False when there is no rendered mark.
-fn blit_fresh(s: &mut [u64], w: usize, cx: usize, cy: usize) -> bool {
-    let side = unsafe { FRESH_SIDE };
-    if side == 0 {
-        return false;
+/// The mark centred at (cx, cy) on the surface, as it stands: the rendered mark when READY (tapuwae's α + darkness over black is α − darkness a channel, 8 bits, widened to the surface's gamma-2 values, white = Q14, red in the low 16 bits as the display server reads them), the ring when RING, nothing while PENDING.
+fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
+    match FRESH_STATE.load(core::sync::atomic::Ordering::Acquire) {
+        READY => {}
+        RING => {
+            mark(s, w, cx, cy, r);
+            return;
+        }
+        _ => return,
     }
+    let side = unsafe { FRESH_SIDE };
     let buf = unsafe { &(&*(&raw const FRESH))[..side * side] };
     let (x0, y0) = (cx - side / 2, cy - side / 2);
     for y in 0..side {
@@ -763,7 +762,6 @@ fn blit_fresh(s: &mut [u64], w: usize, cx: usize, cy: usize) -> bool {
             s[(y0 + y) * w + x0 + x] = ch(16) | ch(8) << 16 | ch(0) << 32;
         }
     }
-    true
 }
 
 #[unsafe(no_mangle)]
@@ -803,7 +801,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
-    render_fresh_mark(grants, w / 8);
+    start_fresh_mark(grants, w / 3);
     a.all();
     a.show();
     console(grants, if mode == Mode::Starting { b"ahau: unlock at boot: the client loaded the stored seed; waiting for membership\n" } else { b"ahau: no identity in hand; type the handle\n" });
@@ -812,7 +810,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     // Every key exact: a rolling finger still types where it landed.
     touches.trace_words = false;
     let mut held = [(0u8, 0i64, 0i64); 16];
+    // Whether the mark has been drawn since its thread finished.
+    let mut mark_shown = false;
     loop {
+        if !mark_shown && FRESH_STATE.load(core::sync::atomic::Ordering::Acquire) == READY {
+            let (cx, cy, r) = a.mark_at();
+            draw_mark(a.surf(), a.w, cx, cy, r);
+            a.show();
+            mark_shown = true;
+        }
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
         let mut k = 0;
