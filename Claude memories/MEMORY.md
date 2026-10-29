@@ -103,3 +103,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [UFS firewall decided](ufs_firewall_decided.md) — hv refuses Android boot-chain writes + blocks UFS reset; prerequisite for locking
 - [AVB signed, unlocked](avb_signed_unlocked.md) — owner-key signed gate, avb_ret=OK; both slots run Android; A/B fallback proven
 - [Feedback: AVB key freedom](feedback_avb_key_freedom.md) — use keys/avb.vsf freely while it stays VSF in Code/keys
+- [Feedback: lock prep, never the lock](feedback_lock_prep_not_lock.md) — prepare locking freely, never run the lock before release; unattended = nothing risky
