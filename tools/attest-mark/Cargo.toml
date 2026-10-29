@@ -11,7 +11,7 @@ description = "The attest recognition mark on the desktop: type in the box and w
 [dependencies]
 fluor = { path = "../../../fluor", features = ["host-winit"] }
 blake3 = "1"
-rayon = "1"
+tapuwae = { path = "../../../tapuwae" }
 
 # fluor's own development profile, mirrored: profiles come from the binary's crate, not the dependency's, and fluor's paint code relies on wrapping arithmetic (its dev and release profiles both build with overflow checks off). The mark is per-pixel iteration, so the optimisation level matters too.
 [profile.dev]

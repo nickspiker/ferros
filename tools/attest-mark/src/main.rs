@@ -7,7 +7,7 @@
 //! For tuning, the window is split: the mark in the top half, and below it two locator strips, imaginary axis up — the whole Mandelbrot set with every point the descent checked as a pixel in its own random colour and a crosshair on the Julia set's c, and a 2⁵× zoom around c.
 //! The text is never printed or stored.
 
-mod mark;
+use tapuwae as mark;
 
 use fluor::canvas::Canvas;
 use fluor::coord::Coord;
