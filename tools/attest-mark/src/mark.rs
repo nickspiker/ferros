@@ -60,8 +60,9 @@ pub struct Params {
     half: f64,
     /// The view's rotation as (cos, sin): plane = centre + rot·(u + iv) for screen offsets (u, v), v downward.
     rot: (f64, f64),
-    /// Per-channel palette phases.
-    phase: [f64; 3],
+    /// The palette family (an index into PALETTES) and a turn of it, both from the salt.
+    palette: u8,
+    hue: f64,
     /// Colouring method: 0 smooth bands, 1 escape angle, 2 orbit trap.
     mode: u8,
     /// The orbit trap's point, for mode 2.
@@ -77,7 +78,8 @@ struct View {
     c: (f32, f32),
     centre: (f32, f32),
     rot: (f32, f32),
-    phase: [f32; 3],
+    palette: u8,
+    hue: f32,
     mode: u8,
     trap: (f32, f32),
 }
@@ -85,7 +87,7 @@ struct View {
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), phase: [self.phase[0] as f32, self.phase[1] as f32, self.phase[2] as f32], mode: self.mode, trap: f(self.trap) }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), palette: self.palette, hue: self.hue as f32, mode: self.mode, trap: f(self.trap) }
     }
 }
 
@@ -399,10 +401,10 @@ impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
         let f = draw(salt, 1, 0, &[]);
-        let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
+        let (palette, hue) = (f[0] & (PALETTES.len() as u8 - 1), (unit(&f[4..8]) - 0.5) * 0.25);
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap, radius: 1. };
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), palette, hue, mode, trap, radius: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
@@ -465,33 +467,69 @@ impl Params {
     }
 }
 
-/// The palette: a cosine per channel, each with its own phase, in [0, 1].
+/// Curated cosine palettes, colour(t) = a + b·cos(2π(c·t + d)) per channel, as (a, b, c, d): smooth and periodic in t, each a family that reads as one mood rather than a random rainbow.
+/// The constants are the palette's design (in the style of Íñigo Quílez's cosine palettes), not tuning knobs.
+const PALETTES: [([f32; 3], [f32; 3], [f32; 3], [f32; 3]); 8] = [
+    // Ember: black-red through orange to gold.
+    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 1.], [0., 0.1, 0.2]),
+    // Aurora: teal, green, violet.
+    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 0.5], [0.8, 0.9, 0.3]),
+    // Copper and verdigris.
+    ([0.55, 0.42, 0.33], [0.45, 0.33, 0.27], [1., 1., 1.], [0., 0.12, 0.25]),
+    // Deep sea: indigo to cyan.
+    ([0.4, 0.5, 0.6], [0.4, 0.4, 0.4], [1., 1., 1.], [0.55, 0.45, 0.35]),
+    // Rose and gold.
+    ([0.8, 0.5, 0.4], [0.2, 0.4, 0.2], [2., 1., 1.], [0., 0.25, 0.25]),
+    // Spectrum.
+    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 1.], [0., 0.33, 0.67]),
+    // Lagoon: sand to turquoise.
+    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 0.7, 0.4], [0., 0.15, 0.2]),
+    // Dusk: plum, amber, lilac.
+    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [2., 1., 0.], [0.5, 0.2, 0.25]),
+];
+
+/// The palette at `t`, turned by `hue`.
 #[inline]
-fn palette(t: f32, phase: &[f32; 3]) -> [f32; 3] {
+fn palette(t: f32, v: &View) -> [f32; 3] {
+    let (a, b, c, d) = PALETTES[v.palette as usize];
     let tau = TAU as f32;
-    [
-        0.5 + 0.5 * (tau * (t + phase[0])).cos(),
-        0.5 + 0.5 * (tau * (t + phase[1])).cos(),
-        0.5 + 0.5 * (tau * (t + phase[2])).cos(),
-    ]
+    [0, 1, 2].map(|i| a[i] + b[i] * (tau * (c[i] * t + d[i] + v.hue)).cos())
 }
 
-/// One point of the plane, as an opaque α + darkness pixel; `k` is plane units per pixel.
+/// The look's tweaks, applied at render time: `offset` is a complex offset of the colouring coordinate (see `shade`); `light` is the direction the disc is lit from, (x right, y down, z toward the viewer), normalised by the renderer.
+#[derive(Clone, Copy)]
+pub struct Look {
+    pub offset: (f32, f32),
+    pub light: (f32, f32, f32),
+}
+
+impl Default for Look {
+    /// No offset, lit from the top left and a little in front.
+    fn default() -> Self {
+        Look { offset: (0., 0.), light: (-1., -1., 1.5) }
+    }
+}
+
+/// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel.
+/// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u runs along the palette and Im u sets a soft light and shade across it (¾ to 1 of full, as cos 2π·Im u), so both halves of the offset visibly move the colour in every method.
+/// Around it: the set's body dark with the colouring faintly inside, a luminous rim about 2 pixels out, and the field dimmed and fading to black far from the set.
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32) -> [f32; 3] {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
     // Smooth iteration count.
     let nu = if escaped { o.n as f32 + 1. - r.ln().log2() } else { MAX_ITER as f32 };
-    let t = match v.mode {
+    let re = match v.mode {
         0 => nu * (1. / (1 << 4) as f32),
         // The orbit's angle at escape, turned by the smooth count: cells that tile each level of the set.
         1 => o.y.atan2(o.x) / TAU as f32 + nu * (1. / (1 << 5) as f32),
         // How close the orbit came to the trap, on a log scale: rings and petals around each preimage of the trap.
         _ => -(o.trap_sq.ln()) * (1. / (1 << 3) as f32),
-    };
-    let col = palette(t, &v.phase);
+    } + look.offset.0;
+    let im = o.y.atan2(o.x) / TAU as f32 + look.offset.1;
+    let shimmer = 0.875 + 0.125 * (TAU as f32 * im).cos();
+    let col = palette(re, v);
     // Distance to the set in pixels (0 on it).
     let dist_px = if escaped { r * r.ln() / o.dm / k } else { 0. };
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
@@ -501,8 +539,8 @@ fn shade(x: f32, y: f32, v: &View, k: f32) -> [f32; 3] {
     let rim = (-(l * l)).exp2();
     // Field: the colouring, dimmed, fading to black far from the set.
     let field = (1. - (-nu * 0.125).exp2()) * 0.375;
-    let gain = body * 0.1875 + rim * 0.875 + (1. - body) * field;
-    [col[0] * gain, col[1] * gain, col[2] * gain]
+    let gain = (body * 0.1875 + rim * 0.875 + (1. - body) * field) * shimmer;
+    col.map(|c| c * gain)
 }
 
 /// A visible colour in [0, 1] per channel at opacity α in [0, 1], as a fluor α + darkness pixel: darkness is premultiplied by α (an empty pixel is 0, opaque black is all ones).
@@ -520,7 +558,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k), 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default()), 1.);
         }
     });
 }
@@ -528,9 +566,14 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
 /// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0).
 /// A disc point p (in units of r) shows z = eye + R·rot·p/√(1 − |p|²): the plane wrapped onto a hemisphere seen from above, its infinity at the rim.
 /// The disc's own edge is anti-aliased with a C∞ step, ½ + ½·tanh(2·(r − |pixel − centre|)), about a pixel wide.
-pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params) {
+pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
     let v = p.view();
     let rad = p.radius as f32;
+    let ll = (look.light.0 * look.light.0 + look.light.1 * look.light.1 + look.light.2 * look.light.2).sqrt();
+    let light = (look.light.0 / ll, look.light.1 / ll, look.light.2 / ll);
+    // Blinn's half vector between the light and the viewer (0, 0, 1).
+    let hl = (light.0 * light.0 + light.1 * light.1 + (light.2 + 1.) * (light.2 + 1.)).sqrt();
+    let half_v = (light.0 / hl, light.1 / hl, (light.2 + 1.) / hl);
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
@@ -552,7 +595,15 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
             // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
             let k = rad / (r * (1. - q2));
-            row[px] = pack(shade(x, y, &v, k), cover);
+            let base = shade(x, y, &v, k, look);
+            // The ball, lit: its normal is (p, √(1 − |p|²)). Diffuse is half-Lambert squared, ((1 + n·l)/2)², smooth and never clipped, so the far side darkens without a terminator line; the highlight is Blinn's ((1 + n·h)/2)^2⁶, a soft white gloss toward the light; a little ambient keeps the shadowed side legible.
+            let nz = (1. - q2).sqrt();
+            let nl = qx * light.0 + qy * light.1 + nz * light.2;
+            let nh = qx * half_v.0 + qy * half_v.1 + nz * half_v.2;
+            let diffuse = (0.5 + 0.5 * nl) * (0.5 + 0.5 * nl);
+            let gloss = (0.5 + 0.5 * nh).powi(1 << 6) * 0.375;
+            let lit = 0.1875 + 0.8125 * diffuse * 1.25;
+            row[px] = pack(base.map(|c| c * lit + gloss), cover);
         }
     });
 }

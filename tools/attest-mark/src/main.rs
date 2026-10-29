@@ -3,6 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
+//! Ctrl+arrows nudge the colouring's complex offset (printed), to tune the look for the final sphere.
 //! For tuning, the window is split: the mark in the top half, and below it two locator strips, imaginary axis up — the whole Mandelbrot set with every point the descent checked as a pixel in its own random colour and a crosshair on the Julia set's c, and a 2⁵× zoom around c.
 //! The text is never printed or stored.
 
@@ -10,7 +11,7 @@ mod mark;
 
 use fluor::canvas::Canvas;
 use fluor::coord::Coord;
-use fluor::event::{CursorIcon, ElementState, Event, Key, MouseButton};
+use fluor::event::{CursorIcon, ElementState, Event, Key, MouseButton, NamedKey};
 use fluor::geom::Viewport;
 use fluor::host::app::{Context, EventResponse, FluorApp};
 use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
@@ -32,6 +33,7 @@ struct App {
     hit_counter: HitId,
     textbox: Textbox,
     device: u32,
+    look: mark::Look,
     salt: [u8; 32],
     /// The rendered mark (α + darkness) and what it was rendered for: (width, height, hash of salt and text).
     mark: Vec<u32>,
@@ -53,6 +55,7 @@ impl App {
             hit_counter,
             textbox,
             device: 0,
+            look: mark::Look::default(),
             salt: salt_for(0),
             mark: Vec::new(),
             mark_key: (0, 0, [0; 32]),
@@ -154,6 +157,24 @@ impl FluorApp for App {
                 EventResponse::StartWindowDrag
             }
             Event::KeyboardInput { event: kev } if kev.state == ElementState::Pressed => {
+                // Ctrl+arrows nudge the colouring's complex offset by 2⁻⁴ (left/right the real part, up/down the imaginary).
+                if ctx.modifiers.control_key() {
+                    let step = 1. / (1 << 4) as f32;
+                    let nudge = match &kev.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => Some((-step, 0.)),
+                        Key::Named(NamedKey::ArrowRight) => Some((step, 0.)),
+                        Key::Named(NamedKey::ArrowUp) => Some((0., step)),
+                        Key::Named(NamedKey::ArrowDown) => Some((0., -step)),
+                        _ => None,
+                    };
+                    if let Some((dr, di)) = nudge {
+                        self.look.offset = (self.look.offset.0 + dr, self.look.offset.1 + di);
+                        println!("colour offset {:+.4} {:+.4}i", self.look.offset.0, self.look.offset.1);
+                        self.mark_key.2 = [0; 32];
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
+                }
                 if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("r")) {
                     self.device += 1;
                     self.salt = salt_for(self.device);
@@ -203,7 +224,7 @@ impl FluorApp for App {
             let (whole, near) = rest.split_at_mut(w * h1);
             // The mark spherized into a disc above the textbox: radius a quarter of the pane's span, centred at 0.45 of its height; the rest of the pane is black.
             let span = 2. * (w * h0) as f32 / (w + h0) as f32;
-            mark::render_disc(top, w, w as f32 * 0.5, h0 as f32 * 0.45, span * 0.25, &p);
+            mark::render_disc(top, w, w as f32 * 0.5, h0 as f32 * 0.45, span * 0.25, &p, &self.look);
             for px in top.iter_mut() {
                 *px = px.under(0xFF_FF_FF_FF, BlendMode::Normal);
             }
