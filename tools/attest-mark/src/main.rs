@@ -104,7 +104,7 @@ fn smooth_min(a: f32, b: f32) -> f32 {
     0.5 * (a + b - ((a - b) * (a - b) + d * d).sqrt())
 }
 
-/// A tiny grey Mandelbrot set in the box (x0, y0, bw, bh) of `buf` (rows of `w`, α + darkness): the set's whole extent [−2, X_RIGHT] × [−1.15, 1.15], imaginary axis up, fitted inside the box; the set mid grey, the field around it a faint grey by escape speed, and a white pixel at `c`.
+/// A tiny grey Mandelbrot set in the box (x0, y0, bw, bh) of `buf` (rows of `w`, α + darkness): the set's whole extent [−2, X_RIGHT] × [−1.15, 1.15], imaginary axis up, fitted inside the box; the set a dim grey, the field around it fainter still by escape speed, and a full white pixel at `c`.
 fn render_minibrot(buf: &mut [u32], w: usize, x0: usize, y0: usize, bw: usize, bh: usize, c: (f64, f64)) {
     let grey = |g: u32| 0xFF00_0000 | ((255 - g) << 16) | ((255 - g) << 8) | (255 - g);
     let (re0, re1, im_half) = (-2.0f64, mark::X_RIGHT, 1.15f64);
@@ -120,7 +120,8 @@ fn render_minibrot(buf: &mut [u32], w: usize, x0: usize, y0: usize, bw: usize, b
                 (x, y) = (x * x - y * y + cr, 2. * x * y + ci);
                 n += 1;
             }
-            let g = if n == 1 << 8 { 0x90 } else { (72. * (1. - (-(n as f32) / 8.).exp2())) as u32 };
+            // A quarter of the earlier greys (0x90 set, up to 72 field), in display code values, so the set stays in the background; the white pixel at c is not scaled.
+            let g = if n == 1 << 8 { 0x90 >> 2 } else { (18. * (1. - (-(n as f32) / 8.).exp2())) as u32 };
             buf[(y0 + py) * w + x0 + px] = grey(g);
         }
     }
