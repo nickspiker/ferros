@@ -3,7 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
-//! Ctrl+arrows nudge the colouring's complex offset (printed), to tune the look for the final sphere.
+//! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief light's height (both printed), to tune the look for the final sphere.
 //! For tuning, the window is split: the mark in the top half, and below it two locator strips, imaginary axis up — the whole Mandelbrot set with every point the descent checked as a pixel in its own random colour and a crosshair on the Julia set's c, and a 2⁵× zoom around c.
 //! The text is never printed or stored.
 
@@ -167,6 +167,19 @@ impl FluorApp for App {
                         Key::Named(NamedKey::ArrowDown) => Some((0., -step)),
                         _ => None,
                     };
+                    // Ctrl+PageUp / PageDown: the light twice as high (flatter) or half as high (steeper relief).
+                    let height = match &kev.logical_key {
+                        Key::Named(NamedKey::PageUp) => Some(2f32),
+                        Key::Named(NamedKey::PageDown) => Some(0.5),
+                        _ => None,
+                    };
+                    if let Some(f) = height {
+                        self.look.height *= f;
+                        println!("relief height {}", self.look.height);
+                        self.mark_key.2 = [0; 32];
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
                     if let Some((dr, di)) = nudge {
                         self.look.offset = (self.look.offset.0 + dr, self.look.offset.1 + di);
                         println!("colour offset {:+.4} {:+.4}i", self.look.offset.0, self.look.offset.1);

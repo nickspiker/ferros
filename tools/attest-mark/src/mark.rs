@@ -112,6 +112,9 @@ struct Orbit {
     y: f32,
     dm: f32,
     trap_sq: f32,
+    /// The direction of z / (dz/dz₀) at escape, a unit complex number: the outward normal of the potential's level line, the "slope" the set's relief would have there (Julia sets only; (0, 0) in the parameter plane).
+    ux: f32,
+    uy: f32,
 }
 
 /// Iterate z² + c from the plane point (px, py): z₀ = that point in a Julia set, c = that point in the parameter plane.
@@ -123,20 +126,33 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         Kind::Plane => ((0f32, 0f32), (px, py), 1f32, 0f32),
         Kind::Julia => ((px, py), v.c, 0., 1.),
     };
+    let julia = v.kind == Kind::Julia;
     let bail = BAIL_SQ as f32;
     let mut trap_sq = f32::MAX;
+    // The derivative's direction, a unit complex number: dz ← 2·z·dz turns it by arg z each step. Kept apart from its magnitude (dm) so it never overflows, however close to the set.
+    let mut dir = (1f32, 0f32);
     for n in 0..MAX_ITER {
         let (x2, y2) = (z.0 * z.0, z.1 * z.1);
         let r2 = x2 + y2;
         if r2 > bail {
-            return Orbit { n, x: z.0, y: z.1, dm, trap_sq };
+            // u = z / dz, as a direction: z/|z| times the conjugate of dz's direction.
+            let rz = r2.sqrt();
+            let (zx, zy) = (z.0 / rz, z.1 / rz);
+            let (ux, uy) = if julia { (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1) } else { (0., 0.) };
+            return Orbit { n, x: z.0, y: z.1, dm, trap_sq, ux, uy };
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
-        dm = 2. * r2.sqrt() * dm + plus;
+        let rz = r2.sqrt();
+        dm = 2. * rz * dm + plus;
+        if julia {
+            let d = (dir.0 * z.0 - dir.1 * z.1, dir.0 * z.1 + dir.1 * z.0);
+            let dl = (d.0 * d.0 + d.1 * d.1).sqrt();
+            dir = (d.0 / dl, d.1 / dl);
+        }
         z = (x2 - y2 + c.0, 2. * z.0 * z.1 + c.1);
     }
-    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, trap_sq }
+    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, trap_sq, ux: 0., uy: 0. }
 }
 
 /// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel: centre + rot·(u + is).
@@ -500,21 +516,34 @@ fn palette(t: f32, v: &View) -> [f32; 3] {
 #[derive(Clone, Copy)]
 pub struct Look {
     pub offset: (f32, f32),
-    pub light: (f32, f32, f32),
+    /// The light's direction across the screen as a complex number (x right, y down), normalised by the renderer.
+    pub light: (f32, f32),
+    /// How steep the relief reads: the light's height above the picture, in units of the normal's length (0 = grazing, large = flat).
+    pub height: f32,
 }
 
 impl Default for Look {
-    /// No offset, lit from the top left and a little in front.
+    /// No offset, lit from the top left at a moderate height.
     fn default() -> Self {
-        Look { offset: (0., 0.), light: (-1., -1., 1.5) }
+        Look { offset: (0., 0.), light: (-1., -1.), height: 1. }
+    }
+}
+
+impl Look {
+    /// The light's direction in the plane for a view turned by `rot` (plane = centre + rot·screen), as a unit complex number.
+    fn plane_light(&self, rot: (f32, f32)) -> (f32, f32) {
+        let l = (self.light.0 * self.light.0 + self.light.1 * self.light.1).sqrt();
+        let (a, b) = (self.light.0 / l, self.light.1 / l);
+        (a * rot.0 - b * rot.1, a * rot.1 + b * rot.0)
     }
 }
 
 /// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel.
 /// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u runs along the palette and Im u sets a soft light and shade across it (¾ to 1 of full, as cos 2π·Im u), so both halves of the offset visibly move the colour in every method.
 /// Around it: the set's body dark with the colouring faintly inside, a luminous rim about 2 pixels out, and the field dimmed and fading to black far from the set.
+/// Relief: the outside of the set is lit as a surface whose slope is the escape potential's — its normal at a point is (u, h) with u = z/(dz/dz₀) the level line's outward direction and h = `look.height` — by a light from `look.light` (`lp`, already turned into the plane): brightness (1 + (u·l + h)/(1 + h))²/4, smooth and never clipped, so the filaments stand up from the field with their top-left faces lit and their bottom-right faces in shade.
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32; 3] {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -539,7 +568,11 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
     let rim = (-(l * l)).exp2();
     // Field: the colouring, dimmed, fading to black far from the set.
     let field = (1. - (-nu * 0.125).exp2()) * 0.375;
-    let gain = (body * 0.1875 + rim * 0.875 + (1. - body) * field) * shimmer;
+    // u·l is in [−1, 1]; with the height added and scaled by 1 + h it is in [(h − 1)/(h + 1), 1], and half-Lambert squared keeps it smooth and positive. The parameter plane has no relief (u = 0), which reads as evenly lit.
+    let ul = o.ux * lp.0 + o.uy * lp.1;
+    let h = look.height;
+    let relief = if v.kind == Kind::Julia { let t = 0.5 + 0.5 * (ul + h) / (1. + h); t * t * 1.5 } else { 1. };
+    let gain = (body * 0.1875 + (rim * 0.875 + (1. - body) * field) * relief) * shimmer;
     col.map(|c| c * gain)
 }
 
@@ -558,7 +591,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k, &Look::default()), 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default(), Look::default().plane_light(v.rot)), 1.);
         }
     });
 }
@@ -569,11 +602,7 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
 pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
     let v = p.view();
     let rad = p.radius as f32;
-    let ll = (look.light.0 * look.light.0 + look.light.1 * look.light.1 + look.light.2 * look.light.2).sqrt();
-    let light = (look.light.0 / ll, look.light.1 / ll, look.light.2 / ll);
-    // Blinn's half vector between the light and the viewer (0, 0, 1).
-    let hl = (light.0 * light.0 + light.1 * light.1 + (light.2 + 1.) * (light.2 + 1.)).sqrt();
-    let half_v = (light.0 / hl, light.1 / hl, (light.2 + 1.) / hl);
+    let lp = look.plane_light(v.rot);
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
@@ -595,15 +624,7 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
             // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
             let k = rad / (r * (1. - q2));
-            let base = shade(x, y, &v, k, look);
-            // The ball, lit: its normal is (p, √(1 − |p|²)). Diffuse is half-Lambert squared, ((1 + n·l)/2)², smooth and never clipped, so the far side darkens without a terminator line; the highlight is Blinn's ((1 + n·h)/2)^2⁶, a soft white gloss toward the light; a little ambient keeps the shadowed side legible.
-            let nz = (1. - q2).sqrt();
-            let nl = qx * light.0 + qy * light.1 + nz * light.2;
-            let nh = qx * half_v.0 + qy * half_v.1 + nz * half_v.2;
-            let diffuse = (0.5 + 0.5 * nl) * (0.5 + 0.5 * nl);
-            let gloss = (0.5 + 0.5 * nh).powi(1 << 6) * 0.375;
-            let lit = 0.1875 + 0.8125 * diffuse * 1.25;
-            row[px] = pack(base.map(|c| c * lit + gloss), cover);
+            row[px] = pack(shade(x, y, &v, k, look, lp), cover);
         }
     });
 }
