@@ -1,6 +1,6 @@
 //! The mark: the Julia set of z² + c seen through an inversion about its root spiral's eye, with c placed by the descent and the eye found on J(c), both drawn from a hash of (salt, text).
 //!
-//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the palette.
+//! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the theme: one pastel scheme for every device, varied by base hue, hue spread, lightness and chroma.
 //!
 //! Placement, the descent: pick x in [−2, 0.375] and come straight down the line Re c = x from Im c = 2, each step the proven lower bound on the distance to the Mandelbrot set (see `descend`), until within 2⁻¹² of the set — the set's skyline seen from above, its outermost contact on that line, from the antenna through the bulb tops and seahorse valley to the cusp.
 //! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
@@ -60,9 +60,8 @@ pub struct Params {
     half: f64,
     /// The view's rotation as (cos, sin): plane = centre + rot·(u + iv) for screen offsets (u, v), v downward.
     rot: (f64, f64),
-    /// The palette family (an index into PALETTES) and a turn of it, both from the salt.
-    palette: u8,
-    hue: f64,
+    /// The device's theme within the one pastel scheme (see `Theme`), from the salt.
+    theme: Theme,
     /// Colouring method: 0 smooth bands, 1 escape angle, 2 orbit trap.
     mode: u8,
     /// The orbit trap's point, for mode 2.
@@ -78,8 +77,7 @@ struct View {
     c: (f32, f32),
     centre: (f32, f32),
     rot: (f32, f32),
-    palette: u8,
-    hue: f32,
+    theme: Theme,
     mode: u8,
     trap: (f32, f32),
 }
@@ -87,7 +85,7 @@ struct View {
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), palette: self.palette, hue: self.hue as f32, mode: self.mode, trap: f(self.trap) }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), theme: self.theme, mode: self.mode, trap: f(self.trap) }
     }
 }
 
@@ -417,10 +415,15 @@ impl Params {
     /// The picture for this device salt and this textbox content.
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
         let f = draw(salt, 1, 0, &[]);
-        let (palette, hue) = (f[0] & (PALETTES.len() as u8 - 1), (unit(&f[4..8]) - 0.5) * 0.25);
+        let theme = Theme {
+            hue: unit(&f[0..4]) as f32 * TAU as f32,
+            spread: (0.125 + unit(&f[4..8]) * 0.5) as f32,
+            lift: ((unit(&f[8..12]) - 0.5) * 0.0625) as f32,
+            chroma: (0.75 + unit(&f[24..28]) * 0.5) as f32,
+        };
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), palette, hue, mode, trap, radius: 1. };
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), theme, mode, trap, radius: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
@@ -483,33 +486,40 @@ impl Params {
     }
 }
 
-/// Curated cosine palettes, colour(t) = a + b·cos(2π(c·t + d)) per channel, as (a, b, c, d): smooth and periodic in t, each a family that reads as one mood rather than a random rainbow.
-/// The constants are the palette's design (in the style of Íñigo Quílez's cosine palettes), not tuning knobs.
-const PALETTES: [([f32; 3], [f32; 3], [f32; 3], [f32; 3]); 8] = [
-    // Ember: black-red through orange to gold.
-    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 1.], [0., 0.1, 0.2]),
-    // Aurora: teal, green, violet.
-    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 0.5], [0.8, 0.9, 0.3]),
-    // Copper and verdigris.
-    ([0.55, 0.42, 0.33], [0.45, 0.33, 0.27], [1., 1., 1.], [0., 0.12, 0.25]),
-    // Deep sea: indigo to cyan.
-    ([0.4, 0.5, 0.6], [0.4, 0.4, 0.4], [1., 1., 1.], [0.55, 0.45, 0.35]),
-    // Rose and gold.
-    ([0.8, 0.5, 0.4], [0.2, 0.4, 0.2], [2., 1., 1.], [0., 0.25, 0.25]),
-    // Spectrum.
-    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 1., 1.], [0., 0.33, 0.67]),
-    // Lagoon: sand to turquoise.
-    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1., 0.7, 0.4], [0., 0.15, 0.2]),
-    // Dusk: plum, amber, lilac.
-    ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [2., 1., 0.], [0.5, 0.2, 0.25]),
-];
+/// A device's theme within the one pastel scheme: every colour is OKLab lightness L and chroma C at a hue, kept light and soft (L about 0.67 to 0.99, C at most about 0.1), so all devices share one calm, low-contrast look and differ only in these.
+#[derive(Clone, Copy)]
+struct Theme {
+    /// Base hue, radians.
+    hue: f32,
+    /// How far the colouring swings the hue either side of the base, radians (2⁻³ to 2⁻³ + ½): from nearly monochrome to a gentle two-tone.
+    spread: f32,
+    /// A shift of every lightness, ±2⁻⁵.
+    lift: f32,
+    /// A scale of every chroma, ¾ to 1¼.
+    chroma: f32,
+}
 
-/// The palette at `t`, turned by `hue`.
+/// OKLab (L, a, b) to display RGB in [0, 1]: OKLab's own matrices (Björn Ottosson's published constants, not tuning knobs) to linear sRGB, then gamma 2 (√) for display.
+/// The theme's lightness and chroma ranges keep every colour inside the sRGB gamut, so no channel goes negative (`pastels_stay_in_gamut` checks every hue at the extremes).
 #[inline]
-fn palette(t: f32, v: &View) -> [f32; 3] {
-    let (a, b, c, d) = PALETTES[v.palette as usize];
-    let tau = TAU as f32;
-    [0, 1, 2].map(|i| a[i] + b[i] * (tau * (c[i] * t + d[i] + v.hue)).cos())
+fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    [
+        4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3,
+        -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3,
+        -0.004_196_086 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3,
+    ]
+    .map(|c| c.sqrt())
+}
+
+/// The pastel at lightness `l`, chroma `c` (before the theme's scale and lift) and hue offset `dh` from the theme's base.
+#[inline]
+fn pastel(th: &Theme, l: f32, c: f32, dh: f32) -> [f32; 3] {
+    let (h, c) = (th.hue + dh, c * th.chroma);
+    oklab(l + th.lift, c * h.cos(), c * h.sin())
 }
 
 /// The look's tweaks, applied at render time: `offset` is a complex offset of the colouring coordinate (see `shade`); `light` is the direction the disc is lit from, (x right, y down, z toward the viewer), normalised by the renderer.
@@ -538,10 +548,10 @@ impl Look {
     }
 }
 
-/// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel.
-/// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u runs along the palette and Im u sets a soft light and shade across it (¾ to 1 of full, as cos 2π·Im u), so both halves of the offset visibly move the colour in every method.
-/// Around it: the set's body dark with the colouring faintly inside, a luminous rim about 2 pixels out, and the field dimmed and fading to black far from the set.
-/// Relief: the outside of the set is lit as a surface whose slope is the escape potential's — its normal at a point is (u, h) with u = z/(dz/dz₀) the level line's outward direction and h = `look.height` — by a light from `look.light` (`lp`, already turned into the plane): brightness (1 + (u·l + h)/(1 + h))²/4, smooth and never clipped, so the filaments stand up from the field with their top-left faces lit and their bottom-right faces in shade.
+/// One point of the plane as a visible colour in [0, 1]; `k` is plane units per pixel; `lp` is the light's direction in the plane.
+/// One pastel scheme, low contrast: the field is a light ground, the set's body a soft deeper tone, its rim the lightest and most coloured; nothing goes near black or white.
+/// The colouring coordinate is complex, u = (the colouring method's value) + i·(the orbit's escape angle in turns), plus the look's offset: Re u swings the hue either side of the theme's base (by the theme's spread) and Im u breathes the lightness a little, so both halves of the offset move every method.
+/// Relief: the outside of the set is lit as a surface whose slope is the escape potential's — normal (u, h), u = z/(dz/dz₀) the level line's outward direction, h = `look.height` — by a light from `look.light`: ((1 + (u·l + h)/(1 + h))/2)², smooth and never clipped, which here lifts or lowers the lightness by up to 2⁻⁴ so the filaments' top-left faces are lit.
 #[inline]
 fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32; 3] {
     let o = orbit(x, y, v);
@@ -549,32 +559,36 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look, lp: (f32, f32)) -> [f32;
     let escaped = o.n < MAX_ITER;
     // Smooth iteration count.
     let nu = if escaped { o.n as f32 + 1. - r.ln().log2() } else { MAX_ITER as f32 };
+    let tau = TAU as f32;
     let re = match v.mode {
         0 => nu * (1. / (1 << 4) as f32),
         // The orbit's angle at escape, turned by the smooth count: cells that tile each level of the set.
-        1 => o.y.atan2(o.x) / TAU as f32 + nu * (1. / (1 << 5) as f32),
+        1 => o.y.atan2(o.x) / tau + nu * (1. / (1 << 5) as f32),
         // How close the orbit came to the trap, on a log scale: rings and petals around each preimage of the trap.
         _ => -(o.trap_sq.ln()) * (1. / (1 << 3) as f32),
     } + look.offset.0;
-    let im = o.y.atan2(o.x) / TAU as f32 + look.offset.1;
-    let shimmer = 0.875 + 0.125 * (TAU as f32 * im).cos();
-    let col = palette(re, v);
+    let im = o.y.atan2(o.x) / tau + look.offset.1;
+    let swing = (tau * re).sin();
+    let breathe = (tau * im).cos() * (1. / (1 << 6) as f32);
     // Distance to the set in pixels (0 on it).
     let dist_px = if escaped { r * r.ln() / o.dm / k } else { 0. };
     // Body: within about a pixel of the set, falling smoothly (C∞) to nothing a few pixels out.
     let body = 1. / (1. + dist_px * dist_px);
-    // Rim: brightest about 2¹ pixels out, a smooth bump in log distance.
-    let l = (dist_px + 1. / (1 << 4) as f32).log2() - 1.;
-    let rim = (-(l * l)).exp2();
-    // Field: the colouring, dimmed, fading to black far from the set.
-    let field = (1. - (-nu * 0.125).exp2()) * 0.375;
-    // u·l is in [−1, 1]; with the height added and scaled by 1 + h it is in [(h − 1)/(h + 1), 1], and half-Lambert squared keeps it smooth and positive. The parameter plane has no relief (u = 0), which reads as evenly lit.
+    // Rim: strongest about 2¹ pixels out, a smooth bump in log distance.
+    let ll = (dist_px + 1. / (1 << 4) as f32).log2() - 1.;
+    let rim = (-(ll * ll)).exp2();
+    // Far: how far out in the field, 0 near the set to 1 far away (the disc's own rim, the plane's infinity, is fully far).
+    let far = (-nu * 0.125).exp2();
+    // Relief, in [((h − 1)/(h + 1) + 1)²/4, 1], centred on ½ so it lifts and lowers about the ground.
     let ul = o.ux * lp.0 + o.uy * lp.1;
     let h = look.height;
-    let relief = if v.kind == Kind::Julia { let t = 0.5 + 0.5 * (ul + h) / (1. + h); t * t * 1.5 } else { 1. };
-    let gain = (body * 0.1875 + (rim * 0.875 + (1. - body) * field) * relief) * shimmer;
-    col.map(|c| c * gain)
+    let relief = if v.kind == Kind::Julia { let t = 0.5 + 0.5 * (ul + h) / (1. + h); t * t - 0.5 } else { 0. };
+    // Lightness and chroma: the ground at 0.86 with little colour, deeper and a touch more coloured toward the body (0.72), lightest and most coloured on the rim (0.92), settling toward the ground far out.
+    let lightness = 0.86 - 0.14 * body + 0.06 * rim * (1. - body) + 0.0625 * relief * (1. - body) * (1. - far) + breathe;
+    let chroma = 0.035 + 0.02 * body + 0.035 * rim * (1. - body) - 0.015 * far;
+    pastel(&v.theme, lightness, chroma, v.theme.spread * swing)
 }
+
 
 /// A visible colour in [0, 1] per channel at opacity α in [0, 1], as a fluor α + darkness pixel: darkness is premultiplied by α (an empty pixel is 0, opaque black is all ones).
 #[inline]
@@ -614,9 +628,9 @@ pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Para
             }
             let (qx, qy) = (dx / r, dy / r);
             let q2 = qx * qx + qy * qy;
-            // At and past the rim (inside the anti-aliasing band) the plane is at infinity: the outer field's farthest, black.
+            // At and past the rim (inside the anti-aliasing band) the plane is at infinity: the field's farthest, the theme's ground.
             if q2 >= 1. {
-                row[px] = pack([0.; 3], cover);
+                row[px] = pack(pastel(&v.theme, 0.86, 0.02, 0.), cover);
                 continue;
             }
             let g = rad / (1. - q2).sqrt();
@@ -705,6 +719,18 @@ mod tests {
             seen.dedup();
             assert!(seen.len() > 1 << 6, "device {device}: only {} distinct pixels", seen.len());
             assert!(a != b, "device {device}: the text did not change the picture");
+        }
+    }
+
+    /// Every pastel the shading can ask for has no negative channel, at every hue: the extremes of lightness (0.72 − 2⁻⁵ − 2⁻⁶ ≈ 0.67 up to past 0.92 + 2⁻⁵ + 2⁻⁴ + 2⁻⁶) and chroma (up to 0.08 before the theme's 1¼, tested at 0.08 · 1¼). A channel past 1 is fine: the pack saturates it.
+    #[test]
+    fn pastels_stay_in_gamut() {
+        for i in 0..(1 << 8) {
+            let th = Theme { hue: i as f32 / (1 << 8) as f32 * TAU as f32, spread: 0., lift: 0., chroma: 1.25 };
+            for &(l, c) in &[(0.67, 0.08f32), (0.67, 0.), (1.0, 0.08), (1.0, 0.), (0.86, 0.08)] {
+                let rgb = pastel(&th, l, c, 0.);
+                assert!(rgb.iter().all(|x| x.is_finite() && *x >= 0.), "hue {i}, L {l}, C {c}: {rgb:?}");
+            }
         }
     }
 
