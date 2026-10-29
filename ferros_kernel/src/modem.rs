@@ -819,8 +819,9 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     download(rep, &mut seq);
     match (n, seq) {
         (8, Some(s)) => start_and_watch(rep, s),
-        (9, Some(s)) => start_and_handshake(rep, s, false),
-        (n, Some(s)) if n >= 10 => start_and_handshake(rep, s, true),
+        (9, Some(s)) => start_and_handshake(rep, s, false, false),
+        (10, Some(s)) => start_and_handshake(rep, s, true, false),
+        (n, Some(s)) if n >= 11 => start_and_handshake(rep, s, true, true),
         _ => {}
     }
 }
@@ -1283,7 +1284,7 @@ fn is_cmd(v: u16) -> bool {
 }
 
 /// Stage 9 answers the handshake bare; stage 10 (`full`) does what Linux does around it — the pktproc DL rings at INIT_START, the legacy-link reset at PHONE_START — and then watches.
-fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool) {
+fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: bool) {
     match command(&mut seq, 0xA400, &[0, 0], 4000) {
         Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
         Err(e) => return line(rep, alloc::format!("START: {e}\n")),
@@ -1340,7 +1341,7 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool) {
         if phone_started { "answered with INIT_END" } else { "never seen" },
         rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get() as u32, CP2AP_WAKEUP.get() as u32));
     if full && phone_started {
-        watch_online(rep, now());
+        watch_online(rep, now(), probe);
     }
 }
 
@@ -1434,9 +1435,76 @@ fn legacy_init() {
     unsafe { core::arch::asm!("dsb sy") };
 }
 
+// ---------------------------------------------------------------------------
+// The RIL's wire (decoded 2026-10-29 from the vendor image's vendor.radio.protocol.sit.base.so and .stream.so, whose builders are exported): each RIL message is one SIT link frame on FMT channel 245 (`umts_ipc0`; 246 is the second), its payload an RCM message — u8 type (0 request, 1 response, 2 indication), u8 0, u16 id, u16 total length, then for a request a u32 token and two zero bytes (a response puts its error byte after the token), an indication only two zero bytes: a 12-byte header, 8 for an indication. Then the parameters. Tokens count up from 0 (TokenGen). Ids from `rcmMsgToString`: SIT_GET_RADIO_POWER G#801, SIT_SET_RADIO_POWER G#800 (u32 state 2 on, 1 off, then two option bytes), SIT_IND_RADIO_STATE_CHANGED G#802, SIT_IND_RADIO_READY G#803, SIT_SET_INITIAL_ATTACH_APN G#603, SIT_SETUP_DATA_CALL G#600, SIT_IND_DATA_CALL_LIST_CHANGED G#604.
+
+const FMT_TXQ_HEAD: usize = IPC + 0x8;
+const FMT_TXQ_TAIL: usize = IPC + 0xC;
+const FMT_TX_RING: usize = IPC + 0x1000;
+const FMT_TX_RING_LEN: u32 = 0x1000;
+const CH_FMT0: u8 = 245;
+/// `mask2int(MASK_SEND_FMT)` (link_device_memory.h: SEND_FMT G#2, SEND_RAW G#1, INT_VALID G#80): what the AP writes to ap2cp_msg after putting frames in the FMT ring.
+const INT_SEND_FMT: u32 = 0x82;
+const SIT_GET_RADIO_POWER: u16 = 0x0801;
+
+/// The AP's side of the SIT link on the RIL channel: the per-io-device frame counter, the channel's own counter (both start at 1, `exynos_build_header`), the RCM token.
+struct SitLink {
+    frame: u16,
+    ch: u8,
+    token: u32,
+}
+
+/// One single-frame message into the FMT TX ring (cfg G#C000, 8-byte padding as on RAW), then the SEND_FMT message and the doorbell (link_device.c 860-880).
+fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::string::String> {
+    let total = 12 + payload.len();
+    let padded = (total + 7) & !7;
+    let head = rd(FMT_TXQ_HEAD);
+    let tail = rd(FMT_TXQ_TAIL);
+    // The cursors live in shared memory the CP also writes: out of range, or too little room, and nothing is written.
+    let free = (tail + FMT_TX_RING_LEN - head - 1) % FMT_TX_RING_LEN;
+    if head >= FMT_TX_RING_LEN || tail >= FMT_TX_RING_LEN || (free as usize) < padded {
+        return Err(alloc::format!("fmt tx ring full or bad: head {head} tail {tail} need {padded}"));
+    }
+    link.frame = link.frame.wrapping_add(1);
+    link.ch = link.ch.wrapping_add(1);
+    let hdr = [0xCD, 0xAB, link.frame as u8, (link.frame >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, ch, link.ch, 0, 0];
+    let mut pos = head;
+    let mut put = |b: &[u8]| {
+        for &x in b {
+            wr8(FMT_TX_RING + pos as usize, x);
+            pos = (pos + 1) % FMT_TX_RING_LEN;
+        }
+    };
+    put(&hdr);
+    put(payload);
+    put(&[0u8; 8][..padded - total]);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(FMT_TXQ_HEAD, pos);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(AP2CP_MSG, INT_SEND_FMT);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    Ok(())
+}
+
+/// A RIL request with the next token on channel 245; returns the token.
+fn sit_request(link: &mut SitLink, id: u16, params: &[u8]) -> Result<u32, alloc::string::String> {
+    let tok = link.token;
+    link.token = link.token.wrapping_add(1);
+    let len = 12 + params.len();
+    let mut m = alloc::vec![0u8, 0, id as u8, (id >> 8) as u8, len as u8, (len >> 8) as u8];
+    m.extend_from_slice(&tok.to_le_bytes());
+    m.extend_from_slice(&[0, 0]);
+    m.extend_from_slice(params);
+    fmt_send(link, CH_FMT0, &m)?;
+    Ok(tok)
+}
+
 /// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
-fn watch_online(rep: &mut Vec<u8>, t0: u64) {
+fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: bool) {
     let mut done = [0u32; PP_QUEUES as usize];
+    let mut link = SitLink { frame: 0, ch: 0, token: 0 };
+    let mut probed = false;
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
     let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
@@ -1460,6 +1528,13 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64) {
             }
         }
         last = now_s;
+        if probe && !probed && since_us(t0) > 2_000_000 {
+            probed = true;
+            match sit_request(&mut link, SIT_GET_RADIO_POWER, &[]) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
         for (name, base, len_max, headr, tailr) in [("raw", RX_RING, RX_RING_LEN, RXQ_HEAD, RXQ_TAIL), ("fmt", FMT_RX_RING, FMT_RX_RING_LEN, FMT_RXQ_HEAD, FMT_RXQ_TAIL)] {
             let head = rd(headr);
             let tail = rd(tailr);
@@ -1474,7 +1549,24 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64) {
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
             per_ch[ch as usize] += 1;
-            if frames < 48 {
+            // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
+            let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
+            let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
+            if ril && flen >= 12 + rcm_hdr && frames < 48 {
+                let b = |i: u32| at(12 + i);
+                let (ty, id, len) = (b(0), b(2) as u16 | (b(3) as u16) << 8, b(4) as u32 | (b(5) as u32) << 8);
+                let kind = match ty {
+                    0 => "request",
+                    1 => "response",
+                    2 => "indication",
+                    _ => "type?",
+                };
+                let tok = b(6) as u32 | (b(7) as u32) << 8 | (b(8) as u32) << 16 | (b(9) as u32) << 24;
+                let params = |i: u32| b(rcm_hdr + i);
+                let resp = if ty == 1 { alloc::format!(" token A#{tok} error G#{:X}", b(10)) } else { alloc::string::String::new() };
+                line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} len A#{len}{resp}: {}\n", since_us(t0) / 1000, hex(&params, (flen - 12 - rcm_hdr).min(16))));
+                frames += 1;
+            } else if frames < 48 {
                 let named = ch == 41 || (129..=136).contains(&ch);
                 let n = (flen - 12).min(if named { 160 } else { 32 });
                 let body = |i: u32| at(12 + i);
