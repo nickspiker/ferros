@@ -1351,6 +1351,12 @@ pub fn run(mut b: Boot) -> ! {
                                                 continue;
                                             }
                                         }
+                                        if cmd.params == b"fp" {
+                                            // Is the fingerprint's SPI controller (PERIC0 USI1, G#10880000) reachable from NS-EL2, or secure-locked? Read-only, fault-safe (fp.rs).
+                                            crate::fp::report(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params.starts_with(b"lun ") {
                                             // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
                                             let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());

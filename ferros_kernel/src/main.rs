@@ -69,6 +69,7 @@ mod camera_rx;
 mod camera_rx_uw;
 #[cfg(feature = "pixel8")]
 mod spi;
+mod fp;
 #[cfg(feature = "pixel8")]
 mod touch;
 #[cfg(feature = "pixel8")]
