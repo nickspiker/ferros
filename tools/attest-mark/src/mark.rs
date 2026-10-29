@@ -441,8 +441,19 @@ pub fn descend(x: f64) -> ((f64, f64), bool, Vec<(f64, f64)>) {
 
 impl Params {
     /// The picture for this device salt and this textbox content.
+    // The app calls `new_placed` to toggle the banding; `new` is the default the tests and the phone use.
+    #[allow(dead_code)]
     pub fn new(salt: &[u8; 32], text: &str) -> Self {
+        Self::new_placed(salt, text, true)
+    }
+
+    /// As `new`, choosing whether the descent's x is banded per device (`banded`: the device's own stretch of 1/12 of [−2, 0.375], every key inside it) or free over the whole span.
+    pub fn new_placed(salt: &[u8; 32], text: &str, banded: bool) -> Self {
         let f = draw(salt, 1, 0, &[]);
+        // The device's stretch of the real axis: 1/12 of the span, placed so it fits.
+        let span = 2.375;
+        let width = span / 12.;
+        let x0 = -2. + unit(&draw(salt, 5, 0, &[])[0..4]) * (span - width);
         let theme = Theme::from_bytes(&f);
         let mode = f[12] & 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
@@ -453,7 +464,8 @@ impl Params {
         loop {
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
-            let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
+            let x = if banded { x0 + unit(&t[16..20]) * width } else { -2. + unit(&t[16..20]) * span };
+            let (land, _, _) = descend(x);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let along = j_extent(c);
             // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
@@ -553,10 +565,11 @@ struct Lighting {
 
 impl Lighting {
     fn from_bytes(f: &[u8; 32]) -> Self {
-        let u = |i: usize| unit(&f[i..i + 4]) as f32;
-        // A second 32 bytes for the rest.
+        // A second 32 bytes for the rest, a third for the band jitter.
         let g = *blake3::hash(f).as_bytes();
-        let u2 = |i: usize| unit(&g[i..i + 4]) as f32;
+        let j = *blake3::Hasher::new().update(f).update(b"lighting jitter").finalize().as_bytes();
+        let u = |i: usize, n: u32| band(unit(&f[i..i + 4]) as f32, unit(&j[i..i + 4]) as f32, n);
+        let u2 = |i: usize, n: u32| band(unit(&g[i..i + 4]) as f32, unit(&j[(i + 16)..(i + 20)]) as f32, n);
         let quarter = TAU as f32 * 0.25;
         let tint = |h: f32| (h.cos(), h.sin());
         let lamp = |azimuth: f32, elevation: f32, strength: f32, hue: f32| Lamp {
@@ -565,35 +578,51 @@ impl Lighting {
             tint: tint(hue),
         };
         // Screen angles run clockwise from +x (y is down): straight left is half a turn, straight above is three quarters.
-        let key_az = 2. * quarter + u(0) * quarter;
-        let key_el = quarter * (0.25 + u(4) * 0.5);
-        let key_s = 0.0625 + u(8) * 0.0375;
-        let key_hue = u(12) * TAU as f32;
+        // Bands: four azimuths across the quarter, three elevations, three strengths, twelve tint hues.
+        let key_az = 2. * quarter + u(0, 4) * quarter;
+        let key_el = quarter * (0.25 + u(4, 3) * 0.5);
+        let key_s = 0.0625 + u(8, 3) * 0.0375;
+        let key_hue = u(12, 12) * TAU as f32;
         // The fill: from the opposite side ± ⅙ of a turn, 2⁻³ to ½ of the way up, a quarter to a half the key's strength (none for a quarter of devices), its hue near the key's complement.
-        let fill_az = key_az + 2. * quarter + (u(16) - 0.5) * quarter * (4. / 3.);
-        let fill_el = quarter * (0.125 + u(20) * 0.375);
-        let fill_s = if f[24] & 3 == 0 { 0. } else { key_s * (0.25 + u(25) * 0.25) };
-        let fill_hue = key_hue + 2. * quarter + (u2(0) - 0.5) * quarter;
+        let fill_az = key_az + 2. * quarter + (u(16, 3) - 0.5) * quarter * (4. / 3.);
+        let fill_el = quarter * (0.125 + u(20, 3) * 0.375);
+        let fill_s = if f[24] & 3 == 0 { 0. } else { key_s * (0.25 + u(25, 2) * 0.25) };
+        let fill_hue = key_hue + 2. * quarter + (u2(0, 3) - 0.5) * quarter;
         // Shadows lean toward the key's complement or the fill's hue.
         let shadow_hue = if f[24] & 4 == 4 { key_hue + 2. * quarter } else { fill_hue };
         Lighting {
             key: lamp(key_az, key_el, key_s, key_hue),
             fill: lamp(fill_az, fill_el, fill_s, fill_hue),
             shadow: tint(shadow_hue),
-            relief: (u2(4) * 3.).exp2(),
+            // Relief in four bands, 2⁰ to 2³ px.
+            relief: (u2(4, 4) * 3.).exp2(),
         }
     }
+
+    /// The one fixed lighting, for comparison with the per-device kind: a key lamp from the top left at 45° up, no tint, no fill, relief 2¹ px.
+    fn fixed() -> Self {
+        let e = std::f32::consts::FRAC_1_SQRT_2;
+        let none = Lamp { dir: (0., 0., 1.), strength: 0., tint: (0., 0.) };
+        Lighting { key: Lamp { dir: (-0.5, -0.5, e), strength: 0.08, tint: (0., 0.) }, fill: none, shadow: (0., 0.), relief: 2. }
+    }
+}
+
+/// A banded draw: `n` bands across [0, 1), the band picked by `pick` and a jitter within it of a quarter of the band (by `jit`), so devices cluster into recognisable families instead of spreading evenly.
+fn band(pick: f32, jit: f32, n: u32) -> f32 {
+    ((pick * n as f32).floor() + 0.5 + (jit - 0.5) * 0.25) / n as f32
 }
 
 impl Theme {
     /// The theme a salt's bytes give.
     fn from_bytes(f: &[u8; 32]) -> Self {
-        let u = |i: usize| unit(&f[i..i + 4]) as f32;
+        // Every continuous choice is banded (see `band`), the jitter from a second 32 bytes.
+        let j = *blake3::Hasher::new().update(f).update(b"theme jitter").finalize().as_bytes();
+        let u = |i: usize, n: u32| band(unit(&f[i..i + 4]) as f32, unit(&j[i..i + 4]) as f32, n);
         let tau = TAU as f32;
         // Ground tone: pale, light, mid or dusk.
         let ground_l = [0.9, 0.82, 0.64, 0.44][(f[28] & 3) as usize];
         // The set against it: darker on pale and light grounds, lighter on dusk, either way on mid; by 2⁻⁴ to 2⁻³ + 2⁻⁴ of lightness, low contrast.
-        let contrast = 0.0625 + u(8) * 0.125;
+        let contrast = 0.0625 + u(8, 4) * 0.125;
         let lighter = match f[28] & 3 {
             0 | 1 => false,
             3 => true,
@@ -606,16 +635,17 @@ impl Theme {
         // The set's hue turn: none, ±⅙, ±¼, ±⅓ or ½ of a turn.
         let accent = [0., 1. / 6., -1. / 6., 0.25, -0.25, 1. / 3., -1. / 3., 0.5][(f[30] & 7) as usize] * tau;
         Theme {
-            hue: u(0) * tau,
-            spread: 0.0625 + u(4) * 0.5,
+            // Twelve hue families.
+            hue: u(0, 12) * tau,
+            spread: 0.0625 + u(4, 4) * 0.5,
             accent,
-            drift: (u(12) - 0.5) * 1.25,
+            drift: (u(12, 4) - 0.5) * 1.25,
             ground_l,
             body_l,
             rim_l,
-            ground_s: 0.015 + u(16) * 0.0625,
-            body_s: 0.03 + u(20) * 0.09375,
-            rim_s: 0.015 + u(24) * 0.09375,
+            ground_s: 0.015 + u(16, 4) * 0.0625,
+            body_s: 0.03 + u(20, 4) * 0.09375,
+            rim_s: 0.015 + u(24, 4) * 0.09375,
             lighting: Lighting::from_bytes(blake3::hash(f).as_bytes()),
         }
     }
@@ -658,12 +688,14 @@ pub struct Look {
     pub offset: (f32, f32),
     /// A multiplier on the device's relief depth (1 = as the salt chose it).
     pub relief: f32,
+    /// One fixed light for every device (`Lighting::fixed`) instead of each device's own.
+    pub fixed_light: bool,
 }
 
 impl Default for Look {
-    /// No offset, the device's own relief.
+    /// No offset, the device's own relief and lighting.
     fn default() -> Self {
-        Look { offset: (0., 0.), relief: 1. }
+        Look { offset: (0., 0.), relief: 1., fixed_light: false }
     }
 }
 
@@ -680,7 +712,7 @@ fn in_plane(d: (f32, f32, f32), rot: (f32, f32)) -> (f32, f32, f32) {
 /// Its gradient points along u = z/(dz/dz₀) (the potential's own direction, outward) with magnitude s/d per pixel at d pixels from the set (d being the distance estimate, G/|∇G| up to a constant), so its unit normal is (sin α·u, cos α) with sin α = s/√(s² + d²), cos α = d/√(s² + d²), exact and finite even on the set (d = 0).
 /// Each lamp's Lambert n·l, taken relative to a flat surface (which sees l_z), moves the lightness by strength·(n·l − l_z): faces turned to it rise, faces turned away fall, the flat field far out is untouched, and nothing is clipped. The faces a lamp lights take its tint, and the faces left in shade take the shadow tint, each split off smoothly (`positive_part`).
 #[inline]
-fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
+fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
     let o = orbit(x, y, v);
     let r = (o.x * o.x + o.y * o.y).sqrt();
     let escaped = o.n < MAX_ITER;
@@ -716,7 +748,8 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
     // Far: how far out in the field, 0 near the set to 1 far away (the disc's own rim, the plane's infinity, is fully far).
     let far = (-nu * 0.125).exp2();
     let th = &v.theme;
-    let lt = &th.lighting;
+    let fixed = Lighting::fixed();
+    let lt = if look.fixed_light { &fixed } else { &th.lighting };
     // The surface's tilt from the slope (the parameter plane has no u, so it lights flat).
     let sr = lt.relief * look.relief;
     let hyp = (sr * sr + dist_px * dist_px).sqrt();
@@ -746,7 +779,7 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> [f32; 3] {
     let lightness = th.ground_l + (th.body_l - th.ground_l) * body + (th.rim_l - th.ground_l) * edge * (1. - far) + shading + breathe;
     let sat = th.ground_s + (th.body_s - th.ground_s) * body + (th.rim_s - th.ground_s) * edge * (1. - far);
     // Hue: the ground's base, drifting toward the far field, swung by the colouring, turned by the nacre, and turned by the theme's accent on the set.
-    soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint)
+    (soft(th, lightness, sat, th.spread * swing + th.drift * far + nacre + th.accent * body, tint), dist_px)
 }
 
 
@@ -765,39 +798,56 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = pack(shade(x, y, &v, k, &Look::default()), 1.);
+            row[px] = pack(shade(x, y, &v, k, &Look::default()).0, 1.);
         }
     });
 }
 
-/// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0).
+/// Render the mark spherized into a disc of radius `r` pixels centred at (`cx`, `cy`) in `buf` (rows of `w`, α + darkness); pixels outside the disc are left empty (α = 0), so it can go over any background.
 /// A disc point p (in units of r) shows z = eye + R·rot·p/√(1 − |p|²): the plane wrapped onto a hemisphere seen from above, its infinity at the rim.
-/// The disc's own edge is anti-aliased with a C∞ step, ½ + ½·tanh(2·(r − |pixel − centre|)), about a pixel wide.
+/// Everything is multiplied by √(1 − |p|²), so the ball tapers to black at its rim, where the warp packs the field tightest.
+/// The disc's edge is the ordinary anti-aliased circle (as Photon's avatars): full inside r − ½, empty outside r + ½, and between them (r + ½)² − d² over (r + ½)² − (r − ½)².
+/// Pixels within 2 px of the set (by the centre sample's distance estimate) are supersampled 2 × 2, so the finest filaments stop shimmering.
 pub fn render_disc(buf: &mut [u32], w: usize, cx: f32, cy: f32, r: f32, p: &Params, look: &Look) {
     let v = p.view();
     let rad = p.radius as f32;
+    let (r_in, r_out) = ((r - 0.5).max(0.), r + 0.5);
+    let (r_in2, r_out2) = (r_in * r_in, r_out * r_out);
+    // One sample at disc offset (dx, dy) pixels from the centre: its colour, already tapered, and its distance to the set in pixels.
+    let sample = |dx: f32, dy: f32| -> ([f32; 3], f32) {
+        let (qx, qy) = (dx / r, dy / r);
+        let q2 = qx * qx + qy * qy;
+        // At and past the rim the taper is 0: black.
+        if q2 >= 1. {
+            return ([0.; 3], f32::MAX);
+        }
+        let g = rad / (1. - q2).sqrt();
+        let (a, b) = (qx * g, qy * g);
+        let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
+        // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
+        let k = rad / (r * (1. - q2));
+        let (rgb, d) = shade(x, y, &v, k, look);
+        let taper = (1. - q2).sqrt();
+        (rgb.map(|c| c * taper), d)
+    };
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
             let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
-            let dist = (dx * dx + dy * dy).sqrt();
-            let cover = 0.5 + 0.5 * (2. * (r - dist)).tanh();
-            if cover <= 0. {
+            let d2 = dx * dx + dy * dy;
+            if d2 >= r_out2 {
                 row[px] = 0;
                 continue;
             }
-            let (qx, qy) = (dx / r, dy / r);
-            let q2 = qx * qx + qy * qy;
-            // At and past the rim (inside the anti-aliasing band) the plane is at infinity: the field's farthest, the theme's ground.
-            if q2 >= 1. {
-                row[px] = pack(soft(&v.theme, v.theme.ground_l, v.theme.ground_s, v.theme.drift, (0., 0.)), cover);
-                continue;
-            }
-            let g = rad / (1. - q2).sqrt();
-            let (a, b) = (qx * g, qy * g);
-            let (x, y) = (v.centre.0 + a * v.rot.0 - b * v.rot.1, v.centre.1 + a * v.rot.1 + b * v.rot.0);
-            // Plane units per pixel: the map's area scale, √(radial · tangential stretch) = R/(1 − |p|²) per disc unit.
-            let k = rad / (r * (1. - q2));
-            row[px] = pack(shade(x, y, &v, k, look), cover);
+            let cover = if d2 <= r_in2 { 1. } else { (r_out2 - d2) / (r_out2 - r_in2) };
+            let (centre, d) = sample(dx, dy);
+            let rgb = if d < 2. {
+                let q = 0.25;
+                let s = [sample(dx - q, dy - q).0, sample(dx + q, dy - q).0, sample(dx - q, dy + q).0, sample(dx + q, dy + q).0];
+                [0, 1, 2].map(|i| (s[0][i] + s[1][i] + s[2][i] + s[3][i]) * 0.25)
+            } else {
+                centre
+            };
+            row[px] = pack(rgb, cover);
         }
     });
 }
