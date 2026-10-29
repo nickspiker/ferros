@@ -5,6 +5,7 @@ use fluor::coord::Coord;
 use fluor::event::{CursorIcon, ElementState, Event, MouseButton};
 use fluor::host::EventResponse;
 use fluor::host::app::{Context, FluorApp};
+use fluor::pixel::G2t16;
 use fluor::text::TextStyle;
 use std::time::Instant;
 
@@ -15,7 +16,8 @@ struct Demo {
     frames: u32,
 }
 
-impl FluorApp for Demo {
+// At fluor's 16-bit depth, all the way to the panel: the display decodes the surface itself (op 22 format G2T16).
+impl FluorApp<G2t16> for Demo {
     type UserEvent = ();
 
     fn init(&mut self, _ctx: &mut Context) {}
@@ -36,11 +38,11 @@ impl FluorApp for Demo {
         }
     }
 
-    fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
+    fn render(&mut self, target: &mut [G2t16], ctx: &mut Context) {
         self.frames += 1;
         let (w, h) = (ctx.viewport.width_px as usize, ctx.viewport.height_px as usize);
         let mut canvas = Canvas::new(target, w, h, ctx.damage);
-        // Darkness convention: 0xFF000000 is opaque white, 0xFFFFFFFF opaque black.
+        // Colours authored as 8-bit darkness (0xFF000000 opaque white, 0xFFFFFFFF opaque black), widened to 16 bits as they are drawn.
         fluor::paint::fill_rect(&mut canvas, 0, 0, w as isize, h as isize, 0xFF_E8_E8_E8, None, None);
         fluor::paint::fill_rect(&mut canvas, 24, 24, w as isize - 48, 120, 0xFF_C0_30_30, None, None);
         let title = TextStyle::new(40.0, 0xFF_00_00_00);
