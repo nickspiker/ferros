@@ -1,0 +1,29 @@
+[package]
+name = "markbench"
+version = "0.1.0"
+edition = "2024"
+description = "A bench of the attest mark (tapuwae) on the phone: sampling schemes and core counts, timed by the wall clock; the same source runs on the desktop for comparison"
+
+[[bin]]
+name = "markbench"
+path = "src/main.rs"
+
+[dependencies]
+tapuwae = { path = "../../../tapuwae" }
+blake3 = "1.5"
+rayon = "1"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+[patch.crates-io]
+libc = { path = "/mnt/Harbor/Code/ferros-libc" }
