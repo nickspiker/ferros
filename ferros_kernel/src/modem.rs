@@ -1434,13 +1434,13 @@ fn legacy_init() {
     unsafe { core::arch::asm!("dsb sy") };
 }
 
-/// After INIT_END: 30 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, the first 32 bytes; RFS path names are not per-unit data, FMT payloads may carry SIM identity, so only their first bytes), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
+/// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
 fn watch_online(rep: &mut Vec<u8>, t0: u64) {
     let mut done = [0u32; PP_QUEUES as usize];
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
     let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
-    line(rep, alloc::format!("online: magic G#{:X} mem_access {}, watching 30 s\n", rd(IPC), rd(IPC + 4)));
+    line(rep, alloc::format!("online: magic G#{:X} mem_access {}, watching 90 s\n", rd(IPC), rd(IPC + 4)));
     let hex = |at: &dyn Fn(u32) -> u8, n: u32| {
         let mut h = alloc::string::String::new();
         for i in 0..n {
@@ -1448,7 +1448,7 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64) {
         }
         h
     };
-    while since_us(t0) < 30_000_000 {
+    while since_us(t0) < 90_000_000 {
         crate::platform::pet_watchdogs();
         let now_s = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
         if now_s != last && changes < 32 {
@@ -1475,10 +1475,11 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64) {
             let ch = at(8);
             per_ch[ch as usize] += 1;
             if frames < 48 {
-                let n = (flen - 12).min(32);
+                let named = ch == 41 || (129..=136).contains(&ch);
+                let n = (flen - 12).min(if named { 160 } else { 32 });
                 let body = |i: u32| at(12 + i);
                 let mut txt = alloc::string::String::new();
-                if name == "raw" {
+                if named {
                     for i in 0..n {
                         let b = body(i);
                         txt.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });

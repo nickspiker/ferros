@@ -345,3 +345,39 @@ Measured: TOC acked; MAIN G#5DA0C00 bytes in 1998 frames, 12.6 s, its CRC accept
 1. Write the DL info and descriptors.
 2. Answer PIF_INIT_DONE, and watch for PHONE_START and the CP's capability words.
 3. Answer INIT_END; the channel-41 requests then arrive on the RAW ring.
+
+## 2026-10-29: ONLINE, and the handover block that makes the CP speak
+
+**The handshake (`diag modem s9`, `sa`):** INIT_START (G#C1) 374 ms after START → PIF_INIT_DONE (G#CD), PHONE_START (G#C8) 6 ms later → INIT_END (G#C2); PHONE_ACTIVE stays high, no CRASH_EXIT. Corrections to the notes above:
+- husky's DT claims no AP capabilities (`ap_capability_0/1 = 0`), so neither do we; the CP reports part 0 = G#7, part 1 = 0 (IPC+G#A4, +G#AC — the AP's words are +G#A0, +G#A8).
+- With no `LINK_ATTR_SBD_IPC` the INIT_START handler is just `pktproc_init` and the capabilities. Stage `a` lays out the DL rings as Linux would (four queues of 3456 2 KiB buffers in place at G#E800_0000, the SysMMU in bypass so IOVA = physical) and runs `init_legacy_link` at PHONE_START; the CP does not need pktproc to come ONLINE.
+- `ap2cp_united_status` is G#0 then G#4000 (dual-SIM detect = 1) in both captures; an earlier reading missed the second write.
+
+**The CP stays silent after INIT_END until it has the handover block.** `struct t_handover_block_info` (G#A1 bytes at IPC+G#82C, `ap2cp_handover_block_info`) is the first thing cbd writes before every boot (the memcpy at the top of both captures), via `IOCTL_HANDOVER_BLOCK_INFO`. Decoded from cbd (`update_handover_block_info`, `scan_cdt_property_data`; the vendor image's `/bin/cbd` carries its symbols in `.gnu_debugdata`):
+
+| offset | field | source on a normal boot of a user build |
+|---|---|---|
+| G#00 | version | 1 |
+| G#04 | project_id | cdt[0] (platform) |
+| G#08 | revision | `hwinfo` from `hardware_config.json` (absent on husky's radio build → 0) |
+| G#0C, G#10 | major_id, minor_id | cdt[3], cdt[4] |
+| G#14, G#18 | modem_sku, modem_hw | cdt[6], cdt[7] |
+| G#1C | cpinfo0 | 0 (set for factory boot modes only) |
+| G#20 | cpinfo1 | 0 (set after an EFS clear only) |
+| G#24 | cpinfo2 | `/chosen/config/modem_flag` (absent on husky) |
+| G#28 | rf_sub | cdt[8] |
+| G#2C | rf_config | `rfid` from `hardware_config.json`, else `/chosen/plat/rfid` |
+| G#30-G#38 | reserved | cdt[1], cdt[2], cdt[5] |
+| G#3C | reserved | 0 (a userdebug build puts a marker here) |
+| G#40, G#50 | cpid[2] | `/chosen/config/imei1`, `imei2`, 16 bytes each (per-unit: never printed or stored) |
+| G#60 | cpsig | 64 bytes of `/mnt/vendor/persist/modem/cpsha` (persist is f2fs), then a NUL |
+
+cdt[] is bootconfig `androidboot.cdt_hwid`, parsed by cbd as `0x%04x%02x%02x%04x%02x%02x%02x%02x%04x%08x`. ferros assembles the block in place at a real boot from ABL's tree (a reload has none; the IPC page keeps it) and adds cpsig at the ROM stage. A zeroed block changed nothing; the real one did.
+
+**What the CP says, unanswered (90 s watch):** 1.2 s after INIT_END, two frames on the FMT ring, then nothing:
+- ch 130 (`oem_ipc1`): a protobuf setting `persist.vendor.modem.experiment.volte_mif_off` to "1" — the CP pushing a property to the AP's property manager.
+- ch 132 (`oem_ipc3`): a protobuf of six {index, ~40 000} entries and two 32-bit words, probably a memory-clock (MIF) request for the clock manager.
+
+Both are served on Android by `/vendor/bin/shared_modem_platform` (Rust; opens `/dev/oem_ipc1` and `/dev/oem_ipc3`). No remote-file request, no RIL frame, no DL packet follows. In the Android capture the CP's first channel-41 frame carries link frame number G#34, so about 51 frames had already passed on FMT by then: the CP expects an FMT conversation (the platform services and the SIT RIL on channels 245/246) before it asks for files.
+
+**Next:** the oem_ipc protocol from `shared_modem_platform`, then the RIL's opening messages from `libsitril.so` (vendor image, `/lib64`). Data only: nothing voice, SMS or emergency.
