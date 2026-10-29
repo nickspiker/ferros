@@ -9,7 +9,7 @@
 //! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
 //! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
 //! The copy's long axis is J's principal axis (from 2⁷ address points) turned by −arg (f^k)′; a hash bit flips it end for end, and a small Gaussian offset (σ an eighth of the window) keeps the framing from looking machine-centred.
-//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral, and the address that repeats p hash bits forever (p from 1 to 2³) names exactly one; the view sits dead on it, with no offset, zoomed by |λ|^−m (m from 0 to 2² − 1), where λ = ∏ 2·z over the cycle is the multiplier by which the spiral repeats itself.
+//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats — zooming by |λ| and turning by arg λ maps it onto itself — and it is a VISIBLE whorl only when it turns a lot per unit of growth (|arg λ| / ln|λ|, the pitch). So 2⁴ cycles are tried (periods 1 to 2³, found by Newton from repeating addresses) and the most spiral one wins; the view sits dead on a drawn preimage of it (0 to 3 levels in, an exact smaller copy of the same whorl), with no offset, a few turns across the window.
 //! A thumbnail still rejects framings that show too little of the set, redrawing with the next counter.
 //!
 //! Precision: placement and framing are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the deepest window kept is 2⁻⁸ across, about 2⁻¹⁸ a pixel, many f32 steps even at |z| = 2).
@@ -37,8 +37,10 @@ const HEIGHT_STOPS: u32 = 1 << 3;
 const DEPTHS: u32 = 1 << 3;
 /// Periods drawn for a spiral's cycle: 1 to 2³.
 const PERIODS: u32 = 1 << 3;
-/// Self-similar zoom steps into a spiral: |λ|^−m for m from 0 to 2² − 1.
-const SPIRAL_STEPS: u32 = 1 << 2;
+/// Cycles tried for a spiral; the most spiral one wins.
+const SPIRAL_TRIES: u32 = 1 << 4;
+/// Preimage levels of the winning eye: 0 to 2² − 1.
+const EYE_DEPTHS: u32 = 1 << 2;
 /// The smallest window half-span kept, so the f32 render still has many representable steps per pixel.
 const MIN_HALF: f64 = 1. / (1 << 8) as f64;
 
@@ -392,19 +394,34 @@ impl Params {
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
             let (axis, along) = j_shape(c);
-            // Spiral framing, for half the keys: dead centre on a repelling cycle's eye, zoomed by |λ|^−m (backing off m to the f32 floor), at a drawn turn. A cycle Newton could not close falls through to copy framing, so every try still ends in a framing and the 2⁵-try exit always applies.
-            let spiral = if t[5] & 1 == 1 { cycle_point(c, &a, 1 + (t[6] as u32 & (PERIODS - 1))) } else { None };
+            // Spiral framing, for half the keys: dead centre, no offset, on a visible whorl. A cycle's eye is a visible spiral only when its multiplier turns a lot per unit of growth (large |arg λ| / ln|λ|, the spiral's pitch): most cycles have large |λ| and little turn and sit on tips and junctions. So 2⁴ cycles are tried and the most spiral one wins, and the view sits on a drawn preimage of it (0 to 3 levels in: an exact, smaller copy of the same whorl), scaled so a few turns fill the window. A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
+            let spiral = if t[5] & 1 == 1 {
+                (0..SPIRAL_TRIES)
+                    .filter_map(|i| cycle_point(c, &draw(salt, 4, (n << 4) | i, text.as_bytes()), 1 + (i & (PERIODS - 1))))
+                    .map(|(eye, ln_mag, arg)| (eye, ln_mag, arg.abs() / ln_mag))
+                    .fold(None, |best: Option<((f64, f64), f64, f64)>, e| if best.map_or(true, |b| e.2 > b.2) { Some(e) } else { best })
+            } else {
+                None
+            };
             if let Some((eye, ln_mag, _)) = spiral {
-                let mut m = t[7] as u32 & (SPIRAL_STEPS - 1);
-                let half = loop {
-                    let half = along * 1.125 * (-(m as f64) * ln_mag).exp();
-                    if half >= MIN_HALF || m == 0 {
-                        break half;
+                // A drawn preimage of the eye, k inverse branches in, and the derivative of f^k there (the whorl's copy shrinks by it).
+                let mut k = t[6] as u32 & (EYE_DEPTHS - 1);
+                let (centre, half) = loop {
+                    let mut chain = vec![eye];
+                    for i in 0..k as usize {
+                        let w = inverse(c, *chain.last().expect("chain starts non-empty"), bit(&a, i));
+                        chain.push(w);
                     }
-                    m -= 1;
+                    let ln_d: f64 = chain.iter().skip(1).map(|w| (2. * (w.0 * w.0 + w.1 * w.1).sqrt()).ln()).sum();
+                    // A few turns of the whorl: 2² repeats of its growth factor |λ| across the window's half-span.
+                    let half = ((ln_mag * 4.) - ln_d).exp() * (-(1. + unit(&t[24..28]) * 2.)).exp2() * along * (-ln_mag * 4.).exp();
+                    if half >= MIN_HALF || k == 0 {
+                        break (*chain.last().expect("chain starts non-empty"), half);
+                    }
+                    k -= 1;
                 };
-                let turn = unit(&t[24..28]) * TAU;
-                let p = Params { c, centre: eye, half, rot: (turn.cos(), turn.sin()), ..base };
+                let turn = unit(&t[28..32]) * TAU;
+                let p = Params { c, centre, half, rot: (turn.cos(), turn.sin()), ..base };
                 if framed(&p) || n >= 1 << 5 {
                     return p;
                 }
