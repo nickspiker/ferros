@@ -249,7 +249,8 @@ fn put(p: &Panel, x: i32, y: i32, rgb: u32) {
 }
 
 fn ring_start(p: &Panel) {
-    // The gate left the screen black but for its own word and arrows: clear just those.
+    // The gate left the screen black but for its own word and arrows: clear just those (the gate is cold-only; ready.rs is not built for the handoff).
+    #[cfg(not(shim_handoff))]
     crate::ready::erase(p);
     let (cx, cy) = centre(p);
     for y in -R_DISC..=R_DISC {

@@ -69,6 +69,7 @@ SECTIONS
     __kernel_size = __kernel_end - _start;
 
     /* Stack: 64KB, placed after kernel image */
+    __stack_bottom = .;
     . = . + 0x10000;
     __stack_top = .;
 

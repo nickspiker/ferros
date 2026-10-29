@@ -2017,6 +2017,8 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        // Slot marking lives only in the cold build: a ferros chainloaded under Android must not rewrite devinfo (slot.rs is cold-only).
+                                        #[cfg(not(shim_handoff))]
                                         if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
                                             // `diag slot`: both A/B slot words from devinfo (retries | flags << 8; flags b0 unbootable, b1 successful, b2 active, b3 de-activated). `diag slot word <a|b> <retries hex> <flags hex>` sets one (slot.rs set_word: the A/B fallback test, a spare's flags).
                                             if let Some(rest) = cmd.params.strip_prefix(b"slot word ") {
@@ -2577,6 +2579,8 @@ pub fn run(mut b: Boot) -> ! {
                                         }
                                         append_hex(&mut resp, b"SPSR_MASKED=", crate::process::SPSR_MASKED.load(core::sync::atomic::Ordering::Relaxed) as u32);
                                         append_hex(&mut resp, b"TICK_REARMS=", crate::process::TICK_REARMS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                                        // The "Ready?" gate is a cold-boot concern (ready.rs is cold-only); the handoff build has no gate telemetry.
+                                        #[cfg(not(shim_handoff))]
                                         {
                                             let g = crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed);
                                             append_hex(&mut resp, b"GATE_ANSWER=", (g & 0xFF) as u32);
