@@ -61,6 +61,76 @@ pub fn find(name: &str) -> Option<Part> {
     None
 }
 
+/// A logical partition inside `super` (Android's dynamic partitions, liblp metadata_format.h), read-only: the geometry at byte 4096 (magic "gDla"), slot 0's metadata header at byte 12288 (magic "0PLA": tables descriptors at 80 partitions, 92 extents, each {offset, count, entry size}, the tables after the header), the partition entry by name (name[36], attributes, first extent, extent count, group), and its extents (u64 sectors, u32 type, u64 first sector, u32 source; 512-byte sectors). Only a single linear extent on `super` itself is taken, 4 KiB aligned — that is how the build lays out vendor_a; anything else is refused, not guessed at. The metadata's checksums are not checked: it is read only to find an ext4 filesystem that checks itself.
+pub fn find_logical(name: &str) -> Result<Part, String> {
+    let sup = find("super").ok_or_else(|| String::from("partition super not found"))?;
+    let ufs = UfsController::new(UFS_BASE);
+    let block = |lba: u64| -> Result<[u8; 4096], String> {
+        // The metadata names blocks inside super: outside it is malformed metadata, not a read to make.
+        if lba > sup.last - sup.first || ufs.read_block_lun(sup.lun, (sup.first + lba) as u32) != 0 || ufs.last_response_status() != 0 {
+            return Err(alloc::format!("super: read of block {lba} failed"));
+        }
+        Ok(*ufs.data_buffer())
+    };
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let u64at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    if u32at(&block(1)?, 0) != 0x616C_4467 {
+        return Err(String::from("super: no LP geometry"));
+    }
+    let hdr = block(3)?;
+    if u32at(&hdr, 0) != 0x414C_5030 {
+        return Err(String::from("super: no LP metadata header"));
+    }
+    let (hsize, tsize) = (u32at(&hdr, 8) as usize, u32at(&hdr, 44) as usize);
+    // The header and its tables, read whole: they are a few KiB (metadata_max_size bounds them; 64 KiB here).
+    if hsize + tsize > 1 << 16 {
+        return Err(alloc::format!("super: metadata of A#{} bytes", hsize + tsize));
+    }
+    let mut meta = Vec::with_capacity(hsize + tsize + 4096);
+    for k in 0..(hsize + tsize).div_ceil(4096) as u64 {
+        meta.extend_from_slice(&block(3 + k)?);
+    }
+    let table = |d: usize| (hsize + u32at(&meta, d) as usize, u32at(&meta, d + 4) as usize, u32at(&meta, d + 8) as usize);
+    let (poff, pcount, psize) = table(80);
+    let (eoff, ecount, esize) = table(92);
+    if psize < 52 || esize < 24 || poff + pcount * psize > meta.len() || eoff + ecount * esize > meta.len() {
+        return Err(String::from("super: LP tables outside the metadata"));
+    }
+    for p in 0..pcount {
+        let e = &meta[poff + p * psize..poff + (p + 1) * psize];
+        let n = &e[..36];
+        let n = &n[..n.iter().position(|&c| c == 0).unwrap_or(36)];
+        if n != name.as_bytes() {
+            continue;
+        }
+        let (first, count) = (u32at(e, 40) as usize, u32at(e, 44) as usize);
+        if count != 1 || first >= ecount {
+            return Err(alloc::format!("{name}: A#{count} extents (one linear extent handled)"));
+        }
+        let x = &meta[eoff + first * esize..eoff + (first + 1) * esize];
+        let (sectors, ty, start, source) = (u64at(x, 0), u32at(x, 8), u64at(x, 12), u32at(x, 20));
+        if ty != 0 || source != 0 || start % 8 != 0 || sectors % 8 != 0 || sectors == 0 {
+            return Err(alloc::format!("{name}: extent type {ty} source {source} start {start} sectors {sectors} not a 4 KiB-aligned linear extent on super"));
+        }
+        let (first_lba, last_lba) = (sup.first + start / 8, sup.first + start / 8 + sectors / 8 - 1);
+        if last_lba > sup.last {
+            return Err(alloc::format!("{name}: extent runs past super"));
+        }
+        return Ok(Part { lun: sup.lun, first: first_lba, last: last_lba });
+    }
+    Err(alloc::format!("{name}: not in super's metadata"))
+}
+
+/// An ext4 mount of a partition already found (a logical one from `find_logical`, say).
+pub fn mount_part(name: &str, part: Part) -> Result<Mount, String> {
+    let mut scratch = vec![0u8; 4096];
+    let fs = ferros_ext4::Fs::mount(PartDisk::new(part), &mut scratch).map_err(|e| alloc::format!("{name}: {e:?}"))?;
+    if fs.block_size != 4096 {
+        return Err(alloc::format!("{name}: block size {} (only 4 KiB handled)", fs.block_size));
+    }
+    Ok(Mount { fs, scratch, block: vec![0u8; 4096] })
+}
+
 /// A partition as an ext4 disk: filesystem block n is LBA first + n (both 4 KiB).
 pub struct PartDisk {
     ufs: UfsController,

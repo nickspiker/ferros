@@ -1476,13 +1476,16 @@ fn carrier_manifest_params() -> Vec<u8> {
     m[0x108..0x108 + id.len()].copy_from_slice(&id);
     m
 }
-/// The APN the data SIM attaches with. Verizon's public internet APN, the one its data-only devices attach on (stack 1's confpack is us_vzw); not IMS, so nothing voice comes up. A per-carrier choice ferros will take from settings later.
-const ATTACH_APN: &[u8] = b"VZWINTERNET";
+/// The APN the data SIM attaches with, and its APN type in the CP's numbering (GetProtocolApnType: 0 default, 1 IMS, 2 emergency). Verizon attaches on its IMS APN (VZWIMS, types ims and ia in its APN list) and carries internet on VZWINTERNET as a second PDN; VZWINTERNET as the attach APN was refused (RCM_E_GENERIC_FAILURE, 2026-10-29). A per-carrier choice ferros will take from settings later.
+const ATTACH_APN: &[u8] = b"VZWIMS";
+const ATTACH_APN_TYPE: u8 = 1;
 
-/// SIT_SET_INITIAL_ATTACH_APN's 239 parameter bytes (ProtocolPsBuilder::BuildSetInitialAttachApn, 251 bytes with the header), as offsets into the whole message: G#C profile id 0, G#D 14 (22 when a PDP type is 5), G#E 0, G#F APN type 0 (default; 1 IMS, 2 emergency), G#10 the APN [101], G#75 user [50], G#A7 password [50], G#D9 auth 0 (none), G#DA PDP type 3 (IPV4V6; 1 IP, 2 IPV6), G#DB P-CSCF request 0, G#F8 the roaming PDP type 3, G#F9 the roaming P-CSCF request 0, the rest 0.
+/// SIT_SET_INITIAL_ATTACH_APN's 239 parameter bytes (ProtocolPsBuilder::BuildSetInitialAttachApn, 251 bytes with the header), as offsets into the whole message: G#C the attach CID 1 (PsService's attach context; 0 is refused with RCM_E_GENERIC_FAILURE), G#D 14 (22 when a PDP type is 5), G#E 0, G#F the APN type (ATTACH_APN_TYPE), G#10 the APN [101], G#75 user [50], G#A7 password [50], G#D9 auth 0 (none), G#DA PDP type 3 (IPV4V6; 1 IP, 2 IPV6), G#DB P-CSCF request 0, G#F8 the roaming PDP type 3, G#F9 the roaming P-CSCF request 0, the rest 0.
 fn initial_attach_params(apn: &[u8]) -> Vec<u8> {
     let mut m = alloc::vec![0u8; 0xFB];
+    m[0xC] = 1;
     m[0xD] = 14;
+    m[0xF] = ATTACH_APN_TYPE;
     // The APN field is 101 bytes with its NUL; the name is our own constant, so one too long is a bug: fail loud.
     assert!(apn.len() <= 100);
     m[0x10..0x10 + apn.len()].copy_from_slice(apn);
@@ -1779,29 +1782,36 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
-// The remote-file service on RAW channel 41 (`umts_rfs0`, Android's /vendor/bin/rfsd; decoded 2026-10-29 from rfsd's handlers and the Android capture's own channel-41 conversation). Each message: u16 cmd, u16 transaction, u32 body length, then the body as u32 words. The CP opens a file into a slot (OPEN 4: slot, path length, path; slots 1-2 are the NV files, 3 the protected NV, 4 up files by path), asks for I/O (IO_REQUEST 6: slot, offset, size, direction 1 read / 2 write), queries (OP_STATUS 7: slot) and closes (CLOSE 5: slot). The AP answers each with STATUS (3: status, slot) and the CP acks every STATUS with its own. A read streams DATA (1: slot, offset, size, bytes) chunks the CP acks; a write is pulled by the AP, a cmd 2 {slot, offset, size} per chunk answered by the CP's cmd 2 {0, slot, size, bytes}, then STATUS. Chunks are G#7DC bytes, as rfsd's.
-// ferros never writes the phone's NV or files: a write is pulled to the end and acknowledged, and its bytes are dropped (the CP keeps its NV in RAM; the next boot loads the NV on flash, as before). Opens of files ferros cannot serve yet are logged and left unanswered.
+// The remote-file service on RAW channel 41 (`umts_rfs0`, Android's /vendor/bin/rfsd; decoded 2026-10-29 from rfsd's handlers and the Android capture's own channel-41 conversation). Each message: u16 cmd, u16 transaction, u32 body length, then the body as u32 words. The CP opens a file into a slot (OPEN 4: slot, path length, path; slots 1-2 are the NV files, 3 the protected NV, 4 up files by path), asks for I/O (IO_REQUEST 6: slot, offset, size, direction 1 read / 2 write), queries (OP_STATUS 7: slot) and closes (CLOSE 5: slot). The AP answers each with STATUS (3: status, slot; an open's also carries the file size): status 0 success, 1 an open that failed. The CP acks every STATUS with its own. A read streams DATA (1: slot, offset, size, bytes) chunks, each acked by the CP's cmd 1, then STATUS; a write is pulled by the AP, a cmd 2 {slot, offset, size} per chunk answered by the CP's cmd 2 {0, slot, size, bytes}, then STATUS. Chunks are G#7DC bytes, as rfsd's.
+// ferros never writes the phone's NV or files: a write is pulled to the end and acknowledged, and its bytes are dropped (the CP keeps its NV in RAM; the next boot loads the NV on flash, as before). Opens are served only under the carrier-config root, read-only from the vendor_a logical partition; any other path fails its open.
 
 const CH_RFS: u8 = 41;
 const RFS_CHUNK: u32 = 0x7DC;
 
-/// A write the CP asked for, being pulled chunk by chunk.
-struct RfsPull {
+/// A transfer in progress: a write being pulled, or a read being streamed, chunk by chunk.
+struct RfsXfer {
     tid: u16,
     slot: u32,
     off: u32,
     end: u32,
 }
 
-fn rfs_status(link: &mut SitLink, tid: u16, slot: u32) -> Result<(), alloc::string::String> {
+/// The remote-file service's state across messages: the transfers and the files open in slots (read whole at open; carrier-config files are a few KiB).
+struct Rfs {
+    pull: Option<RfsXfer>,
+    read: Option<RfsXfer>,
+    files: Vec<(u32, Vec<u8>)>,
+}
+
+fn rfs_status(link: &mut SitLink, tid: u16, status: u32, slot: u32, extra: u32) -> Result<(), alloc::string::String> {
     let mut m = alloc::vec![3u8, 0, tid as u8, (tid >> 8) as u8, 8, 0, 0, 0];
-    for w in [0u32, slot, 0] {
+    for w in [status, slot, extra] {
         m.extend_from_slice(&w.to_le_bytes());
     }
     ring_send(link, true, CH_RFS, &m)
 }
 
-fn rfs_pull(link: &mut SitLink, p: &RfsPull) -> Result<(), alloc::string::String> {
+fn rfs_pull(link: &mut SitLink, p: &RfsXfer) -> Result<(), alloc::string::String> {
     let mut m = alloc::vec![2u8, 0, p.tid as u8, (p.tid >> 8) as u8, 0xC, 0, 0, 0];
     for w in [p.slot, p.off, (p.end - p.off).min(RFS_CHUNK)] {
         m.extend_from_slice(&w.to_le_bytes());
@@ -1809,8 +1819,36 @@ fn rfs_pull(link: &mut SitLink, p: &RfsPull) -> Result<(), alloc::string::String
     ring_send(link, true, CH_RFS, &m)
 }
 
-/// One remote-file message from the CP: answered as rfsd answers it, writes pulled and dropped.
-fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, pull: &mut Option<RfsPull>) {
+/// The next DATA chunk of a read: {1, tid, 12 + n, slot, offset, n, bytes}.
+fn rfs_data(link: &mut SitLink, p: &RfsXfer, file: &[u8]) -> Result<(), alloc::string::String> {
+    let n = (p.end - p.off).min(RFS_CHUNK);
+    let mut m = alloc::vec![1u8, 0, p.tid as u8, (p.tid >> 8) as u8];
+    m.extend_from_slice(&(12 + n).to_le_bytes());
+    for w in [p.slot, p.off, n] {
+        m.extend_from_slice(&w.to_le_bytes());
+    }
+    m.extend_from_slice(&file[p.off as usize..(p.off + n) as usize]);
+    ring_send(link, true, CH_RFS, &m)
+}
+
+/// A carrier-config file from vendor_a, or why not. Paths are the CP's: only plain names under the root, no "..", are looked up.
+fn rfs_vendor_file(path: &str) -> Result<Vec<u8>, alloc::string::String> {
+    let rel = path.strip_prefix(CARRIER_CONFIG_ROOT).filter(|r| r.starts_with('/') && !r.contains("..") && r.bytes().all(|c| c.is_ascii_graphic())).ok_or_else(|| alloc::string::String::from("outside the carrier-config root"))?;
+    let part = crate::partfs::find_logical("vendor_a")?;
+    let mut m = crate::partfs::mount_part("vendor_a", part)?;
+    let ino = m.open(&alloc::format!("/firmware/carrierconfig{rel}"))?;
+    // A file over 4 MiB is not a carrier-config file; the CP's sizes are u32 anyway.
+    if !ino.is_file() || ino.size > 1 << 22 {
+        return Err(alloc::format!("not a file of a sane size"));
+    }
+    let mut v = alloc::vec![0u8; (ino.size as usize + 4095) & !4095];
+    m.read(&ino, 0, &mut v)?;
+    v.truncate(ino.size as usize);
+    Ok(v)
+}
+
+/// One remote-file message from the CP: answered as rfsd answers it, writes pulled and dropped, carrier-config files read from vendor_a.
+fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs) {
     // The CP's bytes: every word read is checked to lie inside the message.
     let w = |i: usize| if b.len() >= i + 4 { Some(u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])) } else { None };
     let (Some(head), Some(_len)) = (w(0), w(4)) else {
@@ -1821,42 +1859,89 @@ fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, pull: &mut Op
         (3, _) => Ok(()),
         (7, Some(slot)) => {
             line(rep, alloc::format!("t={t_ms} ms: rfs OP_STATUS slot A#{slot} (tid A#{tid}) -> status 0\n"));
-            rfs_status(link, tid, slot)
+            rfs_status(link, tid, 0, slot, 0)
         }
         (5, Some(slot)) => {
+            st.files.retain(|(s, _)| *s != slot);
             line(rep, alloc::format!("t={t_ms} ms: rfs CLOSE slot A#{slot} (tid A#{tid}) -> status 0\n"));
-            rfs_status(link, tid, slot)
+            rfs_status(link, tid, 0, slot, 0)
         }
         (4, Some(slot)) => {
             let n = w(12).unwrap_or(0) as usize;
-            let path = if b.len() >= 16 + n { alloc::string::String::from_utf8_lossy(&b[16..16 + n]).into_owned() } else { alloc::string::String::from("?") };
-            line(rep, alloc::format!("t={t_ms} ms: rfs OPEN slot A#{slot} {} (tid A#{tid}): not served yet\n", path.trim_end_matches('\0')));
-            Ok(())
+            let path = if b.len() >= 16 + n { alloc::string::String::from_utf8_lossy(&b[16..16 + n]).trim_end_matches('\0').into() } else { alloc::string::String::from("?") };
+            match rfs_vendor_file(&path) {
+                Ok(v) => {
+                    line(rep, alloc::format!("t={t_ms} ms: rfs OPEN slot A#{slot} {path} (tid A#{tid}) -> A#{} bytes\n", v.len()));
+                    let size = v.len() as u32;
+                    st.files.retain(|(s, _)| *s != slot);
+                    st.files.push((slot, v));
+                    rfs_status(link, tid, 0, slot, size)
+                }
+                Err(e) => {
+                    line(rep, alloc::format!("t={t_ms} ms: rfs OPEN slot A#{slot} {path} (tid A#{tid}) -> status 1 ({e})\n"));
+                    rfs_status(link, tid, 1, slot, 0)
+                }
+            }
         }
         (6, Some(slot)) => match (w(12), w(16), w(20)) {
             (Some(off), Some(size), Some(2)) => {
                 line(rep, alloc::format!("t={t_ms} ms: rfs write slot A#{slot} G#{size:X} bytes at G#{off:X} (tid A#{tid}): pulled, not stored\n"));
                 // Offset and size are the CP's: wrapping keeps a hostile pair from panicking the kernel; the pull then simply ends early.
-                let p = RfsPull { tid, slot, off, end: off.wrapping_add(size) };
-                let r = if size == 0 { rfs_status(link, tid, slot) } else { rfs_pull(link, &p) };
+                let p = RfsXfer { tid, slot, off, end: off.wrapping_add(size) };
+                let r = if size == 0 { rfs_status(link, tid, 0, slot, 0) } else { rfs_pull(link, &p) };
                 if size != 0 {
-                    *pull = Some(p);
+                    st.pull = Some(p);
                 }
                 r
             }
+            (Some(off), Some(size), Some(1)) => match st.files.iter().find(|(s, _)| *s == slot) {
+                Some((_, f)) => {
+                    // The read is cut at the file's end: the CP asks for what it was told the size is, but its numbers are not trusted to index the file.
+                    let end = (off as u64 + size as u64).min(f.len() as u64) as u32;
+                    line(rep, alloc::format!("t={t_ms} ms: rfs read slot A#{slot} G#{size:X} bytes at G#{off:X} (tid A#{tid})\n"));
+                    let p = RfsXfer { tid, slot, off: off.min(end), end };
+                    let r = if p.off == p.end { rfs_status(link, tid, 0, slot, 0) } else { rfs_data(link, &p, f) };
+                    if p.off != p.end {
+                        st.read = Some(p);
+                    }
+                    r
+                }
+                None => {
+                    line(rep, alloc::format!("t={t_ms} ms: rfs read slot A#{slot} (tid A#{tid}): no file open there -> status 1\n"));
+                    rfs_status(link, tid, 1, slot, 0)
+                }
+            },
             (off, size, dir) => {
-                line(rep, alloc::format!("t={t_ms} ms: rfs IO_REQUEST slot A#{slot} offset {off:?} size {size:?} direction {dir:?} (tid A#{tid}): not served yet\n"));
+                line(rep, alloc::format!("t={t_ms} ms: rfs IO_REQUEST slot A#{slot} offset {off:?} size {size:?} direction {dir:?} (tid A#{tid}): not handled\n"));
                 Ok(())
             }
         },
-        (2, _) => match (pull.as_mut(), w(16)) {
+        // The CP's ack of a DATA chunk: the next one, or the read's STATUS.
+        (1, _) => match st.read.as_mut() {
+            Some(p) if p.tid == tid => {
+                p.off += (p.end - p.off).min(RFS_CHUNK);
+                if p.off >= p.end {
+                    let (tid, slot) = (p.tid, p.slot);
+                    st.read = None;
+                    rfs_status(link, tid, 0, slot, 0)
+                } else {
+                    let slot = p.slot;
+                    match st.files.iter().find(|(s, _)| *s == slot) {
+                        Some((_, f)) => rfs_data(link, p, f),
+                        None => Ok(()),
+                    }
+                }
+            }
+            _ => Ok(()),
+        },
+        (2, _) => match (st.pull.as_mut(), w(16)) {
             (Some(p), Some(n)) if p.tid == tid => {
                 p.off = p.off.wrapping_add(n);
                 if n == 0 || p.off >= p.end {
                     let (tid, slot) = (p.tid, p.slot);
-                    *pull = None;
+                    st.pull = None;
                     line(rep, alloc::format!("t={t_ms} ms: rfs write slot A#{slot} pulled to the end -> status 0\n"));
-                    rfs_status(link, tid, slot)
+                    rfs_status(link, tid, 0, slot, 0)
                 } else {
                     rfs_pull(link, p)
                 }
@@ -1884,7 +1969,7 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut next_reg = 5_000_000u64;
     let (mut sim_asked, mut data_on, mut ia_set, mut queried) = (false, false, false, false);
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut pull: Option<RfsPull> = None;
+    let mut rfs_st = Rfs { pull: None, read: None, files: Vec::new() };
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
     let mut per_ch = [0u32; 256];
     let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
@@ -2006,7 +2091,7 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             let served_rfs = probe >= 1 && name == "raw" && ch == CH_RFS;
             if served_rfs {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
-                rfs(rep, since_us(t0) / 1000, &body, &mut link, &mut pull);
+                rfs(rep, since_us(t0) / 1000, &body, &mut link, &mut rfs_st);
             }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
