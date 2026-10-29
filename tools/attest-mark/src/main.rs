@@ -4,7 +4,7 @@
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
 //! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles the descent's x between banded per device (1/12 of the real axis) and free.
-//! For tuning, the window is split: the mark in the top half, and below it two locator strips, imaginary axis up — the whole Mandelbrot set with every point the descent checked as a pixel in its own random colour and a crosshair on the Julia set's c, and a 2⁵× zoom around c.
+//! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
 
 use tapuwae as mark;
@@ -65,12 +65,12 @@ impl App {
         }
     }
 
-    /// The textbox sits near the bottom of the mark (the top half), a little narrower than the window, sized from the span.
+    /// The textbox at the top, a little narrower than the window, sized from the span.
     fn layout(&mut self, vp: Viewport, text: &mut TextRenderer) {
-        let (w, h) = (vp.width_px as Coord, vp.height_px as Coord);
+        let (w, _) = (vp.width_px as Coord, vp.height_px as Coord);
         let span = vp.effective_span();
         let fs = span / (1 << 5) as Coord;
-        self.textbox.set_rect(w * 0.5, h * 0.4, w - span / (1 << 2) as Coord, fs * 1.6);
+        self.textbox.set_rect(w * 0.5, textbox_cy(span), w - span / (1 << 2) as Coord, fs * 1.6);
         self.textbox.set_font_size(fs, text);
     }
 
@@ -85,6 +85,50 @@ impl App {
 
     fn text(&self) -> String {
         self.textbox.chars.iter().collect()
+    }
+}
+
+/// The textbox's centre height: clear of the window's title strip, 2⁻³ of the span down.
+fn textbox_cy(span: Coord) -> Coord {
+    span / (1 << 3) as Coord
+}
+
+/// The textbox's bottom edge.
+fn textbox_bottom(span: Coord) -> Coord {
+    textbox_cy(span) + span / (1 << 5) as Coord * 0.8
+}
+
+/// A smooth (C∞) minimum, (a + b − √((a − b)² + δ²))/2 with δ = 2⁻⁴ of the larger: a hair under the smaller, with no corner where the two cross.
+fn smooth_min(a: f32, b: f32) -> f32 {
+    let d = a.max(b) * (1. / (1 << 4) as f32);
+    0.5 * (a + b - ((a - b) * (a - b) + d * d).sqrt())
+}
+
+/// A tiny grey Mandelbrot set in the box (x0, y0, bw, bh) of `buf` (rows of `w`, α + darkness): the set's whole extent [−2, X_RIGHT] × [−1.15, 1.15], imaginary axis up, fitted inside the box; the set mid grey, the field around it a faint grey by escape speed, and a white pixel at `c`.
+fn render_minibrot(buf: &mut [u32], w: usize, x0: usize, y0: usize, bw: usize, bh: usize, c: (f64, f64)) {
+    let grey = |g: u32| 0xFF00_0000 | ((255 - g) << 16) | ((255 - g) << 8) | (255 - g);
+    let (re0, re1, im_half) = (-2.0f64, mark::X_RIGHT, 1.15f64);
+    // Plane units per pixel at which both extents fit the box: the larger of the two needed picks the fit, it clamps nothing.
+    let k = ((re1 - re0) / bw as f64).max(2. * im_half / bh as f64);
+    let (cre, cim) = (0.5 * (re0 + re1), 0.);
+    for py in 0..bh {
+        for px in 0..bw {
+            let cr = cre + (px as f64 + 0.5 - bw as f64 * 0.5) * k;
+            let ci = cim - (py as f64 + 0.5 - bh as f64 * 0.5) * k;
+            let (mut x, mut y, mut n) = (0f64, 0f64, 0u32);
+            while n < 1 << 8 && x * x + y * y <= 4. {
+                (x, y) = (x * x - y * y + cr, 2. * x * y + ci);
+                n += 1;
+            }
+            let g = if n == 1 << 8 { 0x90 } else { (72. * (1. - (-(n as f32) / 8.).exp2())) as u32 };
+            buf[(y0 + py) * w + x0 + px] = grey(g);
+        }
+    }
+    let px = ((c.0 - cre) / k + bw as f64 * 0.5) as usize;
+    let py = ((cim - c.1) / k + bh as f64 * 0.5) as usize;
+    // WHY/PROOF: c lies on [−2, X_RIGHT] × [0, 2], inside the fitted extent, but the box's integer edges can round its pixel one past the last row or column.
+    if px < bw && py < bh {
+        buf[(y0 + py) * w + x0 + px] = grey(0xFF);
     }
 }
 
@@ -247,18 +291,20 @@ impl FluorApp for App {
             let c = mark::locus(&p);
             let (land, hit, trail) = mark::descend(c.0);
             println!("device {:2}  x {:+.6}  landing {:+.6} {:+.6}i ({} after {} checks)  c {:+.6} {:+.6}i", self.device, c.0, land.0, land.1, if hit { "on the set" } else { "missed, on the axis" }, trail.len(), c.0, c.1);
-            // Top half: the mark; then the whole set, then a 2⁵× zoom around the locus, a quarter of the height each.
-            let (h0, h1) = (h / 2, h / 4);
-            let (top, rest) = self.mark.split_at_mut(w * h0);
-            let (whole, near) = rest.split_at_mut(w * h1);
-            // The mark spherized into a disc above the textbox: radius a quarter of the pane's span, centred at 0.45 of its height; the rest of the pane is black.
-            let span = 2. * (w * h0) as f32 / (w + h0) as f32;
-            mark::render_disc(top, w, w as f32 * 0.5, h0 as f32 * 0.45, span * 0.25, &p, &self.look);
-            for px in top.iter_mut() {
+            // The sphere, centred between the textbox and the bottom: as large as fits that space and the window's width, a hair inside both.
+            let span = 2. * (w * h) as f32 / (w + h) as f32;
+            let top = textbox_bottom(span);
+            let room = h as f32 - top;
+            let r = 0.5 * smooth_min(w as f32, room) * (1. - 1. / (1 << 4) as f32);
+            mark::render_disc(&mut self.mark, w, w as f32 * 0.5, top + room * 0.5, r, &p, &self.look);
+            // A tiny grey Mandelbrot in the top-right gap between the textbox and the sphere, with a white pixel at c.
+            let mb_w = (span / (1 << 2) as f32) as usize;
+            let mb_h = (mb_w as f32 * 2.3 / (mark::X_RIGHT as f32 + 2.)) as usize + 1;
+            let margin = (span / (1 << 6) as f32) as usize;
+            render_minibrot(&mut self.mark, w, w - margin - mb_w, top as usize + margin, mb_w, mb_h, c);
+            for px in self.mark.iter_mut() {
                 *px = px.under(0xFF_FF_FF_FF, BlendMode::Normal);
             }
-            mark::render_whole(whole, w, h1, &p);
-            mark::render_near(near, w, h - h0 - h1, &p);
             self.mark_key = key;
         }
 
