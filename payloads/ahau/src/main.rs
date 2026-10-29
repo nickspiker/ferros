@@ -43,6 +43,13 @@ const RING: u64 = 2;
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
+/// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
+static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
+/// The handle as published for the mark (bytes, length), under FRESH_LOCK; FRESH_GEN counts publications, FRESH_DONE is one past the generation of the last finished frame (0 = none yet).
+static mut FRESH_TEXT: ([u8; 4 * MAX_CHARS], usize) = ([0; 4 * MAX_CHARS], 0);
+static FRESH_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FRESH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FRESH_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_PHOTON_EP: u64 = 8;
 /// The longest handle the screen takes, in characters.
@@ -408,6 +415,7 @@ impl Ahau {
 
     /// The entry: the handle as typed, a cursor, and a line under it.
     fn entry(&self) {
+        publish_fresh_text(&self.handle[..self.len]);
         let (b, px) = self.entry_at();
         self.clear_rows(b - px * 3 / 2, b + px / 2);
         // A newline shows as ¶ (the typeface has no return arrow): the handle stays on one line as typed.
@@ -465,6 +473,7 @@ impl Ahau {
         }
         self.len = 0;
         self.chars = 0;
+        publish_fresh_text(&[]);
     }
 
     fn put(&self, scope: u64, key: &[u8], value: &[u8]) -> bool {
@@ -647,8 +656,8 @@ fn mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     }
 }
 
-/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's.
-/// Rendered on a thread of its own pinned to the X3 (the one big core: about a second at two thirds of the width), so the screen and the keyboard are up at once and the mark appears when it is done; the main loop blits it when FRESH_STATE turns READY.
+/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's, with the device's attest ball inside every component, following the handle as it is typed.
+/// Rendered on a thread of its own pinned to the X3 (the one big core), so the screen and the keyboard are never held: the whole mark once, then on every change to the handle only the components again (the outline never changes); the main loop blits each finished frame (FRESH_DONE).
 /// Without the ira grant, or on a panel too wide for the buffer, the state is RING and the drawn ring stands in.
 fn start_fresh_mark(grants: u64, r: usize) {
     let side = 2 * r + 4;
@@ -666,32 +675,82 @@ fn start_fresh_mark(grants: u64, r: usize) {
     unsafe { FRESH_JOB = (grants, r, salt) };
     let stack = unsafe { &mut *(&raw mut FRESH_STACK) };
     if ferros_sys::thread_spawn(fresh_thread, stack, 0) == ferros_sys::ERR {
-        // No thread: render here, before the screen comes up.
-        console(grants, b"ahau: no thread for the mark; rendering it first\n");
-        render_fresh_mark();
+        // No thread: the whole mark here, once, before the screen comes up; it then does not follow the handle.
+        console(grants, b"ahau: no thread for the mark; rendering it once, first\n");
+        render_fresh_mark(true);
     }
 }
 
+/// The mark's thread: the whole mark, then each new handle's components, waiting on FRESH_GEN between.
 extern "C" fn fresh_thread(_: u64) -> ! {
-    render_fresh_mark();
-    ferros_sys::thread_exit(0)
-}
-
-/// The render itself, on the X3, with its time on the console; then READY.
-fn render_fresh_mark() {
-    let (grants, r, salt) = unsafe { FRESH_JOB };
-    let side = 2 * r + 4;
     ferros_sys::pin(ferros_sys::CORES_BIG);
     sleep_until(now() + freq() / 1000);
+    let mut full = true;
+    loop {
+        let g = FRESH_GEN.load(core::sync::atomic::Ordering::Acquire);
+        render_fresh_mark(full);
+        FRESH_DONE.store(g + 1, core::sync::atomic::Ordering::Release);
+        full = false;
+        while FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) == g {
+            ferros_sys::wait(&FRESH_GEN, g, 0);
+        }
+    }
+}
+
+/// One render for the handle as last published (the whole mark when `full`, else the components), with its time on the console (never the handle); then READY. The thread's copy of the handle is wiped when it is done with it.
+fn render_fresh_mark(full: bool) {
+    let (grants, r, salt) = unsafe { FRESH_JOB };
+    let side = 2 * r + 4;
+    let mut text = [0u8; 4 * MAX_CHARS];
+    let n = with_fresh_text(|t, n| {
+        text[..n].copy_from_slice(&t[..n]);
+        n
+    });
     let t0 = now();
     let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
+    let mask = unsafe { &mut (&mut *(&raw mut FRESH_MASK))[..(side * side).div_ceil(64)] };
     let mid = side as f32 * 0.5;
-    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, 2);
+    tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 2, mask, full);
+    for b in text.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
     let mut l = Line::new();
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark ({side} px, 2x2) in {} ms on the X3\n", ferros_sys::us_since(t0) / 1000));
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {} ({side} px, 2x2) in {} ms on the X3\n", if full { "drawn" } else { "follows the handle" }, ferros_sys::us_since(t0) / 1000));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
+}
+
+/// The handle as the mark's thread is to draw it, under FRESH_LOCK (held only for a copy of at most 4·MAX_CHARS bytes, so a spin).
+fn with_fresh_text<R>(f: impl FnOnce(&mut [u8; 4 * MAX_CHARS], usize) -> R) -> R {
+    while FRESH_LOCK.swap(true, core::sync::atomic::Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let r = unsafe {
+        let (t, n) = &mut *(&raw mut FRESH_TEXT);
+        f(t, *n)
+    };
+    FRESH_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    r
+}
+
+/// Hand the mark's thread the handle as it now stands, when it changed: copied under the lock, the generation moved on, the thread woken.
+fn publish_fresh_text(handle: &[u8]) {
+    let changed = with_fresh_text(|t, n| {
+        if &t[..n] == handle {
+            return false;
+        }
+        t[..handle.len()].copy_from_slice(handle);
+        for b in t[handle.len()..].iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        unsafe { (*(&raw mut FRESH_TEXT)).1 = handle.len() };
+        true
+    });
+    if changed {
+        FRESH_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+        ferros_sys::wake(&FRESH_GEN, 1);
+    }
 }
 
 /// The mark centred at (cx, cy) on the surface, as it stands: the rendered mark when READY (tapuwae's α + darkness over black is α − darkness a channel, 8 bits, widened to the surface's gamma-2 values, white = Q14, red in the low 16 bits as the display server reads them), the ring when RING, nothing while PENDING.
@@ -766,14 +825,15 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     // Every key exact: a rolling finger still types where it landed.
     touches.trace_words = false;
     let mut held = [(0u8, 0i64, 0i64); 16];
-    // Whether the mark has been drawn since its thread finished.
-    let mut mark_shown = false;
+    // The last frame of the mark put on the glass (FRESH_DONE's count).
+    let mut mark_shown = 0u64;
     loop {
-        if !mark_shown && FRESH_STATE.load(core::sync::atomic::Ordering::Acquire) == READY {
+        let done = FRESH_DONE.load(core::sync::atomic::Ordering::Acquire);
+        if done != mark_shown {
             let (cx, cy, r) = a.mark_at();
             draw_mark(a.surf(), a.w, cx, cy, r);
             a.show();
-            mark_shown = true;
+            mark_shown = done;
         }
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
