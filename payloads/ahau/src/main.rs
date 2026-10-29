@@ -53,6 +53,9 @@ static mut FRESH_TEXT: ([u8; 4 * MAX_CHARS], usize) = ([0; 4 * MAX_CHARS], 0);
 static FRESH_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FRESH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FRESH_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The generation the last finished frame drew (FRESH_DONE_GEN), and the generation of the handle as typed (SHOW_GEN): the screen puts up only a frame of the typed handle, so a preview drawn while a finger is down waits for the lift, and one the finger slid off never shows.
+static FRESH_DONE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SHOW_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_PHOTON_EP: u64 = 8;
 /// The longest handle the screen takes, in characters.
@@ -418,7 +421,7 @@ impl Ahau {
 
     /// The entry: the handle as typed, a cursor, and a line under it.
     fn entry(&self) {
-        publish_fresh_text(&self.handle[..self.len]);
+        publish_fresh_text(&self.handle[..self.len], true);
         let (b, px) = self.entry_at();
         self.clear_rows(b - px * 3 / 2, b + px / 2);
         // A newline shows as ¶ (the typeface has no return arrow): the handle stays on one line as typed.
@@ -476,7 +479,7 @@ impl Ahau {
         }
         self.len = 0;
         self.chars = 0;
-        publish_fresh_text(&[]);
+        publish_fresh_text(&[], true);
     }
 
     fn put(&self, scope: u64, key: &[u8], value: &[u8]) -> bool {
@@ -579,6 +582,41 @@ impl Ahau {
         console(self.grants, b"ahau: attested\n");
         window::done(self.display, self.base);
         exit(0)
+    }
+
+    /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
+    fn preview(&self, key: Key) {
+        let mut kb = self.kb.clone();
+        let mut t = [0u8; 4 * MAX_CHARS];
+        let mut n = self.len;
+        t[..n].copy_from_slice(&self.handle[..n]);
+        let mut add = |c: char, t: &mut [u8; 4 * MAX_CHARS], n: &mut usize| {
+            let mut b = [0u8; 4];
+            let e = c.encode_utf8(&mut b).as_bytes();
+            if self.chars < MAX_CHARS {
+                t[*n..*n + e.len()].copy_from_slice(e);
+                *n += e.len();
+            }
+        };
+        match kb.tap(key) {
+            Some(Event::Char(c)) => add(c, &mut t, &mut n),
+            Some(Event::Enter) => add('\n', &mut t, &mut n),
+            Some(Event::Back) => {
+                while n > 0 {
+                    n -= 1;
+                    let lead = t[n] & 0xC0 != 0x80;
+                    if lead {
+                        break;
+                    }
+                }
+            }
+            Some(Event::Leave) => n = 0,
+            _ => return,
+        }
+        publish_fresh_text(&t[..n], false);
+        for b in t.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
     }
 
     fn type_char(&mut self, c: char) {
@@ -696,6 +734,7 @@ extern "C" fn fresh_thread(_: u64) -> ! {
         for fine in [false, true] {
             if render_fresh_mark(full, fine, g) {
                 frames += 1;
+                FRESH_DONE_GEN.store(g, core::sync::atomic::Ordering::Release);
                 FRESH_DONE.store(frames, core::sync::atomic::Ordering::Release);
             }
             full = false;
@@ -753,8 +792,8 @@ fn with_fresh_text<R>(f: impl FnOnce(&mut [u8; 4 * MAX_CHARS], usize) -> R) -> R
     r
 }
 
-/// Hand the mark's thread the handle as it now stands, when it changed: copied under the lock, the generation moved on, the thread woken.
-fn publish_fresh_text(handle: &[u8]) {
+/// Hand the mark's thread a handle, when it changed: copied under the lock, the generation moved on, the thread woken. `typed`: this is the handle as typed (the screen will show its frames); otherwise a preview, the handle as a key that is still down would make it (owner, 2026-10-29: the render starts at the touch, the text and its mark appear together at the lift).
+fn publish_fresh_text(handle: &[u8], typed: bool) {
     let changed = with_fresh_text(|t, n| {
         if &t[..n] == handle {
             return false;
@@ -769,6 +808,9 @@ fn publish_fresh_text(handle: &[u8]) {
     if changed {
         FRESH_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
         ferros_sys::wake(&FRESH_GEN, 1);
+    }
+    if typed {
+        SHOW_GEN.store(FRESH_GEN.load(core::sync::atomic::Ordering::Acquire), core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -847,7 +889,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     let mut mark_shown = 0u64;
     loop {
         let done = FRESH_DONE.load(core::sync::atomic::Ordering::Acquire);
-        if done != mark_shown {
+        let typed = FRESH_DONE_GEN.load(core::sync::atomic::Ordering::Acquire) == SHOW_GEN.load(core::sync::atomic::Ordering::Acquire);
+        if done != mark_shown && typed {
             let (cx, cy, r) = a.mark_at();
             draw_mark(a.surf(), a.w, cx, cy, r);
             a.show();
@@ -867,16 +910,30 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
             outs[no] = t;
             no += 1;
         });
+        // A key let go without its tap (the finger slid off) leaves the typed handle as it was: its preview gives way to the typed handle again, decided after the whole poll, since a lift reports the key's Unlight just before its Tap.
+        let mut slid = false;
         for &t in &outs[..no] {
             match t {
-                Touch::Light(key) => a.kb.draw_key(a.surf(), key, true, &mut a.label()),
-                Touch::Unlight(key) => a.kb.draw_key(a.surf(), key, false, &mut a.label()),
+                Touch::Light(key) => {
+                    a.kb.draw_key(a.surf(), key, true, &mut a.label());
+                    a.preview(key);
+                }
+                Touch::Unlight(key) => {
+                    a.kb.draw_key(a.surf(), key, false, &mut a.label());
+                    slid = true;
+                }
                 Touch::Scrolled => a.kb.draw(a.surf(), &mut a.label()),
-                Touch::Tap(key) => a.tap(key),
+                Touch::Tap(key) => {
+                    a.tap(key);
+                    slid = false;
+                }
                 Touch::TapAt(x, y) => a.tap_at(x, y),
                 // A handle is exact bytes, typed key by key: no shape writing here.
                 Touch::Trail(..) | Touch::Traced => {}
             }
+        }
+        if slid {
+            publish_fresh_text(&a.handle[..a.len], true);
         }
         // Following the Photon client's verdict while the identity is looked up or joined: about four times a second.
         polls += 1;

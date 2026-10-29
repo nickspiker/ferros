@@ -83,6 +83,7 @@ pub enum Event {
 }
 
 /// The keyboard: its geometry (Q8 pixels unless named) and its state.
+#[derive(Clone)]
 pub struct Keyboard {
     w: usize,
     /// The column pitch and the row pitch.
