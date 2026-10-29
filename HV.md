@@ -98,3 +98,23 @@ The slot-a boot image is pre-assembled: `[hv][Linux Image][ferros]` (`tools/husk
 
 Costs: the 16 MiB splash save and restore run with the hv's MMU off (Device accesses), roughly half a second each way.
 Both slots can carry this image once slot b's Android partitions match slot a's; until then slot b keeps the plain cold ferros image as the escape.
+
+## The watchdog under Android (measured 2026-10-28)
+
+Read from Android's dmesg and /proc on husky, booted through the gate:
+- **0.73 s:** the cluster watchdog ABL armed before the hand-off is *stopped* by Android's `s3c2410_wdt` driver at probe ("Watchdog cluster 0 stop done … inactive, reset disabled, irq disabled"; the same for cluster 1).
+- **0.73 to 5.42 s:** no watchdog runs at all.
+- **5.42 s:** init starts `gs_watchdogd` (`/system_ext/bin/gs_watchdogd`, `init.gs_watchdogd.rc`). It opens `/dev/watchdog`, which restarts cluster 0 (`WTCON 11573d`) and cluster 1's multistage watchdog, and keeps them fed from userspace from then on.
+- **Also loaded:** `hardlockup-watchdog` (4 s sampling, three chances, panic = 1), a kernel-side check for a core stuck with interrupts off.
+
+**What follows:**
+- **Early hangs never reset.** An Android that hangs between the driver's probe and `gs_watchdogd` hangs forever, as it did on 2026-10-28 when first-stage init could not load its modules from slot b: init never got far enough to start the daemon. The A/B fallback cannot help either, because nothing resets and the retry count never moves.
+- **Later freezes reset only if the daemon stops.** After 5.4 s a freeze resets only if it stops `gs_watchdogd` as well. The 2026-10-19 freeze that sat 5 minutes without a reset is consistent with a freeze that left that daemon (or its core) running.
+
+**Design, for the UFS firewall milestone:** the hv owns the cluster watchdogs.
+- **It traps their two register pages** in stage 2 (G#1006_0000, G#1007_0000).
+- **It refuses Linux's stop:** the watchdog keeps running from ABL's arm, through Android's boot, with a generous timeout.
+- **It passes Linux's restarts and keepalives through** once `gs_watchdogd` runs, so a running Android feeds it as it does today.
+- **The result:** an Android that hangs anywhere, early or late, is reset, and an Android that never comes up counts down its slot's retries like a dead ferros does.
+
+Not built. The measurement is in this section; the register map is the Exynos s3c2410 WDT block (WTCON, WTDAT, WTCNT), the cluster watchdogs at the two pages above.
