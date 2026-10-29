@@ -18,7 +18,7 @@
 //!
 //! Shading: the distance estimate (|z|·ln|z| over the derivative's magnitude, in pixels) separates the set from the field around it, because near the set the escape count changes chaotically from pixel to pixel and reads as static.
 //! The set's body is dark with the colouring faintly inside it, its edge is a luminous rim a few pixels wide, and the field outside is the colouring method, dimmed and fading to black far out.
-//! The colouring method is one of four: smooth iteration bands, the angle of the orbit at escape (a cellular mosaic), an orbit trap (distance to a hash-chosen point: rings and petals), or the flame (mandelbrot-exploder's weighted orbit means); every method also carries soft contours of the real distance estimate.
+//! The colouring method is one of four: smooth iteration bands, a swirl of the potential's gradient direction, an orbit trap (distance to a hash-chosen point: rings and petals), or the flame (mandelbrot-exploder's weighted orbit means); every method also carries soft contours of the real distance estimate.
 //! Nothing compares the text against anything, so the picture says nothing about whether the text is right.
 
 use fluor::paint::pack_argb;
@@ -27,8 +27,8 @@ use std::f64::consts::TAU;
 
 /// Iteration cap for the render: deep enough for the windows used here.
 const MAX_ITER: u32 = 1 << 10;
-/// Escape when |z|² passes 2⁸ (|z| = 16), far enough out for smooth colouring.
-const BAIL_SQ: f64 = (1 << 8) as f64;
+/// The placement's escape (f64): |z|² past √(f64::MAX), as the render's is past √(f32::MAX), so the descent's distance estimates use every clean bit.
+const BAIL_SQ: f64 = 1.340_780_792_994_259_7e154;
 /// The render's escape: |z|² past √(f32::MAX), the last point at which the next square is still finite (mandelbrot-exploder's rule), so the smooth count, the distance estimate and the flames get every clean bit of the escape.
 const BAIL_SQ_F32: f32 = 1.844_674_4e19;
 /// A jump of 2² iterations between neighbouring thumbnail pixels marks an edge of the set.
@@ -112,9 +112,8 @@ struct Orbit {
     y: f32,
     dm: f32,
     trap_sq: f32,
-    /// z when |z|² first passed 2⁸: its angle is a smooth field to colour by, where the angle at the far escape turns 2ⁿ times faster with every doubling of the escape and aliases into hatching.
-    ax: f32,
-    ay: f32,
+    /// |dz/dz₀| = dm · 2^dm_exp: the magnitude is rescaled by 2⁻⁶⁴ whenever it passes 2⁶⁴, so it never overflows f32 however long the orbit stays near the set (an overflowed derivative read as distance 0, a band of false "on the set" pixels).
+    dm_exp: i32,
     /// The flames, from mandelbrot-exploder (compute/mandelbrot_f64.rs, OrbitTrackerf64): weighted means over the orbit, `fq` of z (weight iter²/|z|, tapered as the orbit escapes) and `fc` of 1/z (weight 1/|z|).
     fq: (f32, f32),
     fc: (f32, f32),
@@ -128,7 +127,7 @@ struct Orbit {
 /// It can overflow to infinity near the set, which the distance estimate reads, correctly, as "on the set".
 #[inline]
 fn orbit(px: f32, py: f32, v: &View) -> Orbit {
-    let (mut z, c, plus, mut dm) = match v.kind {
+    let (mut z, c, mut plus, mut dm) = match v.kind {
         Kind::Plane => ((0f32, 0f32), (px, py), 1f32, 0f32),
         Kind::Julia => ((px, py), v.c, 0., 1.),
     };
@@ -141,7 +140,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
     // The taper's scale: ln ln of the escape.
     let lnln_bail = BAIL_SQ_F32.ln().ln();
     let ln_2ln2 = (2. * 2f32.ln()).ln();
-    let mut early = (0f32, 0f32);
+    let mut dm_exp = 0i32;
     let finish = |fq: (f32, f32), fq_w: f32, fc: (f32, f32), fc_w: f32| ((fq.0 / fq_w, fq.1 / fq_w), (fc.0 / fc_w, fc.1 / fc_w));
     for n in 0..MAX_ITER {
         let (x2, y2) = (z.0 * z.0, z.1 * z.1);
@@ -152,10 +151,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
             let (zx, zy) = (z.0 / rz, z.1 / rz);
             let (ux, uy) = if julia { (zx * dir.0 + zy * dir.1, zy * dir.0 - zx * dir.1) } else { (0., 0.) };
             let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-            return Orbit { n, x: z.0, y: z.1, ax: early.0, ay: early.1, dm, trap_sq, fq, fc, ux, uy };
-        }
-        if r2 > BAIL_SQ as f32 && early == (0., 0.) {
-            early = z;
+            return Orbit { n, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux, uy };
         }
         let (tx, ty) = (z.0 - v.trap.0, z.1 - v.trap.1);
         trap_sq = trap_sq.min(tx * tx + ty * ty);
@@ -170,6 +166,12 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         fc_w += 1. / rz;
         fc = (fc.0 + z.0 / r2, fc.1 - z.1 / r2);
         dm = 2. * rz * dm + plus;
+        if dm > (1u64 << 63) as f32 * 2. {
+            let s = 1. / ((1u64 << 63) as f32 * 2.);
+            dm *= s;
+            plus *= s;
+            dm_exp += 64;
+        }
         if julia {
             let d = (dir.0 * z.0 - dir.1 * z.1, dir.0 * z.1 + dir.1 * z.0);
             let dl = (d.0 * d.0 + d.1 * d.1).sqrt();
@@ -178,7 +180,7 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
         z = (x2 - y2 + c.0, 2. * z.0 * z.1 + c.1);
     }
     let (fq, fc) = finish(fq, fq_w, fc, fc_w);
-    Orbit { n: MAX_ITER, x: z.0, y: z.1, ax: early.0, ay: early.1, dm, trap_sq, fq, fc, ux: 0., uy: 0. }
+    Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, dm_exp, trap_sq, fq, fc, ux: 0., uy: 0. }
 }
 
 /// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel: centre + rot·(u + is).
@@ -721,19 +723,21 @@ fn shade(x: f32, y: f32, v: &View, k: f32, look: &Look) -> ([f32; 3], f32) {
     let tau = TAU as f32;
     // The flame, as mandelbrot-exploder colours it: (conj(fc) − fq)·ln(smooth count)/2⁴, a complex number.
     let flame = { let g = nu.ln() * (1. / (1 << 4) as f32); ((o.fc.0 - o.fq.0) * g, (-o.fc.1 - o.fq.1) * g) };
+    // The potential's gradient direction (u = z/(dz/dz₀)) in turns: continuous everywhere in the field. The angle of z itself is not usable at a fixed radius (it jumps at every level line, banding the field) nor at the far escape (it turns 2ⁿ times faster and aliases).
+    let gangle = o.uy.atan2(o.ux) / tau;
     let (re, im) = match v.mode {
-        0 => (nu * (1. / (1 << 4) as f32), o.ay.atan2(o.ax) / tau),
-        // The orbit's angle as it left |z| = 2⁴, turned by the smooth count: cells that tile each level of the set.
-        1 => (o.ay.atan2(o.ax) / tau + nu * (1. / (1 << 5) as f32), o.ay.atan2(o.ax) / tau),
+        0 => (nu * (1. / (1 << 4) as f32), gangle),
+        // The potential's gradient direction, turned by the smooth count: a continuous swirl around the set.
+        1 => (gangle + nu * (1. / (1 << 5) as f32), gangle),
         // How close the orbit came to the trap, on a log scale: rings and petals around each preimage of the trap.
-        2 => (-(o.trap_sq.ln()) * (1. / (1 << 3) as f32), o.ay.atan2(o.ax) / tau),
+        2 => (-(o.trap_sq.ln()) * (1. / (1 << 3) as f32), gangle),
         // The flame itself: its real part along the colouring, its imaginary part breathing.
         _ => (flame.0, flame.1),
     };
     let (re, im) = (re + look.offset.0, im + look.offset.1);
     let swing = (tau * re).sin();
     // Distance to the set: the real distance estimate, |z|·ln|z| / |dz/dz₀|, in plane units and in pixels (0 on it).
-    let dist = if escaped { r * r.ln() / o.dm } else { 0. };
+    let dist = if escaped { r * r.ln() / o.dm * (-(o.dm_exp as f32)).exp2() } else { 0. };
     let dist_px = dist / k;
     // Distance contours: a soft ripple at every factor 2^(2/3) of distance from the set (log₂ distance × 1.5 per turn), the field's own topography.
     // Near the set the contours crowd closer than a pixel (1.5/(d·ln 2) of them per pixel at d pixels out) and would alias into hatching, so they fade in as d²/(d² + (6/ln 2)²): gone within a few pixels of the set, full once they are over 4 pixels apart.
