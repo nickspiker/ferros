@@ -3,7 +3,7 @@
 //! A phone-shaped window with one textbox: whatever is in the box, together with the device's salt, picks a Julia set that fills the window behind it, and every change to the box changes the picture.
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
-//! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles the descent's x between banded per device (1/12 of the real axis) and free.
+//! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free.
 //! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
 
@@ -34,8 +34,8 @@ struct App {
     textbox: Textbox,
     device: u32,
     look: mark::Look,
-    /// The descent's x banded per device (1/12 of the real axis) or free.
-    banded: bool,
+    /// Each key's choices walking progressively from the device's own (halving per character) or drawn afresh.
+    progressive: bool,
     salt: [u8; 32],
     /// The rendered mark (α + darkness) and what it was rendered for: (width, height, hash of salt and text).
     mark: Vec<u32>,
@@ -58,7 +58,7 @@ impl App {
             textbox,
             device: 0,
             look: mark::Look::default(),
-            banded: true,
+            progressive: true,
             salt: salt_for(0),
             mark: Vec::new(),
             mark_key: (0, 0, [0; 32]),
@@ -205,14 +205,14 @@ impl FluorApp for App {
                 EventResponse::StartWindowDrag
             }
             Event::KeyboardInput { event: kev } if kev.state == ElementState::Pressed => {
-                // Ctrl+L: one fixed light or each device's own. Ctrl+B: the descent's x banded per device or free.
+                // Ctrl+L: one fixed light or each device's own. Ctrl+B: progressive keys or free.
                 if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l") || s.eq_ignore_ascii_case("b")) {
                     if matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l")) {
                         self.look.fixed_light = !self.look.fixed_light;
                         println!("light: {}", if self.look.fixed_light { "fixed" } else { "per device" });
                     } else {
-                        self.banded = !self.banded;
-                        println!("x: {}", if self.banded { "banded per device (1/12 of the axis)" } else { "free" });
+                        self.progressive = !self.progressive;
+                        println!("keys: {}", if self.progressive { "progressive (each character half the nudge of the last)" } else { "free" });
                     }
                     self.mark_key.2 = [0; 32];
                     ctx.window.request_redraw();
@@ -287,7 +287,7 @@ impl FluorApp for App {
         let key = (w, h, *blake3::Hasher::new().update(&self.salt).update(self.text().as_bytes()).finalize().as_bytes());
         if key != self.mark_key {
             self.mark.resize(w * h, 0);
-            let p = mark::Params::new_placed(&self.salt, &self.text(), self.banded);
+            let p = mark::Params::new_placed(&self.salt, &self.text(), self.progressive);
             // For tuning: where this picture came from (coordinates only, never the text).
             let c = mark::locus(&p);
             let (land, hit, trail) = mark::descend(c.0);
