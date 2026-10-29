@@ -452,7 +452,7 @@ pub fn android_from_slot_a(dtb: usize) -> bool {
     let data = foot - 8 - size;
     // Every assignment of slot b, in each form bootconfig allows. ABL writes the override form, `androidboot.slot_suffix:=_b`, after an `_a` from vendor_boot's own bootconfig, and the last assignment wins (read from RAM after an Android boot, 2026-10-28: the gate had matched only `= "_b"`, so Android launched from slot b ran on slot b's partitions). The `_b` is the key's last byte but one or its last byte.
     let keys: [(&[u8], usize); 3] = [(b"androidboot.slot_suffix = \"_b\"", 2), (b"androidboot.slot_suffix:=_b", 1), (b"androidboot.slot_suffix=_b", 1)];
-    let mut rewritten = false;
+    let mut rewritten = 0u32;
     let mut at = data;
     while at < data + size {
         for (key, back) in keys {
@@ -460,16 +460,25 @@ pub fn android_from_slot_a(dtb: usize) -> bool {
                 let b_at = at + key.len() - back;
                 unsafe {
                     write_volatile(b_at as *mut u8, b'a');
-                    // The checksum is a byte sum: 'b' to 'a' lowers it by one.
-                    write_volatile(csum_at as *mut u32, le32(csum_at).wrapping_sub(1));
-                    asm!("dc civac, {a}", "dc civac, {c}", "dsb sy", a = in(reg) b_at as u64, c = in(reg) csum_at as u64);
+                    asm!("dc civac, {a}", "dsb sy", a = in(reg) b_at as u64);
                 }
-                rewritten = true;
+                rewritten += 1;
             }
         }
         at += 1;
     }
-    rewritten
+    if rewritten == 0 {
+        return false;
+    }
+    // The checksum is a byte sum: each 'b' to 'a' lowers it by one. Written byte by byte: it sits at the initrd's end less 12 less 4, which is any alignment (G#8905_66E5 on 2026-10-28), and with the MMU off an unaligned word store faults. The word store here hung every Android boot from slot b once the rewrite above first matched.
+    let sum = le32(csum_at).wrapping_sub(rewritten).to_le_bytes();
+    unsafe {
+        for (k, b) in sum.iter().enumerate() {
+            write_volatile((csum_at + k) as *mut u8, *b);
+        }
+        asm!("dc civac, {c}", "dc civac, {d}", "dsb sy", c = in(reg) csum_at as u64, d = in(reg) (csum_at + 3) as u64);
+    }
+    true
 }
 
 fn name_is_n(a: usize, want: &[u8]) -> bool {

@@ -970,7 +970,9 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         gate::start_ferros(dtb);
     }
     // Android, from either slot: it lives on slot a, so the slot suffix ABL wrote into bootconfig becomes _a (gate.rs).
-    pstore::log(&[if gate::android_from_slot_a(dtb as usize) { b"\nferros hv: gate -- android, slot suffix rewritten to _a\n" as &[u8] } else { b"\nferros hv: gate -- android\n" }]);
+    // Logged before the rewrite as well as after, so a rewrite that never returns still leaves its mark in pstore (2026-10-28: three slot-b attempts left nothing).
+    pstore::log(&[b"\nferros hv: gate -- android, rewriting the slot suffix\n"]);
+    pstore::log(&[if gate::android_from_slot_a(dtb as usize) { b"ferros hv: gate -- slot suffix rewritten to _a\n" as &[u8] } else { b"ferros hv: gate -- slot suffix left as it was\n" }]);
     let new_dtb = match fdt::patch(dtb as usize, DTB_COPY as usize, DTB_COPY_MAX) {
         Some(len) => {
             unsafe {
