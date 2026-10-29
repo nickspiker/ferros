@@ -1,4 +1,4 @@
-//! The mark: a view into the Julia set of z² + c, with c placed by the descent and the view framed on one of J's own self-similar copies, both drawn from a hash of (salt, text).
+//! The mark: the Julia set of z² + c seen through an inversion about its root spiral's eye, with c placed by the descent and the eye found on J(c), both drawn from a hash of (salt, text).
 //!
 //! The salt (on the phone, the device's own, sealed under its ira; here a stand-in) fixes the colouring method and the palette.
 //!
@@ -6,14 +6,14 @@
 //! For x past the cusp (0.25) the line misses the set and reaches the real axis just outside it, in the parabolic-implosion region, which is kept.
 //! c is the landing point raised by 2^−(4..12) back up the line it came down (see HEIGHT_STOPS). Every point of that line above the landing was proven outside the set by the steps that crossed it, so c is always outside, J(c) is a Cantor dust with no inside to go flat, and near the boundary J(c) resembles the Mandelbrot set around c.
 //!
-//! Framing, by self-similarity: for c outside the Mandelbrot set, z² + c on J(c) is conjugate to the full shift on two symbols, so every point of J has an address (which half of J each forward iterate falls in), and the first k bits of an address name one of 2^k pieces of J, each mapped onto the whole of J by f^k.
-//! So a piece is a complete copy of J, shrunk by |(f^k)′| and turned by arg (f^k)′; the hash picks the address and the depth k (0 to 2³ − 1), the view centres on the piece (J's own centre, 0, carried in by the first k inverse branches z → ±√(z − c), the coarsest applied last) and is scaled from 1/|(f^k)′| so the copy fills the window, its long axis upright on the tall screen.
-//! The copy's long axis is J's principal axis (from 2⁷ address points) turned by −arg (f^k)′; a hash bit flips it end for end, and a small Gaussian offset (σ an eighth of the window) keeps the framing from looking machine-centred.
-//! Or, for the other half of the keys, spiral framing: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats (zooming by |λ| and turning by arg λ maps it onto itself), and the ROOT whorl, the largest, is the cycle closest to neutral (smallest ln|λ|).
-//! Candidates: the cycle that is attracting in the Mandelbrot component beneath the descent's landing, Newton-closed at c (near-neutral when that component is close); the α fixed point in closed form; and 2⁵ sprayed cycles. The view sits dead on one of the winner's own points (the hash picks which), never on a preimage, which would be a sub-spiral.
-//! A thumbnail still rejects framings that show too little of the set, redrawing with the next counter.
+//! The eye: a repelling periodic point of J(c) is the eye of a spiral whose multiplier λ = (f^p)′ says how it repeats (zooming by |λ| and turning by arg λ maps it onto itself), and the ROOT whorl, the largest, is the cycle closest to neutral (smallest ln|λ|).
+//! Candidates: the cycle that is attracting in the Mandelbrot component beneath the descent's landing, Newton-closed at c (near-neutral when that component is close); the α fixed point in closed form; and 2⁵ sprayed cycles. The eye is one of the winner's own points (the hash picks which), never a preimage, which would be a sub-spiral.
 //!
-//! Precision: placement and framing are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the deepest window kept is 2⁻⁸ across, about 2⁻¹⁸ a pixel, many f32 steps even at |z| = 2).
+//! The view: w = s/(z − eye), with s = 2⁻³ of the whorl's radius, and the screen a window of half-span 1 on the w-plane, so inversion space has unit scale for every key. The screen's centre (w = 0) is z = ∞, the outer field, and its edge (|w| ≈ 1) is the ring |z − eye| = s, deep in the whorl: the dense middle of the spiral wraps the screen's edge and its arms wind inward toward the field at the centre.
+//! The distance estimate converts to pixels through the inversion's local scale |dz/dw| = s/|w|², so the rim keeps its width everywhere.
+//! A thumbnail still rejects views that show too little of the set, redrawing with the next counter.
+//!
+//! Precision: placement and the eye are f64 (a few dozen points per key, and the descent, the Newton classifier and the landing work near 2⁻¹²); the per-pixel render is f32 (the whorl's radius is kept at least 2⁻⁸, so even at the screen's edge, where the inversion packs z tightest, a pixel spans many f32 steps).
 //!
 //! Shading: the distance estimate (|z|·ln|z| over the derivative's magnitude, in pixels) separates the set from the field around it, because near the set the escape count changes chaotically from pixel to pixel and reads as static.
 //! The set's body is dark with the colouring faintly inside it, its edge is a luminous rim a few pixels wide, and the field outside is the colouring method, dimmed and fading to black far out.
@@ -34,8 +34,6 @@ const JUMP: i32 = 1 << 2;
 const DETAIL_MIN: f64 = 1. / (1 << 2) as f64;
 /// Stops of height for c above its landing point, from 2⁻⁴ down: much above 2⁻⁴ J(c) thins into sparse dust, and below 2⁻¹² the landing's own tolerance (2⁻¹²) dominates, so the 2³ stops between are the ones that matter.
 const HEIGHT_STOPS: u32 = 1 << 3;
-/// Depths drawn for the self-similar copy: 0 to 2³ − 1. Each level shrinks the copy by about 2|z| ≈ 2, so past about 2³ levels the f32 floor (MIN_HALF) would bite on most draws and repeat the same framings.
-const DEPTHS: u32 = 1 << 3;
 /// Periods sprayed for a spiral's cycle: 1 to 2⁴.
 const PERIODS: u32 = 1 << 4;
 /// Cycles sprayed as candidates for the root whorl.
@@ -67,6 +65,10 @@ pub struct Params {
     mode: u8,
     /// The orbit trap's point, for mode 2.
     trap: (f64, f64),
+    /// Seen through the inversion w = s/(z − centre), s = `inv_scale`: the window is on the w-plane, half-span `half`.
+    invert: bool,
+    /// The inversion's scale s: the ring |z − centre| = s is |w| = 1.
+    inv_scale: f64,
 }
 
 /// The same picture in the render's precision (f32).
@@ -79,12 +81,14 @@ struct View {
     phase: [f32; 3],
     mode: u8,
     trap: (f32, f32),
+    invert: bool,
+    inv_scale: f32,
 }
 
 impl Params {
     fn view(&self) -> View {
         let f = |v: (f64, f64)| (v.0 as f32, v.1 as f32);
-        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), phase: [self.phase[0] as f32, self.phase[1] as f32, self.phase[2] as f32], mode: self.mode, trap: f(self.trap) }
+        View { kind: self.kind, c: f(self.c), centre: f(self.centre), rot: f(self.rot), phase: [self.phase[0] as f32, self.phase[1] as f32, self.phase[2] as f32], mode: self.mode, trap: f(self.trap), invert: self.invert, inv_scale: self.inv_scale as f32 }
     }
 }
 
@@ -100,12 +104,6 @@ fn draw(salt: &[u8; 32], domain: u8, counter: u32, extra: &[u8]) -> [u8; 32] {
 
 fn cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
-}
-
-/// A standard normal pair from two uniforms (Box–Muller).
-fn gauss(u0: f64, u1: f64) -> (f64, f64) {
-    let r = (-2. * (1. - u0).ln()).sqrt();
-    (r * (TAU * u1).cos(), r * (TAU * u1).sin())
 }
 
 /// What one orbit did: iterations until escape (MAX_ITER if it never did), z at escape, the derivative's magnitude, and the closest approach to the trap point (squared).
@@ -142,11 +140,18 @@ fn orbit(px: f32, py: f32, v: &View) -> Orbit {
     Orbit { n: MAX_ITER, x: z.0, y: z.1, dm, trap_sq }
 }
 
-/// The plane point under pixel (px, py) of a `w × h` window, `k` plane units per pixel.
+/// The plane point under pixel (px, py) of a `w × h` window, `k` window units per pixel, and the plane units per pixel there; None for the point at infinity.
+/// Straight: z = centre + rot·(u + is). Inverted: w = rot·(u + is) and z = centre + s/w, whose local scale is |dz/dw| = s/|w|²; the pixel exactly at w = 0 (only on a window of odd width and height) is z = ∞.
 #[inline]
-fn plane(v: &View, px: usize, py: usize, w: usize, h: usize, k: f32) -> (f32, f32) {
+fn pixel(v: &View, px: usize, py: usize, w: usize, h: usize, k: f32) -> Option<(f32, f32, f32)> {
     let (u, s) = ((px as f32 + 0.5 - w as f32 * 0.5) * k, (py as f32 + 0.5 - h as f32 * 0.5) * k);
-    (v.centre.0 + u * v.rot.0 - s * v.rot.1, v.centre.1 + u * v.rot.1 + s * v.rot.0)
+    let (a, b) = (u * v.rot.0 - s * v.rot.1, u * v.rot.1 + s * v.rot.0);
+    if !v.invert {
+        return Some((v.centre.0 + a, v.centre.1 + b, k));
+    }
+    let m = a * a + b * b;
+    let sm = v.inv_scale / m;
+    (m > 0.).then(|| (v.centre.0 + a * sm, v.centre.1 - b * sm, k * sm))
 }
 
 /// Plane units per pixel for a `w × h` window: half the span covers `half`.
@@ -165,8 +170,7 @@ fn detail(p: &Params) -> f64 {
     let mut n = [0i32; W * H];
     for py in 0..H {
         for px in 0..W {
-            let (x, y) = plane(&v, px, py, W, H, k);
-            n[py * W + px] = orbit(x, y, &v).n as i32;
+            n[py * W + px] = pixel(&v, px, py, W, H, k).map_or(0, |(x, y, _)| orbit(x, y, &v).n as i32);
         }
     }
     let mut edges = 0;
@@ -211,8 +215,8 @@ fn address_point(c: (f64, f64), bits: &[u8; 32]) -> (f64, f64) {
     z
 }
 
-/// J(c)'s shape: the angle of its principal axis and its half-extent along that axis, from 2⁷ address points (J = −J, so its centre is 0).
-fn j_shape(c: (f64, f64)) -> (f64, f64) {
+/// J(c)'s half-extent along its principal axis, from 2⁷ address points (J = −J, so its centre is 0).
+fn j_extent(c: (f64, f64)) -> f64 {
     let pts: Vec<(f64, f64)> = (0u32..(1 << 7)).map(|i| address_point(c, blake3::hash(&i.to_le_bytes()).as_bytes())).collect();
     let (mut sxx, mut syy, mut sxy) = (0., 0., 0.);
     for p in &pts {
@@ -222,26 +226,7 @@ fn j_shape(c: (f64, f64)) -> (f64, f64) {
     }
     let axis = 0.5 * (2. * sxy).atan2(sxx - syy);
     let (ca, sa) = (axis.cos(), axis.sin());
-    let along = pts.iter().map(|p| (p.0 * ca + p.1 * sa).abs()).fold(0., f64::max);
-    (axis, along)
-}
-
-/// The depth-k piece of J(c) named by the first k bits of `bits`: its centre (J's own centre, 0, carried in by k inverse branches, the coarsest applied last), and ln|(f^k)′| and arg (f^k)′ there.
-/// f^k carries the piece onto the whole of J, so the piece is a copy of J shrunk by |(f^k)′| and turned by −arg (f^k)′.
-/// The derivative is the product of 2·w over the chain the inverse branches built (w₀ the centre, w_{j+1} = f(w_j)), summed in logs and angles so depth never overflows it.
-fn piece(c: (f64, f64), bits: &[u8; 32], k: u32) -> ((f64, f64), f64, f64) {
-    let mut chain = vec![(0f64, 0f64)];
-    for i in (0..k as usize).rev() {
-        let w = inverse(c, *chain.last().expect("chain starts non-empty"), bit(bits, i));
-        chain.push(w);
-    }
-    // chain = [w_k = 0, w_{k−1}, …, w₀]; the derivative runs over w₀ … w_{k−1}.
-    let (mut ln_mag, mut arg) = (0., 0.);
-    for w in chain.iter().skip(1) {
-        ln_mag += (2. * (w.0 * w.0 + w.1 * w.1).sqrt()).ln();
-        arg += w.1.atan2(w.0);
-    }
-    (*chain.last().expect("chain starts non-empty"), ln_mag, arg)
+    pts.iter().map(|p| (p.0 * ca + p.1 * sa).abs()).fold(0., f64::max)
 }
 
 /// Newton on f^period(w) = w from `guess`: the cycle point it closes on, with ln|λ| and arg λ of the multiplier λ = (f^period)′ there, kept only if f^period carries it back onto itself and it repels (every cycle of a Cantor Julia set does; a non-finite derivative means Newton wandered off to infinity).
@@ -426,22 +411,20 @@ impl Params {
         let phase = [unit(&f[0..4]), unit(&f[4..8]), unit(&f[8..12])];
         let mode = f[12] % 3;
         let trap = ((unit(&f[16..20]) - 0.5) * 2., (unit(&f[20..24]) - 0.5) * 2.);
-        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap };
+        let base = Params { kind: Kind::Julia, c: (0., 0.), centre: (0., 0.), half: 2., rot: (1., 0.), phase, mode, trap, invert: true, inv_scale: 1. };
 
         // Each try draws a fresh c and framing from (salt, text, counter); the first framing that shows enough of the set is taken, and after 2⁵ tries the last one stands.
         let mut n = 0;
         loop {
-            let a = draw(salt, 2, n, text.as_bytes());
             let t = draw(salt, 3, n, text.as_bytes());
             n += 1;
             let (land, _, _) = descend(-2. + unit(&t[16..20]) * 2.375);
             let c = (land.0, land.1 + (-(4. + unit(&t[20..24]) * HEIGHT_STOPS as f64)).exp2());
-            let (axis, along) = j_shape(c);
-            // Spiral framing, for half the keys: dead centre, no offset, on the ROOT whorl, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
+            let along = j_extent(c);
+            // Every key sits on the ROOT whorl's eye, dead centre, never a preimage of it (a preimage is a smaller copy: a sub-spiral).
             // The root is the cycle closest to neutral (smallest ln|λ|): it turns slowest and grows slowest, so its whorl is the largest in the picture. Candidates: the cycle of the component beneath the landing (`root_cycle`, near-neutral when that component is close, and losing on its own when it is far), the α fixed point in closed form (the root near the main cardioid), and 2⁵ sprayed cycles of periods 1 to 2⁴.
             // The hash picks which of the cycle's own points to sit on: each is a root, mapped onto the next by f.
-            // A try with no closed cycle falls through to copy framing, so every try ends in a framing and the 2⁵-try exit always applies.
-            let spiral = if t[5] & 1 == 1 {
+            let spiral = {
                 // The α fixed point, z = (1 − √(1 − 4c))/2 with λ = 2z: the root near the main cardioid.
                 let alpha = {
                     let s = {
@@ -458,49 +441,34 @@ impl Params {
                     cycle_point(c, &draw(salt, 4, (n << 5) | i, text.as_bytes()), period).map(|(w, l, g)| (w, l, g, period))
                 });
                 root_cycle(c, land).into_iter().chain(alpha).chain(sprayed).fold(None, |best: Option<((f64, f64), f64, f64, u32)>, e| if best.map_or(true, |b| e.1 < b.1) { Some(e) } else { best })
-            } else {
-                None
             };
-            if let Some((first, _, _, period)) = spiral {
+            // α always closes for c outside the set (it repels there); if even that failed, the next try draws a new c, and after 2⁵ tries the whole of J(c), straight, stands.
+            let Some((first, _, _, period)) = spiral else {
+                if n >= 1 << 5 {
+                    return Params { c, half: along * 1.125, invert: false, ..base };
+                }
+                continue;
+            };
+            {
                 let mut eye = first;
                 for _ in 0..(t[6] as u32 % period) {
                     let ee = cmul(eye, eye);
                     eye = (ee.0 + c.0, ee.1 + c.1);
                 }
-                // The whorl at 2⁻¹ to 2⁻³ of J's half-extent, or shallower until the f32 render resolves it.
+                // The whorl's radius R: 2⁻¹ to 2⁻³ of J's half-extent, or larger until the f32 render resolves it. The inversion's scale is s = R/2³ and the w-window's half-span is 1, so inversion space has unit scale for every key and the screen's edge is the ring |z − eye| = R/2³, deep in the whorl.
                 let mut stops = 1. + unit(&t[24..28]) * 2.;
-                let half = loop {
-                    let half = along * (-stops).exp2();
-                    if half >= MIN_HALF || stops <= 1. {
-                        break half;
+                let radius = loop {
+                    let radius = along * (-stops).exp2();
+                    if radius >= MIN_HALF || stops <= 1. {
+                        break radius;
                     }
                     stops -= 1.;
                 };
                 let turn = unit(&t[28..32]) * TAU;
-                let p = Params { c, centre: eye, half, rot: (turn.cos(), turn.sin()), ..base };
+                let p = Params { c, centre: eye, half: 1., inv_scale: radius / (1 << 3) as f64, rot: (turn.cos(), turn.sin()), ..base };
                 if framed(&p) || n >= 1 << 5 {
                     return p;
                 }
-                continue;
-            }
-            // Copy framing, the other half: the copy at the drawn depth, or shallower until its window is still one the f32 render resolves.
-            let mut depth = (unit(&t[0..4]) * DEPTHS as f64) as u32;
-            let (centre, half, turn) = loop {
-                let (centre, ln_mag, arg) = piece(c, &a, depth);
-                // The copy's long axis fits the window's height: on a tall screen the vertical half-extent is at least `half`, so the copy reaches top and bottom and may run off the sides.
-                let half = along * 1.125 * (-ln_mag).exp();
-                if half >= MIN_HALF || depth == 0 {
-                    break (centre, half, axis - arg);
-                }
-                depth -= 1;
-            };
-            // Upright: the screen's vertical (rot·i) along the copy's axis, and a hash bit turns it end for end.
-            let upright = turn - TAU * 0.25 + if t[4] & 1 == 1 { TAU * 0.5 } else { 0. };
-            let (gx, gy) = gauss(unit(&t[8..12]), unit(&t[12..16]));
-            let sigma = half * 0.125;
-            let p = Params { c, centre: (centre.0 + gx * sigma, centre.1 + gy * sigma), half, rot: (upright.cos(), upright.sin()), ..base };
-            if framed(&p) || n >= 1 << 5 {
-                return p;
             }
         }
     }
@@ -552,8 +520,11 @@ pub fn render(buf: &mut [u32], w: usize, h: usize, p: &Params) {
     let v = p.view();
     buf.par_chunks_mut(w).enumerate().for_each(|(py, row)| {
         for px in 0..w {
-            let (x, y) = plane(&v, px, py, w, h, k);
-            row[px] = shade(x, y, &v, k);
+            row[px] = match pixel(&v, px, py, w, h, k) {
+                Some((x, y, kl)) => shade(x, y, &v, kl),
+                // The point at infinity: the outer field at its farthest, black.
+                None => pack_argb(0, 0, 0, 255),
+            };
         }
     });
 }
@@ -580,7 +551,7 @@ pub fn render_near(buf: &mut [u32], w: usize, h: usize, p: &Params) {
 /// A locator pane at `k` plane units per pixel about `centre`, imaginary axis up, in this device's colouring: every point the descent checked as a pixel in its own random colour, and a crosshair on c.
 fn render_locator(buf: &mut [u32], w: usize, h: usize, p: &Params, centre: (f64, f64), k: f64) {
     let span = 2. * (w * h) as f64 / (w + h) as f64;
-    let q = Params { kind: Kind::Plane, c: (0., 0.), centre, half: k * span * 0.5, rot: (1., 0.), ..*p };
+    let q = Params { kind: Kind::Plane, c: (0., 0.), centre, half: k * span * 0.5, rot: (1., 0.), invert: false, ..*p };
     render(buf, w, h, &q);
     // Rows run downward and the imaginary axis runs up: flip.
     let (top, bottom) = buf.split_at_mut(w * (h / 2));
@@ -653,18 +624,5 @@ mod tests {
         }
     }
 
-    /// A piece really is carried onto J's centre by f^k: iterating its centre k times returns to 0.
-    #[test]
-    fn a_piece_maps_back_onto_the_centre() {
-        let c = (-0.8, 0.2);
-        let bits = *blake3::hash(b"piece").as_bytes();
-        for k in 0..DEPTHS {
-            let (mut z, _, _) = piece(c, &bits, k);
-            for _ in 0..k {
-                let zz = cmul(z, z);
-                z = (zz.0 + c.0, zz.1 + c.1);
-            }
-            assert!(z.0.abs() + z.1.abs() < 1. / (1 << 16) as f64, "depth {k}: f^k(centre) = {z:?}");
-        }
-    }
+
 }
