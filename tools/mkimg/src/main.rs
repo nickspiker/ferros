@@ -864,7 +864,30 @@ fn cmd_avb_sign(args: &[String]) {
     // The boot partition is as large as Google's whole-partition boot image.
     let salt: [u8; 32] = rand::random();
     let boot = avb::boot_partition(&gate, google_boot.len(), &gb, &key, &salt).unwrap_or_else(|e| die("boot", e));
-    let vbmeta = avb::top_vbmeta(&top, &key).unwrap_or_else(|e| die("vbmeta", e));
+    // With --installed <dir> (the slot's own dtbo/vendor_boot/vendor_kernel_boot/init_boot as `<name>_a.img`, e.g. the 2026-10-28 backup of slot a): the top level also hashes those three as installed, and init_boot is chained to the owner's key and re-signed (--google-init-boot gives its properties and rollback index, --out-init-boot receives it). Without it, Google's descriptors for them stay.
+    let installed = args.iter().position(|a| a == "--installed").and_then(|i| args.get(i + 1)).cloned();
+    let mut init_boot_out: Option<(String, Vec<u8>, usize)> = None;
+    let mut hashed: Vec<(String, Vec<u8>)> = Vec::new();
+    let vbmeta = if let Some(dir) = &installed {
+        for name in ["dtbo", "vendor_boot", "vendor_kernel_boot"] {
+            let data = fs::read(format!("{dir}/{name}_a.img")).unwrap_or_else(|e| die(name, e));
+            let n = avb::image_len(&data).unwrap_or_else(|e| die(name, e));
+            hashed.push((name.to_string(), data[..n].to_vec()));
+        }
+        let ib = fs::read(format!("{dir}/init_boot_a.img")).unwrap_or_else(|e| die("init_boot", e));
+        let n = avb::image_len(&ib).unwrap_or_else(|e| die("init_boot", e));
+        let gib = fs::read(arg(args, "--google-init-boot")).unwrap_or_else(|e| die("google init_boot", e));
+        let (gv, _) = avb::find(&gib).unwrap_or_else(|e| die("google init_boot", e));
+        let gv = avb::parse(gv).unwrap_or_else(|e| die("google init_boot", e));
+        let s: [u8; 32] = rand::random();
+        let part = avb::footer_partition("init_boot", &ib[..n], ib.len(), &gv, &key, &s).unwrap_or_else(|e| die("init_boot", e));
+        init_boot_out = Some((arg(args, "--out-init-boot"), part, n));
+        let refs: Vec<(&str, &[u8])> = hashed.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let s: [u8; 32] = rand::random();
+        avb::top_vbmeta_with(&top, &key, &["boot", "init_boot"], &refs, &s).unwrap_or_else(|e| die("vbmeta", e))
+    } else {
+        avb::top_vbmeta(&top, &key).unwrap_or_else(|e| die("vbmeta", e))
+    };
     // Check both as ABL will: hashes, signatures, the gate's digest, and the boot chain naming the key that signed the footer.
     let blob = avb::public_key_blob(&key);
     let (bv, size) = avb::find(&boot).unwrap_or_else(|e| die("boot (check)", e));
@@ -892,6 +915,37 @@ fn cmd_avb_sign(args: &[String]) {
         if !ok {
             die("check failed, nothing written", what);
         }
+    }
+    // The installed partitions, checked the same way: each top-level hash against its image, the init_boot chain naming our key, and the re-signed init_boot's own footer.
+    let digest_of = |salt: &[u8], data: &[u8]| {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, salt);
+        sha2::Digest::update(&mut h, data);
+        sha2::Digest::finalize(h).to_vec()
+    };
+    for (name, data) in &hashed {
+        let ok = tp.descriptors.iter().filter_map(|d| avb::hash_of(d)).any(|(n, size, salt, digest)| &n == name && size as usize == data.len() && digest_of(&salt, data) == digest);
+        if !ok {
+            die("check failed, nothing written", format!("{name} hash"));
+        }
+    }
+    if let Some((_, part, n)) = &init_boot_out {
+        let (iv, size) = avb::find(part).unwrap_or_else(|e| die("init_boot (check)", e));
+        let ip = avb::parse(iv).unwrap();
+        let digest_ok = ip.descriptors.iter().filter_map(|d| avb::hash_of(d)).any(|(name, s, salt, digest)| name == "init_boot" && s as usize == *n && Some(s) == size && digest_of(&salt, &part[..*n]) == digest);
+        let chain = tp.descriptors.iter().filter_map(|d| avb::chain_of(d)).any(|(name, k)| name == "init_boot" && k == blob);
+        for (what, ok) in [("init_boot footer hash", avb::hash_ok(iv) == Some(true)), ("init_boot footer signature", avb::signature_ok(iv).unwrap_or(false)), ("init_boot footer key is ours", ip.public_key == blob), ("init_boot digest", digest_ok), ("init_boot chain names our key", chain)] {
+            if !ok {
+                die("check failed, nothing written", what);
+            }
+        }
+    }
+    if let Some((path, part, n)) = &init_boot_out {
+        fs::write(path, part).unwrap_or_else(|e| die(path, e));
+        eprintln!("init_boot: {path} ({} bytes: image {n} bytes, re-signed)", part.len());
+    }
+    for (name, data) in &hashed {
+        eprintln!("hashed: {name} as installed ({} bytes)", data.len());
     }
     fs::write(&out_boot, &boot).unwrap_or_else(|e| die(&out_boot, e));
     fs::write(&out_vbmeta, &vbmeta).unwrap_or_else(|e| die(&out_vbmeta, e));

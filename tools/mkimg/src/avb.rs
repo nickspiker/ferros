@@ -425,3 +425,110 @@ mod tests {
         assert_eq!(blob_of(&n), v.public_key);
     }
 }
+
+// ==================== the other boot-chain partitions ====================
+
+/// How many bytes of a partition are its image, which is what a hash descriptor covers (avbtool's image_size): read from the image's own header, so the hash spans the image and not the zeros or a stale footer after it.
+/// - `dtbo`: the DT table header (magic G#D7B7AB1E, big-endian), total_size at 4.
+/// - `vendor_boot`, `vendor_kernel_boot`: the vendor boot image v4 header ("VNDRBOOT"): page_size at 12, vendor_ramdisk_size at 24, header_size at 2096, dtb_size at 2100, vendor_ramdisk_table_size at 2112, bootconfig_size at 2124, each section padded to a page.
+/// - `init_boot`, `boot`: the boot image v4 header ("ANDROID!"): a 4 KiB header, kernel_size at 8 and ramdisk_size at 12, each padded to 4 KiB, then signature_size at G#62C.
+pub fn image_len(data: &[u8]) -> Result<usize, String> {
+    let le = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    let page = |n: usize, p: usize| n.div_ceil(p) * p;
+    let len = if data.len() >= 8 && data[0..4] == [0xD7, 0xB7, 0xAB, 0x1E] {
+        be32(data, 4) as usize
+    } else if data.len() >= 2128 && &data[0..8] == b"VNDRBOOT" {
+        if le(8) != 4 {
+            return Err(format!("vendor boot image header version {}, not 4", le(8)));
+        }
+        let p = le(12);
+        page(le(2096), p) + page(le(24), p) + page(le(2100), p) + page(le(2112), p) + page(le(2124), p)
+    } else if data.len() >= 4096 && &data[0..8] == b"ANDROID!" {
+        if le(0x28) != 4 {
+            return Err(format!("boot image header version {}, not 4", le(0x28)));
+        }
+        4096 + page(le(8), 4096) + page(le(12), 4096) + page(le(0x62C), 4096)
+    } else {
+        return Err("not a DT table, vendor boot image or boot image".into());
+    };
+    if len == 0 || len > data.len() {
+        return Err(format!("image length {len} for a {}-byte partition", data.len()));
+    }
+    Ok(len)
+}
+
+/// A whole partition carrying its own signed `vbmeta` behind an AVB footer: the image, a hash of it under `name`, and the properties, rollback index and location of Google's own footer for that partition (`google`). The gate's `boot` and a re-signed `init_boot` are made this way.
+pub fn footer_partition(name: &str, image: &[u8], partition_size: usize, google: &Vbmeta, key: &RsaPrivateKey, salt: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let mut ds = hash_descriptor(name, image, salt);
+    for d in &google.descriptors {
+        if be64(d, 0) == TAG_PROPERTY {
+            ds.extend_from_slice(d);
+        }
+    }
+    let vb = sign(&ds, &google.header[4..12], google.rollback_index, google.rollback_index_location, key)?;
+    let off = pad_to(image.len(), 4096);
+    if off + vb.len() + FOOTER > partition_size {
+        return Err(format!("{name}: image ({} bytes) and vbmeta ({} bytes) do not fit the {partition_size}-byte partition", image.len(), vb.len()));
+    }
+    let mut out = vec![0u8; partition_size];
+    out[..image.len()].copy_from_slice(image);
+    out[off..off + vb.len()].copy_from_slice(&vb);
+    let f = &mut out[partition_size - FOOTER..];
+    f[0..4].copy_from_slice(b"AVBf");
+    put32(f, 4, 1);
+    put32(f, 8, 0);
+    put64(f, 12, image.len() as u64);
+    put64(f, 20, off as u64);
+    put64(f, 28, vb.len() as u64);
+    Ok(out)
+}
+
+/// Google's top-level `vbmeta`, signed with the owner's key, with the changes the owner's slots need: every chain descriptor named in `rechain` naming the owner's key (`boot`, `init_boot`), and every hash descriptor named in `hashes` covering that image instead of Google's (`dtbo`, `vendor_boot`, `vendor_kernel_boot`: the images actually installed). Everything else byte for byte, the rollback index and its location kept.
+pub fn top_vbmeta_with(google: &Vbmeta, key: &RsaPrivateKey, rechain_names: &[&str], hashes: &[(&str, &[u8])], salt: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let blob = public_key_blob(key);
+    let mut ds = Vec::new();
+    let (mut chained, mut hashed) = (Vec::new(), Vec::new());
+    for d in &google.descriptors {
+        if let Some((n, _)) = chain_of(d).filter(|(n, _)| rechain_names.contains(&n.as_str())) {
+            ds.extend_from_slice(&rechain(d, &blob));
+            chained.push(n);
+        } else if let Some((n, img)) = hash_of(d).and_then(|(n, ..)| hashes.iter().find(|(h, _)| *h == n).map(|(h, i)| (h.to_string(), *i))) {
+            ds.extend_from_slice(&hash_descriptor(&n, img, salt));
+            hashed.push(n);
+        } else {
+            ds.extend_from_slice(d);
+        }
+    }
+    for n in rechain_names {
+        if !chained.iter().any(|c| c == n) {
+            return Err(format!("Google's vbmeta has no chain descriptor for {n}"));
+        }
+    }
+    for (n, _) in hashes {
+        if !hashed.iter().any(|h| h == n) {
+            return Err(format!("Google's vbmeta has no hash descriptor for {n}"));
+        }
+    }
+    sign(&ds, &google.header[4..12], google.rollback_index, google.rollback_index_location, key)
+}
+
+#[cfg(test)]
+mod lengths {
+    use super::*;
+
+    /// The image lengths read from the headers must be the image_size Google's own avbtool wrote into the factory vbmeta and footers (AVB_FACTORY = the unpacked factory image directory; skipped without it).
+    #[test]
+    fn image_len_matches_googles_descriptors() {
+        let Ok(dir) = std::env::var("AVB_FACTORY") else { return };
+        let top = parse(&std::fs::read(format!("{dir}/vbmeta.img")).unwrap()).unwrap();
+        let mut want: Vec<(String, u64)> = top.descriptors.iter().filter_map(|d| hash_of(d)).map(|(n, s, ..)| (n, s)).collect();
+        let ib = std::fs::read(format!("{dir}/init_boot.img")).unwrap();
+        let (v, _) = find(&ib).unwrap();
+        want.extend(parse(v).unwrap().descriptors.iter().filter_map(|d| hash_of(d)).map(|(n, s, ..)| (n, s)));
+        for name in ["dtbo", "vendor_boot", "vendor_kernel_boot", "init_boot"] {
+            let data = std::fs::read(format!("{dir}/{name}.img")).unwrap();
+            let (_, size) = want.iter().find(|(n, _)| n == name).unwrap();
+            assert_eq!(image_len(&data).unwrap() as u64, *size, "{name}");
+        }
+    }
+}
