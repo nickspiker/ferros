@@ -2578,6 +2578,11 @@ pub fn up(rep: &mut Vec<u8>) {
     line(rep, alloc::format!("modem up: the service registers and brings up the internet call; `rmnet` serves its packets\n"));
 }
 
+/// Whether the service is running (a bring-up got through the handshake).
+pub fn online() -> bool {
+    unsafe { (*(&raw const ONLINE)).is_some() }
+}
+
 /// `diag modem down`: the service stopped and the CP powered down.
 pub fn down(rep: &mut Vec<u8>) {
     crate::hw::locked(|| unsafe { *(&raw mut ONLINE) = None });

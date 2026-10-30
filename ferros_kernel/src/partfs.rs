@@ -349,10 +349,10 @@ enum Open {
 }
 static mut PART_OPEN: Option<(&'static str, Vec<u8>, Open)> = None;
 
-/// The largest chunk one read returns.
-const PART_CHUNK: usize = 1 << 20;
+/// The largest chunk one read returns: 64 KiB keeps each call's hold on the kernel lock to a couple of milliseconds (a 1 MiB chunk held it ~30 ms, a stall for every other process while the modem driver read its 98 MB image).
+const PART_CHUNK: usize = 1 << 16;
 
-/// One request on partition `part` (the caller holds the kernel lock, as a syscall does): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and 1 MiB allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
+/// One request on partition `part` (the caller holds the kernel lock, as a syscall does): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and `PART_CHUNK` allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
 pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
     let (op, off, path) = match req.first() {
         Some(1) => (1, 0u64, &req[1..]),

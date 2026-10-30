@@ -9,14 +9,14 @@
 //!   14 serve touch, 15-16 usi2-spi, gpio-gpn0, 23 the touch interrupt line, 17 use display, 18 use touch, 19 settings (the map holds it: the device's settings are the back of the device's own circle), 20 the vault scope `map.` (the arrangement made by hand), 21 dma display-phases (the display's four temporal dither frames), 22 dma surfaces (the four apps' surfaces, WINDOWS.md: the display composes them; an app the map starts gets one of its own). 26 dma display-sprites (the display's sprite cache), 27 dma display-canvas (its 16-bit back buffer).
 //!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp,
 //!   46 serve photon, 47 use photon, 48 the vault scope `photon.`, 49 the ira key, 50 use udp (PHOTON.md).
-//!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second).
+//!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
 #![no_std]
 #![no_main]
 
 use ferros_sys::{console, exit, spawn};
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 7] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 8] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
     // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint) (payloads/ahau).
@@ -28,6 +28,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 7] = [
     (b"ip", b"ip", &[44, 45, 41, 52]),
     // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
     (b"photon", b"photon", &[50, 48, 49, 46, 41]),
+    // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
+    (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
 ];
 
 #[unsafe(no_mangle)]
@@ -45,7 +47,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell and network started (display, touch, map, pcie1, ip)\n");
+        console(grants, b"init: shell and network started (display, touch, ahau, map, pcie1, ip, photon, modem)\n");
     }
     exit(failed)
 }

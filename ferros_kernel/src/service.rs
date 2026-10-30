@@ -401,8 +401,14 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Use(b"udp"),
         // 51 the attest screen's vault scope `ahau.` (payloads/ahau).
         Store(b"ahau"),
-        // 52 the cellular link (modem.rs `rmnet_call`; served by the kernel in Phase 1), the IP process's second link.
+        // 52 the cellular link, the IP process's second (served by the modem driver, payloads/modem).
         Use(b"rmnet"),
+        // The modem driver (payloads/modem): 53 serve rmnet; 54-68 its hardware (PCIe ch0, HSI1, the alive GPIO bank, the PMU through EL3); 69-71 its shared-memory windows; 72-76 the partitions it reads (its image, NV, handover signature, carrier configs).
+        Serve(b"rmnet"),
+        Hardware(b"pcie0-elbi"), Hardware(b"pcie0-soc"), Hardware(b"pcie0-pcs"), Hardware(b"pcie0-udbg"), Hardware(b"pcie0-phy"), Hardware(b"pcie0-dbi"), Hardware(b"pcie0-cfg"), Hardware(b"pcie0-mem"),
+        Hardware(b"cmu-hsi1"), Hardware(b"hsi1-sysreg"), Hardware(b"gpio-hsi1"), Hardware(b"sysmmu-hsi1"), Hardware(b"s2mpu-hsi1"), Hardware(b"gpio-alive"), Hardware(b"pmu"),
+        Dma(b"modem-pktproc"), Dma(b"modem-ipc"), Dma(b"modem-msi"),
+        Part(b"modem_a"), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(b"vendor_a"),
     ]
 }
 
@@ -415,6 +421,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
         b"ip" => &[44, 45, 41, 52],
+        // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
+        b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],
         // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
         b"photon" => &[50, 48, 49, 46, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint) (payloads/ahau).

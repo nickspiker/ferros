@@ -77,8 +77,19 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
             ferros_sys::exit(0)
         }
     }
-    modem::up(&mut rep);
-    hw::say(&rep);
+    // Up, or down and again: the boot-channel download fails now and then on its first try (MAIN unanswered), and works the next.
+    for attempt in 0..3 {
+        modem::up(&mut rep);
+        hw::say(&rep);
+        rep.clear();
+        if modem::online() {
+            break;
+        }
+        hw::log(&alloc::format!("bring-up attempt A#{attempt} failed: the CP powered down, trying again"));
+        modem::off(&mut rep);
+        rep.clear();
+        ferros_sys::sleep_until(ferros_sys::now() + ferros_sys::freq());
+    }
     let mut msg = [0u8; 4096];
     let mut tok = [0u8; 32];
     loop {

@@ -10,7 +10,8 @@ R=target/el0/aarch64-unknown-none/release
 pkgs=(); for n in "$@"; do pkgs+=(-p "ferros-payload-$n"); done
 # The display server embeds the app icons; bring the bundle up to date first.
 [[ " $* " == *" display "* ]] && (cd tools/app-icons && cargo run -q --release -- "$REPO/target/icons" >/dev/null)
-cargo el0 -q "${pkgs[@]}" 2>&1 | grep -E "^error" -A10 && exit 1 || true
+# A failed build stops here: under pipefail the old `cargo | grep && exit 1 || true` carried on and stored the last good binary (2026-10-29: init kept its old table for an evening).
+out=$(cargo el0 -q "${pkgs[@]}" 2>&1) || { echo "$out" | grep -E "^error" -A10; exit 1; }
 restart=()
 for n in "$@"; do
     aarch64-linux-gnu-objcopy -O binary "$R/$n" "$R/$n.bin"
