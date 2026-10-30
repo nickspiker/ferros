@@ -2600,7 +2600,7 @@ pub fn up(rep: &mut Vec<u8>) {
 
 /// Whether the service is running (a bring-up got through the handshake).
 pub fn online() -> bool {
-    unsafe { (*(&raw const ONLINE)).is_some() }
+    crate::hw::locked(|| unsafe { (*(&raw const ONLINE)).is_some() })
 }
 
 /// `diag modem down`: the service stopped and the CP powered down.
@@ -2687,6 +2687,31 @@ fn ul_shape(p: &[u8], down: bool) -> alloc::string::String {
 /// - 2 RECV: → the oldest DL packet of the call, or nothing (length 0).
 /// - 3 INFO: → flags (bit 0 the call is up, bit 1 it has IPv4, bit 2 IPv6), MTU (u16 BE), IPv4 address (4), IPv6 address (16), the first DNS server's IPv4 (4) and IPv6 (16) — 43 bytes.
 pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
+    // STATE and DOWN take the lock themselves; RESTART only asks the main thread; the rest touch the call under it.
+    match req.first() {
+        Some(4) => {
+            let mut r = Vec::new();
+            state(&mut r);
+            r
+        }
+        Some(5) => {
+            let mut r = Vec::new();
+            down(&mut r);
+            crate::hw::say(&r);
+            ferros_sys::exit(0)
+        }
+        Some(7) => {
+            RESTART.store(true, core::sync::atomic::Ordering::Relaxed);
+            alloc::vec![0]
+        }
+        _ => crate::hw::locked(|| rmnet_locked(req)),
+    }
+}
+
+/// RESTART (rmnet 7) asked: the main thread powers the CP down and brings it up again.
+pub static RESTART: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn rmnet_locked(req: &[u8]) -> Vec<u8> {
     let o = unsafe { (*(&raw mut ONLINE)).as_mut() };
     match (req.first(), o) {
         (Some(1), o) => {
@@ -2710,12 +2735,6 @@ pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
         }
         (Some(2), Some(o)) => o.dl.pop_front().unwrap_or_default(),
         (Some(2), None) => Vec::new(),
-        (Some(5), _) => {
-            let mut r = Vec::new();
-            down(&mut r);
-            crate::hw::say(&r);
-            ferros_sys::exit(0)
-        }
         (Some(6), Some(o)) => {
             // RESET: the call deactivated (SIT_DEACT_DATA_CALL: call id, reason 0, as Android's RIL sends it); the CP's list indication then shows it gone and the service sets it up again.
             let Some(c) = o.call else { return alloc::vec![2] };
@@ -2723,11 +2742,6 @@ pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
                 Ok(_) => alloc::vec![0],
                 Err(_) => alloc::vec![1],
             }
-        }
-        (Some(4), _) => {
-            let mut r = Vec::new();
-            state(&mut r);
-            r
         }
         (Some(3), o) => {
             let mut r = alloc::vec![0u8; 43];

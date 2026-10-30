@@ -80,8 +80,10 @@ pub fn freq() -> u64 {
     ferros_sys::freq()
 }
 
-/// The kernel's lock, in the kernel's copy of this code: a single-threaded process holds nothing.
+/// The driver's one lock (the kernel's, in the kernel's copy of this code): the service's state is the main thread's and the `rmnet` thread's (main.rs), each pass and each request under it. Not re-entrant: nothing that holds it calls it again.
+static LOCK: ferros_heap::SpinLock<()> = ferros_heap::SpinLock::new(());
 pub fn locked<R>(f: impl FnOnce() -> R) -> R {
+    let _g = LOCK.lock();
     f()
 }
 
