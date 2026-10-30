@@ -12,14 +12,20 @@ use ferros_sys::{cap, console, exit, CALL_LIVE, ERR};
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let base = ferros_sys::arc_base();
-    let req = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else { 4 };
+    // The request is the input (up to 16 bytes: TRACE takes a count after its byte); none is STATE.
+    let mut q = [4u8; 16];
+    let ql = (input_len as usize).min(q.len()).max(1);
+    for k in 0..input_len.min(16) as usize {
+        q[k] = unsafe { core::ptr::read_volatile((base + input + k as u64) as *const u8) };
+    }
+    let req = q[0];
     if req == 3 {
         console(grants, b"rmnetctl: INFO is not printed (the call's addresses)\n");
         exit(0)
     }
     let mut r = [0u8; 2048];
     // CALL_LIVE: no driver serving rmnet is an answer too, not a wait.
-    let n = ferros_sys::svc(ferros_sys::nr::CALL, cap(grants, 1), ferros_sys::off([req].as_ptr()), 1, ferros_sys::off(r.as_mut_ptr()), r.len() as u64 | CALL_LIVE);
+    let n = ferros_sys::svc(ferros_sys::nr::CALL, cap(grants, 1), ferros_sys::off(q.as_ptr()), ql as u64, ferros_sys::off(r.as_mut_ptr()), r.len() as u64 | CALL_LIVE);
     if n == ERR {
         console(grants, b"rmnetctl: no driver serves rmnet\n");
         exit(1)

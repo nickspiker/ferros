@@ -2083,6 +2083,8 @@ struct Online {
     ul_full: u32,
     /// DL packets still to log by shape (`probe` sets it).
     dl_log: u32,
+    /// UL packets still to log by shape (TRACE sets both).
+    ul_log: u32,
 }
 
 /// Bytes as hex, `n` of them from `at`.
@@ -2131,6 +2133,7 @@ impl Online {
             ul_sent: 0,
             ul_full: 0,
             dl_log: 0,
+            ul_log: 0,
         }
     }
 
@@ -2357,7 +2360,7 @@ impl Online {
                     if self.dl_log > 0 {
                         self.dl_log -= 1;
                         let v: Vec<u8> = (0..n.min(64)).map(|i| at(12 + i)).collect();
-                        line(rep, alloc::format!("DL raw ring ch A#{ch}: {}\n", ul_shape(&v, true)));
+                        line(rep, alloc::format!("t={} ms: DL raw ring ch A#{ch}: {}\n", since_us(t0) / 1000, ul_shape(&v, true)));
                     }
                     if self.dl.len() == DL_QUEUE {
                         self.dl.pop_front();
@@ -2512,7 +2515,7 @@ impl Online {
                 if self.dl_log > 0 {
                     self.dl_log -= 1;
                     let v: Vec<u8> = (0..len.min(64)).map(body).collect();
-                    line(rep, alloc::format!("DL q{q} ch A#{ch}: {}\n", ul_shape(&v, true)));
+                    line(rep, alloc::format!("t={} ms: DL q{q} ch A#{ch}: {}\n", since_us(t0) / 1000, ul_shape(&v, true)));
                 }
                 self.packets += 1;
                 // The service keeps the call's packets for `rmnet`. The length is the CP's: one beyond the largest packet it was told it may write (or empty) is malformed and dropped, never read past its buffer.
@@ -2722,6 +2725,10 @@ fn rmnet_locked(req: &[u8]) -> Vec<u8> {
             if pkt.is_empty() || pkt.len() > PP_UL_PKT[PP_UL_NORM as usize] as usize {
                 return alloc::vec![3];
             }
+            if o.ul_log > 0 {
+                o.ul_log -= 1;
+                crate::hw::log(&alloc::format!("t={} ms: UL {}", since_us(o.t0) / 1000, ul_shape(pkt, false)));
+            }
             match pktproc_ul_send(ch, pkt) {
                 Ok(()) => {
                     o.ul_sent += 1;
@@ -2735,6 +2742,13 @@ fn rmnet_locked(req: &[u8]) -> Vec<u8> {
         }
         (Some(2), Some(o)) => o.dl.pop_front().unwrap_or_default(),
         (Some(2), None) => Vec::new(),
+        (Some(8), Some(o)) => {
+            // TRACE: the next n packets each way (default 16) logged by shape — the far end, ports, checksums, never the line's own address.
+            let n = req.get(1).copied().unwrap_or(16) as u32;
+            o.ul_log = n;
+            o.dl_log = n;
+            alloc::vec![0]
+        }
         (Some(6), Some(o)) => {
             // RESET: the call deactivated (SIT_DEACT_DATA_CALL: call id, reason 0, as Android's RIL sends it); the CP's list indication then shows it gone and the service sets it up again.
             let Some(c) = o.call else { return alloc::vec![2] };
