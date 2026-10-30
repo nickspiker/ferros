@@ -399,3 +399,30 @@ Checked and matching Android on the way, so not the cause:
 - **PREFERRED_DATA_MODEM:** Android sends it on channel 245 (stack 0) with value 1, and never sends SET_PS_SERVICE.
 
 **Next:** the data call (SIT_SETUP_DATA_CALL on the internet profile) and packets over pktproc DL/UL.
+
+## 2026-10-29 night: the data call, and the first round trip over cellular
+
+`diag modem s12` brings up the internet PDN and moves packets both ways. Once stack 1 is home, ferros sends one SIT_SETUP_DATA_CALL on VZWINTERNET, laid out as Android's RIL sends it; the full 983-byte request was captured with a second kprobe on `txq_write` covering bytes 512-1023.
+
+| Offset | Field |
+|---|---|
+| G#C | call id (the AP numbers its calls from G#11; SIT_DEACT_DATA_CALL names the same id) |
+| G#D | radio technology 14 |
+| G#10 | APN |
+| G#DA | PDP type 3 |
+| G#F1 | APN types (u32) |
+| G#F5 | 2 (u32) |
+| G#FC, G#101 | -1 (s32 each) |
+| G#105 | 1 |
+| G#106 | 2 |
+| G#10A | the APN again |
+
+From about G#1F4 on, Android's RIL sends uninitialised stack bytes (kernel pointers, a log line); ferros sends zeros. The reply (304 bytes) carries the status (u16) at params G#0, then the call id, the active flag and the PDP type, then the IPv4 address, the 16-byte IPv6 address at params G#9, DNS, gateway, and the MTU (1428) at params G#FA. The CP answers about 5 s after the request: error 0, status 0, call id G#11, active, IPV4V6.
+
+A data call with id `cid` is rmnet(cid - 1) (Android's radio log: cid 17 on rmnet16). The rmnet channels are SIT 181-210, so the internet PDN is channel 197.
+
+UL goes on pktproc UL queue 1 (2 KiB buffers; queue 0 carries TCP ACKs only on this DT). The descriptor is {data_size = length + 76 (pktproc_ul_padding_required), total_pkt_size, the buffer's CP address, last_desc 1 (the end bit is the AP's), lcid = the call's channel}. Then fore + 1 and SEND_DATA (G#81) with the doorbell. Android's own UL packets (a kprobe at `pktproc_send_pkt_to_cp`: skb data at +G#E0, the channel in the skb cb at +G#48) are plain IP on channel 197, the same framing.
+
+The first round trip: an ICMPv6 echo request from the call's own address to 2001:4860:4860::8888 came back as an echo reply on DL queue 0, channel 197, 63 ms later. A router solicitation sent at the same time (from fe80::<the network's interface id>) got no advertisement in 30 s, and none came unsolicited. The address in the data-call reply is already global, so none is needed.
+
+**Next:** an IP stack on top of these two queues (ferros's `ip` server over rmnet instead of WiFi), and the other PDNs only if something needs them.

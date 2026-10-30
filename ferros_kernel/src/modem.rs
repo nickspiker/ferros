@@ -827,7 +827,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         (14, Some(s)) => start_and_handshake(rep, s, true, 4),
         (15, Some(s)) => start_and_handshake(rep, s, true, 5),
         (16, Some(s)) => start_and_handshake(rep, s, true, 6),
-        (n, Some(s)) if n >= 17 => start_and_handshake(rep, s, true, 7),
+        (17, Some(s)) => start_and_handshake(rep, s, true, 7),
+        (n, Some(s)) if n >= 18 => start_and_handshake(rep, s, true, 8),
         _ => {}
     }
 }
@@ -1467,6 +1468,98 @@ fn pktproc_ul_init() {
     unsafe { core::arch::asm!("dsb sy") };
 }
 
+/// The rmnet channels: rmnet0..29 are SIT channels 181..210 (EXYNOS_CH_EX_ID_PDP_0), and a data call with id `cid` is rmnet(cid - 1) (Android's radio log, 2026-10-29: cid 17 on rmnet16).
+const CH_PDP_0: u8 = 181;
+/// UL packets go on the normal queue (1, 2 KiB buffers): the high-priority one carries TCP ACKs only (DT pktproc_ul_hiprio_ack_only).
+const PP_UL_NORM: u32 = 1;
+/// The DT's pktproc_ul_padding_required: each packet's size is written 76 bytes longer than the packet (CP_PADDING, link_tx_pktproc.c).
+const PP_UL_PAD: u32 = 76;
+
+/// One packet up on UL queue `PP_UL_NORM` (pktproc_send_pkt_to_cp, then the fore pointer and SEND_DATA): the packet into the buffer at the queue's fore pointer, its descriptor {data_size, total_pkt_size, sktbuf_point (the buffer's CP address), last_desc 1 (the end bit is the AP's: end_bit_owner 0), lcid = the call's channel}, fore + 1, then the SEND_DATA message and the doorbell.
+fn pktproc_ul_send(ch: u8, pkt: &[u8]) -> Result<(), alloc::string::String> {
+    let q = PP_UL_NORM;
+    let e = PP_UL_INFO + 8 + 20 * q as usize;
+    let n = rd(e + 4);
+    let (fore, rear) = (rd(e + 12), rd(e + 16));
+    // The pointers live in shared memory the CP writes (rear): out of range they would put the packet outside the queue's buffers, so nothing is written; fore + 1 meeting rear is a full queue.
+    if fore >= n || rear >= n || (fore + 1) % n == rear {
+        return Err(alloc::format!("UL queue {q} full or bad: fore {fore} rear {rear} of {n}"));
+    }
+    // Our own packets; one longer than a buffer is a bug: fail loud.
+    assert!(pkt.len() <= PP_UL_PKT[q as usize] as usize);
+    let off = PP_UL_BUFF + q * PP_UL_Q_BUFF + fore * PP_UL_PKT[q as usize];
+    for (i, &b) in pkt.iter().enumerate() {
+        wr8(PKTPROC + off as usize + i, b);
+    }
+    let desc0: u32 = (0..q).map(|k| PP_UL_Q_BUFF / PP_UL_PKT[k as usize] * 32).sum();
+    let d = PKTPROC + (PP_UL_DESC + desc0 + fore * 32) as usize;
+    let size = pkt.len() as u32 + PP_UL_PAD;
+    wr(d, size);
+    wr(d + 4, size);
+    wr64(d + 8, (PP_CP_BASE + off) as u64);
+    wr(d + 16, 1);
+    wr(d + 20, (ch as u32) << 8);
+    wr(d + 24, 0);
+    wr(d + 28, 0);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(e + 12, (fore + 1) % n);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(AP2CP_MSG, INT_SEND_DATA);
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
+    Ok(())
+}
+
+/// An IPv6 router solicitation from the link-local address fe80::<iid> to all routers (no source link-layer option: the PDN has no link layer), the packet that asks the PDN's gateway for its router advertisement. The interface id is the network's (3GPP TS 29.061 11.2.1.3.2: the UE builds its link-local address from it).
+fn router_solicitation(iid: &[u8; 8]) -> [u8; 48] {
+    let mut p = [0u8; 48];
+    p[0] = 0x60;
+    p[5] = 8;
+    p[6] = 58;
+    p[7] = 255;
+    p[8] = 0xFE;
+    p[9] = 0x80;
+    p[16..24].copy_from_slice(iid);
+    p[24] = 0xFF;
+    p[25] = 0x02;
+    p[39] = 0x02;
+    p[40] = 133;
+    icmp6_checksum(&mut p);
+    p
+}
+
+/// A public IPv6 resolver (Google's, 2001:4860:4860::8888) that answers echo requests: the far end for the first round trip over the data call.
+const PING_TARGET: [u8; 16] = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
+
+/// One ICMPv6 echo request (id 1, sequence 0, 8 bytes of payload) from the call's address to `dst`, hop limit 64.
+fn echo_request(src: &[u8; 16], dst: &[u8; 16]) -> [u8; 56] {
+    let mut p = [0u8; 56];
+    p[0] = 0x60;
+    p[5] = 16;
+    p[6] = 58;
+    p[7] = 64;
+    p[8..24].copy_from_slice(src);
+    p[24..40].copy_from_slice(dst);
+    p[40] = 128;
+    p[45] = 1;
+    p[48..56].copy_from_slice(b"ferros\0\0");
+    icmp6_checksum(&mut p);
+    p
+}
+
+/// The ICMPv6 checksum of an IPv6 packet with no extension headers (the message from byte 40): the one's-complement sum of the pseudo-header (both addresses, the upper-layer length, next header 58) and the message, carries folded back in, written at bytes 42-43.
+fn icmp6_checksum(p: &mut [u8]) {
+    let n = p.len() - 40;
+    let mut s: u32 = n as u32 + 58;
+    for i in (8..p.len()).step_by(2) {
+        s += u16::from_be_bytes([p[i], p[i + 1]]) as u32;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xFFFF) + (s >> 16);
+    }
+    p[42..44].copy_from_slice(&(!(s as u16)).to_be_bytes());
+}
+
 /// init_legacy_link (link_device_memory_legacy.c 228-268): magic and mem_access dropped, the FMT and RAW cursors (IPC+G#8..G#24) zeroed, then magic G#AA (MEM_IPC_MAGIC) and mem_access 1.
 fn legacy_init() {
     wr(IPC, 0);
@@ -1578,6 +1671,30 @@ fn initial_attach_params(apn: &[u8]) -> Vec<u8> {
     m[0x10..0x10 + apn.len()].copy_from_slice(apn);
     m[0xDA] = 3;
     m[0xF8] = 2;
+    m[12..].to_vec()
+}
+const SIT_SETUP_DATA_CALL: u16 = 0x0600;
+/// The internet PDN: Verizon's VZWINTERNET profile (types default | SUPL | DUN | HIPRI, G#1D) and the call id the AP gives it (Android's RIL numbers its calls from G#11; SIT_DEACT_DATA_CALL names the same id).
+const DATA_APN: &[u8] = b"VZWINTERNET";
+const DATA_TYPES: u32 = 0x1D;
+const DATA_CID: u8 = 0x11;
+
+/// SIT_SETUP_DATA_CALL's 971 parameter bytes (983 with the header), as offsets into the whole message, laid out as Android's RIL sends them for its internet call (the kprobe trace of cpif txq_write, 2026-10-29): G#C the call id, G#D the radio technology (14, LTE, in the RIL's numbering), G#10 the APN [101], G#DA PDP type 3 (IPV4V6), G#F1 the APN types (u32), G#F5 2 (u32), G#FC -1 (s32), G#100 0, G#101 -1 (s32), G#105 1, G#106 2 (G#E for VZWAPP), G#10A the APN again. The RIL leaves everything from about G#1F4 on uninitialised (stack bytes, a log line); here it is zero.
+fn setup_data_call_params(apn: &[u8], types: u32, cid: u8) -> Vec<u8> {
+    let mut m = alloc::vec![0u8; 983];
+    m[0xC] = cid;
+    m[0xD] = 14;
+    // The APN fields are ours; a name too long for them is a bug: fail loud.
+    assert!(apn.len() <= 100);
+    m[0x10..0x10 + apn.len()].copy_from_slice(apn);
+    m[0xDA] = 3;
+    m[0xF1..0xF5].copy_from_slice(&types.to_le_bytes());
+    m[0xF5..0xF9].copy_from_slice(&2u32.to_le_bytes());
+    m[0xFC..0x100].copy_from_slice(&[0xFF; 4]);
+    m[0x101..0x105].copy_from_slice(&[0xFF; 4]);
+    m[0x105] = 1;
+    m[0x106] = 2;
+    m[0x10A..0x10A + apn.len()].copy_from_slice(apn);
     m[12..].to_vec()
 }
 const SIT_SET_PREFERRED_DATA_MODEM: u16 = 0x0740;
@@ -2098,6 +2215,10 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut allow_set = false;
     let mut reg_last: [Option<[u8; 4]>; 2] = [None, None];
     let mut camp_seen = [0u8; 2];
+    let mut call_sent = false;
+    let mut call_up: Option<(u64, u8, [u8; 16])> = None;
+    let mut rs_sent = false;
+    let mut pp_reports = 0u32;
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut rfs_st = Rfs { pull: None, read: None, files: Vec::new() };
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
@@ -2184,6 +2305,45 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes()) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_ALLOW_NETWORK G#{ALLOWED_RATS:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_ALLOW_NETWORK not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        // Stage G#12: the internet data call once the data stack is home (registration state 1) or roaming (5): one SIT_SETUP_DATA_CALL on VZWINTERNET, as Android's RIL sends it after registering.
+        if probe >= 8 && !call_sent && matches!(reg_last[1], Some([1 | 5, ..])) {
+            call_sent = true;
+            match sit_request(&mut link, CH_FMT0 + 1, SIT_SETUP_DATA_CALL, &setup_data_call_params(DATA_APN, DATA_TYPES, DATA_CID)) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SETUP_DATA_CALL {} cid G#{DATA_CID:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(DATA_APN), CH_FMT0 + 1)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SETUP_DATA_CALL not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        // Stage G#12: a second after the call is up, one IPv6 router solicitation up its rmnet channel: the gateway's advertisement coming back down proves both packet paths.
+        if let (false, Some((t_up, cid, v6))) = (rs_sent, call_up) {
+            if since_us(t0) > t_up + 1_000_000 {
+                rs_sent = true;
+                let ch = CH_PDP_0 + cid - 1;
+                let iid: [u8; 8] = v6[8..].try_into().unwrap();
+                match pktproc_ul_send(ch, &router_solicitation(&iid)) {
+                    Ok(()) => line(rep, alloc::format!("t={} ms: -> UL IPv6 router solicitation on ch A#{ch} (cid G#{cid:X})\n", since_us(t0) / 1000)),
+                    Err(e) => line(rep, alloc::format!("t={} ms: router solicitation not sent: {e}\n", since_us(t0) / 1000)),
+                }
+                match pktproc_ul_send(ch, &echo_request(&v6, &PING_TARGET)) {
+                    Ok(()) => line(rep, alloc::format!("t={} ms: -> UL ICMPv6 echo request to a public resolver on ch A#{ch}\n", since_us(t0) / 1000)),
+                    Err(e) => line(rep, alloc::format!("t={} ms: echo request not sent: {e}\n", since_us(t0) / 1000)),
+                }
+            }
+        }
+        // Stage G#12: every 4 s once the call is up, the packet queues' pointers: UL fore/rear per queue (rear moving = the CP took a packet), DL fore/rear per queue.
+        if let Some((t_up, _, _)) = call_up {
+            if probe >= 8 && since_us(t0) > t_up + 2_000_000 + 4_000_000 * pp_reports as u64 && pp_reports < 8 {
+                pp_reports += 1;
+                let mut s = alloc::string::String::new();
+                for q in 0..2usize {
+                    let e = PP_UL_INFO + 8 + 20 * q;
+                    s.push_str(&alloc::format!(" UL{q} A#{}/A#{}", rd(e + 12), rd(e + 16)));
+                }
+                for q in 0..PP_QUEUES {
+                    s.push_str(&alloc::format!(" DL{q} A#{}/A#{}", rd(pp_qinfo(q) + 12), rd(pp_qinfo(q) + 16)));
+                }
+                line(rep, alloc::format!("t={} ms: queues (fore/rear):{s}; ap2cp G#{:X} cp2ap G#{:X}\n", since_us(t0) / 1000, rd(AP2CP_MSG), rd(CP2AP_MSG)));
             }
         }
         if probe >= 4 && !data_on && since_us(t0) > 7_000_000 {
@@ -2300,6 +2460,18 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                     line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hex(&|i| st[i as usize], 4)));
                 }
             }
+            // A data-call reply, past the cap too: the RCM error, then the call's status (u16), id, active flag and PDP type (params G#0..G#4); the addresses, DNS and gateway after them are the line's and stay hidden.
+            if ril && at(12) == 1 && (at(14) as u16 | (at(15) as u16) << 8) == SIT_SETUP_DATA_CALL && flen >= 12 + 12 + 5 {
+                line(rep, alloc::format!("t={} ms: ch A#{ch} data call reply: error G#{:X}, status G#{:X}, cid G#{:X}, active A#{}, PDP type A#{}\n", since_us(t0) / 1000, at(22), at(24) as u16 | (at(25) as u16) << 8, at(26), at(27), at(28)));
+                if at(22) == 0 && at(24) == 0 && at(25) == 0 && at(27) != 0 {
+                    // The IPv6 address the network gave the call (params G#9..G#18, after the IPv4 address): its low 64 bits are the interface id for the link-local source; kept for the packets, never shown.
+                    let mut v6 = [0u8; 16];
+                    for (i, x) in v6.iter_mut().enumerate() {
+                        *x = at(24 + 9 + i as u32);
+                    }
+                    call_up = Some((since_us(t0), at(26), v6));
+                }
+            }
             // The first physical-channel-config and NITZ indications (the stack camped on a cell) are logged past the cap too, header only.
             if ril && at(12) == 2 && flen >= 12 + 8 {
                 let id = at(14) as u16 | (at(15) as u16) << 8;
@@ -2370,7 +2542,14 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 if packets < 32 {
                     let b = pp_buf_ap(q, i);
                     let body = |o: u32| rd8(b + o as usize);
-                    line(rep, alloc::format!("t={} ms: pktproc q{q} desc A#{i} ch A#{ch} len A#{len} done {} addr G#{:X}: {}\n", since_us(t0) / 1000, (d & PP_DONE != 0) as u32, d & 0xF_FFFF_FFFF, hex(&body, len.min(40))));
+                    // The IP header's version and protocol (IPv6: next header, and an ICMPv6 message's type), never its addresses: they are the line's and its peers'.
+                    let ip = match body(0) >> 4 {
+                        4 if len >= 20 => alloc::format!("IPv4 protocol A#{}", body(9)),
+                        6 if len >= 41 && body(6) == 58 => alloc::format!("IPv6 ICMPv6 type A#{}", body(40)),
+                        6 if len >= 40 => alloc::format!("IPv6 next header A#{}", body(6)),
+                        v => alloc::format!("first nibble G#{v:X}"),
+                    };
+                    line(rep, alloc::format!("t={} ms: pktproc q{q} desc A#{i} ch A#{ch} len A#{len} done {}: {ip}\n", since_us(t0) / 1000, (d & PP_DONE != 0) as u32));
                 }
                 packets += 1;
                 // Repost at fore (Linux's refill): the slot one behind the rear is free now that its packet is read.
