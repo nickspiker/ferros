@@ -2063,6 +2063,8 @@ struct Online {
     reg_last: [Option<[u8; 4]>; 2],
     camp_seen: [u8; 2],
     call_sent: bool,
+    /// Not before this (µs since online): the next setup after a refusal or a lost call.
+    call_retry: u64,
     call: Option<Call>,
     rs_sent: bool,
     pp_reports: u32,
@@ -2112,6 +2114,7 @@ impl Online {
             reg_last: [None, None],
             camp_seen: [0; 2],
             call_sent: false,
+            call_retry: 0,
             call: None,
             rs_sent: false,
             pp_reports: 0,
@@ -2218,7 +2221,7 @@ impl Online {
             }
         }
         // Stage G#12: the internet data call once the data stack is home (registration state 1) or roaming (5): one SIT_SETUP_DATA_CALL on VZWINTERNET, as Android's RIL sends it after registering.
-        if probe >= 8 && !self.call_sent && matches!(self.reg_last[1], Some([1 | 5, ..])) {
+        if probe >= 8 && !self.call_sent && since_us(t0) > self.call_retry && matches!(self.reg_last[1], Some([1 | 5, ..])) {
             self.call_sent = true;
             match sit_request(link, CH_FMT0 + 1, SIT_SETUP_DATA_CALL, &setup_data_call_params(DATA_APN, DATA_TYPES, DATA_CID)) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SETUP_DATA_CALL {} cid G#{DATA_CID:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(DATA_APN), CH_FMT0 + 1)),
@@ -2407,6 +2410,23 @@ impl Online {
                     }
                     line(rep, alloc::format!("t={} ms: data call up on rmnet ch A#{}, MTU A#{}\n", since_us(t0) / 1000, CH_PDP_0 + c.cid - 1, c.mtu));
                     self.call = Some(c);
+                } else {
+                    // Refused: asked again in 16 s, while still registered.
+                    self.call_sent = false;
+                    self.call_retry = since_us(t0) + 16_000_000;
+                }
+            }
+            // The CP's list of calls (SIT_IND_DATA_CALL_LIST_CHANGED on the data stack): a count, then entries of 292 bytes laid out as the setup reply's parameters (status u16, call id, active, PDP type, …; Android's trace, 2026-10-29). Our call missing or inactive there is a call lost (the network dropped it, or the stack left the network): forgotten, and set up again once the stack is registered.
+            if self.call.is_some() && ch == CH_FMT0 + 1 && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0604 && flen >= 12 + 8 + 1 {
+                let n = at(20) as u32;
+                let cid = self.call.map(|c| c.cid).unwrap_or(0);
+                // Only the entries the frame holds (the count is the CP's): their call id and active flag.
+                let alive = (0..n).take_while(|k| 12 + 8 + 1 + k * 292 + 4 <= flen).any(|k| at(21 + k * 292 + 2) == cid && at(21 + k * 292 + 3) != 0);
+                if !alive {
+                    line(rep, alloc::format!("t={} ms: data call cid G#{cid:X} lost (A#{n} calls listed); set up again once registered\n", since_us(t0) / 1000));
+                    self.call = None;
+                    self.call_sent = false;
+                    self.call_retry = since_us(t0) + 2_000_000;
                 }
             }
             // The first physical-channel-config and NITZ indications (the stack camped on a cell) are logged past the cap too, header only.
@@ -2695,6 +2715,14 @@ pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
             down(&mut r);
             crate::hw::say(&r);
             ferros_sys::exit(0)
+        }
+        (Some(6), Some(o)) => {
+            // RESET: the call deactivated (SIT_DEACT_DATA_CALL: call id, reason 0, as Android's RIL sends it); the CP's list indication then shows it gone and the service sets it up again.
+            let Some(c) = o.call else { return alloc::vec![2] };
+            match sit_request(&mut o.link, CH_FMT0 + 1, 0x0601, &[c.cid, 0]) {
+                Ok(_) => alloc::vec![0],
+                Err(_) => alloc::vec![1],
+            }
         }
         (Some(4), _) => {
             let mut r = Vec::new();

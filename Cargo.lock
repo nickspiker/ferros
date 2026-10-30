@@ -1026,6 +1026,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-rmnetctl"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-shelltest"
 version = "0.1.0"
 dependencies = [
