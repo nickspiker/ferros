@@ -18,4 +18,5 @@ The blocker was the modem service's UE-capability file reads on ch130. The CP na
 - When the CP misbehaves silently, diff ferros's *responses* to CP→AP requests against Android's, not only the AP→CP requests.
 - The capture tool is kprobes on stock Android + Magisk: cpif `txq_write` (skb data +0xd8) and `pass_skb_to_demux` (+0xe0), armed from /data/adb/post-fs-data.d/ril-debug.sh.
 - Captures stay local: they carry SIM identity.
-- Next step is SETUP_DATA_CALL plus pktproc DL/UL. See [[cellular-start-authorized]].
+- Data path works (2dd0a0c): SETUP_DATA_CALL on VZWINTERNET, UL queue 1 with lcid = 181 + cid - 1, the size padded +76; an ICMPv6 echo to 2001:4860:4860::8888 answers in 63 ms. The RS gets no RA, and none is needed (the reply's address is global).
+- Next: an IP stack (ferros `ip`) over rmnet. See [[cellular-start-authorized]].

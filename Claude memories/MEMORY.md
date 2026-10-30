@@ -107,4 +107,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [tapuwae: NEON then GPU](tapuwae_neon_then_gpu.md) — attest mark renders on NEON now; owner: convert to the Mali GPU once ferros drives it
 - [fluor pixel depth](fluor_pixel_depth.md) — fluor at Argb8 or G2t16 from one source (2026-10-29); display decodes G2t16 natively (op 22 format 1)
 - [Android boot experiments trip rescue](android_boot_experiments_rescue_party.md) — 2026-10-29 the stock RAM boot and an hv capture build on slot a failed and hit "Cannot load Android system"; ask before booting Android under a changed image, never factory reset
-- [Modem registers: uecap was the blocker](modem_uecap_registration.md) — cold ferros on Verizon LTE/NR since 2026-10-29 (s10/s11); CP wants its own uecap block size + token per block; diff our *answers*, not only our requests; kprobe capture method
+- [Modem registers: uecap was the blocker](modem_uecap_registration.md) — cold ferros on Verizon LTE/NR + IPv6 round trip since 2026-10-29 (s10/s11 register, s12 data); CP wants its own uecap block size + token per block; diff our *answers*, not only our requests; kprobe capture method
