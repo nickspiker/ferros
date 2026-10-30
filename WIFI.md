@@ -242,3 +242,11 @@ SysMMU `sysmmu_hsi2` G#131C_0000 sits in front of PCIe ch1 only (port PCIe_CH1) 
 13. BAR placement vs the 2 MB MEM iATU limit (§10).
 14. SYSREG_HSI2: the ch1 path writes nothing there.
 15. **ferros-specific:** on husky, reading an unpowered block makes the next EL3 call hang (BOOT.md EL3 poison rule) — read the CMU gates (§2) before touching ELBI/DBI.
+
+## The keeper: the driver started again after a failed join (2026-10-29)
+
+When a join fails, the driver exits (`join failed (see events)`). Until tonight nothing started it again before the next boot, so a phone that missed its first join had no WiFi for the session. On 2026-10-29 the home access point refused every join for an evening: dozens of reboots and reloads each rejoined, and it throttles repeated joins.
+
+Now the kernel's service loop keeps it. Once the shell is up, a `pcie1` that is gone is started again from the vault (`diag restart pcie1`'s path, a full fresh bring-up). The first restart comes 64 s after it went, and the wait doubles with each restart up to 1024 s, since a refused join only adds to a throttle. The wait goes back to 64 s once the driver has stayed up that long. `diag kill pcie1` stops the keeper for the session.
+
+Meanwhile the IP process stays on cellular. Its `wlan` calls carry CALL_LIVE (KERNEL.md), so they fail at once while no driver runs, and while a restarted one is still bringing the chip up. It asks again every 4 s and takes WiFi back the moment the driver serves.

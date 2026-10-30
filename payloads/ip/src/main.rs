@@ -267,7 +267,7 @@ impl Ip {
         self.router_solicit();
     }
 
-    /// The WiFi driver stopped answering: its addresses go, so traffic takes the cellular call; `wifi_up` tries again every 16 s.
+    /// The WiFi driver stopped answering: its addresses go, so traffic takes the cellular call; `wifi_up` tries again every 4 s.
     fn wifi_down(&mut self) {
         self.wifi = false;
         self.wifi_t = now();
@@ -1375,7 +1375,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     ip.v6_put(ll);
     ip.put(b"\n");
     ip.flush();
-    // WiFi: the driver's MAC, then DHCP and a router solicitation (`wifi_up`). No `wlan` grant or no driver serving it: cellular only for now, the driver asked again every 16 s.
+    // WiFi: the driver's MAC, then DHCP and a router solicitation (`wifi_up`). No `wlan` grant or no driver serving it: cellular only for now, the driver asked again every 4 s (an error at once while it is not serving: CALL_LIVE).
     ip.wifi_up();
     let mut frame = [0u8; 2048];
     let mut msg = [0u8; 2048];
@@ -1446,7 +1446,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // Timers: DHCP retransmits every 2 s until bound; router solicitation every 4 s, three times, until a global address appears.
         let t = now();
-        if !ip.wifi && t.wrapping_sub(ip.wifi_t) > 16 * ip.freq {
+        if !ip.wifi && t.wrapping_sub(ip.wifi_t) > 4 * ip.freq {
             ip.wifi_up();
         }
         if ip.wifi && !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {

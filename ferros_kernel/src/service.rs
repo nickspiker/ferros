@@ -1078,6 +1078,8 @@ pub fn run(mut b: Boot) -> ! {
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
     let mut ipc_marked = false;
+    // The WiFi driver's keeper (below): whether it runs, when it last looked, since when pcie1 has been gone, the wait before starting it again, when it was last started.
+    let (mut wifi_keep, mut wifi_check, mut wifi_gone, mut wifi_wait, mut wifi_up_since) = (true, 0u64, None::<u64>, 64u64, 0u64);
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
@@ -1191,6 +1193,29 @@ pub fn run(mut b: Boot) -> ! {
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
         crate::usf::poll();
+        // The WiFi driver's keeper: the driver exits when a join fails (an access point that throttles repeated joins refused them all evening, 2026-10-29), and nothing started it again until a reboot. Once the shell is up, a pcie1 that is gone is started again from the vault — 64 s after it went, the wait doubling each time to 1024 s (a join refused again only adds to a throttle), back to 64 s once it has stayed up that long. A `diag kill pcie1` stops the keeper for the session.
+        if home_started && wifi_keep && now.wrapping_sub(wifi_check) > 4 * freq {
+            wifi_check = now;
+            if crate::process::running(b"pcie1") {
+                wifi_gone = None;
+                if wifi_wait > 64 && now.wrapping_sub(wifi_up_since) > 1024 * freq {
+                    wifi_wait = 64;
+                }
+            } else {
+                let since = *wifi_gone.get_or_insert(now);
+                if now.wrapping_sub(since) > wifi_wait * freq {
+                    let mut rep = alloc::vec::Vec::new();
+                    restart(&mut store, b"pcie1", &mut rep);
+                    crate::flashlog::line(&alloc::format!("wifi keeper: pcie1 started again after A#{wifi_wait} s"));
+                    wifi_gone = None;
+                    wifi_up_since = now;
+                    // The policy's cap, not a guard: a driver that keeps failing is tried every 17 minutes from then on.
+                    if wifi_wait < 1024 {
+                        wifi_wait *= 2;
+                    }
+                }
+            }
+        }
         // The checklist's IPC row, once any process has had a call answered (init, which marks the others, makes none).
         if !ipc_marked && crate::process::round_trips() > 0 {
             ipc_marked = true;
@@ -2160,6 +2185,10 @@ pub fn run(mut b: Boot) -> ! {
                                         if let Some(names) = cmd.params.strip_prefix(b"kill ") {
                                             for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
                                                 let killed = crate::process::kill(name);
+                                                // A WiFi driver killed by hand stays down: the keeper stops for the session.
+                                                if name == b"pcie1" {
+                                                    wifi_keep = false;
+                                                }
                                                 resp.extend_from_slice(name);
                                                 resp.extend_from_slice(if killed { b" killed\n" } else { b" was not running\n" });
                                             }

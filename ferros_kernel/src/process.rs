@@ -383,6 +383,8 @@ struct Endpoint {
     queue: alloc::collections::VecDeque<(usize, Vec<u8>)>,
     /// The thread that last polled this endpoint (recv with poll): a call wakes it if it is asleep, so a server that sleeps between polls answers at once rather than at its next deadline.
     poller: Option<usize>,
+    /// A server has received on it (a RECV, polling or not) since its last receiver ended: what CALL_LIVE asks for, so a caller does not wait out a driver that holds the right but is still bringing its device up.
+    served: bool,
 }
 
 struct Kernel {
@@ -590,7 +592,7 @@ fn endpoint(name: &[u8]) -> usize {
     if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
         return i;
     }
-    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None });
+    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, served: false });
     kk.endpoints.len() - 1
 }
 
@@ -1545,8 +1547,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     f.x[0] = n as u64;
                     0
                 }
-                // CALL_LIVE (bit 63 of the reply length) and nobody can serve the endpoint: ERR now, not a wait for a server that may never come (the IP process at a boot where the WiFi driver failed, 2026-10-29).
-                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !has_receiver(ep) => {
+                // CALL_LIVE (bit 63 of the reply length) and no server receiving on the endpoint — none holds the right, or the one that does has not started receiving yet: ERR now, not a wait for a server that may never come (the IP process at a boot where the WiFi driver failed, 2026-10-29; and while the driver brings its device up).
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !(kk.endpoints[ep].served && has_receiver(ep)) => {
                     f.x[0] = ERR;
                     0
                 }
@@ -1583,6 +1585,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_RECV => {
             let token = p.read(f.x[0], 32);
+            if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                if r & RIGHT_RECV != 0 {
+                    kk.endpoints[ep].served = true;
+                }
+            }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 // x4 bit 0 = poll: with nothing queued, return NOTHING at once instead of blocking — for a server that must also keep polling its hardware (the WiFi driver's rings).
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_RECV != 0 && f.x[4] & 1 != 0 && kk.endpoints[ep].queue.is_empty() => {
@@ -1746,7 +1753,7 @@ fn fail_callers(cspace: &[CapEntry]) {
     }
 }
 
-/// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no live process can receive on the endpoint, at the call or later when its last server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
+/// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no server is receiving on the endpoint (none holds the right, or the one that does has not received yet), at the call or later when its last server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
 pub const CALL_LIVE: u64 = 1 << 63;
 
 /// Whether a live process (not one ending) holds the right to receive on endpoint `ep`.
@@ -1758,7 +1765,12 @@ fn has_receiver(ep: usize) -> bool {
 fn fail_orphaned_calls() {
     let kk = k();
     for ep in 0..kk.endpoints.len() {
-        if kk.endpoints[ep].queue.is_empty() || has_receiver(ep) {
+        if has_receiver(ep) {
+            continue;
+        }
+        // No receiver left: a server started again must receive before CALL_LIVE counts it.
+        kk.endpoints[ep].served = false;
+        if kk.endpoints[ep].queue.is_empty() {
             continue;
         }
         let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).collect();
@@ -2025,9 +2037,16 @@ fn kill_locked(name: &[u8]) -> bool {
             q.cspace.retain(|c| !matches!(c.object, Object::Reply(r) if r == t));
         }
     }
+    // Its endpoints may have no server now: CALL_LIVE callers queued there get ERR, as when a process ends by itself.
+    fail_orphaned_calls();
     kk.console.extend_from_slice(name);
     kk.console.extend_from_slice(b": killed\n");
     true
+}
+
+/// Whether a process of this name is alive (not one ending).
+pub fn running(name: &[u8]) -> bool {
+    with_lock(|| k().procs.iter().flatten().any(|p| p.name == name && !p.dying))
 }
 
 /// How many processes are alive (running, runnable or blocked).

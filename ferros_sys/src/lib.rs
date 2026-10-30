@@ -13,7 +13,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 pub const ERR: u64 = u64::MAX;
 /// A polling `recv` found no message waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
-/// OR'd into a `call`'s reply length: fail with ERR instead of waiting when no live process serves the endpoint (now, or once its last server ends). Without it a call waits for a server, as across a restart (process.rs CALL_LIVE).
+/// OR'd into a `call`'s reply length: fail with ERR instead of waiting when no server is receiving on the endpoint (none alive, or one still bringing its device up and not yet receiving; now, or once its last server ends). Without it a call waits for a server, as across a restart (process.rs CALL_LIVE).
 pub const CALL_LIVE: u64 = 1 << 63;
 
 /// Syscall numbers (x8).
