@@ -330,6 +330,8 @@ async fn main() {
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).
                     "--dma" => { grants.push((5, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
+                    // --part NAME: read-only files on one of the phone's partitions (process.rs PARTS: modem_a, efs, persist, modem_userdata, vendor_a).
+                    "--part" => { grants.push((10, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--masked" => { i += 1; }
                     "--text-len" => { i += 2; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).

@@ -1156,8 +1156,6 @@ pub fn run(mut b: Boot) -> ! {
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
         crate::usf::poll();
-        // The cellular modem, once `diag modem up` has it online: one pass of its service (modem.rs `service_poll`).
-        crate::modem::service_poll();
         if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
             let st = &raw mut store;
             let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
@@ -2358,19 +2356,6 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        let hex_stage = |p: &[u8]| -> Option<u8> {
-                                            let d = p.strip_prefix(b"modem s")?;
-                                            if d.is_empty() || d.len() > 2 {
-                                                return None;
-                                            }
-                                            d.iter().try_fold(0u8, |a, &c| Some(a << 4 | (c as char).to_digit(16).filter(|_| !c.is_ascii_uppercase())? as u8))
-                                        };
-                                        if let Some(n) = hex_stage(&cmd.params) {
-                                            // `diag modem sN`: the staged cold modem bring-up, stages 0..=N, N one or two hex digits (modem.rs): 0 survey, 1 power-on, 2 PHY, 3 link, 4 endpoint, 5 ROM boot, 6 link cycle, 7 the boot-channel download, 8 START and a ten-second watch, 9 START and the bare IPC handshake (PIF_INIT_DONE -> PHONE_START -> INIT_END), a the handshake with the pktproc DL rings and the legacy link, then 90 s watching what the online CP sends, b the same with one RIL probe (SIT_GET_RADIO_POWER on channel 245), c also the radio on (SIT_SET_RADIO_POWER, not for emergency), d also the data registration polled every 5 s (SIT_GET_PS_REG_STATE) and the SIM status read once, e also the preferred data modem and allow-data on stack 1, f also the initial-attach APN, 10 instead of the attach APN the carrier-config manifest handshake, the UICC subscription, a radio cycle, the data profiles, the allowed networks (the data stack registers: 2026-10-29) and the stack-status and carrier-restriction queries, 11 also the AP capabilities G#3 with the UL packet rings and the gipc service on channel 132, 12 also the internet data call once registered (VZWINTERNET), then one IPv6 router solicitation and one ICMPv6 echo request to a public resolver up its rmnet channel, the queues' pointers every 4 s and every DL packet by IP version and protocol only; from b on, the modem service on channel 130 (properties, UE-capability files from the modem image) and the remote-file service on channel 41 (writes pulled and dropped) are answered (the whole radio is open during experimentation: owner, 2026-10-29).
-                                            crate::modem::stages(&mut resp, n);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
                                         if cmd.params == b"kv selftest" {
                                             // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
                                             match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
@@ -2467,12 +2452,6 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
-                                        if cmd.params == b"modem files" {
-                                            // `diag modem files`: the modem's images on the flash (modem.bin's TOC, NV file sizes), read only (modem.rs).
-                                            crate::modem::files(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
                                         if let Some(name) = cmd.params.strip_prefix(b"part find ") {
                                             // `diag "part find <name>"`: a GPT partition's LU and LBA range, read-only (partfs.rs find).
                                             let name = alloc::string::String::from_utf8_lossy(name).into_owned();
@@ -2494,48 +2473,6 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"modem hwcfg" {
                                             // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
                                             crate::modem::hwcfg(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem up" {
-                                            // `diag modem up`: the cold bring-up through the handshake, then the service the kernel keeps running: registration, the internet data call, its packets on `rmnet` (modem.rs up).
-                                            crate::modem::up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem down" {
-                                            // `diag modem down`: the service stopped and the CP powered down.
-                                            crate::modem::down(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem probe" {
-                                            // `diag modem probe`: an echo and two DNS queries up the running call, the answers logged by shape (modem.rs probe).
-                                            crate::modem::probe(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem ping" {
-                                            // `diag modem ping`: one ICMPv6 echo request up the running call (modem.rs ping).
-                                            crate::modem::ping(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem state" {
-                                            // `diag modem state`: the service's registration, data call and packet counts (modem.rs state); never the addresses.
-                                            crate::modem::state(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem off" {
-                                            // `diag modem off`: the CP powered down (modem.rs off).
-                                            crate::modem::off(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem readmain" {
-                                            // `diag modem readmain`: read MAIN off the flash, CRC it against the TOC, time it.
-                                            crate::modem::read_main(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
@@ -3267,6 +3204,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     7 => crate::process::Grant::Power(g),
                                                     8 => crate::process::Grant::Irq(g),
                                                     9 => crate::process::Grant::Ira,
+                                                    10 => crate::process::Grant::Part(g),
                                                     _ => crate::process::Grant::Use(g),
                                                 });
                                             }

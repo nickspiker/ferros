@@ -483,3 +483,37 @@ The partfs readers now take the kernel lock per UFS command (or per short lookup
 - Bring the service up at boot.
 - Re-establish the call if it drops.
 - Phase 2: the modem as its own driver process.
+
+## 2026-10-29 night: the modem moves out of the kernel (Phase 2)
+
+The modem is now its own driver process, `payloads/modem`. It runs the same bring-up and service, proven in the kernel the same evening, on the process's own grants. `tools/husky-modem.sh` spawns it.
+
+The driver's grants:
+- **Hardware:** PCIe ch0's blocks, the CP's config space and BAR window (the doorbell), HSI1's CMU, system registers, GPIO, SysMMU and S2MPU, the alive GPIO bank, and the PMU through EL3.
+- **DMA:** three windows of the modem's shared memory, now EL0-accessible Device memory in the static cache map (cachemap.rs `MODEM_WINDOWS`): pktproc, IPC, MSI.
+- **Partitions:** `modem_a`, `efs`, `persist`, `modem_userdata`, `vendor_a`.
+
+It serves `rmnet` to the IP process with the requests the kernel answered in Phase 1, plus STATE (4) and DOWN (5). Its input selects the mode:
+
+| Input | What it does |
+|---|---|
+| empty or `up` | bring up and serve |
+| `off` | power the CP down and exit |
+| `sN` | the staged diagnostic, then exit |
+
+New kernel pieces:
+- `Grant::Part`/`Object::Part`: read-only files on a named partition. partfs.rs `part_call` answers [1] path → size and [2] offset path → up to 1 MiB, with the last file kept open, so the 98 MB MAIN is mounted and walked once. Spawn kind 10, `bridge spawn --part`.
+- The hardware registry's ch0 and HSI1 entries.
+- The three DMA windows.
+- MMIO reads of an EL3-written block (the PMU) now go straight to the register. EL3's path refused the driver's read of the HSI1 power-domain status with −22, which the kernel's own drivers always read directly.
+
+The driver's `priv_rmw` reads its write back, since the kernel's EL3 write path returns no status. From a reset, the PCIe isolation bit read G#C0 before and held after.
+
+What stays in the kernel is `modem::read_board` (the handover block at boot, from ABL's device tree) and `diag modem hwcfg`. The kernel's stages, its service, the kernel-answered `rmnet` object and `platform::priv_rmw` are gone.
+
+Verified from a reset: the driver's cold bring-up went through link up, START and the handshake, registered on NR at 15 s and had the data call up at 20 s. ip took the call, and httptest fetched fgtw.org over cellular IPv6 and IPv4 through the driver: 200 OK, the same body hash.
+
+**Open:**
+- Init does not start the driver at boot yet (spawn it with `tools/husky-modem.sh`).
+- A dropped call is not re-established.
+- The 98 MB download holds the kernel lock a chunk at a time, about 30 ms per MiB, so other processes' syscalls wait during those seconds.

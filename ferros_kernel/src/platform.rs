@@ -177,26 +177,6 @@ pub fn crumb(c: u64) {
 /// Exynos EL3 monitor "privileged register" call: the secure monitor performs the MMIO access for us, so registers the S2MPU blocks from EL2 (the PMU) are still reachable. Same call Linux's set_priv_reg/get_priv_reg make (exynos-pd_el3.c): x0 = SMC_CMD_PRIV_REG, x1 = physical address, x2 = 0 read / 1 write, x3 = value. Returns x0: 0 on a successful write, the register value on a read.
 const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
 
-/// Read-modify-write through the same EL3 call (x2 = 2): the bits of `mask` in `addr` become `val`, as Linux's rmw_priv_reg does. Returns x0 (0 on success).
-pub fn priv_rmw(addr: u64, mask: u32, val: u32) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "smc #0",
-            inout("x0") SMC_CMD_PRIV_REG => ret,
-            inout("x1") addr => _,
-            inout("x2") 2u64 => _,
-            inout("x3") mask as u64 => _,
-            inout("x4") val as u64 => _,
-            out("x5") _, out("x6") _, out("x7") _,
-            out("x8") _, out("x9") _, out("x10") _, out("x11") _,
-            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
-            out("x16") _, out("x17") _,
-        );
-    }
-    ret
-}
-
 pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
     let ret: u64;
     unsafe {

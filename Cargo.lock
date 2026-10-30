@@ -953,6 +953,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-modem"
+version = "0.1.0"
+dependencies = [
+ "ferros_heap",
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-nettest"
 version = "0.1.0"
 dependencies = [

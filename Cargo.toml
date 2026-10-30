@@ -49,6 +49,7 @@ members = [
     "ferros_sandbox",
     "photon_core",
     "payloads/ip",
+    "payloads/modem",
     "payloads/nettest",
     "payloads/httptest",
     "payloads/photon",

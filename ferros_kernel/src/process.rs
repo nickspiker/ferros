@@ -255,8 +255,8 @@ pub enum Object {
     Power(usize),
     /// A surface to be: a spawn turns it into one free surface of `surfaces`, the child's own (`Dma` of `surface-k`), at build. Never held: a parent that passes the whole `surfaces` region passes this instead (SYS_SPAWN), and `bridge spawn --dma surface` asks for it by name.
     NewSurface,
-    /// Served by the kernel (Phase 1, modem.rs `rmnet_call`): the cellular data call's IP packets. Phase 2 moves the modem to its own driver process, which serves an `rmnet` endpoint with the same requests.
-    Rmnet,
+    /// Served by the kernel: read-only files on a partition (index into `PARTS`), answered by partfs.rs `part_call`.
+    Part(usize),
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -294,7 +294,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Power(i) => (9, i as u64),
         Object::Ira => (10, 0),
         Object::NewSurface => (11, 0),
-        Object::Rmnet => (12, 0),
+        Object::Part(i) => (13, i as u64),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -871,6 +871,10 @@ pub struct Dma {
     pub size: usize,
 }
 pub static DMA: &[Dma] = &[
+    // The modem's shared memory (cachemap.rs MODEM_WINDOWS, EL0 Device): pktproc's packet rings and buffers, the IPC region (the legacy rings, the handover block, the ROM image), the MSI and boot-register page.
+    Dma { name: "modem-pktproc", base: crate::cachemap::MODEM_WINDOWS[0].0, size: crate::cachemap::MODEM_WINDOWS[0].1 - crate::cachemap::MODEM_WINDOWS[0].0 },
+    Dma { name: "modem-ipc", base: crate::cachemap::MODEM_WINDOWS[1].0, size: crate::cachemap::MODEM_WINDOWS[1].1 - crate::cachemap::MODEM_WINDOWS[1].0 },
+    Dma { name: "modem-msi", base: crate::cachemap::MODEM_WINDOWS[2].0, size: crate::cachemap::MODEM_WINDOWS[2].1 - crate::cachemap::MODEM_WINDOWS[2].0 },
     Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
@@ -973,8 +977,26 @@ pub struct Hw {
     pub via_el3: bool,
 }
 
+/// The partitions a process may read files from (`Grant::Part`), read only (partfs.rs `part_call`): the modem driver's firmware image, its per-unit NV (efs, modem_userdata), the handover signature (persist) and the carrier configs (vendor_a, inside super). The owner's rule (2026-10-29): ferros reads Android's partitions, never writes them.
+pub static PARTS: &[&str] = &["modem_a", "efs", "persist", "modem_userdata", "vendor_a"];
+
 /// The dev hardware registry: blocks a process may be granted by name (WIFI.md §0: PCIe ch1 sits in HSI2).
 pub static HARDWARE: &[Hw] = &[
+    // The cellular modem on PCIe ch0, in HSI1 (docs/oracle/MODEM-BOOT-RECON.md): the controller's blocks, the CP's config space and its BAR window (the doorbell), and HSI1's clocks, system registers, GPIO, SysMMU and S2MPU; the alive GPIO bank its reset lines share.
+    Hw { name: "pcie0-elbi", base: 0x1210_0000, size: 0x2000, via_el3: false },
+    Hw { name: "pcie0-soc", base: 0x1211_0000, size: 0x5000, via_el3: false },
+    Hw { name: "pcie0-pcs", base: 0x1212_0000, size: 0x5000, via_el3: false },
+    Hw { name: "pcie0-udbg", base: 0x1213_0000, size: 0xD000, via_el3: false },
+    Hw { name: "pcie0-phy", base: 0x1214_0000, size: 0x3000, via_el3: false },
+    Hw { name: "pcie0-dbi", base: 0x1240_0000, size: 0x38_1000, via_el3: false },
+    Hw { name: "pcie0-cfg", base: 0x40FF_E000, size: 0x2000, via_el3: false },
+    Hw { name: "pcie0-mem", base: 0x4000_0000, size: 0xFF_0000, via_el3: false },
+    Hw { name: "cmu-hsi1", base: 0x1200_0000, size: 0x8000, via_el3: false },
+    Hw { name: "hsi1-sysreg", base: 0x1202_0000, size: 0x2000, via_el3: false },
+    Hw { name: "gpio-hsi1", base: 0x1204_0000, size: 0x1000, via_el3: false },
+    Hw { name: "sysmmu-hsi1", base: 0x1206_0000, size: 0x1_0000, via_el3: false },
+    Hw { name: "s2mpu-hsi1", base: 0x1209_0000, size: 0x1_0000, via_el3: false },
+    Hw { name: "gpio-alive", base: 0x154D_0000, size: 0x1000, via_el3: false },
     Hw { name: "pcie1-elbi", base: 0x1312_0000, size: 0x2000, via_el3: false },
     Hw { name: "pcie1-soc", base: 0x1313_0000, size: 0x5000, via_el3: false },
     Hw { name: "pcie1-pcs", base: 0x1314_0000, size: 0x5000, via_el3: false },
@@ -1514,11 +1536,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     f.x[0] = n as u64;
                     0
                 }
-                // The cellular link (modem.rs `rmnet_call`), answered at once under the lock this syscall holds.
-                Some((Object::Rmnet, r)) if r & RIGHT_SEND != 0 => {
+                // Files on a partition, read only (partfs.rs `part_call`), answered at once under the lock this syscall holds.
+                Some((Object::Part(i), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    let reply = crate::modem::rmnet_call(&msg);
-                    let n = reply.len().min(f.x[4] as usize);
+                    let reply = crate::partfs::part_call(PARTS[i], &msg, (f.x[4] & !CALL_LIVE) as usize);
+                    let n = reply.len().min((f.x[4] & !CALL_LIVE) as usize);
                     p.write(f.x[3], &reply[..n]);
                     f.x[0] = n as u64;
                     0
@@ -1594,7 +1616,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     if off % 4 != 0 || off >= hw.size {
                         ERR
                     } else if f.x[8] == SYS_MMIO_READ {
-                        if hw.via_el3 { crate::platform::priv_reg((hw.base + off) as u64, false, 0) & 0xFFFF_FFFF } else { unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 } }
+                        // A read goes straight to the register even in a block only EL3 may write (the PMU): EL2 reads it, as the kernel's own drivers do, and the EL3 path refuses reads of what it does not list (G#FFFF_FFEA, -22: the modem driver's HSI1 power-domain status, 2026-10-29).
+                        unsafe { core::ptr::read_volatile((hw.base + off) as *const u32) as u64 }
                     } else {
                         if hw.via_el3 {
                             crate::platform::priv_reg((hw.base + off) as u64, true, f.x[2] as u32);
@@ -2055,6 +2078,8 @@ pub enum Grant<'a> {
     Ira,
     /// A device's power, by name (syscall 22).
     Power(&'a [u8]),
+    /// Read-only files on one of the phone's own partitions, by name (`PARTS`): the modem driver's images, NV and carrier configs (partfs.rs `part_call`).
+    Part(&'a [u8]),
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2183,8 +2208,6 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
     for g in grants {
         v.push(match g {
             Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
-            // `rmnet` is the kernel's own while the modem lives there (Phase 1); a driver process serving it takes this line's place.
-            Grant::Use(b"rmnet") => (Object::Rmnet, RIGHT_SEND),
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),
@@ -2211,6 +2234,10 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 None => return Err("no such power switch"),
             },
             Grant::Ira => (Object::Ira, RIGHT_SEND),
+            Grant::Part(n) => match PARTS.iter().position(|p| p.as_bytes() == *n) {
+                Some(i) => (Object::Part(i), RIGHT_SEND),
+                None => return Err("no such partition grant"),
+            },
         });
     }
     Ok(v)

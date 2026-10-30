@@ -3,7 +3,7 @@
 //! Both links stay up; a packet leaves on WiFi when WiFi holds an address of its family, else on the cellular call (owner, 2026-10-29: both up, prefer WiFi; IPv6 preferred, which the apps choose by asking for family 6). Link-scope and multicast traffic (Photon's LAN beacons) stays on WiFi. A TCP connection keeps the link and source it opened on. IPv4 over cellular goes out with TTL 63 (owner, 2026-10-19).
 //!
 //! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy --use rmnet
-//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; the kernel's while the modem lives there, `diag modem up`).
+//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; served by the modem driver, payloads/modem: its calls carry CALL_LIVE, so no driver means no cellular link, not a hang).
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
@@ -247,7 +247,7 @@ impl Ip {
         f[0] = 1;
         f[1..1 + pkt.len()].copy_from_slice(pkt);
         let mut r = [0u8; 16];
-        svc(CALL, self.cap(S_RMNET), self.off(f.as_ptr()), 1 + pkt.len() as u64, self.off(r.as_mut_ptr()), 16);
+        svc(CALL, self.cap(S_RMNET), self.off(f.as_ptr()), 1 + pkt.len() as u64, self.off(r.as_mut_ptr()), 16 | CALL_LIVE);
     }
 
     /// Ask the WiFi driver for its MAC (CALL_LIVE: an error at once when no driver serves `wlan`); answered, WiFi is up and DHCP and a router solicitation start.
@@ -283,7 +283,7 @@ impl Ip {
     fn cell_info(&mut self) {
         let mut r = [0u8; 43];
         let q = [3u8];
-        let n = svc(CALL, self.cap(S_RMNET), self.off(q.as_ptr()), 1, self.off(r.as_mut_ptr()), r.len() as u64);
+        let n = svc(CALL, self.cap(S_RMNET), self.off(q.as_ptr()), 1, self.off(r.as_mut_ptr()), r.len() as u64 | CALL_LIVE);
         let c = if n == r.len() as u64 && r[0] & 1 != 0 {
             Cell { flags: r[0], mtu: u16::from_be_bytes([r[1], r[2]]), v4: r[3..7].try_into().unwrap(), v6: r[7..23].try_into().unwrap(), dns4: r[23..27].try_into().unwrap(), dns6: r[27..43].try_into().unwrap() }
         } else {
@@ -1411,7 +1411,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         // Packets from the cellular call: [2] → the oldest, or nothing.
         for _ in 0..if ip.cell.flags & 1 != 0 { 16 } else { 0 } {
             let req = [2u8];
-            let n = svc(CALL, ip.cap(S_RMNET), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64);
+            let n = svc(CALL, ip.cap(S_RMNET), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
             if n == 0 || n == ERR {
                 break;
             }

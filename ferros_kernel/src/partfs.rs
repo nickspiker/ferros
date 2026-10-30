@@ -338,3 +338,65 @@ fn avb_vbmeta_locked(name: &str) -> Result<Vec<u8>, String> {
     }
     Err(alloc::format!("{name}: no AVB footer and no vbmeta at its start"))
 }
+
+// ---------------------------------------------------------------------------
+// Read-only files for a process (process.rs `Object::Part`, granted by partition name from `PARTS`): what the modem driver reads off Android's partitions — its firmware image and UE-capability files (modem_a, ext4), its NV (efs, modem_userdata: f2fs), the handover signature (persist: f2fs), the carrier configs (vendor_a: ext4 in super). Never a write (owner, 2026-10-29).
+
+/// The file last opened, kept so a long file read in chunks (the modem's 98 MB MAIN) is mounted and walked once: an ext4 file by its inode, an f2fs file whole (NV files are a few MB).
+enum Open {
+    Ext4(Mount, ferros_ext4::Inode),
+    F2fs(Vec<u8>),
+}
+static mut PART_OPEN: Option<(&'static str, Vec<u8>, Open)> = None;
+
+/// The largest chunk one read returns.
+const PART_CHUNK: usize = 1 << 20;
+
+/// One request on partition `part` (the caller holds the kernel lock, as a syscall does): [1] + path → the file's size (u64 LE), or nothing when it is not there; [2] + offset (u64 LE) + path → the bytes from there, as many as `cap` and 1 MiB allow (fewer at the end, none past it). Paths are absolute in the partition's filesystem; `..` is refused.
+pub fn part_call(part: &'static str, req: &[u8], cap: usize) -> Vec<u8> {
+    let (op, off, path) = match req.first() {
+        Some(1) => (1, 0u64, &req[1..]),
+        Some(2) if req.len() >= 9 => (2, u64::from_le_bytes(req[1..9].try_into().unwrap()), &req[9..]),
+        _ => return Vec::new(),
+    };
+    if path.first() != Some(&b'/') || path.windows(2).any(|w| w == b"..") {
+        return Vec::new();
+    }
+    let cached = unsafe { (*(&raw const PART_OPEN)).as_ref().is_some_and(|(p, q, _)| *p == part && q.as_slice() == path) };
+    if !cached {
+        let Ok(name) = core::str::from_utf8(path) else { return Vec::new() };
+        let opened = match part {
+            "efs" | "persist" | "modem_userdata" => read_f2fs(part, name).map(Open::F2fs),
+            "vendor_a" => find_logical(part).and_then(|p| mount_part(part, p)).and_then(|mut m| m.open(name).map(|i| Open::Ext4(m, i))),
+            _ => mount(part).and_then(|mut m| m.open(name).map(|i| Open::Ext4(m, i))),
+        };
+        match opened {
+            Ok(o) => unsafe { *(&raw mut PART_OPEN) = Some((part, path.to_vec(), o)) },
+            Err(_) => return Vec::new(),
+        }
+    }
+    let Some((_, _, open)) = (unsafe { (*(&raw mut PART_OPEN)).as_mut() }) else { return Vec::new() };
+    let size = match open {
+        Open::Ext4(_, ino) => ino.size,
+        Open::F2fs(v) => v.len() as u64,
+    };
+    if op == 1 {
+        return size.to_le_bytes().to_vec();
+    }
+    if off >= size {
+        return Vec::new();
+    }
+    let n = ((size - off) as usize).min(cap).min(PART_CHUNK);
+    match open {
+        Open::F2fs(v) => v[off as usize..off as usize + n].to_vec(),
+        Open::Ext4(m, ino) => {
+            // ext4 reads from a block boundary: from the block holding `off`, then the part asked for.
+            let lead = (off % 4096) as usize;
+            let mut buf = vec![0u8; lead + n];
+            match m.read(ino, off - lead as u64, &mut buf) {
+                Ok(got) if got > lead => buf[lead..got].to_vec(),
+                _ => Vec::new(),
+            }
+        }
+    }
+}

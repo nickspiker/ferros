@@ -61,6 +61,9 @@ pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 /// The big arc pool (cold only): 512 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
 #[cfg(not(shim_handoff))]
 pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
+
+/// The cellular modem's shared memory, EL0-accessible Device memory for its driver process (process.rs DMA `modem-pktproc`, `modem-ipc`, `modem-msi`; zuma-rmem.dtsi carveouts): pktproc's rings and packet buffers (32 MiB), the IPC region (legacy rings, handover block, ROM image; 4 MiB), the MSI and boot-register page. Device, as the kernel's own view of them: the CP writes them over PCIe and no cache line may hide that. 2 MiB aligned, in the GiB above the window.
+pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
 #[cfg(shim_handoff)]
 pub const POOL_BIG: (usize, usize) = (0, 0);
 
@@ -139,6 +142,10 @@ const TABLE_OR_PAGE: u64 = 0b11;
 
 fn device(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_DEVICE | AF | if vhe { UXN | PXN } else { AP_EL2 | XN }
+}
+/// Device memory EL0 may read and write (VHE), never executable: the modem's shared memory (`MODEM_WINDOWS`).
+fn device_el0(vhe: bool, addr: usize, kind: u64) -> u64 {
+    addr as u64 | kind | ATTR_DEVICE | AF | if vhe { AP_EL0 | UXN | PXN } else { AP_EL2 | XN }
 }
 fn normal(vhe: bool, addr: usize, kind: u64) -> u64 {
     addr as u64 | kind | ATTR_NORMAL | SH_INNER | AF | if vhe { UXN } else { AP_EL2 }
@@ -254,7 +261,8 @@ pub fn enable() -> bool {
             for (j, e) in l2h.0.iter_mut().enumerate() {
                 let a = base + j * MIB2;
                 let normal_here = (a >= s0 && a + MIB2 <= s1) || (p0 != p1 && a >= p0 && a + MIB2 <= p1) || (q0 != q1 && a >= q0 && a + MIB2 <= q1);
-                *e = if normal_here { pool(vhe, a, BLOCK) | UXN } else { device(vhe, a, BLOCK) };
+                let modem_here = MODEM_WINDOWS.iter().any(|w| a >= w.0 && a + MIB2 <= w.1);
+                *e = if normal_here { pool(vhe, a, BLOCK) | UXN } else if modem_here { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
             }
             l1.0[s0 / GIB] = &raw const L2_HI as u64 | TABLE_OR_PAGE;
         }
