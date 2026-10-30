@@ -96,8 +96,8 @@ fi
 # Signed with the owner's AVB key when it is there (BOOT.md, "Signed and unlocked"): the gate as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names that key, both made by one command from the installed build's Google images. Without the key (or with FERROS_UNSIGNED=1) the gate goes on bare, as before; ABL logs the verification error and boots it, unlocked.
 AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
 AVB_ZIP=${AVB_ZIP:-/mnt/Harbor/tmp/husky-factory/husky-cp1a.260505.005/image-husky-cp1a.260505.005.zip}
-# The slot's own dtbo, vendor_boot, vendor_kernel_boot and init_boot (`<name>_a.img`): the top vbmeta hashes those as installed and chains init_boot to the owner's key, so both slots verify end to end (BOOT.md). Must be what the phone carries: the 2026-10-28 backup of slot a, also mirrored onto slot b.
-AVB_INSTALLED=${AVB_INSTALLED:-/mnt/Harbor/tmp/husky-backup-2026-10-28}
+# The slot's own dtbo, vendor_boot, vendor_kernel_boot and init_boot (`<name>_a.img`): the top vbmeta hashes those as installed and chains init_boot to the owner's key, so both slots verify end to end (BOOT.md). Must be what the phone carries: the 2026-10-30 snapshot of slot a (the post-wipe Magisk init_boot; the rest as on 2026-10-28), also mirrored onto slot b.
+AVB_INSTALLED=${AVB_INSTALLED:-/mnt/Harbor/tmp/husky-backup-2026-10-30}
 SIGNED=""
 if [ -n "$HV_IMG" ] && [ -f "$AVB_KEY" ] && [ "${FERROS_UNSIGNED:-0}" != 1 ]; then
     G=$(mktemp -d)
