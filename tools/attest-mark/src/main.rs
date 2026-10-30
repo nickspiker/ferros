@@ -4,6 +4,7 @@
 //! On the phone this becomes ahau's attest screen, where the salt is the device's own, sealed under its ira, so a swapped phone cannot draw the owner's picture for the owner's handle.
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
 //! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free. Ctrl+M, Ctrl+E, Ctrl+F and Ctrl+S step the material, the engraving, the mirror and the style (soft, medal, enamel, lacquer) through every kind and back to the device's own; Ctrl+O toggles the button's wrapping.
+//! Ctrl+1, Ctrl+2 and Ctrl+3 pick which of the three marks is drawn: the Photon avatar (`Look::avatar()`), the device bonded to an identity (the attest button, `Look::attest()`), and the device free of one (the Mandelbrot set with the attest ball in every component, `render_fresh` in `Look::fresh()`, as ahau draws it, with its maps the phone's sizes and its two passes timed). Each pick starts from that mark's own look; the keys above tune it from there (the free mark's outline is the set's alone, so only the balls follow them and the text).
 //! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
 
@@ -28,6 +29,47 @@ const DEV_SALT_SEED: &[u8; 32] = b"ferros attest mark dev salt 0000";
 const PANEL_W: u32 = 1344;
 const PANEL_H: u32 = 2992;
 
+/// The three marks (Ctrl+1, Ctrl+2, Ctrl+3).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Photon's avatar: `render_disc` in `Look::avatar()`.
+    Avatar,
+    /// A device bonded to an identity: `render_disc` in `Look::attest()`, the button.
+    Bonded,
+    /// A device no identity has attested on yet: `render_fresh` in `Look::fresh()`.
+    Free,
+}
+
+impl Mode {
+    fn look(self) -> mark::Look {
+        match self {
+            Mode::Avatar => mark::Look::avatar(),
+            Mode::Bonded => mark::Look::attest(),
+            Mode::Free => mark::Look::fresh(),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Avatar => "avatar (Photon)",
+            Mode::Bonded => "device bonded (attest button)",
+            Mode::Free => "device free (Mandelbrot)",
+        }
+    }
+}
+
+/// ahau's map sizes (FRESH_COARSE, FRESH_MAP), so the free mark costs here what it costs there: a map too short works the rest out again each time.
+const FRESH_COARSE_CELLS: usize = 1 << 18;
+const FRESH_FINE_CELLS: usize = 3 << 20;
+
+/// The free mark's buffers, as ahau keeps them: its 16-bit pixels, the component mask, the two maps, and what the outline was drawn for (the square's side and the salt).
+struct Fresh {
+    px: Vec<u64>,
+    mask: Vec<u64>,
+    coarse: Vec<mark::FreshCell>,
+    fine: Vec<mark::FreshCell>,
+    outline: (usize, [u8; 32]),
+}
+
 struct App {
     chrome: DefaultChrome,
     hit_counter: HitId,
@@ -40,6 +82,8 @@ struct App {
     /// The rendered mark (α + darkness) and what it was rendered for: (width, height, hash of salt and text).
     mark: Vec<u32>,
     mark_key: (usize, usize, [u8; 32]),
+    mode: Mode,
+    fresh: Fresh,
 }
 
 fn salt_for(device: u32) -> [u8; 32] {
@@ -63,6 +107,8 @@ impl App {
             salt: salt_for(0),
             mark: Vec::new(),
             mark_key: (0, 0, [0; 32]),
+            mode: Mode::Bonded,
+            fresh: Fresh { px: Vec::new(), mask: Vec::new(), coarse: vec![[0; 4]; FRESH_COARSE_CELLS], fine: vec![[0; 4]; FRESH_FINE_CELLS], outline: (0, [0; 32]) },
         }
     }
 
@@ -134,10 +180,45 @@ fn render_minibrot(buf: &mut [u32], w: usize, x0: usize, y0: usize, bw: usize, b
     }
 }
 
+/// A ferros 16-bit surface pixel (`tapuwae::pack16`: light over black, gamma 2 in Q14 a channel, red low) as an opaque fluor pixel over black: each channel's gamma 2 value g is √light, and VSF's g2t code is tanh(√light), so the code is tanh(g)·2⁸ (the cast holds the top code where tanh rounds to 1), its darkness 255 less.
+fn argb8_from_px16(p: u64) -> u32 {
+    let code = |sh: u32| ((((p >> sh) & 0xFFFF) as f32 * (1. / (1 << 14) as f32)).tanh() * (1 << 8) as f32) as u8 as u32;
+    0xFF00_0000 | (255 - code(0)) << 16 | (255 - code(16)) << 8 | (255 - code(32))
+}
+
 impl Container for App {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         f(&mut self.textbox);
         self.chrome.visit(f);
+    }
+}
+
+impl App {
+    /// The free mark in a square of side 2r + 4 centred at (w/2, `cy`), as ahau draws it: the whole outline when the square or the device changed, else the components alone from the maps; a coarse pass (a pixel's centre) then the fine one (4 × 4), each timed; then into the window's pixels.
+    fn render_free(&mut self, w: usize, cy: f32, r: f32) {
+        let side = 2 * r as usize + 4;
+        let f = &mut self.fresh;
+        let full = f.outline != (side, self.salt);
+        if full {
+            f.px = vec![0; side * side];
+            f.mask = vec![0; (side * side).div_ceil(64)];
+            f.outline = (side, self.salt);
+        }
+        let (mid, text, never) = (side as f32 * 0.5, self.textbox.chars.iter().collect::<String>(), || false);
+        let mut pass = |full: bool, fine: bool| {
+            let t = std::time::Instant::now();
+            mark::render_fresh(&mut f.px, side, mid, mid, r as f32, &self.salt, &text, &self.look, 4, &mut f.mask, &mut f.coarse, &mut f.fine, full, fine, &never);
+            t.elapsed().as_secs_f32() * 1000.
+        };
+        let coarse = pass(full, false);
+        let fine = pass(false, true);
+        println!("free mark {side}² px{}: coarse {coarse:.0} ms, fine {fine:.0} ms", if full { " (outline drawn)" } else { "" });
+        let (x0, y0) = (w / 2 - side / 2, cy as usize - side / 2);
+        for (y, row) in f.px.chunks(side).enumerate() {
+            for (x, &p) in row.iter().enumerate() {
+                self.mark[(y0 + y) * w + x0 + x] = argb8_from_px16(p);
+            }
+        }
     }
 }
 
@@ -206,6 +287,23 @@ impl FluorApp for App {
                 EventResponse::StartWindowDrag
             }
             Event::KeyboardInput { event: kev } if kev.state == ElementState::Pressed => {
+                // Ctrl+1 / Ctrl+2 / Ctrl+3: the avatar, the bonded device's mark, the free device's mark, each from its own look.
+                if ctx.modifiers.control_key() {
+                    let mode = match &kev.logical_key {
+                        Key::Character(s) if s == "1" => Some(Mode::Avatar),
+                        Key::Character(s) if s == "2" => Some(Mode::Bonded),
+                        Key::Character(s) if s == "3" => Some(Mode::Free),
+                        _ => None,
+                    };
+                    if let Some(m) = mode {
+                        self.mode = m;
+                        self.look = m.look();
+                        println!("mark: {}", m.name());
+                        self.mark_key.2 = [0; 32];
+                        ctx.window.request_redraw();
+                        return EventResponse::Handled;
+                    }
+                }
                 // Ctrl+O: the button's wrapping on or off.
                 if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("o")) {
                     self.look.button = !self.look.button;
@@ -332,7 +430,12 @@ impl FluorApp for App {
             let top = textbox_bottom(span);
             let room = h as f32 - top;
             let r = 0.5 * smooth_min(w as f32, room) * (1. - 1. / (1 << 4) as f32);
-            mark::render_disc(&mut self.mark, w, w as f32 * 0.5, top + room * 0.5, r, &p, &self.look);
+            self.mark.fill(0);
+            if self.mode == Mode::Free {
+                self.render_free(w, top + room * 0.5, r);
+            } else {
+                mark::render_disc(&mut self.mark, w, w as f32 * 0.5, top + room * 0.5, r, &p, &self.look);
+            }
             // A tiny grey Mandelbrot in the top-right gap between the textbox and the sphere, with a white pixel at c.
             let mb_w = (span / (1 << 2) as f32) as usize;
             let mb_h = (mb_w as f32 * 2.3 / (mark::X_RIGHT as f32 + 2.)) as usize + 1;

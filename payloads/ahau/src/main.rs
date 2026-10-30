@@ -902,7 +902,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let coarse = unsafe { &mut *(&raw mut FRESH_COARSE) };
     let map = unsafe { &mut *(&raw mut FRESH_MAP) };
     let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
-    let done = tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), 4, mask, coarse, map, full, fine, &moved_on);
+    let done = tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), &tapuwae::Look::fresh(), 4, mask, coarse, map, full, fine, &moved_on);
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
