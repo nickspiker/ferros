@@ -1,6 +1,6 @@
 ---
 name: modem-uecap-registration
-description: "cold ferros modem registers on Verizon LTE/NR since 2026-10-29 (diag modem s10/s11); the blocker was the uecap file service (CP's block size 4000, token+k per block), not RIL; Android kprobe capture method"
+description: "cold ferros modem registers on Verizon LTE/NR (diag modem s10/s11) and moves IP both ways (s12: data call + ICMPv6 echo on rmnet ch 197) since 2026-10-29; the registration blocker was the uecap file service (CP's block size 4000, token+k per block), not RIL; Android kprobe capture method"
 metadata:
   node_type: memory
   type: project
@@ -16,7 +16,7 @@ The blocker was the modem service's UE-capability file reads on ch130. The CP na
 
 **How to apply:**
 - When the CP misbehaves silently, diff ferros's *responses* to CP→AP requests against Android's, not only the AP→CP requests.
-- The capture tool is kprobes on stock Android + Magisk: cpif `txq_write` (skb data +0xd8) and `pass_skb_to_demux` (+0xe0), armed from /data/adb/post-fs-data.d/ril-debug.sh.
+- The capture tool is kprobes on stock Android + Magisk: cpif `txq_write` (+0xd8 = skb head, where the SIT header sits) and `pass_skb_to_demux` (+0xe0 = skb data); UL packets at `pktproc_send_pkt_to_cp` (data +0xe0, channel at +0x48 in the cb), armed from /data/adb/post-fs-data.d/ril-debug.sh.
 - Captures stay local: they carry SIM identity.
 - Data path works (2dd0a0c): SETUP_DATA_CALL on VZWINTERNET, UL queue 1 with lcid = 181 + cid - 1, the size padded +76; an ICMPv6 echo to 2001:4860:4860::8888 answers in 63 ms. The RS gets no RA, and none is needed (the reply's address is global).
 - Next: an IP stack (ferros `ip`) over rmnet. See [[cellular-start-authorized]].
