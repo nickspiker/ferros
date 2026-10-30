@@ -19,4 +19,4 @@ The blocker was the modem service's UE-capability file reads on ch130. The CP na
 - The capture tool is kprobes on stock Android + Magisk: cpif `txq_write` (+0xd8 = skb head, where the SIT header sits) and `pass_skb_to_demux` (+0xe0 = skb data); UL packets at `pktproc_send_pkt_to_cp` (data +0xe0, channel at +0x48 in the cb), armed from /data/adb/post-fs-data.d/ril-debug.sh.
 - Captures stay local: they carry SIM identity.
 - Data path works (2dd0a0c): SETUP_DATA_CALL on VZWINTERNET, UL queue 1 with lcid = 181 + cid - 1, the size padded +76; an ICMPv6 echo to 2001:4860:4860::8888 answers in 63 ms. The RS gets no RA, and none is needed (the reply's address is global).
-- Next: an IP stack (ferros `ip`) over rmnet. See [[cellular-start-authorized]].
+- IP over cellular works (c5e35ee): `diag modem up` = persistent kernel service; `rmnet` kernel object (slot 52); ip routes WiFi-first per family else cellular. Trap: UDP answers come down the legacy RAW ring as SIT frames on ch 197, not pktproc. Phase 2 = modem driver process serving `rmnet`. See [[cellular-start-authorized]].
