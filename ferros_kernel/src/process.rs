@@ -2031,6 +2031,11 @@ fn kill_locked(name: &[u8]) -> bool {
 }
 
 /// How many processes are alive (running, runnable or blocked).
+/// IPC round trips since boot (a call answered by a server).
+pub fn round_trips() -> u32 {
+    with_lock(|| k().ipc_round_trips)
+}
+
 pub fn alive() -> usize {
     lock();
     let n = alive_locked();

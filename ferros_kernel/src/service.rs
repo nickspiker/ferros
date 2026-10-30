@@ -347,6 +347,24 @@ fn read_capsule(key: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     }
 }
 
+/// The boot checklist's process rows, from what a spawned process did in its first slice (the host's spawn over USB, or init at boot — which marked nothing until 2026-10-29, so a boot without a host left them red): an arc and a spawn, EL0 reached unless it faulted at entry (exit G#FA…), a syscall and its capabilities once it said something, IPC once a call came back; and the first process itself.
+fn mark_ran(o: &crate::process::Outcome) {
+    use crate::checklist::{mark, Item};
+    mark(Item::Arcs);
+    mark(Item::Spawn);
+    if o.exit >> 56 != 0xFA {
+        mark(Item::El0);
+        mark(Item::FirstProcess);
+    }
+    if !o.console.is_empty() {
+        mark(Item::Syscall);
+        mark(Item::Caps);
+    }
+    if o.round_trips > 0 {
+        mark(Item::Ipc);
+    }
+}
+
 /// What init holds: everything the shell's three processes need, in the slot order payloads/init expects (its header). The kernel grants it once; init hands each process its share.
 fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
     use crate::process::Grant::*;
@@ -480,7 +498,15 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::touch::up(&mut rep);
     crate::checklist::at("home: touch up");
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
-        Ok(o) => crate::process::push_console(&o.console),
+        Ok(o) => {
+            mark_ran(&o);
+            // The processes init started are its spawn syscalls, each handing out capabilities.
+            if crate::process::alive() > 0 {
+                crate::checklist::mark(crate::checklist::Item::Syscall);
+                crate::checklist::mark(crate::checklist::Item::Caps);
+            }
+            crate::process::push_console(&o.console)
+        }
         Err(e) => {
             crate::process::push_console(b"home: init refused: ");
             crate::process::push_console(e.as_bytes());
@@ -1043,6 +1069,7 @@ pub fn run(mut b: Boot) -> ! {
     crate::keys::serve();
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
+    let mut ipc_marked = false;
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
@@ -1156,6 +1183,11 @@ pub fn run(mut b: Boot) -> ! {
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
         crate::usf::poll();
+        // The checklist's IPC row, once any process has had a call answered (init, which marks the others, makes none).
+        if !ipc_marked && crate::process::round_trips() > 0 {
+            ipc_marked = true;
+            crate::checklist::mark(crate::checklist::Item::Ipc);
+        }
         if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
             let st = &raw mut store;
             let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
@@ -3222,19 +3254,7 @@ pub fn run(mut b: Boot) -> ! {
                                             };
                                             match spawned {
                                                 Ok(o) => {
-                                                    use crate::checklist::{mark, Item};
-                                                    mark(Item::Arcs);
-                                                    mark(Item::Spawn);
-                                                    if o.exit >> 56 != 0xFA {
-                                                        mark(Item::El0);
-                                                    }
-                                                    if !o.console.is_empty() {
-                                                        mark(Item::Syscall);
-                                                        mark(Item::Caps);
-                                                    }
-                                                    if o.round_trips > 0 {
-                                                        mark(Item::Ipc);
-                                                    }
+                                                    mark_ran(&o);
                                                     let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + o.console.len());
                                                     resp.extend_from_slice(&o.exit.to_le_bytes());
                                                     resp.extend_from_slice(&o.console);
