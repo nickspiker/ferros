@@ -381,3 +381,21 @@ cdt[] is bootconfig `androidboot.cdt_hwid`, parsed by cbd as `0x%04x%02x%02x%04x
 Both are served on Android by `/vendor/bin/shared_modem_platform` (Rust; opens `/dev/oem_ipc1` and `/dev/oem_ipc3`). No remote-file request, no RIL frame, no DL packet follows. In the Android capture the CP's first channel-41 frame carries link frame number G#34, so about 51 frames had already passed on FMT by then: the CP expects an FMT conversation (the platform services and the SIT RIL on channels 245/246) before it asks for files.
 
 **Next:** the oem_ipc protocol from `shared_modem_platform`, then the RIL's opening messages from `libsitril.so` (vendor image, `/lib64`). Data only: nothing voice, SMS or emergency.
+
+## 2026-10-29 evening: the data stack registers (LTE and NR) from a cold ferros
+
+`diag modem s10` (and `s11`) now ends with the Verizon stack (stack 1, RIL channel 246) home on the network: about 1.2 s after SIT_SET_ALLOW_NETWORK the CP reports a physical-channel config and NITZ, its PS registration reads `01 00 00 14` (home, NR) at 15 s and `01 00 00 0E` (home, LTE) at 30 s. Nothing is replayed from Android; the sequence is ferros's own (radio on, the carrier-config manifest handshake, UICC subscription, a radio cycle, the six Verizon data profiles, the allowed networks).
+
+**What held it back was the UE-capability file service, not any RIL message.** The CP reads its UE-capability files (`WILDCARD.binarypb`, then `VZW.binarypb`, from the modem image's `/images/default/uecap`) over the modem service on channel 130 (`UecapFileMessage`). Its read request names a block size (field 2: 4000 on this firmware), and it books one token per block it expects: its next request's token comes exactly ⌈size / 4000⌉ later (6 then 131 for the 496 290-byte WILDCARD file). Android's `shared_modem_platform` answers block k at offset 4000·k with the request's token + k. ferros had answered in 1 KiB blocks, all under the request's token. The CP took that without complaint and then never searched: both stacks stayed `00 00 00 0E` (not registered, not searching) through every RIL experiment.
+
+How it was found: a kprobe trace of Android's boot in both directions (cpif `txq_write` and `pass_skb_to_demux`, the frames' first 512 / 256 bytes), then a replay of all 264 of Android's AP→CP requests on channels 129, 132, 245 and 246 at Android's own times after ONLINE, with ferros's own setup actions off. That replay still left the stack not searching, so the RIL side was cleared. The difference left was in what ferros answers, and the trace's channel-130 responses showed the block and token pattern.
+
+A 4000-byte block does not fit one SIT frame, so the link layer now sends multi-frame packets as cpif does (`exynos_build_fr_config`, `modify_next_frame`). Each frame holds at most 2 KiB with its header. The first carries cfg `(G#80 | packet index) << 8 | frames after it`, with a 6-bit index per channel counting from 1. Each next frame carries the count less one, and the last swaps G#80 for G#40 with a count of 0. Android's trace shows `81 01`, then `41 00`, for a two-frame packet (cfg bytes high, low).
+
+Checked and matching Android on the way, so not the cause:
+- **Handover block:** identical. A kprobe at `update_handover_block_info` gave version 1, project 4, major 1, G#30/G#34 = 2/6, everything else zero in the board words; ferros builds the same from `androidboot.cdt_hwid`.
+- **IMSI-encryption key:** SIT_SET_CARRIER_INFO_IMSI_ENCRYPTION fails with error 22 on Android as well.
+- **Data profiles:** the two id −1 data profiles get error 2 on Android too.
+- **PREFERRED_DATA_MODEM:** Android sends it on channel 245 (stack 0) with value 1, and never sends SET_PS_SERVICE.
+
+**Next:** the data call (SIT_SETUP_DATA_CALL on the internet profile) and packets over pktproc DL/UL.

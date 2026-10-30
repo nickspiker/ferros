@@ -826,7 +826,8 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
         (13, Some(s)) => start_and_handshake(rep, s, true, 3),
         (14, Some(s)) => start_and_handshake(rep, s, true, 4),
         (15, Some(s)) => start_and_handshake(rep, s, true, 5),
-        (n, Some(s)) if n >= 16 => start_and_handshake(rep, s, true, 6),
+        (16, Some(s)) => start_and_handshake(rep, s, true, 6),
+        (n, Some(s)) if n >= 17 => start_and_handshake(rep, s, true, 7),
         _ => {}
     }
 }
@@ -1315,18 +1316,23 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: u8) {
                         pktproc_init();
                         line(rep, alloc::format!("  pktproc: A#{PP_QUEUES} DL queues of A#{PP_NUM_DESC} descriptors, A#{} buffers posted each\n", PP_NUM_DESC - 1));
                     }
-                    // Claim no capabilities, as husky's own DT does (ap_capability_0/1 = 0): (ap ^ cp) & ap == 0 passes the CP's check whatever it supports (link_device.c:585).
-                    wr(CAP_AP, 0);
+                    // Capabilities: none up to stage G#10 ((ap ^ cp) & ap == 0 passes the CP's check whatever it supports, link_device.c:585). From G#11, G#3 as Android's driver really claims (its live info_region, 2026-10-29: PKTPROC_UL and CH_EXTENSION, added by set_ap_capabilities for the compiled-in features although the DT lists 0), with the UL rings laid out.
+                    let caps = if full && probe >= 7 { pktproc_ul_create(); 3 } else { 0 };
+                    wr(CAP_AP, caps);
                     wr(CAP_AP + 8, 0);
                     unsafe { core::arch::asm!("dsb sy") };
                     ap2cp_cmd(PIF_INIT_DONE);
                     answered_init_start = true;
-                    line(rep, alloc::format!("  -> PIF_INIT_DONE (G#{PIF_INIT_DONE:X}) sent, caps 0\n"));
+                    line(rep, alloc::format!("  -> PIF_INIT_DONE (G#{PIF_INIT_DONE:X}) sent, caps G#{caps:X}\n"));
                 }
                 PHONE_START if !phone_started => {
                     if full {
                         line(rep, alloc::format!("  CP capabilities: part 0 G#{:X}, part 1 G#{:X}\n", rd(CAP_CP), rd(CAP_CP + 8)));
                         legacy_init();
+                        if probe >= 7 {
+                            pktproc_ul_init();
+                            line(rep, alloc::format!("  pktproc UL: CP quota A#{}, end-bit owner A#{}\n", rd(PP_UL_INFO + 4) & 0xFFFF, rd(PP_UL_INFO) >> 24 & 1));
+                        }
                     }
                     ap2cp_cmd(INIT_END);
                     phone_started = true;
@@ -1427,6 +1433,40 @@ fn pktproc_init() {
     unsafe { core::arch::asm!("dsb sy") };
 }
 
+// The UL packet rings (link_tx_pktproc.c pktproc_create_ul / pktproc_init_ul; DT pktproc_ul_*): at G#E800_0000 + G#1C0_0000 an info header {u32 num_queues[3:0] | mode | max_packet_size | end_bit_owner[24]; u32 cp_quota; then 20-byte queue entries {cp_desc_pbase, num_desc, cp_buff_pbase, fore_ptr, rear_ptr}}, 32-byte descriptors from +G#1C0_1000, buffers from +G#1C9_0000 (G#37_0000, half a queue). Queue 0 is the high-priority (ACK) queue, 1 KiB buffers (roundup_pow_of_two(512 + 76)), queue 1 2 KiB: 1760 and 880 descriptors, as Android's sysfs shows. The AP writes the queue count at create and the queue entries at PHONE_START; the CP fills the rest of the header.
+const PP_UL_INFO: usize = PKTPROC + 0x1C0_0000;
+const PP_UL_DESC: u32 = 0x1C0_1000;
+const PP_UL_BUFF: u32 = 0x1C9_0000;
+const PP_UL_Q_BUFF: u32 = 0x37_0000 / 2;
+const PP_UL_PKT: [u32; 2] = [1 << 10, 1 << 11];
+
+fn pktproc_ul_create() {
+    for a in (PP_UL_INFO..PP_UL_INFO + 0x1000).step_by(8) {
+        wr64(a, 0);
+    }
+    let desc_end = PKTPROC + (PP_UL_DESC + PP_UL_Q_BUFF / PP_UL_PKT[0] * 32 + PP_UL_Q_BUFF / PP_UL_PKT[1] * 32) as usize;
+    for a in (PKTPROC + PP_UL_DESC as usize..desc_end).step_by(8) {
+        wr64(a, 0);
+    }
+    wr(PP_UL_INFO, 2);
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
+fn pktproc_ul_init() {
+    let mut desc = PP_UL_DESC;
+    for q in 0..2u32 {
+        let n = PP_UL_Q_BUFF / PP_UL_PKT[q as usize];
+        let e = PP_UL_INFO + 8 + 20 * q as usize;
+        wr(e, PP_CP_BASE + desc);
+        wr(e + 4, n);
+        wr(e + 8, PP_CP_BASE + PP_UL_BUFF + q * PP_UL_Q_BUFF);
+        wr(e + 12, 0);
+        wr(e + 16, 0);
+        desc += n * 32;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+}
+
 /// init_legacy_link (link_device_memory_legacy.c 228-268): magic and mem_access dropped, the FMT and RAW cursors (IPC+G#8..G#24) zeroed, then magic G#AA (MEM_IPC_MAGIC) and mem_access 1.
 fn legacy_init() {
     wr(IPC, 0);
@@ -1456,8 +1496,54 @@ const SIT_GET_PS_REG_STATE: u16 = 0x0701;
 const SIT_GET_SIM_STATUS: u16 = 0x0200;
 const SIT_SET_PS_SERVICE: u16 = 0x0710;
 const SIT_SET_INITIAL_ATTACH_APN: u16 = 0x0603;
+const SIT_SET_DATA_PROFILE: u16 = 0x0613;
+
+/// One data profile (SIT_SET_DATA_PROFILE, 246 bytes with the header: ProtocolPsBuilder::BuildSetDataProfile): G#C profile id (-1 for profiles the framework does not number), G#10 the APN [101], G#75 PDP type, G#76 roaming PDP type (1 IP, 2 IPV6, 3 IPV4V6), G#77 auth, G#78 user [50], G#AA password [50], G#DD max-connection time, G#E1 max connections, G#E5 wait time, G#E9 enabled, G#EA the APN types (1 default, 2 MMS, 4 SUPL, 8 DUN, G#10 HIPRI, G#20 FOTA, G#40 IMS, G#80 CBS, G#100 IA, G#200 emergency), G#EE the network types bitmap.
+struct DataProfile {
+    id: u32,
+    apn: &'static [u8],
+    pdp: u8,
+    roaming: u8,
+    auth: u8,
+    max_time: u32,
+    max_conns: u32,
+    types: u32,
+    networks: u32,
+}
+
+/// Verizon's profile table, as Android's RIL sends it for this SIM (the kprobe trace of cpif txq_write, 2026-10-29): public carrier settings, the same on every Verizon line. IMS (id 2) is the attach profile (types IMS | IA).
+const VZW_PROFILES: [DataProfile; 6] = [
+    DataProfile { id: 0xFFFF_FFFF, apn: b"internet", pdp: 3, roaming: 1, auth: 3, max_time: 0, max_conns: 0, types: 0xBF, networks: 0x11F0 },
+    DataProfile { id: 0, apn: b"VZWINTERNET", pdp: 3, roaming: 1, auth: 0, max_time: 300, max_conns: 20, types: 0x1D, networks: 0x0014_EE0E },
+    DataProfile { id: 3, apn: b"VZWADMIN", pdp: 3, roaming: 1, auth: 0, max_time: 300, max_conns: 20, types: 0x20, networks: 0x0014_EE0E },
+    DataProfile { id: 2, apn: b"IMS", pdp: 3, roaming: 2, auth: 0, max_time: 300, max_conns: 20, types: 0x140, networks: 0x0014_4000 },
+    DataProfile { id: 4, apn: b"VZWAPP", pdp: 3, roaming: 1, auth: 0, max_time: 300, max_conns: 20, types: 0x82, networks: 0x0014_EE0E },
+    DataProfile { id: 0xFFFF_FFFF, apn: b"VZWEMERGENCY", pdp: 3, roaming: 3, auth: 0, max_time: 0, max_conns: 0, types: 0x200, networks: 0 },
+];
+
+/// A profile's 234 parameter bytes (offsets above are into the whole message).
+fn data_profile_params(p: &DataProfile) -> Vec<u8> {
+    let mut m = alloc::vec![0u8; 0xF6];
+    let put = |m: &mut Vec<u8>, off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut m, 0x0C, p.id);
+    // The APN field is 101 bytes with its NUL; the table is ours, so a name too long is a bug: fail loud.
+    assert!(p.apn.len() <= 100);
+    m[0x10..0x10 + p.apn.len()].copy_from_slice(p.apn);
+    m[0x75] = p.pdp;
+    m[0x76] = p.roaming;
+    m[0x77] = p.auth;
+    put(&mut m, 0xDD, p.max_time);
+    put(&mut m, 0xE1, p.max_conns);
+    m[0xE9] = 1;
+    put(&mut m, 0xEA, p.types);
+    put(&mut m, 0xEE, p.networks);
+    m[12..].to_vec()
+}
 const SIT_GET_STACK_STATUS: u16 = 0x0810;
 const SIT_SET_UICC_SUBSCRIPTION: u16 = 0x0249;
+const SIT_SET_ALLOW_NETWORK: u16 = 0x074F;
+/// The RATs the data stack may search, as the CP reports them unset (GET_ALLOW_NETWORK on a fresh boot).
+const ALLOWED_RATS: u32 = 0x0004_03FE;
 const SIT_GET_CARRIER_RESTRICTIONS_V2: u16 = 0x0767;
 const SIT_OEM_SET_CARRIER_CONFIG_MANIFEST: u16 = 0x4600;
 /// The carrier-config root the CP opens its manifest and confseqs under, over the remote-file service (libsitril's CarrierConfigManager path; the Android capture's first remote-file open is `<root>/manifests/<id>`).
@@ -1477,11 +1563,11 @@ fn carrier_manifest_params() -> Vec<u8> {
     m[0x108..0x108 + id.len()].copy_from_slice(&id);
     m
 }
-/// The APN the data SIM attaches with, and its APN type in the CP's numbering (GetProtocolApnType: 0 default, 1 IMS, 2 emergency). Verizon attaches on its IMS APN (VZWIMS, types ims and ia in its APN list) and carries internet on VZWINTERNET as a second PDN; VZWINTERNET as the attach APN was refused (RCM_E_GENERIC_FAILURE, 2026-10-29). A per-carrier choice ferros will take from settings later.
-const ATTACH_APN: &[u8] = b"VZWIMS";
+/// The APN the data SIM attaches with, and its APN type in the CP's numbering (GetProtocolApnType: 0 default, 1 IMS, 2 emergency). Verizon attaches on its IMS APN: Android's own SET_INITIAL_ATTACH_APN on this SIM (the radio log, 2026-10-29) is "IMS", types ims and ia, IPV4V6 at home and IPV6 roaming. A per-carrier choice ferros will take from settings later.
+const ATTACH_APN: &[u8] = b"IMS";
 const ATTACH_APN_TYPE: u8 = 1;
 
-/// SIT_SET_INITIAL_ATTACH_APN's 239 parameter bytes (ProtocolPsBuilder::BuildSetInitialAttachApn, 251 bytes with the header), as offsets into the whole message: G#C the attach CID 1 (PsService's attach context; 0 is refused with RCM_E_GENERIC_FAILURE), G#D 14 (22 when a PDP type is 5), G#E 0, G#F the APN type (ATTACH_APN_TYPE), G#10 the APN [101], G#75 user [50], G#A7 password [50], G#D9 auth 0 (none), G#DA PDP type 3 (IPV4V6; 1 IP, 2 IPV6), G#DB P-CSCF request 0, G#F8 the roaming PDP type 3, G#F9 the roaming P-CSCF request 0, the rest 0.
+/// SIT_SET_INITIAL_ATTACH_APN's 239 parameter bytes (ProtocolPsBuilder::BuildSetInitialAttachApn, 251 bytes with the header), as offsets into the whole message: G#C the attach CID 1 (PsService's attach context; 0 is refused with RCM_E_GENERIC_FAILURE), G#D 14 (22 when a PDP type is 5), G#E 0, G#F the APN type (ATTACH_APN_TYPE), G#10 the APN [101], G#75 user [50], G#A7 password [50], G#D9 auth 0 (none), G#DA PDP type 3 (IPV4V6; 1 IP, 2 IPV6), G#DB P-CSCF request 0, G#F8 the roaming PDP type 2 (IPV6, as Android sends for Verizon), G#F9 the roaming P-CSCF request 0, the rest 0.
 fn initial_attach_params(apn: &[u8]) -> Vec<u8> {
     let mut m = alloc::vec![0u8; 0xFB];
     m[0xC] = 1;
@@ -1491,7 +1577,7 @@ fn initial_attach_params(apn: &[u8]) -> Vec<u8> {
     assert!(apn.len() <= 100);
     m[0x10..0x10 + apn.len()].copy_from_slice(apn);
     m[0xDA] = 3;
-    m[0xF8] = 3;
+    m[0xF8] = 2;
     m[12..].to_vec()
 }
 const SIT_SET_PREFERRED_DATA_MODEM: u16 = 0x0740;
@@ -1523,6 +1609,7 @@ fn sit_name(id: u16) -> &'static str {
         0x070B => "GET_PREFERRED_NTW_TYPE",
         0x0710 => "SET_PS_SERVICE",
         0x0711 => "GET_PS_SERVICE",
+        0x074F => "SET_ALLOW_NETWORK",
         0x0750 => "GET_ALLOW_NETWORK",
         0x0740 => "SET_PREFERRED_DATA_MODEM",
         0x0767 => "GET_CARRIER_RESTRICTIONS_V2",
@@ -1546,23 +1633,50 @@ fn sit_name(id: u16) -> &'static str {
 /// Whether a message's parameters may be shown: radio power and state, registration and coverage, signal, SIM card state and data-call state carry no identity. Anything else — SIM files, IMSI, ICCID, IMEI, numbers, SMS, calls, cell ids, location, time — is shown by its header alone.
 fn sit_shown(id: u16) -> bool {
     // Network state (G#70E) is left out: after the PLMN it carries the tracking-area code. G#4602 (the carrier-config manifest indication) starts with the SIM's ICCID.
-    matches!(id, 0x0210 | 0x0249 | 0x024A | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0703 | 0x070B | 0x0711 | 0x0750 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
+    matches!(id, 0x0210 | 0x0249 | 0x024A | 0x0603 | 0x0604 | 0x0609 | 0x0710 | 0x0717 | 0x072C | 0x0740 | 0x074A | 0x0767 | 0x0800..=0x0805 | 0x0703 | 0x070B | 0x0711 | 0x074F | 0x0750 | 0x0810 | 0x0906 | 0x4600 | 0x4601)
 }
 
-/// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter and its own channel counter, both starting at 1 (`exynos_build_header`); the RCM token counts RIL requests.
+/// The AP's side of the SIT link: each io-device (one per channel here) keeps its own frame counter, its own channel counter, both starting at 1 (`exynos_build_header`), and its own 6-bit multi-frame packet index (`exynos_build_fr_config`); the RCM token counts RIL requests.
 struct SitLink {
     frame: [u16; 256],
     ch: [u8; 256],
+    packet: [u8; 256],
     token: u32,
 }
 
-/// One single-frame message into the FMT TX ring (cfg G#C000, 8-byte padding as on RAW), then the SEND_FMT message and the doorbell (link_device.c 860-880).
+/// A frame holds at most 2 KiB with its 12-byte header (`ipc_io_device.c`: alloc_size capped at SZ_2K for SIT).
+const SIT_FRAME_MAX: usize = 1 << 11;
+
+/// One message into the FMT TX ring (8-byte padding as on RAW), then the SEND_FMT message and the doorbell (link_device.c 860-880). A message longer than one frame goes as a multi-frame packet; see `ring_send`.
 fn fmt_send(link: &mut SitLink, ch: u8, payload: &[u8]) -> Result<(), alloc::string::String> {
     ring_send(link, false, ch, payload)
 }
 
-/// One single-frame message into the FMT or the RAW TX ring, then that ring's SEND message and the doorbell. The RAW ring is the boot channel's and, after START, the remote-file service's.
+/// One message into the FMT or the RAW TX ring. The RAW ring is the boot channel's and, after START, the remote-file service's. A message that fits one frame goes with cfg G#C000 (single); a longer one is cut into frames of `SIT_FRAME_MAX` (`exynos_build_fr_config` + `modify_next_frame`): the first carries cfg (G#80 | packet index) << 8 | the count of frames after it, each next one the count less one, the last its high byte's start bit swapped for the last bit (G#40) and a count of 0. Each frame waits up to 200 ms for ring space once the packet has begun, so a packet is never left half sent while the CP drains.
 fn ring_send(link: &mut SitLink, raw: bool, ch: u8, payload: &[u8]) -> Result<(), alloc::string::String> {
+    let room = SIT_FRAME_MAX - 12;
+    if payload.len() <= room {
+        return ring_frame(link, raw, ch, 0xC000, payload);
+    }
+    let more = (payload.len() - 1) / room;
+    link.packet[ch as usize] = (link.packet[ch as usize] + 1) & 0x3F;
+    let hi = 0x80 | link.packet[ch as usize] as u16;
+    for (k, part) in payload.chunks(room).enumerate() {
+        let left = (more - k) as u16;
+        let cfg = if left == 0 { (hi & 0x3F | 0x40) << 8 } else { hi << 8 | left };
+        let t1 = now();
+        let mut r = ring_frame(link, raw, ch, cfg, part);
+        while r.is_err() && k > 0 && since_us(t1) < 200_000 {
+            us(100);
+            r = ring_frame(link, raw, ch, cfg, part);
+        }
+        r?;
+    }
+    Ok(())
+}
+
+/// One frame with link cfg `cfg` into the FMT or the RAW TX ring, then that ring's SEND message and the doorbell.
+fn ring_frame(link: &mut SitLink, raw: bool, ch: u8, cfg: u16, payload: &[u8]) -> Result<(), alloc::string::String> {
     let (ring, len, headr, tailr, int) = if raw { (TX_RING, TX_RING_LEN, TXQ_HEAD, TXQ_TAIL, INT_SEND_DATA) } else { (FMT_TX_RING, FMT_TX_RING_LEN, FMT_TXQ_HEAD, FMT_TXQ_TAIL, INT_SEND_FMT) };
     let total = 12 + payload.len();
     let padded = (total + 7) & !7;
@@ -1576,7 +1690,7 @@ fn ring_send(link: &mut SitLink, raw: bool, ch: u8, payload: &[u8]) -> Result<()
     link.frame[ch as usize] = link.frame[ch as usize].wrapping_add(1);
     link.ch[ch as usize] = link.ch[ch as usize].wrapping_add(1);
     let (frame, chseq) = (link.frame[ch as usize], link.ch[ch as usize]);
-    let hdr = [0xCD, 0xAB, frame as u8, (frame >> 8) as u8, 0x00, 0xC0, total as u8, (total >> 8) as u8, ch, chseq, 0, 0];
+    let hdr = [0xCD, 0xAB, frame as u8, (frame >> 8) as u8, cfg as u8, (cfg >> 8) as u8, total as u8, (total >> 8) as u8, ch, chseq, 0, 0];
     let mut pos = head;
     let mut put = |b: &[u8]| {
         for &x in b {
@@ -1614,7 +1728,7 @@ fn sit_request(link: &mut SitLink, ch: u8, id: u16, params: &[u8]) -> Result<u32
 // Protobuf is the modem's wire, not a ferros format: read strictly (a malformed message is dropped and logged), written by hand.
 
 const CH_MODEM_SVC: u8 = 130;
-/// UE-capability file blocks: 1 KiB of data a message keeps each one a single SIT frame (under 2 KiB with its headers) and leaves room in the 4 KiB FMT ring.
+/// UE-capability file blocks when the CP names no usable block size: 1 KiB of data a message keeps each one a single SIT frame (under 2 KiB with its headers).
 const UECAP_BLOCK: usize = 1 << 10;
 
 /// One protobuf field: number, wire type, the varint/fixed value, and for a length-delimited field its bytes.
@@ -1701,7 +1815,7 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
         line(rep, alloc::format!("t={t_ms} ms: modem_svc log (id A#{}): {}\n", id.unwrap_or(0), txt(log.bytes).trim_matches(|c: char| !c.is_ascii_graphic())));
         return None;
     }
-    // A UE-capability file read (payload 12, `UecapFileMessage` {1 read_request {1 size, 2 block_size, 3 file_dir, 4 file_name}, 2 read_response {1 offset, 2 data, 3 result, 4 last_block}}). The directory is UECAP_PATH (3), the modem image's /images/default/uecap; the file is served in blocks of UECAP_BLOCK bytes, each a RESPONSE with the request's id and token and its own offset, the last one flagged. A file that is not there gets one final block with result 1 (UFM_INTERNAL_ERROR).
+    // A UE-capability file read (payload 12, `UecapFileMessage` {1 read_request {1 size, 2 block_size, 3 file_dir, 4 file_name}, 2 read_response {1 offset, 2 data, 3 result, 4 last_block}}). The directory is UECAP_PATH (3), the modem image's /images/default/uecap; the file is served in the blocks the CP asks for, each a RESPONSE with the request's id, its own token and its own offset, the last one flagged. A file that is not there gets one final block with result 1 (UFM_INTERNAL_ERROR).
     if let (Some(1), Some(id), Some(uc)) = (ty, id, get(12)) {
         let req = pb_fields(uc.bytes)?;
         let rr = req.iter().find(|f| f.num == 1)?;
@@ -1719,7 +1833,9 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
         } else {
             Err(alloc::format!("not a plain file name"))
         };
-        let block = |off: u32, data: &[u8], result: u64, last: bool| {
+        // The block size is the CP's (read_request field 2; 4000 on this firmware), and block k answers with the request's token + k: the CP books one token per block it expects (its next request's token comes that many later) and Android's shared_modem_platform counts them so (the 2026-10-29 TX trace). The size is the CP's input and lands in the link layer's 8-bit frame count, so a size outside 1..=32 KiB is not trusted and the default block is served.
+        let bsz = g(2).map(|f| f.val as usize).filter(|&n| (1..=1 << 15).contains(&n)).unwrap_or(UECAP_BLOCK);
+        let block = |k: usize, off: u32, data: &[u8], result: u64, last: bool| {
             let mut resp = Vec::new();
             pb_put_varint(&mut resp, 1 << 3);
             pb_put_varint(&mut resp, off as u64);
@@ -1733,19 +1849,21 @@ fn modem_svc(rep: &mut Vec<u8>, t_ms: u64, body: &[u8], props: &mut Vec<(Vec<u8>
             let mut out = alloc::vec![0x08, 0x02, 0x15];
             out.extend_from_slice(&id.to_le_bytes());
             out.push(0x1D);
-            out.extend_from_slice(&token.to_le_bytes());
+            out.extend_from_slice(&token.wrapping_add(k as u32).to_le_bytes());
+            // result 0 written out, as Android does.
+            out.extend_from_slice(&[0x20, 0x00]);
             pb_put_bytes(&mut out, 12, &inner);
             out
         };
         return Some(match file {
             Ok(v) => {
-                line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {name} (token A#{token}) -> A#{} bytes from {MODEM_PART}\n", v.len()));
-                let n = v.len().div_ceil(UECAP_BLOCK).max(1);
-                (0..n).map(|k| block((k * UECAP_BLOCK) as u32, &v[k * UECAP_BLOCK..((k + 1) * UECAP_BLOCK).min(v.len())], 0, k + 1 == n)).collect()
+                line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {name} (token A#{token}) -> A#{} bytes from {MODEM_PART} in blocks of A#{bsz}\n", v.len()));
+                let n = v.len().div_ceil(bsz).max(1);
+                (0..n).map(|k| block(k, (k * bsz) as u32, &v[k * bsz..((k + 1) * bsz).min(v.len())], 0, k + 1 == n)).collect()
             }
             Err(e) => {
                 line(rep, alloc::format!("t={t_ms} ms: modem_svc uecap read {name} (token A#{token}) -> not available ({e})\n"));
-                alloc::vec![block(0, &[], 1, true)]
+                alloc::vec![block(0, 0, &[], 1, true)]
             }
         });
     }
@@ -1972,11 +2090,14 @@ fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs)
 /// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
 fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
     let mut done = [0u32; PP_QUEUES as usize];
-    let mut link = SitLink { frame: [0; 256], ch: [0; 256], token: 0 };
+    let mut link = SitLink { frame: [0; 256], ch: [0; 256], packet: [0; 256], token: 0 };
     let (mut probed, mut powered) = (false, false);
     let mut next_reg = 5_000_000u64;
     let (mut sim_asked, mut data_on, mut ia_set, mut queried, mut uicc_on) = (false, false, false, false, false);
     let mut cycled = 0u8;
+    let mut allow_set = false;
+    let mut reg_last: [Option<[u8; 4]>; 2] = [None, None];
+    let mut camp_seen = [0u8; 2];
     let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut rfs_st = Rfs { pull: None, read: None, files: Vec::new() };
     let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
@@ -2037,12 +2158,32 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_UICC_SUBSCRIPTION not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
-        if probe >= 5 && !ia_set && since_us(t0) > 6_500_000 {
+        // Stage G#10: the data profiles instead — Android's RIL never sends SIT_SET_INITIAL_ATTACH_APN on this build; the attach APN rides in the profile table (the IMS profile's types carry IA).
+        if probe >= 6 && !ia_set && since_us(t0) > 6_500_000 {
+            ia_set = true;
+            let ch = CH_FMT0 + 1;
+            for p in VZW_PROFILES.iter() {
+                match sit_request(&mut link, ch, SIT_SET_DATA_PROFILE, &data_profile_params(p)) {
+                    Ok(_) => {}
+                    Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_DATA_PROFILE not sent: {e}\n", since_us(t0) / 1000)),
+                }
+            }
+            line(rep, alloc::format!("t={} ms: -> SIT_SET_DATA_PROFILE x A#{} on ch A#{ch}\n", since_us(t0) / 1000, VZW_PROFILES.len()));
+        }
+        if probe == 5 && !ia_set && since_us(t0) > 6_500_000 {
             ia_set = true;
             let ch = CH_FMT0 + 1;
             match sit_request(&mut link, ch, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN)) {
-                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_INITIAL_ATTACH_APN {} IPV4V6 ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(ATTACH_APN))),
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_INITIAL_ATTACH_APN {} IPV4V6 (roaming IPV6) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(ATTACH_APN))),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_INITIAL_ATTACH_APN not sent: {e}\n", since_us(t0) / 1000)),
+            }
+        }
+        // Stage G#10: the allowed networks set (SIT_SET_ALLOW_NETWORK, a u32 RAT bitmap in the CP's numbering: ProtocolNetworkBuilder::BuildSetAllowedNetworkTypeBitmap). Android's boot trace (2026-10-29, the radio log): the data stack sits not searching until SET_DATA_PROFILE, SET_INITIAL_ATTACH_APN and then SET_ALLOWED_NETWORK_TYPES_BITMAP, and is home on LTE 12 s after the last. The mask written is the one the CP itself reports (GET_ALLOW_NETWORK, G#4_03FE).
+        if probe >= 6 && !allow_set && since_us(t0) > 6_800_000 {
+            allow_set = true;
+            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes()) {
+                Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_ALLOW_NETWORK G#{ALLOWED_RATS:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
+                Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_ALLOW_NETWORK not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         if probe >= 4 && !data_on && since_us(t0) > 7_000_000 {
@@ -2095,6 +2236,25 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
             per_ch[ch as usize] += 1;
+            // Stage G#11: the gipc service on oem_ipc3 (channel 132) — a request {1 type 0, 2 channel, 3 service hash, 4 method hash, 7 sequence, payload} is answered as Android answers the CP's temperature report: {1 type 1, the same channel, hashes and sequence}, no payload.
+            if probe >= 7 && name == "fmt" && ch == 132 {
+                let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
+                if let Some(f) = pb_fields(&body) {
+                    let g = |n: u32| f.iter().find(|x| x.num == n).map(|x| x.val);
+                    if let (Some(0), Some(svc), Some(m), Some(seq)) = (g(1), g(3), g(4), g(7)) {
+                        let mut r = alloc::vec![0x08, 0x01, 0x10, 0x84, 0x01, 0x1D];
+                        r.extend_from_slice(&(svc as u32).to_le_bytes());
+                        r.push(0x25);
+                        r.extend_from_slice(&(m as u32).to_le_bytes());
+                        r.push(0x38);
+                        pb_put_varint(&mut r, seq);
+                        match fmt_send(&mut link, 132, &r) {
+                            Ok(()) => line(rep, alloc::format!("t={} ms: gipc response to G#{svc:X}/G#{m:X} seq A#{seq}\n", since_us(t0) / 1000)),
+                            Err(e) => line(rep, alloc::format!("  gipc response not sent: {e}\n")),
+                        }
+                    }
+                }
+            }
             if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
                 if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut props) {
@@ -2131,6 +2291,25 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             let rcm_hdr = if at(12) == 2 { 8 } else { 12 };
             // The SIM's file-data and status chatter (G#210, G#246, G#248, G#24F) is counted, not logged: it is long, frequent and identity.
             let quiet = served_rfs || ril && flen >= 16 && matches!(at(14) as u16 | (at(15) as u16) << 8, 0x0210 | 0x0246 | 0x0248 | 0x024F);
+            // A change in a stack's data registration (state, reject cause, RAT: the reply's first 4 bytes) is logged past the frame cap too.
+            if ril && at(12) == 1 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0701 && flen >= 12 + 12 + 4 {
+                let st = [at(24), at(25), at(26), at(27)];
+                let k = (ch - CH_FMT0) as usize;
+                if reg_last[k] != Some(st) {
+                    reg_last[k] = Some(st);
+                    line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hex(&|i| st[i as usize], 4)));
+                }
+            }
+            // The first physical-channel-config and NITZ indications (the stack camped on a cell) are logged past the cap too, header only.
+            if ril && at(12) == 2 && flen >= 12 + 8 {
+                let id = at(14) as u16 | (at(15) as u16) << 8;
+                let k = (ch - CH_FMT0) as usize;
+                let bit = match id { 0x0742 => 1u8, 0x0905 => 2, 0x0604 => 4, _ => 0 };
+                if bit != 0 && camp_seen[k] & bit == 0 {
+                    camp_seen[k] |= bit;
+                    line(rep, alloc::format!("t={} ms: ch A#{ch} first indication G#{id:04X} {}\n", since_us(t0) / 1000, sit_name(id)));
+                }
+            }
             if quiet {
                 // Counted in per_ch only.
             } else if ril && flen >= 12 + rcm_hdr && frames < 256 {
