@@ -5,6 +5,7 @@
 //! Here the salt is a stand-in: Ctrl+R steps to the next stand-in device, to see how different devices' families look.
 //! Ctrl+arrows nudge the colouring's complex offset and Ctrl+PageUp/PageDown double or halve the relief's depth (both printed), to tune the look for the final sphere; Ctrl+L toggles one fixed light against each device's own, Ctrl+B toggles each key's choices between progressive (walking from the device's own, every character half the nudge of the one before) and free. Ctrl+M, Ctrl+E, Ctrl+F and Ctrl+S step the material, the engraving, the mirror and the style (soft, medal, enamel, lacquer) through every kind and back to the device's own; Ctrl+O toggles the button's wrapping.
 //! Ctrl+1, Ctrl+2 and Ctrl+3 pick which of the three marks is drawn: the Photon avatar (`Look::avatar()`), the device bonded to an identity (the attest button, `Look::attest()`), and the device free of one (the Mandelbrot set with the attest ball in every component, `render_fresh` in `Look::fresh()`, as ahau draws it, with its maps the phone's sizes and its two passes timed). Each pick starts from that mark's own look; the keys above tune it from there (the free mark's outline is the set's alone, so only the balls follow them and the text).
+//! With the textbox unfocused (click the mark, or Esc; click the box to type again) the same keys work without Ctrl: R, 1, 2, 3, the arrows, and the rest.
 //! Layout: the textbox at the top, the mark's sphere centred between it and the bottom, and a tiny grey Mandelbrot set in the top-right gap with a white pixel at the Julia set's c.
 //! The text is never printed or stored.
 
@@ -121,12 +122,20 @@ impl App {
         self.textbox.set_font_size(fs, text);
     }
 
-    /// The box always holds the keyboard; its cursor is shown steady, with no blink timer.
+    /// The box takes the keyboard; its cursor is shown steady, with no blink timer.
     fn focus(&mut self) {
         let id = self.textbox.hit_id();
         if !self.textbox.is_focused() {
             widget::apply_focus_change(self as &mut dyn Container, None, Some(id));
-            self.textbox.flip_blinkey();
+            self.textbox.blinkey_visible = true;
+        }
+    }
+
+    /// The box lets the keyboard go, so the tuning keys work without Ctrl.
+    fn unfocus(&mut self) {
+        let id = self.textbox.hit_id();
+        if self.textbox.is_focused() {
+            widget::apply_focus_change(self as &mut dyn Container, Some(id), None);
         }
     }
 
@@ -275,6 +284,7 @@ impl FluorApp for App {
                     return EventResponse::Handled;
                 }
                 if hit == self.textbox.hit_id() {
+                    self.focus();
                     let mods = ctx.modifiers;
                     let r = widget::dispatch_click(self as &mut dyn Container, hit, x, y, mods);
                     ctx.window.request_redraw();
@@ -284,11 +294,24 @@ impl FluorApp for App {
                 if edge != ResizeEdge::None {
                     return EventResponse::StartResize(edge);
                 }
+                // Anywhere else (the mark): the box lets the keyboard go; the window still drags from here.
+                if self.textbox.is_focused() {
+                    self.unfocus();
+                    ctx.window.request_redraw();
+                }
                 EventResponse::StartWindowDrag
             }
             Event::KeyboardInput { event: kev } if kev.state == ElementState::Pressed => {
+                // The tuning keys: with Ctrl, or bare while the box is unfocused.
+                let cmd = ctx.modifiers.control_key() || !self.textbox.is_focused();
+                // Esc: the box lets the keyboard go.
+                if matches!(&kev.logical_key, Key::Named(NamedKey::Escape)) && self.textbox.is_focused() {
+                    self.unfocus();
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
                 // Ctrl+1 / Ctrl+2 / Ctrl+3: the avatar, the bonded device's mark, the free device's mark, each from its own look.
-                if ctx.modifiers.control_key() {
+                if cmd {
                     let mode = match &kev.logical_key {
                         Key::Character(s) if s == "1" => Some(Mode::Avatar),
                         Key::Character(s) if s == "2" => Some(Mode::Bonded),
@@ -305,7 +328,7 @@ impl FluorApp for App {
                     }
                 }
                 // Ctrl+O: the button's wrapping on or off.
-                if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("o")) {
+                if cmd && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("o")) {
                     self.look.button = !self.look.button;
                     println!("button: {}", if self.look.button { "on" } else { "off" });
                     self.mark_key.2 = [0; 32];
@@ -313,7 +336,7 @@ impl FluorApp for App {
                     return EventResponse::Handled;
                 }
                 // Ctrl+L: one fixed light or each device's own. Ctrl+B: progressive keys or free.
-                if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l") || s.eq_ignore_ascii_case("b")) {
+                if cmd && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l") || s.eq_ignore_ascii_case("b")) {
                     if matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("l")) {
                         self.look.fixed_light = !self.look.fixed_light;
                         println!("light: {}", if self.look.fixed_light { "fixed" } else { "per device" });
@@ -326,7 +349,7 @@ impl FluorApp for App {
                     return EventResponse::Handled;
                 }
                 // Ctrl+M / Ctrl+E / Ctrl+F / Ctrl+S: the material (soft style only), the engraving, the mirror, the style, each stepping from the device's own through every kind and back.
-                if ctx.modifiers.control_key() {
+                if cmd {
                     let which = match &kev.logical_key {
                         Key::Character(s) if s.eq_ignore_ascii_case("m") => Some((0, ["matte", "satin", "gloss", "glass"].as_slice())),
                         Key::Character(s) if s.eq_ignore_ascii_case("e") => Some((1, ["none", "level lines", "rays", "net"].as_slice())),
@@ -352,7 +375,7 @@ impl FluorApp for App {
                     }
                 }
                 // Ctrl+arrows nudge the colouring's complex offset by 2⁻⁴ (left/right the real part, up/down the imaginary).
-                if ctx.modifiers.control_key() {
+                if cmd {
                     let step = 1. / (1 << 4) as f32;
                     let nudge = match &kev.logical_key {
                         Key::Named(NamedKey::ArrowLeft) => Some((-step, 0.)),
@@ -382,11 +405,14 @@ impl FluorApp for App {
                         return EventResponse::Handled;
                     }
                 }
-                if ctx.modifiers.control_key() && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("r")) {
+                if cmd && matches!(&kev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("r")) {
                     self.device += 1;
                     self.salt = salt_for(self.device);
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
+                }
+                if !self.textbox.is_focused() {
+                    return EventResponse::Pass;
                 }
                 let (id, mods) = (self.textbox.hit_id(), ctx.modifiers);
                 let r = widget::dispatch_key(self as &mut dyn Container, id, kev, mods, ctx.text);
