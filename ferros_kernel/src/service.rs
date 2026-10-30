@@ -2469,6 +2469,24 @@ pub fn run(mut b: Boot) -> ! {
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
+                                        if let Some(name) = cmd.params.strip_prefix(b"part find ") {
+                                            // `diag "part find <name>"`: a GPT partition's LU and LBA range, read-only (partfs.rs find).
+                                            let name = alloc::string::String::from_utf8_lossy(name).into_owned();
+                                            let s = match crate::partfs::find(&name) {
+                                                Some(p) => alloc::format!("{name}: LU A#{} LBA A#{}..=A#{}\n", p.lun, p.first, p.last),
+                                                None => alloc::format!("{name}: not found\n"),
+                                            };
+                                            resp.extend_from_slice(s.as_bytes());
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params.starts_with(b"part vermagic ") {
+                                            // `diag "part vermagic <logical>"`: which kernel the modules in a logical partition (vendor_dlkm_a, say) were built for — read-only, from super (partfs.rs vermagic).
+                                            let name = alloc::string::String::from_utf8_lossy(&cmd.params[14..]).into_owned();
+                                            crate::partfs::vermagic(&mut resp, &name);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
                                         if cmd.params == b"modem hwcfg" {
                                             // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
                                             crate::modem::hwcfg(&mut resp);

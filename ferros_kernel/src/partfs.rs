@@ -61,8 +61,8 @@ pub fn find(name: &str) -> Option<Part> {
     None
 }
 
-/// A logical partition inside `super` (Android's dynamic partitions, liblp metadata_format.h), read-only: the geometry at byte 4096 (magic "gDla"), slot 0's metadata header at byte 12288 (magic "0PLA": tables descriptors at 80 partitions, 92 extents, each {offset, count, entry size}, the tables after the header), the partition entry by name (name[36], attributes, first extent, extent count, group), and its extents (u64 sectors, u32 type, u64 first sector, u32 source; 512-byte sectors). Only a single linear extent on `super` itself is taken, 4 KiB aligned — that is how the build lays out vendor_a; anything else is refused, not guessed at. The metadata's checksums are not checked: it is read only to find an ext4 filesystem that checks itself.
-pub fn find_logical(name: &str) -> Result<Part, String> {
+/// The extents of a logical partition inside `super` (Android's dynamic partitions, liblp metadata_format.h), read-only: the geometry at byte 4096 (magic "gDla"), slot 0's metadata header at byte 12288 (magic "0PLA": tables descriptors at 80 partitions, 92 extents, each {offset, count, entry size}, the tables after the header), the partition entry by name (name[36], attributes, first extent, extent count, group), and its extents (u64 sectors, u32 type, u64 first sector, u32 source; 512-byte sectors). Each extent must be linear, on `super` itself, 4 KiB aligned; anything else is refused, not guessed at. The metadata's checksums are not checked: it is read only to find an ext4 filesystem that checks itself.
+pub fn logical_extents(name: &str) -> Result<Vec<Part>, String> {
     let sup = find("super").ok_or_else(|| String::from("partition super not found"))?;
     let ufs = UfsController::new(UFS_BASE);
     let block = |lba: u64| -> Result<[u8; 4096], String> {
@@ -104,10 +104,12 @@ pub fn find_logical(name: &str) -> Result<Part, String> {
             continue;
         }
         let (first, count) = (u32at(e, 40) as usize, u32at(e, 44) as usize);
-        if count != 1 || first >= ecount {
-            return Err(alloc::format!("{name}: A#{count} extents (one linear extent handled)"));
+        if first + count > ecount {
+            return Err(alloc::format!("{name}: extents {first}..{} outside the table", first + count));
         }
-        let x = &meta[eoff + first * esize..eoff + (first + 1) * esize];
+        let mut out = Vec::new();
+        for k in first..first + count {
+        let x = &meta[eoff + k * esize..eoff + (k + 1) * esize];
         let (sectors, ty, start, source) = (u64at(x, 0), u32at(x, 8), u64at(x, 12), u32at(x, 20));
         if ty != 0 || source != 0 || start % 8 != 0 || sectors % 8 != 0 || sectors == 0 {
             return Err(alloc::format!("{name}: extent type {ty} source {source} start {start} sectors {sectors} not a 4 KiB-aligned linear extent on super"));
@@ -116,9 +118,48 @@ pub fn find_logical(name: &str) -> Result<Part, String> {
         if last_lba > sup.last {
             return Err(alloc::format!("{name}: extent runs past super"));
         }
-        return Ok(Part { lun: sup.lun, first: first_lba, last: last_lba });
+        out.push(Part { lun: sup.lun, first: first_lba, last: last_lba });
+        }
+        return Ok(out);
     }
     Err(alloc::format!("{name}: not in super's metadata"))
+}
+
+/// A logical partition laid out as one extent, as a plain `Part` (vendor_a on this build).
+pub fn find_logical(name: &str) -> Result<Part, String> {
+    let x = logical_extents(name)?;
+    match x.as_slice() {
+        [p] => Ok(*p),
+        _ => Err(alloc::format!("{name}: A#{} extents (one handled here)", x.len())),
+    }
+}
+
+/// `diag "part vermagic <logical>"`: the first `vermagic=` string in a logical partition's raw blocks, across all its extents — the kernel the modules in it were built for (every .ko carries one). Read-only; no filesystem is mounted, so a partition laid out in many extents (vendor_dlkm_a is) needs no extent-aware mount.
+pub fn vermagic(rep: &mut Vec<u8>, name: &str) {
+    let run = || -> Result<String, String> {
+        let parts = logical_extents(name)?;
+        let ufs = UfsController::new(UFS_BASE);
+        let (mut blocks, mut carry) = (0u64, Vec::new());
+        for p in parts.iter() {
+            for lba in p.first..=p.last {
+                if ufs.read_block_lun(p.lun, lba as u32) != 0 || ufs.last_response_status() != 0 {
+                    return Err(alloc::format!("read of LBA {lba} failed"));
+                }
+                blocks += 1;
+                // The last 64 bytes of the previous block ride along, so a string split across two blocks is still found.
+                let mut buf = core::mem::take(&mut carry);
+                buf.extend_from_slice(ufs.data_buffer());
+                if let Some(at) = buf.windows(9).position(|w| w == b"vermagic=") {
+                    let end = buf[at..].iter().position(|&c| c == 0).map(|e| at + e).unwrap_or(buf.len());
+                    return Ok(alloc::format!("{name}: A#{} extents, found after A#{blocks} blocks: {}\n", parts.len(), String::from_utf8_lossy(&buf[at..end])));
+                }
+                carry = buf[buf.len() - 64..].to_vec();
+            }
+        }
+        Err(alloc::format!("no vermagic in A#{blocks} blocks over A#{} extents", parts.len()))
+    };
+    let s = run().unwrap_or_else(|e| alloc::format!("{name}: {e}\n"));
+    rep.extend_from_slice(s.as_bytes());
 }
 
 /// An ext4 mount of a partition already found (a logical one from `find_logical`, say).
