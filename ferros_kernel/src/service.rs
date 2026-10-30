@@ -383,6 +383,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Use(b"udp"),
         // 51 the attest screen's vault scope `ahau.` (payloads/ahau).
         Store(b"ahau"),
+        // 52 the cellular link (modem.rs `rmnet_call`; served by the kernel in Phase 1), the IP process's second link.
+        Use(b"rmnet"),
     ]
 }
 
@@ -394,7 +396,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
-        b"ip" => &[44, 45, 41],
+        b"ip" => &[44, 45, 41, 52],
         // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
         b"photon" => &[50, 48, 49, 46, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint) (payloads/ahau).
@@ -1154,6 +1156,8 @@ pub fn run(mut b: Boot) -> ! {
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
         crate::usf::poll();
+        // The cellular modem, once `diag modem up` has it online: one pass of its service (modem.rs `service_poll`).
+        crate::modem::service_poll();
         if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
             let st = &raw mut store;
             let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
@@ -2490,6 +2494,36 @@ pub fn run(mut b: Boot) -> ! {
                                         if cmd.params == b"modem hwcfg" {
                                             // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
                                             crate::modem::hwcfg(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem up" {
+                                            // `diag modem up`: the cold bring-up through the handshake, then the service the kernel keeps running: registration, the internet data call, its packets on `rmnet` (modem.rs up).
+                                            crate::modem::up(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem down" {
+                                            // `diag modem down`: the service stopped and the CP powered down.
+                                            crate::modem::down(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem probe" {
+                                            // `diag modem probe`: an echo and two DNS queries up the running call, the answers logged by shape (modem.rs probe).
+                                            crate::modem::probe(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem ping" {
+                                            // `diag modem ping`: one ICMPv6 echo request up the running call (modem.rs ping).
+                                            crate::modem::ping(&mut resp);
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"modem state" {
+                                            // `diag modem state`: the service's registration, data call and packet counts (modem.rs state); never the addresses.
+                                            crate::modem::state(&mut resp);
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }

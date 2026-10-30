@@ -426,3 +426,60 @@ UL goes on pktproc UL queue 1 (2 KiB buffers; queue 0 carries TCP ACKs only on t
 The first round trip: an ICMPv6 echo request from the call's own address to 2001:4860:4860::8888 came back as an echo reply on DL queue 0, channel 197, 63 ms later. A router solicitation sent at the same time (from fe80::<the network's interface id>) got no advertisement in 30 s, and none came unsolicited. The address in the data-call reply is already global, so none is needed.
 
 **Next:** an IP stack on top of these two queues (ferros's `ip` server over rmnet instead of WiFi), and the other PDNs only if something needs them.
+
+## 2026-10-29 late: the modem as a service, and IP over cellular (IPv6 and IPv4)
+
+`diag modem up` brings the CP through the cold boot and the handshake, then leaves a service running from the kernel's service loop (`modem::service_poll`, one pass each loop, under the kernel lock). The service registers, sets up the internet call, answers the CP's file and service requests and keeps the DL rings drained. `diag modem state` shows the registration, the call (never its addresses), the packet counts and the queue pointers; `diag modem down` stops it and powers the CP off.
+
+The call's packets reach processes through the `rmnet` object. In this first phase the kernel answers it itself (process.rs `Object::Rmnet`, granted as `Use(b"rmnet")`, home slot 52). Phase 2 moves the modem into its own driver process, which will serve an `rmnet` endpoint with the same three requests:
+
+| Request | Reply |
+|---|---|
+| `[1]` + IP packet (send) | `[0]` sent, `[1]` UL queue full, `[2]` no call, `[3]` bad |
+| `[2]` (receive) | the oldest DL packet, or empty |
+| `[3]` (info) | 43 bytes: flags, MTU, IPv4, IPv6, then one DNS server per family |
+
+**DL comes down two ways.** An ICMPv6 echo reply came through pktproc DL queue 0, but the answers to UDP DNS queries came as SIT frames on the legacy RAW ring, on the call's channel (197). Both are queued for `rmnet`. Until the RAW-ring frames were taken, every DNS query looked lost: `diag modem probe` (an echo and two DNS queries sent from the kernel, the answers logged by shape) and the per-channel ring counts in `diag modem state` found them.
+
+**The data-call reply, its tail** (offsets into the whole message):
+
+| Offset | Field |
+|---|---|
+| G#E | call id |
+| G#10 | PDP type |
+| G#11 | IPv4 address |
+| G#15 | IPv6 address |
+| G#25 | 3 (both families) |
+| G#26, G#3A | two DNS entries of {IPv4 4, IPv6 16} (Verizon: 198.224.166.135 and 2001:4888:53:ff00:524:d::) |
+| G#8B | MTU (u16, 1428) |
+
+**The IP process** (`payloads/ip`) now has two links:
+- WiFi's `wlan` (Ethernet).
+- The call's `rmnet` (raw IP; addresses and DNS from the call; no ARP, ND, DHCP or SLAAC).
+
+Routing:
+- Traffic leaves on WiFi when WiFi has an address of its family, otherwise on cellular.
+- Link-scope and multicast traffic stays on WiFi.
+- A TCP connection keeps the link and source it opened on.
+- IPv4 over cellular goes out with TTL 63.
+- `udp` request 9 (LINK) forces cellular-only or WiFi-only for tests.
+- INFO reports the effective addresses and DNS, with the call's IPv6 DNS server and a cellular flag appended.
+
+A CALL can carry `CALL_LIVE` (bit 63 of the reply length): it fails at once, instead of waiting forever, when no live process serves the endpoint. ip uses it for `wlan`, so a boot where the WiFi driver failed leaves ip on cellular instead of hung, and it asks the driver again every 16 s.
+
+`httptest` looks up AAAA first, over the IPv6 DNS server when there is one, then A. On the phone, fetching fgtw.org over plain HTTP:
+
+| Link and family | DNS | Connect | Result |
+|---|---|---|---|
+| Cellular, IPv6 | 38 ms | 23 ms | 200 OK |
+| Cellular, IPv4 | 33 ms | 25 ms | 200 OK |
+| WiFi, IPv6 | 39 ms | 28 ms | 200 OK |
+
+All three bodies have the same hash.
+
+The partfs readers now take the kernel lock per UFS command (or per short lookup), so the modem service's file reads no longer race the vault's commands from syscalls.
+
+**Next:**
+- Bring the service up at boot.
+- Re-establish the call if it drops.
+- Phase 2: the modem as its own driver process.

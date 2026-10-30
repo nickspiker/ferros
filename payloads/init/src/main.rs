@@ -9,6 +9,7 @@
 //!   14 serve touch, 15-16 usi2-spi, gpio-gpn0, 23 the touch interrupt line, 17 use display, 18 use touch, 19 settings (the map holds it: the device's settings are the back of the device's own circle), 20 the vault scope `map.` (the arrangement made by hand), 21 dma display-phases (the display's four temporal dither frames), 22 dma surfaces (the four apps' surfaces, WINDOWS.md: the display composes them; an app the map starts gets one of its own). 26 dma display-sprites (the display's sprite cache), 27 dma display-canvas (its 16-bit back buffer).
 //!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp,
 //!   46 serve photon, 47 use photon, 48 the vault scope `photon.`, 49 the ira key, 50 use udp (PHOTON.md).
+//!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second).
 #![no_std]
 #![no_main]
 
@@ -23,8 +24,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 7] = [
     (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope (payloads/pcie1 header).
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43]),
-    // 1 use wlan, 2 serve udp, 3 entropy (payloads/ip).
-    (b"ip", b"ip", &[44, 45, 41]),
+    // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
+    (b"ip", b"ip", &[44, 45, 41, 52]),
     // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
     (b"photon", b"photon", &[50, 48, 49, 46, 41]),
 ];

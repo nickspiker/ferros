@@ -819,16 +819,16 @@ pub fn stages(rep: &mut Vec<u8>, n: u8) {
     download(rep, &mut seq);
     match (n, seq) {
         (8, Some(s)) => start_and_watch(rep, s),
-        (9, Some(s)) => start_and_handshake(rep, s, false, 0),
-        (10, Some(s)) => start_and_handshake(rep, s, true, 0),
-        (11, Some(s)) => start_and_handshake(rep, s, true, 1),
-        (12, Some(s)) => start_and_handshake(rep, s, true, 2),
-        (13, Some(s)) => start_and_handshake(rep, s, true, 3),
-        (14, Some(s)) => start_and_handshake(rep, s, true, 4),
-        (15, Some(s)) => start_and_handshake(rep, s, true, 5),
-        (16, Some(s)) => start_and_handshake(rep, s, true, 6),
-        (17, Some(s)) => start_and_handshake(rep, s, true, 7),
-        (n, Some(s)) if n >= 18 => start_and_handshake(rep, s, true, 8),
+        (9, Some(s)) => {
+            start_and_handshake(rep, s, false, 0);
+        }
+        // Stage 10 (G#A) watches with probe 0, each stage after it with one more, up to G#12 (probe 8); there is no stage after G#12.
+        (10..=18, Some(s)) => {
+            let probe = n - 10;
+            if start_and_handshake(rep, s, true, probe) {
+                watch_online(rep, now(), probe);
+            }
+        }
         _ => {}
     }
 }
@@ -1290,11 +1290,14 @@ fn is_cmd(v: u16) -> bool {
     v & 0x40 != 0
 }
 
-/// Stage 9 answers the handshake bare; stage 10 (`full`) does what Linux does around it — the pktproc DL rings at INIT_START, the legacy-link reset at PHONE_START — and then watches.
-fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: u8) {
+/// Stage 9 answers the handshake bare; stage 10 on (`full`) does what Linux does around it — the pktproc DL rings at INIT_START, the legacy-link reset at PHONE_START. True once a full handshake is through: the CP is online for the watch or the service.
+fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: u8) -> bool {
     match command(&mut seq, 0xA400, &[0, 0], 4000) {
         Ok(()) => line(rep, alloc::format!("START acked (G#C400): the main firmware runs\n")),
-        Err(e) => return line(rep, alloc::format!("START: {e}\n")),
+        Err(e) => {
+            line(rep, alloc::format!("START: {e}\n"));
+            return false;
+        }
     }
     let t0 = now();
     let mut answered_init_start = false;
@@ -1352,9 +1355,7 @@ fn start_and_handshake(rep: &mut Vec<u8>, mut seq: u16, full: bool, probe: u8) {
         if answered_init_start { "answered" } else { "never seen" },
         if phone_started { "answered with INIT_END" } else { "never seen" },
         rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get() as u32, CP2AP_WAKEUP.get() as u32));
-    if full && phone_started {
-        watch_online(rep, now(), probe);
-    }
+    full && phone_started
 }
 
 // ---------------------------------------------------------------------------
@@ -2204,49 +2205,139 @@ fn rfs(rep: &mut Vec<u8>, t_ms: u64, b: &[u8], link: &mut SitLink, st: &mut Rfs)
     }
 }
 
-/// After INIT_END: 90 s of everything the CP does, answering nothing — the message and status words, the RAW and FMT frames (channel, length, and bytes: up to 160 with text for the remote-file channel 41 and the oem_ipc channels 129-136, whose requests name files and properties; only the first 32 as hex for the RIL channels, whose payloads may carry SIM identity), and every DL packet (queue, channel, length, first bytes), each buffer reposted as it is read.
-fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
-    let mut done = [0u32; PP_QUEUES as usize];
-    let mut link = SitLink { frame: [0; 256], ch: [0; 256], packet: [0; 256], token: 0 };
-    let (mut probed, mut powered) = (false, false);
-    let mut next_reg = 5_000_000u64;
-    let (mut sim_asked, mut data_on, mut ia_set, mut queried, mut uicc_on) = (false, false, false, false, false);
-    let mut cycled = 0u8;
-    let mut allow_set = false;
-    let mut reg_last: [Option<[u8; 4]>; 2] = [None, None];
-    let mut camp_seen = [0u8; 2];
-    let mut call_sent = false;
-    let mut call_up: Option<(u64, u8, [u8; 16])> = None;
-    let mut rs_sent = false;
-    let mut pp_reports = 0u32;
-    let mut props: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut rfs_st = Rfs { pull: None, read: None, files: Vec::new() };
-    let (mut frames, mut packets, mut changes) = (0u32, 0u32, 0u32);
-    let mut per_ch = [0u32; 256];
-    let mut last = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
-    line(rep, alloc::format!("online: magic G#{:X} mem_access {}, watching 90 s\n", rd(IPC), rd(IPC + 4)));
-    let hex = |at: &dyn Fn(u32) -> u8, n: u32| {
-        let mut h = alloc::string::String::new();
-        for i in 0..n {
-            h.push_str(&alloc::format!("{:02X}", at(i)));
+// ---------------------------------------------------------------------------
+// Online: what the AP does for an online CP, one pass at a time. The diag stages (probe 1..=8) run passes for 90 s and log nearly everything; the service (`up`, probe SERVICE) keeps running them from the kernel's service loop (`service_poll`) for as long as the modem is up, logs only what matters, and queues the data call's DL packets for the `rmnet` object (`rmnet_call`).
+
+/// The service's probe level: everything stage G#12 does except its tests (the router solicitation, the echo request, the queue reports), quiet, its DL packets queued for `rmnet`.
+const SERVICE: u8 = 9;
+/// DL packets the service holds for `rmnet` before the oldest gives way: a burst the IP process has not read yet (an IP stack drops on overflow anyway; TCP retransmits).
+const DL_QUEUE: usize = 1 << 8;
+
+/// The data call, as its reply gave it (SIT_SETUP_DATA_CALL, offsets into the whole message): G#E the call id, G#10 the PDP type, G#11 the IPv4 address, G#15 the IPv6 address, then two DNS entries of {IPv4, IPv6} at G#26 and G#3A, the MTU (u16) at G#8B. The addresses are the line's: kept for the IP process, never logged.
+#[derive(Clone, Copy)]
+struct Call {
+    t_up: u64,
+    cid: u8,
+    pdp: u8,
+    v4: [u8; 4],
+    v6: [u8; 16],
+    dns4: [u8; 4],
+    dns6: [u8; 16],
+    mtu: u16,
+}
+
+struct Online {
+    t0: u64,
+    probe: u8,
+    done: [u32; PP_QUEUES as usize],
+    link: SitLink,
+    probed: bool,
+    powered: bool,
+    next_reg: u64,
+    sim_asked: bool,
+    data_on: bool,
+    ia_set: bool,
+    queried: bool,
+    uicc_on: bool,
+    cycled: u8,
+    allow_set: bool,
+    reg_last: [Option<[u8; 4]>; 2],
+    camp_seen: [u8; 2],
+    call_sent: bool,
+    call: Option<Call>,
+    rs_sent: bool,
+    pp_reports: u32,
+    props: Vec<(Vec<u8>, Vec<u8>)>,
+    rfs_st: Rfs,
+    frames: u32,
+    packets: u32,
+    changes: u32,
+    per_ch: [u32; 256],
+    last: (u32, u32, bool),
+    dl: alloc::collections::VecDeque<Vec<u8>>,
+    dl_dropped: u32,
+    dl_bad: u32,
+    /// `rmnet` SENDs: taken by the UL queue, refused as full.
+    ul_sent: u32,
+    ul_full: u32,
+    /// DL packets still to log by shape (`probe` sets it).
+    dl_log: u32,
+}
+
+/// Bytes as hex, `n` of them from `at`.
+fn hexs(at: &dyn Fn(u32) -> u8, n: u32) -> alloc::string::String {
+    let mut h = alloc::string::String::new();
+    for i in 0..n {
+        h.push_str(&alloc::format!("{:02X}", at(i)));
+    }
+    h
+}
+
+impl Online {
+    fn new(t0: u64, probe: u8) -> Self {
+        Online {
+            t0,
+            probe,
+            done: [0; PP_QUEUES as usize],
+            link: SitLink { frame: [0; 256], ch: [0; 256], packet: [0; 256], token: 0 },
+            probed: false,
+            powered: false,
+            next_reg: 5_000_000,
+            sim_asked: false,
+            data_on: false,
+            ia_set: false,
+            queried: false,
+            uicc_on: false,
+            cycled: 0,
+            allow_set: false,
+            reg_last: [None, None],
+            camp_seen: [0; 2],
+            call_sent: false,
+            call: None,
+            rs_sent: false,
+            pp_reports: 0,
+            props: Vec::new(),
+            rfs_st: Rfs { pull: None, read: None, files: Vec::new() },
+            frames: 0,
+            packets: 0,
+            changes: 0,
+            per_ch: [0; 256],
+            last: (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get()),
+            dl: alloc::collections::VecDeque::new(),
+            dl_dropped: 0,
+            dl_bad: 0,
+            ul_sent: 0,
+            ul_full: 0,
+            dl_log: 0,
         }
-        h
-    };
-    while since_us(t0) < 90_000_000 {
+    }
+
+    /// The rmnet channel of the data call, once it is up: rmnet(cid - 1).
+    fn call_ch(&self) -> Option<u8> {
+        self.call.map(|c| CH_PDP_0 + c.cid - 1)
+    }
+
+    /// One pass: the CP's state words, the timed actions of the probe level, every frame waiting in the RAW and FMT RX rings (answered where the AP must answer), every DL packet. False once the CP has given up (CRASH_EXIT) or a ring is beyond reading: the caller stops.
+    fn step(&mut self, rep: &mut Vec<u8>) -> bool {
         crate::platform::pet_watchdogs();
+        let t0 = self.t0;
+        let probe = self.probe;
+        let tests = probe == 8;
+        let frame_cap = if probe == SERVICE { 0 } else { 256 };
         let now_s = (rd(CP2AP_MSG), rd(IPC + 0x80C), PHONE_ACTIVE.get());
-        if now_s != last && changes < 32 {
+        if now_s != self.last && self.changes < 32 {
             line(rep, alloc::format!("t={} ms: cp2ap_msg G#{:X} cp2ap_status G#{:X} PHONE_ACTIVE {}\n", since_us(t0) / 1000, now_s.0, now_s.1, now_s.2 as u32));
-            changes += 1;
+            self.changes += 1;
             if now_s.0 as u16 == CRASH_EXIT {
                 line(rep, alloc::format!("  CRASH_EXIT: the CP gave up\n"));
-                break;
+                return false;
             }
         }
-        last = now_s;
-        if probe >= 1 && !probed && since_us(t0) > 2_000_000 {
-            probed = true;
-            match sit_request(&mut link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
+        self.last = now_s;
+        let link = &mut self.link;
+        if probe >= 1 && !self.probed && since_us(t0) > 2_000_000 {
+            self.probed = true;
+            match sit_request(link, CH_FMT0, SIT_GET_RADIO_POWER, &[]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_GET_RADIO_POWER (G#{SIT_GET_RADIO_POWER:X}) token A#{tok} on ch A#{CH_FMT0}\n", since_us(t0) / 1000)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_GET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
             }
@@ -2254,87 +2345,87 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
         // Stage e: what Android's telephony does for its data SIM once the SIM is ready — the preferred data modem (one byte, the stack's index: ProtocolPsBuilder::BuildSetPreferredDataModem), then allow data (SIT_SET_PS_SERVICE, one byte 1: ProtocolNetworkBuilder::BuildAllowData), both on that stack's channel. The SIM sits on stack 1 here (its confpack is us_vzw).
         // Stage f: the initial-attach APN on the data SIM's stack before data is allowed, as Android's telephony sets it once the SIM is ready.
         // Stage G#10: read-only queries for what else keeps the data SIM off the network: the stack's enabled state, the carrier-restriction (SIM lock) policy, the voice registration, the network-selection mode, the preferred network type, packet service and the allowed networks.
-        if probe >= 6 && !queried && since_us(t0) > 8_000_000 {
-            queried = true;
+        if probe >= 6 && !self.queried && since_us(t0) > 8_000_000 {
+            self.queried = true;
             for id in [SIT_GET_STACK_STATUS, SIT_GET_CARRIER_RESTRICTIONS_V2, 0x0700, 0x0703, 0x070B, 0x0711, 0x0750] {
-                if let Err(e) = sit_request(&mut link, CH_FMT0 + 1, id, &[]) {
+                if let Err(e) = sit_request(link, CH_FMT0 + 1, id, &[]) {
                     line(rep, alloc::format!("t={} ms: G#{id:X} not sent: {e}\n", since_us(t0) / 1000));
                 }
             }
         }
         // Stage G#10: the data stack's radio cycled once the carrier pack is in (off at 9 s, on at 9.5 s): the first power-on went out before the manifest swapped the pack.
-        if probe >= 6 && cycled < 2 && since_us(t0) > 9_000_000 + 500_000 * cycled as u64 {
-            let v = if cycled == 0 { 1u8 } else { 2 };
-            cycled += 1;
-            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[v, 0, 0, 0, 0, 0]) {
+        if probe >= 6 && self.cycled < 2 && since_us(t0) > 9_000_000 + 500_000 * self.cycled as u64 {
+            let v = if self.cycled == 0 { 1u8 } else { 2 };
+            self.cycled += 1;
+            match sit_request(link, CH_FMT0 + 1, SIT_SET_RADIO_POWER, &[v, 0, 0, 0, 0, 0]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER {} ch A#{} token A#{tok}\n", since_us(t0) / 1000, if v == 1 { "off" } else { "on" }, CH_FMT0 + 1)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         // Stage G#10: the SIM's applications enabled (SIT_SET_UICC_SUBSCRIPTION, one byte 1: ProtocolSimBuilder::BuildSetUicc), what Android's enableUiccApplications(true) sends for each SIM at boot.
-        if probe >= 6 && !uicc_on && since_us(t0) > 6_200_000 {
-            uicc_on = true;
-            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_UICC_SUBSCRIPTION, &[1]) {
+        if probe >= 6 && !self.uicc_on && since_us(t0) > 6_200_000 {
+            self.uicc_on = true;
+            match sit_request(link, CH_FMT0 + 1, SIT_SET_UICC_SUBSCRIPTION, &[1]) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_UICC_SUBSCRIPTION 1 ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_UICC_SUBSCRIPTION not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         // Stage G#10: the data profiles instead — Android's RIL never sends SIT_SET_INITIAL_ATTACH_APN on this build; the attach APN rides in the profile table (the IMS profile's types carry IA).
-        if probe >= 6 && !ia_set && since_us(t0) > 6_500_000 {
-            ia_set = true;
+        if probe >= 6 && !self.ia_set && since_us(t0) > 6_500_000 {
+            self.ia_set = true;
             let ch = CH_FMT0 + 1;
             for p in VZW_PROFILES.iter() {
-                match sit_request(&mut link, ch, SIT_SET_DATA_PROFILE, &data_profile_params(p)) {
+                match sit_request(link, ch, SIT_SET_DATA_PROFILE, &data_profile_params(p)) {
                     Ok(_) => {}
                     Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_DATA_PROFILE not sent: {e}\n", since_us(t0) / 1000)),
                 }
             }
             line(rep, alloc::format!("t={} ms: -> SIT_SET_DATA_PROFILE x A#{} on ch A#{ch}\n", since_us(t0) / 1000, VZW_PROFILES.len()));
         }
-        if probe == 5 && !ia_set && since_us(t0) > 6_500_000 {
-            ia_set = true;
+        if probe == 5 && !self.ia_set && since_us(t0) > 6_500_000 {
+            self.ia_set = true;
             let ch = CH_FMT0 + 1;
-            match sit_request(&mut link, ch, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN)) {
+            match sit_request(link, ch, SIT_SET_INITIAL_ATTACH_APN, &initial_attach_params(ATTACH_APN)) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_INITIAL_ATTACH_APN {} IPV4V6 (roaming IPV6) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(ATTACH_APN))),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_INITIAL_ATTACH_APN not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         // Stage G#10: the allowed networks set (SIT_SET_ALLOW_NETWORK, a u32 RAT bitmap in the CP's numbering: ProtocolNetworkBuilder::BuildSetAllowedNetworkTypeBitmap). Android's boot trace (2026-10-29, the radio log): the data stack sits not searching until SET_DATA_PROFILE, SET_INITIAL_ATTACH_APN and then SET_ALLOWED_NETWORK_TYPES_BITMAP, and is home on LTE 12 s after the last. The mask written is the one the CP itself reports (GET_ALLOW_NETWORK, G#4_03FE).
-        if probe >= 6 && !allow_set && since_us(t0) > 6_800_000 {
-            allow_set = true;
-            match sit_request(&mut link, CH_FMT0 + 1, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes()) {
+        if probe >= 6 && !self.allow_set && since_us(t0) > 6_800_000 {
+            self.allow_set = true;
+            match sit_request(link, CH_FMT0 + 1, SIT_SET_ALLOW_NETWORK, &ALLOWED_RATS.to_le_bytes()) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_ALLOW_NETWORK G#{ALLOWED_RATS:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, CH_FMT0 + 1)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_ALLOW_NETWORK not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
         // Stage G#12: the internet data call once the data stack is home (registration state 1) or roaming (5): one SIT_SETUP_DATA_CALL on VZWINTERNET, as Android's RIL sends it after registering.
-        if probe >= 8 && !call_sent && matches!(reg_last[1], Some([1 | 5, ..])) {
-            call_sent = true;
-            match sit_request(&mut link, CH_FMT0 + 1, SIT_SETUP_DATA_CALL, &setup_data_call_params(DATA_APN, DATA_TYPES, DATA_CID)) {
+        if probe >= 8 && !self.call_sent && matches!(self.reg_last[1], Some([1 | 5, ..])) {
+            self.call_sent = true;
+            match sit_request(link, CH_FMT0 + 1, SIT_SETUP_DATA_CALL, &setup_data_call_params(DATA_APN, DATA_TYPES, DATA_CID)) {
                 Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SETUP_DATA_CALL {} cid G#{DATA_CID:X} ch A#{} token A#{tok}\n", since_us(t0) / 1000, alloc::string::String::from_utf8_lossy(DATA_APN), CH_FMT0 + 1)),
                 Err(e) => line(rep, alloc::format!("t={} ms: SIT_SETUP_DATA_CALL not sent: {e}\n", since_us(t0) / 1000)),
             }
         }
-        // Stage G#12: a second after the call is up, one IPv6 router solicitation up its rmnet channel: the gateway's advertisement coming back down proves both packet paths.
-        if let (false, Some((t_up, cid, v6))) = (rs_sent, call_up) {
-            if since_us(t0) > t_up + 1_000_000 {
-                rs_sent = true;
-                let ch = CH_PDP_0 + cid - 1;
-                let iid: [u8; 8] = v6[8..].try_into().unwrap();
+        // Stage G#12's test: a second after the call is up, one IPv6 router solicitation and one ICMPv6 echo request up its rmnet channel: the reply coming back down proves both packet paths.
+        if let (true, false, Some(c)) = (tests, self.rs_sent, self.call) {
+            if since_us(t0) > c.t_up + 1_000_000 {
+                self.rs_sent = true;
+                let ch = CH_PDP_0 + c.cid - 1;
+                let iid: [u8; 8] = c.v6[8..].try_into().unwrap();
                 match pktproc_ul_send(ch, &router_solicitation(&iid)) {
-                    Ok(()) => line(rep, alloc::format!("t={} ms: -> UL IPv6 router solicitation on ch A#{ch} (cid G#{cid:X})\n", since_us(t0) / 1000)),
+                    Ok(()) => line(rep, alloc::format!("t={} ms: -> UL IPv6 router solicitation on ch A#{ch} (cid G#{:X})\n", since_us(t0) / 1000, c.cid)),
                     Err(e) => line(rep, alloc::format!("t={} ms: router solicitation not sent: {e}\n", since_us(t0) / 1000)),
                 }
-                match pktproc_ul_send(ch, &echo_request(&v6, &PING_TARGET)) {
+                match pktproc_ul_send(ch, &echo_request(&c.v6, &PING_TARGET)) {
                     Ok(()) => line(rep, alloc::format!("t={} ms: -> UL ICMPv6 echo request to a public resolver on ch A#{ch}\n", since_us(t0) / 1000)),
                     Err(e) => line(rep, alloc::format!("t={} ms: echo request not sent: {e}\n", since_us(t0) / 1000)),
                 }
             }
         }
-        // Stage G#12: every 4 s once the call is up, the packet queues' pointers: UL fore/rear per queue (rear moving = the CP took a packet), DL fore/rear per queue.
-        if let Some((t_up, _, _)) = call_up {
-            if probe >= 8 && since_us(t0) > t_up + 2_000_000 + 4_000_000 * pp_reports as u64 && pp_reports < 8 {
-                pp_reports += 1;
+        // Stage G#12's test: every 4 s once the call is up, the packet queues' pointers: UL fore/rear per queue (rear moving = the CP took a packet), DL fore/rear per queue.
+        if let (true, Some(c)) = (tests, self.call) {
+            if since_us(t0) > c.t_up + 2_000_000 + 4_000_000 * self.pp_reports as u64 && self.pp_reports < 8 {
+                self.pp_reports += 1;
                 let mut s = alloc::string::String::new();
                 for q in 0..2usize {
                     let e = PP_UL_INFO + 8 + 20 * q;
@@ -2346,37 +2437,38 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 line(rep, alloc::format!("t={} ms: queues (fore/rear):{s}; ap2cp G#{:X} cp2ap G#{:X}\n", since_us(t0) / 1000, rd(AP2CP_MSG), rd(CP2AP_MSG)));
             }
         }
-        if probe >= 4 && !data_on && since_us(t0) > 7_000_000 {
-            data_on = true;
+        if probe >= 4 && !self.data_on && since_us(t0) > 7_000_000 {
+            self.data_on = true;
             let ch = CH_FMT0 + 1;
             for (id, v, name) in [(SIT_SET_PREFERRED_DATA_MODEM, 1u8, "SIT_SET_PREFERRED_DATA_MODEM 1"), (SIT_SET_PS_SERVICE, 1, "SIT_SET_PS_SERVICE on")] {
-                match sit_request(&mut link, ch, id, &[v]) {
+                match sit_request(link, ch, id, &[v]) {
                     Ok(tok) => line(rep, alloc::format!("t={} ms: -> {name} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
                     Err(e) => line(rep, alloc::format!("t={} ms: {name} not sent: {e}\n", since_us(t0) / 1000)),
                 }
             }
         }
-        if probe >= 3 && !sim_asked && since_us(t0) > 6_000_000 {
-            sim_asked = true;
+        if probe >= 3 && !self.sim_asked && since_us(t0) > 6_000_000 {
+            self.sim_asked = true;
             for ch in [CH_FMT0, CH_FMT0 + 1] {
-                if let Err(e) = sit_request(&mut link, ch, SIT_GET_SIM_STATUS, &[]) {
+                if let Err(e) = sit_request(link, ch, SIT_GET_SIM_STATUS, &[]) {
                     line(rep, alloc::format!("t={} ms: SIT_GET_SIM_STATUS not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
                 }
             }
         }
-        if probe >= 3 && since_us(t0) > next_reg {
-            next_reg += 5_000_000;
+        // The data registration polled every 5 s (the stage watch), or every 64 s once the service has its call (the CP's indications carry the changes; the poll is the backstop).
+        if probe >= 3 && since_us(t0) > self.next_reg {
+            self.next_reg += if probe == SERVICE && self.call.is_some() { 64_000_000 } else { 5_000_000 };
             for ch in [CH_FMT0, CH_FMT0 + 1] {
-                if let Err(e) = sit_request(&mut link, ch, SIT_GET_PS_REG_STATE, &[]) {
+                if let Err(e) = sit_request(link, ch, SIT_GET_PS_REG_STATE, &[]) {
                     line(rep, alloc::format!("t={} ms: SIT_GET_PS_REG_STATE not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000));
                 }
             }
         }
-        if probe >= 2 && !powered && since_us(t0) > 3_000_000 {
-            powered = true;
+        if probe >= 2 && !self.powered && since_us(t0) > 3_000_000 {
+            self.powered = true;
             // state 2 = on; the two option bytes are Android's forEmergencyCall and preferredForEmergencyCall (NetworkService::DoRadioPower → ProtocolNetworkBuilder::BuildRadioPower): both 0, a plain power-on for data. Each stack has its own RIL channel (245 the first SIM slot, 246 the second) and is powered on its own, as each Android RIL instance does.
             for ch in [CH_FMT0, CH_FMT0 + 1] {
-                match sit_request(&mut link, ch, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
+                match sit_request(link, ch, SIT_SET_RADIO_POWER, &[2, 0, 0, 0, 0, 0]) {
                     Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_SET_RADIO_POWER on (G#{SIT_SET_RADIO_POWER:X}) ch A#{ch} token A#{tok}\n", since_us(t0) / 1000)),
                     Err(e) => line(rep, alloc::format!("t={} ms: SIT_SET_RADIO_POWER not sent on ch A#{ch}: {e}\n", since_us(t0) / 1000)),
                 }
@@ -2391,11 +2483,11 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             let at = |o: u32| rd8(base + ((tail + o) % len_max) as usize);
             if at(0) != 0xCD || at(1) != 0xAB {
                 line(rep, alloc::format!("t={} ms: {name} head {head} tail {tail}: no frame header (G#{:02X}{:02X}), ring left\n", since_us(t0) / 1000, at(1), at(0)));
-                return;
+                return false;
             }
             let flen = (at(6) as u32 | (at(7) as u32) << 8).max(12);
             let ch = at(8);
-            per_ch[ch as usize] += 1;
+            self.per_ch[ch as usize] += 1;
             // Stage G#11: the gipc service on oem_ipc3 (channel 132) — a request {1 type 0, 2 channel, 3 service hash, 4 method hash, 7 sequence, payload} is answered as Android answers the CP's temperature report: {1 type 1, the same channel, hashes and sequence}, no payload.
             if probe >= 7 && name == "fmt" && ch == 132 {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
@@ -2408,8 +2500,9 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                         r.extend_from_slice(&(m as u32).to_le_bytes());
                         r.push(0x38);
                         pb_put_varint(&mut r, seq);
-                        match fmt_send(&mut link, 132, &r) {
-                            Ok(()) => line(rep, alloc::format!("t={} ms: gipc response to G#{svc:X}/G#{m:X} seq A#{seq}\n", since_us(t0) / 1000)),
+                        match fmt_send(&mut self.link, 132, &r) {
+                            Ok(()) if probe != SERVICE => line(rep, alloc::format!("t={} ms: gipc response to G#{svc:X}/G#{m:X} seq A#{seq}\n", since_us(t0) / 1000)),
+                            Ok(()) => {}
                             Err(e) => line(rep, alloc::format!("  gipc response not sent: {e}\n")),
                         }
                     }
@@ -2417,14 +2510,14 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             }
             if probe >= 1 && name == "fmt" && ch == CH_MODEM_SVC {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
-                if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut props) {
+                if let Some(replies) = modem_svc(rep, since_us(t0) / 1000, &body, &mut self.props) {
                     for reply in replies {
                         // The FMT ring is 4 KiB: a burst of replies waits for the CP to drain it, up to 200 ms a frame.
                         let t1 = now();
-                        let mut r = fmt_send(&mut link, CH_MODEM_SVC, &reply);
+                        let mut r = fmt_send(&mut self.link, CH_MODEM_SVC, &reply);
                         while r.is_err() && since_us(t1) < 200_000 {
                             us(100);
-                            r = fmt_send(&mut link, CH_MODEM_SVC, &reply);
+                            r = fmt_send(&mut self.link, CH_MODEM_SVC, &reply);
                         }
                         if let Err(e) = r {
                             line(rep, alloc::format!("  modem_svc reply not sent: {e}\n"));
@@ -2433,17 +2526,36 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                     }
                 }
             }
+            // The call's packets also come down the RAW ring as SIT frames on its rmnet channel (2026-10-29: the answers to UDP DNS queries did, while an ICMPv6 echo reply came through pktproc): the frame's payload is the IP packet, queued for `rmnet` like a pktproc one.
+            if probe == SERVICE && name == "raw" && Some(ch) == self.call_ch() {
+                let n = flen - 12;
+                if n == 0 || n > PP_MAX_PACKET {
+                    self.dl_bad += 1;
+                } else {
+                    if self.dl_log > 0 {
+                        self.dl_log -= 1;
+                        let v: Vec<u8> = (0..n.min(64)).map(|i| at(12 + i)).collect();
+                        line(rep, alloc::format!("DL raw ring ch A#{ch}: {}\n", ul_shape(&v, true)));
+                    }
+                    if self.dl.len() == DL_QUEUE {
+                        self.dl.pop_front();
+                        self.dl_dropped += 1;
+                    }
+                    self.dl.push_back((0..n).map(|i| at(12 + i)).collect());
+                    self.packets += 1;
+                }
+            }
             // The remote-file service answers for itself (rfs logs each request, never the data); its frames are not logged raw.
             let served_rfs = probe >= 1 && name == "raw" && ch == CH_RFS;
             if served_rfs {
                 let body: Vec<u8> = (0..flen - 12).map(|i| at(12 + i)).collect();
-                rfs(rep, since_us(t0) / 1000, &body, &mut link, &mut rfs_st);
+                rfs(rep, since_us(t0) / 1000, &body, &mut self.link, &mut self.rfs_st);
             }
             // A RIL message: the RCM header (type, id, length, then token and error for a response) decoded; the parameters as their first 16 bytes at most. The frame length is the CP's: a frame too short for the header it claims is logged raw below instead of read past its end.
             let ril = ch == CH_FMT0 || ch == CH_FMT0 + 1;
             // The carrier-config handshake (stage G#10 on): the CP's G#4602 indication (the SIM's identity for the carrier lookup) is answered with SIT_OEM_SET_CARRIER_CONFIG_MANIFEST on the same stack.
             if probe >= 6 && ril && flen >= 12 + 8 && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x4602 {
-                match sit_request(&mut link, ch, SIT_OEM_SET_CARRIER_CONFIG_MANIFEST, &carrier_manifest_params()) {
+                match sit_request(&mut self.link, ch, SIT_OEM_SET_CARRIER_CONFIG_MANIFEST, &carrier_manifest_params()) {
                     Ok(tok) => line(rep, alloc::format!("t={} ms: -> SIT_OEM_SET_CARRIER_CONFIG_MANIFEST {} manifest {} ch A#{ch} token A#{tok}\n", since_us(t0) / 1000, CARRIER_CONFIG_ROOT, VZW_MANIFEST)),
                     Err(e) => line(rep, alloc::format!("t={} ms: carrier manifest not sent: {e}\n", since_us(t0) / 1000)),
                 }
@@ -2455,21 +2567,27 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
             if ril && at(12) == 1 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0701 && flen >= 12 + 12 + 4 {
                 let st = [at(24), at(25), at(26), at(27)];
                 let k = (ch - CH_FMT0) as usize;
-                if reg_last[k] != Some(st) {
-                    reg_last[k] = Some(st);
-                    line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hex(&|i| st[i as usize], 4)));
+                if self.reg_last[k] != Some(st) {
+                    self.reg_last[k] = Some(st);
+                    line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hexs(&|i| st[i as usize], 4)));
                 }
             }
-            // A data-call reply, past the cap too: the RCM error, then the call's status (u16), id, active flag and PDP type (params G#0..G#4); the addresses, DNS and gateway after them are the line's and stay hidden.
-            if ril && at(12) == 1 && (at(14) as u16 | (at(15) as u16) << 8) == SIT_SETUP_DATA_CALL && flen >= 12 + 12 + 5 {
+            // A data-call reply, past the cap too: the RCM error, then the call's status (u16), id, active flag and PDP type (params G#0..G#4); the addresses, DNS and gateway after them are the line's and stay hidden. The reply is 304 bytes; one too short for the fields read here is the CP's malformed input and is not taken.
+            if ril && at(12) == 1 && (at(14) as u16 | (at(15) as u16) << 8) == SIT_SETUP_DATA_CALL && flen >= 12 + 0x8D {
                 line(rep, alloc::format!("t={} ms: ch A#{ch} data call reply: error G#{:X}, status G#{:X}, cid G#{:X}, active A#{}, PDP type A#{}\n", since_us(t0) / 1000, at(22), at(24) as u16 | (at(25) as u16) << 8, at(26), at(27), at(28)));
                 if at(22) == 0 && at(24) == 0 && at(25) == 0 && at(27) != 0 {
-                    // The IPv6 address the network gave the call (params G#9..G#18, after the IPv4 address): its low 64 bits are the interface id for the link-local source; kept for the packets, never shown.
-                    let mut v6 = [0u8; 16];
-                    for (i, x) in v6.iter_mut().enumerate() {
-                        *x = at(24 + 9 + i as u32);
+                    let m = |o: u32| at(12 + o);
+                    let mut c = Call { t_up: since_us(t0), cid: m(0xE), pdp: m(0x10), v4: [0; 4], v6: [0; 16], dns4: [0; 4], dns6: [0; 16], mtu: m(0x8B) as u16 | (m(0x8C) as u16) << 8 };
+                    for i in 0..4 {
+                        c.v4[i] = m(0x11 + i as u32);
+                        c.dns4[i] = m(0x26 + i as u32);
                     }
-                    call_up = Some((since_us(t0), at(26), v6));
+                    for i in 0..16 {
+                        c.v6[i] = m(0x15 + i as u32);
+                        c.dns6[i] = m(0x2A + i as u32);
+                    }
+                    line(rep, alloc::format!("t={} ms: data call up on rmnet ch A#{}, MTU A#{}\n", since_us(t0) / 1000, CH_PDP_0 + c.cid - 1, c.mtu));
+                    self.call = Some(c);
                 }
             }
             // The first physical-channel-config and NITZ indications (the stack camped on a cell) are logged past the cap too, header only.
@@ -2477,14 +2595,14 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                 let id = at(14) as u16 | (at(15) as u16) << 8;
                 let k = (ch - CH_FMT0) as usize;
                 let bit = match id { 0x0742 => 1u8, 0x0905 => 2, 0x0604 => 4, _ => 0 };
-                if bit != 0 && camp_seen[k] & bit == 0 {
-                    camp_seen[k] |= bit;
+                if bit != 0 && self.camp_seen[k] & bit == 0 {
+                    self.camp_seen[k] |= bit;
                     line(rep, alloc::format!("t={} ms: ch A#{ch} first indication G#{id:04X} {}\n", since_us(t0) / 1000, sit_name(id)));
                 }
             }
             if quiet {
                 // Counted in per_ch only.
-            } else if ril && flen >= 12 + rcm_hdr && frames < 256 {
+            } else if ril && flen >= 12 + rcm_hdr && self.frames < frame_cap {
                 let b = |i: u32| at(12 + i);
                 let (ty, id, len) = (b(0), b(2) as u16 | (b(3) as u16) << 8, b(4) as u32 | (b(5) as u32) << 8);
                 let kind = match ty {
@@ -2504,15 +2622,15 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                     let mut s = alloc::format!("card G#{:X} apps A#{apps}", params(0));
                     for k in 0..apps.min(4) {
                         if flen - 12 >= rcm_hdr + 3 + 63 * k + 5 {
-                            s.push_str(&alloc::format!(" [{}]", hex(&|i| params(3 + 63 * k + i), 5)));
+                            s.push_str(&alloc::format!(" [{}]", hexs(&|i| params(3 + 63 * k + i), 5)));
                         }
                     }
                     line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIM status: {s}\n", since_us(t0) / 1000));
                 }
                 let resp = if ty == 1 { alloc::format!(" token A#{tok} error G#{:X}", b(10)) } else { alloc::string::String::new() };
-                line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} {} len A#{len}{resp}: {}\n", since_us(t0) / 1000, sit_name(id), hex(&params, np)));
-                frames += 1;
-            } else if frames < 256 {
+                line(rep, alloc::format!("t={} ms: fmt ch A#{ch} SIT {kind} G#{id:04X} {} len A#{len}{resp}: {}\n", since_us(t0) / 1000, sit_name(id), hexs(&params, np)));
+                self.frames += 1;
+            } else if self.frames < frame_cap {
                 let named = ch == 41 || (129..=136).contains(&ch);
                 let n = (flen - 12).min(if named { 160 } else { 32 });
                 let body = |i: u32| at(12 + i);
@@ -2523,25 +2641,26 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                         txt.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });
                     }
                 }
-                line(rep, alloc::format!("t={} ms: {name} ch A#{ch} cfg G#{:02X}{:02X} len A#{flen}: {} |{txt}|\n", since_us(t0) / 1000, at(5), at(4), hex(&body, n)));
-                frames += 1;
+                line(rep, alloc::format!("t={} ms: {name} ch A#{ch} cfg G#{:02X}{:02X} len A#{flen}: {} |{txt}|\n", since_us(t0) / 1000, at(5), at(4), hexs(&body, n)));
+                self.frames += 1;
             }
             wr(tailr, (tail + ((flen + 7) & !7)) % len_max);
         }
+        let call_ch = self.call_ch();
         for q in 0..PP_QUEUES {
             let rear = rd(pp_qinfo(q) + 16);
             if rear >= PP_NUM_DESC {
                 line(rep, alloc::format!("t={} ms: pktproc q{q} rear_ptr A#{rear} out of range, queue left\n", since_us(t0) / 1000));
-                return;
+                return false;
             }
-            while done[q as usize] != rear {
-                let i = done[q as usize];
+            while self.done[q as usize] != rear {
+                let i = self.done[q as usize];
                 let d = rd64(pp_desc(q, i));
                 let w = rd64(pp_desc(q, i) + 8);
                 let (len, ch) = (w as u16 as u32, (w >> 48) as u8);
-                if packets < 32 {
-                    let b = pp_buf_ap(q, i);
-                    let body = |o: u32| rd8(b + o as usize);
+                let b = pp_buf_ap(q, i);
+                let body = |o: u32| rd8(b + o as usize);
+                if self.packets < 32 && probe != SERVICE {
                     // The IP header's version and protocol (IPv6: next header, and an ICMPv6 message's type), never its addresses: they are the line's and its peers'.
                     let ip = match body(0) >> 4 {
                         4 if len >= 20 => alloc::format!("IPv4 protocol A#{}", body(9)),
@@ -2551,26 +2670,274 @@ fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
                     };
                     line(rep, alloc::format!("t={} ms: pktproc q{q} desc A#{i} ch A#{ch} len A#{len} done {}: {ip}\n", since_us(t0) / 1000, (d & PP_DONE != 0) as u32));
                 }
-                packets += 1;
+                if self.dl_log > 0 {
+                    self.dl_log -= 1;
+                    let v: Vec<u8> = (0..len.min(64)).map(body).collect();
+                    line(rep, alloc::format!("DL q{q} ch A#{ch}: {}\n", ul_shape(&v, true)));
+                }
+                self.packets += 1;
+                // The service keeps the call's packets for `rmnet`. The length is the CP's: one beyond the largest packet it was told it may write (or empty) is malformed and dropped, never read past its buffer.
+                if probe == SERVICE && Some(ch) == call_ch {
+                    if len == 0 || len > PP_MAX_PACKET {
+                        self.dl_bad += 1;
+                    } else {
+                        if self.dl.len() == DL_QUEUE {
+                            self.dl.pop_front();
+                            self.dl_dropped += 1;
+                        }
+                        self.dl.push_back((0..len).map(body).collect());
+                    }
+                }
                 // Repost at fore (Linux's refill): the slot one behind the rear is free now that its packet is read.
                 let fore = rd(pp_qinfo(q) + 12);
                 pp_post(q, fore);
                 unsafe { core::arch::asm!("dsb sy") };
                 wr(pp_qinfo(q) + 12, (fore + 1) % PP_NUM_DESC);
-                done[q as usize] = (i + 1) % PP_NUM_DESC;
+                self.done[q as usize] = (i + 1) % PP_NUM_DESC;
             }
         }
         let msi = rd(DBI + 0x830);
         if msi != 0 {
             wr(DBI + 0x830, msi);
         }
+        true
+    }
+
+    fn summary(&self, rep: &mut Vec<u8>) {
+        let mut chs = alloc::string::String::new();
+        for (ch, &n) in self.per_ch.iter().enumerate() {
+            if n != 0 {
+                chs.push_str(&alloc::format!(" ch A#{ch}: A#{n}"));
+            }
+        }
+        line(rep, alloc::format!("watched: A#{} frames logged ({}), A#{} DL packets; cp2ap_msg G#{:X} PHONE_ACTIVE {}\n", self.frames, if chs.is_empty() { " none" } else { &chs }, self.packets, rd(CP2AP_MSG), PHONE_ACTIVE.get() as u32));
+    }
+}
+
+/// After INIT_END, for a diag stage: 90 s of passes, the CP's frames and the DL packets logged as they come (see `Online::step`), then a count per channel.
+fn watch_online(rep: &mut Vec<u8>, t0: u64, probe: u8) {
+    let mut o = Online::new(t0, probe);
+    line(rep, alloc::format!("online: magic G#{:X} mem_access {}, watching 90 s\n", rd(IPC), rd(IPC + 4)));
+    while since_us(t0) < 90_000_000 && o.step(rep) {
         us(500);
     }
-    let mut chs = alloc::string::String::new();
-    for (ch, &n) in per_ch.iter().enumerate() {
-        if n != 0 {
-            chs.push_str(&alloc::format!(" ch A#{ch}: A#{n}"));
+    o.summary(rep);
+}
+
+// ---------------------------------------------------------------------------
+// The service: `up` brings the modem to a data call and leaves it running; the kernel's service loop calls `service_poll` every pass; processes holding the `rmnet` object reach the call's packets through `rmnet_call` (process.rs). Phase 1 of the owner's plan (2026-10-29): the modem stays in the kernel until it moves to its own driver process, which will serve `rmnet` with the same requests.
+
+/// The online modem, touched only under the kernel lock (the service loop's `service_poll` takes it; a syscall holds it).
+static mut ONLINE: Option<Online> = None;
+
+/// `diag modem up`: the cold bring-up (stages 0-7), START and the handshake with the packet rings, then the service, which registers, sets up the internet call and keeps it. Its log lines go to the flash log from then on.
+pub fn up(rep: &mut Vec<u8>) {
+    if crate::process::with_lock(|| unsafe { (*(&raw const ONLINE)).is_some() }) {
+        return line(rep, alloc::format!("modem already up\n"));
+    }
+    if !survey(rep) {
+        return;
+    }
+    power_on(rep);
+    ms(200);
+    phy(rep);
+    if !link(rep) || !endpoint(rep) {
+        return;
+    }
+    rom_boot(rep);
+    if rd(BOOT_STAGE) != 0x3FFF || !link_cycle(rep) {
+        return;
+    }
+    let mut seq = None;
+    download(rep, &mut seq);
+    let Some(s) = seq else { return };
+    if !start_and_handshake(rep, s, true, SERVICE) {
+        return;
+    }
+    let o = Online::new(now(), SERVICE);
+    crate::process::with_lock(|| unsafe { *(&raw mut ONLINE) = Some(o) });
+    line(rep, alloc::format!("modem up: the service registers and brings up the internet call; `diag modem state` follows it\n"));
+}
+
+/// `diag modem down`: the service stopped and the CP powered down.
+pub fn down(rep: &mut Vec<u8>) {
+    crate::process::with_lock(|| unsafe { *(&raw mut ONLINE) = None });
+    off(rep);
+}
+
+/// One service pass, from the kernel's service loop (not under the kernel lock; it takes it). Its log lines go to the flash log; a CP that gave up ends the service.
+pub fn service_poll() {
+    let mut rep = Vec::new();
+    let alive = crate::process::with_lock(|| unsafe { (*(&raw mut ONLINE)).as_mut().map(|o| o.step(&mut rep)) });
+    if alive == Some(false) {
+        crate::process::with_lock(|| unsafe { *(&raw mut ONLINE) = None });
+        rep.extend_from_slice(b"modem service ended\n");
+    }
+    for l in rep.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        if let Ok(t) = core::str::from_utf8(l) {
+            crate::flashlog::line(&alloc::format!("modem: {t}"));
         }
     }
-    line(rep, alloc::format!("watched: A#{frames} frames logged ({}), A#{packets} DL packets; cp2ap_msg G#{:X} PHONE_ACTIVE {}\n", if chs.is_empty() { " none" } else { &chs }, rd(CP2AP_MSG), PHONE_ACTIVE.get() as u32));
+}
+
+/// `diag modem ping`: one ICMPv6 echo request from the call's address to a public resolver, straight up the call's channel (as stage G#12's test): the reply shows in `diag modem state`'s DL count.
+pub fn ping(rep: &mut Vec<u8>) {
+    crate::process::with_lock(|| unsafe {
+        match (*(&raw const ONLINE)).as_ref().and_then(|o| o.call) {
+            None => line(rep, alloc::format!("no data call\n")),
+            Some(c) => match pktproc_ul_send(CH_PDP_0 + c.cid - 1, &echo_request(&c.v6, &PING_TARGET)) {
+                Ok(()) => line(rep, alloc::format!("echo request sent\n")),
+                Err(e) => line(rep, alloc::format!("echo request not sent: {e}\n")),
+            },
+        }
+    });
+}
+
+/// `diag modem probe`: three packets up the running call to tell what comes back — an ICMPv6 echo request to the call's first IPv6 DNS server, a UDP DNS query (AAAA fgtw.org) to Google's resolver, the same query to the call's DNS server. The DL packets that answer are logged by shape (flash log, `modem: DL …`).
+pub fn probe(rep: &mut Vec<u8>) {
+    crate::process::with_lock(|| unsafe {
+        let Some(o) = (*(&raw mut ONLINE)).as_mut() else { return line(rep, alloc::format!("no modem service\n")) };
+        let Some(c) = o.call else { return line(rep, alloc::format!("no data call\n")) };
+        o.dl_log = 8;
+        let ch = CH_PDP_0 + c.cid - 1;
+        let mut q = alloc::vec![0x12u8, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in [&b"fgtw"[..], b"org"] {
+            q.push(l.len() as u8);
+            q.extend_from_slice(l);
+        }
+        q.extend_from_slice(&[0, 0, 28, 0, 1]);
+        let udp = |dst: &[u8; 16]| {
+            let n = 8 + q.len();
+            let mut p = alloc::vec![0u8; 40 + n];
+            p[0] = 0x60;
+            p[4..6].copy_from_slice(&(n as u16).to_be_bytes());
+            p[6] = 17;
+            p[7] = 64;
+            p[8..24].copy_from_slice(&c.v6);
+            p[24..40].copy_from_slice(dst);
+            p[40..42].copy_from_slice(&53054u16.to_be_bytes());
+            p[42..44].copy_from_slice(&53u16.to_be_bytes());
+            p[44..46].copy_from_slice(&(n as u16).to_be_bytes());
+            p[48..].copy_from_slice(&q);
+            // The UDP checksum over the same pseudo-header as ICMPv6's, next header 17.
+            let mut s: u32 = n as u32 + 17;
+            for i in (8..p.len()).step_by(2) {
+                s += (p[i] as u32) << 8 | *p.get(i + 1).unwrap_or(&0) as u32;
+            }
+            while s >> 16 != 0 {
+                s = (s & 0xFFFF) + (s >> 16);
+            }
+            p[46..48].copy_from_slice(&(!(s as u16)).to_be_bytes());
+            p
+        };
+        for (what, pkt) in [("echo to the call's DNS server", echo_request(&c.v6, &c.dns6).to_vec()), ("DNS query to Google's resolver", udp(&PING_TARGET)), ("DNS query to the call's DNS server", udp(&c.dns6))] {
+            match pktproc_ul_send(ch, &pkt) {
+                Ok(()) => line(rep, alloc::format!("sent: {what}\n")),
+                Err(e) => line(rep, alloc::format!("{what} not sent: {e}\n")),
+            }
+            ms(50);
+        }
+    });
+}
+
+/// `diag modem state`: the service's registration, call and packet counts (never the addresses).
+pub fn state(rep: &mut Vec<u8>) {
+    crate::process::with_lock(|| unsafe {
+        match (*(&raw const ONLINE)).as_ref() {
+            None => line(rep, alloc::format!("modem service not running\n")),
+            Some(o) => {
+                let reg = |k: usize| o.reg_last[k].map(|s| hexs(&|i| s[i as usize], 4)).unwrap_or_else(|| alloc::string::String::from("unknown"));
+                line(rep, alloc::format!("up A#{} s; PS registration ch A#245 {}, ch A#246 {}\n", since_us(o.t0) / 1_000_000, reg(0), reg(1)));
+                match o.call {
+                    Some(c) => line(rep, alloc::format!("data call cid G#{:X} on rmnet ch A#{}, PDP type A#{}, MTU A#{}, IPv4 {}, IPv6 {}\n", c.cid, CH_PDP_0 + c.cid - 1, c.pdp, c.mtu, ["no", "yes"][(c.v4 != [0; 4]) as usize], ["no", "yes"][(c.v6 != [0; 16]) as usize])),
+                    None => line(rep, alloc::format!("no data call yet\n")),
+                }
+                line(rep, alloc::format!("DL packets A#{} (queued A#{}, dropped A#{}, malformed A#{}); UL sent A#{}, refused full A#{}\n", o.packets, o.dl.len(), o.dl_dropped, o.dl_bad, o.ul_sent, o.ul_full));
+                let mut s = alloc::string::String::new();
+                for q in 0..2usize {
+                    let e = PP_UL_INFO + 8 + 20 * q;
+                    s.push_str(&alloc::format!(" UL{q} A#{}/A#{}", rd(e + 12), rd(e + 16)));
+                }
+                for q in 0..PP_QUEUES {
+                    s.push_str(&alloc::format!(" DL{q} A#{}/A#{}", rd(pp_qinfo(q) + 12), rd(pp_qinfo(q) + 16)));
+                }
+                line(rep, alloc::format!("queues (fore/rear):{s}\n"));
+                let mut chs = alloc::string::String::new();
+                for (ch, &n) in o.per_ch.iter().enumerate() {
+                    if n != 0 {
+                        chs.push_str(&alloc::format!(" ch A#{ch}: A#{n}"));
+                    }
+                }
+                line(rep, alloc::format!("ring frames by channel:{chs}\n"));
+            }
+        }
+    });
+}
+
+/// A packet's shape for the log, never the line's own address: IP version and lengths, protocol, the far end (the destination of a packet going up, `down` false; the source of one coming down), UDP ports, and whether the header and transport checksums verify.
+fn ul_shape(p: &[u8], down: bool) -> alloc::string::String {
+    let fold = |mut s: u32| {
+        while s >> 16 != 0 {
+            s = (s & 0xFFFF) + (s >> 16);
+        }
+        s
+    };
+    let sum = |b: &[u8]| b.chunks(2).map(|c| (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32).sum::<u32>();
+    match p.first().map(|b| b >> 4) {
+        Some(6) if p.len() >= 48 => {
+            let plen = u16::from_be_bytes([p[4], p[5]]) as usize;
+            let body = &p[40..(40 + plen).min(p.len())];
+            let ck = fold(sum(&p[8..40]) + plen as u32 + p[6] as u32 + sum(body));
+            alloc::format!("IPv6 len A#{} payload A#{} next A#{} hop A#{} {} {} ports A#{}->A#{} checksum {}", p.len(), plen, p[6], p[7], ["to", "from"][down as usize], hexs(&|i| p[if down { 8 } else { 24 } + i as usize], 16), u16::from_be_bytes([p[40], p[41]]), u16::from_be_bytes([p[42], p[43]]), if ck == 0xFFFF { "ok" } else { "BAD" })
+        }
+        Some(4) if p.len() >= 28 => {
+            let hdr = fold(sum(&p[..20]));
+            alloc::format!("IPv4 len A#{} total A#{} proto A#{} ttl A#{} {} A#{}.{}.{}.{} ports A#{}->A#{} header {}", p.len(), u16::from_be_bytes([p[2], p[3]]), p[9], p[8], ["to", "from"][down as usize], p[if down { 12 } else { 16 }], p[if down { 13 } else { 17 }], p[if down { 14 } else { 18 }], p[if down { 15 } else { 19 }], u16::from_be_bytes([p[20], p[21]]), u16::from_be_bytes([p[22], p[23]]), if hdr == 0xFFFF { "ok" } else { "BAD" })
+        }
+        v => alloc::format!("first nibble {v:?}, len A#{}", p.len()),
+    }
+}
+
+/// The `rmnet` object (process.rs SYS_CALL, under the kernel lock): the data call's IP packets for a process. Requests (first byte):
+/// - 1 SEND: an IP packet → [0] sent, [1] the UL queue is full (retry), [2] no data call, [3] bad request (empty, or longer than a UL buffer).
+/// - 2 RECV: → the oldest DL packet of the call, or nothing (length 0).
+/// - 3 INFO: → flags (bit 0 the call is up, bit 1 it has IPv4, bit 2 IPv6), MTU (u16 BE), IPv4 address (4), IPv6 address (16), the first DNS server's IPv4 (4) and IPv6 (16) — 43 bytes.
+pub fn rmnet_call(req: &[u8]) -> Vec<u8> {
+    let o = unsafe { (*(&raw mut ONLINE)).as_mut() };
+    match (req.first(), o) {
+        (Some(1), o) => {
+            let Some(o) = o else { return alloc::vec![2] };
+            let Some(ch) = o.call_ch() else { return alloc::vec![2] };
+            let pkt = &req[1..];
+            // The process's input: an empty packet or one longer than a UL buffer is refused, never written past the buffer.
+            if pkt.is_empty() || pkt.len() > PP_UL_PKT[PP_UL_NORM as usize] as usize {
+                return alloc::vec![3];
+            }
+            match pktproc_ul_send(ch, pkt) {
+                Ok(()) => {
+                    o.ul_sent += 1;
+                    alloc::vec![0]
+                }
+                Err(_) => {
+                    o.ul_full += 1;
+                    alloc::vec![1]
+                }
+            }
+        }
+        (Some(2), Some(o)) => o.dl.pop_front().unwrap_or_default(),
+        (Some(2), None) => Vec::new(),
+        (Some(3), o) => {
+            let mut r = alloc::vec![0u8; 43];
+            if let Some(c) = o.and_then(|o| o.call) {
+                r[0] = 1 | ((c.v4 != [0; 4]) as u8) << 1 | ((c.v6 != [0; 16]) as u8) << 2;
+                r[1..3].copy_from_slice(&c.mtu.to_be_bytes());
+                r[3..7].copy_from_slice(&c.v4);
+                r[7..23].copy_from_slice(&c.v6);
+                r[23..27].copy_from_slice(&c.dns4);
+                r[27..43].copy_from_slice(&c.dns6);
+            }
+            r
+        }
+        _ => alloc::vec![3],
+    }
 }

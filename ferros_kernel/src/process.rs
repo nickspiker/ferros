@@ -255,6 +255,8 @@ pub enum Object {
     Power(usize),
     /// A surface to be: a spawn turns it into one free surface of `surfaces`, the child's own (`Dma` of `surface-k`), at build. Never held: a parent that passes the whole `surfaces` region passes this instead (SYS_SPAWN), and `bridge spawn --dma surface` asks for it by name.
     NewSurface,
+    /// Served by the kernel (Phase 1, modem.rs `rmnet_call`): the cellular data call's IP packets. Phase 2 moves the modem to its own driver process, which serves an `rmnet` endpoint with the same requests.
+    Rmnet,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -292,6 +294,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Power(i) => (9, i as u64),
         Object::Ira => (10, 0),
         Object::NewSurface => (11, 0),
+        Object::Rmnet => (12, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -1511,9 +1514,23 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     f.x[0] = n as u64;
                     0
                 }
+                // The cellular link (modem.rs `rmnet_call`), answered at once under the lock this syscall holds.
+                Some((Object::Rmnet, r)) if r & RIGHT_SEND != 0 => {
+                    let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    let reply = crate::modem::rmnet_call(&msg);
+                    let n = reply.len().min(f.x[4] as usize);
+                    p.write(f.x[3], &reply[..n]);
+                    f.x[0] = n as u64;
+                    0
+                }
+                // CALL_LIVE (bit 63 of the reply length) and nobody can serve the endpoint: ERR now, not a wait for a server that may never come (the IP process at a boot where the WiFi driver failed, 2026-10-29).
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !has_receiver(ep) => {
+                    f.x[0] = ERR;
+                    0
+                }
                 Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
-                    t.state = State::Calling(f.x[3], f.x[4]);
+                    t.state = State::Calling(f.x[3], f.x[4] & !CALL_LIVE);
                     t.frame = *f;
                     tr(TR_CALL, cur, ep as u64);
                     kk.endpoints[ep].queue.push_back((cur, msg));
@@ -1706,6 +1723,35 @@ fn fail_callers(cspace: &[CapEntry]) {
     }
 }
 
+/// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no live process can receive on the endpoint, at the call or later when its last server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
+pub const CALL_LIVE: u64 = 1 << 63;
+
+/// Whether a live process (not one ending) holds the right to receive on endpoint `ep`.
+fn has_receiver(ep: usize) -> bool {
+    k().procs.iter().flatten().any(|p| !p.dying && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0))
+}
+
+/// After a process ends: each CALL_LIVE caller still queued on an endpoint nobody can serve any more gets ERR.
+fn fail_orphaned_calls() {
+    let kk = k();
+    for ep in 0..kk.endpoints.len() {
+        if kk.endpoints[ep].queue.is_empty() || has_receiver(ep) {
+            continue;
+        }
+        let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).collect();
+        for caller in queued {
+            if let Some(ct) = th(caller) {
+                if matches!(ct.state, State::Calling(..)) && ct.frame.x[4] & CALL_LIVE != 0 {
+                    ct.frame.x[0] = ERR;
+                    ct.state = State::Runnable;
+                    enqueue_back(caller);
+                    k().endpoints[ep].queue.retain(|q| q.0 != caller);
+                }
+            }
+        }
+    }
+}
+
 fn end_process(pi: usize, cur: usize, value: u64) {
     let kk = k();
     let mine: Vec<usize> = kk.threads.iter().enumerate().filter(|(_, x)| matches!(x, Some(x) if x.proc == pi)).map(|(i, _)| i).collect();
@@ -1749,6 +1795,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
             arc_free(p.arc);
         }
     }
+    fail_orphaned_calls();
     kk.exited.push((cur, value));
 }
 
@@ -2136,6 +2183,8 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
     for g in grants {
         v.push(match g {
             Grant::Serve(n) => (Object::Endpoint(endpoint(n)), RIGHT_RECV),
+            // `rmnet` is the kernel's own while the modem lives there (Phase 1); a driver process serving it takes this line's place.
+            Grant::Use(b"rmnet") => (Object::Rmnet, RIGHT_SEND),
             Grant::Use(n) => (Object::Endpoint(endpoint(n)), RIGHT_SEND),
             Grant::Hardware(n) => match HARDWARE.iter().position(|h| h.name.as_bytes() == *n) {
                 Some(i) => (Object::Hardware(i), RIGHT_SEND | RIGHT_RECV),

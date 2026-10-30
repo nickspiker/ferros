@@ -1,17 +1,20 @@
-//! The IP process: ARP + IPv4 (DHCP, echo) and IPv6 (neighbour discovery, router solicitation, SLAAC, echo), with UDP for applications and a small client-only TCP (owner, 2026-10-26: fetches over plain HTTP, like Broadcom's LTO file; nothing listens). A client of the WiFi driver's `wlan` endpoint (Ethernet frames) and the server of `udp` (datagrams and connections for apps). Photon itself needs only UDP (WIFI.md).
+//! The IP process: ARP + IPv4 (DHCP, echo) and IPv6 (neighbour discovery, router solicitation, SLAAC, echo), with UDP for applications and a small client-only TCP (owner, 2026-10-26: fetches over plain HTTP, like Broadcom's LTO file; nothing listens). A client of two links — the WiFi driver's `wlan` endpoint (Ethernet frames) and the cellular data call's `rmnet` (raw IP packets: no link layer, the addresses and DNS servers given by the call, no DHCP or SLAAC) — and the server of `udp` (datagrams and connections for apps). Photon itself needs only UDP (WIFI.md).
 //!
-//! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy
-//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy.
+//! Both links stay up; a packet leaves on WiFi when WiFi holds an address of its family, else on the cellular call (owner, 2026-10-29: both up, prefer WiFi; IPv6 preferred, which the apps choose by asking for family 6). Link-scope and multicast traffic (Photon's LAN beacons) stays on WiFi. A TCP connection keeps the link and source it opened on. IPv4 over cellular goes out with TTL 63 (owner, 2026-10-19).
+//!
+//! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy --use rmnet
+//! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; the kernel's while the modem lives there, `diag modem up`).
 //!
 //! `udp` requests (first byte):
 //! - 1 SEND: family (4 or 6), address (16 bytes; IPv4 in the first 4), destination port (u16 BE), source port (u16 BE), payload → [0] sent, [1] resolving the next hop (retry), [2] no address yet, [3] bad request.
 //! - 2 RECV: port (u16 BE) → family, address (16), source port, destination port, payload — or nothing (length 0). A RECV on a port, or a SEND from it, opens it: datagrams are kept only for the last eight ports asked for (a broadcast to a port nobody reads once filled the queue for good), the oldest giving way when the queue is full. IPv4 multicast and IPv6 link-scope multicast (ff02::; Photon's LAN beacons go to 239.104.199.144 and ff02::68c7:9014, port 4384) are delivered like unicast.
-//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global), the DHCP-given DNS server (4).
+//! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up), the DNS server (4), then the cellular call's IPv6 DNS server (16) — 71 bytes. The addresses and DNS are the ones traffic of each family leaves with: WiFi's when it has them, else the call's.
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
 //! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection.
 //! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on).
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the phone until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
+//! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
 //!
 //! TCP here: two connections, a 4 KiB receive window each (what the client has not yet taken; the window is the flow control), a 2 KiB send buffer, MSS 1200, go-back retransmission from the oldest unacknowledged byte (1 s, doubling to 8 s, six tries), no options but MSS on the SYN.
 //!
@@ -23,12 +26,13 @@
 #![no_main]
 
 use ferros_sys::nr::{CALL, ENTROPY as ENTROPY_SYS, RECV, REPLY};
-use ferros_sys::{now, svc, ERR, NOTHING};
+use ferros_sys::{now, svc, CALL_LIVE, ERR, NOTHING};
 
 const S_CONSOLE: u64 = 0;
 const S_WLAN: u64 = 1;
 const S_UDP: u64 = 2;
 const S_ENTROPY: u64 = 3;
+const S_RMNET: u64 = 4;
 
 /// Datagrams held for the apps: a Photon Transport blast is up to 256 chunks at once (photon_core::pt), and a fleet frame is 30-50 of them; 64 slots in `.data` (an arc's stack is 64 KiB, the queue 96 KB) — the oldest gives way when full, PT re-sends what was lost.
 const QN: usize = 64;
@@ -85,18 +89,42 @@ struct Ip {
     groups: [(u8, [u8; 16]); 8],
     groups_n: usize,
     groups_t: u64,
+    /// WiFi's driver answers on `wlan` (`wifi_up`); false until it does, and again after a call to it fails.
+    wifi: bool,
+    /// When the driver was last asked for its MAC.
+    wifi_t: u64,
+    cell: Cell,
+    /// When the cellular call's info was last asked for.
+    cell_t: u64,
+    /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
+    mode: u8,
 }
+
+/// The cellular data call, as `rmnet` INFO gives it (modem.rs `rmnet_call`): flags (bit 0 up, bit 1 IPv4, bit 2 IPv6), MTU, addresses, the first DNS server of each family. The addresses are the line's: never printed.
+#[derive(Clone, Copy)]
+struct Cell {
+    flags: u8,
+    mtu: u16,
+    v4: [u8; 4],
+    v6: [u8; 16],
+    dns4: [u8; 4],
+    dns6: [u8; 16],
+}
+const CELL_DOWN: Cell = Cell { flags: 0, mtu: 0, v4: [0; 4], v6: [0; 16], dns4: [0; 4], dns6: [0; 16] };
+
 
 const TCPN: usize = 2;
 const RXW: usize = 4096;
 const TXB: usize = 2048;
 const MSS: usize = 1200;
 
-/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed.
+/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed. It keeps the link and source address it opened with (`cell`, `src`).
 #[derive(Clone, Copy)]
 struct Tcp {
     state: u8,
     fam: u8,
+    cell: bool,
+    src: [u8; 16],
     addr: [u8; 16],
     rport: u16,
     lport: u16,
@@ -121,7 +149,7 @@ struct Tcp {
     tries: u32,
     closed_t: u64,
 }
-const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0 };
+const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, cell: false, src: [0; 16], addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0 };
 
 impl Ip {
     fn cap(&self, slot: u64) -> u64 {
@@ -196,7 +224,7 @@ impl Ip {
         f[13..15].copy_from_slice(&ty.to_be_bytes());
         f[15..n].copy_from_slice(payload);
         let mut r = [0u8; 16];
-        svc(CALL, self.cap(S_WLAN), self.off(f.as_ptr()), n as u64, self.off(r.as_mut_ptr()), 16);
+        svc(CALL, self.cap(S_WLAN), self.off(f.as_ptr()), n as u64, self.off(r.as_mut_ptr()), 16 | CALL_LIVE);
     }
 
     // ---- IPv4 ----
@@ -207,20 +235,132 @@ impl Ip {
 
     fn ipv4_send_ttl(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) {
         let mut p = [0u8; 1500];
-        let total = 20 + payload.len();
-        if total > p.len() {
+        let total = ip4(&mut p, src, dst, proto, payload, ttl);
+        if total != 0 {
+            self.eth_send(dst_mac, 0x0800, &p[..total]);
+        }
+    }
+
+    /// A packet up the cellular call: [1][IP packet]. A full UL queue drops it, as a full transmit ring would (TCP retransmits; a datagram is best effort).
+    fn cell_send(&mut self, pkt: &[u8]) {
+        let mut f = [0u8; 1 + 1500];
+        f[0] = 1;
+        f[1..1 + pkt.len()].copy_from_slice(pkt);
+        let mut r = [0u8; 16];
+        svc(CALL, self.cap(S_RMNET), self.off(f.as_ptr()), 1 + pkt.len() as u64, self.off(r.as_mut_ptr()), 16);
+    }
+
+    /// Ask the WiFi driver for its MAC (CALL_LIVE: an error at once when no driver serves `wlan`); answered, WiFi is up and DHCP and a router solicitation start.
+    fn wifi_up(&mut self) {
+        self.wifi_t = now();
+        let mut info = [0u8; 16];
+        let q = [3u8];
+        if svc(CALL, self.cap(S_WLAN), self.off(q.as_ptr()), 1, self.off(info.as_mut_ptr()), 16 | CALL_LIVE) == ERR {
             return;
         }
-        p[0] = 0x45;
-        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
-        p[8] = ttl;
-        p[9] = proto;
-        p[12..16].copy_from_slice(&src);
-        p[16..20].copy_from_slice(&dst);
-        let c = csum(&p[..20], 0);
-        p[10..12].copy_from_slice(&c.to_be_bytes());
-        p[20..total].copy_from_slice(payload);
-        self.eth_send(dst_mac, 0x0800, &p[..total]);
+        self.mac.copy_from_slice(&info[..6]);
+        self.wifi = true;
+        self.put(b"WiFi driver answers\n");
+        self.dhcp_state = 1;
+        self.dhcp_send(1);
+        self.rs_n = 0;
+        self.router_solicit();
+    }
+
+    /// The WiFi driver stopped answering: its addresses go, so traffic takes the cellular call; `wifi_up` tries again every 16 s.
+    fn wifi_down(&mut self) {
+        self.wifi = false;
+        self.wifi_t = now();
+        self.bound = false;
+        self.have_global = false;
+        self.have_r6 = false;
+        self.arp_n = 0;
+        self.nd_n = 0;
+        self.put(b"WiFi driver gone\n");
+    }
+
+    /// The cellular call's state from `rmnet` INFO (43 bytes: flags, MTU BE, IPv4, IPv6, DNS IPv4, DNS IPv6). No grant, or the call not up: down. A change is logged by its shape, never its addresses.
+    fn cell_info(&mut self) {
+        let mut r = [0u8; 43];
+        let q = [3u8];
+        let n = svc(CALL, self.cap(S_RMNET), self.off(q.as_ptr()), 1, self.off(r.as_mut_ptr()), r.len() as u64);
+        let c = if n == r.len() as u64 && r[0] & 1 != 0 {
+            Cell { flags: r[0], mtu: u16::from_be_bytes([r[1], r[2]]), v4: r[3..7].try_into().unwrap(), v6: r[7..23].try_into().unwrap(), dns4: r[23..27].try_into().unwrap(), dns6: r[27..43].try_into().unwrap() }
+        } else {
+            CELL_DOWN
+        };
+        let was = self.cell;
+        self.cell = c;
+        if c.flags != was.flags || c.v4 != was.v4 || c.v6 != was.v6 || c.mtu != was.mtu {
+            if c.flags & 1 == 0 {
+                self.put(b"cellular call down\n");
+            } else {
+                self.put(b"cellular call up: IPv4 ");
+                self.put(if c.flags & 2 != 0 { b"yes" } else { b"no" });
+                self.put(b", IPv6 ");
+                self.put(if c.flags & 4 != 0 { b"yes" } else { b"no" });
+                self.put(b", MTU A#");
+                self.dec_raw(c.mtu as u32);
+                self.put(b"\n");
+            }
+        }
+    }
+
+    /// The link and source address for an IPv4 destination: WiFi once DHCP has bound it, else the cellular call if it has an IPv4 address; broadcast, multicast and the WiFi subnet's broadcast stay on WiFi. None: no address of this family on an allowed link.
+    fn pick4(&self, dst: &[u8; 4]) -> Option<(bool, [u8; 4])> {
+        let local = *dst == [255; 4] || dst[0] & 0xF0 == 0xE0 || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k]));
+        if self.mode != 1 && self.bound {
+            return Some((false, self.v4));
+        }
+        if self.mode != 2 && !local && self.cell.flags & 3 == 3 {
+            return Some((true, self.cell.v4));
+        }
+        None
+    }
+
+    /// The link and source address for an IPv6 destination: link-local on WiFi from our link-local address; a global or multicast destination from WiFi's global address once SLAAC has one, else a global destination from the cellular call's address. None: no address on an allowed link.
+    fn pick6(&self, dst: &[u8; 16]) -> Option<(bool, [u8; 16])> {
+        let link_local = dst[0] == 0xFE && dst[1] & 0xC0 == 0x80;
+        if self.mode != 1 && self.wifi && link_local {
+            return Some((false, self.ll));
+        }
+        if self.mode != 1 && self.have_global && !link_local {
+            return Some((false, self.global));
+        }
+        if self.mode != 2 && !link_local && dst[0] != 0xFF && self.cell.flags & 5 == 5 {
+            return Some((true, self.cell.v6));
+        }
+        None
+    }
+
+    /// IPv4 out on the link `pick4` chose: up the cellular call (TTL 63; a packet over the call's MTU is dropped, the senders keep under it) or onto WiFi through the next hop. False while WiFi resolves the next hop (the caller retries).
+    fn out4(&mut self, cell: bool, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> bool {
+        if cell {
+            let mut p = [0u8; 1500];
+            let n = ip4(&mut p, src, dst, proto, payload, 63);
+            if n != 0 && n <= self.cell.mtu as usize {
+                self.cell_send(&p[..n]);
+            }
+            return true;
+        }
+        let Some(mac) = self.next_hop4(dst) else { return false };
+        self.ipv4_send(mac, src, dst, proto, payload);
+        true
+    }
+
+    /// IPv6 out on the link `pick6` chose, as `out4`.
+    fn out6(&mut self, cell: bool, src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) -> bool {
+        if cell {
+            let mut p = [0u8; 1500];
+            let n = ip6(&mut p, src, dst, nh, payload, hop);
+            if n != 0 && n <= self.cell.mtu as usize {
+                self.cell_send(&p[..n]);
+            }
+            return true;
+        }
+        let Some(mac) = self.next_hop6(dst) else { return false };
+        self.ipv6_send(mac, src, dst, nh, payload, hop);
+        true
     }
 
     /// The MAC for an IPv4 destination: broadcast, a cached neighbour (on-link) or the router's; None after sending an ARP request (the caller retries).
@@ -274,7 +414,8 @@ impl Ip {
         }
     }
 
-    fn ipv4_in(&mut self, src_mac: [u8; 6], p: &[u8]) {
+    /// An IPv4 packet in from WiFi (`cell` false: `src_mac` its sender) or from the cellular call (`cell` true: a raw IP packet, `src_mac` unused).
+    fn ipv4_in(&mut self, cell: bool, src_mac: [u8; 6], p: &[u8]) {
         if p.len() < 20 || p[0] >> 4 != 4 {
             return;
         }
@@ -285,12 +426,25 @@ impl Ip {
         }
         let src: [u8; 4] = p[12..16].try_into().unwrap();
         let dst: [u8; 4] = p[16..20].try_into().unwrap();
-        // Ours: our address, broadcast (limited or the subnet's), or IPv4 multicast (224/4: Photon's LAN beacon group 239.104.199.144; the firmware passes all multicast, and only opened ports keep a datagram).
-        let ours = (self.bound && dst == self.v4) || dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k])) || dst[0] & 0xF0 == 0xE0;
+        // Unicast to us: WiFi's bound address, or the call's on the cellular link.
+        let mine = if cell { self.cell.flags & 3 == 3 && dst == self.cell.v4 } else { self.bound && dst == self.v4 };
+        // Ours: our address, or on WiFi broadcast (limited or the subnet's) or IPv4 multicast (224/4: Photon's LAN beacon group 239.104.199.144; the firmware passes all multicast, and only opened ports keep a datagram).
+        let ours = mine || (!cell && (dst == [255; 4] || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k])) || dst[0] & 0xF0 == 0xE0));
         let body = &p[ihl..total];
         match p[9] {
-            // ICMP echo request → reply to the sender's MAC (no resolution needed).
-            1 if self.bound && dst == self.v4 && body.len() >= 8 && body[0] == 8 => {
+            // ICMP echo request → reply up the call, or to the sender's MAC on WiFi (no resolution needed).
+            1 if mine && body.len() >= 8 && body[0] == 8 && cell => {
+                let mut r = [0u8; 1480];
+                let n = body.len().min(r.len());
+                r[..n].copy_from_slice(&body[..n]);
+                r[0] = 0;
+                r[2] = 0;
+                r[3] = 0;
+                let c = csum(&r[..n], 0);
+                r[2..4].copy_from_slice(&c.to_be_bytes());
+                self.out4(true, dst, src, 1, &r[..n]);
+            }
+            1 if mine && body.len() >= 8 && body[0] == 8 => {
                 let mut r = [0u8; 1480];
                 let n = body.len().min(r.len());
                 r[..n].copy_from_slice(&body[..n]);
@@ -306,7 +460,7 @@ impl Ip {
                 self.v4_put(src);
                 self.put(b"\n");
             }
-            6 if self.bound && dst == self.v4 && body.len() >= 20 => {
+            6 if mine && body.len() >= 20 => {
                 let mut a = [0u8; 16];
                 a[..4].copy_from_slice(&src);
                 self.tcp_in(4, a, body);
@@ -315,7 +469,7 @@ impl Ip {
                 let sport = u16::from_be_bytes([body[0], body[1]]);
                 let dport = u16::from_be_bytes([body[2], body[3]]);
                 let ulen = (u16::from_be_bytes([body[4], body[5]]) as usize).clamp(8, body.len());
-                if dport == 68 {
+                if dport == 68 && !cell {
                     self.dhcp_in(&body[8..ulen]);
                 } else if ours {
                     let mut a = [0u8; 16];
@@ -421,18 +575,10 @@ impl Ip {
 
     fn ipv6_send(&mut self, dst_mac: [u8; 6], src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) {
         let mut p = [0u8; 1500];
-        let total = 40 + payload.len();
-        if total > p.len() {
-            return;
+        let total = ip6(&mut p, src, dst, nh, payload, hop);
+        if total != 0 {
+            self.eth_send(dst_mac, 0x86DD, &p[..total]);
         }
-        p[0] = 0x60;
-        p[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        p[6] = nh;
-        p[7] = hop;
-        p[8..24].copy_from_slice(&src);
-        p[24..40].copy_from_slice(&dst);
-        p[40..total].copy_from_slice(payload);
-        self.eth_send(dst_mac, 0x86DD, &p[..total]);
     }
 
     /// ICMPv6 / UDP over IPv6: the checksum covers a pseudo-header (source, destination, upper-layer length, next header).
@@ -546,7 +692,8 @@ impl Ip {
         None
     }
 
-    fn ipv6_in(&mut self, src_mac: [u8; 6], p: &[u8]) {
+    /// An IPv6 packet in from WiFi (`cell` false: `src_mac` its sender) or from the cellular call (`cell` true: a raw IP packet, only unicast to the call's address taken; neighbour discovery and router advertisements are WiFi's).
+    fn ipv6_in(&mut self, cell: bool, src_mac: [u8; 6], p: &[u8]) {
         if p.len() < 40 || p[0] >> 4 != 6 {
             return;
         }
@@ -556,6 +703,31 @@ impl Ip {
         let dst: [u8; 16] = p[24..40].try_into().unwrap();
         let body = &p[40..40 + plen];
         let multicast = dst[0] == 0xFF;
+        if cell {
+            if self.cell.flags & 5 != 5 || dst != self.cell.v6 {
+                return;
+            }
+            if nh == 58 && body.len() >= 8 && body[0] == 128 {
+                // Echo request → reply up the call, from the address it was sent to.
+                let mut r = [0u8; 1452];
+                let n = body.len().min(r.len());
+                r[..n].copy_from_slice(&body[..n]);
+                r[0] = 129;
+                r[2] = 0;
+                r[3] = 0;
+                let c = Self::sum6(&dst, &src, 58, &r[..n]);
+                r[2..4].copy_from_slice(&c.to_be_bytes());
+                self.out6(true, dst, src, 58, &r[..n], 64);
+            } else if nh == 6 && body.len() >= 20 {
+                self.tcp_in(6, src, body);
+            } else if nh == 17 && body.len() >= 8 {
+                let sport = u16::from_be_bytes([body[0], body[1]]);
+                let dport = u16::from_be_bytes([body[2], body[3]]);
+                let ulen = (u16::from_be_bytes([body[4], body[5]]) as usize).clamp(8, body.len());
+                self.queue(6, src, sport, dport, &body[8..ulen]);
+            }
+            return;
+        }
         if !multicast && !self.is_ours6(&dst) {
             return;
         }
@@ -702,27 +874,23 @@ impl Ip {
         u[2..4].copy_from_slice(&dport.to_be_bytes());
         u[4..6].copy_from_slice(&(n as u16).to_be_bytes());
         u[8..n].copy_from_slice(payload);
+        // A datagram that would not fit the cellular call's MTU is refused (3), not cut: there is no fragmentation here.
         if fam == 4 {
-            if !self.bound {
-                return 2;
-            }
             let dst: [u8; 4] = addr[..4].try_into().unwrap();
-            let Some(mac) = self.next_hop4(dst) else { return 1 };
-            let me = self.v4;
-            self.ipv4_send(mac, me, dst, 17, &u[..n]);
-            0
-        } else if fam == 6 {
-            let link_local = addr[0] == 0xFE && addr[1] & 0xC0 == 0x80;
-            if !link_local && !self.have_global {
-                return 2;
+            let Some((cell, src)) = self.pick4(&dst) else { return 2 };
+            if cell && 20 + n > self.cell.mtu as usize {
+                return 3;
             }
-            let src = if link_local { self.ll } else { self.global };
-            let Some(mac) = self.next_hop6(addr) else { return 1 };
+            if self.out4(cell, src, dst, 17, &u[..n]) { 0 } else { 1 }
+        } else if fam == 6 {
+            let Some((cell, src)) = self.pick6(&addr) else { return 2 };
+            if cell && 40 + n > self.cell.mtu as usize {
+                return 3;
+            }
             let c = Self::sum6(&src, &addr, 17, &u[..n]);
             let c = if c == 0 { 0xFFFF } else { c };
             u[6..8].copy_from_slice(&c.to_be_bytes());
-            self.ipv6_send(mac, src, addr, 17, &u[..n], 64);
-            0
+            if self.out6(cell, src, addr, 17, &u[..n], 64) { 0 } else { 1 }
         } else {
             3
         }
@@ -747,10 +915,10 @@ impl Ip {
             seg[20..24].copy_from_slice(&[2, 4, (MSS >> 8) as u8, MSS as u8]);
         }
         seg[hl..n].copy_from_slice(payload);
+        // On the link and from the address the connection opened with.
         if c.fam == 4 {
             let dst: [u8; 4] = c.addr[..4].try_into().unwrap();
-            let Some(mac) = self.next_hop4(dst) else { return false };
-            let me = self.v4;
+            let me: [u8; 4] = c.src[..4].try_into().unwrap();
             let mut ph = [0u8; 12];
             ph[..4].copy_from_slice(&me);
             ph[4..8].copy_from_slice(&dst);
@@ -758,23 +926,29 @@ impl Ip {
             ph[10..12].copy_from_slice(&(n as u16).to_be_bytes());
             let ck = csum(&seg[..n], sum(&ph));
             seg[16..18].copy_from_slice(&ck.to_be_bytes());
-            self.ipv4_send(mac, me, dst, 6, &seg[..n]);
+            self.out4(c.cell, me, dst, 6, &seg[..n])
         } else {
-            let link_local = c.addr[0] == 0xFE && c.addr[1] & 0xC0 == 0x80;
-            let src = if link_local { self.ll } else { self.global };
-            let Some(mac) = self.next_hop6(c.addr) else { return false };
-            let ck = Self::sum6(&src, &c.addr, 6, &seg[..n]);
+            let ck = Self::sum6(&c.src, &c.addr, 6, &seg[..n]);
             seg[16..18].copy_from_slice(&ck.to_be_bytes());
-            self.ipv6_send(mac, src, c.addr, 6, &seg[..n], 64);
+            self.out6(c.cell, c.src, c.addr, 6, &seg[..n], 64)
         }
-        true
     }
 
     fn tcp_connect(&mut self, fam: u8, addr: [u8; 16], port: u16, out: &mut [u8]) -> usize {
-        if (fam == 4 && !self.bound) || (fam == 6 && !self.have_global && !(addr[0] == 0xFE && addr[1] & 0xC0 == 0x80)) || (fam != 4 && fam != 6) {
+        // The link and source the connection keeps for its life.
+        let picked = match fam {
+            4 => self.pick4(&addr[..4].try_into().unwrap()).map(|(c, s)| {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&s);
+                (c, a)
+            }),
+            6 => self.pick6(&addr),
+            _ => None,
+        };
+        let Some((cell, src)) = picked else {
             out[0] = 2;
             return 1;
-        }
+        };
         let Some(i) = self.tcp.iter().position(|c| c.state == 0) else {
             out[0] = 4;
             return 1;
@@ -784,7 +958,7 @@ impl Ip {
         self.eph = 49152 + (self.eph.wrapping_add(1 + (self.seed >> 20) as u16 % 97) % 16384);
         let iss = self.seed;
         let t = now();
-        self.tcp[i] = Tcp { state: 1, fam, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, ..TCP_FREE };
+        self.tcp[i] = Tcp { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, ..TCP_FREE };
         self.tcp_out(i, 2, iss, &[]);
         out[0] = 0;
         out[1] = i as u8;
@@ -970,15 +1144,24 @@ impl Ip {
                 21 + n
             }
             Some(3) => {
+                // The addresses traffic leaves with (`pick4`, `pick6` for a global destination), and the DNS server of the link IPv4 leaves on.
+                let a4 = self.pick4(&[8, 8, 8, 8]);
+                let a6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
                 out[0..6].copy_from_slice(&self.mac);
-                out[6..10].copy_from_slice(&self.v4);
+                out[6..10].copy_from_slice(&a4.map(|a| a.1).unwrap_or([0; 4]));
                 out[10..14].copy_from_slice(&self.mask);
                 out[14..18].copy_from_slice(&self.router);
                 out[18..34].copy_from_slice(&self.ll);
-                out[34..50].copy_from_slice(&self.global);
-                out[50] = self.bound as u8 | (self.have_global as u8) << 1;
-                out[51..55].copy_from_slice(&self.dns);
-                55
+                out[34..50].copy_from_slice(&a6.map(|a| a.1).unwrap_or([0; 16]));
+                out[50] = a4.is_some() as u8 | (a6.is_some() as u8) << 1 | (self.cell.flags & 1) << 2;
+                out[51..55].copy_from_slice(if matches!(a4, Some((true, _))) { &self.cell.dns4 } else { &self.dns });
+                out[55..71].copy_from_slice(&self.cell.dns6);
+                71
+            }
+            Some(9) if m.len() >= 2 && m[1] <= 2 => {
+                self.mode = m[1];
+                out[0] = 0;
+                1
             }
             Some(4) if m.len() >= 20 => {
                 let addr: [u8; 16] = m[2..18].try_into().unwrap();
@@ -1059,6 +1242,40 @@ impl Ip {
     }
 }
 
+/// An IPv4 packet (no options) into `p`; its length, or 0 when the payload does not fit a 1500-byte packet.
+fn ip4(p: &mut [u8; 1500], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) -> usize {
+    let total = 20 + payload.len();
+    if total > p.len() {
+        return 0;
+    }
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[8] = ttl;
+    p[9] = proto;
+    p[12..16].copy_from_slice(&src);
+    p[16..20].copy_from_slice(&dst);
+    let c = csum(&p[..20], 0);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    p[20..total].copy_from_slice(payload);
+    total
+}
+
+/// An IPv6 packet into `p`; its length, or 0 when the payload does not fit a 1500-byte packet.
+fn ip6(p: &mut [u8; 1500], src: [u8; 16], dst: [u8; 16], nh: u8, payload: &[u8], hop: u8) -> usize {
+    let total = 40 + payload.len();
+    if total > p.len() {
+        return 0;
+    }
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    p[6] = nh;
+    p[7] = hop;
+    p[8..24].copy_from_slice(&src);
+    p[24..40].copy_from_slice(&dst);
+    p[40..total].copy_from_slice(payload);
+    total
+}
+
 /// RFC 1071 ones'-complement sum: 16-bit big-endian words added into a wide accumulator, carries folded once at the end.
 fn sum(data: &[u8]) -> u32 {
     let mut s: u64 = 0;
@@ -1133,13 +1350,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         groups: [(0, [0; 16]); 8],
         groups_n: 0,
         groups_t: 0,
+        wifi: false,
+        wifi_t: 0,
+        cell: CELL_DOWN,
+        cell_t: 0,
+        mode: 0,
     };
-    // Who we are: the driver's MAC.
-    let mut info = [0u8; 16];
-    let q = [3u8];
-    svc(CALL, ip.cap(S_WLAN), ip.off(q.as_ptr()), 1, ip.off(info.as_mut_ptr()), 16);
-    let info = &info;
-    ip.mac.copy_from_slice(&info[..6]);
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
     let mut r = [0u8; 16];
     if svc(ENTROPY_SYS, ip.cap(S_ENTROPY), ip.off(r.as_mut_ptr()), 16, 0, 0) != 16 {
@@ -1159,9 +1375,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     ip.v6_put(ll);
     ip.put(b"\n");
     ip.flush();
-    ip.dhcp_state = 1;
-    ip.dhcp_send(1);
-    ip.router_solicit();
+    // WiFi: the driver's MAC, then DHCP and a router solicitation (`wifi_up`). No `wlan` grant or no driver serving it: cellular only for now, the driver asked again every 16 s.
+    ip.wifi_up();
     let mut frame = [0u8; 2048];
     let mut msg = [0u8; 2048];
     let mut out = [0u8; 2048];
@@ -1169,10 +1384,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     loop {
         let mut busy = false;
         // Frames from the driver: [2] → the oldest frame, or nothing.
-        for _ in 0..16 {
+        for _ in 0..if ip.wifi { 16 } else { 0 } {
             let req = [2u8];
-            let n = svc(CALL, ip.cap(S_WLAN), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64);
-            if n == 0 || n == ERR || n < 14 {
+            let n = svc(CALL, ip.cap(S_WLAN), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64 | CALL_LIVE);
+            if n == ERR {
+                ip.wifi_down();
+                break;
+            }
+            if n == 0 || n < 14 {
                 break;
             }
             let f = &frame;
@@ -1184,10 +1403,32 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             if ty == 0x0806 {
                 ip.arp_in(&f[14..n]);
             } else if ty == 0x0800 {
-                ip.ipv4_in(src_mac, &f[14..n]);
+                ip.ipv4_in(false, src_mac, &f[14..n]);
             } else if ty == 0x86DD {
-                ip.ipv6_in(src_mac, &f[14..n]);
+                ip.ipv6_in(false, src_mac, &f[14..n]);
             }
+        }
+        // Packets from the cellular call: [2] → the oldest, or nothing.
+        for _ in 0..if ip.cell.flags & 1 != 0 { 16 } else { 0 } {
+            let req = [2u8];
+            let n = svc(CALL, ip.cap(S_RMNET), ip.off(req.as_ptr()), 1, ip.off(frame.as_mut_ptr()), frame.len() as u64);
+            if n == 0 || n == ERR {
+                break;
+            }
+            let n = (n as usize).min(frame.len());
+            busy = true;
+            let p = &frame[..n];
+            if p[0] >> 4 == 4 {
+                ip.ipv4_in(true, [0; 6], p);
+            } else if p[0] >> 4 == 6 {
+                ip.ipv6_in(true, [0; 6], p);
+            }
+        }
+        // The call's state from `rmnet` INFO: every second until it is up, then every 16 s (a call that drops and comes back may come back with new addresses).
+        let t = now();
+        if t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq {
+            ip.cell_t = t;
+            ip.cell_info();
         }
         // Applications: a polling recv on `udp`.
         let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);
@@ -1205,11 +1446,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         // Timers: DHCP retransmits every 2 s until bound; router solicitation every 4 s, three times, until a global address appears.
         let t = now();
-        if !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {
+        if !ip.wifi && t.wrapping_sub(ip.wifi_t) > 16 * ip.freq {
+            ip.wifi_up();
+        }
+        if ip.wifi && !ip.bound && t.wrapping_sub(ip.dhcp_t) > 2 * ip.freq {
             let ty = if ip.dhcp_state == 2 { 3 } else { 1 };
             ip.dhcp_send(ty);
         }
-        if !ip.have_global && ip.rs_n < 3 && t.wrapping_sub(ip.rs_t) > 4 * ip.freq {
+        if ip.wifi && !ip.have_global && ip.rs_n < 3 && t.wrapping_sub(ip.rs_t) > 4 * ip.freq {
             ip.router_solicit();
         }
         ip.flush();

@@ -18,8 +18,12 @@ pub struct Part {
     pub last: u64,
 }
 
-/// Find a partition by GPT name on LUs 0-7.
+/// Find a partition by GPT name on LUs 0-7. Its reads go under the kernel lock, as every UFS command must while processes use the vault.
 pub fn find(name: &str) -> Option<Part> {
+    crate::process::with_lock_held_or(|| find_locked(name))
+}
+
+fn find_locked(name: &str) -> Option<Part> {
     let ufs = UfsController::new(UFS_BASE);
     for lun in 0..8u8 {
         if ufs.read_block_lun(lun, 1) != 0 || ufs.last_response_status() != 0 {
@@ -63,6 +67,10 @@ pub fn find(name: &str) -> Option<Part> {
 
 /// The extents of a logical partition inside `super` (Android's dynamic partitions, liblp metadata_format.h), read-only: the geometry at byte 4096 (magic "gDla"), slot 0's metadata header at byte 12288 (magic "0PLA": tables descriptors at 80 partitions, 92 extents, each {offset, count, entry size}, the tables after the header), the partition entry by name (name[36], attributes, first extent, extent count, group), and its extents (u64 sectors, u32 type, u64 first sector, u32 source; 512-byte sectors). Each extent must be linear, on `super` itself, 4 KiB aligned; anything else is refused, not guessed at. The metadata's checksums are not checked: it is read only to find an ext4 filesystem that checks itself.
 pub fn logical_extents(name: &str) -> Result<Vec<Part>, String> {
+    crate::process::with_lock_held_or(|| logical_extents_locked(name))
+}
+
+fn logical_extents_locked(name: &str) -> Result<Vec<Part>, String> {
     let sup = find("super").ok_or_else(|| String::from("partition super not found"))?;
     let ufs = UfsController::new(UFS_BASE);
     let block = |lba: u64| -> Result<[u8; 4096], String> {
@@ -136,6 +144,10 @@ pub fn find_logical(name: &str) -> Result<Part, String> {
 
 /// `diag "part vermagic <logical>"`: the first `vermagic=` string in a logical partition's raw blocks, across all its extents — the kernel the modules in it were built for (every .ko carries one). Read-only; no filesystem is mounted, so a partition laid out in many extents (vendor_dlkm_a is) needs no extent-aware mount.
 pub fn vermagic(rep: &mut Vec<u8>, name: &str) {
+    crate::process::with_lock_held_or(|| vermagic_locked(rep, name))
+}
+
+fn vermagic_locked(rep: &mut Vec<u8>, name: &str) {
     let run = || -> Result<String, String> {
         let parts = logical_extents(name)?;
         let ufs = UfsController::new(UFS_BASE);
@@ -191,11 +203,19 @@ impl ferros_ext4::Disk for PartDisk {
             if lba > self.part.last || lba > u32::MAX as u64 {
                 return Err(ferros_ext4::Error::Corrupt);
             }
-            if self.ufs.read_block_lun(self.part.lun, lba as u32) != 0 || self.ufs.last_response_status() != 0 {
+            // One UFS command under the kernel lock, as the vault's are (a syscall holds it): the modem service reads files here while processes use the vault.
+            let ufs = &mut self.ufs;
+            let (lun, n) = (self.part.lun, chunk.len());
+            let ok = crate::process::with_lock_held_or(|| {
+                let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
+                if ok {
+                    chunk.copy_from_slice(&ufs.data_buffer()[..n]);
+                }
+                ok
+            });
+            if !ok {
                 return Err(ferros_ext4::Error::Io);
             }
-            let n = chunk.len();
-            chunk.copy_from_slice(&self.ufs.data_buffer()[..n]);
         }
         Ok(())
     }
@@ -207,10 +227,19 @@ impl ferros_f2fs::Disk for PartDisk {
         if lba > self.part.last || lba > u32::MAX as u64 {
             return Err(ferros_f2fs::Error::Corrupt);
         }
-        if self.ufs.read_block_lun(self.part.lun, lba as u32) != 0 || self.ufs.last_response_status() != 0 {
+        // One UFS command under the kernel lock, as in the ext4 reader above.
+        let ufs = &mut self.ufs;
+        let lun = self.part.lun;
+        let ok = crate::process::with_lock_held_or(|| {
+            let ok = ufs.read_block_lun(lun, lba as u32) == 0 && ufs.last_response_status() == 0;
+            if ok {
+                buf.copy_from_slice(&ufs.data_buffer()[..ferros_f2fs::BLOCK]);
+            }
+            ok
+        });
+        if !ok {
             return Err(ferros_f2fs::Error::Io);
         }
-        buf.copy_from_slice(&self.ufs.data_buffer()[..ferros_f2fs::BLOCK]);
         Ok(())
     }
 }
@@ -263,6 +292,10 @@ impl Mount {
 
 /// A partition's AVB `vbmeta`, read-only (`diag part avb <name>`, BOOT.md "Locked-bootloader endgame"): behind the AVB footer in its last 64 bytes (a partition that carries its own, as `boot`, `vendor_boot`, `dtbo` do), or at its start (a `vbmeta_*` partition). What the owner's re-signed top-level `vbmeta` must copy, so it vouches for the build actually installed rather than a factory image's.
 pub fn avb_vbmeta(name: &str) -> Result<Vec<u8>, String> {
+    crate::process::with_lock_held_or(|| avb_vbmeta_locked(name))
+}
+
+fn avb_vbmeta_locked(name: &str) -> Result<Vec<u8>, String> {
     let part = find(name).ok_or_else(|| alloc::format!("no partition {name}"))?;
     let ufs = UfsController::new(UFS_BASE);
     let read = |lba: u64| -> Result<[u8; 4096], String> {

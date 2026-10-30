@@ -1,7 +1,8 @@
-//! A TCP client on ferros's network stack: looks a host up through the DHCP-given DNS server (UDP), fetches a path over plain HTTP (the `ip` process's client TCP), and prints the status line, the byte count, the time and an FNV-1a 64 of the body to compare with a fetch on the host.
+//! A TCP client on ferros's network stack: looks a host up (AAAA first, over the IPv6 DNS server when ip has one; then A) through the DNS server ip reports (UDP), fetches a path over plain HTTP (the `ip` process's client TCP), and prints the status line, the byte count, the time and an FNV-1a 64 of the body to compare with a fetch on the host.
 //!
 //! Spawn after `ip`: ferros-bridge spawn httptest.bin [hex of "host/path"] --name httptest --use udp
 //! With no input it fetches Broadcom's GNSS orbit file, gllto2.glpals.com/7day/v5/latest/lto2.dat (GNSS.md). Grant slots: 0 console, 1 udp (use).
+//! Prefixes on the input: `!` the cellular link only (ip's LINK mode, given back at the end), `~` IPv4 only.
 
 #![no_std]
 #![no_main]
@@ -11,6 +12,8 @@ use ferros_sys::{now, svc, ERR};
 
 const DEFAULT: &[u8] = b"gllto2.glpals.com/7day/v5/latest/lto2.dat";
 const DNS_PORT: u16 = 53053;
+/// A `!` run set ip to the cellular link only.
+static CELL_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 struct App {
     grants: u64,
@@ -62,7 +65,12 @@ impl App {
     fn udp(&self, req: &[u8], out: &mut [u8]) -> u64 {
         svc(CALL, self.grants + 4 + 32, self.off(req.as_ptr()), req.len() as u64, self.off(out.as_mut_ptr()), out.len() as u64)
     }
+    /// The line, then exit; a `!` run gives ip its default link mode back first.
     fn done(&mut self, msg: &[u8]) -> ! {
+        if CELL_ONLY.load(core::sync::atomic::Ordering::Relaxed) {
+            let mut r = [0u8; 16];
+            let _ = self.udp(&[9, 0], &mut r);
+        }
         self.put(msg);
         self.put(b"\n");
         self.flush();
@@ -74,12 +82,12 @@ fn sleep_ms(ms: u64) {
     ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000 * ms);
 }
 
-/// The A record for `host` from the server `dns`, or None after three tries a second apart.
-fn resolve(a: &App, dns: [u8; 4], host: &[u8]) -> Option<[u8; 4]> {
+/// The first record of type `qtype` (1 A, 28 AAAA) for `host` from the DNS server `dns` (family `fam`, IPv4 in the first 4 bytes): its address in the first 4 or 16 bytes, or None after three tries a second apart.
+fn resolve(a: &App, fam: u8, dns: [u8; 16], host: &[u8], qtype: u16) -> Option<[u8; 16]> {
     let mut q = [0u8; 300];
     q[0] = 1;
-    q[1] = 4;
-    q[2..6].copy_from_slice(&dns);
+    q[1] = fam;
+    q[2..18].copy_from_slice(&dns);
     q[18..20].copy_from_slice(&53u16.to_be_bytes());
     q[20..22].copy_from_slice(&DNS_PORT.to_be_bytes());
     let id = (now() as u16) | 1;
@@ -94,7 +102,8 @@ fn resolve(a: &App, dns: [u8; 4], host: &[u8]) -> Option<[u8; 4]> {
         k += 1 + label.len();
     }
     p[k] = 0;
-    p[k + 1..k + 5].copy_from_slice(&[0, 1, 0, 1]);
+    p[k + 1..k + 3].copy_from_slice(&qtype.to_be_bytes());
+    p[k + 3..k + 5].copy_from_slice(&[0, 1]);
     let qlen = k + 5;
     let mut out = [0u8; 1024];
     for _ in 0..3 {
@@ -140,8 +149,11 @@ fn resolve(a: &App, dns: [u8; 4], host: &[u8]) -> Option<[u8; 4]> {
                 let ty = u16::from_be_bytes([m[i], m[i + 1]]);
                 let len = u16::from_be_bytes([m[i + 8], m[i + 9]]) as usize;
                 i += 10;
-                if ty == 1 && len == 4 && i + 4 <= m.len() {
-                    return Some([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+                let want = if qtype == 28 { 16 } else { 4 };
+                if ty == qtype && len == want && i + want <= m.len() {
+                    let mut r = [0u8; 16];
+                    r[..want].copy_from_slice(&m[i..i + want]);
+                    return Some(r);
                 }
                 i += len;
             }
@@ -167,35 +179,72 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         spec[..DEFAULT.len()].copy_from_slice(DEFAULT);
         DEFAULT.len()
     };
-    let spec = &spec[..spec_len];
+    // Test prefixes: `!` the cellular link only (ip's LINK 1, back to both at the end), `~` IPv4 only.
+    let mut spec = &spec[..spec_len];
+    let mut v4_only = false;
+    let mut r = [0u8; 16];
+    while let Some(&c) = spec.first() {
+        match c {
+            b'!' => {
+                let _ = a.udp(&[9, 1], &mut r);
+                CELL_ONLY.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            b'~' => v4_only = true,
+            _ => break,
+        }
+        spec = &spec[1..];
+    }
     let slash = spec.iter().position(|&c| c == b'/').unwrap_or(spec.len());
     let (host, path) = (&spec[..slash], if slash < spec.len() { &spec[slash..] } else { &b"/"[..] });
 
-    // The DNS server and an IPv4 lease (INFO), waiting up to 16 s for DHCP.
+    // An address of either family and a DNS server (INFO), waiting up to 16 s for DHCP, SLAAC or the cellular call. IPv6 first: AAAA over the IPv6 DNS server when there is one (else the IPv4 one), then A.
     let mut out = [0u8; 4096];
-    let mut dns = [0u8; 4];
     let t0 = now();
-    loop {
+    let (flags, dns4, dns6) = loop {
         let n = a.udp(&[3], &mut out);
-        if n >= 55 && out[50] & 1 != 0 && out[51..55] != [0; 4] {
-            dns.copy_from_slice(&out[51..55]);
-            break;
+        if n >= 55 && out[50] & 3 != 0 && out[51..55] != [0; 4] {
+            let dns6: [u8; 16] = if n >= 71 { out[55..71].try_into().unwrap() } else { [0; 16] };
+            let dns4: [u8; 4] = out[51..55].try_into().unwrap();
+            break (out[50], dns4, dns6);
         }
         if now() - t0 > 16 * ferros_sys::freq() {
-            a.done(b"httptest: no IPv4 lease or DNS server");
+            a.done(b"httptest: no address or DNS server");
         }
         sleep_ms(100);
-    }
+    };
+    let mut d4 = [0u8; 16];
+    d4[..4].copy_from_slice(&dns4);
     let t = now();
-    let Some(ip) = resolve(&a, dns, host) else { a.done(b"httptest: DNS gave no address") };
+    let mut found = None;
+    if flags & 2 != 0 && !v4_only {
+        let via = if dns6 != [0; 16] { (6, dns6) } else { (4, d4) };
+        found = resolve(&a, via.0, via.1, host, 28).map(|ip| (6u8, ip));
+    }
+    if found.is_none() && flags & 1 != 0 {
+        found = resolve(&a, 4, d4, host, 1).map(|ip| (4u8, ip));
+    }
+    let Some((fam, ip)) = found else { a.done(b"httptest: DNS gave no address") };
     a.put(b"httptest: ");
     a.put(host);
-    a.put(b" is A#");
-    for k in 0..4 {
-        if k > 0 {
-            a.put(b".");
+    if fam == 6 {
+        a.put(b" is G#");
+        for g in 0..8 {
+            if g > 0 {
+                a.put(b":");
+            }
+            let d = b"0123456789abcdef";
+            for b in [ip[2 * g], ip[2 * g + 1]] {
+                a.put(&[d[(b >> 4) as usize], d[(b & 15) as usize]]);
+            }
         }
-        a.dec(ip[k] as u64);
+    } else {
+        a.put(b" is A#");
+        for k in 0..4 {
+            if k > 0 {
+                a.put(b".");
+            }
+            a.dec(ip[k] as u64);
+        }
     }
     a.put(b" (");
     a.dec(ferros_sys::us_since(t) / 1000);
@@ -205,8 +254,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // Connect.
     let mut c = [0u8; 20];
     c[0] = 4;
-    c[1] = 4;
-    c[2..6].copy_from_slice(&ip);
+    c[1] = fam;
+    c[2..18].copy_from_slice(&ip);
     c[18..20].copy_from_slice(&80u16.to_be_bytes());
     let t = now();
     let mut r = [0u8; 16];

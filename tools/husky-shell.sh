@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The shell's development loop on husky without a reboot: build the named payloads, sign them into capsules, put them in the vault, and restart those processes from it (kernel `diag restart`, service.rs). Restarting the display server restarts the map too: the map hands a fresh server its scene when it starts.
-# Usage: tools/husky-shell.sh display|map|touch|ahau|ramps|init ...   (ramps and init are capsules started by others: they are only stored; ahau restarted puts the attest screen up again)
+# Usage: tools/husky-shell.sh display|map|touch|ahau|ip|ramps|init ...   (ramps and init are capsules started by others: they are only stored; ahau restarted puts the attest screen up again)
 set -euo pipefail
 REPO=/mnt/Harbor/Code/ferros
 cd "$REPO"
@@ -16,7 +16,7 @@ for n in "$@"; do
     aarch64-linux-gnu-objcopy -O binary "$R/$n" "$R/$n.bin"
     "$B" capsule "$R/$n.bin" "target/$n.capsule.vsf" >/dev/null
     timeout 120 "$B" store put "$n" "@target/$n.capsule.vsf" 2>&1 | grep -q "stored" || { echo "store put $n failed"; exit 1; }
-    case $n in display|map|touch|ahau) restart+=("$n");; esac
+    case $n in display|map|touch|ahau|ip) restart+=("$n");; esac
 done
 # The map follows the display server.
 if [[ " ${restart[*]:-} " == *" display "* && " ${restart[*]} " != *" map "* ]]; then restart+=(map); fi
