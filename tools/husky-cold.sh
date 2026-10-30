@@ -6,7 +6,7 @@
 # No buttons needed: from Android it goes `adb reboot bootloader`; from ferros `bridge reboot fastboot` (EL3 reboot-mode stamp + watchdog reset). `--android` is the only way back to slot a: slot b no longer falls back on its own.
 #
 # Usage:
-#   tools/husky-cold.sh            build, flash slot b (the gate + this ferros, signed), boot it, and only once slot b boots ferros flash slot a and boot the home slot (FERROS_BOTH_AT_ONCE=1: both at once, as before)
+#   tools/husky-cold.sh            build, flash slot b (the gate + this ferros, signed), boot it, and only once slot b boots ferros flash slot a and boot the home slot (FERROS_BOTH_AT_ONCE=1: both at once, as before; FERROS_SLOT_B_ONLY=1: slot b only, slot a left as it is)
 #   tools/husky-cold.sh <img>      same with a prebuilt boot image
 #   tools/husky-cold.sh --android  leave ferros: fastboot, make a active, reboot into Android
 #   tools/husky-cold.sh --read     last ferros report, from Android's dmesg (slot a handoff kernel prints the ramoops block)
@@ -178,6 +178,12 @@ SLOT=$(booted_slot)
 if [ "$SLOT" != b ]; then
     echo "== slot b did not boot ferros (ABL booted slot '${SLOT:-?}'); slot a left as it was" >&2
     exit 1
+fi
+# FERROS_SLOT_B_ONLY=1: stop here, slot a as it was (an Android left on it for captures, say) — the gate on b, verified.
+if [ "${FERROS_SLOT_B_ONLY:-0}" = 1 ]; then
+    echo "== slot b boots this build; slot a left as it was (FERROS_SLOT_B_ONLY)"
+    "$BRIDGE" diag 2>/dev/null | head -3 || true
+    exit 0
 fi
 echo "== slot b boots this build; now slot a"
 to_fastboot
