@@ -1,6 +1,6 @@
 //! The IP process: ARP + IPv4 (DHCP, echo) and IPv6 (neighbour discovery, router solicitation, SLAAC, echo), with UDP for applications and a small client-only TCP (owner, 2026-10-26: fetches over plain HTTP, like Broadcom's LTO file; nothing listens). A client of two links — the WiFi driver's `wlan` endpoint (Ethernet frames) and the cellular data call's `rmnet` (raw IP packets: no link layer, the addresses and DNS servers given by the call, no DHCP or SLAAC) — and the server of `udp` (datagrams and connections for apps). Photon itself needs only UDP (WIFI.md).
 //!
-//! Both links stay up; a packet leaves on WiFi when WiFi holds an address of its family, else on the cellular call (owner, 2026-10-29: both up, prefer WiFi; IPv6 preferred, which the apps choose by asking for family 6). Link-scope and multicast traffic (Photon's LAN beacons) stays on WiFi. A TCP connection keeps the link and source it opened on. IPv4 over cellular goes out with TTL 63 (owner, 2026-10-19).
+//! Both links stay up; a packet leaves on WiFi when WiFi holds an address of its family, else on the cellular call (owner, 2026-10-29: both up, prefer WiFi; IPv6 preferred, which the apps choose by asking for family 6). Link-scope and multicast traffic (Photon's LAN beacons) stays on WiFi. A TCP connection keeps the link and source it opened on. Everything it originates goes out with TTL and hop limit 63, both families on both links (`HOP`; owner, 2026-10-19 and 2026-10-31).
 //!
 //! Spawn after the WiFi driver serves `wlan` (tools/husky-wifi.sh 14): ferros-bridge spawn ip.bin --name ip --use wlan --serve udp --entropy --use rmnet
 //! Grant slots: 0 console, 1 wlan (use), 2 udp (serve), 3 entropy, 4 rmnet (use; served by the modem driver, payloads/modem: its calls carry CALL_LIVE, so no driver means no cellular link, not a hang).
@@ -33,6 +33,8 @@ const S_WLAN: u64 = 1;
 const S_UDP: u64 = 2;
 const S_ENTROPY: u64 = 3;
 const S_RMNET: u64 = 4;
+/// The hop limit of everything this stack originates, IPv4 TTL and IPv6 hop limit alike, on WiFi and cellular: 63, not the usual 64 (owner, 2026-10-19; for all, 2026-10-31), as the husky Android kernel is built (IPDEFTTL, IPV6_DEFAULT_HOPLIMIT). One place, so a revert is one line. Not for what a protocol fixes: neighbour discovery's 255 (RFC 4861) and the 1 of IGMP and MLD reports.
+const HOP: u8 = 63;
 
 /// Datagrams held for the apps: a Photon Transport blast is up to 256 chunks at once (photon_core::pt), and a fleet frame is 30-50 of them; 64 slots in `.data` (an arc's stack is 64 KiB, the queue 96 KB) — the oldest gives way when full, PT re-sends what was lost.
 const QN: usize = 64;
@@ -230,7 +232,7 @@ impl Ip {
     // ---- IPv4 ----
 
     fn ipv4_send(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {
-        self.ipv4_send_ttl(dst_mac, src, dst, proto, payload, 64);
+        self.ipv4_send_ttl(dst_mac, src, dst, proto, payload, HOP);
     }
 
     fn ipv4_send_ttl(&mut self, dst_mac: [u8; 6], src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ttl: u8) {
@@ -333,11 +335,11 @@ impl Ip {
         None
     }
 
-    /// IPv4 out on the link `pick4` chose: up the cellular call (TTL 63; a packet over the call's MTU is dropped, the senders keep under it) or onto WiFi through the next hop. False while WiFi resolves the next hop (the caller retries).
+    /// IPv4 out on the link `pick4` chose: up the cellular call (TTL `HOP`; a packet over the call's MTU is dropped, the senders keep under it) or onto WiFi through the next hop. False while WiFi resolves the next hop (the caller retries).
     fn out4(&mut self, cell: bool, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) -> bool {
         if cell {
             let mut p = [0u8; 1500];
-            let n = ip4(&mut p, src, dst, proto, payload, 63);
+            let n = ip4(&mut p, src, dst, proto, payload, HOP);
             if n != 0 && n <= self.cell.mtu as usize {
                 self.cell_send(&p[..n]);
             }
@@ -591,12 +593,17 @@ impl Ip {
         csum(data, sum(&ph))
     }
 
+    /// An ICMPv6 message at hop limit 255, as neighbour discovery requires (RFC 4861: a receiver drops ND with any other).
     fn icmp6_send(&mut self, dst_mac: [u8; 6], src: [u8; 16], dst: [u8; 16], msg: &mut [u8]) {
+        self.icmp6_send_hop(dst_mac, src, dst, msg, 255);
+    }
+
+    fn icmp6_send_hop(&mut self, dst_mac: [u8; 6], src: [u8; 16], dst: [u8; 16], msg: &mut [u8], hop: u8) {
         msg[2] = 0;
         msg[3] = 0;
         let c = Self::sum6(&src, &dst, 58, msg);
         msg[2..4].copy_from_slice(&c.to_be_bytes());
-        self.ipv6_send(dst_mac, src, dst, 58, msg, 255);
+        self.ipv6_send(dst_mac, src, dst, 58, msg, hop);
     }
 
     fn multicast_mac(dst: &[u8; 16]) -> [u8; 6] {
@@ -717,7 +724,7 @@ impl Ip {
                 r[3] = 0;
                 let c = Self::sum6(&dst, &src, 58, &r[..n]);
                 r[2..4].copy_from_slice(&c.to_be_bytes());
-                self.out6(true, dst, src, 58, &r[..n], 64);
+                self.out6(true, dst, src, 58, &r[..n], HOP);
             } else if nh == 6 && body.len() >= 20 {
                 self.tcp_in(6, src, body);
             } else if nh == 17 && body.len() >= 8 {
@@ -739,7 +746,7 @@ impl Ip {
                 let n = body.len().min(r.len());
                 r[..n].copy_from_slice(&body[..n]);
                 r[0] = 129;
-                self.icmp6_send(src_mac, dst, src, &mut r[..n]);
+                self.icmp6_send_hop(src_mac, dst, src, &mut r[..n], HOP);
                 self.nd_learn(src, src_mac);
                 self.put(b"ping6 from ");
                 self.v6_put(src);
@@ -890,7 +897,7 @@ impl Ip {
             let c = Self::sum6(&src, &addr, 17, &u[..n]);
             let c = if c == 0 { 0xFFFF } else { c };
             u[6..8].copy_from_slice(&c.to_be_bytes());
-            if self.out6(cell, src, addr, 17, &u[..n], 64) { 0 } else { 1 }
+            if self.out6(cell, src, addr, 17, &u[..n], HOP) { 0 } else { 1 }
         } else {
             3
         }
@@ -930,7 +937,7 @@ impl Ip {
         } else {
             let ck = Self::sum6(&c.src, &c.addr, 6, &seg[..n]);
             seg[16..18].copy_from_slice(&ck.to_be_bytes());
-            self.out6(c.cell, c.src, c.addr, 6, &seg[..n], 64)
+            self.out6(c.cell, c.src, c.addr, 6, &seg[..n], HOP)
         }
     }
 

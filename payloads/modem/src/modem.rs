@@ -1351,13 +1351,13 @@ fn router_solicitation(iid: &[u8; 8]) -> [u8; 48] {
 /// A public IPv6 resolver (Google's, 2001:4860:4860::8888) that answers echo requests: the far end for the first round trip over the data call.
 const PING_TARGET: [u8; 16] = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
 
-/// One ICMPv6 echo request (id 1, sequence 0, 8 bytes of payload) from the call's address to `dst`, hop limit 64.
+/// One ICMPv6 echo request (id 1, sequence 0, 8 bytes of payload) from the call's address to `dst`, hop limit 63 (as everything ferros originates: payloads/ip `HOP`).
 fn echo_request(src: &[u8; 16], dst: &[u8; 16]) -> [u8; 56] {
     let mut p = [0u8; 56];
     p[0] = 0x60;
     p[5] = 16;
     p[6] = 58;
-    p[7] = 64;
+    p[7] = 63;
     p[8..24].copy_from_slice(src);
     p[24..40].copy_from_slice(dst);
     p[40] = 128;
