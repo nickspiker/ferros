@@ -996,21 +996,8 @@ fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
+pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    // Spawned with any input: the handle proof's time on this phone over a fixed seed, on the core it lands on and on the X3, then exit (a development measurement; nothing is read or kept).
-    if input_len > 0 && unsafe { *((ferros_sys::arc_base() + _input) as *const u8) } != b'c' {
-        for (name, mask) in [("a worker", ferros_sys::CORES_WORKERS), ("the X3", ferros_sys::CORES_BIG)] {
-            ferros_sys::pin(mask);
-            sleep_until(now() + freq() / 1000);
-            let t0 = now();
-            let p = ihi::handle_proof(&blake3::Hash::from([7u8; 32]));
-            let mut l = Line::new();
-            let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof on {name} in {} ms (first byte {})\n", ferros_sys::us_since(t0) / 1000, p.as_bytes()[0]));
-            console(grants, l.as_bytes());
-        }
-        exit(0);
-    }
     let (display, touch) = (cap(grants, S_DISPLAY), cap(grants, S_TOUCH));
     let mut r = [0u8; 256];
     if call(display, &[5], &mut r) < 4 {

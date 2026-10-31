@@ -453,8 +453,6 @@ struct Client {
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
-    /// When the vault was last asked for the roots while there were none (the attest screen writes them once a person mints this device's identity).
-    last_load_us: u64,
     /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the phone unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set.
     persist: bool,
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
@@ -1193,16 +1191,6 @@ impl Client {
                     }
                 }
             }
-            // No roots yet: the person has not attested on this device. Look again every two seconds; the attest screen (payloads/ahau) writes them, and the join starts from there without a restart.
-            if self.hp.is_none() && t.saturating_sub(self.last_load_us) >= 2_000_000 {
-                self.last_load_us = t;
-                self.load_saying(false);
-                if self.hp.is_some() {
-                    self.verdict = V_LOOKING;
-                    self.last_lookup_us = 0;
-                    self.show_words();
-                }
-            }
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
             // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
             let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
@@ -1295,7 +1283,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

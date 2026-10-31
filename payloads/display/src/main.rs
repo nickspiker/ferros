@@ -315,11 +315,6 @@ static FONT: &[u8] = include_bytes!("../../../assets/fonts/Oxanium-Regular+glyph
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
-const WHITE: u32 = rgb(0xF0, 0xF0, 0xF0);
-const GREY: u32 = rgb(0x9A, 0x9A, 0x9A);
-const DIM: u32 = rgb(0x5C, 0x5C, 0x5C);
-const RULE: u32 = rgb(0x28, 0x28, 0x28);
-const AMBER: u32 = rgb(0xFF, 0xA0, 0x00);
 
 /// One circle of the map (SHELL.md), in world units.
 #[derive(Clone, Copy)]
@@ -1119,16 +1114,6 @@ fn text(c: &mut Canvas, _font: &Font, s: &str, x: f32, baseline: f32, px: f32, c
 
 fn text_width(_font: &Font, s: &str, px: f32) -> f32 {
     glyph_engine().width(s, px)
-}
-
-fn text_center(c: &mut Canvas, font: &Font, s: &str, baseline: f32, px: f32, colour: u32) {
-    let w = text_width(font, s, px);
-    text(c, font, s, (c.width as f32 - w) * 0.5, baseline, px, colour);
-}
-
-fn text_right(c: &mut Canvas, font: &Font, s: &str, right: f32, baseline: f32, px: f32, colour: u32) {
-    let w = text_width(font, s, px);
-    text(c, font, s, right - w, baseline, px, colour);
 }
 
 /// Square root by Newton on plain multiplies and divides. On husky, 2026-10-17, both `libm::sqrtf` and an inline `fsqrt` returned 0 for every input in this process while `libm::tanhf`/`exp2f`/`log2f` and fontdue's arithmetic were right — unexplained; `fsqrt_probe` records it per boot.
@@ -1992,20 +1977,6 @@ fn isqrt(v: i64) -> i64 {
 }
 
 
-/// hh:mm:ss since boot — the only clock this process has until a time source is granted.
-fn uptime(buf: &mut [u8; 8], secs: u64) -> &str {
-    let (h, m, s) = ((secs / 3600) % 100, (secs / 60) % 60, secs % 60);
-    let two = |v: u64, o: usize, b: &mut [u8; 8]| {
-        b[o] = b'0' + (v / 10) as u8;
-        b[o + 1] = b'0' + (v % 10) as u8;
-    };
-    two(h, 0, buf);
-    buf[2] = b':';
-    two(m, 3, buf);
-    buf[5] = b':';
-    two(s, 6, buf);
-    core::str::from_utf8(buf).unwrap_or("--:--:--")
-}
 
 // ---------------------------------------------------------------- the receive thread and the request ring
 //
@@ -2107,7 +2078,7 @@ extern "C" fn receive(grants: u64) -> ! {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // First: the image's own relocations (fontdue's `dyn OutlineBuilder` vtable is an absolute address in .rodata).
     unsafe { ferros_sys::relocate() };
     unsafe { PANIC_GRANTS = grants };
@@ -2153,14 +2124,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         ferros_sys::exit(3);
     }
     let back = back as usize;
-    // Input byte 0 = 1: a deliberate panic, to prove the panic handler's console line.
-    let mut sel = [0u8; 1];
-    let _ = input;
-    if input_len > 0 && ferros_sys::input(0, &mut sel) == 1 && sel[0] == 1 {
-        log.s(b"display: about to panic on purpose\n");
-        log.flush();
-        panic!("deliberate, at frame zero");
-    }
 
     // The core's clock, measured: 2^20 dependent adds take 2^20 cycles (1.8 ms at the 576 MHz measured 2026-10-22), so cycles per microsecond is the MHz this process runs at.
     let t_clk = now();
@@ -2245,30 +2208,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 
     let pixels: &mut [Px] = unsafe { core::slice::from_raw_parts_mut(back as *mut Px, width * height) };
     let screen: &mut [u32] = unsafe { core::slice::from_raw_parts_mut(fb as *mut u32, width * height) };
-    let span = width as f32;
-    let (w, h) = (width as f32, height as f32);
-    let margin = span * 0.04;
-    let status_y = span * 0.05;
-    let status_px = span * 0.021;
 
     pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
 
-    // The first-boot screen (SHELL.md 3), fluor's way: transparent, then front to back — the text, the marks, the rules; what is left empty shows black (the panel ignores alpha).
+    // Black until a client draws: the attest screen's window follows the boot ring within moments (the first-boot "No one yet" screen with its fixed slot line retired 2026-10-31).
     let mut damage = Damage::new();
     pixels.fill(0);
-    {
-        let mut c = Canvas::new(pixels, width, height, &mut damage);
-        text_center(&mut c, &font, "ferros", h * 0.40, span * 0.11, WHITE);
-        text_center(&mut c, &font, "No one yet.", h * 0.47, span * 0.032, GREY);
-        text_center(&mut c, &font, "Pair with a device you trust.", h * 0.51, span * 0.032, GREY);
-        text(&mut c, &font, "apps", margin, h - span * 0.05, span * 0.019, DIM);
-        text_right(&mut c, &font, "slot b \u{2022} ferros", w - margin, h - span * 0.05, span * 0.019, GREY);
-        paint::fill_rect(&mut c, (w * 0.5 - span * 0.004) as isize, (h * 0.56) as isize, (span * 0.008) as isize, (span * 0.008) as isize, AMBER, None, None);
-        paint::fill_rect(&mut c, margin as isize, (status_y + span * 0.03) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
-        paint::fill_rect(&mut c, margin as isize, (h - span * 0.09) as isize, (w - 2.0 * margin) as isize, 0, RULE, None, None);
-    }
-    ALLOC.reset();
-    let strip = (status_y + span * 0.02) as usize;
 
     // The panel's command path, and the link rate its TE timers are figured from (the DPHY PLL at +G#100 of the dphy0 grant).
     let dsi = ferros_dsi::Dsim(DsiGrant { grants });
@@ -2323,7 +2268,6 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut armed: Option<u32> = None;
 
     let mut frames = 0u64;
-    let mut clock = [0u8; 8];
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
     let mut client_owned = false;
     // When the map last moved its camera: while someone is touching, poll the endpoint fast enough to follow a finger; at rest, slowly, so the core sleeps.
@@ -3271,16 +3215,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             frames_last_tick = frames;
             starts_last_tick = fs;
             if !client_owned {
-                // The status line: uptime left, the link right; repainted every second — the strip cleared to transparent, text, then black under it.
-                pixels[..strip * width].fill(0);
-                {
-                    let mut c = Canvas::new(pixels, width, height, &mut damage);
-                    let tt = uptime(&mut clock, secs);
-                    text(&mut c, &font, tt, margin, status_y, status_px, GREY);
-                    text_right(&mut c, &font, "USB \u{2022} slot b", w - margin, status_y, status_px, DIM);
-                    paint::fill_rect(&mut c, 0, 0, width as isize, strip as isize, BLACK, None, None);
-                }
-                ALLOC.reset();
+                // No client yet: the black frame presented again each second, its log line the pipe's health.
                 // The finished frame to the framebuffer: reads from cache, writes combined.
                 if ten && unsafe { TEMPORAL } { publish_next(pixels, width, height, &tabs, draw::Rect::full(width, height)) } else if ten { publish10(pixels, screen, width, &tabs) } else { publish(pixels, screen) }
                 ferros_sys::dma_barrier();
