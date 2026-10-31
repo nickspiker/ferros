@@ -48,10 +48,10 @@ fn bind_req_matches_the_app_and_verifies() {
     let ours = DeviceKeys::derive(FP);
     let theirs = SigningBundle::derive(FP);
     pfleet::install_device_signer(pfleet::DeviceSigner::Pq(theirs.clone()));
-    let req = join::make_bind_request(&ours, &seed(), &hp(), T);
+    let req = join::bind_request(&ours, &seed(), &hp(), T, &[0u8; 32]);
     let identity_pk = ed25519_dalek::SigningKey::from_bytes(&seed()).verifying_key().to_bytes();
     assert!(req.verify(&hp(), &identity_pk), "the request verifies as the registry would");
-    let our_frame = join::bind_req_vsf(&req, &hp(), &ours, T).unwrap();
+    let our_frame = join::bind_req(&req, &hp(), &ours, T).unwrap();
     let (h, back, signer) = pproto::parse_bind_req_vsf(&our_frame).expect("the app parses + verifies our bind_req envelope");
     assert_eq!((h, signer), (hp(), ours.device_pubkey()));
     assert_eq!(back, req);
@@ -70,7 +70,7 @@ fn sponsor_frames_open_on_the_phone() {
     pfleet::install_device_signer(pfleet::DeviceSigner::Pq(sponsor.clone()));
     // A fleet founded by the sponsor, then the phone bound into it declared — the chain the sponsor pushes.
     let mut chain = MembershipBlob::genesis_v2(&sponsor, hp(), &seed(), T);
-    let req = join::make_bind_request(&phone, &seed(), &hp(), T + 1_000);
+    let req = join::bind_request(&phone, &seed(), &hp(), T + 1_000, &[0u8; 32]);
     chain.add_declared(&sponsor, req.device_pubkey, T + 2_000, req.t, req.device_sig.clone(), req.bundle.clone().unwrap());
     let chain_bytes = chain.to_vsf_bytes().unwrap();
     let frame = pproto::build_fleet_resp_vsf(&hp(), &chain_bytes, &sponsor.keypair().public.to_bytes(), sponsor.keypair().secret.as_bytes()).unwrap();
@@ -107,4 +107,23 @@ fn eagle_time_from_utc_matches_vsf() {
     let ours = join::eagle_from_utc(now.as_secs() as i64, now.subsec_nanos() as u64, 1_000_000_000);
     let theirs = vsf::eagle_time_oscillations();
     assert!((ours - theirs).abs() < vsf::OSCILLATIONS_PER_SECOND as i64 / 10, "ours {ours} theirs {theirs}");
+}
+
+/// The phone's departure request, as the app's approver reads it: the fields come back, the frame's signer is the phone, and the consent eggs verify against the phone's own bundle over the departure bytes (what the fold checks on the consented Remove). The approval words' commitment is the app's (blake3 of the lowercased words).
+#[test]
+fn depart_req_is_what_the_app_approves() {
+    let phone = DeviceKeys::derive(FP);
+    let t = T + 5_000;
+    let consent = join::depart_consent(&phone, &hp(), t);
+    let words = join::depart_words(0x1234_5678);
+    assert_eq!(fgtw::pair::pair_word_tokens(&words), 3, "three approval words");
+    let commit = join::depart_words_commit(&words);
+    assert_eq!(commit, *blake3::hash(words.to_lowercase().as_bytes()).as_bytes());
+    let req = join::DepartReq { t, consent_sig: consent.clone(), intent: join::DEPART_DESK, words_commit: Some(commit) };
+    let frame = join::depart_req(&req, &phone, T).unwrap();
+    let (ct, cs, leaver, intent, wc) = pproto::parse_depart_req_vsf(&frame).expect("the app parses + verifies our depart_req");
+    assert_eq!((ct, leaver, intent, wc), (t, phone.device_pubkey(), join::DEPART_DESK, Some(commit)));
+    let eggs = fgtw::pq::eggs_from_bytes(&cs).unwrap();
+    let msg = fgtw::fleet::departreq_signing_bytes(&hp(), &phone.device_pubkey(), t);
+    assert!(fgtw::pq::verify_eggs(&eggs, &phone.public(), &msg, phone.public().mask()), "the consent verifies under every scheme the phone holds");
 }

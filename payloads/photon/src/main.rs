@@ -818,12 +818,11 @@ impl Client {
         let t0 = now();
         self.log.put(b"photon: minting the binding request");
         self.log.line();
-        let mut req = join::make_bind_request(&self.keys, &seed, &hp, t);
         // The tap's secret: 32 fresh bytes per request, committed to in the request (`nh`, fgtw::pair::nfc_secret_hash over this device and stamp) so a sponsor that reads S off the tap knows which candidate it touched. Outside the consent bytes: the signature over the frame covers it.
         let mut s = [0u8; 32];
         kernel_entropy(&mut s);
-        req.nfc_hash = fgtw::pair::nfc_secret_hash(&s, &self.me, t);
-        let framed = join::bind_req_vsf(&req, &hp, &self.keys, t);
+        let req = join::bind_request(&self.keys, &seed, &hp, t, &s);
+        let framed = join::bind_req(&req, &hp, &self.keys, t);
         let ms = ferros_sys::us_since(t0) / 1000;
         match framed {
             Ok(f) => {

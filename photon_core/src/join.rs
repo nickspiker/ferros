@@ -1,17 +1,15 @@
-//! The phone's half of joining a Photon fleet over the mesh (photon docs/pairing-v2.md "The ceremony over the mesh"; photon src/network/fgtw/protocol.rs build_bind_req_vsf / parse_fleet_resp_vsf / parse_fanout_resp_vsf; src/network/udp.rs build_lan_discovery): the device's keys across the three signature families, derived from an ira-rooted secret exactly as the app derives its from the machine fingerprint (fgtw src/pq.rs `SigningBundle::derive`, `eggs`); the LAN beacon; the binding request and its signed `bind_req` frame; the `fleet_resp` and `fanout_resp` frames a sponsor hands back, and what to do with them (fold the chain against our own roots, open the fan-out with our own ira). The chain fold, the egg verification and the fan-out open are `fgtw`'s own code, so what the phone accepts is what the app and the worker accept.
+//! The phone's half of joining a Photon fleet over the mesh (photon docs/pairing-v2.md "The ceremony over the mesh"; photon src/network/fgtw/protocol.rs build_bind_req_vsf / parse_fleet_resp_vsf / parse_fanout_resp_vsf; src/network/udp.rs build_lan_discovery): the device's keys across the three signature families, derived from an ira-rooted secret exactly as the app derives its from the machine fingerprint (fgtw src/pq.rs `SigningBundle::derive`, `eggs`); the frames themselves are fgtw's (`fgtw::protocol`, re-exported here); what is the phone's own is what to do with the `fleet_resp` and `fanout_resp` a sponsor hands back (fold the chain against our own roots, open the fan-out with our own ira). The chain fold, the egg verification and the fan-out open are `fgtw`'s own code, so what the phone accepts is what the app and the worker accept.
 //!
 //! Time is the caller's (eagle oscillations), as everywhere in this crate; byte compatibility with the app is pinned by tools/photon-interop.
 
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use fgtw::fleet::{bindreq_signing_bytes, scheme, BindRequest, Egg, MembershipBlob};
+use fgtw::fleet::{scheme, Egg, MembershipBlob};
 use fgtw::keys::Keypair;
-use fgtw::pq::{envelope_mask, reserve_eggs, sign_envelope, FleetSigner, KeyBundle};
+use fgtw::pq::{FleetSigner, KeyBundle};
 use rand_chacha::ChaCha12Rng;
 use rand_core::SeedableRng;
-use vsf::file_format::{VsfHeader, VsfSection};
-use vsf::{VsfBuilder, VsfType};
 
 /// This device's keys across the three families the fleet signs with: Ed25519 (the device key itself), Falcon-512 and SLH-DSA-SHA2-128s — derived from one secret exactly as the app's `SigningBundle::derive` derives from the machine fingerprint (BLAKE3 domain seeds into rand 0.8's StdRng, which is ChaCha12), so the same secret gives the same keys here and there. On ferros the secret is the kernel's ira-derived key for the domain `photon device` (ferros_sys::ira_key): the same on every boot and after a factory reset.
 pub struct DeviceKeys {
@@ -93,86 +91,8 @@ impl FleetSigner for DeviceKeys {
     }
 }
 
-/// The ports the app listens on: frames, and the LAN beacons.
-pub const PORT: u16 = 4383;
-pub const BEACON_PORT: u16 = 4384;
-/// The app's LAN beacon groups: IPv4 multicast 239.104.199.144 and IPv6 ff02::68c7:9014 (photon src/network/status.rs).
-pub const BEACON_V4: [u8; 4] = [239, 104, 199, 144];
-pub const BEACON_V6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x68, 0xc7, 0x90, 0x14];
-
-/// The LAN discovery beacon (`pt_disc`): the handle proof as the header's provenance, the device key and the frame port in the section; unsigned, provenance only. Byte-identical to the app's `udp::build_lan_discovery` for the same time.
-pub fn beacon(handle_proof: [u8; 32], port: u16, device_pubkey: [u8; 32], time: i64) -> Vec<u8> {
-    VsfBuilder::new()
-        .creation_time_oscillations(time)
-        .provenance_hash(handle_proof)
-        .provenance_only()
-        .add_section("pt_disc", vec![("port".to_string(), VsfType::u(port as usize, false)), ("ke".to_string(), VsfType::ke(device_pubkey.to_vec()))])
-        .build()
-        .unwrap_or_default()
-}
-
-/// A beacon's (handle proof, frame port, device key); None for anything else.
-pub fn parse_beacon(bytes: &[u8]) -> Option<([u8; 32], u16, Option<[u8; 32]>)> {
-    let (header, end) = VsfHeader::decode(bytes).ok()?;
-    let hp: [u8; 32] = match &header.provenance_hash {
-        VsfType::hp(b) if b.len() == 32 => b.as_slice().try_into().ok()?,
-        _ => return None,
-    };
-    let section = header.primary_section(bytes, end).ok()?;
-    if section.name != "pt_disc" {
-        return None;
-    }
-    let port = section.get_field("port").and_then(|f| f.values.first()).and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok())?;
-    let ke = section.get_field("ke").and_then(|f| f.values.first()).and_then(|v| match v {
-        VsfType::ke(b) if b.len() == 32 => b.as_slice().try_into().ok(),
-        _ => None,
-    });
-    Some((hp, port, ke))
-}
-
-/// This device's binding request for fleet `handle_proof` at time `t`: "I consent to join", one egg per scheme it holds, co-signed by `Ed25519(identity_seed)`; no NFC commitment. The same bytes the app's `make_bind_request` mints.
-pub fn make_bind_request(keys: &DeviceKeys, identity_seed: &[u8; 32], handle_proof: &[u8; 32], t: i64) -> BindRequest {
-    use ed25519_dalek::Signer;
-    let me = keys.device_pubkey();
-    let msg = bindreq_signing_bytes(handle_proof, &me, t);
-    let bundle = keys.bundle();
-    let mask = bundle.as_ref().map(|b| b.mask()).unwrap_or(scheme::MASK_BASE);
-    let identity_key = ed25519_dalek::SigningKey::from_bytes(identity_seed);
-    BindRequest { device_pubkey: me, t, device_sig: keys.eggs(&msg, mask), bundle, identity_sig: identity_key.sign(&msg).to_bytes().to_vec(), nfc_hash: [0u8; 32] }
-}
-
-/// A device-signed envelope around `section`: the header reserves one egg slot per scheme at the envelope tier (Ed25519 + Falcon for a full bundle) and `sign_envelope` fills them over the file hash — the app's `signed_only_eggs(envelope_slots)` + `sign_device_envelope`.
-pub fn signed_frame(section: VsfSection, keys: &DeviceKeys, time: i64) -> Result<Vec<u8>, String> {
-    let unsigned = VsfBuilder::new()
-        .creation_time_oscillations(time)
-        .signed_only_eggs(VsfType::ke(keys.device_pubkey().to_vec()), &reserve_eggs(envelope_mask(keys)))
-        .add_section_direct(section)
-        .build()
-        .map_err(|e| alloc::format!("frame build: {e}"))?;
-    sign_envelope(unsigned, keys)
-}
-
-/// The `bind_req` frame: the request's fields (hp, dk, t, ds, is, kb, nh) in an envelope signed by the device — the app's `build_bind_req_vsf`.
-pub fn bind_req_vsf(req: &BindRequest, handle_proof: &[u8; 32], keys: &DeviceKeys, time: i64) -> Result<Vec<u8>, String> {
-    let mut section = VsfSection::new("bind_req");
-    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    section.add_field("dk", VsfType::ke(req.device_pubkey.to_vec()));
-    section.add_field("t", VsfType::e(vsf::types::EtType::e6(req.t)));
-    section.add_field("ds", VsfType::ge(fgtw::pq::eggs_to_bytes(&req.device_sig)));
-    section.add_field("is", VsfType::ge(req.identity_sig.clone()));
-    if let Some(b) = &req.bundle {
-        section.add_field("kb", VsfType::ge(b.to_bytes()));
-    }
-    section.add_field("nh", VsfType::hb(req.nfc_hash.to_vec()));
-    signed_frame(section, keys, time)
-}
-
-/// The `fleet_req` frame: ask a device for handle `hp`'s membership chain.
-pub fn fleet_req_vsf(handle_proof: &[u8; 32], keys: &DeviceKeys, time: i64) -> Result<Vec<u8>, String> {
-    let mut section = VsfSection::new("fleet_req");
-    section.add_field("hp", VsfType::hP(handle_proof.to_vec()));
-    signed_frame(section, keys, time)
-}
+// The frames between fleet devices are fgtw's (`fgtw::protocol`, fgtw MIGRATION.md step 5, 2026-10-31): the beacon, the binding request and its `bind_req` envelope, the departure request, `fleet_req` / `fleet_resp` / `fanout_resp` — one codec with the app and every other fleet client, not a copy pinned against it. Builders take this device's keys (`DeviceKeys` is a `FleetSigner`) and the caller's eagle time.
+pub use fgtw::protocol::{beacon, bind_req, bind_request, depart_consent, depart_req, depart_words, depart_words_commit, parse_beacon, DepartReq, BEACON_PORT, BEACON_V4, BEACON_V6, DEPART_DESK, DEPART_NEW_OWNER, PORT};
 
 /// A device-signed frame from a peer, by its section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,28 +105,13 @@ pub enum Inbound {
     Other(String),
 }
 
-fn field_hp(section: &VsfSection, name: &str) -> Option<[u8; 32]> {
-    section.get_field(name).and_then(|f| f.values.first()).and_then(|v| match v {
-        VsfType::hP(b) | VsfType::hp(b) | VsfType::hb(b) if b.len() == 32 => b.as_slice().try_into().ok(),
-        _ => None,
-    })
-}
-
-fn field_ge(section: &VsfSection, name: &str) -> Option<Vec<u8>> {
-    section.get_field(name).and_then(|f| f.values.first()).and_then(|v| match v {
-        VsfType::ge(b) => Some(b.clone()),
-        _ => None,
-    })
-}
-
-/// Verify a device-signed envelope frame (the file signature under its own `ke`) and read its section. Returns the frame and the signing device. Pings, pongs and photons are not envelopes (their signature covers the provenance alone) — `wire::parse` reads those.
+/// Verify a device-signed envelope frame (fgtw's `open_frame`: the file signature under its own `ke`) and sort it by section. Returns the frame and the signing device. Pings, pongs and photons are not envelopes (their signature covers the provenance alone) — `wire::parse` reads those.
 pub fn parse_frame(bytes: &[u8]) -> Result<(Inbound, [u8; 32]), String> {
-    let (header, end) = vsf::verification::read_verified(bytes, None).map_err(|e| alloc::format!("frame verification failed: {e}"))?;
-    let signer = vsf::verification::extract_signer_pubkey(bytes)?;
-    let section = header.primary_section(bytes, end).map_err(|e| alloc::format!("frame section: {e}"))?;
+    use fgtw::protocol::{field_ge, field_handle_proof, open_frame};
+    let (section, signer) = open_frame(bytes)?;
     let frame = match section.name.as_str() {
-        "fleet_resp" => Inbound::FleetResp { hp: field_hp(&section, "hp").ok_or("fleet_resp missing hp")?, chain: field_ge(&section, "ch").ok_or("fleet_resp missing ch")? },
-        "fanout_resp" => Inbound::FanoutResp { hp: field_hp(&section, "hp").ok_or("fanout_resp missing hp")?, blob: field_ge(&section, "bl").ok_or("fanout_resp missing bl")? },
+        "fleet_resp" => Inbound::FleetResp { hp: field_handle_proof(&section, "hp").ok_or("fleet_resp missing hp")?, chain: field_ge(&section, "ch").ok_or("fleet_resp missing ch")? },
+        "fanout_resp" => Inbound::FanoutResp { hp: field_handle_proof(&section, "hp").ok_or("fanout_resp missing hp")?, blob: field_ge(&section, "bl").ok_or("fanout_resp missing bl")? },
         other => Inbound::Other(other.to_string()),
     };
     Ok((frame, signer))
