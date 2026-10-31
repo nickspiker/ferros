@@ -70,6 +70,39 @@ The network owns the assignment: a phone belongs to the identity whose fleet bou
 | 3 | bind | |
 | 4 | release | |
 
+## What the attest screen does
+
+"Recognized" means this device holds a space for the handle: the key from its seed opens a name list here.
+
+| Device | Handle | Result | Time |
+|---|---|---|---|
+| Bound | recognized (its own) | Opens: the screen goes, straight to the home screen | Instant |
+| Bound | not recognized | Denied | Instant |
+| Unbound | recognized (an earlier attempt, join not finished) | Back to finding the identity and the join | Instant (the proof is kept in its space) |
+| Unbound | not recognized | The earlier attempt's space wiped; the proof computed on the X3 and kept; then: an identity exists → join; none → mint, typed twice; no answer → still looking, "go on" offered | The proof once, about 5 s |
+
+The handle proof is public (beacons and the registry carry it), so keeping it in the identity's sealed space (`ahau.proof`) costs nothing. The identity seed is never kept unless unlock at boot is on.
+
+## What the attest screen says
+
+Owner, 2026-10-31: simple and direct.
+
+| When | Text | Button |
+|---|---|---|
+| Unbound, waiting | This device is unbound. Type your handle to bind. | bind |
+| Bound, waiting | Type your handle. | unlock |
+| Denied | Denied. This device is bound to another identity. | |
+| The proof running | Computing identity keys. | |
+| Looking up | Finding this identity. | |
+| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) | go on |
+| None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint |
+| The two differ | They don't match. Try again. | |
+| Minting | Minting. | |
+| Mint failed | Minting failed. Enter to retry. | |
+| No answer | No answer yet. Still looking. | go on |
+| Wrong slot | This handle's record doesn't match. Start over with another. | start over |
+| Bad character | This keyboard can't type that character. | |
+
 ## Known gaps
 
 - **The hypervisor net is not built yet.** Until it is, Android with root can read the ferros partition, and so the phone-only secret.

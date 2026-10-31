@@ -27,6 +27,8 @@ use honeycomb::{Event, Key, Keyboard, Touch, Touches};
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
+/// The vault scope `ahau.` (identity class, AUTH.md): `proof`, the unlocked identity's handle proof once computed here.
+const S_AHAU: u64 = 4;
 const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
@@ -152,6 +154,8 @@ struct Ahau {
     h: usize,
     kb: Keyboard,
     mode: Mode,
+    /// Whether the device is bound to an identity (one identity per device, AUTH.md): its handle unlocks, any other is denied.
+    bound: bool,
     /// This session's last derived seed and proof (RAM only), so typing the same handle again (after `back`) skips the proof.
     session_seed: Option<[u8; 32]>,
     session_proof: Option<[u8; 32]>,
@@ -263,7 +267,7 @@ impl Ahau {
     /// What the button does now, or nothing while the client is asked.
     fn button_label(&self) -> Option<&'static str> {
         match self.mode {
-            Mode::Fresh => Some("attest"),
+            Mode::Fresh => Some(if self.bound { "unlock" } else { "bind" }),
             Mode::Join(_) | Mode::Grey(_) => Some("go on"),
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong => Some("start over"),
@@ -509,12 +513,14 @@ impl Ahau {
 
     fn prompt(&self) -> &'static str {
         match self.mode {
-            Mode::Fresh => "No identity on this device yet. Type your handle.",
-            Mode::Looking(_) => "Looking this identity up: its devices nearby, then fgtw.org.",
-            Mode::Join(_) => "This identity has a fleet. On one of its devices: Fleet, Add device,\nand type the words below. Go on meanwhile if you like.",
-            Mode::Mint(_) => "No fleet holds this handle. Minting makes it yours for good:\nno reset, no recovery. Type it again, then mint.",
-            Mode::Grey(_) => "No device of this identity and no fgtw.org answers: nothing decided.\nStill looking. Go on meanwhile if you like.",
-            Mode::Wrong => "fgtw.org's chain for this handle claims another slot.\nStart over to type another.",
+            // The screen's words (owner, 2026-10-31: simple and direct; AUTH.md "What the attest screen says").
+            Mode::Fresh if self.bound => "Type your handle.",
+            Mode::Fresh => "This device is unbound.\nType your handle to bind.",
+            Mode::Looking(_) => "Finding this identity.",
+            Mode::Join(_) => "Use an existing device to bind this device to your fleet.",
+            Mode::Mint(_) => "This handle is unclaimed.\nMinting is permanent.\nType your handle again to mint your identity.",
+            Mode::Grey(_) => "No answer yet. Still looking.",
+            Mode::Wrong => "This handle's record doesn't match.\nStart over with another.",
         }
     }
 
@@ -558,7 +564,7 @@ impl Ahau {
         let seed = match core::str::from_utf8(&self.handle[..self.len]).ok().map(ahau_core::identity_seed) {
             Some(Ok(s)) => s,
             _ => {
-                self.status("That handle has a character this keyboard cannot type.");
+                self.status("This keyboard can't type that character.");
                 return;
             }
         };
@@ -571,7 +577,7 @@ impl Ahau {
                 ferros_sys::Unlock::Belongs => {
                     console(self.grants, b"ahau: refused: this phone belongs to another identity\n");
                     self.wipe();
-                    self.status("This phone belongs to another identity.");
+                    self.status("Denied. This device is bound to another identity.");
                     self.entry();
                     return;
                 }
@@ -581,23 +587,7 @@ impl Ahau {
         match self.mode {
             Mode::Fresh => {
                 // The same handle again this session (after `back`): its proof is cached in RAM, no second derivation.
-                let proof = if self.session_seed == Some(seed) {
-                    self.session_proof.unwrap()
-                } else {
-                    self.status("Deriving the handle's proof: about five seconds.");
-                    self.entry();
-                    self.show();
-                    // Let the display put the status up before the proof holds this core.
-                    sleep_until(now() + freq() / 30);
-                    // On the X3 (where the kernel runs): about five seconds (measured 2026-10-27).
-                    let t0 = now();
-                    let proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
-                    let ms = ferros_sys::us_since(t0) / 1000;
-                    let mut l = Line::new();
-                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms\n"));
-                    console(self.grants, l.as_bytes());
-                    proof
-                };
+                let proof = if self.session_seed == Some(seed) { self.session_proof.unwrap() } else { self.proof_for(&seed, true) };
                 // The roots to the client in RAM; it keeps them on disk only if unlock-at-boot is on.
                 self.send_roots(&seed, &proof);
                 console(self.grants, b"ahau: roots handed to the Photon client; it looks the identity up\n");
@@ -607,10 +597,10 @@ impl Ahau {
             }
             Mode::Mint(first) => {
                 if !ahau_core::same(&first, &seed) {
-                    self.status("The two did not match. Fix it and enter.");
+                    self.status("They don't match. Try again.");
                     return;
                 }
-                self.status("Minting: the genesis goes to fgtw.org.");
+                self.status("Minting.");
                 self.entry();
                 self.show();
                 let mut out = [0u8; 600];
@@ -633,7 +623,7 @@ impl Ahau {
                         let mut l = Line::new();
                         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: mint refused, client says {r}\n"));
                         console(self.grants, l.as_bytes());
-                        self.status("fgtw.org did not take the genesis.\nEnter tries again.");
+                        self.status("Minting failed. Enter to retry.");
                     }
                 }
             }
@@ -651,16 +641,41 @@ impl Ahau {
         }
     }
 
+    /// The handle proof for the unlocked identity: kept in its own sealed space after the first time (`ahau.proof`; the proof is public, it is what beacons and the registry carry), so a handle this device recognizes never computes it again. Otherwise computed on the X3 (about 5 s; 9.5 s on a worker core, 2026-10-31), the status saying so when `say`, and kept.
+    fn proof_for(&mut self, seed: &[u8; 32], say: bool) -> [u8; 32] {
+        let mut p = [0u8; 32];
+        if ferros_sys::store_get(cap(self.grants, S_AHAU), b"proof", &mut p) == Some(32) {
+            console(self.grants, b"ahau: handle proof from this identity's space (recognized)\n");
+            return p;
+        }
+        if say {
+            self.status("Computing identity keys.");
+            self.entry();
+            self.show();
+            // Let the display put the status up before the proof holds the core.
+            sleep_until(now() + freq() / 30);
+        }
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        sleep_until(now() + freq() / 1000);
+        let t0 = now();
+        let proof = *ihi::handle_proof(&blake3::Hash::from(*seed)).as_bytes();
+        let ms = ferros_sys::us_since(t0) / 1000;
+        ferros_sys::pin(0);
+        let mut l = Line::new();
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms on the X3\n"));
+        console(self.grants, l.as_bytes());
+        if !self.put(S_AHAU, b"proof", &proof) {
+            console(self.grants, b"ahau: could not keep the handle proof in the identity's space\n");
+        }
+        proof
+    }
+
     /// A person this phone knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
         self.wipe();
         console(self.grants, b"ahau: unlocked (this phone knows the identity); the screen goes, the proof follows\n");
         window::done(self.display, self.base);
-        let t0 = now();
-        let proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
-        let mut l = Line::new();
-        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {} ms, behind the screen\n", ferros_sys::us_since(t0) / 1000));
-        console(self.grants, l.as_bytes());
+        let proof = self.proof_for(&seed, false);
         self.send_roots(&seed, &proof);
         while self.roots_pending {
             sleep_until(now() + freq() / 16);
@@ -1028,8 +1043,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"ahau: no surface\n");
         exit(2);
     }
-    // Unlock at boot (`device.unlock_at_boot`, AUTH.md): the kernel unlocked the person's space from the seed it kept, before init started anything; no attest screen. The Photon client loads its own roots from that space.
-    if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) {
+    // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything): no attest screen; the Photon client loads its own from that space. Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
+    if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         exit(0);
     }
@@ -1039,7 +1054,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
+    let bound = ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
