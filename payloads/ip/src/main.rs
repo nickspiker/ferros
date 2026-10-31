@@ -12,7 +12,7 @@
 //! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection.
 //! - 5 TCP SEND: handle, data → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
 //! - 6 TCP RECV: handle → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection.
-//! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on).
+//! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the phone until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
 //!
@@ -150,8 +150,10 @@ struct Tcp {
     rto_t: u64,
     tries: u32,
     closed_t: u64,
+    /// When its app last asked anything of it (connect, send, receive, close): an app that died or stopped asking leaves it to `tcp_tick`, which frees it 32 s on (2026-10-31: two stalled downloads, their apps killed, held both slots and every connect after was refused).
+    touched: u64,
 }
-const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, cell: false, src: [0; 16], addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0 };
+const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, cell: false, src: [0; 16], addr: [0; 16], rport: 0, lport: 0, iss: 0, snd_una: 0, snd_nxt: 0, snd_max: 0, rcv_nxt: 0, peer_win: 0, rx: [0; RXW], rx_head: 0, rx_len: 0, tx: [0; TXB], tx_len: 0, fin_queued: false, fin_sent: false, fin_ever: false, fin_acked: false, peer_fin: false, rto: 0, rto_t: 0, tries: 0, closed_t: 0, touched: 0 };
 
 impl Ip {
     fn cap(&self, slot: u64) -> u64 {
@@ -965,7 +967,7 @@ impl Ip {
         self.eph = 49152 + (self.eph.wrapping_add(1 + (self.seed >> 20) as u16 % 97) % 16384);
         let iss = self.seed;
         let t = now();
-        self.tcp[i] = Tcp { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, ..TCP_FREE };
+        self.tcp[i] = Tcp { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_max: iss.wrapping_add(1), rto: self.freq, rto_t: t + self.freq, touched: t, ..TCP_FREE };
         self.tcp_out(i, 2, iss, &[]);
         out[0] = 0;
         out[1] = i as u8;
@@ -1054,6 +1056,15 @@ impl Ip {
                 continue;
             }
             if (c.fin_acked && c.peer_fin) || (c.closed_t != 0 && t.wrapping_sub(c.closed_t) > 16 * self.freq) {
+                self.tcp[i] = TCP_FREE;
+                continue;
+            }
+            // Abandoned: a reset to the peer if it was open (it stops sending), then the slot is free.
+            if t.wrapping_sub(c.touched) > 32 * self.freq {
+                if c.state == 2 || c.state == 3 {
+                    let s = c.snd_nxt;
+                    self.tcp_out(i, 4 | 16, s, &[]);
+                }
                 self.tcp[i] = TCP_FREE;
                 continue;
             }
@@ -1177,6 +1188,9 @@ impl Ip {
             }
             Some(5) if m.len() >= 2 => {
                 let i = m[1] as usize;
+                if i < TCPN {
+                    self.tcp[i].touched = now();
+                }
                 if i >= TCPN || self.tcp[i].state == 0 || self.tcp[i].state == 4 || self.tcp[i].fin_queued {
                     out[0] = 5;
                     return 1;
@@ -1193,6 +1207,9 @@ impl Ip {
             }
             Some(6) if m.len() >= 2 => {
                 let i = m[1] as usize;
+                if i < TCPN {
+                    self.tcp[i].touched = now();
+                }
                 if i >= TCPN || self.tcp[i].state == 0 {
                     out[0] = 5;
                     return 1;
@@ -1230,6 +1247,9 @@ impl Ip {
             }
             Some(7) if m.len() >= 2 => {
                 let i = m[1] as usize;
+                if i < TCPN {
+                    self.tcp[i].touched = now();
+                }
                 if i < TCPN && self.tcp[i].state != 0 {
                     let c = &mut self.tcp[i];
                     c.fin_queued = true;
