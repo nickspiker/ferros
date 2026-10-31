@@ -62,8 +62,8 @@ The `nfc` endpoint:
 ## Status (2026-10-31)
 
 - Up from cold on ferros: listening, polling.
+- RF path verified: the owner's tag read as NFC-A Type 2, UID 04 6D F0 EA D2 5B 80 (SENS_RES 0044, SEL_RES 00), re-read each discovery cycle while held.
 - Next:
-  - a tag tap (RF path);
   - a sponsor phone's read of S (the APDU path);
   - the interrupt line instead of polling;
   - wiring to Photon's join ceremony.
