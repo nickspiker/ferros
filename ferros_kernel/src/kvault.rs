@@ -365,26 +365,6 @@ impl KVault {
         for b in [&mut secret, &mut base, &mut k] {
             b.fill(0);
         }
-        self.adopt_legacy()?;
-        Ok(())
-    }
-
-    /// Entries stored under identity-class names before that class existed (2026-10-31: the map's arrangement, the WiFi credential, the Photon client's and the attest screen's) sit sealed under the device's keys, where an unlocked identity would never find them: the first identity unlocked takes them into its own space, and the device's copies are deleted. Later unlocks find none.
-    fn adopt_legacy(&mut self) -> Result<(), KvError> {
-        let all = self.names_in(Class::Device)?;
-        let (moving, staying): (Vec<String>, Vec<String>) = all.into_iter().partition(|n| identity_class(n));
-        if moving.is_empty() {
-            return Ok(());
-        }
-        for n in &moving {
-            if let Some(v) = self.raw_get_in(Class::Device, n)? {
-                self.set(n, &v)?;
-            }
-            let a = self.addr(Class::Device, n)?;
-            self.vault.delete(&a, now())?;
-        }
-        self.put_names(Class::Device, &staying)?;
-        crate::flashlog::line(&alloc::format!("identity: took over {} entries stored before the identity class", moving.len()));
         Ok(())
     }
 

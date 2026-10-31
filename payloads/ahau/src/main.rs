@@ -27,6 +27,8 @@ use honeycomb::{Event, Key, Keyboard, Touch, Touches};
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
+/// The vault scope `ahau.` (identity class, AUTH.md): `member` marks that this phone has been a member of the unlocked identity's fleet.
+const S_AHAU: u64 = 4;
 const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
@@ -377,6 +379,7 @@ impl Ahau {
             1 => Mode::Join(seed),
             2 | 3 => {
                 console(self.grants, b"ahau: this device is a member of the identity's fleet\n");
+                self.mark_member();
                 self.attested();
             }
             5 => Mode::Mint(seed),
@@ -561,11 +564,11 @@ impl Ahau {
                 return;
             }
         };
-        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. A space with something in it is someone who has used this phone: the screen goes now and the proof is made behind it. An empty one is a first time here, or another handle: the look-up carries on as before.
+        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. A space marked as a member here (`member_here`) is someone whose fleet this phone is in: the screen goes now and the proof is made behind it. Anything else (a first time here, another handle, a space holding only what an earlier build left in it) runs the look-up and the join as before: "not empty" was the first rule, and it closed Brittany's screen before her join (2026-10-31).
         if self.mode == Mode::Fresh {
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
-                Some(n) if n > 0 => self.unlocked_known(seed),
-                Some(_) => console(self.grants, b"ahau: unlocked; the space is empty here (a first time on this phone, or another handle): looking the identity up\n"),
+                Some(_) if self.member_here() => self.unlocked_known(seed),
+                Some(_) => console(self.grants, b"ahau: unlocked; this phone has not been a member of this identity's fleet: looking it up\n"),
                 None => console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n"),
             }
         }
@@ -610,6 +613,7 @@ impl Ahau {
                 match r {
                     0 => {
                         console(self.grants, b"ahau: minted; this device is the identity's first member\n");
+                        self.mark_member();
                         self.attested();
                     }
                     4 => {
@@ -633,6 +637,19 @@ impl Ahau {
 
     /// Clear during the mint's second entry only clears it: the verdict stands.
     fn unconfirm(&mut self) {}
+
+    /// Whether the unlocked identity's space carries the mark that this phone has been a member of its fleet (`ahau.member`).
+    fn member_here(&self) -> bool {
+        let mut b = [0u8; 1];
+        ferros_sys::store_get(cap(self.grants, S_AHAU), b"member", &mut b) == Some(1) && b[0] == 1
+    }
+
+    /// Mark the unlocked identity's space: this phone is a member of its fleet (its space is sealed under the identity's key, so the mark says nothing to anyone else).
+    fn mark_member(&self) {
+        if !self.put(S_AHAU, b"member", &[1]) {
+            console(self.grants, b"ahau: could not mark this phone a member in the identity's space\n");
+        }
+    }
 
     /// A person this phone knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
