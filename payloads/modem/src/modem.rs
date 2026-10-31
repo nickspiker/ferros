@@ -2144,7 +2144,7 @@ impl Online {
 
     /// One pass: the CP's state words, the timed actions of the probe level, every frame waiting in the RAW and FMT RX rings (answered where the AP must answer), every DL packet. False once the CP has given up (CRASH_EXIT) or a ring is beyond reading: the caller stops.
     fn step(&mut self, rep: &mut Vec<u8>) -> bool {
-        
+        let taken0 = self.packets;
         let t0 = self.t0;
         let probe = self.probe;
         let tests = probe == 8;
@@ -2541,6 +2541,13 @@ impl Online {
                 wr(pp_qinfo(q) + 12, (fore + 1) % PP_NUM_DESC);
                 self.done[q as usize] = (i + 1) % PP_NUM_DESC;
             }
+        }
+        // Downlink taken this pass: SEND_DATA and the doorbell, as Android's driver does within ~1.4 ms of each downlink interrupt whether or not it has anything to send (kprobes on pcie_send_ap2cp_irq and pktproc_irq_handler, 2026-10-31: 527 of 687 downlink interrupts followed by G#81 within 5 ms). Without it the CP held a TCP reply for up to the next message the AP happened to send — once 37 s, released by the 64 s registration poll.
+        if self.packets != taken0 {
+            unsafe { core::arch::asm!("dsb sy") };
+            wr(AP2CP_MSG, INT_SEND_DATA);
+            unsafe { core::arch::asm!("dsb sy") };
+            wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
         }
         let msi = rd(DBI + 0x830);
         if msi != 0 {
