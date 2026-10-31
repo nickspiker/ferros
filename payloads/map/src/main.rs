@@ -791,7 +791,8 @@ impl Map {
         let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
         b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[PHOTON].label);
         let mut out = [0u8; 512];
-        let n = ferros_sys::call(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
+        // CALL_LIVE: a client not answering yet shows as not running, never a frozen map.
+        let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
         if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
             b.text(cx, cy + r + 160, 32, grey(), 1, "the Photon client is not running \u{2022} two fingers for its back");
             return;

@@ -447,6 +447,9 @@ struct Client {
     radios_at: u64,
     /// A departure in progress (op 5): its stamp, the approval words this screen shows, the signed `depart_req`, and when the chain was last checked for our absence.
     depart: Option<Depart>,
+    /// Whether IPv4 has been up (the first lease triggers a look-up), and the look-up ticks spent with no network while looking.
+    net_up: bool,
+    offline_looks: u8,
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
@@ -1201,10 +1204,28 @@ impl Client {
                 }
             }
             // The verdict: looked up once the network is up, and again every 30 s while GREY or while a fresh handle waits (someone else may mint it meanwhile).
+            // The client serves from the start, network or not (the attest screen waits on it); the network coming up is a reason to look up at once, not 30 s later.
+            let up = self.udp.flags().is_some_and(|f| f & 1 != 0);
+            if up && !self.net_up {
+                self.net_up = true;
+                self.last_lookup_us = 0;
+                self.log.put(b"photon: the network is up (IPv4)");
+                self.log.line();
+            }
             if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) && t.saturating_sub(self.last_lookup_us) >= if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 } {
                 self.last_lookup_us = t;
-                if self.udp.flags().is_some_and(|f| f & 1 != 0) {
+                if up {
+                    self.offline_looks = 0;
                     self.lookup();
+                } else if self.verdict == V_LOOKING && self.sponsors.is_empty() {
+                    // No network to ask and no fleet device heard: after 16 s of that the honest answer is GREY (no verdict), which lets the person go on; the look-ups carry on at the grey cadence and from the moment the network is up.
+                    self.offline_looks += 1;
+                    if self.offline_looks >= 8 {
+                        self.offline_looks = 0;
+                        self.verdict = V_UNREACHABLE;
+                        self.log.put(b"photon: no network and no fleet device heard: no verdict (GREY)");
+                        self.log.line();
+                    }
                 }
             }
             // The binding request only once there is a fleet to ask (the verdict says joining): minting it signs in three families, SLH-DSA-128s among them, which takes seconds; it is done here in the loop, never inside a call another process waits on.
@@ -1258,16 +1279,7 @@ extern "C" fn work(_: u64) -> ! {
     let base = ferros_sys::arc_base();
     let mut log = Log { grants, buf: Vec::new() };
     let udp = Udp { grants, base };
-    // The network first: the stack must be up for anything below to matter.
-    let mut waited = 0;
-    while udp.flags().map_or(true, |f| f & 1 == 0) {
-        ferros_sys::sleep_until(now() + ferros_sys::freq() / 4);
-        waited += 1;
-        if waited == 240 {
-            log.put(b"photon: no IPv4 lease after a minute - still waiting");
-            log.line();
-        }
-    }
+    // No wait for the network here: the `photon` endpoint is served from the start, so the attest screen and the map always get an answer (until 2026-10-31 this thread waited for an IPv4 lease first, and with no network attest froze on the roots hand-over). The UDP ports and beacon groups are taken now; the IP process keeps the groups and reports them once the link is up; look-ups wait for IPv4 in the loop.
     // The device key, rooted in the ira.
     let Some(fingerprint) = ferros_sys::ira_key(cap(grants, S_IRA), "photon device") else {
         log.put(b"photon: no ira-derived key (no Ira grant, or the kernel has no ira this boot)");
@@ -1283,7 +1295,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

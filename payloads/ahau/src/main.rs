@@ -155,6 +155,8 @@ struct Ahau {
     /// This session's last derived seed and proof (RAM only), so typing the same handle again (after `back`) skips the proof.
     session_seed: Option<[u8; 32]>,
     session_proof: Option<[u8; 32]>,
+    /// The roots are set but the client has not taken them yet (`send_roots`).
+    roots_pending: bool,
     /// Unlock at boot (device.unlock_at_boot): the seed is stored so the phone unlocks without typing. Opt-in, warned.
     unlock_at_boot: bool,
     handle: [u8; 4 * MAX_CHARS],
@@ -350,7 +352,8 @@ impl Ahau {
     /// The Photon client's state (op 1): its state byte, with the pairing words kept while it joins.
     fn client_state(&mut self) -> Option<u8> {
         let mut out = [0u8; 600];
-        let n = call(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
+        // CALL_LIVE: a client that is not answering yet (starting, or between passes of its loop) is a None this poll, never a frozen screen.
+        let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
         if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
             return None;
         }
@@ -388,6 +391,12 @@ impl Ahau {
             Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
             _ => return false,
         };
+        if self.roots_pending {
+            self.roots_pending = !self.hand_roots();
+            if self.roots_pending {
+                return false;
+            }
+        }
         let Some(state) = self.client_state() else { return false };
         let next = match state {
             1 => Mode::Join(seed),
@@ -413,16 +422,22 @@ impl Ahau {
         true
     }
 
-    /// Hand the roots to the Photon client in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here.
+    /// Hand the roots to the Photon client in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The call does not wait for a client that is not answering yet (CALL_LIVE): the hand-over is then marked pending and made again at the next poll (`follow_client`), so the screen never freezes on it.
     fn send_roots(&mut self, seed: &[u8; 32], proof: &[u8; 32]) {
-        let mut m = [0u8; 65];
-        m[0] = 4;
-        m[1..33].copy_from_slice(seed);
-        m[33..65].copy_from_slice(proof);
-        let mut out = [0u8; 16];
-        call(cap(self.grants, S_PHOTON_EP), &m, &mut out);
         self.session_seed = Some(*seed);
         self.session_proof = Some(*proof);
+        self.roots_pending = !self.hand_roots();
+    }
+
+    /// One attempt at the op-4 hand-over of the session's roots: true when the client took them.
+    fn hand_roots(&self) -> bool {
+        let (Some(seed), Some(proof)) = (self.session_seed, self.session_proof) else { return false };
+        let mut m = [0u8; 65];
+        m[0] = 4;
+        m[1..33].copy_from_slice(&seed);
+        m[33..65].copy_from_slice(&proof);
+        let mut out = [0u8; 16];
+        ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &m, &mut out) != ferros_sys::ERR
     }
 
     /// The entry: the handle as typed, a cursor, and a line under it.
@@ -608,7 +623,7 @@ impl Ahau {
                 self.entry();
                 self.show();
                 let mut out = [0u8; 600];
-                let n = call(cap(self.grants, S_PHOTON_EP), &[2], &mut out);
+                let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[2], &mut out);
                 let r = if n == ferros_sys::ERR || n == 0 { 255 } else { out[0] };
                 match r {
                     0 => {
@@ -1016,7 +1031,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, input_len: u64) -> ! {
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, roots_pending: false, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
