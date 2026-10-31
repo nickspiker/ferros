@@ -1,6 +1,6 @@
-//! init: the first process of a cold boot, started by the kernel once the boot ring completes (the USB link up, or 1 s after the press without a cable). It holds exactly the capabilities the shell needs and starts the shell's three processes from vault capsules, each with its share (SYS_SPAWN: copies of init's own capabilities, never more), then ends. Policy lives here, in a signed and replaceable capsule; the kernel only starts init (owner, 2026-10-22).
+//! init: the first process of a cold boot, started by the kernel once the boot ring completes (the USB link up, or 1 s after the press without a cable). It holds exactly the capabilities the shell needs and starts every process of the home from vault capsules, each with its share (SYS_SPAWN: copies of init's own capabilities, never more), then ends. Policy lives here, in a signed and replaceable capsule; the kernel only starts init (owner, 2026-10-22).
 //!
-//! The shell (SHELL.md): `display` owns the panel and keeps the map's scene, `touch` serves contacts, `map` places the circles and turns touch into the camera. Started in that order: each runs until it waits for work, so the display is serving before the map asks it for the panel.
+//! The shell (SHELL.md): `display` owns the panel and keeps the map's scene, `touch` serves contacts, `ahau` is the attest screen, `map` places the circles and turns touch into the camera. Started in that order; a spawn only queues, so init waits for the attest screen's window before it starts the map (`wait_front`).
 //!
 //! Then the network (WIFI.md), after the shell so the screen never waits for it: `pcie1`, the WiFi driver, brings up PCIe channel 1, loads the chip's firmware from the vault and joins the network it holds the credential for, then serves Ethernet frames on `wlan`; `ip` (ARP, IPv4 + DHCP, IPv6, UDP) serves `udp` over it. Both are processes with only their own grants; the kernel only hands them out.
 //!
@@ -13,7 +13,10 @@
 #![no_std]
 #![no_main]
 
-use ferros_sys::{console, exit, spawn};
+use ferros_sys::{call_live, cap, console, exit, freq, now, sleep_until, spawn, ERR};
+
+/// Grant slot 17: use display (the header's list).
+const S_USE_DISPLAY: u64 = 17;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
 const SHELL: [(&[u8], &[u8], &[u64]); 10] = [
@@ -47,12 +50,28 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             console(grants, name);
             console(grants, b"\n");
             failed += 1;
+        } else if *name == b"ahau" {
+            wait_front(grants);
         }
     }
     if failed == 0 {
         console(grants, b"init: shell, network and radios started (display, touch, ahau, map, pcie1, ip, nfc, bt, photon, modem)\n");
     }
     exit(failed)
+}
+
+/// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.
+fn wait_front(grants: u64) {
+    let end = now() + freq() * 4;
+    while now() < end {
+        let mut r = [0u8; 16];
+        let n = call_live(cap(grants, S_USE_DISPLAY), &[5], &mut r);
+        if n != ERR && n >= 13 && r[12] == 1 {
+            return;
+        }
+        sleep_until(now() + freq() / 64);
+    }
+    console(grants, b"init: the attest screen's window was not up after 4 s; starting the rest\n");
 }
 
 #[panic_handler]
