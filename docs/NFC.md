@@ -66,4 +66,4 @@ The `nfc` endpoint:
 - Next:
   - a sponsor phone's read of S (the APDU path);
   - the interrupt line instead of polling;
-  - wiring to Photon's join ceremony.
+  - an end-to-end ceremony (wired: Photon serves each binding request's S on the tag, docs/BT.md "Photon").

@@ -15,7 +15,7 @@ call() {
     cargo el0 -q -p ferros-payload-epcall 2>/dev/null
     aarch64-linux-gnu-objcopy -O binary "$R/epcall" "$R/epcall.bin"
     timeout 60 "$B" spawn "$R/epcall.bin" "$2" --name epcall --use "$1" >/dev/null 2>&1 || true
-    console 2 epcall 4
+    sleep 2; timeout 20 "$B" diag console 2>&1 | grep -a "^\(epcall\|$1\): " | tail -12 || true
 }
 case "${1:-}" in
     nfc)

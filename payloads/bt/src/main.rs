@@ -425,10 +425,26 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         }
     }
     let mut bt = Bt { grants, rx: [0; 1024], rx_len: 0, name: [0; 64], name_len: 0, beacon: None, events_in_download: 0, dropped: 0 };
-    if let Err(e) = bt.up() {
-        say!(grants, "bt: bring-up failed: {e}\n");
-        ferros_sys::power(cap(grants, S_POWER), false);
-        ferros_sys::exit(1);
+    // At boot WiFi's driver may not have raised its REG_ON yet (the kernel refuses Bluetooth alone): tried again every 4 s, saying so once. Any other failure ends the driver, the chip powered down.
+    // Started beside WiFi's driver at boot: its REG_ON cycle and bring-up first (it turns this core off before the cycle anyway).
+    sleep_ms(16 << 10);
+    let mut waited = false;
+    loop {
+        match bt.up() {
+            Ok(()) => break,
+            Err(e) if e.starts_with("power refused") => {
+                if !waited {
+                    say!(grants, "bt: waiting for WiFi's REG_ON\n");
+                    waited = true;
+                }
+                sleep_ms(4096);
+            }
+            Err(e) => {
+                say!(grants, "bt: bring-up failed: {e}\n");
+                ferros_sys::power(cap(grants, S_POWER), false);
+                ferros_sys::exit(1);
+            }
+        }
     }
     let mut l = Line { b: [0; 512], n: 0 };
     bt.state(&mut l);
@@ -439,8 +455,39 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     }
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
+    let mut checked = now();
     let mut e = [0u8; 258];
     loop {
+        // WiFi's driver pulling its REG_ON (a restart) resets this core to its ROM, the patch and the beacon gone, the UART answering nothing at 4 Mbaud: every 8 s Read_Local_Version_Information asks, and silence brings the chip up again with the beacon it had.
+        if now() - checked > freq() * 8 {
+            checked = now();
+            if bt.cmd(0x1001, &[], 256, &mut e).is_none() {
+                say!(grants, "bt: the chip stopped answering (WiFi restarted?): bringing it up again\n");
+                let had = bt.beacon.take();
+                bt.rx_len = 0;
+                // WiFi's driver turned this core off before cycling its REG_ON: its bring-up (link, firmware) is given 16 s before this one starts, as Android's coordinator lets one finish before the other begins.
+                sleep_ms(16 << 10);
+                // A chip that keeps failing is tried again 4 s later, the wait doubling to 1024 s (as the modem driver backs off).
+                let mut wait = 4u64;
+                loop {
+                    match bt.up() {
+                        Ok(()) => break,
+                        Err(e) => {
+                            say!(grants, "bt: bring-up failed: {e}; again in {wait} s\n");
+                            sleep_ms(wait * 1024);
+                            if wait < 1024 {
+                                wait *= 2;
+                            }
+                        }
+                    }
+                }
+                if let Some(b) = had {
+                    let ok = bt.advertise(&b);
+                    say!(grants, "bt: beacon {}\n", if ok { "restored" } else { "refused" });
+                }
+                checked = now();
+            }
+        }
         if bt.pull() > 0 {
             while let Some(n) = bt.event(&mut e) {
                 say!(grants, "bt: event {}\n", Hex(&e[..n.min(32)]));

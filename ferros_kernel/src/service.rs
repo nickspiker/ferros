@@ -409,6 +409,10 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Hardware(b"cmu-hsi1"), Hardware(b"hsi1-sysreg"), Hardware(b"gpio-hsi1"), Hardware(b"sysmmu-hsi1"), Hardware(b"s2mpu-hsi1"), Hardware(b"gpio-alive"), Hardware(b"pmu"),
         Dma(b"modem-pktproc"), Dma(b"modem-ipc"), Dma(b"modem-msi"),
         Part(b"modem_a"), Part(b"efs"), Part(b"persist"), Part(b"modem_userdata"), Part(b"vendor_a"),
+        // The NFC driver (payloads/nfc, docs/NFC.md): 77 serve nfc, 78 hsi2c_0, 79 its power; its interrupt line is read in gpio-alive (67). 80 use nfc (Photon's, the tap's secret).
+        Serve(b"nfc"), Hardware(b"hsi2c0"), Power(b"nfc"), Use(b"nfc"),
+        // The Bluetooth driver (payloads/bt, docs/BT.md): 81 serve bt, 82 the APM UART, 83 its power; the patch from vendor_a (76), entropy (41). 84 use bt (Photon's, the beacon).
+        Serve(b"bt"), Hardware(b"apm-usi1-uart"), Power(b"bt"), Use(b"bt"),
     ]
 }
 
@@ -419,12 +423,16 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22, 47],
-        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49],
+        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
         b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
-        b"photon" => &[50, 48, 49, 46, 41],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
+        b"photon" => &[50, 48, 49, 46, 41, 80, 84],
+        // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
+        b"nfc" => &[77, 78, 67, 79],
+        // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
+        b"bt" => &[81, 82, 76, 83, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint) (payloads/ahau).
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47],
         _ => return None,

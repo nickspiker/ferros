@@ -29,6 +29,8 @@ const DMA: u64 = 14;
 const STORE: u64 = 16;
 /// The ira-derived key right (`--ira`, after the vault scope; init grants it at boot): the key the per-network MAC is hashed under.
 const IRA: u64 = 17;
+/// Bluetooth's power switch (`--power bt`, after the ira key; init grants it at boot): the chip's Bluetooth core is turned off before WL_REG_ON is cycled, as Android's REG_ON coordinator resets Bluetooth before a WiFi chip reset (wl_android.c, wl2wbrc_req_bt_reset). Cycling WL_REG_ON under a powered Bluetooth core wedged the chip and the phone with it (2026-10-31: two watchdog resets, each within a minute of a WiFi restart). The Bluetooth driver hears its chip go silent and brings it up again once WiFi is up. A start without the grant (the bridge's) skips it.
+const BT_POWER: u64 = 18;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -276,6 +278,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     con = (con & !(0xF << 4)) | (0x2 << 4);
     con = (con & !(0xF << 16)) | (0x1 << 16);
     con &= !(0xF << 20);
+    ferros_sys::power(d.cap(BT_POWER), false);
     d.clr(GPIO, 0x4, (1 << 0) | (1 << 4)); // B1: both low before switching to outputs
     d.wr(GPIO, 0x0, con);
     let pud = d.rd(GPIO, 0x8);

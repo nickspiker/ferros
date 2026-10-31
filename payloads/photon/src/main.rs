@@ -2,7 +2,7 @@
 //!
 //! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the phone. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
-//! Started by init at boot (payloads/init), or from the bridge: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `photon.sponsor` holds the same 19 bytes for the boot-started client] --name photon --use udp --store photon --ira --serve photon. The `photon` endpoint serves the map's Photon circle: op 1 → [state: 0 not paired, 1 paired, 2 bound, 3 member][fleet devices heard][the 23 pairing words, utf-8, while unbound]. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira. Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Started by init at boot (payloads/init), or from the bridge: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `photon.sponsor` holds the same 19 bytes for the boot-started client] --name photon --use udp --store photon --ira --serve photon --entropy --use nfc --use bt. The `photon` endpoint serves the map's Photon circle: op 1 → [state: 0 not paired, 1 paired, 2 bound, 3 member][fleet devices heard][the 23 pairing words, utf-8, while unbound]. Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira, 4 serve photon, 5 entropy, 6 nfc (use), 7 bt (use): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -65,6 +65,9 @@ const S_IRA: u64 = 3;
 const S_SERVE: u64 = 4;
 /// Grant slot 5: entropy (the kernel's KOHI stream), for fgtw's fleet-key minting (fgtw::set_entropy).
 const S_ENTROPY: u64 = 5;
+/// Grant slots 6 and 7: the NFC and Bluetooth drivers (docs/NFC.md, docs/BT.md), the joiner's two proximity carriers (pairing-v2 "Transports"): the tap serves the request's secret S, the beacon advertises its id.
+const S_NFC: u64 = 6;
+const S_BT: u64 = 7;
 
 struct Log {
     grants: u64,
@@ -424,6 +427,8 @@ struct Client {
     /// This device's current binding request and its stamp (re-minted every 210 s while unbound, as the app re-posts).
     request_t: i64,
     request_frame: Vec<u8>,
+    /// Whether the tap secret and the beacon are out (`radios`).
+    radios_on: bool,
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
@@ -620,8 +625,36 @@ impl Client {
         }
     }
 
+    /// The proximity carriers: with a request, its secret served on the NFC tag and its beacon id advertised; without, both stopped. A driver that is not running is skipped (the call fails at once): the words still work.
+    fn radios(&mut self, on: Option<(&[u8; 32], &[u8; 16])>) {
+        let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
+        let mut r = [0u8; 4];
+        let (a, b) = match on {
+            Some((s, id)) => {
+                let mut m = [0u8; 33];
+                m[0] = 1;
+                m[1..].copy_from_slice(s);
+                let a = ferros_sys::call(nfc, &m, &mut r);
+                let mut m = [0u8; 17];
+                m[0] = 1;
+                m[1..].copy_from_slice(id);
+                (a, ferros_sys::call(bt, &m, &mut r))
+            }
+            None => (ferros_sys::call(nfc, &[2], &mut r), ferros_sys::call(bt, &[2], &mut r)),
+        };
+        self.radios_on = on.is_some();
+        self.log.put(if on.is_some() { b"photon: tap secret and beacon out: nfc " } else { b"photon: tap secret and beacon stopped: nfc " });
+        self.log.put(if a == ERR { b"not running" } else { b"ok" });
+        self.log.put(b", bt ");
+        self.log.put(if b == ERR { b"not running" } else { b"ok" });
+        self.log.line();
+    }
+
     /// Everything held for the identity whose roots were in the vault: its roots, chain standing, key, sponsors and request.
     fn forget_identity(&mut self) {
+        if self.radios_on {
+            self.radios(None);
+        }
         self.identity_seed = None;
         self.hp = None;
         self.bound = false;
@@ -776,13 +809,18 @@ impl Client {
         let t0 = now();
         self.log.put(b"photon: minting the binding request");
         self.log.line();
-        let req = join::make_bind_request(&self.keys, &seed, &hp, t);
+        let mut req = join::make_bind_request(&self.keys, &seed, &hp, t);
+        // The tap's secret: 32 fresh bytes per request, committed to in the request (`nh`, fgtw::pair::nfc_secret_hash over this device and stamp) so a sponsor that reads S off the tap knows which candidate it touched. Outside the consent bytes: the signature over the frame covers it.
+        let mut s = [0u8; 32];
+        kernel_entropy(&mut s);
+        req.nfc_hash = fgtw::pair::nfc_secret_hash(&s, &self.me, t);
         let framed = join::bind_req_vsf(&req, &hp, &self.keys, t);
         let ms = ferros_sys::us_since(t0) / 1000;
         match framed {
             Ok(f) => {
                 self.request_t = t;
                 self.request_frame = f;
+                self.radios(Some((&s, &fgtw::pair::beacon_id(&hp, &self.me, t))));
                 self.log.put(b"photon: binding request minted (");
                 self.log.dec(self.request_frame.len() as u64);
                 self.log.put(b" B) in ");
@@ -1056,6 +1094,10 @@ impl Client {
             if !self.bound && self.hp.is_some() && self.verdict == V_JOIN && self.request_frame.is_empty() {
                 self.mint_request();
             }
+            // Bound: nothing left to prove proximity for.
+            if self.bound && self.radios_on {
+                self.radios(None);
+            }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();
@@ -1118,7 +1160,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

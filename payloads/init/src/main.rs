@@ -16,18 +16,21 @@
 use ferros_sys::{console, exit, spawn};
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 8] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 10] = [
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
     // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint) (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47]),
     (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
-    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC) (payloads/pcie1 header).
-    (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49]),
+    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header).
+    (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83]),
     // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41, 52]),
-    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).
-    (b"photon", b"photon", &[50, 48, 49, 46, 41]),
+    // The radios before Photon, which hands them the tap's secret and the beacon while it joins: the NFC driver 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc); the Bluetooth driver 1 serve bt, 2 the APM UART, 3 vendor_a (the patch), 4 its power, 5 entropy (payloads/bt).
+    (b"nfc", b"nfc", &[77, 78, 67, 79]),
+    (b"bt", b"bt", &[81, 82, 76, 83, 41]),
+    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
+    (b"photon", b"photon", &[50, 48, 49, 46, 41, 80, 84]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
 ];
@@ -47,7 +50,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell and network started (display, touch, ahau, map, pcie1, ip, photon, modem)\n");
+        console(grants, b"init: shell, network and radios started (display, touch, ahau, map, pcie1, ip, nfc, bt, photon, modem)\n");
     }
     exit(failed)
 }
