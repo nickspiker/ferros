@@ -709,11 +709,41 @@ pub mod window {
 /// Whether an identity is unlocked (AUTH.md), through an Unlock capability. None without the capability.
 pub fn identity_unlocked(cap: u64) -> Option<bool> {
     let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
-    (r != ERR).then_some(r == 1)
+    (r != ERR).then_some(r & 1 == 1)
 }
 
-/// Unlock the person's identity class of the vault from their 32-byte seed (AUTH.md): the kernel derives the key from the ira, the phone-only secret and the seed, and keeps it until power goes or the phone switches OS. Some(how many entries the identity already has on this phone) when unlocked.
-pub fn unlock_identity(cap: u64, seed: &[u8; 32]) -> Option<u64> {
-    let r = svc(nr::UNLOCK, cap, 1, off(seed.as_ptr()), 0, 0);
-    (r != ERR).then_some(r)
+/// Whether an identity's fleet has bound this phone (only that identity unlocks it then). None without the capability.
+pub fn identity_bound(cap: u64) -> Option<bool> {
+    let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
+    (r != ERR).then_some(r & 2 == 2)
+}
+
+/// What an unlock did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unlock {
+    /// The identity's space is open; how many entries it has on this phone.
+    Opened(u64),
+    /// The phone is bound to another identity: this one does not open here.
+    Belongs,
+    /// No Unlock right, no vault or no ira.
+    Failed,
+}
+
+/// Unlock the person's identity class of the vault from their 32-byte seed (AUTH.md): the kernel derives the key from the ira, the phone-only secret and the seed, and keeps it until power goes or the phone switches OS. A phone bound to another identity refuses.
+pub fn unlock_identity(cap: u64, seed: &[u8; 32]) -> Unlock {
+    match svc(nr::UNLOCK, cap, 1, off(seed.as_ptr()), 0, 0) {
+        ERR => Unlock::Failed,
+        NOTHING => Unlock::Belongs,
+        n => Unlock::Opened(n),
+    }
+}
+
+/// The unlocked identity's fleet has bound this phone: from now on only it unlocks here. True when done.
+pub fn bind_identity(cap: u64) -> bool {
+    svc(nr::UNLOCK, cap, 3, 0, 0, 0) == 0
+}
+
+/// Release the phone (a completed departure): every identity entry deleted, the binding gone. True when done.
+pub fn release_identity(cap: u64) -> bool {
+    svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }

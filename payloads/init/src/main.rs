@@ -36,9 +36,9 @@ const SHELL: [(&[u8], &[u8], &[u64]); 10] = [
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
-    // What reads the person's space (the identity class), started once an identity is unlocked (`wait_unlocked`): the map (its arrangement), then the Photon client (its chain and key): 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
+    // What reads the person's space (the identity class), started once an identity is unlocked (`wait_unlocked`): the map (its arrangement), then the Photon client (its chain and key): 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/photon).
     (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
-    (b"photon", b"photon", &[50, 48, 49, 46, 41, 80, 84]),
+    (b"photon", b"photon", &[50, 48, 49, 46, 41, 80, 84, 85]),
 ];
 
 #[unsafe(no_mangle)]

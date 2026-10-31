@@ -37,6 +37,10 @@ const ID_SECRET: &str = "\0id.secret";
 const ID_UNLOCK: &str = "\0id.unlock";
 /// The identity class's own list of names, sealed under the identity key.
 const ID_NAMES: &str = "\0id.names";
+/// One identity per phone (AUTH.md; the network owns the assignment): set when the unlocked identity'"'"'s fleet binds this phone, cleared on release (a completed departure). While set, only that identity unlocks.
+const ID_BOUND: &str = "\0id.bound";
+/// Every identity-class entry'"'"'s vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a phone that is not bound yet.
+const ID_ADDRS: &str = "\0id.addrs";
 const ID_CONTEXT: &str = "ferros identity vault v1";
 const ID_ADDR_CONTEXT: &str = "ferros identity vault addr v1";
 const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
@@ -130,6 +134,8 @@ pub enum KvError {
     Locked,
     /// No ira this boot, so no identity key can be derived.
     NoIra,
+    /// The phone is bound to another identity: this seed does not open its space.
+    Belongs,
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
@@ -214,6 +220,9 @@ impl KVault {
         let a = self.addr(class, name)?;
         let sealed = self.seal(class, value)?;
         self.vault.put(&a, &sealed, now())?;
+        if class == Class::Identity {
+            self.track(&a, true)?;
+        }
         Ok(a)
     }
 
@@ -270,6 +279,9 @@ impl KVault {
         let class = class_of(name);
         let a = self.addr(class, name)?;
         let existed = self.vault.delete(&a, now())?;
+        if class == Class::Identity {
+            self.track(&a, false)?;
+        }
         let mut names = self.names_in(class)?;
         if let Some(i) = names.iter().position(|n| n == name) {
             names.remove(i);
@@ -303,6 +315,9 @@ impl KVault {
         let a = self.addr_scoped(prefix, addr)?;
         let sealed = self.seal(class, value)?;
         self.vault.put(&a, &sealed, now())?;
+        if class == Class::Identity {
+            self.track(&a, true)?;
+        }
         let mut list = self.addrs(prefix)?;
         if !list.chunks_exact(32).any(|c| c == addr) {
             list.extend_from_slice(addr);
@@ -315,6 +330,9 @@ impl KVault {
         let class = class_of(prefix);
         let a = self.addr_scoped(prefix, addr)?;
         let existed = self.vault.delete(&a, now())?;
+        if class == Class::Identity {
+            self.track(&a, false)?;
+        }
         let list = self.addrs(prefix)?;
         if list.chunks_exact(32).any(|c| c == addr) {
             let kept: Vec<u8> = list.chunks_exact(32).filter(|c| *c != addr).flatten().copied().collect();
@@ -341,9 +359,6 @@ impl KVault {
     /// Unlock the identity whose seed is `seed` (AUTH.md): its key is BLAKE3 keyed by the ira's identity-vault key over the phone-only secret and the seed — bound to this phone (the ira and the secret) and to the person (the seed). The secret is made from this session's wairua the first time and kept in the device class. Whatever identity was unlocked before is locked first. The seed is not kept.
     pub fn unlock(&mut self, seed: &[u8; 32], keep: bool) -> Result<(), KvError> {
         self.lock();
-        if keep {
-            self.raw_put(ID_UNLOCK, seed)?;
-        }
         let mut secret = [0u8; 32];
         match self.raw_get(ID_SECRET)? {
             Some(s) if s.len() == 32 => secret.copy_from_slice(&s),
@@ -365,6 +380,17 @@ impl KVault {
         for b in [&mut secret, &mut base, &mut k] {
             b.fill(0);
         }
+        // One identity per phone: a seed whose key opens no name list is not the bound identity'"'"'s (refused), or, on a phone not bound yet, a different handle from the last one (whose leftovers go).
+        if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
+            if self.bound()? {
+                self.lock();
+                return Err(KvError::Belongs);
+            }
+            self.wipe_identity()?;
+        }
+        if keep {
+            self.raw_put(ID_UNLOCK, seed)?;
+        }
         Ok(())
     }
 
@@ -379,6 +405,61 @@ impl KVault {
 
     pub fn unlocked(&self) -> bool {
         self.id.is_some()
+    }
+
+    /// Whether an identity'"'"'s fleet has bound this phone.
+    pub fn bound(&mut self) -> Result<bool, KvError> {
+        Ok(self.raw_get(ID_BOUND)?.is_some())
+    }
+
+    /// The unlocked identity'"'"'s fleet has bound this phone: from now on only it unlocks here, until release.
+    pub fn bind(&mut self) -> Result<(), KvError> {
+        if self.id.is_none() {
+            return Err(KvError::Locked);
+        }
+        self.raw_put(ID_BOUND, &[1])?;
+        Ok(())
+    }
+
+    /// Release the phone (a completed departure, or the developer'"'"'s `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the phone-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
+    pub fn release(&mut self) -> Result<usize, KvError> {
+        let n = self.wipe_identity()?;
+        for name in [ID_BOUND, ID_UNLOCK, ID_SECRET] {
+            let a = self.addr(Class::Device, name)?;
+            self.vault.delete(&a, now())?;
+        }
+        self.lock();
+        Ok(n)
+    }
+
+    /// Every identity-class entry deleted by its address (`ID_ADDRS`), without needing its key. Returns how many.
+    fn wipe_identity(&mut self) -> Result<usize, KvError> {
+        let list = self.raw_get(ID_ADDRS)?.unwrap_or_default();
+        for a in list.chunks_exact(32) {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(a);
+            self.vault.delete(&b, now())?;
+        }
+        if !list.is_empty() {
+            let a = self.addr(Class::Device, ID_ADDRS)?;
+            self.vault.delete(&a, now())?;
+        }
+        Ok(list.len() / 32)
+    }
+
+    /// Keep `ID_ADDRS` in step with the identity class'"'"'s entries.
+    fn track(&mut self, a: &[u8; 32], add: bool) -> Result<(), KvError> {
+        let list = self.raw_get(ID_ADDRS)?.unwrap_or_default();
+        let has = list.chunks_exact(32).any(|c| c == a);
+        if add && !has {
+            let mut l = list;
+            l.extend_from_slice(a);
+            self.raw_put(ID_ADDRS, &l)?;
+        } else if !add && has {
+            let kept: Vec<u8> = list.chunks_exact(32).filter(|c| *c != a).flatten().copied().collect();
+            self.raw_put(ID_ADDRS, &kept)?;
+        }
+        Ok(())
     }
 
     /// How many entries the unlocked identity has on this phone (0 while locked): a person who has used this phone before finds a space that is not empty.

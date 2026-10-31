@@ -27,8 +27,6 @@ use honeycomb::{Event, Key, Keyboard, Touch, Touches};
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
-/// The vault scope `ahau.` (identity class, AUTH.md): `member` marks that this phone has been a member of the unlocked identity's fleet.
-const S_AHAU: u64 = 4;
 const S_PHOTON: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
@@ -564,12 +562,20 @@ impl Ahau {
                 return;
             }
         };
-        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. A space marked as a member here (`member_here`) is someone whose fleet this phone is in: the screen goes now and the proof is made behind it. Anything else (a first time here, another handle, a space holding only what an earlier build left in it) runs the look-up and the join as before: "not empty" was the first rule, and it closed Brittany's screen before her join (2026-10-31).
+        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. One identity per phone: on a phone its fleet has bound, the kernel opens only that identity's space, so an open space there is the phone's own person and the screen goes now, the proof made behind it; another handle is refused. On a phone not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
         if self.mode == Mode::Fresh {
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
-                Some(_) if self.member_here() => self.unlocked_known(seed),
-                Some(_) => console(self.grants, b"ahau: unlocked; this phone has not been a member of this identity's fleet: looking it up\n"),
-                None => console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n"),
+                // Opened on a bound phone: this is the identity the phone belongs to.
+                ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => self.unlocked_known(seed),
+                ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this phone is not bound to a fleet yet: looking the identity up\n"),
+                ferros_sys::Unlock::Belongs => {
+                    console(self.grants, b"ahau: refused: this phone belongs to another identity\n");
+                    self.wipe();
+                    self.status("This phone belongs to another identity.");
+                    self.entry();
+                    return;
+                }
+                ferros_sys::Unlock::Failed => console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n"),
             }
         }
         match self.mode {
@@ -638,16 +644,10 @@ impl Ahau {
     /// Clear during the mint's second entry only clears it: the verdict stands.
     fn unconfirm(&mut self) {}
 
-    /// Whether the unlocked identity's space carries the mark that this phone has been a member of its fleet (`ahau.member`).
-    fn member_here(&self) -> bool {
-        let mut b = [0u8; 1];
-        ferros_sys::store_get(cap(self.grants, S_AHAU), b"member", &mut b) == Some(1) && b[0] == 1
-    }
-
-    /// Mark the unlocked identity's space: this phone is a member of its fleet (its space is sealed under the identity's key, so the mark says nothing to anyone else).
+    /// The identity's fleet has this phone: the kernel binds it to the unlocked identity, so from the next boot only that identity's handle opens it (until a departure releases it).
     fn mark_member(&self) {
-        if !self.put(S_AHAU, b"member", &[1]) {
-            console(self.grants, b"ahau: could not mark this phone a member in the identity's space\n");
+        if !ferros_sys::bind_identity(cap(self.grants, S_UNLOCK)) {
+            console(self.grants, b"ahau: could not bind this phone to the identity\n");
         }
     }
 

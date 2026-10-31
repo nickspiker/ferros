@@ -644,7 +644,7 @@ const SYS_LIGHT: u64 = 21;
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
-/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 whether an identity is unlocked (1 or 0), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone, or ERR: no vault or no ira), 2 lock (0). AUTH.md.
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the phone is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone; NOTHING: the phone is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the phone to the unlocked identity, 4 release the phone (every identity entry deleted) (0, or ERR). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
 const SYS_LAST: u64 = 22;
 
@@ -1430,7 +1430,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         seed.fill(0);
                         r.unwrap_or(ERR)
                     }
-                    2 => unlock(2, None).map(|_| 0).unwrap_or(ERR),
+                    2..=4 => unlock(op as u8, None).unwrap_or(ERR),
                     _ => ERR,
                 },
                 _ => ERR,

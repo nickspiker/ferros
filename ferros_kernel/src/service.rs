@@ -320,22 +320,41 @@ fn lock_before_reset() {
     }
 }
 
-/// The identity class's lock (AUTH.md): op 0 asks (1 unlocked, 0 not), 1 unlocks from a seed (the number of entries the identity has on this phone), 2 locks (0).
+/// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound), 1 unlocks from a seed (the number of entries the identity has on this phone, or NOTHING: the phone is bound to another identity), 2 locks, 3 binds the phone to the unlocked identity, 4 releases it (every identity entry deleted).
 fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match (op, seed) {
-        (1, Some(s)) => {
-            st.unlock(s, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1).map_err(|e| crate::flashlog::line(&alloc::format!("identity unlock failed: {e:?}")))?;
-            crate::flashlog::line("identity unlocked");
-        }
+        (1, Some(s)) => match st.unlock(s, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1) {
+            Ok(()) => {
+                crate::flashlog::line("identity unlocked");
+                Ok(st.identity_entries() as u64)
+            }
+            Err(crate::kvault::KvError::Belongs) => {
+                crate::flashlog::line("identity refused: this phone is bound to another identity");
+                Ok(crate::process::NOTHING)
+            }
+            Err(e) => {
+                crate::flashlog::line(&alloc::format!("identity unlock failed: {e:?}"));
+                Err(())
+            }
+        },
         (2, _) => {
             st.lock();
             crate::flashlog::line("identity locked");
-            return Ok(0);
+            Ok(0)
         }
-        _ => return Ok(st.unlocked() as u64),
+        (3, _) => {
+            st.bind().map_err(|_| ())?;
+            crate::flashlog::line("identity bound: this phone now opens only for it");
+            Ok(0)
+        }
+        (4, _) => {
+            let n = st.release().map_err(|_| ())?;
+            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted, the phone-only secret renewed"));
+            Ok(0)
+        }
+        _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1),
     }
-    Ok(st.identity_entries() as u64)
 }
 
 fn store_remove(key: &str) -> Result<bool, ()> {
@@ -454,8 +473,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
         b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
-        b"photon" => &[50, 48, 49, 46, 41, 80, 84],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/photon).
+        b"photon" => &[50, 48, 49, 46, 41, 80, 84, 85],
         // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
@@ -2548,6 +2567,14 @@ pub fn run(mut b: Boot) -> ! {
                                                     (None, None) => resp.extend_from_slice(b"no window yet: diag power start <s>\n"),
                                                 }
                                             }
+                                            queue_pt_response(&mut pt_out_data, &resp);
+                                            continue;
+                                        }
+                                        if cmd.params == b"identity" || cmd.params == b"identity release" {
+                                            // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the phone-only secret renewed — what a completed departure does, for a developer starting the phone over.
+                                            let s = if cmd.params == b"identity release" { store_unlock(4, None).map(|_| "released") } else { Ok("") };
+                                            let st = store_unlock(0, None).unwrap_or(0);
+                                            resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());
                                             queue_pt_response(&mut pt_out_data, &resp);
                                             continue;
                                         }
