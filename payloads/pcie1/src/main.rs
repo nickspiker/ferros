@@ -619,10 +619,14 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
 
     // ---- stage 7: download and start the firmware (dhd_pcie.c _dhdpcie_download_firmware with the CA7 path of __dhdpcie_bus_download_state). Input after the stage byte: [u32 LE len][firmware .bin][u32 LE len][NVRAM text]. ----
     // The files: the bridge's --input-file inputs, or, with none, the vault scope `wifi.` (init's boot start): the firmware streamed from the vault into the chip's RAM a piece at a time, the small files into scratch at 1 MiB into the DMA region (its rings and buffers end below 576 KiB).
+    let mut from_store = false;
     let (fw, nv, clm, cred): (Fw, &mut [u8], &[u8], &[u8]) = match split_files(files) {
         Some((fw, nv, clm, cred)) => (Fw::Mem(fw), nv, clm, cred),
         None => match from_vault(d) {
-            Some(v) => v,
+            Some(v) => {
+                from_store = true;
+                v
+            }
             None => {
                 d.put(b"stage 7 wants --input-file firmware --input-file nvram [--input-file clm_blob [--input-file wifi_credential]], or the vault's wifi.fw / wifi.nvram / wifi.clm / wifi.cred\n");
                 d.failed = true;
@@ -957,6 +961,7 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
         d.kv(b"sh.flags (G#400 = trapped)", f);
     }
     if stage >= 11 {
+        let cred: &[u8] = if cred.is_empty() && from_store { wait_cred(d) } else { cred };
         if let Some((ssid, _)) = credential(cred) {
             m.want[..ssid.len()].copy_from_slice(ssid);
             m.want_len = ssid.len();
@@ -1816,12 +1821,23 @@ fn from_vault(d: &Drv) -> Option<(Fw<'static>, &'static mut [u8], &'static [u8],
     }
     let mut head = [0u8; 4];
     let fw_len = store_get_at(d, b"fw", 0, &mut head)?;
-    let mut read = |key: &[u8], at: u64| -> Option<&'static mut [u8]> {
-        let mut h = [0u8; 4];
-        let len = store_get_at(d, key, 0, &mut h)?;
-        if len > 0x1_0000 {
-            return None;
-        }
+    let nv = vault_file(d, b"nvram", 0x10_0000)?;
+    let clm = vault_file(d, b"clm", 0x11_0000).map(|b| &*b).unwrap_or(&[]);
+    let cred = vault_file(d, b"cred", 0x12_0000).map(|b| &*b).unwrap_or(&[]);
+    Some((Fw::Vault(fw_len), nv, clm, cred))
+}
+
+/// One small file of the vault scope `wifi.`, read whole into scratch `at` bytes into the DMA region (64 KiB at most). None when it is absent, too large, or locked (the credential is the person's, AUTH.md).
+fn vault_file(d: &Drv, key: &[u8], at: u64) -> Option<&'static mut [u8]> {
+    let dma = svc(7, d.cap(DMA), 0, 0, 0, 0);
+    if dma == ERR {
+        return None;
+    }
+    let mut h = [0u8; 4];
+    let len = store_get_at(d, key, 0, &mut h)?;
+    if len > 0x1_0000 {
+        return None;
+    }
         // SAFETY: the DMA region is this process's alone, mapped EL0 read/write for the boot; this scratch lies past every ring and buffer the driver places there.
         let buf = unsafe { core::slice::from_raw_parts_mut((dma + at) as *mut u8, len) };
         // The vault copies into this process's own memory (an arc offset): through a piece on the stack, then into the scratch (the first try handed the DMA region's address and the process ended without a word, 2026-10-26).
@@ -1833,12 +1849,21 @@ fn from_vault(d: &Drv) -> Option<(Fw<'static>, &'static mut [u8], &'static [u8],
             buf[off..off + n].copy_from_slice(&piece[..n]);
             off += n;
         }
-        Some(buf)
-    };
-    let nv = read(b"nvram", 0x10_0000)?;
-    let clm = read(b"clm", 0x11_0000).map(|b| &*b).unwrap_or(&[]);
-    let cred = read(b"cred", 0x12_0000).map(|b| &*b).unwrap_or(&[]);
-    Some((Fw::Vault(fw_len), nv, clm, cred))
+    Some(buf)
+}
+
+/// The network credential when it was not there at the start: networks travel with the person (AUTH.md), so `wifi.cred` is locked until someone attests. Asked again four times a second, the chip up and its firmware running meanwhile; said once.
+fn wait_cred(d: &mut Drv) -> &'static [u8] {
+    d.put(b"no network credential yet (the person's, locked until attest): waiting for it\n");
+    d.flush();
+    loop {
+        if let Some(c) = vault_file(d, b"cred", 0x12_0000) {
+            d.put(b"network credential readable: joining\n");
+            d.flush();
+            return c;
+        }
+        ferros_sys::sleep_until(ferros_sys::now() + d.freq / 4);
+    }
 }
 
 /// The WiFi credential file (keys/wifi.txt): the SSID on the first line, the passphrase on the second. Never printed.

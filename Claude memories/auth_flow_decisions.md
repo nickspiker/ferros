@@ -1,0 +1,40 @@
+---
+name: auth-flow-decisions
+description: "Owner decisions 2026-10-31 for the ferros auth flow — device vs identity vault classes, WiFi creds + BT pairings move with the identity, key bound to phone, lock only on power loss or OS switch, auth mostly in kernel; unlock-key derivation still open"
+metadata:
+  node_type: memory
+  type: project
+  originSessionId: fef83e98-ba6e-4773-9615-f79c25605c30
+  modified: 2026-10-31T21:00:40.344Z
+---
+
+Owner decisions, 2026-10-31. Nothing is built yet; the flowchart page tracks the state (https://claude.ai/artifact/7sxcUNi5owYvcB426AESLB).
+
+**The two classes are agreed:**
+- **Device class**, sealed by the ira. It holds everything that must work before a person is present:
+  - drivers and firmware;
+  - the attest front end (display, touch, ahau);
+  - network and radios;
+  - the hardware-owned settings: language, base, tz, keyboard layout, brightness, dither, prox wake, unlock_at_boot, and theme (my call, since the attest screen draws with it).
+- **Identity class**, sealed under a key bound to this phone AND the person:
+  - the map arrangement and view;
+  - installed apps and their data;
+  - Photon chain and key;
+  - identity prefs;
+  - WiFi credentials and device pairings (car, headphones).
+
+**WiFi credentials and device pairings move with the identity.** The owner wants every device in the fleet to get the identity's networks and pairings instantly. MAC addresses stay the device's (per-network, from the ira).
+
+**The key is bound to the phone:** KDF over (ira, identity input).
+
+**Locking happens only when power goes, or on a switch to another OS.** The owner may add jumping to and from Android. There are no timers.
+
+**Auth mostly in the kernel:**
+- The kernel takes key custody, enforces the scope classes, and wipes the key on an OS switch.
+- The UI and the heavy derivation stay in ahau (EL0).
+
+**Open: how the unlock key is derived.**
+- The owner proposed deriving it straight from the seed for an instant unlock, with no ~1 s wait, and asked me to check the security. The memory-hard handle proof is mainly for handle squatting.
+- My answer: the ira is a brand, not a secret ([[ira-is-brand-not-credential]]). So a fast KDF(ira, seed) becomes a BLAKE3-speed oracle on the handle for anyone holding the phone. That is far cheaper than the memory-hard proof that guards the seed today, and the seed is the identity's root key.
+
+Related: [[identity-not-on-disk-default]], [[ferros-attest-os-level]], [[radio-addresses-belong-to-identity]], [[bluetooth-pairing-moves-with-identity]].

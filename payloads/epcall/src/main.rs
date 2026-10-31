@@ -4,7 +4,7 @@
 #![no_std]
 #![no_main]
 
-use ferros_sys::{call, cap, console, exit};
+use ferros_sys::{call_live, cap, console, exit};
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
@@ -16,7 +16,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         *b = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + k as u64) as *const u8) };
     }
     let mut r = [0u8; 64];
-    let got = call(cap(grants, 1), &msg[..n], &mut r);
+    // CALL_LIVE: a server that is not receiving (down, or busy bringing its device up) is an ERR at once. A waiting call here holds the bridge's spawn, and so the kernel's USB service, until the watchdog resets the phone (twice on 2026-10-31).
+    let got = call_live(cap(grants, 1), &msg[..n], &mut r);
     let mut line = [0u8; 128];
     let mut k = 0;
     for &c in b"epcall: reply " {

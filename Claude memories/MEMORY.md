@@ -110,3 +110,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Modem: registration, IP, driver process](modem_uecap_registration.md) — cold ferros on Verizon LTE/NR, IP over cellular, modem = userspace driver payloads/modem since 2026-10-29; CP wants its own uecap block size + token per block; diff our *answers*, not only our requests; kprobe capture method
 - [pKVM resets on wipe](pkvm_resets_on_wipe.md) — fastboot -w puts pKVM back to enabled and breaks Android under the gate; `fastboot oem pkvm disable` after every wipe, check status (2026-10-30)
 - [NFC + BT drivers](husky_radios_nfc_bt.md) — nfc/bt processes since 2026-10-31; WiFi turns BT off before cycling WL_REG_ON (else watchdog reset); BLE address changes per recovery
+- [Auth flow decisions](auth_flow_decisions.md) — 2026-10-31: device vs identity vault classes; WiFi+BT pairings move with identity; key bound to phone; lock only at power loss/OS switch; unlock-key KDF open

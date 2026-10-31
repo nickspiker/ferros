@@ -17,25 +17,28 @@ use ferros_sys::{call_live, cap, console, exit, freq, now, sleep_until, spawn, E
 
 /// Grant slot 17: use display (the header's list).
 const S_USE_DISPLAY: u64 = 17;
+/// Grant slot 85: the identity unlock right (asked only).
+const S_UNLOCK: u64 = 85;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
 const SHELL: [(&[u8], &[u8], &[u64]); 10] = [
+    // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
-    // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint) (payloads/ahau).
-    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47]),
-    (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
-    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header).
+    // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint), 9 the identity unlock right (payloads/ahau).
+    (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85]),
+    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header). It brings the chip up now and joins once the identity's network credential can be read.
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83]),
     // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41, 52]),
-    // The radios before Photon, which hands them the tap's secret and the beacon while it joins: the NFC driver 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc); the Bluetooth driver 1 serve bt, 2 the APM UART, 3 vendor_a (the patch), 4 its power, 5 entropy (payloads/bt).
+    // The radios: the NFC driver 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc); the Bluetooth driver 1 serve bt, 2 the APM UART, 3 vendor_a (the patch), 4 its power, 5 entropy (payloads/bt).
     (b"nfc", b"nfc", &[77, 78, 67, 79]),
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
-    // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
-    (b"photon", b"photon", &[50, 48, 49, 46, 41, 80, 84]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
+    // What reads the person's space (the identity class), started once an identity is unlocked (`wait_unlocked`): the map (its arrangement), then the Photon client (its chain and key): 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt (payloads/photon).
+    (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
+    (b"photon", b"photon", &[50, 48, 49, 46, 41, 80, 84]),
 ];
 
 #[unsafe(no_mangle)]
@@ -45,6 +48,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let mut failed = 0u64;
     for (name, key, slots) in SHELL.iter() {
+        if *name == b"map" {
+            wait_unlocked(grants);
+        }
         if spawn(grants, name, key, slots) != 0 {
             console(grants, b"init: could not start ");
             console(grants, name);
@@ -55,9 +61,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell, network and radios started (display, touch, ahau, map, pcie1, ip, nfc, bt, photon, modem)\n");
+        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, pcie1, ip, nfc, bt, modem, map, photon)\n");
     }
     exit(failed)
+}
+
+/// The person's space opens only with them (AUTH.md): the map and the Photon client read the identity class, so they start once an identity is unlocked — at once with unlock at boot, else when someone attests. No timeout: without a person there is nothing of theirs to show. A kernel without the Unlock right (an older one) does not hold this up.
+fn wait_unlocked(grants: u64) {
+    let mut said = false;
+    loop {
+        match ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) {
+            Some(false) => {}
+            _ => return,
+        }
+        if !said {
+            console(grants, b"init: waiting for a person (the attest screen) before the map and Photon\n");
+            said = true;
+        }
+        sleep_until(now() + freq() / 64);
+    }
 }
 
 /// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.

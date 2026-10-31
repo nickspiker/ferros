@@ -42,6 +42,7 @@ pub mod nr {
     pub const LIGHT: u64 = 21;
     pub const POWER: u64 = 22;
     pub const IRA: u64 = 23;
+    pub const UNLOCK: u64 = 24;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -703,4 +704,16 @@ pub mod window {
         let chord = (r * r - cx * cx).isqrt();
         (cx, h / 2, r, r - chord + 1)
     }
+}
+
+/// Whether an identity is unlocked (AUTH.md), through an Unlock capability. None without the capability.
+pub fn identity_unlocked(cap: u64) -> Option<bool> {
+    let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
+    (r != ERR).then_some(r == 1)
+}
+
+/// Unlock the person's identity class of the vault from their 32-byte seed (AUTH.md): the kernel derives the key from the ira, the phone-only secret and the seed, and keeps it until power goes or the phone switches OS. Some(how many entries the identity already has on this phone) when unlocked.
+pub fn unlock_identity(cap: u64, seed: &[u8; 32]) -> Option<u64> {
+    let r = svc(nr::UNLOCK, cap, 1, off(seed.as_ptr()), 0, 0);
+    (r != ERR).then_some(r)
 }

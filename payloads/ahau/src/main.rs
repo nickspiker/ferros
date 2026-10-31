@@ -61,6 +61,8 @@ static FRESH_DONE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 static SHOW_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
 const S_PHOTON_EP: u64 = 8;
+/// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
+const S_UNLOCK: u64 = 9;
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
@@ -128,8 +130,6 @@ static ALLOC: Bump = Bump;
 /// What the screen is waiting for.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// Unlock at boot: the client loaded the stored seed; waiting for it to report membership (then unlocked, no handle typed).
-    Starting,
     /// No identity in hand: the entry.
     Fresh,
     /// The roots of this seed are in the vault; the Photon client is looking the identity up.
@@ -157,13 +157,9 @@ struct Ahau {
     session_proof: Option<[u8; 32]>,
     /// The roots are set but the client has not taken them yet (`send_roots`).
     roots_pending: bool,
-    /// Unlock at boot (device.unlock_at_boot): the seed is stored so the phone unlocks without typing. Opt-in, warned.
-    unlock_at_boot: bool,
     handle: [u8; 4 * MAX_CHARS],
     len: usize,
     chars: usize,
-    /// When the screen came up (the Starting wait's 10 s).
-    started: u64,
     /// The Photon client's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
@@ -271,7 +267,7 @@ impl Ahau {
             Mode::Join(_) | Mode::Grey(_) => Some("go on"),
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong => Some("start over"),
-            Mode::Starting | Mode::Looking(_) => None,
+            Mode::Looking(_) => None,
         }
     }
 
@@ -364,29 +360,8 @@ impl Ahau {
         Some(out[0])
     }
 
-    /// Unlock at boot: the client loaded the stored seed. A member (state 2 or 3) unlocks with no handle typed; anything after 15 s means the stored seed is not a member (removed from its fleet, say), so fall to the entry.
-    fn follow_start(&mut self) -> bool {
-        match self.client_state() {
-            Some(2) | Some(3) => {
-                console(self.grants, b"ahau: unlocked at boot (this device is a member)\n");
-                self.attested();
-            }
-            _ if now().wrapping_sub(self.started) > 15 * freq() => {
-                console(self.grants, b"ahau: the stored seed is not a member; asking for the handle\n");
-                self.mode = Mode::Fresh;
-                self.status(self.prompt());
-                self.button();
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// While the identity is being looked up or joined: follow the client. Returns whether the screen changed.
     fn follow_client(&mut self) -> bool {
-        if self.mode == Mode::Starting {
-            return self.follow_start();
-        }
         let seed = match self.mode {
             Mode::Looking(s) | Mode::Join(s) | Mode::Grey(s) => s,
             _ => return false,
@@ -533,7 +508,6 @@ impl Ahau {
 
     fn prompt(&self) -> &'static str {
         match self.mode {
-            Mode::Starting => "Unlocking: asking this device's Photon client to confirm membership.",
             Mode::Fresh => "No identity on this device yet. Type your handle.",
             Mode::Looking(_) => "Looking this identity up: its devices nearby, then fgtw.org.",
             Mode::Join(_) => "This identity has a fleet. On one of its devices: Fleet, Add device,\nand type the words below. Go on meanwhile if you like.",
@@ -574,7 +548,7 @@ impl Ahau {
                 self.words();
                 return;
             }
-            Mode::Looking(_) | Mode::Starting => return,
+            Mode::Looking(_) => return,
             _ => {}
         }
         if self.chars == 0 {
@@ -587,6 +561,14 @@ impl Ahau {
                 return;
             }
         };
+        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. A space with something in it is someone who has used this phone: the screen goes now and the proof is made behind it. An empty one is a first time here, or another handle: the look-up carries on as before.
+        if self.mode == Mode::Fresh {
+            match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
+                Some(n) if n > 0 => self.unlocked_known(seed),
+                Some(_) => console(self.grants, b"ahau: unlocked; the space is empty here (a first time on this phone, or another handle): looking the identity up\n"),
+                None => console(self.grants, b"ahau: the identity could not be unlocked (no Unlock right, or no ira)\n"),
+            }
+        }
         match self.mode {
             Mode::Fresh => {
                 // The same handle again this session (after `back`): its proof is cached in RAM, no second derivation.
@@ -651,6 +633,25 @@ impl Ahau {
 
     /// Clear during the mint's second entry only clears it: the verdict stands.
     fn unconfirm(&mut self) {}
+
+    /// A person this phone knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
+    fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
+        self.wipe();
+        console(self.grants, b"ahau: unlocked (this phone knows the identity); the screen goes, the proof follows\n");
+        window::done(self.display, self.base);
+        let t0 = now();
+        let proof = *ihi::handle_proof(&blake3::Hash::from(seed)).as_bytes();
+        let mut l = Line::new();
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {} ms, behind the screen\n", ferros_sys::us_since(t0) / 1000));
+        console(self.grants, l.as_bytes());
+        self.send_roots(&seed, &proof);
+        while self.roots_pending {
+            sleep_until(now() + freq() / 16);
+            self.roots_pending = !self.hand_roots();
+        }
+        console(self.grants, b"ahau: roots handed to the Photon client\n");
+        exit(0)
+    }
 
     fn attested(&mut self) -> ! {
         self.wipe();
@@ -1010,20 +1011,23 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"ahau: no surface\n");
         exit(2);
     }
-    // Unlock at boot: when it is on, the Photon client loads the stored seed and the screen only waits for membership (Starting). Otherwise the handle is typed (Fresh).
-    let unlock_at_boot = ferros_sys::pref(ferros_sys::PREF_UNLOCK_AT_BOOT) == 1;
-    let mode = if unlock_at_boot { Mode::Starting } else { Mode::Fresh };
+    // Unlock at boot (`device.unlock_at_boot`, AUTH.md): the kernel unlocked the person's space from the seed it kept, before init started anything; no attest screen. The Photon client loads its own roots from that space.
+    if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) {
+        console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
+        exit(0);
+    }
+    let mode = Mode::Fresh;
     let mut kb = Keyboard::new(w, h);
     kb.left = "clear";
     // The device's layout; a value from a newer build than this one falls back to the default.
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, roots_pending: false, unlock_at_boot, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0, started: now() };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
     a.show();
-    console(grants, if mode == Mode::Starting { b"ahau: unlock at boot: the client loaded the stored seed; waiting for membership\n" } else { b"ahau: no identity in hand; type the handle\n" });
+    console(grants, b"ahau: no identity in hand; type the handle\n");
     let mut polls = 0u32;
     let mut touches = Touches::new(w);
     // Every key exact: a rolling finger still types where it landed.

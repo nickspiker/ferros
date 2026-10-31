@@ -326,6 +326,8 @@ async fn main() {
                     "--power" => { grants.push((7, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     // --ira: the right to a per-purpose key derived from the device's ira (syscall 23).
                     "--ira" => { grants.push((9, String::new())); i += 1; }
+                    // --unlock: the identity unlock right (syscall 24, AUTH.md).
+                    "--unlock" => { grants.push((11, String::new())); i += 1; }
                     // --entropy: the right to draw randomness from the session's wairua (syscall 6).
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).

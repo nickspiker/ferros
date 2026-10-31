@@ -5,10 +5,10 @@
 #
 #   tools/usb-kick.sh              kick now
 #   tools/usb-kick.sh --if-wedged  kick only if nothing is enumerated on the port and the kernel gave the port up since the last check (cheap: call it from wait loops)
-# FERROS_USB_PORT (default 1-0:1.0/usb1-port4, the port since the cable swap of 2026-10-31; udev rule 99-usb1-port4-kick.rules) and FERROS_USB_DEV (default 1-4) select the port; the old port was 3-0:1.0/usb3-port3, 3-3.
+# FERROS_USB_PORT (default 3-0:1.0/usb3-port3) and FERROS_USB_DEV (default 3-3) select the port. The second cord tried on 2026-10-31 sat on 1-0:1.0/usb1-port4 (1-4; udev rule 99-usb1-port4-kick.rules) and stopped carrying data in fastboot, so the old one is back.
 set -u
-PORT=${FERROS_USB_PORT:-1-0:1.0/usb1-port4}
-DEV=${FERROS_USB_DEV:-1-4}
+PORT=${FERROS_USB_PORT:-3-0:1.0/usb3-port3}
+DEV=${FERROS_USB_DEV:-3-3}
 SW=/sys/bus/usb/devices/$PORT/disable
 STATE=${XDG_RUNTIME_DIR:-/tmp}/ferros-usb-kick.last
 

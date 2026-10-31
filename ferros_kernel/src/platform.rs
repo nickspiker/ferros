@@ -227,12 +227,22 @@ pub fn dss_mark_clean_reboot() {
 pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
 
 /// A plain reset through EL3 (PSCI SYSTEM_RESET). Measured on husky: the bootloader reads it as "Reboot mode: 0x0", a normal boot of the active slot — which is what the gate's Android choice wants after `slot::set_active(0)`.
+/// Run before every reset this kernel orders (AUTH.md): the vault drops the unlocked identity's key, its bytes overwritten, so a warm reset hands nothing to whatever boots next — Android at the gate's other answer, or a crash's next boot. Registered by the service once the vault is open.
+pub static mut BEFORE_RESET: Option<fn()> = None;
+pub fn before_reset() {
+    if let Some(f) = unsafe { BEFORE_RESET } {
+        f();
+    }
+}
+
 pub fn reboot() -> ! {
+    before_reset();
     dss_mark_clean_reboot();
     unsafe { core::arch::asm!("smc #0", in("x0") 0x8400_0009u64, options(noreturn)) }
 }
 
 pub fn reboot_to_bootloader() -> u64 {
+    before_reset();
     dss_mark_clean_reboot();
     let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
     if r != 0 {
@@ -270,6 +280,7 @@ pub fn reboot_to_bootloader() -> u64 {
 
 /// PSCI SYSTEM_RESET: warm reset, DRAM (and the ramoops report) survives, the bootloader boots Android, which prints the report.
 pub fn psci_reset() -> ! {
+    before_reset();
     unsafe {
         core::arch::asm!(
             "dsb sy",

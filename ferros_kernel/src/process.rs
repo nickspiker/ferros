@@ -257,6 +257,8 @@ pub enum Object {
     NewSurface,
     /// Served by the kernel: read-only files on a partition (index into `PARTS`), answered by partfs.rs `part_call`.
     Part(usize),
+    /// Served by the kernel: the right to unlock the person's identity class of the vault from their seed, and to lock it (`SYS_UNLOCK`, AUTH.md). The attest screen holds it; init holds it to see whether an identity is unlocked.
+    Unlock,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -295,6 +297,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Ira => (10, 0),
         Object::NewSurface => (11, 0),
         Object::Part(i) => (13, i as u64),
+        Object::Unlock => (14, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -641,6 +644,8 @@ const SYS_LIGHT: u64 = 21;
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 whether an identity is unlocked (1 or 0), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone, or ERR: no vault or no ira), 2 lock (0). AUTH.md.
+const SYS_UNLOCK: u64 = 24;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -952,6 +957,8 @@ pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, 
 /// Delete a key (true when it was there) and list every key of the vault (full names): what a std process's vault needs beyond get and set (kete on ferros, STD-TARGET.md).
 pub static mut STORE_REMOVE: Option<fn(&str) -> Result<bool, ()>> = None;
 pub static mut STORE_KEYS: Option<fn() -> Result<Vec<alloc::string::String>, ()>> = None;
+/// The vault's identity half behind `SYS_UNLOCK`, registered with the store (service.rs): (op 0 query, 1 unlock with the seed, 2 lock) -> Ok(unlocked after the op) or Err.
+pub static mut UNLOCK: Option<fn(u8, Option<&[u8; 32]>) -> Result<u64, ()>> = None;
 /// An entry kept by 32-byte address rather than by name (SYS_STORE bit 5): kete on ferros keeps its vaults this way — the address is kete's, the kernel scopes it (kvault `addr_scoped`).
 pub enum AddrOp<'a> {
     Get,
@@ -1406,6 +1413,26 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == MASK_BIG => {
                     if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
                 }
+                _ => ERR,
+            };
+            0
+        }
+        SYS_UNLOCK => {
+            let token = p.read(f.x[0], 32);
+            let op = f.x[1];
+            f.x[0] = match (p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)), unsafe { UNLOCK }) {
+                (Some((Object::Unlock, r)), Some(unlock)) if r & RIGHT_SEND != 0 => match op {
+                    0 => unlock(0, None).unwrap_or(ERR),
+                    1 => {
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&p.read(f.x[2], 32));
+                        let r = unlock(1, Some(&seed));
+                        seed.fill(0);
+                        r.unwrap_or(ERR)
+                    }
+                    2 => unlock(2, None).map(|_| 0).unwrap_or(ERR),
+                    _ => ERR,
+                },
                 _ => ERR,
             };
             0
@@ -2108,6 +2135,8 @@ pub enum Grant<'a> {
     Power(&'a [u8]),
     /// Read-only files on one of the phone's own partitions, by name (`PARTS`): the modem driver's images, NV and carrier configs (partfs.rs `part_call`).
     Part(&'a [u8]),
+    /// The identity unlock right (syscall 24).
+    Unlock,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2262,6 +2291,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
                 None => return Err("no such power switch"),
             },
             Grant::Ira => (Object::Ira, RIGHT_SEND),
+            Grant::Unlock => (Object::Unlock, RIGHT_SEND),
             Grant::Part(n) => match PARTS.iter().position(|p| p.as_bytes() == *n) {
                 Some(i) => (Object::Part(i), RIGHT_SEND),
                 None => return Err("no such partition grant"),

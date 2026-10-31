@@ -1937,6 +1937,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(settings::KEY).ok().flatten()) {
         let _ = settings::apply(&doc, false);
     }
+    // Unlock at boot (AUTH.md, SETTINGS.md): with `device.unlock_at_boot` on, the identity whose seed the kernel kept is unlocked now, before anything that reads its space starts; off, a kept seed is deleted.
+    if let Some(s) = store.as_mut() {
+        match s.boot_unlock(process::pref(process::PREF_UNLOCK_AT_BOOT) == 1) {
+            Ok(true) => flashlog::line("identity unlocked at boot (unlock at boot on)"),
+            Ok(false) => {}
+            Err(e) => flashlog::line(&alloc::format!("unlock at boot failed: {e:?}")),
+        }
+    }
     platform::crumb(0xE5);
     checklist::base_known();
 

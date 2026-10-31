@@ -26,6 +26,39 @@ fn reserved(name: &str) -> bool {
     name.starts_with('\0')
 }
 
+/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the Photon client's chain and key, the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this phone and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included, and another person attesting finds their own space, not this one.
+const IDENTITY: [&str; 4] = ["map.", "photon.", "ahau.", "wifi.cred"];
+pub fn identity_class(name: &str) -> bool {
+    IDENTITY.iter().any(|p| name.starts_with(p))
+}
+/// The phone-only secret mixed into every identity key: 32 bytes from this session's wairua the first time an identity is unlocked, kept in the device class. Google has no record of it and Android cannot read the partition it is on (the hypervisor's net, AUTH.md), so the identity key needs more than the chip's published values and a guessed handle.
+const ID_SECRET: &str = "\0id.secret";
+/// The seed kept for unlock at boot (`device.unlock_at_boot`, SETTINGS.md): only while that setting is on, in the device class, deleted at the first boot with it off. Whoever holds the phone then holds the identity — the warning the setting carries.
+const ID_UNLOCK: &str = "\0id.unlock";
+/// The identity class's own list of names, sealed under the identity key.
+const ID_NAMES: &str = "\0id.names";
+const ID_CONTEXT: &str = "ferros identity vault v1";
+const ID_ADDR_CONTEXT: &str = "ferros identity vault addr v1";
+const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
+const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
+
+/// Which keys an entry is sealed under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Device,
+    Identity,
+}
+fn class_of(name: &str) -> Class {
+    if identity_class(name) { Class::Identity } else { Class::Device }
+}
+
+/// The unlocked identity's keys: the address key its names hash under and the cipher its values seal under.
+struct IdKeys {
+    addr_key: [u8; 32],
+    /// Plain bytes, the cipher built from them per use: a stored cipher's key is not wiped when it is dropped, and these must be (`lock`).
+    payload_key: [u8; 32],
+}
+
 /// Block I/O counters for `selftest`.
 static READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -93,6 +126,10 @@ pub enum KvError {
     Seal,
     Open,
     BadNames,
+    /// An identity-class entry while no identity is unlocked (AUTH.md).
+    Locked,
+    /// No ira this boot, so no identity key can be derived.
+    NoIra,
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
@@ -105,6 +142,8 @@ pub struct KVault {
     addr_key: [u8; 32],
     cipher: XChaCha20Poly1305,
     nonce: crate::wairua::TrngNonce,
+    /// The unlocked identity, while one is: dropped when power goes or the phone switches to another OS (`lock`).
+    id: Option<IdKeys>,
 }
 
 impl KVault {
@@ -115,91 +154,136 @@ impl KVault {
         let payload_key = ferros_vault::anchor::AnchorKey::derive(PAYLOAD_CONTEXT, &base.0);
         let mirror = Mirror::new(Region { base: MIRROR_A, blocks: REGION_BLOCKS }, Region { base: MIRROR_B, blocks: REGION_BLOCKS }).with_events(alloc::boxed::Box::new(LogSink));
         let vault = Vault::open(mirror, RING_LOG2, now(), DeletePolicy::UnlinkOnly)?;
-        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new() })
+        Ok(KVault { vault, addr_key, cipher: XChaCha20Poly1305::new(Key::from_slice(&payload_key)), nonce: crate::wairua::TrngNonce::new(), id: None })
     }
 
-    fn addr(&self, name: &str) -> [u8; 32] {
-        *blake3::keyed_hash(&self.addr_key, name.as_bytes()).as_bytes()
+    /// The address key for `class`: the device's always, the identity's only while one is unlocked.
+    fn addr_key_of(&self, class: Class) -> Result<&[u8; 32], KvError> {
+        match class {
+            Class::Device => Ok(&self.addr_key),
+            Class::Identity => self.id.as_ref().map(|k| &k.addr_key).ok_or(KvError::Locked),
+        }
     }
 
-    fn seal(&mut self, plain: &[u8]) -> Result<Vec<u8>, KvError> {
+    /// The cipher for `class`, likewise.
+    fn cipher_of(&self, class: Class) -> Result<XChaCha20Poly1305, KvError> {
+        match class {
+            Class::Device => Ok(self.cipher.clone()),
+            Class::Identity => self.id.as_ref().map(|k| XChaCha20Poly1305::new(Key::from_slice(&k.payload_key))).ok_or(KvError::Locked),
+        }
+    }
+
+    fn addr(&self, class: Class, name: &str) -> Result<[u8; 32], KvError> {
+        Ok(*blake3::keyed_hash(self.addr_key_of(class)?, name.as_bytes()).as_bytes())
+    }
+
+    fn seal(&mut self, class: Class, plain: &[u8]) -> Result<Vec<u8>, KvError> {
         let n = self.nonce.next_nonce();
+        let cipher = self.cipher_of(class)?;
         // One allocation the size of the result: the nonce, the plaintext encrypted where it lies, then the tag — the same bytes `encrypt` gives. Sealing through `encrypt` into a growing Vec held two copies of the value at once (and a third while the Vec grew), and a 2.78 MB display capsule ran the 12 MiB heap out (2026-10-26, panic "memory allocation … failed" in the crumbs).
         let mut out = Vec::with_capacity(24 + plain.len() + 16);
         out.extend_from_slice(&n[..]);
         out.extend_from_slice(plain);
-        let tag = self.cipher.encrypt_in_place_detached(XNonce::from_slice(&n), b"", &mut out[24..]).map_err(|_| KvError::Seal)?;
+        let tag = cipher.encrypt_in_place_detached(XNonce::from_slice(&n), b"", &mut out[24..]).map_err(|_| KvError::Seal)?;
         out.extend_from_slice(&tag);
         Ok(out)
     }
 
     /// Opened where it lies, as `seal` closes: the nonce taken off the front, the rest decrypted in the same buffer and its tag dropped — one copy of a large value in the heap, not two.
-    fn unseal(&self, mut sealed: Vec<u8>) -> Result<Vec<u8>, KvError> {
+    fn unseal(&self, class: Class, mut sealed: Vec<u8>) -> Result<Vec<u8>, KvError> {
         if sealed.len() < 24 + 16 {
             return Err(KvError::Open);
         }
+        let cipher = self.cipher_of(class)?;
         let mut n = [0u8; 24];
         n.copy_from_slice(&sealed[..24]);
         sealed.drain(..24);
-        self.cipher.decrypt_in_place(XNonce::from_slice(&n), b"", &mut sealed).map_err(|_| KvError::Open)?;
+        cipher.decrypt_in_place(XNonce::from_slice(&n), b"", &mut sealed).map_err(|_| KvError::Open)?;
         Ok(sealed)
     }
 
-    fn raw_get(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
-        let a = self.addr(name);
+    fn raw_get_in(&mut self, class: Class, name: &str) -> Result<Option<Vec<u8>>, KvError> {
+        let a = self.addr(class, name)?;
         match self.vault.get(&a)? {
-            Some(s) => Ok(Some(self.unseal(s)?)),
+            Some(s) => Ok(Some(self.unseal(class, s)?)),
             None => Ok(None),
         }
     }
 
-    fn raw_put(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
-        let a = self.addr(name);
-        let sealed = self.seal(value)?;
+    fn raw_put_in(&mut self, class: Class, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
+        let a = self.addr(class, name)?;
+        let sealed = self.seal(class, value)?;
         self.vault.put(&a, &sealed, now())?;
         Ok(a)
     }
 
-    /// The value stored under `name`.
+    fn raw_get(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
+        self.raw_get_in(Class::Device, name)
+    }
+
+    fn raw_put(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
+        self.raw_put_in(Class::Device, name, value)
+    }
+
+    /// The list of names of `class`, kept under its own reserved name and sealed with it.
+    fn names_in(&mut self, class: Class) -> Result<Vec<String>, KvError> {
+        let list = if class == Class::Device { NAMES } else { ID_NAMES };
+        match self.raw_get_in(class, list)? {
+            None => Ok(Vec::new()),
+            Some(b) => {
+                let s = core::str::from_utf8(&b).map_err(|_| KvError::BadNames)?;
+                Ok(s.split('\n').filter(|n| !n.is_empty() && !reserved(n)).map(String::from).collect())
+            }
+        }
+    }
+
+    fn put_names(&mut self, class: Class, names: &[String]) -> Result<(), KvError> {
+        let list = if class == Class::Device { NAMES } else { ID_NAMES };
+        self.raw_put_in(class, list, names.join("\n").as_bytes())?;
+        Ok(())
+    }
+
+    /// The value stored under `name`; `Locked` for an identity-class name while no identity is unlocked.
     pub fn get_by_key(&mut self, name: &str) -> Result<Option<Vec<u8>>, KvError> {
-        self.raw_get(name)
+        self.raw_get_in(class_of(name), name)
     }
 
     /// Store `value` under `name`, durably (manifestus commits per put). Returns the value's vault address.
     /// Store `value` under `name`. A slice, not an owned buffer: the store command's put used to copy the whole payload into a Vec just to hand it here, a third copy of a 2.7 MB capsule in the kernel heap (2026-10-23: it ran the heap out).
     pub fn set(&mut self, name: &str, value: &[u8]) -> Result<[u8; 32], KvError> {
-        let a = self.raw_put(name, value)?;
+        let class = class_of(name);
+        let a = self.raw_put_in(class, name, value)?;
         if reserved(name) {
             return Ok(a);
         }
-        let mut names = self.keys()?;
+        let mut names = self.names_in(class)?;
         if !names.iter().any(|n| n == name) {
             names.push(String::from(name));
             names.sort();
-            self.raw_put(NAMES, names.join("\n").as_bytes())?;
+            self.put_names(class, &names)?;
         }
         Ok(a)
     }
 
     /// Remove `name`; true if it existed.
     pub fn remove_key(&mut self, name: &str) -> Result<bool, KvError> {
-        let a = self.addr(name);
+        let class = class_of(name);
+        let a = self.addr(class, name)?;
         let existed = self.vault.delete(&a, now())?;
-        let mut names = self.keys()?;
+        let mut names = self.names_in(class)?;
         if let Some(i) = names.iter().position(|n| n == name) {
             names.remove(i);
-            self.raw_put(NAMES, names.join("\n").as_bytes())?;
+            self.put_names(class, &names)?;
         }
         Ok(existed)
     }
 
-    /// Every name the kernel has stored, sorted.
-    /// Entries a process keeps by 32-byte address (kete on ferros, STD-TARGET.md): the address goes through the same keyed hash a name does, with the scope's prefix in front, so one scope cannot reach another's; the scope's address list is kept under a reserved name for listing, 32 bytes an entry.
-    fn addr_scoped(&self, prefix: &str, addr: &[u8; 32]) -> [u8; 32] {
-        let mut h = blake3::Hasher::new_keyed(&self.addr_key);
+    /// Entries a process keeps by 32-byte address (kete on ferros, STD-TARGET.md): the address goes through the same keyed hash a name does, with the scope's prefix in front, so one scope cannot reach another's; the scope's address list is kept under a reserved name for listing, 32 bytes an entry. The scope's class is its prefix's.
+    fn addr_scoped(&self, prefix: &str, addr: &[u8; 32]) -> Result<[u8; 32], KvError> {
+        let mut h = blake3::Hasher::new_keyed(self.addr_key_of(class_of(prefix))?);
         h.update(prefix.as_bytes());
         h.update(addr);
-        *h.finalize().as_bytes()
+        Ok(*h.finalize().as_bytes())
     }
 
     fn addrs_name(prefix: &str) -> String {
@@ -207,48 +291,140 @@ impl KVault {
     }
 
     pub fn get_addr(&mut self, prefix: &str, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, KvError> {
-        let a = self.addr_scoped(prefix, addr);
+        let a = self.addr_scoped(prefix, addr)?;
         match self.vault.get(&a)? {
-            Some(s) => Ok(Some(self.unseal(s)?)),
+            Some(s) => Ok(Some(self.unseal(class_of(prefix), s)?)),
             None => Ok(None),
         }
     }
 
     pub fn set_addr(&mut self, prefix: &str, addr: &[u8; 32], value: &[u8]) -> Result<(), KvError> {
-        let a = self.addr_scoped(prefix, addr);
-        let sealed = self.seal(value)?;
+        let class = class_of(prefix);
+        let a = self.addr_scoped(prefix, addr)?;
+        let sealed = self.seal(class, value)?;
         self.vault.put(&a, &sealed, now())?;
         let mut list = self.addrs(prefix)?;
         if !list.chunks_exact(32).any(|c| c == addr) {
             list.extend_from_slice(addr);
-            self.raw_put(&Self::addrs_name(prefix), &list)?;
+            self.raw_put_in(class, &Self::addrs_name(prefix), &list)?;
         }
         Ok(())
     }
 
     pub fn remove_addr(&mut self, prefix: &str, addr: &[u8; 32]) -> Result<bool, KvError> {
-        let a = self.addr_scoped(prefix, addr);
+        let class = class_of(prefix);
+        let a = self.addr_scoped(prefix, addr)?;
         let existed = self.vault.delete(&a, now())?;
         let list = self.addrs(prefix)?;
         if list.chunks_exact(32).any(|c| c == addr) {
             let kept: Vec<u8> = list.chunks_exact(32).filter(|c| *c != addr).flatten().copied().collect();
-            self.raw_put(&Self::addrs_name(prefix), &kept)?;
+            self.raw_put_in(class, &Self::addrs_name(prefix), &kept)?;
         }
         Ok(existed)
     }
 
     /// The scope's addresses, 32 bytes each, concatenated.
     pub fn addrs(&mut self, prefix: &str) -> Result<Vec<u8>, KvError> {
-        Ok(self.raw_get(&Self::addrs_name(prefix))?.unwrap_or_default())
+        Ok(self.raw_get_in(class_of(prefix), &Self::addrs_name(prefix))?.unwrap_or_default())
     }
 
+    /// Every name stored, sorted: the device's, and the identity's while one is unlocked.
     pub fn keys(&mut self) -> Result<Vec<String>, KvError> {
-        match self.raw_get(NAMES)? {
-            None => Ok(Vec::new()),
-            Some(b) => {
-                let s = core::str::from_utf8(&b).map_err(|_| KvError::BadNames)?;
-                Ok(s.split('\n').filter(|n| !n.is_empty() && !reserved(n)).map(String::from).collect())
+        let mut names = self.names_in(Class::Device)?;
+        if self.id.is_some() {
+            names.extend(self.names_in(Class::Identity)?);
+            names.sort();
+        }
+        Ok(names)
+    }
+
+    /// Unlock the identity whose seed is `seed` (AUTH.md): its key is BLAKE3 keyed by the ira's identity-vault key over the phone-only secret and the seed — bound to this phone (the ira and the secret) and to the person (the seed). The secret is made from this session's wairua the first time and kept in the device class. Whatever identity was unlocked before is locked first. The seed is not kept.
+    pub fn unlock(&mut self, seed: &[u8; 32], keep: bool) -> Result<(), KvError> {
+        self.lock();
+        if keep {
+            self.raw_put(ID_UNLOCK, seed)?;
+        }
+        let mut secret = [0u8; 32];
+        match self.raw_get(ID_SECRET)? {
+            Some(s) if s.len() == 32 => secret.copy_from_slice(&s),
+            _ => {
+                if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
+                    return Err(KvError::NoIra);
+                }
+                self.raw_put(ID_SECRET, &secret)?;
             }
+        }
+        let mut base = crate::ira::derive(ID_CONTEXT).ok_or(KvError::NoIra)?;
+        let mut h = blake3::Hasher::new_keyed(&base);
+        h.update(&secret);
+        h.update(seed);
+        let mut k = *h.finalize().as_bytes();
+        let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
+        let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
+        self.id = Some(IdKeys { addr_key, payload_key });
+        for b in [&mut secret, &mut base, &mut k] {
+            b.fill(0);
+        }
+        self.adopt_legacy()?;
+        Ok(())
+    }
+
+    /// Entries stored under identity-class names before that class existed (2026-10-31: the map's arrangement, the WiFi credential, the Photon client's and the attest screen's) sit sealed under the device's keys, where an unlocked identity would never find them: the first identity unlocked takes them into its own space, and the device's copies are deleted. Later unlocks find none.
+    fn adopt_legacy(&mut self) -> Result<(), KvError> {
+        let all = self.names_in(Class::Device)?;
+        let (moving, staying): (Vec<String>, Vec<String>) = all.into_iter().partition(|n| identity_class(n));
+        if moving.is_empty() {
+            return Ok(());
+        }
+        for n in &moving {
+            if let Some(v) = self.raw_get_in(Class::Device, n)? {
+                self.set(n, &v)?;
+            }
+            let a = self.addr(Class::Device, n)?;
+            self.vault.delete(&a, now())?;
+        }
+        self.put_names(Class::Device, &staying)?;
+        crate::flashlog::line(&alloc::format!("identity: took over {} entries stored before the identity class", moving.len()));
+        Ok(())
+    }
+
+    /// Lock the identity: its keys dropped, their bytes overwritten first. What it had stored stays sealed on disk.
+    pub fn lock(&mut self) {
+        if let Some(mut k) = self.id.take() {
+            k.addr_key.fill(0);
+            k.payload_key.fill(0);
+            core::hint::black_box(&k);
+        }
+    }
+
+    pub fn unlocked(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// How many entries the unlocked identity has on this phone (0 while locked): a person who has used this phone before finds a space that is not empty.
+    pub fn identity_entries(&mut self) -> usize {
+        if self.id.is_none() {
+            return 0;
+        }
+        self.names_in(Class::Identity).map(|n| n.len()).unwrap_or(0)
+    }
+
+    /// At boot, once the settings are loaded: with unlock at boot on, the kept seed's identity unlocks now (true when it did); off, a kept seed is deleted.
+    pub fn boot_unlock(&mut self, on: bool) -> Result<bool, KvError> {
+        match (on, self.raw_get(ID_UNLOCK)?) {
+            (true, Some(s)) if s.len() == 32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&s);
+                let r = self.unlock(&seed, false);
+                seed.fill(0);
+                r.map(|_| true)
+            }
+            (false, Some(_)) => {
+                let a = self.addr(Class::Device, ID_UNLOCK)?;
+                self.vault.delete(&a, now())?;
+                Ok(false)
+            }
+            _ => Ok(false),
         }
     }
 

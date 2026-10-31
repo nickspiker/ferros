@@ -313,6 +313,31 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     }
 }
 
+/// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the phone switches OS, and a warm reset keeps DRAM).
+fn lock_before_reset() {
+    if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
+        st.lock();
+    }
+}
+
+/// The identity class's lock (AUTH.md): op 0 asks (1 unlocked, 0 not), 1 unlocks from a seed (the number of entries the identity has on this phone), 2 locks (0).
+fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
+    let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
+    match (op, seed) {
+        (1, Some(s)) => {
+            st.unlock(s, crate::process::pref(crate::process::PREF_UNLOCK_AT_BOOT) == 1).map_err(|e| crate::flashlog::line(&alloc::format!("identity unlock failed: {e:?}")))?;
+            crate::flashlog::line("identity unlocked");
+        }
+        (2, _) => {
+            st.lock();
+            crate::flashlog::line("identity locked");
+            return Ok(0);
+        }
+        _ => return Ok(st.unlocked() as u64),
+    }
+    Ok(st.identity_entries() as u64)
+}
+
 fn store_remove(key: &str) -> Result<bool, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     crate::flashlog::line(&alloc::format!("store remove {key:?} (process)"));
@@ -413,6 +438,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Serve(b"nfc"), Hardware(b"hsi2c0"), Power(b"nfc"), Use(b"nfc"),
         // The Bluetooth driver (payloads/bt, docs/BT.md): 81 serve bt, 82 the APM UART, 83 its power; the patch from vendor_a (76), entropy (41). 84 use bt (Photon's, the beacon).
         Serve(b"bt"), Hardware(b"apm-usi1-uart"), Power(b"bt"), Use(b"bt"),
+        // 85 the identity unlock right (AUTH.md): the attest screen unlocks the person's space with it; init asks it whether a person is present before it starts what reads that space.
+        Unlock,
     ]
 }
 
@@ -433,8 +460,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint) (payloads/ahau).
-        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47],
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint), 9 the identity unlock right (payloads/ahau).
+        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85],
         _ => return None,
     };
     let all = home_grants();
@@ -958,6 +985,8 @@ pub fn run(mut b: Boot) -> ! {
         crate::process::STORE_REMOVE = Some(store_remove);
         crate::process::STORE_KEYS = Some(store_keys);
         crate::process::STORE_ADDR = Some(store_addr);
+        crate::process::UNLOCK = Some(store_unlock);
+        crate::platform::BEFORE_RESET = Some(lock_before_reset);
     }
     let mut home_started = !matches!(b.kind, BootKind::Cold);
     let t_boot = cntpct();
@@ -3282,6 +3311,7 @@ pub fn run(mut b: Boot) -> ! {
                                                     8 => crate::process::Grant::Irq(g),
                                                     9 => crate::process::Grant::Ira,
                                                     10 => crate::process::Grant::Part(g),
+                                                    11 => crate::process::Grant::Unlock,
                                                     _ => crate::process::Grant::Use(g),
                                                 });
                                             }
