@@ -33,8 +33,8 @@ Owner decisions, 2026-10-31. Nothing is built yet; the flowchart page tracks the
 - The kernel takes key custody, enforces the scope classes, and wipes the key on an OS switch.
 - The UI and the heavy derivation stay in ahau (EL0).
 
-**Open: how the unlock key is derived.**
-- The owner proposed deriving it straight from the seed for an instant unlock, with no ~1 s wait, and asked me to check the security. The memory-hard handle proof is mainly for handle squatting.
-- My answer: the ira is a brand, not a secret ([[ira-is-brand-not-credential]]). So a fast KDF(ira, seed) becomes a BLAKE3-speed oracle on the handle for anyone holding the phone. That is far cheaper than the memory-hard proof that guards the seed today, and the seed is the identity's root key.
+**Decided: instant unlock from the seed** (owner, 2026-10-31). key = BLAKE3-keyed(derive_key(ira), phone-only secret ‖ seed). The phone-only secret is 32 bytes of wairua, kept in the device class; Google never sees it. A hypervisor net still to build keeps Android from reading the ferros partition; the owner wants nets around everything ferros uses that Android does not need. The memory-hard proof stays Photon's (registry, squatting).
+
+**One identity per phone** (owner, 2026-10-31: "when did we start issuing multiple identities per device?"). The kernel binds the phone when its fleet binds it, and refuses any other handle. Release on a completed departure wipes the identity class. I had shipped per-handle spaces without asking; don't reintroduce them. Spec: ferros AUTH.md.
 
 Related: [[identity-not-on-disk-default]], [[ferros-attest-os-level]], [[radio-addresses-belong-to-identity]], [[bluetooth-pairing-moves-with-identity]].
