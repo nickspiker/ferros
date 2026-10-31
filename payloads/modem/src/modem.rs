@@ -2351,6 +2351,10 @@ impl Online {
                     }
                 }
             }
+            // While a TRACE runs, every RAW-ring frame on a channel the service does not otherwise read (not the remote-file service, not the call's) is logged by channel, link cfg and length: a reply that comes down somewhere unexpected shows up here.
+            if self.dl_log > 0 && name == "raw" && ch != CH_RFS && Some(ch) != self.call_ch() {
+                line(rep, alloc::format!("t={} ms: raw ring frame on ch A#{ch}, cfg G#{:02X}{:02X}, len A#{flen}\n", since_us(t0) / 1000, at(5), at(4)));
+            }
             // The call's packets also come down the RAW ring as SIT frames on its rmnet channel (2026-10-29: the answers to UDP DNS queries did, while an ICMPv6 echo reply came through pktproc): the frame's payload is the IP packet, queued for `rmnet` like a pktproc one.
             if probe == SERVICE && name == "raw" && Some(ch) == self.call_ch() {
                 let n = flen - 12;
@@ -2360,7 +2364,7 @@ impl Online {
                     if self.dl_log > 0 {
                         self.dl_log -= 1;
                         let v: Vec<u8> = (0..n.min(64)).map(|i| at(12 + i)).collect();
-                        line(rep, alloc::format!("t={} ms: DL raw ring ch A#{ch}: {}\n", since_us(t0) / 1000, ul_shape(&v, true)));
+                        line(rep, alloc::format!("t={} ms: DL raw ring ch A#{ch} cfg G#{:02X}{:02X}: {}\n", since_us(t0) / 1000, at(5), at(4), ul_shape(&v, true)));
                     }
                     if self.dl.len() == DL_QUEUE {
                         self.dl.pop_front();
@@ -2635,6 +2639,8 @@ pub fn state(rep: &mut Vec<u8>) {
             Some(o) => {
                 let reg = |k: usize| o.reg_last[k].map(|s| hexs(&|i| s[i as usize], 4)).unwrap_or_else(|| alloc::string::String::from("unknown"));
                 line(rep, alloc::format!("up A#{} s; PS registration ch A#245 {}, ch A#246 {}\n", since_us(o.t0) / 1_000_000, reg(0), reg(1)));
+                line(rep, alloc::format!("lines: AP2CP_WAKEUP {} CP2AP_WAKEUP {} AP_ACTIVE {} PHONE_ACTIVE {}\n", AP2CP_WAKEUP.get() as u8, CP2AP_WAKEUP.get() as u8, AP_ACTIVE.get() as u8, PHONE_ACTIVE.get() as u8));
+                line(rep, alloc::format!("link: ltssm G#{:X}, RC link control/status G#{:X}, msi status G#{:X}\n", rd(ELBI + 0x2C8), rd(DBI + 0x80), rd(DBI + 0x830)));
                 match o.call {
                     Some(c) => line(rep, alloc::format!("data call cid G#{:X} on rmnet ch A#{}, PDP type A#{}, MTU A#{}, IPv4 {}, IPv6 {}\n", c.cid, CH_PDP_0 + c.cid - 1, c.pdp, c.mtu, ["no", "yes"][(c.v4 != [0; 4]) as usize], ["no", "yes"][(c.v6 != [0; 16]) as usize])),
                     None => line(rep, alloc::format!("no data call yet\n")),
