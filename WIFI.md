@@ -250,3 +250,13 @@ When a join fails, the driver exits (`join failed (see events)`). Until tonight 
 Now the kernel's service loop keeps it. Once the shell is up, a `pcie1` that is gone is started again from the vault (`diag restart pcie1`'s path, a full fresh bring-up). The first restart comes 64 s after it went, and the wait doubles with each restart up to 1024 s, since a refused join only adds to a throttle. The wait goes back to 64 s once the driver has stayed up that long. `diag kill pcie1` stops the keeper for the session.
 
 Meanwhile the IP process stays on cellular. Its `wlan` calls carry CALL_LIVE (KERNEL.md), so they fail at once while no driver runs, and while a restarted one is still bringing the chip up. It asks again every 4 s and takes WiFi back the moment the driver serves.
+
+## The MAC: a random one, not the calibration file's placeholder (2026-10-31)
+
+Ferros never set a MAC, so the chip joined as its calibration file's `macaddr=00:90:4c:50:10:01`, Broadcom's placeholder (the same on every unit; Android sets the board's own address at every start).
+
+From the evening of 2026-10-29, pangolin refused that address: the key exchange never started, or association failed with status 2. Nothing showed as blocked in the router's settings. The credential matched throughout.
+
+Now the driver sets a random locally administered unicast address (`cur_etheraddr`, while the radio is still down), fresh each start from the entropy right. It joined at once: WPA2 keyed, DHCP, SLAAC, fgtw.org over IPv6 and IPv4, ping replies at TTL 63.
+
+Which address ferros should wear for good is the owner's to decide (radio addresses belong to the identity).

@@ -927,7 +927,19 @@ fn run(d: &mut Drv, stage: u8, files: &mut [u8]) {
     if stage >= 10 {
         // ---- stage 10: a second query the normal way, then the WiFi chip's S2MPU VID, measured: an ioctl whose request buffer sits outside the fence (G#8008_0000: the kernel image, inside the window the first fence allowed). The firmware's DMA read of it is denied (DECERR) and the S2MPU latches the fault with the VID, which `bridge diag` reports (S2MPU_FAULT_INFO bits 26:24). A denied read can't touch memory; the firmware may trap. ----
         match m.get_var(d, b"cur_etheraddr", dma + IOCTL_REQ) {
-            Some((0, _, len)) => d.kv(b"cur_etheraddr len", len),
+            Some((0, b, _)) => {
+                // The address the chip reports before the join sets its own (its OTP's, else the calibration file's `macaddr`): shown so it can be found in the access point's lists.
+                let h = b"0123456789abcdef";
+                d.put(b"MAC ");
+                for k in 0..6u32 {
+                    let v = dbr(m.resp(b) + k);
+                    d.put(&[h[(v >> 4) as usize], h[(v & 15) as usize]]);
+                    if k < 5 {
+                        d.put(b":");
+                    }
+                }
+                d.put(b"\n");
+            }
             r => d.kv(b"cur_etheraddr failed, status", r.map(|r| r.0).unwrap_or(u32::MAX)),
         }
     }
@@ -2018,6 +2030,22 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     d.kv(b"event_msgs_ext set", r);
     for (k, v) in 0u32.to_le_bytes().iter().enumerate() {
         db(req + k as u32, *v);
+    }
+    // The MAC to join with, set while the radio is still down: a random locally administered unicast address (bit 1 of the first byte set, bit 0 clear), fresh each start from the entropy right, as a phone's per-network privacy address is. Without it the chip joins as its calibration file's Broadcom placeholder (00:90:4c:50:10:01, the same on every unit), and pangolin refused that address from the evening of 2026-10-29 on (association status 2, or the key exchange never starting). Which address ferros should wear for good is the owner's (radio addresses belong to the identity); this is the test of the refusal.
+    let mut mac = [0u8; 6];
+    if svc(6, d.cap(ENTROPY), mac.as_mut_ptr() as u64 - d.base, 6, 0, 0) == 6 {
+        mac[0] = (mac[0] & 0xFC) | 2;
+        let r = m.set_var(d, b"cur_etheraddr", &mac);
+        d.kv(b"cur_etheraddr set (random, locally administered)", r);
+        let h = b"0123456789abcdef";
+        d.put(b"joining as MAC ");
+        for (k, v) in mac.iter().enumerate() {
+            d.put(&[h[(v >> 4) as usize], h[(v & 15) as usize]]);
+            if k < 5 {
+                d.put(b":");
+            }
+        }
+        d.put(b"\n");
     }
     let r = m.ioctl(d, 2, req, 4, 4).map(|r| r.0).unwrap_or(u32::MAX);
     d.kv(b"WLC_UP", r);
