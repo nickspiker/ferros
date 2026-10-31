@@ -806,6 +806,7 @@ impl Map {
             4 => "looking the identity up",
             5 => "no fleet holds this handle \u{2022} it can be minted from the attest screen",
             6 => "fgtw.org's chain for this handle is another identity's",
+            8 => "leaving the fleet \u{2022} approve on one of its devices",
             _ => "no fleet device and no fgtw.org answer \u{2022} nothing decided yet",
         };
         b.text(cx, cy + r + 160, 32, grey(), 1, line);
@@ -819,9 +820,9 @@ impl Map {
         if let Ok(t) = core::str::from_utf8(&heard_line[..hl]) {
             b.text(cx, cy + r + 208, 32, grey(), 1, t);
         }
-        if state == 1 {
+        if state == 1 || state == 8 {
             if let Ok(words) = core::str::from_utf8(&out[2..n]) {
-                b.text(cx, cy + r + 280, 32, grey(), 1, "type these on your other device (Settings \u{2022} Fleet \u{2022} Add device):");
+                b.text(cx, cy + r + 280, 32, grey(), 1, if state == 1 { "type these on your other device (Settings \u{2022} Fleet \u{2022} Add device):" } else { "type these on the device approving the departure:" });
                 // The words come camelCased in one run; six to a row, split at the capitals.
                 let mut rows: [[u8; 128]; 5] = [[0; 128]; 5];
                 let mut lens = [0usize; 5];

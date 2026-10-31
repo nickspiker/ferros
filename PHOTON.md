@@ -52,6 +52,22 @@ The attest screen no longer decides anything about an identity. A first entry de
 - **Mint** (op 2, the attest screen's after the permanence warning and the retype): fgtw's `ensure_member` (genesis signed by this device and the identity, published, fetched back; only a chain naming this device makes it a member, the seed's slot settling on one genesis), then `mint_fleet_key` with this device as the only member.
 - **Checked live 2026-10-28** on the husky with its owner's roots and no fleet device heard: the client resolved fgtw.org, fetched her chain over plain HTTP, verified and folded it, and said "this identity has a fleet". Mint is not tested against fgtw.org: a test mint is a permanent identity.
 
+## Leaving the fleet (2026-10-31)
+
+Removal is bilateral (photon docs/pairing-v2.md "Chain changes"), the same as in the app's sign-out. The frames are fgtw's (`fgtw::protocol`), shared with the app.
+
+1. Op 5 `[5][intent]` on the `photon` endpoint starts the departure. Intent is 1 (to a new owner: the approver also releases the device, so another fleet can bind it) or 2 (to the desk).
+2. The client builds three things:
+   - this device's consent eggs over `fleet::departreq_signing_bytes`;
+   - three fresh approval words;
+   - the signed `depart_req`, carrying the words' commitment.
+3. The `depart_req` goes to every sibling heard beaconing, now and later.
+4. The state reads 8 (leaving), and the map shows the words.
+5. A surviving device's user types the words and publishes the consented Remove.
+6. The client checks the seed's chain every 16 s, and any chain a sibling pushes. Once the chain folds without this device, the identity's roots, chain and key are forgotten here.
+
+Verified on the host: photon-interop shows the app parsing the phone's `depart_req` and its consent verifying under every scheme the phone holds. Not yet run against a live approver.
+
 ## Findings
 
 - **Multicast needs a join.** The phone heard another LAN device's beacons but never the dev box's; broadcast arrived, IPv4 multicast did not. The WiFi firmware passes all multicast; the access point's IGMP snooping was the filter. `ip` op 8 JOIN sends an IGMPv2 membership report (IPv4) or an MLDv1 listener report with the Router Alert option (IPv6) now and every 60 s; the client joins both beacon groups at start.
