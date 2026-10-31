@@ -27,6 +27,8 @@ const ENTROPY: u64 = 13;
 const DMA: u64 = 14;
 /// The vault scope `wifi.` (grant slot after the `wlan` endpoint; init grants it at boot): the firmware (`fw`), the NVRAM text (`nvram`), the CLM blob (`clm`) and the credential (`cred`), for a start with no input files.
 const STORE: u64 = 16;
+/// The ira-derived key right (`--ira`, after the vault scope; init grants it at boot): the key the per-network MAC is hashed under.
+const IRA: u64 = 17;
 const ERR: u64 = u64::MAX;
 /// BAR1's offset inside the pcie1-mem window (stage 6 places it above BAR0's 64 KiB), and its size: the 4 MiB slice of the dongle backplane that cfg G#84 selects.
 const BAR1: u64 = 0x40_0000;
@@ -2031,12 +2033,20 @@ fn scan(d: &mut Drv, m: &mut Msgbuf, clm: &[u8]) {
     for (k, v) in 0u32.to_le_bytes().iter().enumerate() {
         db(req + k as u32, *v);
     }
-    // The MAC to join with, set while the radio is still down: a random locally administered unicast address (bit 1 of the first byte set, bit 0 clear), fresh each start from the entropy right, as a phone's per-network privacy address is. Without it the chip joins as its calibration file's Broadcom placeholder (00:90:4c:50:10:01, the same on every unit), and pangolin refused that address from the evening of 2026-10-29 on (association status 2, or the key exchange never starting). Which address ferros should wear for good is the owner's (radio addresses belong to the identity); this is the test of the refusal.
+    // The MAC to join with, set while the radio is still down: one address per network (owner, 2026-10-31) — the first six bytes of BLAKE3 keyed by this phone's ira-derived key over the network's SSID, made a locally administered unicast address (bit 1 of the first byte set, bit 0 clear). The same on a network every time, different on every other, and not linkable between them without the ira. Keyed on the SSID, not the access point's MAC: the SSID is known before the radio comes up, which is when the address must be set, and one network answers from a different MAC on each band and each mesh node. Without the ira right, or with no SSID to join, a random address from the entropy right. Never the chip's own: the calibration file's Broadcom placeholder (00:90:4c:50:10:01, the same on every unit), which pangolin refused from the evening of 2026-10-29 on.
     let mut mac = [0u8; 6];
-    if svc(6, d.cap(ENTROPY), mac.as_mut_ptr() as u64 - d.base, 6, 0, 0) == 6 {
+    let ssid = &m.want[..m.want_len];
+    let keyed = match ferros_sys::ira_key(d.cap(IRA), "wifi mac per network v1") {
+        Some(key) if !ssid.is_empty() => {
+            mac.copy_from_slice(&blake3::keyed_hash(&key, ssid).as_bytes()[..6]);
+            true
+        }
+        _ => false,
+    };
+    if keyed || svc(6, d.cap(ENTROPY), mac.as_mut_ptr() as u64 - d.base, 6, 0, 0) == 6 {
         mac[0] = (mac[0] & 0xFC) | 2;
         let r = m.set_var(d, b"cur_etheraddr", &mac);
-        d.kv(b"cur_etheraddr set (random, locally administered)", r);
+        d.kv(if keyed { b"cur_etheraddr set (this network's, from the ira)" } else { b"cur_etheraddr set (random: no ira right or no SSID)" }, r);
         let h = b"0123456789abcdef";
         d.put(b"joining as MAC ");
         for (k, v) in mac.iter().enumerate() {

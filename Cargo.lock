@@ -971,6 +971,7 @@ dependencies = [
 name = "ferros-payload-pcie1"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ferros_sys",
 ]
 

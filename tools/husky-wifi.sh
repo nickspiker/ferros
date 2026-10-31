@@ -26,7 +26,7 @@ for s in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
     EXTRA=()
     [[ "$s" > 06 ]] && EXTRA=(--entropy --dma pcie1-dma --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM")
     [[ "$s" > 11 ]] && [ -f "$CRED" ] && EXTRA+=(--input-file "$CRED")
-    [ "$s" = 14 ] && EXTRA=(--entropy --dma pcie1-dma --serve wlan --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED")
+    [ "$s" = 14 ] && EXTRA=(--entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED")
     timeout 120 "$B" spawn "$R/pcie1.bin" "$s" --name pcie1 $HW "${EXTRA[@]}" 2>&1 | grep -vE "DATA|SPEC|recv\[|recv:|send|Staging|Staged|COMPLETE|Connected|Signed"
     # Long waits (WL_REG_ON's 200 ms) span many time slices: the spawn returns after the first one and the driver finishes in the background. Drain its console until it exits.
     for _ in $(seq 60); do

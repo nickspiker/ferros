@@ -29,7 +29,7 @@ fi
 drain() { "$B" diag console 2>/dev/null | grep -v '^ALIVE=' | grep -v '^$' | tee -a "$LOG"; }
 HW="--hw pcie1-elbi --hw pcie1-soc --hw pcie1-pcs --hw pcie1-udbg --hw pcie1-phy --hw pcie1-dbi --hw pcie1-cfg --hw pcie1-mem --hw gpio-hsi2 --hw gpio-far-alive --hw cmu-hsi2 --hw pmu"
 echo "=== wifi driver (stage 14: firmware, join, serve wlan)"
-timeout 120 "$B" spawn "$R/pcie1.bin" 14 --name pcie1 $HW --entropy --dma pcie1-dma --serve wlan --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED" >/dev/null 2>&1
+timeout 120 "$B" spawn "$R/pcie1.bin" 14 --name pcie1 $HW --entropy --dma pcie1-dma --serve wlan --store wifi --ira --input-file "$FW" --input-file "$NVRAM" --input-file "$CLM" --input-file "$CRED" >/dev/null 2>&1
 for _ in $(seq 90); do
     drain >/dev/null
     grep -q "serving wlan" "$LOG" && break

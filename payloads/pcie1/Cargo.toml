@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
+# The per-network MAC (keyed BLAKE3 of the SSID under the ira-derived key), portable code only.
+blake3 = { version = "1", default-features = false, features = ["pure"] }

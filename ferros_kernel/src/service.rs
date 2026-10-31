@@ -419,7 +419,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
         b"touch" => &[14, 15, 16, 23],
         b"map" => &[17, 18, 19, 20, 22, 47],
-        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43],
+        b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
         b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],

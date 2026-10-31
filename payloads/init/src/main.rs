@@ -22,8 +22,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 8] = [
     // The attest screen, before the map, so its window is up before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint) (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47]),
     (b"map", b"map", &[17, 18, 19, 20, 22, 47]),
-    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope (payloads/pcie1 header).
-    (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43]),
+    // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC) (payloads/pcie1 header).
+    (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49]),
     // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41, 52]),
     // 1 use udp, 2 the vault scope `photon.`, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting) (payloads/photon).

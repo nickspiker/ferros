@@ -257,6 +257,11 @@ Ferros never set a MAC, so the chip joined as its calibration file's `macaddr=00
 
 From the evening of 2026-10-29, pangolin refused that address: the key exchange never started, or association failed with status 2. Nothing showed as blocked in the router's settings. The credential matched throughout.
 
-Now the driver sets a random locally administered unicast address (`cur_etheraddr`, while the radio is still down), fresh each start from the entropy right. It joined at once: WPA2 keyed, DHCP, SLAAC, fgtw.org over IPv6 and IPv4, ping replies at TTL 63.
+A random address joined at once: WPA2 keyed, DHCP, SLAAC, fgtw.org over IPv6 and IPv4, ping replies at TTL 63.
 
-Which address ferros should wear for good is the owner's to decide (radio addresses belong to the identity).
+**Now one address per network (owner, 2026-10-31).** The driver sets `cur_etheraddr` while the radio is still down. The value is the first six bytes of BLAKE3, keyed by the phone's ira-derived key (`wifi mac per network v1`, the Ira right as pcie1's slot 17, home slot 49), over the network's SSID, made locally administered unicast.
+- It's the same on a network every time and different everywhere else, and can't be linked across networks without the ira. pangolin's is `fe:8c:8a:25:71:6e`.
+- It's keyed on the SSID, not the access point's MAC: the SSID is known before the radio comes up, and one network answers from a different MAC on each band and each mesh node.
+- Without the Ira right or an SSID, it falls back to a random address.
+
+**The router throttles rejoins.** A join a few seconds after the previous session was cut off (a driver killed, so no disassociation) is refused. The keeper's retry 64 s later joined. That's probably what happened to the placeholder on 2026-10-29, after dozens of reload rejoins under one address.
