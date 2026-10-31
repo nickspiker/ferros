@@ -435,6 +435,11 @@ pub fn call(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
     svc(nr::CALL, cap, off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64)
 }
 
+/// `call` that fails with ERR at once when no server is receiving on the endpoint (`CALL_LIVE`), instead of waiting for one: for a caller that must not hang on a driver that is down or still bringing its device up.
+pub fn call_live(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
+    svc(nr::CALL, cap, off(msg.as_ptr()), msg.len() as u64, off(reply.as_mut_ptr()), reply.len() as u64 | CALL_LIVE)
+}
+
 /// Receive on an endpoint: the message lands in `buf`, a single-use reply token in `token`; returns the message length. With `poll`, returns NOTHING at once when no message waits.
 pub fn recv(cap: u64, buf: &mut [u8], token: &mut [u8; 32], poll: bool) -> u64 {
     svc(nr::RECV, cap, off(buf.as_mut_ptr()), buf.len() as u64, off(token.as_mut_ptr()), poll as u64)

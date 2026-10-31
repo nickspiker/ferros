@@ -429,6 +429,10 @@ struct Client {
     request_frame: Vec<u8>,
     /// Whether the tap secret and the beacon are out (`radios`).
     radios_on: bool,
+    /// The secret and beacon id last handed out, a handover that missed a driver, and when it was tried (`radios`).
+    radios_last: Option<([u8; 32], [u8; 16])>,
+    radios_missed: bool,
+    radios_at: u64,
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
@@ -625,7 +629,7 @@ impl Client {
         }
     }
 
-    /// The proximity carriers: with a request, its secret served on the NFC tag and its beacon id advertised; without, both stopped. A driver that is not running is skipped (the call fails at once): the words still work.
+    /// The proximity carriers: with a request, its secret served on the NFC tag and its beacon id advertised; without, both stopped. The calls carry CALL_LIVE: a driver that is down, or still bringing its chip up (Bluetooth gives WiFi 16 s at boot), fails the call at once instead of holding this client and, through it, the attest screen. One that missed its handover is tried again every 16 s from the loop (`radios_retry`); the words work meanwhile.
     fn radios(&mut self, on: Option<(&[u8; 32], &[u8; 16])>) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
         let mut r = [0u8; 4];
@@ -634,15 +638,20 @@ impl Client {
                 let mut m = [0u8; 33];
                 m[0] = 1;
                 m[1..].copy_from_slice(s);
-                let a = ferros_sys::call(nfc, &m, &mut r);
+                let a = ferros_sys::call_live(nfc, &m, &mut r);
                 let mut m = [0u8; 17];
                 m[0] = 1;
                 m[1..].copy_from_slice(id);
-                (a, ferros_sys::call(bt, &m, &mut r))
+                (a, ferros_sys::call_live(bt, &m, &mut r))
             }
-            None => (ferros_sys::call(nfc, &[2], &mut r), ferros_sys::call(bt, &[2], &mut r)),
+            None => (ferros_sys::call_live(nfc, &[2], &mut r), ferros_sys::call_live(bt, &[2], &mut r)),
         };
         self.radios_on = on.is_some();
+        self.radios_missed = on.is_some() && (a == ERR || b == ERR);
+        self.radios_at = now();
+        if let Some((s, id)) = on {
+            self.radios_last = Some((*s, *id));
+        }
         self.log.put(if on.is_some() { b"photon: tap secret and beacon out: nfc " } else { b"photon: tap secret and beacon stopped: nfc " });
         self.log.put(if a == ERR { b"not running" } else { b"ok" });
         self.log.put(b", bt ");
@@ -1098,6 +1107,12 @@ impl Client {
             if self.bound && self.radios_on {
                 self.radios(None);
             }
+            // A driver that missed the handover (down, or still coming up): tried again every 16 s while unbound.
+            if !self.bound && self.radios_missed && now().wrapping_sub(self.radios_at) > ferros_sys::freq() * 16 {
+                if let Some((s, id)) = self.radios_last {
+                    self.radios(Some((&s, &id)));
+                }
+            }
             if self.hp.is_some() && t.saturating_sub(self.last_beacon_us) >= 3_000_000 {
                 self.last_beacon_us = t;
                 self.beacon();
@@ -1160,7 +1175,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, last_load_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 
