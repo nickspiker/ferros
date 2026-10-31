@@ -826,6 +826,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-bt"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-display"
 version = "0.1.0"
 dependencies = [
@@ -962,6 +969,13 @@ dependencies = [
 
 [[package]]
 name = "ferros-payload-nettest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
+name = "ferros-payload-nfc"
 version = "0.1.0"
 dependencies = [
  "ferros_sys",

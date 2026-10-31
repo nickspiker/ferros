@@ -58,6 +58,8 @@ mod aoc;
 mod usf;
 mod haptics;
 mod gnss;
+mod nfc;
+mod bt;
 mod tpu;
 mod gsa;
 mod ffa;

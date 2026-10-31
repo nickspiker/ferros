@@ -29,6 +29,8 @@ members = [
     "payloads/echo_server",
     "payloads/touch",
     "payloads/gnss",
+    "payloads/nfc",
+    "payloads/bt",
     "payloads/gnsstest",
     "payloads/focustest",
     "payloads/touchtest",

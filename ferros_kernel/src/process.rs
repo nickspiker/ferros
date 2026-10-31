@@ -1034,6 +1034,10 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "gpio-gpn0", base: 0x1506_0000, size: 0x1000, via_el3: false },
     // The GNSS chip (GNSS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
     Hw { name: "usi3-spi", base: 0x111E_0000, size: 0x1000, via_el3: false },
+    // The NFC controller (docs/NFC.md): hsi2c_0, the bus it shares with the vibration motor (whose driver is the kernel's diag, never running beside the `nfc` process). Its interrupt line gpa7-6 is read in gpio-alive, above. Pin modes, the reset and the clock pad are the kernel's (`POWERS`).
+    Hw { name: "hsi2c0", base: 0x10C8_0000, size: 0x1000, via_el3: false },
+    // Bluetooth (docs/BT.md): the APM's USI1 UART (serial_18). The USI mode word and the chip's power lines are the kernel's (`POWERS`).
+    Hw { name: "apm-usi1-uart", base: 0x155D_0000, size: 0x1000, via_el3: false },
 ];
 
 /// A device's power switch a spawn can grant (`bridge spawn --power NAME`): the kernel's sequence for the rails, clocks and pin modes behind a userspace driver.
@@ -1041,7 +1045,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
