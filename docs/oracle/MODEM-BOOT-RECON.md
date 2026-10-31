@@ -517,3 +517,31 @@ Verified from a reset: the driver's cold bring-up went through link up, START an
 - Init does not start the driver at boot yet (spawn it with `tools/husky-modem.sh`).
 - A dropped call is not re-established.
 - The 98 MB download holds the kernel lock a chunk at a time, about 30 ms per MiB, so other processes' syscalls wait during those seconds.
+
+## 2026-10-31: the downlink stall was the CP's link power handshake
+
+About one cellular fetch in fifteen stalled: the HTTP request went up, the reply waited in the CP, sometimes for 37 s, and then came down in a single burst, released by whatever the AP next sent (often the service's 64 s registration poll).
+
+These were ruled out by measurement:
+- TTL 63 against 64.
+- AP2CP_WAKEUP, which was high.
+- Link power management: the link was in L0 with ASPM off.
+- Notifying the CP when buffers are given back: Linux does not do it either.
+
+Android showed what was missing. Under the same fetches it never stalled: 60 of 60, at most 560 ms (busybox wget by address, the same Cloudflare servers). Kprobes on `s51xx_pcie_send_doorbell_int` showed a second doorbell next to the message one: G#1_000E, `intval_ap2cp_pcie_link_ack`, rung from `cp2ap_wakeup_work`.
+
+The handshake is this:
+- **The CP goes idle:** it drops CP2AP_WAKEUP. Android waits 30 ms, then, if CP2AP_WAKEUP is still low and nothing is pending to go up, it lowers AP2CP_WAKEUP and powers the link off (`cp2ap_suspend_work`, then `s5100_poweroff_pcie`).
+- **The CP has data for the AP:** it raises CP2AP_WAKEUP. Android powers the link on, restores the endpoint, raises AP2CP_WAKEUP and rings the link ack (`s5100_poweron_pcie`).
+
+Ferros kept the link up and never answered. A CP that had dropped its line sat half-suspended, and did not raise it again for downlink until an AP doorbell came.
+
+The driver now does the same in `Online::step`:
+1. **Watch:** read CP2AP_WAKEUP each pass.
+2. **Suspend:** after 30 ms idle with every TX ring and UL queue drained, lower AP2CP_WAKEUP and drop the link (`suspend`: the boot path's `link_down`).
+3. **Resume:** on a rise with the link down, raise AP2CP_WAKEUP, retrain the link, set the endpoint up again and ring the link ack (`resume`: the boot link cycle's steps). On a rise with the link up, just ring the ack.
+4. **Sending while down:** raise AP2CP_WAKEUP, wait for the CP's rise, and resume first (`ap_wake`, called by every send). Nothing reaches the CP's BAR while the link is down; the controller's own registers are left alone too.
+
+Measured afterwards: 209 of 210 cellular fetches good, at a median of 1.1 s and at most 2.1 s, with no stalls. The one other run completed with a different page from the server. That run saw 298 link acks and 294 suspends, and no faults.
+
+Two earlier half-steps are also kept, since both copy Android: SEND_DATA after taking downlink, and the link ack on every rise.

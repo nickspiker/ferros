@@ -1297,6 +1297,7 @@ const PP_UL_PAD: u32 = 76;
 
 /// One packet up on UL queue `PP_UL_NORM` (pktproc_send_pkt_to_cp, then the fore pointer and SEND_DATA): the packet into the buffer at the queue's fore pointer, its descriptor {data_size, total_pkt_size, sktbuf_point (the buffer's CP address), last_desc 1 (the end bit is the AP's: end_bit_owner 0), lcid = the call's channel}, fore + 1, then the SEND_DATA message and the doorbell.
 fn pktproc_ul_send(ch: u8, pkt: &[u8]) -> Result<(), alloc::string::String> {
+    ap_wake()?;
     let q = PP_UL_NORM;
     let e = PP_UL_INFO + 8 + 20 * q as usize;
     let n = rd(e + 4);
@@ -1612,8 +1613,50 @@ fn ring_send(link: &mut SitLink, raw: bool, ch: u8, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// The link is down because the CP went idle (`Online::step` suspended it, as Android's driver powers the link off then): nothing may go to the CP's BAR until `resume` brings it back.
+static LINK_DOWN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The CP idle and nothing waiting to go up: AP2CP_WAKEUP low and the link down (s5100_poweroff_pcie: AP2CP_WAKEUP 0, then exynos_pcie_poweroff). The CP raises CP2AP_WAKEUP when it next has something for the AP.
+fn suspend() {
+    AP2CP_WAKEUP.out(false);
+    link_down();
+    LINK_DOWN.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The link back for a CP that raised CP2AP_WAKEUP: AP2CP_WAKEUP high, the link retrained and the endpoint set up again (the boot link cycle's steps), then the link acknowledgement (s5100_poweron_pcie).
+fn resume() -> Result<(), alloc::string::String> {
+    AP2CP_WAKEUP.out(true);
+    ms(5);
+    let mut rep = Vec::new();
+    if !link_tries(&mut rep, 6) || !endpoint(&mut rep) {
+        crate::hw::say(&rep);
+        return Err(alloc::format!("the link did not come back"));
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+    LINK_DOWN.store(false, core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Before the AP sends: with the link down, AP2CP_WAKEUP high, the CP's CP2AP_WAKEUP awaited (up to a second: s5100_try_gpio_cp_wakeup and the CP's answer), and the link resumed. Then the send may ring the doorbell.
+fn ap_wake() -> Result<(), alloc::string::String> {
+    if !LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    AP2CP_WAKEUP.out(true);
+    let t0 = now();
+    while !CP2AP_WAKEUP.get() {
+        if since_us(t0) > 1_000_000 {
+            return Err(alloc::format!("the CP did not raise CP2AP_WAKEUP"));
+        }
+        us(100);
+    }
+    resume()
+}
+
 /// One frame with link cfg `cfg` into the FMT or the RAW TX ring, then that ring's SEND message and the doorbell.
 fn ring_frame(link: &mut SitLink, raw: bool, ch: u8, cfg: u16, payload: &[u8]) -> Result<(), alloc::string::String> {
+    ap_wake()?;
     let (ring, len, headr, tailr, int) = if raw { (TX_RING, TX_RING_LEN, TXQ_HEAD, TXQ_TAIL, INT_SEND_DATA) } else { (FMT_TX_RING, FMT_TX_RING_LEN, FMT_TXQ_HEAD, FMT_TXQ_TAIL, INT_SEND_FMT) };
     let total = 12 + payload.len();
     let padded = (total + 7) & !7;
@@ -2083,6 +2126,14 @@ struct Online {
     ul_full: u32,
     /// DL packets still to log by shape (`probe` sets it).
     dl_log: u32,
+    /// CP2AP_WAKEUP as last seen: a rise is the CP asking for the link, answered with the link acknowledgement.
+    cp_wake: bool,
+    /// Link acknowledgements sent (STATE).
+    link_acks: u32,
+    /// Since when the CP's wakeup line has been low (None while it is high, or once the link is down).
+    idle_since: Option<u64>,
+    /// Link suspends (STATE).
+    suspends: u32,
     /// UL packets still to log by shape (TRACE sets both).
     ul_log: u32,
 }
@@ -2133,6 +2184,10 @@ impl Online {
             ul_sent: 0,
             ul_full: 0,
             dl_log: 0,
+            cp_wake: false,
+            link_acks: 0,
+            idle_since: None,
+            suspends: 0,
             ul_log: 0,
         }
     }
@@ -2145,6 +2200,50 @@ impl Online {
     /// One pass: the CP's state words, the timed actions of the probe level, every frame waiting in the RAW and FMT RX rings (answered where the AP must answer), every DL packet. False once the CP has given up (CRASH_EXIT) or a ring is beyond reading: the caller stops.
     fn step(&mut self, rep: &mut Vec<u8>) -> bool {
         let taken0 = self.packets;
+        // The CP's wakeup line: when it has something for the AP (downlink above all) it raises CP2AP_WAKEUP and waits for the link acknowledgement before it sends, as Android's driver gives it once the link is up. Ferros never powers the link down, so the link is always up: every rise is acknowledged at once. Without it the CP held downlink until some other doorbell happened to come (2026-10-31: a TCP reply 37 s late; Android, which acknowledges, never stalled in 60 fetches).
+        let wake = CP2AP_WAKEUP.get();
+        let down = LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed);
+        if wake != self.cp_wake && self.dl_log > 0 {
+            line(rep, alloc::format!("t={} ms: CP2AP_WAKEUP {}{}\n", since_us(self.t0) / 1000, if wake { "rose" } else { "fell" }, if down { " (link down)" } else { "" }));
+        }
+        if wake && down {
+            // The CP wants the link back (it has something for the AP): resume, as cp2ap_wakeup_work -> s5100_poweron_pcie does.
+            let t1 = now();
+            match resume() {
+                Ok(()) => {
+                    self.link_acks += 1;
+                    if self.dl_log > 0 {
+                        line(rep, alloc::format!("t={} ms: link resumed in A#{} us\n", since_us(self.t0) / 1000, since_us(t1)));
+                    }
+                }
+                Err(e) => line(rep, alloc::format!("t={} ms: resume failed: {e}\n", since_us(self.t0) / 1000)),
+            }
+        } else if wake && !self.cp_wake {
+            // The CP raised its line with the link already up: the acknowledgement it waits for.
+            AP2CP_WAKEUP.out(true);
+            unsafe { core::arch::asm!("dsb sy") };
+            wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_LINK_ACK);
+            self.link_acks += 1;
+        }
+        // The CP idle (its line low) for 30 ms with nothing waiting to go up in any ring: the link down, as Android's driver does (cp2ap_suspend_work -> s5100_poweroff_pcie, its 30 ms wait and its pending-transmit check). Kept up, the CP sat half-suspended and did not ask for the link when downlink came: a TCP reply waited 32 s (2026-10-31). The service only: the diag stages keep the link as they find it.
+        if !wake && self.cp_wake {
+            self.idle_since = Some(now());
+        }
+        if wake {
+            self.idle_since = None;
+        }
+        if let (Some(t1), false, true) = (self.idle_since, down, self.probe == SERVICE) {
+            let tx_idle = rd(TXQ_HEAD) == rd(TXQ_TAIL) && rd(FMT_TXQ_HEAD) == rd(FMT_TXQ_TAIL) && (0..2usize).all(|q| rd(PP_UL_INFO + 8 + 20 * q + 12) == rd(PP_UL_INFO + 8 + 20 * q + 16));
+            if since_us(t1) > 30_000 && tx_idle && !CP2AP_WAKEUP.get() {
+                suspend();
+                self.idle_since = None;
+                self.suspends += 1;
+                if self.dl_log > 0 {
+                    line(rep, alloc::format!("t={} ms: CP idle: link down\n", since_us(self.t0) / 1000));
+                }
+            }
+        }
+        self.cp_wake = wake;
         let t0 = self.t0;
         let probe = self.probe;
         let tests = probe == 8;
@@ -2543,13 +2642,14 @@ impl Online {
             }
         }
         // Downlink taken this pass: SEND_DATA and the doorbell, as Android's driver does within ~1.4 ms of each downlink interrupt whether or not it has anything to send (kprobes on pcie_send_ap2cp_irq and pktproc_irq_handler, 2026-10-31: 527 of 687 downlink interrupts followed by G#81 within 5 ms). Without it the CP held a TCP reply for up to the next message the AP happened to send — once 37 s, released by the 64 s registration poll.
-        if self.packets != taken0 {
+        if self.packets != taken0 && !LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) {
             unsafe { core::arch::asm!("dsb sy") };
             wr(AP2CP_MSG, INT_SEND_DATA);
             unsafe { core::arch::asm!("dsb sy") };
             wr(DOORBELL.load(core::sync::atomic::Ordering::Relaxed), DB_MSG);
         }
-        let msi = rd(DBI + 0x830);
+        // The controller's MSI status, cleared while the link is up (its PHY is powered down with the link).
+        let msi = if LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) { 0 } else { rd(DBI + 0x830) };
         if msi != 0 {
             wr(DBI + 0x830, msi);
         }
@@ -2646,8 +2746,10 @@ pub fn state(rep: &mut Vec<u8>) {
             Some(o) => {
                 let reg = |k: usize| o.reg_last[k].map(|s| hexs(&|i| s[i as usize], 4)).unwrap_or_else(|| alloc::string::String::from("unknown"));
                 line(rep, alloc::format!("up A#{} s; PS registration ch A#245 {}, ch A#246 {}\n", since_us(o.t0) / 1_000_000, reg(0), reg(1)));
-                line(rep, alloc::format!("lines: AP2CP_WAKEUP {} CP2AP_WAKEUP {} AP_ACTIVE {} PHONE_ACTIVE {}\n", AP2CP_WAKEUP.get() as u8, CP2AP_WAKEUP.get() as u8, AP_ACTIVE.get() as u8, PHONE_ACTIVE.get() as u8));
-                line(rep, alloc::format!("link: ltssm G#{:X}, RC link control/status G#{:X}, msi status G#{:X}\n", rd(ELBI + 0x2C8), rd(DBI + 0x80), rd(DBI + 0x830)));
+                line(rep, alloc::format!("lines: AP2CP_WAKEUP {} CP2AP_WAKEUP {} AP_ACTIVE {} PHONE_ACTIVE {}; link acknowledgements sent A#{}, link suspends A#{}, link down now {}\n", AP2CP_WAKEUP.get() as u8, CP2AP_WAKEUP.get() as u8, AP_ACTIVE.get() as u8, PHONE_ACTIVE.get() as u8, o.link_acks, o.suspends, LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) as u8));
+                if !LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed) {
+                    line(rep, alloc::format!("link: ltssm G#{:X}, RC link control/status G#{:X}, msi status G#{:X}\n", rd(ELBI + 0x2C8), rd(DBI + 0x80), rd(DBI + 0x830)));
+                }
                 match o.call {
                     Some(c) => line(rep, alloc::format!("data call cid G#{:X} on rmnet ch A#{}, PDP type A#{}, MTU A#{}, IPv4 {}, IPv6 {}\n", c.cid, CH_PDP_0 + c.cid - 1, c.pdp, c.mtu, ["no", "yes"][(c.v4 != [0; 4]) as usize], ["no", "yes"][(c.v6 != [0; 16]) as usize])),
                     None => line(rep, alloc::format!("no data call yet\n")),
