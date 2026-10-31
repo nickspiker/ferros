@@ -1,6 +1,6 @@
 ---
 name: auth-flow-decisions
-description: "Owner decisions 2026-10-31 for the ferros auth flow — device vs identity vault classes, WiFi creds + BT pairings move with the identity, key bound to phone, lock only on power loss or OS switch, auth mostly in kernel; unlock-key derivation still open"
+description: "Owner decisions 2026-10-31 for the ferros auth flow — device vs identity vault classes, WiFi creds + BT pairings move with the identity, key bound to phone, lock only on power loss or OS switch, auth mostly in kernel; instant unlock from seed + phone-only secret; one identity per phone (built, AUTH.md)"
 metadata:
   node_type: memory
   type: project
@@ -8,7 +8,7 @@ metadata:
   modified: 2026-10-31T21:00:40.344Z
 ---
 
-Owner decisions, 2026-10-31. Nothing is built yet; the flowchart page tracks the state (https://claude.ai/artifact/7sxcUNi5owYvcB426AESLB).
+Owner decisions, 2026-10-31. Built the same day (AUTH.md, commits 9daf32c..c6f8bcc); the flowchart page tracks the state (https://claude.ai/artifact/7sxcUNi5owYvcB426AESLB).
 
 **The two classes are agreed:**
 - **Device class**, sealed by the ira. It holds everything that must work before a person is present:
