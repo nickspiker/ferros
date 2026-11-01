@@ -105,7 +105,7 @@ opt-level = 3
 [profile.release.package.blake3]
 opt-level = 3
 
-# Host tools in dev builds: the bridge hashes and frames every PT packet, and unoptimised BLAKE3 there held a 2 MiB transfer to the phone at 240 ms against 102 ms built for speed (2026-10-31).
+# Host tools in dev builds: the bridge hashes and frames every PT packet, and unoptimised BLAKE3 there held a 2 MiB transfer to the device at 240 ms against 102 ms built for speed (2026-10-31).
 [profile.dev.package.blake3]
 opt-level = 3
 

@@ -61,7 +61,7 @@ pub fn entry(x0: u64) -> ! {
     }
 
     // Success signal that does not depend on DRAM persistence: trigger a fast, clean PSCI SYSTEM_RESET.
-    // If the handoff worked, the phone reboots in a few seconds (vs the ~168s hang-then-fallback of a crash).
+    // If the handoff worked, the device reboots in a few seconds (vs the ~168s hang-then-fallback of a crash).
     // A warm PSCI reset may also preserve the scratch, so the recovery boot can read the magic.
     // PSCI SYSTEM_RESET = 0x8400_0009; SMC from EL2 traps to EL3 (TF-A).
     unsafe {

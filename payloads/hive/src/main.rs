@@ -99,10 +99,10 @@ impl Hive {
         let start = self.len;
         for (i, &c) in word.iter().enumerate() {
             let c = c as char;
-            self.push(if i == 0 && self.kb.shift { c.to_ascii_uppercase() } else { c });
+            self.push(if i == 0 && self.kb.shift != honeycomb::Shift::Off { c.to_ascii_uppercase() } else { c });
         }
-        if self.kb.shift {
-            self.kb.shift = false;
+        if self.kb.shift == honeycomb::Shift::Once {
+            self.kb.shift = honeycomb::Shift::Off;
         }
         self.word = Some((start, self.len - start));
         self.cur = best[0].0;

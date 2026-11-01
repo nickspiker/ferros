@@ -1,4 +1,4 @@
-//! The ferros USB service: Photon Transport on the phone's DWC3, shared by both ways ferros boots on husky.
+//! The ferros USB service: Photon Transport on the device's DWC3, shared by both ways ferros boots on husky.
 //!
 //! - **Handoff** (slot a, chainloaded from the patched Linux): UFS is live and the ira-rooted vault is open, so STORE works; every exit warm-resets back into Android.
 //! - **Cold** (slot b, straight from ABL): no Linux; ferros powers the flash back on and brings UFS up itself (cold_ufs.rs), so the vault opens here too. Exits other than a plain host REBOOT go to fastboot, since a plain reset would just boot ferros again (slot marking via devinfo is not implemented yet).
@@ -278,14 +278,14 @@ fn store_scoped(key: &str, value: Option<&[u8]>) -> Result<Option<alloc::vec::Ve
     }
 }
 
-/// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the phone switches OS, and a warm reset keeps DRAM).
+/// Before any reset the kernel orders: the identity's key dropped (AUTH.md: it locks when power goes or the device switches OS, and a warm reset keeps DRAM).
 fn lock_before_reset() {
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
         st.lock();
     }
 }
 
-/// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound), 1 unlocks from a seed (the number of entries the identity has on this phone, or NOTHING: the phone is bound to another identity), 2 locks, 3 binds the phone to the unlocked identity, 4 releases it (every identity entry deleted).
+/// The identity class's lock (AUTH.md): op 0 asks (bit 0 unlocked, bit 1 bound), 1 unlocks from a seed (the number of entries the identity has on this device, or NOTHING: the device is bound to another identity), 2 locks, 3 binds the device to the unlocked identity, 4 releases it (every identity entry deleted).
 fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
     let st = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).ok_or(())?;
     match (op, seed) {
@@ -295,7 +295,7 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
                 Ok(st.identity_entries() as u64)
             }
             Err(crate::kvault::KvError::Belongs) => {
-                crate::flashlog::line("identity refused: this phone is bound to another identity");
+                crate::flashlog::line("identity refused: this device is bound to another identity");
                 Ok(crate::process::NOTHING)
             }
             Err(e) => {
@@ -310,12 +310,12 @@ fn store_unlock(op: u8, seed: Option<&[u8; 32]>) -> Result<u64, ()> {
         }
         (3, _) => {
             st.bind().map_err(|_| ())?;
-            crate::flashlog::line("identity bound: this phone now opens only for it");
+            crate::flashlog::line("identity bound: this device now opens only for it");
             Ok(0)
         }
         (4, _) => {
             let n = st.release().map_err(|_| ())?;
-            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted, the phone-only secret renewed"));
+            crate::flashlog::line(&alloc::format!("identity released: {n} entries deleted, the device-only secret renewed"));
             Ok(0)
         }
         _ => Ok(st.unlocked() as u64 | (st.bound().unwrap_or(false) as u64) << 1),
@@ -450,8 +450,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint), 9 the identity unlock right (payloads/ahau).
-        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85],
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer (payloads/ahau).
+        b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
         // 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch (payloads/sensors).
@@ -459,7 +459,12 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         _ => return None,
     };
     let all = home_grants();
-    Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).collect())
+    // The attest screen's two surfaces as init's spawn hands them out (SYS_SPAWN): each a free surface of the four, its own. Passed as the whole region, a restarted attest screen drew into surface 0 whoever held it, and its back buffer was its own front (2026-11-01: every board redrew in place, black between). Not for the display server, which takes the region's base (surface 0 at boot).
+    let own = name == b"ahau";
+    Some(slots.iter().filter_map(|&s| all.get(s - 1).copied()).map(|g| match g {
+        crate::process::Grant::Dma(b"surfaces") if own => crate::process::Grant::Dma(b"surface"),
+        g => g,
+    }).collect())
 }
 
 /// `diag restart <name>…`: each named shell process killed and started again from its capsule in the vault, in the order given (display before map: the map hands a fresh display server its scene at start). The development loop for the shell — build, `store put`, restart — without a reboot.
@@ -669,7 +674,7 @@ enum SensorBoot {
 /// The DBV told to the AoC with the display's state until the display server reports its own: the shell's usual brightness (DISPLAY-CALIB.md: DBV 1353 ≈ 136 cd/m²).
 const DISPLAY_DBV: u32 = 1353;
 
-/// Gravity's sampling period, ms: 100 Hz, so the clock's turn lags the phone by a fixed 16 ms (owner, 2026-10-24: the 25 Hz stream against the 10 Hz redraws stepped unevenly).
+/// Gravity's sampling period, ms: 100 Hz, so the clock's turn lags the device by a fixed 16 ms (owner, 2026-10-24: the 25 Hz stream against the 10 Hz redraws stepped unevenly).
 const GRAVITY_MS: u64 = 10;
 
 /// The sensors start this long after the service loop does: the home screen first.
@@ -756,7 +761,7 @@ fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<all
 pub static THERMAL: [core::sync::atomic::AtomicU8; 7] = [const { core::sync::atomic::AtomicU8::new(0) }; 7];
 /// The X3's rate before the thermal throttle took it down, kHz; 0 = not throttled.
 static THROTTLED_FROM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// The CPU temperature at which the X3 is taken down (°C); it gets its rate back below this less 10. Linux's control temperature for the big cluster is 95 (zuma's `BIG` thermal zone, its passive trip), its "hot" 115. `diag thermal at <C>` moves it, to test the throttle on a cool phone; every boot starts at 95.
+/// The CPU temperature at which the X3 is taken down (°C); it gets its rate back below this less 10. Linux's control temperature for the big cluster is 95 (zuma's `BIG` thermal zone, its passive trip), its "hot" 115. `diag thermal at <C>` moves it, to test the throttle on a cool device; every boot starts at 95.
 static THROTTLE_AT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(95);
 /// The X3's rate under the throttle, kHz: half its top rate, the firmware takes it as asked (measured 2026-10-23, the core then counts ~1297 M dependent adds/s).
 const THROTTLE_KHZ: u32 = 1_400_000;
@@ -878,7 +883,7 @@ fn power_poll() {
     }
 }
 
-/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the phone hard-resets, so floors, never under). Active — a touch taken by the touch driver, a PT transfer moving, or the display sending frames faster than its rest flips (a focused widget), held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
+/// The clock policy (POWER.md, 2026-10-25): two operating points, chosen from what the kernel knows. Rest — nobody touching, no transfer on the USB link — puts every domain at the lowest point that still carries the rest-state work: the X3 at 2.0 GHz (its 2.9 GHz step alone is 0.66 W, and the display's between-frames redraws fit at 2.0), MIF at 1014 MHz (2028 → 1014 is 0.36 W; lower bought nothing), INT at its 178 MHz floor, the workers' cluster at its 402 MHz floor, CPU0's (parked) at its 324 MHz floor and the DSU (the clusters' shared cache and snoop) at its 324 MHz floor (90 mW; BCI at its floor bought nothing measurable and stays) (zuma-cpu.dtsi: ACPM answers Ok below a floor and the device hard-resets, so floors, never under). Active — a touch taken by the touch driver, a PT transfer moving, or the display sending frames faster than its rest flips (a focused widget), held a second after the last — is the boot's own clocks. Each entry: (ACPM DVFS domain, kHz), applied in order (the X3 first going down, MIF first going up).
 const CLOCKS_REST: [(u32, u32); 7] = [(4, 2_000_000), (0, 1_014_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 400_000)];
 /// Dark — the screen off, nobody touching, no transfer: nothing is drawn, so the X3 and MIF go to their floors and the display's clock to its 143 MHz floor (measured 70 mW under rest with the screen off).
 const CLOCKS_DARK: [(u32, u32); 7] = [(4, 500_000), (0, 421_000), (1, 178_000), (3, 402_000), (2, 324_000), (5, 324_000), (14, 143_000)];
@@ -989,7 +994,7 @@ fn gauge_poll() {
     }
 }
 
-/// The Type-C port controller's USB switch (the MAX77759's TCPC, G#25 on hsi2c_11, vendor register G#93 USBSW_CTRL: G#09 connects D+/D- to the SoC's PHY, 0 parks them): after the cable came out and went back in, the link never came back (2026-10-25, four times) — VBUS present and CC attached on the replug, the eUSB2 repeater correctly tuned, the charger in its mode, yet the host never saw the phone. The chip opens the switch for its own BC1.2 charger detection on a new VBUS, and Google's driver closes it on every attach ("switches will not be configured by HW", tcpci_max77759.c enable_data_path_locked); ABL closes it at power-on and ferros never had. So: attached, VBUS present and the switch not G#09 — close it. The controller's role, CC, power status and the switch go into the flash log when `log` is set and whenever it acts. Called by the kernel's USB re-initialisation and by the `usb` power switch (ptlink.rs), both on the kernel's core, which the battery gauge sharing the bus also polls from.
+/// The Type-C port controller's USB switch (the MAX77759's TCPC, G#25 on hsi2c_11, vendor register G#93 USBSW_CTRL: G#09 connects D+/D- to the SoC's PHY, 0 parks them): after the cable came out and went back in, the link never came back (2026-10-25, four times) — VBUS present and CC attached on the replug, the eUSB2 repeater correctly tuned, the charger in its mode, yet the host never saw the device. The chip opens the switch for its own BC1.2 charger detection on a new VBUS, and Google's driver closes it on every attach ("switches will not be configured by HW", tcpci_max77759.c enable_data_path_locked); ABL closes it at power-on and ferros never had. So: attached, VBUS present and the switch not G#09 — close it. The controller's role, CC, power status and the switch go into the flash log when `log` is set and whenever it acts. Called by the kernel's USB re-initialisation and by the `usb` power switch (ptlink.rs), both on the kernel's core, which the battery gauge sharing the bus also polls from.
 pub(crate) fn tcpc_usb_switch(log: bool) {
     use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
     const TCPC: u8 = 0x25;
@@ -1088,7 +1093,7 @@ pub fn run(mut b: Boot) -> ! {
 
     // The generic timer's event stream: an event on every 0 -> 1 transition of counter bit 15, every 65536 ticks — 2.7 ms at 24.576 MHz (bit 12, 333 us, until 2026-10-25: bit 15 is 15-25 mW less with the screen off, and the idle `wfe`'s EL2 timer is armed at the next thread deadline, so deadlines no longer wait on the stream). Earlier: an event on every 0 -> 1 transition of counter bit 12, every 8192 ticks — 333 us at 24.576 MHz. A core in `wfe` wakes on it without taking an interrupt, so the idle loop below can sleep instead of spinning and still answer USB well inside anything the host would notice.
     // The period sets the split. Each wake runs one full loop pass, about 13 us of work, so bit 9 (41.7 us) left the core awake a third of the time — 68% asleep, measured — while bit 12 leaves it awake about 4%. Only the first packet of a new command can wait up to one period; a transfer in progress never sleeps.
-    // Without it the loop pinned one core at full speed for as long as ferros was up, and with nothing else running that core was most of the phone's heat (owner, 2026-10-21: "why's it so hot? 1 core, always on?").
+    // Without it the loop pinned one core at full speed for as long as ferros was up, and with nothing else running that core was most of the device's heat (owner, 2026-10-21: "why's it so hot? 1 core, always on?").
     unsafe {
         let mut v: u64;
         core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
@@ -2370,7 +2375,7 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 if cmd.params == b"identity" || cmd.params == b"identity release" {
-                    // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the phone-only secret renewed — what a completed departure does, for a developer starting the phone over.
+                    // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the device-only secret renewed — what a completed departure does, for a developer starting the device over.
                     let s = if cmd.params == b"identity release" { store_unlock(4, None).map(|_| "released") } else { Ok("") };
                     let st = store_unlock(0, None).unwrap_or(0);
                     resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());

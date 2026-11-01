@@ -107,7 +107,7 @@ mod tests {
 mod proof_reference {
     extern crate std;
 
-    /// The handle proof over a fixed seed of sevens, for checking ahau's on-phone bench against the host (`cargo test -p ahau_core -- --ignored --nocapture`).
+    /// The handle proof over a fixed seed of sevens, for checking ahau's on-device bench against the host (`cargo test -p ahau_core -- --ignored --nocapture`).
     #[test]
     #[ignore]
     fn sevens() {

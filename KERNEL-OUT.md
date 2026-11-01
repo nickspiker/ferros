@@ -1,6 +1,6 @@
 # What leaves the kernel
 
-The kernel keeps only what a kernel must, plus the killswitch (owner, 2026-10-31). Everything else moves into processes, a module at a time, each move verified on the phone before the kernel's copy goes. This is the plan and the record; USB.md has the first move in detail.
+The kernel keeps only what a kernel must, plus the killswitch (owner, 2026-10-31). Everything else moves into processes, a module at a time, each move verified on the device before the kernel's copy goes. This is the plan and the record; USB.md has the first move in detail.
 
 ## What stays
 
@@ -40,7 +40,7 @@ Each move so far followed the same shape:
 
 ## Rules for each move
 
-- **Measure first.** The process's version is verified on the phone against the kernel's (the same register reads, the same results) before the kernel's copy is removed.
+- **Measure first.** The process's version is verified on the device against the kernel's (the same register reads, the same results) before the kernel's copy is removed.
 - **Boot paths last.** A move that sits on the cold boot's path (touch, display, sensors' proximity) goes through a slot b flash and a cold boot before the kernel's copy goes; slot a stays the last known-good escape while it settles.
 - **No general escape hatches.** A power switch does one device's sequence. No syscall hands EL0 an arbitrary SMC, EL3 register, or PMIC register.
 
@@ -87,7 +87,7 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
   - What it reads goes into one block in its own memory (`ferros_sys::sensor_block`), published with `SYS_SENSORS` 26. The kernel reads the block in place under its lock for `SYS_FACTS`, `SYS_LIGHT` and the power key's proximity rule (`sensorlink.rs`), and forgets it when the process ends — in `end_process`, in `kill`, and every 4 s if no sensors process runs.
   - The kernel keeps the AoC's start (rails, GSA, Trusty: phase 2). With the switch held it stops polling USF and skips its own USF steps; without it, or once the process is gone, it opens the channel again and subscribes.
   - `diag facts` shows the sensor words a process gets and which side answered.
-  - Verified on the phone:
+  - Verified on the device:
     - by hand: start, the facts switch to the process (gravity 9.81 m/s² on z, flat on the table), kill, the kernel takes the conversation back within seconds;
     - a slot b cold boot: the kernel starts the AoC and hands USF over, and the process pushes the registry itself (46 sensors after 321 ms), subscribes and serves;
     - the light scope through the process: 96,162 samples in the ring.

@@ -666,13 +666,13 @@ const SYS_IRQ_WAIT: u64 = 18;
 const SYS_IRQ_ACK: u64 = 19;
 /// pin(mask): the cores this thread may run on from now (bit = core index); 0 = the workers. Returns 0.
 const SYS_PIN: u64 = 20;
-/// The light scope's samples (usf.rs): x0/x1 a buffer and its length; a 16-byte header {u64 the stream's next sample number, u32 rate Hz, u32 the channel mask} then the latest samples (i32, oldest first) as many as fit, up to a second. No capability: it is the light falling on the back of the phone. Returns the bytes written.
+/// The light scope's samples (usf.rs): x0/x1 a buffer and its length; a 16-byte header {u64 the stream's next sample number, u32 rate Hz, u32 the channel mask} then the latest samples (i32, oldest first) as many as fit, up to a second. No capability: it is the light falling on the back of the device. Returns the bytes written.
 const SYS_LIGHT: u64 = 21;
 /// A device's power: x0 the `Power` capability, x1 1 = on, 0 = off. Runs only on the kernel's core (the X3), where it cannot interleave with the service loop's own firmware calls (ACPM): a thread pins itself there first (`SYS_PIN` G#100, then any sleep). Returns 0, or ERR.
 const SYS_POWER: u64 = 22;
 /// ira_key(cap, domain, domain len, out): x0 the Ira capability's token offset, x1/x2 a domain string in the caller's arc (1-64 bytes), x3 a 32-byte buffer that receives `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)`. Returns 32, or ERR (no ira this boot, no capability, bad domain).
 const SYS_IRA: u64 = 23;
-/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the phone is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone; NOTHING: the phone is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the phone to the unlocked identity, 4 release the phone (every identity entry deleted) (0, or ERR). AUTH.md.
+/// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the device is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this device; NOTHING: the device is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the device to the unlocked identity, 4 release the device (every identity entry deleted) (0, or ERR). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
 /// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 2 says a transfer is moving (the clock policy counts it as activity) → 0. Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
@@ -731,7 +731,7 @@ fn irq_pending_take(intid: u32) -> bool {
         let v = core::ptr::read_volatile(p);
         if v != 0 {
             core::ptr::write_volatile(p, 0);
-            // A finger on the glass: the clock policy's sign of someone using the phone (service.rs clock_policy).
+            // A finger on the glass: the clock policy's sign of someone using the device (service.rs clock_policy).
             if intid == IRQ_TOUCH_INT {
                 INPUT_AT.store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
             }
@@ -771,7 +771,7 @@ pub const PREF_SCOPE: usize = 7;
 pub const PREF_LAYOUT: usize = 12;
 /// How many layouts the honeycomb carries: the valid range of PREF_LAYOUT.
 pub const LAYOUTS: u8 = 2;
-/// Preference 13: unlock at boot, 0 off (the default) or 1 on — the identity seed is stored so the phone unlocks without the handle being typed (owner 2026-10-28; a stolen phone then holds the identity, so it is opt-in and warned).
+/// Preference 13: unlock at boot, 0 off (the default) or 1 on — the identity seed is stored so the device unlocks without the handle being typed (owner 2026-10-28; a stolen device then holds the identity, so it is opt-in and warned).
 pub const PREF_UNLOCK_AT_BOOT: usize = 13;
 /// How many themes ferros_sys carries (ferros_sys::theme::THEMES): the valid range of PREF_THEME.
 pub const THEMES: u8 = 4;
@@ -2213,7 +2213,7 @@ pub fn alive() -> usize {
     unlock();
     n
 }
-/// The same with the lock already held — from inside a syscall (the facts provider): `alive` there took the lock its own core held and waited on itself forever, which froze the phone whenever the device's settings were open (2026-10-23).
+/// The same with the lock already held — from inside a syscall (the facts provider): `alive` there took the lock its own core held and waited on itself forever, which froze the device whenever the device's settings were open (2026-10-23).
 pub fn alive_locked() -> usize {
     k().procs.iter().filter(|p| p.is_some()).count()
 }
@@ -2254,7 +2254,7 @@ pub enum Grant<'a> {
     Ira,
     /// A device's power, by name (syscall 22).
     Power(&'a [u8]),
-    /// Read-only files on one of the phone's own partitions, by name (`PARTS`): the modem driver's images, NV and carrier configs (partfs.rs `part_call`).
+    /// Read-only files on one of the device's own partitions, by name (`PARTS`): the modem driver's images, NV and carrier configs (partfs.rs `part_call`).
     Part(&'a [u8]),
     /// The identity unlock right (syscall 24).
     Unlock,

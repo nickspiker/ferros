@@ -1,6 +1,6 @@
 //! Photon on ferros: the client that joins the owner's fleet over the LAN and stands as one of its devices (photon docs/pairing-v2.md "The ceremony over the mesh"; STATUS.md "Enrollment / pairing"). An EL0 process on the `ip` process's UDP: it beacons as the stock app does (`pt_disc` to the app's multicast groups on 4384), hears the owner's other devices beaconing under the same handle, hands the nearest sponsor its binding request as a `bind_req` over Photon Transport, takes the chain (`fleet_resp`) and the fan-out (`fanout_resp`) the sponsor pushes back, folds the chain against its own roots and opens the fan-out with its own ira, and from then on answers pings as a fleet member. Everything it speaks is photon_core (pt, join, wire), pinned byte for byte against the app by tools/photon-interop.
 //!
-//! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the phone. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
+//! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
 //!
 //! Started by init at boot (payloads/init), or from the bridge: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `photon.sponsor` holds the same 19 bytes for the boot-started client] --name photon --use udp --store photon --ira --serve photon --entropy --use nfc --use bt --unlock. The `photon` endpoint (the map's Photon circle, the attest screen): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira, 4 serve photon, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
@@ -68,7 +68,7 @@ const S_ENTROPY: u64 = 5;
 /// Grant slots 6 and 7: the NFC and Bluetooth drivers (docs/NFC.md, docs/BT.md), the joiner's two proximity carriers (pairing-v2 "Transports"): the tap serves the request's secret S, the beacon advertises its id.
 const S_NFC: u64 = 6;
 const S_BT: u64 = 7;
-/// Grant slot 8: the identity unlock right (AUTH.md): the phone is bound to the identity when its fleet binds this device, and released when a departure completes.
+/// Grant slot 8: the identity unlock right (AUTH.md): the device is bound to the identity when its fleet binds this device, and released when a departure completes.
 const S_UNLOCK: u64 = 8;
 
 struct Log {
@@ -455,7 +455,7 @@ struct Client {
     last_beacon_us: u64,
     last_ping_us: u64,
     last_words_us: u64,
-    /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the phone unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set.
+    /// Unlock at boot (device.unlock_at_boot, ferros_sys::PREF_UNLOCK_AT_BOOT): when on, the seed, proof, chain and fleet key are kept in the vault so the device unlocks without the handle being typed; when off (the default), nothing of the identity touches the disk and it is all derived again from the handle and the ira (owner, 2026-10-28: "sand on the beach with no keys anywhere"). Read at start and whenever roots are set.
     persist: bool,
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
     verdict: u8,
@@ -634,10 +634,10 @@ impl Client {
         }
     }
 
-    /// The fleet's chain names this device: bound, and the kernel binds the phone to this identity (one identity per phone, AUTH.md: from now on only its handle opens the phone, until a departure releases it).
+    /// The fleet's chain names this device: bound, and the kernel binds the device to this identity (one identity per device, AUTH.md: from now on only its handle opens the device, until a departure releases it).
     fn became_bound(&mut self) {
         if !self.bound && !ferros_sys::bind_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-            self.log.put(b"photon: the kernel did not bind the phone to this identity");
+            self.log.put(b"photon: the kernel did not bind the device to this identity");
             self.log.line();
         }
         self.bound = true;
@@ -718,7 +718,7 @@ impl Client {
             self.forget_disk();
             self.forget_identity();
             if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-                self.log.put(b"photon: the kernel did not release the phone's identity space");
+                self.log.put(b"photon: the kernel did not release the device's identity space");
                 self.log.line();
             }
         }

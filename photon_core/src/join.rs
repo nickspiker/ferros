@@ -1,4 +1,4 @@
-//! The phone's half of joining a Photon fleet over the mesh (photon docs/pairing-v2.md "The ceremony over the mesh"; photon src/network/fgtw/protocol.rs build_bind_req_vsf / parse_fleet_resp_vsf / parse_fanout_resp_vsf; src/network/udp.rs build_lan_discovery): the device's keys across the three signature families, derived from an ira-rooted secret exactly as the app derives its from the machine fingerprint (fgtw src/pq.rs `SigningBundle::derive`, `eggs`); the frames themselves are fgtw's (`fgtw::protocol`, re-exported here); what is the phone's own is what to do with the `fleet_resp` and `fanout_resp` a sponsor hands back (fold the chain against our own roots, open the fan-out with our own ira). The chain fold, the egg verification and the fan-out open are `fgtw`'s own code, so what the phone accepts is what the app and the worker accept.
+//! The device's half of joining a Photon fleet over the mesh (photon docs/pairing-v2.md "The ceremony over the mesh"; photon src/network/fgtw/protocol.rs build_bind_req_vsf / parse_fleet_resp_vsf / parse_fanout_resp_vsf; src/network/udp.rs build_lan_discovery): the device's keys across the three signature families, derived from an ira-rooted secret exactly as the app derives its from the machine fingerprint (fgtw src/pq.rs `SigningBundle::derive`, `eggs`); the frames themselves are fgtw's (`fgtw::protocol`, re-exported here); what is the device's own is what to do with the `fleet_resp` and `fanout_resp` a sponsor hands back (fold the chain against our own roots, open the fan-out with our own ira). The chain fold, the egg verification and the fan-out open are `fgtw`'s own code, so what the device accepts is what the app and the worker accept.
 //!
 //! Time is the caller's (eagle oscillations), as everywhere in this crate; byte compatibility with the app is pinned by tools/photon-interop.
 
@@ -30,7 +30,7 @@ impl DeviceKeys {
         let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_FALCON512_v1"));
         let mut falcon_sk = vec![0u8; sign_key_size(FN_DSA_LOGN_512)];
         let mut falcon_vk = vec![0u8; vrfy_key_size(FN_DSA_LOGN_512)];
-        // The degree-512-only generator and signing key: the same bytes as the app's Standard ones for this degree, a third of the stack (a phone thread's stack is small).
+        // The degree-512-only generator and signing key: the same bytes as the app's Standard ones for this degree, a third of the stack (a device thread's stack is small).
         KeyPairGenerator512::default().keygen(FN_DSA_LOGN_512, &mut rng, &mut falcon_sk, &mut falcon_vk);
         let mut rng = ChaCha12Rng::from_seed(seed_for("PHOTON_DEVICE_SPHINCS_PLUS_v1"));
         // Keygen from a seeded CSPRNG is deterministic; the only failure is an internal invariant, which is a bug, not a condition.
@@ -101,7 +101,7 @@ pub enum Inbound {
     FleetResp { hp: [u8; 32], chain: Vec<u8> },
     /// A fan-out blob for handle `hp` (`fanout_to_bytes` inside).
     FanoutResp { hp: [u8; 32], blob: Vec<u8> },
-    /// Some other envelope frame, by section name (a sibling's control traffic the phone does not handle yet).
+    /// Some other envelope frame, by section name (a sibling's control traffic the device does not handle yet).
     Other(String),
 }
 

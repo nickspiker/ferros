@@ -56,14 +56,14 @@ The `bt` endpoint:
 
 ## WiFi and Bluetooth share the chip
 
-The rule, following Android's coordinator: Bluetooth is off before WL_REG_ON is cycled. Cycling it under a powered Bluetooth core wedged the chip and, through WiFi's PCIe, the phone. On 2026-10-31 there were two watchdog resets, each within a minute of the WiFi keeper restarting pcie1.
+The rule, following Android's coordinator: Bluetooth is off before WL_REG_ON is cycled. Cycling it under a powered Bluetooth core wedged the chip and, through WiFi's PCIe, the device. On 2026-10-31 there were two watchdog resets, each within a minute of the WiFi keeper restarting pcie1.
 
 - **WiFi driver:** pcie1 holds the `bt` power switch (its grant slot 18) and turns Bluetooth off just before its REG_ON cycle.
 - **Bluetooth driver:**
   - At boot it gives WiFi 16 s first.
   - Every 8 s it asks Read_Local_Version. Silence means the core was reset; it then waits 16 s and comes back up (patch, 4 Mbaud) with the beacon it had, from a fresh address. Repeated failures back off from 4 s to 1024 s.
 
-Verified: two pcie1 restarts with a beacon out. The phone stayed up, and the beacon came back and was heard by the dev box.
+Verified: two pcie1 restarts with a beacon out. The device stayed up, and the beacon came back and was heard by the dev box.
 
 ## Photon
 
@@ -77,4 +77,4 @@ Both stop when the device is bound or the identity is forgotten.
 ## Next
 
 - HOST_WAKE / DEV_WAKE low-power.
-- An end-to-end ceremony: attest on the phone, then the owner's Photon device adds it by beacon and tap.
+- An end-to-end ceremony: attest on the device, then the owner's Photon device adds it by beacon and tap.

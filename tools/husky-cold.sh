@@ -17,7 +17,7 @@ REPO=/mnt/Harbor/Code/ferros
 BRIDGE=$REPO/target/debug/ferros-bridge
 ELF=$REPO/target/aarch64-unknown-none/release/ferros_kernel
 IMG=$REPO/target/aarch64-unknown-none/release/ferros_cold.img
-# Other phones may share this host's adb (2026-10-23: a Pixel 3a); every adb call here means the husky. Its serial is read live, never written down.
+# Other devices may share this host's adb (2026-10-23: a Pixel 3a); every adb call here means the husky. Its serial is read live, never written down.
 husky() {
     if [ -z "${ANDROID_SERIAL:-}" ]; then
         local s
@@ -47,7 +47,7 @@ to_fastboot() {
         adb reboot bootloader
     fi
     for _ in $(seq 60); do fastboot devices | grep -q . && return; sleep 2; "$REPO/tools/usb-kick.sh" --if-wedged; done
-    echo "no fastboot after the Android route either — phone needs hands (Power+VolDown)" >&2
+    echo "no fastboot after the Android route either — the device needs hands (Power+VolDown)" >&2
     exit 1
 }
 
@@ -96,7 +96,7 @@ fi
 # Signed with the owner's AVB key when it is there (BOOT.md, "Signed and unlocked"): the gate as a whole boot partition with its own signed footer, and the top-level vbmeta whose boot chain names that key, both made by one command from the installed build's Google images. Without the key (or with FERROS_UNSIGNED=1) the gate goes on bare, as before; ABL logs the verification error and boots it, unlocked.
 AVB_KEY=${AVB_KEY:-/mnt/Harbor/Code/keys/avb.vsf}
 AVB_ZIP=${AVB_ZIP:-/mnt/Harbor/tmp/husky-factory/husky-cp1a.260505.005/image-husky-cp1a.260505.005.zip}
-# The slot's own dtbo, vendor_boot, vendor_kernel_boot and init_boot (`<name>_a.img`): the top vbmeta hashes those as installed and chains init_boot to the owner's key, so both slots verify end to end (BOOT.md). Must be what the phone carries: the 2026-10-30 snapshot of slot a (the post-wipe Magisk init_boot; the rest as on 2026-10-28), also mirrored onto slot b.
+# The slot's own dtbo, vendor_boot, vendor_kernel_boot and init_boot (`<name>_a.img`): the top vbmeta hashes those as installed and chains init_boot to the owner's key, so both slots verify end to end (BOOT.md). Must be what the device carries: the 2026-10-30 snapshot of slot a (the post-wipe Magisk init_boot; the rest as on 2026-10-28), also mirrored onto slot b.
 AVB_INSTALLED=${AVB_INSTALLED:-/mnt/Harbor/tmp/husky-backup-2026-10-30}
 SIGNED=""
 if [ -n "$HV_IMG" ] && [ -f "$AVB_KEY" ] && [ "${FERROS_UNSIGNED:-0}" != 1 ]; then

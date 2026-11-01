@@ -70,7 +70,7 @@ pub const PREF_SCOPE: u64 = 7;
 pub const PREF_PROX_WAKE: u64 = 6;
 /// Preference 12: the honeycomb keyboard's layout, 0 Dvorak (the default) or 1 QWERTY with Q on the bottom row (honeycomb::LAYOUTS).
 pub const PREF_LAYOUT: u64 = 12;
-/// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the phone unlocks without typing — a stolen phone then holds the identity).
+/// Preference 13: unlock at boot, 0 off (the default: the handle is typed each boot, nothing of the identity on disk) or 1 on (the seed is stored so the device unlocks without typing — a stolen device then holds the identity).
 pub const PREF_UNLOCK_AT_BOOT: u64 = 13;
 
 /// A preference byte as this process's copy holds it now.
@@ -154,7 +154,7 @@ impl Facts {
     pub fn throttled(&self) -> Option<bool> {
         self.get(11).map(|v| v != 0)
     }
-    /// The gravity vector the AoC last reported, m/s², in the panel's frame: x right, y up, z out of the glass (a phone held upright reads y ≈ +9.8, one lying face up z ≈ +9.8). None until the sensors are up.
+    /// The gravity vector the AoC last reported, m/s², in the panel's frame: x right, y up, z out of the glass (a device held upright reads y ≈ +9.8, one lying face up z ≈ +9.8). None until the sensors are up.
     pub fn gravity(&self) -> Option<[f32; 3]> {
         let (xy, z) = (self.get(12)?, self.get(13)?);
         Some([f32::from_bits(xy as u32), f32::from_bits((xy >> 32) as u32), f32::from_bits(z as u32)])
@@ -175,7 +175,7 @@ impl Facts {
         let (c0, c1, c2, g0, g1, g2) = (w(20)?, w(21)?, w(22)?, w(23)?, w(24)?, w(25)?);
         Some(([c0[0], c0[1], c1[0], c1[1], c2[0], c2[1]], [g0[0], g0[1], g1[0], g1[1], g2[0], g2[1]], seq))
     }
-    /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the phone whatever its own rate.
+    /// The last two gravity samples, each (x, y, z m/s², its time in counter ticks — the AoC's own stamp), newest first: gravity at any moment between them by interpolation, so a reader can run at a fixed lag behind the device whatever its own rate.
     pub fn gravity_pair(&self) -> Option<(([f32; 3], u64), ([f32; 3], u64))> {
         let v = |i: usize| -> Option<([f32; 3], u64)> {
             let (xy, z, t) = (self.get(i)?, self.get(i + 1)?, self.get(i + 2)?);
@@ -773,6 +773,18 @@ pub mod window {
         call(display, &m[..17 + n], &mut r);
     }
 
+    /// The advance of `s` at `px` pixels in the display's typeface, in quarter pixels: where text drawn by `text` ends, so a caret sits on it and a tap finds its character. None when the display does not answer (an older display server).
+    pub fn width(display: u64, px: u16, s: &[u8]) -> Option<u32> {
+        let mut m = [0u8; 256];
+        m[0] = 27;
+        m[1..3].copy_from_slice(&px.to_le_bytes());
+        let n = s.len().min(m.len() - 3);
+        m[3..3 + n].copy_from_slice(&s[..n]);
+        let mut r = [0u8; 8];
+        let got = call(display, &m[..3 + n], &mut r);
+        (got >= 5 && got != super::ERR && r[0] == 0).then(|| u32::from_le_bytes([r[1], r[2], r[3], r[4]]))
+    }
+
     /// Whether the screen point belongs to this window: the frontmost window covering it, inside the circle. Ask on each finger down; a finger that lands on another window (or in a corner) is not this app's.
     pub fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
         let mut m = [0u8; 13];
@@ -798,7 +810,7 @@ pub fn identity_unlocked(cap: u64) -> Option<bool> {
     (r != ERR).then_some(r & 1 == 1)
 }
 
-/// Whether an identity's fleet has bound this phone (only that identity unlocks it then). None without the capability.
+/// Whether an identity's fleet has bound this device (only that identity unlocks it then). None without the capability.
 pub fn identity_bound(cap: u64) -> Option<bool> {
     let r = svc(nr::UNLOCK, cap, 0, 0, 0, 0);
     (r != ERR).then_some(r & 2 == 2)
@@ -807,15 +819,15 @@ pub fn identity_bound(cap: u64) -> Option<bool> {
 /// What an unlock did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unlock {
-    /// The identity's space is open; how many entries it has on this phone.
+    /// The identity's space is open; how many entries it has on this device.
     Opened(u64),
-    /// The phone is bound to another identity: this one does not open here.
+    /// The device is bound to another identity: this one does not open here.
     Belongs,
     /// No Unlock right, no vault or no ira.
     Failed,
 }
 
-/// Unlock the person's identity class of the vault from their 32-byte seed (AUTH.md): the kernel derives the key from the ira, the phone-only secret and the seed, and keeps it until power goes or the phone switches OS. A phone bound to another identity refuses.
+/// Unlock the person's identity class of the vault from their 32-byte seed (AUTH.md): the kernel derives the key from the ira, the device-only secret and the seed, and keeps it until power goes or the device switches OS. A device bound to another identity refuses.
 pub fn unlock_identity(cap: u64, seed: &[u8; 32]) -> Unlock {
     match svc(nr::UNLOCK, cap, 1, off(seed.as_ptr()), 0, 0) {
         ERR => Unlock::Failed,
@@ -824,12 +836,12 @@ pub fn unlock_identity(cap: u64, seed: &[u8; 32]) -> Unlock {
     }
 }
 
-/// The unlocked identity's fleet has bound this phone: from now on only it unlocks here. True when done.
+/// The unlocked identity's fleet has bound this device: from now on only it unlocks here. True when done.
 pub fn bind_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 3, 0, 0, 0) == 0
 }
 
-/// Release the phone (a completed departure): every identity entry deleted, the binding gone. True when done.
+/// Release the device (a completed departure): every identity entry deleted, the binding gone. True when done.
 pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }

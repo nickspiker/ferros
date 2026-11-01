@@ -336,7 +336,7 @@ async fn main() {
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).
                     "--dma" => { grants.push((5, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
-                    // --part NAME: read-only files on one of the phone's partitions (process.rs PARTS: modem_a, efs, persist, modem_userdata, vendor_a).
+                    // --part NAME: read-only files on one of the device's partitions (process.rs PARTS: modem_a, efs, persist, modem_userdata, vendor_a).
                     "--part" => { grants.push((10, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--masked" => { i += 1; }
                     "--text-len" => { i += 2; }
@@ -555,7 +555,7 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
     // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump. Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
     eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
 
-    // Receive the DATA blast — silent, no ACKs. The phone sends exactly `count` packets, each padded to 512 bytes, so they are read with several exact bulk transfers in flight (usb.rs `recv_queued`). Each ends when its last packet is in; asking for more than is coming would wait for packets that never come.
+    // Receive the DATA blast — silent, no ACKs. The device sends exactly `count` packets, each padded to 512 bytes, so they are read with several exact bulk transfers in flight (usb.rs `recv_queued`). Each ends when its last packet is in; asking for more than is coming would wait for packets that never come.
     let mut received = 0u64;
     let run = link
         .recv_queued(spec.count as usize * 512)
@@ -696,7 +696,7 @@ async fn cmd_run_with_tail(path: &str, hex_input: Option<&str>, exec_cap: &[u8],
         let need = 4096 + raw.len() + zeroed + prefix.len() + input.len() + tail.len() + 65536;
         let code_offset = (0..=blob.len() - raw.len()).find(|&i| blob[i..i + raw.len()] == raw[..]).expect("the code inside its capsule");
         let t0 = std::time::Instant::now();
-        // What the kernel will hash: the capsule with its 64 signature bytes zeroed — printed so a refusal on the phone can be set against it.
+        // What the kernel will hash: the capsule with its 64 signature bytes zeroed — printed so a refusal on the device can be set against it.
         if let Ok((h, header_end)) = vsf::file_format::VsfHeader::decode(&blob) {
             if let Some(vsf::types::VsfType::ge(sig)) = &h.signature {
                 let hdr = header_end.min(blob.len());

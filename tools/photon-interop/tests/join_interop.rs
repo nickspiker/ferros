@@ -1,4 +1,4 @@
-//! photon_core's join against the stock app's own code, byte for byte: the device keys and eggs against fgtw's SigningBundle, the LAN beacon against udp::build_lan_discovery, the bind_req frame against protocol::build_bind_req_vsf (with the app's device signer installed, so both sides sign the envelope with the same two eggs), and the sponsor's fleet_resp / fanout_resp frames opened by the phone's half: a real chain founded and extended with fgtw, a real fan-out sealed with fgtw.
+//! photon_core's join against the stock app's own code, byte for byte: the device keys and eggs against fgtw's SigningBundle, the LAN beacon against udp::build_lan_discovery, the bind_req frame against protocol::build_bind_req_vsf (with the app's device signer installed, so both sides sign the envelope with the same two eggs), and the sponsor's fleet_resp / fanout_resp frames opened by the device's half: a real chain founded and extended with fgtw, a real fan-out sealed with fgtw.
 
 use fgtw::fleet::{scheme, MembershipBlob};
 use fgtw::pq::{FleetSigner, SigningBundle};
@@ -65,25 +65,25 @@ fn bind_req_matches_the_app_and_verifies() {
 
 #[test]
 fn sponsor_frames_open_on_the_phone() {
-    let phone = DeviceKeys::derive(FP);
+    let dev = DeviceKeys::derive(FP);
     let sponsor = SigningBundle::derive(b"the sponsor's fingerprint");
     pfleet::install_device_signer(pfleet::DeviceSigner::Pq(sponsor.clone()));
-    // A fleet founded by the sponsor, then the phone bound into it declared — the chain the sponsor pushes.
+    // A fleet founded by the sponsor, then the device bound into it declared — the chain the sponsor pushes.
     let mut chain = MembershipBlob::genesis_v2(&sponsor, hp(), &seed(), T);
-    let req = join::bind_request(&phone, &seed(), &hp(), T + 1_000, &[0u8; 32]);
+    let req = join::bind_request(&dev, &seed(), &hp(), T + 1_000, &[0u8; 32]);
     chain.add_declared(&sponsor, req.device_pubkey, T + 2_000, req.t, req.device_sig.clone(), req.bundle.clone().unwrap());
     let chain_bytes = chain.to_vsf_bytes().unwrap();
     let frame = pproto::build_fleet_resp_vsf(&hp(), &chain_bytes, &sponsor.keypair().public.to_bytes(), sponsor.keypair().secret.as_bytes()).unwrap();
-    let (inbound, signer) = join::parse_frame(&frame).expect("the phone verifies the sponsor's fleet_resp envelope");
+    let (inbound, signer) = join::parse_frame(&frame).expect("the device verifies the sponsor's fleet_resp envelope");
     assert_eq!(signer, sponsor.keypair().public.to_bytes());
     let Inbound::FleetResp { hp: h, chain: ch } = inbound else { panic!("not a fleet_resp") };
     assert_eq!((h, ch.len()), (hp(), chain_bytes.len()));
-    let (blob, bound) = join::adopt_chain(&hp(), &seed(), &phone.device_pubkey(), &ch).expect("the phone folds the chain");
-    assert!(bound, "the phone finds itself in the fold");
+    let (blob, bound) = join::adopt_chain(&hp(), &seed(), &dev.device_pubkey(), &ch).expect("the device folds the chain");
+    assert!(bound, "the device finds itself in the fold");
     assert_eq!(blob.ops.len(), 2);
     // A chain for another identity is refused.
-    assert!(join::adopt_chain(&hp(), &[1u8; 32], &phone.device_pubkey(), &ch).is_err());
-    // The sponsor's fan-out, sealed to both members, opens with the phone's own ira.
+    assert!(join::adopt_chain(&hp(), &[1u8; 32], &dev.device_pubkey(), &ch).is_err());
+    // The sponsor's fan-out, sealed to both members, opens with the device's own ira.
     let key = [0x77u8; 32];
     let members = blob.fold().unwrap();
     let wraps = fgtw::fanout::fanout_seal(&hp(), &key, &members, &seed()).unwrap();
@@ -92,12 +92,12 @@ fn sponsor_frames_open_on_the_phone() {
     let frame = pproto::build_fanout_resp_vsf(&hp(), &blob_bytes, &sponsor.keypair().public.to_bytes(), sponsor.keypair().secret.as_bytes()).unwrap();
     let (inbound, _) = join::parse_frame(&frame).unwrap();
     let Inbound::FanoutResp { blob: fb, .. } = inbound else { panic!("not a fanout_resp") };
-    assert_eq!(join::open_fanout(&hp(), &fb, &phone, &seed()).unwrap(), Some((3, key)));
+    assert_eq!(join::open_fanout(&hp(), &fb, &dev, &seed()).unwrap(), Some((3, key)));
     // A stranger's ira opens nothing.
     let stranger = DeviceKeys::derive(b"someone else");
     assert_eq!(join::open_fanout(&hp(), &fb, &stranger, &seed()).unwrap(), None);
-    // The pairing words the phone shows are the ones the sponsor's screen computes for its key.
-    assert_eq!(join::pair_words(&phone.device_pubkey(), &seed()), pfleet::masked_device_words(&phone.device_pubkey(), &seed()));
+    // The pairing words the device shows are the ones the sponsor's screen computes for its key.
+    assert_eq!(join::pair_words(&dev.device_pubkey(), &seed()), pfleet::masked_device_words(&dev.device_pubkey(), &seed()));
 }
 
 #[test]
@@ -109,21 +109,21 @@ fn eagle_time_from_utc_matches_vsf() {
     assert!((ours - theirs).abs() < vsf::OSCILLATIONS_PER_SECOND as i64 / 10, "ours {ours} theirs {theirs}");
 }
 
-/// The phone's departure request, as the app's approver reads it: the fields come back, the frame's signer is the phone, and the consent eggs verify against the phone's own bundle over the departure bytes (what the fold checks on the consented Remove). The approval words' commitment is the app's (blake3 of the lowercased words).
+/// The device's departure request, as the app's approver reads it: the fields come back, the frame's signer is the device, and the consent eggs verify against the device's own bundle over the departure bytes (what the fold checks on the consented Remove). The approval words' commitment is the app's (blake3 of the lowercased words).
 #[test]
 fn depart_req_is_what_the_app_approves() {
-    let phone = DeviceKeys::derive(FP);
+    let dev = DeviceKeys::derive(FP);
     let t = T + 5_000;
-    let consent = join::depart_consent(&phone, &hp(), t);
+    let consent = join::depart_consent(&dev, &hp(), t);
     let words = join::depart_words(0x1234_5678);
     assert_eq!(fgtw::pair::pair_word_tokens(&words), 3, "three approval words");
     let commit = join::depart_words_commit(&words);
     assert_eq!(commit, *blake3::hash(words.to_lowercase().as_bytes()).as_bytes());
     let req = join::DepartReq { t, consent_sig: consent.clone(), intent: join::DEPART_DESK, words_commit: Some(commit) };
-    let frame = join::depart_req(&req, &phone, T).unwrap();
+    let frame = join::depart_req(&req, &dev, T).unwrap();
     let (ct, cs, leaver, intent, wc) = pproto::parse_depart_req_vsf(&frame).expect("the app parses + verifies our depart_req");
-    assert_eq!((ct, leaver, intent, wc), (t, phone.device_pubkey(), join::DEPART_DESK, Some(commit)));
+    assert_eq!((ct, leaver, intent, wc), (t, dev.device_pubkey(), join::DEPART_DESK, Some(commit)));
     let eggs = fgtw::pq::eggs_from_bytes(&cs).unwrap();
-    let msg = fgtw::fleet::departreq_signing_bytes(&hp(), &phone.device_pubkey(), t);
-    assert!(fgtw::pq::verify_eggs(&eggs, &phone.public(), &msg, phone.public().mask()), "the consent verifies under every scheme the phone holds");
+    let msg = fgtw::fleet::departreq_signing_bytes(&hp(), &dev.device_pubkey(), t);
+    assert!(fgtw::pq::verify_eggs(&eggs, &dev.public(), &msg, dev.public().mask()), "the consent verifies under every scheme the device holds");
 }

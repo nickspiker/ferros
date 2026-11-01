@@ -1,4 +1,4 @@
-//! The map (SHELL.md): the phone is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
+//! The map (SHELL.md): the device is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
 //! The circles: the device itself first, at the centre (its front is the dashboard, its back the settings), then the apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time.
 //!
@@ -53,12 +53,12 @@ const CIRCLES: [Spec; 8] = [
     Spec { label: "Ramps", ring: 1, lit: 0, share: 60, icon: 6, needs: "" },
     // The clock, a widget the display draws itself (icon G#80, display WIDGET_CLOCK): three rings and the time, decimal or dozenal by the device's number base.
     Spec { label: "Clock", ring: 1, lit: 0, share: 150, icon: 0x80, needs: "" },
-    // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the phone. (The spectral bars, G#81, went 2026-10-25: the scope's levels show the same channels.)
+    // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the device. (The spectral bars, G#81, went 2026-10-25: the scope's levels show the same channels.)
     Spec { label: "Scope", ring: 1, lit: 0, share: 150, icon: 0x82, needs: "" },
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;
-/// Photon: arrived at, its front shows the client's state and, until the phone is bound, the 23 pairing words for the sponsor's human (payloads/photon op 1).
+/// Photon: arrived at, its front shows the client's state and, until the device is bound, the 23 pairing words for the sponsor's human (payloads/photon op 1).
 const PHOTON: usize = 1;
 const RAMPS: usize = 5;
 /// The light scope: arrived at, it is in focus (`Map::scope_drag`).
@@ -1498,7 +1498,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 }
                 let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 let id = (rec[0] as usize) & 15;
-                // Only fingers, gloves and styluses count (FTM5 touch types 1-3): a palm (4), a hover (0) or the grip of the hand holding the phone at the edge (7) is not a finger — counted as one, it turned a one-finger drag into a two-finger twist around the palm (owner, 2026-10-23: "it's spinning around when I only have one finger down").
+                // Only fingers, gloves and styluses count (FTM5 touch types 1-3): a palm (4), a hover (0) or the grip of the hand holding the device at the edge (7) is not a finger — counted as one, it turned a one-finger drag into a two-finger twist around the palm (owner, 2026-10-23: "it's spinning around when I only have one finger down").
                 if !(1..=3).contains(&rec[2]) {
                     ignored |= 1 << rec[2].min(15);
                     continue;

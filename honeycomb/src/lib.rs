@@ -87,6 +87,14 @@ pub enum Event {
     Redraw,
 }
 
+/// The shift key's three states, cycled by its taps (owner, 2026-11-01): off; once, the next letter capital and then off; caps lock, every letter capital until the next tap. Its ▲ shows which: the label's grey, white, black.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shift {
+    Off,
+    Once,
+    Lock,
+}
+
 /// The keyboard: its geometry (Q8 pixels unless named) and its state.
 #[derive(Clone)]
 pub struct Keyboard {
@@ -107,7 +115,7 @@ pub struct Keyboard {
     pub top: usize,
     /// The extent row at the bottom of the view.
     pub view: usize,
-    pub shift: bool,
+    pub shift: Shift,
     /// The layout: an index into `LETTERS` (a value out of range is the caller's bug and panics on the first draw).
     pub layout: usize,
     /// The bar's left key's label (the host decides what it does: `Event::Leave`).
@@ -134,7 +142,7 @@ impl Keyboard {
         let cy3 = bar0 - cell_r;
         let cy0 = cy3 - (VIS as i64 - 1) * py;
         let a = px / 2 - gap / 2;
-        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: false, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
+        Keyboard { w, px, py, cy0, a, r: a * TWO_OVER_SQRT3 >> 16, gap, bar0, bar1, top: ((cy0 - cell_r) >> 8) as usize, view: 0, shift: Shift::Off, layout: 0, left: BAR_KEYS[B_MAP], tint: None }
     }
 
     /// The row pitch in pixels: a two-finger drag of this far scrolls one row.
@@ -175,7 +183,7 @@ impl Keyboard {
     pub fn cell(&self, k: usize) -> char {
         let (row, col) = self.place(k);
         let c = self.extent_row(row)[col];
-        if self.shift { c.to_uppercase().next().unwrap_or(c) } else { c }
+        if self.shift != Shift::Off { c.to_uppercase().next().unwrap_or(c) } else { c }
     }
 
     /// Bar key `b`'s left and right edges, drawn (inset by half the gap).
@@ -228,14 +236,19 @@ impl Keyboard {
                     self.view = if self.view == MAX_VIEW { 0 } else { (self.view + VIS).min(MAX_VIEW) };
                     return Some(Event::Redraw);
                 }
-                if self.shift && c.is_alphabetic() {
-                    self.shift = false;
+                // Once: the next letter capital, then off (the shift changed: the host redraws the board). Caps lock stays.
+                if self.shift == Shift::Once && c.is_alphabetic() {
+                    self.shift = Shift::Off;
                 }
                 Some(Event::Char(c))
             }
             Key::Bar(B_MAP) => Some(Event::Leave),
             Key::Bar(B_SHIFT) => {
-                self.shift = !self.shift;
+                self.shift = match self.shift {
+                    Shift::Off => Shift::Once,
+                    Shift::Once => Shift::Lock,
+                    Shift::Lock => Shift::Off,
+                };
                 Some(Event::Redraw)
             }
             Key::Bar(B_SPACE) => Some(Event::Char(' ')),
@@ -299,11 +312,22 @@ impl Keyboard {
                 centred(cx, cy, size, t, label);
             }
             Key::Bar(b) => {
-                let on = lit || (b == B_SHIFT && self.shift);
+                let on = lit || (b == B_SHIFT && self.shift != Shift::Off);
                 let (x0, x1) = self.bar_x(b);
                 let (y0, y1) = (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2);
                 shape(s, self.w, x0, x1, self.colour(key, if on { LIT } else { BAR_KEY }), |_| (y0, y1));
-                centred((x0 + x1) / 2, (self.bar0 + self.bar1) / 2, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
+                let (cx, cy) = ((x0 + x1) / 2, (self.bar0 + self.bar1) / 2);
+                if b == B_SHIFT {
+                    // ▲ (owner, 2026-11-01): the label's grey off, white once, black in caps lock (on the lit key all three).
+                    let g = match self.shift {
+                        Shift::Off => LABEL as u64,
+                        Shift::Once => WHITE,
+                        Shift::Lock => 0,
+                    };
+                    up_triangle(s, self.w, cx, cy, (y1 - y0) * 3 >> 3, g);
+                } else {
+                    centred(cx, cy, size * 5 / 7, if b == B_MAP { self.left } else { BAR_KEYS[b] }, label);
+                }
             }
             Key::None => {}
         }
@@ -485,6 +509,29 @@ fn column(s: &mut [u64], w: usize, x: usize, top: i64, bot: i64, cov_x: u32, v: 
     s[yb * w + x] = shade(cb);
 }
 
+/// The shift key's ▲: an equilateral triangle pointing up, centred at (`cx`, `cy`) and `h` high (Q8), in grey `g` over the key under it, each pixel blended in linear light by its coverage (4 × 4 samples). Not text: the host's labels can only brighten what is under them, and the caps-lock ▲ is black. Not `shape`: that writes a key's pixels outright, where this lies on one.
+fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64) {
+    // Half the base: h/√3 (37/64).
+    let hw = h * 37 >> 6;
+    let (top, bot) = (cy - h / 2, cy + h / 2);
+    for y in top >> 8..=bot >> 8 {
+        for x in (cx - hw) >> 8..=(cx + hw) >> 8 {
+            let mut n = 0u64;
+            for k in 0..16 {
+                let (px, py) = ((x << 8) + (k & 3) * 64 + 32, (y << 8) + (k >> 2) * 64 + 32);
+                n += (py >= top && py < bot && (px - cx).abs() * h <= (py - top) * hw) as u64;
+            }
+            if n == 0 {
+                continue;
+            }
+            let i = y as usize * w + x as usize;
+            let p = s[i];
+            let mix = |c: u64| ((c * c * (16 - n) + g * g * n) >> 4).isqrt();
+            s[i] = mix(p & 0xFFFF) | mix(p >> 16 & 0xFFFF) << 16 | mix(p >> 32 & 0xFFFF) << 32;
+        }
+    }
+}
+
 /// A shape `left` to `right` (Q8) wide, each pixel column's top and bottom from `span` at the column's centre.
 fn shape(s: &mut [u64], w: usize, left: i64, right: i64, v: [u64; 3], span: impl Fn(i64) -> (i64, i64)) {
     let (xl, xr) = ((left >> 8) as usize, ((right - 1) >> 8) as usize);
@@ -505,6 +552,25 @@ fn shape(s: &mut [u64], w: usize, left: i64, right: i64, v: [u64; 3], span: impl
 mod tests {
     extern crate std;
     use super::*;
+
+    /// The shift cycles off, once, caps lock, off; once lasts one letter, caps lock every letter.
+    #[test]
+    fn shift_cycle() {
+        let mut kb = Keyboard::new(1344, 2992);
+        let letter = (0..kb.hexes()).find(|&k| kb.cell(k).is_alphabetic()).unwrap();
+        assert_eq!(kb.tap(Key::Bar(B_SHIFT)), Some(Event::Redraw));
+        assert_eq!(kb.shift, Shift::Once);
+        assert!(matches!(kb.tap(Key::Hex(letter)), Some(Event::Char(c)) if c.is_uppercase()));
+        assert_eq!(kb.shift, Shift::Off);
+        kb.tap(Key::Bar(B_SHIFT));
+        kb.tap(Key::Bar(B_SHIFT));
+        assert_eq!(kb.shift, Shift::Lock);
+        assert!(matches!(kb.tap(Key::Hex(letter)), Some(Event::Char(c)) if c.is_uppercase()));
+        assert!(matches!(kb.tap(Key::Hex(letter)), Some(Event::Char(c)) if c.is_uppercase()));
+        assert_eq!(kb.shift, Shift::Lock);
+        kb.tap(Key::Bar(B_SHIFT));
+        assert_eq!(kb.shift, Shift::Off);
+    }
 
     /// Every lit pixel's nearest key is the key that drew it, at every view.
     #[test]

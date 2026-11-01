@@ -611,7 +611,7 @@ fn frames(rep: &mut Vec<u8>, ms: u64, strength: bool) {
         p.present(&mut scratch);
         paint_us += (now() - t0) / (crate::platform::cntfrq() / 1_000_000);
     }
-    // Give the panel back: ferros's own framebuffer held the last heat-map frame, which looks like a frozen phone (2026-10-20). Switching back to the surface the boot left and pushing one frame restores it.
+    // Give the panel back: ferros's own framebuffer held the last heat-map frame, which looks like a frozen device (2026-10-20). Switching back to the surface the boot left and pushing one frame restores it.
     if panel.is_some() {
         let _ = crate::display::use_own_fb(false);
         scratch.clear();

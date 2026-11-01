@@ -1,6 +1,6 @@
 //! ahau: the attest screen (Claude memories/ferros_attest_os_level.md; the capsule the owner named, Māori "I, me"). The first thing on the glass at boot: init starts it before the map, at the system level, so it covers everything until the person proves who they are by typing their handle on the honeycomb keyboard. Then its window goes and the map is there.
 //!
-//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the Photon client in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the phone unlocks without the handle being typed — a stolen phone then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
+//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the Photon client in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the device unlocks without the handle being typed — a stolen device then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
 //!
 //! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the Photon client in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
 //! - Opt-in (unlock at boot): the seed is stored, the client loads it from the vault at boot, and the screen unlocks as soon as the client reports membership, with no handle typed.
@@ -13,7 +13,7 @@
 //!
 //! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the Photon client looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings, 8 the Photon client (use).
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings, 8 the Photon client (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer).
 #![no_std]
 #![no_main]
 
@@ -23,6 +23,40 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::arch::global_asm;
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
 use honeycomb::{Event, Key, Keyboard, Touch, Touches};
+
+/// Typing at the blinkey: `c` into the handle bytes `t` (`n` of them, `chars` characters) at byte `at`, the bytes after it moved up. Nothing at MAX_CHARS. Returns where the blinkey goes: after `c`.
+fn insert_at(t: &mut [u8; 4 * MAX_CHARS], n: &mut usize, chars: &mut usize, at: usize, c: char) -> usize {
+    if *chars >= MAX_CHARS {
+        return at;
+    }
+    let mut b = [0u8; 4];
+    let e = c.encode_utf8(&mut b).as_bytes();
+    t.copy_within(at..*n, at + e.len());
+    t[at..at + e.len()].copy_from_slice(e);
+    *n += e.len();
+    *chars += 1;
+    at + e.len()
+}
+
+/// Delete at the blinkey: the character before byte `at` out of the handle bytes, the bytes after it moved down and the freed tail wiped. Returns where the blinkey goes: where that character began.
+fn delete_before(t: &mut [u8; 4 * MAX_CHARS], n: &mut usize, chars: &mut usize, at: usize) -> usize {
+    if at == 0 {
+        return 0;
+    }
+    // Back to the character's lead byte (the handle is UTF-8: one comes before any continuation byte).
+    let mut s = at - 1;
+    while t[s] & 0xC0 == 0x80 {
+        s -= 1;
+    }
+    t.copy_within(at..*n, s);
+    let gone = at - s;
+    for b in t[*n - gone..*n].iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    *n -= gone;
+    *chars -= 1;
+    s
+}
 
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
@@ -42,12 +76,34 @@ static FRESH_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 const PENDING: u64 = 0;
 const READY: u64 = 1;
 const RING: u64 = 2;
+/// The rainbow laid on a board's rows of `s` from its base, every pixel in one pass: each key's tint weighted by how near the pixel is to the key's own grey, whole on the key and its edge (at or below the grey), none on the label (at its grey, LABEL), in between across the label's anti-aliased edge, so the labels stay white. The key map (KB_INDEX) is the one board geometry every view shares.
+fn tint_rows(kb: &Keyboard, s: &mut [u64], top: usize, bottom: usize, w: usize, base: &[u16]) {
+    let Some(t) = &kb.tint else { return };
+    let index = unsafe { &*(&raw const KB_INDEX) };
+    let label = honeycomb::LABEL as u64;
+    let one = 1i64 << 14;
+    for i in 0..(bottom - top) * w {
+        let k = index[i];
+        if k == 255 {
+            continue;
+        }
+        let p = base[i] as u64;
+        let f = if k < 48 { honeycomb::KEY } else { honeycomb::BAR_KEY };
+        let weight = if p <= f { one } else if p >= label { 0 } else { (((label - p) << 14) / (label - f)) as i64 };
+        let tint = t[k as usize];
+        let ch = |c: usize| (p as i64 * (one + (weight * (tint[c] as i64 - one) >> 14)) >> 14) as u64;
+        s[top * w + i] = ch(0) | ch(1) << 16 | ch(2) << 32;
+    }
+}
+
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// The keyboard as drawn untinted, keys and labels (one channel: it is all grey), its rows from `kb.top` to the bar's foot, and each pixel's key (`Keyboard::tint_index`, 255 for none): a stroke's rainbow is one pass over these (owner, 2026-10-29: a mask and an index to fill), with nothing cleared and no label drawn again, where a whole redraw took 33 label calls to the display and showed the board half drawn. 2²⁰ pixels hold the 1344-wide board's 621 rows.
 static mut KB_BASE: [u16; 1 << 20] = [0; 1 << 20];
 static mut KB_INDEX: [u8; 1 << 20] = [0; 1 << 20];
+/// The prepared board's base, as KB_BASE (`prepare`).
+static mut KB_BASE2: [u16; 1 << 20] = [0; 1 << 20];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
 /// The mark's two maps (tapuwae::FreshCell, 8 bytes a sample): where the masked pixels' samples fall in the set, worked out once, so a new handle costs the balls' shading alone. Independent, so the coarse pass is a sixteenth of the fine one at boot too: the coarse map, a pixel's centre (2¹⁸ cells, 2 MiB, for the 900 px mark's 171 643 masked pixels); the fine map, 4 × 4 a pixel, filled by the first fine pass to reach each (3·2²⁰ cells, 24 MiB, for 2.75 M). Past either tapuwae works the rest out again.
@@ -65,6 +121,8 @@ static SHOW_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 const S_PHOTON_EP: u64 = 8;
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
+/// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
+const S_BACK: u64 = 10;
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
@@ -164,9 +222,18 @@ struct Ahau {
     handle: [u8; 4 * MAX_CHARS],
     len: usize,
     chars: usize,
+    /// The blinkey's place in the handle, a byte offset on a character's boundary: typing inserts there, delete takes the character before it, a tap on the entry line moves it.
+    caret: usize,
     /// The Photon client's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
+    /// The back surface's base (0: none granted, the board redraws in place), and the key whose tap the board drawn there is for, with the keyboard as that tap leaves it.
+    back: u64,
+    prepared: Option<(Key, Keyboard)>,
+    /// Photon's blinkey: which end of its wave is bright, when it next flips (on the counter), and its xorshift32 state (fluor `BlinkTimer`'s seed).
+    wave_top: core::cell::Cell<bool>,
+    blink_next: core::cell::Cell<u64>,
+    blink_rng: core::cell::Cell<u32>,
 }
 
 impl Ahau {
@@ -203,6 +270,12 @@ impl Ahau {
 
     /// A tap on no key: the button under the entry line acts (or `back` beside it).
     fn tap_at(&mut self, x: i64, y: i64) {
+        // On the entry line: the blinkey to the nearest character boundary.
+        let (b, px) = self.entry_at();
+        if ((b - px * 3 / 2) as i64..(b + px / 2) as i64).contains(&y) {
+            self.place_caret(x);
+            return;
+        }
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
             if (bx0 as i64..bx1 as i64).contains(&x) && (by0 as i64..by1 as i64).contains(&y) {
@@ -423,12 +496,70 @@ impl Ahau {
     /// The entry: the handle as typed, a cursor, and a line under it.
     fn entry(&self) {
         publish_fresh_text(&self.handle[..self.len], true);
-        let (b, px) = self.entry_at();
-        self.clear_rows(b - px * 3 / 2, b + px / 2);
-        // A newline shows as ¶ (the typeface has no return arrow): the handle stays on one line as typed.
-        let mut t = [0u8; 4 * MAX_CHARS + 4];
-        let mut n = 0;
-        for &c in &self.handle[..self.len] {
+        // A keystroke restarts the blinkey: bright at the top, its next tick a fresh interval away (Photon: the caret stays solid through typing).
+        self.wave_top.set(true);
+        self.blink_next.set(now() + self.blink_interval());
+        self.entry_line();
+    }
+
+    /// The blinkey's next interval: uniform in 0–300 ms by xorshift32, Photon's (fluor `BlinkTimer`): the irregularity reads as alive rather than mechanical.
+    fn blink_interval(&self) -> u64 {
+        let mut r = self.blink_rng.get();
+        r ^= r << 13;
+        r ^= r >> 17;
+        r ^= r << 5;
+        self.blink_rng.set(r);
+        freq() * (r % 301) as u64 / 1000
+    }
+
+    /// A blinkey tick, when due: the wave flips end and the entry line is drawn again. True when it drew.
+    fn blink(&self) -> bool {
+        if now() < self.blink_next.get() {
+            return false;
+        }
+        self.wave_top.set(!self.wave_top.get());
+        self.blink_next.set(now() + self.blink_interval());
+        self.entry_line();
+        true
+    }
+
+    /// Photon's blinkey (fluor `paint::draw_blinkey`, owner 2026-11-01: "steal the vertical blinkey"): a caret `h` high from `top` at column `x`, its brightness a wave down its height peaking toward the top or the bottom (`wave_top`; each tick flips it), smeared sideways at half the brightness per step, added onto what is there. The wave peaks at (8/9)(16/9) × 100 ≈ 158 of 255, Photon's CURSOR_BRIGHTNESS, here in the working values (white Q14). The smear scales with the text: fluor halves it every pixel over 7 at Photon's 16-20 px text, a hairline beside the entry's 84 px letters, so here a step is a thirty-second of the text's size `px` (a sixteenth read as a bloom, 2026-11-01), over 7 steps either side, added in linear light.
+    fn blinkey(&self, s: &mut [u64], x: usize, top: usize, h: usize, px: usize) {
+        let step = px as f32 / (1 << 5) as f32;
+        let reach = (7. * step) as usize;
+        // WHY/PROOF: the caret follows the typed text, and a long handle pushes it (and its smear) past the screen's edge — the smear would index into the next row. Photon's textbox guards the same.
+        if x < reach || x + reach >= self.w || h < 2 {
+            return;
+        }
+        let half = h / 2;
+        let top_bright = self.wave_top.get();
+        for y in top..top + h {
+            let t = (y as f32 - top as f32 - half as f32) / half as f32;
+            let wave = if top_bright { (1. - t * t) * (1. - t) * (1. - t) } else { (1. - t * t) * (1. + t) * (1. + t) } * 100.;
+            // A byte's worth (up to ~158) in white's Q14: × 64.
+            let w_base = wave * (1 << 6) as f32;
+            for dx in -(reach as i64)..=reach as i64 {
+                let w = (w_base * libm::exp2f(-(dx.unsigned_abs() as f32) / step)) as u64;
+                if w == 0 {
+                    continue;
+                }
+                let i = y * self.w + (x as i64 + dx) as usize;
+                let p = s[i];
+                // Light adds in linear light: the working values are gamma 2, so the caret's brightness w joins a pixel v as √(v² + w²) — over black the same as adding w, over the letters and the line no brighter than their light and the caret's together. WHY/PROOF the min: not a guard — brightening stops at white, as Photon's caret stops at no darkness; past it the value would carry into the next channel.
+                let add = |c: u64| (c * c + w * w).isqrt().min(honeycomb::WHITE);
+                s[i] = add(p & 0xFFFF) | add(p >> 16 & 0xFFFF) << 16 | add(p >> 32 & 0xFFFF) << 32;
+            }
+        }
+    }
+
+    /// The handle as the entry line shows it — a newline as ¶ (the typeface has no return arrow), so the handle stays on one line as typed — its length, and where the blinkey falls in it.
+    fn shown(&self) -> ([u8; 4 * MAX_CHARS + 4 * MAX_CHARS], usize, usize) {
+        let mut t = [0u8; 4 * MAX_CHARS + 4 * MAX_CHARS];
+        let (mut n, mut at) = (0, 0);
+        for (i, &c) in self.handle[..self.len].iter().enumerate() {
+            if i == self.caret {
+                at = n;
+            }
             if c == b'\n' {
                 t[n..n + 2].copy_from_slice("¶".as_bytes());
                 n += 2;
@@ -437,12 +568,67 @@ impl Ahau {
                 n += 1;
             }
         }
-        t[n] = b'_';
-        let shown = core::str::from_utf8(&t[..n + 1]).unwrap_or("_");
-        self.centred(b, px, TEXT, shown);
+        if self.caret >= self.len {
+            at = n;
+        }
+        (t, n, at)
+    }
+
+    /// The width of `t` at `px` in the display's typeface, quarter pixels (display op 27); an older display server that cannot say gets the old estimate (0.56 em a character).
+    fn measure(&self, px: usize, t: &[u8]) -> i64 {
+        match window::width(self.display, px as u16, t) {
+            Some(q) => q as i64,
+            None => core::str::from_utf8(t).map_or(0, |s| s.chars().count() as i64) * px as i64 * 224 / 100,
+        }
+    }
+
+    /// A tap on the entry line: the blinkey to the character boundary nearest `x` (each boundary measured by the display), solid again.
+    fn place_caret(&mut self, x: i64) {
+        let (_, px) = self.entry_at();
+        let (t, n, _) = self.shown();
+        let left = self.w as i64 / 2 - self.measure(px, &t[..n]) / 8;
+        // Walk the handle's character boundaries and the shown text's together (a newline is one byte here, two there).
+        let (mut best, mut best_d) = (0usize, i64::MAX);
+        let (mut i, mut j) = (0usize, 0usize);
+        loop {
+            let d = (left + self.measure(px, &t[..j]) / 4 - x).abs();
+            if d < best_d {
+                (best, best_d) = (i, d);
+            }
+            if i >= self.len {
+                break;
+            }
+            let c = self.handle[i];
+            let step = if c < 0x80 { 1 } else if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else { 2 };
+            j += if c == b'\n' { 2 } else { step };
+            i += step;
+        }
+        self.caret = best;
+        self.wave_top.set(true);
+        self.blink_next.set(now() + self.blink_interval());
+        self.entry_line();
+    }
+
+    /// The typed handle centred on the entry line, the blinkey after it, and the line under them.
+    fn entry_line(&self) {
+        let (b, px) = self.entry_at();
+        let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
+        // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's prepared board uses the back surface's rows below these.
+        let (tb, s) = if self.back != 0 { (self.back, unsafe { core::slice::from_raw_parts_mut(self.back as *mut u64, self.w * self.h) }) } else { (self.base, self.surf()) };
+        s[r0..r1].fill(0);
+        let (t, n, at) = self.shown();
+        let shown = core::str::from_utf8(&t[..n]).unwrap_or("");
+        // Centred by the typeface's own advances (display op 27), the blinkey where the text before it ends.
+        let x = self.w as i64 / 2 - self.measure(px, &t[..n]) / 8;
+        window::text(self.display, tb, x as i16, b as i16, px as u16, TEXT, shown.as_bytes());
+        let cx = x + self.measure(px, &t[..at]) / 4;
+        self.blinkey(s, cx as usize, b - px * 7 / 8, px * 17 / 16, px);
         // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
         let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
-        self.surf()[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
+        s[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
+        if self.back != 0 {
+            self.surf()[r0..r1].copy_from_slice(&s[r0..r1]);
+        }
     }
 
     fn all(&self) {
@@ -460,7 +646,7 @@ impl Ahau {
         (self.kb.top, self.h - honeycomb::corner_rows(self.w, self.h))
     }
 
-    /// The whole keyboard drawn again (at start, and for a new view, a shift or a layout): untinted, from a copy with the tint off; its pixels kept as the base with each one's key; then the rainbow laid on from them.
+    /// The whole keyboard drawn again (at start, and for a new view): untinted, from a copy with the tint off; its pixels kept as the base with each one's key; then the rainbow laid on from them. A shift, a page or a layout comes from the back buffer instead (`prepare`).
     fn redraw_keys(&self) {
         let mut plain = self.kb.clone();
         plain.tint = None;
@@ -486,29 +672,51 @@ impl Ahau {
         self.apply_tint();
     }
 
-    /// The rainbow laid on the board from its base, every pixel in one pass: each key's tint weighted by how near the pixel is to the key's own grey, whole on the key and its edge (at or below the grey), none on the label (at its grey, LABEL), in between across the label's anti-aliased edge, so the labels stay white.
+    /// The rainbow laid on the board from its base, every pixel in one pass.
     fn apply_tint(&self) {
-        let Some(t) = &self.kb.tint else { return };
         let (top, bottom) = self.kb_rows();
         if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE)).len() } {
             return;
         }
-        let s = self.surf();
-        let (base, index) = unsafe { (&*(&raw const KB_BASE), &*(&raw const KB_INDEX)) };
-        let label = honeycomb::LABEL as u64;
-        let one = 1i64 << 14;
-        for i in 0..(bottom - top) * self.w {
-            let k = index[i];
-            if k == 255 {
-                continue;
-            }
-            let p = base[i] as u64;
-            let f = if k < 48 { honeycomb::KEY } else { honeycomb::BAR_KEY };
-            let weight = if p <= f { one } else if p >= label { 0 } else { (((label - p) << 14) / (label - f)) as i64 };
-            let tint = t[k as usize];
-            let ch = |c: usize| (p as i64 * (one + (weight * (tint[c] as i64 - one) >> 14)) >> 14) as u64;
-            s[top * self.w + i] = ch(0) | ch(1) << 16 | ch(2) << 32;
+        tint_rows(&self.kb, self.surf(), top, bottom, self.w, unsafe { &*(&raw const KB_BASE) });
+    }
+
+    /// A finger is down on `key`: if its tap will redraw the board (a shift, a page, a layout), that board is drawn now, whole, into the back buffer — keys, labels and rainbow — so the lift only copies it in (`tap`), the way the mark's next frame is rendered ahead by its thread. The key map stays: those taps change labels, not where the keys are (checked: a board whose keys moved is left to redraw in place).
+    fn prepare(&mut self, key: Key) {
+        self.prepared = None;
+        if self.back == 0 {
+            return;
         }
+        let mut next = self.kb.clone();
+        let event = next.tap(key);
+        // A board redraws on a shift, a page or a layout, and on the letter that ends a one-letter shift (its board goes back to lower case).
+        if (event != Some(Event::Redraw) && next.shift == self.kb.shift) || next.hexes() != self.kb.hexes() || next.top != self.kb.top {
+            return;
+        }
+        // That letter also deals the rainbow afresh: the board is prepared with the rainbow of the handle as the letter will leave it (the copy wiped after).
+        if let Some(Event::Char(c)) = event {
+            let (mut t, mut n, mut ch) = (self.handle, self.len, self.chars);
+            insert_at(&mut t, &mut n, &mut ch, self.caret, c);
+            next.tint = Some(self.tint_for(&t[..n]));
+            for x in t.iter_mut() {
+                unsafe { core::ptr::write_volatile(x, 0) };
+            }
+        }
+        let (top, bottom) = self.kb_rows();
+        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE2)).len() } {
+            return;
+        }
+        let back = unsafe { core::slice::from_raw_parts_mut(self.back as *mut u64, self.w * self.h) };
+        let mut plain = next.clone();
+        plain.tint = None;
+        let (display, b) = (self.display, self.back);
+        plain.draw(back, &mut |x, y, px, v, t| window::text(display, b, x as i16, y as i16, px, v, t.as_bytes()));
+        let base2 = unsafe { &mut *(&raw mut KB_BASE2) };
+        for i in 0..(bottom - top) * self.w {
+            base2[i] = (back[top * self.w + i] & 0xFFFF) as u16;
+        }
+        tint_rows(&next, back, top, bottom, self.w, base2);
+        self.prepared = Some((key, next));
     }
 
     fn prompt(&self) -> &'static str {
@@ -535,6 +743,7 @@ impl Ahau {
         }
         self.len = 0;
         self.chars = 0;
+        self.caret = 0;
         publish_fresh_text(&[], true);
     }
 
@@ -569,14 +778,14 @@ impl Ahau {
                 return;
             }
         };
-        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. One identity per phone: on a phone its fleet has bound, the kernel opens only that identity's space, so an open space there is the phone's own person and the screen goes now, the proof made behind it; another handle is refused. On a phone not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
+        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. One identity per device: on a device its fleet has bound, the kernel opens only that identity's space, so an open space there is the device's own person and the screen goes now, the proof made behind it; another handle is refused. On a device not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
         if self.mode == Mode::Fresh {
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
-                // Opened on a bound phone: this is the identity the phone belongs to.
+                // Opened on a bound device: this is the identity the device belongs to.
                 ferros_sys::Unlock::Opened(_) if ferros_sys::identity_bound(cap(self.grants, S_UNLOCK)) == Some(true) => self.unlocked_known(seed),
-                ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this phone is not bound to a fleet yet: looking the identity up\n"),
+                ferros_sys::Unlock::Opened(_) => console(self.grants, b"ahau: unlocked; this device is not bound to a fleet yet: looking the identity up\n"),
                 ferros_sys::Unlock::Belongs => {
-                    console(self.grants, b"ahau: refused: this phone belongs to another identity\n");
+                    console(self.grants, b"ahau: refused: this device belongs to another identity\n");
                     self.wipe();
                     self.status("Denied. This device is bound to another identity.");
                     self.entry();
@@ -635,10 +844,10 @@ impl Ahau {
     /// Clear during the mint's second entry only clears it: the verdict stands.
     fn unconfirm(&mut self) {}
 
-    /// The identity's fleet has this phone: the kernel binds it to the unlocked identity, so from the next boot only that identity's handle opens it (until a departure releases it).
+    /// The identity's fleet has this device: the kernel binds it to the unlocked identity, so from the next boot only that identity's handle opens it (until a departure releases it).
     fn mark_member(&self) {
         if !ferros_sys::bind_identity(cap(self.grants, S_UNLOCK)) {
-            console(self.grants, b"ahau: could not bind this phone to the identity\n");
+            console(self.grants, b"ahau: could not bind this device to the identity\n");
         }
     }
 
@@ -671,10 +880,10 @@ impl Ahau {
         proof
     }
 
-    /// A person this phone knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
+    /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
         self.wipe();
-        console(self.grants, b"ahau: unlocked (this phone knows the identity); the screen goes, the proof follows\n");
+        console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
         window::done(self.display, self.base);
         let proof = self.proof_for(&seed, false);
         self.send_roots(&seed, &proof);
@@ -696,28 +905,17 @@ impl Ahau {
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
         let mut kb = self.kb.clone();
-        let mut t = [0u8; 4 * MAX_CHARS];
-        let mut n = self.len;
-        t[..n].copy_from_slice(&self.handle[..n]);
-        let mut add = |c: char, t: &mut [u8; 4 * MAX_CHARS], n: &mut usize| {
-            let mut b = [0u8; 4];
-            let e = c.encode_utf8(&mut b).as_bytes();
-            if self.chars < MAX_CHARS {
-                t[*n..*n + e.len()].copy_from_slice(e);
-                *n += e.len();
-            }
-        };
+        // The handle as the key will leave it, at the blinkey, as `tap` will make it.
+        let (mut t, mut n, mut ch) = (self.handle, self.len, self.chars);
         match kb.tap(key) {
-            Some(Event::Char(c)) => add(c, &mut t, &mut n),
-            Some(Event::Enter) => add('\n', &mut t, &mut n),
+            Some(Event::Char(c)) => {
+                insert_at(&mut t, &mut n, &mut ch, self.caret, c);
+            }
+            Some(Event::Enter) => {
+                insert_at(&mut t, &mut n, &mut ch, self.caret, '\n');
+            }
             Some(Event::Back) => {
-                while n > 0 {
-                    n -= 1;
-                    let lead = t[n] & 0xC0 != 0x80;
-                    if lead {
-                        break;
-                    }
-                }
+                delete_before(&mut t, &mut n, &mut ch, self.caret);
             }
             Some(Event::Leave) => n = 0,
             _ => return,
@@ -729,29 +927,16 @@ impl Ahau {
     }
 
     fn type_char(&mut self, c: char) {
-        let mut b = [0u8; 4];
-        let e = c.encode_utf8(&mut b).as_bytes();
-        if self.chars < MAX_CHARS {
-            self.handle[self.len..self.len + e.len()].copy_from_slice(e);
-            self.len += e.len();
-            self.chars += 1;
-        }
+        self.caret = insert_at(&mut self.handle, &mut self.len, &mut self.chars, self.caret, c);
         self.entry();
     }
 
     fn tap(&mut self, key: Key) {
+        let shift_was = self.kb.shift;
         match self.kb.tap(key) {
             Some(Event::Char(c)) => self.type_char(c),
             Some(Event::Back) => {
-                while self.len > 0 {
-                    self.len -= 1;
-                    let lead = self.handle[self.len] & 0xC0 != 0x80;
-                    self.handle[self.len] = 0;
-                    if lead {
-                        self.chars -= 1;
-                        break;
-                    }
-                }
+                self.caret = delete_before(&mut self.handle, &mut self.len, &mut self.chars, self.caret);
                 self.entry();
             }
             // Enter is a character of the handle (owner, 2026-10-28: "enter is a valid char"); the button under the entry line attests.
@@ -761,22 +946,57 @@ impl Ahau {
                 self.unconfirm();
                 self.entry();
             }
+            // A shift, a page or a layout: the board drawn at the press (`prepare`) copied in, or, without one, redrawn in place.
             Some(Event::Redraw) => {
-                self.redraw_keys();
+                match self.prepared.take() {
+                    Some((k, _)) if k == key => {
+                        self.swap_in();
+                    }
+                    _ => {
+                        self.redraw_keys();
+                    }
+                }
                 return;
             }
             None => return,
         }
-        // Every stroke: the keys take the new handle's rainbow, laid on from the base in one pass.
+        // Every stroke: the keys take the new handle's rainbow, laid on from the base in one pass. A letter that ended a one-letter shift changed the board too (lower case again): the board prepared at its press copied in, or, without one, redrawn.
         self.retint();
-        self.apply_tint();
+        if self.kb.shift != shift_was {
+            match self.prepared.take() {
+                Some((k, _)) if k == key => {
+                    self.swap_in();
+                }
+                _ => {
+                    self.redraw_keys();
+                }
+            }
+        } else {
+            self.apply_tint();
+        }
+        // Any other board prepared under a held key has the old rainbow: it is redrawn at its lift instead.
+        self.prepared = None;
+    }
+
+    /// The board drawn at the press copied into the screen's rows, and its base into KB_BASE: the lift's whole cost.
+    fn swap_in(&self) {
+        let (top, bottom) = self.kb_rows();
+        let (a, n) = (top * self.w, (bottom - top) * self.w);
+        let back = unsafe { core::slice::from_raw_parts(self.back as *const u64, self.w * self.h) };
+        self.surf()[a..a + n].copy_from_slice(&back[a..a + n]);
+        unsafe { (&mut *(&raw mut KB_BASE))[..n].copy_from_slice(&(&*(&raw const KB_BASE2))[..n]) };
     }
 
     /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear light the grey mixed a quarter of the way to a hue of the same luminance (Rec. 709 weights), back to gamma 2 as a multiplier per channel.
     fn retint(&mut self) {
+        self.kb.tint = Some(self.tint_for(&self.handle[..self.len]));
+    }
+
+    /// The rainbow for `handle` (`retint`'s), also for a handle not typed yet: the board a held key will leave is prepared with it (`prepare`).
+    fn tint_for(&self, handle: &[u8]) -> [[u16; 3]; 64] {
         let salt = unsafe { FRESH_JOB.2 };
         let mut deal = [0u8; 64];
-        blake3::Hasher::new_keyed(&salt).update(b"attest keys").update(&self.handle[..self.len]).finalize_xof().fill(&mut deal);
+        blake3::Hasher::new_keyed(&salt).update(b"attest keys").update(handle).finalize_xof().fill(&mut deal);
         let hexes = self.kb.hexes();
         let n = hexes + honeycomb::BAR_KEYS.len();
         // A shuffle of the slots 0..n (Fisher-Yates on the hash's bytes; the small modulo bias does not show in a hue).
@@ -801,7 +1021,7 @@ impl Ahau {
             let slot = if k < hexes { k } else { 48 + k - hexes };
             tint[slot] = lin.map(|l| (libm::sqrtf(1. - quarter + quarter * l / luma) * (1u32 << 14) as f32) as u16);
         }
-        self.kb.tint = Some(tint);
+        tint
     }
 }
 
@@ -887,7 +1107,7 @@ fn mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
     }
 }
 
-/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this phone's and no other's, with the device's attest ball inside every component, following the handle as it is typed.
+/// The attest mark for a device no identity has attested on yet (tapuwae::render_fresh): the Mandelbrot set in the device's own colour, from a key the ira derives for this purpose alone ("attest mark"), so it is this device's and no other's, with the device's attest ball inside every component, following the handle as it is typed.
 /// Rendered on a thread of its own pinned to the X3 (the one big core), so the screen and the keyboard are never held: the whole mark once, then on every change to the handle only the components again (the outline never changes); the main loop blits each finished frame (FRESH_DONE).
 /// Without the ira grant, or on a panel too wide for the buffer, the state is RING and the drawn ring stands in.
 fn start_fresh_mark(grants: u64, r: usize) {
@@ -915,7 +1135,8 @@ fn start_fresh_mark(grants: u64, r: usize) {
 
 /// The mark's thread: the whole mark, then each new handle's components, waiting on FRESH_GEN between. Each time two passes (owner, 2026-10-29): a coarse one, a sample a pixel, on the glass at once; then a fine one, 4 × 4 a pixel, a moment later, which a newer handle stops at the next row. FRESH_DONE counts the frames finished, for the main loop to put up.
 extern "C" fn fresh_thread(_: u64) -> ! {
-    ferros_sys::pin(ferros_sys::CORES_BIG);
+    // On the worker cores, not the X3: the display server lives on the X3, and the mark's renders (200 ms a keystroke, seconds of refining) shared it in 10 ms slices with every label, measure and frame the display drew — a board drawn at a shift's press took 300 ms, not 59, and everything on the glass lagged (measured 2026-11-01). Typing holds the workers at their active clocks.
+    ferros_sys::pin(ferros_sys::CORES_WORKERS);
     sleep_until(now() + freq() / 1000);
     let mut full = true;
     let mut frames = 0u64;
@@ -962,7 +1183,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
         (_, true, true) => "cleared up",
         (_, true, false) => "refine stopped for a newer handle",
     };
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms on the X3\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000));
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms on the workers\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
@@ -1056,7 +1277,13 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let bound = ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, word_buf: [0; 512], word_len: 0 };
+    // The keyboard's back buffer, when init granted a second surface (an older init does not: the board then redraws in place).
+    let back = match ferros_sys::dma(cap(grants, S_BACK)) {
+        b if b == 0 || b == u64::MAX || b == base => 0,
+        b => b,
+    };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, prepared: None, wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF) };
+    console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
@@ -1078,6 +1305,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             a.show();
             mark_shown = done;
         }
+        // The blinkey's tick, when due: the entry line drawn again with the wave flipped.
+        if a.blink() {
+            a.show();
+        }
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
         let mut k = 0;
@@ -1098,13 +1329,19 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             match t {
                 Touch::Light(key) => {
                     a.kb.draw_key(a.surf(), key, true, &mut a.label());
+                    // The lit key on the glass first: preparing a whole board takes some 50 ms.
+                    a.show();
                     a.preview(key);
+                    a.prepare(key);
                 }
                 Touch::Unlight(key) => {
                     a.kb.draw_key(a.surf(), key, false, &mut a.label());
                     slid = true;
                 }
-                Touch::Scrolled => a.redraw_keys(),
+                Touch::Scrolled => {
+                    a.prepared = None;
+                    a.redraw_keys();
+                }
                 Touch::Tap(key) => {
                     a.tap(key);
                     slid = false;
@@ -1116,6 +1353,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if slid {
             publish_fresh_text(&a.handle[..a.len], true);
+            // The key let go without its tap: the board prepared for it is not wanted.
+            a.prepared = None;
         }
         // Following the Photon client's verdict while the identity is looked up or joined: about four times a second.
         polls += 1;

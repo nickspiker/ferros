@@ -16,7 +16,7 @@
 //! - 8 `idle [floor u8: 30, 10, 1, 0 = off]`: the panel's auto-rate floor.
 //! - 9 `dcs [bytes…]`: one raw DCS write (dev). 10 `read [reg u8][len u8]` → the bytes (dev).
 //! - 11 `testcard`: the highlight shoulder on the glass (DISPLAY-CALIB.md, DISPLAY-DESIGN.md §6): a log ramp of scene light from −6 to +3.3 stops; the top half through the max-brightness curve (encoded gamma2tanh value as the gamma-2 signal: white at 57 % of peak, highlights rolled by tanh), the bottom half linear with a hard clip at the same white; ticks at 1×, 2×, 4×, 8× white; everything through the panel's measured 2.185. Replaces the frame; `begin` takes it back.
-//! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the phone is a map of your life).
+//! - 12 `scene clear`: empty the map's retained scene (SHELL.md: the device is a map of your life).
 //! - 13 `scene add [count u8][count x circle]`: append circles, each 30 bytes — `x i32`, `y i32` (world units), `r u16`, `ring u8` (0 none, 1 thin, 2 heavy — importance), `lit u8` (1 = changed since last seen, the only colour on the map), `icon u8` (n = the n-th icon in the embedded bundle, 0 = none), `len u8`, `label [16]`.
 //! - 14 `camera [cx i32][cy i32][zoom u32, 16.16]`, the centre in world units ×256 (24.8, so a pan at high zoom moves by a pixel, not a world unit): draw the scene through the camera and present. Reply byte 1 = whether DECON advanced.
 //!   Optional flag byte 13, bit 0: keep the frame's overlay (see 15). Optional bytes 14-17: the turn, `[cos i16][sin i16]` in Q14 (world to screen is that rotation, then the zoom); absent = upright.
@@ -431,10 +431,10 @@ static mut BACK_CLOCK: ClockShown = ClockShown { frac: [0; 6], lighter: [false; 
 
 /// The clock upright by gravity (owner's order, 2026-10-24): the face's turn, Q14 (cos, sin), that puts its 12:00 and its digits up against gravity on the glass, whatever the map's own turn. None until the AoC has sent a sample (then the face turns with the map, as before).
 static mut GRAV_TURN: Option<(i64, i64)> = None;
-/// How far behind the phone the clock's turn runs: gravity is evaluated this long before now, between the last two samples the AoC sent (their own timestamps), so every frame sees the phone's attitude at the same lag whatever the frame and sample rates. One 10 ms sample period, plus the ~1 ms the samples take to arrive, plus margin: 16 ms.
+/// How far behind the device the clock's turn runs: gravity is evaluated this long before now, between the last two samples the AoC sent (their own timestamps), so every frame sees the device's attitude at the same lag whatever the frame and sample rates. One 10 ms sample period, plus the ~1 ms the samples take to arrive, plus margin: 16 ms.
 const GRAV_LAG_MS: u64 = 16;
 
-/// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the phone's tilt says, however small; drawn when a frame goes out (the 10 Hz flips at rest, every frame under a finger). Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
+/// Gravity at `now − GRAV_LAG_MS`, the clock turned to it: no dead zone, no flat hold (owner, 2026-10-24) — the turn is whatever the device's tilt says, however small; drawn when a frame goes out (the 10 Hz flips at rest, every frame under a finger). Up on the glass is the reading's own (x, y): the sensor reports the reaction to gravity, which points away from the ground. In screen pixels (y down) that is (x, −y), and the face's 12:00, (0, −1) turned by θ clockwise, is (sin θ, −cos θ): so θ = atan2(x, y). Returns whether the turn changed.
 fn gravity_poll() -> bool {
     let f = ferros_sys::facts();
     unsafe { SPECTRAL_NOW = f.spectral() };
@@ -2729,6 +2729,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         _ => out[0] = 3,
                     }
                 }
+                // Measure: [size u16 px][utf8…] → [0][width u32, quarter pixels]: the advance of the text at that size in the one typeface (the pen moves by each glyph's advance, as op 26 draws it), so an app puts its caret where the letters end and finds the character under a tap (the attest screen, 2026-11-01: placed by an estimate of the advance, its caret wandered off the letters).
+                Some(27) if m.len() >= 3 => {
+                    let px = u16::from_le_bytes([m[1], m[2]]) as f32;
+                    let t = core::str::from_utf8(&m[3..]).unwrap_or("");
+                    let w = (glyph_engine().width(t, px) * 4.0) as u32;
+                    out[1..5].copy_from_slice(&w.to_le_bytes());
+                    len = 5;
+                }
                 // Text into a window's surface, in its 16-bit working values: [base u64] the surface, [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…] in screen coordinates (a surface is the whole screen). Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black), and clearing the see-through bit where it draws. The app shows the window (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
                 Some(26) if m.len() >= 17 => {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
@@ -2919,7 +2927,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 let _ = handle(m, &mut out);
             }
         };
-        // Gravity at its fixed lag, each pass: drawn at rest on the 10 Hz flips, under a finger on every frame (owner, 2026-10-24: "10 Hz unless touched" — a frame per turn cost the X3 4.4 ms each, 24 % of it on a desk, 53 % in a hand, and 79 °C). The fixed lag keeps the 10 Hz steps even: each shows where the phone was 16 ms before it, not whichever sample came last.
+        // Gravity at its fixed lag, each pass: drawn at rest on the 10 Hz flips, under a finger on every frame (owner, 2026-10-24: "10 Hz unless touched" — a frame per turn cost the X3 4.4 ms each, 24 % of it on a desk, 53 % in a hand, and 79 °C). The fixed lag keeps the 10 Hz steps even: each shows where the device was 16 ms before it, not whichever sample came last.
         gravity_poll();
         if clock_due {
             clock_due = false;

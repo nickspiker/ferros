@@ -10,7 +10,7 @@ B=$REPO/target/debug/ferros-bridge
 R=$REPO/target/el0/aarch64-unknown-none/release
 LAST=${1:-03}
 FIRST=${2:-00}
-# Stage 07's blobs (tools/husky-firmware.sh fetches them from the phone, firmware/husky/MANIFEST.md pins them). Chip rev 3 = d0 (dhd_custom_cis.c chip_revs); the NVRAM is the module's (OTP CIS VID → vid_naming_table_4398; V17 = cal_ROW/JP/MMW byte for byte, cal_NA differs only in FTM ranging calibration).
+# Stage 07's blobs (tools/husky-firmware.sh fetches them from the device, firmware/husky/MANIFEST.md pins them). Chip rev 3 = d0 (dhd_custom_cis.c chip_revs); the NVRAM is the module's (OTP CIS VID → vid_naming_table_4398; V17 = cal_ROW/JP/MMW byte for byte, cal_NA differs only in FTM ranging calibration).
 FWDIR=${FWDIR:-/mnt/Harbor/firmware/husky}
 FW=${FW:-$FWDIR/fw_bcmdhd.bin_4398_d0}
 NVRAM=${NVRAM:-$FWDIR/bcmdhd.cal_USI_G5SN_9957_V17}

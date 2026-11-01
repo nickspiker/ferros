@@ -345,7 +345,7 @@ impl Nfc {
             }
             // RF_INTF_ACTIVATED_NTF: a reader selected us; byte 5 is the connection's initial credits.
             (3, 1, 5) => {
-                // Byte 3 is the technology and mode: below G#80 we polled and found a tag (or a phone answering as one). Its technology parameters follow byte 6 (their length): for NFC-A the SENS_RES, then the UID's length and the UID. Logged, then the tag let go back to discovery (RF_DEACTIVATE, type 3).
+                // Byte 3 is the technology and mode: below G#80 we polled and found a tag (or a device answering as one). Its technology parameters follow byte 6 (their length): for NFC-A the SENS_RES, then the UID's length and the UID. Logged, then the tag let go back to discovery (RF_DEACTIVATE, type 3).
                 let mode = pl.get(3).copied().unwrap_or(0);
                 if mode < 0x80 {
                     self.tags += 1;

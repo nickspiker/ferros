@@ -26,20 +26,20 @@ fn reserved(name: &str) -> bool {
     name.starts_with('\0')
 }
 
-/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the Photon client's chain and key, the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this phone and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not.
+/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the Photon client's chain and key, the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this device and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not.
 const IDENTITY: [&str; 4] = ["map.", "photon.", "ahau.", "wifi.cred"];
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
 }
-/// The phone-only secret mixed into every identity key: 32 bytes from this session's wairua the first time an identity is unlocked, kept in the device class. Google has no record of it and Android cannot read the partition it is on (the hypervisor's net, AUTH.md), so the identity key needs more than the chip's published values and a guessed handle.
+/// The device-only secret mixed into every identity key: 32 bytes from this session's wairua the first time an identity is unlocked, kept in the device class. Google has no record of it and Android cannot read the partition it is on (the hypervisor's net, AUTH.md), so the identity key needs more than the chip's published values and a guessed handle.
 const ID_SECRET: &str = "\0id.secret";
-/// The seed kept for unlock at boot (`device.unlock_at_boot`, SETTINGS.md): only while that setting is on, in the device class, deleted at the first boot with it off. Whoever holds the phone then holds the identity — the warning the setting carries.
+/// The seed kept for unlock at boot (`device.unlock_at_boot`, SETTINGS.md): only while that setting is on, in the device class, deleted at the first boot with it off. Whoever holds the device then holds the identity — the warning the setting carries.
 const ID_UNLOCK: &str = "\0id.unlock";
 /// The identity class's own list of names, sealed under the identity key.
 const ID_NAMES: &str = "\0id.names";
-/// One identity per phone (AUTH.md; the network owns the assignment): set when the unlocked identity'"'"'s fleet binds this phone, cleared on release (a completed departure). While set, only that identity unlocks.
+/// One identity per device (AUTH.md; the network owns the assignment): set when the unlocked identity'"'"'s fleet binds this device, cleared on release (a completed departure). While set, only that identity unlocks.
 const ID_BOUND: &str = "\0id.bound";
-/// Every identity-class entry'"'"'s vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a phone that is not bound yet.
+/// Every identity-class entry'"'"'s vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a device that is not bound yet.
 const ID_ADDRS: &str = "\0id.addrs";
 const ID_CONTEXT: &str = "ferros identity vault v1";
 const ID_ADDR_CONTEXT: &str = "ferros identity vault addr v1";
@@ -134,7 +134,7 @@ pub enum KvError {
     Locked,
     /// No ira this boot, so no identity key can be derived.
     NoIra,
-    /// The phone is bound to another identity: this seed does not open its space.
+    /// The device is bound to another identity: this seed does not open its space.
     Belongs,
 }
 impl From<manifestus::Error> for KvError {
@@ -148,7 +148,7 @@ pub struct KVault {
     addr_key: [u8; 32],
     cipher: XChaCha20Poly1305,
     nonce: crate::wairua::TrngNonce,
-    /// The unlocked identity, while one is: dropped when power goes or the phone switches to another OS (`lock`).
+    /// The unlocked identity, while one is: dropped when power goes or the device switches to another OS (`lock`).
     id: Option<IdKeys>,
 }
 
@@ -356,7 +356,7 @@ impl KVault {
         Ok(names)
     }
 
-    /// Unlock the identity whose seed is `seed` (AUTH.md): its key is BLAKE3 keyed by the ira's identity-vault key over the phone-only secret and the seed — bound to this phone (the ira and the secret) and to the person (the seed). The secret is made from this session's wairua the first time and kept in the device class. Whatever identity was unlocked before is locked first. The seed is not kept.
+    /// Unlock the identity whose seed is `seed` (AUTH.md): its key is BLAKE3 keyed by the ira's identity-vault key over the device-only secret and the seed — bound to this device (the ira and the secret) and to the person (the seed). The secret is made from this session's wairua the first time and kept in the device class. Whatever identity was unlocked before is locked first. The seed is not kept.
     pub fn unlock(&mut self, seed: &[u8; 32], keep: bool) -> Result<(), KvError> {
         self.lock();
         let mut secret = [0u8; 32];
@@ -380,7 +380,7 @@ impl KVault {
         for b in [&mut secret, &mut base, &mut k] {
             b.fill(0);
         }
-        // One identity per phone: a seed whose key opens no name list is not the bound identity'"'"'s (refused), or, on a phone not bound yet, a different handle from the last one (whose leftovers go).
+        // One identity per device: a seed whose key opens no name list is not the bound identity'"'"'s (refused), or, on a device not bound yet, a different handle from the last one (whose leftovers go).
         if self.raw_get_in(Class::Identity, ID_NAMES)?.is_none() {
             if self.bound()? {
                 self.lock();
@@ -407,12 +407,12 @@ impl KVault {
         self.id.is_some()
     }
 
-    /// Whether an identity'"'"'s fleet has bound this phone.
+    /// Whether an identity'"'"'s fleet has bound this device.
     pub fn bound(&mut self) -> Result<bool, KvError> {
         Ok(self.raw_get(ID_BOUND)?.is_some())
     }
 
-    /// The unlocked identity'"'"'s fleet has bound this phone: from now on only it unlocks here, until release.
+    /// The unlocked identity'"'"'s fleet has bound this device: from now on only it unlocks here, until release.
     pub fn bind(&mut self) -> Result<(), KvError> {
         if self.id.is_none() {
             return Err(KvError::Locked);
@@ -421,7 +421,7 @@ impl KVault {
         Ok(())
     }
 
-    /// Release the phone (a completed departure, or the developer'"'"'s `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the phone-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
+    /// Release the device (a completed departure, or the developer'"'"'s `diag "identity release"`): every identity-class entry deleted, the binding and any kept seed gone, the identity locked, and the device-only secret deleted so a new one is made at the next unlock — anything the address list missed can no longer be opened by anyone.
     pub fn release(&mut self) -> Result<usize, KvError> {
         let n = self.wipe_identity()?;
         for name in [ID_BOUND, ID_UNLOCK, ID_SECRET] {
@@ -462,7 +462,7 @@ impl KVault {
         Ok(())
     }
 
-    /// How many entries the unlocked identity has on this phone (0 while locked): a person who has used this phone before finds a space that is not empty.
+    /// How many entries the unlocked identity has on this device (0 while locked): a person who has used this device before finds a space that is not empty.
     pub fn identity_entries(&mut self) -> usize {
         if self.id.is_none() {
             return 0;
