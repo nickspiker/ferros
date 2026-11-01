@@ -570,6 +570,16 @@ impl Process {
         let m = self.arc.mask();
         (0..len).map(|i| unsafe { core::ptr::read_volatile((self.arc.base + ((off as usize + i) & m)) as *const u8) }).collect()
     }
+    /// A buffer a syscall names by address inside a DMA region this process holds (`DMA_ADDR | address`, as the USB driver names its 6 MiB command area): the address, when all `len` bytes lie inside one such region.
+    fn dma_span(&self, addr: u64, len: usize) -> Option<usize> {
+        let a = (addr & !DMA_ADDR) as usize;
+        // The address and length are the process's: an end that wraps would pass the comparison below.
+        let end = a.checked_add(len)?;
+        self.cspace.iter().find_map(|c| match c.object {
+            Object::Dma(i) if DMA[i].size > 0 && a >= DMA[i].base && end <= DMA[i].base + DMA[i].size => Some(a),
+            _ => None,
+        })
+    }
     /// `read` into a slice the caller owns: no heap copy, for a command of megabytes (SYS_PT). One copy when the range does not wrap the arc's mask, as a well-formed caller's never does.
     fn read_into(&self, off: u64, dst: &mut [u8]) {
         let m = self.arc.mask();
@@ -661,8 +671,10 @@ const SYS_POWER: u64 = 22;
 const SYS_IRA: u64 = 23;
 /// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the phone is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone; NOTHING: the phone is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the phone to the unlocked identity, 4 release the phone (every identity entry deleted) (0, or ERR). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
-/// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act; NOTHING while it runs; ERR when none was handed over.
+/// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
+/// Bit 63 of a syscall's buffer argument (SYS_PT): the buffer is named by its address inside one of the caller's DMA regions, not by its offset in the arc.
+const DMA_ADDR: u64 = 1 << 63;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1466,16 +1478,28 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_PT => {
             let token = p.read(f.x[0], 32);
             let (op, at, len) = (f.x[1], f.x[2], f.x[3] as usize);
+            // The buffer: in the arc (an offset), or in a DMA region the process holds (DMA_ADDR | address); refused when it is neither.
+            let dma = if at & DMA_ADDR != 0 { Some(p.dma_span(at, len)) } else { None };
             f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
-                Some((Object::Pt, r)) if r & RIGHT_SEND != 0 => match op {
+                Some((Object::Pt, r)) if r & RIGHT_SEND != 0 && dma != Some(None) => match op {
                     0 | 3 => {
-                        if crate::ptlink::submit(len, op == 3, |dst| p.read_into(at, dst)) { 0 } else { ERR }
+                        let fill = |dst: &mut [u8]| match dma {
+                            Some(Some(a)) => unsafe { core::ptr::copy_nonoverlapping(a as *const u8, dst.as_mut_ptr(), dst.len()) },
+                            _ => p.read_into(at, dst),
+                        };
+                        if crate::ptlink::submit(len, op == 3, fill) { 0 } else { ERR }
                     }
-                    1 => match crate::ptlink::take(f.x[4] as usize, len, |piece| p.write(at, piece)) {
-                        Some((total, act)) => total as u64 | (act as u64) << 32,
-                        None if crate::ptlink::busy() => NOTHING,
-                        None => ERR,
-                    },
+                    1 => {
+                        let put = |piece: &[u8]| match dma {
+                            Some(Some(a)) => unsafe { core::ptr::copy_nonoverlapping(piece.as_ptr(), a as *mut u8, piece.len()) },
+                            _ => p.write(at, piece),
+                        };
+                        match crate::ptlink::take(f.x[4] as usize, len, put) {
+                            Some((total, replied, act)) => total as u64 | (act as u64) << 32 | (!replied as u64) << 33,
+                            None if crate::ptlink::busy() => NOTHING,
+                            None => ERR,
+                        }
+                    }
                     _ => ERR,
                 },
                 _ => ERR,

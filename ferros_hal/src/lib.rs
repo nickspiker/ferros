@@ -54,7 +54,7 @@ pub mod hsi2c;
 // Modules requiring alloc
 #[cfg(feature = "alloc")]
 pub mod console;
-#[cfg(feature = "alloc")]
+// The DWC3 driver needs no allocator: the kernel and the USB driver process (payloads/usb, no heap) both link it.
 pub mod usb;
 #[cfg(feature = "alloc")]
 pub mod hamt;

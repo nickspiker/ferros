@@ -18,16 +18,16 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
    - `ep_cmd` issues a store barrier before every endpoint command, and `poll_event` a load barrier after the event count. Without them, bulk IN wedged after 442 transfers.
 2. **[done] The grants:**
    - `usb-regs`: the controller's registers mapped for EL0, its 2 MiB block in a new level-2 table for the first GiB (`cachemap.rs` `USB_REGS`, `L2_LO`).
-   - `usb-dma`: 2 MiB of non-cacheable EL0 memory at G#8B20_0000 (`USB_DMA`).
+   - `usb-dma`: non-cacheable EL0 memory (`USB_DMA`): 2 MiB at G#8B20_0000 at first, 8 MiB at G#8B80_0000 since step 4.
    - `usb-dwc3`: the controller's interrupt, INTID 434.
    - Verified with `payloads/usb p`: GSNPSID read at EL0 (G#33313130, "3110"), a DMA word written and read back.
 3. **[done] The kernel's PT commands behind an endpoint** (`ptlink.rs`, `SYS_PT` 25, the `--pt` grant). The process hands each assembled command to the kernel and gets the raw reply; the kernel runs the same dispatch its own USB feeds (`service.rs` `run`, now at the end of each pass).
-   - Op 0 hands a command over (up to 1 MiB on the heap; up to 6 MiB in the PT receive region, only while the process owns the controller). Op 1 takes the reply from an offset: its full length, bit 32 set when the command waits to act, NOTHING while it runs.
+   - Op 0 hands a command over (up to 1 MiB on the heap; up to 6 MiB in the PT receive region, only while the process owns the controller). Op 1 takes the reply from an offset: its full length, bit 32 set when the command waits to act, bit 33 when it gave no reply at all (as the kernel's own USB gives none after a reload or reboot), NOTHING while it runs.
    - Reload, reboot and `diag android` are "reply, then act": they answer first, and act when the process hands the same command over again with op 3, after its reply has gone out.
    - The `usb` power switch hands the controller over. On: the kernel stops touching DWC3, closes the Type-C USB switch, brings the eUSB2 PHY up again (the host sees the kernel's device leave) and opens the DMA path. Off: the kernel re-initialises its own USB on the next pass. A process named `usb` gone while it holds the controller is noticed within 4 s, and the kernel takes it back the same way.
    - DIAG: `KERNEL_USB` (1 the kernel drives the controller, 0 the process), `PT_PROC_CMDS`.
    - Verified on a hot-reloaded kernel (`payloads/usb` inputs `d`, `h`, `k`): a `diag` through the endpoint, 3,671 bytes back in 2.1 ms; the controller taken for 2 s and given back, the phone back on the bus about 2 s later; taken by a process that then exited, reclaimed in the same pass; the kernel's own PT unchanged (2 MiB vault round trip byte-exact, 0.7 s each way; reload to the next generation).
-4. **`payloads/usb`:**
+4. **`payloads/usb`** (input `s`). First cut done: the process takes the controller (`power usb on`), resets and runs it with `ferros_hal::usb` unchanged (no allocator; the module no longer needs one), and serves PT. Each command is assembled in its DMA area and handed to the kernel by address (`SYS_PT` takes `DMA_ADDR | address` inside a DMA region the caller holds; an arc offset cannot name memory outside the arc). Reload and reboot act after the COMPLETE is out. While it settles, the process gives the controller back when the host never configures it (four tries), when the kernel refuses a command, or when a reply takes over 16 s. Verified: DIAG through it (`KERNEL_USB=0`); a 2 MiB vault round trip byte-exact, put 1.5 s and get 4.4 s (one 512-byte packet a pass, a sleep while the endpoint is busy); a kernel reload through it, back to kernel USB at the next generation. Still to do:
    - the controller from cold;
    - a ring of large OUT buffers and batched IN;
    - interrupt wake-ups;

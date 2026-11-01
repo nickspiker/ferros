@@ -50,8 +50,8 @@ pub struct Submitted {
 
 struct Link {
     inbox: Option<Submitted>,
-    /// The reply, and whether the command waits for its act.
-    outbox: Option<(Vec<u8>, bool)>,
+    /// The reply, whether one was given at all, and whether the command waits for its act.
+    outbox: Option<(Vec<u8>, bool, bool)>,
     /// A command is in: submitted, and its reply not yet taken in full.
     busy: bool,
 }
@@ -92,16 +92,16 @@ pub fn take_inbox() -> Option<Submitted> {
     link().inbox.take()
 }
 
-/// The service loop's side: the command's reply.
-pub fn reply(bytes: Vec<u8>, wants_act: bool) {
-    link().outbox = Some((bytes, wants_act));
+/// The service loop's side: the command's reply (`replied` false: none, as the kernel's own USB sends none after a reload or a reboot).
+pub fn reply(bytes: Vec<u8>, replied: bool, wants_act: bool) {
+    link().outbox = Some((bytes, replied, wants_act));
 }
 
-/// Op 1: the reply from `offset`, copied by `put`. None while the command is still running; Some((total length, wants act)) when done. The reply is dropped once a take reaches its end.
-pub fn take(offset: usize, cap: usize, put: impl FnOnce(&[u8])) -> Option<(usize, bool)> {
+/// Op 1: the reply from `offset`, copied by `put`. None while the command is still running; Some((total length, replied, wants act)) when done. The reply is dropped once a take reaches its end.
+pub fn take(offset: usize, cap: usize, put: impl FnOnce(&[u8])) -> Option<(usize, bool, bool)> {
     let l = link();
-    let (bytes, act) = l.outbox.as_ref()?;
-    let (total, act) = (bytes.len(), *act);
+    let (bytes, replied, act) = l.outbox.as_ref()?;
+    let (total, replied, act) = (bytes.len(), *replied, *act);
     // The offset and length are the process's: held to the reply, or a bad pair would panic the kernel slicing it.
     let from = offset.min(total);
     let to = (offset + cap).min(total);
@@ -110,7 +110,7 @@ pub fn take(offset: usize, cap: usize, put: impl FnOnce(&[u8])) -> Option<(usize
         l.outbox = None;
         l.busy = false;
     }
-    Some((total, act))
+    Some((total, replied, act))
 }
 
 /// Whether a command is in (op 1 tells "still running" from "nothing submitted" by it).

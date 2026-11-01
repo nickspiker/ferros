@@ -1184,7 +1184,8 @@ pub fn run(mut b: Boot) -> ! {
             platform::RAW_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);
             let reply = core::mem::replace(&mut pt_out_data, saved);
             let act = core::mem::take(&mut proc_act);
-            crate::process::with_lock(|| crate::ptlink::reply(reply, act));
+            let replied = platform::RAW_REPLIED.load(core::sync::atomic::Ordering::Relaxed);
+            crate::process::with_lock(|| crate::ptlink::reply(reply, replied, act));
         }
         crate::keys::serve();
         if !keys_settled && cntpct() > keys_settle {
@@ -1588,6 +1589,7 @@ pub fn run(mut b: Boot) -> ! {
             t_command = cntpct();
             proc_restore = Some(core::mem::take(&mut pt_out_data));
             platform::RAW_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
+            platform::RAW_REPLIED.store(false, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(cmd) = ferros_pt::command::parse(payload) {
             st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
@@ -3381,9 +3383,8 @@ pub fn run(mut b: Boot) -> ! {
                 queue_pt_response(&mut pt_out_data, &(size as u32).to_le_bytes());
             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
                 if from_proc && !pt_act {
-                    // From the USB process: an empty reply now, the handover when it asks again with that reply sent (ptlink.rs).
+                    // From the USB process: no reply (as over the kernel's own USB), and the handover when it asks again with the COMPLETE sent (ptlink.rs).
                     proc_act = reload_ok && reload_size > 0;
-                    queue_pt_response(&mut pt_out_data, b"");
                 } else if reload_ok && reload_size > 0 {
                     // Flush this Exec's COMPLETE before tearing USB down, give the host a moment, detach, then hand off to the copy stub. The wait is only for the kernel's own USB: the USB process sent its reply before asking to act.
                     let mut spins = 0u32;
@@ -3559,9 +3560,8 @@ pub fn run(mut b: Boot) -> ! {
             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                 // Mode byte 1 = fastboot: stamp the PMU reboot mode through the EL3 monitor and reset straight into the bootloader. If the monitor refuses, fall back to a normal exit (report + Android).
                 if from_proc && !pt_act {
-                    // From the USB process: an empty reply now, the reset when it asks again with that reply sent (ptlink.rs).
+                    // From the USB process: no reply (as over the kernel's own USB), and the reset when it asks again with the COMPLETE sent (ptlink.rs).
                     proc_act = true;
-                    queue_pt_response(&mut pt_out_data, b"");
                     continue;
                 }
                 let fastboot = cmd.params.first().copied() == Some(1);

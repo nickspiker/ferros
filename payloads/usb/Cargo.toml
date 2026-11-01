@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 ferros_sys = { path = "../../ferros_sys" }
 ferros_pt = { path = "../../ferros_pt" }
+ferros_hal = { path = "../../ferros_hal", default-features = false }
+ferros_ledger = { path = "../../ferros_ledger" }

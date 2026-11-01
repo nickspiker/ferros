@@ -325,6 +325,8 @@ pub fn append_hex(log: &mut alloc::vec::Vec<u8>, label: &[u8], val: u32) {
 
 /// Set by the service loop while it runs a command from the USB process: `queue_pt_response` then keeps the reply raw.
 pub static RAW_REPLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether a raw reply was queued at all: the kernel's own USB sends nothing for some commands (a reload or reboot that acts, a reload with nothing staged), and the process must not send an empty reply in their place.
+pub static RAW_REPLIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Frame a response as a PT outbound transfer: SPEC + DATA packets each padded to exactly 512 so the idle pump's 512-byte chunks align with packet boundaries (blast mode, no FIN — see the cold-boot loop).
 pub fn queue_pt_response(out: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
@@ -332,6 +334,7 @@ pub fn queue_pt_response(out: &mut alloc::vec::Vec<u8>, payload: &[u8]) {
     // A command the USB process handed over (ptlink.rs) is answered raw: the process frames the reply itself.
     if RAW_REPLY.load(core::sync::atomic::Ordering::Relaxed) {
         out.extend_from_slice(payload);
+        RAW_REPLIED.store(true, core::sync::atomic::Ordering::Relaxed);
         return;
     }
     let mut ob_bitmap = alloc::vec![0u64; ferros_pt::transfer::outbound_bitmap_words(payload.len())];

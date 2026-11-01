@@ -254,27 +254,40 @@ pub fn store_addrs(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
 }
 
+/// Bit 63 of a buffer argument: the buffer is named by its address inside one of the caller's DMA regions instead of its offset in the arc (SYS_PT).
+pub const DMA_ADDR: u64 = 1 << 63;
+
 /// Hand the kernel one assembled PT command (`[cap:32][op][params]`) through a Pt capability (the USB driver process, ptlink.rs). `act` resubmits a command whose reply said it waits to act (reload, reboot, `diag android`), once that reply has gone out. False when one is already in, or the command is too large.
 pub fn pt_submit(cap: u64, cmd: &[u8], act: bool) -> bool {
-    svc(nr::PT, cap, if act { 3 } else { 0 }, off(cmd), cmd.len() as u64, 0) == 0
+    pt_submit_at(cap, off(cmd), cmd.len(), act)
+}
+
+/// `pt_submit` for a command at `at`: an arc offset, or `DMA_ADDR | address` in a DMA region the caller holds.
+pub fn pt_submit_at(cap: u64, at: u64, len: usize, act: bool) -> bool {
+    svc(nr::PT, cap, if act { 3 } else { 0 }, at, len as u64, 0) == 0
 }
 
 /// The kernel's reply to the command handed over.
 pub enum PtReply {
     /// Still running.
     Running,
-    /// Done: the reply's full length (`buf` holds its bytes from the offset asked), and whether the command waits to act.
-    Done(usize, bool),
+    /// Done: the reply's full length (`buf` holds its bytes from the offset asked), whether there is a reply at all (the kernel's own USB sends none after a reload or reboot, nor for a reload with nothing staged), and whether the command waits to act.
+    Done(usize, bool, bool),
     /// Nothing was handed over.
     None,
 }
 
 /// Take the reply from `offset` into `buf`; the kernel drops it once a take reaches its end.
 pub fn pt_take(cap: u64, offset: usize, buf: &mut [u8]) -> PtReply {
-    match svc(nr::PT, cap, 1, off(buf as &[u8]), buf.len() as u64, offset as u64) {
+    pt_take_at(cap, offset, off(buf as &[u8]), buf.len())
+}
+
+/// `pt_take` into `len` bytes at `at`: an arc offset, or `DMA_ADDR | address` in a DMA region the caller holds.
+pub fn pt_take_at(cap: u64, offset: usize, at: u64, len: usize) -> PtReply {
+    match svc(nr::PT, cap, 1, at, len as u64, offset as u64) {
         NOTHING => PtReply::Running,
         ERR => PtReply::None,
-        r => PtReply::Done((r & 0xFFFF_FFFF) as usize, r >> 32 & 1 == 1),
+        r => PtReply::Done((r & 0xFFFF_FFFF) as usize, r >> 33 & 1 == 0, r >> 32 & 1 == 1),
     }
 }
 

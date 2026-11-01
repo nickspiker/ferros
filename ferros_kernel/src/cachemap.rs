@@ -68,9 +68,9 @@ pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
 /// The USB controller's registers (DWC3, G#1121_0000, 64 KiB), EL0 Device memory for the USB driver process (USB.md: USB out of the kernel), its 2 MiB block mapped as the modem's windows are: nothing else lives in G#1120_0000-G#1140_0000 (zuma device tree). Granted as `usb-regs`.
 pub const USB_REGS: (usize, usize) = (0x1120_0000, 0x1140_0000);
-/// The USB driver's DMA memory (cold only): 2 MiB of Normal non-cacheable, EL0 read/write memory for the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem and the receive ring). Free per the device tree: above the camera's diagnostic buffers (which end at G#8B10_0000), below the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
+/// The USB driver's DMA memory (cold only): 8 MiB of Normal non-cacheable, EL0 read/write memory, 8 MiB aligned: the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem, the receive ring) in the first 2 MiB, a PT command assembled in the 6 MiB after (payloads/usb). No reserved-memory node of the device tree lies below G#9000_0000, so this is ferros's own: above the camera's diagnostic buffers (which end at G#8B10_0000), up to the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
 #[cfg(not(shim_handoff))]
-pub const USB_DMA: (usize, usize) = (0x8B20_0000, 0x8B40_0000);
+pub const USB_DMA: (usize, usize) = (0x8B80_0000, 0x8C00_0000);
 #[cfg(shim_handoff)]
 pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
