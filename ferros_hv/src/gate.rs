@@ -44,6 +44,9 @@ pub const ANDROID_ONCE: u64 = 0x414E_4452_4F49_4431; // "ANDROID1"
 /// The word before it: ferros asked for a recovery boot (`diag recovery`; later its attest-gated setting). Without it a recovery boot (Android's sideload and rescue, the way round the reflash lock) goes to ferros instead (owner, 2026-11-01: no reflash without the handle). Taken once, as ANDROID_ONCE is.
 pub const RECOVERY_ONCE_ADDR: usize = 0xFD60_0FF0;
 pub const RECOVERY_ONCE: u64 = 0x5245_434F_5645_5231; // "RECOVER1"
+/// The word before that: the hv core's power + volume up chord under Android (FERROS_HV_CORE) left it before resetting. The gate goes straight to ferros without asking (the keys may still be held), taken once (telemetry how = 5).
+pub const FERROS_ONCE_ADDR: usize = 0xFD60_0FE8;
+pub const FERROS_ONCE: u64 = 0x4645_5252_4F53_5F31; // "FERROS_1"
 /// Where ABL's splash pixels wait while the gate is on screen: inside the hv's own reservation, above its code and stacks.
 const SPLASH_SAVE: usize = 0xA_FD00_0000;
 const SPLASH_SAVE_MAX: usize = 0x200_0000;
@@ -318,6 +321,12 @@ pub fn ask(dtb: usize) -> Choice {
         return Choice::Ferros;
     }
     unsafe {
+        if read_volatile(FERROS_ONCE_ADDR as *const u64) == FERROS_ONCE {
+            write_volatile(FERROS_ONCE_ADDR as *mut u64, 0);
+            asm!("dsb sy");
+            gate_telemetry(5, 0, 0);
+            return Choice::Ferros;
+        }
         if read_volatile(ANDROID_ONCE_ADDR as *const u64) == ANDROID_ONCE {
             write_volatile(ANDROID_ONCE_ADDR as *mut u64, 0);
             asm!("dsb sy");

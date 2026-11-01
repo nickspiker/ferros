@@ -92,6 +92,20 @@ _secondary:
 5:  wfe
     b       5b
 
+// The hv's own core (hvcore, FERROS_HV_CORE): started by the hv itself with PSCI CPU_ON, never by Linux. Same stack slot rule as _secondary.
+.global _hvcore
+_hvcore:
+    msr     daifset, #0xF
+    mrs     x1, mpidr_el1
+    bl      core_index
+    ldr     x1, =__stacks
+    add     x0, x0, #1
+    lsl     x0, x0, #14
+    add     sp, x1, x0
+    bl      hv_core_main
+7:  wfe
+    b       7b
+
 // Exception vectors (VBAR_EL2). Only "lower EL, AArch64, synchronous" does real work; everything else records itself and parks the core.
 .balign 0x800
 .global hv_vectors
@@ -924,6 +938,7 @@ unsafe fn configure_el2() {
 unsafe extern "C" {
     fn hv_vectors();
     fn _secondary();
+    fn _hvcore();
 }
 
 /// EL1h with every interrupt masked, as a kernel expects at entry.
@@ -978,6 +993,12 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     pstore::log(&[if gate::android_from_slot_a(dtb as usize) { b"ferros hv: gate -- slot suffix rewritten to _a\n" as &[u8] } else { b"ferros hv: gate -- slot suffix left as it was\n" }]);
     let new_dtb = match fdt::patch(dtb as usize, DTB_COPY as usize, DTB_COPY_MAX) {
         Some(len) => {
+            if cfg!(hv_core) {
+                // The keys go to the hv's core only when Linux has been pointed at the proxies for all three; otherwise Linux keeps the real lines and the hv core never starts.
+                let n = fdt::retarget_keys(DTB_COPY as usize, &hvcore::DT_SPIS);
+                hvcore::reset_stats(n);
+                pstore::log(&[if n == 3 { b"\nferros hv: hvcore -- keys retargeted to the proxy SPIs\n" as &[u8] } else { b"\nferros hv: hvcore -- key cells not found, hv core stays off\n" }]);
+            }
             unsafe {
                 let mut a = DTB_COPY;
                 while a < DTB_COPY + len as u64 {
@@ -1080,6 +1101,7 @@ const PSCI_CPU_SUSPEND_32: u64 = 0x8400_0001;
 /// Exynos EL3: save / restore a power domain's TrustZone state (TZPC group, S2MPU) around its power cycle (exynos-pd_el3.c).
 const SMC_CMD_PREPARE_PD_ONOFF: u64 = 0x8200_0410;
 const PSCI_CPU_ON_32: u64 = 0x8400_0003;
+const PSCI_DENIED: u64 = -3i64 as u64;
 
 /// The trapped synchronous exception from EL1. `frame` holds x0..x17 (then x18, x30) as the guest left them; results go back through it.
 #[unsafe(no_mangle)]
@@ -1126,6 +1148,20 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 write_volatile(&raw mut LAST_T[core], now);
                 stats_tick(now, freq);
             }
+            // The hv's own core is not Linux's to start: refused (PSCI DENIED, Linux logs the CPU as failed to boot and carries on with eight). Any other CPU_ON is the moment Linux's distributor is set up (boot, and every resume from system suspend), so the hv core is started there if it is not running.
+            if cfg!(hv_core) && (fid == PSCI_CPU_ON || fid == PSCI_CPU_ON_32) && hvcore::enabled() {
+                hvcore::ensure_running();
+                if frame[1] & 0xFF_FFFF == hvcore::MPIDR {
+                    hvcore::refused();
+                    frame[0] = PSCI_DENIED;
+                    unsafe {
+                        let elr: u64;
+                        asm!("mrs {v}, elr_el2", v = out(reg) elr);
+                        asm!("msr elr_el2, {v}", v = in(reg) elr + 4);
+                    }
+                    return;
+                }
+            }
             // Every trapped SMC is forwarded to EL3 from here and the guest resumed past it. The three PSCI calls that carry a re-entry point have it rewritten to `_secondary`; everything else passes through untouched. (The native-SMC re-execution window, breakpoint-stepped from EL1, was removed 2026-10-19: it existed to chase a caller-EL theory that the memory-corruption root cause disproved, and plain forwarding from EL2 booted Android before the window was ever written.)
             match fid {
                 SMC_CMD_PREPARE_PD_ONOFF => {
@@ -1148,6 +1184,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     frame[2] = _secondary as *const () as u64;
                 }
                 PSCI_SYSTEM_SUSPEND => {
+                    // PSCI refuses a system suspend while another core is on: the hv core switches itself off first and is started again at the CPU_ONs of the resume.
+                    if cfg!(hv_core) && hvcore::enabled() {
+                        hvcore::stop();
+                    }
                     unsafe {
                         RESUME[core] = [frame[1], frame[2]];
                         asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
@@ -1479,7 +1519,7 @@ mod chord {
         }
     }
 
-    const DSS_HEADER: usize = 0xD810_0000;
+    pub const DSS_HEADER: usize = 0xD810_0000;
     const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
     const SMC_CMD_PRIV_REG: u64 = 0x8200_0504;
     const PMU_REBOOT_CMD: u64 = 0x1546_0810;
@@ -1729,6 +1769,313 @@ mod fdt {
         wr32(dst + 12, (off_strings + node_len) as u32);
         wr32(dst + 36, (size_struct + node_len) as u32);
         Some(new_total)
+    }
+
+    /// FERROS_HV_CORE: in the pin banks `gpa4` and `gpa6`, each `interrupts` entry `<GIC_SPI from type 0>` whose `from` is in `map` becomes `<GIC_SPI to IRQ_TYPE_EDGE_RISING 0>`, in place (same length). The banks' per-pin wakeup interrupts are what the pin controller chains each EINT from, so Linux then takes the keys from the proxies the hv core raises and never touches the real lines. Returns the entries rewritten.
+    pub fn retarget_keys(dtb: usize, map: &[(u32, u32)]) -> u32 {
+        if rd32(dtb) != MAGIC {
+            return 0;
+        }
+        let strings = dtb + rd32(dtb + 12) as usize;
+        let mut p = dtb + rd32(dtb + 8) as usize;
+        let end = p + rd32(dtb + 36) as usize;
+        let (mut depth, mut bank, mut done) = (0u32, None::<u32>, 0u32);
+        while p < end {
+            let tok = rd32(p);
+            p += 4;
+            match tok {
+                BEGIN_NODE => {
+                    let name = p;
+                    let mut n = 0usize;
+                    while rd8(p + n) != 0 {
+                        n += 1;
+                    }
+                    p = (p + n + 1 + 3) & !3;
+                    depth += 1;
+                    if name_eq(name, b"gpa4") || name_eq(name, b"gpa6") {
+                        bank = Some(depth);
+                    }
+                }
+                END_NODE => {
+                    if bank == Some(depth) {
+                        bank = None;
+                    }
+                    depth -= 1;
+                }
+                PROP => {
+                    let len = rd32(p) as usize;
+                    let name = strings + rd32(p + 4) as usize;
+                    let val = p + 8;
+                    if bank == Some(depth) && len % 16 == 0 && name_eq(name, b"interrupts") {
+                        for e in 0..len / 16 {
+                            let cell = val + e * 16;
+                            if rd32(cell) != 0 {
+                                continue;
+                            }
+                            if let Some(&(_, to)) = map.iter().find(|m| m.0 == rd32(cell + 4)) {
+                                wr32(cell + 4, to);
+                                wr32(cell + 8, 1);
+                                done += 1;
+                            }
+                        }
+                    }
+                    p = (val + len + 3) & !3;
+                }
+                NOP => {}
+                _ => break,
+            }
+        }
+        done
+    }
+}
+
+// ---------------------------------------------------------------- the hv's own core (FERROS_HV_CORE, HV.md "The chords under Android")
+//
+// The chords under Android, taken by interrupt rather than by polling on traps (owner, 2026-11-01). The group-0 route is closed (IGROUPR is RAZ/WI from the non-secure side), so the hv owns a core instead: A510 core 3, started by the hv with PSCI CPU_ON at Linux's first CPU_ON (its distributor is set up by then) and refused to Linux. It sleeps in WFI at EL2 with the three keys' SPIs routed to it (GICD_IROUTER is non-secure-writable). On each key edge it reads all three keys: volume up + volume down = SYSTEM_OFF, power + volume up = reset to ferros (the gate's FERROS_ONCE); anything else clears the pin's EINT pend bit and raises the key's proxy SPI, which the DTB patch made Linux's parent for that pin, so Android sees every key as before.
+// Counters (u64 words from G#FD60_0D00, ramoops page, kept through a warm reset): 0 magic, 1 CPU_ONs the hv issued for its core, 2 the last result, 3 times the core entered, 4 interrupts taken, 5 forwarded to Linux, 6 empty wakes, 7 Linux CPU_ONs refused, 8 stops for system suspend, 9 the last AFFINITY_INFO at stop (1 = off), 10 power + volume up, 11 volume up + volume down, 12 the last INTID, 13 the redistributor frame (G#FF none), 14 unknown INTIDs, 15 DTB cells retargeted.
+mod hvcore {
+    use core::arch::asm;
+    use core::ptr::{read_volatile, write_volatile};
+
+    pub const MPIDR: u64 = 0x300;
+    const GICD: usize = 0x1040_0000;
+    const GICR: usize = 0x1044_0000;
+    const GICR_STRIDE: usize = 0x2_0000;
+    const ALIVE: usize = 0x154D_0000;
+    const GPA4_DAT: usize = ALIVE + 0x84;
+    const GPA6_DAT: usize = ALIVE + 0xA4;
+    const EINT_PEND: usize = ALIVE + 0xA00;
+    const GPA4_EINT: usize = 0x10;
+    const GPA6_EINT: usize = 0x14;
+    /// The DTB's SPI numbers: the key's real line → its proxy. zuma assigns SPIs up to 839 and zuma-hybrid takes 900 and 901; the GIC implements lines to 959.
+    pub const DT_SPIS: [(u32, u32); 3] = [(28, 950), (29, 951), (32, 952)];
+    /// (INTID, its bank's EINT offset, pin, the proxy's INTID), in DT_SPIS order.
+    const KEYS: [(u32, usize, u32, u32); 3] = [(32 + 28, GPA4_EINT, 0, 32 + 950), (32 + 29, GPA4_EINT, 1, 32 + 951), (32 + 32, GPA6_EINT, 2, 32 + 952)];
+    /// Raised by a core in the hv that wants the hv core off (system suspend).
+    const STOP_INTID: u32 = 32 + 953;
+    const STATS: usize = 0xFD60_0D00;
+    const MAGIC: u64 = 0x4856_434F_5245_3031; // "HVCORE01"
+
+    static mut ENABLED: bool = false;
+    static mut RUNNING: bool = false;
+    static mut STOP: bool = false;
+
+    fn rd(a: usize) -> u32 {
+        unsafe { read_volatile(a as *const u32) }
+    }
+    fn wr(a: usize, v: u32) {
+        unsafe { write_volatile(a as *mut u32, v) }
+    }
+    fn stat(i: usize, add: u64) {
+        unsafe {
+            let p = (STATS + i * 8) as *mut u64;
+            write_volatile(p, read_volatile(p) + add);
+        }
+    }
+    fn set(i: usize, v: u64) {
+        unsafe { write_volatile((STATS + i * 8) as *mut u64, v) };
+    }
+
+    /// On the Android path only (the ferros path leaves the last session's counters for ferros to read).
+    pub fn reset_stats(retargeted: u32) {
+        for i in 0..32 {
+            set(i, 0);
+        }
+        set(0, MAGIC);
+        set(15, retargeted as u64);
+        unsafe { write_volatile(&raw mut ENABLED, retargeted == DT_SPIS.len() as u32) };
+    }
+
+    pub fn enabled() -> bool {
+        unsafe { read_volatile(&raw const ENABLED) }
+    }
+
+    pub fn refused() {
+        stat(7, 1);
+    }
+
+    fn smc(fid: u64, a: u64, b: u64, c: u64) -> u64 {
+        let r: u64;
+        unsafe {
+            asm!("smc #0", inout("x0") fid => r, inout("x1") a => _, inout("x2") b => _, inout("x3") c => _,
+                out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
+        }
+        r
+    }
+
+    /// Start the hv core if it is not running. Called from Linux's CPU_ON traps, which Linux issues one at a time.
+    pub fn ensure_running() {
+        unsafe {
+            if read_volatile(&raw const RUNNING) {
+                return;
+            }
+            write_volatile(&raw mut STOP, false);
+            let r = smc(0xC400_0003, MPIDR, super::_hvcore as *const () as u64, 0);
+            stat(1, 1);
+            set(2, r);
+            // 0 started; -4 ALREADY_ON (on from a start this record lost).
+            write_volatile(&raw mut RUNNING, r == 0 || r == -4i64 as u64);
+        }
+    }
+
+    /// Switch the hv core off and wait (up to 64 ms) until PSCI reports it off.
+    pub fn stop() {
+        unsafe {
+            if !read_volatile(&raw const RUNNING) {
+                return;
+            }
+            write_volatile(&raw mut STOP, true);
+            asm!("dsb sy");
+            wr(GICD + 0x200 + (STOP_INTID as usize / 32) * 4, 1 << (STOP_INTID % 32));
+            let (f, t0): (u64, u64);
+            asm!("mrs {f}, cntfrq_el0", "mrs {t}, cntpct_el0", f = out(reg) f, t = out(reg) t0);
+            let mut r;
+            loop {
+                r = smc(0xC400_0004, MPIDR, 0, 0);
+                let t: u64;
+                asm!("mrs {t}, cntpct_el0", t = out(reg) t);
+                if r == 1 || t.wrapping_sub(t0) > f >> 4 {
+                    break;
+                }
+            }
+            stat(8, 1);
+            set(9, r);
+            write_volatile(&raw mut RUNNING, false);
+        }
+    }
+
+    /// This core's redistributor frame (GICR_TYPER[63:32] = its affinity).
+    fn my_gicr() -> Option<usize> {
+        for i in 0..16usize {
+            let base = GICR + i * GICR_STRIDE;
+            if rd(base + 0x0C) == MPIDR as u32 {
+                return Some(base);
+            }
+            if rd(base + 0x08) & (1 << 4) != 0 {
+                break;
+            }
+        }
+        None
+    }
+
+    fn pressed(dat: usize, pin: u32) -> bool {
+        rd(dat) & (1 << pin) == 0
+    }
+
+    /// Reset into the gate with FERROS_ONCE left for it: ferros, no question. The reset is marked clean in the DSS header so the bootloader takes it for a reboot, not a crash.
+    fn to_ferros() -> ! {
+        super::pstore::log(&[b"\nferros hv: power + volume up -- to ferros\n"]);
+        unsafe {
+            write_volatile(super::gate::FERROS_ONCE_ADDR as *mut u64, super::gate::FERROS_ONCE);
+            write_volatile((super::chord::DSS_HEADER + 0x300) as *mut u32, 0xCAFE);
+            write_volatile((super::chord::DSS_HEADER + 0x100) as *mut u32, 0);
+            for cpu in 0..9 {
+                write_volatile((super::chord::DSS_HEADER + 0x500 + cpu * 4) as *mut u32, 0);
+            }
+            asm!("dsb sy");
+            asm!("smc #0", in("x0") 0x8400_0009u64);
+        }
+        loop {
+            unsafe { asm!("wfe") };
+        }
+    }
+
+    fn handle(id: u32) {
+        let Some(&(_, eint, pin, proxy)) = KEYS.iter().find(|k| k.0 == id) else {
+            if id != STOP_INTID {
+                stat(14, 1);
+            }
+            return;
+        };
+        let (power, down, up) = (pressed(GPA4_DAT, 0), pressed(GPA4_DAT, 1), pressed(GPA6_DAT, 2));
+        if down && up {
+            stat(11, 1);
+            super::chord::power_off();
+        }
+        if power && up {
+            stat(10, 1);
+            to_ferros();
+        }
+        // The pend bit holds the level line up; cleared here, before the EOI, or the interrupt would be taken again at once. Linux's own ack of the same bit, when it handles the proxy, finds it clear.
+        wr(EINT_PEND + eint, 1 << pin);
+        wr(GICD + 0x200 + (proxy as usize / 32) * 4, 1 << (proxy % 32));
+        unsafe { asm!("dsb sy") };
+        stat(5, 1);
+    }
+
+    fn off() -> ! {
+        unsafe {
+            asm!("msr s3_0_c12_c12_7, xzr", "isb"); // ICC_IGRPEN1_EL1
+            asm!("smc #0", in("x0") 0x8400_0002u64);
+        }
+        loop {
+            unsafe { asm!("wfe") };
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn hv_core_main() -> ! {
+        unsafe {
+            let s: u64;
+            asm!("mrs {v}, sctlr_el2", v = out(reg) s);
+            asm!("msr sctlr_el2, {v}", "ic iallu", "dsb sy", "isb", v = in(reg) s | (1 << 12));
+            asm!("msr vbar_el2, {v}", "isb", v = in(reg) super::hv_vectors as *const () as u64);
+            // RW, and physical IRQ/FIQ/SError to EL2: with PSTATE.I masked they are never taken, but WFI wakes on them and the loop reads the interface.
+            asm!("msr hcr_el2, {h}", "isb", h = in(reg) (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3));
+            asm!("msr s3_4_c12_c9_5, {v}", "isb", v = in(reg) 0x9u64); // ICC_SRE_EL2: SRE | Enable
+        }
+        stat(3, 1);
+        let Some(gicr) = my_gicr() else {
+            set(13, 0xFF);
+            super::pstore::log(&[b"\nferros hv: hvcore -- no redistributor for core 3, off\n"]);
+            off();
+        };
+        set(13, ((gicr - GICR) / GICR_STRIDE) as u64);
+        // The redistributor awake (ProcessorSleep clear, then ChildrenAsleep clear): EL3's CPU_ON normally leaves it so; waited on for at most 2^20 reads, since a frame that never answers must not stop the core before it reports.
+        wr(gicr + 0x14, rd(gicr + 0x14) & !(1 << 1));
+        for _ in 0..(1 << 20) {
+            if rd(gicr + 0x14) & (1 << 2) == 0 {
+                break;
+            }
+        }
+        unsafe {
+            asm!("msr s3_0_c4_c6_0, {v}", v = in(reg) 0xF0u64); // ICC_PMR_EL1
+            asm!("msr s3_0_c12_c12_3, xzr"); // ICC_BPR1_EL1
+            asm!("msr s3_0_c12_c12_4, xzr"); // ICC_CTLR_EL1: EOImode 0, EOI drops priority and deactivates
+            asm!("msr s3_0_c12_c12_7, {v}", "isb", v = in(reg) 1u64); // ICC_IGRPEN1_EL1
+        }
+        for id in KEYS.iter().map(|k| k.0).chain([STOP_INTID]) {
+            let n = id as usize;
+            unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, MPIDR) };
+            let pr = GICD + 0x400 + (n & !3);
+            wr(pr, (rd(pr) & !(0xFF << ((n & 3) * 8))) | (0x80 << ((n & 3) * 8)));
+            wr(GICD + 0x100 + (n / 32) * 4, 1 << (n % 32));
+        }
+        unsafe { asm!("dsb sy") };
+        if read_count(3) == 1 {
+            super::pstore::log(&[b"\nferros hv: hvcore -- core 3 up, keys routed to it\n"]);
+        }
+        loop {
+            if unsafe { read_volatile(&raw const STOP) } {
+                off();
+            }
+            let iar: u64;
+            unsafe { asm!("mrs {v}, s3_0_c12_c12_0", v = out(reg) iar) }; // ICC_IAR1_EL1
+            let id = (iar & 0xFF_FFFF) as u32;
+            if (1020..1024).contains(&id) {
+                stat(6, 1);
+                unsafe { asm!("wfi") };
+                continue;
+            }
+            stat(4, 1);
+            set(12, id as u64);
+            handle(id);
+            unsafe { asm!("msr s3_0_c12_c12_1, {v}", "isb", v = in(reg) iar) }; // ICC_EOIR1_EL1
+        }
+    }
+
+    fn read_count(i: usize) -> u64 {
+        unsafe { read_volatile((STATS + i * 8) as *const u64) }
     }
 }
 
