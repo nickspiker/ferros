@@ -194,7 +194,9 @@ extern "C" fn panel(grants: u64) -> ! {
                 // The panel's sleep-out settling time before display on (DCS, 120 ms): this thread sleeps, the frames go on.
                 ferros_sys::sleep_until(now() + freq() * 120 / 1000);
                 let _ = dsi.dcs(&[0x29]);
-                te2(&dsi);
+                // The brightness again (preference 3), with TE2: the panel woke very dark (owner, 2026-11-01), its DBV/HBM sent only when the preference changed.
+                let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+                set_panel(&dsi, hbm, dbv);
                 PANEL_REPRESENT.store(1, Ordering::Release);
             }
             dsi_unlock();
