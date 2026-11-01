@@ -104,9 +104,29 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 
 If the glossary's proposals are ruled on (GLOSSARY.md, "Proposed: the auth and fleet words"), "bind" in the first and sixth rows may become "join".
 
+## Next: apps and pairings in the identity class (plan, 2026-10-31)
+
+Not built; for the owner to approve before it is.
+
+**The rule stays one rule.** A name is identity class when it starts with a prefix in `kvault.rs` `IDENTITY`. Moving a thing to the person is adding its prefix there and moving its names under it, never a second mechanism.
+
+**Installed apps.**
+- What the person installs lives under `app.`: the capsule at `app.<name>`, the app's own data under `app.<name>.` (its store scope, one per app, the way `map.` and `photon.` are scoped today).
+- Drivers and the attest front end stay where they are (`display`, `touch`, `usb`, `pcie1`, `ahau`, …), device class: they run before anyone is present.
+- The map starts an app by its vault name, as it starts `ramps` today, so the change there is the name (`app.ramps`) and the moment: the map already runs only once an identity is unlocked (init's `wait_unlocked`), so an app's capsule is readable exactly when it can be started.
+- The `sealed` list (the seals of installed masked capsules) stays device class: a seal is keyed with the OS-only key, so it says nothing about the person, and the kernel needs it before anyone attests to spawn the device's own masked processes.
+- Locked, the device holds no list of the person's apps at all: their names are inside the identity class.
+
+**Pairings** (owner: pairings move with the identity, like networks).
+- Bluetooth link keys under `pair.bt.<peer>`, identity class. The `bt` driver gets an identity-class scope (`pair.`) next to its device-class one. It runs the beacon before anyone is present and reads the pairings once an identity unlocks (the way `pcie1` waits for `wifi.cred` today).
+- The address the person's devices know: the identity's, not the chip's (`radio-addresses-belong-to-identity`). Derived from the identity key, never stored, so it moves with the person and never sits on the device locked.
+- WiFi credentials are already identity class (`wifi.cred`); the per-network MAC stays the device's, from the ira.
+
+**Moving with the person.** Every identity-class entry is what a new device of the fleet should receive: the fleet's chain carries the identity key's derivations, and the entries themselves travel sealed over Photon's fleet channel. That transport is Photon's and is not designed yet; the vault side is only "copy every `IDENTITY` name".
+
 ## Known gaps
 
 - **The hypervisor net is not built yet.** Until it is, Android with root can read the ferros partition, and so the phone-only secret.
 - **A hang the watchdog resets** cannot run `before_reset`, so the key can survive in DRAM into the next boot. Planned: the gate's hypervisor scrubs the kernel's heap before it boots Android.
-- **Installed apps and device pairings** are not in the identity class yet (their capsules are device class today).
+- **Installed apps and device pairings** are not in the identity class yet (their capsules are device class today); the plan is above.
 - **No way back to the attest screen** without a power cycle once a person is unlocked.

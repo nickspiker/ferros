@@ -26,7 +26,7 @@ fn reserved(name: &str) -> bool {
     name.starts_with('\0')
 }
 
-/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the Photon client's chain and key, the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this phone and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included, and another person attesting finds their own space, not this one.
+/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the Photon client's chain and key, the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this phone and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not.
 const IDENTITY: [&str; 4] = ["map.", "photon.", "ahau.", "wifi.cred"];
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
