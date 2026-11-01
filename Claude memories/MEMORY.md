@@ -112,3 +112,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [NFC + BT drivers](husky_radios_nfc_bt.md) — nfc/bt processes since 2026-10-31; WiFi turns BT off before cycling WL_REG_ON (else watchdog reset); BLE address changes per recovery
 - [Auth flow decisions](auth_flow_decisions.md) — 2026-10-31: device vs identity vault classes; WiFi+BT pairings move with identity; key bound to phone; lock only at power loss/OS switch; unlock-key KDF open
 - [Kernel out: moves](kernel_out_moves.md) — USB+PT, touch bring-up, sensors USF are processes since 2026-10-31 (slots 86-96); pattern, traps (kill path skips end hooks, reload 8 s into boot hangs), owner decisions pending
+- [Feedback: device, not phone](feedback_device_not_phone.md) — say "device" for what ferros runs on, never "phone" (owner 2026-11-01): the glyph places no calls
