@@ -749,6 +749,27 @@ pub mod window {
         r[0] == 0
     }
 
+    /// As `show_as`, saying that only (cx, cy, cw, ch) of the surface changed since the window's last show: the display publishes that part alone, where a plain show republishes the whole screen in every dither phase (2026-11-01: the attest screen's blinkey cost four full-screen publishes a tick).
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_changed(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8, format: u8, changed: (u16, u16, u16, u16)) -> bool {
+        let mut m = [0u8; 27];
+        m[0] = 22;
+        m[1..3].copy_from_slice(&x.to_le_bytes());
+        m[3..5].copy_from_slice(&y.to_le_bytes());
+        m[5..7].copy_from_slice(&w.to_le_bytes());
+        m[7..9].copy_from_slice(&h.to_le_bytes());
+        m[9..17].copy_from_slice(&base.to_le_bytes());
+        m[17] = level;
+        m[18] = format;
+        m[19..21].copy_from_slice(&changed.0.to_le_bytes());
+        m[21..23].copy_from_slice(&changed.1.to_le_bytes());
+        m[23..25].copy_from_slice(&changed.2.to_le_bytes());
+        m[25..27].copy_from_slice(&changed.3.to_le_bytes());
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r);
+        r[0] == 0
+    }
+
     /// The window is done: what is behind it shows.
     pub fn done(display: u64, base: u64) {
         let mut m = [0u8; 9];

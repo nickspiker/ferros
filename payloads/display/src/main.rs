@@ -2734,18 +2734,26 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     match surface_of(base) {
                         Some(sk) if ten && unsafe { TEMPORAL } && ferros_sys::pref(8 + sk as u64) != 0 => {
                             let full = draw::Rect::full(width, height);
+                            let generation = ferros_sys::pref(8 + sk as u64);
+                            // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
+                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17]) && unsafe { APP }.is_some();
+                            let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             unsafe {
                                 if { APP }.is_none() {
                                     chrome_draw(width, height, true);
                                 }
-                                RAISES += 1;
-                                WINS[sk] = Some(Win { generation: ferros_sys::pref(8 + sk as u64), level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 } });
+                                if !same || m.len() < 27 {
+                                    RAISES += 1;
+                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 } });
+                                }
                                 APP = Some(full);
-                                PHASE_DIRTY = [full; PHASES];
+                                for k in 0..PHASES {
+                                    PHASE_DIRTY[k] = PHASE_DIRTY[k].union(changed);
+                                }
                             }
                             pipe.settle(&mut armed, true);
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                            publish_app(full, &tabs, k, width, height);
+                            publish_app(changed, &tabs, k, width, height);
                             unsafe {
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
                                 CUR_PHASE = k;

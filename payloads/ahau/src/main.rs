@@ -493,27 +493,27 @@ impl Ahau {
         publish_fresh_text(&self.handle[..self.len], true);
         // A keystroke restarts the blinkey: bright at the top, its next tick a fresh interval away (Photon: the caret stays solid through typing).
         self.wave_top.set(true);
-        self.blink_next.set(now() + self.blink_interval());
+        self.blink_next.set(self.next_blink());
         self.entry_line(true);
     }
 
-    /// The blinkey's next interval: uniform in 0–300 ms by xorshift32, Photon's (fluor `BlinkTimer`): the irregularity reads as alive rather than mechanical.
-    fn blink_interval(&self) -> u64 {
+    /// The blinkey's next tick: a geiger on the display's 10 Hz grid (owner, 2026-11-01: "quantize the blinkey to 10hz, or geiger it"): one to three whole tenths of a second away at random (xorshift32, as Photon's fluor `BlinkTimer` draws its 0–300 ms), landing on a tenth of a second of the counter, so a tick never asks for a frame between the dither's own flips. The irregularity still reads as alive.
+    fn next_blink(&self) -> u64 {
         let mut r = self.blink_rng.get();
         r ^= r << 13;
         r ^= r >> 17;
         r ^= r << 5;
         self.blink_rng.set(r);
-        freq() * (r % 301) as u64 / 1000
+        let tenth = freq() / 10;
+        (now() / tenth + 1 + (r % 3) as u64) * tenth
     }
-
     /// A blinkey tick, when due: the wave flips end and the entry line is drawn again. True when it drew.
     fn blink(&self) -> bool {
         if now() < self.blink_next.get() {
             return false;
         }
         self.wave_top.set(!self.wave_top.get());
-        self.blink_next.set(now() + self.blink_interval());
+        self.blink_next.set(self.next_blink());
         self.entry_line(false);
         true
     }
@@ -648,7 +648,7 @@ impl Ahau {
         }
         self.caret = best;
         self.wave_top.set(true);
-        self.blink_next.set(now() + self.blink_interval());
+        self.blink_next.set(self.next_blink());
         self.entry_line(false);
     }
 
@@ -829,6 +829,13 @@ impl Ahau {
 
     fn show(&self) {
         window::show(self.display, self.base, 0, 0, self.w as u16, self.h as u16, window::SYSTEM);
+    }
+
+    /// The entry line's rows alone presented (`window::show_changed`): a blinkey tick changes nothing else, and a whole show republishes the screen in every dither phase (four full-screen publishes, some 33 ms each on the X3, 2026-11-01).
+    fn show_entry(&self) {
+        let (b, px) = self.entry_at();
+        let (y0, y1) = (b - px * 3 / 2, b + px / 2);
+        window::show_changed(self.display, self.base, 0, 0, self.w as u16, self.h as u16, window::SYSTEM, window::WORKING, (0, y0 as u16, self.w as u16, (y1 - y0) as u16));
     }
 
     /// The typed handle gone from memory.
@@ -1377,9 +1384,9 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             a.show();
             mark_shown = done;
         }
-        // The blinkey's tick, when due: the entry line drawn again with the wave flipped.
+        // The blinkey's tick, when due: the entry line drawn again with the wave flipped, and only its rows presented.
         if a.blink() {
-            a.show();
+            a.show_entry();
         }
         let n = call(touch, &[1], &mut r) as usize;
         let count = if n >= 1 && n != ferros_sys::ERR as usize { (r[0] as usize).min(16) } else { 0 };
