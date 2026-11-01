@@ -59,6 +59,12 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 const STAGE_MAX: usize = 4 << 20;
 /// Where PT transfers over 1 MiB are received: the 6 MiB between the DMA pool and the reload stub, inside the kernel's cacheable window (cachemap WINDOW), used by nothing else.
 const PT_BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
+/// The USB controller's DMA block (ferros_hal::usb::UsbMem), in the kernel's non-cacheable `.bss.dma` pages, handed to the driver before any init (`set_usb_mem`).
+#[unsafe(link_section = ".bss.dma")]
+static mut USB_MEM: ferros_hal::usb::UsbMem = ferros_hal::usb::UsbMem::zeroed();
+pub fn usb_mem() -> *mut ferros_hal::usb::UsbMem {
+    &raw mut USB_MEM
+}
 /// The largest value the vault takes (3 MiB): sealing a value and reading it back each need about twice its size in one piece of the kernel heap. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault, until the vault stores in pieces.
 pub const STORE_VALUE_MAX: usize = 3 << 20;
 
@@ -1043,6 +1049,7 @@ pub fn run(mut b: Boot) -> ! {
             platform::crumb(0xA2);
             crate::checklist::at("usb: phy up");
             ferros_hal::usb::set_dwc3_base(DWC3);
+            ferros_hal::usb::set_usb_mem(usb_mem());
             match ferros_hal::usb::Dwc3Dev::init() {
                 Some(u) => u,
                 None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),

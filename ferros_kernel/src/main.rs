@@ -1793,6 +1793,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if cfg!(not(ferros_production)) && !hv_answered && real_boot {
         pixel8_eusb_phy_init();
         ferros_hal::usb::set_dwc3_base(service::DWC3);
+        ferros_hal::usb::set_usb_mem(service::usb_mem());
         gate_usb = ferros_hal::usb::Dwc3Dev::init();
         checklist::at(if gate_usb.is_some() { "gate: usb up" } else { "gate: usb failed" });
     }

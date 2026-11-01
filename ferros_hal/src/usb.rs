@@ -387,31 +387,18 @@ impl Trb {
     }
 }
 
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut EVT_BUF: EventBuffer = EventBuffer { buf: [0; 256] };
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut EP0_TRBS: Ep0Trbs = Ep0Trbs {
-    setup: Trb::zero(),
-    data: Trb::zero(),
-    status: Trb::zero(),
-    _pad: Trb::zero(),
-};
 
 /// EP0 setup packet buffer (8 bytes, but cache-line aligned to prevent DMA bleed-over from SETUP DMA writes into adjacent buffers).
 #[repr(C, align(64))]
 struct SetupPacket {
     data: [u8; 8],
 }
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut EP0_SETUP_BUF: SetupPacket = SetupPacket { data: [0; 8] };
 
 /// EP0 data buffer for control transfers. Cache-line aligned (64B) to isolate from other DMA buffers.
 #[repr(C, align(64))]
 struct Ep0DataBuf {
     data: [u8; 512],
 }
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut EP0_DATA_BUF: Ep0DataBuf = Ep0DataBuf { data: [0; 512] };
 
 /// Bulk endpoint TRBs — one per direction, cache-line aligned.
 #[repr(C, align(64))]
@@ -419,10 +406,6 @@ struct BulkOutTrb { trb: Trb, _pad: [Trb; 3] }
 #[repr(C, align(64))]
 struct BulkInTrb { trb: Trb, _pad: [Trb; 3] }
 
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut BULK_OUT_TRB: BulkOutTrb = BulkOutTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut BULK_IN_TRB: BulkInTrb = BulkInTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] };
 
 /// Bulk OUT data buffer (host→device). 512B for HS bulk MPS.
 #[repr(C, align(64))]
@@ -431,10 +414,47 @@ struct BulkOutBuf { data: [u8; 512] }
 #[repr(C, align(64))]
 struct BulkInBuf { data: [u8; 4096] }
 
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut BULK_OUT_BUF: BulkOutBuf = BulkOutBuf { data: [0; 512] };
-#[unsafe(link_section = ".bss.dma")] // device DMA: kept uncached by the kernel's cache map
-static mut BULK_IN_BUF: BulkInBuf = BulkInBuf { data: [0; 4096] };
+/// Everything the controller reads and writes by DMA — the event ring, the endpoint TRBs and buffers — in one block whose address the owner hands over before `init` (`set_usb_mem`): the kernel its `.bss.dma` copy, a driver process its DMA region. It must be Normal non-cacheable memory (both are), so no cache maintenance is done (and none could be at EL0, where it traps), and its address must be the one the controller sees (VA = PA: the kernel's identity map, the process's DMA grant).
+#[repr(C)]
+pub struct UsbMem {
+    evt: EventBuffer,
+    ep0_trbs: Ep0Trbs,
+    ep0_setup: SetupPacket,
+    ep0_data: Ep0DataBuf,
+    bulk_out_trb: BulkOutTrb,
+    bulk_in_trb: BulkInTrb,
+    bulk_out_buf: BulkOutBuf,
+    bulk_in_buf: BulkInBuf,
+}
+
+impl UsbMem {
+    pub const fn zeroed() -> Self {
+        UsbMem {
+            evt: EventBuffer { buf: [0; 256] },
+            ep0_trbs: Ep0Trbs { setup: Trb::zero(), data: Trb::zero(), status: Trb::zero(), _pad: Trb::zero() },
+            ep0_setup: SetupPacket { data: [0; 8] },
+            ep0_data: Ep0DataBuf { data: [0; 512] },
+            bulk_out_trb: BulkOutTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] },
+            bulk_in_trb: BulkInTrb { trb: Trb::zero(), _pad: [Trb::zero(); 3] },
+            bulk_out_buf: BulkOutBuf { data: [0; 512] },
+            bulk_in_buf: BulkInBuf { data: [0; 4096] },
+        }
+    }
+}
+
+static USB_MEM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Hand the driver its DMA block before `init`.
+pub fn set_usb_mem(m: *mut UsbMem) {
+    USB_MEM.store(m as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The DMA block. Unset is a bug in the owner's bring-up: fail loud.
+fn mem() -> *mut UsbMem {
+    let m = USB_MEM.load(core::sync::atomic::Ordering::Relaxed);
+    assert!(m != 0, "usb: no DMA block (set_usb_mem before init)");
+    m as *mut UsbMem
+}
 
 // ---------------------------------------------------------------------------
 // Probe (read-only diagnostics)
@@ -517,10 +537,10 @@ pub struct Dwc3Diag {
 
 /// Return the physical addresses of DMA buffers so we can check what address the kernel computed vs what ended up in the DWC3 register.
 pub fn dma_buffer_addrs() -> (u64, u64, u64, u64) {
-    let evt = &raw const EVT_BUF as usize as u64;
-    let trbs = &raw const EP0_TRBS as usize as u64;
-    let setup = &raw const EP0_SETUP_BUF as usize as u64;
-    let data = &raw const EP0_DATA_BUF as usize as u64;
+    let evt = unsafe { &raw const (*mem()).evt } as usize as u64;
+    let trbs = unsafe { &raw const (*mem()).ep0_trbs } as usize as u64;
+    let setup = unsafe { &raw const (*mem()).ep0_setup } as usize as u64;
+    let data = unsafe { &raw const (*mem()).ep0_data } as usize as u64;
     (evt, trbs, setup, data)
 }
 
@@ -536,7 +556,7 @@ pub fn dump_diag(exc_fn: fn() -> u64) -> Dwc3Diag {
 
     // Read event buffer raw content
     let evt_raw = unsafe {
-        let base = &raw const EVT_BUF as *const u32;
+        let base = &raw const (*mem()).evt as *const u32;
         [
             core::ptr::read_volatile(base),
             core::ptr::read_volatile(base.add(1)),
@@ -590,7 +610,7 @@ unsafe fn phy_rmw(addr: usize, clear: u32, set: u32) {
     unsafe { mmio::write32(addr, (val & !clear) | set); }
 }
 
-// Cache ops moved to crate::mmio::cache_clean / cache_invalidate
+// No cache maintenance: the DMA block (UsbMem) is Normal non-cacheable memory.
 
 /// Initialize the SNPS Femto v2 USB2 HS PHY.
 ///
@@ -739,9 +759,9 @@ pub struct Dwc3Dev {
     pub ep0_status_out_arm_fail: u32, // ep0_status_out STARTTRANSFER failures (both)
     pub last_evt_raw: u32,      // Last raw event word (for debug)
     // Diagnostics: readback of data buffer after copy, before DMA
-    pub last_send_preview: u32, // First 4 bytes of EP0_DATA_BUF after volatile copy
+    pub last_send_preview: u32, // First 4 bytes of (*mem()).ep0_data after volatile copy
     pub last_send_len: u16,     // Length passed to ep0_send
-    pub last_send_buf_addr: u32, // Low 32 bits of EP0_DATA_BUF physical address
+    pub last_send_buf_addr: u32, // Low 32 bits of (*mem()).ep0_data physical address
     pub last_send_trb_addr: u32, // Low 32 bits of data TRB physical address
     pub last_send_src_addr: u32, // Low 32 bits of source data slice address
     pub last_send_src_preview: u32, // First 4 bytes of source data (volatile read)
@@ -831,9 +851,9 @@ impl Dwc3Dev {
 
         // Set up our event buffer
         unsafe {
-            let evt_addr = &raw const EVT_BUF as usize;
+            let evt_addr = &raw const (*mem()).evt as usize;
             let evt_size = core::mem::size_of::<EventBuffer>() as u32;
-            for i in 0..256 { EVT_BUF.buf[i] = 0; }
+            for i in 0..256 { (*mem()).evt.buf[i] = 0; }
             mmio::write32(dwc3_base() + GEVNTADRLO, evt_addr as u32);
             mmio::write32(dwc3_base() + GEVNTADRHI, (evt_addr >> 32) as u32);
             mmio::write32(dwc3_base() + GEVNTSIZ, evt_size & !GEVNTSIZ_INTMASK);
@@ -966,12 +986,12 @@ impl Dwc3Dev {
 
         // Set up event buffer with our DRAM address
         unsafe {
-            let evt_addr = &raw const EVT_BUF as usize;
+            let evt_addr = &raw const (*mem()).evt as usize;
             let evt_size = core::mem::size_of::<EventBuffer>() as u32;
 
             // Clear the event buffer
             for i in 0..256 {
-                EVT_BUF.buf[i] = 0;
+                (*mem()).evt.buf[i] = 0;
             }
 
             mmio::write32(dwc3_base() + GEVNTADRLO, evt_addr as u32);
@@ -1145,19 +1165,17 @@ impl Dwc3Dev {
             self.force_end_transfer_unconditional(2);
         }
 
-        let buf_addr = &raw const BULK_OUT_BUF as usize;
-        let trb_addr = unsafe { &raw mut BULK_OUT_TRB.trb } as usize;
+        let buf_addr = unsafe { &raw const (*mem()).bulk_out_buf } as usize;
+        let trb_addr = unsafe { &raw mut (*mem()).bulk_out_trb.trb } as usize;
 
         unsafe {
-            let trb = &raw mut BULK_OUT_TRB.trb;
+            let trb = &raw mut (*mem()).bulk_out_trb.trb;
             (*trb).bpl = buf_addr as u32;
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = 512;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-            crate::mmio::cache_clean(trb_addr, 16);
-            crate::mmio::cache_clean(buf_addr, 512);
             core::arch::asm!("dsb sy");
         }
 
@@ -1167,11 +1185,10 @@ impl Dwc3Dev {
         } else {
             self.force_end_transfer_unconditional(2);
             unsafe {
-                let trb = &raw mut BULK_OUT_TRB.trb;
+                let trb = &raw mut (*mem()).bulk_out_trb.trb;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | TRB_CTRL_ISP_IMI
                     | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-                crate::mmio::cache_clean(trb_addr, 16);
             }
             if self.ep_cmd(2, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 let cmd_reg = unsafe { mmio::read32(dwc3_base() + 0xC800 + 2 * 16 + 0x0C) };
@@ -1186,25 +1203,23 @@ impl Dwc3Dev {
         let len = data.len().min(4096);
         if len == 0 { return false; }
 
-        let buf_addr = &raw const BULK_IN_BUF as usize;
-        let trb_addr = unsafe { &raw mut BULK_IN_TRB.trb } as usize;
+        let buf_addr = unsafe { &raw const (*mem()).bulk_in_buf } as usize;
+        let trb_addr = unsafe { &raw mut (*mem()).bulk_in_trb.trb } as usize;
 
         unsafe {
-            let dst = &raw mut BULK_IN_BUF.data as *mut u8;
+            let dst = &raw mut (*mem()).bulk_in_buf.data as *mut u8;
             for i in 0..len {
                 core::ptr::write_volatile(dst.add(i), data[i]);
             }
             core::arch::asm!("dsb sy");
 
-            let trb = &raw mut BULK_IN_TRB.trb;
+            let trb = &raw mut (*mem()).bulk_in_trb.trb;
             (*trb).bpl = buf_addr as u32;
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = len as u32;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI  // complete on short packet (< 512 bytes)
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-            crate::mmio::cache_clean(buf_addr, len);
-            crate::mmio::cache_clean(trb_addr, 16);
             core::arch::asm!("dsb sy"); // ensure DMA-visible before STARTTRANSFER
         }
 
@@ -1216,10 +1231,9 @@ impl Dwc3Dev {
         } else {
             self.force_end_transfer_unconditional(3);
             unsafe {
-                let trb = &raw mut BULK_IN_TRB.trb;
+                let trb = &raw mut (*mem()).bulk_in_trb.trb;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
-                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(3, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.bulk_in_idle = true;
@@ -1238,9 +1252,8 @@ impl Dwc3Dev {
         let len = self.bulk_out_len as usize;
         if len == 0 { return None; }
         unsafe {
-            crate::mmio::cache_invalidate(&raw const BULK_OUT_BUF as usize, len);
             Some(core::slice::from_raw_parts(
-                &raw const BULK_OUT_BUF as *const u8, len))
+                &raw const (*mem()).bulk_out_buf as *const u8, len))
         }
     }
 
@@ -1248,6 +1261,8 @@ impl Dwc3Dev {
     fn ep_cmd(&mut self, ep_phys: u8, cmd: u32, par0: u32, par1: u32, par2: u32) -> bool {
         let base = dwc3_base() + 0xC800 + (ep_phys as usize) * 16;
         unsafe {
+            // The TRBs and buffers this command points the controller at were written just before, in non-cacheable memory: a store barrier so every one of those writes is done before the doorbell. The cache maintenance that used to sit before each command carried this barrier inside it; without it the controller read half-written TRBs and bulk IN wedged after 442 transfers (2026-10-31).
+            core::arch::asm!("dsb st", options(nostack, preserves_flags));
             mmio::write32(base + 0x00, par2);  // DEPCMDPAR2
             mmio::write32(base + 0x04, par1);  // DEPCMDPAR1
             mmio::write32(base + 0x08, par0);  // DEPCMDPAR0
@@ -1278,30 +1293,24 @@ impl Dwc3Dev {
 
     /// Prepare EP0 to receive a SETUP packet. If STARTTRANSFER fails, force ENDTRANSFER and retry.
     pub fn ep0_start_setup(&mut self) {
-        let setup_addr = &raw const EP0_SETUP_BUF as usize;
+        let setup_addr = unsafe { &raw const (*mem()).ep0_setup } as usize;
 
         // Clear setup buffer
         unsafe {
             for i in 0..8 {
-                EP0_SETUP_BUF.data[i] = 0;
+                (*mem()).ep0_setup.data[i] = 0;
             }
         }
 
         // Build setup TRB
-        let trb_addr = unsafe { &raw mut EP0_TRBS.setup } as usize;
+        let trb_addr = unsafe { &raw mut (*mem()).ep0_trbs.setup } as usize;
         unsafe {
-            let trb = &raw mut EP0_TRBS.setup;
+            let trb = &raw mut (*mem()).ep0_trbs.setup;
             (*trb).bpl = setup_addr as u32;
             (*trb).bph = (setup_addr >> 32) as u32;
             (*trb).size = 8; // SETUP is always 8 bytes
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | (TRBCTL_SETUP << TRB_CTRL_TRBCTL_SHIFT);
-        }
-
-        // Clean cache lines so DWC3 DMA sees the TRB and setup buffer
-        unsafe {
-            crate::mmio::cache_clean(setup_addr, 8);
-            crate::mmio::cache_clean(trb_addr, 16);
         }
 
         // Start transfer on EP0 OUT
@@ -1310,10 +1319,9 @@ impl Dwc3Dev {
         } else {
             self.force_end_transfer_unconditional(0);
             unsafe {
-                let trb = &raw mut EP0_TRBS.setup;
+                let trb = &raw mut (*mem()).ep0_trbs.setup;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_SETUP << TRB_CTRL_TRBCTL_SHIFT);
-                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep0_setup_arm_fail += 1;
@@ -1358,7 +1366,7 @@ impl Dwc3Dev {
 
         // Copy data to DMA buffer using volatile writes to prevent compiler from optimizing away or reordering stores.
         unsafe {
-            let dst = &raw mut EP0_DATA_BUF.data as *mut u8;
+            let dst = &raw mut (*mem()).ep0_data.data as *mut u8;
             for i in 0..len {
                 core::ptr::write_volatile(dst.add(i), data[i]);
             }
@@ -1367,7 +1375,7 @@ impl Dwc3Dev {
         }
 
         // Capture diagnostic readback (volatile read of what we just wrote)
-        let buf_addr = &raw const EP0_DATA_BUF as usize;
+        let buf_addr = unsafe { &raw const (*mem()).ep0_data } as usize;
         self.last_send_buf_addr = buf_addr as u32;
         self.last_send_len = len as u16;
         if len >= 4 {
@@ -1397,25 +1405,17 @@ impl Dwc3Dev {
 
     /// Actually issue STARTTRANSFER on EP1 with data already in EP0_DATA_BUF. Used by both ep0_send (proactive) and XferNotReady handler (reactive).
     fn ep1_start_transfer(&mut self, len: usize, trbctl: u32) {
-        let buf_addr = &raw const EP0_DATA_BUF as usize;
-        let trb_addr = unsafe { &raw mut EP0_TRBS.data } as usize;
+        let buf_addr = unsafe { &raw const (*mem()).ep0_data } as usize;
+        let trb_addr = unsafe { &raw mut (*mem()).ep0_trbs.data } as usize;
         self.last_send_trb_addr = trb_addr as u32;
 
         unsafe {
-            let trb = &raw mut EP0_TRBS.data;
+            let trb = &raw mut (*mem()).ep0_trbs.data;
             (*trb).bpl = buf_addr as u32;
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = len as u32;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | (trbctl << TRB_CTRL_TRBCTL_SHIFT);
-        }
-
-        // Clean data buffer + TRB so DWC3 DMA sees them
-        unsafe {
-            if len > 0 {
-                crate::mmio::cache_clean(buf_addr, len);
-            }
-            crate::mmio::cache_clean(trb_addr, 16);
         }
 
         // Issue STARTTRANSFER on EP1. If it fails (resource occupied), force ENDTRANSFER and retry once.
@@ -1426,10 +1426,9 @@ impl Dwc3Dev {
             self.force_end_transfer_unconditional(1);
             // Re-set HWO since ENDTRANSFER may have cleared it
             unsafe {
-                let trb = &raw mut EP0_TRBS.data;
+                let trb = &raw mut (*mem()).ep0_trbs.data;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (trbctl << TRB_CTRL_TRBCTL_SHIFT);
-                crate::mmio::cache_clean(trb_addr, 16);
             }
             if self.ep_cmd(1, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep1_retry_ok += 1;
@@ -1457,11 +1456,11 @@ impl Dwc3Dev {
     /// Receive zero-length status OUT after sending data. If STARTTRANSFER fails, force ENDTRANSFER and retry (like ep0_send).
     fn ep0_status_out(&mut self) {
         self.status_out_count += 1;
-        let buf_addr = &raw const EP0_DATA_BUF as usize;
-        let trb_addr = unsafe { &raw mut EP0_TRBS.status } as usize;
+        let buf_addr = unsafe { &raw const (*mem()).ep0_data } as usize;
+        let trb_addr = unsafe { &raw mut (*mem()).ep0_trbs.status } as usize;
 
         unsafe {
-            let trb = &raw mut EP0_TRBS.status;
+            let trb = &raw mut (*mem()).ep0_trbs.status;
             (*trb).bpl = buf_addr as u32;
             (*trb).bph = (buf_addr >> 32) as u32;
             (*trb).size = 0;
@@ -1469,18 +1468,15 @@ impl Dwc3Dev {
                 | (TRBCTL_STATUS3 << TRB_CTRL_TRBCTL_SHIFT);
         }
 
-        // Clean TRB so DWC3 DMA sees it
-        unsafe { crate::mmio::cache_clean(trb_addr, 16); }
 
         // Start transfer on EP0 OUT (physical EP 0)
         if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
             // Retry: force ENDTRANSFER then re-arm
             self.force_end_transfer_unconditional(0);
             unsafe {
-                let trb = &raw mut EP0_TRBS.status;
+                let trb = &raw mut (*mem()).ep0_trbs.status;
                 (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                     | (TRBCTL_STATUS3 << TRB_CTRL_TRBCTL_SHIFT);
-                crate::mmio::cache_clean(trb_addr, 16);
             }
             if !self.ep_cmd(0, DEPCMD_STARTTRANSFER, 0, trb_addr as u32, (trb_addr >> 32) as u32) {
                 self.ep0_status_out_arm_fail += 1;
@@ -1502,16 +1498,14 @@ impl Dwc3Dev {
     /// Poll for events. Returns the next event, or None.
     pub fn poll_event(&mut self) -> UsbEvent {
         let count = unsafe { mmio::read32(dwc3_base() + GEVNTCOUNT) } & 0xFFFC;
+        // The count is read from the controller, the event from memory it wrote: a load barrier so the event is not read ahead of the count that says it is there.
+        unsafe { core::arch::asm!("dsb ld", options(nostack, preserves_flags)) };
         if count == 0 {
             return UsbEvent::None;
         }
 
-        // Invalidate event buffer cache line so we see DWC3's DMA writes
-        let evt_base = &raw const EVT_BUF as usize;
-        unsafe { crate::mmio::cache_invalidate(evt_base + self.evt_read_idx, 4); }
-
         // Read one event (4 bytes)
-        let evt = unsafe { core::ptr::read_volatile(&EVT_BUF.buf[self.evt_read_idx / 4]) };
+        let evt = unsafe { core::ptr::read_volatile(&(*mem()).evt.buf[self.evt_read_idx / 4]) };
         self.evt_read_idx = (self.evt_read_idx + 4) % core::mem::size_of::<EventBuffer>();
 
         // Acknowledge this event
@@ -1552,12 +1546,11 @@ impl Dwc3Dev {
                         self.bulk_out_armed = false;
                         self.bulk_out_xfer_complete += 1;
                         unsafe {
-                            crate::mmio::cache_invalidate(&raw mut BULK_OUT_TRB.trb as usize, 16);
-                            let remaining = BULK_OUT_TRB.trb.size & 0x00FF_FFFF;
+                            let remaining = (*mem()).bulk_out_trb.trb.size & 0x00FF_FFFF;
                             self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
                             // Snapshot the raw TRB words for VENDOR_REQ_DBG2 — distinguishes a stale cache read (size still 512, HWO set) from a spurious event (TRB untouched) from a normal short read.
-                            self.ep2_trb_size_snap = BULK_OUT_TRB.trb.size;
-                            self.ep2_trb_ctrl_snap = BULK_OUT_TRB.trb.ctrl;
+                            self.ep2_trb_size_snap = (*mem()).bulk_out_trb.trb.size;
+                            self.ep2_trb_ctrl_snap = (*mem()).bulk_out_trb.trb.ctrl;
                         }
                         self.bulk_out_ready = true;
                         return UsbEvent::TransferComplete { ep: ep_phys };
@@ -1573,13 +1566,11 @@ impl Dwc3Dev {
                     if ep_phys == 0 && self.ep0_state == Ep0State::Setup {
                         // SETUP packet = host is (re)configuring — clear armed flags so bulk endpoints get re-armed by the main loop
                         self.bulk_out_armed = false;
-                        // SETUP packet received — invalidate cache to see DMA data
-                        let setup_addr = &raw const EP0_SETUP_BUF as usize;
-                        unsafe { crate::mmio::cache_invalidate(setup_addr, 8); }
+                        // SETUP packet received: read the 8 bytes the controller wrote.
                         let mut req = [0u8; 8];
                         unsafe {
                             for i in 0..8 {
-                                req[i] = core::ptr::read_volatile(&EP0_SETUP_BUF.data[i]);
+                                req[i] = core::ptr::read_volatile(&(*mem()).ep0_setup.data[i]);
                             }
                         }
                         self.setup_count += 1;
