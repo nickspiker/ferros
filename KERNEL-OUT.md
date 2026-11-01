@@ -57,10 +57,7 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
      - leave it until the pipeline is understood, then write the userspace driver fresh and delete the harness;
      - delete it now.
    - Proposed: the second.
-4. **The `diag` subcommands.**
-   - They are what keep most of the remaining kernel code alive: `touch.rs`'s tools, the display tools (`dpu`, `dsim`), `usf`'s tools, `amp`, `haptics`, `odpm`, `fp`, `cold_ufs`.
-   - Each can be deleted, or moved into a diag payload spawned from the bridge. Moving one usually needs a power switch for its privileged part.
-   - Proposed: delete what has done its job (`fp`'s bus hunt, `cold_ufs`), and move each module's tools with its module.
+4. **[decided 2026-11-01] The `diag` subcommands.** Three buckets. Deleted, their job done: the touch tools (and `touch.rs`'s own bring-up, the `touch` switch kept), the AoC's bring-up tools (`aoc` keeps a status), `gsa`, `ffa`, `trusty`, `fp` and `tpu`. Kept, the kernel inspecting itself: `smp`, `x3`, `sched`, `threads`, `cpu`, `heap`, `console`, `log`, `rep`, `boot`, `ready`, `bench`, `facts`, `screen`, `thermal`, `rtc`, the vault and auth tools, `android`, the power measuring. Moved with their module when it moves: `amp`, `haptics`, `gnss`, `modem`, `cam` (decision 3). And every development command is compiled out of a production build, not only refused there. Done the same day (see the record).
 5. **hsi2c_11.**
    - The battery gauge, the Type-C controller (the USB switch) and the eUSB2 repeater share it. Everything on it runs on the kernel's core today, so nothing collides.
    - Moving the gauge out means one process owning the bus: a charger process, with the usb switch asking it to close the Type-C switch.
@@ -97,3 +94,7 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
   - The display server takes ABL's 8 bpc pipe to the 10 bpc blend at its start (`payloads/display` modeset.rs: the kernel's quiet `dpu::modeset_with` path word for word, then the DQE's dither in shift mode), only while the pipe is still at 8 bpc. New grants: `decon0-sub`, `dqe0`, `dqe0-cgc`, `dpu-sysreg` (init slots 97-100, the server's 19-22). The kernel's `start_home` no longer runs it.
   - `dpu.rs`, `dsim.rs`, `hk3.rs` and `display::resolution` are gone (830 lines), with the `display` commands that used them (G#02 DCS script, G#03 DSIM dump, G#04 DCS read, G#06 refresh, G#08 raster, G#09 idle floor, G#0A modeset) and the bridge's `display dcs|dsim|read|mode|res|idle|modeset`; the kernel no longer depends on `ferros_dsi` or `ferros_dsc`.
   - Verified: slot b cold boots, 8 to 10 bpc in 63-64 ms with nothing stuck, the attest screen up, no banding (owner's eyes); a reload finds 10 bpc and skips it.
+- 2026-11-01: **the `diag` tools (decision 4).**
+  - Gone: the `touch` tools and `touch.rs`'s bring-up (923 lines to 63: the `touch` power switch alone), the AoC's bring-up tools with the `aoc.rs`, `trusty.rs` and `gsa.rs` code only they used (`diag aoc` keeps a status), `diag gsa|ffa|trusty`, `fp.rs` with the shim's `FERROS_FP_SCAN`, and `tpu.rs` with its Trusty channel.
+  - A production build (FERROS_PRODUCTION=1) compiles every development command out (`#[cfg(not(ferros_production))]` on the DIAG subcommands and on each development door's body), where before it only refused them: the production kernel's code is 643 KB against the development build's 1.09 MB. What only the tools used is dead there, allowed by a production-only crate attribute.
+  - Verified: a reload; a slot b cold boot (touch ready after 12 ms through its switch, chip G#3640, scan mode set; the display's modeset; sensors serving); the production configuration compiles.

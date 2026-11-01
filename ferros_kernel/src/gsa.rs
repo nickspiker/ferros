@@ -11,7 +11,6 @@ const INTSR0: usize = 0x2C;
 const INTGR1: usize = 0x40;
 const SR: usize = 0x80;
 
-pub const CMD_ECHO: u32 = 34;
 pub const CMD_AOC: u32 = 91;
 /// `enum gsa_aoc_cmd` (gsa_aoc.h): 0 get state; the answer is `enum gsa_aoc_state`, 0 inactive (no firmware, in reset), 1 loaded (in reset), 2 running.
 pub const AOC_GET_STATE: u32 = 0;

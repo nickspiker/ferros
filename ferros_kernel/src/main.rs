@@ -16,6 +16,8 @@
 
 #![no_std]
 #![no_main]
+// A production build compiles the development tools out (service.rs, `ferros_production`); what only they used is then dead code, and stays in the tree for development builds.
+#![cfg_attr(ferros_production, allow(dead_code, unused_imports, unused_variables, unused_mut, unused_assignments))]
 
 extern crate alloc;
 
@@ -60,7 +62,6 @@ mod haptics;
 mod gnss;
 mod nfc;
 mod bt;
-mod tpu;
 mod gsa;
 mod ffa;
 mod trusty;
@@ -71,7 +72,6 @@ mod camera_rx;
 mod camera_rx_uw;
 #[cfg(feature = "pixel8")]
 mod spi;
-mod fp;
 #[cfg(feature = "pixel8")]
 mod touch;
 #[cfg(feature = "pixel8")]

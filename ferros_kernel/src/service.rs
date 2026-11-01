@@ -1152,19 +1152,16 @@ pub fn run(mut b: Boot) -> ! {
                 queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot and a plain DIAG over USB\n");
             } else if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
                 let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                // The camera's and the TPU's power domains are gated after boot (pd.rs). Their diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
-                if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else if cmd.params.starts_with(b"tpu") { Some("tpu") } else { None } {
+                // Development tools: not in a production build at all (FERROS_PRODUCTION=1, build.rs), which answers only the plain DIAG below and a reboot.
+                #[cfg(not(ferros_production))]
+                {
+                // The camera's power domain is gated after boot (pd.rs; the TPU's too, its tools gone 2026-11-01). Its diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
+                if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else { None } {
                     if !crate::pd::is_on(name) {
                         resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());
                         queue_pt_response(&mut pt_out_data, &resp);
                         continue;
                     }
-                }
-                if cmd.params == b"fp" {
-                    // Is the fingerprint's SPI controller (PERIC0 USI1, G#10880000) reachable from NS-EL2, or secure-locked? Read-only, fault-safe (fp.rs).
-                    crate::fp::report(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
                 }
                 if cmd.params.starts_with(b"lun ") {
                     // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
@@ -1566,53 +1563,11 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if let Some(n) = cmd.params.strip_prefix(b"gsa aoc ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u32>().ok()).filter(|n| [0, 1, 4, 5, 6].contains(n)) {
-                    // `diag gsa aoc <n>`: one AoC management command on GSA's mailbox (gsa_aoc.h `enum gsa_aoc_cmd`: 0 get state, 1 start, 4 shutdown to loaded, 5 release the A32 from reset, 6 reset), then the control block's first words.
-                    let r = crate::gsa::call(crate::gsa::CMD_AOC, &[n], 2048);
-                    let cb = |o: usize| unsafe { core::ptr::read_volatile((crate::aoc::CARVEOUT + 0x1C0_0000 + o) as *const u32) };
-                    resp.extend_from_slice(alloc::format!("aoc cmd {n}: {r:X?}; control block G#{:X} G#{:X} G#{:X} G#{:X}\n", cb(0), cb(4), cb(8), cb(12)).as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"gsa echo" || cmd.params == b"gsa aoc" {
-                    // `diag gsa echo` / `diag gsa aoc`: GSA's non-secure mailbox (gsa.rs), read-only commands only — the echo test, and the AoC's state over the mailbox (command 91, GSA_AOC_GET_STATE), which Linux on zuma sends over Trusty instead.
-                    let r = if cmd.params == b"gsa echo" { crate::gsa::call(crate::gsa::CMD_ECHO, &[0x1234_5678, 0x0A0C_0A0C], 256) } else { crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256) };
-                    resp.extend_from_slice(match r {
-                        Ok((c, e, a)) => alloc::format!("rsp cmd G#{c:X} err A#{e} args {:X?}\n", a),
-                        Err(m) => alloc::format!("{m}\n"),
-                    }.as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc fault" {
-                    resp.extend_from_slice(alloc::format!("AoC SYSMMU fault [status, va, info0, info1, info2]: {:X?}\n", crate::aoc::mmu_fault()).as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc mmu" {
-                    crate::aoc::mmu(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc boot" {
-                    // `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) and start it through GSA's mailbox (aoc.rs `boot`). Each piece is read under the kernel lock (the vault's one owner).
-                    let st = &raw mut store;
-                    let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                    crate::aoc::boot(&mut get, &mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"facts" {
                     // `diag facts`: the sensor words of SYS_FACTS as a process receives them, and whether the sensors process has published its block (sensorlink.rs).
                     let v = crate::process::with_lock(facts);
                     let fl = |w: u64| f32::from_bits(w as u32);
                     resp.extend_from_slice(alloc::format!("source: {}\ngravity ({:.3}, {:.3}, {:.3}) m/s², samples A#{}\nproximity distance {:.1}, samples A#{}\nspectral samples A#{}\nscope: next sample A#{}\n", if crate::process::with_lock(crate::sensorlink::live) { "the sensors process" } else { "none: no sensors process has published" }, fl(v[12]), fl(v[12] >> 32), fl(v[13]), v[13] >> 32, fl(v[27]), v[29] >> 32, v[26], if crate::process::with_lock(crate::sensorlink::live) { crate::process::with_lock(|| crate::sensorlink::word(crate::sensorlink::SCOPE_N).unwrap_or(0)) } else { 0 }).as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc log" || cmd.params.starts_with(b"aoc log ") {
-                    let n = core::str::from_utf8(cmd.params.strip_prefix(b"aoc log").unwrap_or(b"")).unwrap_or("").trim();
-                    crate::aoc::log(if n.is_empty() { "logging" } else { n }, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -1629,23 +1584,6 @@ pub fn run(mut b: Boot) -> ! {
                         }
                         _ => resp.extend_from_slice(b"i2c <bus base> <target> <read n> [write bytes]\n"),
                     }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"tpu load" {
-                    let st = &raw mut store;
-                    let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                    crate::tpu::load(&mut get, &mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"tpu start" {
-                    crate::tpu::start(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"tpu state" {
-                    crate::trusty::tpu_state(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -1674,77 +1612,9 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"aoc services" {
-                    crate::aoc::services(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc usf" {
-                    crate::aoc::usf_probe(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if let Some(n) = cmd.params.strip_prefix(b"aoc svc ").and_then(|t| core::str::from_utf8(t).ok()) {
-                    crate::aoc::svc_report(n.trim(), &mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc pins" || cmd.params.starts_with(b"aoc gpio ") {
-                    // `diag aoc pins`: the AoC GPIO's four ports of pin levels. `diag aoc gpio <hex offset> <hex value>`: write one register of that page, then show the levels (aoc.rs).
-                    let mut it = cmd.params.strip_prefix(b"aoc gpio ").unwrap_or(b"").split(|&c| c == b' ').filter(|t| !t.is_empty()).filter_map(|t| core::str::from_utf8(t).ok()).filter_map(|t| usize::from_str_radix(t.trim_start_matches("G#"), 16).ok());
-                    if let (Some(o), Some(v)) = (it.next(), it.next()) {
-                        let ok = crate::aoc::gpio_write(o, v as u32);
-                        resp.extend_from_slice(alloc::format!("write +G#{o:X} = G#{v:X}: {ok}\n").as_bytes());
-                    }
-                    let p = crate::aoc::pins();
-                    resp.extend_from_slice(alloc::format!("pins a G#{:08X} b G#{:08X} c G#{:08X} d G#{:08X}\n", p[0], p[1], p[2], p[3]).as_bytes());
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"aoc" || cmd.params == b"aoc on" || cmd.params == b"aoc off" || cmd.params.starts_with(b"aoc peek ") {
-                    // `diag aoc [on|off|peek <hex>]`: the AoC block from the AP, AoC in reset (aoc.rs). `on`/`off` move its power request first; `peek` reads one register, saying ABORT if it faulted.
-                    if let Some(h) = cmd.params.strip_prefix(b"aoc peek ") {
-                        match core::str::from_utf8(h).ok().and_then(|t| usize::from_str_radix(t.trim().trim_start_matches("G#"), 16).ok()) {
-                            Some(a) if crate::aoc::req().1 & 1 == 1 || a < crate::aoc::BLK || a >= crate::aoc::BLK + (32 << 20) => resp.extend_from_slice(alloc::format!("G#{a:X}: {:?}\n", crate::aoc::probe32(a).map(|v| alloc::format!("G#{v:X}"))).as_bytes()),
-                            Some(_) => resp.extend_from_slice(b"AoC block not acknowledged; refusing to read inside it\n"),
-                            None => resp.extend_from_slice(b"peek <hex address>\n"),
-                        }
-                    } else {
-                        if cmd.params != b"aoc" {
-                            let (ack, us) = crate::aoc::request(cmd.params == b"aoc on", 256);
-                            resp.extend_from_slice(alloc::format!("request {}: ack G#{ack:X} after A#{us} us\n", if cmd.params == b"aoc on" { 1 } else { 0 }).as_bytes());
-                        }
-                        crate::aoc::report(&mut resp);
-                    }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"trusty aoc" {
-                    // `diag trusty aoc`: start the AoC through Trusty — FF-A, virtio, the GSA hwmgr tipc channel, the START message (trusty.rs). Needs the firmware already loaded (diag aoc boot).
-                    crate::trusty::aoc_start(&mut resp, 4000);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"ffa init" {
-                    // `diag ffa init`: bring up FF-A as Linux's Trusty driver does (ffa.rs) — version, our id, the RX/TX map — the transport ferros needs to reach the secure world.
-                    match crate::ffa::init() {
-                        Ok(v) => resp.extend_from_slice(alloc::format!("FF-A up: version A#{}.{}, our id G#{:X}, secure G#{:X}\n", v >> 16, v & 0xFFFF, unsafe { crate::ffa::LOCAL_ID }, crate::ffa::SECURE_ID).as_bytes()),
-                        Err(e) => resp.extend_from_slice(alloc::format!("FF-A init failed: A#{e}\n").as_bytes()),
-                    }
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"ffa" {
-                    // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
-                    let smc = |a: [u64; 3]| -> [u64; 4] {
-                        let (r0, r1, r2, r3): (u64, u64, u64, u64);
-                        unsafe { core::arch::asm!("smc #0", inout("x0") a[0] => r0, inout("x1") a[1] => r1, inout("x2") a[2] => r2, inout("x3") 0u64 => r3, inout("x4") 0u64 => _, inout("x5") 0u64 => _, inout("x6") 0u64 => _, inout("x7") 0u64 => _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _) };
-                        [r0, r1, r2, r3]
-                    };
-                    for (name, args) in [("FFA_VERSION 1.1", [0x8400_0063, 0x1_0001, 0]), ("FFA_ID_GET", [0x8400_0069, 0, 0]), ("FFA_FEATURES RXTX_MAP64", [0x8400_0064, 0xC400_0066, 0])] {
-                        let r = smc(args);
-                        resp.extend_from_slice(alloc::format!("{name}: x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", r[0], r[1], r[2], r[3]).as_bytes());
-                    }
+                if cmd.params == b"aoc" {
+                    // `diag aoc`: the AoC block from the AP (aoc.rs `report`). Its bring-up tools (on, off, peek, boot, log, mmu, fault, services, svc, usf, pins, gpio; gsa, ffa, trusty) went on 2026-11-01: the `sensors` switch starts it.
+                    crate::aoc::report(&mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -2241,65 +2111,6 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
-                if cmd.params == b"touch raw" {
-                    // `diag touch raw`: the chip's rawest live layer (mutual raw, no baseline removed), auto-ranged on the panel for five minutes (touch.rs).
-                    crate::touch::raw(&mut resp, 300_000);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch gamma" {
-                    // `diag touch gamma`: the pressure value alone in greyscale — a white disc of that radius and a full-screen flood at that level, to see how brightness maps to pressure (touch.rs).
-                    crate::touch::gamma(&mut resp, 30_000);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch decay" {
-                    // `diag touch decay`: a 1:1 10-bit decay screen stamped with a circle per touch reading: the contact's major axis in red, its minor in blue, its pressure in green (touch.rs).
-                    crate::touch::decay(&mut resp, 30_000);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch map" {
-                    // `diag touch map`: the touch chip's capacitance strength frame, live on the panel and as an ASCII map, for 12 s (touch.rs).
-                    crate::touch::map(&mut resp, 12_000);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch info" {
-                    // `diag touch info`: the touch chip's sensor grid and the addresses of its capacitance frames (touch.rs).
-                    crate::touch::info(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch state" {
-                    // `diag touch state`: the touch controller's clocks, pins and rails, read only (touch.rs).
-                    crate::touch::state(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch up" {
-                    // `diag touch up`: SPI controller up, rails on, reset released, controller ready, scan mode active.
-                    crate::touch::up(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch watch" {
-                    // `diag touch watch`: report touches for 8 s.
-                    crate::touch::watch(&mut resp, 8192);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch paint" {
-                    // `diag touch paint`: draw finger strokes on the panel for 16 s, the by-eye test of touch.
-                    crate::touch::paint(&mut resp, 16384);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"touch off" {
-                    crate::touch::off(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
                 if cmd.params == b"cam state" {
                     // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
                     crate::camera::state(&mut resp);
@@ -2313,6 +2124,7 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
+                }
                 }
                 resp.extend_from_slice(match b.kind {
                     BootKind::Handoff => b"ferros on Pixel 8 Pro (Tensor G3), chainloaded from Linux\n".as_slice(),
@@ -2485,10 +2297,17 @@ pub fn run(mut b: Boot) -> ! {
                 resp.extend_from_slice(b"END\n");
                 queue_pt_response(&mut pt_out_data, &resp);
             } else if cmd.cap == cap_store {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
                 let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
                 queue_pt_response(&mut pt_out_data, &resp);
+                }
             } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // A leading G#01 byte = hold (bridge `display --hold`). The DSI tools — G#02 a packet script, G#03 the DSIM dump, G#04 a DCS read, G#06 the refresh rate, G#08 the raster, G#09 the idle floor, G#0A the modeset — left with dpu.rs and dsim.rs on 2026-11-01 (KERNEL-OUT.md decision 6): the display server drives the panel. Anything else is text for the painter.
                 match cmd.params.split_first() {
                     // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
@@ -2680,7 +2499,11 @@ pub fn run(mut b: Boot) -> ! {
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
                 }
+                }
             } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24). A stopgap: in production it becomes a portal verb the owner's identity holds in full (STATUS.md next, PORTAL.md §5).
                 // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
                 let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
@@ -2700,7 +2523,11 @@ pub fn run(mut b: Boot) -> ! {
                 resp[..8].copy_from_slice(&ret.to_le_bytes());
                 resp[8..].copy_from_slice(&back.to_le_bytes());
                 queue_pt_response(&mut pt_out_data, &resp);
+                }
             } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
                 let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
                 let addr = (raw & !(1 << 63)) as usize;
@@ -2721,7 +2548,11 @@ pub fn run(mut b: Boot) -> ! {
                     }
                 }
                 queue_pt_response(&mut pt_out_data, &out);
+                }
             } else if (cmd.cap == cap_reload || cmd.cap == cap_run) && cmd.op == ferros_pt::Op::Write {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
                 let params = cmd.params;
                 let is_kernel = params.len() > 0x1000 && params[..4] == [0x4D, 0x5A, 0x00, 0x91];
@@ -2745,7 +2576,11 @@ pub fn run(mut b: Boot) -> ! {
                     reload_ok = false;
                 }
                 queue_pt_response(&mut pt_out_data, &(size as u32).to_le_bytes());
+                }
             } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 if from_proc && !pt_act {
                     // From the USB process: no reply (as over the kernel's own USB), and the handover when it asks again with the COMPLETE sent (ptlink.rs).
                     proc_act = reload_ok && reload_size > 0;
@@ -2786,7 +2621,11 @@ pub fn run(mut b: Boot) -> ! {
                         );
                     }
                 }
+                }
             } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Write {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // A capsule too large for the staging slot, streamed straight into its arc (STD-TARGET.md): [total u64][need u64][code offset u64][code length u64][piece offset u64][piece]. The first piece allocates the arc (zeroed, from the big pool past 16 MiB); each piece lands at the code offset plus its own; the reply is the bytes received so far. The Exec that follows builds the process in that arc.
                 let pr = cmd.params;
                 let w = |i: usize| u64::from_le_bytes(pr[i * 8..i * 8 + 8].try_into().unwrap()) as usize;
@@ -2811,7 +2650,11 @@ pub fn run(mut b: Boot) -> ! {
                     }
                 }
                 queue_pt_response(&mut pt_out_data, &(received as u32).to_le_bytes());
+                }
             } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
                 let staged = spawn_stage.take();
                 if (run_ok && run_size > 0) || staged.is_some() {
@@ -2872,7 +2715,11 @@ pub fn run(mut b: Boot) -> ! {
                 } else {
                     queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
                 }
+                }
             } else if cmd.cap == cap_seal && cmd.op == ferros_pt::Op::Exec {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // Install the staged masked capsule: gate + checker once, then its seal joins the vault's `sealed` list (idempotent). Reply [0][seal] or ERR.
                 if run_ok && run_size > 0 {
                     let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
@@ -2902,7 +2749,11 @@ pub fn run(mut b: Boot) -> ! {
                 } else {
                     queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
                 }
+                }
             } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
+                // A development door: compiled out of a production build (its `open` check refuses it there anyway).
+                #[cfg(not(ferros_production))]
+                {
                 // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.
                 if run_ok && run_size > 0 {
                     crate::cachemap::sync_code(b.stage, run_size);
@@ -2916,6 +2767,7 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                 } else {
                     queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                }
                 }
             } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
                 // Mode byte 1 = fastboot: stamp the PMU reboot mode through the EL3 monitor and reset straight into the bootloader. If the monitor refuses, fall back to a normal exit (report + Android).

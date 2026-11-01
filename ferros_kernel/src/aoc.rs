@@ -86,23 +86,6 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     }
 }
 
-/// The AoC's DesignWare APB GPIO (version G#3231_332A, four ports of 32 pins, no hardware-control mode): the one page of the AoC block the AP may touch (Linux clears an interrupt bit here). Port n's data, direction and control registers at n·G#C (+0, +4, +8), the pins' levels at G#50 + n·4. The registry's `intr_id` numbers are these pins (43 the IMU's interrupt, 45 the light/proximity sensor's, 47 pressure, 56-59 the spectral sensor's).
-pub const GPIO: usize = BLK + 0x01C0_0000;
-
-/// The four ports' pin levels.
-pub fn pins() -> [u32; 4] {
-    core::array::from_fn(|n| unsafe { read_volatile((GPIO + 0x50 + 4 * n) as *const u32) })
-}
-
-/// Write one register of the AoC GPIO page (and nothing else).
-pub fn gpio_write(off: usize, v: u32) -> bool {
-    if off >= 0x1000 {
-        return false;
-    }
-    unsafe { write_volatile((GPIO + off) as *mut u32, v) };
-    true
-}
-
 // ── Starting Google's AoC firmware through GSA's mailbox (no Trusty) ──
 // The sequence is Linux's (`aoc_fw_callback`, google-modules/aoc aoc.c) with GSA's AoC commands sent on the non-secure mailbox (gsa.rs) instead of over Trusty IPC: GSA answers GSA_AOC_GET_STATE there on this firmware (2026-10-23). The firmware is the phone's own `/vendor/firmware/aoc.bin`, stored in the vault as `aoc.fw.0`, `aoc.fw.1`, ... (2 MiB pieces, tools/husky-aoc-fw.sh); nothing of it is in the repo.
 
@@ -117,7 +100,6 @@ const SUPERBIN_MAGIC: u32 = 0xAABB_CCDD;
 const PARAMETER_MAGIC: u32 = 0x0A0C_DA7A;
 const AOC_MAGIC: u32 = 0xA0C0_0A0C;
 const GSA_CMD_LOAD_AOC: u32 = 90;
-const AOC_START: u32 = 1;
 
 fn wr32(a: usize, v: u32) {
     unsafe { write_volatile(a as *mut u32, v) }
@@ -264,21 +246,6 @@ impl Loader {
         out.extend_from_slice(alloc::format!("loaded; GSA AoC state {:?} (1 = loaded)\n", gsa_state()).as_bytes());
         true
     }
-}
-
-/// `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) in one go; start it with `diag trusty aoc`.
-pub fn boot(get: &mut dyn FnMut(&str) -> Option<alloc::vec::Vec<u8>>, out: &mut alloc::vec::Vec<u8>) -> bool {
-    let Some(mut l) = Loader::begin(out) else { return false };
-    let t0 = crate::platform::cntpct();
-    loop {
-        match l.piece(get, out) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(()) => return false,
-        }
-    }
-    out.extend_from_slice(alloc::format!("pieces in A#{} us\n", (crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()).as_bytes());
-    l.finish(out)
 }
 
 /// Whether the firmware's control block is up (its magic in place of the parameter block).
@@ -479,207 +446,12 @@ pub fn mmu(out: &mut alloc::vec::Vec<u8>) {
     out.extend_from_slice(alloc::format!("AoC SYSMMU: table G#{:X}, VM0 ctrl G#{:X}, flpt G#{:X}\n", mmu_table(), rd32(0x1909_8000), rd32(0x1909_8404)).as_bytes());
 }
 
-/// The AoC SYSMMU's latched fault (samsung-iommu-fault-v9.c): status (bit 0 PTW access, 1 page, 2 access, 3 context), VA, info0 (bit 20 write), info2 (PMMU id << 24 | stream id).
-pub fn mmu_fault() -> [u32; 5] {
-    [rd32(0x1909_8060), rd32(0x1909_8070), rd32(0x1909_8074), rd32(0x1909_8078), rd32(0x1909_807C)]
-}
-
 // ── The AoC service rings (aoc_ipc, google-modules/aoc_ipc) ──
 /// The IPC control block and service table live at the carve-out plus the image size. The image is G#1C0_0000 for husky's aoc.bin (the superbin header's image_size).
 pub const IPC: usize = CARVEOUT + 0x1C0_0000;
-/// Each service header: a 32-byte name, u32 flags, then two 28-byte regions (UP = AoC→AP = index 0, DOWN = AP→AoC = index 1); region = {offset, size, slots, tx, rx, wp, rp}. The table starts at the control block's `services_offset`.
-const SVC_HDR: usize = 92;
-const REGION: usize = 28;
-
-/// Walk the service table for `name`; returns the service header's address, or 0.
-pub fn service(name: &str) -> usize {
-    // Before the firmware is up the carve-out holds whatever DRAM held: no table to walk.
-    if rd32(IPC) != AOC_MAGIC {
-        return 0;
-    }
-    let count = (rd32(IPC + 24) as usize).min(128); // services count (after magic/fw/hw/status + u64 supported_features)
-    let base = IPC + rd32(IPC + 32) as usize; // services_offset
-    for i in 0..count {
-        let h = base + i * SVC_HDR;
-        let mut n = alloc::string::String::new();
-        for k in 0..32 {
-            let c = unsafe { read_volatile((h + k) as *const u8) };
-            if c == 0 {
-                break;
-            }
-            n.push(c as char);
-        }
-        if n == name {
-            return h;
-        }
-    }
-    0
-}
-
-fn region(h: usize, dir: usize) -> usize {
-    h + 36 + dir * REGION
-}
-
-/// `diag aoc svc <name>`: a service's type, mailbox index and both rings' geometry and pointers.
-pub fn svc_report(name: &str, out: &mut alloc::vec::Vec<u8>) {
-    out.extend_from_slice(alloc::format!("control block: magic G#{:X} services A#{} service_size A#{} services_offset G#{:X}\n", rd32(IPC), rd32(IPC + 24), rd32(IPC + 28), rd32(IPC + 32)).as_bytes());
-    let h = service(name);
-    if h == 0 {
-        out.extend_from_slice(alloc::format!("{name}: not found\n").as_bytes());
-        return;
-    }
-    let flags = rd32(h + 32);
-    let ty = (flags >> 16) & 7;
-    let irq = (flags >> 19) & 0x1F;
-    out.extend_from_slice(alloc::format!("{name} @ G#{h:X}: flags G#{flags:X} type A#{ty} (0 queue, 1 ring, 2 buffer) mbox A#{irq}\n").as_bytes());
-    for (d, lbl) in [(0usize, "UP  AoC->AP"), (1, "DOWN AP->AoC")] {
-        let r = region(h, d);
-        out.extend_from_slice(alloc::format!("  {lbl}: offset G#{:X} size A#{} slots A#{} tx A#{} rx A#{} wp A#{} rp A#{}\n", rd32(r), rd32(r + 4), rd32(r + 8), rd32(r + 12), rd32(r + 16), rd32(r + 20), rd32(r + 24)).as_bytes());
-    }
-}
 
 // ── Talking to an AoC queue service (aoc_ipc write/read + mailbox signal) ──
 // The carve-out is Device memory in ferros's map (uncached), so queue reads/writes need no cache maintenance; a dsb orders the payload before the tx bump and the mailbox kick.
-const MBOX_BLOCKS: [usize; 3] = [0x1520_0000, 0x1522_0000, 0x1524_0000];
-const MB_INTGR0: usize = 0x20;
-
-/// Signal the AoC on a service's mailbox index (aoc: write 1<<(idx%16) to that mailbox block's INTGR0; 16 channels per block, a32/f1/p6).
-fn mbox_signal(idx: u32) {
-    let block = MBOX_BLOCKS[(idx / 16) as usize % 3];
-    wr32(block + MB_INTGR0, 1 << (idx % 16));
-}
-
-/// Write one message to a queue service's DOWN ring (AP->AoC) and signal the AoC. The slot holds an 8-byte header {u16 len, 0, 0, 0} then the payload.
-pub fn ipc_write(h: usize, payload: &[u8]) -> bool {
-    let r = region(h, 1);
-    let (off, size, slots, tx, rx) = (rd32(r) as usize, rd32(r + 4) as usize, rd32(r + 8), rd32(r + 12), rd32(r + 16));
-    if slots == 0 || payload.len() + 8 > size || tx.wrapping_sub(rx) >= slots {
-        return false;
-    }
-    let dst = IPC + off + size * (tx % slots) as usize;
-    wr32(dst, payload.len() as u32 & 0xFFFF); // length in the low u16, r1..r3 zero
-    wr32(dst + 4, 0);
-    for (i, &b) in payload.iter().enumerate() {
-        unsafe { write_volatile((dst + 8 + i) as *mut u8, b) };
-    }
-    unsafe { core::arch::asm!("dsb sy") };
-    wr32(r + 12, tx.wrapping_add(1));
-    let irq = (rd32(h + 32) >> 19) & 0x1F;
-    mbox_signal(irq);
-    true
-}
-
-/// Read one message from a queue service's UP ring (AoC->AP) if one is waiting; returns the bytes copied.
-pub fn ipc_read(h: usize, buf: &mut [u8]) -> Option<usize> {
-    let r = region(h, 0);
-    let (off, size, slots, tx, rx) = (rd32(r) as usize, rd32(r + 4) as usize, rd32(r + 8), rd32(r + 12), rd32(r + 16));
-    if slots == 0 || tx == rx {
-        return None;
-    }
-    let src = IPC + off + size * (rx % slots) as usize;
-    let len = (rd32(src) & 0xFFFF) as usize;
-    let n = len.min(buf.len()).min(size - 8);
-    for i in 0..n {
-        buf[i] = unsafe { read_volatile((src + 8 + i) as *const u8) };
-    }
-    wr32(r + 16, rx.wrapping_add(1));
-    // A ring that was full before this read: tell the AoC there is room again, as aoc_service_read does (a stream left full otherwise waits for a signal that never comes).
-    if tx.wrapping_sub(rx) >= slots {
-        mbox_signal((rd32(h + 32) >> 19) & 0x1F);
-    }
-    Some(n)
-}
-
-/// `diag aoc usf`: open a logical channel on com.google.usf (aoc_channel_dev: a control message [channel_index 0][AOCC_CMD_OPEN_CHANNEL 0][my channel]) and poll the UP ring for any reply, dumping each message's channel and head.
-pub fn usf_probe(out: &mut alloc::vec::Vec<u8>) {
-    let h = service("com.google.usf");
-    if h == 0 {
-        out.extend_from_slice(b"com.google.usf not found (is the AoC up? diag aoc boot + diag trusty aoc)\n");
-        return;
-    }
-    let chan: u32 = 1;
-    // AOCC_CMD_OPEN_CHANNEL: {i32 channel_index = 0, i32 command_code = 0, i32 channel_to_modify = chan}.
-    let mut openmsg = alloc::vec::Vec::new();
-    openmsg.extend_from_slice(&0u32.to_le_bytes());
-    openmsg.extend_from_slice(&0u32.to_le_bytes());
-    openmsg.extend_from_slice(&chan.to_le_bytes());
-    out.extend_from_slice(alloc::format!("open channel {chan}: {}\n", ipc_write(h, &openmsg)).as_bytes());
-    // The first USF request Android's sensor HAL sends: a FlatBuffer "get server by UUID" (captured 2026-10-23). Prefixed with our channel, it should draw a reply on the same channel. This proves the USF transport end to end; the full FlatBuffer handshake is the sensor HAL's job later.
-    const USF_GET_SERVER: [u8; 108] = [
-        0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-        0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-        0x28, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x08, 0x00, 0x04, 0x00,
-        0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x6b, 0x31, 0xcb, 0xf0,
-        0x74, 0x4a, 0x14, 0xa1, 0xd4, 0xe8, 0xae, 0x8a, 0x3e, 0x09, 0xfc, 0x4d,
-    ];
-    let mut req = alloc::vec::Vec::new();
-    req.extend_from_slice(&chan.to_le_bytes());
-    req.extend_from_slice(&USF_GET_SERVER);
-    out.extend_from_slice(alloc::format!("send USF get-server on channel {chan}: {}\n", ipc_write(h, &req)).as_bytes());
-    // Poll the UP ring for ~500 ms.
-    let f = crate::platform::cntfrq();
-    let t0 = crate::platform::cntpct();
-    let mut buf = [0u8; 1024];
-    let mut got = 0;
-    while crate::platform::cntpct() - t0 < f / 2 {
-        if let Some(n) = ipc_read(h, &mut buf) {
-            got += 1;
-            let ch = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-            out.extend_from_slice(alloc::format!("UP msg {got}: A#{n} bytes, channel G#{ch:X}, head {:02X?}\n", &buf[4..20.min(n)]).as_bytes());
-            if got >= 8 {
-                break;
-            }
-        }
-    }
-    if got == 0 {
-        out.extend_from_slice(b"no UP messages (AoC did not answer the channel open)\n");
-    }
-}
-
-/// `diag aoc services`: every service's index and name.
-pub fn services(out: &mut alloc::vec::Vec<u8>) {
-    if rd32(IPC) != AOC_MAGIC {
-        out.extend_from_slice(b"AoC not up\n");
-        return;
-    }
-    let count = (rd32(IPC + 24) as usize).min(128);
-    let base = IPC + rd32(IPC + 32) as usize;
-    for i in 0..count {
-        let h = base + i * SVC_HDR;
-        let mut n = alloc::string::String::new();
-        for k in 0..32 {
-            let c = unsafe { read_volatile((h + k) as *const u8) };
-            if c == 0 {
-                break;
-            }
-            n.push(c as char);
-        }
-        out.extend_from_slice(alloc::format!("{i} {n}\n").as_bytes());
-    }
-}
-
-/// `diag aoc log [service]`: drain a service's UP ring (default `logging`, the firmware's own log: 256 × 128-byte messages, full from boot unless read) and show each message's printable text.
-pub fn log(name: &str, out: &mut alloc::vec::Vec<u8>) {
-    let h = service(name);
-    if h == 0 {
-        out.extend_from_slice(alloc::format!("{name}: not found\n").as_bytes());
-        return;
-    }
-    let mut buf = [0u8; 1024];
-    let mut n = 0;
-    while let Some(len) = ipc_read(h, &mut buf) {
-        n += 1;
-        let text: alloc::string::String = buf[..len].iter().map(|&c| if (0x20..0x7F).contains(&c) { c as char } else if c == b'\n' || c == 0 { ' ' } else { '.' }).collect();
-        out.extend_from_slice(text.trim().as_bytes());
-        out.push(b'\n');
-        if n >= 512 {
-            break;
-        }
-    }
-    out.extend_from_slice(alloc::format!("({n} messages)\n").as_bytes());
-}
 
 /// The sensors' two rails on the sub PMIC (zuma-common.dtsi, the AoC's `sensor_power_list`): LDO7S 1.8 V (L7S_SENSORS_FPS) and LDO5S 3.3 V (L5S_PROX), control registers G#35 and G#33 (s2mpg15-register.h); bit 7 enables. Both are boot-on in the device tree.
 pub const RAILS: [(&str, u32); 2] = [("LDO7S 1.8 V", 0x35), ("LDO5S 3.3 V", 0x33)];
