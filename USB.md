@@ -38,12 +38,21 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
      | get | 0.43 s (reply out 239 ms) | 0.78 s |
 
      About 8.8 MB/s each way on the wire; the CPU's share is 30-45 ms.
-   - **Open: the 8.8 MB/s ceiling.** Ruled out:
+   - **[done] The 8.8 MB/s ceiling was the host.** Ruled out first:
      - the CPU;
      - the FIFOs: GTXFIFOSIZ1 G#253 and GRXFIFOSIZ0 G#209 words, about 9 packets each;
      - the bus bursts: GSBUSCFG0 G#2222_0001, undefined-length INCR.
 
-     Next suspects: the host keeping only one transfer in flight, and the endpoint's burst setting.
+     What it was, measured one change at a time on 2 MiB each way:
+
+     | Change | In | Out |
+     |---|---|---|
+     | Before | 271 ms | 239 ms |
+     | The bridge keeps four 128 KiB transfers in flight (usb.rs `send_queued`, `recv_queued`) | 271 ms | 107 ms |
+     | The driver arms the next 512 KiB run in a second buffer before decoding the last | 240 ms | 107 ms |
+     | BLAKE3 and `ferros_pt` built for speed in the bridge's dev builds (Cargo.toml) | 100 ms | 108 ms |
+
+     About 20 MB/s each way. A 2 MiB vault round trip is now put 0.38 s (the kernel's seal and write 265 ms of it) and get 0.19 s; the kernel's own USB took 0.56 s and 0.78 s. What is left in: the driver's CPU, 78 ms per 2 MiB (per-chunk BLAKE3 and the copies).
    - **[done] init starts it.** It runs from the vault capsule `usb`, with init's slots 86-90 (registers, DMA, interrupt, PT commands, power), and `diag "restart usb"` starts it again. Slot b carries this kernel since 2026-10-31. A cold boot comes up with the process serving USB (`KERNEL_USB=0`), the kernel's own USB only until init starts it. The dev switch is the vault itself: with no `usb` capsule, the kernel keeps USB; a driver that fails gives the controller back.
    - **[done] Interrupt wake-ups.** With no event in a pass and no reply awaited, the driver acks the controller's line and waits on it (`irq_wait`, a quarter-second deadline for its own checks) instead of sleeping 122 µs at a time. Measured: 56-65 wake-ups by the interrupt over a 2 MiB round trip, a `diag` round trip 31 ms, the wire unchanged.
    - Still to do: the controller from cold (today the kernel's `usb` switch readies the PHY).

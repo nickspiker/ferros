@@ -404,8 +404,6 @@ fn cmd_status() {
 // PT send (host→device) — unchanged from before
 // ---------------------------------------------------------------------------
 
-/// PT packets per bulk transfer, each way: 2048 (1 MiB), the run the USB process arms at once (payloads/usb `RUN_PACKETS`). The kernel's own USB takes them one packet at a time either way.
-const RUN_BYTES: usize = 1 << 20;
 
 /// Send data to the device via PT and wait for COMPLETE.
 async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
@@ -457,10 +455,10 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let pace_us: u64 = std::env::var("FERROS_PT_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    // Blast all DATA packets — no ACK wait, USB guarantees delivery. Each is padded to 512 bytes and they go out in runs of `RUN_BYTES` per bulk transfer: one host round trip per run instead of per packet (FERROS_PT_PACE_US > 0 goes back to one packet at a time, paced).
+    // Blast all DATA packets — no ACK wait, USB guarantees delivery. Each is padded to 512 bytes and they go out with several bulk transfers in flight (usb.rs `send_queued`), so the host never waits on this program between them (FERROS_PT_PACE_US > 0 goes back to one packet at a time, paced).
     let mut pkt_buf = [0u8; 512];
     let mut sent = 0u64;
-    let mut batch: Vec<u8> = Vec::with_capacity(RUN_BYTES);
+    let mut batch: Vec<u8> = Vec::with_capacity(data.len() / 477 * 512 + 1024);
 
     while !xfer.all_sent() {
         let pkt_len = xfer.next_data_packet(data, &mut pkt_buf);
@@ -472,11 +470,6 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
             let at = batch.len();
             batch.extend_from_slice(&pkt_buf[..pkt_len]);
             batch.resize(at + 512, 0);
-            if batch.len() == RUN_BYTES || xfer.all_sent() {
-                link.send_packets(core::mem::replace(&mut batch, Vec::with_capacity(RUN_BYTES)))
-                    .await
-                    .map_err(|e| format!("DATA send failed by pkt {sent}: {e}"))?;
-            }
             continue;
         }
 
@@ -490,7 +483,7 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     }
 
     if !batch.is_empty() {
-        link.send_packets(batch).await.map_err(|e| format!("DATA send failed by pkt {sent}: {e}"))?;
+        link.send_queued(&batch).await.map_err(|e| format!("DATA send failed: {e}"))?;
     }
     eprintln!("  {} DATA packets blasted", sent);
 
@@ -560,29 +553,24 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
     // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump. Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
     eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
 
-    // Receive the DATA blast — silent, no ACKs. The phone sends exactly `count` packets, each padded to 512 bytes, so they are read in exact runs of up to `RUN_BYTES` per bulk transfer: one host round trip per run instead of per packet. A run ends when its last packet is in; asking for more than is coming would wait for packets that never come.
+    // Receive the DATA blast — silent, no ACKs. The phone sends exactly `count` packets, each padded to 512 bytes, so they are read with several exact bulk transfers in flight (usb.rs `recv_queued`). Each ends when its last packet is in; asking for more than is coming would wait for packets that never come.
     let mut received = 0u64;
-    let mut left = spec.count as usize;
-    while left > 0 && !xfer.all_received() {
-        let n = left.min(RUN_BYTES / 512);
-        let run = link
-            .recv_exact(n * 512)
-            .await
-            .map_err(|e| format!("DATA recv failed: {e}"))?;
-        left -= n;
-        for pkt in run.chunks(512) {
-            if !ferros_pt::is_data_packet(pkt[0]) {
-                eprintln!("  (unexpected packet during recv: {:02x})", pkt[0]);
-                continue;
-            }
-            match packet::decode_data(pkt, xfer.seq_width) {
-                Some((_sid, seq, chunk_hash, payload)) => {
-                    if xfer.handle_data(seq, &chunk_hash, payload) {
-                        received += 1;
-                    }
+    let run = link
+        .recv_queued(spec.count as usize * 512)
+        .await
+        .map_err(|e| format!("DATA recv failed: {e}"))?;
+    for pkt in run.chunks(512) {
+        if !ferros_pt::is_data_packet(pkt[0]) {
+            eprintln!("  (unexpected packet during recv: {:02x})", pkt[0]);
+            continue;
+        }
+        match packet::decode_data(pkt, xfer.seq_width) {
+            Some((_sid, seq, chunk_hash, payload)) => {
+                if xfer.handle_data(seq, &chunk_hash, payload) {
+                    received += 1;
                 }
-                None => eprintln!("  DATA decode failed"),
             }
+            None => eprintln!("  DATA decode failed"),
         }
     }
     let mut resp_buf = [0u8; 128];

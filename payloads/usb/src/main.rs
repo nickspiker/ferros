@@ -124,13 +124,15 @@ fn diag(grants: u64) -> ! {
 /// The DMA region's layout:
 /// - the controller's block;
 /// - the inbound and outbound bitmaps;
-/// - the run buffer, 1 MiB: a run of 512-byte packets as it comes in (a transfer's DATA) or goes out (a reply's SPEC and DATA), 2048 at a time;
+/// - two run buffers, 512 KiB each: runs of 512-byte packets as they come in (a transfer's DATA: one run fills while the other is decoded) or go out (a reply's SPEC and DATA, through the first), 1024 at a time;
 /// - the area, 6 MiB: a command as it is assembled and, once the kernel has it, the kernel's reply as it goes out (the host waits for one before it sends the next).
 const MEM_AT: usize = 0;
 const IN_BITMAP_AT: usize = 1 << 16;
 const OUT_BITMAP_AT: usize = 3 << 15;
+const OUT_BITMAP_LEN: usize = 1 << 15;
 const RUN_AT: usize = 1 << 20;
-const RUN_PACKETS: usize = 1 << 11;
+/// Packets in one run buffer; there are two, back to back, so the next run fills while the last is decoded.
+const RUN_PACKETS: usize = 1 << 10;
 const AREA_AT: usize = 2 << 20;
 const AREA_LEN: usize = 6 << 20;
 const PACKET: usize = 512;
@@ -160,8 +162,10 @@ fn serve(grants: u64) -> ! {
     // SAFETY: the DMA grant is this process's alone, 8 MiB, mapped Normal non-cacheable at its physical address; these regions do not overlap, and each is used by one transfer at a time.
     let area = unsafe { core::slice::from_raw_parts_mut((dma + AREA_AT) as *mut u8, AREA_LEN) } as *mut [u8];
     let in_bitmap = unsafe { core::slice::from_raw_parts_mut((dma + IN_BITMAP_AT) as *mut u64, (OUT_BITMAP_AT - IN_BITMAP_AT) / 8) } as *mut [u64];
-    let out_bitmap = unsafe { core::slice::from_raw_parts_mut((dma + OUT_BITMAP_AT) as *mut u64, (RUN_AT - OUT_BITMAP_AT) / 8) } as *mut [u64];
-    let run_buf = |n: usize| -> &'static mut [u8] { unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n * PACKET) } };
+    let out_bitmap = unsafe { core::slice::from_raw_parts_mut((dma + OUT_BITMAP_AT) as *mut u64, OUT_BITMAP_LEN / 8) } as *mut [u64];
+    // Run buffer `k` (0 or 1), as many packets as asked.
+    let run_at = |k: usize| run + k * RUN_PACKETS * PACKET;
+    let run_buf = |k: usize, n: usize| -> &'static mut [u8] { unsafe { core::slice::from_raw_parts_mut(run_at(k) as *mut u8, n * PACKET) } };
 
     if !ferros_sys::power(power, true) {
         say!(grants, "usb: the kernel kept the controller\n");
@@ -177,8 +181,9 @@ fn serve(grants: u64) -> ! {
     let mut t_init = ferros_sys::now();
     let mut inbound: Option<ferros_pt::InboundTransfer<'static>> = None;
     let mut seq_width = 0usize;
-    // The DATA packets of the inbound transfer still to come, and the run armed for them (0: the endpoint takes single packets).
-    let mut to_come = 0usize;
+    // The inbound transfer's DATA packets not yet armed for, the run buffer armed now, and how many packets it was armed for (0: the endpoint takes single packets).
+    let mut to_arm = 0usize;
+    let mut cur = 0usize;
     let mut armed_run = 0usize;
     let mut t_run = 0u64;
     let mut out: Option<Out> = None;
@@ -227,8 +232,17 @@ fn serve(grants: u64) -> ! {
             UsbEvent::TransferComplete { ep: 2 } => {
                 if armed_run > 0 {
                     let n = usb.bulk_out_received().unwrap_or(0);
+                    let done = cur;
                     armed_run = 0;
-                    packets = &run_buf(RUN_PACKETS)[..n - n % PACKET];
+                    // The next run armed into the other buffer before this one is decoded, so the host keeps sending while the CPU works.
+                    cur ^= 1;
+                    if to_arm > 0 {
+                        armed_run = to_arm.min(RUN_PACKETS);
+                        to_arm -= armed_run;
+                        usb.bulk_out_arm_at(run_at(cur), armed_run * PACKET);
+                        t_run = ferros_sys::now();
+                    }
+                    packets = &run_buf(done, RUN_PACKETS)[..n - n % PACKET];
                 } else if let Some(d) = usb.bulk_out_read() {
                     let n = d.len().min(PACKET);
                     single.0[..n].copy_from_slice(&d[..n]);
@@ -245,8 +259,6 @@ fn serve(grants: u64) -> ! {
             copy_packet(local.0.as_mut_ptr(), packets[k * PACKET..].as_ptr());
             let pkt = &local.0[..];
             if ferros_pt::is_data_packet(pkt[0]) {
-                // The host may send more DATA than its SPEC announced (external input): held at zero, or the next run would be armed for 2^64 packets.
-                to_come = to_come.saturating_sub(1);
                 let Some(x) = inbound.as_mut() else { continue };
                 let Some((_sid, seq, hash, payload)) = packet::decode_data(pkt, seq_width) else { continue };
                 x.handle_data(seq, &hash, payload);
@@ -270,7 +282,7 @@ fn serve(grants: u64) -> ! {
                 waiting = ferros_sys::pt_submit_at(pt, ferros_sys::DMA_ADDR | cmd.as_ptr() as u64, cmd.len(), false);
                 t_submit = ferros_sys::now();
                 inbound = None;
-                to_come = 0;
+                to_arm = 0;
                 if !waiting {
                     give_back(grants, power, "the kernel refused a command");
                 }
@@ -296,18 +308,19 @@ fn serve(grants: u64) -> ! {
                     let l = ack.encode(&mut b);
                     usb.bulk_in_send(&b[..l]);
                     inbound = Some(x);
-                    to_come = spec.count as usize;
+                    to_arm = spec.count as usize;
                     t_spec = ferros_sys::now();
                 }
             }
         }
 
         cpu_in += ferros_sys::now().wrapping_sub(t_cpu);
-        // The OUT endpoint after a completion: the next run of the inbound transfer's DATA, or single packets (a SPEC, a command's end).
-        if matches!(ev, UsbEvent::TransferComplete { ep: 2 }) {
-            if inbound.is_some() && to_come > 0 {
-                armed_run = to_come.min(RUN_PACKETS);
-                usb.bulk_out_arm_at(run, armed_run * PACKET);
+        // The OUT endpoint after a completion, unless a run is armed already: the first run of a transfer just acknowledged, or single packets (a SPEC, a command's end).
+        if matches!(ev, UsbEvent::TransferComplete { ep: 2 }) && armed_run == 0 {
+            if inbound.is_some() && to_arm > 0 {
+                armed_run = to_arm.min(RUN_PACKETS);
+                to_arm -= armed_run;
+                usb.bulk_out_arm_at(run_at(cur), armed_run * PACKET);
                 t_run = ferros_sys::now();
             } else {
                 usb.bulk_out_arm();
@@ -317,7 +330,7 @@ fn serve(grants: u64) -> ! {
         if armed_run > 0 && ferros_sys::now().wrapping_sub(t_run) > 2 * freq {
             armed_run = 0;
             inbound = None;
-            to_come = 0;
+            to_arm = 0;
             usb.bulk_out_arm();
         }
 

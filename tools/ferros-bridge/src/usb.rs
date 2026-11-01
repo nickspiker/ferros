@@ -5,6 +5,10 @@ const FERROS_VID: u16 = 0x1209;
 const FERROS_PID: u16 = 0x4665;
 const INTERFACE: u8 = 0;
 
+/// Bulk transfers kept in flight by the queued send and receive, and each one's size (a multiple of 512).
+const QUEUE_DEPTH: usize = 4;
+const QUEUE_PIECE: usize = 1 << 17;
+
 pub struct UsbLink {
     interface: nusb::Interface,
     ep_out: u8,
@@ -78,15 +82,43 @@ impl UsbLink {
         completion.status
     }
 
-    /// Send a run of whole 512-byte packets (`data`, a multiple of 512) in one bulk transfer: the host controller puts them on the wire one by one, and the phone takes them at its own pace (it NAKs until it is ready), whether its kernel takes one packet at a time or the USB process takes a run.
-    pub async fn send_packets(&self, data: Vec<u8>) -> Result<(), TransferError> {
-        self.interface.bulk_out(self.ep_out, data).await.status
+    /// Send whole 512-byte packets (`data`, a multiple of 512) with `QUEUE_DEPTH` bulk transfers of `QUEUE_PIECE` bytes in flight at once, so the host controller always has the next one when a transfer ends instead of waiting on this program.
+    pub async fn send_queued(&self, data: &[u8]) -> Result<(), TransferError> {
+        let mut q = self.interface.bulk_out_queue(self.ep_out);
+        let mut pieces = data.chunks(QUEUE_PIECE);
+        let mut pending = 0;
+        loop {
+            while pending < QUEUE_DEPTH {
+                let Some(p) = pieces.next() else { break };
+                q.submit(p.to_vec());
+                pending += 1;
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            q.next_complete().await.status?;
+            pending -= 1;
+        }
     }
 
-    /// Receive exactly `len` bytes (a multiple of 512): a run of whole packets in one bulk transfer, which ends when they are all in.
-    pub async fn recv_exact(&self, len: usize) -> Result<Vec<u8>, TransferError> {
-        let completion = self.interface.bulk_in(self.ep_in, RequestBuffer::new(len)).await;
-        completion.status.map(|_| completion.data)
+    /// Receive exactly `len` bytes (a multiple of 512) with `QUEUE_DEPTH` bulk transfers in flight, each an exact run of whole packets: the queue completes in order, so the pieces join in order.
+    pub async fn recv_queued(&self, len: usize) -> Result<Vec<u8>, TransferError> {
+        let mut q = self.interface.bulk_in_queue(self.ep_in);
+        let mut out = Vec::with_capacity(len);
+        let (mut asked, mut pending) = (0usize, 0usize);
+        while out.len() < len {
+            while pending < QUEUE_DEPTH && asked < len {
+                let n = (len - asked).min(QUEUE_PIECE);
+                q.submit(RequestBuffer::new(n));
+                asked += n;
+                pending += 1;
+            }
+            let c = q.next_complete().await;
+            pending -= 1;
+            c.status?;
+            out.extend_from_slice(&c.data);
+        }
+        Ok(out)
     }
 
     /// Receive data via bulk IN (up to 512 bytes).

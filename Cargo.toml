@@ -96,3 +96,17 @@ opt-level = 3
 # The attest screen's mark (tapuwae, four samples at a time): at "s" LLVM's vectoriser is off and it runs on scalar float, so it builds for speed (2026-10-29: no `.4s` ops at "s", 1850 at 3).
 [profile.release.package.ferros-payload-ahau]
 opt-level = 3
+
+# The USB driver's packet path (KERNEL-OUT.md, USB.md): per-chunk BLAKE3 and the copies around it are its CPU time, 81 ms of every 2 MiB received at "s"; built for speed, with BLAKE3 itself, wherever it is linked.
+[profile.release.package.ferros-payload-usb]
+opt-level = 3
+
+[profile.release.package.blake3]
+opt-level = 3
+
+# Host tools in dev builds: the bridge hashes and frames every PT packet, and unoptimised BLAKE3 there held a 2 MiB transfer to the phone at 240 ms against 102 ms built for speed (2026-10-31).
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.ferros_pt]
+opt-level = 3
