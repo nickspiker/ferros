@@ -241,6 +241,7 @@ fn serve(grants: u64) -> ! {
                         to_arm -= armed_run;
                         usb.bulk_out_arm_at(run_at(cur), armed_run * PACKET);
                         t_run = ferros_sys::now();
+                        ferros_sys::pt_moving(pt);
                     }
                     packets = &run_buf(done, RUN_PACKETS)[..n - n % PACKET];
                 } else if let Some(d) = usb.bulk_out_read() {
@@ -309,6 +310,8 @@ fn serve(grants: u64) -> ! {
                     usb.bulk_in_send(&b[..l]);
                     inbound = Some(x);
                     to_arm = spec.count as usize;
+                    // The cores to their active clocks while it moves: the kernel's clock policy cannot see this process's transfers otherwise.
+                    ferros_sys::pt_moving(pt);
                     t_spec = ferros_sys::now();
                 }
             }
@@ -392,6 +395,7 @@ fn serve(grants: u64) -> ! {
                         n += 1;
                     }
                     usb.bulk_in_send_at(run, n * PACKET);
+                    ferros_sys::pt_moving(pt);
                     cpu_out += ferros_sys::now().wrapping_sub(t_cpu);
                 }
             }
@@ -442,9 +446,21 @@ fn give_back(grants: u64, power: u64, why: &str) -> ! {
 #[repr(C, align(16))]
 struct Packet([u8; PACKET]);
 
-/// One 512-byte packet between the run buffer (non-cacheable) and cached memory, 16 bytes a load and a store: from non-cacheable memory every load is a round trip to DRAM, so its width is the throughput. Both pointers are 16-byte aligned (`Packet`, and the run buffer's 512-byte slots).
+/// One 512-byte packet between the run buffer (non-cacheable) and cached memory, 64 bytes a load and a store (four vector registers per instruction): from non-cacheable memory every load is a round trip to DRAM, so its width is the throughput (16-byte loads left the driver 78 ms of CPU per 2 MiB received). Both pointers are 16-byte aligned (`Packet`, and the run buffer's 512-byte slots).
 fn copy_packet(dst: *mut u8, src: *const u8) {
-    for i in 0..PACKET / 16 {
-        unsafe { core::ptr::write_volatile((dst as *mut u128).add(i), core::ptr::read_volatile((src as *const u128).add(i))) };
-    }
+    unsafe {
+        core::arch::asm!(
+            "mov {n}, #8",
+            "2:",
+            "ld1 {{v0.16b, v1.16b, v2.16b, v3.16b}}, [{s}], #64",
+            "st1 {{v0.16b, v1.16b, v2.16b, v3.16b}}, [{d}], #64",
+            "subs {n}, {n}, #1",
+            "b.ne 2b",
+            s = inout(reg) src => _,
+            d = inout(reg) dst => _,
+            n = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            options(nostack),
+        )
+    };
 }

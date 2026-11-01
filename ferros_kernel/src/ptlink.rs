@@ -141,3 +141,6 @@ pub fn reset() {
     l.busy = false;
     INBOX_FULL.store(false, Ordering::Relaxed);
 }
+
+/// When the USB process last said a transfer is moving (`SYS_PT` op 2), on the counter: the clock policy counts it as activity, as it counts the kernel's own PT transfers (service.rs `clock_policy`). Without it a transfer through the process ran at the rest clocks, the workers' cluster at 402 MHz (2026-10-31).
+pub static MOVING_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

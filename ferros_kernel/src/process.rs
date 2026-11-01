@@ -674,7 +674,7 @@ const SYS_POWER: u64 = 22;
 const SYS_IRA: u64 = 23;
 /// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the phone is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone; NOTHING: the phone is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the phone to the unlocked identity, 4 release the phone (every identity entry deleted) (0, or ERR). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
-/// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
+/// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). `ptr` is an offset in the arc, or `DMA_ADDR | address` inside a DMA region the caller holds. Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 2 says a transfer is moving (the clock policy counts it as activity) → 0. Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act and bit 33 when it gave no reply at all; NOTHING while it runs; ERR when none was handed over.
 const SYS_PT: u64 = 25;
 /// Bit 63 of a syscall's buffer argument (SYS_PT): the buffer is named by its address inside one of the caller's DMA regions, not by its offset in the arc.
 const DMA_ADDR: u64 = 1 << 63;
@@ -1499,6 +1499,13 @@ fn el0_trap(f: &mut Frame) -> u64 {
                             _ => p.read_into(at, dst),
                         };
                         if crate::ptlink::submit(len, op == 3, fill) { 0 } else { ERR }
+                    }
+                    // A transfer is moving: the clock policy's activity (ptlink.rs MOVING_AT).
+                    2 => {
+                        let t: u64;
+                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+                        crate::ptlink::MOVING_AT.store(t, core::sync::atomic::Ordering::Relaxed);
+                        0
                     }
                     1 => {
                         let put = |piece: &[u8]| match dma {

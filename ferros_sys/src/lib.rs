@@ -268,6 +268,11 @@ pub fn pt_submit_at(cap: u64, at: u64, len: usize, act: bool) -> bool {
     svc(nr::PT, cap, if act { 3 } else { 0 }, at, len as u64, 0) == 0
 }
 
+/// Say a transfer is moving: the kernel counts it as activity and runs the cores at their active clocks for the next second (the USB process calls it at each SPEC and each reply run).
+pub fn pt_moving(cap: u64) {
+    svc(nr::PT, cap, 2, 0, 0, 0);
+}
+
 /// The kernel's reply to the command handed over.
 pub enum PtReply {
     /// Still running.

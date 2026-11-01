@@ -948,6 +948,9 @@ fn clock_policy(pt_busy: bool, booted_for: u64) {
         return;
     }
     let input = crate::process::INPUT_AT.load(core::sync::atomic::Ordering::Relaxed);
+    // A PT transfer moving: the kernel's own, or one the USB process carries (it says so: ptlink.rs MOVING_AT).
+    let moving = crate::ptlink::MOVING_AT.load(core::sync::atomic::Ordering::Relaxed);
+    let pt_busy = pt_busy || (moving != 0 && now.wrapping_sub(moving) < f / 16);
     let active = pt_busy || (input != 0 && now.wrapping_sub(input) < f);
     if pt_busy {
         unsafe { PT_BUSY_AT = now };
