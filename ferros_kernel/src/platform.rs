@@ -198,6 +198,7 @@ pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
 /// PMU SYSIP_DAT0 (pmu_alive G#1546_0000 + reboot-cmd-offset G#810): the reboot mode the bootloader reads after a reset. Values from pixel-zuma-reboot.c: G#FC bootloader, G#FA fastbootd, G#FF recovery, 0 normal.
 pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
 pub const REBOOT_MODE_BOOTLOADER: u32 = 0xFC;
+pub const REBOOT_MODE_RECOVERY: u32 = 0xFF;
 
 /// Debug-snapshot (DSS) header, reserved-memory `header` node (G#D810_0000, 64 KiB, no-map). Offsets from debug-snapshot-def.h. The bootloader reads it to classify the last reset: Linux's clean-reboot path (dbg_snapshot_restart_handler) stamps EMERGENCY_REASON = DSS_SIGN_NORMAL_REBOOT, clears SCRATCH and every core's PANIC_STAT. Without that stamp the bootloader logs an unexpected "PIN Reset" (reason G#CECA) and boots normally with the reboot mode ignored — measured on hardware: mode G#FC written via EL3, bootloader read "Reboot mode: 0x0".
 pub const DSS_HEADER: usize = 0xD810_0000;
@@ -242,9 +243,14 @@ pub fn reboot() -> ! {
 }
 
 pub fn reboot_to_bootloader() -> u64 {
+    reboot_to_mode(REBOOT_MODE_BOOTLOADER)
+}
+
+/// As `reboot_to_bootloader`, into the given reboot mode (PMU_REBOOT_CMD's word: REBOOT_MODE_BOOTLOADER, REBOOT_MODE_RECOVERY).
+pub fn reboot_to_mode(mode: u32) -> u64 {
     before_reset();
     dss_mark_clean_reboot();
-    let r = priv_reg(PMU_REBOOT_CMD, true, REBOOT_MODE_BOOTLOADER);
+    let r = priv_reg(PMU_REBOOT_CMD, true, mode);
     if r != 0 {
         return r;
     }

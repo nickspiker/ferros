@@ -965,7 +965,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         report(0x200 + core * 8, 0);
     }
     // The boot gate (gate.rs): with a ferros image packed in this boot image, ask before Linux runs; ABL has already done everything Android needs, including the secure world's boot state.
-    if gate::ask() == gate::Choice::Ferros {
+    if gate::ask(dtb as usize) == gate::Choice::Ferros {
         pstore::log(&[b"\nferros hv: gate -- ferros\n"]);
         gate::start_ferros(dtb);
     }

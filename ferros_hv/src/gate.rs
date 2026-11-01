@@ -41,6 +41,9 @@ pub const GATE_MARK: u64 = 0x4741_5445_464F_5252; // "GATEFORR"
 /// In the ramoops result block, the end of its first page (the hv report page at G#A_FFFF_0000 does not survive a PSCI reset; this block does, measured 2026-10-21): ferros's `diag android` leaves this word before resetting, so the next gate answers "Android" by itself, once, with the screen untouched: the host can switch between the two without anyone at the keys.
 pub const ANDROID_ONCE_ADDR: usize = 0xFD60_0FF8;
 pub const ANDROID_ONCE: u64 = 0x414E_4452_4F49_4431; // "ANDROID1"
+/// The word before it: ferros asked for a recovery boot (`diag recovery`; later its attest-gated setting). Without it a recovery boot (Android's sideload and rescue, the way round the reflash lock) goes to ferros instead (owner, 2026-11-01: no reflash without the handle). Taken once, as ANDROID_ONCE is.
+pub const RECOVERY_ONCE_ADDR: usize = 0xFD60_0FF0;
+pub const RECOVERY_ONCE: u64 = 0x5245_434F_5645_5231; // "RECOVER1"
 /// Where ABL's splash pixels wait while the gate is on screen: inside the hv's own reservation, above its code and stacks.
 const SPLASH_SAVE: usize = 0xA_FD00_0000;
 const SPLASH_SAVE_MAX: usize = 0x200_0000;
@@ -298,10 +301,21 @@ fn vol_up() -> bool {
     rd(GPA6_DAT) & (1 << VOL_UP_PIN) == 0
 }
 
-/// Ask. Without a packed ferros image there is nothing to choose: Android, screen untouched.
-pub fn ask() -> Choice {
+/// Ask. Without a packed ferros image there is nothing to choose: Android, screen untouched. A recovery boot is not asked: Android's recovery only when ferros left RECOVERY_ONCE, else ferros (telemetry how = 4).
+pub fn ask(dtb: usize) -> Choice {
     if ferros_image().is_none() {
         return Choice::Android;
+    }
+    if recovery(dtb) {
+        unsafe {
+            if read_volatile(RECOVERY_ONCE_ADDR as *const u64) == RECOVERY_ONCE {
+                write_volatile(RECOVERY_ONCE_ADDR as *mut u64, 0);
+                asm!("dsb sy");
+                return Choice::Android;
+            }
+        }
+        gate_telemetry(4, 0, 0);
+        return Choice::Ferros;
     }
     unsafe {
         if read_volatile(ANDROID_ONCE_ADDR as *const u64) == ANDROID_ONCE {
@@ -376,11 +390,11 @@ pub fn ask() -> Choice {
     choice
 }
 
-/// Android from whichever slot this gate is on. Only slot a holds an Android (slot b's own system partitions are stock or empty), and ABL names the booted slot to the kernel in bootconfig, `androidboot.slot_suffix = "_b"`, the blob at the end of the initrd (data, LE u32 size, LE u32 byte-sum checksum, "#BOOTCONFIG\n"). Rewrite the suffix to `_a` there and lower the checksum by one, so Android mounts slot a's partitions and the choice is a jump, not a slot switch and a reboot (owner, 2026-10-23: identical slots, no flags). The initrd bounds come from the DTB's /chosen. Returns whether a suffix was rewritten (already `_a`, or nothing found: untouched).
-pub fn android_from_slot_a(dtb: usize) -> bool {
+/// ABL's bootconfig in the initrd it loaded: (its text's address, its length, its checksum's address), found through the DTB's /chosen linux,initrd-start and -end and the trailer bootconfig ends with (size, checksum, `#BOOTCONFIG\n`). None when there is none or it does not add up.
+fn bootconfig(dtb: usize) -> Option<(usize, usize, usize)> {
     let be32 = |a: usize| u32::from_be_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
     if be32(dtb) != 0xD00D_FEED {
-        return false;
+        return None;
     }
     let (off_struct, off_strings, size_struct) = (be32(dtb + 8) as usize, be32(dtb + 12) as usize, be32(dtb + 36) as usize);
     let strings = dtb + off_strings;
@@ -437,19 +451,33 @@ pub fn android_from_slot_a(dtb: usize) -> bool {
         }
     }
     if start == 0 || stop <= start + 20 {
-        return false;
+        return None;
     }
     let foot = stop as usize - 12;
     if !name_is_n(foot, b"#BOOTCONFIG\n") {
-        return false;
+        return None;
     }
     let le32 = |a: usize| u32::from_le_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
     let size = le32(foot - 8) as usize;
     let csum_at = foot - 4;
     if size == 0 || size > stop as usize - start as usize {
-        return false;
+        return None;
     }
     let data = foot - 8 - size;
+    Some((data, size, csum_at))
+}
+
+/// A recovery boot (measured on husky 2026-11-01: a normal boot's bootconfig carries `androidboot.force_normal_boot=1`; `fastboot reboot recovery` drops it and adds `androidboot.mode=recovery`). Without a bootconfig to read, or with either sign of recovery, it counts as one: the gate's answer is then ferros, unless ferros asked for recovery (`RECOVERY_ONCE`).
+fn recovery(dtb: usize) -> bool {
+    let Some((data, size, _)) = bootconfig(dtb) else { return true };
+    let has = |key: &[u8]| (data..data + size).any(|at| at + key.len() <= data + size && name_is_n(at, key));
+    !has(b"androidboot.force_normal_boot") || has(b"androidboot.mode:=recovery") || has(b"androidboot.mode=recovery") || has(b"androidboot.mode = \"recovery\"")
+}
+
+/// Android from whichever slot this gate is on. Only slot a holds an Android (slot b's own system partitions are stock or empty), and ABL names the booted slot to the kernel in bootconfig, `androidboot.slot_suffix = "_b"`, the blob at the end of the initrd (data, LE u32 size, LE u32 byte-sum checksum, "#BOOTCONFIG\n"). Rewrite the suffix to `_a` there and lower the checksum by one, so Android mounts slot a's partitions and the choice is a jump, not a slot switch and a reboot (owner, 2026-10-23: identical slots, no flags). The initrd bounds come from the DTB's /chosen. Returns whether a suffix was rewritten (already `_a`, or nothing found: untouched).
+pub fn android_from_slot_a(dtb: usize) -> bool {
+    let Some((data, size, csum_at)) = bootconfig(dtb) else { return false };
+    let le32 = |a: usize| u32::from_le_bytes(unsafe { read_volatile(a as *const [u8; 4]) });
     // Every assignment of slot b, in each form bootconfig allows. ABL writes the override form, `androidboot.slot_suffix:=_b`, after an `_a` from vendor_boot's own bootconfig, and the last assignment wins (read from RAM after an Android boot, 2026-10-28: the gate had matched only `= "_b"`, so Android launched from slot b ran on slot b's partitions). The `_b` is the key's last byte but one or its last byte.
     let keys: [(&[u8], usize); 3] = [(b"androidboot.slot_suffix = \"_b\"", 2), (b"androidboot.slot_suffix:=_b", 1), (b"androidboot.slot_suffix=_b", 1)];
     let mut rewritten = 0u32;

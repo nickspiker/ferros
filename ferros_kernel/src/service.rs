@@ -1239,6 +1239,24 @@ pub fn run(mut b: Boot) -> ! {
                     }
                     continue;
                 }
+                if cmd.params == b"recovery" {
+                    // `diag recovery`: Android's recovery, once. The gate refuses a recovery boot unless this word is there (ferros_hv gate.rs RECOVERY_ONCE: no reflash without the handle, owner 2026-11-01); ferros leaves it, cleaned to DRAM, then resets into the bootloader's recovery mode. A development door for now; the attest-gated setting comes with the UI.
+                    if from_proc && !pt_act {
+                        queue_pt_response(&mut pt_out_data, b"recovery: resetting into recovery once this reply is out\n");
+                        proc_act = true;
+                        continue;
+                    }
+                    unsafe {
+                        let p = 0xFD60_0FF0usize as *mut u64;
+                        core::ptr::write_volatile(p, 0x5245_434F_5645_5231);
+                        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+                    }
+                    platform::crumb(0xC7);
+                    let r = platform::reboot_to_mode(platform::REBOOT_MODE_RECOVERY);
+                    resp.extend_from_slice(alloc::format!("recovery: the EL3 monitor refused the reboot mode ({r})\n").as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"devinfo" {
                     // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
                     let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
