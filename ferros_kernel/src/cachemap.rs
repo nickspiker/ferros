@@ -22,6 +22,8 @@ static mut L1: Table = Table([0; 512]);
 static mut L2: Table = Table([0; 512]);
 /// The level-2 table for the GiB above the window's (G#C000_0000-G#FFFF_FFFF): every 2 MiB block Device, as the 1 GiB block was, except the surfaces, sprites and canvas.
 static mut L2_HI: Table = Table([0; 512]);
+/// Level 2 for the first GiB (the MMIO below the window): Device blocks, EL2-only, except the USB controller's block, which EL0 may reach (`USB_REGS`).
+static mut L2_LO: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
 /// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 16 MiB = 8 blocks, the shim pool 2 MiB = 1.
 static mut POOL_L3: [Table; 8] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
@@ -64,6 +66,13 @@ pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
 
 /// The cellular modem's shared memory, EL0-accessible Device memory for its driver process (process.rs DMA `modem-pktproc`, `modem-ipc`, `modem-msi`; zuma-rmem.dtsi carveouts): pktproc's rings and packet buffers (32 MiB), the IPC region (legacy rings, handover block, ROM image; 4 MiB), the MSI and boot-register page. Device, as the kernel's own view of them: the CP writes them over PCIe and no cache line may hide that. 2 MiB aligned, in the GiB above the window.
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
+/// The USB controller's registers (DWC3, G#1121_0000, 64 KiB), EL0 Device memory for the USB driver process (USB.md: USB out of the kernel), its 2 MiB block mapped as the modem's windows are: nothing else lives in G#1120_0000-G#1140_0000 (zuma device tree). Granted as `usb-regs`.
+pub const USB_REGS: (usize, usize) = (0x1120_0000, 0x1140_0000);
+/// The USB driver's DMA memory (cold only): 2 MiB of Normal non-cacheable, EL0 read/write memory for the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem and the receive ring). Free per the device tree: above the camera's diagnostic buffers (which end at G#8B10_0000), below the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
+#[cfg(not(shim_handoff))]
+pub const USB_DMA: (usize, usize) = (0x8B20_0000, 0x8B40_0000);
+#[cfg(shim_handoff)]
+pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
 pub const POOL_BIG: (usize, usize) = (0, 0);
 
@@ -216,12 +225,19 @@ pub fn enable() -> bool {
         for (i, e) in l1.0.iter_mut().enumerate() {
             *e = device(vhe, i * GIB, BLOCK);
         }
+        // The first GiB at 2 MiB granularity, so the USB controller's block can be EL0's and every other MMIO block stays the kernel's.
+        let l2lo = &mut *(&raw mut L2_LO);
+        for (j, e) in l2lo.0.iter_mut().enumerate() {
+            let a = j * MIB2;
+            *e = if a >= USB_REGS.0 && a + MIB2 <= USB_REGS.1 { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
+        }
+        l1.0[0] = &raw const L2_LO as u64 | TABLE_OR_PAGE;
         let gib = w0 / GIB * GIB;
         l1.0[w0 / GIB] = &raw const L2 as u64 | TABLE_OR_PAGE;
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) {
+            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.1) {
                 dma_pool(vhe, a, BLOCK)
             } else if h0 != h1 && a >= h0 && a + MIB2 <= h1 {
                 pool(vhe, a, BLOCK) | UXN

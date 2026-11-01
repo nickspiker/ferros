@@ -667,6 +667,8 @@ pub static IRQS: &[IrqLine] = &[
     IrqLine { name: "decon0-frame-start", intid: IRQ_DECON0_FRAME_START },
     // The GNSS chip's HOST_REQ ("I have data"): gpa5-3, EINT53 in the far-alive bank, its own line (zuma.h IRQ_ALIVE_EINT53 = SPI 63), level high.
     IrqLine { name: "gnss-host-req", intid: 32 + 63 },
+    // The USB controller (DWC3): zuma IRQ_USB32DRD_GIC_0_HSI0, SPI 402, level high.
+    IrqLine { name: "usb-dwc3", intid: 32 + 402 },
 ];
 /// Set by `.Lirq` with any pending byte (and a `sev`), cleared when `wake_sleepers` has looked: an idle core looks for interrupt waiters only when this says so.
 #[unsafe(no_mangle)]
@@ -883,6 +885,9 @@ pub static DMA: &[Dma] = &[
     Dma { name: "modem-ipc", base: crate::cachemap::MODEM_WINDOWS[1].0, size: crate::cachemap::MODEM_WINDOWS[1].1 - crate::cachemap::MODEM_WINDOWS[1].0 },
     Dma { name: "modem-msi", base: crate::cachemap::MODEM_WINDOWS[2].0, size: crate::cachemap::MODEM_WINDOWS[2].1 - crate::cachemap::MODEM_WINDOWS[2].0 },
     Dma { name: "pcie1-dma", base: crate::cachemap::DMA_POOL.0, size: crate::cachemap::DMA_POOL.1 - crate::cachemap::DMA_POOL.0 },
+    // The USB driver process (USB.md): the controller's registers, mapped for EL0 (Device), and its non-cacheable DMA memory.
+    Dma { name: "usb-regs", base: 0x1121_0000, size: 0x1_0000 },
+    Dma { name: "usb-dma", base: crate::cachemap::USB_DMA.0, size: crate::cachemap::USB_DMA.1 - crate::cachemap::USB_DMA.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },

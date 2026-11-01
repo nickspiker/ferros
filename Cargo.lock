@@ -1118,6 +1118,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-usb"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-usbprobe"
 version = "0.1.0"
 
