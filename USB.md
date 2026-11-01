@@ -45,7 +45,8 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
 
      Next suspects: the host keeping only one transfer in flight, and the endpoint's burst setting.
    - **[done] init starts it.** It runs from the vault capsule `usb`, with init's slots 86-90 (registers, DMA, interrupt, PT commands, power), and `diag "restart usb"` starts it again. Slot b carries this kernel since 2026-10-31. A cold boot comes up with the process serving USB (`KERNEL_USB=0`), the kernel's own USB only until init starts it. The dev switch is the vault itself: with no `usb` capsule, the kernel keeps USB; a driver that fails gives the controller back.
-   - Still to do: interrupt wake-ups instead of the 122 µs idle sleep; the controller from cold (today the kernel's `usb` switch readies the PHY).
+   - **[done] Interrupt wake-ups.** With no event in a pass and no reply awaited, the driver acks the controller's line and waits on it (`irq_wait`, a quarter-second deadline for its own checks) instead of sleeping 122 µs at a time. Measured: 56-65 wake-ups by the interrupt over a 2 MiB round trip, a `diag` round trip 31 ms, the wire unchanged.
+   - Still to do: the controller from cold (today the kernel's `usb` switch readies the PHY).
    - Hazard: a hot reload issued 8 s into a fresh boot left the new kernel hung with the kernel lock held by a worker core (PREV_NOTE_0 = 8). The same reload a minute later was fine. Not yet explained; probably the AoC/Trusty start still running.
 5. **Switch over.** init starts the driver, the kernel stops touching the controller, and the kernel's USB code goes: the event loop, the watchdogs, the gate's host answer and the PT receive. Then the commands move out one at a time, the store first since it is already a clean bytes-to-bytes function.
 

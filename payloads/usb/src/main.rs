@@ -24,6 +24,7 @@ static NO_ALLOC: NoAlloc = NoAlloc;
 const S_REGS: u64 = 1;
 const S_DMA: u64 = 2;
 const S_PT: u64 = 4;
+const S_IRQ: u64 = 3;
 const S_POWER: u64 = 5;
 
 /// GSNPSID: the controller's ID and release (G#5533xxxx for a DWC_usb3).
@@ -152,6 +153,9 @@ fn serve(grants: u64) -> ! {
     let dma = ferros_sys::dma(cap(grants, S_DMA)) as usize;
     let pt = cap(grants, S_PT);
     let power = cap(grants, S_POWER);
+    let irq = cap(grants, S_IRQ);
+    // Wake-ups by the interrupt (the rest are the quarter-second deadline), for the console line.
+    let mut irq_wakes = 0u64;
     let run = dma + RUN_AT;
     // SAFETY: the DMA grant is this process's alone, 8 MiB, mapped Normal non-cacheable at its physical address; these regions do not overlap, and each is used by one transfer at a time.
     let area = unsafe { core::slice::from_raw_parts_mut((dma + AREA_AT) as *mut u8, AREA_LEN) } as *mut [u8];
@@ -352,7 +356,7 @@ fn serve(grants: u64) -> ! {
                     // Where a large command's time went (USB.md step 4 measurements), into the console: receiving it, the kernel, sending the reply.
                     if reply_len >= 1 << 16 || t_whole.wrapping_sub(t_spec) > freq / 64 {
                         let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / freq;
-                        say!(grants, "usb: in A#{} us (CPU A#{} us), kernel A#{} us, reply A#{} bytes out in A#{} us (CPU A#{} us)\n", us(t_spec, t_whole), us(0, cpu_in), us(t_submit, t_reply), reply_len, us(t_reply, ferros_sys::now()), us(0, cpu_out));
+                        say!(grants, "usb: in A#{} us (CPU A#{} us), kernel A#{} us, reply A#{} bytes out in A#{} us (CPU A#{} us); interrupt wake-ups A#{}\n", us(t_spec, t_whole), us(0, cpu_in), us(t_submit, t_reply), reply_len, us(t_reply, ferros_sys::now()), us(0, cpu_out), irq_wakes);
                         (cpu_in, cpu_out) = (0, 0);
                     }
                 } else {
@@ -404,9 +408,12 @@ fn serve(grants: u64) -> ! {
             t_init = ferros_sys::now();
         }
 
-        // Nothing moving: sleep a little (an eighth of a millisecond) instead of spinning a core.
-        if idle && inbound.is_none() && out.is_none() && !waiting {
-            ferros_sys::sleep_until(ferros_sys::now() + freq / 8192);
+        // No event this pass and no reply awaited: sleep until the controller interrupts (a packet, a finished run, a reply sent, the host) or a quarter second passes for the checks above. The events just drained have lowered the line (the HAL writes their count back), so it is unmasked first; one that came since raises it again at once.
+        if idle && !waiting {
+            ferros_sys::irq_ack(irq);
+            if ferros_sys::irq_wait(irq, ferros_sys::now() + freq / 4) == 0 {
+                irq_wakes += 1;
+            }
         }
     }
 }
