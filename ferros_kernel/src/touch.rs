@@ -268,6 +268,30 @@ fn rail_on(reg: u32, vsel: u8) -> Result<u8, u32> {
     acpm::read(acpm::MAIN, acpm::T_PMIC, reg)
 }
 
+/// The `touch` power switch (process.rs POWERS; KERNEL-OUT.md move 1): what only the kernel may do for the touch controller, in `fts_chip_powercycle`'s order — the SPI port's clocks and mode (the HSI0 CMU, USI2's mode word), the reset line held low, DVDD, 1 ms, AVDD, 15 ms, reset high. The touch process then waits for the controller-ready event and sets it scanning (payloads/touch). Off: reset low, both rails off. False when the port's clock path stays gated or a rail fails.
+pub fn power(on: bool) -> bool {
+    if !on {
+        let mut rep = Vec::new();
+        off(&mut rep);
+        return true;
+    }
+    spi_up();
+    if !spi_clocked() {
+        return false;
+    }
+    set_reset(false);
+    if rail_on(L25M_CTRL, L25M_1V8).is_err() {
+        return false;
+    }
+    spin_us(1000);
+    if rail_on(L4M_CTRL, L4M_3V3).is_err() {
+        return false;
+    }
+    spin_us(15_000);
+    set_reset(true);
+    true
+}
+
 /// Bring the touch controller up from a cold boot: SPI controller, then `fts_chip_powercycle` (reset low, DVDD, 1 ms, AVDD, 15 ms, reset high), then the probe's order from the capture: controller-ready event, the GPIO6 fix-up (`FTS_GPIO6_UNUSED`), chip ID, scan mode active with all sensing on.
 pub fn up(rep: &mut Vec<u8>) {
     spi_up();

@@ -478,6 +478,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Unlock,
         // The USB driver (payloads/usb, USB.md): 86 the controller's registers, 87 its DMA memory, 88 its interrupt, 89 the kernel's PT commands, 90 the `usb` power switch (the controller from the kernel).
         Dma(b"usb-regs"), Dma(b"usb-dma"), Irq(b"usb-dwc3"), Pt, Power(b"usb"),
+        // 91 the touch controller's power (clocks, rails, reset: touch.rs `power`); the touch process brings the controller up with it.
+        Power(b"touch"),
     ]
 }
 
@@ -486,7 +488,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27],
-        b"touch" => &[14, 15, 16, 23],
+        b"touch" => &[14, 15, 16, 23, 91],
         b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
@@ -578,8 +580,7 @@ fn start_home(store: &mut Option<ShimStore>) -> bool {
         crate::process::push_console(&rep);
         rep.clear();
     }
-    crate::touch::up(&mut rep);
-    crate::checklist::at("home: touch up");
+    // The touch controller is the touch process's to bring up (its `touch` power switch, then the ready event and scan mode: payloads/touch; KERNEL-OUT.md move 1).
     match crate::process::spawn_capsule(b"init", &capsule, b"", &home_grants(), &sealed) {
         Ok(o) => {
             mark_ran(&o);

@@ -1,9 +1,9 @@
 //! The touch server: an EL0 process that reads the ST FTM5 touch controller over the HSI0 USI2 SPI port and serves contacts on the `touch` endpoint.
 //!
-//! The kernel brings the controller up before this process is spawned — rails over ACPM, reset, the scan-mode command (`touch::up`, docs/oracle/TOUCH.md) — so nothing here needs a privileged path. From then on the port is driven exactly as the kernel drove it: CPU mode, byte transfers, every transfer inside the 64-byte FIFO, through one MMIO capability. The controller's interrupt line is read as a GPIO *level* rather than taken as an interrupt, because EL0 has no interrupt capability on ferros today and every EL0 driver polls (payloads/pcie1, the WiFi driver). A level read costs one syscall and the queue holds events until drained, so polling loses nothing but latency.
+//! It brings the controller up itself (KERNEL-OUT.md move 1): the `touch` power switch does what only the kernel may — the port's clocks, the rails over ACPM, the reset (`fts_chip_powercycle`'s order) — and then this process waits for the controller-ready event, applies the GPIO6 fix-up, and sets scan mode, the probe's order (docs/oracle/TOUCH.md). From then on the port is driven exactly as the kernel drove it: CPU mode, byte transfers, every transfer inside the 64-byte FIFO, through one MMIO capability. The controller's interrupt line is read as a GPIO *level* rather than taken as an interrupt, because EL0 has no interrupt capability on ferros today and every EL0 driver polls (payloads/pcie1, the WiFi driver). A level read costs one syscall and the queue holds events until drained, so polling loses nothing but latency.
 //!
-//! Spawn: ferros-bridge spawn touch.bin 00 --name touch --serve touch --hw usi2-spi --hw gpio-gpn0
-//! Grant slots, in that order: 0 console, 1 the `touch` endpoint (serve), 2 the SPI port, 3 the GPIO bank with the interrupt line.
+//! Spawn: ferros-bridge spawn touch.bin 00 --name touch --serve touch --hw usi2-spi --hw gpio-gpn0 --irq touch-int --power touch
+//! Grant slots, in that order: 0 console, 1 the `touch` endpoint (serve), 2 the SPI port, 3 the GPIO bank with the interrupt line, 4 the interrupt, 5 the `touch` power switch.
 //!
 //! The `touch` endpoint. One op per call, first byte the op, and a contact record is 12 bytes:
 //! `id u8`, `phase u8` (0 enter, 1 move, 2 leave), `kind u8` (the controller's touch type — finger, glove, stylus, palm), `pressure u8` (A#0-255, the controller's own scale, passed through unscaled), `x u16 LE`, `y u16 LE`, `major u16 LE`, `minor u16 LE`. Coordinates are panel pixels, the same space the `display` endpoint takes and fluor hit-tests in, so nothing converts anywhere.
@@ -23,6 +23,8 @@ const S_SPI: u64 = 2;
 const S_GPIO: u64 = 3;
 /// The controller's interrupt line (kernel `touch-int`, gpn0-0): the loop waits on it instead of polling the pin.
 const S_IRQ: u64 = 4;
+/// The `touch` power switch: clocks, rails and reset (the kernel's touch.rs `power`).
+const S_POWER: u64 = 5;
 
 // The s3c64xx SPI registers, offsets from the port's base (ferros_kernel/src/spi.rs).
 const CH_CFG: u64 = 0x00;
@@ -49,8 +51,13 @@ const EINT_PEND: u64 = 0xA00;
 
 /// FTM5 commands (docs/oracle/TOUCH.md).
 const FIFO_READ: u8 = 0x87;
+/// Hardware-register read and write (32-bit address, big-endian; a read returns one dummy byte first) and the scan-mode command (ftsHardware.h, SPI variant).
+const HW_REG_R: u8 = 0xFB;
+const HW_REG_W: u8 = 0xFA;
+const SCAN_MODE: u8 = 0xA0;
 const EVT_SIZE: usize = 8;
 /// Event identifiers are the HIGH NIBBLE of byte zero alone: the low nibble is payload, carrying the top two bits of the major axis.
+const EVT_CONTROLLER_READY: u8 = 0x0;
 const EVT_ENTER: u8 = 0x1;
 const EVT_MOTION: u8 = 0x2;
 const EVT_LEAVE: u8 = 0x3;
@@ -219,10 +226,74 @@ fn decode(e: &[u8; EVT_SIZE], phase: u8) -> Contact {
     }
 }
 
+/// One line to the console, formatted without a heap.
+struct Line {
+    b: [u8; 160],
+    n: usize,
+}
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let k = s.len().min(self.b.len() - self.n);
+        self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+        self.n += k;
+        Ok(())
+    }
+}
+macro_rules! say {
+    ($g:expr, $($t:tt)*) => {{
+        let mut l = Line { b: [0; 160], n: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut l, format_args!($($t)*));
+        console($g, &l.b[..l.n]);
+    }};
+}
+
+/// Bring the controller up from cold, as the kernel's `touch::up` did until KERNEL-OUT.md move 1: the `touch` power switch (the port's clocks, reset low, DVDD, 1 ms, AVDD, 15 ms, reset high), then the probe's order from the oracle capture — the controller-ready event (up to 2 s), the GPIO6 fix-up (`FTS_GPIO6_UNUSED`: bit 7 of hardware register G#2000_00DE), the chip ID, and scan mode active with every sensing bit on (`A0 00 FF`, after the two-byte zero write to G#2000_0000 the controller needs before a mode change). Each step goes to the console; a step that fails is said and the rest still run, as the kernel's did.
+fn bring_up(p: &Port, grants: u64) {
+    if !ferros_sys::power(cap(grants, S_POWER), true) {
+        console(grants, b"touch: the power switch failed (port clock gated, or a rail)\n");
+        return;
+    }
+    let t0 = now();
+    let mut ready = false;
+    while now().wrapping_sub(t0) < 2 * freq() {
+        let mut b = [0u8; 1 + EVT_SIZE];
+        if !p.transact(&[FIFO_READ], &mut b) {
+            console(grants, b"touch: SPI transfer failed waiting for the controller\n");
+            return;
+        }
+        // An empty FIFO reads as all zeroes or all ones; zero shares its high nibble with controller-ready, so nothing-pending is ruled out first.
+        if b[1] == 0x00 || b[1] == 0xFF {
+            delay_us(4000);
+        } else if b[1] >> 4 == EVT_CONTROLLER_READY {
+            ready = true;
+            break;
+        }
+    }
+    let ms = now().wrapping_sub(t0) * 1000 / freq();
+    if !ready {
+        say!(grants, "touch: no controller-ready event in 2 s\n");
+        return;
+    }
+    say!(grants, "touch: controller ready after A#{ms} ms\n");
+    let mut g = [0u8; 2];
+    if p.transact(&[HW_REG_R, 0x20, 0x00, 0x00, 0xDE], &mut g) && p.transact(&[HW_REG_W, 0x20, 0x00, 0x00, 0xDE, g[1] | 0x80], &mut []) {
+        say!(grants, "touch: GPIO6 register G#{:02X} -> G#{:02X}\n", g[1], g[1] | 0x80);
+    }
+    let mut id = [0u8; 9];
+    if p.transact(&[HW_REG_R, 0x20, 0x00, 0x00, 0x00], &mut id) {
+        say!(grants, "touch: chip ID G#{:02X}{:02X}, fw G#{:02X}{:02X}\n", id[1], id[2], id[6], id[5]);
+    }
+    let scanning = p.transact(&[HW_REG_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], &mut []) && p.transact(&[SCAN_MODE, 0x00, 0xFF], &mut []);
+    say!(grants, "touch: scan mode {}\n", if scanning { "set" } else { "failed" });
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+    // The bring-up's console lines format through tables of absolute addresses: apply the payload's relocations first.
+    unsafe { ferros_sys::relocate() };
     let p = Port { grants };
+    bring_up(&p, grants);
     console(grants, b"touch: serving the touch endpoint\n");
     // What is on the glass, and what has happened since the client last asked.
     let mut held = [Contact::default(); SLOTS];

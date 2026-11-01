@@ -1070,7 +1070,7 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "dpu-sysreg", base: 0x1942_1000, size: 0x1000, via_el3: false },
     Hw { name: "gpio-gpp0", base: 0x1084_0000, size: 0x1000, via_el3: false },
     // The touch controller (docs/oracle/TOUCH.md): the HSI0 USI2 SPI port it answers on, and the GPIO bank carrying its interrupt line (gpn0 pin 0, read as a level).
-    // Its clocks, rails and reset are not here on purpose: the kernel's `touch::up` does those (ACPM and the HSI0 CMU), so the server never needs a privileged path.
+    // Its clocks, rails and reset are not here on purpose: they are the `touch` power switch (`POWERS`, touch.rs `power`: ACPM and the HSI0 CMU).
     Hw { name: "usi2-spi", base: 0x111D_0000, size: 0x1000, via_el3: false },
     Hw { name: "gpio-gpn0", base: 0x1506_0000, size: 0x1000, via_el3: false },
     // The GNSS chip (GNSS.md): HSI0 USI3's SPI port (spi_21). Its lines are in banks already above: HOST_REQ in gpio-far-alive (gpa5), MCU_REQ in gpio-gpp0 (gpp4, +G#80), MCU_RESP and nSTANDBY in gpio-hsi2 (gph3). Rails, clocks and pin modes are the kernel's (`POWERS`).
@@ -1086,7 +1086,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
