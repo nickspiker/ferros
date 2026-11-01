@@ -1773,6 +1773,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if option_env!("FERROS_X3") != Some("0") {
         x3::launch();
     }
+    // The firmware TRNG's words for the wairua's KOHI, gathered on worker 3 while this core boots (kohi.rs `start_early`): its 329 ms of SMCs ran in front of the first process (2026-11-01).
+    if cached {
+        kohi::start_early();
+    }
 
     // The previous session's report (ramoops DRAM survives warm resets), then the safety nets: fault sink + panic reporter into the report block, cluster watchdogs.
     let prev = platform::read_report();
@@ -1836,8 +1840,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     checklist::at("checklist drawn");
     // The board's CDT and MLB for the sensor registry scripts (sensorlink.rs, SYS_SENSORS op 1), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
     if real_boot {
-        sensorlink::read_board(dtb_addr);
-        modem::read_board(dtb_addr);
+        // ABL's device tree lies outside the cached window (cachemap.rs: Device memory there), so every byte the walks read was a bus round trip: 554 ms for the two (2026-11-01). One copy into cached memory, eight bytes a load, then both walks on the copy.
+        let copy = dtb_cached_copy(dtb_addr);
+        let at = copy.as_ref().map_or(dtb_addr, |v| v.as_ptr() as u64);
+        sensorlink::read_board(at);
+        modem::read_board(at);
     }
     checklist::at("board read");
     if cached {
@@ -2059,4 +2066,25 @@ fn panic(_info: &PanicInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     platform::report_panic(info)
+}
+
+/// ABL's device tree copied into cached memory, eight bytes a load (its blob is 8-byte aligned by the FDT spec): None when the pointer is not one or the header is not a device tree's. WHY/PROOF the size bound: the size is ABL's word, external input; past 4 MiB it is not a device tree, and the copy would read on past ABL's region (the walks held the same bound).
+fn dtb_cached_copy(addr: u64) -> Option<alloc::vec::Vec<u64>> {
+    if addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let be = |a: u64| u32::from_be(unsafe { core::ptr::read_volatile(a as *const u32) });
+    if be(addr) != 0xD00D_FEED {
+        return None;
+    }
+    let size = be(addr + 4) as usize;
+    if size > 4 << 20 {
+        return None;
+    }
+    let words = size.div_ceil(8);
+    let mut v = alloc::vec::Vec::with_capacity(words);
+    for i in 0..words {
+        v.push(unsafe { core::ptr::read_volatile((addr as usize + 8 * i) as *const u64) });
+    }
+    Some(v)
 }

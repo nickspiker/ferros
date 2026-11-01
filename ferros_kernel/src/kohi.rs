@@ -200,6 +200,51 @@ fn jitter_words(out: &mut [u64]) -> bool {
 
 pub const SOURCES: [&str; 3] = ["trng", "rndr", "jitter"];
 
+/// The firmware TRNG's words for KOHI, gathered ahead on another core while the boot core does its own work (`start_early`, smp::early; 2026-11-01: the TRNG answers 192 bits a call at about 1 ms each, 329 ms for W samples, and the first process waits on the wairua). State: 0 none, 1 gathering, 2 gathered, 3 the TRNG refused. The words are taken once by `gather` and wiped.
+static EARLY_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EARLY_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut EARLY_BUF: [u64; WORDS] = [0; WORDS];
+
+/// The job (on worker 3): the W samples into EARLY_BUF.
+fn trng_early() {
+    let t0 = crate::platform::cntpct();
+    let ok = trng_words(unsafe { &mut *(&raw mut EARLY_BUF) });
+    EARLY_US.store(((crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()) as u32, core::sync::atomic::Ordering::Relaxed);
+    EARLY_STATE.store(if ok { 2 } else { 3 }, core::sync::atomic::Ordering::Release);
+    crate::checklist::at("KOHI: TRNG words, on worker 3");
+}
+
+/// Start gathering the firmware TRNG's words on another core, as early in the boot as the page tables allow.
+pub fn start_early() {
+    EARLY_STATE.store(1, core::sync::atomic::Ordering::Release);
+    if !crate::smp::early(trng_early) {
+        EARLY_STATE.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The early words into `out` if they were gathered (waiting for the job if it still runs, a second at most), then wiped: Some(gathered, its µs), or None to gather here.
+fn take_early(out: &mut [u64]) -> Option<(bool, u32)> {
+    use core::sync::atomic::Ordering::Acquire;
+    let f = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    while EARLY_STATE.load(Acquire) == 1 && crate::platform::cntpct().wrapping_sub(t0) < f {
+        core::hint::spin_loop();
+    }
+    let st = EARLY_STATE.swap(0, core::sync::atomic::Ordering::AcqRel);
+    match st {
+        2 => {
+            let buf = unsafe { &mut *(&raw mut EARLY_BUF) };
+            out.copy_from_slice(&buf[..]);
+            for w in buf.iter_mut() {
+                unsafe { core::ptr::write_volatile(w, 0) };
+            }
+            Some((true, EARLY_US.load(Acquire)))
+        }
+        3 => Some((false, 0)),
+        _ => None,
+    }
+}
+
 /// One KOHI: gather every source, health-check each, apply the byzantine threshold, XOR the healthy ones and extract 256 bits under `context`. Returns the value (None = NGARO) and each source's health.
 pub fn gather(context: &str) -> (Option<[u8; 32]>, [Health; 3]) {
     let mut health_of = [Health::default(); 3];
@@ -209,8 +254,15 @@ pub fn gather(context: &str) -> (Option<[u8; 32]>, [Health; 3]) {
     let mut healthy = 0;
     for (s, h) in health_of.iter_mut().enumerate() {
         let t0 = crate::platform::cntpct();
+        let mut early_us = None;
         let got = match s {
-            0 => trng_words(&mut buf),
+            0 => match take_early(&mut buf) {
+                Some((ok, us)) => {
+                    early_us = Some(us);
+                    ok
+                }
+                None => trng_words(&mut buf),
+            },
             1 => rndr_words(&mut buf),
             _ => jitter_words(&mut buf),
         };
@@ -218,7 +270,7 @@ pub fn gather(context: &str) -> (Option<[u8; 32]>, [Health; 3]) {
             continue;
         }
         present += 1;
-        let us = ((crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()) as u32;
+        let us = early_us.unwrap_or(((crate::platform::cntpct() - t0) * 1_000_000 / crate::platform::cntfrq()) as u32);
         *h = health(&buf);
         h.us = us;
         if h.ok() {

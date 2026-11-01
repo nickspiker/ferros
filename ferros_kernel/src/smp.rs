@@ -83,7 +83,55 @@ unsafe extern "C" {
     fn ferros_core_entry();
 }
 
-/// Start every worker that is not up, from the core the kernel runs on (its registers are what they copy).
+/// Start worker `k` from the core the kernel runs on (its registers are what it copies): the hand-over block, then PSCI CPU_ON. Returns CPU_ON's answer (0: started).
+fn cpu_on(k: usize) -> i64 {
+    let (mair, tcr, ttbr, sctlr, hcr, vbar, cptr, cnthctl): (u64, u64, u64, u64, u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {a}, mair_el2", "mrs {b}, tcr_el2", "mrs {c}, ttbr0_el2", "mrs {d}, sctlr_el2", "mrs {e}, hcr_el2", "mrs {f}, vbar_el2", "mrs {g}, cptr_el2", "mrs {h}, cnthctl_el2",
+            a = out(reg) mair, b = out(reg) tcr, c = out(reg) ttbr, d = out(reg) sctlr, e = out(reg) hcr, f = out(reg) vbar, g = out(reg) cptr, h = out(reg) cnthctl);
+    }
+    let b = BLOCKS + k * BLOCK;
+    unsafe {
+        let w = |o: usize, v: u64| write_volatile((b + o) as *mut u64, v);
+        w(H_MAIR, mair);
+        w(H_TCR, tcr);
+        w(H_TTBR, ttbr);
+        w(H_SCTLR, sctlr);
+        w(H_HCR, hcr);
+        w(H_VBAR, vbar);
+        w(H_CPTR, cptr);
+        w(H_CNTHCTL, cnthctl);
+        w(H_STACK, (&raw const STACKS as usize + (k + 1) * (128 << 10)) as u64);
+        core::arch::asm!("dsb sy");
+        let ret: i64;
+        core::arch::asm!("smc #0", inout("x0") PSCI_CPU_ON => ret, in("x1") WORKERS[k], in("x2") ferros_core_entry as usize as u64, in("x3") b as u64);
+        ret
+    }
+}
+
+/// A one-shot job on worker 3 during the boot, before `launch_all` (2026-11-01: KOHI's firmware TRNG words, 329 ms of SMCs, gathered beside the boot core's own work instead of in front of the first process). The core starts with the boot core's tables, runs the job with every interrupt masked, and switches itself off; `launch_all` waits for that before bringing it up as a worker. False when the core did not start: the job never runs, and whoever waits on it does the work itself.
+static EARLY: AtomicU64 = AtomicU64::new(0);
+/// 0 none, 1 started, 2 the job has run and the core is switching itself off.
+static EARLY_STATE: AtomicU32 = AtomicU32::new(0);
+const EARLY_CORE: usize = 3;
+
+pub fn early(job: fn()) -> bool {
+    if option_env!("FERROS_SMP") == Some("0") {
+        return false;
+    }
+    EARLY.store(job as usize as u64, Ordering::Release);
+    EARLY_STATE.store(1, Ordering::Release);
+    let ret = cpu_on(EARLY_CORE);
+    ON_RESULT[EARLY_CORE].store(ret as u64, Ordering::Relaxed);
+    if ret != 0 {
+        EARLY.store(0, Ordering::Release);
+        EARLY_STATE.store(0, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Start every worker that is not up, from the core the kernel runs on (its registers are what they copy). The early job's core first finishes and is off (a second at most each).
 pub fn launch_all() {
     if option_env!("FERROS_SMP") == Some("0") {
         return;
@@ -91,32 +139,29 @@ pub fn launch_all() {
     crate::platform::crumb(0xCB);
     STOP.store(0, Ordering::Relaxed);
     OFF.store(0, Ordering::Relaxed);
-    let (mair, tcr, ttbr, sctlr, hcr, vbar, cptr, cnthctl): (u64, u64, u64, u64, u64, u64, u64, u64);
-    unsafe {
-        core::arch::asm!("mrs {a}, mair_el2", "mrs {b}, tcr_el2", "mrs {c}, ttbr0_el2", "mrs {d}, sctlr_el2", "mrs {e}, hcr_el2", "mrs {f}, vbar_el2", "mrs {g}, cptr_el2", "mrs {h}, cnthctl_el2",
-            a = out(reg) mair, b = out(reg) tcr, c = out(reg) ttbr, d = out(reg) sctlr, e = out(reg) hcr, f = out(reg) vbar, g = out(reg) cptr, h = out(reg) cnthctl);
+    if EARLY_STATE.load(Ordering::Acquire) != 0 {
+        let f = crate::platform::cntfrq();
+        let t0 = crate::platform::cntpct();
+        while EARLY_STATE.load(Ordering::Acquire) == 1 && crate::platform::cntpct().wrapping_sub(t0) < f {
+            core::hint::spin_loop();
+        }
+        let t1 = crate::platform::cntpct();
+        loop {
+            let st: i64;
+            unsafe { core::arch::asm!("smc #0", inout("x0") PSCI_AFFINITY_INFO => st, in("x1") WORKERS[EARLY_CORE], in("x2") 0u64) };
+            if st == 1 || crate::platform::cntpct().wrapping_sub(t1) > f {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        EARLY_STATE.store(0, Ordering::Release);
     }
-    for (k, &aff) in WORKERS.iter().enumerate() {
+    for k in 0..WORKERS.len() {
         if UP.load(Ordering::Acquire) & (1 << k) != 0 {
             continue;
         }
-        let b = BLOCKS + k * BLOCK;
-        unsafe {
-            let w = |o: usize, v: u64| write_volatile((b + o) as *mut u64, v);
-            w(H_MAIR, mair);
-            w(H_TCR, tcr);
-            w(H_TTBR, ttbr);
-            w(H_SCTLR, sctlr);
-            w(H_HCR, hcr);
-            w(H_VBAR, vbar);
-            w(H_CPTR, cptr);
-            w(H_CNTHCTL, cnthctl);
-            w(H_STACK, (&raw const STACKS as usize + (k + 1) * (128 << 10)) as u64);
-            core::arch::asm!("dsb sy");
-            let ret: i64;
-            core::arch::asm!("smc #0", inout("x0") PSCI_CPU_ON => ret, in("x1") aff, in("x2") ferros_core_entry as usize as u64, in("x3") b as u64);
-            ON_RESULT[k].store(ret as u64, Ordering::Relaxed);
-        }
+        let ret = cpu_on(k);
+        ON_RESULT[k].store(ret as u64, Ordering::Relaxed);
     }
     crate::platform::crumb(0xCC);
 }
@@ -125,6 +170,22 @@ pub fn launch_all() {
 #[unsafe(no_mangle)]
 extern "C" fn ferros_core_main(block: usize) -> ! {
     let k = ((block - BLOCKS) / BLOCK) & 3;
+    // Started for the boot's one-shot job (`early`): run it, say so, and switch off; `launch_all` starts this core again as a worker.
+    if k == EARLY_CORE && EARLY_STATE.load(Ordering::Acquire) == 1 {
+        let job = EARLY.swap(0, Ordering::AcqRel);
+        if job != 0 {
+            let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(job as usize) };
+            f();
+        }
+        EARLY_STATE.store(2, Ordering::Release);
+        unsafe {
+            core::arch::asm!("msr daifset, #0xF");
+            core::arch::asm!("smc #0", inout("x0") PSCI_CPU_OFF => _);
+        }
+        loop {
+            unsafe { core::arch::asm!("wfe") };
+        }
+    }
     crate::killswitch::arm_core();
     crate::pmu::el0_on();
     UP.fetch_or(1 << k, Ordering::AcqRel);
