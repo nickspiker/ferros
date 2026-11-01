@@ -73,6 +73,8 @@ pub const USB_REGS: (usize, usize) = (0x1120_0000, 0x1140_0000);
 pub const USB_DMA: (usize, usize) = (0x8B80_0000, 0x8C00_0000);
 /// How much of `USB_DMA`, from its start, is non-cacheable: the controller's block and the run buffer, which the controller reads and writes. The rest is the driver's command area, which only the CPU touches (the process, and the kernel copying a command out), so it is Normal cacheable, EL0, never executable: decoding 2 MiB of packets straight out of non-cacheable memory took the process 2.2 s of CPU (2026-10-31).
 pub const USB_DMA_NC: usize = 2 << 20;
+/// The AoC's IPC control block and its services' rings (aoc.rs IPC: the carve-out at G#9400_0000 plus G#1C0_0000), EL0 Device memory for the sensors process (KERNEL-OUT.md move 4): com.google.usf's rings lie in its first G#85000 bytes. The rest of the carve-out (the firmware, its heap) stays the kernel's. Granted as `aoc-ipc`.
+pub const AOC_IPC: (usize, usize) = (0x95C0_0000, 0x95E0_0000);
 #[cfg(shim_handoff)]
 pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
@@ -241,6 +243,8 @@ pub fn enable() -> bool {
             let a = gib + j * MIB2;
             *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) {
                 dma_pool(vhe, a, BLOCK)
+            } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
+                device_el0(vhe, a, BLOCK)
             } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) {
                 pool(vhe, a, BLOCK) | UXN
             } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {

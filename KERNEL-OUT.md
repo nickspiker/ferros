@@ -53,3 +53,15 @@ Each move so far followed the same shape:
   - The touch payload now links position-independent and relocates at entry, because its console lines format.
   - Verified from cold by hand (`diag "touch off"`, then `restart touch`) and through a slot b cold boot: controller ready after 12 ms, chip G#3640, scan mode set, serving.
   - Not yet verified: a finger on the glass (nobody here). The kernel's `diag touch …` tools stay until then.
+- 2026-10-31: **sensors, phase 1 (move 4): the USF conversation.**
+  - `payloads/sensors` speaks USF over the AoC's IPC rings: it opens ferros's channel, pushes the registry from the vault (`aoc.` scope), subscribes to gravity, proximity and spectral, tells the AoC the display's state, and follows the screen and the light-scope preference.
+  - Grants: the IPC block mapped for EL0 (`aoc-ipc`, `cachemap.rs` `AOC_IPC`), the AoC mailboxes (`aoc-mbox`), the `aoc.` vault scope, the Sensors right, the `sensors` switch; init slots 92-96.
+  - What it reads goes into one block in its own memory (`ferros_sys::sensor_block`), published with `SYS_SENSORS` 26. The kernel reads the block in place under its lock for `SYS_FACTS`, `SYS_LIGHT` and the power key's proximity rule (`sensorlink.rs`), and forgets it when the process ends — in `end_process`, in `kill`, and every 4 s if no sensors process runs.
+  - The kernel keeps the AoC's start (rails, GSA, Trusty: phase 2). With the switch held it stops polling USF and skips its own USF steps; without it, or once the process is gone, it opens the channel again and subscribes.
+  - `diag facts` shows the sensor words a process gets and which side answered.
+  - Verified on the phone:
+    - by hand: start, the facts switch to the process (gravity 9.81 m/s² on z, flat on the table), kill, the kernel takes the conversation back within seconds;
+    - a slot b cold boot: the kernel starts the AoC and hands USF over, and the process pushes the registry itself (46 sensors after 321 ms), subscribes and serves;
+    - the light scope through the process: 96,162 samples in the ring.
+  - A bug found and fixed on the way: `kill` did not run the end hook, so the kernel kept reading a killed process's memory.
+  - Still in the kernel for now: its own USF code as the fallback, and the `diag usf …` tools (they talk on the kernel's session).

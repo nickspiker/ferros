@@ -34,6 +34,8 @@ mod service;
 #[cfg(feature = "pixel8")]
 mod ptlink;
 #[cfg(feature = "pixel8")]
+mod sensorlink;
+#[cfg(feature = "pixel8")]
 mod display;
 #[cfg(feature = "pixel8")]
 mod dsim;

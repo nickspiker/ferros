@@ -53,6 +53,7 @@ members = [
     "photon_core",
     "payloads/ip",
     "payloads/modem",
+    "payloads/sensors",
     "payloads/rmnetctl",
     "payloads/nettest",
     "payloads/httptest",

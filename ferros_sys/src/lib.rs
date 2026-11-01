@@ -44,6 +44,7 @@ pub mod nr {
     pub const IRA: u64 = 23;
     pub const UNLOCK: u64 = 24;
     pub const PT: u64 = 25;
+    pub const SENSORS: u64 = 26;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -289,6 +290,39 @@ pub fn pt_take_at(cap: u64, offset: usize, at: u64, len: usize) -> PtReply {
         ERR => PtReply::None,
         r => PtReply::Done((r & 0xFFFF_FFFF) as usize, r >> 33 & 1 == 0, r >> 32 & 1 == 1),
     }
+}
+
+/// The block the sensors process publishes (payloads/sensors; the kernel's sensorlink.rs repeats these): u64 words, the magic first and written last, then the samples the kernel answers SYS_FACTS and SYS_LIGHT with and reads proximity from for the power key's wake rule, and from word `SCOPE` the light scope's ring of i32 samples.
+pub mod sensor_block {
+    pub const MAGIC: u64 = 0x5345_4E53_4F52_5301;
+    /// x | y << 32 (f32 bits, m/s²), then z | sample count << 32.
+    pub const GRAVITY_XY: usize = 1;
+    pub const GRAVITY_Z: usize = 2;
+    /// The last two gravity samples: [x | y << 32, z, time in counter ticks], newest first (6 words).
+    pub const PAIR: usize = 3;
+    /// The spectral sensor's channel counts and gains as f32 pairs (6 words), then its sample count.
+    pub const SPECTRAL: usize = 9;
+    /// Proximity: distance | processed pdata0, processed pdata1 | raw pdata0, raw pdata1 | sample count << 32.
+    pub const PROX: usize = 16;
+    /// The light scope: rate | bytes << 32 | ignored bits << 40 | little-endian << 48; the next sample's number; the channel mask.
+    pub const SCOPE_FMT: usize = 19;
+    pub const SCOPE_N: usize = 20;
+    pub const SCOPE_MASK: usize = 21;
+    pub const SCOPE: usize = 32;
+    pub const SCOPE_LEN: usize = 65536;
+    /// The block's size in u64 words.
+    pub const WORDS: usize = SCOPE + SCOPE_LEN / 2;
+}
+
+/// Publish the sensors' block through a Sensors capability: the kernel reads it in place from now on, until this process ends. False if refused (too small, or not in the arc).
+pub fn sensors_publish(cap: u64, block: &[u64]) -> bool {
+    svc(nr::SENSORS, cap, 0, off(block), (block.len() * 8) as u64, 0) == 0
+}
+
+/// The board's CDT and MLB number from the device tree, for the AoC's registry scripts.
+pub fn sensors_board(cap: u64) -> (u32, u32) {
+    let r = svc(nr::SENSORS, cap, 1, 0, 0, 0);
+    if r == ERR { (0, 0) } else { (r as u32, (r >> 32) as u32) }
 }
 
 /// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.

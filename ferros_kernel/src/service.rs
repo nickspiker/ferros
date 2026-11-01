@@ -480,6 +480,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Dma(b"usb-regs"), Dma(b"usb-dma"), Irq(b"usb-dwc3"), Pt, Power(b"usb"),
         // 91 the touch controller's power (clocks, rails, reset: touch.rs `power`); the touch process brings the controller up with it.
         Power(b"touch"),
+        // The sensors process (payloads/sensors, KERNEL-OUT.md move 4): 92 the AoC's IPC block, 93 its mailboxes, 94 the vault scope `aoc.` (the registry scripts), 95 the Sensors right (its published block), 96 the `sensors` switch (the USF conversation from the kernel).
+        Dma(b"aoc-ipc"), Hardware(b"aoc-mbox"), Store(b"aoc"), Sensors, Power(b"sensors"),
     ]
 }
 
@@ -504,6 +506,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
+        // 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch (payloads/sensors).
+        b"sensors" => &[92, 93, 94, 95, 96],
         _ => return None,
     };
     let all = home_grants();
@@ -637,6 +641,31 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
         v[10] = hottest as u64;
     }
     v[11] = (THROTTLED_FROM.load(Relaxed) != 0) as u64;
+    // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4): the same words in the same order as the kernel's own below.
+    if crate::sensorlink::live() {
+        use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};
+        let w = |i: usize| word(i).unwrap_or(0);
+        if w(GRAVITY_Z) >> 32 != 0 {
+            v[12] = w(GRAVITY_XY);
+            v[13] = w(GRAVITY_Z);
+            if w(SPECTRAL + 6) != 0 {
+                for i in 0..7 {
+                    v[20 + i] = w(SPECTRAL + i);
+                }
+            }
+            if w(PROX + 2) >> 32 != 0 {
+                for i in 0..3 {
+                    v[27 + i] = w(PROX + i);
+                }
+            }
+            if w(PAIR + 5) != 0 {
+                for i in 0..6 {
+                    v[14 + i] = w(PAIR + i);
+                }
+            }
+        }
+        return v;
+    }
     // The gravity vector (usf.rs), once a sample has come.
     let gz = crate::usf::GRAVITY_Z.load(Relaxed);
     if gz >> 32 != 0 {
@@ -729,6 +758,11 @@ fn sensor_step(st: SensorBoot, now: u64, get: &mut dyn FnMut(&str) -> Option<all
         }
         SensorBoot::Online(t0) if now.wrapping_sub(t0) > 4 * f => {
             out.extend_from_slice(b"AoC not online after 4 s\n");
+            SensorBoot::Done
+        }
+        // The AoC is online: the USF conversation is the sensors process's when it holds the `sensors` switch (sensorlink.rs; it opens the channel, pushes the registry and subscribes itself), else the kernel's.
+        SensorBoot::Usf if crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) => {
+            out.extend_from_slice(b"AoC online: USF is the sensors process's\n");
             SensorBoot::Done
         }
         SensorBoot::Usf => {
@@ -1135,6 +1169,8 @@ pub fn run(mut b: Boot) -> ! {
     let mut proc_act = false;
     // The USB process's holder check (below): when it last looked.
     let mut usb_check = 0u64;
+    // The sensors process's, the same way.
+    let mut sensors_check = 0u64;
 
     let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
@@ -1204,7 +1240,7 @@ pub fn run(mut b: Boot) -> ! {
             unsafe { core::ptr::write_volatile(&raw mut crate::__power_pressed, 0) };
             let off = crate::process::pref(crate::process::PREF_SCREEN_OFF) ^ 1;
             // The proximity wake (owner's rule): a press lights the screen only if nothing is near the sensor. Fails open: with no proximity reading yet (sensors not up, or the AoC failed), the press wakes as before, so a sensor fault never locks the owner out.
-            let refused = off == 0 && crate::process::pref(crate::process::PREF_PROX_WAKE) == 1 && crate::usf::prox_near() == Some(true);
+            let refused = off == 0 && crate::process::pref(crate::process::PREF_PROX_WAKE) == 1 && (if crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) { crate::sensorlink::prox_near() } else { crate::usf::prox_near() }) == Some(true);
             if refused {
                 crate::flashlog::line(&alloc::format!("wake refused: proximity near ({:?})", crate::usf::prox_counts()));
             } else {
@@ -1213,7 +1249,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The light scope (preference 7): the flicker stream subscribed and its channel set when it changes (usf.rs scope_follow).
         let scope = crate::process::pref(crate::process::PREF_SCOPE);
-        if crate::usf::display_ready() && scope != scope_told {
+        if crate::usf::display_ready() && scope != scope_told && !crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) {
             scope_told = scope;
             let mut out = alloc::vec::Vec::new();
             crate::usf::scope_follow(scope, &mut out);
@@ -1225,7 +1261,7 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The display's state follows the screen: the under-display sensor times its bursts to the panel and must know when it goes dark.
         let screen_off = crate::process::pref(crate::process::PREF_SCREEN_OFF) == 1;
-        if crate::usf::display_ready() && screen_off != screen_off_told {
+        if crate::usf::display_ready() && screen_off != screen_off_told && !crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) {
             screen_off_told = screen_off;
             let mut out = alloc::vec::Vec::new();
             crate::usf::display_info(DISPLAY_DBV, !screen_off, 120, &mut out);
@@ -1310,7 +1346,10 @@ pub fn run(mut b: Boot) -> ! {
             // Outside the USB lines' 256-line budget: after 4.5 h the heartbeats had used it up, and the half hour before a reset went unrecorded (2026-10-25). The log region (64 MiB) holds months of them.
             crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
         }
-        crate::usf::poll();
+        // The USF conversation is the sensors process's while it holds the `sensors` switch (sensorlink.rs).
+        if !crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::usf::poll();
+        }
         // The WiFi driver's keeper: the driver exits when a join fails (an access point that throttles repeated joins refused them all evening, 2026-10-29), and nothing started it again until a reboot. Once the shell is up, a pcie1 that is gone is started again from the vault — 64 s after it went, the wait doubling each time to 1024 s (a join refused again only adds to a throttle), back to 64 s once it has stayed up that long. A `diag kill pcie1` stops the keeper for the session.
         if home_started && wifi_keep && now.wrapping_sub(wifi_check) > 4 * freq {
             wifi_check = now;
@@ -1334,6 +1373,16 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        // No sensors process running, whatever path ended it (its end is caught in end_process and kill as well): its block is forgotten, so the kernel never reads memory that may be another process's now, and the conversation comes back to the kernel if it held it.
+        if now.wrapping_sub(sensors_check) > 4 * freq {
+            sensors_check = now;
+            if !crate::process::running(b"sensors") {
+                crate::process::with_lock(crate::sensorlink::forget);
+                if crate::sensorlink::PROCESS.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                    crate::sensorlink::TAKE_BACK.store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         // The USB process gone while it holds the controller (a fault, `diag kill usb`): the kernel takes the controller back, so the bridge always has a way in.
         if !kernel_usb && now.wrapping_sub(usb_check) > 4 * freq {
             usb_check = now;
@@ -1346,6 +1395,15 @@ pub fn run(mut b: Boot) -> ! {
         if !ipc_marked && crate::process::round_trips() > 0 {
             ipc_marked = true;
             crate::checklist::mark(crate::checklist::Item::Ipc);
+        }
+        // The USF conversation back from the sensors process (`power sensors off`, or the process gone): once the AoC is online, the kernel opens the channel again, pushes the registry if needed and subscribes, as after a warm reload; the display's state and the scope are told again.
+        if crate::sensorlink::TAKE_BACK.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            crate::flashlog::line("sensors: the kernel takes the USF conversation back");
+            if crate::aoc::online() {
+                sensor_boot = SensorBoot::Usf;
+            }
+            screen_off_told = !screen_off;
+            scope_told = 0;
         }
         if !matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq {
             let st = &raw mut store;
@@ -2061,6 +2119,14 @@ pub fn run(mut b: Boot) -> ! {
                     let st = &raw mut store;
                     let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
                     crate::aoc::boot(&mut get, &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"facts" {
+                    // `diag facts`: the sensor words of SYS_FACTS as a process receives them, and which side answered (the sensors process's block, sensorlink.rs, or the kernel's own USF).
+                    let v = crate::process::with_lock(facts);
+                    let fl = |w: u64| f32::from_bits(w as u32);
+                    resp.extend_from_slice(alloc::format!("source: {}\ngravity ({:.3}, {:.3}, {:.3}) m/s², samples A#{}\nproximity distance {:.1}, samples A#{}\nspectral samples A#{}\nscope: next sample A#{}\n", if crate::process::with_lock(crate::sensorlink::live) { "the sensors process" } else { "the kernel" }, fl(v[12]), fl(v[12] >> 32), fl(v[13]), v[13] >> 32, fl(v[27]), v[29] >> 32, v[26], if crate::process::with_lock(crate::sensorlink::live) { crate::process::with_lock(|| crate::sensorlink::word(crate::sensorlink::SCOPE_N).unwrap_or(0)) } else { crate::usf::scope_head().0 }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
@@ -3485,6 +3551,7 @@ pub fn run(mut b: Boot) -> ! {
                             10 => crate::process::Grant::Part(g),
                             11 => crate::process::Grant::Unlock,
                             12 => crate::process::Grant::Pt,
+                            13 => crate::process::Grant::Sensors,
                             _ => crate::process::Grant::Use(g),
                         });
                     }

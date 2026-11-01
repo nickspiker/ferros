@@ -10,7 +10,7 @@
 //!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp,
 //!   46 serve photon, 47 use photon, 48 the vault scope `photon.`, 49 the ira key, 50 use udp (PHOTON.md).
 //!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
-//!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power). 91 the touch controller's power.
+//!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power). 91 the touch controller's power. 92-96 the sensors process's (the AoC's IPC block and mailboxes, the vault scope `aoc.`, the Sensors right, its switch).
 #![no_std]
 #![no_main]
 
@@ -22,7 +22,7 @@ const S_USE_DISPLAY: u64 = 17;
 const S_UNLOCK: u64 = 85;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 11] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
@@ -35,6 +35,8 @@ const SHELL: [(&[u8], &[u8], &[u64]); 11] = [
     // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
     (b"ip", b"ip", &[44, 45, 41, 52]),
     // The radios: the NFC driver 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc); the Bluetooth driver 1 serve bt, 2 the APM UART, 3 vendor_a (the patch), 4 its power, 5 entropy (payloads/bt).
+    // The sensors process (payloads/sensors): the USF conversation with the AoC once the kernel has the AoC online; it publishes the samples the kernel answers SYS_FACTS and SYS_LIGHT from. 1 the AoC's IPC block, 2 its mailboxes, 3 the vault scope `aoc.`, 4 the Sensors right, 5 the `sensors` switch. Should it fail, the kernel keeps the conversation.
+    (b"sensors", b"sensors", &[92, 93, 94, 95, 96]),
     (b"nfc", b"nfc", &[77, 78, 67, 79]),
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
@@ -64,7 +66,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, nfc, bt, modem, map, photon)\n");
+        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, sensors, nfc, bt, modem, map, photon)\n");
     }
     exit(failed)
 }

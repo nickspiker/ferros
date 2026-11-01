@@ -261,6 +261,8 @@ pub enum Object {
     Unlock,
     /// Served by the kernel: the USB driver process's way into the kernel's PT commands (`SYS_PT`, ptlink.rs): hand one over, take its reply.
     Pt,
+    /// Served by the kernel: the sensors process's way to publish what it reads (`SYS_SENSORS`, sensorlink.rs): the block the kernel answers SYS_FACTS and SYS_LIGHT from, and the board's identity for the registry.
+    Sensors,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -301,6 +303,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::Part(i) => (13, i as u64),
         Object::Unlock => (14, 0),
         Object::Pt => (15, 0),
+        Object::Sensors => (16, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -675,6 +678,8 @@ const SYS_UNLOCK: u64 = 24;
 const SYS_PT: u64 = 25;
 /// Bit 63 of a syscall's buffer argument (SYS_PT): the buffer is named by its address inside one of the caller's DMA regions, not by its offset in the arc.
 const DMA_ADDR: u64 = 1 << 63;
+/// sensors(cap, op, offset, len): the sensors process (sensorlink.rs). Op 0 publishes the block of `len` bytes at `offset` in the caller's arc (at least sensorlink `BYTES`) → 0 or ERR. Op 1 → the board's CDT | MLB << 32 from the device tree (usf.rs `read_board`), for the registry scripts.
+const SYS_SENSORS: u64 = 26;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -917,6 +922,8 @@ pub static DMA: &[Dma] = &[
     // The USB driver process (USB.md): the controller's registers, mapped for EL0 (Device), and its non-cacheable DMA memory.
     Dma { name: "usb-regs", base: 0x1121_0000, size: 0x1_0000 },
     Dma { name: "usb-dma", base: crate::cachemap::USB_DMA.0, size: crate::cachemap::USB_DMA.1 - crate::cachemap::USB_DMA.0 },
+    // The AoC's IPC control block and its services' rings (aoc.rs IPC, cachemap.rs AOC_IPC), EL0 Device memory for the sensors process: com.google.usf's rings lie in its first G#85000 bytes.
+    Dma { name: "aoc-ipc", base: crate::cachemap::AOC_IPC.0, size: crate::cachemap::AOC_IPC.1 - crate::cachemap::AOC_IPC.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
@@ -985,6 +992,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "photon", prefix: "photon." },
     // The attest screen's (payloads/ahau): the device's verifier for its identity (`ahau.verifier`), the identity seed under the device's ira key.
     StoreScope { name: "ahau", prefix: "ahau." },
+    // The sensors process's (payloads/sensors): the AoC's registry scripts (`aoc.reg.0`, … : tools/husky-aoc-reg.sh), which it pushes to the AoC after the firmware starts.
+    StoreScope { name: "aoc", prefix: "aoc." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;
@@ -1053,6 +1062,8 @@ pub static HARDWARE: &[Hw] = &[
     Hw { name: "gpio-far-alive", base: 0x154E_0000, size: 0x1000, via_el3: false },
     Hw { name: "cmu-hsi2", base: 0x1300_0000, size: 0x8000, via_el3: false },
     Hw { name: "pmu", base: 0x1546_0000, size: 0x1_0000, via_el3: true },
+    // The AoC's three mailbox blocks (aoc.rs MBOX_BLOCKS): the sensors process signals the AoC on a service's mailbox after writing to its ring (INTGR0 at +G#20 of each).
+    Hw { name: "aoc-mbox", base: 0x1520_0000, size: 0x4_1000, via_el3: false },
     // The display pipe (DISPLAY-DESIGN.md §3; sizes from zuma-drm-dpu.dtsi): DECON0's four blocks and its DQE, layer 0's DMA / DPP / SRAMC / HDR blocks, DSIM0 with its PHY and the DPU sysreg, and the GPIO bank with the panel's TE pin.
     Hw { name: "decon0-main", base: 0x1947_0000, size: 0x6000, via_el3: false },
     Hw { name: "decon0-win", base: 0x1948_0000, size: 0xE000, via_el3: false },
@@ -1086,7 +1097,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }, PowerSwitch { name: "touch", set: crate::touch::power }, PowerSwitch { name: "sensors", set: crate::sensorlink::power }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
@@ -1506,6 +1517,20 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_SENSORS => {
+            let token = p.read(f.x[0], 32);
+            let (op, off, len) = (f.x[1], f.x[2] as usize, f.x[3] as usize);
+            f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                // The block must lie whole in the caller's arc, unwrapped: the kernel reads it in place.
+                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 0 && len >= crate::sensorlink::BYTES && off.checked_add(len).is_some_and(|e| e <= p.arc.size) => {
+                    crate::sensorlink::publish(p.epoch, p.arc.base + off);
+                    0
+                }
+                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 1 => crate::usf::CDT.load(core::sync::atomic::Ordering::Relaxed) as u64 | (crate::usf::MLB.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32,
+                _ => ERR,
+            };
+            0
+        }
         SYS_IRA => {
             let token = p.read(f.x[0], 32);
             let len = f.x[2] as usize;
@@ -1529,13 +1554,24 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_LIGHT => {
             let want = ((f.x[1] as usize).saturating_sub(16) / 4).min(crate::usf::SCOPE_LEN);
-            let (end, rate, mask) = crate::usf::scope_head();
+            // The sensors process's ring when it publishes one (sensorlink.rs), else the kernel's own (usf.rs).
+            let proc = crate::sensorlink::live();
+            let (end, rate, mask) = if proc {
+                use crate::sensorlink::{word, SCOPE_FMT, SCOPE_MASK, SCOPE_N};
+                (word(SCOPE_N).unwrap_or(0), word(SCOPE_FMT).unwrap_or(0) as u32, word(SCOPE_MASK).unwrap_or(0) as u32)
+            } else {
+                crate::usf::scope_head()
+            };
             let n = want.min(end as usize);
             let mut b = alloc::vec::Vec::with_capacity(16 + 4 * n);
             b.extend_from_slice(&end.to_le_bytes());
             b.extend_from_slice(&rate.to_le_bytes());
             b.extend_from_slice(&mask.to_le_bytes());
-            crate::usf::scope_copy(end, n, &mut b);
+            if proc {
+                crate::sensorlink::scope_copy(end, n, &mut b);
+            } else {
+                crate::usf::scope_copy(end, n, &mut b);
+            }
             p.write(f.x[0], &b);
             f.x[0] = b.len() as u64;
             0
@@ -1916,6 +1952,7 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         }
         let name = p.name.clone();
         surfaces_free(p.epoch);
+        crate::sensorlink::ended(p.epoch);
         fail_callers(&p.cspace);
         p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
         kk.console.extend_from_slice(&name);
@@ -2107,6 +2144,7 @@ fn kill_locked(name: &[u8]) -> bool {
     let kk = k();
     let Some(i) = kk.procs.iter().position(|p| matches!(p, Some(p) if p.name == name)) else { return false };
     surfaces_free(kk.procs[i].as_ref().unwrap().epoch);
+    crate::sensorlink::ended(kk.procs[i].as_ref().unwrap().epoch);
     {
         let p = kk.procs[i].as_mut().unwrap();
         fail_callers(&p.cspace);
@@ -2208,6 +2246,8 @@ pub enum Grant<'a> {
     Unlock,
     /// The kernel's PT commands, for the USB driver process (syscall 25).
     Pt,
+    /// Publishing the sensors' block, for the sensors process (syscall 26).
+    Sensors,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2364,6 +2404,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             Grant::Ira => (Object::Ira, RIGHT_SEND),
             Grant::Unlock => (Object::Unlock, RIGHT_SEND),
             Grant::Pt => (Object::Pt, RIGHT_SEND),
+            Grant::Sensors => (Object::Sensors, RIGHT_SEND),
             Grant::Part(n) => match PARTS.iter().position(|p| p.as_bytes() == *n) {
                 Some(i) => (Object::Part(i), RIGHT_SEND),
                 None => return Err("no such partition grant"),
