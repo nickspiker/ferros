@@ -1,9 +1,11 @@
 //! ahau's identity derivation (Claude memories/ferros_attest_os_level.md): what the attest screen computes from the handle typed on the honeycomb keyboard, with no std and without vsf's 8.9 MB text tables.
 //!
-//! The identity seed is ihi's `handle_to_hash`: BLAKE3 over vsf's `x` encoding of the handle, which is `x`, the character count after NFC as a vsf number, then each character's Huffman code most significant bit first, zero-padded to a byte. The keyboard can type only the characters in `codes::CODES`, every one of them its own NFC form and none combining with a neighbour, so NFC changes nothing and those codes are all the encoder needs. A character outside the table is refused, never guessed: the seed must be byte-exact or it names someone else.
+//! The identity seed is ihi's `handle_to_hash`: BLAKE3 over vsf's `x` encoding of the handle, which is `x`, the character count after NFC as a vsf number, then each character's Huffman code most significant bit first, zero-padded to a byte. `codes::CODES` is generated at build time (build.rs) for exactly the characters the keyboard can type, from the frozen codebook, and the build refuses a key whose character is not its own NFC form or is a combining mark, so NFC changes nothing and those codes are all the encoder needs. A character outside the table is refused, never guessed: the seed must be byte-exact or it names someone else.
 #![no_std]
 
-mod codes;
+mod codes {
+    include!(concat!(env!("OUT_DIR"), "/codes.rs"));
+}
 pub use codes::CODES;
 
 /// A character the keyboard cannot type (and so this encoder has no code for).
@@ -50,11 +52,6 @@ pub fn identity_seed(handle: &str) -> Result<[u8; 32], Untypeable> {
         h.update(&[b]);
     })?;
     Ok(*h.finalize().as_bytes())
-}
-
-/// What the device keeps to recognise its identity: the seed under a key only this device has (its ira's `ahau verifier` key, kernel SYS_IRA). It says nothing about the handle off the device, and matching it means the typed handle is this device's.
-pub fn verifier(device_key: &[u8; 32], seed: &[u8; 32]) -> [u8; 32] {
-    *blake3::keyed_hash(device_key, seed).as_bytes()
 }
 
 /// Two 32-byte values equal, in time that does not depend on where they differ.

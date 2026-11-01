@@ -563,8 +563,9 @@ impl Ahau {
         }
         let seed = match core::str::from_utf8(&self.handle[..self.len]).ok().map(ahau_core::identity_seed) {
             Some(Ok(s)) => s,
+            // Unreachable by construction: the encoder's table is generated from the keyboard's own characters (ahau_core build.rs), so a key without a code fails the build. Said on the console, not the screen.
             _ => {
-                self.status("This keyboard can't type that character.");
+                console(self.grants, b"ahau: the handle has a character the encoder has no code for (the keyboard and ahau_core out of step?)\n");
                 return;
             }
         };

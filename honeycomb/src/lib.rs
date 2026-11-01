@@ -34,6 +34,11 @@ pub const LETTERS: [[&[char]; 3]; 2] = [
 /// How many layouts there are (the preference's valid range).
 pub const LAYOUTS: usize = LETTERS.len();
 
+/// Every character this keyboard can type, on any layout, shifted or not: the letters, the extent (the page key aside), space, and the newline its enter key types. The attest screen's encoder is generated from this list (ahau_core build.rs): a key added here gets its exact code, or the build fails.
+pub fn typeable() -> impl Iterator<Item = char> {
+    LETTERS.iter().flat_map(|l| l.iter().copied()).chain(EXTENT.iter().copied()).flat_map(|row| row.iter().copied()).filter(|&c| c != PAGE).flat_map(|c| [c, c.to_uppercase().next().unwrap_or(c)]).chain([' ', '\n'])
+}
+
 /// The extent above the letters, bottom row first, alternating 10 and 9 keys so the honeycomb stays flush at every scroll: the digits from 0, then the symbols. On the symbol row the commonest sit at the ends, where a thumb reaches easiest, with the page key between them (owner: the most common symbols on the symbol row, placed by reach). The letters below it are the layout's (`LETTERS`).
 pub const EXTENT: [&[char]; 5] = [
     &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],

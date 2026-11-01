@@ -101,7 +101,6 @@ Owner, 2026-10-31: simple and direct.
 | Mint failed | Minting failed. Enter to retry. | |
 | No answer | No answer yet. Still looking. | go on |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over |
-| Bad character | This keyboard can't type that character. | |
 
 ## Known gaps
 
