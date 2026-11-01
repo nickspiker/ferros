@@ -1749,7 +1749,7 @@ const FRP_TAIL: u64 = 37_253;
 /// Pixel's PRDT entry: the standard 16 bytes and 112 of inline-encryption fields (ufs-pixel-crypto.c `pixel_ufs_prdt_entry`); des3 bit 31 enables encryption, its low 18 bits are the byte count less one.
 const PRDT_ENTRY: u64 = 128;
 const PRDT_CRYPTO: u32 = 1 << 31;
-/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list or descriptor was outside DRAM.
+/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list, descriptor or data was outside DRAM, 19 UNMAP descriptors reaching a boot chain, 20 the ferros partition, 21 UNMAP descriptors, 22 UNMAP lists unreadable, 23 writes to LU3 (devinfo), 24 writes to LU1/LU2 (the bootloaders).
 const UFS_STATS: usize = 0xFD60_0E00;
 const UFS_MAGIC: u64 = 0x5546_5346_5731_0000; // "UFSFW1"
 
@@ -1771,7 +1771,7 @@ fn ufs_set(i: usize, v: u64) {
 
 /// Called once, while stage 2 is built: the counters zeroed and stamped, the page unmapped.
 unsafe fn ufs_arm() {
-    for i in 0..19 {
+    for i in 0..30 {
         ufs_set(i, 0);
     }
     ufs_set(0, UFS_MAGIC);
@@ -1803,7 +1803,8 @@ unsafe fn ufs_command(utrd: u64) {
     }
     let ucd = ((rd32(utrd + 0x14) as u64) << 32 | rd32(utrd + 0x10) as u64) & !0x7F;
     let w7 = rd32(utrd + 0x1C);
-    let (prdtl, prdto) = ((w7 >> 16) as u64, (w7 & 0xFFFF) as u64 * 4);
+    // UTRD word 7: the PRDT's length in entries (low 16 bits, `prd_table_length`) and its offset into the UCD in dwords (high 16, `prd_table_offset`); zuma's DT sets `fixed-prdt-req_list-ocs`, so not the Exynos byte-granular form. Read the other way round until 2026-11-01, which put every PRDT walk in the wrong place (the 1 KiB offset, past the 512-byte command and response UPIUs, read as a length of 256).
+    let (prdtl, prdto) = ((w7 & 0xFFFF) as u64, (w7 >> 16) as u64 * 4);
     if !in_dram(ucd) || !in_dram(ucd + 31) {
         ufs_stat(18, 1);
         return;
@@ -1828,6 +1829,7 @@ unsafe fn ufs_command(utrd: u64) {
             ufs_stat(11, 1);
             if lun == 0 {
                 ufs_stat(12, 1);
+                ufs_unmap(ucd, prdto, prdtl);
             }
             return;
         }
@@ -1854,6 +1856,7 @@ unsafe fn ufs_command(utrd: u64) {
     }
     if lun != 0 {
         ufs_stat(13, 1);
+        ufs_stat(if lun == 3 { 23 } else { 24 }, 1);
         return;
     }
     let end = lba + len - 1;
@@ -1867,30 +1870,84 @@ unsafe fn ufs_command(utrd: u64) {
     }
     if hits((FRP_TAIL, FRP_TAIL)) {
         ufs_stat(8, 1);
-        // The unlock byte: the write's byte at (FRP_TAIL - lba) blocks + G#FFF, found by walking the PRDT.
-        let mut want = (FRP_TAIL - lba) * 4096 + 0xFFF;
-        let mut e = 0;
-        while e < prdtl {
-            let ent = ucd + prdto + e * PRDT_ENTRY;
-            if !in_dram(ent) || !in_dram(ent + 15) {
-                ufs_stat(18, 1);
-                return;
-            }
-            let addr = (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64;
-            let d3 = rd32(ent + 12);
-            let size = (d3 & 0x3_FFFF) as u64 + 1;
-            if want < size {
-                if d3 & PRDT_CRYPTO != 0 {
+        // The unlock byte: the write's byte at (FRP_TAIL - lba) blocks + G#FFF.
+        match data_byte(ucd, prdto, prdtl, (FRP_TAIL - lba) * 4096 + 0xFFF) {
+            Some((v, crypto)) => {
+                if crypto {
                     ufs_stat(10, 1);
                 }
-                let at = addr + want;
-                if in_dram(at) && read_volatile(at as *const u8) != 0x01 {
+                if v != 0x01 {
                     ufs_stat(9, 1);
                 }
-                break;
             }
-            want -= size;
-            e += 1;
+            None => ufs_stat(18, 1),
+        }
+    }
+}
+
+/// Byte `at` of a command's data, found by walking its PRDT (`prdtl` entries of PRDT_ENTRY bytes from `prdto` into the UCD), and whether its entry has inline encryption on. None when the walk leaves DRAM or the data is shorter. WHY/PROOF the DRAM checks: Android's addresses, external input.
+unsafe fn data_byte(ucd: u64, prdto: u64, prdtl: u64, at: u64) -> Option<(u8, bool)> {
+    let mut want = at;
+    for e in 0..prdtl {
+        let ent = ucd + prdto + e * PRDT_ENTRY;
+        if !in_dram(ent) || !in_dram(ent + 15) {
+            return None;
+        }
+        let addr = (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64;
+        let d3 = rd32(ent + 12);
+        let size = (d3 & 0x3_FFFF) as u64 + 1;
+        if want < size {
+            let a = addr + want;
+            return in_dram(a).then(|| (read_volatile(a as *const u8), d3 & PRDT_CRYPTO != 0));
+        }
+        want -= size;
+    }
+    None
+}
+
+/// An UNMAP's ranges, from its parameter list (SBC: an 8-byte header, then 16-byte block descriptors of LBA (8 bytes) and count (4), big-endian; the descriptors' total length in header bytes 2-3): each counted (21), and those reaching a boot chain (19) or the ferros partition (20). LU0 only; a list that cannot be read counts in 22.
+unsafe fn ufs_unmap(ucd: u64, prdto: u64, prdtl: u64) {
+    let byte = |o: u64| data_byte(ucd, prdto, prdtl, o).map(|v| v.0 as u64);
+    let (Some(h2), Some(h3)) = (byte(2), byte(3)) else {
+        ufs_stat(22, 1);
+        // The first unreadable list, raw, for finding out why (25-29: prdtl, prdto, the first entry's address and des3, the UPIU's expected data length).
+        if read_volatile((UFS_STATS + 8 * 25) as *const u64) == 0 {
+            let ent = ucd + prdto;
+            let ok = in_dram(ent) && in_dram(ent + 15);
+            ufs_set(25, prdtl | 1 << 63);
+            ufs_set(26, prdto);
+            ufs_set(27, if ok { (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64 } else { u64::MAX });
+            ufs_set(28, if ok { rd32(ent + 12) as u64 } else { u64::MAX });
+            ufs_set(29, u32::from_be(rd32(ucd + 12)) as u64);
+        }
+        return;
+    };
+    let n = (h2 << 8 | h3) / 16;
+    for d in 0..n {
+        let o = 8 + d * 16;
+        let mut v = [0u64; 12];
+        for (i, x) in v.iter_mut().enumerate() {
+            match byte(o + i as u64) {
+                Some(b) => *x = b,
+                None => {
+                    ufs_stat(22, 1);
+                    return;
+                }
+            }
+        }
+        let lba = v[..8].iter().fold(0, |a, &b| a << 8 | b);
+        let cnt = v[8..].iter().fold(0, |a, &b| a << 8 | b);
+        ufs_stat(21, 1);
+        if cnt == 0 {
+            continue;
+        }
+        let end = lba + cnt - 1;
+        let hits = |r: (u64, u64)| lba <= r.1 && end >= r.0;
+        if BOOT_CHAIN.iter().any(|&r| hits(r)) {
+            ufs_stat(19, 1);
+        }
+        if hits(FERROS_PART) {
+            ufs_stat(20, 1);
         }
     }
 }
