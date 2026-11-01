@@ -1533,7 +1533,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     crate::sensorlink::publish(p.epoch, p.arc.base + off);
                     0
                 }
-                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 1 => crate::usf::CDT.load(core::sync::atomic::Ordering::Relaxed) as u64 | (crate::usf::MLB.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32,
+                Some((Object::Sensors, r)) if r & RIGHT_SEND != 0 && op == 1 => crate::sensorlink::CDT.load(core::sync::atomic::Ordering::Relaxed) as u64 | (crate::sensorlink::MLB.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32,
                 _ => ERR,
             };
             0
@@ -1560,25 +1560,16 @@ fn el0_trap(f: &mut Frame) -> u64 {
             0
         }
         SYS_LIGHT => {
-            let want = ((f.x[1] as usize).saturating_sub(16) / 4).min(crate::usf::SCOPE_LEN);
-            // The sensors process's ring when it publishes one (sensorlink.rs), else the kernel's own (usf.rs).
-            let proc = crate::sensorlink::live();
-            let (end, rate, mask) = if proc {
-                use crate::sensorlink::{word, SCOPE_FMT, SCOPE_MASK, SCOPE_N};
-                (word(SCOPE_N).unwrap_or(0), word(SCOPE_FMT).unwrap_or(0) as u32, word(SCOPE_MASK).unwrap_or(0) as u32)
-            } else {
-                crate::usf::scope_head()
-            };
+            let want = ((f.x[1] as usize).saturating_sub(16) / 4).min(crate::sensorlink::SCOPE_LEN);
+            // The sensors process's ring (sensorlink.rs); with no process publishing, no samples (the kernel has no USF of its own since 2026-11-01).
+            use crate::sensorlink::{word, SCOPE_FMT, SCOPE_MASK, SCOPE_N};
+            let (end, rate, mask) = (word(SCOPE_N).unwrap_or(0), word(SCOPE_FMT).unwrap_or(0) as u32, word(SCOPE_MASK).unwrap_or(0) as u32);
             let n = want.min(end as usize);
             let mut b = alloc::vec::Vec::with_capacity(16 + 4 * n);
             b.extend_from_slice(&end.to_le_bytes());
             b.extend_from_slice(&rate.to_le_bytes());
             b.extend_from_slice(&mask.to_le_bytes());
-            if proc {
-                crate::sensorlink::scope_copy(end, n, &mut b);
-            } else {
-                crate::usf::scope_copy(end, n, &mut b);
-            }
+            crate::sensorlink::scope_copy(end, n, &mut b);
             p.write(f.x[0], &b);
             f.x[0] = b.len() as u64;
             0

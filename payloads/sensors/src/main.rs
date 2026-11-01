@@ -1,6 +1,6 @@
 //! The sensors process (KERNEL-OUT.md move 4, phase 1): the USF conversation with the AoC — Google's sensor framework, spoken directly over the AoC's IPC rings — out of the kernel. It opens ferros's channel, pushes the board's sensor registry, subscribes to gravity, proximity and the rear spectral sensor, tells the AoC the display's state, follows the light-scope preference, and publishes every sample in one block the kernel reads in place: SYS_FACTS and SYS_LIGHT answer from it, and the power key's wake rule reads proximity from it (sensorlink.rs).
 //!
-//! The kernel keeps the AoC's start — its rails, the firmware through GSA and Trusty — for now: those are secure-world calls (phase 2). This process waits for the AoC to come online, then takes the conversation; should it end, the kernel takes the conversation back.
+//! The kernel keeps the AoC's start — its rails, the firmware through GSA and Trusty: secure-world calls it makes on the `sensors` switch's word (decision 2, 2026-11-01: no FF-A door for EL0). This process turns the switch on, waits for the AoC to come online, then holds the whole conversation: the kernel has no USF of its own. Should it end, init's keeper starts another.
 //!
 //! Spawn: ferros-bridge spawn sensors.bin --name sensors --dma aoc-ipc --hw aoc-mbox --store aoc --sensors --power sensors
 //! Grant slots: 0 console, 1 the AoC's IPC block (`aoc-ipc`), 2 its mailboxes (`aoc-mbox`), 3 the vault scope `aoc.` (the registry scripts), 4 the Sensors right (publish), 5 the `sensors` power switch.
@@ -69,9 +69,9 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ALLOC.init((&raw mut HEAP) as usize, HEAP_SIZE) };
     G.store(grants, core::sync::atomic::Ordering::Relaxed);
     usf::init(grants);
-    // The conversation from the kernel first: from here it neither polls USF nor opens it after the AoC comes online.
+    // The `sensors` switch: the kernel starts the AoC unless it is up (its service loop, some 1.4 s of firmware from the vault, no sooner than 4 s into the boot).
     if !ferros_sys::power(cap(grants, S_POWER), true) {
-        say("sensors: the kernel kept the conversation\n");
+        say("sensors: the kernel refused the switch\n");
         ferros_sys::exit(1);
     }
     let block: &[u64] = unsafe { &(*(&raw const BLOCK)).0 };
@@ -81,9 +81,13 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     let f = freq();
-    // The AoC's firmware is the kernel's to start (a few seconds into the boot): wait for its control block.
+    // Wait for its control block; past 16 s the start failed: this process ends, and init's keeper starts another, whose switch asks again.
     let t0 = now();
     while !usf::aoc_online() {
+        if now() - t0 > (1 << 4) * f {
+            say("sensors: the AoC did not come online in 16 s; this process ends\n");
+            ferros_sys::exit(2);
+        }
         sleep_until(now() + f / 16);
     }
     say(&alloc::format!("sensors: AoC online after A#{} ms of waiting\n", (now() - t0) * 1000 / f));
@@ -92,7 +96,7 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     say(&out);
     out.clear();
     if !ok {
-        say("sensors: USF did not open; the conversation goes back to the kernel\n");
+        say("sensors: USF did not open; this process ends, init's keeper starts another\n");
         ferros_sys::power(cap(grants, S_POWER), false);
         ferros_sys::exit(2);
     }

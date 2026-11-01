@@ -59,7 +59,6 @@ mod x3;
 mod smp;
 mod rtc;
 mod aoc;
-mod usf;
 mod haptics;
 mod gnss;
 mod nfc;
@@ -1838,9 +1837,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
     checklist::at("checklist drawn");
-    // The board's CDT and MLB for the sensor registry scripts (usf.rs), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
+    // The board's CDT and MLB for the sensor registry scripts (sensorlink.rs, SYS_SENSORS op 1), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
     if real_boot {
-        usf::read_board(dtb_addr);
+        sensorlink::read_board(dtb_addr);
         modem::read_board(dtb_addr);
     }
     checklist::at("board read");

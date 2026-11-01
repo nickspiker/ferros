@@ -30,7 +30,7 @@ Each move so far followed the same shape:
 | 1 | Touch bring-up (`touch.rs` `up`) | ~0.9k | ACPM rails (LDO25M, LDO4M), HSI0 USI2 clock gates, the reset GPIO | A `touch` power switch (clocks, rails, reset); the controller handshake (ready event, GPIO6 fix-up, scan mode) in `payloads/touch`, which already speaks SPI to it. The `diag touch …` tools go with it. |
 | 2 | The PT command chain in `service.rs` (~2,000 lines) | ~2k | everything it reaches | Each `diag` subcommand leaves with its module. The rest — store, spawn, seal, mem, display, reload, reboot — stays behind `SYS_PT` until a dev-command server takes the dev-only ones; reload and reboot remain kernel. |
 | 3 | Camera (`camera`, `_snap`, `_events`, `_close`, `_rx`, `_rx_uw`) | ~6.5k | hsi2c (polled, portable), `priv_reg` ×3, ACPM ×3 (the camera PMIC), `display::show` for diag output | `payloads/camera`, a diag process at first (`bridge spawn camera <command>`): ~20 register windows granted, a `camera` power switch for the PMIC and EL3 writes, hsi2c moved into a shared crate. `camera_snap` is captured oracle data: it moves as data, not code. Nothing at boot uses the camera, so this move cannot break a boot. |
-| 4 | Sensors (`usf`, `aoc`, `trusty`, `gsa`, `ffa`, `tpu`) | ~2.7k | FF-A SMCs and memory sharing (trusty), GSA's mailbox (MMIO), ACPM (AoC rails), the proximity gate on the power key | A sensor process: the AoC's IPC rings and the USF protocol (MMIO + shared memory). The kernel keeps a narrow FF-A broker (the calls `trusty.rs` makes, nothing general) and reads proximity from the process for the wake gate, failing open as today. `SYS_FACTS` gravity/proximity come from the process. |
+| 4 | Sensors (`usf`, `aoc`, `trusty`, `gsa`, `ffa`, `tpu`) | ~2.7k | FF-A SMCs and memory sharing (trusty), GSA's mailbox (MMIO), ACPM (AoC rails), the proximity gate on the power key | **Done** 2026-11-01: `payloads/sensors` holds the whole USF conversation and publishes the samples the kernel answers `SYS_FACTS`, `SYS_LIGHT` and the wake rule with; `usf.rs` is gone. The kernel keeps the AoC's start (`aoc`, `trusty`, `gsa`, `ffa`) behind the `sensors` switch (decision 2). `tpu` is not a sensor and stays for now. |
 | 5 | Power (`odpm`, `pd`, `rtc`, the loop's gauge/power/thermal polls, `clock_policy`) | ~1.1k + polls | ACPM throughout, hsi2c_11 (gauge, shared with the TCPC) | A power server for ODPM, the RTC, the gauge and power-domain gating. Thermal throttling keeps a crude kernel fallback (a safety job). DVFS (`clock_policy`) sits beside the scheduler and may stay. |
 | 6 | Display (`display`, `dpu`, `dsim`) | ~1.3k | `priv_reg` (power-domain check), the boot screen | Merged into the display server, which already drives the panel. The kernel keeps the minimum the boot screen and checklist need before processes exist (`display::show` on ABL's pipe). The boot-time modeset (`start_home`) moves to the display server's start. |
 | 7 | Small drivers (`amp`, `haptics`, `gnss`, `spi`, `fp`), the radios' power switches | ~1k | spi (portable), ACPM, `aoc::probe32` (haptics) | Each its own process; `spi.rs` becomes a shared crate (touch, amp, gnss, nfc all use it). `fp` is a bus hunt: a diag payload. |
@@ -49,10 +49,7 @@ Each move so far followed the same shape:
 What blocks the rest of the list after the night of 2026-10-31. Each is a choice, not more work of the same kind.
 
 1. **[decided 2026-11-01] The kernel's USB fallback:** removed with the owner present (USB.md step 5); init's keepers start the driver again.
-2. **Sensors phase 2: the AoC's start.**
-   - It needs the secure world: FF-A calls to Trusty (direct messages, sharing memory for its virtio rings) and GSA's mailbox (plain MMIO, grantable).
-   - Proposed: a `Ffa` capability that allows exactly the calls `trusty.rs` makes — direct requests to Trusty's partition, and sharing pages of the caller's own DMA region — and nothing else.
-   - It is a new door into the secure world, so it waits for your yes.
+2. **[decided 2026-11-01] Sensors phase 2: the AoC's start.** Not an `Ffa` capability: the kernel can check which Trusty calls a process makes but not what its messages say, so that would be a new door into the secure world. Instead the AoC's start is the `sensors` power switch's "on" (the pattern of every other move): the process asks, the kernel's service loop runs its start a step a pass, and the kernel has no USF of its own. Done the same day (see the record).
 3. **The camera harness.**
    - `camera*.rs` (6.5k lines) is the bring-up tool, not a driver. It DMAs into fixed physical regions and draws its viewfinder on the panel directly.
    - Options:
@@ -68,9 +65,7 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
    - The battery gauge, the Type-C controller (the USB switch) and the eUSB2 repeater share it. Everything on it runs on the kernel's core today, so nothing collides.
    - Moving the gauge out means one process owning the bus: a charger process, with the usb switch asking it to close the Type-C switch.
    - Proposed: leave it in the kernel until there is a charger process for other reasons (charging policy).
-6. **The boot modeset.**
-   - `start_home` runs `dpu::modeset_with` (to the 10 bpc blend) before init. Moving it into the display server's start is natural, but it is on the attest screen's path, and `dpu`/`dsim` stay in the kernel for the boot screen and the diag tools anyway.
-   - Proposed: move it together with decision 4's display tools.
+6. **[decided 2026-11-01] The boot modeset.** It moves into the display server's start, run only while the pipe is still at 8 bpc (so a restart does not redo it); `dpu`/`dsim` then leave the kernel with their `diag` tools. On the attest screen's path, so with the owner present and through a slot b cold boot. The display server's grants for it are in place (slots 97-100: `decon0-sub`, `dqe0`, `dqe0-cgc`, `dpu-sysreg`); the port is next.
 
 ## Record
 
@@ -93,3 +88,8 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
     - the light scope through the process: 96,162 samples in the ring.
   - A bug found and fixed on the way: `kill` did not run the end hook, so the kernel kept reading a killed process's memory.
   - Still in the kernel for now: its own USF code as the fallback, and the `diag usf …` tools (they talk on the kernel's session).
+- 2026-11-01: **sensors, phase 2 (move 4, decision 2): the kernel keeps only the AoC's start.**
+  - `usf.rs` is gone (1,109 lines), with the kernel's USF fallback, its take-back, the kernel telling the AoC the screen's state and the light scope, and the `diag usf …` and `diag sensors up` tools. `SYS_FACTS`, `SYS_LIGHT` and the power key's proximity rule read only the process's block; with none published they answer "unknown" and the wake fails open.
+  - The `sensors` switch's on asks for the AoC's start (sensorlink.rs `START`); the service loop runs it a step a pass (`SensorBoot`: rails, the firmware from the vault, GSA's load, the Trusty start, online), no sooner than 4 s into the boot. Off undoes nothing. The rails moved to `aoc::rails`, the board's CDT/MLB reader to `sensorlink::read_board`.
+  - The sensors process waits up to 16 s for the AoC, then ends; init's keeper (`KEPT`, now three: usb, pcie1, sensors) starts another, whose switch asks again.
+  - Verified on the device: after a reload (the AoC already up: "online already", the process serving); `kill sensors`, back in about 3 s; a slot b cold boot, the AoC started from nothing on the switch (online 662 ms after GSA's start), 46 sensors, gravity, proximity and spectral through the process.

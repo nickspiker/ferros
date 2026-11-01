@@ -24,7 +24,7 @@ const S_UNLOCK: u64 = 85;
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
 const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
-    (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
+    (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100]),
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer; `surfaces` again) (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22]),
@@ -53,12 +53,12 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let mut failed = 0u64;
     // The keepers' stacks: in this frame, which never returns.
-    let mut stacks = Stacks([[0u8; KEEPER_STACK]; 2]);
+    let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
     for (name, key, slots) in SHELL.iter() {
         if *name == b"map" {
             // Every driver the keepers watch is started by now.
             for (k, s) in stacks.0.iter_mut().enumerate() {
-                ferros_sys::thread_spawn(keeper, s, (grants << 1) | k as u64);
+                ferros_sys::thread_spawn(keeper, s, (grants << 2) | k as u64);
             }
             wait_unlocked(grants);
         }
@@ -83,16 +83,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 
 const KEEPER_STACK: usize = 8 << 10;
 #[repr(C, align(16))]
-struct Stacks([[u8; KEEPER_STACK]; 2]);
+struct Stacks([[u8; KEEPER_STACK]; KEPT.len()]);
 
 /// The drivers init keeps running (restart policy is init's, not the kernel's: KERNEL-OUT.md; until 2026-11-01 the kernel kept the WiFi driver and took USB back itself). Each: its name in SHELL, the first wait (seconds) between starts, the most the wait doubles to.
 /// - usb: the bridge's only way in, so started again within 4 s of going, at most every 64 s.
 /// - pcie1: it exits when a join fails, and an access point that throttles repeated joins refuses them all evening (2026-10-29), so at most every 64 s, doubling to 1024 s (a join refused again only adds to a throttle).
-const KEPT: [(&[u8], u64, u64); 2] = [(b"usb", 4, 64), (b"pcie1", 64, 1024)];
+/// - sensors: the kernel has no USF of its own since 2026-11-01 (KERNEL-OUT.md decision 2), so a sensors process that ends (the AoC not online in 16 s, USF not opening) is started again like usb; its switch asks the kernel for the AoC's start again.
+const KEPT: [(&[u8], u64, u64); 3] = [(b"usb", 4, 64), (b"pcie1", 64, 1024), (b"sensors", 4, 64)];
 
 /// One keeper, its own thread. Every 4 s, once the wait since its driver's last start has passed, it asks the kernel to start the driver only if no process by that name is alive (`spawn_unique`): "already running" is the answer most of the time, and nothing starts; otherwise the driver starts again from the vault with the slots it booted with, and the wait doubles. Running as long as the longest wait, the wait goes back to the first. Asking the driver itself would not do: one alive but not serving yet (the WiFi driver waits for the person's network credential) looks gone to a call, and a second would start beside it. `diag "kill init pcie1"` stops the keepers with the driver.
 extern "C" fn keeper(arg: u64) -> ! {
-    let (grants, (name, first, most)) = (arg >> 1, KEPT[(arg & 1) as usize]);
+    let (grants, (name, first, most)) = (arg >> 2, KEPT[(arg & 3) as usize]);
     let f = freq();
     let (mut wait, mut started) = (first, now());
     loop {

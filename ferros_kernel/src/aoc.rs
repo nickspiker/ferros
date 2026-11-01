@@ -680,3 +680,14 @@ pub fn log(name: &str, out: &mut alloc::vec::Vec<u8>) {
     }
     out.extend_from_slice(alloc::format!("({n} messages)\n").as_bytes());
 }
+
+/// The sensors' two rails on the sub PMIC (zuma-common.dtsi, the AoC's `sensor_power_list`): LDO7S 1.8 V (L7S_SENSORS_FPS) and LDO5S 3.3 V (L5S_PROX), control registers G#35 and G#33 (s2mpg15-register.h); bit 7 enables. Both are boot-on in the device tree.
+pub const RAILS: [(&str, u32); 2] = [("LDO7S 1.8 V", 0x35), ("LDO5S 3.3 V", 0x33)];
+
+/// Turn the sensors' rails on, as Linux's AoC driver does at probe, before the firmware starts (aoc.c reset_sensor_power): the firmware finds no sensors on dark rails, and its sensor list comes back empty (2026-10-24). Moved here from usf.rs with the AoC's start (2026-11-01).
+pub fn rails(out: &mut alloc::vec::Vec<u8>) {
+    for (name, reg) in RAILS {
+        let r = crate::acpm::update(crate::acpm::SUB, crate::acpm::T_PMIC, reg, 0x80, 0x80).and_then(|_| crate::acpm::read(crate::acpm::SUB, crate::acpm::T_PMIC, reg));
+        out.extend_from_slice(alloc::format!("{name} on: {:?}\n", r.map(|c| alloc::format!("G#{c:02X}"))).as_bytes());
+    }
+}
