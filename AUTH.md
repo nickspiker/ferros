@@ -85,22 +85,24 @@ The handle proof is public (beacons and the registry carry it), so keeping it in
 
 ## What the attest screen says
 
-Owner, 2026-10-31: simple and direct.
+Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "close to that", as given); "proposed" rows are mine, written in the same style and waiting for the owner's correction.
 
-| When | Text | Button |
-|---|---|---|
-| Unbound, waiting | This device is unbound. Type your handle to bind. | bind |
-| Bound, waiting | Type your handle. | unlock |
-| Denied | Denied. This device is bound to another identity. | |
-| The proof running | Computing identity keys. | |
-| Looking up | Finding this identity. | |
-| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) | go on |
-| None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint |
-| The two differ | They don't match. Try again. | |
-| Minting | Minting. | |
-| Mint failed | Minting failed. Enter to retry. | |
-| No answer | No answer yet. Still looking. | go on |
-| Wrong slot | This handle's record doesn't match. Start over with another. | start over |
+| When | Text | Button | Words |
+|---|---|---|---|
+| Unbound, waiting | This device is unbound. Type your handle to bind. | bind | owner |
+| Bound, waiting | Type your handle. | unlock | proposed |
+| Denied | Denied. This device is bound to another identity. | | owner ("DENIED"); the second sentence proposed |
+| The proof running | Computing identity keys. | | owner |
+| Looking up | Finding this identity. | | owner |
+| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) | go on | owner |
+| None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint | owner |
+| The two differ | They don't match. Try again. | | proposed |
+| Minting | Minting. | | proposed |
+| Mint failed | Minting failed. Enter to retry. | | proposed |
+| No answer | No answer yet. Still looking. | go on | proposed |
+| Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
+
+If the glossary's proposals are ruled on (GLOSSARY.md, "Proposed: the auth and fleet words"), "bind" in the first and sixth rows may become "join".
 
 ## Known gaps
 
