@@ -476,6 +476,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Serve(b"bt"), Hardware(b"apm-usi1-uart"), Power(b"bt"), Use(b"bt"),
         // 85 the identity unlock right (AUTH.md): the attest screen unlocks the person's space with it; init asks it whether a person is present before it starts what reads that space.
         Unlock,
+        // The USB driver (payloads/usb, USB.md): 86 the controller's registers, 87 its DMA memory, 88 its interrupt, 89 the kernel's PT commands, 90 the `usb` power switch (the controller from the kernel).
+        Dma(b"usb-regs"), Dma(b"usb-dma"), Irq(b"usb-dwc3"), Pt, Power(b"usb"),
     ]
 }
 
@@ -498,6 +500,8 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"bt" => &[81, 82, 76, 83, 41],
         // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint), 9 the identity unlock right (payloads/ahau).
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85],
+        // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
+        b"usb" => &[86, 87, 88, 89, 90],
         _ => return None,
     };
     let all = home_grants();

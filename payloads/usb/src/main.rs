@@ -1,9 +1,9 @@
-//! The USB device driver as a process (USB.md: USB out of the kernel): the DWC3 controller on HSI0, driven through its registers mapped for EL0 (`usb-regs`) and DMA memory it owns (`usb-dma`), woken by its interrupt (`usb-dwc3`), serving Photon Transport to the bridge. Being built step by step; for now the input `p` probes the grants and exits.
+//! The USB device driver as a process (USB.md: USB out of the kernel): the DWC3 controller on HSI0, driven through its registers mapped for EL0 (`usb-regs`) and DMA memory it owns (`usb-dma`), woken by its interrupt (`usb-dwc3`), serving Photon Transport to the bridge, each command handed to the kernel (SYS_PT). init starts it at boot from the vault capsule `usb`.
 //!
-//! Spawn: ferros-bridge spawn usb.bin p --name usb --dma usb-regs --dma usb-dma --irq usb-dwc3 --pt --power usb
+//! By hand: ferros-bridge spawn usb.bin 73 --name usb --dma usb-regs --dma usb-dma --irq usb-dwc3 --pt --power usb
 //! Grant slots, in that order: 0 console, 1 usb-regs, 2 usb-dma, 3 the interrupt, 4 the kernel's PT commands, 5 the `usb` power switch.
 //!
-//! Inputs: `p` probes the grants; `d` hands the kernel a plain `diag` through the PT endpoint (USB.md step 3) and prints the reply's length and its first lines. `h` takes the controller from the kernel for 2 s and gives it back; `k` takes it and exits, for the kernel to take it back from a driver that is gone. `s` serves: the controller from the kernel, reset and run here, Photon Transport to the bridge, every command handed to the kernel (step 4).
+//! Inputs (hex on the bridge): none or `s` serves (init starts it so); `p` probes the grants; `d` hands the kernel a plain `diag` through the PT endpoint (USB.md step 3) and prints the reply's length and its first lines. `h` takes the controller from the kernel for 2 s and gives it back; `k` takes it and exits, for the kernel to take it back from a driver that is gone.
 #![no_std]
 #![no_main]
 
@@ -57,7 +57,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     if input.first() == Some(&b'd') {
         diag(grants);
     }
-    if input.first() == Some(&b's') {
+    // No input (init's spawn) or `s`: the driver.
+    if input.is_empty() || input.first() == Some(&b's') {
         serve(grants);
     }
     if let Some(&m @ (b'h' | b'k')) = input.first() {

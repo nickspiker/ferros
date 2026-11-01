@@ -10,6 +10,7 @@
 //!   28 serve wlan, 29-40 the WiFi driver's hardware (pcie1-elbi … pmu), 41 entropy, 42 dma pcie1-dma, 43 the vault scope `wifi.`, 44 use wlan, 45 serve udp,
 //!   46 serve photon, 47 use photon, 48 the vault scope `photon.`, 49 the ira key, 50 use udp (PHOTON.md).
 //!   51 the vault scope `ahau.`, 52 use rmnet (the cellular link, the IP process's second), 53 serve rmnet, 54-68 the modem's hardware, 69-71 its shared memory, 72-76 its partitions (payloads/modem).
+//!   77-79 the NFC driver's, 80 use nfc, 81-83 the Bluetooth driver's, 84 use bt, 85 the identity unlock right, 86-90 the USB driver's (registers, DMA, interrupt, PT commands, power).
 #![no_std]
 #![no_main]
 
@@ -21,12 +22,14 @@ const S_USE_DISPLAY: u64 = 17;
 const S_UNLOCK: u64 = 85;
 
 /// Each process: its name, its vault key, and which of init's slots it receives, in the order its own grant slots expect them (payloads/display, payloads/touch, payloads/map headers).
-const SHELL: [(&[u8], &[u8], &[u64]); 10] = [
+const SHELL: [(&[u8], &[u8], &[u64]); 11] = [
     // What runs before a person is present (AUTH.md, the device class): the screen, touch and the attest screen, then the network and the radios.
     (b"display", b"display", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27]),
     (b"touch", b"touch", &[14, 15, 16, 23]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint), 9 the identity unlock right (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85]),
+    // The USB driver (payloads/usb, USB.md): it takes the controller from the kernel and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. Should it fail, it gives the controller back and the kernel serves USB as before.
+    (b"usb", b"usb", &[86, 87, 88, 89, 90]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header). It brings the chip up now and joins once the identity's network credential can be read.
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83]),
     // 1 use wlan, 2 serve udp, 3 entropy, 4 use rmnet (payloads/ip).
@@ -61,7 +64,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, pcie1, ip, nfc, bt, modem, map, photon)\n");
+        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, nfc, bt, modem, map, photon)\n");
     }
     exit(failed)
 }
