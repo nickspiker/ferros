@@ -38,11 +38,8 @@ mod sensorlink;
 #[cfg(feature = "pixel8")]
 mod display;
 #[cfg(feature = "pixel8")]
-mod dsim;
 #[cfg(feature = "pixel8")]
-mod hk3;
 #[cfg(feature = "pixel8")]
-mod dpu;
 #[cfg(feature = "pixel8")]
 mod hsi2c;
 #[cfg(feature = "pixel8")]

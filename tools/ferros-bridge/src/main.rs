@@ -97,11 +97,6 @@ async fn main() {
             cmd_poke(&args[2], &args[3]).await;
         }
         "store" => cmd_store(&args[2..]).await,
-        "display" if args.get(2).map(String::as_str) == Some("dcs") => {
-            // display dcs "<packet> / <packet> / ..." — each packet is hex bytes (the DCS command first), optionally followed by wNN (wait NN ms after it); a leading tNN picks the DSI data type (default: G#05 / G#15 / G#39 by length). Example: 'f0 5a 5a / 51 05 49 / f0 a5 a5' sets brightness 1353.
-            let script = args[3..].join(" ");
-            cmd_display_dcs(&script).await;
-        }
         "display" if args.get(2).map(String::as_str) == Some("power") => {
             // display power [samples = 1] [interval in 1/16 s = 8] [battery] — battery voltage and current from the MAX77759 gauge over hsi2c_11 (PMIC.md), for display power profiling against a `display fill` scene. `battery`: the charger's buck is off for the run so the reading is the system's draw, not the charger's leftovers.
             let n: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(1);
@@ -175,51 +170,8 @@ async fn main() {
             }
             cmd_display_raw(&m).await;
         }
-        "display" if args.get(2).map(String::as_str) == Some("dsim") => cmd_display_raw(&[3]).await,
         "display" if args.get(2).map(String::as_str) == Some("terate") => cmd_display_raw(&[5]).await,
         "display" if args.get(2).map(String::as_str) == Some("tune") => cmd_display_raw(&[7]).await,
-        "display" if args.get(2).map(String::as_str) == Some("modeset") => {
-            // display modeset fhd|wqhd [1368|1346] [8|10|keep] — the link rate (ABL's 1368 Mbps, Android's 1346; omitted keeps the current one) and the blend depth: 10 bpc with the DQE dither is the default (two bits of gradation on the 8 bpc link for no measurable power, DISPLAY-POWER.md), `8` is ABL's path, `keep` leaves it.
-            let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
-            // `link10`: the 10 bpc DSC stream experiment (DISPLAY-DESIGN.md step 5), with `f2=XX` the panel's F2 byte to try; needs eyes on the panel.
-            let mut rate = 0;
-            let mut bpc = 2;
-            let mut f2 = 0u8;
-            for a in &args[4..] {
-                match a.as_str() {
-                    "1368" => rate = 1,
-                    "1346" => rate = 2,
-                    "8" => bpc = 1,
-                    "10" => bpc = 2,
-                    "link10" => bpc = 3,
-                    "keep" => bpc = 0,
-                    s if s.starts_with("f2=") => f2 = u8::from_str_radix(&s[3..], 16).unwrap_or(0),
-                    _ => {}
-                }
-            }
-            cmd_display_raw(&[10, fhd, rate, bpc, f2]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("idle") => {
-            let floor: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(10);
-            let changeable = args.get(4).map(|a| a == "changeable").unwrap_or(false) as u8;
-            cmd_display_raw(&[9, floor, changeable]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("res") => {
-            // display res fhd|wqhd [steps mask: 1 panel, 2 DECON+DSC+layer, 4 DSIM; default 7]
-            let fhd = args.get(3).map(|a| a == "fhd").unwrap_or(false) as u8;
-            let steps: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(7);
-            cmd_display_raw(&[8, fhd, steps]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("mode") => {
-            let hz: u8 = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(120);
-            cmd_display_raw(&[6, hz]).await;
-        }
-        "display" if args.get(2).map(String::as_str) == Some("read") => {
-            // display read <reg hex> [len = 1] — a DCS read from the panel.
-            let reg = u8::from_str_radix(args.get(3).map(String::as_str).unwrap_or("0a"), 16).unwrap_or_else(|_| { eprintln!("bad register"); std::process::exit(1) });
-            let len: u8 = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(1);
-            cmd_display_raw(&[4, reg, len]).await;
-        }
         "display" => {
             // --hold: keep the message up (the device's 512 s idle exit is disabled until a REBOOT; both volume keys still power it off).
             let hold = args.get(2).map(|a| a == "--hold").unwrap_or(false);
@@ -1054,38 +1006,6 @@ async fn cmd_store(args: &[String]) {
     }
 }
 
-/// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
-/// Encode a DCS script into the kernel's `[type][len][bytes…][wait_ms]` packets and send it as DISPLAY op G#02.
-async fn cmd_display_dcs(script: &str) {
-    let mut params = vec![2u8];
-    let mut n = 0;
-    for pkt in script.split('/') {
-        let mut bytes = Vec::new();
-        let mut wait = 0u8;
-        let mut kind: Option<u8> = None;
-        for tok in pkt.split_whitespace() {
-            if let Some(w) = tok.strip_prefix('w') {
-                wait = w.parse().unwrap_or_else(|_| { eprintln!("bad wait: {tok}"); std::process::exit(1) });
-            } else if let Some(t) = tok.strip_prefix('t') {
-                kind = Some(u8::from_str_radix(t, 16).unwrap_or_else(|_| { eprintln!("bad type: {tok}"); std::process::exit(1) }));
-            } else {
-                bytes.push(u8::from_str_radix(tok, 16).unwrap_or_else(|_| { eprintln!("bad byte: {tok}"); std::process::exit(1) }));
-            }
-        }
-        if bytes.is_empty() {
-            continue;
-        }
-        let kind = kind.unwrap_or(match bytes.len() { 1 => 0x05, 2 => 0x15, _ => 0x39 });
-        params.push(kind);
-        params.push(bytes.len() as u8);
-        params.extend_from_slice(&bytes);
-        params.push(wait);
-        n += 1;
-    }
-    println!("{n} packets");
-    cmd_display_raw(&params).await;
-}
-
 /// Send raw DISPLAY params and print the reply.
 async fn cmd_display_raw(params: &[u8]) {
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
@@ -1103,6 +1023,7 @@ async fn cmd_display_raw(params: &[u8]) {
     }
 }
 
+/// Render text on the device's panel (shim, after a --live handoff) and print the device's register report.
 async fn cmd_display(text: &str, hold: bool) {
     let link = usb::UsbLink::open().unwrap_or_else(|e| {
         eprintln!("{e}");

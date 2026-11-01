@@ -2489,60 +2489,8 @@ pub fn run(mut b: Boot) -> ! {
                 let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
                 queue_pt_response(&mut pt_out_data, &resp);
             } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
-                // A leading G#01 byte = hold (bridge `display --hold`); G#02 = a DSI packet script for the panel (dsim::sequence, bridge `display dcs`); G#03 = dump the DSIM link registers (bridge `display dsim`). Anything else is text for the painter.
+                // A leading G#01 byte = hold (bridge `display --hold`). The DSI tools — G#02 a packet script, G#03 the DSIM dump, G#04 a DCS read, G#06 the refresh rate, G#08 the raster, G#09 the idle floor, G#0A the modeset — left with dpu.rs and dsim.rs on 2026-11-01 (KERNEL-OUT.md decision 6): the display server drives the panel. Anything else is text for the painter.
                 match cmd.params.split_first() {
-                    Some((2, script)) => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() {
-                            rep.extend_from_slice(b"DPU powered down\n");
-                        } else if !crate::dsim::alive() {
-                            rep.extend_from_slice(b"DSIM0 not running\n");
-                        } else {
-                            let (sent, fail) = crate::dsim::sequence(script, freq);
-                            rep.extend_from_slice(b"DSI packets sent: ");
-                            rep.extend_from_slice(alloc::format!("{sent}").as_bytes());
-                            match fail {
-                                Some(f) => rep.extend_from_slice(alloc::format!(", then FIFO stuck (FIFOCTRL G#{f:08x})\n").as_bytes()),
-                                None => rep.extend_from_slice(b", all went\n"),
-                            }
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    Some((3, _)) => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() {
-                            rep.extend_from_slice(b"DPU powered down\n");
-                        } else {
-                            crate::dsim::dump(&mut rep);
-                            crate::dsim::dump_phy(&mut rep);
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#06 [hz] = switch the panel's refresh rate with its own command set, set the DSIM's command-TE timers, and measure the result (bridge `display mode 60|120`).
-                    Some((6, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        let hz = args[0] as u32;
-                        let script = match hz {
-                            60 => Some(crate::hk3::REFRESH_60),
-                            120 => Some(crate::hk3::REFRESH_120),
-                            _ => None,
-                        };
-                        if !crate::display::dpu_on() || !crate::dsim::alive() {
-                            rep.extend_from_slice(b"display not running\n");
-                        } else if let Some(script) = script {
-                            let (sent, fail) = crate::dsim::sequence(script, freq);
-                            if fail.is_none() {
-                                crate::dsim::set_cmd_te(hz);
-                                // The DSIM's registers are shadowed: a frame applies the timers.
-                                let _ = crate::display::show(if hz == 60 { b"ferros 60 Hz" } else { b"ferros 120 Hz" }, freq);
-                            }
-                            let (pin_hz, _) = crate::display::te_rate(freq);
-                            rep.extend_from_slice(alloc::format!("mode {hz} Hz: {sent} packets{}; TE now {pin_hz} Hz\n", if fail.is_some() { " (FIFO stuck)" } else { "" }).as_bytes());
-                        } else {
-                            rep.extend_from_slice(b"mode: 60 or 120\n");
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
                     // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
                     Some((11, args)) => {
                         let mut rep = alloc::vec::Vec::new();
@@ -2711,47 +2659,6 @@ pub fn run(mut b: Boot) -> ! {
                         }
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
-                    // G#08 [1 = FHD, 0 = WQHD] = switch the whole pipe's raster (bridge `display res fhd|wqhd`).
-                    Some((8, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() || !crate::dsim::alive() {
-                            rep.extend_from_slice(b"display not running\n");
-                        } else {
-                            crate::display::resolution(args[0] == 1, args.get(1).copied().unwrap_or(7), freq, &mut rep);
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#09 [floor: 30, 10, 1, or 0 = exit to manual 120] = the panel's auto-rate idle floor, then 1.5 s of stillness and the TE pin (bridge `display idle N`).
-                    Some((9, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        let script = match args[0] { 30 => Some(crate::hk3::IDLE_30), 10 => Some(crate::hk3::IDLE_10), 1 => Some(crate::hk3::IDLE_1), 0 => Some(crate::hk3::IDLE_EXIT), _ => None };
-                        if !crate::display::dpu_on() || !crate::dsim::alive() {
-                            rep.extend_from_slice(b"display not running\n");
-                        } else if let Some(script) = script {
-                            let (sent, fail) = crate::dsim::sequence(script, freq);
-                            // A second byte of 1 asks for changeable TE during the measurement, so the pin shows the panel's real rate; fixed TE is restored after.
-                            let changeable = args.get(1) == Some(&1);
-                            if changeable {
-                                let _ = crate::dsim::sequence(crate::hk3::TE_CHANGEABLE, freq);
-                            }
-                            let t0 = cntpct();
-                            while cntpct().wrapping_sub(t0) < freq * 3 / 2 {}
-                            let ((pin_hz, _), width_us) = crate::display::te_profile(freq);
-                            if changeable {
-                                let _ = crate::dsim::sequence(crate::hk3::TE_FIXED, freq);
-                            }
-                            rep.extend_from_slice(alloc::format!("idle floor {}: {sent} packets{}; after 1.5 s still, TE {pin_hz} Hz ({width_us} us high){}\n", args[0], if fail.is_some() { " (FIFO stuck)" } else { "" }, if changeable { " [changeable TE]" } else { "" }).as_bytes());
-                        } else {
-                            rep.extend_from_slice(b"idle: 30, 10, 1 or 0\n");
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#0A [1 = FHD, 0 = WQHD] [link rate: 0 keep, 1 = 1368 Mbps, 2 = 1346 Mbps] [blend depth: 0 keep, 1 = 8 bpc, 2 = 10 bpc] = the full modeset (dpu::modeset: DECON and DSIM stopped, re-initialised, started; bridge `display modeset fhd|wqhd [1368|1346] [8|10]`).
-                    Some((10, args)) if !args.is_empty() => {
-                        let mut rep = alloc::vec::Vec::new();
-                        crate::dpu::modeset(args[0] == 1, args.get(1).copied().unwrap_or(0), args.get(2).copied().unwrap_or(0), args.get(3).copied().unwrap_or(0), freq, &mut rep);
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
                     // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
                     Some((5, _)) => {
                         let mut rep = alloc::vec::Vec::new();
@@ -2760,25 +2667,6 @@ pub fn run(mut b: Boot) -> ! {
                         } else {
                             let ((pin_hz, irq_hz), width_us) = crate::display::te_profile(freq);
                             rep.extend_from_slice(alloc::format!("TE: {pin_hz} Hz on the pin ({width_us} us high), {irq_hz} Hz by DECON interrupt\n").as_bytes());
-                        }
-                        queue_pt_response(&mut pt_out_data, &rep);
-                    }
-                    // G#04 [cmd][len] = a DCS read from the panel (bridge `display read`).
-                    Some((4, args)) if args.len() >= 2 => {
-                        let mut rep = alloc::vec::Vec::new();
-                        if !crate::display::dpu_on() {
-                            rep.extend_from_slice(b"DPU powered down\n");
-                        } else {
-                            match crate::dsim::read(args[0], args[1] as usize, freq) {
-                                Ok(bytes) => {
-                                    rep.extend_from_slice(alloc::format!("read G#{:02x}:", args[0]).as_bytes());
-                                    for b in bytes {
-                                        rep.extend_from_slice(alloc::format!(" {b:02x}").as_bytes());
-                                    }
-                                    rep.push(b'\n');
-                                }
-                                Err(e) => rep.extend_from_slice(alloc::format!("read G#{:02x} failed: G#{e:08x}\n", args[0]).as_bytes()),
-                            }
                         }
                         queue_pt_response(&mut pt_out_data, &rep);
                     }

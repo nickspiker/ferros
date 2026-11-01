@@ -244,10 +244,6 @@ const INT_PEND_TE_RISE: u32 = 1 << 16;
 pub const GPP0_DAT: usize = 0x1084_0004;
 
 /// The panel's refresh rate and TE pulse width over half a second: rising edges on the TE pin (Hz), DECON's TE-rise interrupt with the hardware trigger armed but masked (Hz), and the mean high time of the pulse in µs. Ground truth for mode switches and the TE timing profile, no eyes needed.
-pub fn te_rate(cntfrq: u64) -> (u32, u32) {
-    te_profile(cntfrq).0
-}
-
 pub fn te_profile(cntfrq: u64) -> ((u32, u32), u32) {
     let en = rd(DECON0 + DECON_INT_EN);
     let en_x = rd(DECON0 + DECON_INT_EN_EXTRA);
@@ -292,7 +288,7 @@ pub fn te_profile(cntfrq: u64) -> ((u32, u32), u32) {
 
 /// DECON0's state as Android runs it at WQHD 120 Hz, where ABL leaves it unset (the live diff against oracle/display/husky-hk3/W120_noidle, 2026-10-16): SRAM for every window Android allocates, the out-FIFO QoS, the interrupt enables. The main registers are shadowed: the next present's global shadow update applies them.
 ///
-/// NOT set here: `GLOBAL_CON.TEN_BPC_MODE` with the enhance-path dither alone wedges DECON (2026-10-16: the next frame timed out and the shadow request never cleared). The dither bit on DECON0 means "the DQE output is dithered", so the DQE must be in the path and sized first; dpu::modeset's 10 bpc option does that and works.
+/// NOT set here: `GLOBAL_CON.TEN_BPC_MODE` with the enhance-path dither alone wedges DECON (2026-10-16: the next frame timed out and the shadow request never cleared). The dither bit on DECON0 means "the DQE output is dithered", so the DQE must be in the path and sized first; the display server's boot modeset does that and works (payloads/display modeset.rs; the kernel's dpu::modeset until 2026-11-01).
 const OF_URGENT_EN: usize = 0x02C0;
 const OF_RD_URGENT_0: usize = 0x02C4;
 const OF_RD_URGENT_1: usize = 0x02C8;
@@ -315,70 +311,9 @@ pub fn configure_like_android(rep: &mut alloc::vec::Vec<u8>) {
     append_hex(rep, b"GLOBAL_CON=", rd(DECON0 + GLOBAL_CON));
 }
 
-const DECON_SUB: usize = 0x1949_0000;
 const DMA0: usize = 0x1990_0000;
 const DPP0: usize = 0x1993_0000;
-const SRAMC0: usize = 0x1995_0000;
 const HDRCOMM0: usize = 0x1996_0000;
-const DSIM0: usize = 0x1944_0000;
-
-/// Switch the pipe between the panel's WQHD raster and its FHD raster (DISPLAY-HK3.md §1: the panel scales FHD up itself). The registers and values are the oracle's W120_noidle ⇄ F120_noidle diff (2026-10-16). `steps` selects what to do, to find what the hardware tolerates live: bit 0 the panel (DSC on, the PPS, the raster select — proven harmless alone), bit 1 DECON main sizes, both DSC encoders' group count and PPS words, the layer (DMA0/DPP0/SRAMC0/HDRCOMM0) and window 5, bit 2 DSIM0's resolution, compressed width, slice widths and stable-VFP timer. Then one present to apply the shadow registers, and the panel's raster register and TE rate as the report. A one-shot switch of everything (steps 7) took one frame and then wedged the link; Android does a full modeset for a resolution change.
-pub fn resolution(fhd: bool, steps: u8, cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) {
-    let cfg = if fhd { ferros_dsc::HUSKY_FHD } else { ferros_dsc::HUSKY_WQHD };
-    let (w, h) = (cfg.pic_width as u32, cfg.pic_height as u32);
-    let comp = cfg.slice_width as u32 / 3;
-    let pps = ferros_dsc::pps(&cfg);
-    if steps & 1 != 0 {
-        if crate::dsim::send(crate::dsim::DCS_SHORT_WRITE_1, &[0x9D, 0x01], cntfrq).is_err() || crate::dsim::send(crate::dsim::PPS_LONG_WRITE, &pps, cntfrq).is_err() {
-            rep.extend_from_slice(b"PPS: FIFO stuck\n");
-            return;
-        }
-        let (sent, fail) = crate::dsim::sequence(if fhd { crate::hk3::RES_FHD } else { crate::hk3::RES_WQHD }, cntfrq);
-        if fail.is_some() {
-            append_hex(rep, b"raster select stuck after ", sent as u32);
-            return;
-        }
-    }
-    if steps & 2 != 0 {
-        wr(DECON0 + 0x0220, h << 16 | w);
-        wr(DECON0 + 0x0290, h << 16 | comp);
-        wr(DECON0 + 0x0294, comp);
-        wr(DECON0 + 0x0298, (cfg.slice_height as u32) << 16 | comp);
-        for dsc in [DECON_SUB, DECON_SUB + 0x1000] {
-            wr(dsc + 0x000C, 3 << 12 | comp);
-            for i in 0..18 {
-                wr(dsc + 0x0040 + 4 * i, u32::from_be_bytes([pps[4 * i], pps[4 * i + 1], pps[4 * i + 2], pps[4 * i + 3]]));
-            }
-        }
-        wr(DMA0 + 0x0010, w);
-        wr(DMA0 + 0x0014, h);
-        wr(DMA0 + 0x001C, h << 16 | w);
-        wr(DPP0 + 0x003C, h << 16 | w);
-        wr(SRAMC0 + 0x0014, (h - 1) << 16);
-        wr(HDRCOMM0 + 0x0020, h << 16 | w);
-        wr(DECON_WIN + 5 * 0x1000 + 0x000C, 0);
-        wr(DECON_WIN + 5 * 0x1000 + 0x0010, (h - 1) << 16 | (w - 1));
-    }
-    if steps & 4 != 0 {
-        let dsim = |off: usize, v: u32| unsafe { core::ptr::write_volatile((DSIM0 + off) as *mut u32, v) };
-        dsim(0x0030, h);
-        dsim(0x0034, if fhd { 0x0ED8 } else { 0x063A });
-        dsim(0x0038, comp);
-        dsim(0x003C, h << 16 | comp);
-        dsim(0x0078, (cfg.slice_width as u32) << 16 | cfg.slice_width as u32);
-        dsim(0x0084, w * 2 / 100);
-    }
-    let r = show(if fhd { b"ferros FHD 1008x2244" } else { b"ferros WQHD 1344x2992" }, cntfrq);
-    rep.extend_from_slice(&r);
-    let _ = crate::dsim::dcs(&[0xF0, 0x5A, 0x5A], cntfrq);
-    match crate::dsim::read(0xC3, 1, cntfrq) {
-        Ok(v) => append_hex(rep, b"PANEL_C3=", v[0] as u32),
-        Err(e) => append_hex(rep, b"PANEL_C3_READ_FAILED=", e),
-    }
-    let _ = crate::dsim::dcs(&[0xF0, 0xA5, 0xA5], cntfrq);
-    let (te, _) = te_rate(cntfrq);
-    append_hex(rep, b"TE_HZ=", te);
-}
 
 /// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).
 pub fn dpu_on() -> bool {
