@@ -328,6 +328,8 @@ async fn main() {
                     "--ira" => { grants.push((9, String::new())); i += 1; }
                     // --unlock: the identity unlock right (syscall 24, AUTH.md).
                     "--unlock" => { grants.push((11, String::new())); i += 1; }
+                    // --pt: the kernel's PT commands, for the USB driver process (syscall 25, ptlink.rs).
+                    "--pt" => { grants.push((12, String::new())); i += 1; }
                     // --entropy: the right to draw randomness from the session's wairua (syscall 6).
                     "--entropy" => { grants.push((4, String::new())); i += 1; }
                     // --dma NAME: a DMA region from the kernel's registry (syscall 7 gives its base).

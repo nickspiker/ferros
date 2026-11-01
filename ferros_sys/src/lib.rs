@@ -43,6 +43,7 @@ pub mod nr {
     pub const POWER: u64 = 22;
     pub const IRA: u64 = 23;
     pub const UNLOCK: u64 = 24;
+    pub const PT: u64 = 25;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -251,6 +252,30 @@ pub fn store_delete_addr(cap: u64, addr: &[u8; 32]) -> Option<bool> {
 pub fn store_addrs(cap: u64, offset: usize, buf: &mut [u8]) -> Option<usize> {
     let r = svc(nr::STORE, cap, 32 | 16 | 2 | (buf.len() as u64) << 8 | (offset as u64) << 32, off(b"".as_ptr()), 0, off(buf.as_mut_ptr()));
     if r == ERR || r == NOTHING { None } else { Some(r as usize) }
+}
+
+/// Hand the kernel one assembled PT command (`[cap:32][op][params]`) through a Pt capability (the USB driver process, ptlink.rs). `act` resubmits a command whose reply said it waits to act (reload, reboot, `diag android`), once that reply has gone out. False when one is already in, or the command is too large.
+pub fn pt_submit(cap: u64, cmd: &[u8], act: bool) -> bool {
+    svc(nr::PT, cap, if act { 3 } else { 0 }, off(cmd), cmd.len() as u64, 0) == 0
+}
+
+/// The kernel's reply to the command handed over.
+pub enum PtReply {
+    /// Still running.
+    Running,
+    /// Done: the reply's full length (`buf` holds its bytes from the offset asked), and whether the command waits to act.
+    Done(usize, bool),
+    /// Nothing was handed over.
+    None,
+}
+
+/// Take the reply from `offset` into `buf`; the kernel drops it once a take reaches its end.
+pub fn pt_take(cap: u64, offset: usize, buf: &mut [u8]) -> PtReply {
+    match svc(nr::PT, cap, 1, off(buf as &[u8]), buf.len() as u64, offset as u64) {
+        NOTHING => PtReply::Running,
+        ERR => PtReply::None,
+        r => PtReply::Done((r & 0xFFFF_FFFF) as usize, r >> 32 & 1 == 1),
+    }
 }
 
 /// A device's power through a Power capability (1 on, 0 off). The kernel runs it only on its own core: this pins the calling thread to the X3 for the call (a millisecond's sleep moves it there) and back to the workers after. True when the sequence succeeded.

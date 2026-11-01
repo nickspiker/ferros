@@ -21,9 +21,12 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
    - `usb-dma`: 2 MiB of non-cacheable EL0 memory at G#8B20_0000 (`USB_DMA`).
    - `usb-dwc3`: the controller's interrupt, INTID 434.
    - Verified with `payloads/usb p`: GSNPSID read at EL0 (G#33313130, "3110"), a DMA word written and read back.
-3. **The kernel's PT commands behind an endpoint.** The process hands each assembled command to the kernel and gets the reply. The kernel runs the same dispatch it has today, fed from the endpoint instead of its own controller.
-   - Reload and reboot become "reply, then act".
-   - A `usb` power switch keeps the privileged bring-up in the kernel for now: the eUSB2 PHY, the repeater tune and the TCPC switch on hsi2c_11, which the battery gauge shares, and the SYSMMU/S2MPU bypass.
+3. **[done] The kernel's PT commands behind an endpoint** (`ptlink.rs`, `SYS_PT` 25, the `--pt` grant). The process hands each assembled command to the kernel and gets the raw reply; the kernel runs the same dispatch its own USB feeds (`service.rs` `run`, now at the end of each pass).
+   - Op 0 hands a command over (up to 1 MiB on the heap; up to 6 MiB in the PT receive region, only while the process owns the controller). Op 1 takes the reply from an offset: its full length, bit 32 set when the command waits to act, NOTHING while it runs.
+   - Reload, reboot and `diag android` are "reply, then act": they answer first, and act when the process hands the same command over again with op 3, after its reply has gone out.
+   - The `usb` power switch hands the controller over. On: the kernel stops touching DWC3, closes the Type-C USB switch, brings the eUSB2 PHY up again (the host sees the kernel's device leave) and opens the DMA path. Off: the kernel re-initialises its own USB on the next pass. A process named `usb` gone while it holds the controller is noticed within 4 s, and the kernel takes it back the same way.
+   - DIAG: `KERNEL_USB` (1 the kernel drives the controller, 0 the process), `PT_PROC_CMDS`.
+   - Verified on a hot-reloaded kernel (`payloads/usb` inputs `d`, `h`, `k`): a `diag` through the endpoint, 3,671 bytes back in 2.1 ms; the controller taken for 2 s and given back, the phone back on the bus about 2 s later; taken by a process that then exited, reclaimed in the same pass; the kernel's own PT unchanged (2 MiB vault round trip byte-exact, 0.7 s each way; reload to the next generation).
 4. **`payloads/usb`:**
    - the controller from cold;
    - a ring of large OUT buffers and batched IN;

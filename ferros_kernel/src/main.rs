@@ -32,6 +32,8 @@ mod killswitch;
 #[cfg(feature = "pixel8")]
 mod service;
 #[cfg(feature = "pixel8")]
+mod ptlink;
+#[cfg(feature = "pixel8")]
 mod display;
 #[cfg(feature = "pixel8")]
 mod dsim;

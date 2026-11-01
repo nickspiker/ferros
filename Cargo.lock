@@ -1121,6 +1121,7 @@ dependencies = [
 name = "ferros-payload-usb"
 version = "0.1.0"
 dependencies = [
+ "ferros_pt",
  "ferros_sys",
 ]
 

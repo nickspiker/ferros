@@ -259,6 +259,8 @@ pub enum Object {
     Part(usize),
     /// Served by the kernel: the right to unlock the person's identity class of the vault from their seed, and to lock it (`SYS_UNLOCK`, AUTH.md). The attest screen holds it; init holds it to see whether an identity is unlocked.
     Unlock,
+    /// Served by the kernel: the USB driver process's way into the kernel's PT commands (`SYS_PT`, ptlink.rs): hand one over, take its reply.
+    Pt,
 }
 
 pub const RIGHT_SEND: u32 = 1;
@@ -298,6 +300,7 @@ fn mint(object: Object, rights: u32, epoch: u64) -> [u8; 32] {
         Object::NewSurface => (11, 0),
         Object::Part(i) => (13, i as u64),
         Object::Unlock => (14, 0),
+        Object::Pt => (15, 0),
     };
     let nonce = NONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut h = blake3::Hasher::new_keyed(&key);
@@ -567,6 +570,18 @@ impl Process {
         let m = self.arc.mask();
         (0..len).map(|i| unsafe { core::ptr::read_volatile((self.arc.base + ((off as usize + i) & m)) as *const u8) }).collect()
     }
+    /// `read` into a slice the caller owns: no heap copy, for a command of megabytes (SYS_PT). One copy when the range does not wrap the arc's mask, as a well-formed caller's never does.
+    fn read_into(&self, off: u64, dst: &mut [u8]) {
+        let m = self.arc.mask();
+        let start = off as usize & m;
+        if start + dst.len() <= m + 1 {
+            unsafe { core::ptr::copy_nonoverlapping((self.arc.base + start) as *const u8, dst.as_mut_ptr(), dst.len()) };
+        } else {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = unsafe { core::ptr::read_volatile((self.arc.base + ((off as usize + i) & m)) as *const u8) };
+            }
+        }
+    }
     fn write(&self, off: u64, bytes: &[u8]) {
         let m = self.arc.mask();
         for (i, &b) in bytes.iter().enumerate() {
@@ -646,6 +661,8 @@ const SYS_POWER: u64 = 22;
 const SYS_IRA: u64 = 23;
 /// unlock(cap, op, seed): x0 the Unlock capability, x1 the op — 0 the state (bit 0 an identity is unlocked, bit 1 the phone is bound to one), 1 unlock the identity whose 32-byte seed is at x2 (the number of entries it has on this phone; NOTHING: the phone is bound to another identity; ERR: no vault or no ira), 2 lock, 3 bind the phone to the unlocked identity, 4 release the phone (every identity entry deleted) (0, or ERR). AUTH.md.
 const SYS_UNLOCK: u64 = 24;
+/// pt(cap, op, ptr, len, offset): the kernel's PT commands for the USB driver process (ptlink.rs). Op 0 hands over a command of `len` bytes at `ptr` (op 3: the same command again, to act once its reply is out) → 0 or ERR (one is already in, or too large). Op 1 copies its reply from `offset` into `len` bytes at `ptr` → the reply's full length, plus bit 32 when the command waits to act; NOTHING while it runs; ERR when none was handed over.
+const SYS_PT: u64 = 25;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1057,7 +1074,7 @@ pub struct PowerSwitch {
     pub name: &'static str,
     pub set: fn(bool) -> bool,
 }
-pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }];
+pub static POWERS: &[PowerSwitch] = &[PowerSwitch { name: "gnss", set: crate::gnss::power }, PowerSwitch { name: "nfc", set: crate::nfc::power }, PowerSwitch { name: "bt", set: crate::bt::power }, PowerSwitch { name: "usb", set: crate::ptlink::power }];
 const ERR: u64 = u64::MAX;
 /// What a polling `recv` returns when no message is waiting.
 pub const NOTHING: u64 = u64::MAX - 1;
@@ -1440,6 +1457,25 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         r.unwrap_or(ERR)
                     }
                     2..=4 => unlock(op as u8, None).unwrap_or(ERR),
+                    _ => ERR,
+                },
+                _ => ERR,
+            };
+            0
+        }
+        SYS_PT => {
+            let token = p.read(f.x[0], 32);
+            let (op, at, len) = (f.x[1], f.x[2], f.x[3] as usize);
+            f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+                Some((Object::Pt, r)) if r & RIGHT_SEND != 0 => match op {
+                    0 | 3 => {
+                        if crate::ptlink::submit(len, op == 3, |dst| p.read_into(at, dst)) { 0 } else { ERR }
+                    }
+                    1 => match crate::ptlink::take(f.x[4] as usize, len, |piece| p.write(at, piece)) {
+                        Some((total, act)) => total as u64 | (act as u64) << 32,
+                        None if crate::ptlink::busy() => NOTHING,
+                        None => ERR,
+                    },
                     _ => ERR,
                 },
                 _ => ERR,
@@ -2146,6 +2182,8 @@ pub enum Grant<'a> {
     Part(&'a [u8]),
     /// The identity unlock right (syscall 24).
     Unlock,
+    /// The kernel's PT commands, for the USB driver process (syscall 25).
+    Pt,
 }
 
 /// Where a process finds its *ihi* (the oracle's output for its capsule): the last 32 bytes of the grants page.
@@ -2301,6 +2339,7 @@ fn resolve(grants: &[Grant]) -> Result<Vec<(Object, u32)>, &'static str> {
             },
             Grant::Ira => (Object::Ira, RIGHT_SEND),
             Grant::Unlock => (Object::Unlock, RIGHT_SEND),
+            Grant::Pt => (Object::Pt, RIGHT_SEND),
             Grant::Part(n) => match PARTS.iter().position(|p| p.as_bytes() == *n) {
                 Some(i) => (Object::Part(i), RIGHT_SEND),
                 None => return Err("no such partition grant"),

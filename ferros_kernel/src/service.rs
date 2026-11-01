@@ -82,6 +82,8 @@ struct PtStats {
     specs: u32,
     /// SPECs refused for a size over PT_BIG.
     specs_refused: u32,
+    /// Commands the USB process handed over (ptlink.rs).
+    proc_cmds: u32,
     data_pkts: u32,
     data_decoded: u32,
     data_accepted: u32,
@@ -997,6 +999,23 @@ fn gauge_poll() {
     }
 }
 
+/// The Type-C port controller's USB switch (the MAX77759's TCPC, G#25 on hsi2c_11, vendor register G#93 USBSW_CTRL: G#09 connects D+/D- to the SoC's PHY, 0 parks them): after the cable came out and went back in, the link never came back (2026-10-25, four times) — VBUS present and CC attached on the replug, the eUSB2 repeater correctly tuned, the charger in its mode, yet the host never saw the phone. The chip opens the switch for its own BC1.2 charger detection on a new VBUS, and Google's driver closes it on every attach ("switches will not be configured by HW", tcpci_max77759.c enable_data_path_locked); ABL closes it at power-on and ferros never had. So: attached, VBUS present and the switch not G#09 — close it. The controller's role, CC, power status and the switch go into the flash log when `log` is set and whenever it acts. Called by the kernel's USB re-initialisation and by the `usb` power switch (ptlink.rs), both on the kernel's core, which the battery gauge sharing the bus also polls from.
+pub(crate) fn tcpc_usb_switch(log: bool) {
+    use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
+    const TCPC: u8 = 0x25;
+    let r = |reg: u8| read_byte(HSI2C_11, TCPC, reg).map(|v| v as u32).unwrap_or(0x8000);
+    let (role, cc, pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
+    let attached = cc & 0x8000 == 0 && cc & 0xF != 0;
+    let vbus = pwr & 0x8000 == 0 && pwr & 0x4 != 0;
+    let act = attached && vbus && sw != 0x09;
+    if act {
+        let _ = write_byte(HSI2C_11, TCPC, 0x93, 0x09);
+    }
+    if log || act {
+        crate::flashlog::line(&alloc::format!("usb: tcpc role G#{role:X} cc G#{cc:X} power G#{pwr:X} usb switch G#{sw:X}{}", if act { " -> closed (G#09)" } else { "" }));
+    }
+}
+
 pub fn run(mut b: Boot) -> ! {
     // Report now too: if the USB bring-up wedges, the watchdog's reset still shows the vault result (handoff) and the crumb shows how far USB got.
     report(&b, 0xA0);
@@ -1106,6 +1125,11 @@ pub fn run(mut b: Boot) -> ! {
     // A finished transfer is closed at the top of the next pass, not at the end of the arm that finished it: the DIAG handlers leave their arm with `continue`, which skipped the close and left every finished `diag` transfer "open" — then a 16 s pause tripped the stall exit (every PT-stall exit of 2026-10-16 followed a `diag` with a pause; the record named it).
     let mut pt_done = false;
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // A command from the USB process in flight (ptlink.rs): the kernel's own outbound reply set aside while the raw reply collects in pt_out_data, and whether the command waits to act once its reply has gone out.
+    let mut proc_restore: Option<alloc::vec::Vec<u8>> = None;
+    let mut proc_act = false;
+    // The USB process's holder check (below): when it last looked.
+    let mut usb_check = 0u64;
 
     let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
     let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
@@ -1155,6 +1179,13 @@ pub fn run(mut b: Boot) -> ! {
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // The USB process's command handled last pass: its raw reply to the process, the kernel's own outbound reply back in place.
+        if let Some(saved) = proc_restore.take() {
+            platform::RAW_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);
+            let reply = core::mem::replace(&mut pt_out_data, saved);
+            let act = core::mem::take(&mut proc_act);
+            crate::process::with_lock(|| crate::ptlink::reply(reply, act));
+        }
         crate::keys::serve();
         if !keys_settled && cntpct() > keys_settle {
             crate::keys::forget_missing();
@@ -1193,13 +1224,22 @@ pub fn run(mut b: Boot) -> ! {
             let mut out = alloc::vec::Vec::new();
             crate::usf::display_info(DISPLAY_DBV, !screen_off, 120, &mut out);
         }
-        USB_LINK.store(usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
+        USB_LINK.store(crate::ptlink::kernel_usb() && usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
         if pt_done {
             pt_done = false;
             pt_inbound = None;
             pt_seq_width = 0;
         }
         let now = cntpct();
+        // The controller back from the USB process (`power usb off`, or the process gone): the kernel owns it again, and re-initialises it this pass (the idle arm below) before taking any event from it.
+        let take_back = crate::ptlink::TAKE_BACK.swap(false, core::sync::atomic::Ordering::Relaxed);
+        if take_back {
+            crate::ptlink::KERNEL_USB.store(true, core::sync::atomic::Ordering::Relaxed);
+            crate::process::with_lock(crate::ptlink::reset);
+        }
+        let kernel_usb = crate::ptlink::kernel_usb();
+        // A command from the USB process waiting: no sleep and no time slice before it runs.
+        let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed);
         // Home: once the ring has completed — the host has the USB link, or a second has passed since the press with no cable — start init and with it the shell.
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
@@ -1288,6 +1328,14 @@ pub fn run(mut b: Boot) -> ! {
                 }
             }
         }
+        // The USB process gone while it holds the controller (a fault, `diag kill usb`): the kernel takes the controller back, so the bridge always has a way in.
+        if !kernel_usb && now.wrapping_sub(usb_check) > 4 * freq {
+            usb_check = now;
+            if !crate::process::running(b"usb") {
+                crate::flashlog::line("usb: the USB process is gone; the kernel takes the controller back");
+                crate::ptlink::TAKE_BACK.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // The checklist's IPC row, once any process has had a call answered (init, which marks the others, makes none).
         if !ipc_marked && crate::process::round_trips() > 0 {
             ipc_marked = true;
@@ -1306,19 +1354,21 @@ pub fn run(mut b: Boot) -> ! {
             usb_log(&mut usb_log_n, &alloc::format!("usb: link state {} -> {} at {} s (DSTS G#{:08X})", link_was, link, now.wrapping_sub(t_boot) / freq, dsts()));
         }
         link_was = link;
-        let host_gone = usb.is_configured() && now.wrapping_sub(t_awake) > 16 * freq;
+        let host_gone = kernel_usb && usb.is_configured() && now.wrapping_sub(t_awake) > 16 * freq;
         if usb.is_configured() != usb_was_configured {
             usb_was_configured = usb.is_configured();
             usb_log(&mut usb_log_n, &alloc::format!("usb: {} at {} s (DSTS G#{:08X})", if usb_was_configured { "configured" } else { "not configured" }, now.wrapping_sub(t_boot) / freq, dsts()));
         }
-        match usb.poll_event() {
+        let mut usb_cmd = false;
+        // The controller is the USB process's while it holds the `usb` power switch (ptlink.rs): no events taken from it then, and on the pass it comes back, only the re-initialisation.
+        match if kernel_usb && !take_back { usb.poll_event() } else { UsbEvent::None } {
             UsbEvent::None => {
                 // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires) — but not while a PT transfer is open or a response is still going out: a 10 ms slice per idle pass crawls a transfer to the point where the host gives up, and the half-open transfer then trips the 16 s stall exit (measured 2026-10-16: every PT-stall exit of the day had a busy process running).
                 // `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
                 platform::crumb(0xD1);
-                let ran = if pt_inbound.is_none() && pt_out_data.is_empty() { crate::process::run_slice() } else { false };
+                let ran = if pt_inbound.is_none() && pt_out_data.is_empty() && !inbox_full { crate::process::run_slice() } else { false };
                 platform::crumb(0xD2);
-                if host_gone || !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout) {
+                if take_back || kernel_usb && (host_gone || !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout)) {
                     if host_gone {
                         usb_log(&mut usb_log_n, &alloc::format!("usb: link suspended 16 s while configured at {} s: the host has gone, reconnecting", now.wrapping_sub(t_boot) / freq));
                         t_awake = now;
@@ -1351,22 +1401,7 @@ pub fn run(mut b: Boot) -> ! {
                         }
                     }
                     usb_log(&mut usb_log_n, &alloc::format!("usb: re-initialising (attempt {}) at {} s, DSTS G#{:08X}", attempts + 1, now.wrapping_sub(t_boot) / freq, dsts()));
-                    // The Type-C port controller's USB switch (the MAX77759's TCPC, G#25 on hsi2c_11, vendor register G#93 USBSW_CTRL: G#09 connects D+/D- to the SoC's PHY, 0 parks them): after the cable came out and went back in, the link never came back (2026-10-25, four times) — VBUS present and CC attached on the replug, the eUSB2 repeater correctly tuned, the charger in its mode, yet the host never saw the phone. The chip opens the switch for its own BC1.2 charger detection on a new VBUS, and Google's driver closes it on every attach ("switches will not be configured by HW", tcpci_max77759.c enable_data_path_locked); ABL closes it at power-on and ferros never had. So: attached, VBUS present and the switch not G#09 — close it. The controller's role, CC, power status and the switch into the flash log on every eighth attempt and whenever it acts.
-                    {
-                        use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
-                        const TCPC: u8 = 0x25;
-                        let r = |reg: u8| read_byte(HSI2C_11, TCPC, reg).map(|v| v as u32).unwrap_or(0x8000);
-                        let (role, cc, pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
-                        let attached = cc & 0x8000 == 0 && cc & 0xF != 0;
-                        let vbus = pwr & 0x8000 == 0 && pwr & 0x4 != 0;
-                        let act = attached && vbus && sw != 0x09;
-                        if act {
-                            let _ = write_byte(HSI2C_11, TCPC, 0x93, 0x09);
-                        }
-                        if attempts % 8 == 0 || act {
-                            crate::flashlog::line(&alloc::format!("usb: re-init {}: tcpc role G#{role:X} cc G#{cc:X} power G#{pwr:X} usb switch G#{sw:X}{}", attempts + 1, if act { " -> closed (G#09)" } else { "" }));
-                        }
-                    }
+                    tcpc_usb_switch(attempts % 8 == 0);
                     crate::pixel8_eusb_phy_init();
                     if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() {
                         usb = nu;
@@ -1381,13 +1416,13 @@ pub fn run(mut b: Boot) -> ! {
                     t_init = cntpct();
                     t_progress = t_init;
                 }
-                if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                if kernel_usb && !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
                     let len = pt_out_data.len().min(512);
                     let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
                     usb.bulk_in_send(&chunk);
                 }
                 // Truly idle — enumerated, no transfer half-received, nothing waiting to go out, no process to run — sleep until the next timer event. Anything else keeps the old short spin, so transfers and a live display server behave exactly as before.
-                if usb.is_configured() && pt_inbound.is_none() && pt_out_data.is_empty() && !ran {
+                if (usb.is_configured() || !kernel_usb) && pt_inbound.is_none() && pt_out_data.is_empty() && !inbox_full && !ran {
                     let t = cntpct();
                     platform::crumb(0xB3);
                     // A backstop under the event stream: the EL2 timer armed 2 ms out, so a GIC interrupt ends this `wfe` even if the event stream cannot. On battery at the rest clocks the X3 went into this `wfe` and never came out — the last crumb G#B3, its event stream still on (2026-10-25, three times) — as if the core had been taken down while it waited, where only an interrupt brings a core back. Taken at EL2 the tick only stops the timer (.Lirq_tick). The event stream wakes it first every time it can (333 us), so the timer is disarmed before it fires; a sleep that ran past 1.5 ms was ended by the backstop, and DIAG counts those.
@@ -1464,7 +1499,6 @@ pub fn run(mut b: Boot) -> ! {
                 if n > 0 && ferros_pt::is_data_packet(tmp[0]) {
                     st.data_pkts += 1;
                     t_pt = cntpct();
-                    let mut done = false;
                     if let Some(ref mut xfer) = pt_inbound {
                         if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
                             st.data_decoded += 1;
@@ -1479,1985 +1513,10 @@ pub fn run(mut b: Boot) -> ! {
                                     usb.bulk_in_send(&complete_buf[..clen]);
                                 }
                                 t_command = cntpct();
-                                done = true;
                                 pt_done = true;
-                                if let Some(cmd) = ferros_pt::command::parse(xfer.payload()) {
-                                    st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
-                                    // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
-                                    let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty());
-                                    if !open {
-                                        queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot and a plain DIAG over USB\n");
-                                    } else if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
-                                        let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                                        // The camera's and the TPU's power domains are gated after boot (pd.rs). Their diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
-                                        if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else if cmd.params.starts_with(b"tpu") { Some("tpu") } else { None } {
-                                            if !crate::pd::is_on(name) {
-                                                resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());
-                                                queue_pt_response(&mut pt_out_data, &resp);
-                                                continue;
-                                            }
-                                        }
-                                        if cmd.params == b"fp" {
-                                            // Is the fingerprint's SPI controller (PERIC0 USI1, G#10880000) reachable from NS-EL2, or secure-locked? Read-only, fault-safe (fp.rs).
-                                            crate::fp::report(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"lun ") {
-                                            // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
-                                            let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
-                                            let (lun, first, count) = (it.next().unwrap_or(3).min(7) as u8, it.next().unwrap_or(6), it.next().unwrap_or(1).min(8));
-                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                                            let hex = b"0123456789ABCDEF";
-                                            for lba in first..first + count {
-                                                let mut ok = false;
-                                                for _ in 0..4 {
-                                                    if ufs.read_block_lun(lun, lba) == 0 && ufs.last_response_status() == 0 {
-                                                        ok = true;
-                                                        break;
-                                                    }
-                                                }
-                                                resp.extend_from_slice(alloc::format!("LBA {lba}{}\n", if ok { "" } else { " unreadable" }).as_bytes());
-                                                if !ok {
-                                                    continue;
-                                                }
-                                                let b = ufs.data_buffer();
-                                                for (i, row) in b.chunks(16).enumerate() {
-                                                    if row.iter().any(|&x| x != 0) {
-                                                        resp.extend_from_slice(alloc::format!("  {:04X}:", i * 16).as_bytes());
-                                                        for &x in row {
-                                                            resp.push(b' ');
-                                                            resp.push(hex[(x >> 4) as usize]);
-                                                            resp.push(hex[(x & 15) as usize]);
-                                                        }
-                                                        resp.push(b'\n');
-                                                    }
-                                                }
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"bootlun ") {
-                                            // `diag bootlun <1|2>`: write the UFS device's bBootLunEn attribute (1 = Boot LU A, 2 = Boot LU B) and read it back. The ROM boots the bootloader chain from that LU, and the bootloader's "boot slot" follows the LU's letter before devinfo is read (its log: "ufshc: bBootLunEn 0x2" then "boot slot: b"; devinfo's active flag gets re-synced to it). Only 1 or 2 are accepted: 0 disables boot.
-                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                                            let before = ufs.read_attribute(0x00, 0);
-                                            let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
-                                            let line = match want {
-                                                Some(v @ 1..=2) => {
-                                                    let ok = ufs.write_attribute(0x00, 0, v);
-                                                    alloc::format!("bBootLunEn before {before:?}, write {v}: {}, after {:?}\n", if ok { "accepted" } else { "REFUSED" }, ufs.read_attribute(0x00, 0))
-                                                }
-                                                _ => alloc::format!("bBootLunEn {before:?}; only 1 or 2 may be written\n"),
-                                            };
-                                            resp.extend_from_slice(line.as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        // The handoff build has no `slot`: marking an A/B slot is a cold-boot job, and a ferros chainloaded out of a running Android must not rewrite devinfo under it.
-                                        #[cfg(not(shim_handoff))]
-                                        if cmd.params == b"android" || cmd.params == b"android here" {
-                                            // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
-                                            let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
-                                            // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
-                                            unsafe {
-                                                let p = 0xFD60_0FF8usize as *mut u64;
-                                                core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
-                                                core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
-                                            }
-                                            resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            if r == crate::slot::MARKED {
-                                                let t0 = cntpct();
-                                                while cntpct().wrapping_sub(t0) < freq / 2 {
-                                                    if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
-                                                        let len = pt_out_data.len().min(512);
-                                                        let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
-                                                        usb.bulk_in_send(&chunk);
-                                                    }
-                                                    let _ = usb.poll_event();
-                                                }
-                                                platform::crumb(0xC7);
-                                                platform::reboot();
-                                            }
-                                            continue;
-                                        }
-                                        if cmd.params == b"devinfo" {
-                                            // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
-                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                                            let mut ok = false;
-                                            for _ in 0..4 {
-                                                if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
-                                                    ok = true;
-                                                    break;
-                                                }
-                                            }
-                                            if ok {
-                                                let b = ufs.data_buffer();
-                                                let w = |s: usize| u32::from_le_bytes([b[0x30 + 4 * s], b[0x31 + 4 * s], b[0x32 + 4 * s], b[0x33 + 4 * s]]);
-                                                resp.extend_from_slice(alloc::format!("DEVINFO magic {}{}{}{} major {}: slot a word G#{:08X} (retries {}, flags G#{:02X}), slot b word G#{:08X} (retries {}, flags G#{:02X})\n", b[0] as char, b[1] as char, b[2] as char, b[3] as char, u16::from_le_bytes([b[4], b[5]]), w(0), w(0) & 0xFF, (w(0) >> 8) & 0xFF, w(1), w(1) & 0xFF, (w(1) >> 8) & 0xFF).as_bytes());
-                                            } else {
-                                                resp.extend_from_slice(b"DEVINFO unreadable\n");
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"ufsdesc" {
-                                            // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
-                                            let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                                            let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
-                                            resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
-                                            // The provisioning lock and the write-protect flags (JEDEC UFS: attribute bConfigDescrLock G#1B is one-time — once 1 the LU layout is permanent; flags fPermanentWPEn G#02 and fPowerOnWPEn G#03; attribute bBootLunEn G#00).
-                                            let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("{x}"), None => alloc::string::String::from("?") };
-                                            let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
-                                            resp.extend_from_slice(alloc::format!("bConfigDescrLock {} bBootLunEn {} bCurrentPowerMode {} fPermanentWPEn {} fPowerOnWPEn {} fDeviceInit {}\n", fmt(ufs.read_attribute(0x1B, 0)), fmt(ufs.read_attribute(0x00, 0)), fmt(ufs.read_attribute(0x02, 0)), fmtb(ufs.read_flag(0x02)), fmtb(ufs.read_flag(0x03)), fmtb(ufs.read_flag(0x01))).as_bytes());
-                                            let (c, cn, cocs) = ufs.read_descriptor(0x01, 0);
-                                            resp.extend_from_slice(alloc::format!("CONFIG_DESC len {cn} ocs {cocs}: bootEnable {} descrAccessEn {} initPowerMode {} highPriorityLUN {}\n", c.get(0x03).copied().unwrap_or(0), c.get(0x04).copied().unwrap_or(0), c.get(0x05).copied().unwrap_or(0), c.get(0x06).copied().unwrap_or(0)).as_bytes());
-                                            for lu in 0..8u8 {
-                                                let (u, n, ocs) = ufs.read_descriptor(0x02, lu);
-                                                if n < 0x13 || ocs != 0 {
-                                                    resp.extend_from_slice(alloc::format!("LU{lu}: no descriptor (len {n}, ocs {ocs})\n").as_bytes());
-                                                    continue;
-                                                }
-                                                let blocks = u64::from_be_bytes([u[0x0B], u[0x0C], u[0x0D], u[0x0E], u[0x0F], u[0x10], u[0x11], u[0x12]]);
-                                                let bs = 1u64 << u[0x0A];
-                                                let wp = match u[0x05] { 0 => "none", 1 => "POWER-ON", 2 => "PERMANENT", _ => "?" };
-                                                resp.extend_from_slice(alloc::format!("LU{lu}: enable {} bootLunId {} writeProtect {} memType {} blockSize {bs} blocks {blocks} = {} MiB\n", u[0x03], u[0x04], wp, u[0x08], blocks * bs >> 20).as_bytes());
-                                                if u[0x03] == 0 {
-                                                    continue;
-                                                }
-                                                // GPT: header at LBA 1, the entry array where it says (usually LBA 2), 128-byte entries, UTF-16LE names at +56.
-                                                if ufs.read_block_lun(lu, 1) != 0 || ufs.last_response_status() != 0 {
-                                                    resp.extend_from_slice(b"    (LBA 1 unreadable)\n");
-                                                    continue;
-                                                }
-                                                let h = *ufs.data_buffer();
-                                                if &h[0..8] != b"EFI PART" {
-                                                    resp.extend_from_slice(b"    (no GPT)\n");
-                                                    continue;
-                                                }
-                                                let entry_lba = u64::from_le_bytes(h[0x48..0x50].try_into().unwrap());
-                                                let count = u32::from_le_bytes(h[0x50..0x54].try_into().unwrap()).min(256) as usize;
-                                                let esize = u32::from_le_bytes(h[0x54..0x58].try_into().unwrap()) as usize;
-                                                let per_block = if esize > 0 { 4096 / esize } else { 0 };
-                                                let mut names = alloc::string::String::new();
-                                                let mut i = 0usize;
-                                                while i < count && per_block > 0 {
-                                                    if ufs.read_block_lun(lu, (entry_lba as usize + i / per_block) as u32) != 0 {
-                                                        break;
-                                                    }
-                                                    let blk = *ufs.data_buffer();
-                                                    for e in 0..per_block {
-                                                        if i >= count {
-                                                            break;
-                                                        }
-                                                        let ent = &blk[e * esize..(e + 1) * esize];
-                                                        if ent[..16].iter().any(|&b| b != 0) {
-                                                            let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
-                                                            let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
-                                                            let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
-                                                            let attr = u64::from_le_bytes(ent[48..56].try_into().unwrap());
-                                                            names.push_str(&alloc::format!(" {name}@{first}({}K)", (last + 1 - first) * bs >> 10));
-                                                            if attr != 0 {
-                                                                // GPT attribute bits (Android's A/B HALs keep slot state in bits 48+ on some SoCs); printed only when set, to see whether husky's bootloader uses them.
-                                                                names.push_str(&alloc::format!("[attr G#{attr:X}]"));
-                                                            }
-                                                        }
-                                                        i += 1;
-                                                    }
-                                                }
-                                                resp.extend_from_slice(alloc::format!("    GPT:{names}\n").as_bytes());
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"rep" {
-                                            // The eUSB2 repeater's whole 8-bit register map over I2C (HSI2C11, address from the DT), one "REP_xx=" line per register; G#8000_xxxx = the read failed (TRANS_STATUS low bits). For diffing cold vs handoff state.
-                                            let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
-                                            i2c.init();
-                                            let hex = b"0123456789ABCDEF";
-                                            for reg in 0..=255u8 {
-                                                let v = match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
-                                                    Ok(v) => v as u32,
-                                                    Err(t) => 0x8000_0000 | (t & 0xFFFF),
-                                                };
-                                                let label = [b'R', b'E', b'P', b'_', hex[(reg >> 4) as usize], hex[(reg & 0xF) as usize], b'='];
-                                                append_hex(&mut resp, &label, v);
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        #[cfg(not(shim_handoff))]
-                                        if cmd.params == b"ready" && b.kind == BootKind::Cold {
-                                            // Redraw the "Ready?" screen (dev check; the checklist comes back on the next boot) and count what landed.
-                                            let (text, tri) = crate::ready::show();
-                                            append_hex(&mut resp, b"READY_TEXT_PX=", text);
-                                            append_hex(&mut resp, b"READY_TRIANGLE_PX=", tri);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"heap peak reset" {
-                                            // `diag heap peak reset`: a new heap high-water mark from now (HEAP_PEAK in DIAG).
-                                            ferros_heap::reset_peak();
-                                            resp.extend_from_slice(b"heap peak reset\n");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"console" {
-                                            // What processes have sent their consoles since the last read (background slices included), and how many are alive.
-                                            append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
-                                            resp.extend_from_slice(&crate::process::take_console());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cpu" {
-                                            // The CPU's own feature registers (this core): what the instruction set offers, read rather than assumed — the 1:1 target for codegen, the checker and toka. 64-bit values as HI/LO pairs.
-                                            macro_rules! id {
-                                                ($name:literal, $reg:literal) => {{
-                                                    let v: u64;
-                                                    unsafe { core::arch::asm!(concat!("mrs {}, ", $reg), out(reg) v) };
-                                                    append_hex(&mut resp, concat!($name, "_HI=").as_bytes(), (v >> 32) as u32);
-                                                    append_hex(&mut resp, concat!($name, "_LO=").as_bytes(), v as u32);
-                                                }};
-                                            }
-                                            id!("MIDR", "midr_el1");
-                                            id!("MPIDR", "mpidr_el1");
-                                            id!("ISAR0", "id_aa64isar0_el1");
-                                            id!("ISAR1", "id_aa64isar1_el1");
-                                            id!("ISAR2", "s3_0_c0_c6_2");
-                                            id!("PFR0", "id_aa64pfr0_el1");
-                                            id!("PFR1", "id_aa64pfr1_el1");
-                                            id!("ZFR0", "s3_0_c0_c4_4");
-                                            id!("SMFR0", "s3_0_c0_c4_5");
-                                            id!("MMFR0", "id_aa64mmfr0_el1");
-                                            id!("MMFR1", "id_aa64mmfr1_el1");
-                                            id!("MMFR2", "id_aa64mmfr2_el1");
-                                            id!("DFR0", "id_aa64dfr0_el1");
-                                            id!("CTR", "ctr_el0");
-                                            id!("DCZID", "dczid_el0");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"bench" {
-                                            // Memory speed, for the cache map's before/after: 8 copies of 512 KiB (4 MiB moved) and BLAKE3 over 512 KiB, timed in microseconds, plus SCTLR_EL2 (M b0, C b2, I b12).
-                                            let n = 512 * 1024;
-                                            let src = alloc::vec![0x5Au8; n];
-                                            let mut dst = alloc::vec![0u8; n];
-                                            let us = |t: u64| (t * 1_000_000 / freq) as u32;
-                                            let t0 = cntpct();
-                                            for _ in 0..8 {
-                                                dst.copy_from_slice(&src);
-                                                core::hint::black_box(&mut dst);
-                                            }
-                                            let t1 = cntpct();
-                                            let h = blake3::hash(core::hint::black_box(&src));
-                                            let t2 = cntpct();
-                                            let sctlr: u64;
-                                            unsafe { core::arch::asm!("mrs {}, sctlr_el2", out(reg) sctlr) };
-                                            append_hex(&mut resp, b"BENCH_COPY_4MIB_US=", us(t1 - t0));
-                                            append_hex(&mut resp, b"BENCH_BLAKE3_512KIB_US=", us(t2 - t1));
-                                            append_hex(&mut resp, b"BENCH_HASH0=", h.as_bytes()[0] as u32);
-                                            append_hex(&mut resp, b"SCTLR_EL2=", sctlr as u32);
-                                            resp.extend_from_slice(b"END\n");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"devinfo" {
-                                            // The bootloader's A/B slot record: devinfo is UFS LUN 3 (sdd1), starting at 512-byte sector 48 = 4 KiB LBA 6. Only the 128-byte header goes out ("DEVINFO_xx=" one 32-bit word per line): the rest of the partition is factory identity data (serials, MACs, IMEIs) that has no business on the wire. Needs the disk up (any boot that opened the vault).
-                                            if store.is_none() {
-                                                resp.extend_from_slice(b"no disk on this boot\n");
-                                            } else {
-                                                let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
-                                                // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
-                                                let mut ocs = 0xFF;
-                                                for _ in 0..4 {
-                                                    ocs = ufs.read_block_lun(3, 6);
-                                                    if ocs == 0 && ufs.last_response_status() == 0 {
-                                                        break;
-                                                    }
-                                                }
-                                                append_hex(&mut resp, b"DEVINFO_OCS=", ocs as u32 | (ufs.last_response_status() as u32) << 8);
-                                                let d = ufs.data_buffer();
-                                                let hx = b"0123456789ABCDEF";
-                                                for i in 0..32 {
-                                                    let w = u32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
-                                                    let key = [b'D', b'E', b'V', b'I', b'N', b'F', b'O', b'_', hx[i * 4 >> 4], hx[i * 4 & 15], b'='];
-                                                    append_hex(&mut resp, &key, w);
-                                                }
-                                                // Fingerprint of everything past the header (rest of LBA 6 + all of LBA 7): tells whether a slot change touched anything else (a checksum, a mirror) without sending the identity data itself.
-                                                let mut h = blake3::Hasher::new();
-                                                h.update(&d[0x80..]);
-                                                let mut ocs7 = ufs.read_block_lun(3, 7);
-                                                if ocs7 != 0 || ufs.last_response_status() != 0 {
-                                                    ocs7 = ufs.read_block_lun(3, 7);
-                                                }
-                                                h.update(ufs.data_buffer());
-                                                let f = h.finalize();
-                                                let fb = f.as_bytes();
-                                                append_hex(&mut resp, b"DEVINFO_REST_OCS=", ocs7 as u32);
-                                                append_hex(&mut resp, b"DEVINFO_REST_B3=", u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
-                                            }
-                                            resp.extend_from_slice(b"END\n");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"boot" {
-                                            // `diag boot`: reset-to-entry, then each boot step's time since ferros was entered (checklist.rs).
-                                            resp.extend_from_slice(crate::checklist::boot_times().as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam uw scan" || cmd.params == b"cam uw scan init" {
-                                            crate::camera::uw_scan(&mut resp, cmd.params == b"cam uw scan init");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam uw up" {
-                                            // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
-                                            crate::camera::uw_up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"dvfs") {
-                                            // `diag dvfs`: which core the kernel runs on, its clock measured (2^20 dependent adds), and every DVFS domain's rate as the ACPM firmware holds it. `diag dvfs set <domain index> <kHz>`: ask the firmware for a rate (acpm::dvfs_set), then measure again.
-                                            let measure = || {
-                                                let t0 = cntpct();
-                                                let mut acc = 0u64;
-                                                for _ in 0..(1u64 << 20) {
-                                                    unsafe { core::arch::asm!("add {0}, {0}, #1", inout(reg) acc) };
-                                                }
-                                                let us = ((cntpct() - t0) * 1_000_000 / cntfrq()).max(1);
-                                                (1u64 << 20) / us + (acc & 0)
-                                            };
-                                            let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
-                                            // `diag dvfs policy on|off`: the rest/active clock policy (clock_policy) runs, or holds off so `dvfs set` sticks.
-                                            // `diag dvfs profile rest|active`: one of the policy's operating points by hand.
-                                            if words.len() == 3 && words[1] == b"profile" {
-                                                clock_profile(match words[2] { b"active" => 2, b"dark" => 3, _ => 1 });
-                                            }
-                                            if words.len() == 3 && words[1] == b"policy" {
-                                                unsafe {
-                                                    CLOCK_POLICY_ON = words[2] == b"on";
-                                                    if CLOCK_POLICY_ON {
-                                                        CLOCK_STATE = 0;
-                                                    }
-                                                }
-                                            }
-                                            resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active, 3 dark), {} switches, longest request {} us; display frame starts {}, workers up G#{:X}\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }, crate::process::FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed), crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
-                                            if words.len() == 4 && words[1] == b"set" {
-                                                let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
-                                                match (num(words[2]), num(words[3])) {
-                                                    (Some(d), Some(khz)) if (d as usize) < crate::acpm::DVFS_DOMAINS.len() => {
-                                                        let r = crate::acpm::dvfs_set(d, khz);
-                                                        // The firmware takes a moment to move the PLL; measure after it has.
-                                                        let t = cntpct() + cntfrq() / 100;
-                                                        while cntpct() < t {}
-                                                        resp.extend_from_slice(alloc::format!("set {} to A#{khz} kHz: {r:?}\n", crate::acpm::DVFS_DOMAINS[d as usize]).as_bytes());
-                                                    }
-                                                    _ => resp.extend_from_slice(b"cpu set <domain index> <kHz>\n"),
-                                                }
-                                            }
-                                            let mpidr: u64;
-                                            unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
-                                            resp.extend_from_slice(alloc::format!("kernel core MPIDR G#{mpidr:X}, clock ~A#{} MHz\n", measure()).as_bytes());
-                                            for (i, name) in crate::acpm::DVFS_DOMAINS.iter().enumerate() {
-                                                match crate::acpm::dvfs_get(i as u32) {
-                                                    Ok(k) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} A#{k} kHz\n").as_bytes()),
-                                                    Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
-                                                }
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(k) = cmd.params.strip_prefix(b"core ") {
-                                            // `diag core <k>`: SGI 2 to core k (MPIDR Aff1 = k, Aff0 = 0), whose IRQ handler dumps its position; a moment later the dump is printed.
-                                            let k = core::str::from_utf8(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(99);
-                                            if k < 16 {
-                                                unsafe {
-                                                    core::ptr::write_volatile(&raw mut crate::__core_dump[k as usize], [0; 8]);
-                                                    core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (k << 16) | (2u64 << 24) | 1);
-                                                }
-                                                let t = cntpct();
-                                                while cntpct().wrapping_sub(t) < cntfrq() / 100 {}
-                                                let d = unsafe { core::ptr::read_volatile(&raw const crate::__core_dump[k as usize]) };
-                                                resp.extend_from_slice(alloc::format!("core A#{k}: ELR G#{:X} SPSR G#{:X} SP G#{:X} SP_EL0 G#{:X} x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]).as_bytes());
-                                                if d[0] == 0 {
-                                                    resp.extend_from_slice(b"(no dump: the core did not take the SGI within 10 ms)\n");
-                                                }
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"rtc" {
-                                            // `diag rtc`: the PMIC's clock read now, the unix time it gives, the base the kernel keeps, and the zone.
-                                            match crate::rtc::read() {
-                                                Ok((y, mo, d, h, mi, s)) => resp.extend_from_slice(alloc::format!("rtc: {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC\n").as_bytes()),
-                                                Err(e) => resp.extend_from_slice(alloc::format!("rtc: read failed, ACPM G#{e:X}\n").as_bytes()),
-                                            }
-                                            let _ = crate::rtc::sync();
-                                            let base = crate::rtc::BASE.load(core::sync::atomic::Ordering::Relaxed);
-                                            resp.extend_from_slice(alloc::format!("unix now A#{}; zone A#{} s east of UTC\n", base.wrapping_add(cntpct()) / cntfrq(), crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(c) = cmd.params.strip_prefix(b"thermal at ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u8>().ok()) {
-                                            THROTTLE_AT.store(c.max(20), core::sync::atomic::Ordering::Relaxed);
-                                            resp.extend_from_slice(alloc::format!("throttle at A#{} C, release below A#{} C (takes effect within a second)\n", c.max(20), c.max(20) - 10).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(n) = cmd.params.strip_prefix(b"gsa aoc ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u32>().ok()).filter(|n| [0, 1, 4, 5, 6].contains(n)) {
-                                            // `diag gsa aoc <n>`: one AoC management command on GSA's mailbox (gsa_aoc.h `enum gsa_aoc_cmd`: 0 get state, 1 start, 4 shutdown to loaded, 5 release the A32 from reset, 6 reset), then the control block's first words.
-                                            let r = crate::gsa::call(crate::gsa::CMD_AOC, &[n], 2048);
-                                            let cb = |o: usize| unsafe { core::ptr::read_volatile((crate::aoc::CARVEOUT + 0x1C0_0000 + o) as *const u32) };
-                                            resp.extend_from_slice(alloc::format!("aoc cmd {n}: {r:X?}; control block G#{:X} G#{:X} G#{:X} G#{:X}\n", cb(0), cb(4), cb(8), cb(12)).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"gsa echo" || cmd.params == b"gsa aoc" {
-                                            // `diag gsa echo` / `diag gsa aoc`: GSA's non-secure mailbox (gsa.rs), read-only commands only — the echo test, and the AoC's state over the mailbox (command 91, GSA_AOC_GET_STATE), which Linux on zuma sends over Trusty instead.
-                                            let r = if cmd.params == b"gsa echo" { crate::gsa::call(crate::gsa::CMD_ECHO, &[0x1234_5678, 0x0A0C_0A0C], 256) } else { crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256) };
-                                            resp.extend_from_slice(match r {
-                                                Ok((c, e, a)) => alloc::format!("rsp cmd G#{c:X} err A#{e} args {:X?}\n", a),
-                                                Err(m) => alloc::format!("{m}\n"),
-                                            }.as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc fault" {
-                                            resp.extend_from_slice(alloc::format!("AoC SYSMMU fault [status, va, info0, info1, info2]: {:X?}\n", crate::aoc::mmu_fault()).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc mmu" {
-                                            crate::aoc::mmu(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc boot" {
-                                            // `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) and start it through GSA's mailbox (aoc.rs `boot`). Each piece is read under the kernel lock (the vault's one owner).
-                                            let st = &raw mut store;
-                                            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                                            crate::aoc::boot(&mut get, &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf flk") || cmd.params.starts_with(b"usf scope ") || cmd.params.starts_with(b"usf vd ") || cmd.params.starts_with(b"usf regset ") || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
-                                            // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
-                                            if cmd.params == b"sensors up" {
-                                                let st = &raw mut store;
-                                                let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                                                sensors_up(&mut get, &mut resp);
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf raw ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                                                if v.len() == 2 {
-                                                    crate::usf::raw(v[0], v[1], &mut resp);
-                                                }
-                                            } else if let Some(path) = cmd.params.strip_prefix(b"usf reg ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                crate::usf::reg(path.trim(), &mut resp);
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf display ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                // `diag usf display <dbv> <hz> [off]`
-                                                let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                                                if v.len() >= 2 {
-                                                    crate::usf::display_info(v[0], !a.contains("off"), v[1], &mut resp);
-                                                }
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf regset ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                let t: alloc::vec::Vec<&str> = a.splitn(3, ' ').collect();
-                                                if t.len() == 3 {
-                                                    crate::usf::regset(t[0], t[1], t[2], &mut resp);
-                                                }
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf vd ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                // `diag usf vd <handle> get|set <param> [ch=<n>] [v=<n>]`: the VD6282 access request (usf.rs vd_access).
-                                                let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
-                                                let kv = |k: &str| t.iter().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
-                                                if let (Some(h), Some(p)) = (t.first().and_then(|v| v.parse().ok()), t.get(2).and_then(|v| v.parse().ok())) {
-                                                    crate::usf::vd_access(h, t.get(1) == Some(&"set"), p, kv("ch="), kv("ped="), kv("v="), &mut resp);
-                                                }
-                                            } else if let Some(n) = cmd.params.strip_prefix(b"usf scope ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<usize>().ok()) {
-                                                crate::usf::scope_dump(n, &mut resp);
-                                            } else if cmd.params == b"usf flk" || cmd.params == b"usf flk start" {
-                                                crate::usf::flk(cmd.params == b"usf flk start", &mut resp);
-                                            } else if cmd.params == b"usf ev" {
-                                                crate::usf::events(&mut resp);
-                                            } else if cmd.params == b"usf sensors" {
-                                                crate::usf::sensors(&mut resp);
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf subh ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                // `diag usf subh <handle> <ms> <mode> [wake]`
-                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                                                if v.len() >= 3 {
-                                                    crate::usf::subscribe(v[0] as u32, v[1], v[2] as u32, a.contains("wake"), &mut resp);
-                                                }
-                                            } else if cmd.params == b"usf trace" {
-                                                crate::usf::trace(&mut resp);
-                                            } else if let Some(ms) = cmd.params.strip_prefix(b"usf sub ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
-                                                crate::usf::subscribe_gravity(ms, false, &mut resp);
-                                            } else if cmd.params == b"usf power" {
-                                                crate::usf::power(&mut resp);
-                                            } else if let Some(a) = cmd.params.strip_prefix(b"usf start") {
-                                                let a = core::str::from_utf8(a).unwrap_or("");
-                                                let ms = a.split_whitespace().find_map(|t| t.parse::<u64>().ok()).unwrap_or(64);
-                                                let st = &raw mut store;
-                                                let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                                                crate::usf::start(&mut get, ms, a.contains("wake"), &mut resp);
-                                            }
-                                            crate::usf::report(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc log" || cmd.params.starts_with(b"aoc log ") {
-                                            let n = core::str::from_utf8(cmd.params.strip_prefix(b"aoc log").unwrap_or(b"")).unwrap_or("").trim();
-                                            crate::aoc::log(if n.is_empty() { "logging" } else { n }, &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(a) = cmd.params.strip_prefix(b"i2c ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                            // `diag i2c <bus G#base> <target G#> <read n> [write bytes G#..]`: a raw transfer on an HS-I2C controller that is already up (hsi2c::ready): the bytes written, then n read. For identifying chips; it never brings a bus up.
-                                            let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
-                                            let hx = |s: &str| u64::from_str_radix(s.trim_start_matches("G#"), 16).ok();
-                                            match (t.first().and_then(|s| hx(s)), t.get(1).and_then(|s| hx(s)), t.get(2).and_then(|s| s.parse::<usize>().ok())) {
-                                                (Some(base), Some(target), Some(n)) => {
-                                                    let w: alloc::vec::Vec<u8> = t[3..].iter().filter_map(|s| hx(s)).map(|v| v as u8).collect();
-                                                    let mut r = alloc::vec![0u8; n.min(64)];
-                                                    let res = if n == 0 { crate::hsi2c::write_bytes(base as usize, target as u8, &w) } else if w.is_empty() { crate::hsi2c::read_one(base as usize, target as u8, &mut r) } else { crate::hsi2c::write_read(base as usize, target as u8, &w, &mut r) };
-                                                    resp.extend_from_slice(alloc::format!("i2c G#{base:X} target G#{target:X}: {res:?} read {:02X?}\n", r).as_bytes());
-                                                }
-                                                _ => resp.extend_from_slice(b"i2c <bus base> <target> <read n> [write bytes]\n"),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"tpu load" {
-                                            let st = &raw mut store;
-                                            let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
-                                            crate::tpu::load(&mut get, &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"tpu start" {
-                                            crate::tpu::start(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"tpu state" {
-                                            crate::trusty::tpu_state(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"gnss" || cmd.params.starts_with(b"gnss ") {
-                                            // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
-                                            if cmd.params == b"gnss up" {
-                                                crate::gnss::up(&mut resp);
-                                            } else if cmd.params == b"gnss off" {
-                                                crate::gnss::off(&mut resp);
-                                            } else {
-                                                crate::gnss::state(&mut resp);
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"haptic" || cmd.params.starts_with(b"haptic ") {
-                                            // `diag haptic` (state, read only), `diag haptic up` (bus, reset, IDs), `diag haptic play <n>` (ROM waveform n): the vibration motor's CS40L26 (haptics.rs).
-                                            let a = core::str::from_utf8(&cmd.params[6..]).unwrap_or("").trim();
-                                            if a == "up" {
-                                                crate::haptics::up(&mut resp);
-                                            } else if let Some(n) = a.strip_prefix("play").and_then(|t| t.trim().parse::<u32>().ok()) {
-                                                crate::haptics::play(n, &mut resp);
-                                            } else {
-                                                crate::haptics::state(&mut resp);
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc services" {
-                                            crate::aoc::services(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc usf" {
-                                            crate::aoc::usf_probe(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(n) = cmd.params.strip_prefix(b"aoc svc ").and_then(|t| core::str::from_utf8(t).ok()) {
-                                            crate::aoc::svc_report(n.trim(), &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc pins" || cmd.params.starts_with(b"aoc gpio ") {
-                                            // `diag aoc pins`: the AoC GPIO's four ports of pin levels. `diag aoc gpio <hex offset> <hex value>`: write one register of that page, then show the levels (aoc.rs).
-                                            let mut it = cmd.params.strip_prefix(b"aoc gpio ").unwrap_or(b"").split(|&c| c == b' ').filter(|t| !t.is_empty()).filter_map(|t| core::str::from_utf8(t).ok()).filter_map(|t| usize::from_str_radix(t.trim_start_matches("G#"), 16).ok());
-                                            if let (Some(o), Some(v)) = (it.next(), it.next()) {
-                                                let ok = crate::aoc::gpio_write(o, v as u32);
-                                                resp.extend_from_slice(alloc::format!("write +G#{o:X} = G#{v:X}: {ok}\n").as_bytes());
-                                            }
-                                            let p = crate::aoc::pins();
-                                            resp.extend_from_slice(alloc::format!("pins a G#{:08X} b G#{:08X} c G#{:08X} d G#{:08X}\n", p[0], p[1], p[2], p[3]).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"aoc" || cmd.params == b"aoc on" || cmd.params == b"aoc off" || cmd.params.starts_with(b"aoc peek ") {
-                                            // `diag aoc [on|off|peek <hex>]`: the AoC block from the AP, AoC in reset (aoc.rs). `on`/`off` move its power request first; `peek` reads one register, saying ABORT if it faulted.
-                                            if let Some(h) = cmd.params.strip_prefix(b"aoc peek ") {
-                                                match core::str::from_utf8(h).ok().and_then(|t| usize::from_str_radix(t.trim().trim_start_matches("G#"), 16).ok()) {
-                                                    Some(a) if crate::aoc::req().1 & 1 == 1 || a < crate::aoc::BLK || a >= crate::aoc::BLK + (32 << 20) => resp.extend_from_slice(alloc::format!("G#{a:X}: {:?}\n", crate::aoc::probe32(a).map(|v| alloc::format!("G#{v:X}"))).as_bytes()),
-                                                    Some(_) => resp.extend_from_slice(b"AoC block not acknowledged; refusing to read inside it\n"),
-                                                    None => resp.extend_from_slice(b"peek <hex address>\n"),
-                                                }
-                                            } else {
-                                                if cmd.params != b"aoc" {
-                                                    let (ack, us) = crate::aoc::request(cmd.params == b"aoc on", 256);
-                                                    resp.extend_from_slice(alloc::format!("request {}: ack G#{ack:X} after A#{us} us\n", if cmd.params == b"aoc on" { 1 } else { 0 }).as_bytes());
-                                                }
-                                                crate::aoc::report(&mut resp);
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"trusty aoc" {
-                                            // `diag trusty aoc`: start the AoC through Trusty — FF-A, virtio, the GSA hwmgr tipc channel, the START message (trusty.rs). Needs the firmware already loaded (diag aoc boot).
-                                            crate::trusty::aoc_start(&mut resp, 4000);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"ffa init" {
-                                            // `diag ffa init`: bring up FF-A as Linux's Trusty driver does (ffa.rs) — version, our id, the RX/TX map — the transport ferros needs to reach the secure world.
-                                            match crate::ffa::init() {
-                                                Ok(v) => resp.extend_from_slice(alloc::format!("FF-A up: version A#{}.{}, our id G#{:X}, secure G#{:X}\n", v >> 16, v & 0xFFFF, unsafe { crate::ffa::LOCAL_ID }, crate::ffa::SECURE_ID).as_bytes()),
-                                                Err(e) => resp.extend_from_slice(alloc::format!("FF-A init failed: A#{e}\n").as_bytes()),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"ffa" {
-                                            // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
-                                            let smc = |a: [u64; 3]| -> [u64; 4] {
-                                                let (r0, r1, r2, r3): (u64, u64, u64, u64);
-                                                unsafe { core::arch::asm!("smc #0", inout("x0") a[0] => r0, inout("x1") a[1] => r1, inout("x2") a[2] => r2, inout("x3") 0u64 => r3, inout("x4") 0u64 => _, inout("x5") 0u64 => _, inout("x6") 0u64 => _, inout("x7") 0u64 => _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _) };
-                                                [r0, r1, r2, r3]
-                                            };
-                                            for (name, args) in [("FFA_VERSION 1.1", [0x8400_0063, 0x1_0001, 0]), ("FFA_ID_GET", [0x8400_0069, 0, 0]), ("FFA_FEATURES RXTX_MAP64", [0x8400_0064, 0xC400_0066, 0])] {
-                                                let r = smc(args);
-                                                resp.extend_from_slice(alloc::format!("{name}: x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", r[0], r[1], r[2], r[3]).as_bytes());
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"thermal" || cmd.params == b"thermal init" {
-                                            // `diag thermal`: every TMU zone as the ACPM firmware reads it (acpm::tmu_read) — the hottest probe, the zone's status, each probe; `diag thermal init` sends TMU_IPC_INIT first (Linux does once at probe).
-                                            if cmd.params == b"thermal init" {
-                                                resp.extend_from_slice(alloc::format!("init: {:?}\n", crate::acpm::tmu_init().map(|c| alloc::format!("caps G#{c:X}")).map_err(|e| alloc::format!("G#{e:X}"))).as_bytes());
-                                            }
-                                            let t0 = cntpct();
-                                            let _ = crate::acpm::tmu_read(0);
-                                            resp.extend_from_slice(alloc::format!("one zone read: A#{} us; throttle at A#{} C; X3 throttled from: A#{} kHz (0 = not)\n", cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq(), THROTTLE_AT.load(core::sync::atomic::Ordering::Relaxed), THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
-                                            for (i, name) in crate::acpm::TMU_ZONES.iter().enumerate() {
-                                                match crate::acpm::tmu_read(i as u32) {
-                                                    Ok((t, st, p)) => resp.extend_from_slice(alloc::format!("{name:>6}: A#{t} C  stat G#{st:X}  probes {:?}\n", p).as_bytes()),
-                                                    Err(e) => resp.extend_from_slice(alloc::format!("{name:>6}: G#{e:X}\n").as_bytes()),
-                                                }
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"threads" {
-                                            crate::process::threads_report(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        // Slot marking lives only in the cold build: a ferros chainloaded under Android must not rewrite devinfo (slot.rs is cold-only).
-                                        #[cfg(not(shim_handoff))]
-                                        if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
-                                            // `diag slot`: both A/B slot words from devinfo (retries | flags << 8; flags b0 unbootable, b1 successful, b2 active, b3 de-activated). `diag slot word <a|b> <retries hex> <flags hex>` sets one (slot.rs set_word: the A/B fallback test, a spare's flags).
-                                            if let Some(rest) = cmd.params.strip_prefix(b"slot word ") {
-                                                let t = core::str::from_utf8(rest).unwrap_or("");
-                                                let mut it = t.split_whitespace();
-                                                let slot = match it.next() { Some("a") => Some(0usize), Some("b") => Some(1), _ => None };
-                                                let r = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
-                                                let f = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
-                                                match (slot, r, f) {
-                                                    (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::slot::set_word(s, r, f)).as_bytes()),
-                                                    _ => resp.extend_from_slice(b"slot word <a|b> <retries hex> <flags hex>\n"),
-                                                }
-                                            }
-                                            match crate::slot::words() {
-                                                Some([a, b]) => resp.extend_from_slice(alloc::format!("slot a G#{a:04X}  slot b G#{b:04X}\n").as_bytes()),
-                                                None => resp.extend_from_slice(b"devinfo not readable\n"),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(name) = cmd.params.strip_prefix(b"part avb ") {
-                                            // `diag part avb <partition>`: its AVB vbmeta (behind the footer, or at the start of a vbmeta partition) as one line of hex, read-only (partfs.rs): the installed build's own descriptors, for the owner's re-signed top-level vbmeta.
-                                            match crate::partfs::avb_vbmeta(core::str::from_utf8(name).unwrap_or("").trim()) {
-                                                Ok(v) => {
-                                                    resp.extend_from_slice(b"AVB ");
-                                                    for b in v {
-                                                        resp.extend_from_slice(alloc::format!("{b:02x}").as_bytes());
-                                                    }
-                                                    resp.push(b'\n');
-                                                }
-                                                Err(e) => resp.extend_from_slice(alloc::format!("part avb: {e}\n").as_bytes()),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" {
-                                            // `diag keys [sleep|time|flip]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired (keys.rs).
-                                            crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
-                                            // `diag keyreg [dbg|check|ao]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
-                                            crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"sched" {
-                                            // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
-                                            crate::process::sched_report(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"x3" {
-                                            // `diag x3`: start the big core on a timing probe and report (x3.rs).
-                                            let f = cntfrq();
-                                            let rate = |t: u64| if t > 0 { (1u64 << 24) * f / t / 1_000_000 } else { 0 };
-                                            let (d0, i0) = crate::x3::local();
-                                            resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
-                                            let (ret, d, i, mpidr) = crate::x3::probe();
-                                            resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        // `diag pref <name> <value>`: one device setting (settings.rs FIELDS, or `tz` in seconds east of UTC) set as a change on the device is, and the settings document written again. Unknown names and values out of range are refused, nothing written.
-                                        if let Some(rest) = cmd.params.strip_prefix(b"pref ") {
-                                            let text = core::str::from_utf8(rest).unwrap_or("");
-                                            let mut it = text.split_whitespace();
-                                            let (name, val) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse::<i64>().ok()));
-                                            let ok = match (name, val) {
-                                                ("tz", Some(z)) if z.abs() < 86_400 => {
-                                                    crate::rtc::set_tz(z);
-                                                    true
-                                                }
-                                                (n, Some(v)) => match crate::settings::FIELDS.iter().find(|f| f.0 == n) {
-                                                    Some(&(_, index)) if (0..=255).contains(&v) && crate::process::pref_ok(index, v as u8) => {
-                                                        crate::process::set_pref(index, v as u8);
-                                                        true
-                                                    }
-                                                    _ => false,
-                                                },
-                                                _ => false,
-                                            };
-                                            let kept = ok && crate::settings::document(None).is_some_and(|d| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok()));
-                                            resp.extend_from_slice(alloc::format!("pref {name}: {}\n", if !ok { "refused" } else if kept { "set and kept" } else { "set, NOT kept" }).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        // `diag kill <name>…`: each named process ended, its arc and surface freed (development: a bridge-spawned app has no other way out).
-                                        if let Some(names) = cmd.params.strip_prefix(b"kill ") {
-                                            for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
-                                                let killed = crate::process::kill(name);
-                                                // A WiFi driver killed by hand stays down: the keeper stops for the session.
-                                                if name == b"pcie1" {
-                                                    wifi_keep = false;
-                                                }
-                                                resp.extend_from_slice(name);
-                                                resp.extend_from_slice(if killed { b" killed\n" } else { b" was not running\n" });
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(names) = cmd.params.strip_prefix(b"restart ") {
-                                            restart(&mut store, names, &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"pmic rails" {
-                                            // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
-                                            let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };
-                                            let hx = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X}"), Err(e) => alloc::format!("error G#{e:X}") };
-                                            let (m, sb, t) = (crate::acpm::MAIN, crate::acpm::SUB, crate::acpm::T_PMIC);
-                                            resp.extend_from_slice(alloc::format!("VDD_INT (BUCK5M): ctrl {} out1 {} out2 {}\nVDD_CAM (BUCK1S): ctrl {} out1 {} out2 {}\n",
-                                                hx(crate::acpm::read(m, t, 0x1F)), mv(crate::acpm::read(m, t, 0x20)), mv(crate::acpm::read(m, t, 0xC7)),
-                                                hx(crate::acpm::read(sb, t, 0x0E)), mv(crate::acpm::read(sb, t, 0x0F)), mv(crate::acpm::read(sb, t, 0xCA))).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam bus" {
-                                            // `diag cam bus`: mux and bring up both camera HS-I2C controllers (no device addressed).
-                                            crate::camera::buses_up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"cam pdma") {
-                                            // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
-                                            let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
-                                            if b2.is_none() && cfg!(cam_frame_blob) {
-                                                b2 = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                                            }
-                                            let init = match b2.as_deref() {
-                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                                    if 8 + n <= b.len() { Some(b[8..8 + n].to_vec()) } else { None }
-                                                }
-                                                _ => store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()),
-                                            };
-                                            let prog = match b2.as_deref() {
-                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                                    if 8 + n <= b.len() { Some(b[8 + n..].to_vec()) } else { None }
-                                                }
-                                                _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
-                                            };
-                                            let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
-                                            // `cam pdma uw ...`: the ultrawide's own init and CPU setup (FERROS_CAM_UW) instead of the main camera's bundle.
-                                            let (init, prog) = if words.contains(&&b"uw"[..]) { crate::camera::Cam::uw_bundle() } else { (init, prog) };
-                                            crate::camera::pdma_probe(&mut resp, init, prog, if words.contains(&&b"slit"[..]) { 64 } else { 0 }, words.contains(&&b"fast"[..]), crate::camera::Shot::parse(&cmd.params));
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam frame" {
-                                            // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
-                                            // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).
-                                            let mut bundle = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
-                                            if bundle.is_none() && cfg!(cam_frame_blob) {
-                                                bundle = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                                            }
-                                            let (init, prog) = match bundle.as_deref() {
-                                                Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
-                                                    let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                                    if 8 + n <= b.len() { (Some(b[8..8 + n].to_vec()), Some(b[8 + n..].to_vec())) } else { (None, None) }
-                                                }
-                                                _ => (store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()), store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
-                                            };
-                                            crate::camera::frame_probe(&mut resp, init, prog);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam stream" || cmd.params == b"cam raw" || cmd.params == b"cam lochs" {
-                                            // `diag cam stream`: replay the sensor init, configure CSI link 1, stream 300 ms, report what the link saw and dump its words.
-                                            // The init comes from the same places `cam frame` takes it from: the vault's own key, the bundled `cam.frame` value, or the image's built-in bundle. The vault lost these keys in the move to manifestus, and the dump is the whole point of the command, so it should not depend on which of the three is present.
-                                            let mut init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
-                                            if init.is_none() {
-                                                let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
-                                                if b.is_none() && cfg!(cam_frame_blob) {
-                                                    b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                                                }
-                                                if let Some(b) = b.as_deref() {
-                                                    if b.len() > 8 && &b[..4] == b"CFRM" {
-                                                        let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                                        if 8 + n <= b.len() {
-                                                            init = Some(b[8..8 + n].to_vec());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if cmd.params == b"cam raw" { crate::camera::raw_probe(&mut resp, init) } else if cmd.params == b"cam lochs" { crate::camera::lochs_probe(&mut resp, init) } else { crate::camera::stream_probe(&mut resp, init) }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam slit" || cmd.params == b"cam slitsweep" {
-                                            // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
-                                            let mut t = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
-                                            if t.is_none() {
-                                                let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
-                                                if b.is_none() && cfg!(cam_frame_blob) {
-                                                    b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
-                                                }
-                                                if let Some(b) = b.as_deref() {
-                                                    if b.len() > 8 && &b[..4] == b"CFRM" {
-                                                        let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                                                        if 8 + n <= b.len() {
-                                                            t = Some(b[8..8 + n].to_vec());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if cmd.params == b"cam slitsweep" { crate::camera::slit_sweep(&mut resp, t) } else { crate::camera::slit(&mut resp, t, 64) }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam preexist" {
-                                            // `diag cam preexist`: front-end state Linux had before the capture window, which nothing in the replay sets up (camera.rs).
-                                            crate::camera::preexisting(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam probe" {
-                                            // `diag cam probe`: whether an impossible capability read is the sensor's answer or this driver's (camera.rs).
-                                            crate::camera::read_probe(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam preview" {
-                                            // `diag cam preview`: the camera app's 1344 x 1008 NV12 preview, its luma painted 1:1 (camera.rs).
-                                            crate::camera::preview(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam iova" {
-                                            // `diag cam iova`: every buffer the camera IOMMU maps, by walking its page table in DRAM (camera.rs).
-                                            crate::camera::iova_scan(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam inherit" {
-                                            // `diag cam inherit`: after a live handoff with the camera running, read the frame Linux's pipeline wrote and paint it (camera.rs).
-                                            crate::camera::inherit_probe(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam scan all" {
-                                            // `diag cam scan all`: power each camera module in turn and read its model ID (camera.rs).
-                                            crate::camera::scan_all(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam buses" {
-                                            // `diag cam buses`: all four camera I2C controllers up, nothing powered and no device addressed (camera.rs).
-                                            crate::camera::buses_all(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam clamp" {
-                                            // `diag cam clamp`: prove the camera-PMIC overvoltage guard refuses what it must, with no I2C at all (camera.rs).
-                                            crate::camera::clamp_test(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam caps" {
-                                            // `diag cam caps`: the sensor's MIPI CCS capability block — what rates, windows and modes the silicon says it allows (camera.rs).
-                                            crate::camera::caps_dump(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam events" {
-                                            // `diag cam events`: every ISP interrupt source that is reporting, with its bits named (camera.rs, camera_events.rs).
-                                            crate::camera::events_dump(&mut resp, false);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam link" {
-                                            // `diag cam link`: every CSI link 1 word the camera stack touches, for diffing a cold ferros against a streaming Android through the handoff (camera.rs).
-                                            crate::camera::link_dump(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam fe" {
-                                            // `diag cam fe`: power the ISP front end, restore its clocks, read CSI link 1's version.
-                                            crate::camera::fe_up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam up" {
-                                            // `diag cam up`: power the main camera module (rails programmed and verified first), then read the sensor's model ID.
-                                            crate::camera::power_up(&mut resp);
-                                            crate::camera::sensor_id(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam off" {
-                                            // `diag cam off`: power the main camera module down.
-                                            crate::camera::power_down(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam scan" {
-                                            // `diag cam scan`: which addresses acknowledge on the camera-PMIC bus.
-                                            crate::camera::scan(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"acpm ") {
-                                            // `diag acpm r <speedy> <type> <reg>` / `diag acpm u <speedy> <type> <reg> <val> <mask>` (hex): one PMIC transaction over the ACPM channel, for experiments without a rebuild.
-                                            let words: alloc::vec::Vec<&[u8]> = cmd.params[5..].split(|&c| c == b' ').filter(|w| !w.is_empty()).collect();
-                                            let hx = |w: &[u8]| -> Option<u32> { let w = w.strip_prefix(b"G#").or_else(|| w.strip_prefix(b"0x")).unwrap_or(w); u32::from_str_radix(core::str::from_utf8(w).ok()?, 16).ok() };
-                                            let nums: alloc::vec::Vec<u32> = words.iter().skip(1).filter_map(|w| hx(w)).collect();
-                                            let out = match (words.first().copied(), nums.as_slice()) {
-                                                (Some(b"r"), [sp, ty, rg]) => alloc::format!("read {sp:X}/{ty:X}/{rg:X}: {:?}\n", crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))),
-                                                (Some(b"u"), [sp, ty, rg, v, m]) => {
-                                                    let r = crate::acpm::update(*sp, *ty, *rg, *v as u8, *m as u8);
-                                                    alloc::format!("update {sp:X}/{ty:X}/{rg:X} val G#{v:X} mask G#{m:X}: {:?}; now {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}")))
-                                                }
-                                                _ => alloc::string::String::from("usage: acpm r <speedy> <type> <reg> | acpm u <speedy> <type> <reg> <val> <mask> (hex)\n"),
-                                            };
-                                            resp.extend_from_slice(out.as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam pmicon" {
-                                            // `diag cam pmicon`: raise the camera PMIC's supply enables (sub-PMIC GPIO1, GPIO3) and read its ID.
-                                            crate::camera::pmic_power_on(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam pmic" {
-                                            // `diag cam pmic`: the camera PMIC's ID and the main camera's regulators, read only.
-                                            crate::camera::pmic_dump(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"kv selftest" {
-                                            // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
-                                            match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
-                                                Some(t) => resp.extend_from_slice(t.as_bytes()),
-                                                None => resp.extend_from_slice(b"no vault open\n"),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(n) = cmd.params.strip_prefix(b"evnt ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
-                                            // `diag evnt <bit>`: the kernel core's event stream on counter bit n (8-15: the selector is four bits; 12, every 333 us, is the boot's), for measuring what its wakeups cost. The idle wfe's 2 ms EL2-timer backstop holds whatever the setting.
-                                            let n = n.clamp(8, 15);
-                                            unsafe {
-                                                let mut v: u64;
-                                                core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
-                                                v = (v & !(0xF << 4)) | (n & 0xF) << 4;
-                                                core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
-                                            }
-                                            resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"pd" || cmd.params.starts_with(b"pd ") {
-                                            // `diag pd [off <name>|all]`: the unused SoC power domains (pd.rs).
-                                            crate::pd::diag(core::str::from_utf8(&cmd.params[2..]).unwrap_or(""), &mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"odpm" || cmd.params == b"odpm start" {
-                                            // `diag odpm start`, then `diag odpm`: every supply rail's power from the PMICs' meters (odpm.rs).
-                                            if cmd.params == b"odpm start" {
-                                                resp.extend_from_slice(crate::odpm::start().as_bytes());
-                                            } else {
-                                                crate::odpm::report(&mut resp);
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"ufs h8") {
-                                            // `diag ufs h8 [on|off]`: the UFS link's hibernate on idle (ferros_hal ufs), and its counts.
-                                            if cmd.params == b"ufs h8 on" || cmd.params == b"ufs h8 off" {
-                                                ferros_hal::ufs::H8_ENABLED.store(cmd.params == b"ufs h8 on", core::sync::atomic::Ordering::Relaxed);
-                                            }
-                                            let c = |i: usize| ferros_hal::ufs::H8_COUNTS[i].load(core::sync::atomic::Ordering::Relaxed);
-                                            resp.extend_from_slice(alloc::format!("ufs hibernate on idle {}: {} entries, {} exits, {} failures; lost commands {}\n", if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { "on" } else { "off" }, c(0), c(1), c(2), ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"smp dark on" || cmd.params == b"smp dark off" {
-                                            DARK_WORKERS_OFF.store(cmd.params == b"smp dark on", core::sync::atomic::Ordering::Relaxed);
-                                            resp.extend_from_slice(alloc::format!("workers off while dark: {}\n", cmd.params == b"smp dark on").as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"smp off" || cmd.params == b"smp on" {
-                                            // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
-                                            if cmd.params == b"smp off" {
-                                                crate::smp::stop_all();
-                                            } else {
-                                                crate::smp::launch_all();
-                                            }
-                                            let (up, _) = crate::smp::report();
-                                            resp.extend_from_slice(alloc::format!("workers up G#{up:X}\n").as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"screen off" || cmd.params == b"screen on" {
-                                            // `diag screen off|on`: what the power key does (preference 2), from the host, for measuring.
-                                            crate::process::set_pref(crate::process::PREF_SCREEN_OFF, (cmd.params == b"screen off") as u8);
-                                            resp.extend_from_slice(b"screen preference set\n");
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"power" || cmd.params.starts_with(b"power start") {
-                                            // `diag power start <s> [gap in 1/16 s] [input]`, then `diag power`: the system's draw over a window, sampled by the service loop's own passes (power_start / power_poll), the charger cut for it.
-                                            if let Some(a) = cmd.params.strip_prefix(b"power start").and_then(|t| core::str::from_utf8(t).ok()) {
-                                                let v: alloc::vec::Vec<u64> = a.split_whitespace().take_while(|w| *w != "after").filter_map(|t| t.parse().ok()).collect();
-                                                let delay = a.split_whitespace().skip_while(|w| *w != "after").nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
-                                                resp.extend_from_slice(power_start(v.first().copied().unwrap_or(16), v.get(1).copied().unwrap_or(2), a.contains("input"), delay).as_bytes());
-                                            } else {
-                                                match unsafe { (&*(&raw const POWER_WIN), &*(&raw const POWER_RESULT)) } {
-                                                    (Some(w), _) => resp.extend_from_slice(alloc::format!("running: {} samples so far\n", w.n).as_bytes()),
-                                                    (None, Some(r)) => resp.extend_from_slice(r.as_bytes()),
-                                                    (None, None) => resp.extend_from_slice(b"no window yet: diag power start <s>\n"),
-                                                }
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"identity" || cmd.params == b"identity release" {
-                                            // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the phone-only secret renewed — what a completed departure does, for a developer starting the phone over.
-                                            let s = if cmd.params == b"identity release" { store_unlock(4, None).map(|_| "released") } else { Ok("") };
-                                            let st = store_unlock(0, None).unwrap_or(0);
-                                            resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"log" || cmd.params.starts_with(b"log ") {
-                                            // `diag log [KiB]`: the last 16 KiB of the flash text log (flashlog.rs), or the last KiB asked for (up to 256: a reply's room).
-                                            let kib = core::str::from_utf8(&cmd.params[3..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256);
-                                            resp.extend_from_slice(&crate::flashlog::tail(kib * 1024));
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if let Some(name) = cmd.params.strip_prefix(b"part find ") {
-                                            // `diag "part find <name>"`: a GPT partition's LU and LBA range, read-only (partfs.rs find).
-                                            let name = alloc::string::String::from_utf8_lossy(name).into_owned();
-                                            let s = match crate::partfs::find(&name) {
-                                                Some(p) => alloc::format!("{name}: LU A#{} LBA A#{}..=A#{}\n", p.lun, p.first, p.last),
-                                                None => alloc::format!("{name}: not found\n"),
-                                            };
-                                            resp.extend_from_slice(s.as_bytes());
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params.starts_with(b"part vermagic ") {
-                                            // `diag "part vermagic <logical>"`: which kernel the modules in a logical partition (vendor_dlkm_a, say) were built for — read-only, from super (partfs.rs vermagic).
-                                            let name = alloc::string::String::from_utf8_lossy(&cmd.params[14..]).into_owned();
-                                            crate::partfs::vermagic(&mut resp, &name);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"modem hwcfg" {
-                                            // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
-                                            crate::modem::hwcfg(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"amp state" {
-                                            // `diag amp state`: the speaker amplifiers' SPI clock path, pins and supply, read only (amp.rs).
-                                            crate::amp::state(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"amp up" {
-                                            // `diag amp up`: SPI up, supply, each amplifier's reset, boot-done and chip IDs.
-                                            crate::amp::up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch raw" {
-                                            // `diag touch raw`: the chip's rawest live layer (mutual raw, no baseline removed), auto-ranged on the panel for five minutes (touch.rs).
-                                            crate::touch::raw(&mut resp, 300_000);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch gamma" {
-                                            // `diag touch gamma`: the pressure value alone in greyscale — a white disc of that radius and a full-screen flood at that level, to see how brightness maps to pressure (touch.rs).
-                                            crate::touch::gamma(&mut resp, 30_000);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch decay" {
-                                            // `diag touch decay`: a 1:1 10-bit decay screen stamped with a circle per touch reading: the contact's major axis in red, its minor in blue, its pressure in green (touch.rs).
-                                            crate::touch::decay(&mut resp, 30_000);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch map" {
-                                            // `diag touch map`: the touch chip's capacitance strength frame, live on the panel and as an ASCII map, for 12 s (touch.rs).
-                                            crate::touch::map(&mut resp, 12_000);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch info" {
-                                            // `diag touch info`: the touch chip's sensor grid and the addresses of its capacitance frames (touch.rs).
-                                            crate::touch::info(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch state" {
-                                            // `diag touch state`: the touch controller's clocks, pins and rails, read only (touch.rs).
-                                            crate::touch::state(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch up" {
-                                            // `diag touch up`: SPI controller up, rails on, reset released, controller ready, scan mode active.
-                                            crate::touch::up(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch watch" {
-                                            // `diag touch watch`: report touches for 8 s.
-                                            crate::touch::watch(&mut resp, 8192);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch paint" {
-                                            // `diag touch paint`: draw finger strokes on the panel for 16 s, the by-eye test of touch.
-                                            crate::touch::paint(&mut resp, 16384);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"touch off" {
-                                            crate::touch::off(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"cam state" {
-                                            // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
-                                            crate::camera::state(&mut resp);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        if cmd.params == b"ufs" {
-                                            match b.ufs_probe {
-                                                Some(f) => resp = f(),
-                                                None => resp.extend_from_slice(b"no UFS probe on this boot path (the handoff adopts Linux's live link)\n"),
-                                            }
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                            continue;
-                                        }
-                                        resp.extend_from_slice(match b.kind {
-                                            BootKind::Handoff => b"ferros on Pixel 8 Pro (Tensor G3), chainloaded from Linux\n".as_slice(),
-                                            BootKind::Cold => b"ferros on Pixel 8 Pro (Tensor G3), cold boot from ABL\n",
-                                        });
-                                        let r = |a: usize| unsafe { read_volatile(a as *const u32) };
-                                        append_hex(&mut resp, b"GEN=", generation as u32);
-                                        // Percent of time since the service loop started that the core spent asleep in `wfe`, rather than spinning.
-                                        // CPU0's state as PSCI sees it (AFFINITY_INFO: 0 on, 1 off, 2 on pending): whether the park's CPU_OFF took (x3.rs).
-                                        {
-                                            let r: i64;
-                                            unsafe { core::arch::asm!("smc #0", inout("x0") 0x8400_0004u64 => r, in("x1") 0u64, in("x2") 0u64) };
-                                            append_hex(&mut resp, b"CPU0_AFFINITY=", r as u32);
-                                        }
-                                        append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                        append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
-                                        append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
-                                        append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
-                                        append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
-                                        append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
-                                        // The hottest thermal zone, °C (thermal_poll), and the X3's pre-throttle rate in MHz while the thermal throttle holds it (0 = not throttled).
-                                        append_hex(&mut resp, b"SOC_C=", THERMAL.iter().map(|t| t.load(core::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0) as u32);
-                                        append_hex(&mut resp, b"THROTTLED_MHZ=", THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed) / 1000);
-                                        for k in 4..9 {
-                                            append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
-                                        }
-                                        append_hex(&mut resp, b"SPSR_MASKED=", crate::process::SPSR_MASKED.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                        append_hex(&mut resp, b"TICK_REARMS=", crate::process::TICK_REARMS.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                        // The "Ready?" gate is a cold-boot concern (ready.rs is cold-only); the handoff build has no gate telemetry.
-                                        #[cfg(not(shim_handoff))]
-                                        {
-                                            let g = crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed);
-                                            append_hex(&mut resp, b"GATE_ANSWER=", (g & 0xFF) as u32);
-                                            append_hex(&mut resp, b"GATE_MS=", (g >> 8 & 0xFF_FFFF) as u32);
-                                            append_hex(&mut resp, b"GATE_POWER_HELD_MS=", (g >> 32) as u32);
-                                        }
-                                        // The post-mortem notes (platform::note): this boot's and the previous boot's — the lock's holder (core + 1) and each core's last crumb with the core in the top byte.
-                                        for k in 0..7 {
-                                            let (v, pv) = (platform::note_read(k), platform::note_read(8 + k));
-                                            append_hex(&mut resp, alloc::format!("NOTE_{k}_HI=").as_bytes(), (v >> 32) as u32);
-                                            append_hex(&mut resp, alloc::format!("NOTE_{k}=").as_bytes(), v as u32);
-                                            append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}_HI=").as_bytes(), (pv >> 32) as u32);
-                                            append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}=").as_bytes(), pv as u32);
-                                        }
-                                        {
-                                            let (up, on) = crate::smp::report();
-                                            append_hex(&mut resp, b"SMP_UP=", up);
-                                            for (k, v) in on.iter().enumerate() {
-                                                append_hex(&mut resp, alloc::format!("SMP_ON_{k}=").as_bytes(), *v as u32);
-                                            }
-                                            for (k, s) in crate::process::SLICES.iter().enumerate().filter(|(k, _)| (4..=8).contains(k)) {
-                                                append_hex(&mut resp, alloc::format!("SLICES_C{k}=").as_bytes(), s.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                            }
-                                            append_hex(&mut resp, b"LOCK_SPINS=", crate::process::LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                            for (k, w) in crate::smp::IDLE_WAKES.iter().enumerate() {
-                                                append_hex(&mut resp, alloc::format!("IDLE_WAKES_C{}=", k + 4).as_bytes(), w.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                            }
-                                            // Why idle cores take the lock: the queue count, the interrupt flag, and how far off the next deadline is (signed ms; negative = already passed, which would make every core look on every event-stream tick).
-                                            append_hex(&mut resp, b"IDLE_RUNNABLE_N=", crate::process::RUNNABLE_N.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                            append_hex(&mut resp, b"IDLE_IRQ_ANY=", unsafe { core::ptr::read_volatile(&raw const crate::process::__irq_any) } as u32);
-                                            let nw = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Relaxed);
-                                            let now = cntpct();
-                                            append_hex(&mut resp, b"IDLE_NEXT_WAKE_MS=", if nw == u64::MAX { 0x7FFF_FFFF } else { ((nw as i64 - now as i64) * 1000 / freq as i64) as u32 });
-                                        }
-                                        {
-                                            let (bad, at, val) = platform::canary_check();
-                                            append_hex(&mut resp, b"CANARY_BAD=", bad);
-                                            append_hex(&mut resp, b"CANARY_BASE=", platform::canary_base() as u32);
-                                            append_hex(&mut resp, b"CANARY_AT=", at as u32);
-                                            append_hex(&mut resp, b"CANARY_VAL_HI=", (val >> 32) as u32);
-                                            append_hex(&mut resp, b"CANARY_VAL_LO=", val as u32);
-                                        }
-                                        {
-                                            let (size, used) = platform::stack_used_max();
-                                            append_hex(&mut resp, b"STACK_SIZE=", size);
-                                            append_hex(&mut resp, b"STACK_USED_MAX=", used);
-                                        }
-                                        append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
-                                        append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
-                                        append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
-                                        append_hex(&mut resp, b"USB_ATTEMPTS=", attempts);
-                                        {
-                                            use core::sync::atomic::Ordering::Relaxed;
-                                            let k = &crate::killswitch::REPORT;
-                                            append_hex(&mut resp, b"KILL_GICR_FRAME=", k[0].load(Relaxed));
-                                            append_hex(&mut resp, b"KILL_GICD_CTLR=", k[1].load(Relaxed));
-                                            append_hex(&mut resp, b"KILL_HCR_BEFORE=", k[2].load(Relaxed));
-                                            append_hex(&mut resp, b"KILL_KEYS_IDLE=", k[3].load(Relaxed));
-                                            let kohi = crate::wairua::peek();
-                                            append_hex(&mut resp, b"KOHI_DONE=", kohi.is_some() as u32);
-                                            for (name, h) in crate::kohi::SOURCES.iter().zip(kohi.map(|k| k.1).unwrap_or_default().iter()) {
-                                                // present b0, rct_fail b1, apt_fail b2, level_fail b8..15, level-0 ones/2 b16..31
-                                                let mut key = alloc::vec::Vec::from(&b"KOHI_"[..]);
-                                                key.extend_from_slice(name.to_ascii_uppercase().as_bytes());
-                                                key.push(b'=');
-                                                append_hex(&mut resp, &key, h.packed());
-                                                key.pop();
-                                                key.extend_from_slice(b"_US=");
-                                                append_hex(&mut resp, &key, h.us);
-                                            }
-                                            append_hex(&mut resp, b"KOHI_OK=", kohi.is_some_and(|k| k.0) as u32);
-                                            append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
-                                            append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
-                                            #[cfg(all(feature = "pixel8", not(shim_handoff)))]
-                                            crate::s2mpu::report(&mut resp);
-                                            append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
-                                            let daif: u64;
-                                            unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
-                                            append_hex(&mut resp, b"DAIF=", daif as u32);
-                                        }
-                                        unsafe extern "C" {
-                                            static _start: u8;
-                                        }
-                                        append_hex(&mut resp, b"BASE=", b.link_base as u32);
-                                        append_hex(&mut resp, b"RUNNING_AT=", &raw const _start as usize as u32);
-                                        append_hex(&mut resp, b"STAGE=", b.stage as u32);
-                                        append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
-                                        append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
-                                        // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
-                                        if let Some((free, blocks, largest)) = crate::heap_stats() {
-                                            append_hex(&mut resp, b"HEAP_FREE=", free as u32);
-                                            append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", blocks as u32);
-                                            append_hex(&mut resp, b"HEAP_LARGEST_FREE=", largest as u32);
-                                        }
-                                        append_hex(&mut resp, b"HEAP_IN_USE=", ferros_heap::IN_USE.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                        append_hex(&mut resp, b"HEAP_PEAK=", ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed) as u32);
-                                        if let Some(probe) = &b.probe {
-                                            append_hex(&mut resp, b"UFS_LINK=", probe.link_up as u32);
-                                            append_hex(&mut resp, b"VAULT_OPENED=", probe.opened as u32);
-                                            append_hex(&mut resp, b"VAULT_VERIFIED=", probe.verified as u32);
-                                            append_hex(&mut resp, b"VAULT_SEALED=", probe.sealed as u32);
-                                            append_hex(&mut resp, b"VAULT_STAGE=", probe.stage as u32);
-                                            for (i, w) in probe.root16.chunks(4).enumerate() {
-                                                let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
-                                                append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
-                                            }
-                                            append_hex(&mut resp, b"WAIRUA_OK=", crate::wairua::peek().is_some_and(|k| k.0) as u32);
-                                            append_hex(&mut resp, b"IRA_FAIL=", probe.ira_fail);
-                                        }
-                                        if let Some(prev) = &b.prev {
-                                            // Why the previous session ended (crumb byte G#Bx = exit reason, G#EExx = panic; a nonzero fault ELR = the fault sink fired).
-                                            append_hex(&mut resp, b"PREV_EXIT=", prev[3] as u32);
-                                            append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
-                                            // The post-mortem notes (platform::note): the lock's holder, then cores 4-8's last crumb (core in the top byte).
-                                            // (notes: below, from platform::NOTES, which survives every kind of boot)
-                                            append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
-                                            append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
-                                            // The PT record (leave(): words 24..27): the last command (cap bytes, op), and at a stall exit the open transfer and its age.
-                                            append_hex(&mut resp, b"PREV_PT_CMD_CAP=", prev[24] as u32);
-                                            append_hex(&mut resp, b"PREV_PT_CMD_OP=", (prev[24] >> 56) as u32);
-                                            append_hex(&mut resp, b"PREV_PT_OPEN_SID=", prev[25] as u32);
-                                            append_hex(&mut resp, b"PREV_PT_OPEN_RECV=", (prev[25] >> 32) as u32);
-                                            append_hex(&mut resp, b"PREV_PT_OPEN_TOTAL=", prev[26] as u32);
-                                            append_hex(&mut resp, b"PREV_PT_AGE_MS=", (prev[26] >> 32) as u32);
-                                            append_hex(&mut resp, b"PREV_ALIVE=", prev[27] as u32);
-                                        }
-                                        for (label, v) in &b.extras {
-                                            append_hex(&mut resp, label, *v);
-                                        }
-                                        // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
-                                        append_hex(&mut resp, b"PMU_REBOOT_CMD=", platform::priv_reg(platform::PMU_REBOOT_CMD, false, 0) as u32);
-                                        append_hex(&mut resp, b"DSS_REASON=", r(platform::DSS_HEADER + platform::DSS_OFFSET_EMERGENCY_REASON));
-                                        append_hex(&mut resp, b"DSS_SCRATCH=", r(platform::DSS_HEADER + platform::DSS_OFFSET_SCRATCH));
-                                        append_hex(&mut resp, b"S2MPU_HSI0_CTRL_LINUX=", dma.s2mpu_ctrl);
-                                        append_hex(&mut resp, b"SYSMMU_NUM_VM=", dma.num_vm as u32);
-                                        for vm in 0..dma.num_vm {
-                                            append_hex(&mut resp, b"SYSMMU_VM_CTRL_LINUX=", dma.vm_ctrl_before[vm]);
-                                            append_hex(&mut resp, b"SYSMMU_VM_CTRL_NOW=", dma.vm_ctrl_after[vm]);
-                                        }
-                                        const ATT_KEYS: [&[u8]; 24] = [b"  LTSTATE=", b"  LINKDBG=", b"  DSTS=", b"  RESETS=", b"  CONNDONES=", b"  SETUPS=", b"  SETUP_ARM_OK_FAIL=", b"  XFERNOTREADY=", b"  CMD_FAIL=", b"  EVENTS=", b"  LAST_SETUP=", b"  STATUS_IN_OUT=", b"  E0=", b"  E1=", b"  E2=", b"  E3=", b"  E4=", b"  E5=", b"  E6=", b"  E7=", b"  E8=", b"  E9=", b"  EA=", b"  EB="];
-                                        for (i, h) in init_history.iter().enumerate() {
-                                            append_hex(&mut resp, b"FAIL_ATT=", i as u32);
-                                            for (k, &v) in ATT_KEYS.iter().zip(h.iter()) {
-                                                append_hex(&mut resp, k, v);
-                                            }
-                                        }
-                                        resp.extend_from_slice(b"END\n");
-                                        queue_pt_response(&mut pt_out_data, &resp);
-                                    } else if cmd.cap == cap_store {
-                                        // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
-                                        let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
-                                        queue_pt_response(&mut pt_out_data, &resp);
-                                    } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
-                                        // A leading G#01 byte = hold (bridge `display --hold`); G#02 = a DSI packet script for the panel (dsim::sequence, bridge `display dcs`); G#03 = dump the DSIM link registers (bridge `display dsim`). Anything else is text for the painter.
-                                        match cmd.params.split_first() {
-                                            Some((2, script)) => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() {
-                                                    rep.extend_from_slice(b"DPU powered down\n");
-                                                } else if !crate::dsim::alive() {
-                                                    rep.extend_from_slice(b"DSIM0 not running\n");
-                                                } else {
-                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
-                                                    rep.extend_from_slice(b"DSI packets sent: ");
-                                                    rep.extend_from_slice(alloc::format!("{sent}").as_bytes());
-                                                    match fail {
-                                                        Some(f) => rep.extend_from_slice(alloc::format!(", then FIFO stuck (FIFOCTRL G#{f:08x})\n").as_bytes()),
-                                                        None => rep.extend_from_slice(b", all went\n"),
-                                                    }
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            Some((3, _)) => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() {
-                                                    rep.extend_from_slice(b"DPU powered down\n");
-                                                } else {
-                                                    crate::dsim::dump(&mut rep);
-                                                    crate::dsim::dump_phy(&mut rep);
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#06 [hz] = switch the panel's refresh rate with its own command set, set the DSIM's command-TE timers, and measure the result (bridge `display mode 60|120`).
-                                            Some((6, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                let hz = args[0] as u32;
-                                                let script = match hz {
-                                                    60 => Some(crate::hk3::REFRESH_60),
-                                                    120 => Some(crate::hk3::REFRESH_120),
-                                                    _ => None,
-                                                };
-                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
-                                                    rep.extend_from_slice(b"display not running\n");
-                                                } else if let Some(script) = script {
-                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
-                                                    if fail.is_none() {
-                                                        crate::dsim::set_cmd_te(hz);
-                                                        // The DSIM's registers are shadowed: a frame applies the timers.
-                                                        let _ = crate::display::show(if hz == 60 { b"ferros 60 Hz" } else { b"ferros 120 Hz" }, freq);
-                                                    }
-                                                    let (pin_hz, _) = crate::display::te_rate(freq);
-                                                    rep.extend_from_slice(alloc::format!("mode {hz} Hz: {sent} packets{}; TE now {pin_hz} Hz\n", if fail.is_some() { " (FIFO stuck)" } else { "" }).as_bytes());
-                                                } else {
-                                                    rep.extend_from_slice(b"mode: 60 or 120\n");
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
-                                            Some((11, args)) => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                let n = args.first().copied().unwrap_or(1).max(1) as u32;
-                                                let gap = args.get(1).copied().unwrap_or(8) as u64 * freq / 16;
-                                                let battery = args.get(2).copied().unwrap_or(0) >= 1;
-                                                // 2 = also open the CHGIN input (CHG_CNFG_12 CHGINSEL) for the window, the stronger isolation.
-                                                let open_input = args.get(2).copied().unwrap_or(0) == 2;
-                                                let wait = |ticks: u64| {
-                                                    let t0: u64;
-                                                    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
-                                                    loop {
-                                                        let t: u64;
-                                                        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
-                                                        if t.wrapping_sub(t0) >= ticks {
-                                                            break;
-                                                        }
-                                                    }
-                                                };
-                                                let mut input_prev: Option<u8> = None;
-                                                let charger = if battery {
-                                                    match crate::hsi2c::charger::set_mode(0) {
-                                                        Ok(prev) => {
-                                                            rep.extend_from_slice(alloc::format!("charger mode G#{:X} -> buck off\n", prev & 0xF).as_bytes());
-                                                            if open_input {
-                                                                match crate::hsi2c::charger::input_select(false) {
-                                                                    Ok(p) => {
-                                                                        input_prev = Some(p);
-                                                                        rep.extend_from_slice(alloc::format!("charger input CHG_CNFG_12 G#{p:02X} -> CHGIN deselected\n").as_bytes());
-                                                                    }
-                                                                    Err(e) => rep.extend_from_slice(alloc::format!("charger input write failed: G#{e:X}\n").as_bytes()),
-                                                                }
-                                                            }
-                                                            wait(freq / 2);
-                                                            Some(prev)
-                                                        }
-                                                        Err(e) => {
-                                                            rep.extend_from_slice(alloc::format!("charger mode write failed: G#{e:X}; sampling as is\n").as_bytes());
-                                                            None
-                                                        }
-                                                    }
-                                                } else {
-                                                    None
-                                                };
-                                                let mut sum_ua: i64 = 0;
-                                                let mut sum_uv: u64 = 0;
-                                                let mut got = 0u32;
-                                                for i in 0..n {
-                                                    if i > 0 {
-                                                        wait(gap);
-                                                    }
-                                                    match crate::hsi2c::gauge::sample() {
-                                                        Ok(g) => {
-                                                            sum_ua += g.current_ua as i64;
-                                                            sum_uv += g.vcell_uv as u64;
-                                                            got += 1;
-                                                            rep.extend_from_slice(alloc::format!("soc {}% temp {}.{:02} C vcell {} mV current {} mA (avg {} mA, avg vcell {} mV)\n", g.soc, g.temp_cc / 100, (g.temp_cc % 100).unsigned_abs(), g.vcell_uv / 1000, g.current_ua / 1000, g.avg_current_ua / 1000, g.avg_vcell_uv / 1000).as_bytes());
-                                                        }
-                                                        Err(e) => rep.extend_from_slice(alloc::format!("gauge read failed: G#{e:X} (1 controller not up, 2 busy, 4 no device, 8 bus error, 10 timeout, 20 empty)\n").as_bytes()),
-                                                    }
-                                                }
-                                                if let Some(p) = input_prev {
-                                                    match crate::hsi2c::charger::restore_input(p) {
-                                                        Ok(()) => rep.extend_from_slice(alloc::format!("charger input G#{p:02X} restored\n").as_bytes()),
-                                                        Err(e) => rep.extend_from_slice(alloc::format!("CHARGER INPUT RESTORE FAILED: G#{e:X} — write G#69[G#C5] = G#{p:02X} by hand\n").as_bytes()),
-                                                    }
-                                                }
-                                                if let Some(prev) = charger {
-                                                    match crate::hsi2c::charger::restore(prev) {
-                                                        Ok(()) => rep.extend_from_slice(alloc::format!("charger mode G#{:X} restored\n", prev & 0xF).as_bytes()),
-                                                        Err(e) => rep.extend_from_slice(alloc::format!("CHARGER RESTORE FAILED: G#{e:X} — write G#69[G#B9] = G#{prev:02X} by hand\n").as_bytes()),
-                                                    }
-                                                }
-                                                if got > 0 {
-                                                    let ma = sum_ua / got as i64 / 1000;
-                                                    let mv = sum_uv / got as u64 / 1000;
-                                                    rep.extend_from_slice(alloc::format!("MEAN over {got}: {ma} mA at {mv} mV = {} mW (negative = discharging)\n", ma * mv as i64 / 1000).as_bytes());
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#0D [target] [reg] = an 8-bit register read on hsi2c_11; G#0E [target] [reg] [val] = an 8-bit write, read back after (bridge `display i2c <target> <reg> [val]`). The PMIC-side chips: gauge G#36, charger G#69, PMIC G#66.
-                                            Some((13, args)) if args.len() >= 2 => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                match crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1]) {
-                                                    Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] = G#{v:02X}\n", args[0], args[1]).as_bytes()),
-                                                    Err(e) => rep.extend_from_slice(alloc::format!("i2c read failed: G#{e:X}\n").as_bytes()),
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            Some((14, args)) if args.len() >= 3 => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                match crate::hsi2c::write_byte(crate::hsi2c::HSI2C_11, args[0], args[1], args[2]).and_then(|_| crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1])) {
-                                                    Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] <- G#{:02X}, reads back G#{v:02X}\n", args[0], args[1], args[2]).as_bytes()),
-                                                    Err(e) => rep.extend_from_slice(alloc::format!("i2c write failed: G#{e:X}\n").as_bytes()),
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#0F [1 = ferros's own framebuffer (cachemap DISPLAY_FB), 0 = ABL's surface] = where the painter draws and the layer reads (bridge `display fb own|abl`), then a frame to prove it.
-                                            Some((15, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::use_own_fb(args[0] == 1) {
-                                                    rep.extend_from_slice(b"no framebuffer region on this boot path\n");
-                                                } else {
-                                                    let r = crate::display::show(if args[0] == 1 { b"ferros: own framebuffer" } else { b"ferros: ABL's surface" }, freq);
-                                                    rep.extend_from_slice(&r);
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#10 [dither word] = the DQE's display dither register (DQE_DISP_DITHER: EN b0, MODE b1 = shift, FRAME_CON b2 = temporal, FRAME_OFFSET [4:3], TABLE_SEL R/G/B b5..b7) with the DQE shadow update requested; the next present applies it (bridge `display dither <hex>`). For finding the setting that doesn't speckle black at 10 bpc.
-                                            Some((16, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                let dqe = 0x194D_0000usize;
-                                                unsafe {
-                                                    write_volatile((dqe + 0x2800) as *mut u32, args[0] as u32);
-                                                    let shd = 0x1947_0050usize;
-                                                    write_volatile(shd as *mut u32, read_volatile(shd as *const u32) | 1 << 24);
-                                                }
-                                                crate::display::append_hex(&mut rep, b"DQE_DISP_DITHER=", unsafe { read_volatile((dqe + 0x2800) as *const u32) });
-                                                crate::display::append_hex(&mut rep, b"DQE_CGC_DITHER=", unsafe { read_volatile((dqe + 0x2400) as *const u32) });
-                                                crate::display::append_hex(&mut rep, b"DECON_GLOBAL_CON=", unsafe { read_volatile(0x1947_0020usize as *const u32) });
-                                                crate::display::append_hex(&mut rep, b"DATA_PATH_CON_0=", unsafe { read_volatile(0x1947_0200usize as *const u32) });
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#11 [diameter hi] [diameter lo] [r] [g] [b] [surround r] [g] [b] = a measurement disc centred on the panel over a surround; diameter 0 = full field (bridge `display patch <diameter px> <rrggbb> [surround rrggbb]`, tools/display-profile.sh).
-                                            Some((17, args)) if args.len() >= 8 => {
-                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
-                                                let c = |i: usize| (args[i] as u32) << 16 | (args[i + 1] as u32) << 8 | args[i + 2] as u32;
-                                                let rep = crate::display::patch(diam, c(2), c(5), freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#12 [diameter hi lo] [r g b, 10-bit, hi lo each] [surround r g b, the same] = the measurement disc in 10 bits a channel, the layer in 2:10:10:10 (bridge `display patch10`).
-                                            Some((18, args)) if args.len() >= 14 => {
-                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
-                                                let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
-                                                let rep = crate::display::patch10(diam, [v(2), v(4), v(6)], [v(8), v(10), v(12)], freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#13 [r g b, 10-bit, hi lo each] = DECON's background colour with the base window off; G#13 alone = the window back on (bridge `display bg <r> <g> <b>` / `display bg off`).
-                                            Some((19, args)) => {
-                                                let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
-                                                let c = if args.len() >= 6 { Some([v(0), v(2), v(4)]) } else { None };
-                                                let rep = crate::display::bg10(c, freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#14 [diameter hi lo] [word, 4 bytes BE] [surround word, 4 bytes BE] = the 10-bit layer's disc with raw words (bridge `display patchraw`).
-                                            Some((20, args)) if args.len() >= 10 => {
-                                                let diam = (args[0] as usize) << 8 | args[1] as usize;
-                                                let w = |i: usize| u32::from_be_bytes([args[i], args[i + 1], args[i + 2], args[i + 3]]);
-                                                let rep = crate::display::patch_raw(diam, w(2), w(6), freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
-                                            Some((12, args)) if args.len() >= 3 => {
-                                                let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#07 = set DECON0 to Android's state (10 bpc, dither, SRAM, QoS, interrupts), then paint a frame to apply it (bridge `display tune`).
-                                            Some((7, _)) => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() {
-                                                    rep.extend_from_slice(b"DPU powered down\n");
-                                                } else {
-                                                    crate::display::configure_like_android(&mut rep);
-                                                    let r = crate::display::show(b"ferros: DECON as Android", freq);
-                                                    rep.extend_from_slice(&r);
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#08 [1 = FHD, 0 = WQHD] = switch the whole pipe's raster (bridge `display res fhd|wqhd`).
-                                            Some((8, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
-                                                    rep.extend_from_slice(b"display not running\n");
-                                                } else {
-                                                    crate::display::resolution(args[0] == 1, args.get(1).copied().unwrap_or(7), freq, &mut rep);
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#09 [floor: 30, 10, 1, or 0 = exit to manual 120] = the panel's auto-rate idle floor, then 1.5 s of stillness and the TE pin (bridge `display idle N`).
-                                            Some((9, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                let script = match args[0] { 30 => Some(crate::hk3::IDLE_30), 10 => Some(crate::hk3::IDLE_10), 1 => Some(crate::hk3::IDLE_1), 0 => Some(crate::hk3::IDLE_EXIT), _ => None };
-                                                if !crate::display::dpu_on() || !crate::dsim::alive() {
-                                                    rep.extend_from_slice(b"display not running\n");
-                                                } else if let Some(script) = script {
-                                                    let (sent, fail) = crate::dsim::sequence(script, freq);
-                                                    // A second byte of 1 asks for changeable TE during the measurement, so the pin shows the panel's real rate; fixed TE is restored after.
-                                                    let changeable = args.get(1) == Some(&1);
-                                                    if changeable {
-                                                        let _ = crate::dsim::sequence(crate::hk3::TE_CHANGEABLE, freq);
-                                                    }
-                                                    let t0 = cntpct();
-                                                    while cntpct().wrapping_sub(t0) < freq * 3 / 2 {}
-                                                    let ((pin_hz, _), width_us) = crate::display::te_profile(freq);
-                                                    if changeable {
-                                                        let _ = crate::dsim::sequence(crate::hk3::TE_FIXED, freq);
-                                                    }
-                                                    rep.extend_from_slice(alloc::format!("idle floor {}: {sent} packets{}; after 1.5 s still, TE {pin_hz} Hz ({width_us} us high){}\n", args[0], if fail.is_some() { " (FIFO stuck)" } else { "" }, if changeable { " [changeable TE]" } else { "" }).as_bytes());
-                                                } else {
-                                                    rep.extend_from_slice(b"idle: 30, 10, 1 or 0\n");
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#0A [1 = FHD, 0 = WQHD] [link rate: 0 keep, 1 = 1368 Mbps, 2 = 1346 Mbps] [blend depth: 0 keep, 1 = 8 bpc, 2 = 10 bpc] = the full modeset (dpu::modeset: DECON and DSIM stopped, re-initialised, started; bridge `display modeset fhd|wqhd [1368|1346] [8|10]`).
-                                            Some((10, args)) if !args.is_empty() => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                crate::dpu::modeset(args[0] == 1, args.get(1).copied().unwrap_or(0), args.get(2).copied().unwrap_or(0), args.get(3).copied().unwrap_or(0), freq, &mut rep);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
-                                            Some((5, _)) => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() {
-                                                    rep.extend_from_slice(b"DPU powered down\n");
-                                                } else {
-                                                    let ((pin_hz, irq_hz), width_us) = crate::display::te_profile(freq);
-                                                    rep.extend_from_slice(alloc::format!("TE: {pin_hz} Hz on the pin ({width_us} us high), {irq_hz} Hz by DECON interrupt\n").as_bytes());
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            // G#04 [cmd][len] = a DCS read from the panel (bridge `display read`).
-                                            Some((4, args)) if args.len() >= 2 => {
-                                                let mut rep = alloc::vec::Vec::new();
-                                                if !crate::display::dpu_on() {
-                                                    rep.extend_from_slice(b"DPU powered down\n");
-                                                } else {
-                                                    match crate::dsim::read(args[0], args[1] as usize, freq) {
-                                                        Ok(bytes) => {
-                                                            rep.extend_from_slice(alloc::format!("read G#{:02x}:", args[0]).as_bytes());
-                                                            for b in bytes {
-                                                                rep.extend_from_slice(alloc::format!(" {b:02x}").as_bytes());
-                                                            }
-                                                            rep.push(b'\n');
-                                                        }
-                                                        Err(e) => rep.extend_from_slice(alloc::format!("read G#{:02x} failed: G#{e:08x}\n", args[0]).as_bytes()),
-                                                    }
-                                                }
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                            _ => {
-                                                let (text, h) = match cmd.params.split_first() {
-                                                    Some((1, rest)) => (rest, true),
-                                                    _ => (cmd.params, false),
-                                                };
-                                                hold |= h;
-                                                let rep = crate::display::show(text, freq);
-                                                queue_pt_response(&mut pt_out_data, &rep);
-                                            }
-                                        }
-                                    } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
-                                        // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24). A stopgap: in production it becomes a portal verb the owner's identity holds in full (STATUS.md next, PORTAL.md §5).
-                                        // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
-                                        let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
-                                        let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
-                                        let addr = raw & !(1 << 63);
-                                        let (ret, back) = if raw >> 63 == 1 {
-                                            let ret = platform::priv_reg(addr, true, val);
-                                            (ret, platform::priv_reg(addr, false, 0) as u32)
-                                        } else {
-                                            unsafe {
-                                                write_volatile(addr as usize as *mut u32, val);
-                                                core::arch::asm!("dsb sy");
-                                                (0, read_volatile(addr as usize as *const u32))
-                                            }
-                                        };
-                                        let mut resp = [0u8; 12];
-                                        resp[..8].copy_from_slice(&ret.to_le_bytes());
-                                        resp[8..].copy_from_slice(&back.to_le_bytes());
-                                        queue_pt_response(&mut pt_out_data, &resp);
-                                    } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
-                                        // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
-                                        let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
-                                        let addr = (raw & !(1 << 63)) as usize;
-                                        let len = (u32::from_be_bytes(cmd.params[8..12].try_into().unwrap()) as usize).min(64 << 10);
-                                        let mut out = alloc::vec![0u8; len];
-                                        if raw >> 63 == 1 {
-                                            for (i, c) in out.chunks_mut(4).enumerate() {
-                                                let v = platform::priv_reg((addr + i * 4) as u64, false, 0) as u32;
-                                                c.copy_from_slice(&v.to_le_bytes()[..c.len()]);
-                                            }
-                                        } else if addr % 4 == 0 && len % 4 == 0 {
-                                            for (i, c) in out.chunks_mut(4).enumerate() {
-                                                c.copy_from_slice(&unsafe { read_volatile((addr + i * 4) as *const u32) }.to_le_bytes());
-                                            }
-                                        } else {
-                                            for (i, b) in out.iter_mut().enumerate() {
-                                                *b = unsafe { read_volatile((addr + i) as *const u8) };
-                                            }
-                                        }
-                                        queue_pt_response(&mut pt_out_data, &out);
-                                    } else if (cmd.cap == cap_reload || cmd.cap == cap_run) && cmd.op == ferros_pt::Op::Write {
-                                        // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
-                                        let params = cmd.params;
-                                        let is_kernel = params.len() > 0x1000 && params[..4] == [0x4D, 0x5A, 0x00, 0x91];
-                                        let fits = !params.is_empty() && params.len() <= STAGE_MAX && heap_end <= b.stage;
-                                        let ok_shape = if cmd.cap == cap_reload { is_kernel && fits } else { fits };
-                                        let mut ok = false;
-                                        if ok_shape {
-                                            let src_hash = blake3::hash(params);
-                                            unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), b.stage as *mut u8, params.len()) };
-                                            let staged = unsafe { core::slice::from_raw_parts(b.stage as *const u8, params.len()) };
-                                            ok = blake3::hash(staged) == src_hash;
-                                        }
-                                        let size = if ok { params.len() } else { 0 };
-                                        if cmd.cap == cap_reload {
-                                            reload_ok = ok;
-                                            reload_size = size;
-                                            run_ok = false;
-                                        } else {
-                                            run_ok = ok;
-                                            run_size = size;
-                                            reload_ok = false;
-                                        }
-                                        queue_pt_response(&mut pt_out_data, &(size as u32).to_le_bytes());
-                                    } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
-                                        if reload_ok && reload_size > 0 {
-                                            // Flush this Exec's COMPLETE before tearing USB down, give the host a moment, detach, then hand off to the copy stub.
-                                            let mut spins = 0u32;
-                                            while !usb.bulk_in_is_idle() && spins < (1 << 20) {
-                                                let _ = usb.poll_event();
-                                                spins += 1;
-                                            }
-                                            for _ in 0..(1 << 24) {
-                                                core::hint::spin_loop();
-                                            }
-                                            platform::crumb(0xA6);
-                                            // The workers off first: the copy below rewrites the kernel under them (smp.rs).
-                                            ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
-                                            crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
-                                            crate::smp::stop_all();
-                                            unsafe {
-                                                // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.
-                                                core::arch::asm!("msr daifset, #2");
-                                                // Copy the stub (cacheable) first, then hand over with every dirty line written back and the MMU off: the stub and the next image run MMU-off, as from ABL.
-                                                let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
-                                                write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
-                                                let stub = &raw const ferros_reload_stub as usize;
-                                                let stub_len = &raw const ferros_reload_stub_end as usize - stub;
-                                                core::ptr::copy_nonoverlapping(stub as *const u8, b.stub as *mut u8, stub_len);
-                                                crate::cachemap::off_for_handover();
-                                                let len = (reload_size + 7) & !7;
-                                                let next_x0 = ((generation + 1) << 1) | 1;
-                                                core::arch::asm!(
-                                                    "dsb sy",
-                                                    "ic iallu",
-                                                    "dsb sy",
-                                                    "isb",
-                                                    "br {stub}",
-                                                    stub = in(reg) b.stub,
-                                                    in("x0") b.stage,
-                                                    in("x1") b.link_base,
-                                                    in("x2") len,
-                                                    in("x3") next_x0,
-                                                    options(noreturn)
-                                                );
-                                            }
-                                        }
-                                    } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Write {
-                                        // A capsule too large for the staging slot, streamed straight into its arc (STD-TARGET.md): [total u64][need u64][code offset u64][code length u64][piece offset u64][piece]. The first piece allocates the arc (zeroed, from the big pool past 16 MiB); each piece lands at the code offset plus its own; the reply is the bytes received so far. The Exec that follows builds the process in that arc.
-                                        let pr = cmd.params;
-                                        let w = |i: usize| u64::from_le_bytes(pr[i * 8..i * 8 + 8].try_into().unwrap()) as usize;
-                                        let mut received = 0usize;
-                                        if pr.len() >= 40 {
-                                            let (total, need, co, cl, off) = (w(0), w(1), w(2), w(3), w(4));
-                                            let piece = &pr[40..];
-                                            if off == 0 {
-                                                if let Some((a, ..)) = spawn_stage.take() {
-                                                    crate::process::arc_free(a);
-                                                }
-                                                if let Some(arc) = crate::process::arc_alloc(need, false) {
-                                                    spawn_stage = Some((arc, total, 0, co, cl));
-                                                }
-                                            }
-                                            if let Some((arc, t, r, _, _)) = spawn_stage.as_mut() {
-                                                if *t == total && off == *r && off + piece.len() <= total && crate::process::CODE + total + crate::process::STACK <= arc.size {
-                                                    unsafe { core::ptr::copy_nonoverlapping(piece.as_ptr(), (arc.base + crate::process::CODE + off) as *mut u8, piece.len()) };
-                                                    *r += piece.len();
-                                                    received = *r;
-                                                }
-                                            }
-                                        }
-                                        queue_pt_response(&mut pt_out_data, &(received as u32).to_le_bytes());
-                                    } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
-                                        // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
-                                        let staged = spawn_stage.take();
-                                        if (run_ok && run_size > 0) || staged.is_some() {
-                                            let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
-                                            let pr = cmd.params;
-                                            let mut at = 0usize;
-                                            let mut take = |n: usize| { let s = &pr[at.min(pr.len())..(at + n).min(pr.len())]; at += n; s };
-                                            let nl = take(1).first().copied().unwrap_or(0) as usize;
-                                            let name = take(nl);
-                                            let ng = take(1).first().copied().unwrap_or(0) as usize;
-                                            let mut grants = alloc::vec::Vec::new();
-                                            for _ in 0..ng {
-                                                let kind = take(1).first().copied().unwrap_or(0);
-                                                let l = take(1).first().copied().unwrap_or(0) as usize;
-                                                let g = take(l);
-                                                grants.push(match kind {
-                                                    1 => crate::process::Grant::Serve(g),
-                                                    3 => crate::process::Grant::Hardware(g),
-                                                    4 => crate::process::Grant::Entropy,
-                                                    5 => crate::process::Grant::Dma(g),
-                                                    6 => crate::process::Grant::Store(g),
-                                                    7 => crate::process::Grant::Power(g),
-                                                    8 => crate::process::Grant::Irq(g),
-                                                    9 => crate::process::Grant::Ira,
-                                                    10 => crate::process::Grant::Part(g),
-                                                    11 => crate::process::Grant::Unlock,
-                                                    _ => crate::process::Grant::Use(g),
-                                                });
-                                            }
-                                            let input = &pr[at.min(pr.len())..];
-                                            // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
-                                            let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
-                                            let nm = if name.is_empty() { b"proc" } else { name };
-                                            let spawned = match staged {
-                                                Some((arc, total, received, co, cl)) if received == total => crate::process::spawn_capsule_staged(nm, arc, total, co, cl, input, &grants),
-                                                Some((arc, ..)) => {
-                                                    crate::process::arc_free(arc);
-                                                    Err("spawn: the streamed capsule is incomplete")
-                                                }
-                                                None => crate::process::spawn_capsule(nm, code, input, &grants, &sealed),
-                                            };
-                                            match spawned {
-                                                Ok(o) => {
-                                                    mark_ran(&o);
-                                                    let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + o.console.len());
-                                                    resp.extend_from_slice(&o.exit.to_le_bytes());
-                                                    resp.extend_from_slice(&o.console);
-                                                    queue_pt_response(&mut pt_out_data, &resp);
-                                                }
-                                                Err(e) => {
-                                                    let mut resp = alloc::vec::Vec::from(&b"ERR:"[..]);
-                                                    resp.extend_from_slice(e.as_bytes());
-                                                    queue_pt_response(&mut pt_out_data, &resp);
-                                                }
-                                            }
-                                        } else {
-                                            queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
-                                        }
-                                    } else if cmd.cap == cap_seal && cmd.op == ferros_pt::Op::Exec {
-                                        // Install the staged masked capsule: gate + checker once, then its seal joins the vault's `sealed` list (idempotent). Reply [0][seal] or ERR.
-                                        if run_ok && run_size > 0 {
-                                            let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
-                                            let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
-                                                (Ok(seal), Some(store)) => {
-                                                    let mut list = crate::process::with_lock(|| store.get_by_key("sealed").ok().flatten()).unwrap_or_default();
-                                                    if !list.chunks_exact(32).any(|e| e == seal) {
-                                                        list.extend_from_slice(&seal);
-                                                    }
-                                                    match crate::process::with_lock(|| store.set("sealed", &list)) {
-                                                        Ok(_) => {
-                                                            let mut r = alloc::vec![0u8];
-                                                            r.extend_from_slice(&seal);
-                                                            r
-                                                        }
-                                                        Err(_) => alloc::vec::Vec::from(&b"ERR:install: vault write failed"[..]),
-                                                    }
-                                                }
-                                                (Ok(_), None) => alloc::vec::Vec::from(&b"ERR:install: no vault"[..]),
-                                                (Err(e), _) => {
-                                                    let mut r = alloc::vec::Vec::from(&b"ERR:"[..]);
-                                                    r.extend_from_slice(e.as_bytes());
-                                                    r
-                                                }
-                                            };
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                        } else {
-                                            queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
-                                        }
-                                    } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
-                                        // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.
-                                        if run_ok && run_size > 0 {
-                                            crate::cachemap::sync_code(b.stage, run_size);
-                                            let mut out = alloc::vec![0u8; 4096];
-                                            let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(b.stage) };
-                                            let ret = entry(cmd.params.as_ptr(), cmd.params.len(), out.as_mut_ptr(), out.len());
-                                            let n = (ret as usize).min(out.len());
-                                            let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + n);
-                                            resp.extend_from_slice(&ret.to_le_bytes());
-                                            resp.extend_from_slice(&out[..n]);
-                                            queue_pt_response(&mut pt_out_data, &resp);
-                                        } else {
-                                            queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
-                                        }
-                                    } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
-                                        // Mode byte 1 = fastboot: stamp the PMU reboot mode through the EL3 monitor and reset straight into the bootloader. If the monitor refuses, fall back to a normal exit (report + Android).
-                                        let fastboot = cmd.params.first().copied() == Some(1);
-                                        let mut spins = 0u32;
-                                        while !usb.bulk_in_is_idle() && spins < (1 << 20) {
-                                            let _ = usb.poll_event();
-                                            spins += 1;
-                                        }
-                                        if fastboot {
-                                            report(&b, EXIT_FASTBOOT);
-                                            unsafe {
-                                                let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
-                                                write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
-                                            }
-                                            // Only returns on failure: platform::WATCHDOG_DID_NOT_FIRE, or the EL3 monitor's refusal (nonzero, negative = error). Kept in report slot r[23] so the exit report says which.
-                                            FASTBOOT_FAIL.store(platform::reboot_to_bootloader(), core::sync::atomic::Ordering::Relaxed);
-                                        }
-                                        leave(&b, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
-                                    }
-                                }
+                                usb_cmd = true;
                             }
                         }
-                    }
-                    if done {
-                        pt_inbound = None;
-                        pt_seq_width = 0;
                     }
                 } else if n > 0 && ferros_pt::is_control_packet(tmp[0]) {
                     // SPEC opens a transfer; reply SPEC ACK.
@@ -3511,6 +1570,2017 @@ pub fn run(mut b: Boot) -> ! {
                 usb.bulk_out_arm();
             }
             UsbEvent::TransferNotReady { .. } => st.not_ready += 1,
+        }
+        // A command to run: the one the kernel's own USB just finished receiving, or one the USB process handed over (ptlink.rs, USB.md step 3), both through the one dispatch below. Its handlers end with `continue`, so what follows a process's command — its raw reply handed back — runs at the top of the next pass (`proc_restore`).
+        let proc_cmd = if usb_cmd { None } else { crate::process::with_lock(crate::ptlink::take_inbox) };
+        if !usb_cmd && proc_cmd.is_none() {
+            continue;
+        }
+        let from_proc = proc_cmd.is_some();
+        // The process's second submission of a command that answered first (reload, reboot, `diag android`): now act.
+        let pt_act = proc_cmd.as_ref().is_some_and(|s| s.act);
+        let payload: &[u8] = match &proc_cmd {
+            Some(s) => s.payload.bytes(),
+            None => pt_inbound.as_ref().map_or(&[][..], |x| x.payload()),
+        };
+        if from_proc {
+            st.proc_cmds += 1;
+            t_command = cntpct();
+            proc_restore = Some(core::mem::take(&mut pt_out_data));
+            platform::RAW_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(cmd) = ferros_pt::command::parse(payload) {
+            st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
+            // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
+            let open = !cfg!(ferros_production) || (cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec) || (cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read && cmd.params.is_empty());
+            if !open {
+                queue_pt_response(&mut pt_out_data, b"closed: a production build answers only a reboot and a plain DIAG over USB\n");
+            } else if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                // The camera's and the TPU's power domains are gated after boot (pd.rs). Their diags refuse while they are: bringing a domain back without Linux's saved CMU registers is not yet trusted (a TPU on/off by hand preceded a reset in the next power window, 2026-10-25). `diag pd on <name>` does it by hand.
+                if let Some(name) = if cmd.params.starts_with(b"cam") { Some("ispfe") } else if cmd.params.starts_with(b"tpu") { Some("tpu") } else { None } {
+                    if !crate::pd::is_on(name) {
+                        resp.extend_from_slice(alloc::format!("the {name} power domain is gated after boot (pd.rs); `diag pd on {name}` first (experimental: see pd.rs)\n").as_bytes());
+                        queue_pt_response(&mut pt_out_data, &resp);
+                        continue;
+                    }
+                }
+                if cmd.params == b"fp" {
+                    // Is the fingerprint's SPI controller (PERIC0 USI1, G#10880000) reachable from NS-EL2, or secure-locked? Read-only, fault-safe (fp.rs).
+                    crate::fp::report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"lun ") {
+                    // Hex dump of UFS blocks: `diag lun <lun> <first lba> <count>`, non-zero 16-byte rows only (LU3: devinfo LBA 6, pinfo 8, blenv 10; LU0 partitions at the LBAs `diag ufsdesc` prints) — for finding where the bootloader keeps the active slot besides devinfo (2026-10-17). devinfo carries the device's identity (serials, IMEIs, MACs): don't paste it anywhere.
+                    let mut it = cmd.params[4..].split(|&c| c == b' ').filter_map(|t| core::str::from_utf8(t).ok()?.parse::<u32>().ok());
+                    let (lun, first, count) = (it.next().unwrap_or(3).min(7) as u8, it.next().unwrap_or(6), it.next().unwrap_or(1).min(8));
+                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                    let hex = b"0123456789ABCDEF";
+                    for lba in first..first + count {
+                        let mut ok = false;
+                        for _ in 0..4 {
+                            if ufs.read_block_lun(lun, lba) == 0 && ufs.last_response_status() == 0 {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        resp.extend_from_slice(alloc::format!("LBA {lba}{}\n", if ok { "" } else { " unreadable" }).as_bytes());
+                        if !ok {
+                            continue;
+                        }
+                        let b = ufs.data_buffer();
+                        for (i, row) in b.chunks(16).enumerate() {
+                            if row.iter().any(|&x| x != 0) {
+                                resp.extend_from_slice(alloc::format!("  {:04X}:", i * 16).as_bytes());
+                                for &x in row {
+                                    resp.push(b' ');
+                                    resp.push(hex[(x >> 4) as usize]);
+                                    resp.push(hex[(x & 15) as usize]);
+                                }
+                                resp.push(b'\n');
+                            }
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"bootlun ") {
+                    // `diag bootlun <1|2>`: write the UFS device's bBootLunEn attribute (1 = Boot LU A, 2 = Boot LU B) and read it back. The ROM boots the bootloader chain from that LU, and the bootloader's "boot slot" follows the LU's letter before devinfo is read (its log: "ufshc: bBootLunEn 0x2" then "boot slot: b"; devinfo's active flag gets re-synced to it). Only 1 or 2 are accepted: 0 disables boot.
+                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                    let before = ufs.read_attribute(0x00, 0);
+                    let want = cmd.params[8..].first().map(|&c| c.wrapping_sub(b'0') as u32);
+                    let line = match want {
+                        Some(v @ 1..=2) => {
+                            let ok = ufs.write_attribute(0x00, 0, v);
+                            alloc::format!("bBootLunEn before {before:?}, write {v}: {}, after {:?}\n", if ok { "accepted" } else { "REFUSED" }, ufs.read_attribute(0x00, 0))
+                        }
+                        _ => alloc::format!("bBootLunEn {before:?}; only 1 or 2 may be written\n"),
+                    };
+                    resp.extend_from_slice(line.as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // The handoff build has no `slot`: marking an A/B slot is a cold-boot job, and a ferros chainloaded out of a running Android must not rewrite devinfo under it.
+                #[cfg(not(shim_handoff))]
+                if cmd.params == b"android" || cmd.params == b"android here" {
+                    // From the USB process: reply first, and reset when it asks again with its reply sent (ptlink.rs).
+                    if from_proc && !pt_act {
+                        queue_pt_response(&mut pt_out_data, b"android: resetting once this reply is out\n");
+                        proc_act = true;
+                        continue;
+                    }
+                    // The gate's Android path from the host, for bisecting it: slot a active in devinfo, then the plain PSCI reset. The bootloader boots the active slot. `android here` leaves the slot as it is, so the gate of the slot that booted answers, as volume down there does (how Android from slot b is tested, 2026-10-28).
+                    let r = if cmd.params == b"android here" { crate::slot::MARKED } else { crate::slot::set_active(0) };
+                    // Tell slot a's boot gate (ferros_hv/src/gate.rs) to answer "Android" this once instead of auto-choosing ferros; cleaned to DRAM, since the gate reads it with the caches off.
+                    unsafe {
+                        let p = 0xFD60_0FF8usize as *mut u64;
+                        core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+                        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+                    }
+                    resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    if r == crate::slot::MARKED {
+                        let t0 = cntpct();
+                        while cntpct().wrapping_sub(t0) < freq / 2 {
+                            if !from_proc && !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                                let len = pt_out_data.len().min(512);
+                                let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
+                                usb.bulk_in_send(&chunk);
+                            }
+                            if !from_proc {
+                                let _ = usb.poll_event();
+                            }
+                        }
+                        platform::crumb(0xC7);
+                        platform::reboot();
+                    }
+                    continue;
+                }
+                if cmd.params == b"devinfo" {
+                    // The bootloader's slot record as it stands (slot.rs): both words, retries byte and flags byte (b0 unbootable, b1 successful, b2 active, b3 fastboot-ok).
+                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                    let mut ok = false;
+                    for _ in 0..4 {
+                        if ufs.read_block_lun(3, 6) == 0 && ufs.last_response_status() == 0 {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let b = ufs.data_buffer();
+                        let w = |s: usize| u32::from_le_bytes([b[0x30 + 4 * s], b[0x31 + 4 * s], b[0x32 + 4 * s], b[0x33 + 4 * s]]);
+                        resp.extend_from_slice(alloc::format!("DEVINFO magic {}{}{}{} major {}: slot a word G#{:08X} (retries {}, flags G#{:02X}), slot b word G#{:08X} (retries {}, flags G#{:02X})\n", b[0] as char, b[1] as char, b[2] as char, b[3] as char, u16::from_le_bytes([b[4], b[5]]), w(0), w(0) & 0xFF, (w(0) >> 8) & 0xFF, w(1), w(1) & 0xFF, (w(1) >> 8) & 0xFF).as_bytes());
+                    } else {
+                        resp.extend_from_slice(b"DEVINFO unreadable\n");
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"ufsdesc" {
+                    // The UFS device's provisioning, read from the device itself: the Device descriptor (LU count, feature bits), every Unit descriptor (enabled, boot LUN id, WRITE PROTECT TYPE: 0 none / 1 power-on / 2 permanent, block size, block count), and each enabled LU's GPT partition names — so the boot-chain write-protect question (BOOT.md, 2026-10-17) is answered by the flash, not by guessing.
+                    let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                    let (d, n, ocs) = ufs.read_descriptor(0x00, 0);
+                    resp.extend_from_slice(alloc::format!("DEVICE_DESC len {n} ocs {ocs}: numLU {} bootEnable {} descrAccessEn {} features G#{:02X}{:02X}\n", d.get(0x08).copied().unwrap_or(0), d.get(0x05).copied().unwrap_or(0), d.get(0x06).copied().unwrap_or(0), d.get(0x1F).copied().unwrap_or(0), d.get(0x1E).copied().unwrap_or(0)).as_bytes());
+                    // The provisioning lock and the write-protect flags (JEDEC UFS: attribute bConfigDescrLock G#1B is one-time — once 1 the LU layout is permanent; flags fPermanentWPEn G#02 and fPowerOnWPEn G#03; attribute bBootLunEn G#00).
+                    let fmt = |v: Option<u32>| match v { Some(x) => alloc::format!("{x}"), None => alloc::string::String::from("?") };
+                    let fmtb = |v: Option<bool>| match v { Some(x) => alloc::format!("{}", x as u8), None => alloc::string::String::from("?") };
+                    resp.extend_from_slice(alloc::format!("bConfigDescrLock {} bBootLunEn {} bCurrentPowerMode {} fPermanentWPEn {} fPowerOnWPEn {} fDeviceInit {}\n", fmt(ufs.read_attribute(0x1B, 0)), fmt(ufs.read_attribute(0x00, 0)), fmt(ufs.read_attribute(0x02, 0)), fmtb(ufs.read_flag(0x02)), fmtb(ufs.read_flag(0x03)), fmtb(ufs.read_flag(0x01))).as_bytes());
+                    let (c, cn, cocs) = ufs.read_descriptor(0x01, 0);
+                    resp.extend_from_slice(alloc::format!("CONFIG_DESC len {cn} ocs {cocs}: bootEnable {} descrAccessEn {} initPowerMode {} highPriorityLUN {}\n", c.get(0x03).copied().unwrap_or(0), c.get(0x04).copied().unwrap_or(0), c.get(0x05).copied().unwrap_or(0), c.get(0x06).copied().unwrap_or(0)).as_bytes());
+                    for lu in 0..8u8 {
+                        let (u, n, ocs) = ufs.read_descriptor(0x02, lu);
+                        if n < 0x13 || ocs != 0 {
+                            resp.extend_from_slice(alloc::format!("LU{lu}: no descriptor (len {n}, ocs {ocs})\n").as_bytes());
+                            continue;
+                        }
+                        let blocks = u64::from_be_bytes([u[0x0B], u[0x0C], u[0x0D], u[0x0E], u[0x0F], u[0x10], u[0x11], u[0x12]]);
+                        let bs = 1u64 << u[0x0A];
+                        let wp = match u[0x05] { 0 => "none", 1 => "POWER-ON", 2 => "PERMANENT", _ => "?" };
+                        resp.extend_from_slice(alloc::format!("LU{lu}: enable {} bootLunId {} writeProtect {} memType {} blockSize {bs} blocks {blocks} = {} MiB\n", u[0x03], u[0x04], wp, u[0x08], blocks * bs >> 20).as_bytes());
+                        if u[0x03] == 0 {
+                            continue;
+                        }
+                        // GPT: header at LBA 1, the entry array where it says (usually LBA 2), 128-byte entries, UTF-16LE names at +56.
+                        if ufs.read_block_lun(lu, 1) != 0 || ufs.last_response_status() != 0 {
+                            resp.extend_from_slice(b"    (LBA 1 unreadable)\n");
+                            continue;
+                        }
+                        let h = *ufs.data_buffer();
+                        if &h[0..8] != b"EFI PART" {
+                            resp.extend_from_slice(b"    (no GPT)\n");
+                            continue;
+                        }
+                        let entry_lba = u64::from_le_bytes(h[0x48..0x50].try_into().unwrap());
+                        let count = u32::from_le_bytes(h[0x50..0x54].try_into().unwrap()).min(256) as usize;
+                        let esize = u32::from_le_bytes(h[0x54..0x58].try_into().unwrap()) as usize;
+                        let per_block = if esize > 0 { 4096 / esize } else { 0 };
+                        let mut names = alloc::string::String::new();
+                        let mut i = 0usize;
+                        while i < count && per_block > 0 {
+                            if ufs.read_block_lun(lu, (entry_lba as usize + i / per_block) as u32) != 0 {
+                                break;
+                            }
+                            let blk = *ufs.data_buffer();
+                            for e in 0..per_block {
+                                if i >= count {
+                                    break;
+                                }
+                                let ent = &blk[e * esize..(e + 1) * esize];
+                                if ent[..16].iter().any(|&b| b != 0) {
+                                    let name: alloc::string::String = ent[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).filter_map(|c| char::from_u32(c as u32)).collect();
+                                    let first = u64::from_le_bytes(ent[32..40].try_into().unwrap());
+                                    let last = u64::from_le_bytes(ent[40..48].try_into().unwrap());
+                                    let attr = u64::from_le_bytes(ent[48..56].try_into().unwrap());
+                                    names.push_str(&alloc::format!(" {name}@{first}({}K)", (last + 1 - first) * bs >> 10));
+                                    if attr != 0 {
+                                        // GPT attribute bits (Android's A/B HALs keep slot state in bits 48+ on some SoCs); printed only when set, to see whether husky's bootloader uses them.
+                                        names.push_str(&alloc::format!("[attr G#{attr:X}]"));
+                                    }
+                                }
+                                i += 1;
+                            }
+                        }
+                        resp.extend_from_slice(alloc::format!("    GPT:{names}\n").as_bytes());
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"rep" {
+                    // The eUSB2 repeater's whole 8-bit register map over I2C (HSI2C11, address from the DT), one "REP_xx=" line per register; G#8000_xxxx = the read failed (TRANS_STATUS low bits). For diffing cold vs handoff state.
+                    let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+                    i2c.init();
+                    let hex = b"0123456789ABCDEF";
+                    for reg in 0..=255u8 {
+                        let v = match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
+                            Ok(v) => v as u32,
+                            Err(t) => 0x8000_0000 | (t & 0xFFFF),
+                        };
+                        let label = [b'R', b'E', b'P', b'_', hex[(reg >> 4) as usize], hex[(reg & 0xF) as usize], b'='];
+                        append_hex(&mut resp, &label, v);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(shim_handoff))]
+                if cmd.params == b"ready" && b.kind == BootKind::Cold {
+                    // Redraw the "Ready?" screen (dev check; the checklist comes back on the next boot) and count what landed.
+                    let (text, tri) = crate::ready::show();
+                    append_hex(&mut resp, b"READY_TEXT_PX=", text);
+                    append_hex(&mut resp, b"READY_TRIANGLE_PX=", tri);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"heap peak reset" {
+                    // `diag heap peak reset`: a new heap high-water mark from now (HEAP_PEAK in DIAG).
+                    ferros_heap::reset_peak();
+                    resp.extend_from_slice(b"heap peak reset\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"console" {
+                    // What processes have sent their consoles since the last read (background slices included), and how many are alive.
+                    append_hex(&mut resp, b"ALIVE=", crate::process::alive() as u32);
+                    resp.extend_from_slice(&crate::process::take_console());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cpu" {
+                    // The CPU's own feature registers (this core): what the instruction set offers, read rather than assumed — the 1:1 target for codegen, the checker and toka. 64-bit values as HI/LO pairs.
+                    macro_rules! id {
+                        ($name:literal, $reg:literal) => {{
+                            let v: u64;
+                            unsafe { core::arch::asm!(concat!("mrs {}, ", $reg), out(reg) v) };
+                            append_hex(&mut resp, concat!($name, "_HI=").as_bytes(), (v >> 32) as u32);
+                            append_hex(&mut resp, concat!($name, "_LO=").as_bytes(), v as u32);
+                        }};
+                    }
+                    id!("MIDR", "midr_el1");
+                    id!("MPIDR", "mpidr_el1");
+                    id!("ISAR0", "id_aa64isar0_el1");
+                    id!("ISAR1", "id_aa64isar1_el1");
+                    id!("ISAR2", "s3_0_c0_c6_2");
+                    id!("PFR0", "id_aa64pfr0_el1");
+                    id!("PFR1", "id_aa64pfr1_el1");
+                    id!("ZFR0", "s3_0_c0_c4_4");
+                    id!("SMFR0", "s3_0_c0_c4_5");
+                    id!("MMFR0", "id_aa64mmfr0_el1");
+                    id!("MMFR1", "id_aa64mmfr1_el1");
+                    id!("MMFR2", "id_aa64mmfr2_el1");
+                    id!("DFR0", "id_aa64dfr0_el1");
+                    id!("CTR", "ctr_el0");
+                    id!("DCZID", "dczid_el0");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"bench" {
+                    // Memory speed, for the cache map's before/after: 8 copies of 512 KiB (4 MiB moved) and BLAKE3 over 512 KiB, timed in microseconds, plus SCTLR_EL2 (M b0, C b2, I b12).
+                    let n = 512 * 1024;
+                    let src = alloc::vec![0x5Au8; n];
+                    let mut dst = alloc::vec![0u8; n];
+                    let us = |t: u64| (t * 1_000_000 / freq) as u32;
+                    let t0 = cntpct();
+                    for _ in 0..8 {
+                        dst.copy_from_slice(&src);
+                        core::hint::black_box(&mut dst);
+                    }
+                    let t1 = cntpct();
+                    let h = blake3::hash(core::hint::black_box(&src));
+                    let t2 = cntpct();
+                    let sctlr: u64;
+                    unsafe { core::arch::asm!("mrs {}, sctlr_el2", out(reg) sctlr) };
+                    append_hex(&mut resp, b"BENCH_COPY_4MIB_US=", us(t1 - t0));
+                    append_hex(&mut resp, b"BENCH_BLAKE3_512KIB_US=", us(t2 - t1));
+                    append_hex(&mut resp, b"BENCH_HASH0=", h.as_bytes()[0] as u32);
+                    append_hex(&mut resp, b"SCTLR_EL2=", sctlr as u32);
+                    resp.extend_from_slice(b"END\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"devinfo" {
+                    // The bootloader's A/B slot record: devinfo is UFS LUN 3 (sdd1), starting at 512-byte sector 48 = 4 KiB LBA 6. Only the 128-byte header goes out ("DEVINFO_xx=" one 32-bit word per line): the rest of the partition is factory identity data (serials, MACs, IMEIs) that has no business on the wire. Needs the disk up (any boot that opened the vault).
+                    if store.is_none() {
+                        resp.extend_from_slice(b"no disk on this boot\n");
+                    } else {
+                        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+                        // A LUN's first command after power-on can report UNIT ATTENTION; it succeeds on retry.
+                        let mut ocs = 0xFF;
+                        for _ in 0..4 {
+                            ocs = ufs.read_block_lun(3, 6);
+                            if ocs == 0 && ufs.last_response_status() == 0 {
+                                break;
+                            }
+                        }
+                        append_hex(&mut resp, b"DEVINFO_OCS=", ocs as u32 | (ufs.last_response_status() as u32) << 8);
+                        let d = ufs.data_buffer();
+                        let hx = b"0123456789ABCDEF";
+                        for i in 0..32 {
+                            let w = u32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
+                            let key = [b'D', b'E', b'V', b'I', b'N', b'F', b'O', b'_', hx[i * 4 >> 4], hx[i * 4 & 15], b'='];
+                            append_hex(&mut resp, &key, w);
+                        }
+                        // Fingerprint of everything past the header (rest of LBA 6 + all of LBA 7): tells whether a slot change touched anything else (a checksum, a mirror) without sending the identity data itself.
+                        let mut h = blake3::Hasher::new();
+                        h.update(&d[0x80..]);
+                        let mut ocs7 = ufs.read_block_lun(3, 7);
+                        if ocs7 != 0 || ufs.last_response_status() != 0 {
+                            ocs7 = ufs.read_block_lun(3, 7);
+                        }
+                        h.update(ufs.data_buffer());
+                        let f = h.finalize();
+                        let fb = f.as_bytes();
+                        append_hex(&mut resp, b"DEVINFO_REST_OCS=", ocs7 as u32);
+                        append_hex(&mut resp, b"DEVINFO_REST_B3=", u32::from_be_bytes([fb[0], fb[1], fb[2], fb[3]]));
+                    }
+                    resp.extend_from_slice(b"END\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"boot" {
+                    // `diag boot`: reset-to-entry, then each boot step's time since ferros was entered (checklist.rs).
+                    resp.extend_from_slice(crate::checklist::boot_times().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam uw scan" || cmd.params == b"cam uw scan init" {
+                    crate::camera::uw_scan(&mut resp, cmd.params == b"cam uw scan init");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam uw up" {
+                    // `diag cam uw up`: power the ultrawide in its own sequence and read its identifier (camera.rs).
+                    crate::camera::uw_up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"dvfs") {
+                    // `diag dvfs`: which core the kernel runs on, its clock measured (2^20 dependent adds), and every DVFS domain's rate as the ACPM firmware holds it. `diag dvfs set <domain index> <kHz>`: ask the firmware for a rate (acpm::dvfs_set), then measure again.
+                    let measure = || {
+                        let t0 = cntpct();
+                        let mut acc = 0u64;
+                        for _ in 0..(1u64 << 20) {
+                            unsafe { core::arch::asm!("add {0}, {0}, #1", inout(reg) acc) };
+                        }
+                        let us = ((cntpct() - t0) * 1_000_000 / cntfrq()).max(1);
+                        (1u64 << 20) / us + (acc & 0)
+                    };
+                    let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&b| b == b' ').filter(|w| !w.is_empty()).collect();
+                    // `diag dvfs policy on|off`: the rest/active clock policy (clock_policy) runs, or holds off so `dvfs set` sticks.
+                    // `diag dvfs profile rest|active`: one of the policy's operating points by hand.
+                    if words.len() == 3 && words[1] == b"profile" {
+                        clock_profile(match words[2] { b"active" => 2, b"dark" => 3, _ => 1 });
+                    }
+                    if words.len() == 3 && words[1] == b"policy" {
+                        unsafe {
+                            CLOCK_POLICY_ON = words[2] == b"on";
+                            if CLOCK_POLICY_ON {
+                                CLOCK_STATE = 0;
+                            }
+                        }
+                    }
+                    resp.extend_from_slice(alloc::format!("clock policy {}, state {} (1 rest, 2 active, 3 dark), {} switches, longest request {} us; display frame starts {}, workers up G#{:X}\n", if unsafe { CLOCK_POLICY_ON } { "on" } else { "off" }, unsafe { CLOCK_STATE }, unsafe { CLOCK_SWITCHES }, unsafe { CLOCK_WAIT_MAX_US }, crate::process::FRAME_STARTS.load(core::sync::atomic::Ordering::Relaxed), crate::smp::UP.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                    if words.len() == 4 && words[1] == b"set" {
+                        let num = |w: &[u8]| core::str::from_utf8(w).ok().and_then(|t| t.parse::<u32>().ok());
+                        match (num(words[2]), num(words[3])) {
+                            (Some(d), Some(khz)) if (d as usize) < crate::acpm::DVFS_DOMAINS.len() => {
+                                let r = crate::acpm::dvfs_set(d, khz);
+                                // The firmware takes a moment to move the PLL; measure after it has.
+                                let t = cntpct() + cntfrq() / 100;
+                                while cntpct() < t {}
+                                resp.extend_from_slice(alloc::format!("set {} to A#{khz} kHz: {r:?}\n", crate::acpm::DVFS_DOMAINS[d as usize]).as_bytes());
+                            }
+                            _ => resp.extend_from_slice(b"cpu set <domain index> <kHz>\n"),
+                        }
+                    }
+                    let mpidr: u64;
+                    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+                    resp.extend_from_slice(alloc::format!("kernel core MPIDR G#{mpidr:X}, clock ~A#{} MHz\n", measure()).as_bytes());
+                    for (i, name) in crate::acpm::DVFS_DOMAINS.iter().enumerate() {
+                        match crate::acpm::dvfs_get(i as u32) {
+                            Ok(k) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} A#{k} kHz\n").as_bytes()),
+                            Err(e) => resp.extend_from_slice(alloc::format!("{i:>2} {name:<7} error G#{e:X}\n").as_bytes()),
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(k) = cmd.params.strip_prefix(b"core ") {
+                    // `diag core <k>`: SGI 2 to core k (MPIDR Aff1 = k, Aff0 = 0), whose IRQ handler dumps its position; a moment later the dump is printed.
+                    let k = core::str::from_utf8(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(99);
+                    if k < 16 {
+                        unsafe {
+                            core::ptr::write_volatile(&raw mut crate::__core_dump[k as usize], [0; 8]);
+                            core::arch::asm!("msr S3_0_C12_C11_5, {v}", "isb", v = in(reg) (k << 16) | (2u64 << 24) | 1);
+                        }
+                        let t = cntpct();
+                        while cntpct().wrapping_sub(t) < cntfrq() / 100 {}
+                        let d = unsafe { core::ptr::read_volatile(&raw const crate::__core_dump[k as usize]) };
+                        resp.extend_from_slice(alloc::format!("core A#{k}: ELR G#{:X} SPSR G#{:X} SP G#{:X} SP_EL0 G#{:X} x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]).as_bytes());
+                        if d[0] == 0 {
+                            resp.extend_from_slice(b"(no dump: the core did not take the SGI within 10 ms)\n");
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"rtc" {
+                    // `diag rtc`: the PMIC's clock read now, the unix time it gives, the base the kernel keeps, and the zone.
+                    match crate::rtc::read() {
+                        Ok((y, mo, d, h, mi, s)) => resp.extend_from_slice(alloc::format!("rtc: {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC\n").as_bytes()),
+                        Err(e) => resp.extend_from_slice(alloc::format!("rtc: read failed, ACPM G#{e:X}\n").as_bytes()),
+                    }
+                    let _ = crate::rtc::sync();
+                    let base = crate::rtc::BASE.load(core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(alloc::format!("unix now A#{}; zone A#{} s east of UTC\n", base.wrapping_add(cntpct()) / cntfrq(), crate::rtc::TZ.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(c) = cmd.params.strip_prefix(b"thermal at ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u8>().ok()) {
+                    THROTTLE_AT.store(c.max(20), core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(alloc::format!("throttle at A#{} C, release below A#{} C (takes effect within a second)\n", c.max(20), c.max(20) - 10).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(n) = cmd.params.strip_prefix(b"gsa aoc ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u32>().ok()).filter(|n| [0, 1, 4, 5, 6].contains(n)) {
+                    // `diag gsa aoc <n>`: one AoC management command on GSA's mailbox (gsa_aoc.h `enum gsa_aoc_cmd`: 0 get state, 1 start, 4 shutdown to loaded, 5 release the A32 from reset, 6 reset), then the control block's first words.
+                    let r = crate::gsa::call(crate::gsa::CMD_AOC, &[n], 2048);
+                    let cb = |o: usize| unsafe { core::ptr::read_volatile((crate::aoc::CARVEOUT + 0x1C0_0000 + o) as *const u32) };
+                    resp.extend_from_slice(alloc::format!("aoc cmd {n}: {r:X?}; control block G#{:X} G#{:X} G#{:X} G#{:X}\n", cb(0), cb(4), cb(8), cb(12)).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"gsa echo" || cmd.params == b"gsa aoc" {
+                    // `diag gsa echo` / `diag gsa aoc`: GSA's non-secure mailbox (gsa.rs), read-only commands only — the echo test, and the AoC's state over the mailbox (command 91, GSA_AOC_GET_STATE), which Linux on zuma sends over Trusty instead.
+                    let r = if cmd.params == b"gsa echo" { crate::gsa::call(crate::gsa::CMD_ECHO, &[0x1234_5678, 0x0A0C_0A0C], 256) } else { crate::gsa::call(crate::gsa::CMD_AOC, &[crate::gsa::AOC_GET_STATE], 256) };
+                    resp.extend_from_slice(match r {
+                        Ok((c, e, a)) => alloc::format!("rsp cmd G#{c:X} err A#{e} args {:X?}\n", a),
+                        Err(m) => alloc::format!("{m}\n"),
+                    }.as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc fault" {
+                    resp.extend_from_slice(alloc::format!("AoC SYSMMU fault [status, va, info0, info1, info2]: {:X?}\n", crate::aoc::mmu_fault()).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc mmu" {
+                    crate::aoc::mmu(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc boot" {
+                    // `diag aoc boot`: load Google's AoC firmware from the vault (aoc.fw.*) and start it through GSA's mailbox (aoc.rs `boot`). Each piece is read under the kernel lock (the vault's one owner).
+                    let st = &raw mut store;
+                    let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                    crate::aoc::boot(&mut get, &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"usf" || cmd.params.starts_with(b"usf start") || cmd.params.starts_with(b"usf raw ") || cmd.params == b"usf power" || cmd.params == b"usf trace" || cmd.params == b"usf ev" || cmd.params.starts_with(b"usf flk") || cmd.params.starts_with(b"usf scope ") || cmd.params.starts_with(b"usf vd ") || cmd.params.starts_with(b"usf regset ") || cmd.params.starts_with(b"usf display ") || cmd.params == b"usf sensors" || cmd.params.starts_with(b"usf subh ") || cmd.params.starts_with(b"usf sub ") || cmd.params.starts_with(b"usf reg ") || cmd.params == b"sensors up" {
+                    // `diag sensors up`: the whole chain — the AoC's firmware from the vault, started through Trusty, then the gravity stream (sensors_up). `diag usf start [wake] [ms]`: the stream alone, on an AoC already up. `diag usf`: its counters and last vector (usf.rs).
+                    if cmd.params == b"sensors up" {
+                        let st = &raw mut store;
+                        let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                        sensors_up(&mut get, &mut resp);
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf raw ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                        if v.len() == 2 {
+                            crate::usf::raw(v[0], v[1], &mut resp);
+                        }
+                    } else if let Some(path) = cmd.params.strip_prefix(b"usf reg ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        crate::usf::reg(path.trim(), &mut resp);
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf display ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        // `diag usf display <dbv> <hz> [off]`
+                        let v: alloc::vec::Vec<u32> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                        if v.len() >= 2 {
+                            crate::usf::display_info(v[0], !a.contains("off"), v[1], &mut resp);
+                        }
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf regset ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        let t: alloc::vec::Vec<&str> = a.splitn(3, ' ').collect();
+                        if t.len() == 3 {
+                            crate::usf::regset(t[0], t[1], t[2], &mut resp);
+                        }
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf vd ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        // `diag usf vd <handle> get|set <param> [ch=<n>] [v=<n>]`: the VD6282 access request (usf.rs vd_access).
+                        let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
+                        let kv = |k: &str| t.iter().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
+                        if let (Some(h), Some(p)) = (t.first().and_then(|v| v.parse().ok()), t.get(2).and_then(|v| v.parse().ok())) {
+                            crate::usf::vd_access(h, t.get(1) == Some(&"set"), p, kv("ch="), kv("ped="), kv("v="), &mut resp);
+                        }
+                    } else if let Some(n) = cmd.params.strip_prefix(b"usf scope ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<usize>().ok()) {
+                        crate::usf::scope_dump(n, &mut resp);
+                    } else if cmd.params == b"usf flk" || cmd.params == b"usf flk start" {
+                        crate::usf::flk(cmd.params == b"usf flk start", &mut resp);
+                    } else if cmd.params == b"usf ev" {
+                        crate::usf::events(&mut resp);
+                    } else if cmd.params == b"usf sensors" {
+                        crate::usf::sensors(&mut resp);
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf subh ").and_then(|t| core::str::from_utf8(t).ok()) {
+                        // `diag usf subh <handle> <ms> <mode> [wake]`
+                        let v: alloc::vec::Vec<u64> = a.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                        if v.len() >= 3 {
+                            crate::usf::subscribe(v[0] as u32, v[1], v[2] as u32, a.contains("wake"), &mut resp);
+                        }
+                    } else if cmd.params == b"usf trace" {
+                        crate::usf::trace(&mut resp);
+                    } else if let Some(ms) = cmd.params.strip_prefix(b"usf sub ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
+                        crate::usf::subscribe_gravity(ms, false, &mut resp);
+                    } else if cmd.params == b"usf power" {
+                        crate::usf::power(&mut resp);
+                    } else if let Some(a) = cmd.params.strip_prefix(b"usf start") {
+                        let a = core::str::from_utf8(a).unwrap_or("");
+                        let ms = a.split_whitespace().find_map(|t| t.parse::<u64>().ok()).unwrap_or(64);
+                        let st = &raw mut store;
+                        let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                        crate::usf::start(&mut get, ms, a.contains("wake"), &mut resp);
+                    }
+                    crate::usf::report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc log" || cmd.params.starts_with(b"aoc log ") {
+                    let n = core::str::from_utf8(cmd.params.strip_prefix(b"aoc log").unwrap_or(b"")).unwrap_or("").trim();
+                    crate::aoc::log(if n.is_empty() { "logging" } else { n }, &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(a) = cmd.params.strip_prefix(b"i2c ").and_then(|t| core::str::from_utf8(t).ok()) {
+                    // `diag i2c <bus G#base> <target G#> <read n> [write bytes G#..]`: a raw transfer on an HS-I2C controller that is already up (hsi2c::ready): the bytes written, then n read. For identifying chips; it never brings a bus up.
+                    let t: alloc::vec::Vec<&str> = a.split_whitespace().collect();
+                    let hx = |s: &str| u64::from_str_radix(s.trim_start_matches("G#"), 16).ok();
+                    match (t.first().and_then(|s| hx(s)), t.get(1).and_then(|s| hx(s)), t.get(2).and_then(|s| s.parse::<usize>().ok())) {
+                        (Some(base), Some(target), Some(n)) => {
+                            let w: alloc::vec::Vec<u8> = t[3..].iter().filter_map(|s| hx(s)).map(|v| v as u8).collect();
+                            let mut r = alloc::vec![0u8; n.min(64)];
+                            let res = if n == 0 { crate::hsi2c::write_bytes(base as usize, target as u8, &w) } else if w.is_empty() { crate::hsi2c::read_one(base as usize, target as u8, &mut r) } else { crate::hsi2c::write_read(base as usize, target as u8, &w, &mut r) };
+                            resp.extend_from_slice(alloc::format!("i2c G#{base:X} target G#{target:X}: {res:?} read {:02X?}\n", r).as_bytes());
+                        }
+                        _ => resp.extend_from_slice(b"i2c <bus base> <target> <read n> [write bytes]\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"tpu load" {
+                    let st = &raw mut store;
+                    let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
+                    crate::tpu::load(&mut get, &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"tpu start" {
+                    crate::tpu::start(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"tpu state" {
+                    crate::trusty::tpu_state(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"gnss" || cmd.params.starts_with(b"gnss ") {
+                    // `diag gnss`: the GNSS chip's rails, lines and SPI port, read only; `diag gnss up`: power, wake and the first register reads (gnss.rs).
+                    if cmd.params == b"gnss up" {
+                        crate::gnss::up(&mut resp);
+                    } else if cmd.params == b"gnss off" {
+                        crate::gnss::off(&mut resp);
+                    } else {
+                        crate::gnss::state(&mut resp);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"haptic" || cmd.params.starts_with(b"haptic ") {
+                    // `diag haptic` (state, read only), `diag haptic up` (bus, reset, IDs), `diag haptic play <n>` (ROM waveform n): the vibration motor's CS40L26 (haptics.rs).
+                    let a = core::str::from_utf8(&cmd.params[6..]).unwrap_or("").trim();
+                    if a == "up" {
+                        crate::haptics::up(&mut resp);
+                    } else if let Some(n) = a.strip_prefix("play").and_then(|t| t.trim().parse::<u32>().ok()) {
+                        crate::haptics::play(n, &mut resp);
+                    } else {
+                        crate::haptics::state(&mut resp);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc services" {
+                    crate::aoc::services(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc usf" {
+                    crate::aoc::usf_probe(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(n) = cmd.params.strip_prefix(b"aoc svc ").and_then(|t| core::str::from_utf8(t).ok()) {
+                    crate::aoc::svc_report(n.trim(), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc pins" || cmd.params.starts_with(b"aoc gpio ") {
+                    // `diag aoc pins`: the AoC GPIO's four ports of pin levels. `diag aoc gpio <hex offset> <hex value>`: write one register of that page, then show the levels (aoc.rs).
+                    let mut it = cmd.params.strip_prefix(b"aoc gpio ").unwrap_or(b"").split(|&c| c == b' ').filter(|t| !t.is_empty()).filter_map(|t| core::str::from_utf8(t).ok()).filter_map(|t| usize::from_str_radix(t.trim_start_matches("G#"), 16).ok());
+                    if let (Some(o), Some(v)) = (it.next(), it.next()) {
+                        let ok = crate::aoc::gpio_write(o, v as u32);
+                        resp.extend_from_slice(alloc::format!("write +G#{o:X} = G#{v:X}: {ok}\n").as_bytes());
+                    }
+                    let p = crate::aoc::pins();
+                    resp.extend_from_slice(alloc::format!("pins a G#{:08X} b G#{:08X} c G#{:08X} d G#{:08X}\n", p[0], p[1], p[2], p[3]).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"aoc" || cmd.params == b"aoc on" || cmd.params == b"aoc off" || cmd.params.starts_with(b"aoc peek ") {
+                    // `diag aoc [on|off|peek <hex>]`: the AoC block from the AP, AoC in reset (aoc.rs). `on`/`off` move its power request first; `peek` reads one register, saying ABORT if it faulted.
+                    if let Some(h) = cmd.params.strip_prefix(b"aoc peek ") {
+                        match core::str::from_utf8(h).ok().and_then(|t| usize::from_str_radix(t.trim().trim_start_matches("G#"), 16).ok()) {
+                            Some(a) if crate::aoc::req().1 & 1 == 1 || a < crate::aoc::BLK || a >= crate::aoc::BLK + (32 << 20) => resp.extend_from_slice(alloc::format!("G#{a:X}: {:?}\n", crate::aoc::probe32(a).map(|v| alloc::format!("G#{v:X}"))).as_bytes()),
+                            Some(_) => resp.extend_from_slice(b"AoC block not acknowledged; refusing to read inside it\n"),
+                            None => resp.extend_from_slice(b"peek <hex address>\n"),
+                        }
+                    } else {
+                        if cmd.params != b"aoc" {
+                            let (ack, us) = crate::aoc::request(cmd.params == b"aoc on", 256);
+                            resp.extend_from_slice(alloc::format!("request {}: ack G#{ack:X} after A#{us} us\n", if cmd.params == b"aoc on" { 1 } else { 0 }).as_bytes());
+                        }
+                        crate::aoc::report(&mut resp);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"trusty aoc" {
+                    // `diag trusty aoc`: start the AoC through Trusty — FF-A, virtio, the GSA hwmgr tipc channel, the START message (trusty.rs). Needs the firmware already loaded (diag aoc boot).
+                    crate::trusty::aoc_start(&mut resp, 4000);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"ffa init" {
+                    // `diag ffa init`: bring up FF-A as Linux's Trusty driver does (ffa.rs) — version, our id, the RX/TX map — the transport ferros needs to reach the secure world.
+                    match crate::ffa::init() {
+                        Ok(v) => resp.extend_from_slice(alloc::format!("FF-A up: version A#{}.{}, our id G#{:X}, secure G#{:X}\n", v >> 16, v & 0xFFFF, unsafe { crate::ffa::LOCAL_ID }, crate::ffa::SECURE_ID).as_bytes()),
+                        Err(e) => resp.extend_from_slice(alloc::format!("FF-A init failed: A#{e}\n").as_bytes()),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"ffa" {
+                    // `diag ffa`: does the secure world answer ferros? Read-only FF-A queries (Arm DEN0077A), the first steps of Linux's Trusty driver: FFA_VERSION (asking for 1.1), FFA_ID_GET, FFA_FEATURES of FFA_RXTX_MAP (64-bit). Trusty is the only way to start the AoC (SENSORS.md).
+                    let smc = |a: [u64; 3]| -> [u64; 4] {
+                        let (r0, r1, r2, r3): (u64, u64, u64, u64);
+                        unsafe { core::arch::asm!("smc #0", inout("x0") a[0] => r0, inout("x1") a[1] => r1, inout("x2") a[2] => r2, inout("x3") 0u64 => r3, inout("x4") 0u64 => _, inout("x5") 0u64 => _, inout("x6") 0u64 => _, inout("x7") 0u64 => _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _) };
+                        [r0, r1, r2, r3]
+                    };
+                    for (name, args) in [("FFA_VERSION 1.1", [0x8400_0063, 0x1_0001, 0]), ("FFA_ID_GET", [0x8400_0069, 0, 0]), ("FFA_FEATURES RXTX_MAP64", [0x8400_0064, 0xC400_0066, 0])] {
+                        let r = smc(args);
+                        resp.extend_from_slice(alloc::format!("{name}: x0 G#{:X} x1 G#{:X} x2 G#{:X} x3 G#{:X}\n", r[0], r[1], r[2], r[3]).as_bytes());
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"thermal" || cmd.params == b"thermal init" {
+                    // `diag thermal`: every TMU zone as the ACPM firmware reads it (acpm::tmu_read) — the hottest probe, the zone's status, each probe; `diag thermal init` sends TMU_IPC_INIT first (Linux does once at probe).
+                    if cmd.params == b"thermal init" {
+                        resp.extend_from_slice(alloc::format!("init: {:?}\n", crate::acpm::tmu_init().map(|c| alloc::format!("caps G#{c:X}")).map_err(|e| alloc::format!("G#{e:X}"))).as_bytes());
+                    }
+                    let t0 = cntpct();
+                    let _ = crate::acpm::tmu_read(0);
+                    resp.extend_from_slice(alloc::format!("one zone read: A#{} us; throttle at A#{} C; X3 throttled from: A#{} kHz (0 = not)\n", cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq(), THROTTLE_AT.load(core::sync::atomic::Ordering::Relaxed), THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                    for (i, name) in crate::acpm::TMU_ZONES.iter().enumerate() {
+                        match crate::acpm::tmu_read(i as u32) {
+                            Ok((t, st, p)) => resp.extend_from_slice(alloc::format!("{name:>6}: A#{t} C  stat G#{st:X}  probes {:?}\n", p).as_bytes()),
+                            Err(e) => resp.extend_from_slice(alloc::format!("{name:>6}: G#{e:X}\n").as_bytes()),
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"threads" {
+                    crate::process::threads_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // Slot marking lives only in the cold build: a ferros chainloaded under Android must not rewrite devinfo (slot.rs is cold-only).
+                #[cfg(not(shim_handoff))]
+                if cmd.params == b"slot" || cmd.params.starts_with(b"slot word ") {
+                    // `diag slot`: both A/B slot words from devinfo (retries | flags << 8; flags b0 unbootable, b1 successful, b2 active, b3 de-activated). `diag slot word <a|b> <retries hex> <flags hex>` sets one (slot.rs set_word: the A/B fallback test, a spare's flags).
+                    if let Some(rest) = cmd.params.strip_prefix(b"slot word ") {
+                        let t = core::str::from_utf8(rest).unwrap_or("");
+                        let mut it = t.split_whitespace();
+                        let slot = match it.next() { Some("a") => Some(0usize), Some("b") => Some(1), _ => None };
+                        let r = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
+                        let f = it.next().and_then(|v| u8::from_str_radix(v, 16).ok());
+                        match (slot, r, f) {
+                            (Some(s), Some(r), Some(f)) => resp.extend_from_slice(alloc::format!("set_word: G#{:X}\n", crate::slot::set_word(s, r, f)).as_bytes()),
+                            _ => resp.extend_from_slice(b"slot word <a|b> <retries hex> <flags hex>\n"),
+                        }
+                    }
+                    match crate::slot::words() {
+                        Some([a, b]) => resp.extend_from_slice(alloc::format!("slot a G#{a:04X}  slot b G#{b:04X}\n").as_bytes()),
+                        None => resp.extend_from_slice(b"devinfo not readable\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(name) = cmd.params.strip_prefix(b"part avb ") {
+                    // `diag part avb <partition>`: its AVB vbmeta (behind the footer, or at the start of a vbmeta partition) as one line of hex, read-only (partfs.rs): the installed build's own descriptors, for the owner's re-signed top-level vbmeta.
+                    match crate::partfs::avb_vbmeta(core::str::from_utf8(name).unwrap_or("").trim()) {
+                        Ok(v) => {
+                            resp.extend_from_slice(b"AVB ");
+                            for b in v {
+                                resp.extend_from_slice(alloc::format!("{b:02x}").as_bytes());
+                            }
+                            resp.push(b'\n');
+                        }
+                        Err(e) => resp.extend_from_slice(alloc::format!("part avb: {e}\n").as_bytes()),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"keys" || cmd.params == b"keys sleep" || cmd.params == b"keys time" || cmd.params == b"keys flip" {
+                    // `diag keys [sleep|time|flip]`: where the ira and wairua are held, the self-test and check, a power-down rehearsal, the cost of a use, a flipped bit caught and repaired (keys.rs).
+                    crate::keys::diag(cmd.params.strip_prefix(b"keys").unwrap_or(b"").trim_ascii(), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"keyreg" || cmd.params.starts_with(b"keyreg ") {
+                    // `diag keyreg [dbg|check|ao]`: which unused CPU registers could hold the ira and wairua, on the X3 and worker 0 (keyreg.rs).
+                    crate::keyreg::diag(cmd.params.strip_prefix(b"keyreg").unwrap_or(b"").trim_ascii(), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"sched" {
+                    // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
+                    crate::process::sched_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"x3" {
+                    // `diag x3`: start the big core on a timing probe and report (x3.rs).
+                    let f = cntfrq();
+                    let rate = |t: u64| if t > 0 { (1u64 << 24) * f / t / 1_000_000 } else { 0 };
+                    let (d0, i0) = crate::x3::local();
+                    resp.extend_from_slice(alloc::format!("CPU0: dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", rate(d0), rate(i0)).as_bytes());
+                    let (ret, d, i, mpidr) = crate::x3::probe();
+                    resp.extend_from_slice(alloc::format!("CPU_ON G#{:X}; X3 (MPIDR G#{mpidr:X}): dependent adds ~A#{} M/s (= its clock), four chains ~A#{} M/s\n", ret as u64, rate(d), rate(i)).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag pref <name> <value>`: one device setting (settings.rs FIELDS, or `tz` in seconds east of UTC) set as a change on the device is, and the settings document written again. Unknown names and values out of range are refused, nothing written.
+                if let Some(rest) = cmd.params.strip_prefix(b"pref ") {
+                    let text = core::str::from_utf8(rest).unwrap_or("");
+                    let mut it = text.split_whitespace();
+                    let (name, val) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse::<i64>().ok()));
+                    let ok = match (name, val) {
+                        ("tz", Some(z)) if z.abs() < 86_400 => {
+                            crate::rtc::set_tz(z);
+                            true
+                        }
+                        (n, Some(v)) => match crate::settings::FIELDS.iter().find(|f| f.0 == n) {
+                            Some(&(_, index)) if (0..=255).contains(&v) && crate::process::pref_ok(index, v as u8) => {
+                                crate::process::set_pref(index, v as u8);
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    let kept = ok && crate::settings::document(None).is_some_and(|d| store.as_mut().is_some_and(|s| s.set(crate::settings::KEY, &d).is_ok()));
+                    resp.extend_from_slice(alloc::format!("pref {name}: {}\n", if !ok { "refused" } else if kept { "set and kept" } else { "set, NOT kept" }).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                // `diag kill <name>…`: each named process ended, its arc and surface freed (development: a bridge-spawned app has no other way out).
+                if let Some(names) = cmd.params.strip_prefix(b"kill ") {
+                    for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                        let killed = crate::process::kill(name);
+                        // A WiFi driver killed by hand stays down: the keeper stops for the session.
+                        if name == b"pcie1" {
+                            wifi_keep = false;
+                        }
+                        resp.extend_from_slice(name);
+                        resp.extend_from_slice(if killed { b" killed\n" } else { b" was not running\n" });
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(names) = cmd.params.strip_prefix(b"restart ") {
+                    restart(&mut store, names, &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"pmic rails" {
+                    // `diag pmic rails`: the two rails the camera's clocks run on, read through ACPM: S5M_VDD_INT (main PMIC BUCK5M, control G#1F, outputs G#20/G#C7) and S1S_VDD_CAM (sub PMIC BUCK1S, control G#0E, outputs G#0F/G#CA). Volts = 200 mV + 6.25 mV x code (s2mpg14/15-register.h). Under Linux, streaming: INT 568.75 mV, CAM 600 mV (idle 537.5 mV).
+                    let mv = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X} ({} uV)", 200_000 + c as u32 * 6250), Err(e) => alloc::format!("error G#{e:X}") };
+                    let hx = |r: Result<u8, u32>| match r { Ok(c) => alloc::format!("G#{c:02X}"), Err(e) => alloc::format!("error G#{e:X}") };
+                    let (m, sb, t) = (crate::acpm::MAIN, crate::acpm::SUB, crate::acpm::T_PMIC);
+                    resp.extend_from_slice(alloc::format!("VDD_INT (BUCK5M): ctrl {} out1 {} out2 {}\nVDD_CAM (BUCK1S): ctrl {} out1 {} out2 {}\n",
+                        hx(crate::acpm::read(m, t, 0x1F)), mv(crate::acpm::read(m, t, 0x20)), mv(crate::acpm::read(m, t, 0xC7)),
+                        hx(crate::acpm::read(sb, t, 0x0E)), mv(crate::acpm::read(sb, t, 0x0F)), mv(crate::acpm::read(sb, t, 0xCA))).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam bus" {
+                    // `diag cam bus`: mux and bring up both camera HS-I2C controllers (no device addressed).
+                    crate::camera::buses_up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"cam pdma") {
+                    // `diag cam pdma`: hand the front end's register program to the PDMA engine (camera.rs), the only path to the region the CPU cannot write.
+                    let mut b2 = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                    if b2.is_none() && cfg!(cam_frame_blob) {
+                        b2 = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                    }
+                    let init = match b2.as_deref() {
+                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                            if 8 + n <= b.len() { Some(b[8..8 + n].to_vec()) } else { None }
+                        }
+                        _ => store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()),
+                    };
+                    let prog = match b2.as_deref() {
+                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                            if 8 + n <= b.len() { Some(b[8 + n..].to_vec()) } else { None }
+                        }
+                        _ => store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten()),
+                    };
+                    let words: alloc::vec::Vec<&[u8]> = cmd.params.split(|&c| c == b' ').collect();
+                    // `cam pdma uw ...`: the ultrawide's own init and CPU setup (FERROS_CAM_UW) instead of the main camera's bundle.
+                    let (init, prog) = if words.contains(&&b"uw"[..]) { crate::camera::Cam::uw_bundle() } else { (init, prog) };
+                    crate::camera::pdma_probe(&mut resp, init, prog, if words.contains(&&b"slit"[..]) { 64 } else { 0 }, words.contains(&&b"fast"[..]), crate::camera::Shot::parse(&cmd.params));
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam frame" {
+                    // `diag cam frame`: `cam stream` plus the front end's DMA program from the vault (cam.ispfe.prog, tools/camera-prog.py); reports which output buffers were written.
+                    // Both tables can come as one value, `cam.frame` = 'CFRM' + init length (u32 LE) + init + program, because only one vault write per boot succeeds at the moment (2026-10-20).
+                    let mut bundle = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                    if bundle.is_none() && cfg!(cam_frame_blob) {
+                        bundle = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                    }
+                    let (init, prog) = match bundle.as_deref() {
+                        Some(b) if b.len() > 8 && &b[..4] == b"CFRM" => {
+                            let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                            if 8 + n <= b.len() { (Some(b[8..8 + n].to_vec()), Some(b[8 + n..].to_vec())) } else { (None, None) }
+                        }
+                        _ => (store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten()), store.as_mut().and_then(|s| s.get_by_key("cam.ispfe.prog").ok().flatten())),
+                    };
+                    crate::camera::frame_probe(&mut resp, init, prog);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam stream" || cmd.params == b"cam raw" || cmd.params == b"cam lochs" {
+                    // `diag cam stream`: replay the sensor init, configure CSI link 1, stream 300 ms, report what the link saw and dump its words.
+                    // The init comes from the same places `cam frame` takes it from: the vault's own key, the bundled `cam.frame` value, or the image's built-in bundle. The vault lost these keys in the move to manifestus, and the dump is the whole point of the command, so it should not depend on which of the three is present.
+                    let mut init = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                    if init.is_none() {
+                        let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                        if b.is_none() && cfg!(cam_frame_blob) {
+                            b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                        }
+                        if let Some(b) = b.as_deref() {
+                            if b.len() > 8 && &b[..4] == b"CFRM" {
+                                let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                if 8 + n <= b.len() {
+                                    init = Some(b[8..8 + n].to_vec());
+                                }
+                            }
+                        }
+                    }
+                    if cmd.params == b"cam raw" { crate::camera::raw_probe(&mut resp, init) } else if cmd.params == b"cam lochs" { crate::camera::lochs_probe(&mut resp, init) } else { crate::camera::stream_probe(&mut resp, init) }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam slit" || cmd.params == b"cam slitsweep" {
+                    // `diag cam slit`: set our own window and frame rate through the sensor's CCS registers and measure the rate change (camera.rs).
+                    let mut t = store.as_mut().and_then(|s| s.get_by_key("cam.boitata.init").ok().flatten());
+                    if t.is_none() {
+                        let mut b = store.as_mut().and_then(|s| s.get_by_key("cam.frame").ok().flatten());
+                        if b.is_none() && cfg!(cam_frame_blob) {
+                            b = Some(include_bytes!(concat!(env!("OUT_DIR"), "/cam_frame.bin")).to_vec());
+                        }
+                        if let Some(b) = b.as_deref() {
+                            if b.len() > 8 && &b[..4] == b"CFRM" {
+                                let n = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+                                if 8 + n <= b.len() {
+                                    t = Some(b[8..8 + n].to_vec());
+                                }
+                            }
+                        }
+                    }
+                    if cmd.params == b"cam slitsweep" { crate::camera::slit_sweep(&mut resp, t) } else { crate::camera::slit(&mut resp, t, 64) }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam preexist" {
+                    // `diag cam preexist`: front-end state Linux had before the capture window, which nothing in the replay sets up (camera.rs).
+                    crate::camera::preexisting(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam probe" {
+                    // `diag cam probe`: whether an impossible capability read is the sensor's answer or this driver's (camera.rs).
+                    crate::camera::read_probe(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam preview" {
+                    // `diag cam preview`: the camera app's 1344 x 1008 NV12 preview, its luma painted 1:1 (camera.rs).
+                    crate::camera::preview(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam iova" {
+                    // `diag cam iova`: every buffer the camera IOMMU maps, by walking its page table in DRAM (camera.rs).
+                    crate::camera::iova_scan(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam inherit" {
+                    // `diag cam inherit`: after a live handoff with the camera running, read the frame Linux's pipeline wrote and paint it (camera.rs).
+                    crate::camera::inherit_probe(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam scan all" {
+                    // `diag cam scan all`: power each camera module in turn and read its model ID (camera.rs).
+                    crate::camera::scan_all(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam buses" {
+                    // `diag cam buses`: all four camera I2C controllers up, nothing powered and no device addressed (camera.rs).
+                    crate::camera::buses_all(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam clamp" {
+                    // `diag cam clamp`: prove the camera-PMIC overvoltage guard refuses what it must, with no I2C at all (camera.rs).
+                    crate::camera::clamp_test(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam caps" {
+                    // `diag cam caps`: the sensor's MIPI CCS capability block — what rates, windows and modes the silicon says it allows (camera.rs).
+                    crate::camera::caps_dump(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam events" {
+                    // `diag cam events`: every ISP interrupt source that is reporting, with its bits named (camera.rs, camera_events.rs).
+                    crate::camera::events_dump(&mut resp, false);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam link" {
+                    // `diag cam link`: every CSI link 1 word the camera stack touches, for diffing a cold ferros against a streaming Android through the handoff (camera.rs).
+                    crate::camera::link_dump(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam fe" {
+                    // `diag cam fe`: power the ISP front end, restore its clocks, read CSI link 1's version.
+                    crate::camera::fe_up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam up" {
+                    // `diag cam up`: power the main camera module (rails programmed and verified first), then read the sensor's model ID.
+                    crate::camera::power_up(&mut resp);
+                    crate::camera::sensor_id(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam off" {
+                    // `diag cam off`: power the main camera module down.
+                    crate::camera::power_down(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam scan" {
+                    // `diag cam scan`: which addresses acknowledge on the camera-PMIC bus.
+                    crate::camera::scan(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"acpm ") {
+                    // `diag acpm r <speedy> <type> <reg>` / `diag acpm u <speedy> <type> <reg> <val> <mask>` (hex): one PMIC transaction over the ACPM channel, for experiments without a rebuild.
+                    let words: alloc::vec::Vec<&[u8]> = cmd.params[5..].split(|&c| c == b' ').filter(|w| !w.is_empty()).collect();
+                    let hx = |w: &[u8]| -> Option<u32> { let w = w.strip_prefix(b"G#").or_else(|| w.strip_prefix(b"0x")).unwrap_or(w); u32::from_str_radix(core::str::from_utf8(w).ok()?, 16).ok() };
+                    let nums: alloc::vec::Vec<u32> = words.iter().skip(1).filter_map(|w| hx(w)).collect();
+                    let out = match (words.first().copied(), nums.as_slice()) {
+                        (Some(b"r"), [sp, ty, rg]) => alloc::format!("read {sp:X}/{ty:X}/{rg:X}: {:?}\n", crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))),
+                        (Some(b"u"), [sp, ty, rg, v, m]) => {
+                            let r = crate::acpm::update(*sp, *ty, *rg, *v as u8, *m as u8);
+                            alloc::format!("update {sp:X}/{ty:X}/{rg:X} val G#{v:X} mask G#{m:X}: {:?}; now {:?}\n", r.map_err(|e| alloc::format!("G#{e:X}")), crate::acpm::read(*sp, *ty, *rg).map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}")))
+                        }
+                        _ => alloc::string::String::from("usage: acpm r <speedy> <type> <reg> | acpm u <speedy> <type> <reg> <val> <mask> (hex)\n"),
+                    };
+                    resp.extend_from_slice(out.as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam pmicon" {
+                    // `diag cam pmicon`: raise the camera PMIC's supply enables (sub-PMIC GPIO1, GPIO3) and read its ID.
+                    crate::camera::pmic_power_on(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam pmic" {
+                    // `diag cam pmic`: the camera PMIC's ID and the main camera's regulators, read only.
+                    crate::camera::pmic_dump(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"kv selftest" {
+                    // `diag kv selftest`: one large put through the manifestus vault, with its block I/O counted and every appended block re-read (kvault.rs).
+                    match crate::process::with_lock(|| store.as_mut().map(|s| s.selftest())) {
+                        Some(t) => resp.extend_from_slice(t.as_bytes()),
+                        None => resp.extend_from_slice(b"no vault open\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(n) = cmd.params.strip_prefix(b"evnt ").and_then(|t| core::str::from_utf8(t).ok()).and_then(|t| t.trim().parse::<u64>().ok()) {
+                    // `diag evnt <bit>`: the kernel core's event stream on counter bit n (8-15: the selector is four bits; 12, every 333 us, is the boot's), for measuring what its wakeups cost. The idle wfe's 2 ms EL2-timer backstop holds whatever the setting.
+                    let n = n.clamp(8, 15);
+                    unsafe {
+                        let mut v: u64;
+                        core::arch::asm!("mrs {}, cnthctl_el2", out(reg) v);
+                        v = (v & !(0xF << 4)) | (n & 0xF) << 4;
+                        core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
+                    }
+                    resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"pd" || cmd.params.starts_with(b"pd ") {
+                    // `diag pd [off <name>|all]`: the unused SoC power domains (pd.rs).
+                    crate::pd::diag(core::str::from_utf8(&cmd.params[2..]).unwrap_or(""), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"odpm" || cmd.params == b"odpm start" {
+                    // `diag odpm start`, then `diag odpm`: every supply rail's power from the PMICs' meters (odpm.rs).
+                    if cmd.params == b"odpm start" {
+                        resp.extend_from_slice(crate::odpm::start().as_bytes());
+                    } else {
+                        crate::odpm::report(&mut resp);
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"ufs h8") {
+                    // `diag ufs h8 [on|off]`: the UFS link's hibernate on idle (ferros_hal ufs), and its counts.
+                    if cmd.params == b"ufs h8 on" || cmd.params == b"ufs h8 off" {
+                        ferros_hal::ufs::H8_ENABLED.store(cmd.params == b"ufs h8 on", core::sync::atomic::Ordering::Relaxed);
+                    }
+                    let c = |i: usize| ferros_hal::ufs::H8_COUNTS[i].load(core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(alloc::format!("ufs hibernate on idle {}: {} entries, {} exits, {} failures; lost commands {}\n", if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { "on" } else { "off" }, c(0), c(1), c(2), ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"smp dark on" || cmd.params == b"smp dark off" {
+                    DARK_WORKERS_OFF.store(cmd.params == b"smp dark on", core::sync::atomic::Ordering::Relaxed);
+                    resp.extend_from_slice(alloc::format!("workers off while dark: {}\n", cmd.params == b"smp dark on").as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"smp off" || cmd.params == b"smp on" {
+                    // `diag smp off|on`: the four workers switched off (PSCI CPU_OFF, as before a reload) or started again — for measuring what idle cores cost; threads pinned to the workers wait meanwhile.
+                    if cmd.params == b"smp off" {
+                        crate::smp::stop_all();
+                    } else {
+                        crate::smp::launch_all();
+                    }
+                    let (up, _) = crate::smp::report();
+                    resp.extend_from_slice(alloc::format!("workers up G#{up:X}\n").as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"screen off" || cmd.params == b"screen on" {
+                    // `diag screen off|on`: what the power key does (preference 2), from the host, for measuring.
+                    crate::process::set_pref(crate::process::PREF_SCREEN_OFF, (cmd.params == b"screen off") as u8);
+                    resp.extend_from_slice(b"screen preference set\n");
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"power" || cmd.params.starts_with(b"power start") {
+                    // `diag power start <s> [gap in 1/16 s] [input]`, then `diag power`: the system's draw over a window, sampled by the service loop's own passes (power_start / power_poll), the charger cut for it.
+                    if let Some(a) = cmd.params.strip_prefix(b"power start").and_then(|t| core::str::from_utf8(t).ok()) {
+                        let v: alloc::vec::Vec<u64> = a.split_whitespace().take_while(|w| *w != "after").filter_map(|t| t.parse().ok()).collect();
+                        let delay = a.split_whitespace().skip_while(|w| *w != "after").nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+                        resp.extend_from_slice(power_start(v.first().copied().unwrap_or(16), v.get(1).copied().unwrap_or(2), a.contains("input"), delay).as_bytes());
+                    } else {
+                        match unsafe { (&*(&raw const POWER_WIN), &*(&raw const POWER_RESULT)) } {
+                            (Some(w), _) => resp.extend_from_slice(alloc::format!("running: {} samples so far\n", w.n).as_bytes()),
+                            (None, Some(r)) => resp.extend_from_slice(r.as_bytes()),
+                            (None, None) => resp.extend_from_slice(b"no window yet: diag power start <s>\n"),
+                        }
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"identity" || cmd.params == b"identity release" {
+                    // `diag identity`: the identity class's state (AUTH.md); `diag "identity release"`: every identity entry deleted, the binding and any kept seed gone, the phone-only secret renewed — what a completed departure does, for a developer starting the phone over.
+                    let s = if cmd.params == b"identity release" { store_unlock(4, None).map(|_| "released") } else { Ok("") };
+                    let st = store_unlock(0, None).unwrap_or(0);
+                    resp.extend_from_slice(alloc::format!("identity: {} unlocked {}, bound {}\n", s.unwrap_or("release failed"), st & 1 == 1, st & 2 == 2).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"log" || cmd.params.starts_with(b"log ") {
+                    // `diag log [KiB]`: the last 16 KiB of the flash text log (flashlog.rs), or the last KiB asked for (up to 256: a reply's room).
+                    let kib = core::str::from_utf8(&cmd.params[3..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256);
+                    resp.extend_from_slice(&crate::flashlog::tail(kib * 1024));
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(name) = cmd.params.strip_prefix(b"part find ") {
+                    // `diag "part find <name>"`: a GPT partition's LU and LBA range, read-only (partfs.rs find).
+                    let name = alloc::string::String::from_utf8_lossy(name).into_owned();
+                    let s = match crate::partfs::find(&name) {
+                        Some(p) => alloc::format!("{name}: LU A#{} LBA A#{}..=A#{}\n", p.lun, p.first, p.last),
+                        None => alloc::format!("{name}: not found\n"),
+                    };
+                    resp.extend_from_slice(s.as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params.starts_with(b"part vermagic ") {
+                    // `diag "part vermagic <logical>"`: which kernel the modules in a logical partition (vendor_dlkm_a, say) were built for — read-only, from super (partfs.rs vermagic).
+                    let name = alloc::string::String::from_utf8_lossy(&cmd.params[14..]).into_owned();
+                    crate::partfs::vermagic(&mut resp, &name);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"modem hwcfg" {
+                    // `diag modem hwcfg`: the handover block's inputs (modem.rs hwcfg): ABL's board fields, hardware_config.json, persist's cpsha size; the IMEIs never shown.
+                    crate::modem::hwcfg(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"amp state" {
+                    // `diag amp state`: the speaker amplifiers' SPI clock path, pins and supply, read only (amp.rs).
+                    crate::amp::state(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"amp up" {
+                    // `diag amp up`: SPI up, supply, each amplifier's reset, boot-done and chip IDs.
+                    crate::amp::up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch raw" {
+                    // `diag touch raw`: the chip's rawest live layer (mutual raw, no baseline removed), auto-ranged on the panel for five minutes (touch.rs).
+                    crate::touch::raw(&mut resp, 300_000);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch gamma" {
+                    // `diag touch gamma`: the pressure value alone in greyscale — a white disc of that radius and a full-screen flood at that level, to see how brightness maps to pressure (touch.rs).
+                    crate::touch::gamma(&mut resp, 30_000);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch decay" {
+                    // `diag touch decay`: a 1:1 10-bit decay screen stamped with a circle per touch reading: the contact's major axis in red, its minor in blue, its pressure in green (touch.rs).
+                    crate::touch::decay(&mut resp, 30_000);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch map" {
+                    // `diag touch map`: the touch chip's capacitance strength frame, live on the panel and as an ASCII map, for 12 s (touch.rs).
+                    crate::touch::map(&mut resp, 12_000);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch info" {
+                    // `diag touch info`: the touch chip's sensor grid and the addresses of its capacitance frames (touch.rs).
+                    crate::touch::info(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch state" {
+                    // `diag touch state`: the touch controller's clocks, pins and rails, read only (touch.rs).
+                    crate::touch::state(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch up" {
+                    // `diag touch up`: SPI controller up, rails on, reset released, controller ready, scan mode active.
+                    crate::touch::up(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch watch" {
+                    // `diag touch watch`: report touches for 8 s.
+                    crate::touch::watch(&mut resp, 8192);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch paint" {
+                    // `diag touch paint`: draw finger strokes on the panel for 16 s, the by-eye test of touch.
+                    crate::touch::paint(&mut resp, 16384);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"touch off" {
+                    crate::touch::off(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"cam state" {
+                    // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
+                    crate::camera::state(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if cmd.params == b"ufs" {
+                    match b.ufs_probe {
+                        Some(f) => resp = f(),
+                        None => resp.extend_from_slice(b"no UFS probe on this boot path (the handoff adopts Linux's live link)\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                resp.extend_from_slice(match b.kind {
+                    BootKind::Handoff => b"ferros on Pixel 8 Pro (Tensor G3), chainloaded from Linux\n".as_slice(),
+                    BootKind::Cold => b"ferros on Pixel 8 Pro (Tensor G3), cold boot from ABL\n",
+                });
+                let r = |a: usize| unsafe { read_volatile(a as *const u32) };
+                append_hex(&mut resp, b"GEN=", generation as u32);
+                // Percent of time since the service loop started that the core spent asleep in `wfe`, rather than spinning.
+                // CPU0's state as PSCI sees it (AFFINITY_INFO: 0 on, 1 off, 2 on pending): whether the park's CPU_OFF took (x3.rs).
+                {
+                    let r: i64;
+                    unsafe { core::arch::asm!("smc #0", inout("x0") 0x8400_0004u64 => r, in("x1") 0u64, in("x2") 0u64) };
+                    append_hex(&mut resp, b"CPU0_AFFINITY=", r as u32);
+                }
+                append_hex(&mut resp, b"BACKSTOP_WAKES=", BACKSTOP_WAKES.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                append_hex(&mut resp, b"IDLE_PCT=", (asleep * 100 / cntpct().wrapping_sub(t_awake_from).max(1)) as u32);
+                append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
+                append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
+                append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
+                append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
+                // The USB process: whether the kernel drives the controller (1) or the process does (0), and the commands it has handed over (ptlink.rs).
+                append_hex(&mut resp, b"KERNEL_USB=", kernel_usb as u32);
+                append_hex(&mut resp, b"PT_PROC_CMDS=", st.proc_cmds);
+                // The hottest thermal zone, °C (thermal_poll), and the X3's pre-throttle rate in MHz while the thermal throttle holds it (0 = not throttled).
+                append_hex(&mut resp, b"SOC_C=", THERMAL.iter().map(|t| t.load(core::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0) as u32);
+                append_hex(&mut resp, b"THROTTLED_MHZ=", THROTTLED_FROM.load(core::sync::atomic::Ordering::Relaxed) / 1000);
+                for k in 4..9 {
+                    append_hex(&mut resp, alloc::format!("IRQ_STAGE_C{k}=").as_bytes(), unsafe { core::ptr::read_volatile(&raw const crate::__irq_stage[k]) } as u32);
+                }
+                append_hex(&mut resp, b"SPSR_MASKED=", crate::process::SPSR_MASKED.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                append_hex(&mut resp, b"TICK_REARMS=", crate::process::TICK_REARMS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                // The "Ready?" gate is a cold-boot concern (ready.rs is cold-only); the handoff build has no gate telemetry.
+                #[cfg(not(shim_handoff))]
+                {
+                    let g = crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed);
+                    append_hex(&mut resp, b"GATE_ANSWER=", (g & 0xFF) as u32);
+                    append_hex(&mut resp, b"GATE_MS=", (g >> 8 & 0xFF_FFFF) as u32);
+                    append_hex(&mut resp, b"GATE_POWER_HELD_MS=", (g >> 32) as u32);
+                }
+                // The post-mortem notes (platform::note): this boot's and the previous boot's — the lock's holder (core + 1) and each core's last crumb with the core in the top byte.
+                for k in 0..7 {
+                    let (v, pv) = (platform::note_read(k), platform::note_read(8 + k));
+                    append_hex(&mut resp, alloc::format!("NOTE_{k}_HI=").as_bytes(), (v >> 32) as u32);
+                    append_hex(&mut resp, alloc::format!("NOTE_{k}=").as_bytes(), v as u32);
+                    append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}_HI=").as_bytes(), (pv >> 32) as u32);
+                    append_hex(&mut resp, alloc::format!("PREV_NOTE_{k}=").as_bytes(), pv as u32);
+                }
+                {
+                    let (up, on) = crate::smp::report();
+                    append_hex(&mut resp, b"SMP_UP=", up);
+                    for (k, v) in on.iter().enumerate() {
+                        append_hex(&mut resp, alloc::format!("SMP_ON_{k}=").as_bytes(), *v as u32);
+                    }
+                    for (k, s) in crate::process::SLICES.iter().enumerate().filter(|(k, _)| (4..=8).contains(k)) {
+                        append_hex(&mut resp, alloc::format!("SLICES_C{k}=").as_bytes(), s.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    }
+                    append_hex(&mut resp, b"LOCK_SPINS=", crate::process::LOCK_SPINS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    for (k, w) in crate::smp::IDLE_WAKES.iter().enumerate() {
+                        append_hex(&mut resp, alloc::format!("IDLE_WAKES_C{}=", k + 4).as_bytes(), w.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    }
+                    // Why idle cores take the lock: the queue count, the interrupt flag, and how far off the next deadline is (signed ms; negative = already passed, which would make every core look on every event-stream tick).
+                    append_hex(&mut resp, b"IDLE_RUNNABLE_N=", crate::process::RUNNABLE_N.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                    append_hex(&mut resp, b"IDLE_IRQ_ANY=", unsafe { core::ptr::read_volatile(&raw const crate::process::__irq_any) } as u32);
+                    let nw = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Relaxed);
+                    let now = cntpct();
+                    append_hex(&mut resp, b"IDLE_NEXT_WAKE_MS=", if nw == u64::MAX { 0x7FFF_FFFF } else { ((nw as i64 - now as i64) * 1000 / freq as i64) as u32 });
+                }
+                {
+                    let (bad, at, val) = platform::canary_check();
+                    append_hex(&mut resp, b"CANARY_BAD=", bad);
+                    append_hex(&mut resp, b"CANARY_BASE=", platform::canary_base() as u32);
+                    append_hex(&mut resp, b"CANARY_AT=", at as u32);
+                    append_hex(&mut resp, b"CANARY_VAL_HI=", (val >> 32) as u32);
+                    append_hex(&mut resp, b"CANARY_VAL_LO=", val as u32);
+                }
+                {
+                    let (size, used) = platform::stack_used_max();
+                    append_hex(&mut resp, b"STACK_SIZE=", size);
+                    append_hex(&mut resp, b"STACK_USED_MAX=", used);
+                }
+                append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
+                append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
+                append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
+                append_hex(&mut resp, b"USB_ATTEMPTS=", attempts);
+                {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let k = &crate::killswitch::REPORT;
+                    append_hex(&mut resp, b"KILL_GICR_FRAME=", k[0].load(Relaxed));
+                    append_hex(&mut resp, b"KILL_GICD_CTLR=", k[1].load(Relaxed));
+                    append_hex(&mut resp, b"KILL_HCR_BEFORE=", k[2].load(Relaxed));
+                    append_hex(&mut resp, b"KILL_KEYS_IDLE=", k[3].load(Relaxed));
+                    let kohi = crate::wairua::peek();
+                    append_hex(&mut resp, b"KOHI_DONE=", kohi.is_some() as u32);
+                    for (name, h) in crate::kohi::SOURCES.iter().zip(kohi.map(|k| k.1).unwrap_or_default().iter()) {
+                        // present b0, rct_fail b1, apt_fail b2, level_fail b8..15, level-0 ones/2 b16..31
+                        let mut key = alloc::vec::Vec::from(&b"KOHI_"[..]);
+                        key.extend_from_slice(name.to_ascii_uppercase().as_bytes());
+                        key.push(b'=');
+                        append_hex(&mut resp, &key, h.packed());
+                        key.pop();
+                        key.extend_from_slice(b"_US=");
+                        append_hex(&mut resp, &key, h.us);
+                    }
+                    append_hex(&mut resp, b"KOHI_OK=", kohi.is_some_and(|k| k.0) as u32);
+                    append_hex(&mut resp, b"KOHI_MS=", crate::wairua::kohi_ms());
+                    append_hex(&mut resp, b"VHE=", crate::cachemap::vhe() as u32);
+                    #[cfg(all(feature = "pixel8", not(shim_handoff)))]
+                    crate::s2mpu::report(&mut resp);
+                    append_hex(&mut resp, b"KILL_IRQS=", unsafe { read_volatile(&raw const crate::__irq_count) } as u32);
+                    let daif: u64;
+                    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
+                    append_hex(&mut resp, b"DAIF=", daif as u32);
+                }
+                unsafe extern "C" {
+                    static _start: u8;
+                }
+                append_hex(&mut resp, b"BASE=", b.link_base as u32);
+                append_hex(&mut resp, b"RUNNING_AT=", &raw const _start as usize as u32);
+                append_hex(&mut resp, b"STAGE=", b.stage as u32);
+                append_hex(&mut resp, b"BOOT_EL=", crate::boot_el() as u32);
+                append_hex(&mut resp, b"HEAP_END=", heap_end as u32);
+                // The kernel heap now: free bytes, free blocks, the largest (what a big vault value needs in one piece).
+                if let Some((free, blocks, largest)) = crate::heap_stats() {
+                    append_hex(&mut resp, b"HEAP_FREE=", free as u32);
+                    append_hex(&mut resp, b"HEAP_FREE_BLOCKS=", blocks as u32);
+                    append_hex(&mut resp, b"HEAP_LARGEST_FREE=", largest as u32);
+                }
+                append_hex(&mut resp, b"HEAP_IN_USE=", ferros_heap::IN_USE.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                append_hex(&mut resp, b"HEAP_PEAK=", ferros_heap::PEAK.load(core::sync::atomic::Ordering::Relaxed) as u32);
+                if let Some(probe) = &b.probe {
+                    append_hex(&mut resp, b"UFS_LINK=", probe.link_up as u32);
+                    append_hex(&mut resp, b"VAULT_OPENED=", probe.opened as u32);
+                    append_hex(&mut resp, b"VAULT_VERIFIED=", probe.verified as u32);
+                    append_hex(&mut resp, b"VAULT_SEALED=", probe.sealed as u32);
+                    append_hex(&mut resp, b"VAULT_STAGE=", probe.stage as u32);
+                    for (i, w) in probe.root16.chunks(4).enumerate() {
+                        let label: &[u8] = [b"VAULT_ROOT0=".as_slice(), b"VAULT_ROOT1=", b"VAULT_ROOT2=", b"VAULT_ROOT3="][i];
+                        append_hex(&mut resp, label, u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+                    }
+                    append_hex(&mut resp, b"WAIRUA_OK=", crate::wairua::peek().is_some_and(|k| k.0) as u32);
+                    append_hex(&mut resp, b"IRA_FAIL=", probe.ira_fail);
+                }
+                if let Some(prev) = &b.prev {
+                    // Why the previous session ended (crumb byte G#Bx = exit reason, G#EExx = panic; a nonzero fault ELR = the fault sink fired).
+                    append_hex(&mut resp, b"PREV_EXIT=", prev[3] as u32);
+                    append_hex(&mut resp, b"PREV_EXC=", prev[5] as u32);
+                    // The post-mortem notes (platform::note): the lock's holder, then cores 4-8's last crumb (core in the top byte).
+                    // (notes: below, from platform::NOTES, which survives every kind of boot)
+                    append_hex(&mut resp, b"PREV_FAULT_ELR=", prev[20] as u32);
+                    append_hex(&mut resp, b"PREV_FAULT_FAR=", prev[21] as u32);
+                    // The PT record (leave(): words 24..27): the last command (cap bytes, op), and at a stall exit the open transfer and its age.
+                    append_hex(&mut resp, b"PREV_PT_CMD_CAP=", prev[24] as u32);
+                    append_hex(&mut resp, b"PREV_PT_CMD_OP=", (prev[24] >> 56) as u32);
+                    append_hex(&mut resp, b"PREV_PT_OPEN_SID=", prev[25] as u32);
+                    append_hex(&mut resp, b"PREV_PT_OPEN_RECV=", (prev[25] >> 32) as u32);
+                    append_hex(&mut resp, b"PREV_PT_OPEN_TOTAL=", prev[26] as u32);
+                    append_hex(&mut resp, b"PREV_PT_AGE_MS=", (prev[26] >> 32) as u32);
+                    append_hex(&mut resp, b"PREV_ALIVE=", prev[27] as u32);
+                }
+                for (label, v) in &b.extras {
+                    append_hex(&mut resp, label, *v);
+                }
+                // Reboot mode as the bootloader will see it, read through the EL3 monitor (proves the fastboot path without rebooting; 0 = normal).
+                append_hex(&mut resp, b"PMU_REBOOT_CMD=", platform::priv_reg(platform::PMU_REBOOT_CMD, false, 0) as u32);
+                append_hex(&mut resp, b"DSS_REASON=", r(platform::DSS_HEADER + platform::DSS_OFFSET_EMERGENCY_REASON));
+                append_hex(&mut resp, b"DSS_SCRATCH=", r(platform::DSS_HEADER + platform::DSS_OFFSET_SCRATCH));
+                append_hex(&mut resp, b"S2MPU_HSI0_CTRL_LINUX=", dma.s2mpu_ctrl);
+                append_hex(&mut resp, b"SYSMMU_NUM_VM=", dma.num_vm as u32);
+                for vm in 0..dma.num_vm {
+                    append_hex(&mut resp, b"SYSMMU_VM_CTRL_LINUX=", dma.vm_ctrl_before[vm]);
+                    append_hex(&mut resp, b"SYSMMU_VM_CTRL_NOW=", dma.vm_ctrl_after[vm]);
+                }
+                const ATT_KEYS: [&[u8]; 24] = [b"  LTSTATE=", b"  LINKDBG=", b"  DSTS=", b"  RESETS=", b"  CONNDONES=", b"  SETUPS=", b"  SETUP_ARM_OK_FAIL=", b"  XFERNOTREADY=", b"  CMD_FAIL=", b"  EVENTS=", b"  LAST_SETUP=", b"  STATUS_IN_OUT=", b"  E0=", b"  E1=", b"  E2=", b"  E3=", b"  E4=", b"  E5=", b"  E6=", b"  E7=", b"  E8=", b"  E9=", b"  EA=", b"  EB="];
+                for (i, h) in init_history.iter().enumerate() {
+                    append_hex(&mut resp, b"FAIL_ATT=", i as u32);
+                    for (k, &v) in ATT_KEYS.iter().zip(h.iter()) {
+                        append_hex(&mut resp, k, v);
+                    }
+                }
+                resp.extend_from_slice(b"END\n");
+                queue_pt_response(&mut pt_out_data, &resp);
+            } else if cmd.cap == cap_store {
+                // Under the kernel lock: syscalls on the worker cores reach the vault holding it (the map's places, a setting), so this core takes it too — one owner at a time.
+                let resp = crate::process::with_lock(|| store_command(store.as_mut(), cmd.op, cmd.params));
+                queue_pt_response(&mut pt_out_data, &resp);
+            } else if cmd.cap == cap_display && cmd.op == ferros_pt::Op::Write {
+                // A leading G#01 byte = hold (bridge `display --hold`); G#02 = a DSI packet script for the panel (dsim::sequence, bridge `display dcs`); G#03 = dump the DSIM link registers (bridge `display dsim`). Anything else is text for the painter.
+                match cmd.params.split_first() {
+                    Some((2, script)) => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() {
+                            rep.extend_from_slice(b"DPU powered down\n");
+                        } else if !crate::dsim::alive() {
+                            rep.extend_from_slice(b"DSIM0 not running\n");
+                        } else {
+                            let (sent, fail) = crate::dsim::sequence(script, freq);
+                            rep.extend_from_slice(b"DSI packets sent: ");
+                            rep.extend_from_slice(alloc::format!("{sent}").as_bytes());
+                            match fail {
+                                Some(f) => rep.extend_from_slice(alloc::format!(", then FIFO stuck (FIFOCTRL G#{f:08x})\n").as_bytes()),
+                                None => rep.extend_from_slice(b", all went\n"),
+                            }
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    Some((3, _)) => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() {
+                            rep.extend_from_slice(b"DPU powered down\n");
+                        } else {
+                            crate::dsim::dump(&mut rep);
+                            crate::dsim::dump_phy(&mut rep);
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#06 [hz] = switch the panel's refresh rate with its own command set, set the DSIM's command-TE timers, and measure the result (bridge `display mode 60|120`).
+                    Some((6, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        let hz = args[0] as u32;
+                        let script = match hz {
+                            60 => Some(crate::hk3::REFRESH_60),
+                            120 => Some(crate::hk3::REFRESH_120),
+                            _ => None,
+                        };
+                        if !crate::display::dpu_on() || !crate::dsim::alive() {
+                            rep.extend_from_slice(b"display not running\n");
+                        } else if let Some(script) = script {
+                            let (sent, fail) = crate::dsim::sequence(script, freq);
+                            if fail.is_none() {
+                                crate::dsim::set_cmd_te(hz);
+                                // The DSIM's registers are shadowed: a frame applies the timers.
+                                let _ = crate::display::show(if hz == 60 { b"ferros 60 Hz" } else { b"ferros 120 Hz" }, freq);
+                            }
+                            let (pin_hz, _) = crate::display::te_rate(freq);
+                            rep.extend_from_slice(alloc::format!("mode {hz} Hz: {sent} packets{}; TE now {pin_hz} Hz\n", if fail.is_some() { " (FIFO stuck)" } else { "" }).as_bytes());
+                        } else {
+                            rep.extend_from_slice(b"mode: 60 or 120\n");
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#0B [samples] [interval, 1/16 s units] [1 = battery only] = battery gauge samples over hsi2c_11 (hsi2c::gauge; bridge `display power [n] [sixteenths] [battery]`): voltage, current, the average of the samples. Battery only: the charger's buck is switched off for the run (the system then draws from the battery and the current is the system's), half a second for the gauge to see it, and the charger put back whatever happens.
+                    Some((11, args)) => {
+                        let mut rep = alloc::vec::Vec::new();
+                        let n = args.first().copied().unwrap_or(1).max(1) as u32;
+                        let gap = args.get(1).copied().unwrap_or(8) as u64 * freq / 16;
+                        let battery = args.get(2).copied().unwrap_or(0) >= 1;
+                        // 2 = also open the CHGIN input (CHG_CNFG_12 CHGINSEL) for the window, the stronger isolation.
+                        let open_input = args.get(2).copied().unwrap_or(0) == 2;
+                        let wait = |ticks: u64| {
+                            let t0: u64;
+                            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t0) };
+                            loop {
+                                let t: u64;
+                                unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+                                if t.wrapping_sub(t0) >= ticks {
+                                    break;
+                                }
+                            }
+                        };
+                        let mut input_prev: Option<u8> = None;
+                        let charger = if battery {
+                            match crate::hsi2c::charger::set_mode(0) {
+                                Ok(prev) => {
+                                    rep.extend_from_slice(alloc::format!("charger mode G#{:X} -> buck off\n", prev & 0xF).as_bytes());
+                                    if open_input {
+                                        match crate::hsi2c::charger::input_select(false) {
+                                            Ok(p) => {
+                                                input_prev = Some(p);
+                                                rep.extend_from_slice(alloc::format!("charger input CHG_CNFG_12 G#{p:02X} -> CHGIN deselected\n").as_bytes());
+                                            }
+                                            Err(e) => rep.extend_from_slice(alloc::format!("charger input write failed: G#{e:X}\n").as_bytes()),
+                                        }
+                                    }
+                                    wait(freq / 2);
+                                    Some(prev)
+                                }
+                                Err(e) => {
+                                    rep.extend_from_slice(alloc::format!("charger mode write failed: G#{e:X}; sampling as is\n").as_bytes());
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let mut sum_ua: i64 = 0;
+                        let mut sum_uv: u64 = 0;
+                        let mut got = 0u32;
+                        for i in 0..n {
+                            if i > 0 {
+                                wait(gap);
+                            }
+                            match crate::hsi2c::gauge::sample() {
+                                Ok(g) => {
+                                    sum_ua += g.current_ua as i64;
+                                    sum_uv += g.vcell_uv as u64;
+                                    got += 1;
+                                    rep.extend_from_slice(alloc::format!("soc {}% temp {}.{:02} C vcell {} mV current {} mA (avg {} mA, avg vcell {} mV)\n", g.soc, g.temp_cc / 100, (g.temp_cc % 100).unsigned_abs(), g.vcell_uv / 1000, g.current_ua / 1000, g.avg_current_ua / 1000, g.avg_vcell_uv / 1000).as_bytes());
+                                }
+                                Err(e) => rep.extend_from_slice(alloc::format!("gauge read failed: G#{e:X} (1 controller not up, 2 busy, 4 no device, 8 bus error, 10 timeout, 20 empty)\n").as_bytes()),
+                            }
+                        }
+                        if let Some(p) = input_prev {
+                            match crate::hsi2c::charger::restore_input(p) {
+                                Ok(()) => rep.extend_from_slice(alloc::format!("charger input G#{p:02X} restored\n").as_bytes()),
+                                Err(e) => rep.extend_from_slice(alloc::format!("CHARGER INPUT RESTORE FAILED: G#{e:X} — write G#69[G#C5] = G#{p:02X} by hand\n").as_bytes()),
+                            }
+                        }
+                        if let Some(prev) = charger {
+                            match crate::hsi2c::charger::restore(prev) {
+                                Ok(()) => rep.extend_from_slice(alloc::format!("charger mode G#{:X} restored\n", prev & 0xF).as_bytes()),
+                                Err(e) => rep.extend_from_slice(alloc::format!("CHARGER RESTORE FAILED: G#{e:X} — write G#69[G#B9] = G#{prev:02X} by hand\n").as_bytes()),
+                            }
+                        }
+                        if got > 0 {
+                            let ma = sum_ua / got as i64 / 1000;
+                            let mv = sum_uv / got as u64 / 1000;
+                            rep.extend_from_slice(alloc::format!("MEAN over {got}: {ma} mA at {mv} mV = {} mW (negative = discharging)\n", ma * mv as i64 / 1000).as_bytes());
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#0D [target] [reg] = an 8-bit register read on hsi2c_11; G#0E [target] [reg] [val] = an 8-bit write, read back after (bridge `display i2c <target> <reg> [val]`). The PMIC-side chips: gauge G#36, charger G#69, PMIC G#66.
+                    Some((13, args)) if args.len() >= 2 => {
+                        let mut rep = alloc::vec::Vec::new();
+                        match crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1]) {
+                            Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] = G#{v:02X}\n", args[0], args[1]).as_bytes()),
+                            Err(e) => rep.extend_from_slice(alloc::format!("i2c read failed: G#{e:X}\n").as_bytes()),
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    Some((14, args)) if args.len() >= 3 => {
+                        let mut rep = alloc::vec::Vec::new();
+                        match crate::hsi2c::write_byte(crate::hsi2c::HSI2C_11, args[0], args[1], args[2]).and_then(|_| crate::hsi2c::read_byte(crate::hsi2c::HSI2C_11, args[0], args[1])) {
+                            Ok(v) => rep.extend_from_slice(alloc::format!("G#{:02X}[G#{:02X}] <- G#{:02X}, reads back G#{v:02X}\n", args[0], args[1], args[2]).as_bytes()),
+                            Err(e) => rep.extend_from_slice(alloc::format!("i2c write failed: G#{e:X}\n").as_bytes()),
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#0F [1 = ferros's own framebuffer (cachemap DISPLAY_FB), 0 = ABL's surface] = where the painter draws and the layer reads (bridge `display fb own|abl`), then a frame to prove it.
+                    Some((15, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::use_own_fb(args[0] == 1) {
+                            rep.extend_from_slice(b"no framebuffer region on this boot path\n");
+                        } else {
+                            let r = crate::display::show(if args[0] == 1 { b"ferros: own framebuffer" } else { b"ferros: ABL's surface" }, freq);
+                            rep.extend_from_slice(&r);
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#10 [dither word] = the DQE's display dither register (DQE_DISP_DITHER: EN b0, MODE b1 = shift, FRAME_CON b2 = temporal, FRAME_OFFSET [4:3], TABLE_SEL R/G/B b5..b7) with the DQE shadow update requested; the next present applies it (bridge `display dither <hex>`). For finding the setting that doesn't speckle black at 10 bpc.
+                    Some((16, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        let dqe = 0x194D_0000usize;
+                        unsafe {
+                            write_volatile((dqe + 0x2800) as *mut u32, args[0] as u32);
+                            let shd = 0x1947_0050usize;
+                            write_volatile(shd as *mut u32, read_volatile(shd as *const u32) | 1 << 24);
+                        }
+                        crate::display::append_hex(&mut rep, b"DQE_DISP_DITHER=", unsafe { read_volatile((dqe + 0x2800) as *const u32) });
+                        crate::display::append_hex(&mut rep, b"DQE_CGC_DITHER=", unsafe { read_volatile((dqe + 0x2400) as *const u32) });
+                        crate::display::append_hex(&mut rep, b"DECON_GLOBAL_CON=", unsafe { read_volatile(0x1947_0020usize as *const u32) });
+                        crate::display::append_hex(&mut rep, b"DATA_PATH_CON_0=", unsafe { read_volatile(0x1947_0200usize as *const u32) });
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#11 [diameter hi] [diameter lo] [r] [g] [b] [surround r] [g] [b] = a measurement disc centred on the panel over a surround; diameter 0 = full field (bridge `display patch <diameter px> <rrggbb> [surround rrggbb]`, tools/display-profile.sh).
+                    Some((17, args)) if args.len() >= 8 => {
+                        let diam = (args[0] as usize) << 8 | args[1] as usize;
+                        let c = |i: usize| (args[i] as u32) << 16 | (args[i + 1] as u32) << 8 | args[i + 2] as u32;
+                        let rep = crate::display::patch(diam, c(2), c(5), freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#12 [diameter hi lo] [r g b, 10-bit, hi lo each] [surround r g b, the same] = the measurement disc in 10 bits a channel, the layer in 2:10:10:10 (bridge `display patch10`).
+                    Some((18, args)) if args.len() >= 14 => {
+                        let diam = (args[0] as usize) << 8 | args[1] as usize;
+                        let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
+                        let rep = crate::display::patch10(diam, [v(2), v(4), v(6)], [v(8), v(10), v(12)], freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#13 [r g b, 10-bit, hi lo each] = DECON's background colour with the base window off; G#13 alone = the window back on (bridge `display bg <r> <g> <b>` / `display bg off`).
+                    Some((19, args)) => {
+                        let v = |i: usize| (args[i] as u32) << 8 | args[i + 1] as u32;
+                        let c = if args.len() >= 6 { Some([v(0), v(2), v(4)]) } else { None };
+                        let rep = crate::display::bg10(c, freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#14 [diameter hi lo] [word, 4 bytes BE] [surround word, 4 bytes BE] = the 10-bit layer's disc with raw words (bridge `display patchraw`).
+                    Some((20, args)) if args.len() >= 10 => {
+                        let diam = (args[0] as usize) << 8 | args[1] as usize;
+                        let w = |i: usize| u32::from_be_bytes([args[i], args[i + 1], args[i + 2], args[i + 3]]);
+                        let rep = crate::display::patch_raw(diam, w(2), w(6), freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#0C [r] [g] [b] = a solid colour over the whole panel (bridge `display fill rrggbb`).
+                    Some((12, args)) if args.len() >= 3 => {
+                        let rep = crate::display::fill((args[0] as u32) << 16 | (args[1] as u32) << 8 | args[2] as u32, freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#07 = set DECON0 to Android's state (10 bpc, dither, SRAM, QoS, interrupts), then paint a frame to apply it (bridge `display tune`).
+                    Some((7, _)) => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() {
+                            rep.extend_from_slice(b"DPU powered down\n");
+                        } else {
+                            crate::display::configure_like_android(&mut rep);
+                            let r = crate::display::show(b"ferros: DECON as Android", freq);
+                            rep.extend_from_slice(&r);
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#08 [1 = FHD, 0 = WQHD] = switch the whole pipe's raster (bridge `display res fhd|wqhd`).
+                    Some((8, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() || !crate::dsim::alive() {
+                            rep.extend_from_slice(b"display not running\n");
+                        } else {
+                            crate::display::resolution(args[0] == 1, args.get(1).copied().unwrap_or(7), freq, &mut rep);
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#09 [floor: 30, 10, 1, or 0 = exit to manual 120] = the panel's auto-rate idle floor, then 1.5 s of stillness and the TE pin (bridge `display idle N`).
+                    Some((9, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        let script = match args[0] { 30 => Some(crate::hk3::IDLE_30), 10 => Some(crate::hk3::IDLE_10), 1 => Some(crate::hk3::IDLE_1), 0 => Some(crate::hk3::IDLE_EXIT), _ => None };
+                        if !crate::display::dpu_on() || !crate::dsim::alive() {
+                            rep.extend_from_slice(b"display not running\n");
+                        } else if let Some(script) = script {
+                            let (sent, fail) = crate::dsim::sequence(script, freq);
+                            // A second byte of 1 asks for changeable TE during the measurement, so the pin shows the panel's real rate; fixed TE is restored after.
+                            let changeable = args.get(1) == Some(&1);
+                            if changeable {
+                                let _ = crate::dsim::sequence(crate::hk3::TE_CHANGEABLE, freq);
+                            }
+                            let t0 = cntpct();
+                            while cntpct().wrapping_sub(t0) < freq * 3 / 2 {}
+                            let ((pin_hz, _), width_us) = crate::display::te_profile(freq);
+                            if changeable {
+                                let _ = crate::dsim::sequence(crate::hk3::TE_FIXED, freq);
+                            }
+                            rep.extend_from_slice(alloc::format!("idle floor {}: {sent} packets{}; after 1.5 s still, TE {pin_hz} Hz ({width_us} us high){}\n", args[0], if fail.is_some() { " (FIFO stuck)" } else { "" }, if changeable { " [changeable TE]" } else { "" }).as_bytes());
+                        } else {
+                            rep.extend_from_slice(b"idle: 30, 10, 1 or 0\n");
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#0A [1 = FHD, 0 = WQHD] [link rate: 0 keep, 1 = 1368 Mbps, 2 = 1346 Mbps] [blend depth: 0 keep, 1 = 8 bpc, 2 = 10 bpc] = the full modeset (dpu::modeset: DECON and DSIM stopped, re-initialised, started; bridge `display modeset fhd|wqhd [1368|1346] [8|10]`).
+                    Some((10, args)) if !args.is_empty() => {
+                        let mut rep = alloc::vec::Vec::new();
+                        crate::dpu::modeset(args[0] == 1, args.get(1).copied().unwrap_or(0), args.get(2).copied().unwrap_or(0), args.get(3).copied().unwrap_or(0), freq, &mut rep);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#05 = the panel's TE rate as DECON counts it (bridge `display terate`).
+                    Some((5, _)) => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() {
+                            rep.extend_from_slice(b"DPU powered down\n");
+                        } else {
+                            let ((pin_hz, irq_hz), width_us) = crate::display::te_profile(freq);
+                            rep.extend_from_slice(alloc::format!("TE: {pin_hz} Hz on the pin ({width_us} us high), {irq_hz} Hz by DECON interrupt\n").as_bytes());
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    // G#04 [cmd][len] = a DCS read from the panel (bridge `display read`).
+                    Some((4, args)) if args.len() >= 2 => {
+                        let mut rep = alloc::vec::Vec::new();
+                        if !crate::display::dpu_on() {
+                            rep.extend_from_slice(b"DPU powered down\n");
+                        } else {
+                            match crate::dsim::read(args[0], args[1] as usize, freq) {
+                                Ok(bytes) => {
+                                    rep.extend_from_slice(alloc::format!("read G#{:02x}:", args[0]).as_bytes());
+                                    for b in bytes {
+                                        rep.extend_from_slice(alloc::format!(" {b:02x}").as_bytes());
+                                    }
+                                    rep.push(b'\n');
+                                }
+                                Err(e) => rep.extend_from_slice(alloc::format!("read G#{:02x} failed: G#{e:08x}\n", args[0]).as_bytes()),
+                            }
+                        }
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                    _ => {
+                        let (text, h) = match cmd.params.split_first() {
+                            Some((1, rest)) => (rest, true),
+                            _ => (cmd.params, false),
+                        };
+                        hold |= h;
+                        let rep = crate::display::show(text, freq);
+                        queue_pt_response(&mut pt_out_data, &rep);
+                    }
+                }
+            } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Write && cmd.params.len() >= 12 {
+                // MEM (read and poke any physical address, the screen grabs among them) is a development affordance: a production build answers it as an unknown command (owner, 2026-10-24). A stopgap: in production it becomes a portal verb the owner's identity holds in full (STATUS.md next, PORTAL.md §5).
+                // 32-bit poke: params [addr:8 BE][val:4 BE]. Address bit 63 set = through the EL3 monitor (SMC_CMD_PRIV_REG) for registers the S2MPU blocks from EL2. Response: [smc_ret:8 LE][readback:4 LE] (smc_ret 0 for a direct write).
+                let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
+                let val = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap());
+                let addr = raw & !(1 << 63);
+                let (ret, back) = if raw >> 63 == 1 {
+                    let ret = platform::priv_reg(addr, true, val);
+                    (ret, platform::priv_reg(addr, false, 0) as u32)
+                } else {
+                    unsafe {
+                        write_volatile(addr as usize as *mut u32, val);
+                        core::arch::asm!("dsb sy");
+                        (0, read_volatile(addr as usize as *const u32))
+                    }
+                };
+                let mut resp = [0u8; 12];
+                resp[..8].copy_from_slice(&ret.to_le_bytes());
+                resp[8..].copy_from_slice(&back.to_le_bytes());
+                queue_pt_response(&mut pt_out_data, &resp);
+            } else if cfg!(not(ferros_production)) && cmd.cap == cap_mem && cmd.op == ferros_pt::Op::Read && cmd.params.len() >= 12 {
+                // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
+                let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
+                let addr = (raw & !(1 << 63)) as usize;
+                let len = (u32::from_be_bytes(cmd.params[8..12].try_into().unwrap()) as usize).min(64 << 10);
+                let mut out = alloc::vec![0u8; len];
+                if raw >> 63 == 1 {
+                    for (i, c) in out.chunks_mut(4).enumerate() {
+                        let v = platform::priv_reg((addr + i * 4) as u64, false, 0) as u32;
+                        c.copy_from_slice(&v.to_le_bytes()[..c.len()]);
+                    }
+                } else if addr % 4 == 0 && len % 4 == 0 {
+                    for (i, c) in out.chunks_mut(4).enumerate() {
+                        c.copy_from_slice(&unsafe { read_volatile((addr + i * 4) as *const u32) }.to_le_bytes());
+                    }
+                } else {
+                    for (i, b) in out.iter_mut().enumerate() {
+                        *b = unsafe { read_volatile((addr + i) as *const u8) };
+                    }
+                }
+                queue_pt_response(&mut pt_out_data, &out);
+            } else if (cmd.cap == cap_reload || cmd.cap == cap_run) && cmd.op == ferros_pt::Op::Write {
+                // Stage into STAGE, write-verify against the source. RELOAD additionally requires the ARM64 MZ header and must fit below the heap of the image it will replace.
+                let params = cmd.params;
+                let is_kernel = params.len() > 0x1000 && params[..4] == [0x4D, 0x5A, 0x00, 0x91];
+                let fits = !params.is_empty() && params.len() <= STAGE_MAX && heap_end <= b.stage;
+                let ok_shape = if cmd.cap == cap_reload { is_kernel && fits } else { fits };
+                let mut ok = false;
+                if ok_shape {
+                    let src_hash = blake3::hash(params);
+                    unsafe { core::ptr::copy_nonoverlapping(params.as_ptr(), b.stage as *mut u8, params.len()) };
+                    let staged = unsafe { core::slice::from_raw_parts(b.stage as *const u8, params.len()) };
+                    ok = blake3::hash(staged) == src_hash;
+                }
+                let size = if ok { params.len() } else { 0 };
+                if cmd.cap == cap_reload {
+                    reload_ok = ok;
+                    reload_size = size;
+                    run_ok = false;
+                } else {
+                    run_ok = ok;
+                    run_size = size;
+                    reload_ok = false;
+                }
+                queue_pt_response(&mut pt_out_data, &(size as u32).to_le_bytes());
+            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                if from_proc && !pt_act {
+                    // From the USB process: an empty reply now, the handover when it asks again with that reply sent (ptlink.rs).
+                    proc_act = reload_ok && reload_size > 0;
+                    queue_pt_response(&mut pt_out_data, b"");
+                } else if reload_ok && reload_size > 0 {
+                    // Flush this Exec's COMPLETE before tearing USB down, give the host a moment, detach, then hand off to the copy stub. The wait is only for the kernel's own USB: the USB process sent its reply before asking to act.
+                    let mut spins = 0u32;
+                    while kernel_usb && !usb.bulk_in_is_idle() && spins < (1 << 20) {
+                        let _ = usb.poll_event();
+                        spins += 1;
+                    }
+                    for _ in 0..(1 << 24) {
+                        core::hint::spin_loop();
+                    }
+                    platform::crumb(0xA6);
+                    // The workers off first: the copy below rewrites the kernel under them (smp.rs).
+                    ferros_hal::ufs::H8_ENABLED.store(false, core::sync::atomic::Ordering::Relaxed);
+                    crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_wake_now());
+                    crate::smp::stop_all();
+                    unsafe {
+                        // The copy overwrites the vector table: no interrupt may land mid-copy. The new image re-arms the killswitch first thing.
+                        core::arch::asm!("msr daifset, #2");
+                        // Copy the stub (cacheable) first, then hand over with every dirty line written back and the MMU off: the stub and the next image run MMU-off, as from ABL.
+                        let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
+                        write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
+                        let stub = &raw const ferros_reload_stub as usize;
+                        let stub_len = &raw const ferros_reload_stub_end as usize - stub;
+                        core::ptr::copy_nonoverlapping(stub as *const u8, b.stub as *mut u8, stub_len);
+                        crate::cachemap::off_for_handover();
+                        let len = (reload_size + 7) & !7;
+                        let next_x0 = ((generation + 1) << 1) | 1;
+                        core::arch::asm!(
+                            "dsb sy",
+                            "ic iallu",
+                            "dsb sy",
+                            "isb",
+                            "br {stub}",
+                            stub = in(reg) b.stub,
+                            in("x0") b.stage,
+                            in("x1") b.link_base,
+                            in("x2") len,
+                            in("x3") next_x0,
+                            options(noreturn)
+                        );
+                    }
+                }
+            } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Write {
+                // A capsule too large for the staging slot, streamed straight into its arc (STD-TARGET.md): [total u64][need u64][code offset u64][code length u64][piece offset u64][piece]. The first piece allocates the arc (zeroed, from the big pool past 16 MiB); each piece lands at the code offset plus its own; the reply is the bytes received so far. The Exec that follows builds the process in that arc.
+                let pr = cmd.params;
+                let w = |i: usize| u64::from_le_bytes(pr[i * 8..i * 8 + 8].try_into().unwrap()) as usize;
+                let mut received = 0usize;
+                if pr.len() >= 40 {
+                    let (total, need, co, cl, off) = (w(0), w(1), w(2), w(3), w(4));
+                    let piece = &pr[40..];
+                    if off == 0 {
+                        if let Some((a, ..)) = spawn_stage.take() {
+                            crate::process::arc_free(a);
+                        }
+                        if let Some(arc) = crate::process::arc_alloc(need, false) {
+                            spawn_stage = Some((arc, total, 0, co, cl));
+                        }
+                    }
+                    if let Some((arc, t, r, _, _)) = spawn_stage.as_mut() {
+                        if *t == total && off == *r && off + piece.len() <= total && crate::process::CODE + total + crate::process::STACK <= arc.size {
+                            unsafe { core::ptr::copy_nonoverlapping(piece.as_ptr(), (arc.base + crate::process::CODE + off) as *mut u8, piece.len()) };
+                            *r += piece.len();
+                            received = *r;
+                        }
+                    }
+                }
+                queue_pt_response(&mut pt_out_data, &(received as u32).to_le_bytes());
+            } else if cmd.cap == cap_spawn && cmd.op == ferros_pt::Op::Exec {
+                // Run the staged payload as a process (EL0, own arc, a console capability plus the requested endpoint grants); reply [exit][console]. Params: [name len][name][grant count][(kind 1 serve / 2 use / 3 hardware / 4 entropy / 5 dma, len, name)*][input].
+                let staged = spawn_stage.take();
+                if (run_ok && run_size > 0) || staged.is_some() {
+                    let code = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                    let pr = cmd.params;
+                    let mut at = 0usize;
+                    let mut take = |n: usize| { let s = &pr[at.min(pr.len())..(at + n).min(pr.len())]; at += n; s };
+                    let nl = take(1).first().copied().unwrap_or(0) as usize;
+                    let name = take(nl);
+                    let ng = take(1).first().copied().unwrap_or(0) as usize;
+                    let mut grants = alloc::vec::Vec::new();
+                    for _ in 0..ng {
+                        let kind = take(1).first().copied().unwrap_or(0);
+                        let l = take(1).first().copied().unwrap_or(0) as usize;
+                        let g = take(l);
+                        grants.push(match kind {
+                            1 => crate::process::Grant::Serve(g),
+                            3 => crate::process::Grant::Hardware(g),
+                            4 => crate::process::Grant::Entropy,
+                            5 => crate::process::Grant::Dma(g),
+                            6 => crate::process::Grant::Store(g),
+                            7 => crate::process::Grant::Power(g),
+                            8 => crate::process::Grant::Irq(g),
+                            9 => crate::process::Grant::Ira,
+                            10 => crate::process::Grant::Part(g),
+                            11 => crate::process::Grant::Unlock,
+                            12 => crate::process::Grant::Pt,
+                            _ => crate::process::Grant::Use(g),
+                        });
+                    }
+                    let input = &pr[at.min(pr.len())..];
+                    // Signed capsules only: the gate (oracle.rs) must pass, or spawn never completes.
+                    let sealed = crate::process::with_lock(|| store.as_mut().and_then(|s| s.get_by_key("sealed").ok().flatten())).unwrap_or_default();
+                    let nm = if name.is_empty() { b"proc" } else { name };
+                    let spawned = match staged {
+                        Some((arc, total, received, co, cl)) if received == total => crate::process::spawn_capsule_staged(nm, arc, total, co, cl, input, &grants),
+                        Some((arc, ..)) => {
+                            crate::process::arc_free(arc);
+                            Err("spawn: the streamed capsule is incomplete")
+                        }
+                        None => crate::process::spawn_capsule(nm, code, input, &grants, &sealed),
+                    };
+                    match spawned {
+                        Ok(o) => {
+                            mark_ran(&o);
+                            let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + o.console.len());
+                            resp.extend_from_slice(&o.exit.to_le_bytes());
+                            resp.extend_from_slice(&o.console);
+                            queue_pt_response(&mut pt_out_data, &resp);
+                        }
+                        Err(e) => {
+                            let mut resp = alloc::vec::Vec::from(&b"ERR:"[..]);
+                            resp.extend_from_slice(e.as_bytes());
+                            queue_pt_response(&mut pt_out_data, &resp);
+                        }
+                    }
+                } else {
+                    queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                }
+            } else if cmd.cap == cap_seal && cmd.op == ferros_pt::Op::Exec {
+                // Install the staged masked capsule: gate + checker once, then its seal joins the vault's `sealed` list (idempotent). Reply [0][seal] or ERR.
+                if run_ok && run_size > 0 {
+                    let capsule = unsafe { core::slice::from_raw_parts(b.stage as *const u8, run_size) };
+                    let resp = match (crate::process::install_capsule(capsule), store.as_mut()) {
+                        (Ok(seal), Some(store)) => {
+                            let mut list = crate::process::with_lock(|| store.get_by_key("sealed").ok().flatten()).unwrap_or_default();
+                            if !list.chunks_exact(32).any(|e| e == seal) {
+                                list.extend_from_slice(&seal);
+                            }
+                            match crate::process::with_lock(|| store.set("sealed", &list)) {
+                                Ok(_) => {
+                                    let mut r = alloc::vec![0u8];
+                                    r.extend_from_slice(&seal);
+                                    r
+                                }
+                                Err(_) => alloc::vec::Vec::from(&b"ERR:install: vault write failed"[..]),
+                            }
+                        }
+                        (Ok(_), None) => alloc::vec::Vec::from(&b"ERR:install: no vault"[..]),
+                        (Err(e), _) => {
+                            let mut r = alloc::vec::Vec::from(&b"ERR:"[..]);
+                            r.extend_from_slice(e.as_bytes());
+                            r
+                        }
+                    };
+                    queue_pt_response(&mut pt_out_data, &resp);
+                } else {
+                    queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                }
+            } else if cmd.cap == cap_run && cmd.op == ferros_pt::Op::Exec {
+                // CALL the staged payload. ABI: extern "C" fn(in_ptr, in_len, out_ptr, out_cap) -> u64, entry at offset 0, PC-relative code only. A payload fault lands in the fault sink (report + reset to Android); a payload that never returns stops the watchdog pets.
+                if run_ok && run_size > 0 {
+                    crate::cachemap::sync_code(b.stage, run_size);
+                    let mut out = alloc::vec![0u8; 4096];
+                    let entry: extern "C" fn(*const u8, usize, *mut u8, usize) -> u64 = unsafe { core::mem::transmute(b.stage) };
+                    let ret = entry(cmd.params.as_ptr(), cmd.params.len(), out.as_mut_ptr(), out.len());
+                    let n = (ret as usize).min(out.len());
+                    let mut resp: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(8 + n);
+                    resp.extend_from_slice(&ret.to_le_bytes());
+                    resp.extend_from_slice(&out[..n]);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                } else {
+                    queue_pt_response(&mut pt_out_data, b"ERR:NOPAYLOAD");
+                }
+            } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
+                // Mode byte 1 = fastboot: stamp the PMU reboot mode through the EL3 monitor and reset straight into the bootloader. If the monitor refuses, fall back to a normal exit (report + Android).
+                if from_proc && !pt_act {
+                    // From the USB process: an empty reply now, the reset when it asks again with that reply sent (ptlink.rs).
+                    proc_act = true;
+                    queue_pt_response(&mut pt_out_data, b"");
+                    continue;
+                }
+                let fastboot = cmd.params.first().copied() == Some(1);
+                let mut spins = 0u32;
+                while kernel_usb && !usb.bulk_in_is_idle() && spins < (1 << 20) {
+                    let _ = usb.poll_event();
+                    spins += 1;
+                }
+                if fastboot {
+                    report(&b, EXIT_FASTBOOT);
+                    unsafe {
+                        let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
+                        write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
+                    }
+                    // Only returns on failure: platform::WATCHDOG_DID_NOT_FIRE, or the EL3 monitor's refusal (nonzero, negative = error). Kept in report slot r[23] so the exit report says which.
+                    FASTBOOT_FAIL.store(platform::reboot_to_bootloader(), core::sync::atomic::Ordering::Relaxed);
+                }
+                leave(&b, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
+            }
         }
     }
 }
