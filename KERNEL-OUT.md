@@ -26,7 +26,7 @@ Each move so far followed the same shape:
 
 | # | What | Lines | Kernel dependencies (outside its own block) | Becomes |
 |---|---|---|---|---|
-| 0 | USB + PT (`ferros_hal::usb`, the service loop's USB, `ptlink.rs`) | ~1.5k + the loop | eUSB2 PHY, TCPC switch, DMA path | **Done to step 5** (USB.md): process from boot, interrupt-driven. The kernel's USB stays as the fallback until removed with the owner present. |
+| 0 | USB + PT (`ferros_hal::usb`, the service loop's USB, `ptlink.rs`) | ~1.5k + the loop | eUSB2 PHY, TCPC switch, DMA path | **Done** (USB.md): the process from boot, interrupt-driven, about 29 MB/s; the kernel's USB removed 2026-11-01. |
 | 1 | Touch bring-up (`touch.rs` `up`) | ~0.9k | ACPM rails (LDO25M, LDO4M), HSI0 USI2 clock gates, the reset GPIO | A `touch` power switch (clocks, rails, reset); the controller handshake (ready event, GPIO6 fix-up, scan mode) in `payloads/touch`, which already speaks SPI to it. The `diag touch …` tools go with it. |
 | 2 | The PT command chain in `service.rs` (~2,000 lines) | ~2k | everything it reaches | Each `diag` subcommand leaves with its module. The rest — store, spawn, seal, mem, display, reload, reboot — stays behind `SYS_PT` until a dev-command server takes the dev-only ones; reload and reboot remain kernel. |
 | 3 | Camera (`camera`, `_snap`, `_events`, `_close`, `_rx`, `_rx_uw`) | ~6.5k | hsi2c (polled, portable), `priv_reg` ×3, ACPM ×3 (the camera PMIC), `display::show` for diag output | `payloads/camera`, a diag process at first (`bridge spawn camera <command>`): ~20 register windows granted, a `camera` power switch for the PMIC and EL3 writes, hsi2c moved into a shared crate. `camera_snap` is captured oracle data: it moves as data, not code. Nothing at boot uses the camera, so this move cannot break a boot. |
@@ -35,7 +35,7 @@ Each move so far followed the same shape:
 | 6 | Display (`display`, `dpu`, `dsim`) | ~1.3k | `priv_reg` (power-domain check), the boot screen | Merged into the display server, which already drives the panel. The kernel keeps the minimum the boot screen and checklist need before processes exist (`display::show` on ABL's pipe). The boot-time modeset (`start_home`) moves to the display server's start. |
 | 7 | Small drivers (`amp`, `haptics`, `gnss`, `spi`, `fp`), the radios' power switches | ~1k | spi (portable), ACPM, `aoc::probe32` (haptics) | Each its own process; `spi.rs` becomes a shared crate (touch, amp, gnss, nfc all use it). `fp` is a bus hunt: a diag payload. |
 | 8 | `partfs` (ext4/f2fs on Android's partitions) | ~0.4k | the UFS link under the kernel lock | A read-only file server, once a process can be given block access to a partition without the vault's LU. |
-| 9 | Policy in the service loop: the WiFi keeper, the AoC boot sequence, the home start | — | — | init (restart policy is init's). The keeper can tell `pcie1` is gone with no new syscall: a live call on `wlan` (op 3, the MAC) fails at once when nobody serves it. But a probe blocks while `pcie1` is busy joining, so it needs its own thread in init, or it would hold up the map's start at unlock. |
+| 9 | Policy in the service loop: the AoC boot sequence, the home start | — | — | init (restart policy is init's). **The WiFi keeper moved 2026-11-01:** init's keepers restart `usb` and `pcie1` with `spawn_unique` (USB.md step 5). |
 | 10 | Probes: `cold_ufs`, `shim.rs` | ~0.6k | — | `cold_ufs` (UFS solved 2026-10-14) to a diag payload or out; `shim.rs` stays while the Linux register oracle is used. |
 
 ## Rules for each move
@@ -48,10 +48,7 @@ Each move so far followed the same shape:
 
 What blocks the rest of the list after the night of 2026-10-31. Each is a choice, not more work of the same kind.
 
-1. **The kernel's USB fallback.**
-   - Today the kernel serves USB until init starts the usb process, and again if it ends. Removing it takes out the service loop's USB (the event loop, the watchdogs, the PT receive, about 400 lines) and the gate's host answer.
-   - The cost: a usb process that fails at every boot leaves no bridge, and recovery is by hand (volume down at the gate → Android → fastboot).
-   - Proposed: remove it with you present, after the process has carried a week of use.
+1. **[decided 2026-11-01] The kernel's USB fallback:** removed with the owner present (USB.md step 5); init's keepers start the driver again.
 2. **Sensors phase 2: the AoC's start.**
    - It needs the secure world: FF-A calls to Trusty (direct messages, sharing memory for its virtio rings) and GSA's mailbox (plain MMIO, grantable).
    - Proposed: a `Ffa` capability that allows exactly the calls `trusty.rs` makes — direct requests to Trusty's partition, and sharing pages of the caller's own DMA region — and nothing else.

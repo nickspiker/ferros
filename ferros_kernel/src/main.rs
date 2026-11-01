@@ -1792,19 +1792,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if hv_answered {
         display::KEEP_PIXELS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
-    // Dev builds bring USB up before the gate, so the host can answer it (`ferros-bridge gate ferros|android|hold`) as the keys do; the service takes the controller over after the press. Release builds have no USB until the press (owner, 2026-10-22).
-    let mut gate_usb: Option<ferros_hal::usb::Dwc3Dev> = None;
-    if cfg!(not(ferros_production)) && !hv_answered && real_boot {
-        pixel8_eusb_phy_init();
-        ferros_hal::usb::set_dwc3_base(service::DWC3);
-        ferros_hal::usb::set_usb_mem(service::usb_mem());
-        gate_usb = ferros_hal::usb::Dwc3Dev::init();
-        checklist::at(if gate_usb.is_some() { "gate: usb up" } else { "gate: usb failed" });
-    }
+    // No USB at the gate: the kernel has none of its own since 2026-11-01 (USB.md); the USB process comes with init, after the press. Dev builds answer the gate themselves after a second.
     let (pressed_at, gate_choice) = if hv_answered {
         (platform::cntpct(), ready::Choice::Ferros)
     } else if real_boot {
-        ready::wait(gate_usb.as_mut())
+        ready::wait()
     } else {
         (0, ready::Choice::Ferros)
     };
@@ -1993,7 +1985,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         prev,
         extras,
         ufs_probe: Some(cold_ufs::probe),
-        usb: gate_usb,
     };
     // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
     // CPU0 is about to park: the ira and wairua it holds go sealed to the X3 and the workers, and its own registers are cleared (keys.rs).

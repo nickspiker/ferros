@@ -9,15 +9,10 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use ferros_hal::usb::UsbEvent;
-use ferros_pt::packet;
-use ferros_pt::transfer::InboundTransfer;
-
 use crate::platform::{self, append_hex, cntfrq, cntpct, open_usb_dma_path, queue_pt_response};
 use crate::vault_boot::{report_vault, ShimStore, VaultProbe};
 
 pub const DWC3: usize = 0x1121_0000;
-const USBCON: usize = 0x1110_0000;
 
 /// Which way ferros got here; decides the DIAG banner and where exits go.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,8 +43,6 @@ pub struct Boot {
     pub extras: alloc::vec::Vec<(&'static [u8], u32)>,
     /// `bridge diag ufs`: the cold path's UFS link-startup probe.
     pub ufs_probe: Option<fn() -> alloc::vec::Vec<u8>>,
-    /// A USB controller already up and enumerated (a dev build's gate brings it up before the press); the service takes it over instead of starting its own.
-    pub usb: Option<ferros_hal::usb::Dwc3Dev>,
 }
 
 /// What `reboot_to_bootloader` returned when a fastboot request fell through (0 = never tried); reported in r[23].
@@ -57,45 +50,20 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 
 /// Largest RELOAD/RUN image the staging slot takes.
 const STAGE_MAX: usize = 4 << 20;
-/// Where PT transfers over 1 MiB are received: the 6 MiB between the DMA pool and the reload stub, inside the kernel's cacheable window (cachemap WINDOW), used by nothing else.
-const PT_BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
-/// The USB controller's DMA block (ferros_hal::usb::UsbMem), in the kernel's non-cacheable `.bss.dma` pages, handed to the driver before any init (`set_usb_mem`).
-#[unsafe(link_section = ".bss.dma")]
-static mut USB_MEM: ferros_hal::usb::UsbMem = ferros_hal::usb::UsbMem::zeroed();
-pub fn usb_mem() -> *mut ferros_hal::usb::UsbMem {
-    &raw mut USB_MEM
-}
 /// The largest value the vault takes (3 MiB): sealing a value and reading it back each need about twice its size in one piece of the kernel heap. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault, until the vault stores in pieces.
 pub const STORE_VALUE_MAX: usize = 3 << 20;
 
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
 const EXIT_REBOOT: u8 = 0xB0;
-const EXIT_NO_ENUM: u8 = 0xB1;
-const EXIT_IDLE: u8 = 0xB2;
 const EXIT_FASTBOOT: u8 = 0xB3;
-const EXIT_NO_USB: u8 = 0xB4;
-const EXIT_PT_STALL: u8 = 0xB6;
 
-/// PT-level counters for the exit report.
+/// The session's command counters for DIAG and the exit report.
 #[derive(Default)]
 struct PtStats {
-    specs: u32,
-    /// SPECs refused for a size over PT_BIG.
-    specs_refused: u32,
     /// Commands the USB process handed over (ptlink.rs).
     proc_cmds: u32,
-    data_pkts: u32,
-    data_decoded: u32,
-    data_accepted: u32,
-    commands: u32,
-    not_ready: u32,
-    /// The last command parsed: cap bytes 0..3 (LE) | op << 56 — so a stall exit says what the host was doing (DIAG PREV_PT_CMD).
+    /// The last command parsed: cap bytes 0..3 (LE) | op << 56 (DIAG PREV_PT_CMD).
     last_cmd: u64,
-    /// The transfer open at a stall exit: stream id, chunks received, expected bytes, and how long since its last packet (DIAG PREV_PT_*).
-    open_sid: u32,
-    open_recv: u32,
-    open_total: u32,
-    pt_age_ms: u32,
 }
 
 
@@ -127,41 +95,21 @@ unsafe extern "C" {
     static ferros_reload_stub_end: u8;
 }
 
-/// Report the vault + the USB session and warm-reset back to Android. The kernel dumps the whole 256-byte block as r[00..31].
-/// USB-service layout: r[4] (0x20) bytes = init attempts, ever-configured, DSTS[7:0], DSTS[15:8], DSTS[23:16]; r[6] = bulk OUT completes | bulk IN completes << 32; r[7] = XferNotReady (HAL) | DEPCMD status failures << 32; r[8] = EP events seen | SETUPs << 32; r[9] = GEVNTCOUNT | GEVNTSIZ << 32; r[10] = last failed DEPCMD | its ep << 32 | its type << 40; r[11] = bulk_out_armed | bulk_out_ready << 8 | bulk_in_idle << 16 | configured << 24 | ep2 TRB ctrl snapshot << 32; r[12..17] = last 12 raw EP events (oldest-first order is evt_ring_n mod 12); r[18] = PT SPECs | DATA packets << 32; r[19] = DATA decoded | DATA accepted << 32; r[22] = commands | loop XferNotReady << 32.
-fn leave(b: &Boot, exit: u8, attempts: u32, configured_ever: bool, usb: Option<&ferros_hal::usb::Dwc3Dev>, st: &PtStats) -> ! {
+/// Report the vault and the session, then reset. The kernel dumps the whole 256-byte block as r[00..31]; this session's words: r[22] the commands the USB process handed over, r[23] what `reboot_to_bootloader` returned, r[24] the last command (cap bytes 0..3 | op << 56), r[27] the processes alive.
+fn leave(b: &Boot, exit: u8, st: &PtStats) -> ! {
     report(b, exit);
-    let rd = |a: usize| unsafe { read_volatile(a as *const u32) };
-    let dsts = rd(DWC3 + 0xC70C);
-    let usb_b = [attempts.min(255) as u8, configured_ever as u8, dsts as u8, (dsts >> 8) as u8, (dsts >> 16) as u8];
     let w = |idx: usize, v: u64| unsafe { write_volatile((0xFD60_0000usize + idx * 8) as *mut u64, v) };
-    if let Some(u) = usb {
-        w(6, u.bulk_out_xfer_complete as u64 | (u.bulk_in_xfer_complete as u64) << 32);
-        w(7, u.ep0_xfer_notready as u64 | (u.cmd_status_fail as u64) << 32);
-        w(8, u.evt_ring_n as u64 | (u.setup_count as u64) << 32);
-        w(10, u.last_cmd_status as u64 | (u.last_cmd_ep as u64) << 32 | (u.last_cmd_type as u64 & 0xFF_FFFF) << 40);
-        w(11, u.bulk_out_armed as u64 | (u.bulk_out_ready as u64) << 8 | (u.bulk_in_idle as u64) << 16 | (u.is_configured() as u64) << 24 | (u.ep2_trb_ctrl_snap as u64) << 32);
-        for i in 0..6 {
-            w(12 + i, u.evt_ring[2 * i] as u64 | (u.evt_ring[2 * i + 1] as u64) << 32);
-        }
-    }
-    w(9, rd(DWC3 + 0xC40C) as u64 | (rd(DWC3 + 0xC408) as u64) << 32); // GEVNTCOUNT(0) | GEVNTSIZ(0)
-    w(18, st.specs as u64 | (st.data_pkts as u64) << 32);
-    w(19, st.data_decoded as u64 | (st.data_accepted as u64) << 32);
-    w(22, st.commands as u64 | (st.not_ready as u64) << 32);
+    w(22, st.proc_cmds as u64);
     w(23, FASTBOOT_FAIL.load(core::sync::atomic::Ordering::Relaxed));
     w(24, st.last_cmd);
-    w(25, st.open_sid as u64 | (st.open_recv as u64) << 32);
-    w(26, st.open_total as u64 | (st.pt_age_ms as u64) << 32);
     w(27, crate::process::alive() as u64);
     unsafe {
-        core::ptr::copy_nonoverlapping(usb_b.as_ptr(), (0xFD60_0000usize + 0x20) as *mut u8, 5);
         ferros_hal::mmio::cache_clean(0xFD60_0000, 0x100);
-        // Graceful detach so the host sees a disconnect rather than a dead device.
+        // The USB process's controller stopped, so the host sees a disconnect rather than a dead device.
         let dctl = read_volatile((DWC3 + 0xC704) as *const u32);
         write_volatile((DWC3 + 0xC704) as *mut u32, dctl & !(1 << 31));
     }
-    // Cold boot: a plain reset would just boot ferros again, so anything but an explicit host REBOOT goes to fastboot for the host to decide (falls back to a plain reset if the EL3 monitor refuses the reboot-mode write).
+    // Cold boot: a plain reset would just boot ferros again, so anything but an explicit host REBOOT goes to fastboot for the host to decide (falls back to a plain reset if the EL3 call is refused).
     if b.kind == BootKind::Cold && exit != EXIT_REBOOT {
         let _ = platform::reboot_to_bootloader();
     }
@@ -1094,32 +1042,9 @@ pub fn run(mut b: Boot) -> ! {
     }
     platform::mark(0x35);
 
+    // The USB DMA master on physical addresses (the HSI0 S2MPU bypassed, every USB SYSMMU context off), reported by DIAG. USB itself is the USB process's (payloads/usb, USB.md): the kernel brings up no controller of its own and readies the link only when the process asks (`power usb on`, ptlink.rs).
     let dma = open_usb_dma_path();
     platform::mark(0x36);
-    platform::crumb(0xA1);
-    crate::checklist::at("usb: dma path open");
-    let mut usb = match b.usb.take() {
-        Some(u) => {
-            platform::crumb(0xA2);
-            crate::checklist::at("usb: up since the gate");
-            u
-        }
-        None => {
-            crate::pixel8_eusb_phy_init();
-            platform::mark(0x37);
-            platform::crumb(0xA2);
-            crate::checklist::at("usb: phy up");
-            ferros_hal::usb::set_dwc3_base(DWC3);
-            ferros_hal::usb::set_usb_mem(usb_mem());
-            match ferros_hal::usb::Dwc3Dev::init() {
-                Some(u) => u,
-                None => leave(&b, EXIT_NO_USB, 1, false, None, &PtStats::default()),
-            }
-        }
-    };
-    platform::mark(0x38);
-    platform::crumb(0xA3);
-    crate::checklist::at("usb: controller up");
 
     // The worker cores (smp.rs): up once the kernel is settled on its own core, before the first slice is handed out.
     crate::smp::launch_all();
@@ -1127,52 +1052,16 @@ pub fn run(mut b: Boot) -> ! {
     // The wall clock (rtc.rs): read now, so the first process to ask has it.
     let _ = crate::rtc::sync();
     let freq = cntfrq();
-    // Enumeration watchdog (cold-boot values): 2 s of total silence = dead attempt; 4 s since init without SET_CONFIGURATION = wedged EP0. Either re-inits PHY + DWC3, which the host sees as a fresh attach.
-    let enum_timeout = freq * 2;
-    let wedge_timeout = freq * 4;
-    // Give up on enumeration after 64 s (Android comes back with the report); give up on an idle session after 512 s without a PT command.
-    let enum_giveup = freq * 64;
-    let idle_giveup = freq * 512;
-    let mut t_init = cntpct();
-    let mut t_progress = t_init;
-    let mut t_command = t_init;
-    let mut attempts: u32 = 1;
-    let mut configured_ever = false;
-    // The USB link's story in the flash log (2026-10-24: three times the link went and never came back while the kernel kept running, and nothing recorded why): each change of configured state, every disconnect, bus reset and re-initialisation, and a heartbeat every 64 s — at most 256 lines a boot.
-    let mut usb_log_n = 0u32;
-    let mut usb_was_configured = false;
     let mut t_heartbeat = cntpct();
-    // The fourth drop (2026-10-24, 753 s into the boot) left no disconnect and no reset on this side: the host logged "USB disconnect" and the only trace here was DSTS's link state going 0 (on) → 3 (L2 suspend) and staying there, with the kernel still "configured". The dev host never suspends the port (power/control = on), so a link held in suspend for 16 s is a host that has gone: re-initialise, which drops the pull-up and brings a fresh enumeration.
-    let mut t_awake = cntpct();
-    let mut link_was = 0u32;
     let mut sensor_boot = SensorBoot::Wait;
     let mut screen_off_told = false;
     let mut scope_told = 0u8;
-    let mut init_history: alloc::vec::Vec<[u32; 24]> = alloc::vec::Vec::new();
-    // Per-attempt bus events seen by the loop: USB resets, ConnectDones, SETUPs (reset with each re-init; recorded into init_history when an attempt is abandoned).
-    let mut att_ev = [0u32; 3];
     let mut st = PtStats::default();
-    // A PT transfer that stops moving for 16 s is a wedged endpoint: report it and leave rather than idling for 512 s.
-    let stall_giveup = freq * 16;
-    let mut pt_stalls = 0u32;
-    let mut t_pt = t_init;
-    // `display --hold` keeps a message on the panel: the idle exit is off until a host REBOOT ends the session (both volume keys still kill it: killswitch.rs).
-    let mut hold = false;
-
-    // Backing storage for the open inbound transfer (it holds raw slices into these); assigned on every SPEC.
-    let mut pt_data_buf: alloc::vec::Vec<u8>;
-    let mut pt_bitmap_buf: alloc::vec::Vec<u64>;
-    let mut pt_inbound: Option<InboundTransfer<'_>> = None;
-    let mut pt_seq_width: usize = 0;
-    // A finished transfer is closed at the top of the next pass, not at the end of the arm that finished it: the DIAG handlers leave their arm with `continue`, which skipped the close and left every finished `diag` transfer "open" — then a 16 s pause tripped the stall exit (every PT-stall exit of 2026-10-16 followed a `diag` with a pause; the record named it).
-    let mut pt_done = false;
+    // A command's reply as it is built (raw: the USB process frames it), and the reply being built when the next command came, put back after (ptlink.rs); whether the command waits to act once its reply has gone out.
     let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    // A command from the USB process in flight (ptlink.rs): the kernel's own outbound reply set aside while the raw reply collects in pt_out_data, and whether the command waits to act once its reply has gone out.
     let mut proc_restore: Option<alloc::vec::Vec<u8>> = None;
     let mut proc_act = false;
-    // The USB process's holder check (below): when it last looked.
-    let mut usb_check = 0u64;
-    // The sensors process's, the same way.
+    // The sensors process's check (below): when it last looked.
     let mut sensors_check = 0u64;
 
     let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
@@ -1218,8 +1107,6 @@ pub fn run(mut b: Boot) -> ! {
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
     let mut ipc_marked = false;
-    // The WiFi driver's keeper (below): whether it runs, when it last looked, since when pcie1 has been gone, the wait before starting it again, when it was last started.
-    let (mut wifi_keep, mut wifi_check, mut wifi_gone, mut wifi_wait, mut wifi_up_since) = (true, 0u64, None::<u64>, 64u64, 0u64);
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
@@ -1269,23 +1156,10 @@ pub fn run(mut b: Boot) -> ! {
             let mut out = alloc::vec::Vec::new();
             crate::usf::display_info(DISPLAY_DBV, !screen_off, 120, &mut out);
         }
-        USB_LINK.store(crate::ptlink::kernel_usb() && usb.is_configured(), core::sync::atomic::Ordering::Relaxed);
-        if pt_done {
-            pt_done = false;
-            pt_inbound = None;
-            pt_seq_width = 0;
-        }
         let now = cntpct();
-        // The controller back from the USB process (`power usb off`, or the process gone): the kernel owns it again, and re-initialises it this pass (the idle arm below) before taking any event from it.
-        let take_back = crate::ptlink::TAKE_BACK.swap(false, core::sync::atomic::Ordering::Relaxed);
-        if take_back {
-            crate::ptlink::KERNEL_USB.store(true, core::sync::atomic::Ordering::Relaxed);
-            crate::process::with_lock(crate::ptlink::reset);
-        }
-        let kernel_usb = crate::ptlink::kernel_usb();
         // A command from the USB process waiting: no sleep and no time slice before it runs.
         let inbox_full = crate::ptlink::INBOX_FULL.load(core::sync::atomic::Ordering::Relaxed);
-        // Home: once the ring has completed — the host has the USB link, or a second has passed since the press with no cable — start init and with it the shell.
+        // Home: a second after the press (the boot ring's time on the panel), start init and with it the shell; init starts the USB process among the rest.
         // The wall clock, re-read hourly (rtc.rs), and the battery gauge every two seconds: both on this core, never inside a syscall.
         crate::rtc::poll();
         gauge_poll();
@@ -1298,83 +1172,31 @@ pub fn run(mut b: Boot) -> ! {
         crate::odpm::poll();
         // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
         crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
-        clock_policy(pt_inbound.is_some() || !pt_out_data.is_empty(), now.wrapping_sub(t_boot));
+        clock_policy(false, now.wrapping_sub(t_boot));
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
             crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
         }
         thermal_poll();
         if !home_started {
+            // From the press on a boot; from the service's start on a reload, which has no press. Until 2026-11-01 a reload started home when the host configured the kernel's own USB; without it, a reloaded kernel never started init, and so never the USB process (the first reload after the removal sat at the boot screen).
             let press = crate::checklist::PRESS.load(core::sync::atomic::Ordering::Relaxed);
-            if configured_ever || (press != 0 && now.wrapping_sub(press) > cntfrq()) {
+            let from = if press != 0 { press } else { t_boot };
+            if now.wrapping_sub(from) > cntfrq() {
                 home_started = true;
-                // A session with the shell off (`home.off`) is someone measuring: no idle exit while they position an instrument.
-                hold |= !start_home(&mut store);
+                let _ = start_home(&mut store);
             }
-        }
-        // No host after 64 s is a dead USB attempt only while nothing else is running: with the shell up, a phone without a cable is the normal case.
-        if !configured_ever && crate::process::alive() == 0 && now.wrapping_sub(t_boot) > enum_giveup {
-            leave(&b, EXIT_NO_ENUM, attempts, configured_ever, Some(&usb), &st);
-        }
-        // The idle exit is a dev safety net for a kernel nobody is talking to; a live process (the display server, a driver) is the session itself, so it holds the kernel up like `display --hold` does. The killswitch and `bridge reboot` still end it.
-        if configured_ever && !hold && crate::process::alive() == 0 && now.wrapping_sub(t_command) > idle_giveup {
-            leave(&b, EXIT_IDLE, attempts, configured_ever, Some(&usb), &st);
-        }
-        // A transfer half-open for 16 s is dropped and the bulk endpoint re-armed; it used to end the session in fastboot, which, on the first boot after a flash, the host's own first DIAG managed to trigger — a phone that leaves because a cable hiccuped is not a phone (2026-10-23: three of the day's four flashes "landed in fastboot after 34 s"). Counted for DIAG (PT_STALLS); the host simply retries.
-        if pt_inbound.is_some() && now.wrapping_sub(t_pt) > stall_giveup {
-            if let Some(x) = &pt_inbound {
-                st.open_sid = x.sid.0 as u32;
-                st.open_recv = x.chunks_received as u32;
-                st.open_total = x.expected_total as u32;
-                st.pt_age_ms = (now.wrapping_sub(t_pt) * 1000 / freq) as u32;
-            }
-            pt_stalls += 1;
-            pt_inbound = None;
-            pt_seq_width = 0;
-            pt_out_data.clear();
-            usb.bulk_out_arm();
-            platform::crumb(0xB6);
         }
 
-        let usb_log = |n: &mut u32, text: &str| {
-            if *n < 256 {
-                *n += 1;
-                crate::flashlog::line(text);
-            }
-        };
-        let dsts = || unsafe { read_volatile((DWC3 + 0xC70C) as *const u32) };
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
             t_heartbeat = now;
             let sl: alloc::vec::Vec<u64> = crate::process::SLICES.iter().skip(4).take(5).map(|s| s.load(core::sync::atomic::Ordering::Relaxed)).collect();
-            // Outside the USB lines' 256-line budget: after 4.5 h the heartbeats had used it up, and the half hour before a reset went unrecorded (2026-10-25). The log region (64 MiB) holds months of them.
-            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, usb configured {} (attempts {}, stalls {}, DSTS G#{:08X}), slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, usb.is_configured(), attempts, pt_stalls, dsts(), sl));
+            // The log region (64 MiB) holds months of these.
+            crate::flashlog::line(&alloc::format!("heartbeat: up {} s, commands from the USB process {}, slices C4-C8 {:?}", now.wrapping_sub(t_boot) / freq, st.proc_cmds, sl));
         }
         // The USF conversation is the sensors process's while it holds the `sensors` switch (sensorlink.rs).
         if !crate::sensorlink::PROCESS.load(core::sync::atomic::Ordering::Relaxed) {
             crate::usf::poll();
-        }
-        // The WiFi driver's keeper: the driver exits when a join fails (an access point that throttles repeated joins refused them all evening, 2026-10-29), and nothing started it again until a reboot. Once the shell is up, a pcie1 that is gone is started again from the vault — 64 s after it went, the wait doubling each time to 1024 s (a join refused again only adds to a throttle), back to 64 s once it has stayed up that long. A `diag kill pcie1` stops the keeper for the session.
-        if home_started && wifi_keep && now.wrapping_sub(wifi_check) > 4 * freq {
-            wifi_check = now;
-            if crate::process::running(b"pcie1") {
-                wifi_gone = None;
-                if wifi_wait > 64 && now.wrapping_sub(wifi_up_since) > 1024 * freq {
-                    wifi_wait = 64;
-                }
-            } else {
-                let since = *wifi_gone.get_or_insert(now);
-                if now.wrapping_sub(since) > wifi_wait * freq {
-                    let mut rep = alloc::vec::Vec::new();
-                    restart(&mut store, b"pcie1", &mut rep);
-                    crate::flashlog::line(&alloc::format!("wifi keeper: pcie1 started again after A#{wifi_wait} s"));
-                    wifi_gone = None;
-                    wifi_up_since = now;
-                    // The policy's cap, not a guard: a driver that keeps failing is tried every 17 minutes from then on.
-                    if wifi_wait < 1024 {
-                        wifi_wait *= 2;
-                    }
-                }
-            }
         }
         // No sensors process running, whatever path ended it (its end is caught in end_process and kill as well): its block is forgotten, so the kernel never reads memory that may be another process's now, and the conversation comes back to the kernel if it held it.
         if now.wrapping_sub(sensors_check) > 4 * freq {
@@ -1384,14 +1206,6 @@ pub fn run(mut b: Boot) -> ! {
                 if crate::sensorlink::PROCESS.swap(false, core::sync::atomic::Ordering::Relaxed) {
                     crate::sensorlink::TAKE_BACK.store(true, core::sync::atomic::Ordering::Relaxed);
                 }
-            }
-        }
-        // The USB process gone while it holds the controller (a fault, `diag kill usb`): the kernel takes the controller back, so the bridge always has a way in.
-        if !kernel_usb && now.wrapping_sub(usb_check) > 4 * freq {
-            usb_check = now;
-            if !crate::process::running(b"usb") {
-                crate::flashlog::line("usb: the USB process is gone; the kernel takes the controller back");
-                crate::ptlink::TAKE_BACK.store(true, core::sync::atomic::Ordering::Relaxed);
             }
         }
         // The checklist's IPC row, once any process has had a call answered (init, which marks the others, makes none).
@@ -1413,250 +1227,40 @@ pub fn run(mut b: Boot) -> ! {
             let mut get = |k: &str| crate::process::with_lock(|| unsafe { (*st).as_mut().and_then(|s| s.get_by_key(k).ok().flatten()) });
             sensor_boot = sensor_step(core::mem::replace(&mut sensor_boot, SensorBoot::Done), now, &mut get);
         }
-        let link = (dsts() >> 18) & 15;
-        if link != 3 {
-            t_awake = now;
+        // Give one runnable process a time slice (it comes back at the latest when the slice timer fires), unless a command from the USB process waits: that runs first. `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
+        platform::crumb(0xD1);
+        let ran = if !inbox_full { crate::process::run_slice() } else { false };
+        platform::crumb(0xD2);
+        if !inbox_full && !ran {
+            let t = cntpct();
+            platform::crumb(0xB3);
+            // A backstop under the event stream: the EL2 timer armed 2 ms out, so a GIC interrupt ends this `wfe` even if the event stream cannot. On battery at the rest clocks the X3 went into this `wfe` and never came out — the last crumb G#B3, its event stream still on (2026-10-25, three times) — as if the core had been taken down while it waited, where only an interrupt brings a core back. Taken at EL2 the tick only stops the timer (.Lirq_tick). The event stream wakes it first every time it can, so the timer is disarmed before it fires; a sleep that ran past 1.5 ms was ended by the backstop, and DIAG counts those.
+            if !backstop_ppi {
+                crate::killswitch::enable_ppi(26);
+                backstop_ppi = true;
+            }
+            // Armed at the next sleeping thread's deadline when that is sooner (process::NEXT_WAKE), so deadlines land on time however slow the event stream: with the stream every 2.7 ms (bit 15, 15-25 mW under bit 12's 333 us with the screen off, 2026-10-25) a display waiting on its next flip would otherwise wake up to a stream period late.
+            let next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire);
+            let backstop = next.saturating_sub(cntpct()).clamp(cntfrq() / 20_000, cntfrq() / 500);
+            unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
+            platform::crumb(0xB4);
+            let slept = cntpct().wrapping_sub(t);
+            if slept > cntfrq() / 500 * 3 / 4 {
+                BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            asleep += slept;
         }
-        if link != link_was && configured_ever {
-            usb_log(&mut usb_log_n, &alloc::format!("usb: link state {} -> {} at {} s (DSTS G#{:08X})", link_was, link, now.wrapping_sub(t_boot) / freq, dsts()));
-        }
-        link_was = link;
-        let host_gone = kernel_usb && usb.is_configured() && now.wrapping_sub(t_awake) > 16 * freq;
-        if usb.is_configured() != usb_was_configured {
-            usb_was_configured = usb.is_configured();
-            usb_log(&mut usb_log_n, &alloc::format!("usb: {} at {} s (DSTS G#{:08X})", if usb_was_configured { "configured" } else { "not configured" }, now.wrapping_sub(t_boot) / freq, dsts()));
-        }
-        let mut usb_cmd = false;
-        // The controller is the USB process's while it holds the `usb` power switch (ptlink.rs): no events taken from it then, and on the pass it comes back, only the re-initialisation.
-        match if kernel_usb && !take_back { usb.poll_event() } else { UsbEvent::None } {
-            UsbEvent::None => {
-                // Idle: give one runnable process a time slice (it comes back at the latest when the slice timer fires) — but not while a PT transfer is open or a response is still going out: a 10 ms slice per idle pass crawls a transfer to the point where the host gives up, and the half-open transfer then trips the 16 s stall exit (measured 2026-10-16: every PT-stall exit of the day had a busy process running).
-                // `ran` is false when no process could run (all asleep or blocked): then the core sleeps below until the next event-stream tick instead of spinning the pass. With the shell up, processes are always alive, so "alive == 0" never let it sleep: the X3 spun at 2.9 GHz the whole time (owner, 2026-10-23: "the phone is a smidge warm").
-                platform::crumb(0xD1);
-                let ran = if pt_inbound.is_none() && pt_out_data.is_empty() && !inbox_full { crate::process::run_slice() } else { false };
-                platform::crumb(0xD2);
-                if take_back || kernel_usb && (host_gone || !usb.is_configured() && (now.wrapping_sub(t_progress) > enum_timeout || now.wrapping_sub(t_init) > wedge_timeout)) {
-                    if host_gone {
-                        usb_log(&mut usb_log_n, &alloc::format!("usb: link suspended 16 s while configured at {} s: the host has gone, reconnecting", now.wrapping_sub(t_boot) / freq));
-                        t_awake = now;
-                    }
-                    if init_history.len() < 32 {
-                        unsafe {
-                            let n = usb.evt_ring_n as usize;
-                            let mut h = [0u32; 24];
-                            h[..12].copy_from_slice(&[
-                                read_volatile((USBCON + 0x80) as *const u32),  // LTSTATE_HIS
-                                read_volatile((USBCON + 0x84) as *const u32),  // LINK_DEBUG_L
-                                read_volatile((DWC3 + 0xC70C) as *const u32), // DSTS
-                                att_ev[0],
-                                att_ev[1],
-                                att_ev[2],
-                                usb.ep0_setup_arm_ok | usb.ep0_setup_arm_fail << 16,
-                                usb.ep0_xfer_notready,
-                                usb.cmd_status_fail,
-                                usb.evt_ring_n,
-                                usb.last_setup_brequest as u32 | (usb.last_setup_wvalue as u32) << 16,
-                                usb.status_in_count | usb.status_out_count << 16,
-                            ]);
-                            // The event ring, oldest first.
-                            for k in 0..12 {
-                                if n >= 12 - k {
-                                    h[12 + k] = usb.evt_ring[(n + k) % 12];
-                                }
-                            }
-                            init_history.push(h);
-                        }
-                    }
-                    usb_log(&mut usb_log_n, &alloc::format!("usb: re-initialising (attempt {}) at {} s, DSTS G#{:08X}", attempts + 1, now.wrapping_sub(t_boot) / freq, dsts()));
-                    tcpc_usb_switch(attempts % 8 == 0);
-                    crate::pixel8_eusb_phy_init();
-                    if let Some(nu) = ferros_hal::usb::Dwc3Dev::init() {
-                        usb = nu;
-                    } else {
-                        usb_log(&mut usb_log_n, "usb: DWC3 init failed");
-                    }
-                    attempts += 1;
-                    att_ev = [0; 3];
-                    pt_inbound = None;
-                    pt_seq_width = 0;
-                    pt_out_data.clear();
-                    t_init = cntpct();
-                    t_progress = t_init;
-                }
-                if kernel_usb && !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
-                    let len = pt_out_data.len().min(512);
-                    let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
-                    usb.bulk_in_send(&chunk);
-                }
-                // Truly idle — enumerated, no transfer half-received, nothing waiting to go out, no process to run — sleep until the next timer event. Anything else keeps the old short spin, so transfers and a live display server behave exactly as before.
-                if (usb.is_configured() || !kernel_usb) && pt_inbound.is_none() && pt_out_data.is_empty() && !inbox_full && !ran {
-                    let t = cntpct();
-                    platform::crumb(0xB3);
-                    // A backstop under the event stream: the EL2 timer armed 2 ms out, so a GIC interrupt ends this `wfe` even if the event stream cannot. On battery at the rest clocks the X3 went into this `wfe` and never came out — the last crumb G#B3, its event stream still on (2026-10-25, three times) — as if the core had been taken down while it waited, where only an interrupt brings a core back. Taken at EL2 the tick only stops the timer (.Lirq_tick). The event stream wakes it first every time it can (333 us), so the timer is disarmed before it fires; a sleep that ran past 1.5 ms was ended by the backstop, and DIAG counts those.
-                    if !backstop_ppi {
-                        crate::killswitch::enable_ppi(26);
-                        backstop_ppi = true;
-                    }
-                    // Armed at the next sleeping thread's deadline when that is sooner (process::NEXT_WAKE), so deadlines land on time however slow the event stream: with the stream every 2.7 ms (bit 15, 15-25 mW under bit 12's 333 us with the screen off, 2026-10-25) a display waiting on its next flip would otherwise wake up to a stream period late.
-                    let next = crate::process::NEXT_WAKE.load(core::sync::atomic::Ordering::Acquire);
-                    let backstop = next.saturating_sub(cntpct()).clamp(cntfrq() / 20_000, cntfrq() / 500);
-                    unsafe { core::arch::asm!("msr cnthp_tval_el2, {t}", "mov {c}, #1", "msr cnthp_ctl_el2, {c}", "isb", "wfe", "msr cnthp_ctl_el2, xzr", "isb", t = in(reg) backstop, c = out(reg) _) };
-                    platform::crumb(0xB4);
-                    let slept = cntpct().wrapping_sub(t);
-                    if slept > cntfrq() / 500 * 3 / 4 {
-                        BACKSTOP_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    }
-                    asleep += slept;
-                } else {
-                    for _ in 0..64u32 {
-                        core::hint::spin_loop();
-                    }
-                }
-            }
-            UsbEvent::Reset => {
-                if configured_ever {
-                    usb_log(&mut usb_log_n, &alloc::format!("usb: bus reset at {} s (DSTS G#{:08X})", now.wrapping_sub(t_boot) / freq, dsts()));
-                }
-                att_ev[0] += 1;
-                t_progress = cntpct();
-                usb.handle_reset();
-                pt_inbound = None;
-                pt_seq_width = 0;
-                pt_out_data.clear();
-            }
-            UsbEvent::ConnectDone { .. } => {
-                att_ev[1] += 1;
-                t_progress = cntpct();
-                usb.handle_connect_done();
-                usb.ep0_start_setup();
-                usb.bulk_out_arm();
-            }
-            UsbEvent::Disconnect => {
-                usb_log(&mut usb_log_n, &alloc::format!("usb: disconnect at {} s (DSTS G#{:08X})", now.wrapping_sub(t_boot) / freq, dsts()));
-                usb.handle_disconnect();
-                pt_inbound = None;
-                pt_seq_width = 0;
-                pt_out_data.clear();
-            }
-            UsbEvent::Ep0Setup { request } => {
-                att_ev[2] += 1;
-                t_progress = cntpct();
-                if !usb.handle_setup(&request) {
-                    usb.ep0_stall();
-                }
-                if usb.is_configured() && !configured_ever {
-                    configured_ever = true;
-                    crate::checklist::mark(crate::checklist::Item::Usb);
-                    t_command = cntpct();
-                    platform::crumb(0xA4);
-                    crate::checklist::at("usb: configured by host");
-                }
-            }
-            UsbEvent::TransferComplete { ep } => {
-                t_progress = cntpct();
-                if ep != 2 {
-                    continue;
-                }
-                let mut tmp = [0u8; 512];
-                let mut n = 0usize;
-                if let Some(data) = usb.bulk_out_read() {
-                    n = data.len().min(512);
-                    tmp[..n].copy_from_slice(&data[..n]);
-                }
-                if n > 0 && ferros_pt::is_data_packet(tmp[0]) {
-                    st.data_pkts += 1;
-                    t_pt = cntpct();
-                    if let Some(ref mut xfer) = pt_inbound {
-                        if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
-                            st.data_decoded += 1;
-                            if xfer.handle_data(seq, &hash, payload) {
-                                st.data_accepted += 1;
-                            }
-                            if xfer.all_received() {
-                                st.commands += 1;
-                                let mut complete_buf = [0u8; 512];
-                                let clen = xfer.finish(&mut complete_buf);
-                                if clen > 0 {
-                                    usb.bulk_in_send(&complete_buf[..clen]);
-                                }
-                                t_command = cntpct();
-                                pt_done = true;
-                                usb_cmd = true;
-                            }
-                        }
-                    }
-                } else if n > 0 && ferros_pt::is_control_packet(tmp[0]) {
-                    // SPEC opens a transfer; reply SPEC ACK.
-                    if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
-                        st.specs += 1;
-                        t_pt = cntpct();
-                        pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
-                        // The previous transfer's buffer goes first: allocating the new one beside it doubled the peak, and with the store's own copy a 2.2 MB capsule ran the kernel heap out (2026-10-23, the 256-px icon bundle).
-                        pt_inbound = None;
-                        pt_data_buf = alloc::vec::Vec::new();
-                        // The host's announced size is external input: a transfer larger than PT_BIG (6 MiB) is refused here, answered COMPLETE-failed instead of a SPEC ACK. Taken on the heap, an 8 MiB store put needed a second 8 MiB for the vault's seal and the kernel panicked out of memory (2026-10-31).
-                        if spec.total as usize > PT_BIG.1 - PT_BIG.0 {
-                            st.specs_refused += 1;
-                            let done = packet::Complete { sid: spec.sid, success: false, data_hash: [0; 32] };
-                            let mut b = [0u8; 64];
-                            let l = done.encode(&mut b);
-                            if l > 0 {
-                                usb.bulk_in_send(&b[..l]);
-                            }
-                            usb.bulk_out_arm();
-                            continue;
-                        }
-                        // A transfer over 1 MiB lands in a fixed region outside the heap (PT_BIG): a 2.7 MB display capsule needed its receive buffer and the vault's working copy contiguous in a heap earlier puts had fragmented, and the kernel panicked out of memory twice (2026-10-23).
-                        let total = spec.total as usize;
-                        let (buf_ptr, buf_len) = if total > 1 << 20 && total <= PT_BIG.1 - PT_BIG.0 {
-                            (PT_BIG.0 as *mut u8, total)
-                        } else {
-                            pt_data_buf = alloc::vec![0u8; total];
-                            (pt_data_buf.as_mut_ptr(), pt_data_buf.len())
-                        };
-                        pt_bitmap_buf = alloc::vec![0u64; ferros_pt::transfer::bitmap_words(spec.count)];
-                        // SAFETY: the receive buffer (pt_data_buf, or PT_BIG) and pt_bitmap_buf outlive pt_inbound (both are replaced only when a new SPEC replaces the transfer).
-                        let xfer = unsafe {
-                            InboundTransfer::new(
-                                &spec,
-                                core::slice::from_raw_parts_mut(buf_ptr, buf_len),
-                                core::slice::from_raw_parts_mut(pt_bitmap_buf.as_mut_ptr(), pt_bitmap_buf.len()),
-                            )
-                        };
-                        if let Some(xfer) = xfer {
-                            let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
-                            let mut ack_buf = [0u8; 64];
-                            let ack_len = ack.encode(&mut ack_buf);
-                            if ack_len > 0 {
-                                usb.bulk_in_send(&ack_buf[..ack_len]);
-                            }
-                            pt_inbound = Some(xfer);
-                        }
-                    }
-                }
-                usb.bulk_out_arm();
-            }
-            UsbEvent::TransferNotReady { .. } => st.not_ready += 1,
-        }
-        // A command to run: the one the kernel's own USB just finished receiving, or one the USB process handed over (ptlink.rs, USB.md step 3), both through the one dispatch below. Its handlers end with `continue`, so what follows a process's command — its raw reply handed back — runs at the top of the next pass (`proc_restore`).
-        let proc_cmd = if usb_cmd { None } else { crate::process::with_lock(crate::ptlink::take_inbox) };
-        if !usb_cmd && proc_cmd.is_none() {
-            continue;
-        }
-        let from_proc = proc_cmd.is_some();
+        // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
+        let Some(proc_cmd) = crate::process::with_lock(crate::ptlink::take_inbox) else { continue };
+        // Every command comes from the process now (the kernel's own USB went 2026-11-01); the name stays for the handlers that answer first and act later.
+        let from_proc = true;
         // The process's second submission of a command that answered first (reload, reboot, `diag android`): now act.
-        let pt_act = proc_cmd.as_ref().is_some_and(|s| s.act);
-        let payload: &[u8] = match &proc_cmd {
-            Some(s) => s.payload.bytes(),
-            None => pt_inbound.as_ref().map_or(&[][..], |x| x.payload()),
-        };
-        if from_proc {
-            st.proc_cmds += 1;
-            t_command = cntpct();
-            proc_restore = Some(core::mem::take(&mut pt_out_data));
-            platform::RAW_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
-            platform::RAW_REPLIED.store(false, core::sync::atomic::Ordering::Relaxed);
-        }
+        let pt_act = proc_cmd.act;
+        let payload: &[u8] = proc_cmd.payload.bytes();
+        st.proc_cmds += 1;
+        proc_restore = Some(core::mem::take(&mut pt_out_data));
+        platform::RAW_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
+        platform::RAW_REPLIED.store(false, core::sync::atomic::Ordering::Relaxed);
         if let Some(cmd) = ferros_pt::command::parse(payload) {
             st.last_cmd = u32::from_le_bytes([cmd.cap[0], cmd.cap[1], cmd.cap[2], cmd.cap[3]]) as u64 | (cmd.op as u64) << 56;
             // Production builds (FERROS_PRODUCTION=1) close the development doors over USB, for the locked bootloader (BOOT.md): a cable must not be able to reload the kernel, run code, read or write memory or the vault, read the screen, spawn, or drive a diagnostic, since ABL checks only what it boots. Open: a reboot, and DIAG with no parameters (status, no secrets). The portal will grant the rest to the owner's identity (STATUS.md 7); until then they are closed outright.
@@ -1749,17 +1353,7 @@ pub fn run(mut b: Boot) -> ! {
                     resp.extend_from_slice(alloc::format!("set_active(a) result {r}; {}\n", if r == crate::slot::MARKED { "resetting" } else { "not resetting" }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     if r == crate::slot::MARKED {
-                        let t0 = cntpct();
-                        while cntpct().wrapping_sub(t0) < freq / 2 {
-                            if !from_proc && !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
-                                let len = pt_out_data.len().min(512);
-                                let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
-                                usb.bulk_in_send(&chunk);
-                            }
-                            if !from_proc {
-                                let _ = usb.poll_event();
-                            }
-                        }
+                        // The reply went out through the USB process before it asked to act.
                         platform::crumb(0xC7);
                         platform::reboot();
                     }
@@ -2448,11 +2042,8 @@ pub fn run(mut b: Boot) -> ! {
                 // `diag kill <name>…`: each named process ended, its arc and surface freed (development: a bridge-spawned app has no other way out).
                 if let Some(names) = cmd.params.strip_prefix(b"kill ") {
                     for name in names.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
+                        // A driver killed by hand is started again by init's keeper (usb, pcie1); `diag "kill init pcie1"` stops the keeper with it.
                         let killed = crate::process::kill(name);
-                        // A WiFi driver killed by hand stays down: the keeper stops for the session.
-                        if name == b"pcie1" {
-                            wifi_keep = false;
-                        }
                         resp.extend_from_slice(name);
                         resp.extend_from_slice(if killed { b" killed\n" } else { b" was not running\n" });
                     }
@@ -2920,9 +2511,7 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"UPTIME_MS=", (cntpct().wrapping_sub(t_boot) / (freq / 1000)) as u32);
                 append_hex(&mut resp, b"EXC=", crate::exception_count().wrapping_sub(exc_start) as u32);
                 append_hex(&mut resp, b"UFS_LOST=", ferros_hal::ufs::UFS_LOST.load(core::sync::atomic::Ordering::Relaxed));
-                append_hex(&mut resp, b"PT_STALLS=", pt_stalls);
-                // The USB process: whether the kernel drives the controller (1) or the process does (0), and the commands it has handed over (ptlink.rs).
-                append_hex(&mut resp, b"KERNEL_USB=", kernel_usb as u32);
+                // The commands the USB process has handed over (ptlink.rs).
                 append_hex(&mut resp, b"PT_PROC_CMDS=", st.proc_cmds);
                 // The hottest thermal zone, °C (thermal_poll), and the X3's pre-throttle rate in MHz while the thermal throttle holds it (0 = not throttled).
                 append_hex(&mut resp, b"SOC_C=", THERMAL.iter().map(|t| t.load(core::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0) as u32);
@@ -2984,7 +2573,6 @@ pub fn run(mut b: Boot) -> ! {
                 append_hex(&mut resp, b"SNPSID=", r(DWC3 + 0xC120));
                 append_hex(&mut resp, b"GSTS=", r(DWC3 + 0xC118));
                 append_hex(&mut resp, b"DSTS=", r(DWC3 + 0xC70C));
-                append_hex(&mut resp, b"USB_ATTEMPTS=", attempts);
                 {
                     use core::sync::atomic::Ordering::Relaxed;
                     let k = &crate::killswitch::REPORT;
@@ -3072,13 +2660,6 @@ pub fn run(mut b: Boot) -> ! {
                 for vm in 0..dma.num_vm {
                     append_hex(&mut resp, b"SYSMMU_VM_CTRL_LINUX=", dma.vm_ctrl_before[vm]);
                     append_hex(&mut resp, b"SYSMMU_VM_CTRL_NOW=", dma.vm_ctrl_after[vm]);
-                }
-                const ATT_KEYS: [&[u8]; 24] = [b"  LTSTATE=", b"  LINKDBG=", b"  DSTS=", b"  RESETS=", b"  CONNDONES=", b"  SETUPS=", b"  SETUP_ARM_OK_FAIL=", b"  XFERNOTREADY=", b"  CMD_FAIL=", b"  EVENTS=", b"  LAST_SETUP=", b"  STATUS_IN_OUT=", b"  E0=", b"  E1=", b"  E2=", b"  E3=", b"  E4=", b"  E5=", b"  E6=", b"  E7=", b"  E8=", b"  E9=", b"  EA=", b"  EB="];
-                for (i, h) in init_history.iter().enumerate() {
-                    append_hex(&mut resp, b"FAIL_ATT=", i as u32);
-                    for (k, &v) in ATT_KEYS.iter().zip(h.iter()) {
-                        append_hex(&mut resp, k, v);
-                    }
                 }
                 resp.extend_from_slice(b"END\n");
                 queue_pt_response(&mut pt_out_data, &resp);
@@ -3381,11 +2962,11 @@ pub fn run(mut b: Boot) -> ! {
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
                     _ => {
-                        let (text, h) = match cmd.params.split_first() {
-                            Some((1, rest)) => (rest, true),
-                            _ => (cmd.params, false),
+                        // A leading 1 is `display --hold`, which held off the idle exit; there is none now (the kernel has no USB of its own to time out), so it only marks the text.
+                        let text = match cmd.params.split_first() {
+                            Some((1, rest)) => rest,
+                            _ => cmd.params,
                         };
-                        hold |= h;
                         let rep = crate::display::show(text, freq);
                         queue_pt_response(&mut pt_out_data, &rep);
                     }
@@ -3460,12 +3041,7 @@ pub fn run(mut b: Boot) -> ! {
                     // From the USB process: no reply (as over the kernel's own USB), and the handover when it asks again with the COMPLETE sent (ptlink.rs).
                     proc_act = reload_ok && reload_size > 0;
                 } else if reload_ok && reload_size > 0 {
-                    // Flush this Exec's COMPLETE before tearing USB down, give the host a moment, detach, then hand off to the copy stub. The wait is only for the kernel's own USB: the USB process sent its reply before asking to act.
-                    let mut spins = 0u32;
-                    while kernel_usb && !usb.bulk_in_is_idle() && spins < (1 << 20) {
-                        let _ = usb.poll_event();
-                        spins += 1;
-                    }
+                    // The USB process sent its COMPLETE before asking to act: give the host a moment, detach, then hand off to the copy stub.
                     for _ in 0..(1 << 24) {
                         core::hint::spin_loop();
                     }
@@ -3640,11 +3216,6 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 let fastboot = cmd.params.first().copied() == Some(1);
-                let mut spins = 0u32;
-                while kernel_usb && !usb.bulk_in_is_idle() && spins < (1 << 20) {
-                    let _ = usb.poll_event();
-                    spins += 1;
-                }
                 if fastboot {
                     report(&b, EXIT_FASTBOOT);
                     unsafe {
@@ -3654,7 +3225,7 @@ pub fn run(mut b: Boot) -> ! {
                     // Only returns on failure: platform::WATCHDOG_DID_NOT_FIRE, or the EL3 monitor's refusal (nonzero, negative = error). Kept in report slot r[23] so the exit report says which.
                     FASTBOOT_FAIL.store(platform::reboot_to_bootloader(), core::sync::atomic::Ordering::Relaxed);
                 }
-                leave(&b, EXIT_REBOOT, attempts, configured_ever, Some(&usb), &st);
+                leave(&b, EXIT_REBOOT, &st);
             }
         }
     }

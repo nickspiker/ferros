@@ -370,6 +370,5 @@ pub fn entry_usb(x0: u64) -> ! {
         prev,
         extras: alloc::vec::Vec::new(),
         ufs_probe: None,
-        usb: None,
     })
 }

@@ -1,30 +1,21 @@
-//! The kernel's PT commands, fed by the USB driver process (USB.md step 3).
+//! The kernel's PT commands, fed by the USB driver process (USB.md). The kernel has no USB of its own since 2026-11-01: the process is the bridge's only way in, and init's keeper starts it again should it end.
 //!
-//! The process receives Photon Transport from the bridge and hands each assembled command here (`SYS_PT` op 0). The service loop runs it through the same dispatch the kernel's own USB feeds (service.rs `run`) and leaves the raw reply here for the process to take (op 1) and send. Reload, reboot and `diag android` answer first and act only when the process asks again with op 3, after its reply has gone out: "reply, then act".
+//! The process receives Photon Transport from the bridge and hands each assembled command here (`SYS_PT` op 0). The service loop runs it through its dispatch (service.rs `run`) and leaves the raw reply here for the process to take (op 1) and send. Reload, reboot and `diag android` answer first and act only when the process asks again with op 3, after its reply has gone out: "reply, then act".
 //!
-//! The controller itself changes hands with the `usb` power switch: on, the kernel stops touching DWC3 and readies the link for the process (the Type-C switch, the eUSB2 PHY, the DMA path); off, or the process gone, the kernel brings its own USB back.
+//! The `usb` power switch readies the link for the process: the Type-C switch, the eUSB2 PHY, the DMA path, the parts that are not the controller's.
 //!
 //! Every function here runs with the kernel lock held: from a syscall, or from the service loop through `with_lock`.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// The kernel drives the USB controller (true), or the USB process does (false, between `power usb on` and `off`).
-pub static KERNEL_USB: AtomicBool = AtomicBool::new(true);
-/// Set when the controller comes back to the kernel: the service loop re-initialises it before touching it again.
-pub static TAKE_BACK: AtomicBool = AtomicBool::new(false);
-
 /// A submitted command waits in the inbox: read without the lock by the service loop, which then neither sleeps nor hands out a time slice before running it.
 pub static INBOX_FULL: AtomicBool = AtomicBool::new(false);
 
-pub fn kernel_usb() -> bool {
-    KERNEL_USB.load(Ordering::Relaxed)
-}
-
-/// Commands up to 1 MiB are copied to the heap; larger ones, up to the receive region's 6 MiB, into that region, which is free while the process owns the controller (the kernel's own PT receive is what else uses it).
+/// Commands up to 1 MiB are copied to the heap; larger ones, up to 6 MiB, into a fixed region outside it, so a large store put cannot run the heap out by fragmentation.
 const SMALL: usize = 1 << 20;
 
-/// The receive region (service.rs PT_BIG).
+/// That region: 6 MiB between the DMA pool and the reload stub, inside the kernel's cacheable window (cachemap WINDOW).
 pub const BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
 
 pub enum Payload {
@@ -36,7 +27,7 @@ impl Payload {
     pub fn bytes(&self) -> &[u8] {
         match self {
             Payload::Heap(v) => v,
-            // SAFETY: BIG is kernel memory outside the heap, mapped, and nothing else writes it while a submitted command holds it (`submit` refuses a large command while the kernel owns the controller).
+            // SAFETY: BIG is kernel memory outside the heap, mapped, and nothing else writes it while a submitted command holds it (one command at a time).
             Payload::Big(n) => unsafe { core::slice::from_raw_parts(BIG.0 as *const u8, *n) },
         }
     }
@@ -73,7 +64,7 @@ pub fn submit(len: usize, act: bool, fill: impl FnOnce(&mut [u8])) -> bool {
         let mut v = alloc::vec![0u8; len];
         fill(&mut v);
         Payload::Heap(v)
-    } else if len <= BIG.1 - BIG.0 && !kernel_usb() {
+    } else if len <= BIG.1 - BIG.0 {
         // SAFETY: as Payload::bytes.
         fill(unsafe { core::slice::from_raw_parts_mut(BIG.0 as *mut u8, len) });
         Payload::Big(len)
@@ -92,7 +83,7 @@ pub fn take_inbox() -> Option<Submitted> {
     link().inbox.take()
 }
 
-/// The service loop's side: the command's reply (`replied` false: none, as the kernel's own USB sends none after a reload or a reboot).
+/// The service loop's side: the command's reply (`replied` false: none, as after a reload or a reboot, which only act).
 pub fn reply(bytes: Vec<u8>, replied: bool, wants_act: bool) {
     link().outbox = Some((bytes, replied, wants_act));
 }
@@ -118,23 +109,20 @@ pub fn busy() -> bool {
     link().busy
 }
 
-/// The `usb` power switch (process.rs POWERS). On: the kernel lets go of the controller, then readies the link for the process: the Type-C port's USB switch closed, the eUSB2 PHY brought up again (which drops the host's view of the kernel's device), the DMA path to physical addresses open. The process then resets and runs the controller itself. Off: the kernel takes it back on the service loop's next pass.
+/// The `usb` power switch (process.rs POWERS). On, as a USB process starts: the link readied — the Type-C port's USB switch closed, the eUSB2 PHY brought up again (the host sees a fresh attach), the DMA path to physical addresses open — and a command an earlier process left half-done dropped (`reset`), so this one starts clean. The process then resets and runs the controller itself. Off: nothing to give back; the process is going.
 pub fn power(on: bool) -> bool {
     if on {
-        KERNEL_USB.store(false, Ordering::Relaxed);
+        reset();
         crate::service::tcpc_usb_switch(true);
         crate::pixel8_eusb_phy_init();
         let _ = crate::platform::open_usb_dma_path();
-        crate::flashlog::line("usb: the controller goes to the USB process");
-    } else if !kernel_usb() {
-        TAKE_BACK.store(true, Ordering::Relaxed);
-        crate::flashlog::line("usb: the controller comes back to the kernel");
+        crate::flashlog::line("usb: the link readied for the USB process");
     }
     true
 }
 
-/// The controller back with the kernel: a command the process left half-done (submitted, its reply never taken) is dropped, so the next USB process starts clean.
-pub fn reset() {
+/// A command an earlier USB process left half-done (submitted, its reply never taken) dropped.
+fn reset() {
     let l = link();
     l.inbox = None;
     l.outbox = None;
@@ -142,5 +130,5 @@ pub fn reset() {
     INBOX_FULL.store(false, Ordering::Relaxed);
 }
 
-/// When the USB process last said a transfer is moving (`SYS_PT` op 2), on the counter: the clock policy counts it as activity, as it counts the kernel's own PT transfers (service.rs `clock_policy`). Without it a transfer through the process ran at the rest clocks, the workers' cluster at 402 MHz (2026-10-31).
+/// When the USB process last said a transfer is moving (`SYS_PT` op 2), on the counter: the clock policy counts it as activity, (service.rs `clock_policy`). Without it a transfer through the process ran at the rest clocks, the workers' cluster at 402 MHz (2026-10-31).
 pub static MOVING_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

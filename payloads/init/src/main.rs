@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use ferros_sys::{call_live, cap, console, exit, freq, now, sleep_until, spawn, ERR};
+use ferros_sys::{call_live, cap, console, freq, now, sleep_until, spawn, ERR};
 
 /// Grant slot 17: use display (the header's list).
 const S_USE_DISPLAY: u64 = 17;
@@ -28,7 +28,7 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"touch", b"touch", &[14, 15, 16, 23, 91]),
     // The attest screen, before anything else draws: 1 use display, 2 use touch, 3 a surface (init's `surfaces` passes as one of its own), 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (its layout switch writes the device's layout), 8 use photon (the Photon client's verdict on the identity, and the mint), 9 the identity unlock right (payloads/ahau).
     (b"ahau", b"ahau", &[17, 18, 22, 51, 48, 49, 19, 47, 85]),
-    // The USB driver (payloads/usb, USB.md): it takes the controller from the kernel and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. Should it fail, it gives the controller back and the kernel serves USB as before.
+    // The USB driver (payloads/usb, USB.md): it runs the controller and serves Photon Transport to the bridge, handing each command to the kernel. 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch. The kernel has no USB of its own: should the driver end, the keeper below starts it again.
     (b"usb", b"usb", &[86, 87, 88, 89, 90]),
     // The WiFi driver's slots in its own order: 1-12 hardware, 13 entropy, 14 DMA, 15 serve wlan, 16 the vault scope, 17 the ira key (its per-network MAC), 18 Bluetooth's power (off before WL_REG_ON is cycled) (payloads/pcie1 header). It brings the chip up now and joins once the identity's network credential can be read.
     (b"pcie1", b"pcie1", &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83]),
@@ -52,8 +52,14 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The table's names and slot lists are `&'static` slices, absolute addresses fixed at link time: apply the payload's relocations before reading them (the first run faulted at address 0 without this, 2026-10-22, as the map once did).
     unsafe { ferros_sys::relocate() };
     let mut failed = 0u64;
+    // The keepers' stacks: in this frame, which never returns.
+    let mut stacks = Stacks([[0u8; KEEPER_STACK]; 2]);
     for (name, key, slots) in SHELL.iter() {
         if *name == b"map" {
+            // Every driver the keepers watch is started by now.
+            for (k, s) in stacks.0.iter_mut().enumerate() {
+                ferros_sys::thread_spawn(keeper, s, (grants << 1) | k as u64);
+            }
             wait_unlocked(grants);
         }
         if spawn(grants, name, key, slots) != 0 {
@@ -68,7 +74,51 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     if failed == 0 {
         console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, sensors, nfc, bt, modem, map, photon)\n");
     }
-    exit(failed)
+    // init stays: its keepers run in this process. The main thread only waits.
+    let _ = failed;
+    loop {
+        sleep_until(now() + freq() * 1024);
+    }
+}
+
+const KEEPER_STACK: usize = 8 << 10;
+#[repr(C, align(16))]
+struct Stacks([[u8; KEEPER_STACK]; 2]);
+
+/// The drivers init keeps running (restart policy is init's, not the kernel's: KERNEL-OUT.md; until 2026-11-01 the kernel kept the WiFi driver and took USB back itself). Each: its name in SHELL, the first wait (seconds) between starts, the most the wait doubles to.
+/// - usb: the bridge's only way in, so started again within 4 s of going, at most every 64 s.
+/// - pcie1: it exits when a join fails, and an access point that throttles repeated joins refuses them all evening (2026-10-29), so at most every 64 s, doubling to 1024 s (a join refused again only adds to a throttle).
+const KEPT: [(&[u8], u64, u64); 2] = [(b"usb", 4, 64), (b"pcie1", 64, 1024)];
+
+/// One keeper, its own thread. Every 4 s, once the wait since its driver's last start has passed, it asks the kernel to start the driver only if no process by that name is alive (`spawn_unique`): "already running" is the answer most of the time, and nothing starts; otherwise the driver starts again from the vault with the slots it booted with, and the wait doubles. Running as long as the longest wait, the wait goes back to the first. Asking the driver itself would not do: one alive but not serving yet (the WiFi driver waits for the person's network credential) looks gone to a call, and a second would start beside it. `diag "kill init pcie1"` stops the keepers with the driver.
+extern "C" fn keeper(arg: u64) -> ! {
+    let (grants, (name, first, most)) = (arg >> 1, KEPT[(arg & 1) as usize]);
+    let f = freq();
+    let (mut wait, mut started) = (first, now());
+    loop {
+        sleep_until(now() + 4 * f);
+        if now() - started < wait * f {
+            continue;
+        }
+        let Some((n, key, slots)) = SHELL.iter().find(|s| s.0 == name) else { continue };
+        match ferros_sys::spawn_unique(grants, n, key, slots) {
+            ferros_sys::NOTHING => {
+                if wait > first && now() - started > most * f {
+                    wait = first;
+                }
+            }
+            r => {
+                console(grants, if r == 0 { b"init: keeper started " } else { b"init: keeper could not start " });
+                console(grants, name);
+                console(grants, b" again\n");
+                started = now();
+                // The policy's ceiling, not a guard: a driver that keeps failing is tried every `most` seconds from then on.
+                if wait < most {
+                    wait *= 2;
+                }
+            }
+        }
+    }
 }
 
 /// The person's space opens only with them (AUTH.md): the map and the Photon client read the identity class, so they start once an identity is unlocked — at once with unlock at boot, else when someone attests. No timeout: without a person there is nothing of theirs to show. A kernel without the Unlock right (an older one) does not hold this up.

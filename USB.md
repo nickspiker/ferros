@@ -69,7 +69,20 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
    - **[done] Interrupt wake-ups.** With no event in a pass and no reply awaited, the driver acks the controller's line and waits on it (`irq_wait`, a quarter-second deadline for its own checks) instead of sleeping 122 µs at a time. Measured: 56-65 wake-ups by the interrupt over a 2 MiB round trip, a `diag` round trip 31 ms, the wire unchanged.
    - **The PHY stays behind the kernel's `usb` switch** (my call, 2026-10-31, for the owner to overrule). "The controller from cold" would mean the process bringing up the eUSB2 PHY itself. The PHY sits in the USBCON block (G#1110_0000), whose 2 MiB block also holds the USB SYSMMU (G#1104_0000) and the HSI0 S2MPU (G#1107_0000), the fences on what the controller may reach by DMA. Mapping it for the process would hand a driver its own fence. The Type-C switch and the repeater are on hsi2c_11 with the battery gauge (KERNEL-OUT.md decision 5). So the switch keeps the PHY, the switch and the DMA path, and the process does everything from the controller's registers up.
    - Hazard: a hot reload issued 8 s into a fresh boot left the new kernel hung with the kernel lock held by a worker core (PREV_NOTE_0 = 8). The same reload a minute later was fine. Not yet explained; probably the AoC/Trusty start still running.
-5. **Switch over.** init starts the driver, the kernel stops touching the controller, and the kernel's USB code goes: the event loop, the watchdogs, the gate's host answer and the PT receive. Then the commands move out one at a time, the store first since it is already a clean bytes-to-bytes function.
+5. **[done, 2026-11-01, with the owner present] Switch over.**
+   - The kernel's USB is gone: its controller and its use of it in the service loop, the PT receive, the enumeration, stall and idle watchdogs, the gate's host answer (`bridge gate`), and the USB fields of the exit report and DIAG. The kernel keeps the `usb` switch (PHY, Type-C switch, DMA path, and dropping a command a dead driver left half-done) and the command endpoint.
+   - **init's keepers** start the driver again: a thread per kept driver, started once init has started them all. Every 4 s, once the wait since the driver's last start has passed, `spawn_unique` starts it only if no process by that name is alive (`SYS_SPAWN` x2 bit 0, NOTHING when running). usb waits 4 s, doubling to 64; pcie1 waits 64 s, doubling to 1024. The WiFi keeper moved here from the kernel.
+   - Three things found on the way:
+     - **A reload never started init.** Home used to start when the host configured the kernel's USB; a reload has no button press. Home now starts a second after the press, or after the service starts.
+     - **A keeper that asks the driver** would start a second WiFi driver beside one still waiting for its credential (alive, not serving yet). Hence `spawn_unique`.
+     - **`CALL_LIVE` counted any holder of the receive right as a server.** init stays alive now and holds them all, so a live call to a dead driver waited forever (`ip` on `wlan` too). An endpoint now counts as served by the process that last received on it, while that process lives.
+   - Verified:
+     - a reload and a slot b cold boot with no kernel USB: init starts usb, touch and sensors as processes;
+     - `diag "kill usb"`: the bridge is back within seconds;
+     - 80 s with `pcie1` waiting for its credential: no second one started;
+     - `diag "kill pcie1"`: back within 4 s.
+   - Recovery without the bridge: the killswitch boots slot b again; volume down at the gate gives Android once.
+   - Then the commands move out one at a time, the store first since it is already a clean bytes-to-bytes function.
 
 ## Facts
 

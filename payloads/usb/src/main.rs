@@ -174,7 +174,7 @@ fn serve(grants: u64) -> ! {
     ferros_hal::usb::set_dwc3_base(regs);
     ferros_hal::usb::set_usb_mem((dma + MEM_AT) as *mut UsbMem);
     let Some(mut usb) = Dwc3Dev::init() else {
-        give_back(grants, power, "DWC3 init failed");
+        give_up(grants, power, "DWC3 init failed");
     };
     say!(grants, "usb: serving\n");
     let freq = ferros_sys::freq();
@@ -285,7 +285,7 @@ fn serve(grants: u64) -> ! {
                 inbound = None;
                 to_arm = 0;
                 if !waiting {
-                    give_back(grants, power, "the kernel refused a command");
+                    give_up(grants, power, "the kernel refused a command");
                 }
             } else if ferros_pt::is_control_packet(pkt[0]) {
                 let Some(spec) = packet::Spec::decode(pkt) else { continue };
@@ -340,8 +340,8 @@ fn serve(grants: u64) -> ! {
         // The kernel's reply, taken into the area (the command there is the kernel's now) and started on its way out.
         if waiting {
             match ferros_sys::pt_take_at(pt, 0, ferros_sys::DMA_ADDR | (dma + AREA_AT) as u64, AREA_LEN) {
-                // While the driver settles: a command the kernel never answers gives the controller back, so the bridge keeps a way in.
-                ferros_sys::PtReply::Running if ferros_sys::now().wrapping_sub(t_submit) > 16 * freq => give_back(grants, power, "no reply from the kernel in 16 s"),
+                // A command the kernel never answers: this driver gives up, and init's keeper starts a fresh one.
+                ferros_sys::PtReply::Running if ferros_sys::now().wrapping_sub(t_submit) > 16 * freq => give_up(grants, power, "no reply from the kernel in 16 s"),
                 ferros_sys::PtReply::Running => ferros_sys::sleep_until(ferros_sys::now() + freq / 16384),
                 ferros_sys::PtReply::None => waiting = false,
                 ferros_sys::PtReply::Done(total, replied, wants_act) => {
@@ -411,9 +411,9 @@ fn serve(grants: u64) -> ! {
         // Enumeration watchdog, as the kernel's: not configured 4 s after an init, the link is brought up again.
         if !usb.is_configured() && ferros_sys::now().wrapping_sub(t_init) > 4 * freq {
             attempts += 1;
-            // While the driver settles: never configured after four tries, the controller goes back to the kernel, so the bridge always has a way in.
+            // Never configured after four tries: this driver gives up, and init's keeper starts a fresh one (the link readied again from the start).
             if attempts > 4 {
-                give_back(grants, power, "not configured after four tries");
+                give_up(grants, power, "not configured after four tries");
             }
             ferros_sys::power(power, true);
             if let Some(u) = Dwc3Dev::init() {
@@ -435,9 +435,9 @@ fn serve(grants: u64) -> ! {
     }
 }
 
-/// The controller back to the kernel, and this process gone: the way out while the driver settles, so the bridge always has a way in.
-fn give_back(grants: u64, power: u64, why: &str) -> ! {
-    say!(grants, "usb: {why}; giving the controller back\n");
+/// Give up: the reason on the console and this process gone. init's keeper starts the driver again (payloads/init), its `power usb on` readying the link afresh; the kernel has no USB of its own to fall back to since 2026-11-01.
+fn give_up(grants: u64, power: u64, why: &str) -> ! {
+    say!(grants, "usb: {why}; this driver ends, init's keeper starts another\n");
     ferros_sys::power(power, false);
     ferros_sys::exit(2)
 }

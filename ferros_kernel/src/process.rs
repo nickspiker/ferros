@@ -392,8 +392,8 @@ struct Endpoint {
     queue: alloc::collections::VecDeque<(usize, Vec<u8>)>,
     /// The thread that last polled this endpoint (recv with poll): a call wakes it if it is asleep, so a server that sleeps between polls answers at once rather than at its next deadline.
     poller: Option<usize>,
-    /// A server has received on it (a RECV, polling or not) since its last receiver ended: what CALL_LIVE asks for, so a caller does not wait out a driver that holds the right but is still bringing its device up.
-    served: bool,
+    /// The process (by epoch) that last received on it, a RECV polling or not; 0: none. What CALL_LIVE asks for: that process still alive. A driver that holds the right but has not received yet (still bringing its device up) does not count, and neither does a process that only holds the right to hand it on (init, which stays alive for its keepers since 2026-11-01: counting it, a live call to a dead driver waited forever).
+    server: u64,
 }
 
 struct Kernel {
@@ -623,7 +623,7 @@ fn endpoint(name: &[u8]) -> usize {
     if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
         return i;
     }
-    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, served: false });
+    kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, server: 0 });
     kk.endpoints.len() - 1
 }
 
@@ -1627,15 +1627,21 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     Some(o) => objects.push(o),
                 }
             }
-            let r = if bad { Err("spawn: a token the caller does not hold (or a reply/console)") } else { spawn_queued(if name.is_empty() { &key } else { &name }, &key, &objects) };
-            let kk = k();
-            match r {
-                Ok(_) => f.x[0] = 0,
-                Err(e) => {
-                    kk.console.extend_from_slice(b"spawn refused: ");
-                    kk.console.extend_from_slice(e.as_bytes());
-                    kk.console.push(b'\n');
-                    f.x[0] = ERR;
+            // x2 bit 0: only if no live process has this name — init's keepers start a driver again this way (NOTHING: it is running), never a second beside one that is alive but not serving yet.
+            let shown = if name.is_empty() { &key } else { &name };
+            if f.x[2] & 1 != 0 && k().procs.iter().flatten().any(|q| q.name == *shown && !q.dying) {
+                f.x[0] = NOTHING;
+            } else {
+                let r = if bad { Err("spawn: a token the caller does not hold (or a reply/console)") } else { spawn_queued(shown, &key, &objects) };
+                let kk = k();
+                match r {
+                    Ok(_) => f.x[0] = 0,
+                    Err(e) => {
+                        kk.console.extend_from_slice(b"spawn refused: ");
+                        kk.console.extend_from_slice(e.as_bytes());
+                        kk.console.push(b'\n');
+                        f.x[0] = ERR;
+                    }
                 }
             }
             0
@@ -1691,7 +1697,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     0
                 }
                 // CALL_LIVE (bit 63 of the reply length) and no server receiving on the endpoint — none holds the right, or the one that does has not started receiving yet: ERR now, not a wait for a server that may never come (the IP process at a boot where the WiFi driver failed, 2026-10-29; and while the driver brings its device up).
-                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !(kk.endpoints[ep].served && has_receiver(ep)) => {
+                Some((Object::Endpoint(ep), r)) if r & RIGHT_SEND != 0 && f.x[4] & CALL_LIVE != 0 && !has_receiver(ep) => {
                     f.x[0] = ERR;
                     0
                 }
@@ -1730,7 +1736,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             let token = p.read(f.x[0], 32);
             if let Some((Object::Endpoint(ep), r)) = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 if r & RIGHT_RECV != 0 {
-                    kk.endpoints[ep].served = true;
+                    kk.endpoints[ep].server = p.epoch;
                 }
             }
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
@@ -1896,12 +1902,13 @@ fn fail_callers(cspace: &[CapEntry]) {
     }
 }
 
-/// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no server is receiving on the endpoint (none holds the right, or the one that does has not received yet), at the call or later when its last server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
+/// Bit 63 of a CALL's reply length (x4): fail with ERR instead of waiting when no server is receiving on the endpoint (the process that last received on it has ended, or none has received yet), at the call or later when its server ends. Opt-in: a call without it waits for a server as before (a restarted display server takes the map's queued calls).
 pub const CALL_LIVE: u64 = 1 << 63;
 
-/// Whether a live process (not one ending) holds the right to receive on endpoint `ep`.
+/// Whether the process that last received on endpoint `ep` is alive (not ending).
 fn has_receiver(ep: usize) -> bool {
-    k().procs.iter().flatten().any(|p| !p.dying && p.cspace.iter().any(|c| matches!(c.object, Object::Endpoint(e) if e == ep) && c.rights & RIGHT_RECV != 0))
+    let s = k().endpoints[ep].server;
+    s != 0 && k().procs.iter().flatten().any(|p| !p.dying && p.epoch == s)
 }
 
 /// After a process ends: each CALL_LIVE caller still queued on an endpoint nobody can serve any more gets ERR.
@@ -1911,8 +1918,8 @@ fn fail_orphaned_calls() {
         if has_receiver(ep) {
             continue;
         }
-        // No receiver left: a server started again must receive before CALL_LIVE counts it.
-        kk.endpoints[ep].served = false;
+        // No server left: one started again must receive before CALL_LIVE counts it.
+        kk.endpoints[ep].server = 0;
         if kk.endpoints[ep].queue.is_empty() {
             continue;
         }
