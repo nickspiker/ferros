@@ -839,6 +839,7 @@ dependencies = [
 name = "ferros-payload-display"
 version = "0.1.0"
 dependencies = [
+ "ferros_dsc",
  "ferros_dsi",
  "ferros_sys",
  "fluor",

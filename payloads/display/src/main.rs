@@ -3,7 +3,7 @@
 //! What it owns: the `display-fb` DMA region (the surface the layer DMA reads), a heap region, DECON0's main/win/wincon blocks, layer 0's DMA / DPP / SRAMC / HDR-common blocks, DSIM0 with its PHY, and the GPIO bank with the TE pin. What it takes from the pipe as found: the raster (the layer DMA's image size) and the modeset ABL or the kernel left — the panel, DSIM's link and DECON's own geometry stay as they are. The layer it programs itself, every word (`Pipe::program_layer`), so nothing about window 5 is inherited.
 //!
 //! Spawn: ferros-bridge spawn display.bin 00 --name display --serve display --hw decon0-main --hw decon0-win --hw decon0-wincon --hw dpu-dma0 --hw dpp0 --hw gpio-gpp0 --dma display-fb --dma display-heap --hw dsim0 --hw dphy0 --hw sramc0 --hw hdrcomm0
-//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words).
+//! Grant slots, in that order: 0 console, 1 the `display` endpoint (serve), 2 DECON main, 3 DECON win, 4 DECON wincon, 5 DMA0, 6 DPP0, 7 GPP0, 8 the framebuffer region, 9 the heap region (cacheable; the arc pool is too small for a typeface and the framebuffer region too slow), 10 DSIM0, 11 its PHY (the link rate for the TE timers), 12 SRAMC0, 13 HDRCOMM0 (the layer's geometry words); then 14-22 below (the phases, the app surfaces, the frame-start line, the sprites, the canvas, and the modeset's blocks).
 //!
 //! The `display` endpoint (SHELL.md: the shell draws lists, this process paints). One op per call, first byte the op, coordinates u16 little-endian in panel pixels, colours u32 little-endian G#00RRGGBB, one status byte back (0 = ok, 1 = bad message, 2 = too big):
 //! - 1 `begin`: a new frame — the whole surface transparent. Until a client's first `begin`, this process paints its own first-boot screen.
@@ -38,6 +38,7 @@ extern crate alloc;
 
 mod draw;
 mod glyphs;
+mod modeset;
 mod neon;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -104,6 +105,11 @@ const S_IRQ_FS: u64 = 16;
 const S_SPRITES: u64 = 17;
 /// 18: the `display-canvas` region (32 MiB, cacheable): the 16-bit back buffer. Without it there is no canvas: the server says so and leaves.
 const S_CANVAS: u64 = 18;
+/// 19-22: what the boot modeset (modeset.rs) needs beyond the blocks above: DECON0's sub block (the DSC encoders, the DSIM interface select), its DQE, the DQE's CGC, the DPU sysreg (the D-PHY's resets).
+const S_DECON_SUB: u64 = 19;
+const S_DQE: u64 = 20;
+const S_DQE_CGC: u64 = 21;
+const S_DPU_SYSREG: u64 = 22;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -2099,6 +2105,18 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         ferros_sys::exit(1);
     }
     ALLOC.init(heap);
+
+    // ABL's 8 bpc pipe to the 10 bpc blend, once (modeset.rs; the kernel did this before init until 2026-11-01): before the raster is read and before any frame or panel thread.
+    let t_ms = now();
+    let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }));
+    if !rep.is_empty() {
+        log.s(b"display: ");
+        log.s(&rep);
+        log.s(b"display: start to 10 bpc took ");
+        log.dec(ferros_sys::us_since(t_ms) / 1000);
+        log.s(b" ms\n");
+        log.flush();
+    }
 
     // The raster as the pipe runs it.
     let img = pipe.rd(S_DMA0, RDMA_IMG_SIZE);
