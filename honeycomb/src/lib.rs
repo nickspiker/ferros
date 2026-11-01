@@ -351,6 +351,8 @@ pub enum Touch {
     Traced,
     /// A finger lifted without moving where there is no key (above the keyboard, on the host's own things).
     TapAt(i64, i64),
+    /// One of the host's fingers that landed where there is no key has moved past the slop: where it landed and where it is now, every poll while it moves (TEXT.md: a drag on the text pans it). It lifts as nothing: no TapAt.
+    Drag(i64, i64, i64, i64),
 }
 
 /// Fingers on the keyboard, each on its own (owner, 2026-10-27): a second finger landing before the first lifts is two taps, not a gesture; a key is lit while a finger is on it and is a tap when that finger lifts without moving past the slop; two of the host's fingers moving together scroll the extent a row per row pitch. A finger that moves alone does nothing yet: shape writing goes there.
@@ -393,7 +395,7 @@ impl Touches {
                 if f.3 != Key::None {
                     out(Touch::Light(f.3));
                 }
-            } else if self.trace_words && !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > self.slop * self.slop {
+            } else if (self.trace_words || f.3 == Key::None) && !f.4 && (x - f.1).pow(2) + (y - f.2).pow(2) > self.slop * self.slop {
                 f.4 = true;
                 if f.3 != Key::None {
                     out(Touch::Unlight(f.3));
@@ -409,6 +411,10 @@ impl Touches {
                 self.trace[self.traced] = (x, y);
                 self.traced += 1;
                 out(Touch::Trail(x, y));
+            }
+            // An off-key finger of the host's, moved, outside a scroll: a drag (a keyed finger that moves stays its key's, or traces).
+            if f.4 && f.5 && f.3 == Key::None && self.scroll.is_none() {
+                out(Touch::Drag(f.1, f.2, x, y));
             }
             if f.5 {
                 sum_y += y;

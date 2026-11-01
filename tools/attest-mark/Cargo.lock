@@ -2409,6 +2409,7 @@ dependencies = [
  "blake3",
  "libm",
  "rayon",
+ "vsf",
 ]
 
 [[package]]

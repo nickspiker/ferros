@@ -226,6 +226,9 @@ struct Ahau {
     wave_top: core::cell::Cell<bool>,
     blink_next: core::cell::Cell<u64>,
     blink_rng: core::cell::Cell<u32>,
+    /// The entry line's pan in pixels (TEXT.md: 0 while the handle fits), and the drag that moves it: where its finger landed and the pan then.
+    pan: core::cell::Cell<i64>,
+    grab: core::cell::Cell<Option<(i64, i64, i64)>>,
 }
 
 impl Ahau {
@@ -491,7 +494,7 @@ impl Ahau {
         // A keystroke restarts the blinkey: bright at the top, its next tick a fresh interval away (Photon: the caret stays solid through typing).
         self.wave_top.set(true);
         self.blink_next.set(now() + self.blink_interval());
-        self.entry_line();
+        self.entry_line(true);
     }
 
     /// The blinkey's next interval: uniform in 0–300 ms by xorshift32, Photon's (fluor `BlinkTimer`): the irregularity reads as alive rather than mechanical.
@@ -511,7 +514,7 @@ impl Ahau {
         }
         self.wave_top.set(!self.wave_top.get());
         self.blink_next.set(now() + self.blink_interval());
-        self.entry_line();
+        self.entry_line(false);
         true
     }
 
@@ -574,11 +577,59 @@ impl Ahau {
         }
     }
 
+    /// The entry line's window (TEXT.md, "The attest line"): the underline's span, from an eighth of the width to seven eighths; the fade's width, half an em of the text size `px`; and inside the fades, where text that fits sits whole.
+    fn window_of(&self, px: usize) -> (i64, i64, i64, i64) {
+        let (w0, w1, f) = ((self.w / 8) as i64, (self.w * 7 / 8) as i64, (px / 2) as i64);
+        (w0, w1, w0 + f, w1 - f)
+    }
+
+    /// Where text `tw` pixels wide starts on the line: centred while it fits inside the fades, else centred and moved by the pan.
+    fn text_left(&self, px: usize, tw: i64) -> i64 {
+        let (_, _, in0, in1) = self.window_of(px);
+        let xc = self.w as i64 / 2 - tw / 2;
+        if tw <= in1 - in0 { xc } else { xc + self.pan.get() }
+    }
+
+    /// A pan held to the text's ends: its left end no further right than the window's inner left edge, its right end no further left than the inner right edge. WHY/PROOF: past either the text would leave the window with blank line beside it, the ends the owner asked to stop at (TEXT.md, Open 2: a hard stop, a bound with a velocity step, the owner's to accept or replace); text that fits has no pan.
+    fn bound_pan(&self, px: usize, tw: i64, p: i64) -> i64 {
+        let (_, _, in0, in1) = self.window_of(px);
+        if tw <= in1 - in0 {
+            return 0;
+        }
+        let xc = self.w as i64 / 2 - tw / 2;
+        let (lo, hi) = (in1 - tw - xc, in0 - xc);
+        if p < lo { lo } else if p > hi { hi } else { p }
+    }
+
+    /// A one-finger drag that landed on the entry line at (x0, y0) is at x now: the text pans with it, the character it grabbed staying under the finger (TEXT.md). The pan at the landing is kept for the drag, keyed by where it landed.
+    fn drag_text(&self, x0: i64, y0: i64, x: i64) -> bool {
+        let (b, px) = self.entry_at();
+        if !((b - px * 3 / 2) as i64..(b + px / 2) as i64).contains(&y0) {
+            return false;
+        }
+        let grab = match self.grab.get() {
+            Some(g) if g.0 == x0 && g.1 == y0 => g.2,
+            _ => {
+                self.grab.set(Some((x0, y0, self.pan.get())));
+                self.pan.get()
+            }
+        };
+        let (t, n, _) = self.shown();
+        let tw = self.measure(px, &t[..n]) / 4;
+        let p = self.bound_pan(px, tw, grab + x - x0);
+        if p == self.pan.get() {
+            return false;
+        }
+        self.pan.set(p);
+        self.entry_line(false);
+        true
+    }
+
     /// A tap on the entry line: the blinkey to the character boundary nearest `x` (each boundary measured by the display), solid again.
     fn place_caret(&mut self, x: i64) {
         let (_, px) = self.entry_at();
         let (t, n, _) = self.shown();
-        let left = self.w as i64 / 2 - self.measure(px, &t[..n]) / 8;
+        let left = self.text_left(px, self.measure(px, &t[..n]) / 4);
         // Walk the handle's character boundaries and the shown text's together (a newline is one byte here, two there).
         let (mut best, mut best_d) = (0usize, i64::MAX);
         let (mut i, mut j) = (0usize, 0usize);
@@ -598,11 +649,11 @@ impl Ahau {
         self.caret = best;
         self.wave_top.set(true);
         self.blink_next.set(now() + self.blink_interval());
-        self.entry_line();
+        self.entry_line(false);
     }
 
-    /// The typed handle centred on the entry line, the blinkey after it, and the line under them.
-    fn entry_line(&self) {
+    /// The typed handle on the entry line, the blinkey after it, and the line under them. Centred while it fits; wider, inside the underline's window, panned, its ends fading out over half an em (TEXT.md, "The attest line"). `chase`: after a keystroke the pan first follows the caret, landing it exactly on the window's inner edge it crossed (fluor `update_scroll`), so typing at the end keeps the newest characters in view.
+    fn entry_line(&self, chase: bool) {
         let (b, px) = self.entry_at();
         let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
         // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
@@ -610,11 +661,37 @@ impl Ahau {
         s[r0..r1].fill(0);
         let (t, n, at) = self.shown();
         let shown = core::str::from_utf8(&t[..n]).unwrap_or("");
-        // Centred by the typeface's own advances (display op 28), the blinkey where the text before it ends.
-        let x = self.w as i64 / 2 - self.measure(px, &t[..n]) / 8;
+        // Measured by the typeface's own advances (display op 28), the blinkey where the text before it ends.
+        let (tw, caret_px) = (self.measure(px, &t[..n]) / 4, self.measure(px, &t[..at]) / 4);
+        let (w0, w1, in0, in1) = self.window_of(px);
+        if chase {
+            let xc = self.w as i64 / 2 - tw / 2;
+            let cx = xc + self.pan.get() + caret_px;
+            let p = if cx < in0 { in0 - xc - caret_px } else if cx > in1 { in1 - xc - caret_px } else { self.pan.get() };
+            self.pan.set(self.bound_pan(px, tw, p));
+        }
+        let x = self.text_left(px, tw);
         window::text(self.display, tb, x as i16, b as i16, px as u16, TEXT, shown.as_bytes());
-        let cx = x + self.measure(px, &t[..at]) / 4;
-        self.blinkey(s, cx as usize, b - px * 7 / 8, px * 17 / 16, px);
+        // The window: nothing outside it, and over the last half em at each end the text fades by a C∞ smooth step (exp(−1/t) against its mirror: exactly 0 at the window's edge and 1 at the fade's inner edge, every derivative matching there), in linear light: the gamma-2 value times √f. Fixed in place, so text that fits (inside the fades) is never dimmed and nothing jumps as the handle grows past the edge.
+        let fade = |t: f32| {
+            let e = |u: f32| if u > 0. { libm::expf(-1. / u) } else { 0. };
+            e(t) / (e(t) + e(1. - t))
+        };
+        let f = (in0 - w0) as f32;
+        let (y0, y1) = (r0 / self.w, r1 / self.w);
+        for col in (0..in0).chain(in1..self.w as i64) {
+            let t = (if col < in0 { (col - w0) as f32 + 0.5 } else { (w1 - col) as f32 - 0.5 }) / f;
+            let k = (libm::sqrtf(fade(t)) * (1u32 << 14) as f32) as u64;
+            for y in y0..y1 {
+                let p = &mut s[y * self.w + col as usize];
+                let ch = |v: u64| (v & 0xFFFF) * k >> 14;
+                *p = ch(*p) | ch(*p >> 16) << 16 | ch(*p >> 32) << 32;
+            }
+        }
+        // The blinkey where the caret is, while it is in the window: a drag can carry it out (typing brings it back, `chase`).
+        if (w0..w1).contains(&(x + caret_px)) {
+            self.blinkey(s, (x + caret_px) as usize, b - px * 7 / 8, px * 17 / 16, px);
+        }
         // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
         let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
         s[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
@@ -976,7 +1053,7 @@ impl Ahau {
     }
 
 
-    /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear light the grey mixed a quarter of the way to a hue of the same luminance (Rec. 709 weights), back to gamma 2 as a multiplier per channel.
+    /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear VSF RGB the grey mixed a quarter of the way to a hue of the same photopic luminance (through LMS, vsf::colour::convert::vsf_rgb_to_photopic_f32; Rec. 709 weights until 2026-11-01, an sRGB assumption the display never shared), back to gamma 2 as a multiplier per channel.
     fn retint(&mut self) {
         self.kb.tint = Some(self.tint_for(&self.handle[..self.len]));
     }
@@ -1001,12 +1078,12 @@ impl Ahau {
         let mut tint = [[1u16 << 14; 3]; 64];
         for k in 0..n {
             let hue = (order[k] as f32 + turn) / n as f32;
-            // A smooth rainbow in linear light: each channel a raised cosine a third of a turn from the next.
+            // A smooth rainbow in linear VSF RGB: each primary a raised cosine a third of a turn from the next, a point in its triangle.
             let lin = [0, 1, 2].map(|c| {
                 let v = 0.5 + 0.5 * libm::cosf(core::f32::consts::TAU * (hue - c as f32 / 3.));
                 v * v
             });
-            let luma = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+            let luma = vsf::colour::convert::vsf_rgb_to_photopic_f32(lin[0], lin[1], lin[2]);
             let slot = if k < hexes { k } else { 48 + k - hexes };
             tint[slot] = lin.map(|l| (libm::sqrtf(1. - quarter + quarter * l / luma) * (1u32 << 14) as f32) as u16);
         }
@@ -1271,7 +1348,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF), pan: core::cell::Cell::new(0), grab: core::cell::Cell::new(None) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
@@ -1341,6 +1418,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     slid = false;
                 }
                 Touch::TapAt(x, y) => a.tap_at(x, y),
+                // A drag on the entry line pans it (TEXT.md); elsewhere nothing yet.
+                Touch::Drag(x0, y0, x, _) => {
+                    a.drag_text(x0, y0, x);
+                }
                 // A handle is exact bytes, typed key by key: no shape writing here.
                 Touch::Trail(..) | Touch::Traced => {}
             }

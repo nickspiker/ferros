@@ -277,6 +277,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     hive.kb.draw(hive.surf(), &mut hive.label());
                 }
                 Touch::TapAt(x, y) => hive.tap_at(x, y),
+                Touch::Drag(..) => {}
             }
         }
         if dirty {

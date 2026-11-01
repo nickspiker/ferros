@@ -817,6 +817,7 @@ dependencies = [
  "ihi 0.0.48",
  "libm",
  "tapuwae",
+ "vsf 0.10.2",
 ]
 
 [[package]]
@@ -2979,6 +2980,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "libm",
+ "vsf 0.10.2",
 ]
 
 [[package]]
