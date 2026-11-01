@@ -66,6 +66,7 @@ The map is a window like any other, on layer 0, with the camera ops it has today
 - **The corners.** The time, top left, in the device's base, redrawn each minute into every phase. Signal, navigation and taps in the corners are not built.
 - **Touches** still go to every client; each asks op 27 on a finger down and drops fingers that are not its own. Routing through the display is still the plan.
 - **Measure** is op 28 (2026-11-01): `[size u16][utf8…]` → `[0][width u32, quarter pixels]`, synchronous. It was op 27 for a day, which is "whose point"; the same collision as op 24.
+- **Centred text** is op 29 (2026-11-01): op 26's layout with x the centre of the text's ink, left to right; the keyboards' labels (`window::text_centred`).
 
 - **The system level.** The attest screen (payloads/ahau) is the first window at level 2: init starts it before the map, so nothing else shows until the person attests. Started by init through SYS_SPAWN, it got its own surface from init's `surfaces` grant, which exercised that path.
 

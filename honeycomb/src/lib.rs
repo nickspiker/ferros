@@ -266,7 +266,7 @@ impl Keyboard {
         changed
     }
 
-    /// The whole keyboard: its area cleared to black (the surface's rows from `top` to the bar's bottom), every key, every label through `label(x, baseline, size px, value, text)`.
+    /// The whole keyboard: its area cleared to black (the surface's rows from `top` to the bar's bottom), every key, every label through `label(x, baseline, size px, value, text)`, x the label's centre: the host centres it by its ink (ferros_sys window::text_centred).
     pub fn draw(&self, s: &mut [u64], label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
         s[self.top * self.w..((self.bar1 >> 8) as usize) * self.w].fill(0);
         for k in 0..self.hexes() {
@@ -456,10 +456,10 @@ impl Touches {
     }
 }
 
-/// Text centred on (cx, cy) in Q8, by an estimate of the typeface's advance (0.56 em) and cap height (0.7 em): the display does not say how wide a string is yet.
+/// A label centred on (cx, cy) in Q8: the centre handed on as x (the host centres it by its ink, ferros_sys window::text_centred), the baseline by an estimate of the cap height (0.7 em; owner, 2026-11-01: across by the ink box, not up and down).
 fn centred(cx: i64, cy: i64, px: u16, s: &str, label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
     let (cx, cy, p) = (cx >> 8, cy >> 8, px as i64);
-    label(cx - s.chars().count() as i64 * p * 28 / 100, cy + p * 35 / 100, px, LABEL, s);
+    label(cx, cy + p * 35 / 100, px, LABEL, s);
 }
 
 /// A round dot of radius `r` pixels at (x, y) (a tracing finger's trail): coverage from the squared distance, a root only on the one-pixel edge band. The caller keeps it on the surface.

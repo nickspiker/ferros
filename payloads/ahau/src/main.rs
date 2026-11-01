@@ -234,7 +234,7 @@ impl Ahau {
     }
 
     fn label(&self) -> impl FnMut(i64, i64, u16, u16, &str) + '_ {
-        move |x, y, px, v, t| window::text(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
+        move |x, y, px, v, t| window::text_centred(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
     }
 
     /// Text centred across the screen on `baseline`, by the keyboard's estimate of the typeface's advance (0.56 em).
@@ -659,7 +659,7 @@ impl Ahau {
         let mut plain = kb.clone();
         plain.tint = None;
         let display = self.display;
-        plain.draw(t, &mut |x, y, px, v, s| window::text(display, tb, x as i16, y as i16, px, v, s.as_bytes()));
+        plain.draw(t, &mut |x, y, px, v, s| window::text_centred(display, tb, x as i16, y as i16, px, v, s.as_bytes()));
         let boards = unsafe { &mut *(&raw mut BOARDS) };
         let (b, other) = if slot == 0 { let (x, y) = boards.split_at_mut(1); (&mut x[0], &y[0]) } else { let (x, y) = boards.split_at_mut(1); (&mut y[0], &x[0]) };
         let n = (bottom - top) * w;

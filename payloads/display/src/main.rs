@@ -2000,7 +2000,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -2740,13 +2740,27 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     len = 5;
                 }
                 // Text into a window's surface, in its 16-bit working values: [base u64] the surface, [x i16][baseline i16][size u16 px][value u16 Q14, white = 16384][utf8…] in screen coordinates (a surface is the whole screen). Glyph coverage times the value, grey, taking the brighter of itself and what is there (so labels sit on black), and clearing the see-through bit where it draws. The app shows the window (op 22) when it is done drawing. Apps have no font of their own yet; the display's is the one typeface (SHELL.md). Synchronous, so the text is in the surface before the app writes it again. Was op 24 until 2026-10-27: the frame wait took that number on 2026-10-24 (answered by the receive thread, never queued), and every text call since had been a frame wait that drew nothing.
-                Some(26) if m.len() >= 17 => {
+                // Op 29, the same with x the centre of the text's ink (window::text_centred, the keyboard's labels, 2026-11-01): the glyphs' coverage found once at a pen of 0 (the cache keeps them for the draw), its leftmost and rightmost pixels' middle put on x. Left and right only: the baseline stays where it is asked.
+                Some(op @ (26 | 29)) if m.len() >= 17 => {
                     let i16le = |k: usize| i16::from_le_bytes([m[k], m[k + 1]]) as i32;
                     let (x0, base, px, val) = (i16le(9), i16le(11), u16::from_le_bytes([m[13], m[14]]) as f32, u16::from_le_bytes([m[15], m[16]]) as u32);
                     match surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())) {
                         Some(sk) if px >= 4.0 && px <= 512.0 => {
                             let surf = surface(sk, width, height);
                             let t = core::str::from_utf8(&m[17..]).unwrap_or("");
+                            let x0 = if *op == 29 {
+                                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                                glyph_engine().cover(t, 0.0, 0.0, px, (1.0, 0.0), |x, _, a| {
+                                    if a != 0 {
+                                        lo = lo.min(x);
+                                        hi = hi.max(x);
+                                    }
+                                });
+                                // No ink (a space): centred on its advance instead.
+                                if lo > hi { x0 - (glyph_engine().width(t, px) / 2.0) as i32 } else { x0 - ((lo + hi + 1) / 2) as i32 }
+                            } else {
+                                x0
+                            };
                             glyph_engine().cover(t, x0 as f32, base as f32, px, (1.0, 0.0), |x, y, a| {
                                 if x < 0 || y < 0 || x >= width as i64 || y >= height as i64 {
                                     return;

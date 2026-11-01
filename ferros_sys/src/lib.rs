@@ -760,8 +760,17 @@ pub mod window {
 
     /// A line of text into the surface (the display's typeface): screen coordinates, size in pixels, grey value Q14 (white 16384).
     pub fn text(display: u64, base: u64, x: i16, baseline: i16, px: u16, value: u16, s: &[u8]) {
+        text_op(26, display, base, x, baseline, px, value, s);
+    }
+
+    /// As `text`, centred across `cx` by its ink: the middle of the pixels the glyphs draw, left to right, not of their advances, so a narrow letter (i, l) or one with uneven side bearings sits in the middle of its key (owner, 2026-11-01: left and right by the ink box, not up and down). Display op 29.
+    pub fn text_centred(display: u64, base: u64, cx: i16, baseline: i16, px: u16, value: u16, s: &[u8]) {
+        text_op(29, display, base, cx, baseline, px, value, s);
+    }
+
+    fn text_op(op: u8, display: u64, base: u64, x: i16, baseline: i16, px: u16, value: u16, s: &[u8]) {
         let mut m = [0u8; 256];
-        m[0] = 26;
+        m[0] = op;
         m[1..9].copy_from_slice(&base.to_le_bytes());
         m[9..11].copy_from_slice(&x.to_le_bytes());
         m[11..13].copy_from_slice(&baseline.to_le_bytes());

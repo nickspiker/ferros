@@ -38,7 +38,7 @@ impl Hive {
     }
 
     fn label(&self) -> impl FnMut(i64, i64, u16, u16, &str) + '_ {
-        move |x, y, px, v, t| window::text(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
+        move |x, y, px, v, t| window::text_centred(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
     }
 
     /// The typed line's band above the keys: cleared, then the line's tail and a cursor.
