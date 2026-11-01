@@ -44,6 +44,37 @@ Each move so far followed the same shape:
 - **Boot paths last.** A move that sits on the cold boot's path (touch, display, sensors' proximity) goes through a slot b flash and a cold boot before the kernel's copy goes; slot a stays the last known-good escape while it settles.
 - **No general escape hatches.** A power switch does one device's sequence. No syscall hands EL0 an arbitrary SMC, EL3 register, or PMIC register.
 
+## Decisions needed (owner)
+
+What blocks the rest of the list after the night of 2026-10-31. Each is a choice, not more work of the same kind.
+
+1. **The kernel's USB fallback.**
+   - Today the kernel serves USB until init starts the usb process, and again if it ends. Removing it takes out the service loop's USB (the event loop, the watchdogs, the PT receive, about 400 lines) and the gate's host answer.
+   - The cost: a usb process that fails at every boot leaves no bridge, and recovery is by hand (volume down at the gate → Android → fastboot).
+   - Proposed: remove it with you present, after the process has carried a week of use.
+2. **Sensors phase 2: the AoC's start.**
+   - It needs the secure world: FF-A calls to Trusty (direct messages, sharing memory for its virtio rings) and GSA's mailbox (plain MMIO, grantable).
+   - Proposed: a `Ffa` capability that allows exactly the calls `trusty.rs` makes — direct requests to Trusty's partition, and sharing pages of the caller's own DMA region — and nothing else.
+   - It is a new door into the secure world, so it waits for your yes.
+3. **The camera harness.**
+   - `camera*.rs` (6.5k lines) is the bring-up tool, not a driver. It DMAs into fixed physical regions and draws its viewfinder on the panel directly.
+   - Options:
+     - port it as it is (hours, and it changes the tool you are using);
+     - leave it until the pipeline is understood, then write the userspace driver fresh and delete the harness;
+     - delete it now.
+   - Proposed: the second.
+4. **The `diag` subcommands.**
+   - They are what keep most of the remaining kernel code alive: `touch.rs`'s tools, the display tools (`dpu`, `dsim`), `usf`'s tools, `amp`, `haptics`, `odpm`, `fp`, `cold_ufs`.
+   - Each can be deleted, or moved into a diag payload spawned from the bridge. Moving one usually needs a power switch for its privileged part.
+   - Proposed: delete what has done its job (`fp`'s bus hunt, `cold_ufs`), and move each module's tools with its module.
+5. **hsi2c_11.**
+   - The battery gauge, the Type-C controller (the USB switch) and the eUSB2 repeater share it. Everything on it runs on the kernel's core today, so nothing collides.
+   - Moving the gauge out means one process owning the bus: a charger process, with the usb switch asking it to close the Type-C switch.
+   - Proposed: leave it in the kernel until there is a charger process for other reasons (charging policy).
+6. **The boot modeset.**
+   - `start_home` runs `dpu::modeset_with` (to the 10 bpc blend) before init. Moving it into the display server's start is natural, but it is on the attest screen's path, and `dpu`/`dsim` stay in the kernel for the boot screen and the diag tools anyway.
+   - Proposed: move it together with decision 4's display tools.
+
 ## Record
 
 - 2026-10-31: USB steps 1-5 (partial) — USB.md.
