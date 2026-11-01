@@ -59,6 +59,8 @@ static FASTBOOT_FAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 const STAGE_MAX: usize = 4 << 20;
 /// Where PT transfers over 1 MiB are received: the 6 MiB between the DMA pool and the reload stub, inside the kernel's cacheable window (cachemap WINDOW), used by nothing else.
 const PT_BIG: (usize, usize) = (0x81A0_0000, 0x8200_0000);
+/// The largest value the vault takes (3 MiB): sealing a value and reading it back each need about twice its size in one piece of the kernel heap. The largest capsule today is the display server's, 2.8 MB. Larger things (std images) go through the streamed spawn, not the vault, until the vault stores in pieces.
+pub const STORE_VALUE_MAX: usize = 3 << 20;
 
 /// Exit reasons (crumb byte in the ramoops report, kernel prints it as the low byte of `mbr_sig`).
 const EXIT_REBOOT: u8 = 0xB0;
@@ -72,6 +74,8 @@ const EXIT_PT_STALL: u8 = 0xB6;
 #[derive(Default)]
 struct PtStats {
     specs: u32,
+    /// SPECs refused for a size over PT_BIG.
+    specs_refused: u32,
     data_pkts: u32,
     data_decoded: u32,
     data_accepted: u32,
@@ -164,7 +168,7 @@ fn report(b: &Boot, exit: u8) {
     }
 }
 
-/// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open.
+/// `ferros.dev.store` on the ira-keyed vault (every set/remove is sealed by commit_root, so it survives a reset). Responses start with a status byte: 0 ok, 1 key not found, 2 vault error, 3 bad request, 4 no vault open, 5 a value over STORE_VALUE_MAX.
 /// Write [keylen:2 BE][key][value] -> [0][object hash:32]. Read [key] -> [0][value]; an empty key lists every key, '\n'-separated. Exec [key] -> remove -> [0] or [1].
 fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]) -> alloc::vec::Vec<u8> {
     let store = match store {
@@ -186,6 +190,11 @@ fn store_command(store: Option<&mut ShimStore>, op: ferros_pt::Op, params: &[u8]
                 _ => return alloc::vec![3],
             };
             let len = params.len() - 2 - klen;
+            // A value larger than STORE_VALUE_MAX is refused (status 5): sealing it, and reading it back, each take about twice its size in one piece of the 22 MiB kernel heap, and 4 and 5 MiB values ran it out and panicked the kernel (2026-10-31).
+            if len > STORE_VALUE_MAX {
+                crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes refused: over {STORE_VALUE_MAX}"));
+                return alloc::vec![5];
+            }
             crate::flashlog::line(&alloc::format!("store set {key:?} {len} bytes"));
             match store.set(&key, &params[2 + klen..]) {
                 Ok(h) => {
@@ -3452,6 +3461,18 @@ pub fn run(mut b: Boot) -> ! {
                         // The previous transfer's buffer goes first: allocating the new one beside it doubled the peak, and with the store's own copy a 2.2 MB capsule ran the kernel heap out (2026-10-23, the 256-px icon bundle).
                         pt_inbound = None;
                         pt_data_buf = alloc::vec::Vec::new();
+                        // The host's announced size is external input: a transfer larger than PT_BIG (6 MiB) is refused here, answered COMPLETE-failed instead of a SPEC ACK. Taken on the heap, an 8 MiB store put needed a second 8 MiB for the vault's seal and the kernel panicked out of memory (2026-10-31).
+                        if spec.total as usize > PT_BIG.1 - PT_BIG.0 {
+                            st.specs_refused += 1;
+                            let done = packet::Complete { sid: spec.sid, success: false, data_hash: [0; 32] };
+                            let mut b = [0u8; 64];
+                            let l = done.encode(&mut b);
+                            if l > 0 {
+                                usb.bulk_in_send(&b[..l]);
+                            }
+                            usb.bulk_out_arm();
+                            continue;
+                        }
                         // A transfer over 1 MiB lands in a fixed region outside the heap (PT_BIG): a 2.7 MB display capsule needed its receive buffer and the vault's working copy contiguous in a heap earlier puts had fragmented, and the kernel panicked out of memory twice (2026-10-23).
                         let total = spec.total as usize;
                         let (buf_ptr, buf_len) = if total > 1 << 20 && total <= PT_BIG.1 - PT_BIG.0 {

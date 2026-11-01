@@ -1363,7 +1363,11 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     } else if set {
                         *cache = None;
                         let piece = p.read(f.x[4], len);
-                        if let Some(at) = at {
+                        // A value past the vault's limit (service.rs STORE_VALUE_MAX: the seal and the read-back each need about twice it in one piece of the kernel heap) is refused, its stage dropped, before it grows the heap.
+                        if at.unwrap_or(0) + piece.len() > crate::service::STORE_VALUE_MAX {
+                            unsafe { *(&raw mut STORE_STAGE) = None };
+                            ERR
+                        } else if let Some(at) = at {
                             let stage = unsafe { &mut *(&raw mut STORE_STAGE) };
                             if stage.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
                                 *stage = Some((key.clone(), Vec::new()));

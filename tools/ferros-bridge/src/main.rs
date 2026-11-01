@@ -406,6 +406,10 @@ fn cmd_status() {
 async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     let sid = StreamId::FIRST;
 
+    // The kernel takes at most 6 MiB in one transfer (its PT_BIG receive region, service.rs) and refuses more, answering COMPLETE-failed: said here first.
+    if data.len() > 6 << 20 {
+        return Err(format!("{} bytes is more than the kernel takes in one transfer (6 MiB)", data.len()));
+    }
     let mut spec_buf = [0u8; 512];
     let mut bitmap_buf = vec![0u64; ferros_pt::transfer::outbound_bitmap_words(data.len())];
 
@@ -428,6 +432,9 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
         .recv()
         .await
         .map_err(|e| format!("SPEC ACK recv failed: {e}"))?;
+    if ferros_pt::packet::Complete::decode(&resp).is_some_and(|c| !c.success) {
+        return Err("the kernel refused the transfer (too large for its receive region)".into());
+    }
     if let Some(ack) = Ack::decode(&resp) {
         if ack.seq != u64::MAX {
             return Err(format!("Expected SPEC ACK (seq=MAX), got seq={}", ack.seq));
@@ -444,6 +451,7 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     // Small delay after SPEC ACK — let kernel finish arming ep2
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
+    let pace_us: u64 = std::env::var("FERROS_PT_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     // Blast all DATA packets — no ACK wait, USB guarantees delivery
     let mut pkt_buf = [0u8; 512];
     let mut sent = 0u64;
@@ -458,8 +466,10 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
             .await
             .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
         sent += 1;
-        // Pace sends — kernel needs time to process + re-arm ep2
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        // No pacing by default (FERROS_PT_PACE_US, microseconds, to bring it back): the kernel takes one 512-byte packet per USB transfer and re-arms, and until it does the controller NAKs and the host retries, so nothing is lost. The 1 ms tokio sleep that was here (really 1-2 ms) held PT to 215 KB/s; without it 2 MiB went over in 0.62 s, byte-exact both ways (2026-10-31).
+        if pace_us > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(pace_us)).await;
+        }
     }
 
     eprintln!("  {} DATA packets blasted", sent);
@@ -980,6 +990,11 @@ async fn cmd_store(args: &[String]) {
                 None => args[2].as_bytes().to_vec(),
             };
             let key = args[1].as_bytes();
+            // The vault takes values up to 3 MiB (the kernel's STORE_VALUE_MAX: the seal and the read-back each need about twice the value in one piece of its heap); larger ones it refuses with status 5.
+            if value.len() > 3 << 20 {
+                eprintln!("{} bytes is over the vault's 3 MiB value limit", value.len());
+                std::process::exit(1);
+            }
             let mut p = Vec::with_capacity(2 + key.len() + value.len());
             p.extend_from_slice(&(key.len() as u16).to_be_bytes());
             p.extend_from_slice(key);
@@ -1011,7 +1026,7 @@ async fn cmd_store(args: &[String]) {
             std::process::exit(1);
         }
         Some(s) => {
-            eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", _ => "unknown status" });
+            eprintln!("{}", match s { 2 => "vault error", 3 => "bad request", 4 => "no vault open on the device", 5 => "refused: over the vault's 3 MiB value limit", _ => "unknown status" });
             // Newer kernels follow status 2 with the vault's own error text.
             if r.len() > 1 {
                 eprintln!("  {}", String::from_utf8_lossy(&r[1..]));
