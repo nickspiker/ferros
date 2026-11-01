@@ -776,7 +776,7 @@ pub mod window {
     /// The advance of `s` at `px` pixels in the display's typeface, in quarter pixels: where text drawn by `text` ends, so a caret sits on it and a tap finds its character. None when the display does not answer (an older display server).
     pub fn width(display: u64, px: u16, s: &[u8]) -> Option<u32> {
         let mut m = [0u8; 256];
-        m[0] = 27;
+        m[0] = 28;
         m[1..3].copy_from_slice(&px.to_le_bytes());
         let n = s.len().min(m.len() - 3);
         m[3..3 + n].copy_from_slice(&s[..n]);

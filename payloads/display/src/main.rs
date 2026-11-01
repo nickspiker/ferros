@@ -1998,7 +1998,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -2729,8 +2729,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         _ => out[0] = 3,
                     }
                 }
-                // Measure: [size u16 px][utf8…] → [0][width u32, quarter pixels]: the advance of the text at that size in the one typeface (the pen moves by each glyph's advance, as op 26 draws it), so an app puts its caret where the letters end and finds the character under a tap (the attest screen, 2026-11-01: placed by an estimate of the advance, its caret wandered off the letters).
-                Some(27) if m.len() >= 3 => {
+                // Measure: [size u16 px][utf8…] → [0][width u32, quarter pixels]: the advance of the text at that size in the one typeface (the pen moves by each glyph's advance, as op 26 draws it), so an app puts its caret where the letters end and finds the character under a tap (the attest screen, 2026-11-01: placed by an estimate of the advance, its caret wandered off the letters). Synchronous (`op_is_sync`): the reply is the width. Was op 27 for its first day, which was already "whose point" (answered by the receive thread for any call of 13 bytes or more): with that and no wait for its reply, every measure fell back to the estimate.
+                Some(28) if m.len() >= 3 => {
                     let px = u16::from_le_bytes([m[1], m[2]]) as f32;
                     let t = core::str::from_utf8(&m[3..]).unwrap_or("");
                     let w = (glyph_engine().width(t, px) * 4.0) as u32;

@@ -76,34 +76,25 @@ static FRESH_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 const PENDING: u64 = 0;
 const READY: u64 = 1;
 const RING: u64 = 2;
-/// The rainbow laid on a board's rows of `s` from its base, every pixel in one pass: each key's tint weighted by how near the pixel is to the key's own grey, whole on the key and its edge (at or below the grey), none on the label (at its grey, LABEL), in between across the label's anti-aliased edge, so the labels stay white. The key map (KB_INDEX) is the one board geometry every view shares.
-fn tint_rows(kb: &Keyboard, s: &mut [u64], top: usize, bottom: usize, w: usize, base: &[u16]) {
-    let Some(t) = &kb.tint else { return };
-    let index = unsafe { &*(&raw const KB_INDEX) };
-    let label = honeycomb::LABEL as u64;
-    let one = 1i64 << 14;
-    for i in 0..(bottom - top) * w {
-        let k = index[i];
-        if k == 255 {
-            continue;
-        }
-        let p = base[i] as u64;
-        let f = if k < 48 { honeycomb::KEY } else { honeycomb::BAR_KEY };
-        let weight = if p <= f { one } else if p >= label { 0 } else { (((label - p) << 14) / (label - f)) as i64 };
-        let tint = t[k as usize];
-        let ch = |c: usize| (p as i64 * (one + (weight * (tint[c] as i64 - one) >> 14)) >> 14) as u64;
-        s[top * w + i] = ch(0) | ch(1) << 16 | ch(2) << 32;
-    }
+/// A board as drawn untinted, its rows from `kb.top` to the bar's foot (owner, 2026-10-29: a mask and an index to fill): each pixel's grey (one channel: it is all grey), its key (`Keyboard::tint_index`; 0 off the keys, where the weight is 0), and how much of its key's tint it takes (Q14): whole on the key and its edge (at or below the key's grey), none on the label (at its grey, LABEL) and off the keys, in between across the label's anti-aliased edge, so the labels stay white. 2²⁰ pixels hold the 1344-wide board's 621 rows.
+struct Board {
+    base: [u16; 1 << 20],
+    weight: [u16; 1 << 20],
+    index: [u8; 1 << 20],
+}
+const NO_BOARD: Board = Board { base: [0; 1 << 20], weight: [0; 1 << 20], index: [0; 1 << 20] };
+/// Two boards kept (owner, 2026-11-01: copy and tint): the one on show and the one a held key will leave, or the other case, so a shift, a letter or a lift is one tint pass and a copy, with no label drawn. A board missing is drawn once into the slot not on show (`Ahau::board`); `Ahau::boards` says which board each slot holds.
+static mut BOARDS: [Board; 2] = [NO_BOARD; 2];
+/// What a board's untinted pixels follow: its layout, its view, upper case or not, the bar's left key's label. The shift key's own look (off, once, lock) is drawn over it at every paint.
+type BoardKey = (usize, usize, bool, &'static str);
+
+fn board_key(kb: &Keyboard) -> BoardKey {
+    (kb.layout, kb.view, kb.shift != honeycomb::Shift::Off, kb.left)
 }
 
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
-/// The keyboard as drawn untinted, keys and labels (one channel: it is all grey), its rows from `kb.top` to the bar's foot, and each pixel's key (`Keyboard::tint_index`, 255 for none): a stroke's rainbow is one pass over these (owner, 2026-10-29: a mask and an index to fill), with nothing cleared and no label drawn again, where a whole redraw took 33 label calls to the display and showed the board half drawn. 2²⁰ pixels hold the 1344-wide board's 621 rows.
-static mut KB_BASE: [u16; 1 << 20] = [0; 1 << 20];
-static mut KB_INDEX: [u8; 1 << 20] = [0; 1 << 20];
-/// The prepared board's base, as KB_BASE (`prepare`).
-static mut KB_BASE2: [u16; 1 << 20] = [0; 1 << 20];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
 /// The mark's two maps (tapuwae::FreshCell, 8 bytes a sample): where the masked pixels' samples fall in the set, worked out once, so a new handle costs the balls' shading alone. Independent, so the coarse pass is a sixteenth of the fine one at boot too: the coarse map, a pixel's centre (2¹⁸ cells, 2 MiB, for the 900 px mark's 171 643 masked pixels); the fine map, 4 × 4 a pixel, filled by the first fine pass to reach each (3·2²⁰ cells, 24 MiB, for 2.75 M). Past either tapuwae works the rest out again.
@@ -227,9 +218,10 @@ struct Ahau {
     /// The Photon client's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
-    /// The back surface's base (0: none granted, the board redraws in place), and the key whose tap the board drawn there is for, with the keyboard as that tap leaves it.
+    /// The back surface's base (0: none granted, the board is drawn in place), where boards are drawn and tinted before they show; which board each slot of BOARDS holds, and the slot on show.
     back: u64,
-    prepared: Option<(Key, Keyboard)>,
+    boards: core::cell::Cell<[Option<BoardKey>; 2]>,
+    shown_board: core::cell::Cell<usize>,
     /// Photon's blinkey: which end of its wave is bright, when it next flips (on the counter), and its xorshift32 state (fluor `BlinkTimer`'s seed).
     wave_top: core::cell::Cell<bool>,
     blink_next: core::cell::Cell<u64>,
@@ -302,7 +294,7 @@ impl Ahau {
             return false;
         }
         self.kb.layout = l;
-        self.redraw_keys();
+        self.show_board();
         true
     }
 
@@ -574,7 +566,7 @@ impl Ahau {
         (t, n, at)
     }
 
-    /// The width of `t` at `px` in the display's typeface, quarter pixels (display op 27); an older display server that cannot say gets the old estimate (0.56 em a character).
+    /// The width of `t` at `px` in the display's typeface, quarter pixels (display op 28); an older display server that cannot say gets the old estimate (0.56 em a character).
     fn measure(&self, px: usize, t: &[u8]) -> i64 {
         match window::width(self.display, px as u16, t) {
             Some(q) => q as i64,
@@ -613,12 +605,12 @@ impl Ahau {
     fn entry_line(&self) {
         let (b, px) = self.entry_at();
         let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
-        // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's prepared board uses the back surface's rows below these.
+        // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
         let (tb, s) = if self.back != 0 { (self.back, unsafe { core::slice::from_raw_parts_mut(self.back as *mut u64, self.w * self.h) }) } else { (self.base, self.surf()) };
         s[r0..r1].fill(0);
         let (t, n, at) = self.shown();
         let shown = core::str::from_utf8(&t[..n]).unwrap_or("");
-        // Centred by the typeface's own advances (display op 27), the blinkey where the text before it ends.
+        // Centred by the typeface's own advances (display op 28), the blinkey where the text before it ends.
         let x = self.w as i64 / 2 - self.measure(px, &t[..n]) / 8;
         window::text(self.display, tb, x as i16, b as i16, px as u16, TEXT, shown.as_bytes());
         let cx = x + self.measure(px, &t[..at]) / 4;
@@ -638,7 +630,7 @@ impl Ahau {
         self.status(self.prompt());
         self.entry();
         self.button();
-        self.redraw_keys();
+        self.show_board();
     }
 
     /// The keyboard's rows: from its top to the bar's foot.
@@ -646,77 +638,103 @@ impl Ahau {
         (self.kb.top, self.h - honeycomb::corner_rows(self.w, self.h))
     }
 
-    /// The whole keyboard drawn again (at start, and for a new view): untinted, from a copy with the tint off; its pixels kept as the base with each one's key; then the rainbow laid on from them. A shift, a page or a layout comes from the back buffer instead (`prepare`).
-    fn redraw_keys(&self) {
-        let mut plain = self.kb.clone();
-        plain.tint = None;
-        plain.draw(self.surf(), &mut self.label());
+    /// Where a board is drawn and painted before it shows: the back surface (its base and pixels), or, without one, the screen itself.
+    fn target(&self) -> (u64, &'static mut [u64]) {
+        let b = if self.back != 0 { self.back } else { self.base };
+        (b, unsafe { core::slice::from_raw_parts_mut(b as *mut u64, self.w * self.h) })
+    }
+
+    /// The board for `kb` (its keys, labels and case, untinted), as a slot of BOARDS: kept, or drawn now into the slot not on show — every key and label through the display (some 50 ms), its greys read back, each pixel's key and tint weight worked out. The key map is the board on show's when the layout and view are the same (a shift, the left key), else hit-tested afresh (some 37 ms).
+    fn board(&self, kb: &Keyboard) -> usize {
+        let key = board_key(kb);
+        let mut keys = self.boards.get();
+        if let Some(slot) = (0..2).find(|&i| keys[i] == Some(key)) {
+            return slot;
+        }
+        let shown = self.shown_board.get();
+        let slot = 1 - shown;
         let (top, bottom) = self.kb_rows();
-        // WHY: the board's size follows the panel's; one too big for the base draws tinted the slow way (every key and label again) instead of indexing past it.
-        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE)).len() } {
+        let w = self.w;
+        let (tb, t) = self.target();
+        let mut plain = kb.clone();
+        plain.tint = None;
+        let display = self.display;
+        plain.draw(t, &mut |x, y, px, v, s| window::text(display, tb, x as i16, y as i16, px, v, s.as_bytes()));
+        let boards = unsafe { &mut *(&raw mut BOARDS) };
+        let (b, other) = if slot == 0 { let (x, y) = boards.split_at_mut(1); (&mut x[0], &y[0]) } else { let (x, y) = boards.split_at_mut(1); (&mut y[0], &x[0]) };
+        let n = (bottom - top) * w;
+        let same = keys[shown].is_some_and(|k| k.0 == key.0 && k.1 == key.1);
+        if same {
+            b.index[..n].copy_from_slice(&other.index[..n]);
+        }
+        let label = honeycomb::LABEL as u64;
+        for y in top..bottom {
+            for x in 0..w {
+                let i = (y - top) * w + x;
+                let p = t[y * w + x] & 0xFFFF;
+                b.base[i] = p as u16;
+                let k = if same {
+                    b.index[i] as usize
+                } else {
+                    let k = match kb.hit(x as i64, y as i64) {
+                        Key::None => 64,
+                        k => Keyboard::tint_index(k),
+                    };
+                    b.index[i] = if k == 64 { 0 } else { k as u8 };
+                    k
+                };
+                let f = if k < 48 { honeycomb::KEY } else { honeycomb::BAR_KEY };
+                // Off the keys (k 64, kept as key 0) no tint at all: the pixel stays the grey it was drawn.
+                b.weight[i] = if k == 64 || p >= label { 0 } else if p <= f { 1 << 14 } else { (((label - p) << 14) / (label - f)) as u16 };
+            }
+        }
+        keys[slot] = Some(key);
+        self.boards.set(keys);
+        slot
+    }
+
+    /// The keyboard on the glass as `self.kb` stands: its board (`board`), the rainbow laid on from the base in one pass (three multiplies a channel), the shift key drawn over it as it stands (off, once or lock; it has no label), then copied in whole, so the display never composes it half done. Its rows: the keyboard's, from its top to the bar's foot.
+    fn show_board(&self) {
+        let (top, bottom) = self.kb_rows();
+        let w = self.w;
+        let n = (bottom - top) * w;
+        // WHY: the board's size follows the panel's; one too big for BOARDS is drawn tinted the slow way (every key and label again) instead of indexing past it.
+        if n > 1 << 20 {
             self.kb.draw(self.surf(), &mut self.label());
             return;
         }
-        let s = self.surf();
-        let (base, index) = unsafe { (&mut *(&raw mut KB_BASE), &mut *(&raw mut KB_INDEX)) };
-        for y in top..bottom {
-            for x in 0..self.w {
-                let i = (y - top) * self.w + x;
-                base[i] = (s[y * self.w + x] & 0xFFFF) as u16;
-                index[i] = match self.kb.hit(x as i64, y as i64) {
-                    Key::None => 255,
-                    k => honeycomb::Keyboard::tint_index(k) as u8,
-                };
-            }
+        let slot = self.board(&self.kb);
+        let b = unsafe { &(*(&raw const BOARDS))[slot] };
+        let (_, t) = self.target();
+        let one = 1i64 << 14;
+        let tint = self.kb.tint.unwrap_or([[1 << 14; 3]; 64]);
+        let rows = &mut t[top * w..top * w + n];
+        for i in 0..n {
+            let (p, wt, c) = (b.base[i] as i64, b.weight[i] as i64, &tint[b.index[i] as usize]);
+            let ch = |c: u16| (p * (one + (wt * (c as i64 - one) >> 14)) >> 14) as u64;
+            rows[i] = ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32;
         }
-        self.apply_tint();
+        self.kb.draw_key(t, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
+        if self.back != 0 {
+            self.surf()[top * w..top * w + n].copy_from_slice(&t[top * w..top * w + n]);
+        }
+        self.shown_board.set(slot);
     }
 
-    /// The rainbow laid on the board from its base, every pixel in one pass.
-    fn apply_tint(&self) {
-        let (top, bottom) = self.kb_rows();
-        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE)).len() } {
-            return;
-        }
-        tint_rows(&self.kb, self.surf(), top, bottom, self.w, unsafe { &*(&raw const KB_BASE) });
-    }
-
-    /// A finger is down on `key`: if its tap will redraw the board (a shift, a page, a layout), that board is drawn now, whole, into the back buffer — keys, labels and rainbow — so the lift only copies it in (`tap`), the way the mark's next frame is rendered ahead by its thread. The key map stays: those taps change labels, not where the keys are (checked: a board whose keys moved is left to redraw in place).
-    fn prepare(&mut self, key: Key) {
-        self.prepared = None;
-        if self.back == 0 {
-            return;
-        }
+    /// A finger is down on `key`: if its tap will change the board (a shift, a page, a layout, the letter ending a one-letter shift), that board is drawn now (`prepare_board`), the way the mark's next frame is rendered ahead by its thread, so the lift is a tint and a copy.
+    fn prepare(&self, key: Key) {
         let mut next = self.kb.clone();
-        let event = next.tap(key);
-        // A board redraws on a shift, a page or a layout, and on the letter that ends a one-letter shift (its board goes back to lower case).
-        if (event != Some(Event::Redraw) && next.shift == self.kb.shift) || next.hexes() != self.kb.hexes() || next.top != self.kb.top {
-            return;
+        next.tap(key);
+        if board_key(&next) != board_key(&self.kb) {
+            self.prepare_board(&next);
         }
-        // That letter also deals the rainbow afresh: the board is prepared with the rainbow of the handle as the letter will leave it (the copy wiped after).
-        if let Some(Event::Char(c)) = event {
-            let (mut t, mut n, mut ch) = (self.handle, self.len, self.chars);
-            insert_at(&mut t, &mut n, &mut ch, self.caret, c);
-            next.tint = Some(self.tint_for(&t[..n]));
-            for x in t.iter_mut() {
-                unsafe { core::ptr::write_volatile(x, 0) };
-            }
+    }
+
+    /// Board `kb` drawn ahead into BOARDS. Only into the back surface: drawn on the screen it would show untinted. And only one that fits (`show_board`'s check).
+    fn prepare_board(&self, kb: &Keyboard) {
+        if self.back != 0 && (self.kb_rows().1 - self.kb_rows().0) * self.w <= 1 << 20 {
+            self.board(kb);
         }
-        let (top, bottom) = self.kb_rows();
-        if (bottom - top) * self.w > unsafe { (&*(&raw const KB_BASE2)).len() } {
-            return;
-        }
-        let back = unsafe { core::slice::from_raw_parts_mut(self.back as *mut u64, self.w * self.h) };
-        let mut plain = next.clone();
-        plain.tint = None;
-        let (display, b) = (self.display, self.back);
-        plain.draw(back, &mut |x, y, px, v, t| window::text(display, b, x as i16, y as i16, px, v, t.as_bytes()));
-        let base2 = unsafe { &mut *(&raw mut KB_BASE2) };
-        for i in 0..(bottom - top) * self.w {
-            base2[i] = (back[top * self.w + i] & 0xFFFF) as u16;
-        }
-        tint_rows(&next, back, top, bottom, self.w, base2);
-        self.prepared = Some((key, next));
     }
 
     fn prompt(&self) -> &'static str {
@@ -932,7 +950,6 @@ impl Ahau {
     }
 
     fn tap(&mut self, key: Key) {
-        let shift_was = self.kb.shift;
         match self.kb.tap(key) {
             Some(Event::Char(c)) => self.type_char(c),
             Some(Event::Back) => {
@@ -946,53 +963,25 @@ impl Ahau {
                 self.unconfirm();
                 self.entry();
             }
-            // A shift, a page or a layout: the board drawn at the press (`prepare`) copied in, or, without one, redrawn in place.
+            // A shift, a page or a layout: the board, drawn at the press (`prepare`), tinted and copied in.
             Some(Event::Redraw) => {
-                match self.prepared.take() {
-                    Some((k, _)) if k == key => {
-                        self.swap_in();
-                    }
-                    _ => {
-                        self.redraw_keys();
-                    }
-                }
+                self.show_board();
                 return;
             }
             None => return,
         }
-        // Every stroke: the keys take the new handle's rainbow, laid on from the base in one pass. A letter that ended a one-letter shift changed the board too (lower case again): the board prepared at its press copied in, or, without one, redrawn.
+        // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press.
         self.retint();
-        if self.kb.shift != shift_was {
-            match self.prepared.take() {
-                Some((k, _)) if k == key => {
-                    self.swap_in();
-                }
-                _ => {
-                    self.redraw_keys();
-                }
-            }
-        } else {
-            self.apply_tint();
-        }
-        // Any other board prepared under a held key has the old rainbow: it is redrawn at its lift instead.
-        self.prepared = None;
+        self.show_board();
     }
 
-    /// The board drawn at the press copied into the screen's rows, and its base into KB_BASE: the lift's whole cost.
-    fn swap_in(&self) {
-        let (top, bottom) = self.kb_rows();
-        let (a, n) = (top * self.w, (bottom - top) * self.w);
-        let back = unsafe { core::slice::from_raw_parts(self.back as *const u64, self.w * self.h) };
-        self.surf()[a..a + n].copy_from_slice(&back[a..a + n]);
-        unsafe { (&mut *(&raw mut KB_BASE))[..n].copy_from_slice(&(&*(&raw const KB_BASE2))[..n]) };
-    }
 
     /// The keys' rainbow for the handle as typed (owner, 2026-10-29): every key its own hue, the hues spread evenly round the wheel and dealt to the keys by a hash of the handle keyed by the mark's salt (the device's), so the board is always a whole rainbow and every stroke deals it afresh. Each tint is a quarter saturation at the key's own brightness: in linear light the grey mixed a quarter of the way to a hue of the same luminance (Rec. 709 weights), back to gamma 2 as a multiplier per channel.
     fn retint(&mut self) {
         self.kb.tint = Some(self.tint_for(&self.handle[..self.len]));
     }
 
-    /// The rainbow for `handle` (`retint`'s), also for a handle not typed yet: the board a held key will leave is prepared with it (`prepare`).
+    /// The rainbow for `handle` (`retint`'s).
     fn tint_for(&self, handle: &[u8]) -> [[u16; 3]; 64] {
         let salt = unsafe { FRESH_JOB.2 };
         let mut deal = [0u8; 64];
@@ -1282,12 +1271,18 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         b if b == 0 || b == u64::MAX || b == base => 0,
         b => b,
     };
-    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, prepared: None, wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF) };
+    let mut a = Ahau { grants, display, base, w, h, kb, mode, bound, session_seed: None, session_proof: None, roots_pending: false, handle: [0; 4 * MAX_CHARS], len: 0, chars: 0, caret: 0, word_buf: [0; 512], word_len: 0, back, boards: core::cell::Cell::new([None; 2]), shown_board: core::cell::Cell::new(0), wave_top: core::cell::Cell::new(true), blink_next: core::cell::Cell::new(0), blink_rng: core::cell::Cell::new(0xDEAD_BEEF) };
     console(grants, if back != 0 { b"ahau: the keyboard's back buffer is a second surface\n" } else { b"ahau: no second surface: the keyboard redraws in place\n" });
     start_fresh_mark(grants, w / 3);
     a.retint();
     a.all();
     a.show();
+    // The upper-case board drawn ahead too, so the first shift is a tint and a copy.
+    if back != 0 {
+        let mut up = a.kb.clone();
+        up.shift = honeycomb::Shift::Once;
+        a.prepare_board(&up);
+    }
     console(grants, b"ahau: no identity in hand; type the handle\n");
     let mut polls = 0u32;
     let mut touches = Touches::new(w);
@@ -1339,8 +1334,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     slid = true;
                 }
                 Touch::Scrolled => {
-                    a.prepared = None;
-                    a.redraw_keys();
+                    a.show_board();
                 }
                 Touch::Tap(key) => {
                     a.tap(key);
@@ -1353,8 +1347,6 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         if slid {
             publish_fresh_text(&a.handle[..a.len], true);
-            // The key let go without its tap: the board prepared for it is not wanted.
-            a.prepared = None;
         }
         // Following the Photon client's verdict while the identity is looked up or joined: about four times a second.
         polls += 1;
