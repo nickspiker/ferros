@@ -179,6 +179,8 @@ fn serve(grants: u64) -> ! {
     say!(grants, "usb: serving\n");
     let freq = ferros_sys::freq();
     let mut t_init = ferros_sys::now();
+    // When the link was last seen awake (not suspended): `host_gone` below.
+    let mut t_awake = t_init;
     let mut inbound: Option<ferros_pt::InboundTransfer<'static>> = None;
     let mut seq_width = 0usize;
     // The inbound transfer's DATA packets not yet armed for, the run buffer armed now, and how many packets it was armed for (0: the endpoint takes single packets).
@@ -408,8 +410,19 @@ fn serve(grants: u64) -> ! {
             }
         }
 
+        // The host gone, as the kernel's loop had it: configured, but the link suspended for 16 s. A pulled cable looks just like that (no disconnect event; the link goes to sleep and the driver stays configured), so without this the enumeration watchdog below never fired and a replugged cable found the device silent (2026-11-01, twice: the check went out of the kernel with its USB and not into this driver). The link brought up again, as a fresh start: four tries, then a fresh driver.
+        let now = ferros_sys::now();
+        if usb.link_state() != 3 {
+            t_awake = now;
+        }
+        let host_gone = usb.is_configured() && now.wrapping_sub(t_awake) > 16 * freq;
+        if host_gone {
+            say!(grants, "usb: link suspended 16 s while configured: the host has gone, reconnecting\n");
+            t_awake = now;
+            attempts = 0;
+        }
         // Enumeration watchdog, as the kernel's: not configured 4 s after an init, the link is brought up again.
-        if !usb.is_configured() && ferros_sys::now().wrapping_sub(t_init) > 4 * freq {
+        if host_gone || !usb.is_configured() && now.wrapping_sub(t_init) > 4 * freq {
             attempts += 1;
             // Never configured after four tries: this driver gives up, and init's keeper starts a fresh one (the link readied again from the start).
             if attempts > 4 {
