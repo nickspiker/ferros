@@ -116,3 +116,16 @@ pub fn hwcfg(rep: &mut Vec<u8>) {
     let set = |off: usize, len: usize| (0..len).any(|i| rd8(HANDOVER + off + i) != 0);
     line(rep, alloc::format!("cpid 0, cpid 1, cpsig: {}, {}, {} (not shown)\n", ["zero", "set"][set(0x40, 16) as usize], ["zero", "set"][set(0x50, 16) as usize], ["zero", "set"][set(0x60, 64) as usize]));
 }
+
+/// ABL's bootconfig as it was at this boot (`keep_bootconfig`), for `diag bootconfig`: what the gate will key on to tell a recovery boot from a normal one (2026-11-01: AOSP passes androidboot.force_normal_boot=1 on a normal boot and leaves it out for recovery; checked on husky before the gate relies on it).
+pub static mut BOOTCONFIG: Option<Vec<u8>> = None;
+
+/// Keep a copy of ABL's bootconfig (a real boot only, while ABL's initrd is still in place).
+pub fn keep_bootconfig(dtb_addr: u64) {
+    let Some(dtb) = (unsafe { ferros_hal::dtb::Dtb::from_ptr(dtb_addr as *const u8) }) else {
+        return;
+    };
+    if let Some(t) = bootconfig(&dtb) {
+        unsafe { BOOTCONFIG = Some(Vec::from(t)) };
+    }
+}

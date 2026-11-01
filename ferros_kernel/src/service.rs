@@ -1563,6 +1563,15 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"bootconfig" {
+                    // `diag bootconfig`: ABL's bootconfig for this boot, as kept at entry (modem.rs `keep_bootconfig`): normal and recovery boots compared, for the gate's recovery check.
+                    match unsafe { (*(&raw const crate::modem::BOOTCONFIG)).as_ref() } {
+                        Some(t) => resp.extend_from_slice(t),
+                        None => resp.extend_from_slice(b"no bootconfig kept (not a real boot, or none found)\n"),
+                    }
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"facts" {
                     // `diag facts`: the sensor words of SYS_FACTS as a process receives them, and whether the sensors process has published its block (sensorlink.rs).
                     let v = crate::process::with_lock(facts);

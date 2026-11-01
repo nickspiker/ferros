@@ -1845,6 +1845,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let at = copy.as_ref().map_or(dtb_addr, |v| v.as_ptr() as u64);
         sensorlink::read_board(at);
         modem::read_board(at);
+        modem::keep_bootconfig(at);
     }
     checklist::at("board read");
     if cached {
