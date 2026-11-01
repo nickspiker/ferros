@@ -2753,7 +2753,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             }
                             pipe.settle(&mut armed, true);
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                            publish_app(changed, &tabs, k, width, height);
+                            // Everything phase k owes, which now holds `changed`: it is about to be shown, and its dirty region is cleared below. Publishing `changed` alone dropped what it still owed from earlier shows, and stale strips of older frames flashed as the phases rotated (2026-11-01).
+                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height);
                             unsafe {
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
                                 CUR_PHASE = k;
