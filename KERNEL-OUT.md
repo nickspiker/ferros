@@ -47,3 +47,9 @@ Each move so far followed the same shape:
 ## Record
 
 - 2026-10-31: USB steps 1-5 (partial) — USB.md.
+- 2026-10-31: **touch (move 1).**
+  - The kernel keeps a `touch` power switch (touch.rs `power`: the port's clocks, reset low, DVDD, 1 ms, AVDD, 15 ms, reset high; init slot 91). The handshake moved into `payloads/touch`: the ready event, the GPIO6 fix-up, the chip ID, scan mode.
+  - The kernel no longer brings touch up in `start_home`.
+  - The touch payload now links position-independent and relocates at entry, because its console lines format.
+  - Verified from cold by hand (`diag "touch off"`, then `restart touch`) and through a slot b cold boot: controller ready after 12 ms, chip G#3640, scan mode set, serving.
+  - Not yet verified: a finger on the glass (nobody here). The kernel's `diag touch …` tools stay until then.
