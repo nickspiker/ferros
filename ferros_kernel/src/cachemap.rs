@@ -68,9 +68,11 @@ pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
 /// The USB controller's registers (DWC3, G#1121_0000, 64 KiB), EL0 Device memory for the USB driver process (USB.md: USB out of the kernel), its 2 MiB block mapped as the modem's windows are: nothing else lives in G#1120_0000-G#1140_0000 (zuma device tree). Granted as `usb-regs`.
 pub const USB_REGS: (usize, usize) = (0x1120_0000, 0x1140_0000);
-/// The USB driver's DMA memory (cold only): 8 MiB of Normal non-cacheable, EL0 read/write memory, 8 MiB aligned: the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem, the receive ring) in the first 2 MiB, a PT command assembled in the 6 MiB after (payloads/usb). No reserved-memory node of the device tree lies below G#9000_0000, so this is ferros's own: above the camera's diagnostic buffers (which end at G#8B10_0000), up to the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
+/// The USB driver's DMA memory (cold only): 8 MiB of EL0 read/write memory, 8 MiB aligned: the controller's event ring, TRBs and buffers (ferros_hal::usb::UsbMem, the run buffer) in the first 2 MiB, Normal non-cacheable (`USB_DMA_NC`); a PT command assembled in the 6 MiB after (payloads/usb), cacheable. No reserved-memory node of the device tree lies below G#9000_0000, so this is ferros's own: above the camera's diagnostic buffers (which end at G#8B10_0000), up to the display's dither phases (G#8C00_0000). Granted as `usb-dma`.
 #[cfg(not(shim_handoff))]
 pub const USB_DMA: (usize, usize) = (0x8B80_0000, 0x8C00_0000);
+/// How much of `USB_DMA`, from its start, is non-cacheable: the controller's block and the run buffer, which the controller reads and writes. The rest is the driver's command area, which only the CPU touches (the process, and the kernel copying a command out), so it is Normal cacheable, EL0, never executable: decoding 2 MiB of packets straight out of non-cacheable memory took the process 2.2 s of CPU (2026-10-31).
+pub const USB_DMA_NC: usize = 2 << 20;
 #[cfg(shim_handoff)]
 pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
@@ -237,9 +239,9 @@ pub fn enable() -> bool {
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.1) {
+            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) {
                 dma_pool(vhe, a, BLOCK)
-            } else if h0 != h1 && a >= h0 && a + MIB2 <= h1 {
+            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) {
                 pool(vhe, a, BLOCK) | UXN
             } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
                 pool(vhe, a, BLOCK)

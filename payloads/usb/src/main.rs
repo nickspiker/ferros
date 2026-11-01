@@ -119,22 +119,31 @@ fn diag(grants: u64) -> ! {
     }
 }
 
-/// The DMA region's layout: the controller's block first, then the bitmaps, then 6 MiB that holds a command as it arrives and, once the kernel has it, the kernel's reply as it goes out (the host waits for one before it sends the next).
+/// The DMA region's layout:
+/// - the controller's block;
+/// - the inbound and outbound bitmaps;
+/// - the run buffer, 1 MiB: a run of 512-byte packets as it comes in (a transfer's DATA) or goes out (a reply's SPEC and DATA), 2048 at a time;
+/// - the area, 6 MiB: a command as it is assembled and, once the kernel has it, the kernel's reply as it goes out (the host waits for one before it sends the next).
 const MEM_AT: usize = 0;
 const IN_BITMAP_AT: usize = 1 << 16;
 const OUT_BITMAP_AT: usize = 3 << 15;
+const RUN_AT: usize = 1 << 20;
+const RUN_PACKETS: usize = 1 << 11;
 const AREA_AT: usize = 2 << 20;
 const AREA_LEN: usize = 6 << 20;
+const PACKET: usize = 512;
 
-/// A reply going out: the SPEC first, then each DATA packet, each in a 512-byte USB packet as the kernel's own USB sends them.
+/// A reply going out, in runs: the SPEC first, then the DATA packets, each padded to 512 bytes as the kernel's own USB sends them.
 struct Out {
     ob: ferros_pt::OutboundTransfer<'static>,
     reply: &'static [u8],
-    spec: [u8; 512],
+    spec: [u8; PACKET],
     spec_sent: bool,
 }
 
-/// `s`: the USB driver. Takes the controller from the kernel (the `usb` power switch readies the PHY and the DMA path), resets and runs it with ferros_hal's DWC3 code over this process's grants, and serves Photon Transport: each command received whole goes to the kernel (SYS_PT), its reply back to the host. Polled for now; the interrupt and the receive ring come next (USB.md step 4).
+/// `s`: the USB driver. Takes the controller from the kernel (the `usb` power switch readies the PHY and the DMA path), resets and runs it with ferros_hal's DWC3 code over this process's grants, and serves Photon Transport: each command received whole goes to the kernel (SYS_PT), its reply back to the host.
+///
+/// A transfer's DATA comes in runs: after the SPEC is acknowledged, the OUT endpoint is armed for up to 2048 packets at once straight into the run buffer, so a megabyte costs one completion instead of 2048. Replies go out the same way. Polled for now; the interrupt comes next (USB.md step 4).
 fn serve(grants: u64) -> ! {
     use ferros_hal::usb::{Dwc3Dev, UsbEvent, UsbMem};
     use ferros_pt::packet;
@@ -142,13 +151,12 @@ fn serve(grants: u64) -> ! {
     let dma = ferros_sys::dma(cap(grants, S_DMA)) as usize;
     let pt = cap(grants, S_PT);
     let power = cap(grants, S_POWER);
-    // SAFETY: the DMA grant is this process's alone, 8 MiB, mapped Normal non-cacheable at its physical address; these regions do not overlap.
-    let area: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut((dma + AREA_AT) as *mut u8, AREA_LEN) };
-    let in_bitmap: &'static mut [u64] = unsafe { core::slice::from_raw_parts_mut((dma + IN_BITMAP_AT) as *mut u64, (OUT_BITMAP_AT - IN_BITMAP_AT) / 8) };
-    let out_bitmap: &'static mut [u64] = unsafe { core::slice::from_raw_parts_mut((dma + OUT_BITMAP_AT) as *mut u64, (AREA_AT - OUT_BITMAP_AT) / 8) };
-    let area = area as *mut [u8];
-    let in_bitmap = in_bitmap as *mut [u64];
-    let out_bitmap = out_bitmap as *mut [u64];
+    let run = dma + RUN_AT;
+    // SAFETY: the DMA grant is this process's alone, 8 MiB, mapped Normal non-cacheable at its physical address; these regions do not overlap, and each is used by one transfer at a time.
+    let area = unsafe { core::slice::from_raw_parts_mut((dma + AREA_AT) as *mut u8, AREA_LEN) } as *mut [u8];
+    let in_bitmap = unsafe { core::slice::from_raw_parts_mut((dma + IN_BITMAP_AT) as *mut u64, (OUT_BITMAP_AT - IN_BITMAP_AT) / 8) } as *mut [u64];
+    let out_bitmap = unsafe { core::slice::from_raw_parts_mut((dma + OUT_BITMAP_AT) as *mut u64, (RUN_AT - OUT_BITMAP_AT) / 8) } as *mut [u64];
+    let run_buf = |n: usize| -> &'static mut [u8] { unsafe { core::slice::from_raw_parts_mut(run as *mut u8, n * PACKET) } };
 
     if !ferros_sys::power(power, true) {
         say!(grants, "usb: the kernel kept the controller\n");
@@ -157,32 +165,43 @@ fn serve(grants: u64) -> ! {
     ferros_hal::usb::set_dwc3_base(regs);
     ferros_hal::usb::set_usb_mem((dma + MEM_AT) as *mut UsbMem);
     let Some(mut usb) = Dwc3Dev::init() else {
-        say!(grants, "usb: DWC3 init failed\n");
-        ferros_sys::power(power, false);
-        ferros_sys::exit(1);
+        give_back(grants, power, "DWC3 init failed");
     };
     say!(grants, "usb: serving\n");
     let freq = ferros_sys::freq();
     let mut t_init = ferros_sys::now();
     let mut inbound: Option<ferros_pt::InboundTransfer<'static>> = None;
     let mut seq_width = 0usize;
+    // The DATA packets of the inbound transfer still to come, and the run armed for them (0: the endpoint takes single packets).
+    let mut to_come = 0usize;
+    let mut armed_run = 0usize;
+    let mut t_run = 0u64;
     let mut out: Option<Out> = None;
     // A command with the kernel, its reply not yet taken.
     let mut waiting = false;
-    // A command that acts once its reply (or its COMPLETE) is out: a copy of it, to hand over again.
+    let mut t_submit = 0u64;
+    // A command that acts once everything before it is out (reload, reboot, `diag android`): a copy of it, to hand over again.
     let mut act: Option<([u8; 256], usize)> = None;
     let mut held = ([0u8; 256], 0usize);
-    let mut t_submit = 0u64;
-    let (mut commands, mut attempts) = (0u64, 1u64);
+    let mut attempts = 1u64;
+    // Timing of the last command: its SPEC, its last packet, its reply from the kernel, and the reply's length.
+    let (mut t_spec, mut t_whole, mut t_reply, mut reply_len) = (0u64, 0u64, 0u64, 0usize);
+    // CPU time in the packet loops: decoding what came in, framing what goes out.
+    let (mut cpu_in, mut cpu_out) = (0u64, 0u64);
+
     loop {
         let ev = usb.poll_event();
         let idle = matches!(ev, UsbEvent::None);
+        // Packets to take this pass: one from the single-packet buffer, or a whole run.
+        let mut packets: &[u8] = &[];
+        let mut single = Packet([0u8; PACKET]);
         match ev {
-            UsbEvent::None => {}
+            UsbEvent::None | UsbEvent::TransferNotReady { .. } => {}
             UsbEvent::Reset => {
                 usb.handle_reset();
                 inbound = None;
                 out = None;
+                armed_run = 0;
             }
             UsbEvent::ConnectDone { .. } => {
                 usb.handle_connect_done();
@@ -193,97 +212,128 @@ fn serve(grants: u64) -> ! {
                 usb.handle_disconnect();
                 inbound = None;
                 out = None;
+                armed_run = 0;
             }
             UsbEvent::Ep0Setup { request } => {
                 if !usb.handle_setup(&request) {
                     usb.ep0_stall();
                 }
             }
-            UsbEvent::TransferComplete { ep } => {
-                if ep == 2 {
-                    let mut pkt = [0u8; 512];
-                    let n = match usb.bulk_out_read() {
-                        Some(d) => {
-                            let n = d.len().min(512);
-                            pkt[..n].copy_from_slice(&d[..n]);
-                            n
-                        }
-                        None => 0,
-                    };
-                    if n > 0 && ferros_pt::is_data_packet(pkt[0]) {
-                        if let Some(x) = inbound.as_mut() {
-                            if let Some((_sid, seq, hash, payload)) = packet::decode_data(&pkt[..n], seq_width) {
-                                x.handle_data(seq, &hash, payload);
-                                if x.all_received() {
-                                    let mut done = [0u8; 512];
-                                    let l = x.finish(&mut done);
-                                    if l > 0 {
-                                        usb.bulk_in_send(&done[..l]);
-                                    }
-                                    let cmd = x.payload();
-                                    commands += 1;
-                                    if cmd.len() <= held.0.len() {
-                                        held.0[..cmd.len()].copy_from_slice(cmd);
-                                        held.1 = cmd.len();
-                                    } else {
-                                        held.1 = 0;
-                                    }
-                                    // Straight from the area: the kernel copies it out of this process's DMA region.
-                                    waiting = ferros_sys::pt_submit_at(pt, ferros_sys::DMA_ADDR | cmd.as_ptr() as u64, cmd.len(), false);
-                                    t_submit = ferros_sys::now();
-                                    if !waiting {
-                                        give_back(grants, power, "the kernel refused a command");
-                                    }
-                                    inbound = None;
-                                }
-                            }
-                        }
-                    } else if n > 0 && ferros_pt::is_control_packet(pkt[0]) {
-                        if let Some(spec) = packet::Spec::decode(&pkt[..n]) {
-                            inbound = None;
-                            out = None;
-                            seq_width = ferros_ledger::ewe::seq_width(spec.count);
-                            let total = spec.total as usize;
-                            let words = ferros_pt::transfer::bitmap_words(spec.count);
-                            // The host's size is external input: over the area, refused as the kernel refuses it (COMPLETE-failed).
-                            if total > AREA_LEN || words > (OUT_BITMAP_AT - IN_BITMAP_AT) / 8 {
-                                let c = packet::Complete { sid: spec.sid, success: false, data_hash: [0; 32] };
-                                let mut b = [0u8; 64];
-                                let l = c.encode(&mut b);
-                                usb.bulk_in_send(&b[..l]);
-                            } else {
-                                // SAFETY: the area and the bitmap are this process's DMA memory (above), used by one transfer at a time.
-                                let x = unsafe { ferros_pt::InboundTransfer::new(&spec, &mut (&mut *area)[..total], &mut (&mut *in_bitmap)[..words]) };
-                                if let Some(x) = x {
-                                    let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
-                                    let mut b = [0u8; 64];
-                                    let l = ack.encode(&mut b);
-                                    usb.bulk_in_send(&b[..l]);
-                                    inbound = Some(x);
-                                }
-                            }
-                        }
-                    }
-                    usb.bulk_out_arm();
+            UsbEvent::TransferComplete { ep: 2 } => {
+                if armed_run > 0 {
+                    let n = usb.bulk_out_received().unwrap_or(0);
+                    armed_run = 0;
+                    packets = &run_buf(RUN_PACKETS)[..n - n % PACKET];
+                } else if let Some(d) = usb.bulk_out_read() {
+                    let n = d.len().min(PACKET);
+                    single.0[..n].copy_from_slice(&d[..n]);
+                    packets = &single.0[..];
                 }
             }
-            UsbEvent::TransferNotReady { .. } => {}
+            UsbEvent::TransferComplete { .. } => {}
         }
+
+        let t_cpu = ferros_sys::now();
+        let mut local = Packet([0; PACKET]);
+        for k in 0..packets.len() / PACKET {
+            // Each packet into cached memory first, 16 bytes a load: decoding straight out of the non-cacheable run buffer cost a bus round trip per byte.
+            copy_packet(local.0.as_mut_ptr(), packets[k * PACKET..].as_ptr());
+            let pkt = &local.0[..];
+            if ferros_pt::is_data_packet(pkt[0]) {
+                // The host may send more DATA than its SPEC announced (external input): held at zero, or the next run would be armed for 2^64 packets.
+                to_come = to_come.saturating_sub(1);
+                let Some(x) = inbound.as_mut() else { continue };
+                let Some((_sid, seq, hash, payload)) = packet::decode_data(pkt, seq_width) else { continue };
+                x.handle_data(seq, &hash, payload);
+                if !x.all_received() {
+                    continue;
+                }
+                let mut done = [0u8; PACKET];
+                let l = x.finish(&mut done);
+                if l > 0 {
+                    usb.bulk_in_send(&done[..l]);
+                }
+                let cmd = x.payload();
+                t_whole = ferros_sys::now();
+                if cmd.len() <= held.0.len() {
+                    held.0[..cmd.len()].copy_from_slice(cmd);
+                    held.1 = cmd.len();
+                } else {
+                    held.1 = 0;
+                }
+                // Straight from the area: the kernel copies it out of this process's DMA region.
+                waiting = ferros_sys::pt_submit_at(pt, ferros_sys::DMA_ADDR | cmd.as_ptr() as u64, cmd.len(), false);
+                t_submit = ferros_sys::now();
+                inbound = None;
+                to_come = 0;
+                if !waiting {
+                    give_back(grants, power, "the kernel refused a command");
+                }
+            } else if ferros_pt::is_control_packet(pkt[0]) {
+                let Some(spec) = packet::Spec::decode(pkt) else { continue };
+                inbound = None;
+                out = None;
+                seq_width = ferros_ledger::ewe::seq_width(spec.count);
+                let total = spec.total as usize;
+                let words = ferros_pt::transfer::bitmap_words(spec.count);
+                // The host's size is external input: over the area, refused as the kernel refuses it (COMPLETE-failed).
+                let mut b = [0u8; 64];
+                if total > AREA_LEN || words > (OUT_BITMAP_AT - IN_BITMAP_AT) / 8 {
+                    let c = packet::Complete { sid: spec.sid, success: false, data_hash: [0; 32] };
+                    let l = c.encode(&mut b);
+                    usb.bulk_in_send(&b[..l]);
+                    continue;
+                }
+                // SAFETY: as above.
+                let x = unsafe { ferros_pt::InboundTransfer::new(&spec, &mut (&mut *area)[..total], &mut (&mut *in_bitmap)[..words]) };
+                if let Some(x) = x {
+                    let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
+                    let l = ack.encode(&mut b);
+                    usb.bulk_in_send(&b[..l]);
+                    inbound = Some(x);
+                    to_come = spec.count as usize;
+                    t_spec = ferros_sys::now();
+                }
+            }
+        }
+
+        cpu_in += ferros_sys::now().wrapping_sub(t_cpu);
+        // The OUT endpoint after a completion: the next run of the inbound transfer's DATA, or single packets (a SPEC, a command's end).
+        if matches!(ev, UsbEvent::TransferComplete { ep: 2 }) {
+            if inbound.is_some() && to_come > 0 {
+                armed_run = to_come.min(RUN_PACKETS);
+                usb.bulk_out_arm_at(run, armed_run * PACKET);
+                t_run = ferros_sys::now();
+            } else {
+                usb.bulk_out_arm();
+            }
+        }
+        // A run that stops filling (the host gave up mid-transfer): dropped, back to single packets, so the host's next SPEC is heard.
+        if armed_run > 0 && ferros_sys::now().wrapping_sub(t_run) > 2 * freq {
+            armed_run = 0;
+            inbound = None;
+            to_come = 0;
+            usb.bulk_out_arm();
+        }
+
         // The kernel's reply, taken into the area (the command there is the kernel's now) and started on its way out.
         if waiting {
             match ferros_sys::pt_take_at(pt, 0, ferros_sys::DMA_ADDR | (dma + AREA_AT) as u64, AREA_LEN) {
                 // While the driver settles: a command the kernel never answers gives the controller back, so the bridge keeps a way in.
                 ferros_sys::PtReply::Running if ferros_sys::now().wrapping_sub(t_submit) > 16 * freq => give_back(grants, power, "no reply from the kernel in 16 s"),
-                ferros_sys::PtReply::Running => {}
+                ferros_sys::PtReply::Running => ferros_sys::sleep_until(ferros_sys::now() + freq / 16384),
                 ferros_sys::PtReply::None => waiting = false,
                 ferros_sys::PtReply::Done(total, replied, wants_act) => {
                     waiting = false;
+                    t_reply = ferros_sys::now();
+                    reply_len = total;
                     if wants_act && held.1 > 0 {
                         act = Some(held);
                     }
                     if replied && total <= AREA_LEN {
+                        // SAFETY: as above; the area holds the reply until it is out.
                         let reply: &'static [u8] = unsafe { &(&*area)[..total] };
-                        let mut spec = [0u8; 512];
+                        let mut spec = [0u8; PACKET];
                         let bm = unsafe { &mut (&mut *out_bitmap)[..ferros_pt::transfer::outbound_bitmap_words(total)] };
                         if let Some((ob, _)) = ferros_pt::OutboundTransfer::start(ferros_pt::StreamId::FIRST, reply, bm, &mut spec) {
                             out = Some(Out { ob, reply, spec, spec_sent: false });
@@ -292,32 +342,50 @@ fn serve(grants: u64) -> ! {
                 }
             }
         }
-        // The reply out one 512-byte packet at a time, as the bulk endpoint frees.
-        let mut sent = false;
+
+        // The reply out in runs of up to 2048 packets, each run framed into the run buffer while the endpoint is free.
         if let Some(o) = out.as_mut() {
             if usb.bulk_in_is_idle() {
-                if !o.spec_sent {
-                    usb.bulk_in_send(&o.spec);
-                    o.spec_sent = true;
-                } else {
-                    let mut p = [0u8; 512];
-                    if o.ob.next_data_packet(o.reply, &mut p) > 0 {
-                        usb.bulk_in_send(&p);
+                if o.spec_sent && o.ob.all_sent() {
+                    out = None;
+                    // Where a large command's time went (USB.md step 4 measurements), into the console: receiving it, the kernel, sending the reply.
+                    if reply_len >= 1 << 16 || t_whole.wrapping_sub(t_spec) > freq / 64 {
+                        let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / freq;
+                        say!(grants, "usb: in A#{} us (CPU A#{} us), kernel A#{} us, reply A#{} bytes out in A#{} us (CPU A#{} us)\n", us(t_spec, t_whole), us(0, cpu_in), us(t_submit, t_reply), reply_len, us(t_reply, ferros_sys::now()), us(0, cpu_out));
+                        (cpu_in, cpu_out) = (0, 0);
                     }
+                } else {
+                    let t_cpu = ferros_sys::now();
+                    // Each packet framed in cached memory, then written to the run buffer 16 bytes a store.
+                    let mut local = Packet([0; PACKET]);
+                    let mut n = 0usize;
+                    if !o.spec_sent {
+                        local.0.copy_from_slice(&o.spec);
+                        copy_packet(run as *mut u8, local.0.as_ptr());
+                        o.spec_sent = true;
+                        n = 1;
+                    }
+                    while n < RUN_PACKETS && !o.ob.all_sent() {
+                        local.0.fill(0);
+                        if o.ob.next_data_packet(o.reply, &mut local.0) == 0 {
+                            break;
+                        }
+                        copy_packet((run + n * PACKET) as *mut u8, local.0.as_ptr());
+                        n += 1;
+                    }
+                    usb.bulk_in_send_at(run, n * PACKET);
+                    cpu_out += ferros_sys::now().wrapping_sub(t_cpu);
                 }
-                sent = true;
-            }
-            if o.spec_sent && o.ob.all_sent() {
-                out = None;
             }
         }
+
         // A command that acts (reload, reboot, `diag android`): once everything before it is out, handed over again to act.
         if out.is_none() && !waiting && usb.bulk_in_is_idle() {
             if let Some((c, l)) = act.take() {
-                say!(grants, "usb: acting on command A#{commands}\n");
                 ferros_sys::pt_submit(pt, &c[..l], true);
             }
         }
+
         // Enumeration watchdog, as the kernel's: not configured 4 s after an init, the link is brought up again.
         if !usb.is_configured() && ferros_sys::now().wrapping_sub(t_init) > 4 * freq {
             attempts += 1;
@@ -331,10 +399,12 @@ fn serve(grants: u64) -> ! {
             }
             inbound = None;
             out = None;
+            armed_run = 0;
             t_init = ferros_sys::now();
-            say!(grants, "usb: re-initialised (attempt A#{attempts})\n");
         }
-        if idle && !sent && inbound.is_none() && !waiting {
+
+        // Nothing moving: sleep a little (an eighth of a millisecond) instead of spinning a core.
+        if idle && inbound.is_none() && out.is_none() && !waiting {
             ferros_sys::sleep_until(ferros_sys::now() + freq / 8192);
         }
     }
@@ -345,4 +415,15 @@ fn give_back(grants: u64, power: u64, why: &str) -> ! {
     say!(grants, "usb: {why}; giving the controller back\n");
     ferros_sys::power(power, false);
     ferros_sys::exit(2)
+}
+
+/// One packet's bytes, aligned for 16-byte loads and stores.
+#[repr(C, align(16))]
+struct Packet([u8; PACKET]);
+
+/// One 512-byte packet between the run buffer (non-cacheable) and cached memory, 16 bytes a load and a store: from non-cacheable memory every load is a round trip to DRAM, so its width is the throughput. Both pointers are 16-byte aligned (`Packet`, and the run buffer's 512-byte slots).
+fn copy_packet(dst: *mut u8, src: *const u8) {
+    for i in 0..PACKET / 16 {
+        unsafe { core::ptr::write_volatile((dst as *mut u128).add(i), core::ptr::read_volatile((src as *const u128).add(i))) };
+    }
 }

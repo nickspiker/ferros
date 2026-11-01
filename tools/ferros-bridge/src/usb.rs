@@ -78,6 +78,17 @@ impl UsbLink {
         completion.status
     }
 
+    /// Send a run of whole 512-byte packets (`data`, a multiple of 512) in one bulk transfer: the host controller puts them on the wire one by one, and the phone takes them at its own pace (it NAKs until it is ready), whether its kernel takes one packet at a time or the USB process takes a run.
+    pub async fn send_packets(&self, data: Vec<u8>) -> Result<(), TransferError> {
+        self.interface.bulk_out(self.ep_out, data).await.status
+    }
+
+    /// Receive exactly `len` bytes (a multiple of 512): a run of whole packets in one bulk transfer, which ends when they are all in.
+    pub async fn recv_exact(&self, len: usize) -> Result<Vec<u8>, TransferError> {
+        let completion = self.interface.bulk_in(self.ep_in, RequestBuffer::new(len)).await;
+        completion.status.map(|_| completion.data)
+    }
+
     /// Receive data via bulk IN (up to 512 bytes).
     pub async fn recv(&self) -> Result<Vec<u8>, TransferError> {
         let completion = self

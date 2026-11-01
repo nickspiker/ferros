@@ -769,7 +769,9 @@ pub struct Dwc3Dev {
     bulk_out_resource_idx: u8,  // Transfer resource index for bulk OUT (phys EP 2)
     bulk_in_resource_idx: u8,   // Transfer resource index for bulk IN (phys EP 3)
     /// Bytes received in last bulk OUT transfer
-    pub bulk_out_len: u16,
+    pub bulk_out_len: u32,
+    /// The OUT TRB's size at its last arm: 512 (`bulk_out_arm`), or the run of whole packets `bulk_out_arm_at` asked for.
+    bulk_out_size: u32,
     /// New bulk OUT data available for kernel to consume
     pub bulk_out_ready: bool,
     pub bulk_out_armed: bool,
@@ -917,6 +919,7 @@ impl Dwc3Dev {
             bulk_out_resource_idx: 0,
             bulk_in_resource_idx: 0,
             bulk_out_len: 0,
+            bulk_out_size: 512,
             bulk_out_ready: false,
             bulk_out_armed: false,
             bulk_in_idle: true,
@@ -1058,6 +1061,7 @@ impl Dwc3Dev {
             bulk_out_resource_idx: 0,
             bulk_in_resource_idx: 0,
             bulk_out_len: 0,
+            bulk_out_size: 512,
             bulk_out_ready: false,
             bulk_out_armed: false,
             bulk_in_idle: true,
@@ -1157,22 +1161,29 @@ impl Dwc3Dev {
         self.bulk_in_idle
     }
 
+    /// Arm bulk OUT for one 512-byte packet into the block's own buffer (`bulk_out_read`).
     pub fn bulk_out_arm(&mut self) {
+        let buf_addr = unsafe { &raw const (*mem()).bulk_out_buf } as usize;
+        self.bulk_out_arm_at(buf_addr, 512);
+    }
+
+    /// Arm bulk OUT to receive a run of `len` bytes (whole 512-byte packets) straight into DMA memory at `buf_addr` (VA = PA, non-cacheable): the driver process's way to take a PT transfer's DATA in one completion instead of one per packet. The transfer completes when the run is full or a short packet ends it; `bulk_out_received` then says how much came.
+    pub fn bulk_out_arm_at(&mut self, buf_addr: usize, len: usize) {
         self.bulk_out_armed = true;
+        self.bulk_out_size = len as u32;
 
         // ENDTRANSFER only if a transfer is actually in flight (resource index nonzero — XferComplete zeroes it). The old unconditional ENDTRANSFER errored a DEPCMD on every normal re-arm and is the prime suspect for the spurious len=0 ep2 event that eats the first PT DATA packet.
         if self.bulk_out_resource_idx != 0 {
             self.force_end_transfer_unconditional(2);
         }
 
-        let buf_addr = unsafe { &raw const (*mem()).bulk_out_buf } as usize;
         let trb_addr = unsafe { &raw mut (*mem()).bulk_out_trb.trb } as usize;
 
         unsafe {
             let trb = &raw mut (*mem()).bulk_out_trb.trb;
             (*trb).bpl = buf_addr as u32;
             (*trb).bph = (buf_addr >> 32) as u32;
-            (*trb).size = 512;
+            (*trb).size = len as u32;
             (*trb).ctrl = TRB_CTRL_HWO | TRB_CTRL_LST | TRB_CTRL_IOC
                 | TRB_CTRL_ISP_IMI
                 | (TRBCTL_NORMAL << TRB_CTRL_TRBCTL_SHIFT);
@@ -1202,15 +1213,22 @@ impl Dwc3Dev {
         if !self.bulk_in_idle { return false; }
         let len = data.len().min(4096);
         if len == 0 { return false; }
-
         let buf_addr = unsafe { &raw const (*mem()).bulk_in_buf } as usize;
-        let trb_addr = unsafe { &raw mut (*mem()).bulk_in_trb.trb } as usize;
-
         unsafe {
             let dst = &raw mut (*mem()).bulk_in_buf.data as *mut u8;
             for i in 0..len {
                 core::ptr::write_volatile(dst.add(i), data[i]);
             }
+        }
+        self.bulk_in_send_at(buf_addr, len)
+    }
+
+    /// Start bulk IN straight from DMA memory at `buf_addr` (VA = PA, non-cacheable), `len` bytes up to the TRB's 16 MiB: the driver process's way to send a run of PT packets in one transfer. False if one is already in progress.
+    pub fn bulk_in_send_at(&mut self, buf_addr: usize, len: usize) -> bool {
+        if !self.bulk_in_idle { return false; }
+        let trb_addr = unsafe { &raw mut (*mem()).bulk_in_trb.trb } as usize;
+
+        unsafe {
             core::arch::asm!("dsb sy");
 
             let trb = &raw mut (*mem()).bulk_in_trb.trb;
@@ -1243,6 +1261,13 @@ impl Dwc3Dev {
             self.bulk_in_resource_idx = ((cmd_reg >> 16) & 0x7F) as u8;
         }
         true
+    }
+
+    /// How many bytes a run armed with `bulk_out_arm_at` received (consumes the completion, as `bulk_out_read` does). None if nothing completed.
+    pub fn bulk_out_received(&mut self) -> Option<usize> {
+        if !self.bulk_out_ready { return None; }
+        self.bulk_out_ready = false;
+        Some(self.bulk_out_len as usize)
     }
 
     /// Read received bulk OUT data. Returns slice of received bytes, or None if no data available. Caller must call bulk_out_arm() after.
@@ -1547,7 +1572,8 @@ impl Dwc3Dev {
                         self.bulk_out_xfer_complete += 1;
                         unsafe {
                             let remaining = (*mem()).bulk_out_trb.trb.size & 0x00FF_FFFF;
-                            self.bulk_out_len = (512u32.saturating_sub(remaining)) as u16;
+                            // Saturating as before (a spurious event with an untouched TRB must read as nothing, not as a huge length).
+                            self.bulk_out_len = self.bulk_out_size.saturating_sub(remaining);
                             // Snapshot the raw TRB words for VENDOR_REQ_DBG2 — distinguishes a stale cache read (size still 512, HWO set) from a spurious event (TRB untouched) from a normal short read.
                             self.ep2_trb_size_snap = (*mem()).bulk_out_trb.trb.size;
                             self.ep2_trb_ctrl_snap = (*mem()).bulk_out_trb.trb.ctrl;

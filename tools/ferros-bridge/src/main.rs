@@ -404,6 +404,9 @@ fn cmd_status() {
 // PT send (host→device) — unchanged from before
 // ---------------------------------------------------------------------------
 
+/// PT packets per bulk transfer, each way: 2048 (1 MiB), the run the USB process arms at once (payloads/usb `RUN_PACKETS`). The kernel's own USB takes them one packet at a time either way.
+const RUN_BYTES: usize = 1 << 20;
+
 /// Send data to the device via PT and wait for COMPLETE.
 async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     let sid = StreamId::FIRST;
@@ -454,26 +457,41 @@ async fn pt_send(link: &usb::UsbLink, data: &[u8]) -> Result<Complete, String> {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let pace_us: u64 = std::env::var("FERROS_PT_PACE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    // Blast all DATA packets — no ACK wait, USB guarantees delivery
+    // Blast all DATA packets — no ACK wait, USB guarantees delivery. Each is padded to 512 bytes and they go out in runs of `RUN_BYTES` per bulk transfer: one host round trip per run instead of per packet (FERROS_PT_PACE_US > 0 goes back to one packet at a time, paced).
     let mut pkt_buf = [0u8; 512];
     let mut sent = 0u64;
+    let mut batch: Vec<u8> = Vec::with_capacity(RUN_BYTES);
 
     while !xfer.all_sent() {
         let pkt_len = xfer.next_data_packet(data, &mut pkt_buf);
         if pkt_len == 0 {
             break;
         }
+        sent += 1;
+        if pace_us == 0 {
+            let at = batch.len();
+            batch.extend_from_slice(&pkt_buf[..pkt_len]);
+            batch.resize(at + 512, 0);
+            if batch.len() == RUN_BYTES || xfer.all_sent() {
+                link.send_packets(core::mem::replace(&mut batch, Vec::with_capacity(RUN_BYTES)))
+                    .await
+                    .map_err(|e| format!("DATA send failed by pkt {sent}: {e}"))?;
+            }
+            continue;
+        }
 
         link.send(&pkt_buf[..pkt_len])
             .await
             .map_err(|e| format!("DATA send failed at pkt {sent}: {e}"))?;
-        sent += 1;
         // No pacing by default (FERROS_PT_PACE_US, microseconds, to bring it back): the kernel takes one 512-byte packet per USB transfer and re-arms, and until it does the controller NAKs and the host retries, so nothing is lost. The 1 ms tokio sleep that was here (really 1-2 ms) held PT to 215 KB/s; without it 2 MiB went over in 0.62 s, byte-exact both ways (2026-10-31).
         if pace_us > 0 {
             tokio::time::sleep(std::time::Duration::from_micros(pace_us)).await;
         }
     }
 
+    if !batch.is_empty() {
+        link.send_packets(batch).await.map_err(|e| format!("DATA send failed by pkt {sent}: {e}"))?;
+    }
     eprintln!("  {} DATA packets blasted", sent);
 
     // Wait for COMPLETE. Kernel responds when all_received(). Timeout proportional to transfer size: ~1ms per packet + 2s base.
@@ -542,50 +560,35 @@ async fn pt_recv(link: &usb::UsbLink) -> Result<Vec<u8>, String> {
     // Skip SPEC ACK — kernel starts blasting immediately via idle-poll pump. Sending SPEC ACK on OUT would block because the kernel's ep2 may be busy.
     eprintln!("  SPEC ACK skipped (kernel auto-blasts)");
 
-    // Receive DATA blast — silent, no ACKs
+    // Receive the DATA blast — silent, no ACKs. The phone sends exactly `count` packets, each padded to 512 bytes, so they are read in exact runs of up to `RUN_BYTES` per bulk transfer: one host round trip per run instead of per packet. A run ends when its last packet is in; asking for more than is coming would wait for packets that never come.
     let mut received = 0u64;
-
-    loop {
-        let resp = link
-            .recv()
+    let mut left = spec.count as usize;
+    while left > 0 && !xfer.all_received() {
+        let n = left.min(RUN_BYTES / 512);
+        let run = link
+            .recv_exact(n * 512)
             .await
             .map_err(|e| format!("DATA recv failed: {e}"))?;
-
-        if resp.is_empty() {
-            eprintln!("  recv: empty");
-            continue;
+        left -= n;
+        for pkt in run.chunks(512) {
+            if !ferros_pt::is_data_packet(pkt[0]) {
+                eprintln!("  (unexpected packet during recv: {:02x})", pkt[0]);
+                continue;
+            }
+            match packet::decode_data(pkt, xfer.seq_width) {
+                Some((_sid, seq, chunk_hash, payload)) => {
+                    if xfer.handle_data(seq, &chunk_hash, payload) {
+                        received += 1;
+                    }
+                }
+                None => eprintln!("  DATA decode failed"),
+            }
         }
-
-        eprintln!("  recv: {} bytes first=G#{:02x}", resp.len(), resp[0]);
-
-        if ferros_pt::is_data_packet(resp[0]) {
-            if let Some((_sid, seq, chunk_hash, payload)) =
-                packet::decode_data(&resp, xfer.seq_width)
-            {
-                let ok = xfer.handle_data(seq, &chunk_hash, payload);
-                if ok { received += 1; }
-                eprintln!("  DATA seq={} ok={} rcv={}/{}", seq, ok, xfer.chunks_received, xfer.expected_count);
-            } else {
-                eprintln!("  DATA decode failed");
-            }
-
-            // All chunks received? Verify and return (no COMPLETE send needed for response direction)
-            if xfer.all_received() {
-                let mut resp_buf = [0u8; 128];
-                xfer.finish(&mut resp_buf); // verify hash
-                break;
-            }
-        } else if resp[0] == b'F' {
-            // FIN — sender says blast is done. Check what we have.
-            let mut resp_buf = [0u8; 128];
-            xfer.finish(&mut resp_buf);
-            if xfer.state == ferros_pt::TransferState::Done {
-                break;
-            }
-            // If missing chunks, keep receiving (can't NAK without OUT send)
-        } else {
-            eprintln!("  (unexpected packet during recv: {:02x})", resp[0]);
-        }
+    }
+    let mut resp_buf = [0u8; 128];
+    xfer.finish(&mut resp_buf);
+    if !xfer.all_received() {
+        return Err(format!("reply incomplete: {} of {} packets", xfer.chunks_received, xfer.expected_count));
     }
 
     eprintln!("  {} DATA packets received", received);

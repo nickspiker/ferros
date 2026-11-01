@@ -27,13 +27,25 @@ The USB device controller (DWC3 on HSI0) and Photon Transport, the bridge's link
    - The `usb` power switch hands the controller over. On: the kernel stops touching DWC3, closes the Type-C USB switch, brings the eUSB2 PHY up again (the host sees the kernel's device leave) and opens the DMA path. Off: the kernel re-initialises its own USB on the next pass. A process named `usb` gone while it holds the controller is noticed within 4 s, and the kernel takes it back the same way.
    - DIAG: `KERNEL_USB` (1 the kernel drives the controller, 0 the process), `PT_PROC_CMDS`.
    - Verified on a hot-reloaded kernel (`payloads/usb` inputs `d`, `h`, `k`): a `diag` through the endpoint, 3,671 bytes back in 2.1 ms; the controller taken for 2 s and given back, the phone back on the bus about 2 s later; taken by a process that then exited, reclaimed in the same pass; the kernel's own PT unchanged (2 MiB vault round trip byte-exact, 0.7 s each way; reload to the next generation).
-4. **`payloads/usb`** (input `s`). First cut done: the process takes the controller (`power usb on`), resets and runs it with `ferros_hal::usb` unchanged (no allocator; the module no longer needs one), and serves PT. Each command is assembled in its DMA area and handed to the kernel by address (`SYS_PT` takes `DMA_ADDR | address` inside a DMA region the caller holds; an arc offset cannot name memory outside the arc). Reload and reboot act after the COMPLETE is out. While it settles, the process gives the controller back when the host never configures it (four tries), when the kernel refuses a command, or when a reply takes over 16 s. Verified: DIAG through it (`KERNEL_USB=0`); a 2 MiB vault round trip byte-exact, put 1.5 s and get 4.4 s (one 512-byte packet a pass, a sleep while the endpoint is busy); a kernel reload through it, back to kernel USB at the next generation. Still to do:
-   - the controller from cold;
-   - a ring of large OUT buffers and batched IN;
-   - interrupt wake-ups;
-   - PT to the bridge exactly as now.
+4. **`payloads/usb`** (input `s`). First cut done: the process takes the controller (`power usb on`), resets and runs it with `ferros_hal::usb` unchanged (no allocator; the module no longer needs one), and serves PT. Each command is assembled in its DMA area and handed to the kernel by address (`SYS_PT` takes `DMA_ADDR | address` inside a DMA region the caller holds; an arc offset cannot name memory outside the arc). Reload and reboot act after the COMPLETE is out. While it settles, the process gives the controller back when the host never configures it (four tries), when the kernel refuses a command, or when a reply takes over 16 s. Verified: DIAG through it (`KERNEL_USB=0`); a 2 MiB vault round trip byte-exact, put 1.5 s and get 4.4 s (one 512-byte packet a pass, a sleep while the endpoint is busy); a kernel reload through it, back to kernel USB at the next generation.
+   - **[done] Runs.** After a SPEC is acknowledged, the OUT endpoint is armed for up to 2048 packets at once, straight into a 1 MiB run buffer (`ferros_hal::usb` `bulk_out_arm_at`). Replies go out the same way (`bulk_in_send_at`). The bridge writes and reads 1 MiB per bulk transfer (`RUN_BYTES`); the kernel's own USB takes the same transfers a packet at a time.
+   - **[done] Cached command area.** Measured per phase (the driver writes a console line per large command): decoding straight out of non-cacheable memory cost 2.2 s of CPU per 2 MiB. Now only the controller's block and the run buffer stay non-cacheable (`USB_DMA_NC`, 2 MiB), the command area is cached, and each packet moves between the run buffer and the stack 16 bytes a load.
+   - **Now:** a 2 MiB vault round trip, byte-exact.
 
-   A dev switch picks kernel or process USB while it settles.
+     | | Process USB | Kernel USB |
+     |---|---|---|
+     | put | 0.64 s (wire 238 ms; the kernel's seal and write 266 ms) | 0.56 s |
+     | get | 0.43 s (reply out 239 ms) | 0.78 s |
+
+     About 8.8 MB/s each way on the wire; the CPU's share is 30-45 ms.
+   - **Open: the 8.8 MB/s ceiling.** Ruled out:
+     - the CPU;
+     - the FIFOs: GTXFIFOSIZ1 G#253 and GRXFIFOSIZ0 G#209 words, about 9 packets each;
+     - the bus bursts: GSBUSCFG0 G#2222_0001, undefined-length INCR.
+
+     Next suspects: the host keeping only one transfer in flight, and the endpoint's burst setting.
+   - Still to do: interrupt wake-ups instead of the 122 µs idle sleep; the controller from cold (today the kernel's `usb` switch readies the PHY); init starting the driver, with a dev switch for kernel or process USB while it settles.
+   - Hazard: a hot reload issued 8 s into a fresh boot left the new kernel hung with the kernel lock held by a worker core (PREV_NOTE_0 = 8). The same reload a minute later was fine. Not yet explained; probably the AoC/Trusty start still running.
 5. **Switch over.** init starts the driver, the kernel stops touching the controller, and the kernel's USB code goes: the event loop, the watchdogs, the gate's host answer and the PT receive. Then the commands move out one at a time, the store first since it is already a clean bytes-to-bytes function.
 
 ## Facts
