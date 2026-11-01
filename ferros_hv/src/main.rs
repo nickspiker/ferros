@@ -635,6 +635,9 @@ unsafe fn stage2_base() -> u64 {
                 i += 1;
             }
         }
+        if cfg!(hv_ufs) {
+            ufs_arm();
+        }
         asm!("dsb sy", "tlbi alle1", "dsb sy", "isb");
         write_volatile(&raw mut S2_READY, true);
     }
@@ -896,9 +899,9 @@ unsafe fn configure_el2() {
     // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
     // The flush is local: this core's EL1 TLB is empty on a first boot and after a power-down anyway, and a broadcast (ALLE1IS) on every resume of nine cores would be a DVM storm.
     // VTCR_EL2: T0SZ 24 (40-bit IPA), SL0 1 (start at level 1), IRGN/ORGN write-back, SH inner, TG0 4 KiB, PS 40-bit, RES1 bit 31.
-    let vttbr = if cfg!(hv_stage2) { stage2_base() } else { 0 };
+    let vttbr = if cfg!(hv_stage2) || cfg!(hv_ufs) { stage2_base() } else { 0 };
     asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1", "dsb nsh", "isb", v = in(reg) vttbr, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
-    if cfg!(hv_stage2) {
+    if cfg!(hv_stage2) || cfg!(hv_ufs) {
         let hcr: u64;
         asm!("mrs {h}, hcr_el2", h = out(reg) hcr);
         asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr | 1); // VM
@@ -1182,6 +1185,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 unsafe {
                     if wnr == 1 {
                         let v = if srt == 31 { 0 } else { frame[srt] };
+                        // The UFS firewall's doorbell: the commands it starts, read before the device sees them.
+                        if cfg!(hv_ufs) && sas == 2 && pa == UFS_HCI + UTRLDBR {
+                            ufs_doorbell(v as u32);
+                        }
                         let ring_old = if cfg!(hv_modem_ring) && sas == 2 && (pa == MODEM_IPC + 0x18 || pa == MODEM_IPC + 0x24) { Some(read_volatile(pa as *const u32)) } else { None };
                         match sas {
                             0 => write_volatile(pa as *mut u8, v as u8),
@@ -1215,7 +1222,11 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                         logval = v;
                     }
                 }
-                oracle_log(pa, wnr == 1, bytes, logval);
+                if cfg!(hv_ufs) && pa & !0xFFF == UFS_HCI {
+                    ufs_stat(1, 1);
+                } else {
+                    oracle_log(pa, wnr == 1, bytes, logval);
+                }
                 // Only once the oracle is armed: the camera service starts the PDMA during boot too, and a dump that hangs there boot-loops the phone (2026-10-19).
                 // Dumped at start (bit 0 set) and again at stop (0): the walk works since 2026-10-20 but the buffer reads all zeros at start, so it may be the PDMA's output rather than its input; the stop dump shows what the engine left there.
                 // And mid-stream: the descriptor index (PDMA + G#10, +G#10 per frame) reaching G#100, while the lists are certainly still mapped (at stop the HAL had sometimes already unmapped them, 2026-10-20).
@@ -1718,5 +1729,168 @@ mod fdt {
         wr32(dst + 12, (off_strings + node_len) as u32);
         wr32(dst + 36, (size_struct + node_len) as u32);
         Some(new_total)
+    }
+}
+
+// ---------------------------------------------------------------- the UFS firewall (HV.md M1)
+//
+// Under FERROS_HV_UFS the host controller's standard registers (zuma-ufs.dtsi reg 0: G#1320_0000, G#200 bytes, alone in their page) are unmapped from Android: every access traps to EL2 and is performed here (the 0x24 handler). At a doorbell write each newly started command is read from Android's list before the device sees it — the UFS DMA has no IOMMU on zuma (dma-coherent, no iommus), so the list's addresses are physical.
+// This first build only counts (2026-11-01: measure before the firewall refuses anything): what Android writes where, in a normal day's use. The counters live in the ramoops result block, which survives a warm reset: `adb reboot` back to ferros, then `bridge read FD600E00 80`.
+
+const UFS_HCI: u64 = 0x1320_0000;
+const UTRLBA: u64 = 0x50;
+const UTRLBAU: u64 = 0x54;
+const UTRLDBR: u64 = 0x58;
+/// LU0's protected runs, from this device's GPT (read 2026-11-01): each slot's boot chain, boot_* to pvmfw_* (boot, init_boot, vendor_boot, vendor_kernel_boot, dtbo, the three vbmetas, pvmfw); and the ferros partition (the vault). 4 KiB blocks.
+const BOOT_CHAIN: [(u64, u64); 2] = [(153_478, 209_077), (260_278, 315_877)];
+const FERROS_PART: (u64, u64) = (28_881_920, 62_436_346);
+/// frp's last block: its final byte is "OEM unlocking allowed" (Android's persistent data block), read G#01 on 2026-11-01.
+const FRP_TAIL: u64 = 37_253;
+/// Pixel's PRDT entry: the standard 16 bytes and 112 of inline-encryption fields (ufs-pixel-crypto.c `pixel_ufs_prdt_entry`); des3 bit 31 enables encryption, its low 18 bits are the byte count less one.
+const PRDT_ENTRY: u64 = 128;
+const PRDT_CRYPTO: u32 = 1 << 31;
+/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list or descriptor was outside DRAM.
+const UFS_STATS: usize = 0xFD60_0E00;
+const UFS_MAGIC: u64 = 0x5546_5346_5731_0000; // "UFSFW1"
+
+fn ufs_stat(i: usize, add: u64) {
+    unsafe {
+        let p = (UFS_STATS + 8 * i) as *mut u64;
+        write_volatile(p, read_volatile(p).wrapping_add(add));
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+    }
+}
+
+fn ufs_set(i: usize, v: u64) {
+    unsafe {
+        let p = (UFS_STATS + 8 * i) as *mut u64;
+        write_volatile(p, v);
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+    }
+}
+
+/// Called once, while stage 2 is built: the counters zeroed and stamped, the page unmapped.
+unsafe fn ufs_arm() {
+    for i in 0..19 {
+        ufs_set(i, 0);
+    }
+    ufs_set(0, UFS_MAGIC);
+    stage2_unmap(UFS_HCI);
+}
+
+fn rd32(pa: u64) -> u32 {
+    unsafe { read_volatile(pa as *const u32) }
+}
+
+/// A doorbell write of `bits`: each command it starts that was not already running, read from Android's list (before the real write reaches the device).
+unsafe fn ufs_doorbell(bits: u32) {
+    let running = read_volatile((UFS_HCI + UTRLDBR) as *const u32);
+    let list = (read_volatile((UFS_HCI + UTRLBAU) as *const u32) as u64) << 32 | read_volatile((UFS_HCI + UTRLBA) as *const u32) as u64;
+    let mut new = bits & !running;
+    while new != 0 {
+        let slot = new.trailing_zeros() as u64;
+        new &= new - 1;
+        ufs_command(list + slot * 32);
+    }
+}
+
+/// One command: its UTRD at `utrd`, its UCD (command UPIU, then the PRDT) where the UTRD says. WHY/PROOF the DRAM checks: every address here is Android's, external input; a read outside DRAM could land on a device register or a hole (an SError at EL2).
+unsafe fn ufs_command(utrd: u64) {
+    ufs_stat(2, 1);
+    if !in_dram(utrd) || !in_dram(utrd + 31) {
+        ufs_stat(18, 1);
+        return;
+    }
+    let ucd = ((rd32(utrd + 0x14) as u64) << 32 | rd32(utrd + 0x10) as u64) & !0x7F;
+    let w7 = rd32(utrd + 0x1C);
+    let (prdtl, prdto) = ((w7 >> 16) as u64, (w7 & 0xFFFF) as u64 * 4);
+    if !in_dram(ucd) || !in_dram(ucd + 31) {
+        ufs_stat(18, 1);
+        return;
+    }
+    let b = |o: u64| read_volatile((ucd + o) as *const u8);
+    // A command UPIU only (transaction type 1): queries and NOPs carry no SCSI command.
+    if b(0) & 0x3F != 0x01 {
+        return;
+    }
+    let lun = b(2) as u64;
+    let cdb = ucd + 16;
+    let c = |i: u64| read_volatile((cdb + i) as *const u8) as u64;
+    let op = c(0);
+    let (lba, len) = match op {
+        0x2A => ((c(2) << 24) | (c(3) << 16) | (c(4) << 8) | c(5), (c(7) << 8) | c(8)),
+        0x8A => ((0..8).fold(0, |a, i| a << 8 | c(2 + i)), (0..4).fold(0, |a, i| a << 8 | c(10 + i))),
+        0x28 | 0x88 => {
+            ufs_stat(3, 1);
+            return;
+        }
+        0x42 => {
+            ufs_stat(11, 1);
+            if lun == 0 {
+                ufs_stat(12, 1);
+            }
+            return;
+        }
+        0x3B => {
+            ufs_stat(15, 1);
+            return;
+        }
+        // TEST UNIT READY, INQUIRY, MODE SENSE/SELECT, START STOP, READ CAPACITY, SYNCHRONIZE CACHE, REPORT LUNS, SECURITY PROTOCOL IN/OUT (RPMB), READ BUFFER: no data reaches the flash's blocks.
+        0x00 | 0x03 | 0x12 | 0x15 | 0x55 | 0x1A | 0x5A | 0x1B | 0x25 | 0x9E | 0x35 | 0x91 | 0xA0 | 0xA2 | 0xB5 | 0x3C => return,
+        _ => {
+            ufs_stat(16, 1);
+            ufs_set(17, lun << 56 | op);
+            return;
+        }
+    };
+    // A zero-length write moves no data.
+    if len == 0 {
+        return;
+    }
+    ufs_stat(4, 1);
+    if lun & 0x80 != 0 {
+        ufs_stat(14, 1);
+        return;
+    }
+    if lun != 0 {
+        ufs_stat(13, 1);
+        return;
+    }
+    let end = lba + len - 1;
+    let hits = |r: (u64, u64)| lba <= r.1 && end >= r.0;
+    if BOOT_CHAIN.iter().any(|&r| hits(r)) {
+        ufs_stat(5, 1);
+        ufs_set(6, lun << 56 | lba);
+    }
+    if hits(FERROS_PART) {
+        ufs_stat(7, 1);
+    }
+    if hits((FRP_TAIL, FRP_TAIL)) {
+        ufs_stat(8, 1);
+        // The unlock byte: the write's byte at (FRP_TAIL - lba) blocks + G#FFF, found by walking the PRDT.
+        let mut want = (FRP_TAIL - lba) * 4096 + 0xFFF;
+        let mut e = 0;
+        while e < prdtl {
+            let ent = ucd + prdto + e * PRDT_ENTRY;
+            if !in_dram(ent) || !in_dram(ent + 15) {
+                ufs_stat(18, 1);
+                return;
+            }
+            let addr = (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64;
+            let d3 = rd32(ent + 12);
+            let size = (d3 & 0x3_FFFF) as u64 + 1;
+            if want < size {
+                if d3 & PRDT_CRYPTO != 0 {
+                    ufs_stat(10, 1);
+                }
+                let at = addr + want;
+                if in_dram(at) && read_volatile(at as *const u8) != 0x01 {
+                    ufs_stat(9, 1);
+                }
+                break;
+            }
+            want -= size;
+            e += 1;
+        }
     }
 }
