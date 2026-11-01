@@ -116,3 +116,21 @@ The same split ferros draws everywhere ([ORACLE.md](ORACLE.md), [SEED.md](SEED.m
 | oracle / *ihi* | kernel-mediated, rooted in the on-chip *ira* | `tohu` in software, rooted in `device_secret` |
 
 The wire and the derivations are identical across the split, so the kernel/hardware service drops in under the apps unchanged.
+
+---
+
+## Proposed: the auth and fleet words (2026-10-31, not decided)
+
+Drift found while building the auth flow (AUTH.md), each with a count of where the words are used now, for the owner to rule on. Nothing in the code or docs has been renamed yet; once a ruling is made, the rename is one pass.
+
+| Thing | In use now | Proposed | Why |
+|---|---|---|---|
+| BLAKE3 over the encoded handle | `identity_seed` (713 in code), "identity seed" (111); this file says `handle_seed` (11), defined as `BLAKE3(NFC(handle))` | One word. Either `handle_seed` (it pairs with `handle_proof`, and this file already says it) or `identity_seed` (what the code says). Whichever, fix the formula here: it is `BLAKE3(VsfType::x(handle))` — NFC and the frozen Huffman codebook inside the `x` encoder (photon `types/handle.rs` `to_identity_seed`), not BLAKE3 over NFC bytes. | One word per thing. |
+| What the Photon client gets at pairing | "roots" (175) | Drop "roots": say what is carried — the seed and the proof. | The owner asked "roots = identity seed, phone only secret?": the word hides its contents. |
+| The 32-byte secret only this phone holds (AUTH.md), in the identity key with the ira and the seed | "phone-only secret" (14); unnamed | A name, the owner's. Not "device secret": that is tohu's interim device root here (`device_secret`, 261 uses), a different thing. A candidate in the same register as *ira* and *wairua*: *muna* (te reo: secret, confidential) — to be checked. | A thing without a name gets three descriptions. |
+| The handset | "the phone" (438), "the device" (823) | *device* everywhere (as this file and the attest screen's wording say), *phone* only where the handset itself matters (the cord, the glass). | The fleet holds laptops and desktops too. |
+| The vault's two halves | "device class" / "identity class", "the person's space", "the person's part" | *device class* and *identity class*; drop "space". | AUTH.md's own terms. |
+| A device coming into a fleet | join (1517 uses, many unrelated), bind (870), pair (2606, mostly unrelated), sponsor (330), add | A device **joins** a fleet; an existing member **sponsors** it; the pairing words are the join's check; once the chain names it, the device is **bound** (the kernel's op 3). | Four verbs for one ceremony today. |
+| A device going out of a fleet | leave (Photon op 5), depart (fgtw `DepartReq`, 623), release (the kernel's op 4), remove (the fleet's consent), unbind (8) | The device **departs** (the request and the consent: one word for the protocol, fgtw's); the fleet **removes** it from the chain; the kernel **releases** the device class's hold (wipes the identity class). Drop "leave" and "unbind". | Five words for one exit. |
+| "gate" | the hv boot gate (slot a/b's Ready?, Android once on volume down; HV.md), the Ready? gate (BOOT.md, ready.rs), the capsule gate (oracle.rs: a capsule spawns only once its signature proves its content), the production gate (`open` in service.rs) | Keep "the Ready? gate" for the boot screen; name the others for what they check: the *boot chooser* (hv), the *signature check* (oracle), the *production lock* (service.rs). | Four different gates in one boot. |
+| attest / unlock | attest (1087), unlock (555) | Keep both, distinct: a person **attests** (types the handle at the attest screen); the identity class **unlocks** (its key is derived and held). | Already distinct; noted so they stay so. |
