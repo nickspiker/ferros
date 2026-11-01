@@ -35,7 +35,7 @@ Each move so far followed the same shape:
 | 6 | Display (`display`, `dpu`, `dsim`) | ~1.3k | `priv_reg` (power-domain check), the boot screen | Merged into the display server, which already drives the panel. The kernel keeps the minimum the boot screen and checklist need before processes exist (`display::show` on ABL's pipe). The boot-time modeset (`start_home`) moves to the display server's start. |
 | 7 | Small drivers (`amp`, `haptics`, `gnss`, `spi`, `fp`), the radios' power switches | ~1k | spi (portable), ACPM, `aoc::probe32` (haptics) | Each its own process; `spi.rs` becomes a shared crate (touch, amp, gnss, nfc all use it). `fp` is a bus hunt: a diag payload. |
 | 8 | `partfs` (ext4/f2fs on Android's partitions) | ~0.4k | the UFS link under the kernel lock | A read-only file server, once a process can be given block access to a partition without the vault's LU. |
-| 9 | Policy in the service loop: the WiFi keeper, the AoC boot sequence, the home start | — | — | init (restart policy is init's). |
+| 9 | Policy in the service loop: the WiFi keeper, the AoC boot sequence, the home start | — | — | init (restart policy is init's). The keeper can tell `pcie1` is gone with no new syscall: a live call on `wlan` (op 3, the MAC) fails at once when nobody serves it. But a probe blocks while `pcie1` is busy joining, so it needs its own thread in init, or it would hold up the map's start at unlock. |
 | 10 | Probes: `cold_ufs`, `shim.rs` | ~0.6k | — | `cold_ufs` (UFS solved 2026-10-14) to a diag payload or out; `shim.rs` stays while the Linux register oracle is used. |
 
 ## Rules for each move
