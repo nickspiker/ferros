@@ -113,6 +113,12 @@ const S_DPU_SYSREG: u64 = 22;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
+/// The frame-start count, as `present`, `arm` and `settle` compare it (truncated: they look only for a change). They read DECON's FRAME_COUNT register until 2026-11-01, which on this pipe stays at 1: `settle` never saw its frame start, left the TE trigger unmasked until a later pass, and the panel re-sent the same frame at up to 120 Hz meanwhile — 68 frame starts a second for the attest screen's 12 presents, which held the kernel's clock policy in its active profile (it counts 24 a second as animating) and the device warm at rest.
+fn frame_no() -> u32 {
+    FRAME_STARTS.load(Ordering::Acquire) as u32
+}
+/// A frame armed (`arm`, `present`): the frame-start thread masks the trigger again when it starts.
+static ONE_FRAME: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut VSYNC_STACK: [u8; 16384] = [0; 16384];
 
 /// The frame-start thread: each start of a frame at DECON clears its pending bit, counts it and wakes whoever waits for it.
@@ -141,6 +147,11 @@ extern "C" fn vsync(grants: u64) -> ! {
             ferros_sys::mmio_write(decon, INT_PEND_EXTRA, extra);
         }
         if pend & INT_EN_FRAME_START != 0 {
+            // An armed frame has started: the TE trigger masked again at once, so the panel gets that one frame. Left to `settle` on the main loop's next pass (up to a sixteenth of a second later), the 120 Hz TE re-sent it meanwhile: about 7 frame starts per 10 Hz dither flip, 70 a second at rest, which held the kernel's clock policy in its active profile (it counts 24 a second as animating) and the device warm (2026-11-01).
+            if ONE_FRAME.swap(false, Ordering::AcqRel) {
+                let t = ferros_sys::mmio_read(decon, TRIG_CON) as u32;
+                ferros_sys::mmio_write(decon, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK);
+            }
             FRAME_STARTS.fetch_add(1, Ordering::Release);
             ferros_sys::wake(&FRAME_STARTS, 4);
         }
@@ -240,7 +251,6 @@ impl ferros_dsi::Link for DsiGrant {
 }
 
 // DECON main (cal_9865 regs-decon.h).
-const FRAME_COUNT: u64 = 0x0004;
 const TRIG_CON: u64 = 0x0030;
 const HW_TRIG_EN: u32 = 1 << 0;
 const HW_TRIG_MASK: u32 = 1 << 4;
@@ -937,7 +947,7 @@ static mut SCENE: [Circle; 256] = [NO_CIRCLE; 256];
 static mut SCENE_N: usize = 0;
 /// Whether the layer is 10-bit (set once at start; `program_layer` reads it).
 static mut TEN: bool = false;
-/// What DECON said when a settle timed out: TRIG_CON, SHD_REG_UP_REQ, FRAME_COUNT, the count it was waiting to move.
+/// What DECON said when a settle timed out: TRIG_CON, SHD_REG_UP_REQ, the frame-start count, the count it was waiting to move.
 static mut SETTLE_TIMEOUT: [u32; 4] = [1; 4];
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
@@ -1035,9 +1045,10 @@ impl Pipe {
         self.wr(S_SRAMC0, 0x0014, (height - 1) << 16);
         self.wr(S_HDRCOMM0, 0x0020, height << 16 | width);
     }
-    /// One frame: the window's and the global shadow update, the TE trigger unmasked until FRAME_COUNT moves (or a quarter second), then masked again. Returns (frames advanced, RDMA_IRQ).
+    /// One frame: the window's and the global shadow update, the TE trigger unmasked until a frame starts (the frame-start interrupt's count, `frame_no`) (or a quarter second), then masked again. Returns (frames advanced, RDMA_IRQ).
     fn present(&self, win: u32) -> (bool, u32) {
-        let f0 = self.rd(S_DECON, FRAME_COUNT);
+        let f0 = frame_no();
+        ONE_FRAME.store(true, Ordering::Release);
         self.wr(S_DECON, SHD_REG_UP_REQ, self.rd(S_DECON, SHD_REG_UP_REQ) | SHD_GLOBAL | SHD_CMP | (1 << win));
         let t = self.rd(S_DECON, TRIG_CON);
         self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_MASK) | HW_TRIG_EN);
@@ -1045,7 +1056,7 @@ impl Pipe {
         let limit = freq() / 4;
         let mut moved = false;
         while now().wrapping_sub(t0) < limit {
-            if self.rd(S_DECON, FRAME_COUNT) != f0 {
+            if frame_no() != f0 {
                 moved = true;
                 break;
             }
@@ -1058,9 +1069,10 @@ impl Pipe {
         self.wr(S_DMA0, RDMA_IRQ, irq & IDMA_IRQ_CLEAR);
         (moved, irq)
     }
-    /// Start a frame and return at once: the shadow update and the TE trigger unmasked; `settle` masks it again once the frame has started. Returns FRAME_COUNT as it was, for `settle`.
+    /// Start a frame and return at once: the shadow update and the TE trigger unmasked; `settle` masks it again once the frame has started. Returns the frame-start count as it was, for `settle`.
     fn arm(&self, win: u32) -> u32 {
-        let f0 = self.rd(S_DECON, FRAME_COUNT);
+        let f0 = frame_no();
+        ONE_FRAME.store(true, Ordering::Release);
         self.wr(S_DECON, SHD_REG_UP_REQ, self.rd(S_DECON, SHD_REG_UP_REQ) | SHD_GLOBAL | SHD_CMP | (1 << win));
         let t = self.rd(S_DECON, TRIG_CON);
         self.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_MASK) | HW_TRIG_EN);
@@ -1071,7 +1083,7 @@ impl Pipe {
         let Some(f0) = *armed else { return };
         let t0 = now();
         loop {
-            if self.rd(S_DECON, FRAME_COUNT) != f0 {
+            if frame_no() != f0 {
                 break;
             }
             if wait {
@@ -1082,7 +1094,7 @@ impl Pipe {
                     return;
                 }
                 unsafe {
-                    SETTLE_TIMEOUT = [self.rd(S_DECON, TRIG_CON), self.rd(S_DECON, SHD_REG_UP_REQ), self.rd(S_DECON, FRAME_COUNT), f0];
+                    SETTLE_TIMEOUT = [self.rd(S_DECON, TRIG_CON), self.rd(S_DECON, SHD_REG_UP_REQ), frame_no(), f0];
                 }
                 break;
             }
