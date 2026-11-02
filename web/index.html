@@ -308,16 +308,16 @@
          <li>Its own kernel, written in 100% Rust from the first instruction with custom chainlifted Rust to assembly for low level bringup. All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
          <li>The display at full resolution, with its own true 16-bit spectral pipeline, no 1931 CIE anywhere. Gradients look real nice! Oh, and touch. You can touch it and it does things.</li>
-         <li>The cameras: the main camera takes pictures from a cold boot.</li>
-         <li>WiFi, cellular data (LTE and 5G), satellite positioning, the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
+         <li>The cameras: the camera takes pitures, so that's fun.</li>
+         <li>WiFi, cellular data (LTE and 5G), satellite positioning (assisted GPS bringup in the works but not currently working), the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
          <li>Keys that live in isolated CPU registers and never touch RAM.</li>
          <li><strong>passless</strong> identity: you type your handle, and nothing of yours is visible until you do.</li>
          <li>The killswitch: both volume keys, held together, and the power is cut below the software. Nothing polls; the key presses are the interrupt. BOOP!</li>
       </ul>
       <p>
-         Android is on the same device, from the same boot image, behind a gate and under a thin hypervisor that ferros owns.
-         A storage firewall under Android stops it writing the boot chain or ferros's store, whatever it has been told to update.
-         It is there for the apps that do not exist yet elsewhere, and for nothing else.
+         Android is on the same device, from the same boot image, behind a gate and under a thin hypervisor that ferros owns. <br>Why?<br>To stop android from fucking with the device without your permission.<br>
+         A storage firewall under Android stops it writing the boot chain or ferros's store, whatever it has been told to update.<br>
+         It is there for the apps that do not exist yet elsewhere, and until the APK service is functional.
       </p>
 
       <h2>What it will never be</h2>
@@ -357,6 +357,28 @@
          <li>Open source, MIT. The kernel, the drivers, the store, the design documents, the bring-up notes, all of it, in one repository, with the commit log as the record.</li>
       </ul>
 
+      <h2>Written from scratch for ferros</h2>
+      <p>Nothing here was ported. Each of these is its own crate, open, and built because what existed carried the assumptions ferros exists to remove:</p>
+      <dl>
+         <dt>VSF</dt>
+         <dd>The one format: every file, every wire, every record. Self-describing, typed, hashed. No JSON, no text parsers.</dd>
+         <dt>Manifestus</dt>
+         <dd>The store: mirrored 4 KiB block devices, a generation ring, copy-on-write hash tries. Every block guards itself; the guards verify each other. No file system was ported.</dd>
+         <dt>Photon Transport</dt>
+         <dd>One transport for every medium: USB today, a single wire on PIPE, the air later. Chunked, each chunk hashed.</dd>
+         <dt>fluor</dt>
+         <dd>The compositor: centre-origin coordinates, every curve derived and continuous, scaled by the harmonic mean of the screen. No pixels in the source.</dd>
+         <dt>tapuwae</dt>
+         <dd>A mark you can recognise, from a hash: a Julia set placed on the Mandelbrot skyline, lit as a disc. The attest screen and every default avatar.</dd>
+         <dt>honeycomb</dt>
+         <dd>The keyboard: a hexagonal grid you write across in one stroke.</dd>
+         <dt>tatau</dt>
+         <dd>Every number a person reads, in the base they chose: dozenal, hexadecimal or decimal. No floats, no allocation.</dd>
+         <dt>tohu, ihi, fgtw, CLUTCH</dt>
+         <dd>Device identity, the identity primitives, the fleet and its scoped keys, the post-quantum key exchange: the stack under passless and Photon, shared with every TOKEN app.</dd>
+         <dt>The kernel and its crates</dt>
+         <dd>The sandbox checker that proves a program cannot reach outside its arc, the append-only ledger, the heap, the display and compression paths, the hypervisor that keeps Android in its place.</dd>
+      </dl>
       <h2>Designed, and still a bet</h2>
       <p><strong>Designed, being built:</strong></p>
       <ul>
