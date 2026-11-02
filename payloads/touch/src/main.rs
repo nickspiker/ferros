@@ -248,10 +248,10 @@ macro_rules! say {
 }
 
 /// Bring the controller up from cold, as the kernel's `touch::up` did until KERNEL-OUT.md move 1: the `touch` power switch (the port's clocks, reset low, DVDD, 1 ms, AVDD, 15 ms, reset high), then the probe's order from the oracle capture — the controller-ready event (up to 2 s), the GPIO6 fix-up (`FTS_GPIO6_UNUSED`: bit 7 of hardware register G#2000_00DE), the chip ID, and scan mode active with every sensing bit on (`A0 00 FF`, after the two-byte zero write to G#2000_0000 the controller needs before a mode change). Each step goes to the console; a step that fails is said and the rest still run, as the kernel's did.
-fn bring_up(p: &Port, grants: u64) {
+fn bring_up(p: &Port, grants: u64) -> bool {
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         console(grants, b"touch: the power switch failed (port clock gated, or a rail)\n");
-        return;
+        return false;
     }
     let t0 = now();
     let mut ready = false;
@@ -259,7 +259,7 @@ fn bring_up(p: &Port, grants: u64) {
         let mut b = [0u8; 1 + EVT_SIZE];
         if !p.transact(&[FIFO_READ], &mut b) {
             console(grants, b"touch: SPI transfer failed waiting for the controller\n");
-            return;
+            return false;
         }
         // An empty FIFO reads as all zeroes or all ones; zero shares its high nibble with controller-ready, so nothing-pending is ruled out first.
         if b[1] == 0x00 || b[1] == 0xFF {
@@ -272,7 +272,7 @@ fn bring_up(p: &Port, grants: u64) {
     let ms = now().wrapping_sub(t0) * 1000 / freq();
     if !ready {
         say!(grants, "touch: no controller-ready event in 2 s\n");
-        return;
+        return false;
     }
     say!(grants, "touch: controller ready after A#{ms} ms\n");
     let mut g = [0u8; 2];
@@ -285,6 +285,7 @@ fn bring_up(p: &Port, grants: u64) {
     }
     let scanning = p.transact(&[HW_REG_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00], &mut []) && p.transact(&[SCAN_MODE, 0x00, 0xFF], &mut []);
     say!(grants, "touch: scan mode {}\n", if scanning { "set" } else { "failed" });
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -293,7 +294,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The bring-up's console lines format through tables of absolute addresses: apply the payload's relocations first.
     unsafe { ferros_sys::relocate() };
     let p = Port { grants };
-    bring_up(&p, grants);
+    // Up to three tries, the controller switched fully off between them: after the jump from Android (the controller still in Android's session) the first bring-up found no controller-ready event, and a restart of this process brought it up (2026-11-01).
+    for attempt in 0..3 {
+        if bring_up(&p, grants) {
+            break;
+        }
+        if attempt < 2 {
+            console(grants, b"touch: powering the controller off and trying again\n");
+            ferros_sys::power(cap(grants, S_POWER), false);
+            delay_us(64_000);
+        }
+    }
     console(grants, b"touch: serving the touch endpoint\n");
     // What is on the glass, and what has happened since the client last asked.
     let mut held = [Contact::default(); SLOTS];
