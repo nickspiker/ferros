@@ -1782,8 +1782,17 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
-    // The hairline's colour: the theme's ring, as the 16-bit working channels.
-    let line = draw::opaque(ferros_sys::theme::current().ring);
+    // The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
+    let line = if option_env!("FERROS_PRODUCTION").is_some() {
+        let ring = draw::opaque(ferros_sys::theme::current().ring);
+        let lin = |sh: u32| { let c = (ring >> sh & 0xFFFF) as f32 * (1.0 / 16384.0); c * c };
+        let light = 0.2584 * lin(0) + 0.6346 * lin(16) + 0.1070 * lin(32);
+        let code = (libm::sqrtf(light * 0.5) * 16384.0) as u64;
+        1 << 63 | code | code << 16 | code << 32
+    } else {
+        let g = (libm::sqrtf(0.5) * 16384.0) as u64;
+        1 << 63 | 16384 | g << 16
+    };
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
