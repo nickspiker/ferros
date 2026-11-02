@@ -1138,6 +1138,12 @@ pub fn run(mut b: Boot) -> ! {
             }
             asleep += slept;
         }
+        // Development, while the jump from Android is brought up: a jumped session that the host has not reached in 60 s (no command from the USB process) leaves a note and resets warm, so the next boot reads its whole log from the pstore ring (tools/husky-pstore.sh). The killswitch, the only other way out of such a session, powers off and the log decays with the RAM (the twenty-seventh jump, 2026-11-02: ferros up, its killswitch armed, no USB, the screen still Android's).
+        #[cfg(not(ferros_production))]
+        if platform::jumped() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
+            platform::pstore(b"ferros: the jump's session: no host in 60 s, resetting warm to keep this log\n");
+            platform::reboot();
+        }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
         let Some(proc_cmd) = crate::process::with_lock(crate::ptlink::take_inbox) else { continue };
         // Every command comes from the process now (the kernel's own USB went 2026-11-01); the name stays for the handlers that answer first and act later.
