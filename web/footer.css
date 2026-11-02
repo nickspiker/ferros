@@ -1,0 +1,19 @@
+footer {
+   margin-top: calc(4 * var(--ru));
+   padding: calc(3 * var(--ru)) 0;
+   text-align: center;
+   color: #8b949e;
+   font-size: calc(1.2 * var(--ru));
+}
+
+footer p {
+   text-align: center;
+   margin-bottom: 0;
+}
+
+footer .tagline {
+   margin-top: calc(0.8 * var(--ru));
+   font-style: italic;
+   color: #6b7280;
+   font-size: calc(2 * var(--ru));
+}

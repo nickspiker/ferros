@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1100" height="400" viewBox="0 0 1100 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <linearGradient id="timeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ffaa00;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#32ff00;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="400" fill="#0a0e13"/>
+
+  <!-- Title -->
+  <text x="550" y="35" font-family="'Oxanium', sans-serif" font-size="26" font-weight="300"
+        fill="#32ff00" text-anchor="middle" filter="url(#glow)">
+    Boot Sequence: 0ms → 1850ms
+  </text>
+
+  <!-- Timeline bar -->
+  <rect x="50" y="80" width="1000" height="30" fill="#1f2937" rx="15"/>
+  <rect x="50" y="80" width="1000" height="30" fill="url(#timeGradient)" rx="15" opacity="0.3"/>
+
+  <!-- Time markers -->
+  <text x="50" y="140" font-family="'IBM Plex Mono', monospace" font-size="12"
+        fill="#8b949e" text-anchor="start">0ms</text>
+  <text x="550" y="140" font-family="'IBM Plex Mono', monospace" font-size="12"
+        fill="#8b949e" text-anchor="middle">925ms</text>
+  <text x="1050" y="140" font-family="'IBM Plex Mono', monospace" font-size="12"
+        fill="#8b949e" text-anchor="end">1850ms</text>
+
+  <!-- Component bars -->
+  <g id="components">
+    <!-- BIOS/CPU/RAM (instant) -->
+    <rect x="50" y="170" width="540" height="25" fill="#32ff00" opacity="0.8" rx="4"/>
+    <text x="60" y="188" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">BIOS + CPU + RAM</text>
+    <text x="580" y="188" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#32ff00">0ms</text>
+
+    <!-- SSD -->
+    <rect x="100" y="205" width="490" height="25" fill="#32ff00" opacity="0.8" rx="4"/>
+    <text x="110" y="223" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">SSD</text>
+    <text x="580" y="223" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#32ff00">50ms</text>
+
+    <!-- Radio -->
+    <rect x="350" y="240" width="890" height="25" fill="#ffaa00" opacity="0.8" rx="4"/>
+    <text x="360" y="258" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">Radio (Connecting...)</text>
+    <text x="1230" y="258" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#ffaa00">300ms → 3500ms</text>
+
+    <!-- Display -->
+    <rect x="400" y="275" width="450" height="25" fill="#ffaa00" opacity="0.8" rx="4"/>
+    <text x="410" y="293" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">Display (Initializing...)</text>
+    <text x="850" y="293" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#ffaa00">350ms → 850ms</text>
+
+    <!-- GPU -->
+    <rect x="851" y="310" width="199" height="25" fill="#32ff00" opacity="0.8" rx="4"/>
+    <text x="861" y="328" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">GPU</text>
+    <text x="1040" y="328" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#32ff00">851ms</text>
+
+    <!-- GUI -->
+    <rect x="851" y="345" width="540" height="25" fill="#ffaa00" opacity="0.8" rx="4"/>
+    <text x="861" y="363" font-family="'IBM Plex Mono', monospace" font-size="13"
+          fill="#0a0e13" font-weight="600">GUI (Loading...)</text>
+    <text x="1380" y="363" font-family="'IBM Plex Mono', monospace" font-size="11"
+          fill="#ffaa00">851ms → 1850ms</text>
+  </g>
+
+  <!-- Scale adjustments -->
+  <g transform="translate(-165, 0)">
+    <rect x="50" y="170" width="2" height="25" fill="#32ff00" opacity="1"/>
+    <rect x="102" y="205" width="2" height="25" fill="#32ff00" opacity="1"/>
+    <rect x="352" y="240" width="2" height="25" fill="#ffaa00" opacity="1"/>
+    <rect x="402" y="275" width="2" height="25" fill="#ffaa00" opacity="1"/>
+    <rect x="1016" y="310" width="2" height="25" fill="#32ff00" opacity="1"/>
+    <rect x="1016" y="345" width="2" height="25" fill="#ffaa00" opacity="1"/>
+  </g>
+
+  <!-- Legend -->
+  <rect x="920" y="170" width="160" height="50" fill="#1f2937" stroke="#32ff00" stroke-width="1" rx="6"/>
+  <rect x="930" y="182" width="20" height="12" fill="#32ff00" opacity="0.8" rx="2"/>
+  <text x="960" y="192" font-family="'IBM Plex Serif', serif" font-size="12" fill="#c9d1d9">
+    Instant/Complete
+  </text>
+  <rect x="930" y="200" width="20" height="12" fill="#ffaa00" opacity="0.8" rx="2"/>
+  <text x="960" y="210" font-family="'IBM Plex Serif', serif" font-size="12" fill="#c9d1d9">
+    Progressive
+  </text>
+</svg>

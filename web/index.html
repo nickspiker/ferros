@@ -1,0 +1,1516 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>ferros | Killswitch Ready Mobile OS</title>
+   <link rel="stylesheet" href="nav.css">
+   <link rel="stylesheet" href="footer.css">
+   <style>
+      :root {
+         --ru: 1vw;
+      }
+
+      @media (min-aspect-ratio: 1/1) {
+         :root {
+            --ru: 1vh;
+         }
+      }
+
+      * {
+         margin: 0;
+         padding: 0;
+         box-sizing: border-box;
+      }
+
+      body {
+         background-color: #0a0e13;
+         color: #e1e8f0;
+         font-family: 'IBM Plex Serif', serif;
+         font-size: calc(2.2 * var(--ru));
+         line-height: 1.8;
+         padding-top: calc(10 * var(--ru));
+         text-align: center;
+      }
+
+      @media (min-aspect-ratio: 1/1) {
+         body {
+            padding-top: 8vw;
+         }
+      }
+
+      .container {
+         width: calc(90 * var(--ru));
+         margin: 0 auto;
+         padding: calc(2.5 * var(--ru)) calc(1.25 * var(--ru));
+      }
+
+      header {
+         margin-top: calc(4 * var(--ru));
+         text-align: center;
+         margin-bottom: calc(10 * var(--ru));
+         display: flex;
+         flex-direction: column;
+         align-items: center;
+      }
+
+      .site-title {
+         color: #32ff00;
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(10 * var(--ru));
+         font-weight: 200;
+         margin-bottom: calc(1 * var(--ru));
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.5),
+            0 0 0.125vw rgba(50, 255, 0, 0.5),
+            0 0 0.25vw rgba(50, 255, 0, 0.5),
+            0 0 0.5vw rgba(50, 255, 0, 0.5),
+            0 0 1vw rgba(50, 255, 0, 0.5),
+            0 0 2vw rgba(50, 255, 0, 0.5),
+            0 0 4vw rgba(50, 255, 0, 0.5),
+            0 0 8vw rgba(50, 255, 0, 0.5);
+      }
+
+      .tagline {
+         color: #c9d1d9;
+         font-size: calc(3.5 * var(--ru));
+         margin-bottom: calc(1.5 * var(--ru));
+      }
+
+      .subtitle {
+         color: #8b949e;
+         font-size: calc(2.5 * var(--ru));
+      }
+
+      section {
+         margin-bottom: calc(10 * var(--ru));
+      }
+
+      p {
+         color: #8b949e;
+         font-size: calc(3 * var(--ru));
+         margin-bottom: calc(3 * var(--ru));
+         text-align: center;
+      }
+
+      h2 {
+         color: #32ff00;
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(6 * var(--ru));
+         font-weight: 300;
+         margin-top: calc(4 * var(--ru));
+         margin-bottom: calc(4 * var(--ru));
+         text-align: center;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333),
+            0 0 0.125vw rgba(50, 255, 0, 0.333),
+            0 0 0.25vw rgba(50, 255, 0, 0.333),
+            0 0 0.5vw rgba(50, 255, 0, 0.333),
+            0 0 1vw rgba(50, 255, 0, 0.333),
+            0 0 2vw rgba(50, 255, 0, 0.333),
+            0 0 4vw rgba(50, 255, 0, 0.333),
+            0 0 8vw rgba(50, 255, 0, 0.333);
+      }
+
+      h3 {
+         color: #32ff00;
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(4.5 * var(--ru));
+         font-weight: 300;
+         margin-top: calc(3 * var(--ru));
+         margin-bottom: calc(2 * var(--ru));
+         text-align: center;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.25),
+            0 0 0.125vw rgba(50, 255, 0, 0.25),
+            0 0 0.25vw rgba(50, 255, 0, 0.25),
+            0 0 0.5vw rgba(50, 255, 0, 0.25),
+            0 0 1vw rgba(50, 255, 0, 0.25),
+            0 0 2vw rgba(50, 255, 0, 0.25),
+            0 0 4vw rgba(50, 255, 0, 0.25),
+            0 0 8vw rgba(50, 255, 0, 0.25);
+      }
+
+      /* Kill Switch Demo */
+      .killswitch-demo {
+         margin: calc(4 * var(--ru)) auto;
+         text-align: center;
+      }
+
+      .demo-layout {
+         display: grid;
+         grid-template-columns: 1fr 1fr;
+         gap: calc(4 * var(--ru));
+         align-items: center;
+         margin: calc(2 * var(--ru)) 0;
+      }
+
+      .glyph-base {
+         width: calc(35 * var(--ru));
+         height: auto;
+         display: block;
+         border-radius: calc(1 * var(--ru));
+      }
+
+      #glyph-off {
+         position: relative;
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 0.125vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 0.25vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 0.5vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 1vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 2vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 4vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 8vw rgba(255, 50, 50, 0.0625))
+            drop-shadow(0 0 16vw rgba(255, 50, 50, 0.0625));
+      }
+
+      #glyph-loading {
+         position: absolute;
+         top: 0;
+         left: 0;
+         opacity: 0;
+         pointer-events: none;
+         mix-blend-mode: screen;
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 0.125vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 0.25vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 0.5vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 1vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 2vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 4vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 8vw rgba(255, 170, 0, 0.0625))
+            drop-shadow(0 0 16vw rgba(255, 170, 0, 0.0625));
+      }
+
+      #glyph-on {
+         position: absolute;
+         top: 0;
+         left: 0;
+         opacity: 0;
+         pointer-events: none;
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 0.125vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 0.25vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 0.5vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 1vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 2vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 4vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 8vw rgba(50, 255, 0, 0.0625))
+            drop-shadow(0 0 16vw rgba(50, 255, 0, 0.0625));
+      }
+
+      .killswitch-container:hover #glyph-off {
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 0.125vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 0.25vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 0.5vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 1vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 2vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 4vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 8vw rgba(255, 50, 50, 0.125))
+            drop-shadow(0 0 16vw rgba(255, 50, 50, 0.125));
+      }
+
+      .killswitch-container:hover #glyph-loading {
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 0.125vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 0.25vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 0.5vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 1vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 2vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 4vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 8vw rgba(255, 170, 0, 0.125))
+            drop-shadow(0 0 16vw rgba(255, 170, 0, 0.125));
+      }
+
+      .killswitch-container:hover #glyph-on {
+         filter:
+            drop-shadow(0 0 0.0625vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 0.125vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 0.25vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 0.5vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 1vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 2vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 4vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 8vw rgba(50, 255, 0, 0.125))
+            drop-shadow(0 0 16vw rgba(50, 255, 0, 0.125));
+      }
+
+      .status-panel {
+         text-align: left;
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(3 * var(--ru));
+      }
+
+      .power-connection-wrapper {
+         display: flex;
+         align-items: center;
+         justify-content: center;
+         gap: calc(1 * var(--ru));
+         margin-bottom: calc(2 * var(--ru));
+      }
+
+      .power-connection {
+         width: calc(15 * var(--ru));
+         height: calc(7 * var(--ru));
+      }
+
+      .connection-label {
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(2.5 * var(--ru));
+         color: #32ff00;
+      }
+
+      .connection-label.hardware.disconnected {
+         color: #6b7280;
+      }
+
+      .plug-container {
+         transition: transform 0.1s ease-out;
+      }
+
+      .plug-container.disconnected {
+         transform: translateX(-75px);
+      }
+
+      .plug-container.disconnected rect,
+      .plug-container.disconnected circle,
+      .plug-container.disconnected path {
+         stroke: #6b7280 !important;
+         fill: #6b7280 !important;
+      }
+
+      .plug-container.disconnected text {
+         fill: #6b7280 !important;
+      }
+
+      .status-title {
+         color: #32ff00;
+         font-size: calc(4 * var(--ru));
+         margin-bottom: calc(1.5 * var(--ru));
+         text-align: center;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333),
+            0 0 0.125vw rgba(50, 255, 0, 0.333),
+            0 0 0.25vw rgba(50, 255, 0, 0.333),
+            0 0 0.5vw rgba(50, 255, 0, 0.333),
+            0 0 1vw rgba(50, 255, 0, 0.333),
+            0 0 2vw rgba(50, 255, 0, 0.333),
+            0 0 4vw rgba(50, 255, 0, 0.333),
+            0 0 8vw rgba(50, 255, 0, 0.333);
+      }
+
+      .status-item {
+         margin-bottom: calc(1 * var(--ru));
+         color: #c9d1d9;
+         display: flex;
+         gap: calc(1 * var(--ru));
+      }
+
+      .status-label {
+         color: #8b949e;
+         text-align: right;
+         flex: 1;
+      }
+
+      .status-value {
+         color: #32ff00;
+         text-shadow: 0 0 0.5vw rgba(50, 255, 0, 0.5);
+         flex: 1;
+      }
+
+      .status-value.offline {
+         color: #ff3232;
+         text-shadow: 0 0 0.5vw rgba(255, 50, 50, 0.5);
+      }
+
+      .status-value.booting {
+         color: #ffaa00;
+         text-shadow: 0 0 0.5vw rgba(255, 170, 0, 0.5);
+      }
+
+      .boot-progress {
+         position: absolute;
+         top: 50%;
+         left: 50%;
+         transform: translate(-50%, -50%);
+         width: calc(4 * var(--ru));
+         height: calc(4 * var(--ru));
+         z-index: 10;
+         pointer-events: none;
+      }
+
+      .killswitch-container {
+         position: relative;
+         cursor: pointer;
+         justify-self: end;
+      }
+
+      .system-clock {
+         position: absolute;
+         top: calc(6.5 * var(--ru));
+         right: calc(8 * var(--ru));
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(1.3 * var(--ru));
+         font-weight: 100;
+         color: #5b6270;
+         opacity: 0;
+         pointer-events: none;
+      }
+
+      .system-clock.visible {
+         opacity: 1;
+      }
+
+      .network-icon {
+         position: absolute;
+         top: calc(6.5 * var(--ru));
+         left: calc(10 * var(--ru));
+         width: calc(1.2 * var(--ru));
+         height: calc(1.2 * var(--ru));
+         opacity: 0;
+         pointer-events: none;
+         transition: opacity 0.3s;
+      }
+
+      .network-icon.visible {
+         opacity: 1;
+      }
+
+      .boot-progress circle {
+         transform: rotate(-90deg);
+         transform-origin: 50% 50%;
+      }
+
+      ul {
+         list-style: none;
+         padding: 0;
+         text-align: center;
+         margin-bottom: calc(3 * var(--ru));
+      }
+
+      li {
+         font-size: calc(3 * var(--ru));
+         margin-bottom: calc(2 * var(--ru));
+         text-align: center;
+      }
+
+      section ul li::before {
+         content: '→ ';
+         color: #32ff00;
+         font-weight: bold;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.5),
+            0 0 0.125vw rgba(50, 255, 0, 0.5),
+            0 0 0.25vw rgba(50, 255, 0, 0.5),
+            0 0 0.5vw rgba(50, 255, 0, 0.5),
+            0 0 1vw rgba(50, 255, 0, 0.5),
+            0 0 2vw rgba(50, 255, 0, 0.5),
+            0 0 4vw rgba(50, 255, 0, 0.5),
+            0 0 8vw rgba(50, 255, 0, 0.5);
+      }
+
+      section ul li::after {
+         content: ' ←';
+         color: #32ff00;
+         font-weight: bold;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.5),
+            0 0 0.125vw rgba(50, 255, 0, 0.5),
+            0 0 0.25vw rgba(50, 255, 0, 0.5),
+            0 0 0.5vw rgba(50, 255, 0, 0.5),
+            0 0 1vw rgba(50, 255, 0, 0.5),
+            0 0 2vw rgba(50, 255, 0, 0.5),
+            0 0 4vw rgba(50, 255, 0, 0.5),
+            0 0 8vw rgba(50, 255, 0, 0.5);
+      }
+
+      .no-arrows li::before,
+      .no-arrows li::after {
+         content: none;
+      }
+
+      .feature-grid {
+         display: grid;
+         grid-template-columns: 1fr 1fr;
+         gap: calc(3 * var(--ru));
+         text-align: center;
+         margin: calc(4 * var(--ru)) 0;
+      }
+
+      .feature-item {
+         background: rgba(50, 255, 0, 0.05);
+         padding: calc(2.5 * var(--ru));
+         border-radius: calc(0.5 * var(--ru));
+         border: 1px solid rgba(50, 255, 0, 0.2);
+      }
+
+      .feature-item h3 {
+         color: #32ff00;
+         font-family: 'Oxanium', sans-serif;
+         font-size: calc(3.6 * var(--ru));
+         margin-bottom: calc(1.5 * var(--ru));
+         text-align: center;
+         text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.5),
+            0 0 0.125vw rgba(50, 255, 0, 0.5),
+            0 0 0.25vw rgba(50, 255, 0, 0.5),
+            0 0 0.5vw rgba(50, 255, 0, 0.5),
+            0 0 1vw rgba(50, 255, 0, 0.5),
+            0 0 2vw rgba(50, 255, 0, 0.5),
+            0 0 4vw rgba(50, 255, 0, 0.5),
+            0 0 8vw rgba(50, 255, 0, 0.5);
+      }
+
+      .feature-item p {
+         color: #8b949e;
+         font-size: calc(2.6 * var(--ru));
+         text-align: center;
+         line-height: 1.6;
+      }
+
+      code {
+         font-family: 'IBM Plex Mono', monospace;
+         background: #1f2937;
+         padding: calc(0.2 * var(--ru)) calc(0.5 * var(--ru));
+         border-radius: calc(0.3 * var(--ru));
+         font-size: calc(2.2 * var(--ru));
+         color: #32ff00;
+      }
+
+      pre {
+         background: #1f2937;
+         padding: calc(2 * var(--ru));
+         border-radius: calc(0.5 * var(--ru));
+         overflow-x: auto;
+         text-align: left;
+         margin: calc(3 * var(--ru)) 0;
+      }
+
+      pre code {
+         background: transparent;
+         padding: 0;
+      }
+
+      /* Divider line */
+      .divider {
+         height: 1px;
+         margin: calc(8 * var(--ru)) 0;
+         position: relative;
+      }
+
+      .divider-line {
+         position: absolute;
+         left: 50%;
+         top: 50%;
+         width: calc(100 * var(--ru));
+         height: 1px;
+         filter: url(#hairline-glow);
+         transform: translate(-50%, -50%);
+         background: linear-gradient(90deg, rgba(50, 255, 0, 0) 0%, rgba(50, 255, 0, 0.309) 10%, rgba(50, 255, 0, 0.588) 20%, rgba(50, 255, 0, 0.809) 30%, rgba(50, 255, 0, 0.951) 40%, rgba(50, 255, 0, 1) 50%, rgba(50, 255, 0, 0.951) 60%, rgba(50, 255, 0, 0.809) 70%, rgba(50, 255, 0, 0.588) 80%, rgba(50, 255, 0, 0.309) 90%, rgba(50, 255, 0, 0) 100%);
+      }
+
+      .scan-line {
+         position: fixed;
+         top: calc(7 * var(--ru));
+         left: 0;
+         width: 50vw;
+         height: 1px;
+         background: linear-gradient(to right, rgba(0, 255, 0, 0) 0%, rgba(0, 255, 0, 0.25) 100%);
+         pointer-events: none;
+         z-index: 9999;
+         animation: raster-scan 4s linear infinite;
+         will-change: transform;
+      }
+
+      .scan-line::after {
+         content: '';
+         position: absolute;
+         right: 0;
+         top: 0;
+         width: 1px;
+         height: 1px;
+         background: #00ff00;
+         box-shadow: 0 0 0.0625vw rgba(0, 255, 0, 1),
+            0 0 0.0883883476483185vw rgba(0, 255, 0, 1),
+            0 0 0.125vw rgba(0, 255, 0, 1),
+            0 0 0.176776695296637vw rgba(0, 255, 0, 1),
+            0 0 0.25vw rgba(0, 255, 0, 1),
+            0 0 0.353553390593274vw rgba(0, 255, 0, 1),
+            0 0 0.5vw rgba(0, 255, 0, 1),
+            0 0 0.707106781186547vw rgba(0, 255, 0, 1),
+            0 0 1vw rgba(0, 255, 0, 1),
+            0 0 1.414213562373095vw rgba(0, 255, 0, 1),
+            0 0 2vw rgba(0, 255, 0, 1),
+            0 0 2.82842712474619vw rgba(0, 255, 0, 1),
+            0 0 4vw rgba(0, 255, 0, 1),
+            0 0 5.65685424949238vw rgba(0, 255, 0, 1),
+            0 0 8vw rgba(0, 255, 0, 1),
+            0 0 11.31370849898476vw rgba(0, 255, 0, 1),
+            0 0 16vw rgba(0, 255, 0, 1);
+      }
+
+      @keyframes raster-scan {
+         0% {
+            transform: translateX(-25vw);
+         }
+         100% {
+            transform: translateX(calc(100vw + 25vw));
+         }
+      }
+
+   </style>
+</head>
+
+<body>
+   <div class="scan-line"></div>
+   <svg width="0" height="0" style="position: absolute;">
+      <defs>
+         <!-- Horizontal gradient for hairlines: transparent at edges, bright green in center -->
+         <linearGradient id="hairline-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" style="stop-color:#32ff00;stop-opacity:0" />
+            <stop offset="10%" style="stop-color:#32ff00;stop-opacity:0.309" />
+            <stop offset="20%" style="stop-color:#32ff00;stop-opacity:0.588" />
+            <stop offset="30%" style="stop-color:#32ff00;stop-opacity:0.809" />
+            <stop offset="40%" style="stop-color:#32ff00;stop-opacity:0.951" />
+            <stop offset="50%" style="stop-color:#32ff00;stop-opacity:1" />
+            <stop offset="60%" style="stop-color:#32ff00;stop-opacity:0.951" />
+            <stop offset="70%" style="stop-color:#32ff00;stop-opacity:0.809" />
+            <stop offset="80%" style="stop-color:#32ff00;stop-opacity:0.588" />
+            <stop offset="90%" style="stop-color:#32ff00;stop-opacity:0.309" />
+            <stop offset="100%" style="stop-color:#32ff00;stop-opacity:0" />
+         </linearGradient>
+
+         <filter id="hairline-glow" x="-5000%" y="-5000%" width="10000%" height="10000%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="1" result="b1" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="1.414" result="b2" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="b3" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="2.828" result="b4" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="b5" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="5.657" result="b6" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="8" result="b7" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="11.314" result="b8" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="16" result="b9" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="22.627" result="b10" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="32" result="b11" />
+            <feMerge>
+               <feMergeNode in="b11" />
+               <feMergeNode in="b10" />
+               <feMergeNode in="b9" />
+               <feMergeNode in="b8" />
+               <feMergeNode in="b7" />
+               <feMergeNode in="b6" />
+               <feMergeNode in="b5" />
+               <feMergeNode in="b4" />
+               <feMergeNode in="b3" />
+               <feMergeNode in="b2" />
+               <feMergeNode in="b1" />
+               <feMergeNode in="SourceGraphic" />
+            </feMerge>
+         </filter>
+      </defs>
+   </svg>
+
+   <script src="nav.js"></script>
+
+   <div class="container">
+      <header>
+         <h1 class="site-title">ferros</h1>
+         <p class="tagline">Killswitch Ready Mobile OS</p>
+         <p class="subtitle">Built from first principles. No compromises.</p>
+      </header>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <p>I spent 20 years climbing cell towers and debugging RF systems. You know what I learned? Every OS we use is built on 50-year-old assumptions that don't make sense anymore.</p>
+
+         <p>So I built ferros. It's not Android with modifications. It's not Linux for mobile. It's a ground-up rethinking of what an operating system should be when you actually care about security, performance, and mathematical correctness.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section class="killswitch-demo">
+         <h2>0ms Shutdown. Always.</h2>
+         <p>The kill-switch isn't a feature. It's the architecture.</p>
+         <p style="text-align: center; margin-bottom: calc(2 * var(--ru)); color: #8b949e;">Click the image or plug to toggle power<br>instant shutdown and &lt;1s boot time,<br>Full OS in under 3 seconds</p>
+
+         <div class="demo-layout">
+            <div class="killswitch-container" onclick="togglePower()">
+               <img id="glyph-off" class="glyph-base" src="glyph_off.webp" alt="Minimalist smartphone device called Glyph in powered-off state, dark matte black chassis, subtle red ambient glow around edges, RISC-V custom silicon branding barely visible, physical SIM slot detail, hardware kill-switch button, professional product photography, dark background with soft red rim lighting, photorealistic, 8k, ultra detailed --ar 9:16 --v 6" />
+               <img id="glyph-loading" class="glyph-base" src="glyph_loading.webp" alt="Minimalist smartphone device called Glyph in loading state, dark matte black chassis, screen showing abstract orange geometric boot animation with semi-transparent UI elements appearing, ambient orange glow, RISC-V branding lit, physical SIM slot detail, hardware kill-switch button orange, professional product photography, dark background with orange accent lighting, photorealistic, 8k, ultra detailed --ar 9:16 --v 6" />
+               <img id="glyph-on" class="glyph-base" src="glyph_on.webp" alt="Minimalist smartphone device called Glyph fully powered on, dark matte black chassis, vibrant lime green (#32ff00) glowing screen with clean UI showing time and network status, bright green ambient glow around device edges, RISC-V branding illuminated in green, physical SIM slot visible, hardware kill-switch button green, professional product photography, dark background with green accent lighting, photorealistic, 8k, ultra detailed --ar 9:16 --v 6" />
+
+               <div id="system-clock" class="system-clock">00:00:00</div>
+
+               <svg id="network-icon" class="network-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9z" fill="#6b7280"/>
+                  <path d="M5 13l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" fill="#6b7280"/>
+                  <path d="M9 17l3 3 3-3c-1.65-1.66-4.34-1.66-6 0z" fill="#6b7280"/>
+               </svg>
+
+               <svg id="boot-progress" class="boot-progress" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" style="display: none;">
+                  <circle id="progress-circle-top" cx="50" cy="50" r="48" fill="none" stroke="#ffffff" stroke-width="2"
+                          stroke-dasharray="150.796 301.593" stroke-dashoffset="150.796"
+                          style="transform: rotate(-90deg); transform-origin: 50% 50%;"/>
+                  <circle id="progress-circle-bottom" cx="50" cy="50" r="48" fill="none" stroke="#ffffff" stroke-width="2"
+                          stroke-dasharray="150.796 301.593" stroke-dashoffset="150.796"
+                          style="transform: rotate(90deg); transform-origin: 50% 50%;"/>
+               </svg>
+            </div>
+
+            <div class="status-panel">
+               <div class="power-connection-wrapper" onclick="togglePower()" style="cursor: pointer;">
+                  <div id="hardware-label" class="connection-label hardware disconnected">HARDWARE</div>
+
+                  <svg class="power-connection" viewBox="0 0 270 70" xmlns="http://www.w3.org/2000/svg">
+                     <g id="receptacle">
+                        <path d="M 218 30 L 270 30" stroke="#32ff00" stroke-width="3" fill="none" stroke-linecap="round"/>
+                        <rect x="162" y="12" width="56" height="36" fill="#0a0e13" stroke="#32ff00" stroke-width="2" rx="2"/>
+                        <rect x="168" y="18" width="44" height="24" fill="#1f2937" stroke="#32ff00" stroke-width="1.5" rx="1"/>
+                        <line x1="176" y1="20" x2="176" y2="40" stroke="#0a0e13" stroke-width="4"/>
+                        <line x1="186" y1="20" x2="186" y2="40" stroke="#0a0e13" stroke-width="4"/>
+                        <line x1="196" y1="20" x2="196" y2="40" stroke="#0a0e13" stroke-width="4"/>
+                        <line x1="206" y1="20" x2="206" y2="40" stroke="#0a0e13" stroke-width="4"/>
+                     </g>
+
+                     <g id="plug-container" class="plug-container disconnected">
+                        <path d="M 0 30 Q 60 30 125 30" stroke="#32ff00" stroke-width="3" fill="none" stroke-linecap="round"/>
+                        <rect x="125" y="15" width="38" height="30" fill="#1f2937" stroke="#32ff00" stroke-width="2" rx="3"/>
+                        <rect x="163" y="20" width="6" height="20" fill="#32ff00" rx="1"/>
+                        <rect x="173" y="20" width="6" height="20" fill="#32ff00" rx="1"/>
+                        <rect x="183" y="20" width="6" height="20" fill="#32ff00" rx="1"/>
+                        <rect x="193" y="20" width="6" height="20" fill="#32ff00" rx="1"/>
+                     </g>
+                  </svg>
+
+                  <div class="connection-label power">POWER</div>
+               </div>
+
+               <div class="status-title">Status</div>
+               <div class="status-item">
+                  <span class="status-label">BIOS</span>
+                  <span class="status-value offline" id="status-bios">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">CPU</span>
+                  <span class="status-value offline" id="status-cpu">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">RAM</span>
+                  <span class="status-value offline" id="status-ram">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">SSD</span>
+                  <span class="status-value offline" id="status-ssd">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">Radio</span>
+                  <span class="status-value offline" id="status-radio">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">Display</span>
+                  <span class="status-value offline" id="status-display">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">GPU</span>
+                  <span class="status-value offline" id="status-gpu">Off</span>
+               </div>
+               <div class="status-item">
+                  <span class="status-label">GUI</span>
+                  <span class="status-value offline" id="status-ui">Off</span>
+               </div>
+            </div>
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <p>Power loss at any moment is normal operation. Not an edge case. Not something to "handle gracefully." Just normal.</p>
+
+         <div class="feature-grid">
+            <div class="feature-item">
+               <h3>Instant shutdown</h3>
+               <p>Hardware cutoff, no software in the loop</p>
+            </div>
+
+            <div class="feature-item">
+               <h3>No cleanup</h3>
+               <p>Ring architecture has no partial states to save</p>
+            </div>
+
+            <div class="feature-item">
+               <h3>Instant recovery</h3>
+               <p>Boot and continue, no fsck or "recovery mode"</p>
+            </div>
+
+            <div class="feature-item">
+               <h3>Atomic everything</h3>
+               <p>Operations complete or never existed</p>
+            </div>
+         </div>
+
+         <p>Traditional systems need complex shutdown because they maintain invariants: "page table must be consistent," "superblock must be updated," "buffers must be flushed."</p>
+
+         <p>ferros has one invariant: <strong>the ring is always valid</strong>. And because it's a ring, any point on it is as good as any other.</p>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="killswitch-diagram.svg" alt="Kill-switch architecture diagram showing 0ms hardware power cutoff, CSR key zeroing, and instant shutdown sequence" style="width: 100%; height: auto; display: block;" />
+         </div>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="boot-sequence-diagram.svg" alt="Boot sequence timeline visualization showing overlapping component initialization from 0ms to 1850ms" style="width: 100%; height: auto; display: block;" />
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>What Makes ferros Different</h2>
+
+         <h3>Ring Memory Architecture</h3>
+
+         <p>No beginning, no end. Addresses wrap using two's complement. Buffer overflows? Can't happen - there are no boundaries to overflow.</p>
+
+         <p>Every process gets two numbers:</p>
+         <ul>
+            <li><strong>offset:</strong> Random position in the ring (signed, arbitrary)</li>
+            <li><strong>limit:</strong> Size of their allocation (arbitrary, not power-of-2)</li>
+         </ul>
+
+         <p>Memory access check is two instructions:</p>
+         <pre><code>fn check_access(ptr: usize, offset: usize, limit: usize) -> bool {
+    (ptr.wrapping_sub(offset)) &lt; limit
+}</code></pre>
+
+         <p>Two CPU cycles. No page table lookups, no TLB, no segmentation faults.</p>
+
+         <p><strong>Traditional systems:</strong> 5-10 memory accesses every TLB miss<br>
+         <strong>ferros:</strong> 2 CPU cycles every time</p>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="ring-memory-diagram.svg" alt="Ring memory architecture diagram showing circular address space with offset and limit, no boundaries, and 2-cycle access check" style="width: 100%; height: auto; display: block;" />
+         </div>
+
+         <div style="text-align: center; margin-top: calc(4 * var(--ru));">
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↓</div>
+            <a href="ring.html" style="display: inline-block; background: rgba(50, 255, 0, 0.1); border: 1px solid #32ff00; padding: calc(1.5 * var(--ru)) calc(3 * var(--ru)); color: #32ff00; text-decoration: none; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333); transition: all 0.3s ease; margin: calc(0.5 * var(--ru)) 0;">Learn about ring architecture</a>
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↑</div>
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Hardware Key Storage</h3>
+
+         <p>Encryption keys live in CPU registers, never RAM. Custom RISC-V CSRs or ARM TrustZone. Even root can't read them.</p>
+
+         <p>Keys are stored in:</p>
+         <ul>
+            <li><strong>Debug registers</strong> (x86-64) - read-disabled, DMA-proof</li>
+            <li><strong>Custom CSRs</strong> (RISC-V) - hardware enforced isolation</li>
+            <li><strong>TrustZone</strong> (ARM) - secure world separation</li>
+         </ul>
+
+         <p>ChaCha20 crypto coprocessor encrypts faster than RAM bandwidth. All storage and memory encrypted by default.</p>
+
+         <p><strong>Kill-switch zeroes keys instantly</strong> - hardware operation, not software cleanup.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>TOKEN Integration</h3>
+
+         <p>Passless authentication via device fingerprints. Social attestation for identity. No passwords, no biometric theater.</p>
+
+         <p><strong>A=1</strong> - authenticate once per device lifetime, never again.</p>
+
+         <ul>
+            <li>Device generates hardware fingerprint (Android_ID + IMEI + characteristics)</li>
+            <li>Social attestation maps device→human ("I vouch this is Nick's phone")</li>
+            <li>Keys derived deterministically in secure hardware</li>
+            <li>Device loss? Social revocation by threshold of friends</li>
+            <li>Multiple devices? Each independently attested</li>
+         </ul>
+
+         <p><strong>NFID (Near Field Identity):</strong> Optional paranoia layer. Prevents unauthorized device binding when someone borrows your car. Configurable from "unlocked" to "high security."</p>
+
+         <p>Not required for core passless operation - just prevents adding rogue devices.</p>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="token-flow-diagram.svg" alt="TOKEN passless authentication flow diagram showing device fingerprint, social attestation, and A=1 authentication" style="width: 100%; height: auto; display: block;" />
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>VSF Compositor</h3>
+
+         <p>Spectral color from sensor to display. Ring-based damage tracking. Only renders what you can actually see.</p>
+
+         <p><strong>VSF (Versatile Storage Format):</strong></p>
+         <ul>
+            <li>Replaces HTML/CSS/JS with single unified format</li>
+            <li>Native spectral color (RGB 462nm/523nm/703nm)</li>
+            <li>Compositor optimized for ring memory architecture</li>
+            <li>Occlusion-aware rendering (widgets know when they're visible)</li>
+         </ul>
+
+         <p><strong>Performance:</strong></p>
+         <ul>
+            <li>Only damaged regions redraw</li>
+            <li>Occluded widgets don't render at all</li>
+            <li>No "layers" or "backing stores" - direct ring rendering</li>
+            <li>Compositor and filesystem use same ring semantics</li>
+         </ul>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="vsf-compositor-diagram.svg" alt="VSF compositor architecture diagram showing spectral color pipeline and comparison with traditional HTML/CSS/JS stack" style="width: 100%; height: auto; display: block;" />
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Ring Filesystem</h3>
+
+         <p>Superblock at random location. No fragmentation because rings rotate. Power loss? Any ring state is valid.</p>
+
+         <p><strong>Key features:</strong></p>
+         <ul>
+            <li>Superblock location: Random ring position, stored encrypted in UEFI</li>
+            <li>Dual SSDs at different offsets (different manufacturers for resilience)</li>
+            <li>Header ring buffer with generation numbers (1000+ valid states)</li>
+            <li>Stochastic block placement (natural wear leveling, exploit prevention)</li>
+            <li>No beginning, no end - files live in the ring</li>
+         </ul>
+
+         <p><strong>Power loss handling:</strong></p>
+         <ul>
+            <li>Kernel scans header ring on boot</li>
+            <li>Finds highest valid generation number</li>
+            <li>Continues from there</li>
+            <li>No fsck, no journal, no "filesystem needs repair"</li>
+         </ul>
+
+         <p>Based on RedoxFS with ring topology instead of linear blocks.</p>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="ring-filesystem-diagram.svg" alt="Ring filesystem architecture diagram showing random superblock placement, dual SSD configuration, and power loss recovery" style="width: 100%; height: auto; display: block;" />
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Crypto Coprocessor</h3>
+
+         <p>ChaCha20 in dedicated silicon. Encrypts faster than RAM bandwidth. All storage and memory encrypted by default.</p>
+
+         <p><strong>Hardware acceleration:</strong></p>
+         <ul>
+            <li>64 bytes/cycle at 1 GHz = 64 GB/s throughput</li>
+            <li>CPU cost: Zero - runs independently via DMA</li>
+            <li>Software ChaCha20: ~250 MB/s (256x slower)</li>
+         </ul>
+
+         <p><strong>Integration:</strong></p>
+         <ul>
+            <li>Keys from CSRs feed crypto unit directly</li>
+            <li>Modem, storage, memory all go through coprocessor</li>
+            <li>Kill-switch zeroes crypto unit + CSRs simultaneously</li>
+         </ul>
+
+         <p>ChaCha20 is faster than RAM on modern hardware (~3-4 GB/s per core). Dedicated unit is even better.</p>
+
+         <div style="margin: calc(6 * var(--ru)) auto; max-width: 100%;">
+            <img src="crypto-coprocessor-diagram.svg" alt="ChaCha20 crypto coprocessor architecture diagram showing CSR keys, DMA engine, and 64 GB/s throughput" style="width: 100%; height: auto; display: block;" />
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>The Glyph Device</h2>
+
+         <p>ferros runs on Glyph - hardware I designed from scratch for this OS. Not Android on commodity chips. Purpose-built silicon running purpose-built software.</p>
+
+         <h3>RISC-V Custom Silicon</h3>
+
+         <ul>
+            <li>Custom CSRs for key storage (read-disabled, write-only)</li>
+            <li>Crypto coprocessor integrated on die</li>
+            <li>Hardware kill-switch circuit</li>
+            <li>Debug registers for additional key isolation</li>
+         </ul>
+
+         <p>No proprietary secure elements. No vendor black boxes. Just open RISC-V with custom extensions you can audit.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Bring Your Own SIM</h3>
+
+         <p>Physical SIM slot. No carrier lock-in. No eSIM DRM. Use any carrier's data plan worldwide.</p>
+
+         <p><strong>Why physical SIM:</strong></p>
+         <ul>
+            <li>User swaps freely between carriers</li>
+            <li>No provisioning bullshit</li>
+            <li>No remote carrier control</li>
+            <li>SIM is just dumb auth token for network</li>
+         </ul>
+
+         <p><strong>Software eSIM support:</strong> Implemented via GSMA SGP.22 client in ferros. Download profiles, store credentials in CSRs, use standard 3GPP authentication. Works with any carrier's SM-DP+ server.</p>
+
+         <p>Physical slot as fallback for carriers without eSIM support.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Crypto Only</h3>
+
+         <p>Purchase with BTC, SOL, XMR, or TOKEN. No credit cards. No fiat. No compromises.</p>
+
+         <p><strong>No exceptions.</strong></p>
+
+         <p>If you can't acquire cryptocurrency, you can't buy Glyph. That's not a bug - it's the filter. People who understand crypto understand why Glyph matters.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>No Phone Numbers</h3>
+
+         <p>Photon messenger via TOKEN identity. No SMS. No legacy telephony. Pure sovereignty.</p>
+
+         <p><strong>Glyph doesn't support:</strong></p>
+         <ul>
+            <li>Phone numbers (never coming)</li>
+            <li>SMS fallback (never coming)</li>
+            <li>Voice calls to PSTN (never coming)</li>
+            <li>Traditional 2FA via SMS (use TOTP or hardware keys)</li>
+         </ul>
+
+         <p><strong>What it does support:</strong></p>
+         <ul>
+            <li>Photon messenger (TOKEN-based, E2E encrypted)</li>
+            <li>Data connectivity via any SIM</li>
+            <li>IP-based voice (if someone builds it on Photon)</li>
+            <li>TOTP for services that require 2FA</li>
+         </ul>
+
+         <p>If you need to call 911, get a burner phone for emergencies. Glyph is for sovereignty, not legacy infrastructure.</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>Available on Sovereign Web Only</h2>
+
+         <p>You can't buy Glyph on Amazon. You can't buy it with a credit card. You can't buy it on this website.</p>
+
+         <p>Glyph is available exclusively on the decentralized web. Same compositor that runs on the device renders the purchase experience. If you can't access fgtw.org/portal, you're not ready for Glyph.</p>
+
+         <p><strong>Requirements to purchase:</strong></p>
+         <ul>
+            <li>Cryptocurrency (BTC, SOL, XMR, or TOKEN)</li>
+            <li>WASM-capable browser for VSF rendering</li>
+            <li>Understanding that phone numbers aren't supported</li>
+            <li>Willingness to use new stack (TOKEN, Photon, VSF)</li>
+         </ul>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h3>Glyph is not for everyone.</h3>
+
+         <p><strong>You CANNOT use Glyph if you:</strong></p>
+         <ul>
+            <li>Need phone numbers for work</li>
+            <li>Require legacy SMS for banking 2FA</li>
+            <li>Can't acquire cryptocurrency</li>
+            <li>Need to call 911 from your primary device</li>
+            <li>Expect traditional customer support</li>
+         </ul>
+
+         <p><strong>Glyph works if you:</strong></p>
+         <ul>
+            <li>Communicate primarily online (Photon, messaging apps)</li>
+            <li>Can handle emergency calls via separate device</li>
+            <li>Already use crypto or are willing to learn</li>
+            <li>Value sovereignty over convenience</li>
+            <li>Understand this is cutting-edge technology</li>
+         </ul>
+
+         <p><strong>Still here? You might be ready for Glyph.</strong></p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>The Launch Plan</h2>
+
+         <p><strong>Founders Edition:</strong> 1,000 units, $5,000, crypto only</p>
+         <ul>
+            <li>Serial #0001-1000 (blockchain verified)</li>
+            <li>12-year warranty (yes, twelve)</li>
+            <li>Direct access to engineering team</li>
+            <li>GREEN check in all Photon communications forever</li>
+         </ul>
+
+         <p><strong>Elite Edition:</strong> 10,000 units, $3,000, 6 months after Founders</p>
+
+         <p><strong>Pro Edition:</strong> 100,000 units, $1,500, 12 months after Founders</p>
+
+         <p><strong>Standard:</strong> 1M+ units, $600, 18-24 months after Founders</p>
+
+         <p>No traditional launch. No press releases. No review units. Just: "Portal is open. If you know, you know."</p>
+
+         <div style="text-align: center; margin-top: calc(4 * var(--ru));">
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↓</div>
+            <a href="https://fgtw.org/portal/glyph" style="display: inline-block; background: rgba(50, 255, 0, 0.1); border: 1px solid #32ff00; padding: calc(1.5 * var(--ru)) calc(3 * var(--ru)); color: #32ff00; text-decoration: none; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333); transition: all 0.3s ease; margin: calc(0.5 * var(--ru)) 0;">View on Decentralized Web</a>
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↑</div>
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>Learn More</h2>
+
+         <div style="margin: calc(4 * var(--ru)) 0;">
+            <h3>Ring Memory Architecture</h3>
+            <p>Why memory doesn't need boundaries and how two's complement wraparound eliminates entire classes of vulnerabilities.</p>
+            <div style="text-align: center; margin-top: calc(2 * var(--ru));">
+               <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↓</div>
+               <a href="ring.html" style="display: inline-block; background: rgba(50, 255, 0, 0.1); border: 1px solid #32ff00; padding: calc(1.5 * var(--ru)) calc(3 * var(--ru)); color: #32ff00; text-decoration: none; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333); transition: all 0.3s ease; margin: calc(0.5 * var(--ru)) 0;">Read the details</a>
+               <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↑</div>
+            </div>
+         </div>
+
+         <div style="margin: calc(4 * var(--ru)) 0;">
+            <h3>Kill-Switch Design</h3>
+            <p>Hardware power cutoff, CSR key zeroing, and why 0ms shutdown isn't a feature - it's a consequence of ring architecture.</p>
+            <p style="font-style: italic;">(Coming soon)</p>
+         </div>
+
+         <div style="margin: calc(4 * var(--ru)) 0;">
+            <h3>TOKEN Integration</h3>
+            <p>How device fingerprints, social attestation, and NFID create genuinely passless authentication.</p>
+            <p style="font-style: italic;">(Coming soon)</p>
+         </div>
+
+         <div style="margin: calc(4 * var(--ru)) 0;">
+            <h3>VSF Compositor</h3>
+            <p>Spectral color, occlusion-aware rendering, and why HTML/CSS/JS needed to be replaced.</p>
+            <p style="font-style: italic;">(Coming soon)</p>
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>Open Source</h2>
+
+         <p>ferros is open source (MIT license). The OS, ring memory architecture, filesystem - all open.</p>
+
+         <p><strong>What's open:</strong></p>
+         <ul>
+            <li>ferros kernel and userspace</li>
+            <li>Ring memory implementation</li>
+            <li>VSF renderer and compositor</li>
+            <li>TOKEN protocol</li>
+            <li>Photon messenger</li>
+         </ul>
+
+         <p><strong>What's closed:</strong></p>
+         <ul>
+            <li>Glyph hardware schematics (initially)</li>
+            <li>Custom RISC-V CSR implementations (until silicon ships)</li>
+            <li>Manufacturing processes</li>
+         </ul>
+
+         <p>Hardware will open-source after Founders Edition ships and we've proven the design.</p>
+
+         <div style="text-align: center; margin-top: calc(4 * var(--ru));">
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↓</div>
+            <a href="https://github.com/ferros-org/ferros" style="display: inline-block; background: rgba(50, 255, 0, 0.1); border: 1px solid #32ff00; padding: calc(1.5 * var(--ru)) calc(3 * var(--ru)); color: #32ff00; text-decoration: none; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333); transition: all 0.3s ease; margin: calc(0.5 * var(--ru)) 0;">View on GitHub</a>
+            <div style="color: #32ff00; font-size: calc(6 * var(--ru)); font-family: 'Oxanium', sans-serif; font-weight: 300; text-shadow: 0 0 0.0625vw rgba(50, 255, 0, 0.333), 0 0 0.125vw rgba(50, 255, 0, 0.333), 0 0 0.25vw rgba(50, 255, 0, 0.333), 0 0 0.5vw rgba(50, 255, 0, 0.333), 0 0 1vw rgba(50, 255, 0, 0.333), 0 0 2vw rgba(50, 255, 0, 0.333), 0 0 4vw rgba(50, 255, 0, 0.333), 0 0 8vw rgba(50, 255, 0, 0.333);">↑</div>
+         </div>
+
+         <p style="margin-top: calc(4 * var(--ru));"><strong>First Published:</strong> January 1, 2025</p>
+         <p style="line-height: 1;"><strong>License:</strong> MIT (ferros modifications)<br>+<br>MIT (original Redox OS code)</p>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>Status</h2>
+
+         <p><strong>Current:</strong> Architecture design, early implementation</p>
+
+         <p><strong>Next 3 months:</strong></p>
+         <ul>
+            <li>Ring memory kernel complete</li>
+            <li>RedoxFS → ring filesystem conversion</li>
+            <li>Basic TOKEN integration</li>
+         </ul>
+
+         <p><strong>Next 6 months:</strong></p>
+         <ul>
+            <li>VSF compositor alpha</li>
+            <li>Photon messenger beta</li>
+            <li>Hardware prototype (FPGA)</li>
+         </ul>
+
+         <p><strong>Next 12 months:</strong></p>
+         <ul>
+            <li>Silicon tapeout (RISC-V + crypto coprocessor)</li>
+            <li>Founders Edition manufacturing</li>
+            <li>Portal opens for purchases</li>
+         </ul>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <h2>FAQ</h2>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Can I port ferros to my phone?</strong></p>
+            <p>Yes. It'll work on PinePhone, Fairphone, etc. But you'll lose hardware kill-switch, crypto coprocessor, custom CSRs, and TOKEN attestation. Glyph is the complete package.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Why Rust?</strong></p>
+            <p>Memory safety without garbage collection. Zero-cost abstractions. Compile-time guarantees. No unsafe code in critical paths.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Why RISC-V?</strong></p>
+            <p>Open ISA. Custom extensions allowed. No Intel ME / AMD PSP backdoors. Auditable silicon.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Why not Linux?</strong></p>
+            <p>Linux has 30M+ lines of C. Ring memory requires ground-up redesign. Kill-switch requires atomic-everything architecture. Microkernel prevents driver crashes from killing system.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Why no phone numbers?</strong></p>
+            <p>Phone numbers are surveillance infrastructure tied to government ID. TOKEN provides cryptographic identity without surveillance. If you need PSTN, get a burner for emergencies.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>What about app compatibility?</strong></p>
+            <p>None. ferros doesn't run Android apps. Developers build for VSF or they don't ship on Glyph. This is intentional - legacy compatibility is how security gets compromised.</p>
+         </div>
+
+         <div style="margin: calc(3 * var(--ru)) 0;">
+            <p><strong>Is this vaporware?</strong></p>
+            <p>Code is being written. Architecture is documented. Hardware is being designed. This README establishes prior art. Judge for yourself in 6 months when we ship alpha.</p>
+         </div>
+      </section>
+
+      <div class="divider">
+         <div class="divider-line"></div>
+      </div>
+
+      <section>
+         <p style="margin-top: calc(4 * var(--ru));">Built by Nick Spiker and contributors.</p>
+         <p><strong>Sovereignty is a choice. Make it.</strong></p>
+      </section>
+   </div>
+
+   <script src="footer.js"></script>
+
+   <script>
+      let isPowered = false;
+      const glyphOff = document.getElementById('glyph-off');
+      const glyphLoading = document.getElementById('glyph-loading');
+      const glyphOn = document.getElementById('glyph-on');
+      const systemClock = document.getElementById('system-clock');
+      const networkIcon = document.getElementById('network-icon');
+      let clockInterval = null;
+
+      function updateClock() {
+         const now = new Date();
+         const hours = String(now.getHours()).padStart(2, '0');
+         const minutes = String(now.getMinutes()).padStart(2, '0');
+         const seconds = String(now.getSeconds()).padStart(2, '0');
+         systemClock.textContent = `${hours}:${minutes}:${seconds}`;
+      }
+
+      const statusElements = {
+         bios: document.getElementById('status-bios'),
+         cpu: document.getElementById('status-cpu'),
+         ram: document.getElementById('status-ram'),
+         ssd: document.getElementById('status-ssd'),
+         radio: document.getElementById('status-radio'),
+         display: document.getElementById('status-display'),
+         gpu: document.getElementById('status-gpu'),
+         ui: document.getElementById('status-ui')
+      };
+
+      const dotPatterns = [' ..', '. .', '.. '];
+      let activeTimers = [];
+
+      function clearAllTimers() {
+         activeTimers.forEach(id => {
+            clearTimeout(id);
+            clearInterval(id);
+         });
+         activeTimers = [];
+      }
+
+      function setStatus(component, text, state) {
+         const el = statusElements[component];
+         el.textContent = text;
+         el.className = 'status-value';
+         if (state === 'offline') el.classList.add('offline');
+         if (state === 'booting') el.classList.add('booting');
+      }
+
+
+      let hasAutoBooted = false;
+
+      // Auto-boot on first scroll
+      window.addEventListener('scroll', function autoBootOnScroll() {
+         if (!hasAutoBooted && !isPowered) {
+            hasAutoBooted = true;
+            togglePower();
+         }
+      }, { passive: true });
+
+      function togglePower() {
+         isPowered = !isPowered;
+         clearAllTimers();
+
+         const plugContainer = document.getElementById('plug-container');
+         const hardwareLabel = document.getElementById('hardware-label');
+
+         if (!isPowered) {
+            // Instant shutdown - kill switch ALWAYS works
+
+            // Show only off layer
+            glyphOff.src = 'glyph_off.webp'; // Reset to regular off image
+            glyphOff.style.opacity = '1';
+            glyphLoading.style.opacity = '0';
+            glyphLoading.style.filter = 'blur(0)';
+            glyphOn.style.opacity = '0';
+
+            // Hide boot progress circle
+            document.getElementById('boot-progress').style.display = 'none';
+
+            // Hide clock and network icon
+            systemClock.classList.remove('visible');
+            networkIcon.classList.remove('visible');
+            if (clockInterval) {
+               clearInterval(clockInterval);
+               clockInterval = null;
+            }
+
+            // Disconnect plug and turn grey
+            plugContainer.classList.add('disconnected');
+            hardwareLabel.classList.add('disconnected');
+
+            setStatus('bios', 'Off', 'offline');
+            setStatus('cpu', 'Off', 'offline');
+            setStatus('ram', 'Off', 'offline');
+            setStatus('ssd', 'Off', 'offline');
+            setStatus('radio', 'Off', 'offline');
+            setStatus('display', 'Off', 'offline');
+            setStatus('gpu', 'Off', 'offline');
+            setStatus('ui', 'Off', 'offline');
+         } else {
+            // Reset base layer to regular off, then switch to orange
+            glyphOff.src = 'glyph_off.webp';
+
+            // Force reflow to ensure the image change takes effect
+            void glyphOff.offsetWidth;
+
+            // Now switch to orange glow base during boot, keep GUI hidden
+            glyphOff.src = 'glyph_orange.webp';
+            glyphOff.style.opacity = '1';
+            glyphLoading.style.opacity = '0'; // Start hidden until display initializes
+            glyphLoading.style.filter = 'blur(calc(5 * var(--ru)))';
+            glyphOn.style.opacity = '0';
+
+            // Connect plug and restore green
+            plugContainer.classList.remove('disconnected');
+            hardwareLabel.classList.remove('disconnected');
+
+            // When display goes online, fade in GUI and start blur ramp
+            activeTimers.push(setTimeout(() => {
+               if (!isPowered) return; // Kill-switch check
+
+               // Half-circle curve for blur and brightness over 1 second
+               const blurStartTime = Date.now();
+               const duration = 1000;
+               const blurAnimation = setInterval(() => {
+                  if (!isPowered) {
+                     clearInterval(blurAnimation);
+                     return;
+                  }
+
+                  const elapsed = Date.now() - blurStartTime;
+                  const progress = Math.min(elapsed / duration, 1);
+
+                  // Half-circle curve: y = sqrt(1 - (1-x)^2)
+                  // Starts slow, accelerates in middle, eases at end
+                  const curveProgress = Math.sqrt(1 - Math.pow(1 - progress, 2));
+
+                  const blurAmount = (1 - curveProgress);
+                  const brightness = curveProgress; // 30% to 100%
+
+                  glyphLoading.style.filter = `blur(calc(${blurAmount} * var(--ru))) brightness(${brightness})`;
+                  glyphLoading.style.opacity = curveProgress;
+
+                  if (progress >= 1) {
+                     clearInterval(blurAnimation);
+                     glyphLoading.style.filter = 'blur(0) brightness(1)';
+                     glyphLoading.style.opacity = '1';
+                  }
+               }, 16); // ~60fps
+               activeTimers.push(blurAnimation);
+            }, 850)); // When display finishes initializing
+
+            // Show and animate boot progress circles
+            const bootProgressSvg = document.getElementById('boot-progress');
+            const progressCircleTop = document.getElementById('progress-circle-top');
+            const progressCircleBottom = document.getElementById('progress-circle-bottom');
+
+            // Reset to starting position (both start at half circumference)
+            const halfCircumference = 150.796; // PI * 48 (half circle)
+            progressCircleTop.setAttribute('stroke-dashoffset', halfCircumference);
+            progressCircleBottom.setAttribute('stroke-dashoffset', halfCircumference);
+            bootProgressSvg.style.display = 'block';
+
+            const progressDuration = 850; // Until display turns on
+            const progressStartTime = Date.now();
+
+            const progressAnimation = setInterval(() => {
+               if (!isPowered) {
+                  clearInterval(progressAnimation);
+                  return;
+               }
+
+               const progressElapsed = Date.now() - progressStartTime;
+               const progress = Math.min(progressElapsed / progressDuration, 1);
+               const offset = halfCircumference * (1 - progress);
+               progressCircleTop.style.strokeDashoffset = offset;
+               progressCircleBottom.style.strokeDashoffset = offset;
+
+               if (progress >= 1) {
+                  clearInterval(progressAnimation);
+                  // Hide circle when display initializes
+                  activeTimers.push(setTimeout(() => {
+                     if (!isPowered) return;
+                     bootProgressSvg.style.display = 'none';
+                  }, 100));
+               }
+            }, 16);
+            activeTimers.push(progressAnimation);
+
+            // Boot sequence with overlapping states
+            const bootSequence = [
+               { component: 'bios', delay: 0, finishDelay: 0 },
+               { component: 'cpu', delay: 0, finishDelay: 0 },
+               { component: 'ram', delay: 0, finishDelay: 0 },
+               { component: 'ssd', delay: 50, finishDelay: 50 },
+               { component: 'radio', delay: 300, text: 'Connecting', finishDelay: 3500 },
+               { component: 'display', delay: 350, text: 'Initializing', finishDelay: 850 },
+               { component: 'gpu', delay: 851, finishDelay: 851 },
+               { component: 'ui', delay: 851, text: 'Loading', finishDelay: 1851 }
+            ];
+
+            bootSequence.forEach(({ component, delay, text, finishDelay }) => {
+               activeTimers.push(setTimeout(() => {
+                  if (!isPowered) return; // Kill-switch check
+                  if (text) {
+                     setStatus(component, text, 'booting');
+                  } else {
+                     setStatus(component, 'On', 'online');
+                  }
+               }, delay));
+
+               if (text) {
+                  activeTimers.push(setTimeout(() => {
+                     if (!isPowered) return; // Kill-switch check
+                     setStatus(component, 'On', 'online');
+
+                     // Show network icon when radio comes online
+                     if (component === 'radio') {
+                        networkIcon.classList.add('visible');
+                     }
+                  }, finishDelay));
+               }
+            });
+
+            // Switch to fully on layer when blur completes (at 1.85s)
+            activeTimers.push(setTimeout(() => {
+               if (!isPowered) return; // Kill-switch check
+               glyphOff.src = 'glyph_off.webp'; // Switch back to regular off state
+               glyphLoading.style.opacity = '0';
+               glyphLoading.style.filter = 'none'; // Clear any remaining filters
+               glyphOn.style.opacity = '1';
+
+               // Show and start updating clock
+               updateClock();
+               systemClock.classList.add('visible');
+               clockInterval = setInterval(updateClock, 1000);
+            }, 1850));
+         }
+      }
+   </script>
+</body>
+
+</html>
