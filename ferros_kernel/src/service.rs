@@ -1147,7 +1147,7 @@ pub fn run(mut b: Boot) -> ! {
             crate::process::threads_report(&mut threads);
             platform::pstore(&threads);
             let w = |k: usize| crate::smp::IDLE_WAKES[k].load(core::sync::atomic::Ordering::Relaxed);
-            platform::pstore(alloc::format!("workers: up G#{:X}, idle wakes [{}, {}, {}, {}]\n", crate::smp::up_mask(), w(0), w(1), w(2), w(3)).as_bytes());
+            platform::pstore(alloc::format!("workers: up G#{:X}, idle wakes [{}, {}, {}, {}]; x3 parked {}\n", crate::smp::up_mask(), w(0), w(1), w(2), w(3), crate::x3::parked()).as_bytes());
             platform::pstore(&crate::process::take_console());
             platform::reboot();
         }

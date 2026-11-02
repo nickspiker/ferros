@@ -308,6 +308,11 @@ const MARK_TRAIL: usize = RAMOOPS_RESULT + 0x240;
 pub fn mark_trail(m: u8) {
     unsafe {
         let p = MARK_TRAIL as *mut u64;
+        // Mark 0 (entry) keeps the previous session's trail at +8 before clearing: a boot after a dead jump reads it there (`bridge read FD600248 8`).
+        if m == 0 {
+            write_volatile(p.add(1), read_volatile(p));
+            core::arch::asm!("dc civac, {a}", a = in(reg) p.add(1) as u64);
+        }
         let v = if m == 0 { 0 } else { read_volatile(p) << 8 | m as u64 };
         write_volatile(p, v);
         core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);

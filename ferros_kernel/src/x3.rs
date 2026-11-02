@@ -229,7 +229,8 @@ pub fn launch() {
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
     // Whatever an earlier session left in the block is not this boot's: no core is parked until this launch says so.
     unsafe { write_volatile((HOP + H_PARKED) as *mut u64, 0) };
-    if mpidr & 0xFFFF != 0 {
+    // After the jump from Android the boot core is the hv's core 3, not CPU0, and the X3 must still be launched: this test took the jump for a reload and never started the X3, so the display server and touch, which pin themselves to it after their first lines, were never scheduled again (jumps 28 to 34, 2026-11-02).
+    if mpidr & 0xFFFF != 0 && !crate::platform::jumped() {
         // A reload, already on the X3 (CPU0 is parked for good): the X3's own setup that `ferros_x3_main` would have done.
         crate::killswitch::arm_power_key();
         return;
