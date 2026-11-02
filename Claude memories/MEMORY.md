@@ -116,4 +116,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) — no sRGB/OKLab/Rec.709/XYZ-1931 in ferros or Photon (platform edge only); pick in VSF RGB, match brightness by photopic via LMS (vsf_rgb_to_photopic_f32); the mark + keyboard rainbow were sRGB-authored (2026-11-01)
 - [Android behind attestation](android_behind_attestation.md) — planned after the OS swap: always ferros, Android only after attest, back by reboot; blunt "not a phone" disclaimer required (no 911 without the handle), OEM-unlock kept reachable, no firehose on Pixel
 - [hv chords](hv_chords_decided.md) — power+vol up → ferros, vol up+down = kill; hv-owned core 3 takes the key SPIs, proxies to Android (works on slot b 2026-11-01)
-- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros fresh (no bootloader); drivers vs Android's hw state = the work left; slot b only via signed husky-cold
+- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros fresh on the hv core; LANDS since 2026-11-02 (jump 35); radios still gated after a jump; the 35-jump bug list

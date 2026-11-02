@@ -165,11 +165,7 @@ A core that will not stop, or a failed CPU_ON, falls back to the reset path (FER
 
 Each comes back when its driver can bring its block up from any state, not only from the bootloader's.
 
-**Where it stands (eleven jumps):**
-- **Freeze and start:** solid.
-- **Jumped session:** stays up some of the time. Jump 10 ran with every process up; jump 11 (the same build) hit the APC watchdog with the lock free and the workers idle, so the kernel's own service loop on the X3 stalled on something it drives itself (battery gauge, thermal, clock policy: not yet named).
-- **Panel:** stays on Android's last frame. Frames leave DECON at 10/s with ferros's layer, raster 1344x2992 (Android runs WQHD; the display server takes the size from DECON's blender), so the difference lies between DECON and the glass: DSIM, the DSC encoder or the panel's own mode. A cold-boot snapshot of every display block is on the dev host for the diff (`dispsnap.sh` in the session scratchpad); the jumped side is still to take.
-- **Gave reboots, taken out:** switching off Android's DECON windows from the hv, together with forcing the modeset.
+**Where it stands (thirty-seven jumps, 2026-11-02): it lands.** Power + volume up from a running Android gives the attest screen in about a second, with USB, touch and the display right, from Android's full or scaled resolution. The bugs found in order: drivers meeting Android's hardware (gated off after a jump: WiFi, Bluetooth, NFC, sensors, the modem; each returns once it can bring its block up from any state); the TRNG/key lock; the X3 never launched (`x3::launch` took a non-zero boot MPIDR for a reload, so the display server and touch, which pin themselves to the X3, were never scheduled); the layer scaler, the DQE stages and DECON's configuration left at Android's (the display server now runs its full modeset after a jump). Still gated after a jump: the radios and sensors.
 
 **Tools added:**
 - The kernel records each core's last register access a process asks for (SYS_MMIO_READ/WRITE: the physical address, bit 63 = write) in the ramoops page at +G#180. Boot rotates it to +G#1C8 (`bridge read FD6001C8 48`), beside the per-core notes (`PREV_NOTE_*`: the lock's holder, each core's syscall crumb, 0x90 + n inside syscall n, 0x70 + n with the thread). Together they name the stalled register.

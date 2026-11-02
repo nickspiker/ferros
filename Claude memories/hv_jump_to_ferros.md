@@ -1,15 +1,17 @@
 ---
 name: hv-jump-to-ferros
-description: "Power+vol up under Android = jump: hv freezes Linux (stage-2 pull), boots ferros fresh, no bootloader. Mechanics solid; drivers meeting Android's hardware state stall the bus; panel stays on Android's frame"
+description: "Power+vol up under Android = jump: hv freezes Linux (stage-2 pull), parks cores on a mailbox, boots ferros fresh on the hv core, no bootloader. LANDS since 2026-11-02 (jumps 35-37): attest screen, USB, touch, display right, from Android at full or scaled resolution; radios still gated after a jump"
 metadata:
   type: project
 ---
 
 Owner direction (2026-11-01): "jump to ferros", not reboot. Halt Android, fresh ferros boot, no bootloader nag, no RAM wipe (owner: skip it). The reverse (the circle back to Android) is wanted too, with no reboot.
 
-**Built (`FERROS_HV_CORE`, HV.md "The jump to ferros"):**
-- The freeze stops all 8 Android cores in 1-3 ms.
-- ferros starts on core 0 with GATE_ANSWER 6; SYS_FACTS 31 = 6 tells processes.
+**Built (`FERROS_HV_CORE`, HV.md "The jump to ferros"); lands since 2026-11-02 (jump 35):**
+- The freeze pulls stage 2; Android's cores park powered on a mailbox (G#A_FFFE_0000), ferros starts them from it (platform::start_core); no PSCI CPU_ON of an Android core (hung in EL3 one time in two).
+- ferros boots on the hv core (core 3) by a branch, not CPU_ON (core 0's hung).
+- The 35-jump hunt's real bugs, in order: drivers meeting Android's hardware (gated off after a jump), the TRNG/keys lock, the X3 never launched (x3::launch took a non-zero boot MPIDR for a reload; display and touch pin to the X3 and starved), the layer scaler, the DQE and DECON's configuration left at Android's (the display server runs its full modeset after a jump; works from the scaled resolution too, jump 37).
+- Diagnosis tools that found them: the pstore ring mirror (loses its position word on watchdog deaths: use the crumb page), the mark trail (G#FD60_0240, previous at +8), per-worker steps (G#FD60_0B00), the hand-off trace, the 60 s escape's thread dump.
 
 **The real work left:** every ferros driver assumes the bootloader's hardware state. After a jump they meet Android's state and stall the bus, and a watchdog resets the device (APM or APC). Seen so far:
 - the modem's register read;
