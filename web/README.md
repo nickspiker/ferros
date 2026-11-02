@@ -1,3 +1,5 @@
 # web
 
-The source of ferros.org. Pulled from the live site on 2026-11-02 as the baseline (wget mirror: both pages, the diagrams, the fonts, nav and footer), so the site can be regenerated from the repo. The content is stale: it still describes ferros as based on Redox OS, a ring-memory kernel, a status board with everything off, and a launch plan with blockchain-verified serials. Rewrite from the repo's current state (README.md, docs/) before publishing again.
+The source of ferros.org: one self-contained page, `index.html`, wired the way passless.org is (no scripts, no cookies, no trackers, no fonts fetched, relative units only), and `robots.txt`.
+
+Rewritten on 2026-11-02 to say what is true: what runs on the Pixel 8 Pro today, what is designed, what is still a bet, and what ferros will never be. The page before it (ripped from the live site that day, commit 2086daf) described a Redox-based ring-memory kernel and a status board with everything off; git history keeps it. Every claim on the page should point at something in this repository; change the page when the repository changes.
