@@ -341,6 +341,11 @@ pub fn adopt_once(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
 }
 
 pub fn adopt(cntfrq: u64, rep: &mut alloc::vec::Vec<u8>) -> Option<Panel> {
+    // After the jump from Android the pipe is Android's, not the bootloader's splash this adopts (window, trigger, frame state): the kernel draws nothing there (no checklist), and the display server takes the panel. Drawing the checklist on it hung the jump between the repeater and the board read on some jumps (the twenty-fourth, 2026-11-02).
+    if crate::platform::jumped() {
+        rep.extend_from_slice(b"display: started by the jump; the kernel leaves Android's pipe to the display server\n");
+        return None;
+    }
     // Never touch a powered-down DPU: on husky a CPU read of DECON with the DPU domain off returns 0 but leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever (measured: the boot screen's single DECON_VERSION read in the reboot path made DIAG's PMU readback hang). The domain state is read through the EL3 monitor, which is safe: word 0 of each PMU power-domain block is 1 when on (pd-dpub G#1546_1D00, pd-dpuf0 G#1546_1D80, pd-dpuf1 G#1546_1E00; other offsets are not whitelisted and return -EINVAL).
     let pd = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].map(|a| crate::platform::priv_reg(a, false, 0));
     append_hex(rep, b"PD_DPUB=", pd[0] as u32);
