@@ -279,7 +279,10 @@ fn random(out: &mut [u64]) {
         }
         return;
     }
-    if crate::kohi::trng_words(out) {
+    crate::platform::pstore(b"ferros: keys: firmware TRNG call\n");
+    let got = crate::kohi::trng_words(out);
+    crate::platform::pstore(if got { b"ferros: keys: TRNG answered\n" as &[u8] } else { b"ferros: keys: TRNG refused\n" });
+    if got {
         return;
     }
     WEAK_MASKS.fetch_add(1, Ordering::Relaxed);
@@ -450,7 +453,9 @@ pub fn serve() {
 
 /// Hold `value` as this boot's ira (slot 0) or wairua (slot 1), on this core and, sealed, on every other; `value` is wiped. False if the self-test failed (the secret is then not held anywhere: callers refuse, as for no secret at all).
 pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
+    crate::platform::pstore(b"ferros: keys: set, locking\n");
     lock();
+    crate::platform::pstore(b"ferros: keys: locked\n");
     if TEST.load(Ordering::Acquire) == 0 {
         TEST.store(self_test(), Ordering::Release);
     }
