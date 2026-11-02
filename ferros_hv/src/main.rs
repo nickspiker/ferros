@@ -2214,7 +2214,7 @@ mod hvcore {
         unsafe { asm!("dsb sy") };
     }
 
-    /// Power + volume up: Android stops where it is and ferros starts on core 0, as the gate would start it. Counters: 16 jumps, 17 the cores PSCI reported off (bit per core), 18 ms until then, 20 core 0's CPU_ON result, 21 the kept image's length, 22 the kept bootconfig's, 23 + core each core caught by the freeze. A freeze that does not stop every core, or a CPU_ON that fails, falls back to the reset.
+    /// Power + volume up: Android stops where it is and ferros starts on this core (the hv core), as the gate would start it. Counters: 16 jumps, 17 the cores PSCI reported off (bit per core), 18 ms until then, 19 the last step done (1 watchdogs stopped, 2 trigger masked, 3 GIC quiet, 4 caches cleaned, 5 ferros copied, 6 branching into ferros on this core), 20 unused since core 0's CPU_ON result, 21 the kept image's length, 22 the kept bootconfig's, 23 + core each core caught by the freeze. A freeze that does not stop every core, or a CPU_ON that fails, falls back to the reset.
     fn jump() -> ! {
         stat(16, 1);
         let len = unsafe { read_volatile(&raw const IMAGE_LEN) };
@@ -2252,18 +2252,26 @@ mod hvcore {
             super::pstore::log(&[b"\nferros hv: jump -- not every core went off, resetting instead\n"]);
             to_ferros();
         }
-        // The cluster watchdogs stop here: Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). ferros arms them itself, as after the bootloader.
+        // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
+            wr(w + 0x04, 0xFFFF);
+            wr(w + 0x08, 0xFFFF);
+            wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
+        set(19, 1);
         // No frame may be in flight when translation goes off: the second jump switched the display SysMMUs off under a running scanout, the engine fetched Android's IOVAs as physical addresses, and the interconnect stalled until the APM watchdog reset the device (ferros left no notes). Trigger masked first, then 1/16 s, longer than a frame at 60 Hz.
         let t = rd(DECON0_TRIG_CON);
         wr(DECON0_TRIG_CON, (t & !1) | (1 << 4));
         let (t1, _) = now();
         while now().0.wrapping_sub(t1) < f >> 4 {}
+        set(19, 2);
         gic_quiet();
+        set(19, 3);
         flush_all();
+        set(19, 4);
         copy64(JUMP_IMAGE, FERROS_LINK, len);
+        set(19, 5);
         let bc = read_count(22) as usize;
         for k in 0..bc {
             unsafe { write_volatile((LOW_BOOTCONFIG + k) as *mut u8, read_volatile((JUMP_BOOTCONFIG + k) as *const u8)) };
@@ -2280,12 +2288,13 @@ mod hvcore {
             write_volatile((super::gate::GATE_MARK_ADDR + 8) as *mut u64, 6);
             asm!("dsb sy");
         }
-        let r = smc(0xC400_0003, 0, super::_ferros_go as *const () as u64, JUMP_DTB as u64);
-        set(20, r);
-        if r != 0 {
-            to_ferros();
+        // ferros starts on this core, the hv's own: no PSCI CPU_ON. Starting core 0 again after Android had it hung in the secure firmware on some jumps (step 6 reached, the call never returned, the APM watchdog: the seventeenth jump), as if core 0 had gone off mid-way through an idle transition with the power-management firmware. This core is running at EL2 with its caches clean; its interface is quieted and EL2 put back as a fresh core finds it (HCR_EL2 RW only), then it branches to ferros's entry with the kept device tree in x0. ferros has no tie to core 0: its kernel moves to the X3.
+        set(19, 6);
+        unsafe {
+            asm!("msr s3_0_c12_c12_7, xzr", "isb"); // ICC_IGRPEN1_EL1 off: ferros sets its own
+            asm!("msr hcr_el2, {h}", "isb", h = in(reg) 1u64 << 31);
+            asm!("br {e}", e = in(reg) super::_ferros_go as *const () as u64, in("x0") JUMP_DTB as u64, options(noreturn));
         }
-        off_now()
     }
 
     /// Returns true for power + volume up: the jump, made once this interrupt is completed (an interrupt left active would never reach ferros).
@@ -2410,7 +2419,7 @@ const FRP_TAIL: u64 = 37_253;
 /// Pixel's PRDT entry: the standard 16 bytes and 112 of inline-encryption fields (ufs-pixel-crypto.c `pixel_ufs_prdt_entry`); des3 bit 31 enables encryption, its low 18 bits are the byte count less one.
 const PRDT_ENTRY: u64 = 128;
 const PRDT_CRYPTO: u32 = 1 << 31;
-/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list, descriptor or data was outside DRAM, 19 UNMAP descriptors reaching a boot chain, 20 the ferros partition, 21 UNMAP descriptors, 22 UNMAP lists unreadable, 23 writes to LU3 (devinfo), 24 writes to LU1/LU2 (the bootloaders).
+/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list, descriptor or data was outside DRAM, 19 UNMAP descriptors reaching a boot chain, 20 the ferros partition, 21 UNMAP descriptors, 22 UNMAP lists unreadable, 23 writes to LU3 (devinfo), 24 writes to LU1/LU2 (the bootloaders). Refused (the firewall, 2026-11-01): 30 writes, 31 UNMAP ranges emptied, 32 queries, 33 the last refused (lun << 56 | lba for a write, G#51 << 56 | opcode << 8 | idn for a query).
 const UFS_STATS: usize = 0xFD60_0E00;
 const UFS_MAGIC: u64 = 0x5546_5346_5731_0000; // "UFSFW1"
 
@@ -2432,7 +2441,7 @@ fn ufs_set(i: usize, v: u64) {
 
 /// Called once, while stage 2 is built: the counters zeroed and stamped, the page unmapped.
 unsafe fn ufs_arm() {
-    for i in 0..30 {
+    for i in 0..34 {
         ufs_set(i, 0);
     }
     ufs_set(0, UFS_MAGIC);
@@ -2441,6 +2450,23 @@ unsafe fn ufs_arm() {
 
 fn rd32(pa: u64) -> u32 {
     unsafe { read_volatile(pa as *const u32) }
+}
+
+/// Clean and invalidate the lines over [pa, pa + len) to the point of coherency. Android builds its UFS commands in cacheable memory (the host controller is dma-coherent), and the hv reads and rewrites them with its MMU off: without this a read could see DRAM behind a dirty line, and a rewrite could be overwritten by that line's eviction or missed by the device's snoop of a stale copy.
+fn civac(pa: u64, len: u64) {
+    let mut a = pa & !63;
+    while a < pa + len {
+        unsafe { asm!("dc civac, {a}", a = in(reg) a) };
+        a += 64;
+    }
+    unsafe { asm!("dsb sy") };
+}
+
+/// Write `v` over Android's byte at `pa` (a command it built), coherently.
+fn poke8(pa: u64, v: u8) {
+    civac(pa, 1);
+    unsafe { write_volatile(pa as *mut u8, v) };
+    civac(pa, 1);
 }
 
 /// A doorbell write of `bits`: each command it starts that was not already running, read from Android's list (before the real write reaches the device).
@@ -2462,6 +2488,7 @@ unsafe fn ufs_command(utrd: u64) {
         ufs_stat(18, 1);
         return;
     }
+    civac(utrd, 32);
     let ucd = ((rd32(utrd + 0x14) as u64) << 32 | rd32(utrd + 0x10) as u64) & !0x7F;
     let w7 = rd32(utrd + 0x1C);
     // UTRD word 7: the PRDT's length in entries (low 16 bits, `prd_table_length`) and its offset into the UCD in dwords (high 16, `prd_table_offset`); zuma's DT sets `fixed-prdt-req_list-ocs`, so not the Exynos byte-granular form. Read the other way round until 2026-11-01, which put every PRDT walk in the wrong place (the 1 KiB offset, past the 512-byte command and response UPIUs, read as a length of 256).
@@ -2471,7 +2498,19 @@ unsafe fn ufs_command(utrd: u64) {
         return;
     }
     let b = |o: u64| read_volatile((ucd + o) as *const u8);
-    // A command UPIU only (transaction type 1): queries and NOPs carry no SCSI command.
+    civac(ucd, 64);
+    // A query (transaction type G#16): the writes that change how the device boots or is provisioned are refused by naming an IDN that does not exist (G#FF), so the device answers "invalid IDN" and Android sees the write fail: WRITE DESCRIPTOR (opcode 2: re-provisioning, the LU layout), WRITE ATTRIBUTE (4) of bBootLunEn (IDN 0: which boot LU, and so which slot, the ROM boots; the OTA engine's switch) or bConfigDescrLock (G#B: locks the configuration for good), and SET or TOGGLE FLAG (6, 8) of fPermanentWPEn (2: write protection that never clears). Everything else (reads, power modes, background ops, purge) passes.
+    if b(0) & 0x3F == 0x16 {
+        let (opcode, idn) = (b(12), b(13));
+        let refuse = opcode == 0x02 || (opcode == 0x04 && (idn == 0x00 || idn == 0x0B)) || ((opcode == 0x06 || opcode == 0x08) && idn == 0x02);
+        if refuse {
+            poke8(ucd + 13, 0xFF);
+            ufs_stat(32, 1);
+            ufs_set(33, 0x51 << 56 | (opcode as u64) << 8 | idn as u64);
+        }
+        return;
+    }
+    // Otherwise a command UPIU only (transaction type 1): NOPs and task management carry no SCSI command.
     if b(0) & 0x3F != 0x01 {
         return;
     }
@@ -2518,6 +2557,10 @@ unsafe fn ufs_command(utrd: u64) {
     if lun != 0 {
         ufs_stat(13, 1);
         ufs_stat(if lun == 3 { 23 } else { 24 }, 1);
+        // LU1 and LU2 are the bootloader's two copies (bl1, pbl, bl2, abl and the rest): Android writes them only to update the bootloader, into the copy it does not run.
+        if lun == 1 || lun == 2 {
+            refuse_write(cdb, op, lun, lba);
+        }
         return;
     }
     let end = lba + len - 1;
@@ -2528,6 +2571,10 @@ unsafe fn ufs_command(utrd: u64) {
     }
     if hits(FERROS_PART) {
         ufs_stat(7, 1);
+    }
+    if BOOT_CHAIN.iter().any(|&r| hits(r)) || hits(FERROS_PART) {
+        refuse_write(cdb, op, lun, lba);
+        return;
     }
     if hits((FRP_TAIL, FRP_TAIL)) {
         ufs_stat(8, 1);
@@ -2546,20 +2593,38 @@ unsafe fn ufs_command(utrd: u64) {
     }
 }
 
+/// Refuse a WRITE(10) or WRITE(16) by moving its LBA past the end of any LU (G#FFFF_0000, G#FFFF_FFFF_FFFF_0000): the device answers ILLEGAL REQUEST, LBA out of range, before any data moves, and Android sees an ordinary I/O error (no faked completion, no host reset). The firewall's refusal (owner, 2026-11-01: no reflash without the handle; the OTA engine writes the inactive slot, which is ferros's, and switches the boot LU). Android can still change the command between this check and the device's fetch (it lives in Android's memory): the shadow lists close that, later.
+unsafe fn refuse_write(cdb: u64, op: u64, lun: u64, lba: u64) {
+    let n = if op == 0x2A { 4 } else { 8 };
+    for i in 0..n {
+        poke8(cdb + 2 + i, if i + 2 < n { 0xFF } else { 0x00 });
+    }
+    ufs_stat(30, 1);
+    ufs_set(33, lun << 56 | lba);
+}
+
 /// Byte `at` of a command's data, found by walking its PRDT (`prdtl` entries of PRDT_ENTRY bytes from `prdto` into the UCD), and whether its entry has inline encryption on. None when the walk leaves DRAM or the data is shorter. WHY/PROOF the DRAM checks: Android's addresses, external input.
 unsafe fn data_byte(ucd: u64, prdto: u64, prdtl: u64, at: u64) -> Option<(u8, bool)> {
+    let (a, crypto) = data_addr(ucd, prdto, prdtl, at)?;
+    civac(a, 1);
+    Some((read_volatile(a as *const u8), crypto))
+}
+
+/// The physical address of byte `at` of a command's data, and whether its PRDT entry has inline encryption on (data_byte's walk). WHY/PROOF the DRAM checks: Android's addresses, external input.
+unsafe fn data_addr(ucd: u64, prdto: u64, prdtl: u64, at: u64) -> Option<(u64, bool)> {
     let mut want = at;
     for e in 0..prdtl {
         let ent = ucd + prdto + e * PRDT_ENTRY;
         if !in_dram(ent) || !in_dram(ent + 15) {
             return None;
         }
+        civac(ent, 16);
         let addr = (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64;
         let d3 = rd32(ent + 12);
         let size = (d3 & 0x3_FFFF) as u64 + 1;
         if want < size {
             let a = addr + want;
-            return in_dram(a).then(|| (read_volatile(a as *const u8), d3 & PRDT_CRYPTO != 0));
+            return in_dram(a).then_some((a, d3 & PRDT_CRYPTO != 0));
         }
         want -= size;
     }
@@ -2609,6 +2674,20 @@ unsafe fn ufs_unmap(ucd: u64, prdto: u64, prdtl: u64) {
         }
         if hits(FERROS_PART) {
             ufs_stat(20, 1);
+        }
+        // Refused: the range's block count set to 0, which UNMAP treats as no blocks (SBC), so the rest of the list still trims what it names.
+        if BOOT_CHAIN.iter().any(|&r| hits(r)) || hits(FERROS_PART) {
+            for i in 0..4 {
+                match data_addr(ucd, prdto, prdtl, o + 8 + i) {
+                    Some((a, _)) => poke8(a, 0),
+                    None => {
+                        ufs_stat(22, 1);
+                        return;
+                    }
+                }
+            }
+            ufs_stat(31, 1);
+            ufs_set(33, lba);
         }
     }
 }
