@@ -1724,12 +1724,8 @@ pub(crate) fn pixel8_eusb_phy_init() {
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
-    // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot.
-    platform::pstore(b"\nferros: entry\n");
-    platform::detect_jump();
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
-    platform::pstore(b"ferros: killswitch armed\n");
     cachemap::enable();
     // Init the DRAM bump heap (same as cold boot; __stack_top is inside the carveout for the shim link, so this stays in reserved DRAM).
     unsafe extern "C" { static __stack_top: u8; }
@@ -1755,8 +1751,13 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
             unsafe { core::arch::asm!("wfe") };
         }
     }
+    // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot. Then whether this boot is the jump from Android, before anything starts a core (platform::start_core). Both were first written into the shim's kernel_main by mistake, so the jumps of 2026-11-02 started parked cores with PSCI.
+    platform::pstore(b"\nferros: entry\n");
+    platform::detect_jump();
+    platform::pstore(if platform::jumped() { b"ferros: started by the jump from Android\n" as &[u8] } else { b"ferros: not a jump\n" });
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
+    platform::pstore(b"ferros: killswitch armed\n");
     // Boot timing starts here: everything after this is ferros's own time (`diag boot`).
     checklist::ENTRY.store(platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
     // The I-cache before the cache map: with the MMU off and the I-cache off every instruction is a DRAM read, and building the tables plus discarding the window's stale lines ran 317 ms that way (`diag boot`, 2026-10-27). With SCTLR.I set and the MMU off, instruction fetches are cacheable; `enable_icache` invalidates first.
