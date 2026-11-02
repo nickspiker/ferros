@@ -195,7 +195,7 @@ If clock calibration fails the bridge exits — it will not run with an uncalibr
 
 ## Running it
 
-Setup (Fedora dev host), per [CLAUDE.md](CLAUDE.md):
+Setup (Fedora dev host), per [CLAUDE.md](../CLAUDE.md):
 - udev rule grants `dialout` access and auto-loads the needed modules.
 - The device must be booted and past USB init (run `status`, then `diag`).
 
@@ -222,4 +222,4 @@ cargo run -p ferros-bridge -- install ferros_kernel.signed
 - Polling only — no GIC interrupts on the device side; the bridge paces sends to match.
 - Single-TRB device model — no TRB rings yet; throughput is pacing-bound, not bandwidth-bound.
 - No stall recovery — a wedged endpoint needs a power cycle.
-- Mirrors the device-side caveats in [CLAUDE.md](CLAUDE.md) Phase 4 "Known limitations" — keep the two lists in sync.
+- Mirrors the device-side caveats in [CLAUDE.md](../CLAUDE.md) Phase 4 "Known limitations" — keep the two lists in sync.

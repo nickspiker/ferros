@@ -1,7 +1,7 @@
 # ferros — Claude Code Project Instructions
 
 ## What This Is
-ferros is a mobile OS distilled down to what an OS actually is, in Rust; inspired by Redox OS, but its own kernel, sharing no code with it. Ring memory, hardware key storage, killswitch ready. See README.md for full overview.
+ferros is a mobile OS distilled down to what an OS actually is, in Rust; inspired by Redox OS, but its own kernel, sharing no code with it. Ring memory, hardware key storage, killswitch ready. See README.md for full overview. The design documents live in docs/ (one per subsystem: BOOT, HV, VAULT, DISPLAY, …), the ferros.org source in web/.
 
 ## Conventions
 - All numeric output uses `[base36]#[number]` format (G# for hex, A# for decimal) — NEVER use 0x prefix

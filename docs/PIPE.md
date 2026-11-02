@@ -126,7 +126,7 @@ Any commit that breaks one of these changes the threat model.
 
 ## Relationship to Glyph
 
-PIPE on ECP5 is the FPGA prototype of the same write-once-key anchor that [Glyph silicon](README.md#hardware-platform-glyph) will hold in a custom RISC-V CSR. The capability shape is identical:
+PIPE on ECP5 is the FPGA prototype of the same write-once-key anchor that [Glyph silicon](../README.md#hardware-platform-glyph) will hold in a custom RISC-V CSR. The capability shape is identical:
 
 - Hardware-controlled write-once register, no read path back.
 - Output usable only as the key input to a keyed cryptographic hash.

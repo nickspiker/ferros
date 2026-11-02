@@ -1,5 +1,7 @@
 # Edge TPU (and the GXP DSP) on husky
 
+> 2026-11-01: the kernel's TPU tools (`tpu.rs`, `diag tpu load|start|state`) and `tools/husky-tpu-fw.sh` are gone (KERNEL-OUT.md decision 4); this page is the record of what they found.
+
 The TPU ("rio", `google,edgetpu-zuma`) at G#1A00_0000 is started exactly as the AoC is: **GSA's non-secure mailbox loads and authenticates its signed image (command 50, `LOAD_TPU_FW_IMG`), and GSA's Trusty service `com.android.trusty.gsa.hwmgr.tpu` starts the Cortex-R52**. ferros has every piece of that path (gsa.rs, trusty.rs).
 
 ## Measured under ferros (2026-10-24 night)
