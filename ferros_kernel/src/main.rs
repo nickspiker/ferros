@@ -1724,8 +1724,11 @@ pub(crate) fn pixel8_eusb_phy_init() {
 #[cfg(all(feature = "pixel8", shim_handoff))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot.
+    platform::pstore(b"\nferros: entry\n");
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
+    platform::pstore(b"ferros: killswitch armed\n");
     cachemap::enable();
     // Init the DRAM bump heap (same as cold boot; __stack_top is inside the carveout for the shim link, so this stays in reserved DRAM).
     unsafe extern "C" { static __stack_top: u8; }
@@ -1758,6 +1761,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The I-cache before the cache map: with the MMU off and the I-cache off every instruction is a DRAM read, and building the tables plus discarding the window's stale lines ran 317 ms that way (`diag boot`, 2026-10-27). With SCTLR.I set and the MMU off, instruction fetches are cacheable; `enable_icache` invalidates first.
     platform::enable_icache();
     let cached = cachemap::enable();
+    platform::pstore(b"ferros: cache map on\n");
     checklist::at("cache map on");
     // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
     unsafe extern "C" { static __stack_top: u8; static _start: u8; }
@@ -1773,15 +1777,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     if option_env!("FERROS_X3") != Some("0") {
         x3::launch();
     }
+    platform::pstore(b"ferros: X3 launched\n");
     // The firmware TRNG's words for the wairua's KOHI, gathered on worker 3 while this core boots (kohi.rs `start_early`): its 329 ms of SMCs ran in front of the first process (2026-11-01).
     if cached {
         kohi::start_early();
     }
+    platform::pstore(b"ferros: KOHI early started\n");
 
     // The previous session's report (ramoops DRAM survives warm resets), then the safety nets: fault sink + panic reporter into the report block, cluster watchdogs.
     let prev = platform::read_report();
     platform::arm_safety();
     platform::crumb(0xC0);
+    platform::pstore(b"ferros: safety armed\n");
     checklist::at("safety armed");
 
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
@@ -1990,7 +1997,6 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         store,
         prev,
         extras,
-        ufs_probe: Some(cold_ufs::probe),
     };
     // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
     // CPU0 is about to park: the ira and wairua it holds go sealed to the X3 and the workers, and its own registers are cleared (keys.rs).

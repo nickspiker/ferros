@@ -36,7 +36,7 @@ Each move so far followed the same shape:
 | 7 | Small drivers (`amp`, `haptics`, `gnss`, `spi`, `fp`), the radios' power switches | ~1k | spi (portable), ACPM, `aoc::probe32` (haptics) | Each its own process; `spi.rs` becomes a shared crate (touch, amp, gnss, nfc all use it). `fp` is a bus hunt: a diag payload. |
 | 8 | `partfs` (ext4/f2fs on Android's partitions) | ~0.4k | the UFS link under the kernel lock | A read-only file server, once a process can be given block access to a partition without the vault's LU. |
 | 9 | Policy in the service loop: the AoC boot sequence, the home start | — | — | init (restart policy is init's). **The WiFi keeper moved 2026-11-01:** init's keepers restart `usb` and `pcie1` with `spawn_unique` (USB.md step 5). |
-| 10 | Probes: `cold_ufs`, `shim.rs` | ~0.6k | — | `cold_ufs` (UFS solved 2026-10-14) to a diag payload or out; `shim.rs` stays while the Linux register oracle is used. |
+| 10 | Probes: `cold_ufs`, `shim.rs` | ~0.6k | — | **`cold_ufs` done** 2026-11-01: the link-startup probe (`bridge diag ufs`) is gone; the cold boot's power-on and bring-up stay. `shim.rs` stays while the Linux register oracle is used. |
 
 ## Rules for each move
 

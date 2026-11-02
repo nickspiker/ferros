@@ -45,7 +45,7 @@ fn usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  status       Check if device is connected");
-    eprintln!("  diag [ufs]   Retrieve boot diagnostics from device (ufs = run the cold UFS link-startup probe)");
+    eprintln!("  diag         Retrieve boot diagnostics from device");
     eprintln!("  read <addr> [len]  Read MMIO (hex addr, optional len, default 4)");
     eprintln!("  echo         PT echo test — send pattern, verify round-trip");
     eprintln!("  send <hex>   Send hex bytes via PT transfer");

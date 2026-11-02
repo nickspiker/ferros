@@ -41,8 +41,6 @@ pub struct Boot {
     pub prev: Option<[u64; 32]>,
     /// Boot-path specific DIAG lines.
     pub extras: alloc::vec::Vec<(&'static [u8], u32)>,
-    /// `bridge diag ufs`: the cold path's UFS link-startup probe.
-    pub ufs_probe: Option<fn() -> alloc::vec::Vec<u8>>,
 }
 
 /// What `reboot_to_bootloader` returned when a fastboot request fell through (0 = never tried); reported in r[23].
@@ -2148,14 +2146,6 @@ pub fn run(mut b: Boot) -> ! {
                 if cmd.params == b"cam state" {
                     // `diag cam state`: the main camera's power-up dependencies, read only (camera.rs), so a cold boot is measured before anything is written.
                     crate::camera::state(&mut resp);
-                    queue_pt_response(&mut pt_out_data, &resp);
-                    continue;
-                }
-                if cmd.params == b"ufs" {
-                    match b.ufs_probe {
-                        Some(f) => resp = f(),
-                        None => resp.extend_from_slice(b"no UFS probe on this boot path (the handoff adopts Linux's live link)\n"),
-                    }
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
