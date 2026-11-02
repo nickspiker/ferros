@@ -454,6 +454,7 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     if TEST.load(Ordering::Acquire) == 0 {
         TEST.store(self_test(), Ordering::Release);
     }
+    crate::platform::pstore(b"ferros: keys: self-test done\n");
     if TEST.load(Ordering::Acquire) != 1 {
         wipe(value);
         unlock();
@@ -461,8 +462,10 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     }
     // This core must hold the other secret before the new generation, or the blob would carry a stale one.
     let _ = adopt();
+    crate::platform::pstore(b"ferros: keys: adopted\n");
     let mut m = [0u64; 4];
     random(&mut m);
+    crate::platform::pstore(b"ferros: keys: random drawn\n");
     let mut v = words(value);
     sealed(|| unsafe { keyreg_set(slot, &m, &v, &[0; 4]) });
     wipe_words(&mut v);
@@ -472,8 +475,10 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     TAG[slot as usize].store(tag_here(slot), Ordering::Release);
     let g = GEN.fetch_add(1, Ordering::AcqRel) + 1;
     HELD[me()].store(g, Ordering::Release);
+    crate::platform::pstore(b"ferros: keys: sealed, publishing\n");
     publish(running() & !(1 << me()));
     unlock();
+    crate::platform::pstore(b"ferros: keys: set\n");
     true
 }
 
