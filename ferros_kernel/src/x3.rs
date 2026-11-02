@@ -252,8 +252,7 @@ pub fn launch() {
         w(H_GO, 0);
         w(H_STARTED, 0);
         core::arch::asm!("dsb sy");
-        let ret: i64;
-        core::arch::asm!("smc #0", inout("x0") PSCI_CPU_ON => ret, in("x1") 0x800u64, in("x2") ferros_x3_entry as usize as u64, in("x3") HOP as u64);
+        let ret = crate::platform::start_core(8, 0x800, ferros_x3_entry as usize as u64, HOP as u64);
         if ret == 0 {
             LAUNCHED_AT.store(crate::platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
         }

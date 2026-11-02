@@ -1726,6 +1726,7 @@ pub(crate) fn pixel8_eusb_phy_init() {
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot.
     platform::pstore(b"\nferros: entry\n");
+    platform::detect_jump();
     // Killswitch before anything else, then the cache map.
     killswitch::arm();
     platform::pstore(b"ferros: killswitch armed\n");
@@ -1843,10 +1844,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     platform::crumb(0xC1);
     checklist::at("repeater read + tuned");
+    platform::pstore(b"ferros: repeater read and tuned\n");
 
     // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
     checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
     checklist::at("checklist drawn");
+    platform::pstore(b"ferros: checklist drawn\n");
     // The board's CDT and MLB for the sensor registry scripts (sensorlink.rs, SYS_SENSORS op 1), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
     if real_boot {
         // ABL's device tree lies outside the cached window (cachemap.rs: Device memory there), so every byte the walks read was a bus round trip: 554 ms for the two (2026-11-01). One copy into cached memory, eight bytes a load, then both walks on the copy.
@@ -1857,6 +1860,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         modem::keep_bootconfig(at);
     }
     checklist::at("board read");
+    platform::pstore(b"ferros: board read\n");
     if cached {
         checklist::mark(checklist::Item::CacheMap);
     }
@@ -1871,6 +1875,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let t_ufs = platform::cntpct();
     let link_up = cold_ufs::bring_up();
     let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
+    platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
     if link_up {
         checklist::mark(checklist::Item::Disk);
     }
@@ -1929,6 +1934,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
 
     platform::crumb(0xE4);
+    platform::pstore(b"ferros: vault opened, flash write-protect armed\n");
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
@@ -2005,6 +2011,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };
     platform::crumb(0xE7);
+    platform::pstore(b"ferros: into the service\n");
     service::run(boot)
 }
 

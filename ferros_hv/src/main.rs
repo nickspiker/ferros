@@ -2152,17 +2152,33 @@ mod hvcore {
         unsafe { read_volatile(&raw const FREEZE) }
     }
 
-    /// A Linux core caught by the freeze: counted in its own word (23 + core), then off.
+    /// The jump's mailbox (2026-11-02), in the hv's reservation below the report page: one 32-byte slot per core, [entry, context, state]. A parked core sets state 1 and waits; ferros, started by the jump, starts a core by writing its context and then its entry (ferros_kernel platform::start_core) instead of calling PSCI CPU_ON.
+    pub const MAILBOX: usize = 0xA_FFFE_0000;
+
+    /// A Linux core caught by the freeze: counted in its own word (23 + core), then parked at EL2 on the mailbox, powered. Not PSCI CPU_OFF: every way back from an Android core's power-down went through the secure firmware and the power-management core, and that round trip hung on one jump in two (core 0's CPU_ON, then the KOHI worker's, even with the power-mode hint set as Linux sets it: the seventeenth to twentieth jumps). The core leaves its interrupt group off, cleans its own caches (its L1 and L2 may hold Linux's dirty lines), and waits; when an entry appears it drops its stale instructions and branches there at EL2 with the MMU off, as a core fresh from CPU_ON would start, x0 = the context.
     pub fn park() -> ! {
         let m: u64;
         unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) m) };
-        stat(23 + ((m >> 8) & 0xF) as usize, 1);
-        // The core's power-mode hint (PMU CPU_INFORM, G#1546_0860 + 4 per core) set to C2 (1) before CPU_OFF, as Linux's own offline does (pmucal_cpu_disable: zuma's on/off sequences are empty, the hint is all it writes). A core caught busy left 0, one in a cluster power-down 2; after either, ferros's CPU_ON of that core could hang in the secure firmware (the seventeenth jump: core 0; the eighteenth: the KOHI worker), the APM watchdog. Through the EL3 register window, as Linux writes it.
-        let core = (m >> 8) & 0xF;
-        smc(0x8200_0504, 0x1546_0860 + core * 4, 1, 1);
-        unsafe { asm!("smc #0", in("x0") 0x8400_0002u64) };
-        loop {
-            unsafe { asm!("wfe") };
+        let core = ((m >> 8) & 0xF) as usize;
+        stat(23 + core, 1);
+        unsafe { asm!("msr s3_0_c12_c12_7, xzr", "isb") }; // ICC_IGRPEN1_EL1
+        flush_all();
+        let slot = MAILBOX + core * 32;
+        unsafe {
+            write_volatile(slot as *mut u64, 0);
+            write_volatile((slot + 8) as *mut u64, 0);
+            write_volatile((slot + 16) as *mut u64, 1);
+            asm!("dsb sy");
+            loop {
+                asm!("wfe");
+                let entry = read_volatile(slot as *const u64);
+                if entry != 0 {
+                    let ctx = read_volatile((slot + 8) as *const u64);
+                    write_volatile((slot + 16) as *mut u64, 2);
+                    asm!("dsb sy", "ic iallu", "dsb sy", "isb");
+                    asm!("br {e}", e = in(reg) entry, in("x0") ctx, options(noreturn));
+                }
+            }
         }
     }
 
@@ -2225,6 +2241,11 @@ mod hvcore {
             to_ferros();
         }
         super::pstore::log(&[b"\nferros hv: power + volume up -- jumping to ferros\n"]);
+        for c in 0..9usize {
+            for w in 0..4 {
+                unsafe { write_volatile((MAILBOX + c * 32 + w * 8) as *mut u64, 0) };
+            }
+        }
         unsafe {
             write_volatile(&raw mut FREEZE, true);
             asm!("dsb sy");
@@ -2235,8 +2256,9 @@ mod hvcore {
             // SGI 0 to every core but this one (IRM): idle cores wake, fault on their first fetch, and park.
             unsafe { asm!("msr s3_0_c12_c11_5, {v}", "isb", v = in(reg) 1u64 << 40) };
             let mut off = 0u32;
-            for c in 0..9u64 {
-                if OTHERS & (1 << c) != 0 && smc(0xC400_0004, c << 8, 0, 0) == 1 {
+            // Parked: each core says so in its mailbox slot (state 1).
+            for c in 0..9usize {
+                if OTHERS & (1 << c) != 0 && unsafe { read_volatile((MAILBOX + c * 32 + 16) as *const u64) } == 1 {
                     off |= 1 << c;
                 }
             }

@@ -103,9 +103,7 @@ fn cpu_on(k: usize) -> i64 {
         w(H_CNTHCTL, cnthctl);
         w(H_STACK, (&raw const STACKS as usize + (k + 1) * (128 << 10)) as u64);
         core::arch::asm!("dsb sy");
-        let ret: i64;
-        core::arch::asm!("smc #0", inout("x0") PSCI_CPU_ON => ret, in("x1") WORKERS[k], in("x2") ferros_core_entry as usize as u64, in("x3") b as u64);
-        ret
+        crate::platform::start_core(((WORKERS[k] >> 8) & 0xF) as usize, WORKERS[k], ferros_core_entry as usize as u64, b as u64)
     }
 }
 

@@ -216,6 +216,10 @@ fn trng_early() {
 
 /// Start gathering the firmware TRNG's words on another core, as early in the boot as the page tables allow.
 pub fn start_early() {
+    // After the jump from Android the worker is a parked Android core started through the hv's mailbox, and the early core's own switch-off (PSCI CPU_OFF) would hand it back to the firmware path the jump avoids: KOHI gathers on the boot path instead (take_early finds nothing).
+    if crate::platform::jumped() {
+        return;
+    }
     EARLY_STATE.store(1, core::sync::atomic::Ordering::Release);
     if !crate::smp::early(trng_early) {
         EARLY_STATE.store(0, core::sync::atomic::Ordering::Release);
