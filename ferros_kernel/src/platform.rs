@@ -256,14 +256,12 @@ pub fn jumped() -> bool {
     JUMPED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. -1 when the core is not parked there.
+/// Start core `aff1` (MPIDR Aff1; `mpidr` its whole affinity) at `entry` with x0 = `ctx`: PSCI CPU_ON, or after the jump the hv's mailbox. The jump leaves Android's cores parked and powered, because powering them back on through the secure firmware hung on one jump in two (2026-11-01/02); the context is written before the entry, which the parked core polls. A core that is not parked there (Android had it off) gets PSCI CPU_ON.
 pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
-    if jumped() {
-        let slot = JUMP_MAILBOX + aff1 * 32;
+    // A core Android had already taken offline is not on the mailbox: PSCI CPU_ON below, Linux's own way back from its own offline.
+    let slot = JUMP_MAILBOX + aff1 * 32;
+    if jumped() && unsafe { read_volatile((slot + 16) as *const u64) } == 1 {
         unsafe {
-            if read_volatile((slot + 16) as *const u64) != 1 {
-                return -1;
-            }
             write_volatile((slot + 8) as *mut u64, ctx);
             core::arch::asm!("dsb sy");
             write_volatile(slot as *mut u64, entry);

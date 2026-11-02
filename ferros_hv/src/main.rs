@@ -2233,7 +2233,7 @@ mod hvcore {
         unsafe { asm!("dsb sy") };
     }
 
-    /// Power + volume up: Android stops where it is and ferros starts on this core (the hv core), as the gate would start it. Counters: 16 jumps, 17 the cores PSCI reported off (bit per core), 18 ms until then, 19 the last step done (1 watchdogs stopped, 2 trigger masked, 3 GIC quiet, 4 caches cleaned, 5 ferros copied, 6 branching into ferros on this core), 20 unused since core 0's CPU_ON result, 21 the kept image's length, 22 the kept bootconfig's, 23 + core each core caught by the freeze. A freeze that does not stop every core, or a CPU_ON that fails, falls back to the reset.
+    /// Power + volume up: Android stops where it is and ferros starts on this core (the hv core), as the gate would start it. Counters: 16 jumps, 17 the cores PSCI reported off (bit per core), 18 ms until then, 19 the last step done (1 watchdogs stopped, 2 trigger masked, 3 GIC quiet, 4 caches cleaned, 5 ferros copied, 6 branching into ferros on this core), 20 the cores found already off (not parked) at the last check core 0's CPU_ON result, 21 the kept image's length, 22 the kept bootconfig's, 23 + core each core caught by the freeze. A freeze that does not stop every core, or a CPU_ON that fails, falls back to the reset.
     fn jump() -> ! {
         stat(16, 1);
         let len = unsafe { read_volatile(&raw const IMAGE_LEN) };
@@ -2256,12 +2256,20 @@ mod hvcore {
             // SGI 0 to every core but this one (IRM): idle cores wake, fault on their first fetch, and park.
             unsafe { asm!("msr s3_0_c12_c11_5, {v}", "isb", v = in(reg) 1u64 << 40) };
             let mut off = 0u32;
-            // Parked: each core says so in its mailbox slot (state 1).
+            // Each core either parked (its mailbox slot says 1) or already off: Android takes cores offline through its own hotplug (the X3, idle, on the twenty-first jump), and a powered-off core cannot wake to park. ferros starts that one with PSCI CPU_ON, Linux's own path back from its own offline (platform::start_core). Word 20: the cores found off.
+            let mut was_off = 0u32;
             for c in 0..9usize {
-                if OTHERS & (1 << c) != 0 && unsafe { read_volatile((MAILBOX + c * 32 + 16) as *const u64) } == 1 {
+                if OTHERS & (1 << c) == 0 {
+                    continue;
+                }
+                if unsafe { read_volatile((MAILBOX + c * 32 + 16) as *const u64) } == 1 {
                     off |= 1 << c;
+                } else if smc(0xC400_0004, (c as u64) << 8, 0, 0) == 1 {
+                    off |= 1 << c;
+                    was_off |= 1 << c;
                 }
             }
+            set(20, was_off as u64);
             for &w in &WATCHDOGS {
                 wr(w + 0x08, 0xFFFF);
             }
