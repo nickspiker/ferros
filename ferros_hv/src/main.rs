@@ -2157,6 +2157,9 @@ mod hvcore {
         let m: u64;
         unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) m) };
         stat(23 + ((m >> 8) & 0xF) as usize, 1);
+        // The core's power-mode hint (PMU CPU_INFORM, G#1546_0860 + 4 per core) set to C2 (1) before CPU_OFF, as Linux's own offline does (pmucal_cpu_disable: zuma's on/off sequences are empty, the hint is all it writes). A core caught busy left 0, one in a cluster power-down 2; after either, ferros's CPU_ON of that core could hang in the secure firmware (the seventeenth jump: core 0; the eighteenth: the KOHI worker), the APM watchdog. Through the EL3 register window, as Linux writes it.
+        let core = (m >> 8) & 0xF;
+        smc(0x8200_0504, 0x1546_0860 + core * 4, 1, 1);
         unsafe { asm!("smc #0", in("x0") 0x8400_0002u64) };
         loop {
             unsafe { asm!("wfe") };
@@ -2324,6 +2327,8 @@ mod hvcore {
     }
 
     fn off_now() -> ! {
+        // C2 hint first, as `park` and Linux's offline do.
+        smc(0x8200_0504, 0x1546_0860 + (MPIDR >> 8) * 4, 1, 1);
         unsafe {
             asm!("msr s3_0_c12_c12_7, xzr", "isb"); // ICC_IGRPEN1_EL1
             asm!("smc #0", in("x0") 0x8400_0002u64);

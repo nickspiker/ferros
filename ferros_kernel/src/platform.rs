@@ -241,6 +241,13 @@ pub fn priv_reg(addr: u64, write: bool, val: u32) -> u64 {
 
 /// PMU SYSIP_DAT0 (pmu_alive G#1546_0000 + reboot-cmd-offset G#810): the reboot mode the bootloader reads after a reset. Values from pixel-zuma-reboot.c: G#FC bootloader, G#FA fastbootd, G#FF recovery, 0 normal.
 pub const PMU_REBOOT_CMD: u64 = 0x1546_0810;
+
+/// This core's power-mode hint (PMU CPU_INFORM, G#1546_0860 + 4 per core: 0 none, 1 C2, 2 cluster power-down) cleared, as Linux's online does (pmucal_cpu_enable) on each core it starts. A no-op after the bootloader, whose hints read 0; after the jump from Android the hv leaves 1 on each core it parked, and a core started with its hint still set could be powered down by the PMU whenever it idles.
+pub fn cpu_inform_clear() {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let _ = priv_reg(0x1546_0860 + ((mpidr >> 8) & 0xF) * 4, true, 0);
+}
 pub const REBOOT_MODE_BOOTLOADER: u32 = 0xFC;
 pub const REBOOT_MODE_RECOVERY: u32 = 0xFF;
 
