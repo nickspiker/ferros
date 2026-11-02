@@ -45,6 +45,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
 
     let mut ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
     crate::platform::pstore(b"ferros: ira combined\n");
+    crate::platform::mark_trail(0x10);
     if let Ok(mut i) = ira {
         crumb(0xC3);
         // Into the registers (keys.rs); this copy is wiped there, the one in `ira` at the end of the probe.
@@ -66,10 +67,10 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         stage: 0,
         root16: [0u8; 16],
         ira_fp,
-        ap_tune: crate::ira::read_ap_hw_tune(),
-        asv_nz: nz(&crate::ira::read_asv_tbl()),
-        hpm_nz: nz(&crate::ira::read_hpm_asv()),
-        dvfs: crate::ira::read_dvfs_version(),
+        ap_tune: { crate::platform::mark_trail(0x11); crate::ira::read_ap_hw_tune() },
+        asv_nz: { crate::platform::mark_trail(0x12); nz(&crate::ira::read_asv_tbl()) },
+        hpm_nz: { crate::platform::mark_trail(0x13); nz(&crate::ira::read_hpm_asv()) },
+        dvfs: { crate::platform::mark_trail(0x14); crate::ira::read_dvfs_version() },
         ira_fail,
     };
 
@@ -78,6 +79,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let Ok(ira) = ira.as_mut() else {
         return (p, None);
     };
+    crate::platform::mark_trail(0x15);
     let key: AnchorKey = AnchorKey::from_ira(ira); // the ira-rooted vault key
     crate::oracle::set_system_secret(ira);
     let _ = key;
@@ -87,6 +89,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let mut kept: Option<ShimStore> = None;
     let t_open = crate::platform::cntpct();
     crate::platform::pstore(b"ferros: opening the vault\n");
+    crate::platform::mark_trail(0x16);
     crumb(0xE0); // before KVault::open (manifestus open ladder: bootstrap the spine, or genesis a blank pair of regions)
     match crate::kvault::KVault::open(ira) {
         Ok(mut store) => {

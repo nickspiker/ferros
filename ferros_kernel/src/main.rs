@@ -1753,6 +1753,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot. Then whether this boot is the jump from Android, before anything starts a core (platform::start_core). Both were first written into the shim's kernel_main by mistake, so the jumps of 2026-11-02 started parked cores with PSCI.
     platform::pstore(b"\nferros: entry\n");
+    platform::mark_trail(0);
     platform::detect_jump();
     platform::pstore(if platform::jumped() { b"ferros: started by the jump from Android\n" as &[u8] } else { b"ferros: not a jump\n" });
     // Killswitch before anything else, then the cache map.
@@ -1936,6 +1937,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     platform::crumb(0xE4);
     platform::pstore(b"ferros: vault opened, flash write-protect armed\n");
+    platform::mark_trail(0x17);
 
     // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
     let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() {
@@ -2013,6 +2015,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let boot = if option_env!("FERROS_X3") != Some("0") { x3::hand_over(boot) } else { boot };
     platform::crumb(0xE7);
     platform::pstore(b"ferros: into the service\n");
+    platform::mark_trail(0x18);
     service::run(boot)
 }
 

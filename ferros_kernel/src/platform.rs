@@ -303,6 +303,17 @@ pub fn worker_step(s: u64) {
     }
 }
 
+/// The boot's mark trail in the report page (G#FD60_0240, cleaned to DRAM, cleared at entry): each step shifts a byte in, newest lowest, so a session that dies by watchdog leaves its last eight steps (`bridge read FD600240 8`). The pstore ring lost its position word on the dying jumps, so its lines after "ira combined" were overwritten by the next boot; the crumb page never was. Marks: G#10 ira combined, G#11-15 the probe's tune/ASV/HPM/DVFS reads and the anchor key, G#16 opening the vault, G#17 opened, G#18 into the service.
+const MARK_TRAIL: usize = RAMOOPS_RESULT + 0x240;
+pub fn mark_trail(m: u8) {
+    unsafe {
+        let p = MARK_TRAIL as *mut u64;
+        let v = if m == 0 { 0 } else { read_volatile(p) << 8 | m as u64 };
+        write_volatile(p, v);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+    }
+}
+
 pub fn note_arrival() {
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
