@@ -112,6 +112,50 @@ So the firewall's rules cost normal use nothing: refuse LU0 writes and UNMAPs th
   - **Costs:** the reset goes through ABL, so its unlocked-device warning shows each time, and Android's RAM is lost. Keeping Android's RAM and skipping ABL is the swap without a reset (the reverse swap). Suspend with core 3 is not measured yet (no stop counted that session).
   - **Still polled:** the kill chord's old trap-time check stays alongside, as a fallback.
 
+## The jump to ferros (built 2026-11-01, slot b)
+
+Power + volume up under Android stops Android where it is and boots ferros fresh, with no reset, no bootloader and no unlocked-device warning. The owner asked for exactly this: "halt Android, clear it as needed, fresh boot into ferros". Android's RAM is not kept, and no wipe is done either (owner: skip the wipe). `FERROS_HV_CORE` builds, `mod hvcore` `jump`.
+
+**At boot, before Linux.** The hv keeps three things in its reservation, because Linux reuses the RAM they arrive in:
+- the packed ferros image (G#A_FF00_0000);
+- ABL's device tree (G#A_FFC0_0000);
+- the last 64 KiB of the initrd, where the bootconfig sits.
+
+The kept tree's `/chosen` initrd range is pointed at a copy below 4 GiB (G#8004_0000), since its cells are 32-bit. Android then runs under the identity stage 2.
+
+**On the chord (the hv core):**
+1. Stage 2 is invalidated (all level-1 entries, the table cleaned, `tlbi alle1is`) and SGI 0 is sent to every other core. Each Linux core faults on its next instruction, or wakes from idle into `hv_secondary`, and calls PSCI CPU_OFF from the hv. Measured: all eight off in 1-3 ms.
+2. DECON's trigger is masked and the hv waits 1/16 s, so no frame is in flight.
+3. Every SPI and every core's SGI/PPI is made neither active nor pending. An interrupt Linux had acknowledged would otherwise never reach ferros.
+4. The caches are cleaned by set/way.
+5. ferros is copied to G#8008_0000 and the bootconfig below it.
+6. The display SysMMUs' translation is turned off.
+7. The gate mark is set (GATE_ANSWER 6).
+8. Core 0 is started at ferros's entry, and the hv core switches itself off.
+
+A core that will not stop, or a failed CPU_ON, falls back to the reset path (FERROS_ONCE).
+
+**After a jump** (SYS_FACTS 31 = 6), init starts the shell, the screen, touch, the attest screen and USB, but not WiFi, Bluetooth, NFC, sensors or the modem (nor their keepers). The kernel leaves the AoC, GSA and Trusty alone. Every one of those met hardware Android left running and stalled the bus or the service loop:
+- the modem's register read (APM watchdog);
+- the AoC start;
+- the WiFi driver's write into its BAR (APC watchdog, named by the register record below).
+
+Each comes back when its driver can bring its block up from any state, not only from the bootloader's.
+
+**Where it stands (eleven jumps):**
+- **Freeze and start:** solid.
+- **Jumped session:** stays up some of the time. Jump 10 ran with every process up; jump 11 (the same build) hit the APC watchdog with the lock free and the workers idle, so the kernel's own service loop on the X3 stalled on something it drives itself (battery gauge, thermal, clock policy: not yet named).
+- **Panel:** stays on Android's last frame. Frames leave DECON at 10/s with ferros's layer, raster 1344x2992 (Android runs WQHD; the display server takes the size from DECON's blender), so the difference lies between DECON and the glass: DSIM, the DSC encoder or the panel's own mode. A cold-boot snapshot of every display block is on the dev host for the diff (`dispsnap.sh` in the session scratchpad); the jumped side is still to take.
+- **Gave reboots, taken out:** switching off Android's DECON windows from the hv, together with forcing the modeset.
+
+**Tools added:**
+- The kernel records each core's last register access a process asks for (SYS_MMIO_READ/WRITE: the physical address, bit 63 = write) in the ramoops page at +G#180. Boot rotates it to +G#1C8 (`bridge read FD6001C8 48`), beside the per-core notes (`PREV_NOTE_*`: the lock's holder, each core's syscall crumb, 0x90 + n inside syscall n, 0x70 + n with the thread). Together they name the stalled register.
+- Slot b's hv also leaves a stage trail at G#FD60_0FD0 that survives a watchdog reset.
+
+**Slot b, learned the hard way (2026-11-01):** flash it with `FERROS_HV_CORE=1 FERROS_SLOT_B_ONLY=1 tools/husky-cold.sh`.
+- The tool signs the gate with the owner's key, writes the matching `vbmeta_b`, sets b active and checks the slot the bootloader really booted.
+- Hand-flashed unsigned images and `fastboot --set-active` from a fastboot entered warm through ferros left slot b refused: the early loader reported "other slot boot ok, mark other slot as active and reboot", and three retries were gone in about 25 s.
+
 ## The boot gate (2026-10-20, built, not yet run on hardware)
 
 The slot-a boot image is pre-assembled: `[hv][Linux Image][ferros]` (`tools/husky-hv.sh`; `--no-ferros` for the old Android-only blob). ABL boots slot a as always, which prepares Android completely, including the secure world's boot state that only the bootloader can set. Before Linux runs, the hv shows the gate (`ferros_hv/src/gate.rs`):
