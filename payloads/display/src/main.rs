@@ -1728,6 +1728,45 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
     (v, n)
 }
 
+/// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
+const GLASS_RADIUS: f32 = 91.0;
+/// Whether this is a development build (the hairlines, the orange).
+const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
+/// Outside the screen's edge: black on release; on development builds the hairline's orange one stop darker (each channel's code over the root of two: half the light at gamma 2), so a dev image is told at a glance and the mask is still a mask.
+const EDGE_MASK: u64 = if DEV { 1 << 48 | 11585 | 8192 << 16 } else { 1 << 48 };
+
+/// The screen's own edge, as Photon draws its window on Android glass (fluor chrome_widget.rs `glass_corner_params`, Nick 2026-09-17): a superellipse corner that sits inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left (the 2:1 asymmetry). (small radius, big radius, exponent), computed once.
+static mut EDGE: (f32, f32, i32) = (0.0, 0.0, 6);
+fn glass_corner_params(g: f32, w: f32, h: f32) -> (f32, f32, i32) {
+    let cut = 1.5 * (g * (1.0 - core::f32::consts::FRAC_1_SQRT_2) + 1.0);
+    let short = if w < h { w } else { h } * 0.9;
+    let mut n = 6;
+    while n > 3 {
+        let r = cut / (1.0 - libm::powf(2.0, -1.0 / n as f32));
+        // The corners' reach along an edge: the big and the small cap, as fluor's crossings count them (near the radius itself at these exponents).
+        if r * 3.0 <= short {
+            break;
+        }
+        n -= 1;
+    }
+    let r_small = cut / (1.0 - libm::powf(2.0, -1.0 / n as f32)) * 0.9;
+    (r_small, r_small * 2.0, n)
+}
+
+/// A row's insets from the left and right screen edges to the edge curve: (left, right), in pixels from the edge to where the curve crosses the row; 0 on rows the corners do not reach. The curve at `d` rows from a corner's edge, inside a corner of radius `r`: fluor's `squircle_inset`.
+fn edge_insets(y: usize, width: usize, height: usize) -> (f32, f32) {
+    let (rs, rb, n) = unsafe { EDGE };
+    let yc = y as f32 + 0.5;
+    let from = |edge_dist: f32, r: f32| if edge_dist < r { fluor::paint::squircle::squircle_inset(r - edge_dist, r, n) } else { 0.0 };
+    let top = yc;
+    let bot = height as f32 - yc;
+    // Top-left and bottom-right big; top-right and bottom-left small.
+    let left = if top < bot { from(top, rb) } else { from(bot, rs) };
+    let right = if top < bot { from(top, rs) } else { from(bot, rb) };
+    let _ = width;
+    (left, right)
+}
+
 /// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.
 const CUTOUT_BOTTOM: f32 = 118.25;
 
@@ -1855,6 +1894,40 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     };
                     px[x] = (p & 1 << 48) | ch(0) | ch(16) | ch(32);
                 }
+            }
+        }
+        // The screen's own edge (owner, 2026-11-02, as Photon's window on Android glass): outside the curve the mask colour (black on release builds; the hairline's orange one stop darker on development builds), the curve's pixel antialiased by its coverage, and on development builds the hairline along the curve and the straight edges. Rows the corners do not reach cost two compares.
+        let (il, ir) = edge_insets(y, width, height);
+        if il > 0.0 || ir > 0.0 || y == 0 || y == height - 1 {
+            let mix = |a: u64, b: u64, wb: u64| {
+                let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
+                (b & 1 << 48) | ch(0) | ch(16) | ch(32)
+            };
+            let (ml, mr) = (il as usize, ir as usize);
+            let (fl, fr) = (il - ml as f32, ir - mr as f32);
+            for x in xa..xb {
+                let from_right = width - 1 - x;
+                let p = px[x];
+                px[x] = if x < ml || from_right < mr {
+                    EDGE_MASK
+                } else if x == ml && il > 0.0 {
+                    // The curve's outer pixel: inside by (1 - fl); on dev the hairline shows by as much over the mask.
+                    let cov = ((1.0 - fl) * 65536.0) as u64;
+                    if DEV { mix(EDGE_MASK, line, cov) } else { mix(EDGE_MASK, p, cov) }
+                } else if from_right == mr && ir > 0.0 {
+                    let cov = ((1.0 - fr) * 65536.0) as u64;
+                    if DEV { mix(EDGE_MASK, line, cov) } else { mix(EDGE_MASK, p, cov) }
+                } else if DEV && (x == ml + 1 && il > 0.0) {
+                    // The inner pixel: the hairline by the rest, under the content.
+                    mix(p, line, (fl * 65536.0) as u64)
+                } else if DEV && (from_right == mr + 1 && ir > 0.0) {
+                    mix(p, line, (fr * 65536.0) as u64)
+                } else if DEV && (y == 0 || y == height - 1 || (x == 0 && il == 0.0) || (from_right == 0 && ir == 0.0)) {
+                    // The straight edges' hairline, one pixel in from the glass.
+                    line
+                } else {
+                    p
+                };
             }
         }
         let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
@@ -2271,6 +2344,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let (top, bot) = chrome_rows(width, height);
         CHROME_TOP = top;
         CHROME_BOT = bot;
+        EDGE = glass_corner_params(GLASS_RADIUS, width as f32, height as f32);
         CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
