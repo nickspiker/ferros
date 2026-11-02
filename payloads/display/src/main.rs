@@ -2122,6 +2122,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let t_ms = now();
     // After the jump from a running Android (SYS_FACTS 31 = 6) the pipe runs Android's raster and panel mode (already 10 bpc). The raster below is then DECON's own output (the blender's background size), not the layer DMA's, which holds whatever layer Android drew last (1008x2023 on the sixth jump, 2026-11-01). The modeset is not forced: forcing it under Android's panel state was followed by the APM watchdog on jumps seven to nine.
     let jumped = ferros_sys::facts().0[31] == 6;
+    // Android switches the panel between 1008x2244 (its default "high resolution") and 1344x2992. A jump from 1008x2244 is drawn at that raster (touch then lands off: the controller reports in 1344x2992). Forcing the WQHD modeset there switched DECON and the DSC encoders but not the panel, which kept decoding in its scaled mode (the picture three-up, garbage below; the thirteenth jump, 2026-11-01): the stock driver changes the panel's resolution inside a full re-initialisation (reset, init set, PPS, C3/F2), not yet ported. Android set to "Full resolution" jumps clean.
     let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), false);
     if !rep.is_empty() {
         log.s(b"display: ");
@@ -2135,7 +2136,19 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The raster as the pipe runs it.
     let img = if jumped { pipe.rd(S_DECON, 0x0220) } else { pipe.rd(S_DMA0, RDMA_IMG_SIZE) };
     let (width, height) = ((img & 0xFFFF) as usize, (img >> 16) as usize);
-    let win = pipe.base_window();
+    // After the jump, window 5 (the base layer ferros owns on a cold boot) and no other: Android leaves its own layers enabled (window 0 on the thirteenth jump, its blend word G#00FF0D02 still in place), and the first enabled one carried ferros's pixels too bright and posterized. Every other window off, from here.
+    let win = if jumped {
+        for w in 0..8u64 {
+            if w != 5 {
+                pipe.wr(S_WINCON, w * 0x1000, 0);
+            }
+        }
+        // Their shadow copies latch at the next frame only with their own update bits.
+        pipe.wr(S_DECON, SHD_REG_UP_REQ, pipe.rd(S_DECON, SHD_REG_UP_REQ) | SHD_GLOBAL | 0xFF);
+        5
+    } else {
+        pipe.base_window()
+    };
     log.s(b"display: ");
     log.dec(width as u64);
     log.s(b"x");
