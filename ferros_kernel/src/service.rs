@@ -1142,6 +1142,11 @@ pub fn run(mut b: Boot) -> ! {
         #[cfg(not(ferros_production))]
         if platform::jumped() && st.proc_cmds == 0 && cntpct().wrapping_sub(t_boot) > 60 * cntfrq() {
             platform::pstore(b"ferros: the jump's session: no host in 60 s, resetting warm to keep this log\n");
+            // Every thread and where it waits, so the log says what the session was stuck on (the twenty-ninth jump: the display server and the attest screen ran, init, touch and USB printed nothing).
+            let mut threads = alloc::vec::Vec::new();
+            crate::process::threads_report(&mut threads);
+            platform::pstore(&threads);
+            platform::pstore(&crate::process::take_console());
             platform::reboot();
         }
         // A command the USB process handed over (ptlink.rs, USB.md): the one dispatch below. Its handlers end with `continue`, so what follows — the raw reply handed back — runs at the top of the next pass (`proc_restore`).
