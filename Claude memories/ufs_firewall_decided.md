@@ -12,6 +12,6 @@ Owner, 2026-10-28: "as long as it gets built. I'd block reset too." The hv (EL2,
 
 **Why:** the flash's own write protection can't cover LU0 on husky, and Android's driver resets clear it (measured 2026-10-17); locking without the firewall is the one thing BOOT.md says not to do.
 
-**Built 2026-11-01 (HV.md "The UFS firewall refuses"):** boot-chain, ferros-partition and LU1/LU2 writes, protected UNMAP ranges, bBootLunEn/descriptor/config-lock/permanent-WP query writes and WRITE BUFFER are refused (tested as root on slot b). devinfo must stay writable: refusing it reboots Android every boot (vold MarkBootSuccessful). Open: shadow lists (check-to-fetch window), the ONCE words, the device-reset block, slot a.
+**Built 2026-11-01 (HV.md "The UFS firewall refuses"):** boot-chain, ferros-partition and LU1/LU2 writes, protected UNMAP ranges, bBootLunEn/descriptor/config-lock/permanent-WP query writes and WRITE BUFFER are refused (tested as root on slot b). devinfo must stay writable: refusing it reboots Android every boot (vold MarkBootSuccessful). Both slots carry it since 2026-11-02 (identical, signed, via tools/husky-cold.sh). Open: shadow lists (check-to-fetch window), the ONCE words, the device-reset block.
 
 **How to apply:** order is signed vbmeta (unlocked) → fix the hv direct-I/O hang/freeze (HV.md) → firewall → only then think about locking (on a second Pixel 8 Pro first). Related: [[keys-in-registers]], [[pixel8-dedicated-dev-device]].

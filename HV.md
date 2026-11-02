@@ -118,7 +118,7 @@ So the firewall's rules cost normal use nothing: refuse LU0 writes and UNMAPs th
 - **The check-to-fetch window.** Android can change a command between the hv's check and the device's fetch; shadow command lists close it.
 - **The ONCE words.** ANDROID_ONCE, RECOVERY_ONCE and FERROS_ONCE live in the ramoops page, which Android writes (pmsg) and can forge.
 - **The UFS device reset.** Android's driver can still reset the device (the 2026-10-28 list).
-- **Slot a's protection.** Slot a still runs the hv without the firewall, so only Android started through slot b's gate is protected.
+- **Both slots** carry the same signed build since 2026-11-02 (FERROS_HV_CORE + FERROS_HV_UFS through `tools/husky-cold.sh`, slot b first): Android is firewalled from either slot. The slots stay identical (owner); flash both with that tool, never one by hand.
 
 ## The chords under Android (decided 2026-11-01)
 

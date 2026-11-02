@@ -24,7 +24,7 @@ These are gated off after a jump for now. The panel still shows Android's last f
 - `PREV_NOTE_*` in DIAG: the lock holder, plus 0x90/0x70 + syscall n per core.
 - the bootloader log at G#FD80_0000: the reset reason.
 
-**Slot b:** only via `FERROS_HV_CORE=1 FERROS_SLOT_B_ONLY=1 tools/husky-cold.sh`, which signs the image and writes vbmeta_b. Hand-flashed unsigned images, or a set-active from a warm fastboot, got slot b refused by the bootloader.
+**Both slots identical** (owner): flash with `FERROS_HV_CORE=1 FERROS_HV_UFS=1 tools/husky-cold.sh` (slot b first, then a; FERROS_SLOT_B_ONLY=1 only for a quick test), which signs the image and writes vbmeta_b. Hand-flashed unsigned images, or a set-active from a warm fastboot, got slot b refused by the bootloader.
 
 **Android OTA warning:** Android thinks it is slot a, so an update writes slot b (ferros's). Keep updates postponed until the UFS firewall refuses writes (not built yet; it only measures).
 
