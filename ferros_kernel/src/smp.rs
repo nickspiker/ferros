@@ -291,3 +291,8 @@ pub fn report() -> (u32, [u64; 4]) {
 fn _unused(_: u64) -> u64 {
     unsafe { read_volatile(BLOCKS as *const u64) }
 }
+
+/// Which workers have come up (bit per worker index), for the jump's escape dump.
+pub fn up_mask() -> u32 {
+    UP.load(Ordering::Acquire)
+}
