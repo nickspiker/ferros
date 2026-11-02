@@ -303,6 +303,7 @@ pub fn hand_over(b: crate::service::Boot) -> crate::service::Boot {
 #[unsafe(no_mangle)]
 extern "C" fn ferros_x3_main(hop: usize) -> ! {
     crate::platform::cpu_inform_clear();
+    crate::platform::note_arrival();
     unsafe {
         write_volatile((hop + H_PARKED) as *mut u64, PARKED);
         core::arch::asm!("dsb sy");

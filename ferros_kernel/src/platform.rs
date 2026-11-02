@@ -262,6 +262,7 @@ pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
     let slot = JUMP_MAILBOX + aff1 * 32;
     if jumped() && unsafe { read_volatile((slot + 16) as *const u64) } == 1 {
         unsafe {
+            write_volatile((0xFD60_0C80usize + aff1 * 8) as *mut u64, cntpct() | 1);
             write_volatile((slot + 8) as *mut u64, ctx);
             core::arch::asm!("dsb sy");
             write_volatile(slot as *mut u64, entry);
@@ -272,6 +273,17 @@ pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
     let ret: i64;
     unsafe { core::arch::asm!("smc #0", inout("x0") 0xC400_0003u64 => ret, in("x1") mpidr, in("x2") entry, in("x3") ctx) };
     ret
+}
+
+/// The jump hand-off trace (ferros_hv hvcore::TRACE): this core's arrival in ferros's Rust, at -G#80 from the hv's word.
+pub fn note_arrival() {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let a = 0xFD60_0B80usize + ((mpidr >> 8) & 0xF) as usize * 8;
+    unsafe {
+        write_volatile(a as *mut u64, cntpct() | 1);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) a as u64);
+    }
 }
 
 pub fn cpu_inform_clear() {

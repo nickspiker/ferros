@@ -2154,6 +2154,8 @@ mod hvcore {
 
     /// The jump's mailbox (2026-11-02), in the hv's reservation below the report page: one 32-byte slot per core, [entry, context, state]. A parked core sets state 1 and waits; ferros, started by the jump, starts a core by writing its context and then its entry (ferros_kernel platform::start_core) instead of calling PSCI CPU_ON.
     pub const MAILBOX: usize = 0xA_FFFE_0000;
+    /// The hand-off's trace in the ramoops page (survives the warm reset a failed jump ends in; the mailbox does not): per core, when ferros asked (+G#80), when the parked core took its entry (+G#0), when it reached ferros's Rust (-G#80, written by ferros). Cleared at each jump.
+    pub const TRACE: usize = 0xFD60_0C00;
 
     /// A Linux core caught by the freeze: counted in its own word (23 + core), then parked at EL2 on the mailbox, powered. Not PSCI CPU_OFF: every way back from an Android core's power-down went through the secure firmware and the power-management core, and that round trip hung on one jump in two (core 0's CPU_ON, then the KOHI worker's, even with the power-mode hint set as Linux sets it: the seventeenth to twentieth jumps). The core leaves its interrupt group off, cleans its own caches (its L1 and L2 may hold Linux's dirty lines), and waits; when an entry appears it drops its stale instructions and branches there at EL2 with the MMU off, as a core fresh from CPU_ON would start, x0 = the context.
     pub fn park() -> ! {
@@ -2174,6 +2176,9 @@ mod hvcore {
                 let entry = read_volatile(slot as *const u64);
                 if entry != 0 {
                     let ctx = read_volatile((slot + 8) as *const u64);
+                    let t: u64;
+                    asm!("mrs {t}, cntpct_el0", t = out(reg) t);
+                    write_volatile((TRACE + core * 8) as *mut u64, t | 1);
                     write_volatile((slot + 16) as *mut u64, 2);
                     asm!("dsb sy", "ic iallu", "dsb sy", "isb");
                     asm!("br {e}", e = in(reg) entry, in("x0") ctx, options(noreturn));
@@ -2250,6 +2255,9 @@ mod hvcore {
         for c in 0..9usize {
             for w in 0..4 {
                 unsafe { write_volatile((MAILBOX + c * 32 + w * 8) as *mut u64, 0) };
+            }
+            for o in [TRACE - 0x80, TRACE, TRACE + 0x80] {
+                unsafe { write_volatile((o + c * 8) as *mut u64, 0) };
             }
         }
         unsafe {

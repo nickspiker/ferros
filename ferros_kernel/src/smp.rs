@@ -168,6 +168,7 @@ pub fn launch_all() {
 #[unsafe(no_mangle)]
 extern "C" fn ferros_core_main(block: usize) -> ! {
     crate::platform::cpu_inform_clear();
+    crate::platform::note_arrival();
     let k = ((block - BLOCKS) / BLOCK) & 3;
     // Started for the boot's one-shot job (`early`): run it, say so, and switch off; `launch_all` starts this core again as a worker.
     if k == EARLY_CORE && EARLY_STATE.load(Ordering::Acquire) == 1 {
