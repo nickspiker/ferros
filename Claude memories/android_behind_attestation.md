@@ -19,3 +19,16 @@ Direction once the OS swap is sorted (owner, 2026-11-01): every boot lands in fe
 **Why:** owner: "if you're standing under a cell tower with a full battery and don't know that handle? you fucked" — the trade must be explicit, not discovered. Ownership: this husky is the owner's wife's phone ([[pixel8-dedicated-dev-device]], [[feedback-identity-belongs-to-a-person]]) — whose identity gates Android here is hers to answer too.
 
 **How to apply:** recovery under the production lock — ferros repairs its own slots after attest (no unlock needed); unlock+reflash needs "OEM unlocking allowed", whose Android switch would be behind the gate, so ferros keeps that bit reachable; Tensor's boot-ROM USB recovery (18d1:4f00) restores only Google-signed boot stages — no firehose on Pixel. Check before relying on unlock+reflash whether the ferros partition (the vault) survives `fastboot flashing unlock`'s wipe; if not, the disclaimer says so. Related: [[feedback-lock-prep-not-lock]], [[mvno-data-only]], [[ufs-firewall-decided]].
+
+**Recovery requests from Android (owner, 2026-11-02: build roughly in this shape, revise later):**
+1. The gate refuses every recovery boot (built: RECOVERY_ONCE).
+2. ferros reads the reason from `misc` (the bootloader message: `--wipe_data`, RescueParty's `--prompt_and_wipe_data`, `--update_package`).
+3. ferros asks on its own screen, the reason in plain words.
+4. Yes, with proof: RECOVERY_ONCE and a reset into recovery. No, or no proof: clear the command and arguments in `misc` (nothing else there), or Android stays unreachable, every start bounced to ferros.
+
+Proof scales with the stakes:
+- **Wipe or crash rescue** (Android's data only): attestation.
+- **Sideload, update, or anything that changes what boots:** attestation plus a second fleet device.
+- **Remote wipes** (Find My Device): refused; no one is at the device.
+
+Tested 2026-11-02: a Settings factory reset was refused by the gate (answer 4); `diag recovery` let it through once; the wipe ran; pKVM stayed disabled.
