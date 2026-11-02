@@ -6,7 +6,7 @@
 
 ## Overview
 
-ferros is a mobile operating system distilled down to what an OS is, written in Rust, designed with zero-downtime power loss tolerance and architectural elimination of entire vulnerability classes. Based on the Redox OS microkernel, ferros extends it with ring memory architecture, hardware key storage, and true killswitch readiness.
+ferros is a mobile operating system distilled down to what an OS is, written in Rust, designed with zero-downtime power loss tolerance and architectural elimination of entire vulnerability classes. Inspired by Redox OS but sharing no code with it, ferros has ring memory architecture, hardware key storage, and true killswitch readiness.
 
 **Not Android with modifications. Not Linux for mobile. The inherited assumptions removed until only the operating system is left.**
 
@@ -85,8 +85,7 @@ Half of MITRE's vulnerability database becomes **irrelevant**, not mitigated.
 - **No TLB** - No cache pollution, predictable latency, 50% faster context switch
 
 ### Filesystem Layer
-- **Based on RedoxFS** - B-tree structure, Copy-on-Write, checksums
-- **Ring modifications** - ~2K LOC changed, block allocator and superblock logic
+- **The vault** - ferros's own object store (ferros_vault: tract, plow, HAMT, spine; HAMT.md), copy-on-write, checksummed, no B-tree
 - **Atomic updates** - Generation numbers, never partial writes
 - **No journal needed** - Header ring provides hundreds of consistent states
 - **Vendor diversity** - Multiple SSDs from different manufacturers
@@ -240,7 +239,6 @@ Contributions welcome! Please note:
 
 ### Areas Needing Help
 - **Ring memory kernel** - Core implementation in Rust
-- **Filesystem conversion** - RedoxFS → ring topology
 - **VSF renderer** - Compositor and widget toolkit
 - **Photon messenger** - Peer-to-peer protocol implementation
 - **Hardware design** - RISC-V extensions, mesh integration, crypto coprocessor
@@ -270,15 +268,14 @@ This publication establishes prior art for:
 
 ## Licenses
 
-**ferros modifications:** MIT License  
-**Original Redox OS code:** MIT License (see LICENSES/MIT.txt)  
+**ferros:** MIT License  
 **Documentation:** CC-BY-4.0
 
 **Patent stance:** Defensive only. If you attack ferros with patents, our prior art and open-source license is your defense. If you use ferros to attack others with patents, you lose your license.
 
 ## Acknowledgments
 
-ferros is based on the excellent [Redox OS](https://gitlab.redox-os.org/redox-os/redox) project. I extend my thanks to the Redox team for their pioneering work in Rust-based operating systems.
+ferros was inspired by the [Redox OS](https://gitlab.redox-os.org/redox-os/redox) project, whose pioneering work in Rust-based operating systems showed what was possible; ferros shares no code with it.
 
 Additional inspiration from:
 - **Mill Computing** - Metadata tracking and belt architecture concepts efficient.computer
