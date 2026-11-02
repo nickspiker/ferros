@@ -131,6 +131,17 @@ pub fn note(slot: usize, v: u64) {
         core::arch::asm!("dc civac, {a}", a = in(reg) a as u64);
     }
 }
+/// Each core's last register access a process asked for (SYS_MMIO_READ/WRITE), at +G#180 + core*8: the physical address, bit 63 set for a write; the previous boot's at +G#1C8 (`bridge read FD6001C8 48`). A bus stall on a block whose clock or power is off leaves the core inside that access with the kernel lock held and the watchdog to reset it: this names the register (the jump from Android stalled on the display's modeset, 2026-11-01).
+pub const MMIO_NOTES: usize = RAMOOPS_RESULT + 0x180;
+pub fn note_mmio(v: u64) {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let a = MMIO_NOTES + (((mpidr >> 8) & 0xF) as usize % 9) * 8;
+    unsafe {
+        write_volatile(a as *mut u64, v);
+        core::arch::asm!("dc civac, {a}", a = in(reg) a as u64);
+    }
+}
 pub fn note_read(slot: usize) -> u64 {
     unsafe { read_volatile((NOTES + (slot & 15) * 8) as *const u64) }
 }
@@ -143,6 +154,12 @@ pub fn notes_rotate() {
             write_volatile((NOTES + 0x40 + i * 8) as *mut u64, v);
             write_volatile((NOTES + i * 8) as *mut u64, 0);
             core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (NOTES + i * 8) as u64, b = in(reg) (NOTES + 0x40 + i * 8) as u64);
+        }
+        for i in 0..9 {
+            let v = read_volatile((MMIO_NOTES + i * 8) as *const u64);
+            write_volatile((MMIO_NOTES + 0x48 + i * 8) as *mut u64, v);
+            write_volatile((MMIO_NOTES + i * 8) as *mut u64, 0);
+            core::arch::asm!("dc civac, {a}", "dc civac, {b}", a = in(reg) (MMIO_NOTES + i * 8) as u64, b = in(reg) (MMIO_NOTES + 0x48 + i * 8) as u64);
         }
         core::arch::asm!("dsb sy");
     }

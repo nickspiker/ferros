@@ -1760,6 +1760,9 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 Some(Object::Hardware(g)) => {
                     let hw = &HARDWARE[g];
                     let off = f.x[1] as usize;
+                    if off % 4 == 0 && off < hw.size {
+                        crate::platform::note_mmio((hw.base + off) as u64 | ((f.x[8] == SYS_MMIO_WRITE) as u64) << 63);
+                    }
                     if off % 4 != 0 || off >= hw.size {
                         ERR
                     } else if f.x[8] == SYS_MMIO_READ {

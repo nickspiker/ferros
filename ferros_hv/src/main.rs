@@ -2104,6 +2104,8 @@ mod hvcore {
     const LOW_BOOTCONFIG: usize = 0x8004_0000;
     /// The display engines' IOMMUs (zuma-sysmmu.dtsi sysmmu_dpuf0/1): Android leaves translation on with its own tables; ferros gives the DPU physical addresses, as after the bootloader. Measured on the first jump: VM0 control G#25, the panel showed static and then black.
     const DPU_SYSMMUS: [usize; 2] = [0x1984_0000, 0x19C4_0000];
+    /// DECON0's trigger control (gate.rs): the hardware trigger enable (bit 0) and its mask (bit 4). The panel is in command mode, so the engine fetches a frame only when the trigger fires.
+    const DECON0_TRIG_CON: usize = 0x1947_0030;
     const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
     /// Every core but this one (MPIDR Aff1 0-8 without 3).
     const OTHERS: u32 = 0x1F7;
@@ -2250,6 +2252,11 @@ mod hvcore {
             super::pstore::log(&[b"\nferros hv: jump -- not every core went off, resetting instead\n"]);
             to_ferros();
         }
+        // No frame may be in flight when translation goes off: the second jump switched the display SysMMUs off under a running scanout, the engine fetched Android's IOVAs as physical addresses, and the interconnect stalled until the APM watchdog reset the device (ferros left no notes). Trigger masked first, then 1/16 s, longer than a frame at 60 Hz.
+        let t = rd(DECON0_TRIG_CON);
+        wr(DECON0_TRIG_CON, (t & !1) | (1 << 4));
+        let (t1, _) = now();
+        while now().0.wrapping_sub(t1) < f >> 4 {}
         gic_quiet();
         flush_all();
         copy64(JUMP_IMAGE, FERROS_LINK, len);

@@ -367,9 +367,10 @@ impl M<'_> {
 }
 
 /// The modeset when the pipe is still at 8 bpc (ABL's), then the DQE's dither in shift mode either way. Returns what it did and what misbehaved, for the console; empty when the pipe was already at 10 bpc.
-pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>) -> Vec<u8> {
+/// `force`: run it even when DECON is already at 10 bpc (after the jump from Android, whose raster and panel mode may not be ferros's).
+pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
-    if m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
+    if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
         if !dsi.alive() {
             m.say(b"modeset: DSIM not running, left at 8 bpc\n");
             return m.rep;
