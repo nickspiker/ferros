@@ -46,6 +46,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let mut ira = crate::ira::derive_ira(); // every stable per-device source, each read twice and checked (derive_ira v2)
     crate::platform::pstore(b"ferros: ira combined\n");
     if let Ok(mut i) = ira {
+        crumb(0xC3);
         // Into the registers (keys.rs); this copy is wiped there, the one in `ira` at the end of the probe.
         crate::ira::keep_ira(&mut i);
     }

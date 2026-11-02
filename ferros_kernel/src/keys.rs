@@ -454,7 +454,9 @@ pub fn serve() {
 /// Hold `value` as this boot's ira (slot 0) or wairua (slot 1), on this core and, sealed, on every other; `value` is wiped. False if the self-test failed (the secret is then not held anywhere: callers refuse, as for no secret at all).
 pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     crate::platform::pstore(b"ferros: keys: set, locking\n");
+    crate::platform::crumb(0xC4);
     lock();
+    crate::platform::crumb(0xC5);
     crate::platform::pstore(b"ferros: keys: locked\n");
     if TEST.load(Ordering::Acquire) == 0 {
         TEST.store(self_test(), Ordering::Release);
@@ -465,6 +467,7 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
         unlock();
         return false;
     }
+    crate::platform::crumb(0xC6);
     // This core must hold the other secret before the new generation, or the blob would carry a stale one.
     let _ = adopt();
     crate::platform::pstore(b"ferros: keys: adopted\n");
@@ -481,6 +484,7 @@ pub fn set(slot: u32, value: &mut [u8; 32]) -> bool {
     let g = GEN.fetch_add(1, Ordering::AcqRel) + 1;
     HELD[me()].store(g, Ordering::Release);
     crate::platform::pstore(b"ferros: keys: sealed, publishing\n");
+    crate::platform::crumb(0xC8);
     publish(running() & !(1 << me()));
     unlock();
     crate::platform::pstore(b"ferros: keys: set\n");
