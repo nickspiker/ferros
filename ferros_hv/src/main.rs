@@ -2162,7 +2162,7 @@ mod hvcore {
         let core = ((m >> 8) & 0xF) as usize;
         stat(23 + core, 1);
         unsafe { asm!("msr s3_0_c12_c12_7, xzr", "isb") }; // ICC_IGRPEN1_EL1
-        flush_all();
+        flush_levels(2);
         let slot = MAILBOX + core * 32;
         unsafe {
             write_volatile(slot as *mut u64, 0);
@@ -2190,11 +2190,17 @@ mod hvcore {
 
     /// Clean and invalidate every data and unified cache level this core sees, by set/way (its L1 and L2, and the cluster's L3): Linux's dirty lines must not be written back later over what the jump puts in DRAM with the MMU off. The other cores' own levels were cleaned by their power-down.
     fn flush_all() {
+        flush_levels(7);
+    }
+
+    /// As flush_all, the levels below `upto` only (0-based: 0 L1, 1 L2, 2 the cluster's L3). A parking core cleans its own L1 and L2: the shared L3, cleaned by eight cores at once, made the X3 miss the jump's wait (the twenty-third jump), and the hv core cleans it once before ferros runs.
+    fn flush_levels(upto: u64) {
         unsafe {
             let (clidr, mmfr2): (u64, u64);
             asm!("mrs {a}, clidr_el1", "mrs {b}, id_aa64mmfr2_el1", a = out(reg) clidr, b = out(reg) mmfr2);
             let ccidx = (mmfr2 >> 20) & 0xF != 0;
-            let loc = (clidr >> 24) & 7;
+            // WHY the min: it chooses how many levels this call cleans (the caller's limit, or what CLIDR reports, whichever is fewer: 7 = every level there is); no bound is being guarded.
+            let loc = ((clidr >> 24) & 7).min(upto);
             for level in 0..loc {
                 if (clidr >> (level * 3)) & 7 < 2 {
                     continue;
@@ -2274,7 +2280,7 @@ mod hvcore {
                 wr(w + 0x08, 0xFFFF);
             }
             let (t, _) = now();
-            if off == OTHERS || t.wrapping_sub(t0) > f >> 2 {
+            if off == OTHERS || t.wrapping_sub(t0) > f {
                 break off;
             }
             while now().0.wrapping_sub(t) < f >> 10 {}
