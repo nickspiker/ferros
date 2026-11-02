@@ -1691,9 +1691,10 @@ static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
 /// Bit 63 of a surface pixel: see-through.
 const CLEAR: u64 = 1 << 63;
-/// The corners outside the circle (the system's: the clock now, signal and navigation later): the top and bottom `CHROME_ROWS` rows, 64-bit pixels like a surface. Drawn by `chrome_draw`.
+/// The corners outside the circle (the system's: the clock now, signal and navigation later): the top `CHROME_TOP` rows then the bottom `CHROME_BOT` rows, 64-bit pixels like a surface. Drawn by `chrome_draw`.
 static mut CHROME: usize = 1;
-static mut CHROME_ROWS: usize = 0;
+static mut CHROME_TOP: usize = 0;
+static mut CHROME_BOT: usize = 0;
 /// The minute the corners' clock last drew, so it redraws once a minute.
 static mut CHROME_KEY: i64 = -1;
 
@@ -1727,15 +1728,20 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
     (v, n)
 }
 
-/// The circle an app lives in (owner, 2026-10-27): tangent to the top and bottom of the screen, centred, so the four corners outside it belong to the system. Its radius and centre, in pixels.
+/// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's hole is centred at (672, 75) with radius 43.25 at 1344 x 2992 (Android's DisplayCutout for the physical raster), so its bottom edge is row 118.
+const CUTOUT_BOTTOM: f32 = 118.25;
+
+/// The circle an app lives in (owner, 2026-11-02): tangent to the bottom of the camera cutout and to the bottom of the screen, centred, so the corners outside it belong to the system. Its centre and radius, in pixels. (Until 2026-11-02 it was tangent to the top of the screen, through the cutout.)
 fn circle(width: usize, height: usize) -> (f32, f32, f32) {
-    (width as f32 * 0.5, height as f32 * 0.5, height as f32 * 0.5)
+    let r = (height as f32 - CUTOUT_BOTTOM) * 0.5;
+    (width as f32 * 0.5, CUTOUT_BOTTOM + r, r)
 }
 
-/// How many rows at the top (and at the bottom) reach outside the circle: where the circle's chord is narrower than the screen.
-fn chrome_rows(width: usize, height: usize) -> usize {
-    let (cx, _, r) = circle(width, height);
-    (r - libm::sqrtf(r * r - cx * cx)) as usize + 1
+/// How many rows at the top and at the bottom reach outside the circle: where the circle's chord is narrower than the screen, plus the hairline's own width and a row of slack.
+fn chrome_rows(width: usize, height: usize) -> (usize, usize) {
+    let (cx, cy, r) = circle(width, height);
+    let half = libm::sqrtf(r * r - cx * cx);
+    ((cy - half) as usize + 3, (height as f32 - (cy + half)) as usize + 3)
 }
 
 /// Whether the screen point is inside the circle.
@@ -1772,9 +1778,12 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     }
     let (ord, n) = front_order();
     let (cx, cy, rad) = circle(width, height);
-    let (rin, rout) = ((rad - 0.5) * (rad - 0.5), (rad + 0.5) * (rad + 0.5));
-    let rows = unsafe { CHROME_ROWS };
-    let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, 2 * rows * width) };
+    // The band the edge and its hairline touch: a pixel and a half either side of the radius.
+    let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
+    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
+    // The hairline's colour: the theme's ring, as the 16-bit working channels.
+    let line = draw::opaque(ferros_sys::theme::current().ring);
     let mut row = [3u32; 1344];
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
@@ -1810,8 +1819,8 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
             *p &= ((*p >> 63) ^ 1).wrapping_neg();
         }
         // The circle: only the rows that reach the corners have anything outside it.
-        if y < rows || y >= height - rows {
-            let crow = if y < rows { &chrome[y * width..(y + 1) * width] } else { &chrome[(rows + y - (height - rows)) * width..(rows + y - (height - rows) + 1) * width] };
+        if y < top || y >= height - bot {
+            let crow = if y < top { &chrome[y * width..(y + 1) * width] } else { &chrome[(top + y - (height - bot)) * width..(top + y - (height - bot) + 1) * width] };
             let dy = y as f32 + 0.5 - cy;
             let dy2 = dy * dy;
             for x in xa..xb {
@@ -1820,11 +1829,21 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 if d2 >= rout {
                     px[x] = crow[x];
                 } else if d2 > rin {
-                    // The edge: coverage is how far inside the edge the pixel's centre is, 0 to 1 across the one-pixel band; the light scales with it, so the working value with its root (the corners are black at the edge).
-                    let cov = rad + 0.5 - libm::sqrtf(d2);
+                    let d = libm::sqrtf(d2);
+                    // The edge: coverage is how far inside the edge the pixel's centre is, 0 to 1 across the one-pixel band at the radius; the light scales with it, so the working value with its root (the corners are black at the edge).
+                    // WHY the two limits: a pixel's coverage by the disc is 1 with its centre half a pixel or more inside the edge and 0 half a pixel or more outside, by the definition of coverage; this band is wider than that one pixel (it holds the hairline too), so the geometry says so, not a guard.
+                    let cov = rad + 0.5 - d;
+                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
                     let f = (libm::sqrtf(cov) * 65536.0) as u64;
                     let p = px[x];
-                    let ch = |sh: u32| ((p >> sh & 0xFFFF) * f >> 16) << sh;
+                    // The hairline (owner, 2026-11-02): one pixel wide, centred on the radius, its profile (1 - t²)² across it, C¹ at its edges and its centre; the edge's own pixel, light inside and chrome outside, shows through by the rest.
+                    let t = d - rad;
+                    let hl = if t * t < 1.0 { let u = 1.0 - t * t; u * u } else { 0.0 };
+                    let h = (hl * 65536.0) as u64;
+                    let ch = |sh: u32| {
+                        let base = (p >> sh & 0xFFFF) * f >> 16;
+                        ((base * (65536 - h) + (line >> sh & 0xFFFF) * h) >> 16) << sh
+                    };
                     px[x] = (p & 1 << 48) | ch(0) | ch(16) | ch(32);
                 }
             }
@@ -1872,8 +1891,8 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
         return false;
     }
     unsafe { CHROME_KEY = minute };
-    let rows = unsafe { CHROME_ROWS };
-    let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, 2 * rows * width) };
+    let (rows, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, (rows + bot) * width) };
     chrome[..rows * width].fill(0);
     // Hours and minutes: the first two places of the time's first line.
     let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
@@ -2240,8 +2259,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
         ARENA_NEXT = 0;
         // The corners' chrome, kept across calls (before the mark).
-        CHROME_ROWS = chrome_rows(width, height);
-        CHROME = alloc::vec![0u64; 2 * CHROME_ROWS * width].leak().as_mut_ptr() as usize;
+        let (top, bot) = chrome_rows(width, height);
+        CHROME_TOP = top;
+        CHROME_BOT = bot;
+        CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
     log.s(b"display: present table (E peak ");
@@ -3138,7 +3159,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 windows_changed(width, height);
             }
             if { APP }.is_some() && chrome_draw(width, height, false) {
-                let corner = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_ROWS as i32 };
+                let corner = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
                 for k in 0..PHASES {
                     publish_app(corner, &tabs, k, width, height);
                 }
