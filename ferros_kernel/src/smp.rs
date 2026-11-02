@@ -186,11 +186,19 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
             unsafe { core::arch::asm!("wfe") };
         }
     }
+    crate::platform::worker_step(1);
     crate::killswitch::arm_core();
+    crate::platform::worker_step(2);
     crate::pmu::el0_on();
+    crate::platform::worker_step(3);
     UP.fetch_or(1 << k, Ordering::AcqRel);
     let mut last_look = 0u64;
+    let mut steps = 0u32;
     loop {
+        if steps < 3 {
+            steps += 1;
+            crate::platform::worker_step(3 + steps as u64);
+        }
         // `diag keyreg` asks worker 0 to probe its own registers (keyreg.rs).
         crate::keyreg::serve(k);
         // The ira and wairua into this core's registers when a sealed copy is meant for it (keys.rs): before any slice runs here.
@@ -215,6 +223,7 @@ extern "C" fn ferros_core_main(block: usize) -> ! {
         if (crate::process::RUNNABLE_N.load(Ordering::Acquire) != 0 || irq || now >= next) && {
             last_look = now;
             unsafe { core::arch::asm!("msr daifclr, #2") };
+            crate::platform::worker_step(8);
             crate::process::run_slice()
         } {
             continue;

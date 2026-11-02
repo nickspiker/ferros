@@ -292,6 +292,17 @@ pub fn start_core(aff1: usize, mpidr: u64, entry: u64, ctx: u64) -> i64 {
 }
 
 /// The jump hand-off trace (ferros_hv hvcore::TRACE): this core's arrival in ferros's Rust, at -G#80 from the hv's word.
+/// A worker's progress after the jump, a word per core at G#FD60_0B00 + core*8 (cleaned to DRAM): 1 arrived, 2 GIC armed, 3 EL0 on, 4-6 the first loop passes, 8 the first slice taken. The thirty-second jump: three of the four workers arrived and took no slice.
+pub fn worker_step(s: u64) {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
+    let a = 0xFD60_0B00usize + ((mpidr >> 8) & 0xF) as usize * 8;
+    unsafe {
+        write_volatile(a as *mut u64, s | (cntpct() & !0xFF));
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) a as u64);
+    }
+}
+
 pub fn note_arrival() {
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };

@@ -2256,7 +2256,7 @@ mod hvcore {
             for w in 0..4 {
                 unsafe { write_volatile((MAILBOX + c * 32 + w * 8) as *mut u64, 0) };
             }
-            for o in [TRACE - 0x80, TRACE, TRACE + 0x80] {
+            for o in [TRACE - 0x100, TRACE - 0x80, TRACE, TRACE + 0x80] {
                 unsafe { write_volatile((o + c * 8) as *mut u64, 0) };
             }
         }
