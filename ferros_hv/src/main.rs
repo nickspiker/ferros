@@ -2252,6 +2252,10 @@ mod hvcore {
             super::pstore::log(&[b"\nferros hv: jump -- not every core went off, resetting instead\n"]);
             to_ferros();
         }
+        // The cluster watchdogs stop here: Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). ferros arms them itself, as after the bootloader.
+        for &w in &WATCHDOGS {
+            wr(w, 0);
+        }
         // No frame may be in flight when translation goes off: the second jump switched the display SysMMUs off under a running scanout, the engine fetched Android's IOVAs as physical addresses, and the interconnect stalled until the APM watchdog reset the device (ferros left no notes). Trigger masked first, then 1/16 s, longer than a frame at 60 Hz.
         let t = rd(DECON0_TRIG_CON);
         wr(DECON0_TRIG_CON, (t & !1) | (1 << 4));

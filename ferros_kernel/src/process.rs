@@ -1665,6 +1665,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
                 Some((Object::Console, r)) if r & RIGHT_SEND != 0 => {
                     let msg = p.read(f.x[1], (f.x[2] as usize).min(4096));
+                    let at = kk.console.len();
                     for &c in &msg {
                         if p.line_start {
                             kk.console.extend_from_slice(&p.name);
@@ -1673,6 +1674,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         kk.console.push(c);
                         p.line_start = c == b'\n';
                     }
+                    crate::platform::pstore(&kk.console[at..]);
                     let n = 2usize.min(f.x[4] as usize);
                     p.write(f.x[3], &b"ok"[..n]);
                     f.x[0] = n as u64;
@@ -1963,12 +1965,14 @@ fn end_process(pi: usize, cur: usize, value: u64) {
         crate::sensorlink::ended(p.epoch);
         fail_callers(&p.cspace);
         p.cspace.retain(|c| !matches!(c.object, Object::Reply(_)));
+        let at = kk.console.len();
         kk.console.extend_from_slice(&name);
         kk.console.extend_from_slice(b": exit G#");
         for i in (0..16).rev() {
             kk.console.push(b"0123456789ABCDEF"[((value >> (4 * i)) & 0xF) as usize]);
         }
         kk.console.push(b'\n');
+        crate::platform::pstore(&kk.console[at..]);
         if elsewhere {
             kk.procs[pi].as_mut().unwrap().dying = true;
         } else if let Some(p) = kk.procs[pi].take() {
@@ -2130,6 +2134,7 @@ pub fn run_slice() -> bool {
 pub fn push_console(bytes: &[u8]) {
     lock();
     k().console.extend_from_slice(bytes);
+    crate::platform::pstore(bytes);
     unlock();
 }
 

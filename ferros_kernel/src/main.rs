@@ -1787,6 +1787,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
     // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
     let hv_answered = ready::answered_by_hv();
+    // Into the pstore ring first thing: whether the hv's gate mark was there and how it was answered (6 = the jump from Android), so a session that dies before USB still says how it began.
+    platform::pstore(alloc::format!("\nferros: boot, hv answered {hv_answered}, gate telemetry G#{:X}\n", ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
     let real_boot = dtb_addr != 0 && dtb_addr & 1 == 0;
     // The hv's gate cleared the panel and drew only the gate's picture: adopting it need not clear it again.
     if hv_answered {

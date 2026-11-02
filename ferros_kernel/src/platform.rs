@@ -131,6 +131,33 @@ pub fn note(slot: usize, v: u64) {
         core::arch::asm!("dc civac, {a}", a = in(reg) a as u64);
     }
 }
+/// ferros's console, mirrored into Android's pstore console ring (ramoops at G#FD3F_F000, 2 MiB: u32 "DBGC", u32 start, u32 size, then the ring), the RAM log the hv writes and that survives a warm reset. A session that dies before anyone reads `diag console` (the jumps from Android that ended in a watchdog reset before USB, 2026-11-01) leaves its whole log there for the next boot (`tools/husky-pstore.sh`). Same layout and wrap as the hv's `pstore::log`; nothing written while the ring has no signature.
+const PSTORE_ZONE: usize = 0xFD3F_F000;
+const PSTORE_BUF: u32 = 0x20_0000 - 12;
+pub fn pstore(bytes: &[u8]) {
+    unsafe {
+        if read_volatile(PSTORE_ZONE as *const u32) != 0x4347_4244 {
+            return;
+        }
+        let mut start = read_volatile((PSTORE_ZONE + 4) as *const u32);
+        let mut size = read_volatile((PSTORE_ZONE + 8) as *const u32);
+        // The header is written by others (the bootloader, Linux, the hv): a start or size past the ring would put these writes outside the 2 MiB zone, over whatever lies beyond it. Such a header is not ours to repair: nothing is written.
+        if start >= PSTORE_BUF || size > PSTORE_BUF {
+            return;
+        }
+        for &b in bytes {
+            write_volatile((PSTORE_ZONE + 12 + start as usize) as *mut u8, b);
+            start = if start + 1 >= PSTORE_BUF { 0 } else { start + 1 };
+            if size < PSTORE_BUF {
+                size += 1;
+            }
+        }
+        write_volatile((PSTORE_ZONE + 4) as *mut u32, start);
+        write_volatile((PSTORE_ZONE + 8) as *mut u32, size);
+        core::arch::asm!("dsb sy");
+    }
+}
+
 /// Each core's last register access a process asked for (SYS_MMIO_READ/WRITE), at +G#180 + core*8: the physical address, bit 63 set for a write; the previous boot's at +G#1C8 (`bridge read FD6001C8 48`). A bus stall on a block whose clock or power is off leaves the core inside that access with the kernel lock held and the watchdog to reset it: this names the register (the jump from Android stalled on the display's modeset, 2026-11-01).
 pub const MMIO_NOTES: usize = RAMOOPS_RESULT + 0x180;
 pub fn note_mmio(v: u64) {
