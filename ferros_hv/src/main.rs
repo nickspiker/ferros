@@ -2291,6 +2291,16 @@ mod hvcore {
             super::pstore::log(&[b"\nferros hv: jump -- not every core went off, resetting instead\n"]);
             to_ferros();
         }
+        // Android's TRNG reads are a session through EL3 (exyswd-rng.c: SMC_CMD_RANDOM G#8200_1012 with HWRNG_INIT, HWRNG_GET_DATA, HWRNG_EXIT), and Android reads random numbers all the time: a freeze inside one leaves the firmware believing Linux holds the TRNG, and ferros's first TRNG call (the key registers' self-test, or KOHI) then never returned (the twenty-sixth jump, after "ira combined"; likely the earlier KOHI-worker hangs too). Closed here as the driver closes it, up to eight tries; with no session open the firmware just says no.
+        let mut trng = u64::MAX;
+        for _ in 0..8 {
+            trng = smc(0x8200_1012, 1, 0, 0);
+            if trng == 0 {
+                break;
+            }
+        }
+        let mut h = [0u8; 16];
+        super::pstore::log(&[b"\nferros hv: jump -- TRNG session closed: ", super::pstore::hex(trng, &mut h), b"\n"]);
         // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
