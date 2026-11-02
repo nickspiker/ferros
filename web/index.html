@@ -275,7 +275,7 @@
 
       <p class="thesis">
          Imagine a device that is dead the moment you say so,<br>
-         and alive again before you finish blinking.
+         and alive again before you blink.
       </p>
       <p class="thesis">
          Imagine nothing about you on it<br>
@@ -286,7 +286,7 @@
          with the inherited assumptions taken out,<br>
          until only the operating system is left.
       </p>
-      <p class="thesis">Now stop imagining. It boots.</p>
+      <p class="thesis">Now stop imagining.</p>
 
       <p class="audit-note">View source.</p>
 
@@ -300,23 +300,18 @@
       <p class="audit-note">The first two from this file. The rest from the repository.</p>
 
       <p class="one">&lt;1</p>
-      <p><strong>Under one second</strong> from the bootloader to the screen, from cold, every time.</p>
-      <p>
-         Not because of a fast path or a saved snapshot.
-         Because there is nothing to clean up on the way down and nothing to repair on the way up.
-         Power loss is normal operation, not an edge case.
-      </p>
+      <p><strong>Under one second</strong> from the bootloader to the home screen, from cold, every time.</p>
 
       <h2>What runs today</h2>
       <p>On a Pixel 8 Pro, from a cold boot, with no Linux underneath:</p>
       <ul>
-         <li>Its own kernel, written in Rust from the first instruction. Drivers run as ordinary processes with capabilities, and the kernel keeps shrinking as they move out.</li>
+         <li>Its own kernel, written in 100% Rust from the first instruction with custom chainlifted Rust to assembly for low level bringup. All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
-         <li>The display at full resolution, with its own colour pipeline, and touch.</li>
-         <li>WiFi, cellular data (LTE and 5G, data only), satellite positioning, the sensors, NFC, Bluetooth and USB.</li>
-         <li>Keys that live in CPU registers and never touch RAM.</li>
-         <li><strong>passless</strong> identity: you type your handle, and nothing of yours is on the disk until you do.</li>
-         <li>The kill switch: both volume keys, held together, and the power is cut below the software. Nothing polls; the key presses are the interrupt.</li>
+         <li>The display at full resolution, with its own true 16-bit spectral pipeline, no 1931 CIE anywhere. Gradients look real nice! Oh, and touch. You can touch it and it does things.</li>
+         <li>WiFi, cellular data (LTE and 5G), satellite positioning, the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
+         <li>Keys that live in isolated CPU registers and never touch RAM.</li>
+         <li><strong>passless</strong> identity: you type your handle, and nothing of yours is visible until you do.</li>
+         <li>The killswitch: both volume keys, held together, and the power is cut below the software. Nothing polls; the key presses are the interrupt. BOOP!</li>
       </ul>
       <p>
          Android is on the same device, from the same boot image, behind a gate and under a thin hypervisor that ferros owns.
@@ -326,7 +321,7 @@
 
       <h2>What it will never be</h2>
       <p class="warn">
-         <strong>This is not a phone.</strong>
+         <strong>This is not a phone!</strong>
          No phone number. No SMS. No calls to the telephone network, including emergency calls.
          If you need to be able to call for help, carry something that can.
       </p>
@@ -335,10 +330,10 @@
          The cellular radio carries data and nothing else, on purpose.
       </p>
 
-      <h2>The kill switch</h2>
+      <h2>The killswitch</h2>
       <p>
-         Both volume keys, held together. The press is an interrupt; the handler cuts the rails through the power-management chip.
-         The keys were in on-die flip-flops that stop existing when the core voltage drops. There is no zeroing step, because there is nothing left to zero.
+         Both volume keys, held together. The press is an interrupt; the handler cuts the rails thru the power-management IC directly.
+         The keys were in on-die flip-flops that stop existing when the core voltage drops.
       </p>
       <p>
          Nothing is written on the way down and nothing is checked on the way up: the store is never in a half-written state, so the next boot is just a boot.
@@ -347,7 +342,7 @@
 
       <h2>How it is built</h2>
       <ul>
-         <li>Rust, no C. <code>unsafe</code> only at audited hardware boundaries.</li>
+         <li>100% Rust. <code>unsafe</code> only at audited hardware boundaries, and those are chainlifted: the routine is written in safe Rust first, the compiler drafts the assembly, the assembly is read line by line and frozen, and the frozen assembly is what runs. The compiler is the draftsman; the audited listing is the artefact. The keys in CPU registers are built this way.</li>
          <li>One format for every file, every wire and every record (VSF). No JSON, no text parsers waiting to be fooled.</li>
          <li>Every secret is a relationship across independent media, never a property of one of them. Seize any one and you hold nothing.</li>
          <li>Inspired by <a href="https://gitlab.redox-os.org/redox-os/redox">Redox OS</a>, which showed what Rust could do; ferros shares no code with it.</li>
@@ -357,25 +352,20 @@
       <h2>Designed, and still a bet</h2>
       <p><strong>Designed, being built:</strong></p>
       <ul>
-         <li>Android apps compiled on the device at install and sealed to its hardware, never translated at run time, never redistributed. Required before anything ships.</li>
+         <li>Android apps compiled on the device at install and sealed to its hardware, never translated at run time, never redistributed.</li>
          <li>Every remaining driver out of the kernel, until what is left is a kernel and nothing else.</li>
-         <li><strong>Glyph</strong>, the device ferros is for: hermetic, no ports, no openings, a sapphire slab for a face, one physical control (the kill switch), nothing in it replaceable, built for a twelve-year life. Designed for the parts of 2032, not 2026.</li>
-      </ul>
-      <p><strong>Still a bet:</strong></p>
-      <ul>
-         <li>Spirix, a two's complement floating point that replaces IEEE-754 across the whole stack.</li>
-         <li>toka, the pipeline that lets the device compile everything it runs, so nothing precompiled has to be trusted.</li>
-         <li>Glyph's silicon.</li>
+         <li><strong>Glyph</strong>, the device ferros is for: hermetic, no ports, no openings, a sapphire slab for a face, one physical control (the killswitch), nothing in it replaceable, built for a twelve-year life. Designed for the parts of 2032, not 2026.</li>
       </ul>
 
       <h2>Glyph, the plan</h2>
       <table class="tiers">
-         <tr><td>Founders</td><td>1,000 units</td><td>$5,000</td><td>the first thousand, serial-numbered, 12-year warranty</td></tr>
-         <tr><td>Elite</td><td>10,000</td><td>$3,000</td><td>six months on</td></tr>
-         <tr><td>Pro</td><td>100,000</td><td>$1,500</td><td>twelve months on</td></tr>
-         <tr><td>Standard</td><td>1M+</td><td>$600</td><td>eighteen to twenty-four months on</td></tr>
+         <tr><td>Founders</td><td>1,728 units</td><td>$5,000</td><td>the first dozen cubed, serial-numbered, 12-year warranty</td></tr>
+         <tr><td>Elite</td><td>20,736</td><td>$3,000</td><td>six months on</td></tr>
+         <tr><td>Pro</td><td>248,832</td><td>$1,500</td><td>twelve months on</td></tr>
+         <tr><td>Standard</td><td>2,985,984</td><td>$600</td><td>eighteen to twenty-four months on</td></tr>
       </table>
       <p>
+         The counts are powers of twelve, and the whole table is inspirational: a shape to aim at, revised yearly against the parts that exist.
          Crypto only. Decentralized web only. No press, no review units.
          Founders does not pay for the development and cannot; it is a funding event and a proof, and the engineering cost spreads across the later tiers.
          The hardware notes are in the repository, revised yearly against the parts that exist.
@@ -394,6 +384,8 @@
          <dd>Everything under "What runs today", on one device, the Pixel 8 Pro, since the autumn of 2026. Both boot slots carry the same signed image.</dd>
          <dt>Being worked on</dt>
          <dd>Returning from a running Android to ferros without a reboot (it works, not yet every time). The last gaps in the storage firewall. The drivers still in the kernel.</dd>
+         <dt>Public release</dt>
+         <dd>Expected by 2027-01-01. Until then: development builds on the Pixel 8 Pro, from the repository.</dd>
          <dt>Not started</dt>
          <dd>Glyph's hardware. A second device.</dd>
          <dt>Last updated</dt>
@@ -403,7 +395,7 @@
       <h2>Questions</h2>
       <dl>
          <dt>Can I run it on my phone?</dt>
-         <dd>Not yet. One device today, the Pixel 8 Pro, and bringing up a second is months of work per device. The repository has everything needed to try.</dd>
+         <dd>Yes, today, if it is a Pixel 8 Pro: development builds, flashed from the repository (<code>tools/husky-cold.sh</code>), with a stock Android kept alongside. A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
          <dt>Why Rust?</dt>
          <dd>Memory safety without a garbage collector, and a compiler that holds the line the design draws. There is no C to inherit from.</dd>
          <dt>Why not Linux?</dt>
