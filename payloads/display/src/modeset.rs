@@ -424,3 +424,23 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -
     m.set(S_DECON, SHD_REG_UP_REQ, SHD_REG_UP_REQ_DQE);
     m.rep
 }
+
+/// After the jump from Android, with the pipe already at 10 bpc so `ten_bpc` has nothing to do: the DQE as `decon_init` leaves it on a cold boot, written over Android's colour stages (gamut correction, adaptive tone, the gamma and matrix stages: colours off and the gradients posterized on the thirty-fifth jump, 2026-11-02), and the stages' shadow latched at the next frame. Nothing of DECON's timing, DSIM or the panel is touched.
+pub fn dqe_quiet(p: &Pipe, w: u32, h: u32) {
+    let m = M { p, f: freq(), rep: Vec::new() };
+    let path = (m.rd(S_DECON, DATA_PATH_CON_0) & !ENHANCE_PATH_MASK) | ENHANCE_DQE_ON | ENHANCE_DITHER_ON;
+    m.wr(S_DECON, DATA_PATH_CON_0, path);
+    m.wr(S_DQE, DQE_TOP_IMG_SIZE, h << 16 | w);
+    m.wr(S_DQE, DQE_TOP_FRM_SIZE, h << 16 | w);
+    m.wr(S_DQE, DQE_TOP_FRM_PXL_NUM, w * h);
+    // Every colour stage off: ATC, HSC, the gamma matrix, degamma, the linear matrix, the three regamma blocks (regs-dqe.h), and the CGC with its dither.
+    for off in [DQE_ATC_CONTROL, 0x0800, 0x0C00, 0x1000, 0x1400, 0x2000, 0x4800, 0x4C00] {
+        m.wr(S_DQE, off, 0);
+    }
+    m.wr(S_DQE, DQE_CGC_DITHER, 0);
+    m.wr(S_DQE, DQE_DISP_DITHER, DITHER_EN);
+    m.wr(S_DQE_CGC, DQE_CGC_CON, 0);
+    m.set(S_DPP0, DPP_COM_IO_CON, BPC_MODE_10);
+    m.set(S_HDRCOMM0, LSI_COMM_IO_CON, BPC_MODE_10);
+    m.set(S_DECON, SHD_REG_UP_REQ, SHD_GLOBAL | SHD_CMP | SHD_REG_UP_REQ_DQE);
+}

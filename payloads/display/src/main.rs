@@ -1042,6 +1042,13 @@ impl Pipe {
         self.wr(S_DMA0, RDMA_IMG_SIZE, height << 16 | width);
         self.wr(S_DMA0, RDMA_BASEADDR_P0, fb as u32);
         self.wr(S_DPP0, 0x003C, height << 16 | width);
+        // The scaler off at 1:1 (DPP_COM_SCL_* in regs-dpp.h): Android leaves it on at its last layer's ratio, which drew ferros's full-raster layer blown up (the thirty-fifth jump).
+        self.wr(S_DPP0, 0x0080, 0);
+        self.wr(S_DPP0, 0x0084, height << 16 | width);
+        self.wr(S_DPP0, 0x0088, 1 << 20);
+        self.wr(S_DPP0, 0x008C, 1 << 20);
+        self.wr(S_DPP0, 0x0090, 0);
+        self.wr(S_DPP0, 0x0094, 0);
         self.wr(S_SRAMC0, 0x0014, (height - 1) << 16);
         self.wr(S_HDRCOMM0, 0x0020, height << 16 | width);
     }
@@ -2124,6 +2131,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let jumped = ferros_sys::facts().0[31] == 6;
     // Android switches the panel between 1008x2244 (its default "high resolution") and 1344x2992. A jump from 1008x2244 is drawn at that raster (touch then lands off: the controller reports in 1344x2992). Forcing the WQHD modeset there switched DECON and the DSC encoders but not the panel, which kept decoding in its scaled mode (the picture three-up, garbage below; the thirteenth jump, 2026-11-01): the stock driver changes the panel's resolution inside a full re-initialisation (reset, init set, PPS, C3/F2), not yet ported. Android set to "Full resolution" jumps clean.
     let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), false);
+    if jumped {
+        let bg = pipe.rd(S_DECON, 0x0220);
+        modeset::dqe_quiet(&pipe, bg & 0xFFFF, bg >> 16);
+    }
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
