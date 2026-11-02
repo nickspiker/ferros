@@ -308,6 +308,7 @@
          <li>Its own kernel, written in 100% Rust from the first instruction with custom chainlifted Rust to assembly for low level bringup. All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
          <li>The display at full resolution, with its own true 16-bit spectral pipeline, no 1931 CIE anywhere. Gradients look real nice! Oh, and touch. You can touch it and it does things.</li>
+         <li>The cameras: the main camera takes pictures from a cold boot.</li>
          <li>WiFi, cellular data (LTE and 5G), satellite positioning, the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
          <li>Keys that live in isolated CPU registers and never touch RAM.</li>
          <li><strong>passless</strong> identity: you type your handle, and nothing of yours is visible until you do.</li>
@@ -322,12 +323,13 @@
       <h2>What it will never be</h2>
       <p class="warn">
          <strong>This is not a phone!</strong>
-         No phone number. No SMS. No calls to the telephone network, including emergency calls.
-         If you need to be able to call for help, carry something that can.
+         No phone number. No SMS. No calls to the telephone network, and no 911.
+         It is a data device, like a tablet. If you need to be able to call for help, carry a phone, or run a voice app with a registered address: that is the app's provider's business, never ferros's.
       </p>
       <p>
-         Messages go over <a href="https://passless.org/photon/">Photon</a>, between identities, not numbers.
-         The cellular radio carries data and nothing else, on purpose.
+         This is an invariant of <a href="https://fgtw.org/">FGTW</a>, not a missing feature: data only, no PSTN, ever.
+         The moment anything dials a phone number, every regime the whole thing is built to avoid comes back.
+         Messages, voice and video go over <a href="https://passless.org/photon/">Photon</a>, between people, not numbers.
       </p>
 
       <h2>The killswitch</h2>
@@ -340,6 +342,12 @@
          The same is true of a dead battery, which is why it is normal operation.
       </p>
 
+      <h2>Where it fits</h2>
+      <p>
+         ferros is the device half of <a href="https://fgtw.org/">FGTW</a>: a member-governed, at-cost, data-only network where service is granted to a human, a handle, never to a SIM or a device.
+         The carrier underneath is a wholesale pipe. The identity above it belongs to the person and to nobody else.
+         Year 4 of 42. The end state is not a product; it is a world where owning your own identity is ambient, like TLS.
+      </p>
       <h2>How it is built</h2>
       <ul>
          <li>100% Rust. <code>unsafe</code> only at audited hardware boundaries, and those are chainlifted: the routine is written in safe Rust first, the compiler drafts the assembly, the assembly is read line by line and frozen, and the frozen assembly is what runs. The compiler is the draftsman; the audited listing is the artefact. The keys in CPU registers are built this way.</li>
@@ -366,6 +374,8 @@
       </table>
       <p>
          The counts are powers of twelve, and the whole table is inspirational: a shape to aim at, revised yearly against the parts that exist.
+         Before Glyph, the device tiers of the plan: Glyph itself; a Pixel 8 Pro on ferros paired with a dumb PIPE watch; a Pixel 8 Pro on ferros alone. Service follows the handle; the tier sets how much the network trusts the device.
+         The first pilot is fifty Pixel 8 Pros for three months, not a thousand.
          Crypto only. Decentralized web only. No press, no review units.
          Founders does not pay for the development and cannot; it is a funding event and a proof, and the engineering cost spreads across the later tiers.
          The hardware notes are in the repository, revised yearly against the parts that exist.
@@ -374,6 +384,7 @@
       <h2>Doors</h2>
       <ul class="doors">
          <li><a href="https://github.com/nickspiker/ferros">The repository →<span class="who">The kernel, the drivers, the design documents, the day-by-day record.</span></a></li>
+         <li><a href="https://fgtw.org/">FGTW →<span class="who">The network ferros is built for, and the plan around it: the runway, the invariants, the membership.</span></a></li>
          <li><a href="https://passless.org/">passless →<span class="who">The identity ferros is built around: no password, no account, no company in the middle.</span></a></li>
          <li><a href="https://passless.org/photon/">Photon →<span class="who">The messenger. The first passless application, and the first ferros one.</span></a></li>
       </ul>
@@ -381,13 +392,13 @@
       <h2>Status</h2>
       <dl>
          <dt>Working today</dt>
-         <dd>Everything under "What runs today", on one device, the Pixel 8 Pro, since the autumn of 2026. Both boot slots carry the same signed image.</dd>
+         <dd>Everything under "What runs today", on one device, the Pixel 8 Pro, since the autumn of 2026: display, touch, all cores, cameras, data-only cellular. Both boot slots carry the same signed image.</dd>
          <dt>Being worked on</dt>
          <dd>Returning from a running Android to ferros without a reboot (it works, not yet every time). The last gaps in the storage firewall. The drivers still in the kernel.</dd>
          <dt>Public release</dt>
          <dd>Expected by 2027-01-01. Until then: development builds on the Pixel 8 Pro, from the repository.</dd>
          <dt>Not started</dt>
-         <dd>Glyph's hardware. A second device.</dd>
+         <dd>The GPU. Carrier voice, by design, never. Glyph's hardware (years nine to twelve of the plan). A second device.</dd>
          <dt>Last updated</dt>
          <dd>2026-11-02</dd>
       </dl>
