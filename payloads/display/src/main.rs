@@ -2130,11 +2130,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // After the jump from a running Android (SYS_FACTS 31 = 6) the pipe runs Android's raster and panel mode (already 10 bpc). The raster below is then DECON's own output (the blender's background size), not the layer DMA's, which holds whatever layer Android drew last (1008x2023 on the sixth jump, 2026-11-01). The modeset is not forced: forcing it under Android's panel state was followed by the APM watchdog on jumps seven to nine.
     let jumped = ferros_sys::facts().0[31] == 6;
     // Android switches the panel between 1008x2244 (its default "high resolution") and 1344x2992. A jump from 1008x2244 is drawn at that raster (touch then lands off: the controller reports in 1344x2992). Forcing the WQHD modeset there switched DECON and the DSC encoders but not the panel, which kept decoding in its scaled mode (the picture three-up, garbage below; the thirteenth jump, 2026-11-01): the stock driver changes the panel's resolution inside a full re-initialisation (reset, init set, PPS, C3/F2), not yet ported. Android set to "Full resolution" jumps clean.
-    let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), false);
-    if jumped {
-        let bg = pipe.rd(S_DECON, 0x0220);
-        modeset::dqe_quiet(&pipe, bg & 0xFFFF, bg >> 16);
-    }
+    // After the jump the whole modeset runs again (force): with DECON left as Android configured it, ferros's frames never completed (the frame counter stood still, "settle timeout", the panel holding Android's last frame: the thirty-fifth jump). The panel must be at its full raster already (Android at "Full resolution"): the modeset switches DECON and the encoders but not the panel's own scaled mode (the thirteenth jump, three-up).
+    let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped);
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
