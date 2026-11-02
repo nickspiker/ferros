@@ -54,11 +54,22 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut failed = 0u64;
     // The keepers' stacks: in this frame, which never returns.
     let mut stacks = Stacks([[0u8; KEEPER_STACK]; KEPT.len()]);
+    // After the jump from a running Android (fact 31 = 6) the radios and the AoC are still in Android's state, and their drivers know only the bootloader's: the WiFi driver's first register write hung the bus (the fifth jump, 2026-11-01), as the modem's read and the AoC start had. They wait for drivers that bring their block up from any state; the shell, the screen and USB start as always.
+    let jumped = ferros_sys::facts().0[31] == 6;
+    let after_jump = |n: &[u8]| jumped && matches!(n, b"pcie1" | b"nfc" | b"bt" | b"sensors" | b"modem");
     for (name, key, slots) in SHELL.iter() {
+        if after_jump(name) {
+            console(grants, b"init: ");
+            console(grants, name);
+            console(grants, b" not started: the jump from Android left its hardware in Android's state\n");
+            continue;
+        }
         if *name == b"map" {
             // Every driver the keepers watch is started by now.
             for (k, s) in stacks.0.iter_mut().enumerate() {
-                ferros_sys::thread_spawn(keeper, s, (grants << 2) | k as u64);
+                if !after_jump(KEPT[k].0) {
+                    ferros_sys::thread_spawn(keeper, s, (grants << 2) | k as u64);
+                }
             }
             wait_unlocked(grants);
         }

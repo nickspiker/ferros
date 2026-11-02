@@ -551,7 +551,7 @@ static USB_LINK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// The last battery sample and when it was taken: the gauge is read at most every two seconds, however often a dashboard asks.
 static mut GAUGE: ([u64; 4], u64) = ([crate::process::FACT_UNKNOWN; 4], 0);
 
-/// SYS_FACTS (process.rs): 0 press to home µs; 1 battery %; 2 battery temperature, hundredths of a degree C (i64); 3 cell voltage µV; 4 battery current µA, positive = charging (i64); 5 USB link up (0/1); 6 processes alive; 7 keys in the vault; 8 the wall clock's base — unix seconds × counter frequency − the counter, so unix time = (base + counter) / frequency (rtc.rs; unknown until the PMIC's clock has been read); 9 the time zone, seconds east of UTC (i64); the rest unknown.
+/// SYS_FACTS (process.rs): 0 press to home µs; 1 battery %; 2 battery temperature, hundredths of a degree C (i64); 3 cell voltage µV; 4 battery current µA, positive = charging (i64); 5 USB link up (0/1); 6 processes alive; 7 keys in the vault; 8 the wall clock's base — unix seconds × counter frequency − the counter, so unix time = (base + counter) / frequency (rtc.rs; unknown until the PMIC's clock has been read); 9 the time zone, seconds east of UTC (i64); 31 how this boot began (the hv gate's answer, 6 = the jump from Android, 0 = not through the hv); the rest unknown.
 fn facts() -> [u64; crate::process::FACT_COUNT] {
     use core::sync::atomic::Ordering::Relaxed;
     let mut v = [crate::process::FACT_UNKNOWN; crate::process::FACT_COUNT];
@@ -582,6 +582,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
         v[10] = hottest as u64;
     }
     v[11] = (THROTTLED_FROM.load(Relaxed) != 0) as u64;
+    // How this boot began: the hv gate's answer (ready.rs GATE_TELEMETRY low byte: 1 power, 2 timer, 3 volume down, 4 recovery refused, 5 the chord's reset, 6 the jump from a running Android), 0 when not through the hv. A driver whose hardware Android may have left running reads it (the modem, after a jump).
+    v[31] = crate::ready::GATE_TELEMETRY.load(Relaxed) & 0xFF;
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
         use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};
@@ -1103,7 +1105,12 @@ pub fn run(mut b: Boot) -> ! {
         }
         // The AoC's start, when the `sensors` switch has asked for it and the boot's first seconds are past (the home screen first).
         if matches!(sensor_boot, SensorBoot::Done) && now.wrapping_sub(t_boot) > SENSORS_AFTER_S * freq && crate::sensorlink::START.swap(false, core::sync::atomic::Ordering::Relaxed) {
-            sensor_boot = SensorBoot::Wait;
+            // After the jump from a running Android (gate answer 6) the AoC, GSA and Trusty are still in Android's session, and this start knows only the cold path: the fourth jump's service loop stopped feeding the watchdog once sensors asked (APC watchdog, 2026-11-01). Left alone until a restart path exists; the sensors process gives up after its wait.
+            if crate::ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF == 6 {
+                crate::process::push_console(b"sensors: started by the jump from Android; the AoC is Android's, left alone (no restart path yet)\n");
+            } else {
+                sensor_boot = SensorBoot::Wait;
+            }
         }
         if !matches!(sensor_boot, SensorBoot::Done) {
             let st = &raw mut store;
