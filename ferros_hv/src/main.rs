@@ -106,6 +106,16 @@ _hvcore:
 7:  wfe
     b       7b
 
+// Core 0 started by the hv core's jump: straight into the ferros image the jump copied to its link base, x0 = the saved device tree (CPU_ON's context).
+.global _ferros_go
+_ferros_go:
+    msr     daifset, #0xF
+    ic      iallu
+    dsb     sy
+    isb
+    ldr     x1, =0x80080000
+    br      x1
+
 // Exception vectors (VBAR_EL2). Only "lower EL, AArch64, synchronous" does real work; everything else records itself and parks the core.
 .balign 0x800
 .global hv_vectors
@@ -210,8 +220,19 @@ fn report(off: usize, v: u64) {
     }
 }
 
+/// The stage history in the ramoops page (G#FD60_0FD0), which survives the watchdog resets a failed boot ends in: each stage shifts in a byte, newest lowest. Read from ferros after a fallback to the other slot.
+const STAGE_TRAIL: usize = 0xFD60_0FD0;
+fn trail(s: u64) {
+    unsafe {
+        let p = STAGE_TRAIL as *mut u64;
+        write_volatile(p, read_volatile(p) << 8 | (s & 0xFF));
+        asm!("dsb sy");
+    }
+}
+
 fn stage(s: u64) {
     report(0x40, s);
+    trail(s);
     // Errors only, in slot 1 of the splash (magenta: DTB rebuild failed; green: an unexpected trap parked a core; yellow: panic). The progress greys (slots 0, 2, 3) were bring-up crumbs, invisible until the boot gate began pushing the restored splash as a frame (2026-10-20: grey bars above Google's logo) — removed.
     match s {
         STAGE_DTB_FAILED => splash::band(1, 0xFFFF_00FF),
@@ -629,6 +650,20 @@ unsafe fn pdma_dump() {
 }
 
 /// Build the shared stage-2 table once (the primary boots and enables it before any secondary is started, so the flag needs no lock), unmap the oracle's targets into it, and return its base for VTTBR_EL2. Secondaries call this too and get the finished table.
+/// The jump's freeze: every level-1 entry invalid, the table cleaned to DRAM (the walkers read it write-back cacheable, the hv writes it with its MMU off), and every EL1&0 translation dropped on every core. From the next instruction, everything Linux does traps here.
+unsafe fn stage2_freeze() {
+    let s2 = (&raw mut STAGE2) as *mut u64;
+    for i in 0..1024 {
+        write_volatile(s2.add(i), 0);
+    }
+    let mut a = s2 as u64;
+    while a < s2 as u64 + 1024 * 8 {
+        asm!("dc civac, {a}", a = in(reg) a);
+        a += 64;
+    }
+    asm!("dsb sy", "tlbi alle1is", "dsb sy", "isb");
+}
+
 unsafe fn stage2_base() -> u64 {
     let s2 = (&raw mut STAGE2) as *mut u64;
     if !read_volatile(&raw const S2_READY) {
@@ -913,9 +948,9 @@ unsafe fn configure_el2() {
     // The VMID. With EL2 present, every EL1&0 TLB entry is tagged with VTTBR_EL2.VMID even while stage 2 is off, and VTTBR_EL2 is UNKNOWN at reset — a different value per core, and again after every power-down. Linux's broadcast TLB invalidations (VMALLE1IS and friends) only reach entries with the issuing core's VMID, so without one fixed VMID the other cores keep stale translations: the load-dependent, minutes-later hangs of 2026-10-17, worst under GPU mapping churn. VMID 0 everywhere, and the EL1 TLB flushed on the way in.
     // The flush is local: this core's EL1 TLB is empty on a first boot and after a power-down anyway, and a broadcast (ALLE1IS) on every resume of nine cores would be a DVM storm.
     // VTCR_EL2: T0SZ 24 (40-bit IPA), SL0 1 (start at level 1), IRGN/ORGN write-back, SH inner, TG0 4 KiB, PS 40-bit, RES1 bit 31.
-    let vttbr = if cfg!(hv_stage2) || cfg!(hv_ufs) { stage2_base() } else { 0 };
+    let vttbr = if cfg!(hv_stage2) || cfg!(hv_ufs) || cfg!(hv_core) { stage2_base() } else { 0 };
     asm!("msr vttbr_el2, {v}", "msr vtcr_el2, {t}", "isb", "tlbi alle1", "dsb nsh", "isb", v = in(reg) vttbr, t = in(reg) 0x8000_0000u64 | (24 << 0) | (1 << 6) | (3 << 8) | (3 << 10) | (3 << 12) | (2 << 16));
-    if cfg!(hv_stage2) || cfg!(hv_ufs) {
+    if cfg!(hv_stage2) || cfg!(hv_ufs) || cfg!(hv_core) {
         let hcr: u64;
         asm!("mrs {h}, hcr_el2", h = out(reg) hcr);
         asm!("msr hcr_el2, {h}", "isb", h = in(reg) hcr | 1); // VM
@@ -939,6 +974,7 @@ unsafe extern "C" {
     fn hv_vectors();
     fn _secondary();
     fn _hvcore();
+    fn _ferros_go();
 }
 
 /// EL1h with every interrupt masked, as a kernel expects at entry.
@@ -972,6 +1008,7 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
     stage(STAGE_ENTERED);
     chord::arm();
     chord::early_to_fastboot_if_held();
+    trail(0xB1);
     report(0x48, 0);
     report(0x50, 0);
     report(0x80, 0);
@@ -983,20 +1020,29 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
         report(0x200 + core * 8, 0);
     }
     // The boot gate (gate.rs): with a ferros image packed in this boot image, ask before Linux runs; ABL has already done everything Android needs, including the secure world's boot state.
+    trail(0xB2);
     if gate::ask(dtb as usize) == gate::Choice::Ferros {
+        trail(0xBF);
         pstore::log(&[b"\nferros hv: gate -- ferros\n"]);
         gate::start_ferros(dtb);
     }
     // Android, from either slot: it lives on slot a, so the slot suffix ABL wrote into bootconfig becomes _a (gate.rs).
     // Logged before the rewrite as well as after, so a rewrite that never returns still leaves its mark in pstore (2026-10-28: three slot-b attempts left nothing).
+    // What the jump to ferros needs and Linux will reuse: the packed image, ABL's device tree and its bootconfig, kept in the hv's reservation (before the slot-suffix rewrite, so ferros reads the slot that booted).
+    trail(0xB3);
+    if cfg!(hv_core) {
+        hvcore::save_for_jump(dtb as usize);
+    }
+    trail(0xB4);
     pstore::log(&[b"\nferros hv: gate -- android, rewriting the slot suffix\n"]);
     pstore::log(&[if gate::android_from_slot_a(dtb as usize) { b"ferros hv: gate -- slot suffix rewritten to _a\n" as &[u8] } else { b"ferros hv: gate -- slot suffix left as it was\n" }]);
+    trail(0xB5);
     let new_dtb = match fdt::patch(dtb as usize, DTB_COPY as usize, DTB_COPY_MAX) {
         Some(len) => {
             if cfg!(hv_core) {
                 // The keys go to the hv's core only when Linux has been pointed at the proxies for all three; otherwise Linux keeps the real lines and the hv core never starts.
                 let n = fdt::retarget_keys(DTB_COPY as usize, &hvcore::DT_SPIS);
-                hvcore::reset_stats(n);
+                hvcore::retargeted(n);
                 pstore::log(&[if n == 3 { b"\nferros hv: hvcore -- keys retargeted to the proxy SPIs\n" as &[u8] } else { b"\nferros hv: hvcore -- key cells not found, hv core stays off\n" }]);
             }
             unsafe {
@@ -1038,6 +1084,10 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn hv_secondary(ctx: u64) -> ! {
+    // A core the jump woke from idle: off, not back into Linux.
+    if cfg!(hv_core) && hvcore::freezing() {
+        hvcore::park();
+    }
     let mpidr: u64;
     unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) mpidr) };
     let idx = ((mpidr >> 8) & 0xF) as usize;
@@ -1106,6 +1156,10 @@ const PSCI_DENIED: u64 = -3i64 as u64;
 /// The trapped synchronous exception from EL1. `frame` holds x0..x17 (then x18, x30) as the guest left them; results go back through it.
 #[unsafe(no_mangle)]
 extern "C" fn hv_sync(frame: &mut [u64; 32]) {
+    // The jump to ferros has taken stage 2 away: whatever brought this core here (the fault on its next instruction, or an SMC already in flight), it goes off.
+    if cfg!(hv_core) && hvcore::freezing() {
+        hvcore::park();
+    }
     if chord::held() {
         chord::power_off();
     }
@@ -1425,6 +1479,10 @@ fn forward_smc(f: &mut [u64; 32]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn hv_unexpected(esr: u64, elr: u64, far: u64) {
+    unsafe {
+        write_volatile((STAGE_TRAIL - 0x10) as *mut u64, esr);
+        write_volatile((STAGE_TRAIL - 0x8) as *mut u64, elr);
+    }
     report(0x58, esr);
     report(0x60, elr);
     report(0x68, far);
@@ -1771,6 +1829,62 @@ mod fdt {
         Some(new_total)
     }
 
+    /// The value of `/chosen/<name>`: (its address, its length).
+    pub fn chosen_prop(dtb: usize, want: &[u8]) -> Option<(usize, usize)> {
+        if rd32(dtb) != MAGIC {
+            return None;
+        }
+        let strings = dtb + rd32(dtb + 12) as usize;
+        let mut p = dtb + rd32(dtb + 8) as usize;
+        let end = p + rd32(dtb + 36) as usize;
+        let (mut depth, mut chosen) = (0u32, false);
+        while p < end {
+            let tok = rd32(p);
+            p += 4;
+            match tok {
+                BEGIN_NODE => {
+                    let name = p;
+                    let mut n = 0usize;
+                    while rd8(p + n) != 0 {
+                        n += 1;
+                    }
+                    p = (p + n + 1 + 3) & !3;
+                    depth += 1;
+                    chosen = depth == 2 && name_eq(name, b"chosen");
+                }
+                END_NODE => {
+                    if chosen && depth == 2 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                PROP => {
+                    let len = rd32(p) as usize;
+                    if chosen && name_eq(strings + rd32(p + 4) as usize, want) {
+                        return Some((p + 8, len));
+                    }
+                    p = (p + 8 + len + 3) & !3;
+                }
+                NOP => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// A one- or two-cell big-endian value.
+    pub fn cells(at: usize, len: usize) -> u64 {
+        if len == 8 { (rd32(at) as u64) << 32 | rd32(at + 4) as u64 } else { rd32(at) as u64 }
+    }
+    pub fn set_cells(at: usize, len: usize, v: u64) {
+        if len == 8 {
+            wr32(at, (v >> 32) as u32);
+            wr32(at + 4, v as u32);
+        } else {
+            wr32(at, v as u32);
+        }
+    }
+
     /// FERROS_HV_CORE: in the pin banks `gpa4` and `gpa6`, each `interrupts` entry `<GIC_SPI from type 0>` whose `from` is in `map` becomes `<GIC_SPI to IRQ_TYPE_EDGE_RISING 0>`, in place (same length). The banks' per-pin wakeup interrupts are what the pin controller chains each EINT from, so Linux then takes the keys from the proxies the hv core raises and never touches the real lines. Returns the entries rewritten.
     pub fn retarget_keys(dtb: usize, map: &[(u32, u32)]) -> u32 {
         if rd32(dtb) != MAGIC {
@@ -1832,7 +1946,7 @@ mod fdt {
 // ---------------------------------------------------------------- the hv's own core (FERROS_HV_CORE, HV.md "The chords under Android")
 //
 // The chords under Android, taken by interrupt rather than by polling on traps (owner, 2026-11-01). The group-0 route is closed (IGROUPR is RAZ/WI from the non-secure side), so the hv owns a core instead: A510 core 3, started by the hv with PSCI CPU_ON at Linux's first CPU_ON (its distributor is set up by then) and refused to Linux. It sleeps in WFI at EL2 with the three keys' SPIs routed to it (GICD_IROUTER is non-secure-writable). On each key edge it reads all three keys: volume up + volume down = SYSTEM_OFF, power + volume up = reset to ferros (the gate's FERROS_ONCE); anything else clears the pin's EINT pend bit and raises the key's proxy SPI, which the DTB patch made Linux's parent for that pin, so Android sees every key as before.
-// Counters (u64 words from G#FD60_0D00, ramoops page, kept through a warm reset): 0 magic, 1 CPU_ONs the hv issued for its core, 2 the last result, 3 times the core entered, 4 interrupts taken, 5 forwarded to Linux, 6 empty wakes, 7 Linux CPU_ONs refused, 8 stops for system suspend, 9 the last AFFINITY_INFO at stop (1 = off), 10 power + volume up, 11 volume up + volume down, 12 the last INTID, 13 the redistributor frame (G#FF none), 14 unknown INTIDs, 15 DTB cells retargeted.
+// Counters (u64 words from G#FD60_0D00, ramoops page, kept through a warm reset): 0 magic, 1 CPU_ONs the hv issued for its core, 2 the last result, 3 times the core entered, 4 interrupts taken, 5 forwarded to Linux, 6 empty wakes, 7 Linux CPU_ONs refused, 8 stops for system suspend, 9 the last AFFINITY_INFO at stop (1 = off), 10 power + volume up, 11 volume up + volume down, 12 the last INTID, 13 the redistributor frame (G#FF none), 14 unknown INTIDs, 15 DTB cells retargeted, 16-22 and 23-31 the jump (`jump`).
 mod hvcore {
     use core::arch::asm;
     use core::ptr::{read_volatile, write_volatile};
@@ -1876,12 +1990,8 @@ mod hvcore {
         unsafe { write_volatile((STATS + i * 8) as *mut u64, v) };
     }
 
-    /// On the Android path only (the ferros path leaves the last session's counters for ferros to read).
-    pub fn reset_stats(retargeted: u32) {
-        for i in 0..32 {
-            set(i, 0);
-        }
-        set(0, MAGIC);
+    /// After the DTB patch: how many key cells now point at the proxies; the hv core runs only when all three do. (The counters were cleared by `save_for_jump`, on the Android path only: the ferros path leaves the last session's counters for ferros to read.)
+    pub fn retargeted(retargeted: u32) {
         set(15, retargeted as u64);
         unsafe { write_volatile(&raw mut ENABLED, retargeted == DT_SPIS.len() as u32) };
     }
@@ -1980,30 +2090,220 @@ mod hvcore {
         }
     }
 
-    fn handle(id: u32) {
+    // ---- the jump to ferros (power + volume up): no reset, no bootloader ----
+    // At boot, before Linux runs, the hv keeps what ferros reads at entry and Linux will reuse: the packed image, ABL's device tree, and the bootconfig at the end of the initrd (the copy's /chosen initrd range pointed at the kept tail). In the hv's reservation, above the gate's splash save (G#A_FD00_0000, 32 MiB) and below the report page.
+    const JUMP_IMAGE: usize = 0xA_FF00_0000;
+    const JUMP_IMAGE_MAX: usize = 0xC0_0000;
+    const JUMP_DTB: usize = 0xA_FFC0_0000;
+    const JUMP_DTB_MAX: usize = 0x10_0000;
+    const JUMP_BOOTCONFIG: usize = 0xA_FFD0_0000;
+    /// The bootconfig text and its 12-byte trailer sit at the initrd's end and run to a few KiB; the last 64 KiB are kept (all of it when the initrd is shorter).
+    const JUMP_BOOTCONFIG_MAX: u64 = 0x1_0000;
+    const FERROS_LINK: usize = 0x8008_0000;
+    /// Where the jump puts the kept bootconfig for ferros: below its link base, in DRAM nothing touches before ferros reads it, and under 4 GiB because `/chosen` carries the initrd range in one-cell values (the first jump read none, SLOT_MARK G#11, with the copy at G#A_FFD0_0000).
+    const LOW_BOOTCONFIG: usize = 0x8004_0000;
+    /// The display engines' IOMMUs (zuma-sysmmu.dtsi sysmmu_dpuf0/1): Android leaves translation on with its own tables; ferros gives the DPU physical addresses, as after the bootloader. Measured on the first jump: VM0 control G#25, the panel showed static and then black.
+    const DPU_SYSMMUS: [usize; 2] = [0x1984_0000, 0x19C4_0000];
+    const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+    /// Every core but this one (MPIDR Aff1 0-8 without 3).
+    const OTHERS: u32 = 0x1F7;
+    static mut IMAGE_LEN: usize = 0;
+    static mut FREEZE: bool = false;
+
+    fn copy64(src: usize, dst: usize, len: usize) {
+        for k in 0..len.div_ceil(8) {
+            unsafe { write_volatile((dst + k * 8) as *mut u64, read_volatile((src + k * 8) as *const u64)) };
+        }
+    }
+
+    /// On the Android path, before Linux: the counters cleared, then the image, the device tree and the bootconfig kept.
+    pub fn save_for_jump(dtb: usize) {
+        for i in 0..32 {
+            set(i, 0);
+        }
+        set(0, MAGIC);
+        let Some((src, len)) = super::gate::ferros_image() else { return };
+        let be = |a: usize| u32::from_be(unsafe { read_volatile(a as *const u32) }) as usize;
+        let size = be(dtb + 4);
+        if len > JUMP_IMAGE_MAX || be(dtb) != 0xD00D_FEED || size > JUMP_DTB_MAX {
+            return;
+        }
+        copy64(src, JUMP_IMAGE, len);
+        copy64(dtb, JUMP_DTB, size);
+        if let (Some((s_at, s_len)), Some((e_at, e_len))) = (super::fdt::chosen_prop(JUMP_DTB, b"linux,initrd-start"), super::fdt::chosen_prop(JUMP_DTB, b"linux,initrd-end")) {
+            let (s, e) = (super::fdt::cells(s_at, s_len), super::fdt::cells(e_at, e_len));
+            if e > s {
+                let n = if e - s < JUMP_BOOTCONFIG_MAX { e - s } else { JUMP_BOOTCONFIG_MAX };
+                for k in 0..n as usize {
+                    unsafe { write_volatile((JUMP_BOOTCONFIG + k) as *mut u8, read_volatile((e as usize - n as usize + k) as *const u8)) };
+                }
+                super::fdt::set_cells(s_at, s_len, LOW_BOOTCONFIG as u64);
+                super::fdt::set_cells(e_at, e_len, LOW_BOOTCONFIG as u64 + n);
+                set(22, n);
+            }
+        }
+        unsafe { write_volatile(&raw mut IMAGE_LEN, len) };
+        set(21, len as u64);
+    }
+
+    pub fn freezing() -> bool {
+        unsafe { read_volatile(&raw const FREEZE) }
+    }
+
+    /// A Linux core caught by the freeze: counted in its own word (23 + core), then off.
+    pub fn park() -> ! {
+        let m: u64;
+        unsafe { asm!("mrs {v}, mpidr_el1", v = out(reg) m) };
+        stat(23 + ((m >> 8) & 0xF) as usize, 1);
+        unsafe { asm!("smc #0", in("x0") 0x8400_0002u64) };
+        loop {
+            unsafe { asm!("wfe") };
+        }
+    }
+
+    fn now() -> (u64, u64) {
+        let (t, f): (u64, u64);
+        unsafe { asm!("mrs {t}, cntpct_el0", "mrs {f}, cntfrq_el0", t = out(reg) t, f = out(reg) f) };
+        (t, f)
+    }
+
+    /// Clean and invalidate every data and unified cache level this core sees, by set/way (its L1 and L2, and the cluster's L3): Linux's dirty lines must not be written back later over what the jump puts in DRAM with the MMU off. The other cores' own levels were cleaned by their power-down.
+    fn flush_all() {
+        unsafe {
+            let (clidr, mmfr2): (u64, u64);
+            asm!("mrs {a}, clidr_el1", "mrs {b}, id_aa64mmfr2_el1", a = out(reg) clidr, b = out(reg) mmfr2);
+            let ccidx = (mmfr2 >> 20) & 0xF != 0;
+            let loc = (clidr >> 24) & 7;
+            for level in 0..loc {
+                if (clidr >> (level * 3)) & 7 < 2 {
+                    continue;
+                }
+                let ccsidr: u64;
+                asm!("msr csselr_el1, {l}", "isb", "mrs {c}, ccsidr_el1", l = in(reg) level << 1, c = out(reg) ccsidr);
+                let line = (ccsidr & 7) + 4;
+                let (ways, sets) = if ccidx { (((ccsidr >> 3) & 0x1F_FFFF) + 1, ((ccsidr >> 32) & 0xFF_FFFF) + 1) } else { (((ccsidr >> 3) & 0x3FF) + 1, ((ccsidr >> 13) & 0x7FFF) + 1) };
+                let way_shift = ((ways - 1) as u32).leading_zeros() as u64;
+                for way in 0..ways {
+                    for set in 0..sets {
+                        let v = (way << way_shift) | (set << line) | (level << 1);
+                        asm!("dc cisw, {v}", v = in(reg) v);
+                    }
+                }
+            }
+            asm!("dsb sy", "isb");
+        }
+    }
+
+    /// Every SPI and every core's SGIs and PPIs neither active nor pending: an interrupt Linux had acknowledged when it froze would otherwise stay active for good, and ferros would never get it again (its keys, its slice timer).
+    fn gic_quiet() {
+        let lines = ((rd(GICD + 0x4) & 0x1F) as usize + 1) * 32;
+        for r in 1..lines / 32 {
+            wr(GICD + 0x380 + r * 4, 0xFFFF_FFFF);
+            wr(GICD + 0x280 + r * 4, 0xFFFF_FFFF);
+        }
+        for i in 0..16usize {
+            let base = GICR + i * GICR_STRIDE;
+            wr(base + 0x1_0000 + 0x380, 0xFFFF_FFFF);
+            wr(base + 0x1_0000 + 0x280, 0xFFFF_FFFF);
+            if rd(base + 0x08) & (1 << 4) != 0 {
+                break;
+            }
+        }
+        unsafe { asm!("dsb sy") };
+    }
+
+    /// Power + volume up: Android stops where it is and ferros starts on core 0, as the gate would start it. Counters: 16 jumps, 17 the cores PSCI reported off (bit per core), 18 ms until then, 20 core 0's CPU_ON result, 21 the kept image's length, 22 the kept bootconfig's, 23 + core each core caught by the freeze. A freeze that does not stop every core, or a CPU_ON that fails, falls back to the reset.
+    fn jump() -> ! {
+        stat(16, 1);
+        let len = unsafe { read_volatile(&raw const IMAGE_LEN) };
+        if len == 0 {
+            to_ferros();
+        }
+        super::pstore::log(&[b"\nferros hv: power + volume up -- jumping to ferros\n"]);
+        unsafe {
+            write_volatile(&raw mut FREEZE, true);
+            asm!("dsb sy");
+            super::stage2_freeze();
+        }
+        let (t0, f) = now();
+        let off = loop {
+            // SGI 0 to every core but this one (IRM): idle cores wake, fault on their first fetch, and park.
+            unsafe { asm!("msr s3_0_c12_c11_5, {v}", "isb", v = in(reg) 1u64 << 40) };
+            let mut off = 0u32;
+            for c in 0..9u64 {
+                if OTHERS & (1 << c) != 0 && smc(0xC400_0004, c << 8, 0, 0) == 1 {
+                    off |= 1 << c;
+                }
+            }
+            for &w in &WATCHDOGS {
+                wr(w + 0x08, 0xFFFF);
+            }
+            let (t, _) = now();
+            if off == OTHERS || t.wrapping_sub(t0) > f >> 2 {
+                break off;
+            }
+            while now().0.wrapping_sub(t) < f >> 10 {}
+        };
+        set(17, off as u64);
+        set(18, now().0.wrapping_sub(t0) * 1000 / f);
+        if off != OTHERS {
+            super::pstore::log(&[b"\nferros hv: jump -- not every core went off, resetting instead\n"]);
+            to_ferros();
+        }
+        gic_quiet();
+        flush_all();
+        copy64(JUMP_IMAGE, FERROS_LINK, len);
+        let bc = read_count(22) as usize;
+        for k in 0..bc {
+            unsafe { write_volatile((LOW_BOOTCONFIG + k) as *mut u8, read_volatile((JUMP_BOOTCONFIG + k) as *const u8)) };
+        }
+        for &s in &DPU_SYSMMUS {
+            let n = (rd(s + 0x100) & 0x1F) as usize;
+            for vm in 0..n {
+                let c = s + 0x8000 + vm * 0x1000;
+                wr(c, rd(c) & !1);
+            }
+        }
+        unsafe {
+            write_volatile(super::gate::GATE_MARK_ADDR as *mut u64, super::gate::GATE_MARK);
+            write_volatile((super::gate::GATE_MARK_ADDR + 8) as *mut u64, 6);
+            asm!("dsb sy");
+        }
+        let r = smc(0xC400_0003, 0, super::_ferros_go as *const () as u64, JUMP_DTB as u64);
+        set(20, r);
+        if r != 0 {
+            to_ferros();
+        }
+        off_now()
+    }
+
+    /// Returns true for power + volume up: the jump, made once this interrupt is completed (an interrupt left active would never reach ferros).
+    fn handle(id: u32) -> bool {
         let Some(&(_, eint, pin, proxy)) = KEYS.iter().find(|k| k.0 == id) else {
             if id != STOP_INTID {
                 stat(14, 1);
             }
-            return;
+            return false;
         };
         let (power, down, up) = (pressed(GPA4_DAT, 0), pressed(GPA4_DAT, 1), pressed(GPA6_DAT, 2));
         if down && up {
             stat(11, 1);
             super::chord::power_off();
         }
-        if power && up {
-            stat(10, 1);
-            to_ferros();
-        }
         // The pend bit holds the level line up; cleared here, before the EOI, or the interrupt would be taken again at once. Linux's own ack of the same bit, when it handles the proxy, finds it clear.
         wr(EINT_PEND + eint, 1 << pin);
+        // The chord's edge is not forwarded: Android never sees it.
+        if power && up {
+            stat(10, 1);
+            return true;
+        }
         wr(GICD + 0x200 + (proxy as usize / 32) * 4, 1 << (proxy % 32));
         unsafe { asm!("dsb sy") };
         stat(5, 1);
+        false
     }
 
-    fn off() -> ! {
+    fn off_now() -> ! {
         unsafe {
             asm!("msr s3_0_c12_c12_7, xzr", "isb"); // ICC_IGRPEN1_EL1
             asm!("smc #0", in("x0") 0x8400_0002u64);
@@ -2028,7 +2328,7 @@ mod hvcore {
         let Some(gicr) = my_gicr() else {
             set(13, 0xFF);
             super::pstore::log(&[b"\nferros hv: hvcore -- no redistributor for core 3, off\n"]);
-            off();
+            off_now();
         };
         set(13, ((gicr - GICR) / GICR_STRIDE) as u64);
         // The redistributor awake (ProcessorSleep clear, then ChildrenAsleep clear): EL3's CPU_ON normally leaves it so; waited on for at most 2^20 reads, since a frame that never answers must not stop the core before it reports.
@@ -2057,7 +2357,7 @@ mod hvcore {
         }
         loop {
             if unsafe { read_volatile(&raw const STOP) } {
-                off();
+                off_now();
             }
             let iar: u64;
             unsafe { asm!("mrs {v}, s3_0_c12_c12_0", v = out(reg) iar) }; // ICC_IAR1_EL1
@@ -2069,8 +2369,11 @@ mod hvcore {
             }
             stat(4, 1);
             set(12, id as u64);
-            handle(id);
+            let go = handle(id);
             unsafe { asm!("msr s3_0_c12_c12_1, {v}", "isb", v = in(reg) iar) }; // ICC_EOIR1_EL1
+            if go {
+                jump();
+            }
         }
     }
 
