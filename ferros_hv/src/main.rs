@@ -2534,7 +2534,11 @@ unsafe fn ufs_command(utrd: u64) {
             return;
         }
         0x3B => {
+            // WRITE BUFFER (firmware download into the flash's controller): refused by naming a reserved mode (byte 1 = G#1F), which the device answers ILLEGAL REQUEST, invalid field in CDB, before any data moves. Never seen from Android in a day's use (2026-11-01 measurement).
             ufs_stat(15, 1);
+            poke8(cdb + 1, 0x1F);
+            ufs_stat(30, 1);
+            ufs_set(33, lun << 56 | 0x3B);
             return;
         }
         // TEST UNIT READY, INQUIRY, MODE SENSE/SELECT, START STOP, READ CAPACITY, SYNCHRONIZE CACHE, REPORT LUNS, SECURITY PROTOCOL IN/OUT (RPMB), READ BUFFER: no data reaches the flash's blocks.
@@ -2557,7 +2561,7 @@ unsafe fn ufs_command(utrd: u64) {
     if lun != 0 {
         ufs_stat(13, 1);
         ufs_stat(if lun == 3 { 23 } else { 24 }, 1);
-        // LU1 and LU2 are the bootloader's two copies (bl1, pbl, bl2, abl and the rest): Android writes them only to update the bootloader, into the copy it does not run.
+        // LU1 and LU2 are the bootloader's two copies (bl1, pbl, bl2, abl and the rest): Android writes them only to update the bootloader, into the copy it does not run. LU3 (devinfo, the slots' retries and flags) stays writable: refusing it (the owner's list, 2026-10-28) made vold's MarkBootSuccessful fail, and Android rebooted itself every boot ("Checkpoint commit failed", 2026-11-01). A rule that lets Android mark its own slot but not ferros's is open.
         if lun == 1 || lun == 2 {
             refuse_write(cdb, op, lun, lba);
         }

@@ -97,6 +97,29 @@ One session of the owner's normal use (~10 minutes after boot): 884,040 commands
 Correction, the same day: that first build read UTRD word 7 the wrong way round (it is `prd_table_length` in entries, low 16 bits, then `prd_table_offset` in dwords, high 16; zuma's DT sets `fixed-prdt-req_list-ocs`, so not the Exynos byte-granular form), so its frp-byte reading came from the wrong place and does not count. With the fields right, a session with Android's idle maintenance (trim) run by hand: 13 UNMAPs on LU0, all 13 descriptors decoded, **none reaching a boot chain or the ferros partition**; one LU3 write, none to LU1/LU2; no frp write that session, so the unlock-byte check waits for a real one.
 So the firewall's rules cost normal use nothing: refuse LU0 writes and UNMAPs that touch the boot chains or the ferros partition, LU1/LU2 (the bootloaders) entirely, Boot LU switches (attribute writes), WRITE BUFFER; on frp's last block let a write through only with its final byte unchanged and encryption off (Pixel's PRDT entries are 128 bytes, `pixel_ufs_prdt_entry`; des3 bit 31 enables inline encryption, which would let RAM say one thing and the flash get another). Still to settle: LU3 (devinfo holds the slot record Android must write; whether it also holds lock state an Android with root could change), the UNMAP ranges, and a stage-2 write protection on the ramoops page (ANDROID_ONCE, RECOVERY_ONCE and these counters live there, and an Android with root can survive its own crash into them).
 
+## The UFS firewall refuses (2026-11-01)
+
+`FERROS_HV_UFS` builds act on the measurement (`ufs_command`, `refuse_write`). Nothing is faked: each refusal is a rewrite of Android's command before the doorbell reaches the device, so the device itself answers with an ordinary error and Linux handles it as one.
+- **Writes** (WRITE 10/16) into either slot's boot chain or the ferros partition on LU0, and any write to LU1/LU2 (the bootloader's copies). The LBA is moved past every LU's end; the device answers ILLEGAL REQUEST / LBA out of range before any data moves.
+- **UNMAP ranges** reaching a protected run get their block count set to 0. The rest of the list still trims.
+- **Queries:** WRITE DESCRIPTOR, WRITE ATTRIBUTE of bBootLunEn (the OTA engine's slot switch) or bConfigDescrLock, and SET/TOGGLE FLAG of fPermanentWPEn are given IDN G#FF, so the device answers "invalid IDN".
+- **WRITE BUFFER** (flash firmware) gets a reserved mode (G#1F).
+- **Coherency:** every line the hv reads or rewrites in Android's command memory is cleaned and invalidated first. The memory is cacheable, the controller dma-coherent, and the hv's MMU off.
+
+**Tested on slot b (Magisk root):**
+- A same-content write to boot_b block 100: refused (sense 5 / ASC 21, `Buffer I/O error on dev sda23`).
+- Writing bBootLunEn through `boot_lun_enabled`: refused (`ufshcd_query_attr: opcode 0x04 for idn 0 failed, err = 253`, three retries, the attribute unchanged).
+- The rest of the session normal: 142,532 commands, 51 UNMAPs passed untouched, devinfo written.
+- Counters 30-33 at G#FD60_0E00: writes refused, UNMAP ranges emptied, queries refused, the last refusal.
+
+**devinfo (LU3) stays writable.** Refusing it made vold's `MarkBootSuccessful` fail ("Failed to set successful flag"), and Android rebooted itself on every boot ("Checkpoint commit failed"). A rule that lets Android mark its own slot but not ferros's is the owner's call.
+
+**Open:**
+- **The check-to-fetch window.** Android can change a command between the hv's check and the device's fetch; shadow command lists close it.
+- **The ONCE words.** ANDROID_ONCE, RECOVERY_ONCE and FERROS_ONCE live in the ramoops page, which Android writes (pmsg) and can forge.
+- **The UFS device reset.** Android's driver can still reset the device (the 2026-10-28 list).
+- **Slot a's protection.** Slot a still runs the hv without the firewall, so only Android started through slot b's gate is protected.
+
 ## The chords under Android (decided 2026-11-01)
 
 - **Power + volume up: to ferros.** Android's "prevent ringing" shortcut goes (its quick-settings tile does the same); the hv swallows the chord, so Android never sees it. Power + volume down stays Android's screenshot.
