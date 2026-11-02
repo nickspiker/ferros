@@ -51,6 +51,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     let ira_fail = ira.err().unwrap_or(0);
     let ira_fp = ira.map(|i| fingerprint(IRA_FP_CONTEXT, &i)).unwrap_or([0u8; 8]);
     crumb(0xC1); // ira derived (or refused)
+    crate::platform::pstore(b"ferros: ira derived (or refused)\n");
 
     crumb(0xC2);
 
@@ -70,6 +71,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
         ira_fail,
     };
 
+    crate::platform::pstore(b"ferros: tune, ASV, HPM and DVFS read\n");
     // No valid ira, no vault (PIPE: refuse to operate). The probe reports why.
     let Ok(ira) = ira.as_mut() else {
         return (p, None);
@@ -82,6 +84,7 @@ pub fn vault_probe(link_up: bool) -> (VaultProbe, Option<ShimStore>) {
     const MSG: &[u8] = b"FERROS-GENESIS-0";
     let mut kept: Option<ShimStore> = None;
     let t_open = crate::platform::cntpct();
+    crate::platform::pstore(b"ferros: opening the vault\n");
     crumb(0xE0); // before KVault::open (manifestus open ladder: bootstrap the spine, or genesis a blank pair of regions)
     match crate::kvault::KVault::open(ira) {
         Ok(mut store) => {

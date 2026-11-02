@@ -110,15 +110,24 @@ pub fn read_dvfs_version() -> u8 {
 /// Proven STABLE across boots and temperature (sources 0-4, IRA-ENTROPY-SOURCES.md; 5-6 are factory data), not proven high-entropy fleet-wide. Context v2 = this material set: a vault sealed under v1 won't reopen (open-or-genesis re-genesises).
 pub fn derive_ira() -> Result<[u8; 32], u32> {
     let reads = || -> Result<[alloc::vec::Vec<u8>; 7], u32> {
-        Ok([
-            read_hw_identity().to_vec(),
-            read_ap_hw_tune().to_vec(),
-            read_asv_tbl().to_vec(),
-            read_hpm_asv().to_vec(),
-            alloc::vec![read_dvfs_version()],
-            read_devinfo_identity().ok_or(0x300u32)?,
-            read_ufs_serial().unwrap_or_default(),
-        ])
+        // A mark before each source in the pstore ring: the jump from Android hung somewhere between the UFS link and the vault (2026-11-02), and two of these reach the flash.
+        let m = |s: &[u8]| crate::platform::pstore(s);
+        m(b"ferros: ira: hwid\n");
+        let hwid = read_hw_identity().to_vec();
+        m(b"ferros: ira: tune\n");
+        let tune = read_ap_hw_tune().to_vec();
+        m(b"ferros: ira: asv\n");
+        let asv = read_asv_tbl().to_vec();
+        m(b"ferros: ira: hpm\n");
+        let hpm = read_hpm_asv().to_vec();
+        m(b"ferros: ira: dvfs\n");
+        let dvfs = alloc::vec![read_dvfs_version()];
+        m(b"ferros: ira: devinfo (UFS LU3)\n");
+        let devinfo = read_devinfo_identity().ok_or(0x300u32)?;
+        m(b"ferros: ira: UFS serial\n");
+        let serial = read_ufs_serial().unwrap_or_default();
+        m(b"ferros: ira: sources read\n");
+        Ok([hwid, tune, asv, hpm, dvfs, devinfo, serial])
     };
     let a = reads()?;
     let b = reads()?;
