@@ -145,6 +145,7 @@ pub fn pstore(bytes: &[u8]) {
         if start >= PSTORE_BUF || size > PSTORE_BUF {
             return;
         }
+        let first = start;
         for &b in bytes {
             write_volatile((PSTORE_ZONE + 12 + start as usize) as *mut u8, b);
             start = if start + 1 >= PSTORE_BUF { 0 } else { start + 1 };
@@ -154,6 +155,21 @@ pub fn pstore(bytes: &[u8]) {
         }
         write_volatile((PSTORE_ZONE + 4) as *mut u32, start);
         write_volatile((PSTORE_ZONE + 8) as *mut u32, size);
+        // To DRAM now: the ring is cacheable under ferros's map, and a session that dies by watchdog takes its dirty lines with it (the jumps of 2026-11-02 lost their last lines, and the 60 s escape's thread dump, while the crumbs, cleaned, survived). The written span (wrapped: both parts) and the header.
+        let clean = |a: usize, n: usize| {
+            let mut p = a & !63;
+            while p < a + n {
+                core::arch::asm!("dc civac, {p}", p = in(reg) p as u64);
+                p += 64;
+            }
+        };
+        if first as usize + bytes.len() <= PSTORE_BUF as usize {
+            clean(PSTORE_ZONE + 12 + first as usize, bytes.len());
+        } else {
+            clean(PSTORE_ZONE + 12 + first as usize, PSTORE_BUF as usize - first as usize);
+            clean(PSTORE_ZONE + 12, bytes.len() - (PSTORE_BUF as usize - first as usize));
+        }
+        clean(PSTORE_ZONE, 12);
         core::arch::asm!("dsb sy");
     }
 }
