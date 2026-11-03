@@ -1061,6 +1061,11 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
                 let n = fdt::retarget_keys(DTB_COPY as usize, &hvcore::DT_SPIS);
                 hvcore::retargeted(n);
                 pstore::log(&[if n == 3 { b"\nferros hv: hvcore -- keys retargeted to the proxy SPIs\n" as &[u8] } else { b"\nferros hv: hvcore -- key cells not found, hv core stays off\n" }]);
+                // Core 3 is the hv's while its core runs, so Linux has a possible CPU it can never start. Google's gs_perf_mon creates a perf counter on every possible CPU at probe, fails on core 3 (ENODEV), frees its per-CPU table and leaves its CPU-hotplug callback registered; the first CPU taken down (every system suspend: "Disabling non-boot CPUs") then locks a mutex in freed memory and spins until the soft-lockup panic (the deep-sleep hang, pstore 2026-11-03: cpuhp/1 in gs_perf_mon_cpuhp_down from 622 s to the panic at 668 s). The probe already failed, so nothing reads it; renaming its compatible in place keeps the driver from probing at all, and with it the dangling callback.
+                if n == 3 {
+                    let k = fdt::rename_compatible(DTB_COPY as usize, b"google,gs_perf_mon", b"ferros,gs_perf_mon");
+                    pstore::log(&[if k == 1 { b"ferros hv: hvcore -- gs_perf_mon kept from probing (core 3 is the hv's)\n" as &[u8] } else { b"ferros hv: hvcore -- gs_perf_mon compatible not found\n" }]);
+                }
             }
             unsafe {
                 let mut a = DTB_COPY;
@@ -1149,6 +1154,12 @@ extern "C" fn hv_secondary(ctx: u64) -> ! {
             }
         }
         write_volatile(&raw mut RESUMES[idx], read_volatile(&raw const RESUMES[idx]) + 1);
+        if read_volatile(&raw const SUSP_PENDING) {
+            write_volatile(&raw mut SUSP_PENDING, false);
+            susp(5, 1, true);
+            susp(6, ticks(), false);
+            susp(7, idx as u64, false);
+        }
         // First time through for this core after Linux is up: one line, so the log shows resume reaching the hv at all.
         let seen = (REPORT + 0x200 + idx * 8) as *mut u64;
         if read_volatile(seen) < 2 {
@@ -1259,9 +1270,13 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     frame[2] = _secondary as *const () as u64;
                 }
                 PSCI_SYSTEM_SUSPEND => {
+                    susp(1, 1, true);
+                    susp(2, ticks(), false);
+                    unsafe { write_volatile(&raw mut SUSP_PENDING, true) };
                     // PSCI refuses a system suspend while another core is on: the hv core switches itself off first and is started again at the CPU_ONs of the resume.
                     if cfg!(hv_core) && hvcore::enabled() {
                         hvcore::stop();
+                        susp(3, unsafe { read_volatile(0xFD60_0D48 as *const u64) }, false);
                     }
                     unsafe {
                         RESUME[core] = [frame[1], frame[2]];
@@ -1273,6 +1288,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
             }
             let args = [frame[0], frame[1], frame[2], frame[3]];
             forward_smc(frame);
+            // A system suspend that returns failed (on success the core comes back through _secondary instead).
+            if args[0] == PSCI_SYSTEM_SUSPEND {
+                susp(4, frame[0], false);
+            }
             if cfg!(hv_oracle_smc) {
                 oracle_smc(args, frame[0], frame[1]);
             }
@@ -1916,6 +1935,55 @@ mod fdt {
         }
     }
 
+    /// Every `compatible` property entry exactly `from` becomes `to`, in place (same length, so nothing moves); a driver matching `from` then never probes. Returns the entries rewritten.
+    pub fn rename_compatible(dtb: usize, from: &[u8], to: &[u8]) -> u32 {
+        if rd32(dtb) != MAGIC || from.len() != to.len() {
+            return 0;
+        }
+        let strings = dtb + rd32(dtb + 12) as usize;
+        let mut p = dtb + rd32(dtb + 8) as usize;
+        let end = p + rd32(dtb + 36) as usize;
+        let mut done = 0u32;
+        while p < end {
+            let tok = rd32(p);
+            p += 4;
+            match tok {
+                BEGIN_NODE => {
+                    while rd8(p) != 0 {
+                        p += 1;
+                    }
+                    p = (p + 1 + 3) & !3;
+                }
+                PROP => {
+                    let len = rd32(p) as usize;
+                    let name = strings + rd32(p + 4) as usize;
+                    let val = p + 8;
+                    if name_eq(name, b"compatible") {
+                        // The value is NUL-separated strings; each entry starts at 0 or just past a NUL.
+                        let mut s = 0usize;
+                        while s < len {
+                            // External input (ABL's tree): the entry and its NUL must lie inside this property, or the match would read into the next token.
+                            if s + from.len() < len && name_eq(val + s, from) {
+                                for (k, &c) in to.iter().enumerate() {
+                                    wr8(val + s + k, c);
+                                }
+                                done += 1;
+                            }
+                            while s < len && rd8(val + s) != 0 {
+                                s += 1;
+                            }
+                            s += 1;
+                        }
+                    }
+                    p = (val + len + 3) & !3;
+                }
+                END => break,
+                _ => {}
+            }
+        }
+        done
+    }
+
     /// FERROS_HV_CORE: in the pin banks `gpa4` and `gpa6`, each `interrupts` entry `<GIC_SPI from type 0>` whose `from` is in `map` becomes `<GIC_SPI to IRQ_TYPE_EDGE_RISING 0>`, in place (same length). The banks' per-pin wakeup interrupts are what the pin controller chains each EINT from, so Linux then takes the keys from the proxies the hv core raises and never touches the real lines. Returns the entries rewritten.
     pub fn retarget_keys(dtb: usize, map: &[(u32, u32)]) -> u32 {
         if rd32(dtb) != MAGIC {
@@ -2155,6 +2223,11 @@ mod hvcore {
             set(i, 0);
         }
         set(0, MAGIC);
+        // The suspend trail starts fresh with each Android boot.
+        for i in 0..12 {
+            super::susp(i, 0, false);
+        }
+        super::susp(0, super::SUSP_MAGIC, false);
         let Some((src, len)) = super::gate::ferros_image() else { return };
         let be = |a: usize| u32::from_be(unsafe { read_volatile(a as *const u32) }) as usize;
         let size = be(dtb + 4);
