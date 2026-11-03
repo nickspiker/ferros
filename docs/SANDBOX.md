@@ -70,6 +70,18 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 - **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at install time.
 - **Kernel**: install (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
 
+## Handles (decided with the owner 2026-11-03, built the same day)
+
+A masked process reaches memory through one pair, x28 and x27, so it reaches one region: its arc. Drivers and the display hold many: DMA pools, surfaces, MMIO blocks at the chip's addresses. A handle is how a granted region is reached under the mask, and it is the model KERNEL.md already names for toka (a wasm module's memory is one handle; hardware reaches a process only as handles), so the emitter and the toka backend share it.
+
+- **The table.** For every grant slot the kernel writes a pair, the region's base and its mask, in the page just below the arc's base (slot k at base − 16(k + 1)): the arc's lower guard, which nobody owns, because every arc now takes a 2S block. The page is written while writable and then made read-only, at every level (the map has no "kernel writes, process reads" permission), so the process cannot forge a pair; the kernel toggles it at the next spawn. A grant that is not a region, or a region that is not a power of two aligned to its size, has the pair (0, 0): masked code reaching through it lands on address 0 and faults.
+- **The pair.** x23 the selected region's base, x22 its mask, x21 an offset masked by it. Reserved in codegen like the arc's registers (targets/aarch64-ferros.json, .cargo/config.toml).
+- **The forms,** the only three the checker admits for them: the select, `ldp x23, x22, [x28, #-16(k + 1)]`, one instruction so the base and the mask change together and the invariant holds at every boundary; the offset, `and x21, xN, x22`; the access, `[x23, x21]` with no shift, any width, SIMD included. No immediate offsets through the pair: a shared region has no guards, so every access is masked. Nothing else may write x21-x23.
+- **The source.** `ferros_sys::Handle<SLOT>` writes those forms by hand (`read8..64`, `write8..64`, `fill64`, `pair`, `len`); the emitter passes them through untouched and refuses any other use of the registers. Native and masked code run the same instructions, so a process migrates by replacing its pointer accesses to granted regions with handle calls, and runs natively until its masked build is sealed.
+- **Sharing** is the same pair written into two tables. Rights come later as a second, read-only pair that the checker allows only in loads; revocation is rewriting the pair, and a pair already in registers dies at the next select or re-entry.
+- **Verified:** `payloads/wintest` draws its surface only through `Handle<3>`; the same binary ran natively and, built by the masked pipeline (1632 bytes of text, every instruction accepted), sealed and spawned masked, with the red block read back from the glass both times.
+- **Next:** the attest screen and the keyboard (a surface and endpoints) masked; then the drivers, touch first, the display last (its NEON loops over surfaces become handle loads with the SIMD register-offset form); the read-only pair when the display needs the surfaces read-only.
+
 ## Status
 
 - **Checker** (`ferros_sandbox`): written, tested against GNU-assembled encodings.
