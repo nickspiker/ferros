@@ -473,10 +473,10 @@ pub fn off<T: ?Sized>(p: *const T) -> u64 {
     p as *const u8 as u64 - arc_base()
 }
 
-/// The token for grant `slot`, given the grants offset the kernel passed at entry (x0): a u32 count, then 32-byte tokens; slot 0 is the console.
+/// The token for grant `slot`, given the grants offset the kernel passed at entry (x0): the handle table in the page's first 512 bytes, then at 0x200 a u32 count, then 32-byte tokens; slot 0 is the console.
 #[inline(always)]
 pub fn cap(grants: u64, slot: u64) -> u64 {
-    grants + 4 + 32 * slot
+    grants + 0x204 + 32 * slot
 }
 
 /// Start the signed capsule stored in the vault under `key` as a new process called `name`, handing it copies of this process's own capabilities in grant `slots` (they become the child's slots 1.. in that order; slot 0 is always its console). The child is queued; this process carries on. Returns 0, or ERR (the reason is on the console). At most 24 slots.
@@ -909,7 +909,7 @@ pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }
 
-/// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table below the arc base (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #-16·(SLOT + 1)]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
+/// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table at the arc's start (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #16·SLOT]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
 pub struct Handle<const SLOT: u64>;
 
 impl<const SLOT: u64> Handle<SLOT> {
@@ -918,7 +918,7 @@ impl<const SLOT: u64> Handle<SLOT> {
     pub fn pair() -> (u64, u64) {
         let (b, m): (u64, u64);
         // Through the pair registers, the only destination the checker allows the table's load.
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "mov {b}, x23", "mov {m}, x22", b = out(reg) b, m = out(reg) m, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "mov {b}, x23", "mov {m}, x22", b = out(reg) b, m = out(reg) m, t = const 16 * SLOT, options(nostack, readonly, preserves_flags)) };
         (b, m)
     }
     /// The region's size in bytes (0 for a grant with no region).
@@ -930,32 +930,32 @@ impl<const SLOT: u64> Handle<SLOT> {
     #[inline(always)]
     pub fn read8(off: u64) -> u8 {
         let v: u32;
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldrb {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldrb {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const 16 * SLOT, options(nostack, readonly, preserves_flags)) };
         v as u8
     }
     #[inline(always)]
     pub fn read32(off: u64) -> u32 {
         let v: u32;
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const 16 * SLOT, options(nostack, readonly, preserves_flags)) };
         v
     }
     #[inline(always)]
     pub fn read64(off: u64) -> u64 {
         let v: u64;
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const 16 * SLOT, options(nostack, readonly, preserves_flags)) };
         v
     }
     #[inline(always)]
     pub fn write8(off: u64, v: u8) {
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "strb {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v as u32, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "strb {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v as u32, t = const 16 * SLOT, options(nostack, preserves_flags)) };
     }
     #[inline(always)]
     pub fn write32(off: u64, v: u32) {
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const 16 * SLOT, options(nostack, preserves_flags)) };
     }
     #[inline(always)]
     pub fn write64(off: u64, v: u64) {
-        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const 16 * SLOT, options(nostack, preserves_flags)) };
     }
     /// `n` words of `v` from `off`, the pair selected once.
     #[inline(always)]
@@ -971,7 +971,7 @@ impl<const SLOT: u64> Handle<SLOT> {
                 "subs {n}, {n}, #1",
                 "b.ne 1b",
                 "2:",
-                o = inout(reg) off => _, n = inout(reg) n => _, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack)
+                o = inout(reg) off => _, n = inout(reg) n => _, v = in(reg) v, t = const 16 * SLOT, options(nostack)
             )
         };
     }

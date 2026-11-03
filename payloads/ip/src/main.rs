@@ -157,7 +157,7 @@ const TCP_FREE: Tcp = Tcp { state: 0, fam: 0, cell: false, src: [0; 16], addr: [
 
 impl Ip {
     fn cap(&self, slot: u64) -> u64 {
-        self.grants + 4 + 32 * slot
+        self.grants + 0x204 + 32 * slot
     }
     fn off<T>(&self, p: *const T) -> u64 {
         p as u64 - self.base

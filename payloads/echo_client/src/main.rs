@@ -29,7 +29,7 @@ const REPLY_BUF: u64 = 0x8000;
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let base = arc_base();
     let console = grants + 4;
-    let endpoint = grants + 4 + 32;
+    let endpoint = grants + 0x204 + 32;
     let default = b"hello across an endpoint";
     let (msg, len) = if input_len > 0 { (input, input_len) } else { (default.as_ptr() as u64 - base, default.len() as u64) };
     let n = svc(CALL, endpoint, msg, len, REPLY_BUF, 256);

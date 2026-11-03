@@ -15,6 +15,8 @@ SECTIONS {
     }
     .data : { *(.data*) *(.got*) *(.got.plt*) }
     .dynamic : { *(.dynamic) }
-    .bss : { *(.bss*) }
+    . = ALIGN(64);
+    .bss : { *(.bss*) *(COMMON) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.interp) }
 }
+__ferros_tail = SIZEOF(.bss) + 16;

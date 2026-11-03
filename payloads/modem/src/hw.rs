@@ -35,7 +35,7 @@ pub fn init(grants: u64) {
 }
 
 pub fn cap(slot: u64) -> u64 {
-    unsafe { GRANTS + 4 + 32 * slot }
+    unsafe { GRANTS + 0x204 + 32 * slot }
 }
 
 /// The grant slot and offset of a register. An address in no granted block is a bug in this driver: fail loud.

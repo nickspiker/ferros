@@ -25,7 +25,8 @@ for s in $SRCS; do
     llvm-mc -triple=aarch64-unknown-none -mattr=$ATTR -filetype=obj -o "$OUT/s/$b.o" "$OUT/s/$b.s"
     OBJS+=("$OUT/s/$b.o")
 done
-ld.lld -T "$REPO/payloads/$P/payload.ld" --gc-sections -e _entry -o "$OUT/$BIN.elf" "${OBJS[@]}"
+# Position-independent, as the payloads' build.rs links them: every absolute address in data becomes an R_AARCH64_RELATIVE entry for ferros_sys::relocate() (a static link baked link-time offsets into vtables and slice pointers, and the first masked process that formatted a number branched to an arc offset, 2026-11-03).
+ld.lld -T "$REPO/payloads/$P/payload.ld" --gc-sections -e _entry -pie --no-dynamic-linker -z norelro -z notext -o "$OUT/$BIN.elf" "${OBJS[@]}"
 aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).

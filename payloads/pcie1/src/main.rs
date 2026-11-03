@@ -49,7 +49,7 @@ struct Drv {
 
 impl Drv {
     fn cap(&self, slot: u64) -> u64 {
-        self.grants + 4 + 32 * slot
+        self.grants + 0x204 + 32 * slot
     }
     fn rd(&mut self, g: u64, off: u64) -> u32 {
         let v = svc(4, self.cap(g), off, 0, 0, 0);

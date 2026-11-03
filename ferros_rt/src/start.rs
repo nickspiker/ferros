@@ -75,7 +75,7 @@ pub fn grant_count() -> u64 {
 /// The arc offset of grant `slot`'s 32-byte token (slot 0 is the console).
 #[inline]
 pub fn cap(slot: u64) -> u64 {
-    grants() + 4 + 32 * slot
+    grants() + 0x204 + 32 * slot
 }
 
 /// The spawn input, in the arc for the life of the process.

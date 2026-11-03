@@ -5,15 +5,39 @@
 #![no_std]
 #![no_main]
 
+use core::arch::global_asm;
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
+
+// The entry with the image header (as ahau, the modem driver and hive carry it), so the zeroed static below is in the arc and the arc lands in the big pool: this window is the smallest test of a masked process there.
+global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym wintest_main
+);
+
+/// Twenty megabytes of nothing, so the arc is 32 MiB and lives in the big pool.
+static mut BULK: [u64; (20 << 20) / 8] = [0; (20 << 20) / 8];
 
 const S_DISPLAY: u64 = 1;
 const S_SURF: u64 = 3;
 
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
+    // Touched once, so it is not optimised away and the arc really holds it.
+    unsafe { core::ptr::write_volatile((&raw mut BULK as *mut u64).add(1000), 1) };
     let display = cap(grants, S_DISPLAY);
     // The input is at an offset from the arc base (ferros_rt start.rs).
     let inp = unsafe { core::slice::from_raw_parts((ferros_sys::arc_base() + input) as *const u8, input_len as usize) };

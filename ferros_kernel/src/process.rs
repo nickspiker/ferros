@@ -144,9 +144,13 @@ fn arcs() -> &'static mut Arcs {
 fn arcs_big() -> &'static mut Arcs {
     let a = unsafe { &mut *ARCS_BIG.0.get() };
     if !a.init {
+        // The pool as aligned power-of-two chunks, largest first: its end is where the secure carveout begins, not a power of two from its start.
         let (p0, p1) = crate::cachemap::POOL_BIG;
-        if p1 > p0 {
-            a.free[(p1 - p0).trailing_zeros() as usize].push(p0);
+        let mut at = p0;
+        while at < p1 {
+            let order = (at.trailing_zeros() as usize).min(usize::BITS as usize - 1 - (p1 - at).leading_zeros() as usize);
+            a.free[order].push(at);
+            at += 1 << order;
         }
         a.init = true;
     }
@@ -193,9 +197,7 @@ impl Arc {
 /// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed. `guard` reserves a guard of the arc's own size on each side (a 2S block, SANDBOX.md): the base is 2S-aligned, hence S-aligned, so masking stays a single `and`, and the usable arc never abuts another.
 pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
     let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
-    // Every arc takes a 2S block: the upper half is its guard (SANDBOX.md), and the page below its base holds its handle table, native or masked (the table is read by the same instructions either way).
-    let block = want * 2;
-    let _ = guard;
+    let block = if guard { want * 2 } else { want };
     // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
     // Both pools carry 4 KiB pages since 2026-11-03, so a masked arc may live in either: the page pool first, the big pool when it is large or the page pool is full.
     let base = if guard && block < BIG_FROM {
@@ -808,7 +810,10 @@ pub fn set_pref(index: usize, value: u8) {
 fn write_pref_all(index: usize, value: u8) {
     let kk = k();
     for p in kk.procs.iter().flatten() {
+        // The grants page is read-only at every level: opened for the write, closed after.
+        crate::cachemap::grants_page(p.arc.base, true);
         p.write((PREFS + index) as u64, &[value]);
+        crate::cachemap::grants_page(p.arc.base, false);
     }
     for i in 0..kk.threads.len() {
         if let Some(x) = kk.threads[i].as_mut() {
@@ -2230,8 +2235,10 @@ pub struct Outcome {
     pub round_trips: u32,
 }
 
-/// Arc layout: grants page, then code. The handle table (SANDBOX.md, "Handles") lies in the page just below the arc's base, in its lower guard: slot k's pair at base - 16(k + 1), the granted region's base then its mask, both zero when the grant is not a region or the region cannot be masked; the page is read-only once written.
+/// Arc layout: grants page, then code. The grants page (SANDBOX.md, "Handles"): the handle table in its first 512 bytes (slot k's pair at 16k: the granted region's base, then its mask, both zero when the grant is not a region or the region cannot be masked), the u32 token count at `TOKENS`, the 32-byte tokens after it, the preferences at `PREFS`, the ihi at `IHI`. Read-only to every level once written, so a process cannot forge a pair; the kernel opens it to write a preference.
 const GRANTS: usize = 0;
+pub const HANDLES: usize = 0;
+pub const TOKENS: usize = 0x200;
 pub const CODE: usize = 0x1000;
 pub const STACK: usize = 64 * 1024;
 
@@ -2466,18 +2473,17 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec() };
-    // Grants page: count, then the tokens in slot order. Then the code, then the input. The handle table below the base, written while its page is writable, then read-only.
-    p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
-    crate::cachemap::guard_page(arc.base, true);
+    // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
+    p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {
-        p.write((GRANTS + 4 + 32 * i) as u64, &c.token);
-        let (base, mask) = handle_of(c.object);
-        unsafe {
-            core::ptr::write_volatile((arc.base - 16 * (i + 1)) as *mut u64, base);
-            core::ptr::write_volatile((arc.base - 16 * (i + 1) + 8) as *mut u64, mask);
+        p.write((TOKENS + 4 + 32 * i) as u64, &c.token);
+        // The table holds the first 32 slots, the pair load's reach (init holds a hundred grants and uses no handle; its tokens begin where the table ends).
+        if i < 32 {
+            let (base, mask) = handle_of(c.object);
+            p.write((HANDLES + 16 * i) as u64, &base.to_le_bytes());
+            p.write((HANDLES + 16 * i + 8) as u64, &mask.to_le_bytes());
         }
     }
-    crate::cachemap::guard_page(arc.base, false);
     if let Some(i) = ihi {
         p.write(IHI as u64, &i);
     }
@@ -2487,6 +2493,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     crate::cachemap::sync_code(arc.base + CODE, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
     crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
+    // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
+    crate::cachemap::grants_page(arc.base, false);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
     let mut frame = zero;
     frame.elr = (arc.base + CODE) as u64;
@@ -2544,4 +2552,15 @@ fn handle_of(object: Object) -> (u64, u64) {
         return (0, 0);
     }
     (base as u64, (span - 1) as u64)
+}
+
+/// `diag arcs`: every process's arc, for reading the pools' state: name, base, size, block, under the lock.
+pub fn arcs_report() -> alloc::string::String {
+    lock();
+    let mut s = alloc::string::String::new();
+    for p in k().procs.iter().flatten() {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} block G#{:X}\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.block));
+    }
+    unlock();
+    s
 }

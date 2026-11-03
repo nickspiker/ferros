@@ -64,7 +64,7 @@ pub const POOL: (usize, usize) = (0x92C0_0000, 0x92E0_0000);
 
 /// The big arc pool (cold only): 512 MiB of Normal write-back, EL0 read/write/execute DRAM at G#A000_0000, in 2 MiB blocks of the window's GiB table — arcs of 16 MiB and up (a std process: Photon's heap, a fluor frame's scratch), where the 16 MiB page pool holds the small ones and the masked ones. Nothing in the device tree reserves G#9800_0000-G#C000_0000 (the TPU, GSA and modem carveouts sit below G#9740_0000 and from G#C000_0000; ferros-ref soc-gs dts, 2026-10-27); W^X is not kept per page here — native processes only, and the whole arc is theirs to execute.
 #[cfg(not(shim_handoff))]
-pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xC000_0000);
+pub const POOL_BIG: (usize, usize) = (0xA000_0000, 0xB600_0000);
 
 /// The cellular modem's shared memory, EL0-accessible Device memory for its driver process (process.rs DMA `modem-pktproc`, `modem-ipc`, `modem-msi`; zuma-rmem.dtsi carveouts): pktproc's rings and packet buffers (32 MiB), the IPC region (legacy rings, handover block, ROM image; 4 MiB), the MSI and boot-register page. Device, as the kernel's own view of them: the CP writes them over PCIe and no cache line may hide that. 2 MiB aligned, in the GiB above the window.
 pub const MODEM_WINDOWS: [(usize, usize); 3] = [(0xE800_0000, 0xEA00_0000), (0xEA40_0000, 0xEA80_0000), (0xF620_0000, 0xF640_0000)];
@@ -448,12 +448,12 @@ pub fn sync_code(addr: usize, len: usize) {
     }
 }
 
-/// The handle table's page (SANDBOX.md, "Handles"): the 4 KiB just below an arc's base, in its lower guard, which nobody owns. Writable only while the kernel fills the table at spawn; read-only to everyone after (the map has no "kernel writes, the process does not": a page is read-only at every level or at none), so a process cannot forge a handle. Non-executable always.
-pub fn guard_page(base: usize, writable: bool) {
+/// The grants page (SANDBOX.md, "Handles"): the arc's first 4 KiB, the handle table, the tokens, the preferences and the ihi. Read-only to everyone once the kernel has written it (the map has no "kernel writes, the process does not": a page is read-only at every level or at none), so a process cannot forge a handle; the kernel opens it to write a preference and closes it again. Non-executable always.
+pub fn grants_page(base: usize, writable: bool) {
     if !vhe() {
         return;
     }
-    let a = base - PAGE;
+    let a = base;
     let Some(e) = page_entry(a) else { return };
     unsafe {
         *e = pool_page(true, a, writable, false);

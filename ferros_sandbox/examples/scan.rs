@@ -7,7 +7,12 @@ fn main() {
         let code = std::fs::read(&path).expect("read image");
         let mut tally: Vec<(Refusal, usize, u32, usize)> = Vec::new();
         let mut total = 0;
+        // The image header (a pad word at 4, "ferrosRT" at 8, five words to 56) is data the entry branches over; check_image steps over it, and so does this tally.
+        let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
         for (k, w) in code.chunks_exact(4).enumerate() {
+            if header && (1..14).contains(&k) {
+                continue;
+            }
             let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             total += 1;
             if let Err(why) = check(insn) {

@@ -155,12 +155,12 @@ fn control_flow() {
 /// Handles (SANDBOX.md): the pair load from the table, the masked offset, and accesses through the pair; nothing else may write x21-x23, and the pair takes no immediate offsets.
 #[test]
 fn handle_forms() {
-    accepts("ldp x23, x22, [x28, #-16]");
-    accepts("ldp x23, x22, [x28, #-512]");
+    accepts("ldp x23, x22, [x28]");
+    accepts("ldp x23, x22, [x28, #16]");
+    accepts("ldp x23, x22, [x28, #496]");
     assert_eq!(one("ldp x23, x22, [x28]"), ferros_sandbox::LDP_HANDLE);
-    refuses("ldp x23, x22, [x28]", Refusal::AddressForm);
-    refuses("ldp x23, x22, [x28, #16]", Refusal::AddressForm);
-    refuses("ldp x23, x22, [x28, #-8]", Refusal::AddressForm);
+    refuses("ldp x23, x22, [x28, #-16]", Refusal::AddressForm);
+    refuses("ldp x23, x22, [x28, #8]", Refusal::AddressForm);
     assert_eq!(one("and x21, x0, x22"), ferros_sandbox::AND_X21);
     accepts("and x21, x5, x22");
     accepts("str w3, [x23, x21]");
@@ -177,4 +177,18 @@ fn handle_forms() {
     refuses("str w3, [x23, x26]", Refusal::AddressForm);
     refuses("str w3, [x28, x21]", Refusal::AddressForm);
     refuses("str w3, [x23, x21, lsl #2]", Refusal::AddressForm);
+}
+
+/// An image with the entry header: the branch at 0 is checked, the pad, the magic and the five words to 56 are stepped over, and the code after is checked.
+#[test]
+fn header_is_skipped() {
+    let mut img = Vec::new();
+    img.extend_from_slice(&one("b 56").to_le_bytes());
+    img.extend_from_slice(&[0u8; 4]);
+    img.extend_from_slice(b"ferrosRT");
+    img.extend_from_slice(&[0xFFu8; 40]);
+    img.extend_from_slice(&one("and x26, x3, x27").to_le_bytes());
+    assert_eq!(ferros_sandbox::check_image(&img), Ok(2));
+    img.extend_from_slice(&one("mov x28, x0").to_le_bytes());
+    assert!(ferros_sandbox::check_image(&img).is_err());
 }

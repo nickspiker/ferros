@@ -51,7 +51,7 @@ pub const AND_X26: u32 = 0x8A1B_001A; // and x26, xN, x27  (with Rn in bits 9:5)
 const AND_X26_MASK: u32 = 0xFFFF_FC1F;
 pub const ADD_X25: u32 = 0x8B1A_0399; // add x25, x28, x26
 pub const ADD_SP: u32 = 0x8B3A_639F; // add sp, x28, x26, uxtx
-/// The handle pair's writers: `ldp x23, x22, [x28, #imm]` with imm a slot's pair in the handle table, which lies in the 512 bytes below the arc base (offset form, imm7 negative and even: slot k at -16(k + 1)), and `and x21, xN, x22`.
+/// The handle pair's writers: `ldp x23, x22, [x28, #imm]` with imm a slot's pair in the handle table, the grants page's first 512 bytes (offset form, imm7 even and under 64: slot k at 16k), and `and x21, xN, x22`.
 pub const LDP_HANDLE: u32 = 0xA940_5B97; // ldp x23, x22, [x28, #0]  (imm7 in bits 21:15)
 const LDP_HANDLE_MASK: u32 = 0xFFC0_7FFF;
 pub const AND_X21: u32 = 0x8A16_0015; // and x21, xN, x22  (with Rn in bits 9:5)
@@ -95,7 +95,7 @@ pub fn check(i: u32) -> Result<(), Refusal> {
     // The handle select: one pair load from the table, so the base and the mask change together and the invariant holds at every boundary.
     if i & LDP_HANDLE_MASK == LDP_HANDLE {
         let imm7 = (i >> 15) & 0x7F;
-        return if imm7 & 1 == 0 && imm7 >= 0x40 { Ok(()) } else { Err(Refusal::AddressForm) };
+        return if imm7 & 1 == 0 && imm7 < 64 { Ok(()) } else { Err(Refusal::AddressForm) };
     }
     let op0 = (i >> 25) & 0xF;
     match op0 {
@@ -332,7 +332,12 @@ fn simd_fp(i: u32) -> Result<(), Refusal> {
 /// Check a whole image (little-endian A64 words). Returns the first violation, or the instruction count.
 pub fn check_image(code: &[u8]) -> Result<usize, Violation> {
     let mut n = 0;
+    // The image header (ferros_rt start.rs, the payloads' entry stubs): a pad word at 4, "ferrosRT" at 8, then five words to 56, data the kernel reads, never executed (the entry at 0 branches over it).
+    let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
     for (k, w) in code.chunks_exact(4).enumerate() {
+        if header && (1..14).contains(&k) {
+            continue;
+        }
         let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         check(insn).map_err(|why| Violation { offset: 4 * k, insn, why })?;
         n += 1;

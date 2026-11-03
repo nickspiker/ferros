@@ -1786,6 +1786,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                // `diag arcs`: every process's arc (name, base, size, block).
+                if cmd.params == b"arcs" {
+                    resp.extend_from_slice(crate::process::arcs_report().as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if let Some(names) = cmd.params.strip_prefix(b"restart ") {
                     restart(&mut store, names, &mut resp);
                     queue_pt_response(&mut pt_out_data, &resp);

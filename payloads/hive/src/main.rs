@@ -8,7 +8,28 @@
 #![no_std]
 #![no_main]
 
+use core::arch::global_asm;
 use ferros_sys::{call, cap, console, exit, freq, now, sleep_until, window};
+
+// The entry with ferros_rt's image header (offset 8: "ferrosRT", then .bss + 16, three unused words, a heap of 0), as ahau and the modem driver carry it: the kernel sizes the arc with the zeroed tail (process.rs `image_tail`), so the 32 MiB back buffer in .bss is in the arc. The checker steps over the header words when the magic is there.
+global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym hive_main
+);
 use honeycomb::{Event, Key, Keyboard, Lexicon, Touch, Touches};
 
 /// The shape-writing lexicon, built from rhe's list (build.rs).
@@ -17,6 +38,15 @@ static LEXICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lexicon.bin"))
 const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
+
+/// The surface through its handle (SANDBOX.md, "Handles"): the keyboard draws into `BACK`, a frame-sized buffer in its own arc, and presents the rows it touched through the handle, so the same binary runs native and masked and the drawing code never holds a pointer outside the arc. Labels are text the display draws into the shown surface (op 29), so they are recorded while the keyboard draws and drawn after the rows are presented, or the presenting would wipe them.
+type Surf = ferros_sys::Handle<S_SURF>;
+/// The back buffer holds the screen's lowest `ROWS` rows, where everything the keyboard draws lies (the typed line's band, the strip, the keys): 1600 of 2992 at the panel's width, 17 MiB, so the arc stays at 32 MiB (64 with its guard when masked) and three such processes fit the big pool beside Photon. `row0` is the first row it holds; `surf()` hands the drawing code a slice indexed by absolute rows, whose first `row0` rows lie before the buffer and are never touched (checked at start against the lowest row drawn).
+const ROWS: usize = 1600;
+static mut BACK: [u64; 1344 * ROWS] = [0; 1344 * ROWS];
+/// A recorded label: x, baseline, size, value, the text and its length.
+static mut LABELS: [(i64, i64, u16, u16, [u8; 32], usize); 256] = [(0, 0, 0, 0, [0; 32], 0); 256];
+static mut NLABELS: usize = 0;
 
 struct Hive {
     display: u64,
@@ -33,12 +63,50 @@ struct Hive {
 }
 
 impl Hive {
+    /// The first row the back buffer holds.
+    fn row0(&self) -> usize {
+        self.h - ROWS
+    }
+
+    /// The lowest row the keyboard ever draws: the typed line's band above the strip.
+    fn lowest_row(&self) -> usize {
+        let size = self.w / 21;
+        self.strip().0 - size - size * 3 / 2
+    }
+
     fn surf(&self) -> &'static mut [u64] {
-        unsafe { core::slice::from_raw_parts_mut(self.base as *mut u64, self.w * self.h) }
+        // Indexed by absolute rows: the slice starts `row0` rows before the buffer, in memory that is never read or written (rows above `lowest_row`, which `hive_main` checks are above `row0`).
+        unsafe { core::slice::from_raw_parts_mut((&raw mut BACK as *mut u64).sub(self.row0() * self.w), self.w * self.h) }
+    }
+
+    /// Rows y0..y1 of the back buffer onto the shown surface, through the handle.
+    fn present(&self, y0: usize, y1: usize) {
+        let s = self.surf();
+        Surf::write_words((y0 * self.w * 8) as u64, &s[y0 * self.w..y1 * self.w]);
+    }
+
+    /// The labels recorded by the last draw, drawn by the display onto the shown surface.
+    fn replay_labels(&self) {
+        let n = unsafe { NLABELS };
+        for i in 0..n {
+            let (x, y, px, v, text, len) = unsafe { (*(&raw const LABELS))[i] };
+            window::text_centred(self.display, self.base, x as i16, y as i16, px, v, &text[..len]);
+        }
+        unsafe { NLABELS = 0 };
     }
 
     fn label(&self) -> impl FnMut(i64, i64, u16, u16, &str) + '_ {
-        move |x, y, px, v, t| window::text_centred(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
+        move |x, y, px, v, t| unsafe {
+            let n = NLABELS;
+            if n < 256 {
+                let b = t.as_bytes();
+                let len = if b.len() > 32 { 32 } else { b.len() };
+                let mut text = [0u8; 32];
+                text[..len].copy_from_slice(&b[..len]);
+                (*(&raw mut LABELS))[n] = (x, y, px, v, text, len);
+                NLABELS = n + 1;
+            }
+        }
     }
 
     /// The typed line's band above the keys: cleared, then the line's tail and a cursor.
@@ -48,6 +116,7 @@ impl Hive {
         let size = self.w / 21;
         let base = self.strip().0 - size;
         s[(base - size * 3 / 2) * w..(base + size / 2) * w].fill(0);
+        self.present(base - size * 3 / 2, base + size / 2);
         // The tail that fits: a whole number of UTF-8 characters, about 30 of them.
         let mut from = self.len;
         let mut n = 0;
@@ -74,6 +143,7 @@ impl Hive {
         let (y0, y1) = self.strip();
         let s = self.surf();
         s[y0 * self.w..y1 * self.w].fill(0);
+        self.present(y0, y1);
         let lex = Lexicon(LEXICON);
         let size = self.w / 28;
         for (k, &r) in self.alts.iter().enumerate() {
@@ -140,8 +210,12 @@ impl Hive {
 
     fn all(&self) {
         let s = self.surf();
-        s.fill(0);
+        // The rows above the back buffer, straight onto the surface; the rest through the buffer.
+        Surf::fill64(0, (self.row0() * self.w) as u64, 0);
+        s[self.row0() * self.w..].fill(0);
         self.kb.draw(s, &mut self.label());
+        self.present(self.row0(), self.h);
+        self.replay_labels();
         let size = (self.w / 37) as u16;
         window::text(self.display, self.base, (self.w / 28) as i16, (self.h / 8) as i16, size, 5000, b"hive: the honeycomb keyboard (two fingers: scroll; page on the symbol row)");
         self.line();
@@ -190,16 +264,18 @@ impl Hive {
                 console(grants, b"hive: back to the map\n");
                 exit(0);
             }
-            Some(Event::Redraw) => self.kb.draw(self.surf(), &mut self.label()),
+            Some(Event::Redraw) => {
+                self.kb.draw(self.surf(), &mut self.label());
+                self.present(self.kb.top, self.h);
+                self.replay_labels();
+            }
             None => {}
         }
         self.line();
     }
 }
 
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+extern "C" fn hive_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let (display, touch) = (cap(grants, S_DISPLAY), cap(grants, S_TOUCH));
     let mut r = [0u8; 256];
@@ -218,6 +294,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let mut hive = Hive { display, base, w, h, kb, text: [0; 256], len: 0, word: None, cur: u32::MAX, alts: [u32::MAX; 3] };
+    if w > 1344 || h < ROWS || hive.lowest_row() < hive.row0() {
+        console(grants, b"hive: the back buffer does not hold the rows the keyboard draws\n");
+        exit(5);
+    }
     let t0 = now();
     hive.all();
     let drawn = ferros_sys::us_since(t0);
@@ -258,8 +338,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let dirty = no > 0 || relaid;
         for &t in &outs[..no] {
             match t {
-                Touch::Light(key) => hive.kb.draw_key(hive.surf(), key, true, &mut hive.label()),
-                Touch::Unlight(key) => hive.kb.draw_key(hive.surf(), key, false, &mut hive.label()),
+                Touch::Light(key) => {
+                    hive.kb.draw_key(hive.surf(), key, true, &mut hive.label());
+                    hive.present(hive.kb.top, hive.h);
+                    hive.replay_labels();
+                }
+                Touch::Unlight(key) => {
+                    hive.kb.draw_key(hive.surf(), key, false, &mut hive.label());
+                    hive.present(hive.kb.top, hive.h);
+                    hive.replay_labels();
+                }
                 Touch::Scrolled => hive.kb.draw(hive.surf(), &mut hive.label()),
                 Touch::Tap(key) => {
                     // A tapped character ends the traced word's chance to be swapped.
