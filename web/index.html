@@ -387,22 +387,6 @@
          <li><strong>Glyph</strong>, the device ferros is for: hermetic, no ports, no openings, a sapphire slab for a face, one physical control (the killswitch), nothing in it replaceable, built for a twelve-year life. Designed for the parts of 2032, not 2026.</li>
       </ul>
 
-      <h2>Glyph, the plan</h2>
-      <table class="tiers">
-         <tr><td>Founders</td><td>1,728 units</td><td>$5,000</td><td>the first dozen cubed, serial-numbered, 12-year warranty</td></tr>
-         <tr><td>Elite</td><td>20,736</td><td>$3,000</td><td>six months on</td></tr>
-         <tr><td>Pro</td><td>248,832</td><td>$1,500</td><td>twelve months on</td></tr>
-         <tr><td>Standard</td><td>2,985,984</td><td>$600</td><td>eighteen to twenty-four months on</td></tr>
-      </table>
-      <p>
-         The counts are powers of twelve, and the whole table is inspirational: a shape to aim at, revised yearly against the parts that exist.
-         Before Glyph, the device tiers of the plan: Glyph itself; a Pixel 8 Pro on ferros paired with a dumb PIPE watch; a Pixel 8 Pro on ferros alone. Service follows the handle; the tier sets how much the network trusts the device.
-         The first pilot is fifty Pixel 8 Pros for three months, not a thousand.
-         Crypto only. Decentralized web only. No press, no review units.
-         Founders does not pay for the development and cannot; it is a funding event and a proof, and the engineering cost spreads across the later tiers.
-         The hardware notes are in the repository, revised yearly against the parts that exist.
-      </p>
-
       <h2>Doors</h2>
       <ul class="doors">
          <li><a href="https://github.com/nickspiker/ferros">The repository →<span class="who">The kernel, the drivers, the design documents, the day-by-day record.</span></a></li>
@@ -430,9 +414,9 @@
          <dt>Can I run it on my phone?</dt>
          <dd>Yes, today, if it is a Pixel 8 Pro: development builds, flashed from the repository (<code>tools/husky-cold.sh</code>), with a stock Android kept alongside. A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
          <dt>Why Rust?</dt>
-         <dd>Memory safety without a garbage collector, and a compiler that holds the line the design draws. There is no C to inherit from.</dd>
-         <dt>Why not Linux?</dt>
-         <dd>Linux is built on assumptions ferros exists to remove: a file system that needs repair, a shutdown that needs ordering, a kernel that owns every driver. Taking them out is a rewrite, not a patch.</dd>
+         <dd>Safety first? Oh, and it's real fast.</dd>
+         <dt>Why a new operating system?</dt>
+         <dd>Because every operating system you can get was built to keep its maker in the room: an account before it works, a store between you and your programs, a bootloader that answers to someone else, an identity a carrier mints. None of that is a setting you can turn off. ferros starts from what an operating system is, the thing that runs your programs on your hardware, and keeps only what that needs. The rest was never the operating system.</dd>
          <dt>What about apps?</dt>
          <dd>Android apps, compiled on the device when installed and sealed to it. Not optional: nothing ships without them.</dd>
          <dt>Is this vaporware?</dt>
