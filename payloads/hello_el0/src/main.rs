@@ -35,7 +35,7 @@ fn exit(code: u64) -> ! {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let base = arc_base();
-    let console = grants + 4;
+    let console = grants + 0x204;
     let reply = 0x800; // tail of the grants page
     let say = |m: &[u8]| call(console, m.as_ptr() as u64 - base, m.len() as u64, reply, 16);
 

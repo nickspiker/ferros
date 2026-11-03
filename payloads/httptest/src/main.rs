@@ -37,7 +37,7 @@ impl App {
     fn flush(&mut self) {
         if self.n > 0 {
             let mut r = [0u8; 16];
-            svc(CALL, self.grants + 4, self.off(self.log.as_ptr()), self.n as u64, self.off(r.as_mut_ptr()), 16);
+            svc(CALL, self.grants + 0x204, self.off(self.log.as_ptr()), self.n as u64, self.off(r.as_mut_ptr()), 16);
             self.n = 0;
         }
     }

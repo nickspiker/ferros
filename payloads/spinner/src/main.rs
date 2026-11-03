@@ -18,7 +18,7 @@ fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let base: u64;
     unsafe { asm!("mov {}, x28", out(reg) base) };
-    let console = grants + 4;
+    let console = grants + 0x204;
     let mut line = *b"tick 0\n";
     let mut count: u64 = 0;
     let mut ticks = 0u8;

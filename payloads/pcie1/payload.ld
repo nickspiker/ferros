@@ -8,6 +8,8 @@ SECTIONS {
     }
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
-    .bss : { *(.bss*) }
+    . = ALIGN(64);
+    .bss : { *(.bss*) *(COMMON) }
     /DISCARD/ : { *(.comment) *(.eh_frame*) }
 }
+__ferros_tail = SIZEOF(.bss) + 16;

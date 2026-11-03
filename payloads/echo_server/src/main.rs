@@ -31,7 +31,7 @@ const REPLY_TOKEN: u64 = 0x900;
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let base = arc_base();
-    let console = grants + 4;
+    let console = grants + 0x204;
     let endpoint = grants + 0x204 + 32;
     let up = b"serving, parked in recv\n";
     svc(CALL, console, up.as_ptr() as u64 - base, up.len() as u64, 0xA00, 16);

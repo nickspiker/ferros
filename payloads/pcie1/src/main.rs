@@ -194,7 +194,7 @@ impl Drv {
     }
     fn flush(&mut self) {
         if self.n > 0 {
-            svc(1, self.grants + 4, self.log.as_ptr() as u64 - self.base, self.n as u64, 0xA00, 16);
+            svc(1, self.grants + 0x204, self.log.as_ptr() as u64 - self.base, self.n as u64, 0xA00, 16);
             self.n = 0;
         }
     }
@@ -204,12 +204,31 @@ impl Drv {
     }
 }
 
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+// The entry with ferros_rt's image header (offset 8: "ferrosRT", then .bss + 16, three unused words, a heap of 0), as ahau, the modem driver and hive carry it: the kernel sizes the arc with the zeroed tail, so the vault files' buffers in .bss are in the arc.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym pcie1_main
+);
+
+extern "C" fn pcie1_main(grants: u64, input: u64, input_len: u64) -> ! {
     let (base, freq) = (ferros_sys::arc_base(), ferros_sys::freq());
     // Spawned by init at boot there is no input (a spawn from the vault carries none): with the vault scope granted, the whole bring-up from the vault's files; from the bridge, the stage byte it was given.
-    let has_store = unsafe { core::ptr::read_volatile((base + grants) as *const u32) } as u64 > STORE;
+    // The grant count at 0x200 of the grants page (the handle table fills the first 512 bytes since 2026-11-03; read at 0 it was 0, and the driver thought it had no vault scope).
+    let has_store = unsafe { core::ptr::read_volatile((base + grants + 0x200) as *const u32) } as u64 > STORE;
     let stage = if input_len > 0 { unsafe { core::ptr::read_volatile((base + input) as *const u8) } } else if has_store { 14 } else { 0 };
     let mut d = Drv { grants, base, freq, log: [0; 3000], n: 0, failed: false, win: u32::MAX };
     let rest: &mut [u8] = if input_len > 1 { unsafe { core::slice::from_raw_parts_mut((base + input + 1) as *mut u8, input_len as usize - 1) } } else { &mut [] };
@@ -1494,18 +1513,22 @@ fn dr32u(a: u32) -> u32 {
     u32::from_le_bytes([dbr(a), dbr(a + 1), dbr(a + 2), dbr(a + 3)])
 }
 
-/// Physical (= identity-mapped) access to the DMA region: Normal non-cacheable, EL0 read/write.
+/// The DMA region through its handle (SANDBOX.md, "Handles"): every access `base + (offset & mask)`, the same instructions native and masked. The driver keeps the region's physical addresses (the chip is told them); the handle takes the offset from the region's base.
+type DmaH = ferros_sys::Handle<DMA>;
+fn doff(a: u32) -> u64 {
+    a as u64 - DmaH::pair().0
+}
 fn dw(a: u32, v: u32) {
-    unsafe { core::ptr::write_volatile(a as u64 as *mut u32, v) }
+    DmaH::write32(doff(a), v)
 }
 fn dr(a: u32) -> u32 {
-    unsafe { core::ptr::read_volatile(a as u64 as *const u32) }
+    DmaH::read32(doff(a))
 }
 fn db(a: u32, v: u8) {
-    unsafe { core::ptr::write_volatile(a as u64 as *mut u8, v) }
+    DmaH::write8(doff(a), v)
 }
 fn dbr(a: u32) -> u8 {
-    unsafe { core::ptr::read_volatile(a as u64 as *const u8) }
+    DmaH::read8(doff(a))
 }
 
 /// The firmware's console ring (hnd_cons log) from `start`, `len` bytes, printable text only.
@@ -1829,17 +1852,14 @@ fn from_vault(d: &Drv) -> Option<(Fw<'static>, &'static mut [u8], &'static [u8],
 
 /// One small file of the vault scope `wifi.`, read whole into scratch `at` bytes into the DMA region (64 KiB at most). None when it is absent, too large, or locked (the credential is the person's, AUTH.md).
 fn vault_file(d: &Drv, key: &[u8], at: u64) -> Option<&'static mut [u8]> {
-    let dma = svc(7, d.cap(DMA), 0, 0, 0, 0);
-    if dma == ERR {
-        return None;
-    }
+    // Into the arc (FILES), one 64 KiB buffer per file by its old place in the DMA region (nvram at 1 MiB, clm 1 MiB + 64 KiB, cred 1 MiB + 128 KiB): nothing reads them but this driver, so they need not be where the chip can see them, and a masked process reads only its own arc and its handles.
+    let slot = ((at - 0x10_0000) >> 16) as usize;
     let mut h = [0u8; 4];
     let len = store_get_at(d, key, 0, &mut h)?;
     if len > 0x1_0000 {
         return None;
     }
-        // SAFETY: the DMA region is this process's alone, mapped EL0 read/write for the boot; this scratch lies past every ring and buffer the driver places there.
-        let buf = unsafe { core::slice::from_raw_parts_mut((dma + at) as *mut u8, len) };
+        let buf = unsafe { core::slice::from_raw_parts_mut((&raw mut FILES as *mut u8).add(slot << 16), len) };
         // The vault copies into this process's own memory (an arc offset): through a piece on the stack, then into the scratch (the first try handed the DMA region's address and the process ended without a word, 2026-10-26).
         let mut piece = [0u8; 4096];
         let mut off = 0;
@@ -2164,3 +2184,6 @@ fn process_nvram_vars(v: &mut [u8]) -> usize {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
 }
+
+/// The vault files (nvram, clm, cred), 64 KiB each, in the arc (`vault_file`).
+static mut FILES: [[u8; 0x1_0000]; 3] = [[0; 0x1_0000]; 3];
