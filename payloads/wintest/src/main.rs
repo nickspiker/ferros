@@ -33,7 +33,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     surf.fill(0);
     // A fluor 16-bit pixel: alpha in bits 48-63, then each channel's darkness scaled by alpha (R 32-47, G 16-31, B 0-15). Half-transparent red: alpha G#8000, red no darkness, green and blue full darkness at that alpha.
     let red = (0x8000u64) << 48 | 0x8000 << 16 | 0x8000;
-    for y in h / 3..h * 2 / 3 {
+    for y in h / 4..h {
         for x in w / 6..w * 5 / 6 {
             surf[y * w + x] = red;
         }
