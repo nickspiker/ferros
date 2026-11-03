@@ -1061,10 +1061,10 @@ extern "C" fn hv_primary(dtb: u64) -> ! {
                 let n = fdt::retarget_keys(DTB_COPY as usize, &hvcore::DT_SPIS);
                 hvcore::retargeted(n);
                 pstore::log(&[if n == 3 { b"\nferros hv: hvcore -- keys retargeted to the proxy SPIs\n" as &[u8] } else { b"\nferros hv: hvcore -- key cells not found, hv core stays off\n" }]);
-                // Core 3 is the hv's while its core runs, so Linux has a possible CPU it can never start. Google's gs_perf_mon creates a perf counter on every possible CPU at probe, fails on core 3 (ENODEV), frees its per-CPU table and leaves its CPU-hotplug callback registered; the first CPU taken down (every system suspend: "Disabling non-boot CPUs") then locks a mutex in freed memory and spins until the soft-lockup panic (the deep-sleep hang, pstore 2026-11-03: cpuhp/1 in gs_perf_mon_cpuhp_down from 622 s to the panic at 668 s). The probe already failed, so nothing reads it; renaming its compatible in place keeps the driver from probing at all, and with it the dangling callback.
+                // Core 3 is the hv's while its core runs, so Linux has a possible CPU it can never start. Google's gs_perf_mon creates a perf counter on every possible CPU at probe, fails on core 3 (ENODEV), frees its per-CPU table and leaves its CPU-hotplug callback registered; the first CPU taken down (every system suspend: "Disabling non-boot CPUs") then locks a mutex in freed memory and spins until the soft-lockup panic (the deep-sleep hang, pstore 2026-11-03: cpuhp/1 in gs_perf_mon_cpuhp_down from 622 s to the panic at 668 s). The probe already failed, so nothing reads it; keeping the driver from probing at all removes the dangling callback with it. Both the compatible and the node name go: the driver's match table has no sentinel entry, so the match walks past it into the bytes after (its own name string, by the look of it) and matched the node by name with the compatible alone renamed (2026-11-03, the first try).
                 if n == 3 {
-                    let k = fdt::rename_compatible(DTB_COPY as usize, b"google,gs_perf_mon", b"ferros,gs_perf_mon");
-                    pstore::log(&[if k == 1 { b"ferros hv: hvcore -- gs_perf_mon kept from probing (core 3 is the hv's)\n" as &[u8] } else { b"ferros hv: hvcore -- gs_perf_mon compatible not found\n" }]);
+                    let k = fdt::rename_compatible(DTB_COPY as usize, b"google,gs_perf_mon", b"ferros,gs_perf_mon") + fdt::rename_node(DTB_COPY as usize, b"gs_perf_mon", b"ferros_perf");
+                    pstore::log(&[if k == 2 { b"ferros hv: hvcore -- gs_perf_mon kept from probing (core 3 is the hv's)\n" as &[u8] } else { b"ferros hv: hvcore -- gs_perf_mon compatible not found\n" }]);
                 }
             }
             unsafe {
@@ -1976,6 +1976,41 @@ mod fdt {
                         }
                     }
                     p = (val + len + 3) & !3;
+                }
+                END => break,
+                _ => {}
+            }
+        }
+        done
+    }
+
+    /// Every node named exactly `from` (no unit address) is renamed `to`, in place (same length, so nothing moves). Returns the nodes renamed.
+    pub fn rename_node(dtb: usize, from: &[u8], to: &[u8]) -> u32 {
+        if rd32(dtb) != MAGIC || from.len() != to.len() {
+            return 0;
+        }
+        let mut p = dtb + rd32(dtb + 8) as usize;
+        let end = p + rd32(dtb + 36) as usize;
+        let mut done = 0u32;
+        while p < end {
+            let tok = rd32(p);
+            p += 4;
+            match tok {
+                BEGIN_NODE => {
+                    if name_eq(p, from) {
+                        for (k, &c) in to.iter().enumerate() {
+                            wr8(p + k, c);
+                        }
+                        done += 1;
+                    }
+                    while rd8(p) != 0 {
+                        p += 1;
+                    }
+                    p = (p + 1 + 3) & !3;
+                }
+                PROP => {
+                    let len = rd32(p) as usize;
+                    p = (p + 8 + len + 3) & !3;
                 }
                 END => break,
                 _ => {}
