@@ -1666,6 +1666,8 @@ struct Win {
     order: u32,
     rect: draw::Rect,
     format: u8,
+    /// Its mode byte (`MODE_MASK`, `OPAQUE`).
+    mode: u8,
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
 const G2T16: u8 = 1;
@@ -1684,8 +1686,9 @@ fn working(p: u64, format: u8) -> u64 {
     }
     let t = unsafe { core::slice::from_raw_parts(G2T16_Q14, 1 << 16) };
     // (65535 − d) × α + 32767 stays under 2³², as fluor's present computes it.
-    let ch = |sh: u32| t[((((0xFFFF - (p >> sh & 0xFFFF)) * a + 0x7FFF) / 0xFFFF) as usize)] as u64;
-    ch(32) | ch(16) << 16 | ch(0) << 32
+    let ch = |sh: u32| t[(((0xFFFF - (p >> sh & 0xFFFF)) * a + 0x7FFF) / 0xFFFF) as usize] as u64;
+    // Its transparency, Q14 in bits 49-62 (`trans`), so a chain can fold what is behind it by what its alpha left; a working surface's own pixels carry only the bit.
+    ch(32) | ch(16) << 16 | ch(0) << 32 | (16384 - (a >> 2)) << 49
 }
 static mut WINS: [Option<Win>; SURFACES] = [None; SURFACES];
 static mut RAISES: u32 = 0;
@@ -1711,7 +1714,7 @@ fn surface_of(base: u64) -> Option<usize> {
 
 /// The windows up, frontmost first: (surface, window), at most four.
 fn front_order() -> ([(usize, Win); SURFACES], usize) {
-    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0 }); SURFACES];
+    let mut v = [(0usize, Win { generation: 0, level: 0, order: 0, rect: draw::Rect::EMPTY, format: 0, mode: 0 }); SURFACES];
     let mut n = 0;
     for k in 0..SURFACES {
         if let Some(w) = unsafe { WINS[k] } {
@@ -1726,6 +1729,116 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
         }
     }
     (v, n)
+}
+
+/// The layer stack as bands and spans (WINDOWS.md, "The layer stack", 2026-11-02), rebuilt only when the windows change (`layout_build`), never per frame.
+/// The windows' top and bottom edges cut the screen into bands of rows; within a band every row is laid out alike, so the windows' left and right edges cut it into spans. A span's chain is the windows covering it, frontmost first, cut after the first opaque one: nothing behind an opaque window is ever read. Publishing a row walks its band's spans: a span with one opaque working window is a copy, a chain of working windows in Normal is the branchless select, anything else (a 16-bit fluor surface with its alpha, a blend mode) is the general fold.
+/// At most four windows, so at most nine bands and nine spans a band.
+#[derive(Clone, Copy)]
+struct Span {
+    x0: u16,
+    x1: u16,
+    /// The chain's length, then (surface, format, mode) frontmost first.
+    n: u8,
+    chain: [(u8, u8, u8); SURFACES],
+}
+#[derive(Clone, Copy)]
+struct Band {
+    y0: u16,
+    y1: u16,
+    n: u8,
+    spans: [Span; 2 * SURFACES + 1],
+}
+const NO_SPAN: Span = Span { x0: 0, x1: 0, n: 0, chain: [(0, 0, 0); SURFACES] };
+const NO_BAND: Band = Band { y0: 0, y1: 0, n: 0, spans: [NO_SPAN; 2 * SURFACES + 1] };
+static mut BANDS: [Band; 2 * SURFACES + 1] = [NO_BAND; 2 * SURFACES + 1];
+static mut NBANDS: usize = 0;
+/// A window's mode byte (op 22, `ferros_sys::window`): bits 0-2 the blend mode in fluor's order (0 Normal, 1 Multiply, 2 Screen, 3 Add, 4 Subtract, 5 Overlay, 6 Darken, 7 Lighten), bit 3 opaque (no see-through pixel anywhere: the chain stops at it).
+const MODE_MASK: u8 = 7;
+const OPAQUE: u8 = 8;
+fn layout_build(width: usize, height: usize) {
+    let (ord, n) = front_order();
+    // The sorted, distinct edges along one axis, the screen's own first and last.
+    fn edges(vals: impl Iterator<Item = i32>, end: usize) -> ([u16; 2 * SURFACES + 2], usize) {
+        let mut e = [0u16; 2 * SURFACES + 2];
+        let mut m = 1;
+        for v in vals {
+            if v > 0 && (v as usize) < end {
+                let v = v as u16;
+                let mut at = m;
+                while at > 1 && e[at - 1] > v {
+                    e[at] = e[at - 1];
+                    at -= 1;
+                }
+                if at > 1 && e[at - 1] == v {
+                    for i in at..m {
+                        e[i] = e[i + 1];
+                    }
+                    continue;
+                }
+                e[at] = v;
+                m += 1;
+            }
+        }
+        e[m] = end as u16;
+        (e, m + 1)
+    }
+    let (ys, ny) = edges(ord[..n].iter().flat_map(|(_, w)| [w.rect.y0, w.rect.y1]), height);
+    let mut nb = 0;
+    for b in 0..ny - 1 {
+        let (y0, y1) = (ys[b], ys[b + 1]);
+        let rows = ord[..n].iter().filter(|(_, w)| w.rect.y0 <= y0 as i32 && w.rect.y1 >= y1 as i32);
+        let (xs, nx) = edges(rows.clone().flat_map(|(_, w)| [w.rect.x0, w.rect.x1]), width);
+        let mut band = Band { y0, y1, n: 0, spans: [NO_SPAN; 2 * SURFACES + 1] };
+        for s in 0..nx - 1 {
+            let (x0, x1) = (xs[s], xs[s + 1]);
+            let mut span = Span { x0, x1, n: 0, chain: [(0, 0, 0); SURFACES] };
+            for &(k, w) in rows.clone() {
+                if w.rect.x0 <= x0 as i32 && w.rect.x1 >= x1 as i32 {
+                    span.chain[span.n as usize] = (k as u8, w.format, w.mode);
+                    span.n += 1;
+                    if w.mode & OPAQUE != 0 {
+                        break;
+                    }
+                }
+            }
+            band.spans[band.n as usize] = span;
+            band.n += 1;
+        }
+        unsafe { BANDS[nb] = band };
+        nb += 1;
+    }
+    unsafe { NBANDS = nb };
+}
+
+/// A working pixel's transparency, Q14: 0 opaque, 16384 clear (bit 63, the see-through bit every working surface may set), between from bits 49-62 (a decoded fluor surface's alpha; a working surface declares only the bit).
+#[inline]
+fn trans(p: u64) -> u64 {
+    if p >> 63 != 0 { 16384 } else { p >> 49 & 0x3FFF }
+}
+
+/// One layer folded under the composite so far (`acc` with transparency `t`), as fluor's `Blend::under` does it front to back, on the working values: each channel gains the mode's value of (composite, layer) by what the layer's alpha fills of what was still transparent, and the transparency is the product. The mode is the one of the layer above (how that layer sits on what is beneath it). Modes are defined against white (Q14 16384) as fluor's are against the top code; brighter working values (the canvas goes to four times white) are taken as the math gives, and a channel saturates at the field: 16 bits is what a working value holds, and Add past the field is the mode's own definition, as fluor's Add saturates at its one.
+#[inline]
+fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
+    let tp = trans(p);
+    let consumed = (t * (16384 - tp)) >> 14;
+    let ch = |sh: u32| -> u64 {
+        let (a, b) = ((acc >> sh & 0xFFFF) as i64, (p >> sh & 0xFFFF) as i64);
+        let m = match mode & MODE_MASK {
+            0 => b,
+            1 => a * b >> 14,
+            2 => 16384 - ((16384 - a) * (16384 - b) >> 14),
+            3 => a + b,
+            4 => if a > b { a - b } else { 0 },
+            5 => if b < 8192 { 2 * a * b >> 14 } else { 16384 - (2 * (16384 - a) * (16384 - b) >> 14) },
+            6 => if a < b { a } else { b },
+            _ => if a > b { a } else { b },
+        };
+        let v = a + (m * consumed as i64 >> 14);
+        (if v < 0 { 0 } else if v > 0xFFFF { 0xFFFF } else { v } as u64) << sh
+    };
+    let t2 = (t * tp) >> 14;
+    ((acc & 1 << 48) | ch(0) | ch(16) | ch(32) | t2 << 49 | if t2 == 16384 { 1 << 63 } else { 0 }, t2)
 }
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
@@ -1951,7 +2064,6 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     unsafe {
         PHASE_CLOCK[k] = None;
     }
-    let (ord, n) = front_order();
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
     // The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
@@ -1969,35 +2081,55 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     let mut px = [0u64; 1344];
     let (xa, xb) = (r.x0 as usize, r.x1 as usize);
     for y in r.y0 as usize..r.y1 as usize {
-        px[xa..xb].fill(CLEAR);
-        for &(s, w) in &ord[..n] {
-            let wr = w.rect;
-            if (y as i32) < wr.y0 || (y as i32) >= wr.y1 {
-                continue;
-            }
-            let (a, b) = ((wr.x0 as usize).max(xa), (wr.x1 as usize).min(xb));
+        // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
+        let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
+        let band = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1).unwrap();
+        for sp in &band.spans[..band.n as usize] {
+            let (a, b) = ((sp.x0 as usize).max(xa), (sp.x1 as usize).min(xb));
             if a >= b {
                 continue;
             }
-            let src = &surface(s, width, height)[y * width..(y + 1) * width];
-            // Branchless: an uncovered pixel (bit 63) takes this window's, a covered one keeps its own. A fluor window's pixels are decoded on the way in (`working`); the format is the window's, so the loop is chosen once per window.
-            if w.format == G2T16 {
-                for x in a..b {
-                    let p = px[x];
-                    let m = (p >> 63).wrapping_neg();
-                    px[x] = (p & !m) | (working(src[x], G2T16) & m);
+            let chain = &sp.chain[..sp.n as usize];
+            if chain.is_empty() {
+                // Nothing here: black.
+                px[a..b].fill(0);
+                continue;
+            }
+            let plain = chain.iter().all(|&(_, f, m)| f != G2T16 && m & MODE_MASK == 0);
+            let front = &surface(chain[0].0 as usize, width, height)[y * width..(y + 1) * width];
+            if chain[0].2 & OPAQUE != 0 && chain[0].1 != G2T16 {
+                px[a..b].copy_from_slice(&front[a..b]);
+            } else if plain {
+                // Working windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
+                px[a..b].copy_from_slice(&front[a..b]);
+                for &(k, _, _) in &chain[1..] {
+                    let src = &surface(k as usize, width, height)[y * width..(y + 1) * width];
+                    for x in a..b {
+                        let p = px[x];
+                        let m = (p >> 63).wrapping_neg();
+                        px[x] = (p & !m) | (src[x] & m);
+                    }
+                }
+                for p in &mut px[a..b] {
+                    *p &= ((*p >> 63) ^ 1).wrapping_neg();
                 }
             } else {
                 for x in a..b {
-                    let p = px[x];
-                    let m = (p >> 63).wrapping_neg();
-                    px[x] = (p & !m) | (src[x] & m);
+                    let mut acc = working(front[x], chain[0].1);
+                    let mut t = trans(acc);
+                    let mut mode = chain[0].2;
+                    for &(k, f, m) in &chain[1..] {
+                        if t == 0 {
+                            break;
+                        }
+                        let p = working(surface(k as usize, width, height)[y * width + x], f);
+                        (acc, t) = fold(acc, t, p, mode);
+                        mode = m;
+                    }
+                    // What is still transparent at the end is over black: the premultiplied channels are the light, the transparency is spent.
+                    px[x] = acc & !(0x7FFF << 49);
                 }
             }
-        }
-        // Still see-through after every window: black.
-        for p in &mut px[xa..xb] {
-            *p &= ((*p >> 63) ^ 1).wrapping_neg();
         }
         // The glass's shape, from the plan (`plan_glass`): the circle's outside copies the chrome row, the edge's outside takes the mask colour (black on release builds; the hairline's orange one stop darker on development builds), and the listed pixels take their hairline at its alpha, then their base by their coverage's complement. The circle's hairline is `line`; the edge's is the orange on development builds and on release builds the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve. A chrome row is read only where the plan put chrome; elsewhere it is empty and a wrong plan would say so.
         {
@@ -2070,6 +2202,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
 /// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
 fn windows_changed(width: usize, height: usize) {
     let full = draw::Rect::full(width, height);
+    layout_build(width, height);
     unsafe {
         PHASE_DIRTY = [full; PHASES];
         if (*(&raw const WINS)).iter().all(|w| w.is_none()) {
@@ -2978,7 +3111,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             let full = draw::Rect::full(width, height);
                             let generation = ferros_sys::pref(8 + sk as u64);
                             // What changed (ferros_sys `show_changed`: [x u16][y u16][w u16][h u16] after the format byte): only that part is published and owed by the other phases — when the window is already up as it was (same generation, place and level) and the screen composed. Otherwise, and for a plain show, the whole screen.
-                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17]) && unsafe { APP }.is_some();
+                            let mode = if m.len() > 27 { m[27] } else { 0 };
+                            let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
                             unsafe {
                                 if { APP }.is_none() {
@@ -2986,7 +3120,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                                 }
                                 if !same || m.len() < 27 {
                                     RAISES += 1;
-                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 } });
+                                    WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
+                                    layout_build(width, height);
                                 }
                                 APP = Some(full);
                                 for k in 0..PHASES {

@@ -770,6 +770,39 @@ pub mod window {
         r[0] == 0
     }
 
+    /// A window's mode byte: bits 0-2 the blend mode, how the window sits on what is beneath it, in fluor's order; bit 3 `OPAQUE`, a promise that no pixel of the surface is see-through, so the display never reads what the window covers.
+    pub const NORMAL: u8 = 0;
+    pub const MULTIPLY: u8 = 1;
+    pub const SCREEN: u8 = 2;
+    pub const ADD: u8 = 3;
+    pub const SUBTRACT: u8 = 4;
+    pub const OVERLAY: u8 = 5;
+    pub const DARKEN: u8 = 6;
+    pub const LIGHTEN: u8 = 7;
+    pub const OPAQUE: u8 = 8;
+
+    /// As `show_changed`, with the window's mode byte (a blend mode, `OPAQUE`, or both); `changed` is the whole window when nothing narrower is known.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_full(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8, format: u8, changed: (u16, u16, u16, u16), mode: u8) -> bool {
+        let mut m = [0u8; 28];
+        m[0] = 22;
+        m[1..3].copy_from_slice(&x.to_le_bytes());
+        m[3..5].copy_from_slice(&y.to_le_bytes());
+        m[5..7].copy_from_slice(&w.to_le_bytes());
+        m[7..9].copy_from_slice(&h.to_le_bytes());
+        m[9..17].copy_from_slice(&base.to_le_bytes());
+        m[17] = level;
+        m[18] = format;
+        m[19..21].copy_from_slice(&changed.0.to_le_bytes());
+        m[21..23].copy_from_slice(&changed.1.to_le_bytes());
+        m[23..25].copy_from_slice(&changed.2.to_le_bytes());
+        m[25..27].copy_from_slice(&changed.3.to_le_bytes());
+        m[27] = mode;
+        let mut r = [0u8; 4];
+        call(display, &m, &mut r);
+        r[0] == 0
+    }
+
     /// The window is done: what is behind it shows.
     pub fn done(display: u64, base: u64) {
         let mut m = [0u8; 9];
