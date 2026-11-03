@@ -1280,9 +1280,13 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     if wnr == 1 {
                         let v = if srt == 31 { 0 } else { frame[srt] };
                         // The UFS firewall's doorbell: the commands it starts, read before the device sees them.
-                        if cfg!(hv_ufs) && sas == 2 && pa == UFS_HCI + UTRLDBR {
-                            ufs_doorbell(v as u32);
-                        }
+                        let v = if cfg!(hv_ufs) && sas == 2 && pa == UFS_HCI + UTRLDBR {
+                            ufs_doorbell(v as u32) as u64
+                        } else if cfg!(hv_shadow) && sas == 2 && (pa == UFS_HCI + UTRLBA || pa == UFS_HCI + UTRLBAU) {
+                            ufs_shadow_base(pa == UFS_HCI + UTRLBAU, v as u32) as u64
+                        } else {
+                            v
+                        };
                         let ring_old = if cfg!(hv_modem_ring) && sas == 2 && (pa == MODEM_IPC + 0x18 || pa == MODEM_IPC + 0x24) { Some(read_volatile(pa as *const u32)) } else { None };
                         match sas {
                             0 => write_volatile(pa as *mut u8, v as u8),
@@ -1295,12 +1299,18 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                             modem_ring(pa == MODEM_IPC + 0x18, o, v as u32);
                         }
                     } else {
-                        let raw = match sas {
+                        // Shadow lists: completions copied back before any register is answered (Android reads the interrupt status and the doorbell before a result), and the list base answered as Android wrote it.
+                        if cfg!(hv_shadow) && pa & !0xFFF == UFS_HCI {
+                            ufs_sync();
+                        }
+                        let raw = if cfg!(hv_shadow) && sas == 2 && (pa == UFS_HCI + UTRLBA || pa == UFS_HCI + UTRLBAU) {
+                            SH_ANDROID_UTRL[(pa == UFS_HCI + UTRLBAU) as usize] as u64
+                        } else { match sas {
                             0 => read_volatile(pa as *const u8) as u64,
                             1 => read_volatile(pa as *const u16) as u64,
                             2 => read_volatile(pa as *const u32) as u64,
                             _ => read_volatile(pa as *const u64),
-                        };
+                        } };
                         let bits = 8u32 << sas;
                         let mut v = raw;
                         if sse == 1 && bits < 64 {
@@ -2478,7 +2488,7 @@ const FRP_TAIL: u64 = 37_253;
 /// Pixel's PRDT entry: the standard 16 bytes and 112 of inline-encryption fields (ufs-pixel-crypto.c `pixel_ufs_prdt_entry`); des3 bit 31 enables encryption, its low 18 bits are the byte count less one.
 const PRDT_ENTRY: u64 = 128;
 const PRDT_CRYPTO: u32 = 1 << 31;
-/// The counters (u64 words from G#FD60_0E00): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list, descriptor or data was outside DRAM, 19 UNMAP descriptors reaching a boot chain, 20 the ferros partition, 21 UNMAP descriptors, 22 UNMAP lists unreadable, 23 writes to LU3 (devinfo), 24 writes to LU1/LU2 (the bootloaders). Refused (the firewall, 2026-11-01): 30 writes, 31 UNMAP ranges emptied, 32 queries, 33 the last refused (lun << 56 | lba for a write, G#51 << 56 | opcode << 8 | idn for a query).
+/// The counters (u64 words from G#FD60_0E00; 34 commands shadowed, 35 completions copied back, 36 commands not started because they could not be shadowed): 0 magic, 1 traps, 2 commands, 3 reads, 4 writes, 5 boot-chain writes, 6 the last one (lun << 56 | lba), 7 ferros-partition writes, 8 frp-tail writes, 9 of them changing the unlock byte, 10 of them with encryption on, 11 UNMAPs, 12 UNMAPs on LU0, 13 writes to LU1-3, 14 writes to well-known LUNs, 15 WRITE BUFFER (firmware), 16 other opcodes, 17 the last other (lun << 56 | opcode), 18 commands whose list, descriptor or data was outside DRAM, 19 UNMAP descriptors reaching a boot chain, 20 the ferros partition, 21 UNMAP descriptors, 22 UNMAP lists unreadable, 23 writes to LU3 (devinfo), 24 writes to LU1/LU2 (the bootloaders). Refused (the firewall, 2026-11-01): 30 writes, 31 UNMAP ranges emptied, 32 queries, 33 the last refused (lun << 56 | lba for a write, G#51 << 56 | opcode << 8 | idn for a query).
 const UFS_STATS: usize = 0xFD60_0E00;
 const UFS_MAGIC: u64 = 0x5546_5346_5731_0000; // "UFSFW1"
 
@@ -2500,7 +2510,7 @@ fn ufs_set(i: usize, v: u64) {
 
 /// Called once, while stage 2 is built: the counters zeroed and stamped, the page unmapped.
 unsafe fn ufs_arm() {
-    for i in 0..34 {
+    for i in 0..40 {
         ufs_set(i, 0);
     }
     ufs_set(0, UFS_MAGIC);
@@ -2528,16 +2538,158 @@ fn poke8(pa: u64, v: u8) {
     civac(pa, 1);
 }
 
-/// A doorbell write of `bits`: each command it starts that was not already running, read from Android's list (before the real write reaches the device).
-unsafe fn ufs_doorbell(bits: u32) {
+// Shadow command lists (FERROS_HV_SHADOW; HV.md, "The UFS firewall refuses", the check-to-fetch window): the controller fetches every transfer request and its command descriptor from memory the hv owns and Android cannot write. At a doorbell each new command is copied out of Android's list into the shadow (its UTRD, its UCD with the command UPIU, the response area and the PRDT; an UNMAP's parameter list too, since the firewall reads it), the copy is checked and rewritten as before, and the device sees only the copy. The data buffers stay Android's: the firewall judges commands, not data. When Android reads any of the controller's registers (its completion path reads the interrupt status and the doorbell before it looks at a result), every started command that the doorbell no longer shows is copied back: the UTRD's overall command status and the response UPIU, into Android's own structures. Android's writes of the list base are kept and answered back to it, while the real register holds the shadow list.
+const SH_SLOTS: usize = 32;
+/// A shadow UCD: the command UPIU and the response UPIU at Linux's 512 bytes each, then up to 128 PRDT entries of Pixel's 128 bytes.
+const SH_UCD: usize = 512 + 512 + 128 * PRDT_ENTRY as usize;
+#[repr(C, align(1024))]
+struct ShUtrl([u8; SH_SLOTS * 32]);
+#[repr(C, align(128))]
+struct ShUcd([u8; SH_SLOTS * SH_UCD]);
+#[repr(C, align(4096))]
+struct ShData([u8; SH_SLOTS * 4096]);
+static mut SH_UTRL: ShUtrl = ShUtrl([0; SH_SLOTS * 32]);
+static mut SH_UCDS: ShUcd = ShUcd([0; SH_SLOTS * SH_UCD]);
+static mut SH_DATA: ShData = ShData([0; SH_SLOTS * 4096]);
+/// Android's list base as it wrote it (low and high words), answered back on reads.
+static mut SH_ANDROID_UTRL: [u32; 2] = [0; 2];
+/// The slots in flight through the shadow, and for each Android's UTRD and UCD and the response UPIU's offset and length in bytes.
+static mut SH_STARTED: u32 = 0;
+static mut SH_BACK: [(u64, u64, u64, u64); SH_SLOTS] = [(0, 0, 0, 0); SH_SLOTS];
+
+fn sh_utrd(slot: usize) -> u64 {
+    (&raw const SH_UTRL) as u64 + slot as u64 * 32
+}
+fn sh_ucd(slot: usize) -> u64 {
+    (&raw const SH_UCDS) as u64 + (slot * SH_UCD) as u64
+}
+
+/// A copy with the MMU off (every access a device access, so as few as possible): words where both ends and the length allow, bytes otherwise.
+fn copy_bytes(dst: u64, src: u64, n: u64) {
+    if (dst | src | n) & 7 == 0 {
+        for k in (0..n).step_by(8) {
+            unsafe { write_volatile((dst + k) as *mut u64, read_volatile((src + k) as *const u64)) };
+        }
+    } else {
+        for k in 0..n {
+            unsafe { write_volatile((dst + k) as *mut u8, read_volatile((src + k) as *const u8)) };
+        }
+    }
+}
+
+/// Android's write of the list base: kept, and the shadow list's half written instead. Returns the value for the real register.
+unsafe fn ufs_shadow_base(hi: bool, v: u32) -> u32 {
+    unsafe { SH_ANDROID_UTRL[hi as usize] = v };
+    let base = (&raw const SH_UTRL) as u64;
+    if hi { (base >> 32) as u32 } else { base as u32 }
+}
+
+/// Slot `slot`'s command copied from Android's UTRD at `utrd` into the shadow: false when it cannot be (an address outside DRAM, a PRDT longer than the shadow holds, an UNMAP list longer than a page), and the command is then not started. WHY/PROOF the DRAM checks: every address is Android's, external input.
+unsafe fn ufs_shadow(slot: usize, utrd: u64) -> bool {
+    if !in_dram(utrd) || !in_dram(utrd + 31) {
+        return false;
+    }
+    civac(utrd, 32);
+    let ucd = ((rd32(utrd + 0x14) as u64) << 32 | rd32(utrd + 0x10) as u64) & !0x7F;
+    let w6 = rd32(utrd + 0x18);
+    let w7 = rd32(utrd + 0x1C);
+    let (resp_len, resp_off) = ((w6 & 0xFFFF) as u64 * 4, (w6 >> 16) as u64 * 4);
+    let (prdtl, prdto) = ((w7 & 0xFFFF) as u64, (w7 >> 16) as u64 * 4);
+    // What the device will read or write of the UCD: the command UPIU from 0, the response area, the PRDT.
+    let mut ucd_len = 512u64;
+    if resp_off + resp_len > ucd_len {
+        ucd_len = resp_off + resp_len;
+    }
+    if prdtl > 0 && prdto + prdtl * PRDT_ENTRY > ucd_len {
+        ucd_len = prdto + prdtl * PRDT_ENTRY;
+    }
+    if ucd_len > SH_UCD as u64 || !in_dram(ucd) || !in_dram(ucd + ucd_len - 1) {
+        return false;
+    }
+    civac(ucd, ucd_len);
+    let (su, sc) = (sh_utrd(slot), sh_ucd(slot));
+    copy_bytes(su, utrd, 32);
+    // The command UPIU and the PRDT; the response area is the device's to write, so it stays as the shadow has it.
+    copy_bytes(sc, ucd, 512);
+    if prdtl > 0 {
+        copy_bytes(sc + prdto, ucd + prdto, prdtl * PRDT_ENTRY);
+    }
+    unsafe {
+        write_volatile((su + 0x10) as *mut u32, sc as u32);
+        write_volatile((su + 0x14) as *mut u32, (sc >> 32) as u32);
+    }
+    // An UNMAP's parameter list: the device reads it from the data buffer after the check, so the buffer is shadowed too (the first PRDT entry's, at most a page).
+    let is_cmd = unsafe { read_volatile(sc as *const u8) } & 0x3F == 0x01;
+    if is_cmd && unsafe { read_volatile((sc + 16) as *const u8) } == 0x42 && prdtl > 0 {
+        let ent = sc + prdto;
+        let addr = (rd32(ent + 4) as u64) << 32 | rd32(ent) as u64;
+        let size = (rd32(ent + 12) & 0x3_FFFF) as u64 + 1;
+        if size > 4096 || !in_dram(addr) || !in_dram(addr + size - 1) {
+            return false;
+        }
+        let sd = (&raw const SH_DATA) as u64 + slot as u64 * 4096;
+        civac(addr, size);
+        copy_bytes(sd, addr, size);
+        unsafe {
+            write_volatile(ent as *mut u32, sd as u32);
+            write_volatile((ent + 4) as *mut u32, (sd >> 32) as u32);
+        }
+    }
+    unsafe {
+        SH_BACK[slot] = (utrd, ucd, resp_off, resp_len);
+        SH_STARTED |= 1 << slot;
+    }
+    ufs_stat(34, 1);
+    true
+}
+
+/// Every started command the doorbell no longer shows: its overall command status (UTRD word 2) and its response UPIU copied back to Android's structures, coherently.
+unsafe fn ufs_sync() {
+    let started = unsafe { SH_STARTED };
+    if started == 0 {
+        return;
+    }
+    let db = read_volatile((UFS_HCI + UTRLDBR) as *const u32);
+    let mut done = started & !db;
+    while done != 0 {
+        let slot = done.trailing_zeros() as usize;
+        done &= done - 1;
+        let (utrd, ucd, resp_off, resp_len) = unsafe { SH_BACK[slot] };
+        let (su, sc) = (sh_utrd(slot), sh_ucd(slot));
+        civac(utrd + 8, 4);
+        unsafe { write_volatile((utrd + 8) as *mut u32, read_volatile((su + 8) as *const u32)) };
+        civac(utrd + 8, 4);
+        if resp_len > 0 {
+            civac(ucd + resp_off, resp_len);
+            copy_bytes(ucd + resp_off, sc + resp_off, resp_len);
+            civac(ucd + resp_off, resp_len);
+        }
+        unsafe { SH_STARTED &= !(1 << slot) };
+        ufs_stat(35, 1);
+    }
+}
+
+/// A doorbell write of `bits`: each command it starts that was not already running, read from Android's list (before the real write reaches the device). Returns the bits to ring: all of them, or with shadow lists only those whose command could be copied into the shadow (one that could not be is never started, and Android sees it time out).
+unsafe fn ufs_doorbell(bits: u32) -> u32 {
     let running = read_volatile((UFS_HCI + UTRLDBR) as *const u32);
-    let list = (read_volatile((UFS_HCI + UTRLBAU) as *const u32) as u64) << 32 | read_volatile((UFS_HCI + UTRLBA) as *const u32) as u64;
+    let list = if cfg!(hv_shadow) { (SH_ANDROID_UTRL[1] as u64) << 32 | SH_ANDROID_UTRL[0] as u64 } else { (read_volatile((UFS_HCI + UTRLBAU) as *const u32) as u64) << 32 | read_volatile((UFS_HCI + UTRLBA) as *const u32) as u64 };
+    let mut ring = bits;
     let mut new = bits & !running;
     while new != 0 {
         let slot = new.trailing_zeros() as u64;
         new &= new - 1;
-        ufs_command(list + slot * 32);
+        if cfg!(hv_shadow) {
+            if ufs_shadow(slot as usize, list + slot * 32) {
+                ufs_command(sh_utrd(slot as usize));
+            } else {
+                ufs_stat(36, 1);
+                ring &= !(1 << slot);
+            }
+        } else {
+            ufs_command(list + slot * 32);
+        }
     }
+    ring
 }
 
 /// One command: its UTRD at `utrd`, its UCD (command UPIU, then the PRDT) where the UTRD says. WHY/PROOF the DRAM checks: every address here is Android's, external input; a read outside DRAM could land on a device register or a hole (an SError at EL2).
