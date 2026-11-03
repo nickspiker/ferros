@@ -43,6 +43,13 @@ core::arch::global_asm!(
     ".global ferros_core_entry",
     "ferros_core_entry:",
     // Entry marks in this core's arrival word (G#FD60_0B80 + core * 8, the low byte G#11-G#17; Rust's note_arrival overwrites it with the counter): the eighth jump of 2026-11-03 lost worker core 7 after the hv's branch and before any Rust, with nothing in the hv's trap report. Before the MMU is on the stores go straight to DRAM; after, each is cleaned to it.
+    // PSTATE as a fresh CPU_ON leaves it, first: a core parked by the jump from Android keeps the PSTATE it trapped with, PAN set among it (Linux runs with PAN), and once HCR.E2H and TGE are set PAN applies at EL2, so the first load from the hand-over block (in the DMA pool, EL0-accessible) after the MMU is on took a permission fault into vectors that were still the hv's and not executable under these tables (the tenth jump of 2026-11-03: cores 5, 7 and the X3 stopped at mark G#15). An eret to the next instruction at EL2h, D A I F masked, resets PAN, UAO, TCO, SSBS, DIT and the rest.
+    "adr x10, 2f",
+    "msr elr_el2, x10",
+    "mov x10, #0x3C9",
+    "msr spsr_el2, x10",
+    "eret",
+    "2:",
     "mov x19, x0",
     "mrs x9, mpidr_el1",
     "ubfx x9, x9, #8, #4",
