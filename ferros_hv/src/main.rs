@@ -2448,6 +2448,19 @@ mod hvcore {
         }
         let mut h = [0u8; 16];
         super::pstore::log(&[b"\nferros hv: jump -- TRNG session closed: ", super::pstore::hex(trng, &mut h), b"\n"]);
+        // Measurement for the post-jump TRNG hang (2026-11-03: two jumps in a row froze at ferros's first TRNG_RND64, with or without a suspend before, and the close above answered all ones): each Android core's last trapped SMC, a session opened and closed again here (what the firmware answers to INIT and EXIT), then the hv's own TRNG_RND64 with a line before and after, so a hang here says the firmware is wedged before ferros starts and a return says the hang is ferros's.
+        for c in 0..9usize {
+            let fid = unsafe { read_volatile(&raw const super::LAST_FID[c]) };
+            let mut hf = [0u8; 16];
+            super::pstore::log(&[b"ferros hv: jump -- core ", &[b'0' + c as u8], b" last SMC ", &super::pstore::hex(fid, &mut hf)[8..16], b"\n"]);
+        }
+        let init = smc(0x8200_1012, 0, 0, 0);
+        let exit = smc(0x8200_1012, 1, 0, 0);
+        let (mut hi, mut he) = ([0u8; 16], [0u8; 16]);
+        super::pstore::log(&[b"ferros hv: jump -- TRNG INIT ", super::pstore::hex(init, &mut hi), b" EXIT ", super::pstore::hex(exit, &mut he), b"\nferros hv: jump -- TRNG_RND64 probe\n"]);
+        let rnd = smc(0xC400_0053, 192, 0, 0);
+        let mut hr = [0u8; 16];
+        super::pstore::log(&[b"ferros hv: jump -- TRNG_RND64 answered ", super::pstore::hex(rnd, &mut hr), b"\n"]);
         // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
