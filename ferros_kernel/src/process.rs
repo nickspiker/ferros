@@ -2540,18 +2540,18 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     Ok(me)
 }
 
-/// A granted region as a handle (SANDBOX.md, "Handles"): its base and its mask, for masked code to reach it as `base + (offset & mask)`. A region is maskable when it is a power of two in size and aligned to it; the registry's blocks are, bar a few MMIO blocks of odd sizes, which round up to the next power of two when their base allows. A grant that is not a region, or a region that cannot be masked, is (0, 0): native code reaches it as it always has, masked code cannot.
+/// A granted region as a handle (SANDBOX.md, "Handles"): its base and its mask, for masked code to reach it as `base + (offset & mask)`. A region is maskable when it is a power of two in size and aligned to it; an MMIO block of any other size (20 KiB, 52 KiB, 3.5 MiB) gets no handle and is reached through the kernel's mmio calls instead, never rounded up over its neighbours. A grant that is not a region, or a region that cannot be masked, is (0, 0): native code reaches it as it always has, masked code cannot.
 fn handle_of(object: Object) -> (u64, u64) {
     let (base, size) = match object {
         Object::Dma(i) => (DMA[i].base, DMA[i].size),
         Object::Hardware(h) if !HARDWARE[h].via_el3 => (HARDWARE[h].base, HARDWARE[h].size),
         _ => return (0, 0),
     };
-    let span = size.next_power_of_two();
-    if size == 0 || base % span != 0 {
+    // Exact or nothing (ISOMEM Claim 5: a grant reaches its own bytes and no neighbour's): a region the mask can bound exactly is a power of two at a base aligned to it. Rounding a 20 KiB block up to 32 KiB would hand the process the next block's registers too; such a block is reached through the kernel's mmio calls, which check each offset.
+    if size == 0 || !size.is_power_of_two() || base % size != 0 {
         return (0, 0);
     }
-    (base as u64, (span - 1) as u64)
+    (base as u64, (size - 1) as u64)
 }
 
 /// `diag arcs`: every process's arc, for reading the pools' state: name, base, size, block, under the lock.
