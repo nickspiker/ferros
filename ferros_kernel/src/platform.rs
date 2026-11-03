@@ -319,12 +319,16 @@ pub fn mark_trail(m: u8) {
     }
 }
 
+/// The low two bits say how far: 1 into Rust, before `cpu_inform_clear`'s firmware call; 2 past it (`note_arrival_step(2)`). The seventh jump of 2026-11-03: the X3 took its entry with an intact hand-over block and never wrote the arrival, and that call came first.
 pub fn note_arrival() {
+    note_arrival_step(1);
+}
+pub fn note_arrival_step(s: u64) {
     let mpidr: u64;
     unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr) };
     let a = 0xFD60_0B80usize + ((mpidr >> 8) & 0xF) as usize * 8;
     unsafe {
-        write_volatile(a as *mut u64, cntpct() | 1);
+        write_volatile(a as *mut u64, (cntpct() & !3) | s);
         core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) a as u64);
     }
 }

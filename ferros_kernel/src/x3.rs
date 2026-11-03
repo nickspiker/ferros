@@ -303,8 +303,9 @@ pub fn hand_over(b: crate::service::Boot) -> crate::service::Boot {
 /// The X3, parked: wait for go, then this core's own interrupt setup (the killswitch's redistributor and key routing, the power key) and the service loop — the kernel from here on.
 #[unsafe(no_mangle)]
 extern "C" fn ferros_x3_main(hop: usize) -> ! {
-    crate::platform::cpu_inform_clear();
     crate::platform::note_arrival();
+    crate::platform::cpu_inform_clear();
+    crate::platform::note_arrival_step(2);
     unsafe {
         write_volatile((hop + H_PARKED) as *mut u64, PARKED);
         core::arch::asm!("dsb sy");
