@@ -36,6 +36,8 @@ pub struct Gated {
     pub fixed: u32,
     /// The image carries BTI landing pads (SANDBOX.md, "BTI"): its code runs on guarded pages and the checker refuses RET.
     pub bti: bool,
+    /// Exact mode (SANDBOX.md, "Modes"): the subtract and unsigned compare against a limit; needs `bti`.
+    pub exact: bool,
 }
 
 /// What the gate learned about a capsule whose code stays where it was staged (no copy): the developer's key and the provenance hash for the ihi.
@@ -170,7 +172,11 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
         return Err("gate: fixed mode size out of range");
     }
     let bti = masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("bti")).is_some();
-    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed, bti })
+    let exact = masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("exact")).is_some();
+    if exact && (fixed != 0 || !bti) {
+        return Err("gate: exact mode needs BTI and is not fixed");
+    }
+    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed, bti, exact })
 }
 
 /// The OS-only key that seals installed images (SANDBOX.md): derived from the system persistent secret, so nothing outside this OS on this device can produce a seal.
@@ -192,6 +198,9 @@ pub fn seal(g: &Gated) -> Option<[u8; 32]> {
     }
     if g.bti {
         h.update(b"bti");
+    }
+    if g.exact {
+        h.update(b"exact");
     }
     h.update(&(g.text_len as u64).to_le_bytes());
     h.update(&g.code);

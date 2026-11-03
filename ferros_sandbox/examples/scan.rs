@@ -6,6 +6,17 @@ fn main() {
     // `--fixed K` checks under fixed mode at 2^K (SANDBOX.md, "Modes"); without it, ring mode.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let bti = args.iter().any(|a| a == "--bti");
+    // `--exact`: exact mode, which is checked over the whole image (its sequences span four instructions), so the tally is the whole-image verdict.
+    if args.iter().any(|a| a == "--exact") {
+        for path in args.iter().filter(|a| !a.starts_with("--")) {
+            let code = std::fs::read(path).expect("read image");
+            match ferros_sandbox::check_image_with(&code, Mode::Exact, bti) {
+                Ok(n) => println!("{path}: {n} words, 0 refused"),
+                Err(v) => println!("{path}: 1 refused\n  {:?} at +{:#x} ({:08x})", v.why, v.offset, v.insn),
+            }
+        }
+        return;
+    }
     let mode = args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).map(Mode::Fixed).unwrap_or(Mode::Ring);
     let paths: Vec<&String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && *a != "--bti" && !(*i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a).collect();
     for path in paths {

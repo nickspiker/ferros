@@ -294,6 +294,7 @@ async fn main() {
                     "--text-len" => { i += 2; }
                     "--fixed" => { i += 2; }
                     "--bti" => { i += 1; }
+                    "--exact" => { i += 1; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -593,6 +594,10 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     // `--bti`: the image carries BTI landing pads; the kernel maps its code on guarded pages (SANDBOX.md, "BTI").
     if masked && std::env::args().any(|a| a == "--bti") {
         section.add_field("bti", VsfType::u(1, false));
+    }
+    // `--exact`: exact mode, the subtract and unsigned compare (SANDBOX.md, "Modes"); needs `--bti`.
+    if masked && std::env::args().any(|a| a == "--exact") {
+        section.add_field("exact", VsfType::u(1, false));
     }
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(section)

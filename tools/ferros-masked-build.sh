@@ -26,7 +26,7 @@ ATTR="+neon,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fullfp16,+fp16fml,+i8
 OBJS=()
 for s in $SRCS; do
     b=$(basename "$s" .s)
-    "$REPO/target/debug/ferros-mask" "$s" "$OUT/s/$b.s" ${FIXED:+--fixed $FIXED} ${BTI:+--bti}
+    "$REPO/target/debug/ferros-mask" "$s" "$OUT/s/$b.s" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact}
     llvm-mc -triple=aarch64-unknown-none -mattr=$ATTR -filetype=obj -o "$OUT/s/$b.o" "$OUT/s/$b.s"
     OBJS+=("$OUT/s/$b.o")
 done
@@ -38,8 +38,9 @@ aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
 stat -c %s "$OUT/$BIN.text" > "$OUT/$BIN.textlen"
-( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ) | tee "$OUT/scan.txt"
+( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact} ) | tee "$OUT/scan.txt"
 if [ -n "${BTI:-}" ]; then touch "$OUT/$BIN.bti"; else rm -f "$OUT/$BIN.bti"; fi
+if [ -n "${EXACT:-}" ]; then touch "$OUT/$BIN.exact"; else rm -f "$OUT/$BIN.exact"; fi
 # Fixed mode: the arc is exactly 2^K, so the image, its zeroed tail, the grants page and the 64 KiB stack must fit (process.rs `build`: CODE + image + tail + STACK).
 if [ -n "$FIXED" ]; then
     TAIL=0

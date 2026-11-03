@@ -70,6 +70,13 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
         exit(3);
     }
     console(grants, b"wintest: shown\n");
+    // Input byte 3 = 1: the exact-mode test (SANDBOX.md, "Modes"): read 30 MiB past the 20 MiB static, beyond the limit. Built in exact mode the address is poisoned and the read ends in a data abort; in any other mode it wraps inside the arc and returns.
+    if inp.len() > 3 && inp[3] == 1 {
+        let far = unsafe { (&raw const BULK as *const u64).add((30 << 20) / 8) };
+        console(grants, b"wintest: reading past the limit\n");
+        let v = unsafe { core::ptr::read_volatile(far) };
+        console(grants, if v == 0 { b"wintest: the read past the limit returned 0\n" as &[u8] } else { b"wintest: the read past the limit returned data\n" });
+    }
     // Input byte 2 = 1: the BTI test (SANDBOX.md, "BTI"): call `landing` four bytes past its entry, past its `bti c`. Built with BTI and run on guarded pages, this must end in a branch-target exception (EC G#0D); without BTI it simply returns.
     if inp.len() > 2 && inp[2] == 1 {
         let entry = unsafe { core::ptr::read_volatile(&(landing as extern "C" fn() -> u64)) } as usize;

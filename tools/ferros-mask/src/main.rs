@@ -62,6 +62,8 @@ struct Out {
     fixed: Option<u32>,
     /// BTI (SANDBOX.md, "BTI"): every return becomes `br x30` and every call is followed by `bti j`, so a return lands only right after a call; rustc's `-Z branch-protection=bti` puts `bti c` at function entries and `bti j` at jump-table targets.
     bti: bool,
+    /// Exact mode (SANDBOX.md, "Modes"): addresses checked by the subtract and unsigned compare, flag-free, into x26 (all ones when out of bounds, which never maps); used from x26 directly as in fixed mode. Needs `bti`.
+    exact: bool,
 }
 
 impl Out {
@@ -77,7 +79,16 @@ impl Out {
         }
         self.sp_from_x24();
     }
+    /// Whether accesses go through x26 as an address (fixed and exact) rather than x28 + x26 (ring).
+    fn direct(&self) -> bool {
+        self.fixed.is_some() || self.exact
+    }
     fn sp_from_x24(&mut self) {
+        if self.exact {
+            self.safe("x24");
+            self.ins("mov sp, x26");
+            return;
+        }
         match self.fixed {
             None => {
                 self.ins("and x26, x24, x27");
@@ -91,6 +102,14 @@ impl Out {
     }
     /// `src` made safe: ring mode the masked offset in x26, fixed mode the address itself in x26.
     fn safe(&mut self, src: &str) {
+        if self.exact {
+            // offset = addr - base; negative iff offset < limit; top bit set iff bad (below base, or at or past the limit); the address, or all ones.
+            self.ins(&format!("sub x25, {src}, x28"));
+            self.ins("sub x26, x25, x27");
+            self.ins("orn x26, x25, x26");
+            self.ins(&format!("orr x26, {src}, x26, asr #63"));
+            return;
+        }
         match self.fixed {
             None => self.ins(&format!("and x26, {src}, x27")),
             Some(k) => self.ins(&format!("bfi x26, {src}, #0, #{k}")),
@@ -177,7 +196,7 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
         if let Some(v) = neg {
             o.ins(&format!("sub x24, {base}, #{}", -v));
             o.safe("x24");
-            if o.fixed.is_some() {
+            if o.direct() {
                 access(o, "[x26]");
             } else if has_reg_offset(mnem) {
                 access(o, "[x28, x26]");
@@ -197,8 +216,8 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
         let imm = if inner.len() == 2 && is_imm(&inner[1]) && !writeback_pre { Some(inner[1].as_str()) } else { None };
         match imm {
             // Fixed mode: x26 is the address; the immediate, when there is one, stays on the access.
-            None if o.fixed.is_some() => access(o, "[x26]"),
-            Some(i) if o.fixed.is_some() => access(o, &format!("[x26, {i}]")),
+            None if o.direct() => access(o, "[x26]"),
+            Some(i) if o.direct() => access(o, &format!("[x26, {i}]")),
             None if has_reg_offset(mnem) => access(o, "[x28, x26]"),
             None => {
                 o.ins("add x25, x28, x26");
@@ -235,13 +254,18 @@ fn main() {
         std::process::exit(2)
     }));
     let bti = args.iter().any(|a| a == "--bti");
-    let args: Vec<String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && *a != "--bti" && !(fixed.is_some() && *i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a.clone()).collect();
+    let exact = args.iter().any(|a| a == "--exact");
+    if exact && (!bti || fixed.is_some()) {
+        eprintln!("--exact needs --bti, and is not --fixed");
+        std::process::exit(2);
+    }
+    let args: Vec<String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && *a != "--bti" && *a != "--exact" && !(fixed.is_some() && *i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a.clone()).collect();
     if args.len() != 3 {
         eprintln!("usage: ferros-mask <in.s> <out.s> [--fixed K]");
         std::process::exit(2);
     }
     let src = std::fs::read_to_string(&args[1]).expect("read input");
-    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0, fixed, bti };
+    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0, fixed, bti, exact };
     for (n, line) in src.lines().enumerate() {
         let code = line.split("//").next().unwrap_or("");
         let t = code.trim();

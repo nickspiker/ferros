@@ -243,3 +243,31 @@ fn fixed_mode() {
     refuses("bfi x26, x8, #0, #17", Refusal::WritesInvariantRegister);
     refuses("mov sp, x26", Refusal::WritesInvariantRegister);
 }
+
+fn image(src: &str) -> Vec<u8> {
+    assemble(src).iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// Exact mode (SANDBOX.md, "Modes"): the four-instruction sequence is the only writer of x26, only in a BTI image, and no direct branch may land inside it.
+#[test]
+fn exact_mode() {
+    use ferros_sandbox::{check_image_with, Mode};
+    let seq = "sub x25, x8, x28\nsub x26, x25, x27\norn x26, x25, x26\norr x26, x8, x26, asr #63\n";
+    assert_eq!(one("sub x25, x8, x28") & 0xFFFF_FC1F, ferros_sandbox::EXACT_0);
+    assert_eq!(one("sub x26, x25, x27"), ferros_sandbox::EXACT_1);
+    assert_eq!(one("orn x26, x25, x26"), ferros_sandbox::EXACT_2);
+    assert_eq!(one("orr x26, x8, x26, asr #63") & 0xFFFF_FC1F, ferros_sandbox::EXACT_3);
+    let ok = image(&format!("{seq}ldr x0, [x26]\nstr q0, [x26, #16]\nmov sp, x26\nbr x30\n"));
+    assert!(check_image_with(&ok, Mode::Exact, true).is_ok(), "a sequence and its accesses");
+    assert!(check_image_with(&ok, Mode::Exact, false).is_err(), "exact needs BTI");
+    let into = image(&format!("b 1f\n{}1:\n{}", "sub x25, x8, x28\nsub x26, x25, x27\n", "orn x26, x25, x26\norr x26, x8, x26, asr #63\nldr x0, [x26]\nbr x30\n"));
+    assert!(check_image_with(&into, Mode::Exact, true).is_err(), "a branch into the sequence");
+    let partial = image("sub x25, x8, x28\nsub x26, x25, x27\norn x26, x25, x26\nldr x0, [x26]\nbr x30\n");
+    assert!(check_image_with(&partial, Mode::Exact, true).is_err(), "a partial sequence");
+    let other = image("sub x25, x8, x28\nsub x26, x25, x27\norn x26, x25, x26\norr x26, x9, x26, asr #63\nbr x30\n");
+    assert!(check_image_with(&other, Mode::Exact, true).is_err(), "a different register in the last");
+    let ret = image(&format!("{seq}ldr x0, [x26]\nret\n"));
+    assert!(check_image_with(&ret, Mode::Exact, true).is_err(), "ret in a BTI image");
+    let bfi = image("bfi x26, x8, #0, #17\nbr x30\n");
+    assert!(check_image_with(&bfi, Mode::Exact, true).is_err(), "the fixed writer in exact mode");
+}

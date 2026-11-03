@@ -32,6 +32,8 @@ pub enum Refusal {
 pub enum Mode {
     Ring,
     Fixed(u32),
+    /// The subtract and unsigned compare (SANDBOX.md, "Modes"): x28 the base, x27 the limit, x26 written only by the four-instruction sequence `sub x25, xA, x28` / `sub x26, x25, x27` / `orn x26, x25, x26` / `orr x26, xA, x26, asr #63`, so x26 is xA when xA is in [base, base + limit) and all ones (unmapped) otherwise. Only in a BTI image, where no indirect branch can land inside the sequence, and no direct branch may.
+    Exact,
 }
 
 /// A refusal at a byte offset into the image.
@@ -63,6 +65,11 @@ pub const fn bfi_x26(k: u32) -> u32 {
     0xB340_001A | (k - 1) << 10
 }
 pub const MOV_SP_X26: u32 = 0x9100_035F;
+/// Exact mode's sequence (Rn of the first and last in bits 9:5, the same register in both).
+pub const EXACT_0: u32 = 0xCB1C_0019; // sub x25, xA, x28
+pub const EXACT_1: u32 = 0xCB1B_033A; // sub x26, x25, x27
+pub const EXACT_2: u32 = 0xAA3A_033A; // orn x26, x25, x26
+pub const EXACT_3: u32 = 0xAA9A_FC1A; // orr x26, xA, x26, asr #63
 /// The handle pair's writers: `ldp x23, x22, [x28, #imm]` with imm a slot's pair in the handle table, the grants page's first 512 bytes (offset form, imm7 even and under 64: slot k at 16k), and `and x21, xN, x22`.
 pub const LDP_HANDLE: u32 = 0xA940_5B97; // ldp x23, x22, [x28, #0]  (imm7 in bits 21:15)
 const LDP_HANDLE_MASK: u32 = 0xFFC0_7FFF;
@@ -118,6 +125,12 @@ pub fn check_in(i: u32, m: Mode) -> Result<(), Refusal> {
         // x26 is an absolute address in the arc in fixed mode: the ring forms (an offset in x26, x25 from it, sp from x28 + x26) would break it, so they are refused with every other write.
         Mode::Fixed(k) => {
             if (16..=40).contains(&k) && (i & AND_X26_MASK == bfi_x26(k) || i == MOV_SP_X26) {
+                return Ok(());
+            }
+        }
+        // The sequence's four instructions are accepted only as a whole, by `check_image_with`; alone each writes x25 or x26 and is refused below.
+        Mode::Exact => {
+            if i == MOV_SP_X26 {
                 return Ok(());
             }
         }
@@ -231,7 +244,7 @@ fn system(i: u32) -> Result<(), Refusal> {
 fn imm_base(n: u32, m: Mode) -> Result<(), Refusal> {
     let addr = match m {
         Mode::Ring => ADDR,
-        Mode::Fixed(_) => OFF,
+        Mode::Fixed(_) | Mode::Exact => OFF,
     };
     if n == addr || n == R31 {
         Ok(())
@@ -382,6 +395,30 @@ pub fn check_image_in(code: &[u8], m: Mode) -> Result<usize, Violation> {
     check_image_with(code, m, false)
 }
 
+/// A direct branch's target as an instruction index from `k`, if `i` is one (B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ).
+fn branch_target(i: u32, k: usize) -> Option<isize> {
+    let sext = |v: u32, bits: u32| ((v << (32 - bits)) as i32 >> (32 - bits)) as isize;
+    let off = if (i >> 26) & 0x1F == 0b00101 {
+        sext(i & 0x3FF_FFFF, 26)
+    } else if (i >> 24) & 0xFF == 0b0101_0100 || (i >> 25) & 0x3F == 0b011010 {
+        sext((i >> 5) & 0x7_FFFF, 19)
+    } else if (i >> 25) & 0x3F == 0b011011 {
+        sext((i >> 5) & 0x3FFF, 14)
+    } else {
+        return None;
+    };
+    Some(k as isize + off)
+}
+
+/// The register an exact sequence checks, if `w[0..4]` is one: the same xA in the first and last, not x25-x28 or 31.
+fn exact_sequence(w: &[u32]) -> Option<u32> {
+    if w.len() < 4 || w[0] & AND_X26_MASK != EXACT_0 || w[1] != EXACT_1 || w[2] != EXACT_2 || w[3] & AND_X26_MASK != EXACT_3 {
+        return None;
+    }
+    let a = rn(w[0]);
+    (rn(w[3]) == a && !matches!(a, 25..=28 | 31)).then_some(a)
+}
+
 /// RET in any form (BTI capsules return with `br x30`, whose target must be a landing pad).
 fn is_ret(i: u32) -> bool {
     i & 0xFFFF_FC1F == 0xD65F_0000
@@ -389,6 +426,9 @@ fn is_ret(i: u32) -> bool {
 
 /// Check a whole image under `m`; with `bti` (SANDBOX.md, "BTI") the image runs on guarded pages, where every indirect branch must land on a `bti` landing pad, and a return is refused unless it is `br x30` (RET is not checked by the hardware, so a forged x30 could land anywhere).
 pub fn check_image_with(code: &[u8], m: Mode, bti: bool) -> Result<usize, Violation> {
+    if m == Mode::Exact {
+        return check_exact(code, bti);
+    }
     let mut n = 0;
     // The image header (ferros_rt start.rs, the payloads' entry stubs): a pad word at 4, "ferrosRT" at 8, then five words to 56, data the kernel reads, never executed (the entry at 0 branches over it).
     let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
@@ -404,4 +444,61 @@ pub fn check_image_with(code: &[u8], m: Mode, bti: bool) -> Result<usize, Violat
         n += 1;
     }
     Ok(n)
+}
+
+/// Exact mode's image check: BTI required; every write to x26 is the last instruction of an exact sequence; no direct branch targets the second, third or fourth instruction of one (indirect branches cannot: BTI admits them only at landing pads, and the sequence holds none).
+fn check_exact(code: &[u8], bti: bool) -> Result<usize, Violation> {
+    let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
+    let words: alloc_free::Words = alloc_free::Words(code);
+    let n = code.len() / 4;
+    let word = |k: usize| words.at(k);
+    let skip = |k: usize| header && (1..14).contains(&k);
+    if !bti {
+        return Err(Violation { offset: 0, insn: 0, why: Refusal::System });
+    }
+    // Every direct branch target that lands inside a sequence (pass one: the sequences; pass two: the branches).
+    let inside = |t: isize| -> bool {
+        if t < 1 || t as usize >= n {
+            return false;
+        }
+        let t = t as usize;
+        (1..=3).any(|d| t >= d && !skip(t - d) && exact_sequence(&[word(t - d), word((t - d + 1).min(n - 1)), word((t - d + 2).min(n - 1)), word((t - d + 3).min(n - 1))]).is_some() && t - d + 3 < n)
+    };
+    let mut k = 0;
+    let mut count = 0;
+    while k < n {
+        if skip(k) {
+            k += 1;
+            continue;
+        }
+        let insn = word(k);
+        if k + 3 < n && exact_sequence(&[insn, word(k + 1), word(k + 2), word(k + 3)]).is_some() {
+            k += 4;
+            count += 4;
+            continue;
+        }
+        check_in(insn, Mode::Exact).map_err(|why| Violation { offset: 4 * k, insn, why })?;
+        if is_ret(insn) {
+            return Err(Violation { offset: 4 * k, insn, why: Refusal::System });
+        }
+        if let Some(t) = branch_target(insn, k) {
+            if inside(t) {
+                return Err(Violation { offset: 4 * k, insn, why: Refusal::AddressForm });
+            }
+        }
+        k += 1;
+        count += 1;
+    }
+    Ok(count)
+}
+
+mod alloc_free {
+    /// An image's little-endian words without allocating (the checker is no_std and allocation-free).
+    pub struct Words<'a>(pub &'a [u8]);
+    impl Words<'_> {
+        pub fn at(&self, k: usize) -> u32 {
+            let b = &self.0[4 * k..4 * k + 4];
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        }
+    }
 }

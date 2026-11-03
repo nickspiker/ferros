@@ -188,6 +188,8 @@ pub struct Arc {
     pub block: usize,
     /// A masked arc's guard above it (GUARD bytes at base + size, kernel-only pages), 0 for a native arc.
     pub guard: usize,
+    /// Exact mode's limit (SANDBOX.md, "Modes"): checked code reaches [base, base + limit); 0 in the other modes, whose x27 is the mask.
+    pub limit: usize,
 }
 
 /// The guard above a masked arc: the reach of an immediate offset past its last byte (SANDBOX.md: 65520 + 15).
@@ -196,6 +198,14 @@ const GUARD: usize = 64 << 10;
 impl Arc {
     pub fn mask(&self) -> usize {
         self.size - 1
+    }
+    /// What a process's x27 holds: exact mode's limit, or the mask.
+    pub fn x27(&self) -> usize {
+        if self.limit != 0 { self.limit } else { self.size - 1 }
+    }
+    /// The top of what the process may use (its first stack is just under it): the limit in exact mode, the arc's end otherwise.
+    pub fn top(&self) -> usize {
+        self.base + if self.limit != 0 { self.limit } else { self.size }
     }
 }
 
@@ -214,7 +224,7 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
     };
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, want) };
     if !masked {
-        return Some(Arc { base, size: want, block, guard: 0 });
+        return Some(Arc { base, size: want, block, guard: 0, limit: 0 });
     }
     // The doubled block is kept only for its alignment: the arc, then a 64 KiB guard nobody can read (its pages kernel-only, so neither another process nor stale data from an arc freed there is in reach), and the rest of the upper half back to the pool as aligned chunks (64 KiB at S + 64 KiB, 128 KiB at S + 128 KiB, ... S/2 at S + S/2). A 128 MiB arc costs 128 MiB and 64 KiB, not 256 MiB.
     crate::cachemap::guard_pages(base + want, GUARD, true);
@@ -224,7 +234,7 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
         a.free[piece.trailing_zeros() as usize].push(base + want + piece);
         piece <<= 1;
     }
-    Some(Arc { base, size: want, block: want, guard: GUARD })
+    Some(Arc { base, size: want, block: want, guard: GUARD, limit: 0 })
 }
 
 /// Return an arc to its pool, merging buddies; a masked arc's guard goes back with it.
@@ -1264,7 +1274,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             frame.elr = p.arc.base as u64 + (entry & m);
             frame.sp_el0 = p.arc.base as u64 + (stack & m & !15);
             frame.x[28] = p.arc.base as u64;
-            frame.x[27] = m;
+            frame.x[27] = p.arc.x27() as u64;
             frame.x[26] = p.arc.base as u64;
             frame.x[0] = arg;
             let mask = t.mask;
@@ -2316,7 +2326,7 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8)
+    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -2325,7 +2335,7 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
     if !g.masked {
         return Err("install: only masked capsules are installed");
     }
-    let mode = if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
+    let mode = if g.exact { ferros_sandbox::Mode::Exact } else if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
     ferros_sandbox::check_image_with(&g.code[..g.text_len], mode, g.bti).map_err(|_| "install: masked code failed the sandbox checker")?;
     crate::oracle::seal(&g).ok_or("no system secret: cannot seal")
 }
@@ -2406,7 +2416,7 @@ fn launch(built: Result<(usize, Arc, usize), &'static str>, input_len: usize) ->
     cur_set(Some(me));
     unlock();
     arm_slice();
-    unsafe { ferros_el0_enter(arc.base + CODE, arc.base + arc.size - 16, arc.base, arc.mask(), GRANTS as u64, in_off as u64, input_len as u64) };
+    unsafe { ferros_el0_enter(arc.base + CODE, arc.top() - 16, arc.base, arc.x27(), GRANTS as u64, in_off as u64, input_len as u64) };
     disarm_slice();
     lock();
     let kk = k();
@@ -2481,14 +2491,18 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     let tail = image_tail(code);
-    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages).
-    let (fixed, bti) = (fixed & 0xFF, fixed >> 8 & 1 == 1);
+    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages), bit 9 exact mode.
+    let (fixed, bti, exact) = (fixed & 0xFF, fixed >> 8 & 1 == 1, fixed >> 9 & 1 == 1);
     let need = CODE + code.len() + tail + inline + STACK;
     // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes.
     if fixed != 0 && need > 1 << fixed {
         return Err("spawn: the image does not fit its fixed arc");
     }
-    let arc = arc_alloc(if fixed != 0 { 1 << fixed } else { need }, masked).ok_or("arc pool exhausted")?;
+    let mut arc = arc_alloc(if fixed != 0 { 1 << fixed } else { need }, masked).ok_or("arc pool exhausted")?;
+    // Exact mode: the limit is what the image needs, rounded to the 16 bytes the stack pointer must keep; the arc around it is the power of two the pool hands out, its rest the room the limit can grow into.
+    if exact {
+        arc.limit = (need + 15) & !15;
+    }
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
     build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len, bti)
 }
@@ -2533,10 +2547,10 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
     let mut frame = zero;
     frame.elr = (arc.base + CODE) as u64;
-    frame.sp_el0 = (arc.base + arc.size - 16) as u64;
+    frame.sp_el0 = (arc.top() - 16) as u64;
     frame.spsr = 0;
     frame.x[28] = arc.base as u64;
-    frame.x[27] = arc.mask() as u64;
+    frame.x[27] = arc.x27() as u64;
     // Fixed mode's address register starts at the base: its bits above K are the base's for good, since only `bfi x26, xN, #0, #K` writes it.
     frame.x[26] = arc.base as u64;
     frame.x[0] = GRANTS as u64;
@@ -2572,7 +2586,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8)?;
+    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)?;
     enqueue_back(me);
     Ok(me)
 }
