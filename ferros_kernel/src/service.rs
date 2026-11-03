@@ -1161,6 +1161,14 @@ pub fn run(mut b: Boot) -> ! {
                 let r = |base: usize| unsafe { core::ptr::read_volatile((base + c * 8) as *const u64) };
                 platform::pstore(alloc::format!("core {}: step {} at G#{:X}, arrived G#{:X}, hv G#{:X} G#{:X}\n", c, r(0xFD60_0B00) & 0xFF, r(0xFD60_0B00) & !0xFF, r(0xFD60_0B80), r(0xFD60_0C00), r(0xFD60_0C80)).as_bytes());
             }
+            // The hand-over blocks the X3 (G#819F_F100) and the workers (G#819F_F200 + k * G#80) read with their MMU off, beside this core's own registers: the jump freezes Android's CPUs but not its DMA masters, so a block that differs from what was written says a device wrote into ferros's memory (the theory for the 2026-11-03 jumps whose cores died before their first Rust line).
+            let (mair, tcr, ttbr, sctlr, hcr): (u64, u64, u64, u64, u64);
+            unsafe { core::arch::asm!("mrs {a}, mair_el2", "mrs {b}, tcr_el2", "mrs {c}, ttbr0_el2", "mrs {d}, sctlr_el2", "mrs {e}, hcr_el2", a = out(reg) mair, b = out(reg) tcr, c = out(reg) ttbr, d = out(reg) sctlr, e = out(reg) hcr) };
+            platform::pstore(alloc::format!("live: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X}\n", mair, tcr, ttbr, sctlr, hcr).as_bytes());
+            for (name, base) in [("x3", 0x819F_F100usize), ("w0", 0x819F_F200), ("w1", 0x819F_F280), ("w2", 0x819F_F300), ("w3", 0x819F_F380)] {
+                let r = |o: usize| unsafe { core::ptr::read_volatile((base + o) as *const u64) };
+                platform::pstore(alloc::format!("{}: mair G#{:X} tcr G#{:X} ttbr G#{:X} sctlr G#{:X} hcr G#{:X} vbar G#{:X} cptr G#{:X} stack G#{:X} cnthctl G#{:X}\n", name, r(0), r(8), r(16), r(24), r(32), r(40), r(48), r(56), r(88)).as_bytes());
+            }
             platform::pstore(&crate::process::take_console());
             platform::reboot();
         }
