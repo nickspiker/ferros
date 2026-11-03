@@ -2090,6 +2090,14 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     (b & 1 << 48) | ch(0) | ch(16) | ch(32)
                 };
                 let q = |v: u16| if v == 0xFFFF { 65536 } else { v as u64 };
+                // Coverage is an area, so it weighs light, and a working value is a gamma-2 code: the covered mix is on the squares, back to a code by the root (what the circle did before the plan: the value by the root of its coverage, over black). The hairline's weight stays on the codes, as it was drawn and judged (owner, 2026-11-02).
+                let mixl = |a: u64, b: u64, wb: u64| {
+                    let ch = |sh: u32| {
+                        let (la, lb) = ((a >> sh & 0xFFFF) * (a >> sh & 0xFFFF), (b >> sh & 0xFFFF) * (b >> sh & 0xFFFF));
+                        (libm::sqrt(((la * (65536 - wb) + lb * wb) >> 16) as f64) as u64) << sh
+                    };
+                    (b & 1 << 48) | ch(0) | ch(16) | ch(32)
+                };
                 px[xa..xb.min(cl)].copy_from_slice(&crow[xa..xb.min(cl)]);
                 if xa.max(cr) < xb {
                     px[xa.max(cr)..xb].copy_from_slice(&crow[xa.max(cr)..xb]);
@@ -2104,7 +2112,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                         continue;
                     }
                     let p = px[x];
-                    px[x] = mix(crow[x], mix(p, line, q(h)), q(c));
+                    px[x] = mixl(crow[x], mix(p, line, q(h)), q(c));
                 }
                 for x in xa..xb.min(ml) {
                     px[x] = EDGE_MASK;
@@ -2118,7 +2126,7 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                         continue;
                     }
                     let p = px[x];
-                    px[x] = mix(EDGE_MASK, mix(p, edge_line, q(h)), q(c));
+                    px[x] = mixl(EDGE_MASK, mix(p, edge_line, q(h)), q(c));
                 }
             }
         }
