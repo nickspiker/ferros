@@ -83,6 +83,45 @@ The owner's direction: "we will need to support full compositing. How do we main
 - **Cost.** Nothing where no layer uses a mode or an alpha: the copy and the select are what the server did before. A moded or alpha slice is a few integer operations per channel, on that slice alone. A moded window can never become a hardware plane later (DECON blends with alpha only); the rest of the model does not care.
 - **The glass's shape** (the circle and the edge, `plan_glass`) applies after the spans, as the last layer of all.
 
+## The corners: controls and gestures (proposed 2026-11-02, the owner sleeping on it, nothing built)
+
+The owner's question: "controls. could be zero, could be a hundred. back, recents, home, search... should we? gestures?" The proposal is close to zero, with the four corners doing what is left, because the map already is most of it.
+
+**What the map already is**
+
+- **Home** is the map. An app is one of its circles opened in front; leaving the app is closing the circle, and the map is there with no transition.
+- **Recents** is the map too: the circles that are open look open. A task switcher would be a second, worse map.
+- **Search** is typing on the map: the keyboard is shape writing, so writing a name on the map filters its circles. No button, no search bar.
+- **Back** belongs to the app. Android's system back exists because apps could not be trusted to draw their own; a fluor app draws its own way back. The exception is APKs (decision 0).
+
+**Why the corners, and only the corners**
+
+The corners outside the circle are the system's by construction: no app surface ever covers them, so a touch there can never be stolen by a fullscreen game or a misbehaving app. That makes them the escape hatch every OS needs, without a button. Each corner does the one thing it shows:
+
+- Top left, the clock: time, alarms, the zone.
+- Top right, the radios: connections, WiFi join, airplane.
+- Bottom left, the battery: power, brightness.
+- Bottom right: home. A tap from anywhere and the map is there. The only navigation control, and enough, because the map is home, recents and search at once.
+
+Four corners, four things, nothing to learn. Hardware stays what it is: power wakes under the proximity gate, the volume pair is the killswitch chord and volume.
+
+**Gestures**
+
+Geometric ones only and nothing timed (the standing rule: no long press, no double tap, no swipe that depends on speed):
+
+- Pinch an app down to close its circle: home by gesture, the same operation as the corner.
+- Two fingers turn a circle over for its back and settings, as the map does now.
+- Drag to pan the map.
+- A drag that begins outside the circle is the system's by the same ownership rule: room later for an edge slider (volume, brightness) no app can collide with.
+- No edge swipes from the glass edge: they collide with the screen's own mask and the apps' content, and they are the gesture most often triggered by accident.
+
+**Decisions**
+
+0. **APK back.** Android apps need a back signal. Either bottom right means back while an APK is in front and home from an APK's top screen (what Android's gesture ends up doing), or the APK runtime draws a small back control inside the APK's window and the corner stays home everywhere. Proposed: the second, one meaning per corner.
+1. **Home as a tap, a pinch, or both.** Proposed: both; they are the same operation and neither is timed.
+
+**Build order, once decided:** the bottom-right tap (one corner hit test and a done op), then the pinch, then the other three corners as their pages exist (ATTEST-UI.md's indicators give the top right and bottom left their faces first).
+
 ## Order of work
 
 1. Done: map frames kept off the glass under an app; text at op 26; the map stands aside for any app in front.
