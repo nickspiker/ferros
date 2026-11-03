@@ -320,6 +320,31 @@ pub fn mark_trail(m: u8) {
 }
 
 /// The low two bits say how far: 1 into Rust, before `cpu_inform_clear`'s firmware call; 2 past it (`note_arrival_step(2)`). The seventh jump of 2026-11-03: the X3 took its entry with an intact hand-over block and never wrote the arrival, and that call came first.
+/// The last session's hand-off words for cores 4-8, into the pstore ring before this boot starts any core over them (no heap yet): per core the arrival word (G#11-G#17: the entry step it reached; a counter: Rust, low bits 1 or 2) and the hv's two trace words. The ninth jump of 2026-11-03 froze at its first TRNG call with the X3 launched, and the cold boot after it overwrote the X3's marks.
+pub fn pstore_prev_handoff() {
+    let mut line = [0u8; 5 * 60 + 32];
+    let mut n = 0;
+    let mut put = |b: &[u8], n: &mut usize| {
+        line[*n..*n + b.len()].copy_from_slice(b);
+        *n += b.len();
+    };
+    put(b"ferros: last session's hand-off:", &mut n);
+    for c in 4..9usize {
+        put(&[b' ', b'c', b'0' + c as u8], &mut n);
+        for base in [0xFD60_0B80usize, 0xFD60_0C80, 0xFD60_0C00] {
+            let v = unsafe { read_volatile((base + c * 8) as *const u64) };
+            let mut h = [b' '; 17];
+            for k in 0..16 {
+                let d = (v >> (60 - 4 * k)) & 0xF;
+                h[k + 1] = if d < 10 { b'0' + d as u8 } else { b'A' + d as u8 - 10 };
+            }
+            put(&h, &mut n);
+        }
+    }
+    put(b"\n", &mut n);
+    pstore(&line[..n]);
+}
+
 pub fn note_arrival() {
     note_arrival_step(1);
 }

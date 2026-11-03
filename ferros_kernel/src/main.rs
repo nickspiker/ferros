@@ -1762,6 +1762,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot. Then whether this boot is the jump from Android, before anything starts a core (platform::start_core). Both were first written into the shim's kernel_main by mistake, so the jumps of 2026-11-02 started parked cores with PSCI.
     platform::pstore(b"\nferros: entry\n");
+    platform::pstore_prev_handoff();
     platform::mark_trail(0);
     platform::detect_jump();
     platform::pstore(if platform::jumped() { b"ferros: started by the jump from Android\n" as &[u8] } else { b"ferros: not a jump\n" });
