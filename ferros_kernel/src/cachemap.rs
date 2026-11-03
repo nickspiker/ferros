@@ -113,6 +113,8 @@ pub const SURFACES: (usize, usize) = (0xCA00_0000, 0xD200_0000);
 pub const SURFACES: (usize, usize) = (0, 0);
 /// One surface's size: a power of two that holds a full panel.
 pub const SURFACE_SIZE: usize = 32 << 20;
+/// The first 64 bytes of every surface are a porch nobody draws in (SANDBOX.md, "Handles"): a surface's handle spans its whole 32 MiB, and an access through it at the last offset reads up to its width less one byte past the end (63 for a structure load), into the next surface. With the porch that lands in the next surface's porch, never in its pixels. A process is told its surface 64 bytes in (SYS_DMA), so pixel 0 is at the porch's end for native pointers and handle offsets alike; a screen's pixels (1344 x 2992 x 8 bytes) fit the rest.
+pub const SURFACE_PORCH: usize = 64;
 
 /// The display's sprite cache (cold only): 32 MiB of Normal write-back, EL0 read/write, never executable memory in the same GiB, 32 MiB clear of the apps' surface (in case the bootloader's modem image runs past it): every circle's drawn pixels, kept while its size and turn stay, so a pan blits rather than redraws. A screen packed with circles needs ~20 MB of square sprites; the 6 MiB the display's heap could spare thrashed at 200 circles (2026-10-24: every icon redrawn every frame, 11 ms). Free per the device tree (the first carveout in this GiB is G#E800_0000). Granted as the region `display-sprites`.
 #[cfg(not(shim_handoff))]

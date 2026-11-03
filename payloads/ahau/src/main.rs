@@ -246,19 +246,21 @@ impl Ahau {
 
     /// Rows y0..y1 of the buffer onto the shown surface.
     fn present(&self, y0: usize, y1: usize) {
-        Front::write_words((y0 * self.w * 8) as u64, &self.surf()[y0 * self.w..y1 * self.w]);
+        Front::write_words(window::PORCH + (y0 * self.w * 8) as u64, &self.surf()[y0 * self.w..y1 * self.w]);
     }
 
     /// Rows y0..y1 of the buffer onto surface `tb` (the second surface or the shown one), for the display to draw text into.
     fn put_rows(&self, tb: u64, y0: usize, y1: usize) {
         let rows = &self.surf()[y0 * self.w..y1 * self.w];
-        if tb == self.back && self.back != 0 { BackS::write_words((y0 * self.w * 8) as u64, rows) } else { Front::write_words((y0 * self.w * 8) as u64, rows) }
+        let off = window::PORCH + (y0 * self.w * 8) as u64;
+        if tb == self.back && self.back != 0 { BackS::write_words(off, rows) } else { Front::write_words(off, rows) }
     }
 
     /// Rows y0..y1 back from surface `tb` into the buffer, with what the display drew there.
     fn get_rows(&self, tb: u64, y0: usize, y1: usize) {
         let rows = &mut self.surf()[y0 * self.w..y1 * self.w];
-        if tb == self.back && self.back != 0 { BackS::read_words((y0 * self.w * 8) as u64, rows) } else { Front::read_words((y0 * self.w * 8) as u64, rows) }
+        let off = window::PORCH + (y0 * self.w * 8) as u64;
+        if tb == self.back && self.back != 0 { BackS::read_words(off, rows) } else { Front::read_words(off, rows) }
     }
 
     /// The labels recorded by the last keyboard draw, drawn by the display onto surface `tb`.
@@ -754,7 +756,7 @@ impl Ahau {
 
     fn all(&self) {
         self.surf().fill(0);
-        Front::fill64(0, (self.w * self.h) as u64, 0);
+        Front::fill64(window::PORCH, (self.w * self.h) as u64, 0);
         let (cx, cy, r) = self.mark_at();
         draw_mark(self.surf(), self.w, cx, cy, r);
         self.present(cy - r - 2, cy + r + 2);

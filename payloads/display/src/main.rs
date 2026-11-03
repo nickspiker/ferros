@@ -1657,6 +1657,8 @@ static mut APP: Option<draw::Rect> = None;
 static mut SURFS: usize = 1;
 const SURFACES: usize = 4;
 const SURFACE_BYTES: usize = 32 << 20;
+/// The porch before each surface's pixel 0 (the kernel's SURFACE_PORCH): clients name their surface by its address past it.
+const PORCH: usize = 64;
 /// A window (WINDOWS.md), one per surface: the surface's generation when it was shown (the kernel's preference bytes 8-11; a change or a 0 means its process ended), its level (0 an app, 1 input, 2 the system: higher is in front), when it was last shown (later is in front within a level), and the part of the screen it covers. Outside its rectangle, and wherever a pixel has `CLEAR` set, what is behind it shows.
 /// Its surface's `format` says what its pixels are (op 22's optional last byte): 0 the display's own working values (gamma 2, white = Q14, bit 63 see-through); 1 fluor's 16-bit `g2t` (`G2T16`), which the display decodes itself so a fluor app hands its buffer over as it drew it (owner, 2026-10-29: fluor the one compositor, passed straight through).
 #[derive(Clone, Copy)]
@@ -1704,13 +1706,13 @@ static mut CHROME_KEY: i64 = -1;
 
 /// Surface k's pixels.
 fn surface(k: usize, width: usize, height: usize) -> &'static mut [u64] {
-    unsafe { core::slice::from_raw_parts_mut((SURFS + k * SURFACE_BYTES) as *mut u64, width * height) }
+    unsafe { core::slice::from_raw_parts_mut((SURFS + k * SURFACE_BYTES + PORCH) as *mut u64, width * height) }
 }
 
 /// The surface a client names by its base (its own `dma` of the surface it was given). A message from another process: the base is checked, not trusted.
 fn surface_of(base: u64) -> Option<usize> {
     let off = base.wrapping_sub(unsafe { SURFS } as u64) as usize;
-    if off % SURFACE_BYTES == 0 && off / SURFACE_BYTES < SURFACES { Some(off / SURFACE_BYTES) } else { None }
+    if off % SURFACE_BYTES == PORCH && off / SURFACE_BYTES < SURFACES { Some(off / SURFACE_BYTES) } else { None }
 }
 
 /// The windows up, frontmost first: (surface, window), at most four.
@@ -2613,7 +2615,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     log.flush();
     let surf = ferros_sys::dma(cap(grants, S_APPSURF)) as usize;
     if surf != 0 && surf != u64::MAX as usize {
-        unsafe { SURFS = surf };
+        // The four surfaces' start: from init's spawn the grant arrives as one surface, surface 0, answered past its porch; from a restart (the kernel's shell grants) as the whole region at its base. Rounded down to the surface size, both are the region's start (the native display reaches all four from there; masked, it will need the whole region as one grant either way).
+        unsafe { SURFS = surf & !(SURFACE_BYTES - 1) };
     }
     let mut next_flip = now() + freq() / 10;
     // In focus, when the clock is next drawn (10 Hz).

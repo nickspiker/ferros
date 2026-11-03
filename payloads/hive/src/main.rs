@@ -82,7 +82,7 @@ impl Hive {
     /// Rows y0..y1 of the back buffer onto the shown surface, through the handle.
     fn present(&self, y0: usize, y1: usize) {
         let s = self.surf();
-        Surf::write_words((y0 * self.w * 8) as u64, &s[y0 * self.w..y1 * self.w]);
+        Surf::write_words(window::PORCH + (y0 * self.w * 8) as u64, &s[y0 * self.w..y1 * self.w]);
     }
 
     /// The labels recorded by the last draw, drawn by the display onto the shown surface.
@@ -211,7 +211,7 @@ impl Hive {
     fn all(&self) {
         let s = self.surf();
         // The rows above the back buffer, straight onto the surface; the rest through the buffer.
-        Surf::fill64(0, (self.row0() * self.w) as u64, 0);
+        Surf::fill64(window::PORCH, (self.row0() * self.w) as u64, 0);
         s[self.row0() * self.w..].fill(0);
         self.kb.draw(s, &mut self.label());
         self.present(self.row0(), self.h);

@@ -722,6 +722,8 @@ pub mod window {
     pub const SYSTEM: u8 = 2;
     /// A surface pixel that shows what is behind it.
     pub const CLEAR: u64 = 1 << 63;
+    /// The bytes before a surface's pixel 0 (the kernel's SURFACE_PORCH): `dma` answers a surface past them, and a process that reaches its surface through its handle adds them to every offset.
+    pub const PORCH: u64 = 64;
 
     /// Show (or redraw) the window: the part of the screen it covers, its surface's base, its level. True when the display took it.
     pub fn show(display: u64, base: u64, x: u16, y: u16, w: u16, h: u16, level: u8) -> bool {

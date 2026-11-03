@@ -55,15 +55,15 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
     }
     // The surface through its handle (SANDBOX.md, "Handles"): the same instructions native and masked, so this window is the first process that reaches a granted region the way a sandboxed one must.
     type Surf = ferros_sys::Handle<S_SURF>;
-    if Surf::len() < (w * h * 8) as u64 {
+    if Surf::len() < window::PORCH + (w * h * 8) as u64 {
         console(grants, b"wintest: the surface's handle is too small\n");
         exit(4);
     }
-    Surf::fill64(0, (w * h) as u64, 0);
+    Surf::fill64(window::PORCH, (w * h) as u64, 0);
     // A fluor 16-bit pixel: alpha in bits 48-63, then each channel's darkness scaled by alpha (R 32-47, G 16-31, B 0-15). Half-transparent red: alpha G#8000, red no darkness, green and blue full darkness at that alpha.
     let red = (0x8000u64) << 48 | 0x8000 << 16 | 0x8000;
     for y in h / 4..h {
-        Surf::fill64(((y * w + w / 6) * 8) as u64, (w * 5 / 6 - w / 6) as u64, red);
+        Surf::fill64(window::PORCH + ((y * w + w / 6) * 8) as u64, (w * 5 / 6 - w / 6) as u64, red);
     }
     if !window::show_full(display, base, 0, 0, w as u16, h as u16, level, window::G2T16, (0, 0, w as u16, h as u16), mode) {
         console(grants, b"wintest: the display refused the window\n");

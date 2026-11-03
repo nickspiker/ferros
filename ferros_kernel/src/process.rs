@@ -1802,7 +1802,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_DMA => {
             let token = p.read(f.x[0], 32);
             f.x[0] = match p.lookup(&token).map(|i| p.cspace[i].object) {
-                Some(Object::Dma(i)) if DMA[i].size > 0 => DMA[i].base as u64,
+                // A surface is answered past its porch (cachemap SURFACE_PORCH); every other region at its base.
+                Some(Object::Dma(i)) if DMA[i].size > 0 => (DMA[i].base + if DMA[i].name.starts_with("surface-") { crate::cachemap::SURFACE_PORCH } else { 0 }) as u64,
                 _ => ERR,
             };
             0
