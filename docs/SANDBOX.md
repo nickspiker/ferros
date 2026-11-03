@@ -2,6 +2,19 @@
 
 Decided with the owner 2026-10-15. Trust model A: ferros compiles everything it runs and trusts nothing precompiled (KERNEL.md). Strict from day 0: no capsule runs unless the device itself compiled it (today: checked it) and sealed the result.
 
+## Vocabulary (settled with the owner 2026-11-03)
+
+One word per thing, used the same way in the docs, the kernel, ferros_sys and the tools:
+
+- **capsule** — the signed VSF file the gate verifies (ORACLE.md). A capsule is **native** when it carries an `aarch64` section (unchecked machine code: development only, a production build refuses it) or **masked** when it carries a `masked` section (code the emitter rewrote so every access goes through the mask, with the byte count of its instructions).
+- **masked** — the property of a capsule and of the process it becomes: every memory access is `base + (offset & mask)` in the checker's forms, its code pages read-only and executable, everything else non-executable. The same word in the kernel (`spawn`'s and `arc_alloc`'s `masked` flag; it was `guard` until 2026-11-03), in ferros_sys and in the build tools (`tools/ferros-masked-build.sh`, `--masked`).
+- **sealed** — a masked capsule the device has checked once and recorded (its seal, a keyed hash, in the vault's `sealed` list). Only sealed masked capsules run; running one never re-runs the checker.
+- **the sandbox** — the whole mechanism: the checker, the emitter, the mask, W^X, the seal and the handles. "Sandboxed" is a plain-English way to say masked and sealed, not a third state.
+- **arc** — a process's memory: a power of two at a base aligned to it, from one of the two arc pools; its **block** is what the pool gave (2S for a masked arc: the upper half its guard).
+- **grant** — a capability handed at spawn; its **token** sits in the grants page at its **slot** (ferros_sys::cap); the first 32 slots have a **handle**.
+- **handle** — a granted region's (base, mask) pair in the handle table, the only way masked code reaches outside its arc (below, "Handles").
+- **the gate** and **ihi** — the oracle's verification of a capsule and what it writes into the arc (ORACLE.md).
+
 ## Lifecycle: compile once, then run and gun
 
 1. **Install** (once per capsule version). The capsule's signature passes the oracle gate (ORACLE.md). The device compiles it — the toka compiler from bytecode once it exists; until then the *checker* over native code produced by the ferros emitter. A capsule that fails is refused, in dev builds too.

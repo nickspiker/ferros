@@ -195,12 +195,12 @@ impl Arc {
 }
 
 /// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed. `guard` reserves a guard of the arc's own size on each side (a 2S block, SANDBOX.md): the base is 2S-aligned, hence S-aligned, so masking stays a single `and`, and the usable arc never abuts another.
-pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
+pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
     let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
-    let block = if guard { want * 2 } else { want };
+    let block = if masked { want * 2 } else { want };
     // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
     // Both pools carry 4 KiB pages since 2026-11-03, so a masked arc may live in either: the page pool first, the big pool when it is large or the page pool is full.
-    let base = if guard && block < BIG_FROM {
+    let base = if masked && block < BIG_FROM {
         buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
     } else if block >= BIG_FROM {
         buddy_take(arcs_big(), block).or_else(|| buddy_take(arcs(), block))?
@@ -2303,7 +2303,7 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<Outcome, &'static str> {
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
@@ -2315,7 +2315,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
             return Err(e);
         }
     };
-    let built = build(name, code, input, &objects, ihi, guard, exec_len);
+    let built = build(name, code, input, &objects, ihi, masked, exec_len);
     launch(built, input.len())
 }
 
@@ -2449,17 +2449,17 @@ fn image_tail(code: &[u8]) -> usize {
 }
 
 /// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
-fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     let tail = image_tail(code);
-    let arc = arc_alloc(CODE + code.len() + tail + inline + STACK, guard).ok_or("arc pool exhausted")?;
+    let arc = arc_alloc(CODE + code.len() + tail + inline + STACK, masked).ok_or("arc pool exhausted")?;
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
-    build_from(name, arc, code.len(), input, objects, ihi, guard, exec_len)
+    build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len)
 }
 
 /// The process in an arc that already holds its code at the code offset (`build` copied it; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
-fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, guard: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len) });
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -2492,7 +2492,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
-    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !guard);
+    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !masked);
     // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
     crate::cachemap::grants_page(arc.base, false);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
