@@ -741,7 +741,7 @@ ferros_el0_enter:
     mov     x23, xzr
     mov     x24, xzr
     mov     x25, xzr
-    mov     x26, xzr
+    mov     x26, x28               // fixed mode's address register starts at the arc base (SANDBOX.md, "Modes"); ring mode rewrites it before any use
     mov     x29, xzr
     mov     x30, xzr
     movi    v0.16b, #0
