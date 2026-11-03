@@ -2458,9 +2458,18 @@ mod hvcore {
         let exit = smc(0x8200_1012, 1, 0, 0);
         let (mut hi, mut he) = ([0u8; 16], [0u8; 16]);
         super::pstore::log(&[b"ferros hv: jump -- TRNG INIT ", super::pstore::hex(init, &mut hi), b" EXIT ", super::pstore::hex(exit, &mut he), b"\nferros hv: jump -- TRNG_RND64 probe\n"]);
-        let rnd = smc(0xC400_0053, 192, 0, 0);
-        let mut hr = [0u8; 16];
-        super::pstore::log(&[b"ferros hv: jump -- TRNG_RND64 answered ", super::pstore::hex(rnd, &mut hr), b"\n"]);
+        // 64 calls (about the self-test's volume), a line every 8: the third jump's single probe answered and so did ferros's first call, then ferros's second never returned; a hang partway here says the firmware's TRNG goes bad after Android whoever asks, all 64 says it is ferros's.
+        let mut rnd = 0u64;
+        for k in 0..64u64 {
+            rnd = smc(0xC400_0053, 192, 0, 0);
+            if k % 8 == 7 || rnd != 0 {
+                let (mut hk, mut hr) = ([0u8; 16], [0u8; 16]);
+                super::pstore::log(&[b"ferros hv: jump -- TRNG_RND64 call ", &super::pstore::hex(k + 1, &mut hk)[14..16], b" answered ", super::pstore::hex(rnd, &mut hr), b"\n"]);
+            }
+            if rnd != 0 {
+                break;
+            }
+        }
         // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
