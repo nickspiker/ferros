@@ -197,8 +197,9 @@ pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
     let block = want * 2;
     let _ = guard;
     // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
-    let base = if guard {
-        buddy_take(arcs(), block)?
+    // Both pools carry 4 KiB pages since 2026-11-03, so a masked arc may live in either: the page pool first, the big pool when it is large or the page pool is full.
+    let base = if guard && block < BIG_FROM {
+        buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
     } else if block >= BIG_FROM {
         buddy_take(arcs_big(), block).or_else(|| buddy_take(arcs(), block))?
     } else {

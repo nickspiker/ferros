@@ -976,3 +976,24 @@ impl<const SLOT: u64> Handle<SLOT> {
         };
     }
 }
+
+impl<const SLOT: u64> Handle<SLOT> {
+    /// `words` into the region from `off`: a frame's rows from a buffer in the arc to a surface, the pair selected once per word (the load from the arc is ordinary masked code).
+    #[inline(always)]
+    pub fn write_words(off: u64, words: &[u64]) {
+        let mut o = off;
+        for &w in words {
+            Self::write64(o, w);
+            o += 8;
+        }
+    }
+    /// `words` out of the region from `off`.
+    #[inline(always)]
+    pub fn read_words(off: u64, words: &mut [u64]) {
+        let mut o = off;
+        for w in words.iter_mut() {
+            *w = Self::read64(o);
+            o += 8;
+        }
+    }
+}

@@ -27,6 +27,8 @@ static mut L2_LO: Table = Table([0; 512]);
 static mut L3: [Table; 2] = [Table([0; 512]), Table([0; 512])];
 /// 4 KiB pages for the arc pool (POOL), so a process's pages carry per-arc W^X (SANDBOX.md): the cold pool is 16 MiB = 8 blocks, the shim pool 2 MiB = 1.
 static mut POOL_L3: [Table; 8] = [Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512]), Table([0; 512])];
+/// 4 KiB pages for the big arc pool too (POOL_BIG, 512 MiB = 256 blocks), since 2026-11-03: a masked process whose arc holds a frame-sized buffer (the attest screen, the keyboard: SANDBOX.md, "Handles") lives there and needs per-arc W^X and its handle table's read-only page like any other.
+static mut POOL_BIG_L3: [Table; 256] = [const { Table([0; 512]) }; 256];
 
 unsafe extern "C" {
     static __dma_start: u8;
@@ -248,7 +250,12 @@ pub fn enable() -> bool {
             } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) {
                 pool(vhe, a, BLOCK) | UXN
             } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
-                pool(vhe, a, BLOCK)
+                // The big pool at 4 KiB granularity as well: fresh pages are data.
+                let t = &mut (*(&raw mut POOL_BIG_L3))[(a - b0) / MIB2];
+                for (k, pg) in t.0.iter_mut().enumerate() {
+                    *pg = pool_page(vhe, a + k * PAGE, true, false);
+                }
+                &raw const t.0 as u64 | TABLE_OR_PAGE
             } else if a + MIB2 <= w0 || a >= w1 {
                 device(vhe, a, BLOCK)
             } else if a >= p0 && a + MIB2 <= p1 {
@@ -403,18 +410,15 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
     if !vhe() {
         return;
     }
-    let (p0, p1) = POOL;
-    if base < p0 || base + size > p1 {
+    if page_entry(base).is_none() || page_entry(base + size - PAGE).is_none() {
         return;
     }
     unsafe {
-        let pool_l3 = &mut *(&raw mut POOL_L3);
         let mut a = base;
         while a < base + size {
-            let idx = (a - p0) / PAGE;
             let exec = native || (a >= exec_start && a < exec_end);
             let writable = native || !exec;
-            pool_l3[idx / 512].0[idx % 512] = pool_page(true, a, writable, exec);
+            *page_entry(a).unwrap() = pool_page(true, a, writable, exec);
             a += PAGE;
         }
         asm!("dsb ish");
@@ -449,17 +453,29 @@ pub fn guard_page(base: usize, writable: bool) {
     if !vhe() {
         return;
     }
-    let (p0, p1) = POOL;
     let a = base - PAGE;
-    if a < p0 || a >= p1 {
-        return;
-    }
+    let Some(e) = page_entry(a) else { return };
     unsafe {
-        let pool_l3 = &mut *(&raw mut POOL_L3);
-        let idx = (a - p0) / PAGE;
-        pool_l3[idx / 512].0[idx % 512] = pool_page(true, a, writable, false);
+        *e = pool_page(true, a, writable, false);
         asm!("dsb ish");
         asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
         asm!("dsb ish", "isb");
+    }
+}
+
+/// The level-3 entry of the pool page at `a`, in either pool; None outside both.
+fn page_entry(a: usize) -> Option<&'static mut u64> {
+    let (p0, p1) = POOL;
+    let (b0, b1) = POOL_BIG;
+    unsafe {
+        if a >= p0 && a < p1 {
+            let idx = (a - p0) / PAGE;
+            Some(&mut (*(&raw mut POOL_L3))[idx / 512].0[idx % 512])
+        } else if b0 != b1 && a >= b0 && a < b1 {
+            let idx = (a - b0) / PAGE;
+            Some(&mut (*(&raw mut POOL_BIG_L3))[idx / 512].0[idx % 512])
+        } else {
+            None
+        }
     }
 }
