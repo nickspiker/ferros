@@ -118,6 +118,8 @@ So the firewall's rules cost normal use nothing: refuse LU0 writes and UNMAPs th
 - **The check-to-fetch window.** Android can change a command between the hv's check and the device's fetch; shadow command lists close it.
 - **The ONCE words.** ANDROID_ONCE, RECOVERY_ONCE and FERROS_ONCE live in the ramoops page, which Android writes (pmsg) and can forge.
 - **The UFS device reset.** Android's driver can still reset the device (the 2026-10-28 list).
+- **ferros's memory before Android.** A warm reset keeps DRAM, so an Android started from the gate finds ferros's working set where it was (surfaces, the canvas, process arcs, the vault's heap; the roots are in registers and die with the reset, messages are sealed at rest). The hv runs before Linux: it scrubs ferros's regions (cachemap) there, a few hundred megabytes, well under a second. Part of dual boot, not of the jump, which the owner keeps fast.
+- **Dual boot is the owner's choice** (owner, 2026-11-02: "no restrictions"): off by default, opt in after attest with the disclaimer, the cage (hv, firewall, gate) on whenever Android is installed, supervised Android is yellow to Google's hardware verdicts and nothing of ours spoofs that, unsupported means not promised and not broken on purpose.
 - **Both slots** carry the same signed build since 2026-11-02 (FERROS_HV_CORE + FERROS_HV_UFS through `tools/husky-cold.sh`, slot b first): Android is firewalled from either slot. The slots stay identical (owner); flash both with that tool, never one by hand.
 
 ## The chords under Android (decided 2026-11-01)
