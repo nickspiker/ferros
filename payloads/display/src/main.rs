@@ -1678,7 +1678,8 @@ static mut G2T16_Q14: *const u16 = core::ptr::null();
 #[inline]
 fn working(p: u64, format: u8) -> u64 {
     if format != G2T16 {
-        return p;
+        // A see-through working pixel is clear whatever its channels hold (a client clears by the bit alone and may leave old values under it); the fold adds channels, so they must be nothing.
+        return if p >> 63 != 0 { CLEAR } else { p };
     }
     let a = p >> 48;
     if a == 0 {
