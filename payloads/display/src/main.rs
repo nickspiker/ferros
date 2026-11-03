@@ -1735,25 +1735,31 @@ const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Outside the screen's edge: black on release; on development builds the hairline's orange one stop darker (each channel's code over the root of two: half the light at gamma 2), so a dev image is told at a glance and the mask is still a mask.
 const EDGE_MASK: u64 = if DEV { 1 << 48 | 11585 | 8192 << 16 } else { 1 << 48 };
 
-/// The screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17): a superellipse corner that sits inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left (the 2:1 asymmetry).
-/// Planned once per screen size (owner, 2026-11-02: once you have the crossings it is a four-corner mirror and a single-pixel alias per axis): fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with) reports every clip-mask and hairline pixel, and the plan keeps them per row: the columns masked from the left and from the right, then the row's antialiased pixels (column, coverage Q16, hairline alpha Q16) in column order, in one list indexed by row (`EDGE_ROWS` has height + 1 entries, a row's pixels run from its `first` to the next row's). The middle rows hold only the straight edges' pixels.
-struct EdgeRow {
+/// The glass's shape, planned once per screen size (owner, 2026-11-02: "maintain a global compressed mask since most will be opaque for the OS in general"): the circle an app lives in (the corners outside it are the system's chrome) and the screen's own edge, as Photon draws its window on Android glass (fluor paint/edge.rs `glass_corner_params`, Nick 2026-09-17: a superellipse corner inside the glass's circular arc, cutting one and a half glass insets deeper at the diagonal, exponent 6 or the first lower one whose corners fit, nine tenths of the fitted size; the top-left and bottom-right corners twice the top-right and bottom-left, the 2:1 asymmetry).
+/// Per row: the columns of chrome from the left and from the right (the circle's outside), the columns masked from the left and from the right (the edge's outside, over the chrome), then the row's antialiased pixels in the order they apply (column, shape, coverage Q16, hairline alpha Q16): the circle's first, in column order, then the edge's. `GLASS_ROWS` has height + 1 entries; a row's pixels run from its `first` to the next row's. Everything else on a row is glass, untouched: the publish path does no geometry at all, it copies runs and blends the listed pixels.
+/// The edge comes from fluor's walk of the corners' crossings (`walk_window_edges`, the one walk Photon's chrome draws with: a four-corner mirror and a single-pixel alias per axis), the circle from its distance field, both at plan time only.
+struct GlassRow {
     first: u32,
+    chrome_l: u16,
+    chrome_r: u16,
     mask_l: u16,
     mask_r: u16,
 }
-/// Non-zero initialisers (see `ALLOC`): `plan_edge` sets them.
-static mut EDGE_ROWS: usize = 1;
-static mut EDGE_PX: usize = 1;
-fn plan_edge(width: usize, height: usize) {
+/// A listed pixel's shape: the circle (its base is the chrome under it, its hairline the ring's) or the edge (its base the mask colour, its hairline the edge's).
+const SHAPE_CIRCLE: u16 = 0;
+const SHAPE_EDGE: u16 = 1;
+/// Non-zero initialisers (see `ALLOC`): `plan_glass` sets them.
+static mut GLASS_ROWS: usize = 1;
+static mut GLASS_PX: usize = 1;
+fn plan_glass(width: usize, height: usize) {
     use fluor::paint::edge::{compute_squircle_crossings, glass_corner_params, walk_window_edges};
     let (rs, rb, n) = glass_corner_params(GLASS_RADIUS, width as f32, height as f32);
     let (ss, cs) = compute_squircle_crossings(rs, n);
     let (sb, cb) = compute_squircle_crossings(rb, n);
-    // The rows the corners reach, at the top and at the bottom: the big cap and the inner pixel past it. Those rows are kept whole while the walk runs, in the sprite arena (empty at init, 64 MiB; the walk's writes land in any order and a pixel can be written more than once, so the rows are compacted afterwards, not as they come); the rows between get only the straight edges' pixels, which arrive one per row per edge.
+    // The rows the edge's corners reach, at the top and at the bottom: the big cap and the inner pixel past it. Those rows are kept whole while the walk runs, in the sprite arena (empty at init, 64 MiB; the walk's writes land in any order and a pixel can be written more than once, so the rows are compacted afterwards, not as they come); the rows between get only the straight edges' pixels, which arrive one per row per edge.
     let band = sb + cb.len() + 2;
     let dense = band * width;
-    assert!(2 * 2 * 2 * dense <= unsafe { ARENA_WORDS } * 8, "edge plan: the arena is smaller than two bands of clip and hairline");
+    assert!(2 * 2 * 2 * dense <= unsafe { ARENA_WORDS } * 8, "glass plan: the arena is smaller than two bands of clip and hairline");
     let clip = unsafe { core::slice::from_raw_parts_mut(ARENA as *mut u16, 2 * dense) };
     let hair = unsafe { core::slice::from_raw_parts_mut((ARENA as *mut u16).add(2 * dense), 2 * dense) };
     clip.fill(0xFFFF);
@@ -1785,11 +1791,78 @@ fn plan_edge(width: usize, height: usize) {
     walk_window_edges(width as u32, height as u32, sb, &cb, ss, &cs, &mut on_clip, &mut on_hair);
     mid.extend_from_slice(&mid_h);
     mid.sort_unstable_by_key(|e| (e.0, e.1));
-    let mut rows: alloc::vec::Vec<EdgeRow> = alloc::vec::Vec::with_capacity(height + 1);
-    let mut px: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
+    // The circle: its centre and radius, the band its edge and hairline touch (a pixel and a half either side of the radius), and the rows that reach outside it (the chrome rows, the only rows the circle's runs and pixels may land on: the chrome buffer holds those rows alone, and a plan that put the circle elsewhere would index past it, loudly).
+    let (cx, cy, rad) = circle(width, height);
+    let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
+    let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
+    let mut rows: alloc::vec::Vec<GlassRow> = alloc::vec::Vec::with_capacity(height + 1);
+    let mut px: alloc::vec::Vec<(u16, u16, u16, u16)> = alloc::vec::Vec::new();
     let mut mi = 0;
     for y in 0..height {
         let first = px.len() as u32;
+        let (mut cl, mut cr) = (0usize, width);
+        if y < top || y >= height - bot {
+            let dy = y as f32 + 0.5 - cy;
+            let dy2 = dy * dy;
+            // A pixel's coverage by the disc and the hairline's weight at it, from its centre's distance to the edge: coverage 1 with the centre half a pixel or more inside the edge, 0 half a pixel or more outside, the ramp between (by the definition of coverage; the band is wider than that pixel, it holds the hairline too, so the limits are the geometry's, not a guard); the hairline one pixel wide, centred on the radius, its profile (1 - t²)² across it, C¹ at its edges and its centre.
+            let pixel = |x: usize| -> (u32, u32) {
+                let dx = x as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy2;
+                if d2 >= rout {
+                    (0, 0)
+                } else if d2 > rin {
+                    let d = libm::sqrtf(d2);
+                    let cov = rad + 0.5 - d;
+                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
+                    let t = d - rad;
+                    let hl = if t * t < 1.0 { let u = 1.0 - t * t; u * u } else { 0.0 };
+                    ((cov * 65536.0) as u32, (hl * 65536.0) as u32)
+                } else {
+                    (65536, 0)
+                }
+            };
+            // One crossing per row (owner, 2026-11-02: "count the crossings vertically"): the circle's chord at this row, where its edge band begins and ends; only the band's pixels are looked at. Past the outer crossing is chrome, inside the inner one is glass; where the inner crossing does not exist (the rows at the circle's top and bottom) the band is the whole chord.
+            if dy2 >= rout {
+                cl = width;
+                cr = width;
+            } else {
+                let half_out = libm::sqrtf(rout - dy2);
+                // WHY the screen's bounds: the circle is wider than the screen (its radius exceeds half the width), so on most rows its crossings lie off the glass; the band is cut to the row.
+                let (x0, x1) = ((cx - half_out) as i64 - 2, (cx + half_out) as i64 + 2);
+                cl = if x0 < 0 { 0 } else { x0 as usize };
+                cr = if x1 > width as i64 { width } else { x1 as usize };
+                while cl < width && pixel(cl) == (0, 0) {
+                    cl += 1;
+                }
+                while cr > cl && pixel(cr - 1) == (0, 0) {
+                    cr -= 1;
+                }
+                let (li, ri) = if dy2 < rin {
+                    let half_in = libm::sqrtf(rin - dy2);
+                    let (li, ri) = ((cx - half_in) as i64 + 2, (cx + half_in) as i64 - 2);
+                    (if li < cl as i64 { cl } else { li as usize }, if ri > cr as i64 { cr } else { ri as usize })
+                } else {
+                    (cr, cr)
+                };
+                let mut band = |x: usize| {
+                    let (c, h) = pixel(x);
+                    if c != 65536 || h != 0 {
+                        px.push((x as u16, SHAPE_CIRCLE, c.min(0xFFFF) as u16, h.min(0xFFFF) as u16));
+                    }
+                };
+                for x in cl..li.min(cr) {
+                    band(x);
+                }
+                for x in li.max(ri)..cr {
+                    band(x);
+                }
+            }
+        } else if y == top {
+            // The first glass row: the circle's chord is wider than the screen here, by `chrome_rows`'s construction, so no chrome and no circle pixel lies on it or on any row until the bottom's.
+            let dx = 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            assert!(dx * dx + dy * dy <= rin, "glass plan: the circle reaches a row the chrome does not hold");
+        }
         let (mut ml, mut mr) = (0usize, width);
         let d = if y < band { Some(y) } else if y >= height - band { Some(band + y - (height - band)) } else { None };
         if let Some(d) = d {
@@ -1802,31 +1875,31 @@ fn plan_edge(width: usize, height: usize) {
             }
             for x in ml..mr {
                 if c[x] != 0xFFFF || h[x] != 0 {
-                    px.push((x as u16, c[x], h[x]));
+                    px.push((x as u16, SHAPE_EDGE, c[x], h[x]));
                 }
             }
         } else {
             while mi < mid.len() && mid[mi].0 == y as u32 {
                 let e = mid[mi];
                 // The same pixel from both lists (never, today: the middle rows carry one pixel per edge): the last clip, the hairlines composed.
-                let same = px.len() > first as usize && px[px.len() - 1].0 == e.1;
+                let same = px.len() > first as usize && px[px.len() - 1].0 == e.1 && px[px.len() - 1].1 == SHAPE_EDGE;
                 match px.last_mut() {
                     Some(l) if same => {
-                        l.1 = e.2.min(l.1);
-                        let (u, a) = (l.2 as u32, e.3 as u32);
-                        l.2 = (u + a - ((u * a + 0xFFFF) >> 16)) as u16;
+                        l.2 = e.2.min(l.2);
+                        let (u, a) = (l.3 as u32, e.3 as u32);
+                        l.3 = (u + a - ((u * a + 0xFFFF) >> 16)) as u16;
                     }
-                    _ => px.push((e.1, e.2, e.3)),
+                    _ => px.push((e.1, SHAPE_EDGE, e.2, e.3)),
                 }
                 mi += 1;
             }
         }
-        rows.push(EdgeRow { first, mask_l: ml as u16, mask_r: mr as u16 });
+        rows.push(GlassRow { first, chrome_l: cl as u16, chrome_r: cr as u16, mask_l: ml as u16, mask_r: mr as u16 });
     }
-    rows.push(EdgeRow { first: px.len() as u32, mask_l: 0, mask_r: width as u16 });
+    rows.push(GlassRow { first: px.len() as u32, chrome_l: 0, chrome_r: width as u16, mask_l: 0, mask_r: width as u16 });
     unsafe {
-        EDGE_ROWS = rows.leak().as_ptr() as usize;
-        EDGE_PX = px.leak().as_ptr() as usize;
+        GLASS_ROWS = rows.leak().as_ptr() as usize;
+        GLASS_PX = px.leak().as_ptr() as usize;
     }
 }
 
@@ -1879,9 +1952,6 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         PHASE_CLOCK[k] = None;
     }
     let (ord, n) = front_order();
-    let (cx, cy, rad) = circle(width, height);
-    // The band the edge and its hairline touch: a pixel and a half either side of the radius.
-    let (rin, rout) = ((rad - 1.5) * (rad - 1.5), (rad + 1.5) * (rad + 1.5));
     let (top, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts(CHROME as *const u64, (top + bot) * width) };
     // The hairline's colour (owner, 2026-11-02). Release builds: standard-illuminant-E grey (equal VSF RGB codes) one stop darker than the theme's ring: the ring's photopic light (VSF RGB's weights, as vsf::colour::convert::vsf_rgb_to_photopic_f32 has them: R 0.2584, G 0.6346, B 0.1070, on gamma-2 codes) halved, back to a code. Development builds: bright orange in VSF RGB, full red, half-light green, no blue, so a dev image is told at a glance.
@@ -1929,57 +1999,43 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         for p in &mut px[xa..xb] {
             *p &= ((*p >> 63) ^ 1).wrapping_neg();
         }
-        // The circle: only the rows that reach the corners have anything outside it.
-        if y < top || y >= height - bot {
-            let crow = if y < top { &chrome[y * width..(y + 1) * width] } else { &chrome[(top + y - (height - bot)) * width..(top + y - (height - bot) + 1) * width] };
-            let dy = y as f32 + 0.5 - cy;
-            let dy2 = dy * dy;
-            for x in xa..xb {
-                let dx = x as f32 + 0.5 - cx;
-                let d2 = dx * dx + dy2;
-                if d2 >= rout {
-                    px[x] = crow[x];
-                } else if d2 > rin {
-                    let d = libm::sqrtf(d2);
-                    // The edge: coverage is how far inside the edge the pixel's centre is, 0 to 1 across the one-pixel band at the radius; the light scales with it, so the working value with its root (the corners are black at the edge).
-                    // WHY the two limits: a pixel's coverage by the disc is 1 with its centre half a pixel or more inside the edge and 0 half a pixel or more outside, by the definition of coverage; this band is wider than that one pixel (it holds the hairline too), so the geometry says so, not a guard.
-                    let cov = rad + 0.5 - d;
-                    let cov = if cov > 1.0 { 1.0 } else if cov < 0.0 { 0.0 } else { cov };
-                    let f = (libm::sqrtf(cov) * 65536.0) as u64;
-                    let p = px[x];
-                    // The hairline (owner, 2026-11-02): one pixel wide, centred on the radius, its profile (1 - t²)² across it, C¹ at its edges and its centre; the edge's own pixel, light inside and chrome outside, shows through by the rest.
-                    let t = d - rad;
-                    let hl = if t * t < 1.0 { let u = 1.0 - t * t; u * u } else { 0.0 };
-                    let h = (hl * 65536.0) as u64;
-                    let ch = |sh: u32| {
-                        let base = (p >> sh & 0xFFFF) * f >> 16;
-                        ((base * (65536 - h) + (line >> sh & 0xFFFF) * h) >> 16) << sh
-                    };
-                    px[x] = (p & 1 << 48) | ch(0) | ch(16) | ch(32);
-                }
-            }
-        }
-        // The screen's own edge (owner, 2026-11-02, as Photon's window on Android glass), from the plan (`plan_edge`): the columns masked from the left and from the right take the mask colour (black on release builds; the hairline's orange one stop darker on development builds), and the row's antialiased pixels take the hairline at its alpha, then the mask by their coverage's complement. The hairline is the orange on development builds; on release builds it is the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve.
+        // The glass's shape, from the plan (`plan_glass`): the circle's outside copies the chrome row, the edge's outside takes the mask colour (black on release builds; the hairline's orange one stop darker on development builds), and the listed pixels take their hairline at its alpha, then their base by their coverage's complement. The circle's hairline is `line`; the edge's is the orange on development builds and on release builds the mask colour itself, as Photon's release build on Android draws its hairline black so the glass's corner is black to the curve. A chrome row is read only where the plan put chrome; elsewhere it is empty and a wrong plan would say so.
         {
-            let rows = unsafe { core::slice::from_raw_parts(EDGE_ROWS as *const EdgeRow, height + 1) };
-            let er = &rows[y];
-            let (first, next) = (er.first as usize, rows[y + 1].first as usize);
-            let (ml, mr) = (er.mask_l as usize, er.mask_r as usize);
-            if ml > 0 || mr < width || first != next {
+            let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+            let g = &rows[y];
+            let (first, next) = (g.first as usize, rows[y + 1].first as usize);
+            let (cl, cr, ml, mr) = (g.chrome_l as usize, g.chrome_r as usize, g.mask_l as usize, g.mask_r as usize);
+            if cl > 0 || cr < width || ml > 0 || mr < width || first != next {
+                let crow = if y < top { &chrome[y * width..(y + 1) * width] } else if y >= height - bot { &chrome[(top + y - (height - bot)) * width..(top + y - (height - bot) + 1) * width] } else { &chrome[..0] };
                 let edge_line = if DEV { line } else { EDGE_MASK };
                 let mix = |a: u64, b: u64, wb: u64| {
                     let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
                     (b & 1 << 48) | ch(0) | ch(16) | ch(32)
                 };
                 let q = |v: u16| if v == 0xFFFF { 65536 } else { v as u64 };
+                px[xa..xb.min(cl)].copy_from_slice(&crow[xa..xb.min(cl)]);
+                if xa.max(cr) < xb {
+                    px[xa.max(cr)..xb].copy_from_slice(&crow[xa.max(cr)..xb]);
+                }
+                // In the order the shapes stack: the circle over the windows and its chrome, the edge over everything. The row's circle pixels come first in the list, so the mask runs go in between.
+                let plan = unsafe { core::slice::from_raw_parts(GLASS_PX as *const (u16, u16, u16, u16), next) };
+                let row_px = &plan[first..next];
+                let split = row_px.iter().position(|e| e.1 == SHAPE_EDGE).unwrap_or(row_px.len());
+                for &(x, _, c, h) in &row_px[..split] {
+                    let x = x as usize;
+                    if x < xa || x >= xb {
+                        continue;
+                    }
+                    let p = px[x];
+                    px[x] = mix(crow[x], mix(p, line, q(h)), q(c));
+                }
                 for x in xa..xb.min(ml) {
                     px[x] = EDGE_MASK;
                 }
                 for x in xa.max(mr)..xb {
                     px[x] = EDGE_MASK;
                 }
-                let plan = unsafe { core::slice::from_raw_parts(EDGE_PX as *const (u16, u16, u16), next) };
-                for &(x, c, h) in &plan[first..next] {
+                for &(x, _, c, h) in &row_px[split..] {
                     let x = x as usize;
                     if x < xa || x >= xb {
                         continue;
@@ -2403,7 +2459,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let (top, bot) = chrome_rows(width, height);
         CHROME_TOP = top;
         CHROME_BOT = bot;
-        plan_edge(width, height);
+        plan_glass(width, height);
         CHROME = alloc::vec![0u64; (top + bot) * width].leak().as_mut_ptr() as usize;
     }
     ALLOC.mark();
