@@ -34,6 +34,8 @@ pub struct Gated {
     pub text_len: usize,
     /// Fixed mode's K (SANDBOX.md, "Modes"): the arc is exactly 2^K and the checker holds every address to `bfi x26, xN, #0, #K`; 0 is ring mode (or native code).
     pub fixed: u32,
+    /// The image carries BTI landing pads (SANDBOX.md, "BTI"): its code runs on guarded pages and the checker refuses RET.
+    pub bti: bool,
 }
 
 /// What the gate learned about a capsule whose code stays where it was staged (no copy): the developer's key and the provenance hash for the ihi.
@@ -167,7 +169,8 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
     if fixed != 0 && !(16..=40).contains(&fixed) {
         return Err("gate: fixed mode size out of range");
     }
-    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed })
+    let bti = masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("bti")).is_some();
+    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed, bti })
 }
 
 /// The OS-only key that seals installed images (SANDBOX.md): derived from the system persistent secret, so nothing outside this OS on this device can produce a seal.
@@ -186,6 +189,9 @@ pub fn seal(g: &Gated) -> Option<[u8; 32]> {
     if g.fixed != 0 {
         h.update(b"fixed");
         h.update(&[g.fixed as u8]);
+    }
+    if g.bti {
+        h.update(b"bti");
     }
     h.update(&(g.text_len as u64).to_le_bytes());
     h.update(&g.code);

@@ -5,8 +5,9 @@ use ferros_sandbox::{check_in, Mode, Refusal};
 fn main() {
     // `--fixed K` checks under fixed mode at 2^K (SANDBOX.md, "Modes"); without it, ring mode.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let bti = args.iter().any(|a| a == "--bti");
     let mode = args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).map(Mode::Fixed).unwrap_or(Mode::Ring);
-    let paths: Vec<&String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && !(*i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a).collect();
+    let paths: Vec<&String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && *a != "--bti" && !(*i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a).collect();
     for path in paths {
         let code = std::fs::read(&path).expect("read image");
         let mut tally: Vec<(Refusal, usize, u32, usize)> = Vec::new();
@@ -19,7 +20,8 @@ fn main() {
             }
             let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             total += 1;
-            if let Err(why) = check_in(insn, mode) {
+            let r = check_in(insn, mode).and_then(|_| if bti && insn & 0xFFFF_FC1F == 0xD65F_0000 { Err(Refusal::System) } else { Ok(()) });
+            if let Err(why) = r {
                 match tally.iter_mut().find(|t| t.0 == why) {
                     Some(t) => t.1 += 1,
                     None => tally.push((why, 1, insn, 4 * k)),

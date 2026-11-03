@@ -70,6 +70,14 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
         exit(3);
     }
     console(grants, b"wintest: shown\n");
+    // Input byte 2 = 1: the BTI test (SANDBOX.md, "BTI"): call `landing` four bytes past its entry, past its `bti c`. Built with BTI and run on guarded pages, this must end in a branch-target exception (EC G#0D); without BTI it simply returns.
+    if inp.len() > 2 && inp[2] == 1 {
+        let entry = unsafe { core::ptr::read_volatile(&(landing as extern "C" fn() -> u64)) } as usize;
+        let past: extern "C" fn() -> u64 = unsafe { core::mem::transmute(entry + 4) };
+        console(grants, b"wintest: calling past the landing pad\n");
+        let v = past();
+        console(grants, if v == 42 { b"wintest: the call past the pad returned: BTI is not enforced\n" as &[u8] } else { b"wintest: the call past the pad returned something\n" });
+    }
     let end = now() + 60 * freq();
     while now() < end {
         sleep_until(now() + freq());
@@ -81,4 +89,10 @@ extern "C" fn wintest_main(grants: u64, input: u64, input_len: u64) -> ! {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     ferros_sys::panic_exit()
+}
+
+/// The BTI test's target: a real function, its first instruction `bti c` when built with branch protection.
+#[inline(never)]
+extern "C" fn landing() -> u64 {
+    unsafe { core::ptr::read_volatile(&42u64) }
 }

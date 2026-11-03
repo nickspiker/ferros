@@ -60,6 +60,8 @@ struct Out {
     rewritten: usize,
     /// Fixed mode's K (SANDBOX.md, "Modes"): addresses are made safe with `bfi x26, xN, #0, #K` and used from x26 directly; None is ring mode.
     fixed: Option<u32>,
+    /// BTI (SANDBOX.md, "BTI"): every return becomes `br x30` and every call is followed by `bti j`, so a return lands only right after a call; rustc's `-Z branch-protection=bti` puts `bti c` at function entries and `bti j` at jump-table targets.
+    bti: bool,
 }
 
 impl Out {
@@ -105,6 +107,21 @@ impl Out {
 
 /// Rewrite one instruction (mnemonic + operand text). Returns false if it passes through unchanged.
 fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
+    if o.bti {
+        match mnem {
+            "ret" => {
+                let r = if ops.trim().is_empty() { "x30" } else { ops.trim() };
+                o.ins(&format!("br {r}"));
+                return Ok(true);
+            }
+            "bl" | "blr" => {
+                o.ins(&format!("{mnem} {ops}"));
+                o.ins("bti j");
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
     // An address is a bracket that opens an operand (`[x8]`, `str w0, [x1, #4]`); a bracket inside an operand is a vector lane (`mov v1.b[4], v0.b[6]`) and no memory access.
     let address = ops.match_indices('[').map(|(i, _)| i).find(|&open| open == 0 || ops[..open].trim_end().ends_with(','));
     if let Some(open) = address {
@@ -217,13 +234,14 @@ fn main() {
         eprintln!("--fixed needs K, 16 to 40");
         std::process::exit(2)
     }));
-    let args: Vec<String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && !(fixed.is_some() && *i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a.clone()).collect();
+    let bti = args.iter().any(|a| a == "--bti");
+    let args: Vec<String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && *a != "--bti" && !(fixed.is_some() && *i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a.clone()).collect();
     if args.len() != 3 {
         eprintln!("usage: ferros-mask <in.s> <out.s> [--fixed K]");
         std::process::exit(2);
     }
     let src = std::fs::read_to_string(&args[1]).expect("read input");
-    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0, fixed };
+    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0, fixed, bti };
     for (n, line) in src.lines().enumerate() {
         let code = line.split("//").next().unwrap_or("");
         let t = code.trim();

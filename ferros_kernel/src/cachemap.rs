@@ -358,6 +358,10 @@ pub fn enable() -> bool {
             ttbr = in(reg) &raw const L1 as u64,
             t = out(reg) _,
         );
+        // BTI for EL0 (SCTLR_EL2.BT0 under VHE): enforced only on guarded pages, which only BTI capsules' code gets (set_arc_wx), so nothing else changes.
+        if vhe {
+            asm!("mrs {t}, sctlr_el2", "orr {t}, {t}, #(1 << 35)", "msr sctlr_el2, {t}", "isb", t = out(reg) _);
+        }
     }
     true
 }
@@ -408,7 +412,7 @@ pub fn off_for_handover() {
 
 /// Make freshly written code at [addr, addr + len) executable: clean it to the point of unification, then invalidate the I-cache.
 /// Set the W^X attributes of an arc's pool pages (SANDBOX.md), then invalidate the TLB for them. A masked process marks `[exec_start, exec_end)` read-only + executable (its checked `.text`) and leaves every other page writable + non-executable (grants, read-only data, input, stack). A native dev process (`native`) gets the whole arc RWX. Call after writing the code, before entering; `arc_reset` returns every page to data on free.
-pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, native: bool) {
+pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, native: bool, guarded: bool) {
     if !vhe() {
         return;
     }
@@ -420,7 +424,8 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
         while a < base + size {
             let exec = native || (a >= exec_start && a < exec_end);
             let writable = native || !exec;
-            *page_entry(a).unwrap() = pool_page(true, a, writable, exec);
+            // A BTI capsule's code on guarded pages (GP, bit 50): every indirect branch into them must land on a `bti` instruction (SCTLR_EL2.BT0, set at boot), so no jump enters a multi-instruction check midway.
+            *page_entry(a).unwrap() = pool_page(true, a, writable, exec) | if guarded && exec && !native { 1 << 50 } else { 0 };
             a += PAGE;
         }
         asm!("dsb ish");
@@ -436,7 +441,7 @@ pub fn set_arc_wx(base: usize, size: usize, exec_start: usize, exec_end: usize, 
 
 /// Return an arc's pages to the default (writable data, non-executable) when it is freed.
 pub fn arc_reset(base: usize, size: usize) {
-    set_arc_wx(base, size, 0, 0, false);
+    set_arc_wx(base, size, 0, 0, false, false);
 }
 
 pub fn sync_code(addr: usize, len: usize) {

@@ -99,6 +99,12 @@ Every masked capsule declares one mode, carried in its masked section and covere
 - **ring** is what ran first, and stays for handles (fixed cannot serve them: the checker cannot know which slot was loaded).
 - **exact** needs BTI first: a multi-instruction check is only provable if no indirect branch can land inside it (guarded code pages, landing pads at function entries and after calls, the scanner refusing a landing pad inside a check). Not built yet.
 
+## BTI (built 2026-11-03)
+
+The prerequisite for exact mode, and control-flow integrity in its own right. A capsule built with `BTI=1 tools/ferros-masked-build.sh <p>` carries landing pads: rustc's `-Z branch-protection=bti` puts `bti c` at every function entry and `bti j` at jump-table targets, and the emitter rewrites every `ret` into `br x30` and puts `bti j` after every `bl` and `blr`, so a return can land only right after a call. The checker refuses `ret` in a BTI capsule (the hardware does not check RET, and a forged x30 could land anywhere), the capsule says `bti` (`bridge capsule|seal|spawn ... --bti`), the seal covers it, and the kernel maps its code on guarded pages (bit 50 of the page descriptor), with SCTLR_EL2.BT0 set once at boot. On a guarded page every indirect branch must land on a landing pad or the process ends with a branch-target exception. Capsules built without BTI get no guarded pages and run as before.
+
+Verified on the device: `payloads/wintest` built with BTI (18 landing pads, no `ret` left) runs; asked to call a function four bytes past its entry, past its `bti c`, it ends with EC G#0D at that address.
+
 ## Handles (decided with the owner 2026-11-03, built the same day)
 
 A masked process reaches memory through one pair, x28 and x27, so it reaches one region: its arc. Drivers and the display hold many: DMA pools, surfaces, MMIO blocks at the chip's addresses. A handle is how a granted region is reached under the mask, and it is the model KERNEL.md already names for toka (a wasm module's memory is one handle; hardware reaches a process only as handles), so the emitter and the toka backend share it.

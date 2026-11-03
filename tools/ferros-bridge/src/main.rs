@@ -293,6 +293,7 @@ async fn main() {
                     "--masked" => { i += 1; }
                     "--text-len" => { i += 2; }
                     "--fixed" => { i += 2; }
+                    "--bti" => { i += 1; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -589,6 +590,10 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     if let Some(k) = fixed_arg().filter(|_| masked) {
         section.add_field("fixed", VsfType::u(k as usize, false));
     }
+    // `--bti`: the image carries BTI landing pads; the kernel maps its code on guarded pages (SANDBOX.md, "BTI").
+    if masked && std::env::args().any(|a| a == "--bti") {
+        section.add_field("bti", VsfType::u(1, false));
+    }
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(section)
         .signature_ed25519(pubkey, [0u8; 64])
@@ -597,10 +602,28 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
             eprintln!("Capsule build failed: {e}");
             std::process::exit(1);
         });
-    vsf::verification::sign_file(unsigned, &seed).unwrap_or_else(|e| {
+    // Test switches for the gate (it must refuse both): FERROS_ZERO_SIG sends the capsule with its signature slot still all zeros; FERROS_RANDOM_SIG signs it, then overwrites the signature with other bytes.
+    if std::env::var("FERROS_ZERO_SIG").is_ok() {
+        return unsigned;
+    }
+    let plain = unsigned.clone();
+    let mut signed = vsf::verification::sign_file(unsigned, &seed).unwrap_or_else(|e| {
         eprintln!("Capsule signing failed: {e}");
         std::process::exit(1);
-    })
+    });
+    if std::env::var("FERROS_RANDOM_SIG").is_ok() && signed.len() == plain.len() {
+        let fake = blake3::hash(b"not the signature");
+        let mut k = 0;
+        for i in 0..signed.len() {
+            if signed[i] != plain[i] || (k > 0 && k < 64) {
+                if k < 64 {
+                    signed[i] = fake.as_bytes()[k % 32] ^ k as u8;
+                    k += 1;
+                }
+            }
+        }
+    }
+    signed
 }
 
 /// `prefix` goes in front of the Exec params (spawn's name + grants header; empty for run).

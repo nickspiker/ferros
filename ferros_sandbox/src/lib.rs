@@ -379,6 +379,16 @@ pub fn check_image(code: &[u8]) -> Result<usize, Violation> {
 
 /// Check a whole image under `m`.
 pub fn check_image_in(code: &[u8], m: Mode) -> Result<usize, Violation> {
+    check_image_with(code, m, false)
+}
+
+/// RET in any form (BTI capsules return with `br x30`, whose target must be a landing pad).
+fn is_ret(i: u32) -> bool {
+    i & 0xFFFF_FC1F == 0xD65F_0000
+}
+
+/// Check a whole image under `m`; with `bti` (SANDBOX.md, "BTI") the image runs on guarded pages, where every indirect branch must land on a `bti` landing pad, and a return is refused unless it is `br x30` (RET is not checked by the hardware, so a forged x30 could land anywhere).
+pub fn check_image_with(code: &[u8], m: Mode, bti: bool) -> Result<usize, Violation> {
     let mut n = 0;
     // The image header (ferros_rt start.rs, the payloads' entry stubs): a pad word at 4, "ferrosRT" at 8, then five words to 56, data the kernel reads, never executed (the entry at 0 branches over it).
     let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
@@ -388,6 +398,9 @@ pub fn check_image_in(code: &[u8], m: Mode) -> Result<usize, Violation> {
         }
         let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         check_in(insn, m).map_err(|why| Violation { offset: 4 * k, insn, why })?;
+        if bti && is_ret(insn) {
+            return Err(Violation { offset: 4 * k, insn, why: Refusal::System });
+        }
         n += 1;
     }
     Ok(n)

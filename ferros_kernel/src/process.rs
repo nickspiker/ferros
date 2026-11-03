@@ -2316,7 +2316,7 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed)
+    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -2326,7 +2326,7 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
         return Err("install: only masked capsules are installed");
     }
     let mode = if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
-    ferros_sandbox::check_image_in(&g.code[..g.text_len], mode).map_err(|_| "install: masked code failed the sandbox checker")?;
+    ferros_sandbox::check_image_with(&g.code[..g.text_len], mode, g.bti).map_err(|_| "install: masked code failed the sandbox checker")?;
     crate::oracle::seal(&g).ok_or("no system secret: cannot seal")
 }
 
@@ -2384,7 +2384,7 @@ pub fn spawn_capsule_staged(name: &[u8], arc: Arc, capsule_len: usize, code_offs
             return Err(e);
         }
     };
-    let built = build_from(name, arc, code_len, input, &objects, Some(ihi), false, code_len);
+    let built = build_from(name, arc, code_len, input, &objects, Some(ihi), false, code_len, false);
     launch(built, input.len())
 }
 
@@ -2481,6 +2481,8 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     let tail = image_tail(code);
+    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages).
+    let (fixed, bti) = (fixed & 0xFF, fixed >> 8 & 1 == 1);
     let need = CODE + code.len() + tail + inline + STACK;
     // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes.
     if fixed != 0 && need > 1 << fixed {
@@ -2488,11 +2490,11 @@ fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi:
     }
     let arc = arc_alloc(if fixed != 0 { 1 << fixed } else { need }, masked).ok_or("arc pool exhausted")?;
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
-    build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len)
+    build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len, bti)
 }
 
 /// The process in an arc that already holds its code at the code offset (`build` copied it; a streamed spawn staged it there): the capability table, the grants page, the ihi, the preferences, the input past the code's zeroed tail, W^X, and the first thread.
-fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, bti: bool) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, code_len) });
     let epoch = EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -2525,7 +2527,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     p.write(in_off as u64, input);
     crate::cachemap::sync_code(arc.base + CODE, code_len);
     // W^X (SANDBOX.md): a masked process may execute only its checked .text ([CODE, CODE+exec_len)), read-only, and may not write it; everything else is non-executable. A native dev process gets the whole arc RWX. The arc returns to writable data on free (arc_free → arc_reset).
-    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !masked);
+    crate::cachemap::set_arc_wx(arc.base, arc.block, arc.base + CODE, arc.base + CODE + exec_len, !masked, bti);
     // The grants page read-only (the handle table, the tokens, the preferences, the ihi): nothing in it is the process's to write.
     crate::cachemap::grants_page(arc.base, false);
     // The frame a queued start resumes into: exactly what `ferros_el0_enter` sets up (entry, stack at the arc's top, the arc's base and mask in x28/x27 for masked code, grants/input/length in x0-x2, EL0t with interrupts open).
@@ -2570,7 +2572,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed)?;
+    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8)?;
     enqueue_back(me);
     Ok(me)
 }
