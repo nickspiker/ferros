@@ -26,7 +26,9 @@ for s in $SRCS; do
     OBJS+=("$OUT/s/$b.o")
 done
 # Position-independent, as the payloads' build.rs links them: every absolute address in data becomes an R_AARCH64_RELATIVE entry for ferros_sys::relocate() (a static link baked link-time offsets into vtables and slice pointers, and the first masked process that formatted a number branched to an arc offset, 2026-11-03).
-ld.lld -T "$REPO/payloads/$P/payload.ld" --gc-sections -e _entry -pie --no-dynamic-linker -z norelro -z notext -o "$OUT/$BIN.elf" "${OBJS[@]}"
+# The data on its own pages: the sandbox makes the text pages read-only and executable, and a small image whose .rodata shared the last text page faulted on its first relocation write (touch, 2026-11-03).
+sed 's/^\( *\)\.rodata : /\1. = ALIGN(4096);\n\1.rodata : /' "$REPO/payloads/$P/payload.ld" > "$OUT/payload.ld"
+ld.lld -T "$OUT/payload.ld" --gc-sections -e _entry -pie --no-dynamic-linker -z norelro -z notext -o "$OUT/$BIN.elf" "${OBJS[@]}"
 aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
