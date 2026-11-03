@@ -1731,84 +1731,25 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
     (v, n)
 }
 
-/// The layer stack as bands and spans (WINDOWS.md, "The layer stack", 2026-11-02), rebuilt only when the windows change (`layout_build`), never per frame.
-/// The windows' top and bottom edges cut the screen into bands of rows; within a band every row is laid out alike, so the windows' left and right edges cut it into spans. A span's chain is the windows covering it, frontmost first, cut after the first opaque one: nothing behind an opaque window is ever read. Publishing a row walks its band's spans: a span with one opaque working window is a copy, a chain of working windows in Normal is the branchless select, anything else (a 16-bit fluor surface with its alpha, a blend mode) is the general fold.
-/// At most four windows, so at most nine bands and nine spans a band.
-#[derive(Clone, Copy)]
-struct Span {
-    x0: u16,
-    x1: u16,
-    /// The chain's length, then (surface, format, mode) frontmost first.
-    n: u8,
-    chain: [(u8, u8, u8); SURFACES],
-}
-#[derive(Clone, Copy)]
-struct Band {
-    y0: u16,
-    y1: u16,
-    n: u8,
-    spans: [Span; 2 * SURFACES + 1],
-}
-const NO_SPAN: Span = Span { x0: 0, x1: 0, n: 0, chain: [(0, 0, 0); SURFACES] };
-const NO_BAND: Band = Band { y0: 0, y1: 0, n: 0, spans: [NO_SPAN; 2 * SURFACES + 1] };
-static mut BANDS: [Band; 2 * SURFACES + 1] = [NO_BAND; 2 * SURFACES + 1];
+/// The layer stack as bands and spans (WINDOWS.md, "The layer stack", 2026-11-02; the geometry is fluor's `layout`, shared with Photon's stacking), rebuilt only when the windows change (`layout_build`), never per frame.
+/// A span's chain is the windows covering it, frontmost first, cut after the first opaque one: nothing behind an opaque window is ever read. Publishing a row walks its band's spans: a span with one opaque working window is a copy, a chain of working windows in Normal is the branchless select, anything else (a 16-bit fluor surface with its alpha, a blend mode) is the general fold.
+/// At most four windows, so at most nine bands and nine spans a band; the chains index `ORDER`.
+type Band = fluor::layout::Band<SURFACES, { 2 * SURFACES + 1 }>;
+static mut BANDS: [Band; 2 * SURFACES + 1] = [Band::NONE; 2 * SURFACES + 1];
 static mut NBANDS: usize = 0;
+/// The layout's layers, frontmost first, as its chains index them: (surface, format, mode).
+static mut ORDER: [(u8, u8, u8); SURFACES] = [(0, 0, 0); SURFACES];
 /// A window's mode byte (op 22, `ferros_sys::window`): bits 0-2 the blend mode in fluor's order (0 Normal, 1 Multiply, 2 Screen, 3 Add, 4 Subtract, 5 Overlay, 6 Darken, 7 Lighten), bit 3 opaque (no see-through pixel anywhere: the chain stops at it).
 const MODE_MASK: u8 = 7;
 const OPAQUE: u8 = 8;
 fn layout_build(width: usize, height: usize) {
     let (ord, n) = front_order();
-    // The sorted, distinct edges along one axis, the screen's own first and last.
-    fn edges(vals: impl Iterator<Item = i32>, end: usize) -> ([u16; 2 * SURFACES + 2], usize) {
-        let mut e = [0u16; 2 * SURFACES + 2];
-        let mut m = 1;
-        for v in vals {
-            if v > 0 && (v as usize) < end {
-                let v = v as u16;
-                let mut at = m;
-                while at > 1 && e[at - 1] > v {
-                    e[at] = e[at - 1];
-                    at -= 1;
-                }
-                if at > 1 && e[at - 1] == v {
-                    for i in at..m {
-                        e[i] = e[i + 1];
-                    }
-                    continue;
-                }
-                e[at] = v;
-                m += 1;
-            }
-        }
-        e[m] = end as u16;
-        (e, m + 1)
+    let mut layers = [fluor::layout::Layer { x0: 0, y0: 0, x1: 0, y1: 0, opaque: false }; SURFACES];
+    for (i, &(k, w)) in ord[..n].iter().enumerate() {
+        layers[i] = fluor::layout::Layer { x0: w.rect.x0, y0: w.rect.y0, x1: w.rect.x1, y1: w.rect.y1, opaque: w.mode & OPAQUE != 0 };
+        unsafe { ORDER[i] = (k as u8, w.format, w.mode) };
     }
-    let (ys, ny) = edges(ord[..n].iter().flat_map(|(_, w)| [w.rect.y0, w.rect.y1]), height);
-    let mut nb = 0;
-    for b in 0..ny - 1 {
-        let (y0, y1) = (ys[b], ys[b + 1]);
-        let rows = ord[..n].iter().filter(|(_, w)| w.rect.y0 <= y0 as i32 && w.rect.y1 >= y1 as i32);
-        let (xs, nx) = edges(rows.clone().flat_map(|(_, w)| [w.rect.x0, w.rect.x1]), width);
-        let mut band = Band { y0, y1, n: 0, spans: [NO_SPAN; 2 * SURFACES + 1] };
-        for s in 0..nx - 1 {
-            let (x0, x1) = (xs[s], xs[s + 1]);
-            let mut span = Span { x0, x1, n: 0, chain: [(0, 0, 0); SURFACES] };
-            for &(k, w) in rows.clone() {
-                if w.rect.x0 <= x0 as i32 && w.rect.x1 >= x1 as i32 {
-                    span.chain[span.n as usize] = (k as u8, w.format, w.mode);
-                    span.n += 1;
-                    if w.mode & OPAQUE != 0 {
-                        break;
-                    }
-                }
-            }
-            band.spans[band.n as usize] = span;
-            band.n += 1;
-        }
-        unsafe { BANDS[nb] = band };
-        nb += 1;
-    }
-    unsafe { NBANDS = nb };
+    unsafe { NBANDS = fluor::layout::layout(&layers[..n], width, height, core::slice::from_raw_parts_mut(&raw mut BANDS as *mut Band, 2 * SURFACES + 1)) };
 }
 
 /// A working pixel's transparency, Q14: 0 opaque, 16384 clear (bit 63, the see-through bit every working surface may set), between from bits 49-62 (a decoded fluor surface's alpha; a working surface declares only the bit).
@@ -2083,27 +2024,30 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
     for y in r.y0 as usize..r.y1 as usize {
         // The row's spans (`layout_build`): each one's chain, frontmost first, into the row.
         let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
+        let order = unsafe { core::slice::from_raw_parts(&raw const ORDER as *const (u8, u8, u8), SURFACES) };
         let band = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1).unwrap();
-        for sp in &band.spans[..band.n as usize] {
+        for sp in band.spans() {
             let (a, b) = ((sp.x0 as usize).max(xa), (sp.x1 as usize).min(xb));
             if a >= b {
                 continue;
             }
-            let chain = &sp.chain[..sp.n as usize];
+            let chain = sp.chain();
             if chain.is_empty() {
                 // Nothing here: black.
                 px[a..b].fill(0);
                 continue;
             }
-            let plain = chain.iter().all(|&(_, f, m)| f != G2T16 && m & MODE_MASK == 0);
-            let front = &surface(chain[0].0 as usize, width, height)[y * width..(y + 1) * width];
-            if chain[0].2 & OPAQUE != 0 && chain[0].1 != G2T16 {
+            let layer = |i: u8| order[i as usize];
+            let plain = chain.iter().all(|&i| layer(i).1 != G2T16 && layer(i).2 & MODE_MASK == 0);
+            let (k0, f0, m0) = layer(chain[0]);
+            let front = &surface(k0 as usize, width, height)[y * width..(y + 1) * width];
+            if m0 & OPAQUE != 0 && f0 != G2T16 {
                 px[a..b].copy_from_slice(&front[a..b]);
             } else if plain {
                 // Working windows in Normal: see-through is the bit alone, so the fold is a select. Branchless: an uncovered pixel takes this window's, a covered one keeps its own; black where every window is see-through.
                 px[a..b].copy_from_slice(&front[a..b]);
-                for &(k, _, _) in &chain[1..] {
-                    let src = &surface(k as usize, width, height)[y * width..(y + 1) * width];
+                for &i in &chain[1..] {
+                    let src = &surface(layer(i).0 as usize, width, height)[y * width..(y + 1) * width];
                     for x in a..b {
                         let p = px[x];
                         let m = (p >> 63).wrapping_neg();
@@ -2115,13 +2059,14 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
             } else {
                 for x in a..b {
-                    let mut acc = working(front[x], chain[0].1);
+                    let mut acc = working(front[x], f0);
                     let mut t = trans(acc);
-                    let mut mode = chain[0].2;
-                    for &(k, f, m) in &chain[1..] {
+                    let mut mode = m0;
+                    for &i in &chain[1..] {
                         if t == 0 {
                             break;
                         }
+                        let (k, f, m) = layer(i);
                         let p = working(surface(k as usize, width, height)[y * width + x], f);
                         (acc, t) = fold(acc, t, p, mode);
                         mode = m;
