@@ -51,11 +51,12 @@ The scan only speaks for code it saw, so the process may execute nothing else. A
 
 ## Placement and guards
 
-Immediate offsets reach up to G = 64 KiB past a masked address (every AArch64 scaled 12-bit immediate, up to 65520 for 16-byte accesses; unscaled ones reach 256 below). So every arc needs at least G of memory nobody else owns on both sides.
+Immediate offsets reach up to G = 64 KiB past a masked address (every AArch64 scaled 12-bit immediate, up to 65520 for 16-byte accesses). So every masked arc needs 64 KiB above it that nobody owns, and nothing below it: since 2026-11-03 the checker refuses negative immediates on x25 and sp, and the emitter folds a negative offset into the address before the mask (`sub x24, xN, #k`, `and x26, x24, x27`, then the access with no offset). The fix is the order: offset first, mask second, for anything that would land below the base.
 
-- An arc of size S (a power of two, at least 64 KiB) is placed at an **S-aligned base inside a 2S block whose upper half is left unused**. The half above is its guard; the half below belongs to the previous block's guard (the pool starts with an unused G). So each arc has at least S ≥ G of guard on both sides.
-- Because the base is S-aligned, masking an absolute pointer gives its offset directly: `and x26, xN, x27` — an address inside the arc maps to itself, one outside wraps inside (still safe). One instruction.
-- Cost: an arc takes twice its size in the pool (the pool grows accordingly; DRAM is not the constraint).
+- An arc of size S (a power of two, at least 64 KiB) is placed at an **S-aligned base**, taken from a 2S block for the alignment. Above the arc lie 64 KiB of **guard pages, kernel-only** (`cachemap::guard_pages`): no process reads or writes them, so neither a neighbour nor stale data from an arc freed there is in reach. The rest of the upper half goes back to the pool as aligned chunks (64 KiB, 128 KiB, ... S/2), and freeing the arc gives the guard back with it.
+- Because the base is S-aligned, masking an absolute pointer gives its offset directly: `and x26, xN, x27`: an address inside the arc maps to itself, one outside wraps inside (still safe). One instruction.
+- Native and masked arcs share both pools. With no reach below a masked arc's base, a native neighbour under it is out of reach (until 2026-11-03 an unscaled load could read the last 256 bytes of whatever lay below: the top of a native process's stack).
+- Cost: an arc takes its size and 64 KiB, not twice its size (the first cut kept the whole upper half as guard, and a 128 MiB attest screen and a 32 MiB modem filled the 352 MiB big pool).
 
 ## What the emitter rewrites (measured on today's payloads: ~15% of instructions)
 

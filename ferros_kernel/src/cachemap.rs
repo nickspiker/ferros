@@ -465,6 +465,29 @@ pub fn grants_page(base: usize, writable: bool) {
     }
 }
 
+/// A masked arc's guard (SANDBOX.md): `len` bytes from `base` mapped kernel-only (`on`), so no process reads or writes them, or back to ordinary pool pages (writable data) when the arc is freed. The kernel keeps its own access (the scrub zeroes the pools whole).
+pub fn guard_pages(base: usize, len: usize, on: bool) {
+    if !vhe() {
+        return;
+    }
+    unsafe {
+        let mut a = base;
+        while a < base + len {
+            if let Some(e) = page_entry(a) {
+                *e = if on { a as u64 | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF | PXN | UXN } else { pool_page(true, a, true, false) };
+            }
+            a += PAGE;
+        }
+        asm!("dsb ish");
+        let mut a = base;
+        while a < base + len {
+            asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
+            a += PAGE;
+        }
+        asm!("dsb ish", "isb");
+    }
+}
+
 /// The level-3 entry of the pool page at `a`, in either pool; None outside both.
 fn page_entry(a: usize) -> Option<&'static mut u64> {
     let (p0, p1) = POOL;

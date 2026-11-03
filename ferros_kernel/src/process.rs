@@ -186,7 +186,12 @@ pub struct Arc {
     pub base: usize,
     pub size: usize,
     pub block: usize,
+    /// A masked arc's guard above it (GUARD bytes at base + size, kernel-only pages), 0 for a native arc.
+    pub guard: usize,
 }
+
+/// The guard above a masked arc: the reach of an immediate offset past its last byte (SANDBOX.md: 65520 + 15).
+const GUARD: usize = 64 << 10;
 
 impl Arc {
     pub fn mask(&self) -> usize {
@@ -208,15 +213,35 @@ pub fn arc_alloc(bytes: usize, masked: bool) -> Option<Arc> {
         buddy_take(arcs(), block).or_else(|| buddy_take(arcs_big(), block))?
     };
     unsafe { core::ptr::write_bytes(base as *mut u8, 0, want) };
-    Some(Arc { base, size: want, block })
+    if !masked {
+        return Some(Arc { base, size: want, block, guard: 0 });
+    }
+    // The doubled block is kept only for its alignment: the arc, then a 64 KiB guard nobody can read (its pages kernel-only, so neither another process nor stale data from an arc freed there is in reach), and the rest of the upper half back to the pool as aligned chunks (64 KiB at S + 64 KiB, 128 KiB at S + 128 KiB, ... S/2 at S + S/2). A 128 MiB arc costs 128 MiB and 64 KiB, not 256 MiB.
+    crate::cachemap::guard_pages(base + want, GUARD, true);
+    let (a, _) = pool_of(base);
+    let mut piece = GUARD;
+    while piece < want {
+        a.free[piece.trailing_zeros() as usize].push(base + want + piece);
+        piece <<= 1;
+    }
+    Some(Arc { base, size: want, block: want, guard: GUARD })
 }
 
-/// Return an arc to its pool, merging buddies.
+/// Return an arc to its pool, merging buddies; a masked arc's guard goes back with it.
 pub fn arc_free(arc: Arc) {
     crate::cachemap::arc_reset(arc.base, arc.block);
-    let (a, (p0, p1)) = pool_of(arc.base);
-    let mut base = arc.base;
-    let mut k = arc.block.trailing_zeros() as usize;
+    if arc.guard != 0 {
+        crate::cachemap::guard_pages(arc.base + arc.size, arc.guard, false);
+        buddy_give(arc.base + arc.size, arc.guard);
+    }
+    buddy_give(arc.base, arc.block);
+}
+
+/// A free block of `block` bytes at `base` back to its pool's lists, merged with its buddies while they are free.
+fn buddy_give(base: usize, block: usize) {
+    let (a, (p0, p1)) = pool_of(base);
+    let mut base = base;
+    let mut k = block.trailing_zeros() as usize;
     while (1usize << k) < p1 - p0 {
         let buddy = p0 + ((base - p0) ^ (1 << k));
         match a.free[k].iter().position(|&b| b == buddy) {
@@ -2560,7 +2585,7 @@ pub fn arcs_report() -> alloc::string::String {
     lock();
     let mut s = alloc::string::String::new();
     for p in k().procs.iter().flatten() {
-        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} block G#{:X}\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.block));
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{} base G#{:X} size G#{:X} block G#{:X} {}\n", core::str::from_utf8(&p.name).unwrap_or("?"), p.arc.base, p.arc.size, p.arc.block, if p.arc.guard != 0 { "masked" } else { "native" }));
     }
     unlock();
     s

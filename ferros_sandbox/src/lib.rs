@@ -231,12 +231,15 @@ fn load_store(i: u32) -> Result<(), Refusal> {
         }
         // Load register (literal): PC-relative.
         0b01 if op2 & 2 == 0 => Err(Refusal::LiteralLoad),
-        // Load/store pair: offset form only (op2 = 10), base x25/sp; loads write Rt and Rt2.
+        // Load/store pair: offset form only (op2 = 10), base x25/sp, a non-negative offset (nothing below the arc base is the arc's: native arcs sit right under masked ones); loads write Rt and Rt2.
         0b10 => {
             if op2 != 0b10 {
                 return Err(Refusal::Writeback);
             }
             imm_base(rn(i))?;
+            if (i >> 21) & 1 == 1 {
+                return Err(Refusal::AddressForm);
+            }
             if (i >> 22) & 1 == 1 && op1 == 0 {
                 gpr_write(rd(i))?;
                 gpr_write(rt2(i))?;
@@ -250,8 +253,13 @@ fn load_store(i: u32) -> Result<(), Refusal> {
                 imm_base(rn(i))?;
             } else if (i >> 21) & 1 == 0 {
                 match op4 {
-                    // Unscaled immediate (LDUR/STUR, ±256).
-                    0b00 => imm_base(rn(i))?,
+                    // Unscaled immediate (LDUR/STUR): base x25/sp, non-negative only (0 to 255; the emitter folds a negative offset into the masked address).
+                    0b00 => {
+                        imm_base(rn(i))?;
+                        if (i >> 20) & 1 == 1 {
+                            return Err(Refusal::AddressForm);
+                        }
+                    }
                     // Unprivileged (LDTR/STTR): refused.
                     0b10 => return Err(Refusal::AddressForm),
                     // Pre/post-index.

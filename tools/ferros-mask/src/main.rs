@@ -114,7 +114,8 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
             match (inner.len(), writeback_pre, writeback_post) {
                 // [sp] / [sp, #imm] without writeback: already allowed.
                 (1, false, false) => return Ok(false),
-                (2, false, false) if is_imm(&inner[1]) => return Ok(false),
+                // A non-negative offset only: a negative one reaches below the arc base, so it is folded into the masked address below.
+                (2, false, false) if is_imm(&inner[1]) && imm_value(&inner[1]).is_none_or(|v| v >= 0) => return Ok(false),
                 // [sp, #imm]! : move sp first, then access [sp].
                 (2, true, false) => {
                     let d = imm_value(&inner[1]).ok_or("pre-index needs a number")?;
@@ -137,6 +138,19 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
             o.base_update(base, d);
         }
         let computed = inner.len() >= 2 && !is_imm(&inner[1]);
+        // A negative immediate (no writeback): the address computed first, then masked, then accessed with no offset; the checker admits no access below the arc base.
+        let neg = if inner.len() == 2 && !writeback_pre && is_imm(&inner[1]) { imm_value(&inner[1]).filter(|&v| v < 0) } else { None };
+        if let Some(v) = neg {
+            o.ins(&format!("sub x24, {base}, #{}", -v));
+            o.ins("and x26, x24, x27");
+            if has_reg_offset(mnem) {
+                access(o, "[x28, x26]");
+            } else {
+                o.ins("add x25, x28, x26");
+                access(o, "[x25]");
+            }
+            return Ok(true);
+        }
         if computed {
             // Register offset (with optional shift/extend): fold into x24 first.
             o.ins(&format!("add x24, {base}, {}", inner[1..].join(", ")));

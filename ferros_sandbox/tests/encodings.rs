@@ -104,7 +104,7 @@ fn memory_forms() {
     accepts("ldr x0, [x25, #8]");
     accepts("str x0, [x25, #32760]");
     accepts("ldr q1, [x25, #65520]");
-    accepts("ldur x0, [x25, #-8]");
+    refuses("ldur x0, [x25, #-8]", Refusal::AddressForm);
     accepts("ldr x0, [sp, #16]");
     accepts("stp x29, x30, [sp, #16]");
     accepts("ldp q0, q1, [x25, #32]");
@@ -191,4 +191,17 @@ fn header_is_skipped() {
     assert_eq!(ferros_sandbox::check_image(&img), Ok(2));
     img.extend_from_slice(&one("mov x28, x0").to_le_bytes());
     assert!(ferros_sandbox::check_image(&img).is_err());
+}
+
+/// Nothing below the arc base: negative immediates on x25 and sp are refused (the emitter folds them into the masked address); non-negative ones stay.
+#[test]
+fn no_negative_offsets() {
+    accepts("ldur w0, [x25, #255]");
+    accepts("ldr x0, [x25, #8]");
+    accepts("ldp x0, x1, [sp, #16]");
+    accepts("stur q0, [sp, #1]");
+    refuses("ldur w0, [x25, #-8]", Refusal::AddressForm);
+    refuses("stur x0, [sp, #-256]", Refusal::AddressForm);
+    refuses("ldp x0, x1, [x25, #-16]", Refusal::AddressForm);
+    refuses("stp q0, q1, [sp, #-32]", Refusal::AddressForm);
 }
