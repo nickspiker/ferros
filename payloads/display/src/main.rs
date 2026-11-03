@@ -1922,12 +1922,21 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                     mix(p, line, (fl * 65536.0) as u64)
                 } else if DEV && (from_right == mr + 1 && ir > 0.0) {
                     mix(p, line, (fr * 65536.0) as u64)
-                } else if DEV && (y == 0 || y == height - 1 || (x == 0 && il == 0.0) || (from_right == 0 && ir == 0.0)) {
-                    // The straight edges' hairline, one pixel in from the glass.
+                } else if DEV && (y == 0 || y == height - 1) {
+                    // The top and bottom edges' hairline.
                     line
                 } else {
                     p
                 };
+            }
+        }
+        // The left and right edges' hairline on the rows the corners do not reach (the block above runs only where they do: without this the line stopped dead where the curve met the edge, the owner's "hard stop on the vertical", 2026-11-02).
+        if DEV {
+            if xa == 0 && il == 0.0 {
+                px[0] = line;
+            }
+            if xb == width && ir == 0.0 {
+                px[width - 1] = line;
             }
         }
         let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
