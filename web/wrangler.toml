@@ -1,8 +1,4 @@
-name = "ferros-org"
+# ferros.org on Cloudflare Pages (the project is `ferros`, ferros.org and ferros.pages.dev attached). Deploy from this directory: `wrangler pages deploy`.
+name = "ferros"
 compatibility_date = "2024-01-01"
-
-[site]
-bucket = "."
-
-[[pages]]
-# Cloudflare Pages configuration
+pages_build_output_dir = "."
