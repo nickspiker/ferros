@@ -308,8 +308,8 @@
          <li>Its own kernel, in Rust from the first instruction after four short hand-written entry stubs (the image headers the bootloader parses and the first jumps, with the MMU off and no stack). All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
          <li>The display at full resolution, with its own true 16-bit spectral pipeline, no 1931 CIE anywhere. Gradients look real nice! Oh, and touch. You can touch it and it does things.</li>
-         <li>The cameras: the camera takes pitures, so that's fun.</li>
-         <li>WiFi, cellular data (LTE and 5G), satellite positioning (assisted GPS bringup in the works but not currently working), the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
+         <li>The cameras: the camera takes pictures, so that's fun.</li>
+         <li>WiFi, cellular data (LTE and 5G), satellite positioning (a fix from the chip's own engine; assisted GPS in the works), the sensors, NFC, Bluetooth and USB, NEVER POTS, calls, SMS, MMS or 911!</li>
          <li>Keys that live in isolated CPU registers and never touch RAM.</li>
          <li><strong>passless</strong> identity: you type your handle, and nothing of yours is visible until you do.</li>
          <li>The killswitch: both volume keys, held together, and the power is cut below the software. Nothing polls; the key presses are the interrupt. BOOP!</li>
@@ -335,7 +335,7 @@
       <h2>The killswitch</h2>
       <p>
          Both volume keys, held together. The press is an interrupt; the handler cuts the rails thru the power-management IC directly.
-         The keys were in on-die flip-flops that stop existing when the core voltage drops.
+         The keys are in on-die flip-flops that stop existing when the core voltage drops.
       </p>
       <p>
          Nothing is written on the way down and nothing is checked on the way up: the store is never in a half-written state, so the next boot is just a boot.
@@ -379,8 +379,7 @@
          <dt>The kernel and its crates</dt>
          <dd>The sandbox checker that proves a program cannot reach outside its arc, the append-only ledger, the heap, the display and compression paths, the hypervisor that keeps Android in its place.</dd>
       </dl>
-      <h2>Designed, and still a bet</h2>
-      <p><strong>Designed, being built:</strong></p>
+      <h2>Designed, being built</h2>
       <ul>
          <li>Android apps compiled on the device at install and sealed to its hardware, never translated at run time, never redistributed.</li>
          <li>Every remaining driver out of the kernel, until what is left is a kernel and nothing else.</li>
@@ -406,7 +405,7 @@
          <dt>Not started</dt>
          <dd>The GPU. Carrier voice, by design, never. Glyph's hardware (years nine to twelve of the plan). A second device.</dd>
          <dt>Last updated</dt>
-         <dd>2026-11-02</dd>
+         <dd>2026-11-03</dd>
       </dl>
 
       <h2>Questions</h2>
