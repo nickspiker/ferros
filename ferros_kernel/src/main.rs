@@ -155,9 +155,12 @@ static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
 #[cfg_attr(feature = "pixel8", allow(dead_code))]
 static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 
-/// The kernel heap's first region: its base (0 until `kernel_main` sets it) and its end.
+/// The kernel heap's first region, as every boot path lays it: the page after the kernel stack (the linker's `__stack_top`), `HEAP_SIZE` long.
 pub fn heap_bounds() -> (usize, usize) {
-    let b = HEAP_BASE.load(Ordering::Relaxed);
+    unsafe extern "C" {
+        static __stack_top: u8;
+    }
+    let b = (unsafe { &__stack_top as *const u8 as usize } + 0xFFF) & !0xFFF;
     (b, b + HEAP_SIZE)
 }
 

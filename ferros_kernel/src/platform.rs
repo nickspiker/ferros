@@ -377,7 +377,9 @@ pub fn scrub_memory() {
     if sctlr & 1 == 0 || hb == 0 {
         return;
     }
+    reset_step(2);
     crate::smp::stop_all();
+    reset_step(3);
     let t0 = cntpct();
     let regions: [(usize, usize); 12] = [
         (hb, he),
@@ -407,17 +409,30 @@ pub fn scrub_memory() {
     }
     unsafe { core::arch::asm!("dsb sy") };
     let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
+    reset_step(4);
     unsafe {
         write_volatile(0xFD60_0250 as *mut u64, total as u64);
         write_volatile(0xFD60_0258 as *mut u64, us);
+        // Cleaned to DRAM, as the trail words are: the report page is cacheable under the map, and the reset discards the caches.
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) 0xFD60_0250u64);
     }
-    crate::flashlog::line("memory scrubbed before the reset");
+    pstore(alloc::format!("memory scrubbed before the reset: {} MiB in {} us\n", total >> 20, us).as_bytes());
+}
+
+/// The reset path's own steps, in the report page at G#FD60_0F00 (a magic word) and G#FD60_0F08 (the step: 1 the hook done, 2 the scrub's checks passed, 3 the workers stopped, 4 the memory zeroed), for reading after the boot that follows.
+pub fn reset_step(s: u64) {
+    unsafe {
+        write_volatile(0xFD60_0F00 as *mut u64, 0x4245_4652_4553_4554);
+        write_volatile(0xFD60_0F08 as *mut u64, s);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) 0xFD60_0F00u64);
+    }
 }
 
 pub fn before_reset() {
     if let Some(f) = unsafe { BEFORE_RESET } {
         f();
     }
+    reset_step(1);
     #[cfg(not(shim_handoff))]
     scrub_memory();
 }
