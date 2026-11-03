@@ -1729,7 +1729,7 @@ fn front_order() -> ([(usize, Win); SURFACES], usize) {
 }
 
 /// The glass's own corner radius, in panel pixels: a fact of this panel to be tuned on the device (owner, 2026-11-02: "we'll fine tune the radius on this device to squeeze as much out of it"). Android reports 68 at its 1008-wide frame, 91 at the full raster.
-const GLASS_RADIUS: f32 = 91.0;
+const GLASS_RADIUS: f32 = 80.0;
 /// Whether this is a development build (the hairlines, the orange).
 const DEV: bool = option_env!("FERROS_PRODUCTION").is_none();
 /// Outside the screen's edge: black on release; on development builds the hairline's orange one stop darker (each channel's code over the root of two: half the light at gamma 2), so a dev image is told at a glance and the mask is still a mask.
