@@ -155,6 +155,12 @@ static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
 #[cfg_attr(feature = "pixel8", allow(dead_code))]
 static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
 
+/// The kernel heap's first region: its base (0 until `kernel_main` sets it) and its end.
+pub fn heap_bounds() -> (usize, usize) {
+    let b = HEAP_BASE.load(Ordering::Relaxed);
+    (b, b + HEAP_SIZE)
+}
+
 #[cfg_attr(feature = "pixel8", allow(dead_code))]
 struct BumpAlloc;
 

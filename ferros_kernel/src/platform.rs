@@ -367,10 +367,59 @@ pub const WATCHDOG_DID_NOT_FIRE: u64 = 0xDEAD_B007;
 /// A plain reset through EL3 (PSCI SYSTEM_RESET). Measured on husky: the bootloader reads it as "Reboot mode: 0x0", a normal boot of the active slot — which is what the gate's Android choice wants after `slot::set_active(0)`.
 /// Run before every reset this kernel orders (AUTH.md): the vault drops the unlocked identity's key, its bytes overwritten, so a warm reset hands nothing to whatever boots next — Android at the gate's other answer, or a crash's next boot. Registered by the service once the vault is open.
 pub static mut BEFORE_RESET: Option<fn()> = None;
+/// ferros's memory zeroed on the way out (HV.md, dual boot; owner, 2026-11-02): a warm reset keeps DRAM, so whatever boots next (Android from the gate) would find ferros's working set where it was. The roots are in registers and die with the reset; everything else that ever held a decrypted thing is in these regions: the kernel heap (both regions: the vault's working set, capsules in flight), the arc pools (every process's memory), the driver DMA pools, and the display's regions (frames, surfaces, sprites, the canvas). The image's own data and the stack this runs on stay: the stack is in use, and the image holds no secret.
+/// The workers are stopped first so no process writes behind the scrub. Each line is zeroed with `dc zva` and cleaned to DRAM at once, so the zeros are in memory before the reset discards the caches: about three quarters of a gigabyte, tens of milliseconds. Only with the cache map on (the zeroing instruction needs Normal memory) and the heap up: an early reset has nothing to scrub. The bytes and the microseconds go to the crumb page at G#FD60_0250 and G#FD60_0258.
+#[cfg(not(shim_handoff))]
+pub fn scrub_memory() {
+    let sctlr: u64;
+    unsafe { core::arch::asm!("mrs {v}, sctlr_el2", v = out(reg) sctlr) };
+    let (hb, he) = crate::heap_bounds();
+    if sctlr & 1 == 0 || hb == 0 {
+        return;
+    }
+    crate::smp::stop_all();
+    let t0 = cntpct();
+    let regions: [(usize, usize); 12] = [
+        (hb, he),
+        crate::cachemap::HEAP2,
+        crate::cachemap::POOL,
+        crate::cachemap::POOL_BIG,
+        crate::cachemap::DMA_POOL,
+        crate::cachemap::USB_DMA,
+        crate::cachemap::DISPLAY_FB,
+        crate::cachemap::DISPLAY_HEAP,
+        crate::cachemap::DISPLAY_PHASES,
+        crate::cachemap::DISPLAY_SPRITES,
+        crate::cachemap::DISPLAY_CANVAS,
+        crate::cachemap::SURFACES,
+    ];
+    let mut total = 0usize;
+    for &(lo, hi) in &regions {
+        if hi <= lo {
+            continue;
+        }
+        let mut a = lo;
+        while a < hi {
+            unsafe { core::arch::asm!("dc zva, {a}", "dc cvac, {a}", a = in(reg) a) };
+            a += 64;
+        }
+        total += hi - lo;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
+    unsafe {
+        write_volatile(0xFD60_0250 as *mut u64, total as u64);
+        write_volatile(0xFD60_0258 as *mut u64, us);
+    }
+    crate::flashlog::line("memory scrubbed before the reset");
+}
+
 pub fn before_reset() {
     if let Some(f) = unsafe { BEFORE_RESET } {
         f();
     }
+    #[cfg(not(shim_handoff))]
+    scrub_memory();
 }
 
 pub fn reboot() -> ! {
