@@ -1156,6 +1156,11 @@ pub fn run(mut b: Boot) -> ! {
             platform::pstore(&threads);
             let w = |k: usize| crate::smp::IDLE_WAKES[k].load(core::sync::atomic::Ordering::Relaxed);
             platform::pstore(alloc::format!("workers: up G#{:X}, idle wakes [{}, {}, {}, {}]; x3 parked {}\n", crate::smp::up_mask(), w(0), w(1), w(2), w(3), crate::x3::parked()).as_bytes());
+            // Per core, the hand-off words the next cold boot overwrites (the fourth jump of 2026-11-03: the X3 and two workers took their entries and were never heard from): the worker's progress (G#FD60_0B00, low byte the step: 1 arrived, 2 GIC armed, 3 EL0 on, 4-6 loop passes, 8 first slice), its arrival in Rust (0B80), and the hv's two trace words (0C00, 0C80), all in counter ticks.
+            for c in 0..9usize {
+                let r = |base: usize| unsafe { core::ptr::read_volatile((base + c * 8) as *const u64) };
+                platform::pstore(alloc::format!("core {}: step {} at G#{:X}, arrived G#{:X}, hv G#{:X} G#{:X}\n", c, r(0xFD60_0B00) & 0xFF, r(0xFD60_0B00) & !0xFF, r(0xFD60_0B80), r(0xFD60_0C00), r(0xFD60_0C80)).as_bytes());
+            }
             platform::pstore(&crate::process::take_console());
             platform::reboot();
         }
