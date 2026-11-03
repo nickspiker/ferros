@@ -230,6 +230,23 @@ fn trail(s: u64) {
     }
 }
 
+/// The suspend trail (G#FD60_0F40, u64 words in the ramoops page, kept through a warm reset, cleared when Android boots): what Android's sleeps did under the hv, so a hang in deep sleep (HV.md: the one path never measured) leaves its last steps for the boot after. 0 magic "SUSPEND1"; 1 system suspends entered; 2 the counter at the last; 3 the hv core's AFFINITY_INFO after it switched itself off (1: off); 4 what EL3 answered when a system suspend came back (it only returns on failure); 5 resumes after a system suspend; 6 the counter at the last; 7 the core it came back on; 8 CPU_SUSPENDs (idle); 9 the last one's core; 10 its power state; 11 the last CPU_SUSPEND's counter.
+const SUSP: usize = 0xFD60_0F40;
+const SUSP_MAGIC: u64 = 0x5355_5350_454E_4431; // "SUSPEND1"
+static mut SUSP_PENDING: bool = false;
+fn susp(i: usize, v: u64, add: bool) {
+    unsafe {
+        let p = (SUSP + 8 * i) as *mut u64;
+        write_volatile(p, if add { read_volatile(p).wrapping_add(v) } else { v });
+        asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+    }
+}
+fn ticks() -> u64 {
+    let t: u64;
+    unsafe { asm!("mrs {t}, cntpct_el0", t = out(reg) t) };
+    t
+}
+
 fn stage(s: u64) {
     report(0x40, s);
     trail(s);
@@ -1231,6 +1248,10 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                     frame[2] = _secondary as *const () as u64;
                 }
                 PSCI_CPU_SUSPEND | PSCI_CPU_SUSPEND_32 => {
+                    susp(8, 1, true);
+                    susp(9, core as u64, false);
+                    susp(10, frame[1], false);
+                    susp(11, ticks(), false);
                     unsafe {
                         RESUME[core] = [frame[2], frame[3]];
                         asm!("dc civac, {a}", "dsb sy", a = in(reg) (&raw const RESUME[core]) as u64);
