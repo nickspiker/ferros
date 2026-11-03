@@ -39,6 +39,10 @@ const BASE: u32 = 28;
 const MASK: u32 = 27;
 const OFF: u32 = 26;
 const ADDR: u32 = 25;
+/// The handle pair (SANDBOX.md, "Handles"): x23 a granted region's base, x22 its mask, x21 an offset masked by it. Written only by the pair load from the handle table and the masked AND.
+const HBASE: u32 = 23;
+const HMASK: u32 = 22;
+const HOFF: u32 = 21;
 /// Register number 31 as a base or destination: sp in some encodings, xzr in others.
 const R31: u32 = 31;
 
@@ -47,6 +51,10 @@ pub const AND_X26: u32 = 0x8A1B_001A; // and x26, xN, x27  (with Rn in bits 9:5)
 const AND_X26_MASK: u32 = 0xFFFF_FC1F;
 pub const ADD_X25: u32 = 0x8B1A_0399; // add x25, x28, x26
 pub const ADD_SP: u32 = 0x8B3A_639F; // add sp, x28, x26, uxtx
+/// The handle pair's writers: `ldp x23, x22, [x28, #imm]` with imm a slot's pair in the handle table, which lies in the 512 bytes below the arc base (offset form, imm7 negative and even: slot k at -16(k + 1)), and `and x21, xN, x22`.
+pub const LDP_HANDLE: u32 = 0xA940_5B97; // ldp x23, x22, [x28, #0]  (imm7 in bits 21:15)
+const LDP_HANDLE_MASK: u32 = 0xFFC0_7FFF;
+pub const AND_X21: u32 = 0x8A16_0015; // and x21, xN, x22  (with Rn in bits 9:5)
 
 fn rd(i: u32) -> u32 {
     i & 31
@@ -65,7 +73,7 @@ fn rm(i: u32) -> u32 {
 fn gpr_write(r: u32) -> Result<(), Refusal> {
     match r {
         BASE | MASK => Err(Refusal::WritesBaseOrMask),
-        OFF | ADDR => Err(Refusal::WritesInvariantRegister),
+        OFF | ADDR | HBASE | HMASK | HOFF => Err(Refusal::WritesInvariantRegister),
         _ => Ok(()),
     }
 }
@@ -81,8 +89,13 @@ fn gpr_or_sp_write(r: u32) -> Result<(), Refusal> {
 /// Check one instruction.
 pub fn check(i: u32) -> Result<(), Refusal> {
     // The single allowed writers of the invariant registers.
-    if i & AND_X26_MASK == AND_X26 || i == ADD_X25 || i == ADD_SP {
+    if i & AND_X26_MASK == AND_X26 || i == ADD_X25 || i == ADD_SP || i & AND_X26_MASK == AND_X21 {
         return Ok(());
+    }
+    // The handle select: one pair load from the table, so the base and the mask change together and the invariant holds at every boundary.
+    if i & LDP_HANDLE_MASK == LDP_HANDLE {
+        let imm7 = (i >> 15) & 0x7F;
+        return if imm7 & 1 == 0 && imm7 >= 0x40 { Ok(()) } else { Err(Refusal::AddressForm) };
     }
     let op0 = (i >> 25) & 0xF;
     match op0 {
@@ -252,11 +265,12 @@ fn load_store(i: u32) -> Result<(), Refusal> {
                         gpr_write(rd(i))?;
                         return Ok(());
                     }
-                    // Register offset: only [x28, x26] with LSL/UXTX #0.
+                    // Register offset: only [x28, x26] or the handle's [x23, x21], with LSL/UXTX #0.
                     0b10 => {
                         let option = (i >> 13) & 7;
                         let s = (i >> 12) & 1;
-                        if rn(i) != BASE || rm(i) != OFF || option != 0b011 || s != 0 {
+                        let pair = (rn(i) == BASE && rm(i) == OFF) || (rn(i) == HBASE && rm(i) == HOFF);
+                        if !pair || option != 0b011 || s != 0 {
                             return Err(Refusal::AddressForm);
                         }
                     }

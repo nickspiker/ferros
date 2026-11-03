@@ -151,3 +151,30 @@ fn control_flow() {
     refuses("dc zva, x25", Refusal::System);
     refuses("ic ivau, x0", Refusal::System);
 }
+
+/// Handles (SANDBOX.md): the pair load from the table, the masked offset, and accesses through the pair; nothing else may write x21-x23, and the pair takes no immediate offsets.
+#[test]
+fn handle_forms() {
+    accepts("ldp x23, x22, [x28, #-16]");
+    accepts("ldp x23, x22, [x28, #-512]");
+    assert_eq!(one("ldp x23, x22, [x28]"), ferros_sandbox::LDP_HANDLE);
+    refuses("ldp x23, x22, [x28]", Refusal::AddressForm);
+    refuses("ldp x23, x22, [x28, #16]", Refusal::AddressForm);
+    refuses("ldp x23, x22, [x28, #-8]", Refusal::AddressForm);
+    assert_eq!(one("and x21, x0, x22"), ferros_sandbox::AND_X21);
+    accepts("and x21, x5, x22");
+    accepts("str w3, [x23, x21]");
+    accepts("ldr x0, [x23, x21]");
+    accepts("strb w3, [x23, x21]");
+    accepts("ldr q0, [x23, x21]");
+    accepts("str q1, [x23, x21]");
+    refuses("ldp x23, x22, [x25, #16]", Refusal::WritesInvariantRegister);
+    refuses("ldp x22, x23, [x28, #16]", Refusal::AddressForm);
+    refuses("mov x23, x1", Refusal::WritesInvariantRegister);
+    refuses("and x21, x5, x27", Refusal::WritesInvariantRegister);
+    refuses("add x22, x22, #1", Refusal::WritesInvariantRegister);
+    refuses("str w3, [x23, #4]", Refusal::AddressForm);
+    refuses("str w3, [x23, x26]", Refusal::AddressForm);
+    refuses("str w3, [x28, x21]", Refusal::AddressForm);
+    refuses("str w3, [x23, x21, lsl #2]", Refusal::AddressForm);
+}

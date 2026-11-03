@@ -443,3 +443,23 @@ pub fn sync_code(addr: usize, len: usize) {
         asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
     }
 }
+
+/// The handle table's page (SANDBOX.md, "Handles"): the 4 KiB just below an arc's base, in its lower guard, which nobody owns. Writable only while the kernel fills the table at spawn; read-only to everyone after (the map has no "kernel writes, the process does not": a page is read-only at every level or at none), so a process cannot forge a handle. Non-executable always.
+pub fn guard_page(base: usize, writable: bool) {
+    if !vhe() {
+        return;
+    }
+    let (p0, p1) = POOL;
+    let a = base - PAGE;
+    if a < p0 || a >= p1 {
+        return;
+    }
+    unsafe {
+        let pool_l3 = &mut *(&raw mut POOL_L3);
+        let idx = (a - p0) / PAGE;
+        pool_l3[idx / 512].0[idx % 512] = pool_page(true, a, writable, false);
+        asm!("dsb ish");
+        asm!("tlbi vae1is, {x}", x = in(reg) (a as u64) >> 12);
+        asm!("dsb ish", "isb");
+    }
+}

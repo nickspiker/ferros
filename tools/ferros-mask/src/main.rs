@@ -2,7 +2,7 @@
 //!
 //! Usage: ferros-mask <in.s> <out.s>
 //!
-//! Register roles (reserved in codegen): x28 arc base, x27 mask, x26 masked offset, x25 address in the arc, x24 scratch.
+//! Register roles (reserved in codegen): x28 arc base, x27 mask, x26 masked offset, x25 address in the arc, x24 scratch; x23 a handle's base, x22 its mask, x21 an offset masked by it (SANDBOX.md, "Handles"; the forms are written by hand in ferros_sys and pass through untouched).
 
 use std::fmt::Write as _;
 
@@ -94,11 +94,18 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
         let inner = split_commas(&ops[open + 1..close]);
         let post = ops[close + 1..].trim();
         let base = inner.first().ok_or("empty address")?.as_str();
-        if matches!(base, "x24" | "x25" | "x26" | "x27" | "x28") {
-            return Err(format!("reserved register as base: {mnem} {ops}"));
-        }
         let writeback_pre = post == "!";
         let writeback_post = post.starts_with(',');
+        // The handle forms (SANDBOX.md, "Handles"), written by hand in ferros_sys and left as they are: the pair load from the table and an access through the pair.
+        if mnem == "ldp" && pre == "x23, x22" && base == "x28" && !writeback_pre && !writeback_post && (inner.len() == 1 || (inner.len() == 2 && is_imm(&inner[1]))) {
+            return Ok(false);
+        }
+        if base == "x23" && inner.len() == 2 && inner[1] == "x21" && !writeback_pre && !writeback_post {
+            return Ok(false);
+        }
+        if matches!(base, "x21" | "x22" | "x23" | "x24" | "x25" | "x26" | "x27" | "x28") {
+            return Err(format!("reserved register as base: {mnem} {ops}"));
+        }
         let post_imm = if writeback_post { imm_value(post.trim_start_matches(',').trim()) } else { None };
         let access = |o: &mut Out, addr: &str| o.ins(&format!("{mnem} {pre}, {addr}"));
         if base == "sp" {

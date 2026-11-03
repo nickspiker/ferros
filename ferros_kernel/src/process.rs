@@ -193,7 +193,9 @@ impl Arc {
 /// Allocate the smallest arc of at least `bytes` (buddy split from the pool), zeroed. `guard` reserves a guard of the arc's own size on each side (a 2S block, SANDBOX.md): the base is 2S-aligned, hence S-aligned, so masking stays a single `and`, and the usable arc never abuts another.
 pub fn arc_alloc(bytes: usize, guard: bool) -> Option<Arc> {
     let want = bytes.max(1 << ARC_MIN_LOG2).next_power_of_two();
-    let block = if guard { want * 2 } else { want };
+    // Every arc takes a 2S block: the upper half is its guard (SANDBOX.md), and the page below its base holds its handle table, native or masked (the table is read by the same instructions either way).
+    let block = want * 2;
+    let _ = guard;
     // Masked (guarded) arcs need the page pool's per-page W^X; a big native arc goes to the big pool, and a small one too when the page pool is full.
     let base = if guard {
         buddy_take(arcs(), block)?
@@ -2227,7 +2229,7 @@ pub struct Outcome {
     pub round_trips: u32,
 }
 
-/// Arc layout: grants page, then code.
+/// Arc layout: grants page, then code. The handle table (SANDBOX.md, "Handles") lies in the page just below the arc's base, in its lower guard: slot k's pair at base - 16(k + 1), the granted region's base then its mask, both zero when the grant is not a region or the region cannot be masked; the page is read-only once written.
 const GRANTS: usize = 0;
 pub const CODE: usize = 0x1000;
 pub const STACK: usize = 64 * 1024;
@@ -2463,11 +2465,18 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
     let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec() };
-    // Grants page: count, then the tokens in slot order. Then the code, then the input.
+    // Grants page: count, then the tokens in slot order. Then the code, then the input. The handle table below the base, written while its page is writable, then read-only.
     p.write(GRANTS as u64, &(p.cspace.len() as u32).to_le_bytes());
+    crate::cachemap::guard_page(arc.base, true);
     for (i, c) in p.cspace.iter().enumerate() {
         p.write((GRANTS + 4 + 32 * i) as u64, &c.token);
+        let (base, mask) = handle_of(c.object);
+        unsafe {
+            core::ptr::write_volatile((arc.base - 16 * (i + 1)) as *mut u64, base);
+            core::ptr::write_volatile((arc.base - 16 * (i + 1) + 8) as *mut u64, mask);
+        }
     }
+    crate::cachemap::guard_page(arc.base, false);
     if let Some(i) = ihi {
         p.write(IHI as u64, &i);
     }
@@ -2520,4 +2529,18 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
     let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len)?;
     enqueue_back(me);
     Ok(me)
+}
+
+/// A granted region as a handle (SANDBOX.md, "Handles"): its base and its mask, for masked code to reach it as `base + (offset & mask)`. A region is maskable when it is a power of two in size and aligned to it; the registry's blocks are, bar a few MMIO blocks of odd sizes, which round up to the next power of two when their base allows. A grant that is not a region, or a region that cannot be masked, is (0, 0): native code reaches it as it always has, masked code cannot.
+fn handle_of(object: Object) -> (u64, u64) {
+    let (base, size) = match object {
+        Object::Dma(i) => (DMA[i].base, DMA[i].size),
+        Object::Hardware(h) if !HARDWARE[h].via_el3 => (HARDWARE[h].base, HARDWARE[h].size),
+        _ => return (0, 0),
+    };
+    let span = size.next_power_of_two();
+    if size == 0 || base % span != 0 {
+        return (0, 0);
+    }
+    (base as u64, (span - 1) as u64)
 }

@@ -908,3 +908,71 @@ pub fn bind_identity(cap: u64) -> bool {
 pub fn release_identity(cap: u64) -> bool {
     svc(nr::UNLOCK, cap, 4, 0, 0, 0) == 0
 }
+
+/// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table below the arc base (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #-16·(SLOT + 1)]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
+pub struct Handle<const SLOT: u64>;
+
+impl<const SLOT: u64> Handle<SLOT> {
+    /// The region's base and mask as the table holds them.
+    #[inline(always)]
+    pub fn pair() -> (u64, u64) {
+        let (b, m): (u64, u64);
+        // Through the pair registers, the only destination the checker allows the table's load.
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "mov {b}, x23", "mov {m}, x22", b = out(reg) b, m = out(reg) m, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        (b, m)
+    }
+    /// The region's size in bytes (0 for a grant with no region).
+    #[inline(always)]
+    pub fn len() -> u64 {
+        let (b, m) = Self::pair();
+        if b == 0 { 0 } else { m + 1 }
+    }
+    #[inline(always)]
+    pub fn read8(off: u64) -> u8 {
+        let v: u32;
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldrb {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        v as u8
+    }
+    #[inline(always)]
+    pub fn read32(off: u64) -> u32 {
+        let v: u32;
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v:w}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn read64(off: u64) -> u64 {
+        let v: u64;
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "ldr {v}, [x23, x21]", o = in(reg) off, v = out(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, readonly, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn write8(off: u64, v: u8) {
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "strb {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v as u32, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+    }
+    #[inline(always)]
+    pub fn write32(off: u64, v: u32) {
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v:w}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+    }
+    #[inline(always)]
+    pub fn write64(off: u64, v: u64) {
+        unsafe { asm!("ldp x23, x22, [x28, #{t}]", "and x21, {o}, x22", "str {v}, [x23, x21]", o = in(reg) off, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack, preserves_flags)) };
+    }
+    /// `n` words of `v` from `off`, the pair selected once.
+    #[inline(always)]
+    pub fn fill64(off: u64, n: u64, v: u64) {
+        unsafe {
+            asm!(
+                "ldp x23, x22, [x28, #{t}]",
+                "cbz {n}, 2f",
+                "1:",
+                "and x21, {o}, x22",
+                "str {v}, [x23, x21]",
+                "add {o}, {o}, #8",
+                "subs {n}, {n}, #1",
+                "b.ne 1b",
+                "2:",
+                o = inout(reg) off => _, n = inout(reg) n => _, v = in(reg) v, t = const -16 * (SLOT as i64 + 1), options(nostack)
+            )
+        };
+    }
+}
