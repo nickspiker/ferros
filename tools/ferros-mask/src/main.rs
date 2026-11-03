@@ -88,7 +88,9 @@ impl Out {
 
 /// Rewrite one instruction (mnemonic + operand text). Returns false if it passes through unchanged.
 fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
-    if let Some(open) = ops.find('[') {
+    // An address is a bracket that opens an operand (`[x8]`, `str w0, [x1, #4]`); a bracket inside an operand is a vector lane (`mov v1.b[4], v0.b[6]`) and no memory access.
+    let address = ops.match_indices('[').map(|(i, _)| i).find(|&open| open == 0 || ops[..open].trim_end().ends_with(','));
+    if let Some(open) = address {
         let close = ops[open..].find(']').map(|c| open + c).ok_or("unclosed address")?;
         let pre = ops[..open].trim().trim_end_matches(',').trim();
         let inner = split_commas(&ops[open + 1..close]);

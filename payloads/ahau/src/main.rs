@@ -114,6 +114,14 @@ const S_PHOTON_EP: u64 = 8;
 const S_UNLOCK: u64 = 9;
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
 const S_BACK: u64 = 10;
+
+/// The surfaces through their handles (SANDBOX.md, "Handles"): the screen draws into `BUF`, a frame-sized buffer in its own arc, and presents the rows it touched through the shown surface's handle, so the same binary runs native and masked and the drawing code (honeycomb, tapuwae, the pills) never holds a pointer outside the arc. Text is the display's to draw, into a surface it knows: the rows go to that surface first (`put_rows`), the text is asked for, and the rows come back (`get_rows`) before anything more is drawn over them. The second surface stays a display surface for that, reached through its own handle. Labels the keyboard draws are recorded while it draws and asked for after the rows are presented, or the presenting would wipe them.
+type Front = ferros_sys::Handle<S_SURF>;
+type BackS = ferros_sys::Handle<S_BACK>;
+static mut BUF: [u64; (32 << 20) / 8] = [0; (32 << 20) / 8];
+/// A recorded label: x, baseline, size, value, the text and its length.
+static mut LABELS: [(i64, i64, u16, u16, [u8; 32], usize); 256] = [(0, 0, 0, 0, [0; 32], 0); 256];
+static mut NLABELS: usize = 0;
 /// The longest handle the screen takes, in characters.
 const MAX_CHARS: usize = 64;
 /// Grey working values: the mark, the prompt, the status line (gamma 2, white = Q14).
@@ -233,11 +241,48 @@ struct Ahau {
 
 impl Ahau {
     fn surf(&self) -> &'static mut [u64] {
-        unsafe { core::slice::from_raw_parts_mut(self.base as *mut u64, self.w * self.h) }
+        unsafe { core::slice::from_raw_parts_mut(&raw mut BUF as *mut u64, self.w * self.h) }
+    }
+
+    /// Rows y0..y1 of the buffer onto the shown surface.
+    fn present(&self, y0: usize, y1: usize) {
+        Front::write_words((y0 * self.w * 8) as u64, &self.surf()[y0 * self.w..y1 * self.w]);
+    }
+
+    /// Rows y0..y1 of the buffer onto surface `tb` (the second surface or the shown one), for the display to draw text into.
+    fn put_rows(&self, tb: u64, y0: usize, y1: usize) {
+        let rows = &self.surf()[y0 * self.w..y1 * self.w];
+        if tb == self.back && self.back != 0 { BackS::write_words((y0 * self.w * 8) as u64, rows) } else { Front::write_words((y0 * self.w * 8) as u64, rows) }
+    }
+
+    /// Rows y0..y1 back from surface `tb` into the buffer, with what the display drew there.
+    fn get_rows(&self, tb: u64, y0: usize, y1: usize) {
+        let rows = &mut self.surf()[y0 * self.w..y1 * self.w];
+        if tb == self.back && self.back != 0 { BackS::read_words((y0 * self.w * 8) as u64, rows) } else { Front::read_words((y0 * self.w * 8) as u64, rows) }
+    }
+
+    /// The labels recorded by the last keyboard draw, drawn by the display onto surface `tb`.
+    fn replay_labels(&self, tb: u64) {
+        let n = unsafe { NLABELS };
+        for i in 0..n {
+            let (x, y, px, v, text, len) = unsafe { (*(&raw const LABELS))[i] };
+            window::text_centred(self.display, tb, x as i16, y as i16, px, v, &text[..len]);
+        }
+        unsafe { NLABELS = 0 };
     }
 
     fn label(&self) -> impl FnMut(i64, i64, u16, u16, &str) + '_ {
-        move |x, y, px, v, t| window::text_centred(self.display, self.base, x as i16, y as i16, px, v, t.as_bytes())
+        move |x, y, px, v, t| unsafe {
+            let n = NLABELS;
+            if n < 256 {
+                let b = t.as_bytes();
+                let len = if b.len() > 32 { 32 } else { b.len() };
+                let mut text = [0u8; 32];
+                text[..len].copy_from_slice(&b[..len]);
+                (*(&raw mut LABELS))[n] = (x, y, px, v, text, len);
+                NLABELS = n + 1;
+            }
+        }
     }
 
     /// Text centred across the screen on `baseline`, by the keyboard's estimate of the typeface's advance (0.56 em).
@@ -248,6 +293,7 @@ impl Ahau {
 
     fn clear_rows(&self, y0: usize, y1: usize) {
         self.surf()[y0 * self.w..y1 * self.w].fill(0);
+        self.present(y0, y1);
     }
 
     /// Where things go, from the screen's size: the mark's centre and radius, the title's and status line's baselines and sizes, the entry's baseline and size.
@@ -353,13 +399,18 @@ impl Ahau {
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
             pill(s, self.w, bx0, by0, bx1, by1, 1800, self.w / 24);
-            let px = self.w / 24;
-            let x = (bx0 + bx1) as i64 / 2 - 4 * px as i64 * 28 / 100;
-            window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         let (x0, y0, x1, y1) = self.button_at();
         if self.button_label().is_some() {
             pill(s, self.w, x0, y0, x1, y1, 2600, self.w / 24);
+        }
+        // The row presented before the display writes its words on it.
+        self.present(ry0, ry1);
+        if self.can_go_back() {
+            let (bx0, by0, bx1, by1) = self.back_at();
+            let px = self.w / 24;
+            let x = (bx0 + bx1) as i64 / 2 - 4 * px as i64 * 28 / 100;
+            window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         if let Some(t) = self.button_label() {
             let px = self.w / 24;
@@ -657,7 +708,8 @@ impl Ahau {
         let (b, px) = self.entry_at();
         let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
         // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
-        let (tb, s) = if self.back != 0 { (self.back, unsafe { core::slice::from_raw_parts_mut(self.back as *mut u64, self.w * self.h) }) } else { (self.base, self.surf()) };
+        let tb = if self.back != 0 { self.back } else { self.base };
+        let s = self.surf();
         s[r0..r1].fill(0);
         let (t, n, at) = self.shown();
         let shown = core::str::from_utf8(&t[..n]).unwrap_or("");
@@ -671,7 +723,9 @@ impl Ahau {
             self.pan.set(self.bound_pan(px, tw, p));
         }
         let x = self.text_left(px, tw);
+        self.put_rows(tb, r0 / self.w, r1 / self.w);
         window::text(self.display, tb, x as i16, b as i16, px as u16, TEXT, shown.as_bytes());
+        self.get_rows(tb, r0 / self.w, r1 / self.w);
         // The window: nothing outside it, and over the last half em at each end the text fades by a C∞ smooth step (exp(−1/t) against its mirror: exactly 0 at the window's edge and 1 at the fade's inner edge, every derivative matching there), in linear light: the gamma-2 value times √f. Fixed in place, so text that fits (inside the fades) is never dimmed and nothing jumps as the handle grows past the edge.
         let fade = |t: f32| {
             let e = |u: f32| if u > 0. { libm::expf(-1. / u) } else { 0. };
@@ -695,15 +749,15 @@ impl Ahau {
         // The line: three quarters of the width, a single pixel, grey at a quarter in gamma 2 (owner, 2026-10-29).
         let (x0, x1, y) = (self.w / 8, self.w * 7 / 8, b + px / 4);
         s[y * self.w + x0..y * self.w + x1].fill(grey(LINE));
-        if self.back != 0 {
-            self.surf()[r0..r1].copy_from_slice(&s[r0..r1]);
-        }
+        self.present(r0 / self.w, r1 / self.w);
     }
 
     fn all(&self) {
         self.surf().fill(0);
+        Front::fill64(0, (self.w * self.h) as u64, 0);
         let (cx, cy, r) = self.mark_at();
         draw_mark(self.surf(), self.w, cx, cy, r);
+        self.present(cy - r - 2, cy + r + 2);
         self.status(self.prompt());
         self.entry();
         self.button();
@@ -717,8 +771,7 @@ impl Ahau {
 
     /// Where a board is drawn and painted before it shows: the back surface (its base and pixels), or, without one, the screen itself.
     fn target(&self) -> (u64, &'static mut [u64]) {
-        let b = if self.back != 0 { self.back } else { self.base };
-        (b, unsafe { core::slice::from_raw_parts_mut(b as *mut u64, self.w * self.h) })
+        (if self.back != 0 { self.back } else { self.base }, self.surf())
     }
 
     /// The board for `kb` (its keys, labels and case, untinted), as a slot of BOARDS: kept, or drawn now into the slot not on show — every key and label through the display (some 50 ms), its greys read back, each pixel's key and tint weight worked out. The key map is the board on show's when the layout and view are the same (a shift, the left key), else hit-tested afresh (some 37 ms).
@@ -735,8 +788,10 @@ impl Ahau {
         let (tb, t) = self.target();
         let mut plain = kb.clone();
         plain.tint = None;
-        let display = self.display;
-        plain.draw(t, &mut |x, y, px, v, s| window::text_centred(display, tb, x as i16, y as i16, px, v, s.as_bytes()));
+        plain.draw(t, &mut self.label());
+        self.put_rows(tb, top, bottom);
+        self.replay_labels(tb);
+        self.get_rows(tb, top, bottom);
         let boards = unsafe { &mut *(&raw mut BOARDS) };
         let (b, other) = if slot == 0 { let (x, y) = boards.split_at_mut(1); (&mut x[0], &y[0]) } else { let (x, y) = boards.split_at_mut(1); (&mut y[0], &x[0]) };
         let n = (bottom - top) * w;
@@ -778,6 +833,8 @@ impl Ahau {
         // WHY: the board's size follows the panel's; one too big for BOARDS is drawn tinted the slow way (every key and label again) instead of indexing past it.
         if n > 1 << 20 {
             self.kb.draw(self.surf(), &mut self.label());
+            self.present(top, self.h);
+            self.replay_labels(self.base);
             return;
         }
         let slot = self.board(&self.kb);
@@ -792,9 +849,7 @@ impl Ahau {
             rows[i] = ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32;
         }
         self.kb.draw_key(t, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
-        if self.back != 0 {
-            self.surf()[top * w..top * w + n].copy_from_slice(&t[top * w..top * w + n]);
-        }
+        self.present(top, bottom);
         self.shown_board.set(slot);
     }
 
@@ -1381,6 +1436,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if done != mark_shown && typed {
             let (cx, cy, r) = a.mark_at();
             draw_mark(a.surf(), a.w, cx, cy, r);
+            a.present(cy - r - 2, cy + r + 2);
             a.show();
             mark_shown = done;
         }
