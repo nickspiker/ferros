@@ -1766,16 +1766,8 @@ fn fold(acc: u64, t: u64, p: u64, mode: u8) -> (u64, u64) {
     let consumed = (t * (16384 - tp)) >> 14;
     let ch = |sh: u32| -> u64 {
         let (a, b) = ((acc >> sh & 0xFFFF) as i64, (p >> sh & 0xFFFF) as i64);
-        let m = match mode & MODE_MASK {
-            0 => b,
-            1 => a * b >> 14,
-            2 => 16384 - ((16384 - a) * (16384 - b) >> 14),
-            3 => a + b,
-            4 => if a > b { a - b } else { 0 },
-            5 => if b < 8192 { 2 * a * b >> 14 } else { 16384 - (2 * (16384 - a) * (16384 - b) >> 14) },
-            6 => if a < b { a } else { b },
-            _ => if a > b { a } else { b },
-        };
+        // The mode's value on the visible operands: fluor's one definition of the eight modes (BlendMode::visible), white at Q14.
+        let m = fluor::pixel::BlendMode::from_byte(mode).visible(a, b, 16384);
         let v = a + (m * consumed as i64 >> 14);
         (if v < 0 { 0 } else if v > 0xFFFF { 0xFFFF } else { v } as u64) << sh
     };
