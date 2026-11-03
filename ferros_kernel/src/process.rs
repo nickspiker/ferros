@@ -1265,6 +1265,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
             frame.sp_el0 = p.arc.base as u64 + (stack & m & !15);
             frame.x[28] = p.arc.base as u64;
             frame.x[27] = m;
+            frame.x[26] = p.arc.base as u64;
             frame.x[0] = arg;
             let mask = t.mask;
             let nt = add_thread(Thread { proc: pi, frame, state: State::Runnable, mask });
@@ -2315,7 +2316,7 @@ pub fn spawn_capsule(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Grant]
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len)
+    spawn(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed)
 }
 
 /// Install a masked capsule: the gate (signature), the sandbox checker over its instruction span — once — then its seal. Returns the seal for the caller to add to the vault's `sealed` list.
@@ -2324,12 +2325,13 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
     if !g.masked {
         return Err("install: only masked capsules are installed");
     }
-    ferros_sandbox::check_image(&g.code[..g.text_len]).map_err(|_| "install: masked code failed the sandbox checker")?;
+    let mode = if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
+    ferros_sandbox::check_image_in(&g.code[..g.text_len], mode).map_err(|_| "install: masked code failed the sandbox checker")?;
     crate::oracle::seal(&g).ok_or("no system secret: cannot seal")
 }
 
 /// Spawn `code` (position-independent, entry at offset 0) as a process holding a console capability (grant slot 0) plus `grants` (slots 1..), and run until nothing is runnable: it exits, or it blocks (a server in recv stays parked for later callers). `input` is copied into the arc after the code; x0 = grants offset, x1 = input offset, x2 = input length.
-pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<Outcome, &'static str> {
+pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32) -> Result<Outcome, &'static str> {
     if !crate::cachemap::vhe() {
         return Err("no VHE: processes need the EL2&0 regime");
     }
@@ -2341,7 +2343,7 @@ pub fn spawn(name: &[u8], code: &[u8], input: &[u8], grants: &[Grant], ihi: Opti
             return Err(e);
         }
     };
-    let built = build(name, code, input, &objects, ihi, masked, exec_len);
+    let built = build(name, code, input, &objects, ihi, masked, exec_len, fixed);
     launch(built, input.len())
 }
 
@@ -2475,11 +2477,16 @@ fn image_tail(code: &[u8]) -> usize {
 }
 
 /// Make a process — arc, capability table (console first, then `objects` in order), grants page, code, input — and its first thread, in the tables, not yet running. Returns (the thread's index, the arc, the input's offset).
-fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize) -> Result<(usize, Arc, usize), &'static str> {
+fn build(name: &[u8], code: &[u8], input: &[u8], objects: &[(Object, u32)], ihi: Option<[u8; 32]>, masked: bool, exec_len: usize, fixed: u32) -> Result<(usize, Arc, usize), &'static str> {
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
     let inline = input.len(); // bridge: full inline (pcie1 still reads input from its arc); sandboxed apps carry no input, so their arcs stay small either way. INLINE_INPUT becomes the cap once pcie1 streams firmware via SYS_INPUT (option 1).
     let tail = image_tail(code);
-    let arc = arc_alloc(CODE + code.len() + tail + inline + STACK, masked).ok_or("arc pool exhausted")?;
+    let need = CODE + code.len() + tail + inline + STACK;
+    // Fixed mode (SANDBOX.md, "Modes"): the arc is exactly the sealed 2^K, the size every `bfi` in the code assumes.
+    if fixed != 0 && need > 1 << fixed {
+        return Err("spawn: the image does not fit its fixed arc");
+    }
+    let arc = arc_alloc(if fixed != 0 { 1 << fixed } else { need }, masked).ok_or("arc pool exhausted")?;
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), (arc.base + CODE) as *mut u8, code.len()) };
     build_from(name, arc, code.len(), input, objects, ihi, masked, exec_len)
 }
@@ -2528,6 +2535,8 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
     frame.spsr = 0;
     frame.x[28] = arc.base as u64;
     frame.x[27] = arc.mask() as u64;
+    // Fixed mode's address register starts at the base: its bits above K are the base's for good, since only `bfi x26, xN, #0, #K` writes it.
+    frame.x[26] = arc.base as u64;
     frame.x[0] = GRANTS as u64;
     frame.x[1] = in_off as u64;
     frame.x[2] = input.len() as u64;
@@ -2561,7 +2570,7 @@ fn spawn_queued(name: &[u8], key: &[u8], objects: &[(Object, u32)]) -> Result<us
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len)?;
+    let (me, _, _) = build(name, &g.code, b"", objects, Some(ihi), g.masked, g.text_len, g.fixed)?;
     enqueue_back(me);
     Ok(me)
 }

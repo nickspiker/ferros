@@ -1,9 +1,13 @@
 //! Scan a flat payload image (objcopy -O binary of its .text) and tally what the checker refuses: `cargo run -p ferros_sandbox --example scan -- <image.bin>...`.
 
-use ferros_sandbox::{check, Refusal};
+use ferros_sandbox::{check_in, Mode, Refusal};
 
 fn main() {
-    for path in std::env::args().skip(1) {
+    // `--fixed K` checks under fixed mode at 2^K (SANDBOX.md, "Modes"); without it, ring mode.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).map(Mode::Fixed).unwrap_or(Mode::Ring);
+    let paths: Vec<&String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && !(*i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a).collect();
+    for path in paths {
         let code = std::fs::read(&path).expect("read image");
         let mut tally: Vec<(Refusal, usize, u32, usize)> = Vec::new();
         let mut total = 0;
@@ -15,7 +19,7 @@ fn main() {
             }
             let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             total += 1;
-            if let Err(why) = check(insn) {
+            if let Err(why) = check_in(insn, mode) {
                 match tally.iter_mut().find(|t| t.0 == why) {
                     Some(t) => t.1 += 1,
                     None => tally.push((why, 1, insn, 4 * k)),

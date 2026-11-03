@@ -32,6 +32,8 @@ pub struct Gated {
     pub masked: bool,
     /// For masked code: how many bytes from the start are instructions (`.text`); the rest is read-only data. The checker covers exactly this span, and W^X makes everything after it non-executable.
     pub text_len: usize,
+    /// Fixed mode's K (SANDBOX.md, "Modes"): the arc is exactly 2^K and the checker holds every address to `bfi x26, xN, #0, #K`; 0 is ring mode (or native code).
+    pub fixed: u32,
 }
 
 /// What the gate learned about a capsule whose code stays where it was staged (no copy): the developer's key and the provenance hash for the ihi.
@@ -148,7 +150,24 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
     } else {
         code.len()
     };
-    Ok(Gated { code, developer_pubkey, hp, masked, text_len })
+    // The mode: a masked section with `fixed` = K is fixed mode at 2^K (16 to 40), without it ring.
+    let fixed = if masked {
+        match sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("fixed")).and_then(|f| f.values.first()) {
+            None => 0,
+            Some(v) => match v {
+                VsfType::u(n, _) => *n as u32,
+                VsfType::u3(n) => *n as u32,
+                VsfType::u4(n) => *n as u32,
+                _ => return Err("gate: fixed mode without a size"),
+            },
+        }
+    } else {
+        0
+    };
+    if fixed != 0 && !(16..=40).contains(&fixed) {
+        return Err("gate: fixed mode size out of range");
+    }
+    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed })
 }
 
 /// The OS-only key that seals installed images (SANDBOX.md): derived from the system persistent secret, so nothing outside this OS on this device can produce a seal.
@@ -163,6 +182,11 @@ pub fn seal(g: &Gated) -> Option<[u8; 32]> {
     h.update(&g.developer_pubkey);
     h.update(&g.hp);
     h.update(&[g.masked as u8]);
+    // Fixed mode's size is part of what was checked, so it is part of the seal (absent for ring, so ring seals are unchanged).
+    if g.fixed != 0 {
+        h.update(b"fixed");
+        h.update(&[g.fixed as u8]);
+    }
     h.update(&(g.text_len as u64).to_le_bytes());
     h.update(&g.code);
     Some(*h.finalize().as_bytes())

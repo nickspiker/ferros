@@ -27,6 +27,13 @@ pub enum Refusal {
     Unknown,
 }
 
+/// How a masked capsule makes a variable address safe (SANDBOX.md, "Modes"). Ring: `and x26, xN, x27` (an offset, the mask a register the kernel sets), then `[x28, x26]` or `add x25, x28, x26`; the arc may grow by doubling. Fixed(K): `bfi x26, xN, #0, #K` (x26 keeps the arc base in its bits above K, so it is always an address inside the 2^K arc), then `[x26, #imm]`; the size is in the code, sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Ring,
+    Fixed(u32),
+}
+
 /// A refusal at a byte offset into the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Violation {
@@ -51,6 +58,11 @@ pub const AND_X26: u32 = 0x8A1B_001A; // and x26, xN, x27  (with Rn in bits 9:5)
 const AND_X26_MASK: u32 = 0xFFFF_FC1F;
 pub const ADD_X25: u32 = 0x8B1A_0399; // add x25, x28, x26
 pub const ADD_SP: u32 = 0x8B3A_639F; // add sp, x28, x26, uxtx
+/// Fixed mode's writers: `bfi x26, xN, #0, #K` (BFM with immr 0, imms K - 1; Rn in bits 9:5) and `mov sp, x26` (add sp, x26, #0).
+pub const fn bfi_x26(k: u32) -> u32 {
+    0xB340_001A | (k - 1) << 10
+}
+pub const MOV_SP_X26: u32 = 0x9100_035F;
 /// The handle pair's writers: `ldp x23, x22, [x28, #imm]` with imm a slot's pair in the handle table, the grants page's first 512 bytes (offset form, imm7 even and under 64: slot k at 16k), and `and x21, xN, x22`.
 pub const LDP_HANDLE: u32 = 0xA940_5B97; // ldp x23, x22, [x28, #0]  (imm7 in bits 21:15)
 const LDP_HANDLE_MASK: u32 = 0xFFC0_7FFF;
@@ -86,11 +98,29 @@ fn gpr_or_sp_write(r: u32) -> Result<(), Refusal> {
     gpr_write(r)
 }
 
-/// Check one instruction.
+/// Check one instruction (ring mode).
 pub fn check(i: u32) -> Result<(), Refusal> {
-    // The single allowed writers of the invariant registers.
-    if i & AND_X26_MASK == AND_X26 || i == ADD_X25 || i == ADD_SP || i & AND_X26_MASK == AND_X21 {
+    check_in(i, Mode::Ring)
+}
+
+/// Check one instruction under `m`.
+pub fn check_in(i: u32, m: Mode) -> Result<(), Refusal> {
+    // The single allowed writers of the invariant registers, by mode; the handle's offset in every mode.
+    if i & AND_X26_MASK == AND_X21 {
         return Ok(());
+    }
+    match m {
+        Mode::Ring => {
+            if i & AND_X26_MASK == AND_X26 || i == ADD_X25 || i == ADD_SP {
+                return Ok(());
+            }
+        }
+        // x26 is an absolute address in the arc in fixed mode: the ring forms (an offset in x26, x25 from it, sp from x28 + x26) would break it, so they are refused with every other write.
+        Mode::Fixed(k) => {
+            if (16..=40).contains(&k) && (i & AND_X26_MASK == bfi_x26(k) || i == MOV_SP_X26) {
+                return Ok(());
+            }
+        }
     }
     // The handle select: one pair load from the table, so the base and the mask change together and the invariant holds at every boundary.
     if i & LDP_HANDLE_MASK == LDP_HANDLE {
@@ -104,7 +134,7 @@ pub fn check(i: u32) -> Result<(), Refusal> {
         // Branches, exception generation, system.
         0b1010 | 0b1011 => branch_sys(i),
         // Loads and stores.
-        0b0100 | 0b0110 | 0b1100 | 0b1110 => load_store(i),
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => load_store(i, m),
         // Data processing — register.
         0b0101 | 0b1101 => dp_reg(i),
         // SIMD and floating point data processing.
@@ -198,15 +228,19 @@ fn system(i: u32) -> Result<(), Refusal> {
 }
 
 /// The base register is acceptable for an immediate-offset access: x25 or sp.
-fn imm_base(n: u32) -> Result<(), Refusal> {
-    if n == ADDR || n == R31 {
+fn imm_base(n: u32, m: Mode) -> Result<(), Refusal> {
+    let addr = match m {
+        Mode::Ring => ADDR,
+        Mode::Fixed(_) => OFF,
+    };
+    if n == addr || n == R31 {
         Ok(())
     } else {
         Err(Refusal::AddressForm)
     }
 }
 
-fn load_store(i: u32) -> Result<(), Refusal> {
+fn load_store(i: u32, m: Mode) -> Result<(), Refusal> {
     let op0 = (i >> 28) & 0xF;
     let op1 = (i >> 26) & 1;
     let op2 = (i >> 23) & 3;
@@ -215,7 +249,7 @@ fn load_store(i: u32) -> Result<(), Refusal> {
     // Advanced SIMD load/store multiple or single structures (LD1..ST4): only the no-offset forms (op2 = 00 or 10 with op3 = 0) on x25/sp.
     if op0 & 0b1011 == 0b0000 && op1 == 1 {
         if op2 & 1 == 0 && op3 & 0x1F == 0 && (i >> 23) & 1 == 0 {
-            imm_base(rn(i))?;
+            imm_base(rn(i), m)?;
             return Ok(());
         }
         return Err(Refusal::Writeback);
@@ -223,7 +257,7 @@ fn load_store(i: u32) -> Result<(), Refusal> {
     match op0 & 0b0011 {
         // Load/store exclusive, ordered, compare-and-swap: [Xn|SP] only.
         0b00 if op1 == 0 && op2 & 2 == 0 => {
-            imm_base(rn(i))?;
+            imm_base(rn(i), m)?;
             // Rs (bits 20:16) is a status/compare register written by store-exclusive and CAS; Rt / Rt2 by loads.
             gpr_write(rm(i))?;
             gpr_write(rd(i))?;
@@ -236,7 +270,7 @@ fn load_store(i: u32) -> Result<(), Refusal> {
             if op2 != 0b10 {
                 return Err(Refusal::Writeback);
             }
-            imm_base(rn(i))?;
+            imm_base(rn(i), m)?;
             if (i >> 21) & 1 == 1 {
                 return Err(Refusal::AddressForm);
             }
@@ -250,12 +284,12 @@ fn load_store(i: u32) -> Result<(), Refusal> {
             let load_gpr = op1 == 0 && (i >> 22) & 3 != 0; // opc != 00 → load (or prefetch), for integer registers
             if op2 & 2 == 2 {
                 // Unsigned immediate: base x25/sp, offset within G.
-                imm_base(rn(i))?;
+                imm_base(rn(i), m)?;
             } else if (i >> 21) & 1 == 0 {
                 match op4 {
                     // Unscaled immediate (LDUR/STUR): base x25/sp, non-negative only (0 to 255; the emitter folds a negative offset into the masked address).
                     0b00 => {
-                        imm_base(rn(i))?;
+                        imm_base(rn(i), m)?;
                         if (i >> 20) & 1 == 1 {
                             return Err(Refusal::AddressForm);
                         }
@@ -269,7 +303,7 @@ fn load_store(i: u32) -> Result<(), Refusal> {
                 match op4 {
                     // Atomic memory operations (LDADD, SWP ...): [Xn|SP], Rs read, Rt written.
                     0b00 => {
-                        imm_base(rn(i))?;
+                        imm_base(rn(i), m)?;
                         gpr_write(rd(i))?;
                         return Ok(());
                     }
@@ -277,7 +311,8 @@ fn load_store(i: u32) -> Result<(), Refusal> {
                     0b10 => {
                         let option = (i >> 13) & 7;
                         let s = (i >> 12) & 1;
-                        let pair = (rn(i) == BASE && rm(i) == OFF) || (rn(i) == HBASE && rm(i) == HOFF);
+                        // [x28, x26] only in ring mode, where x26 is an offset; in fixed mode x26 is an address and [x28, x26] would leave the arc.
+                        let pair = (m == Mode::Ring && rn(i) == BASE && rm(i) == OFF) || (rn(i) == HBASE && rm(i) == HOFF);
                         if !pair || option != 0b011 || s != 0 {
                             return Err(Refusal::AddressForm);
                         }
@@ -339,6 +374,11 @@ fn simd_fp(i: u32) -> Result<(), Refusal> {
 
 /// Check a whole image (little-endian A64 words). Returns the first violation, or the instruction count.
 pub fn check_image(code: &[u8]) -> Result<usize, Violation> {
+    check_image_in(code, Mode::Ring)
+}
+
+/// Check a whole image under `m`.
+pub fn check_image_in(code: &[u8], m: Mode) -> Result<usize, Violation> {
     let mut n = 0;
     // The image header (ferros_rt start.rs, the payloads' entry stubs): a pad word at 4, "ferrosRT" at 8, then five words to 56, data the kernel reads, never executed (the entry at 0 branches over it).
     let header = code.len() >= 56 && &code[8..16] == b"ferrosRT";
@@ -347,7 +387,7 @@ pub fn check_image(code: &[u8]) -> Result<usize, Violation> {
             continue;
         }
         let insn = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-        check(insn).map_err(|why| Violation { offset: 4 * k, insn, why })?;
+        check_in(insn, m).map_err(|why| Violation { offset: 4 * k, insn, why })?;
         n += 1;
     }
     Ok(n)

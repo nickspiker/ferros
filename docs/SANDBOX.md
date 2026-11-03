@@ -9,6 +9,7 @@ One word per thing, used the same way in the docs, the kernel, ferros_sys and th
 - **capsule** — the signed VSF file the gate verifies (ORACLE.md). A capsule is **native** when it carries an `aarch64` section (unchecked machine code: development only, a production build refuses it) or **masked** when it carries a `masked` section (code the emitter rewrote so every access goes through the mask, with the byte count of its instructions).
 - **masked** — the property of a capsule and of the process it becomes: every memory access is `base + (offset & mask)` in the checker's forms, its code pages read-only and executable, everything else non-executable. The same word in the kernel (`spawn`'s and `arc_alloc`'s `masked` flag; it was `guard` until 2026-11-03), in ferros_sys and in the build tools (`tools/ferros-masked-build.sh`, `--masked`).
 - **sealed** — a masked capsule the device has checked once and recorded (its seal, a keyed hash, in the vault's `sealed` list). Only sealed masked capsules run; running one never re-runs the checker.
+- **fixed**, **ring**, **exact** — the three modes a masked capsule can be in (below, "Modes").
 - **the sandbox** — the whole mechanism: the checker, the emitter, the mask, W^X, the seal and the handles. "Sandboxed" is a plain-English way to say masked and sealed, not a third state.
 - **arc** — a process's memory: a power of two at a base aligned to it, from one of the two arc pools; its **block** is what the pool gave (2S for a masked arc: the upper half its guard).
 - **grant** — a capability handed at spawn; its **token** sits in the grants page at its **slot** (ferros_sys::cap); the first 32 slots have a **handle**.
@@ -83,6 +84,20 @@ The stack area is the top of the arc. Every stack-pointer adjustment is compiled
 - **Checker** (`ferros_sandbox`, no_std, in the kernel's install path): decodes each A64 instruction and enforces the rules above. Tested exhaustively against instruction tables and cross-checked with `objdump`.
 - **Emitter** (host tool, Rust): rewrites rustc's assembly output (`--emit asm`) into the allowed forms before assembling — rewriting before assembly keeps every label and branch correct. When toka exists, its on-device backend emits the same forms directly, and the checker stays as an assertion over its output at install time.
 - **Kernel**: install (check + seal + store), spawn only sealed images, arcs placed with guards, W^X page attributes per arc at spawn.
+
+## Modes (decided with the owner 2026-11-03)
+
+Every masked capsule declares one mode, carried in its masked section and covered by its seal; the checker admits only that mode's forms, and the kernel sets the arc up to match. All three share the static screen (fixed jumps into checked code, no system instructions, no writes to the reserved registers, no negative offsets); they differ only in how a variable address is made safe.
+
+| Mode | A variable access | Size | Grows | For |
+|---|---|---|---|---|
+| **fixed** | `bfi x26, xN, #0, #K`, then `[x26, #imm]` | Power of two, sealed (`fixed` = K in the capsule) | Never | Drivers, the keyboard, the attest screen, system servers |
+| **ring** | `and x26, xN, x27`, then `[x28, x26]` or `add x25, x28, x26` | Power of two, x27 a mask the kernel sets | Doubles in place, by x27 | Mid-size processes; handles to power-of-two regions |
+| **exact** | the subtract and unsigned compare (`sub`, `cmp`, `csinv`; or `sub`, `sub`, `orn`, `orr asr` where the flags are live) | Any size, x27 a limit | By any amount, in place | Photon and big growers; handles to odd-sized MMIO |
+
+- **fixed.** `bfi` writes only x26's low K bits, and the kernel starts x26 at the arc's base (aligned to 2^K) for every thread, so x26's bits above K are the base's for good: at every instruction boundary x26 is an address inside the arc, wherever a jump lands. One instruction, and the result is the address (immediates, pairs and structure loads work from it directly, no x25). Measured on touch: 2339 instructions against ring's 2466, every one of its 221 variable addresses one `bfi`. The checker refuses the ring forms in fixed mode (`[x28, x26]` would leave the arc, x26 being an address); sp is written only by `mov sp, x26`. Built 2026-11-03: `tools/ferros-masked-build.sh <p> --fixed K`, `bridge capsule|seal|spawn ... --fixed K`; the kernel allocates exactly 2^K and refuses an image that does not fit.
+- **ring** is what ran first, and stays for handles (fixed cannot serve them: the checker cannot know which slot was loaded).
+- **exact** needs BTI first: a multi-instruction check is only provable if no indirect branch can land inside it (guarded code pages, landing pads at function entries and after calls, the scanner refusing a landing pad inside a check). Not built yet.
 
 ## Handles (decided with the owner 2026-11-03, built the same day)
 

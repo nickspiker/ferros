@@ -3,6 +3,11 @@
 # Usage: tools/ferros-masked-build.sh <payload dir under payloads/> [bin name]   → target/masked/<bin>/<bin>.bin (flat image) and .elf
 set -euo pipefail
 REPO=/mnt/Harbor/Code/ferros
+# --fixed K anywhere after the payload: fixed mode at arc size 2^K (SANDBOX.md, "Modes"): every address made safe by `bfi x26, xN, #0, #K`, the capsule sealed at that size; without it, ring mode.
+FIXED=""
+ARGS=()
+while [ $# -gt 0 ]; do case $1 in --fixed) FIXED=$2; shift 2;; *) ARGS+=("$1"); shift;; esac; done
+set -- "${ARGS[@]}"
 P=$1
 BIN=${2:-$1}
 CRATE=$(grep -m1 '^name' "$REPO/payloads/$P/Cargo.toml" | sed 's/.*"\(.*\)"/\1/')
@@ -21,7 +26,7 @@ ATTR="+neon,+aes,+sha2,+sha3,+sm4,+crc,+lse,+rdm,+dotprod,+fullfp16,+fp16fml,+i8
 OBJS=()
 for s in $SRCS; do
     b=$(basename "$s" .s)
-    "$REPO/target/debug/ferros-mask" "$s" "$OUT/s/$b.s"
+    "$REPO/target/debug/ferros-mask" "$s" "$OUT/s/$b.s" ${FIXED:+--fixed $FIXED}
     llvm-mc -triple=aarch64-unknown-none -mattr=$ATTR -filetype=obj -o "$OUT/s/$b.o" "$OUT/s/$b.s"
     OBJS+=("$OUT/s/$b.o")
 done
@@ -33,6 +38,16 @@ aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
 stat -c %s "$OUT/$BIN.text" > "$OUT/$BIN.textlen"
-( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ) | tee "$OUT/scan.txt"
+( cd "$REPO" && cargo run -q -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ) | tee "$OUT/scan.txt"
+# Fixed mode: the arc is exactly 2^K, so the image, its zeroed tail, the grants page and the 64 KiB stack must fit (process.rs `build`: CODE + image + tail + STACK).
+if [ -n "$FIXED" ]; then
+    TAIL=0
+    if [ "$(dd if="$OUT/$BIN.bin" bs=1 skip=8 count=8 2>/dev/null)" = ferrosRT ]; then TAIL=$(od -An -tu8 -j 16 -N 8 "$OUT/$BIN.bin" | tr -d ' '); fi
+    NEED=$(( 4096 + $(stat -c %s "$OUT/$BIN.bin") + TAIL + 65536 ))
+    [ $NEED -le $((1 << FIXED)) ] || { echo "REFUSED: $BIN needs $NEED bytes, over a fixed arc of 2^$FIXED"; exit 1; }
+    echo $FIXED > "$OUT/$BIN.fixed"
+else
+    rm -f "$OUT/$BIN.fixed"
+fi
 grep -q " 0 refused" "$OUT/scan.txt" || { echo "REFUSED: $BIN does not pass the sandbox checker"; exit 1; }
 echo "$BIN: sandboxed image $(stat -c %s "$OUT/$BIN.bin") bytes → $OUT/$BIN.bin"

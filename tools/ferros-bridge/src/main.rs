@@ -292,6 +292,7 @@ async fn main() {
                     "--part" => { grants.push((10, args.get(i + 1).cloned().unwrap_or_default())); i += 2; }
                     "--masked" => { i += 1; }
                     "--text-len" => { i += 2; }
+                    "--fixed" => { i += 2; }
                     // --input-file F: append F's bytes to the process input (repeatable; each framed as u32 LE length + bytes after the hex input).
                     "--input-file" => { files.push(args.get(i + 1).cloned().unwrap_or_default()); i += 2; }
                     other => { hex = Some(other.to_string()); i += 1; }
@@ -560,6 +561,12 @@ fn text_len_arg(args: &[String]) -> Option<usize> {
     args.iter().position(|a| a == "--text-len").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
 }
 
+/// `--fixed K`: a masked capsule in fixed mode at arc size 2^K (SANDBOX.md, "Modes"), written into its masked section as `fixed`; read once from the command line.
+fn fixed_arg() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == "--fixed").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
+}
+
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
     use vsf::types::VsfType;
@@ -578,6 +585,9 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
     section.add_field("code", VsfType::v(b'b', code.to_vec()));
     if let Some(t) = text_len {
         section.add_field("text", VsfType::u(t, false));
+    }
+    if let Some(k) = fixed_arg().filter(|_| masked) {
+        section.add_field("fixed", VsfType::u(k as usize, false));
     }
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(section)

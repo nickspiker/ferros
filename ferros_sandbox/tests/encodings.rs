@@ -205,3 +205,41 @@ fn no_negative_offsets() {
     refuses("ldp x0, x1, [x25, #-16]", Refusal::AddressForm);
     refuses("stp q0, q1, [sp, #-32]", Refusal::AddressForm);
 }
+
+fn accepts_fixed(src: &str, k: u32) {
+    let i = one(src);
+    assert_eq!(ferros_sandbox::check_in(i, ferros_sandbox::Mode::Fixed(k)), Ok(()), "{src} ({i:08x}) should be accepted in fixed {k}");
+}
+
+fn refuses_fixed(src: &str, k: u32) {
+    let i = one(src);
+    assert!(ferros_sandbox::check_in(i, ferros_sandbox::Mode::Fixed(k)).is_err(), "{src} ({i:08x}) should be refused in fixed {k}");
+}
+
+/// Fixed mode (SANDBOX.md, "Modes"): x26 written only by `bfi x26, xN, #0, #K` at the sealed K, sp only from x26; accesses through x26 (immediates non-negative), sp and the handle; the ring forms refused.
+#[test]
+fn fixed_mode() {
+    accepts_fixed("bfi x26, x8, #0, #17", 17);
+    accepts_fixed("bfi x26, x24, #0, #17", 17);
+    assert_eq!(one("bfi x26, x8, #0, #17"), ferros_sandbox::bfi_x26(17) | 8 << 5);
+    accepts_fixed("mov sp, x26", 17);
+    accepts_fixed("ldr x0, [x26]", 17);
+    accepts_fixed("ldr x0, [x26, #16]", 17);
+    accepts_fixed("ldp q0, q1, [x26, #32]", 17);
+    accepts_fixed("ld4 {v0.8h, v1.8h, v2.8h, v3.8h}, [x26]", 17);
+    accepts_fixed("ldur w0, [x26, #3]", 17);
+    accepts_fixed("str x0, [sp, #8]", 17);
+    accepts_fixed("str w3, [x23, x21]", 17);
+    refuses_fixed("bfi x26, x8, #0, #18", 17);
+    refuses_fixed("bfi x26, x8, #1, #17", 17);
+    refuses_fixed("and x26, x8, x27", 17);
+    refuses_fixed("add x25, x28, x26", 17);
+    refuses_fixed("add sp, x28, x26, uxtx", 17);
+    refuses_fixed("ldr x0, [x28, x26]", 17);
+    refuses_fixed("ldr x0, [x25, #8]", 17);
+    refuses_fixed("ldur x0, [x26, #-8]", 17);
+    refuses_fixed("mov x26, x0", 17);
+    // Ring mode refuses the fixed forms.
+    refuses("bfi x26, x8, #0, #17", Refusal::WritesInvariantRegister);
+    refuses("mov sp, x26", Refusal::WritesInvariantRegister);
+}

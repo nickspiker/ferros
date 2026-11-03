@@ -58,6 +58,8 @@ fn split_commas(s: &str) -> Vec<String> {
 struct Out {
     text: String,
     rewritten: usize,
+    /// Fixed mode's K (SANDBOX.md, "Modes"): addresses are made safe with `bfi x26, xN, #0, #K` and used from x26 directly; None is ring mode.
+    fixed: Option<u32>,
 }
 
 impl Out {
@@ -74,8 +76,23 @@ impl Out {
         self.sp_from_x24();
     }
     fn sp_from_x24(&mut self) {
-        self.ins("and x26, x24, x27");
-        self.ins("add sp, x28, x26, uxtx");
+        match self.fixed {
+            None => {
+                self.ins("and x26, x24, x27");
+                self.ins("add sp, x28, x26, uxtx");
+            }
+            Some(k) => {
+                self.ins(&format!("bfi x26, x24, #0, #{k}"));
+                self.ins("mov sp, x26");
+            }
+        }
+    }
+    /// `src` made safe: ring mode the masked offset in x26, fixed mode the address itself in x26.
+    fn safe(&mut self, src: &str) {
+        match self.fixed {
+            None => self.ins(&format!("and x26, {src}, x27")),
+            Some(k) => self.ins(&format!("bfi x26, {src}, #0, #{k}")),
+        }
     }
     fn base_update(&mut self, base: &str, delta: i64) {
         if delta >= 0 {
@@ -142,8 +159,10 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
         let neg = if inner.len() == 2 && !writeback_pre && is_imm(&inner[1]) { imm_value(&inner[1]).filter(|&v| v < 0) } else { None };
         if let Some(v) = neg {
             o.ins(&format!("sub x24, {base}, #{}", -v));
-            o.ins("and x26, x24, x27");
-            if has_reg_offset(mnem) {
+            o.safe("x24");
+            if o.fixed.is_some() {
+                access(o, "[x26]");
+            } else if has_reg_offset(mnem) {
                 access(o, "[x28, x26]");
             } else {
                 o.ins("add x25, x28, x26");
@@ -154,12 +173,15 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
         if computed {
             // Register offset (with optional shift/extend): fold into x24 first.
             o.ins(&format!("add x24, {base}, {}", inner[1..].join(", ")));
-            o.ins("and x26, x24, x27");
+            o.safe("x24");
         } else {
-            o.ins(&format!("and x26, {base}, x27"));
+            o.safe(base);
         }
         let imm = if inner.len() == 2 && is_imm(&inner[1]) && !writeback_pre { Some(inner[1].as_str()) } else { None };
         match imm {
+            // Fixed mode: x26 is the address; the immediate, when there is one, stays on the access.
+            None if o.fixed.is_some() => access(o, "[x26]"),
+            Some(i) if o.fixed.is_some() => access(o, &format!("[x26, {i}]")),
             None if has_reg_offset(mnem) => access(o, "[x28, x26]"),
             None => {
                 o.ins("add x25, x28, x26");
@@ -190,12 +212,18 @@ fn rewrite(o: &mut Out, mnem: &str, ops: &str) -> Result<bool, String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `--fixed K` (SANDBOX.md, "Modes"): fixed mode at arc size 2^K; without it, ring mode.
+    let fixed = args.iter().position(|a| a == "--fixed").map(|i| args.get(i + 1).and_then(|v| v.parse::<u32>().ok()).filter(|k| (16..=40).contains(k)).unwrap_or_else(|| {
+        eprintln!("--fixed needs K, 16 to 40");
+        std::process::exit(2)
+    }));
+    let args: Vec<String> = args.iter().enumerate().filter(|(i, a)| *a != "--fixed" && !(fixed.is_some() && *i > 0 && args[*i - 1] == "--fixed")).map(|(_, a)| a.clone()).collect();
     if args.len() != 3 {
-        eprintln!("usage: ferros-mask <in.s> <out.s>");
+        eprintln!("usage: ferros-mask <in.s> <out.s> [--fixed K]");
         std::process::exit(2);
     }
     let src = std::fs::read_to_string(&args[1]).expect("read input");
-    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0 };
+    let mut o = Out { text: String::with_capacity(src.len() * 5 / 4), rewritten: 0, fixed };
     for (n, line) in src.lines().enumerate() {
         let code = line.split("//").next().unwrap_or("");
         let t = code.trim();
