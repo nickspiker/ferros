@@ -1896,42 +1896,49 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
             }
         }
-        // The screen's own edge (owner, 2026-11-02, as Photon's window on Android glass): outside the curve the mask colour (black on release builds; the hairline's orange one stop darker on development builds), the curve's pixel antialiased by its coverage, and on development builds the hairline along the curve and the straight edges. Rows the corners do not reach cost two compares.
-        let (il, ir) = edge_insets(y, width, height);
-        if il > 0.0 || ir > 0.0 || y == 0 || y == height - 1 {
+        // The screen's own edge (owner, 2026-11-02, as Photon's window on Android glass): in each corner's square, every pixel's coverage comes from its signed distance to the superellipse (the implicit function over its gradient, in pixels), so the antialiasing is right in every direction (a row walk split coverage horizontally and stepped where the curve runs near horizontal; the owner's "still hard stepped"). Outside the curve the mask colour (black on release builds; the hairline's orange one stop darker on development builds); on development builds the hairline, one pixel wide along the curve, its profile (1 - d²)², and along the straight edges.
+        let (rs, rb, n) = unsafe { EDGE };
+        let reach = rb as usize + 1;
+        if y < reach || y + reach > height || y == 0 || y == height - 1 {
             let mix = |a: u64, b: u64, wb: u64| {
                 let ch = |sh: u32| (((a >> sh & 0xFFFF) * (65536 - wb) + (b >> sh & 0xFFFF) * wb) >> 16) << sh;
                 (b & 1 << 48) | ch(0) | ch(16) | ch(32)
             };
-            let (ml, mr) = (il as usize, ir as usize);
-            let (fl, fr) = (il - ml as f32, ir - mr as f32);
+            let top = y < height / 2;
+            let yl = if top { y as f32 + 0.5 } else { height as f32 - (y as f32 + 0.5) };
             for x in xa..xb {
-                let from_right = width - 1 - x;
+                let left = x < width / 2;
+                let xl = if left { x as f32 + 0.5 } else { width as f32 - (x as f32 + 0.5) };
+                // Top-left and bottom-right big, top-right and bottom-left small.
+                let r = if left == top { rb } else { rs };
+                if xl >= r || yl >= r {
+                    if DEV && (y == 0 || y == height - 1) {
+                        px[x] = line;
+                    }
+                    continue;
+                }
+                let (u, v) = ((r - xl) / r, (r - yl) / r);
+                let (un, vn) = (libm::powf(u, (n - 1) as f32), libm::powf(v, (n - 1) as f32));
+                let fv = u * un + v * vn - 1.0;
+                let g = n as f32 / r * libm::sqrtf(un * un + vn * vn);
+                // Deep inside the gradient vanishes with the function at -1: far inside, by any distance.
+                let d = if g > 0.0 { fv / g } else { -2.0 };
+                // WHY the two limits: a pixel's coverage by the inside is 1 when its centre is half a pixel or more inside the curve and 0 half a pixel or more outside, by the definition of coverage; between them the cubic, C¹ at both ends.
+                let t = 0.5 - d;
+                let cov = if t <= 0.0 { 0.0 } else if t >= 1.0 { 1.0 } else { t * t * (3.0 - 2.0 * t) };
                 let p = px[x];
-                px[x] = if x < ml || from_right < mr {
-                    EDGE_MASK
-                } else if x == ml && il > 0.0 {
-                    // The curve's outer pixel: inside by (1 - fl); on dev the hairline shows by as much over the mask.
-                    let cov = ((1.0 - fl) * 65536.0) as u64;
-                    if DEV { mix(EDGE_MASK, line, cov) } else { mix(EDGE_MASK, p, cov) }
-                } else if from_right == mr && ir > 0.0 {
-                    let cov = ((1.0 - fr) * 65536.0) as u64;
-                    if DEV { mix(EDGE_MASK, line, cov) } else { mix(EDGE_MASK, p, cov) }
-                } else if DEV && (x == ml + 1 && il > 0.0) {
-                    // The inner pixel: the hairline by the rest, under the content.
-                    mix(p, line, (fl * 65536.0) as u64)
-                } else if DEV && (from_right == mr + 1 && ir > 0.0) {
-                    mix(p, line, (fr * 65536.0) as u64)
-                } else if DEV && (y == 0 || y == height - 1) {
-                    // The top and bottom edges' hairline.
-                    line
+                let base = mix(EDGE_MASK, p, (cov * 65536.0) as u64);
+                px[x] = if DEV {
+                    let hl = if d * d < 1.0 { let w = 1.0 - d * d; w * w } else { 0.0 };
+                    mix(base, line, (hl * 65536.0) as u64)
                 } else {
-                    p
+                    base
                 };
             }
         }
-        // The left and right edges' hairline on the rows the corners do not reach (the block above runs only where they do: without this the line stopped dead where the curve met the edge, the owner's "hard stop on the vertical", 2026-11-02).
+        // The left and right edges' hairline on the rows the corners do not reach (development builds).
         if DEV {
+            let (il, ir) = edge_insets(y, width, height);
             if xa == 0 && il == 0.0 {
                 px[0] = line;
             }
