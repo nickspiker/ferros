@@ -317,7 +317,7 @@
       <p>
          Android is on the same device, from the same boot image, behind a gate and under a thin hypervisor that ferros owns. <br>Why?<br>To stop android from fucking with the device without your permission.<br>
          A storage firewall under Android stops it writing the boot chain or ferros's store, whatever it has been told to update.<br>
-         It is there for the apps that do not exist yet elsewhere, and until the APK service is functional.
+         Running it is your choice, never the default: opt in after you attest, the firewall and the gate on whenever it is installed, and ferros zeroes its own memory before handing over. Apps come to ferros as APKs compiled on the device; Android stays for whoever wants it, unsupported and unforbidden.
       </p>
 
       <h2>What it will never be</h2>
@@ -416,7 +416,7 @@
          <dt>Working today</dt>
          <dd>Everything under "What runs today", on one device, the Pixel 8 Pro, since the autumn of 2026: display, touch, all cores, cameras, data-only cellular. Both boot slots carry the same signed image.</dd>
          <dt>Being worked on</dt>
-         <dd>Returning from a running Android to ferros without a reboot (it works, not yet every time). The last gaps in the storage firewall. The drivers still in the kernel.</dd>
+         <dd>The radios after a jump from a running Android (the jump itself lands). The last gaps in the storage firewall. The drivers still in the kernel. The window stack: bands, spans and blend modes are in, the corners' controls are decided on paper.</dd>
          <dt>Public release</dt>
          <dd>Expected by 2027-01-01. Until then: development builds on the Pixel 8 Pro, from the repository.</dd>
          <dt>Not started</dt>
