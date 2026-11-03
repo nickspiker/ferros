@@ -512,6 +512,17 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
 /// Returns false when the shell is off this boot (`home.off`).
 fn start_home(store: &mut Option<ShimStore>) -> bool {
     crate::checklist::HOME.store(cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // FERROS_RESCUE (2026-11-03): the vault's usb, pcie1 and bt capsules replaced by the native builds this kernel carries, when the stored one is masked. A masked build of a driver that reaches its registers by raw pointers dies at once, and with usb dead the bridge cannot put the capsule back: the chicken-and-egg this switch exists for. Flash it once, let it mend the vault, flash the ordinary kernel again.
+    #[cfg(ferros_rescue)]
+    if let Some(s) = store.as_mut() {
+        for (name, bytes) in [("usb", include_bytes!("../../target/usb.capsule.vsf") as &[u8]), ("pcie1", include_bytes!("../../target/pcie1.capsule.vsf") as &[u8]), ("bt", include_bytes!("../../target/bt.capsule.vsf") as &[u8])] {
+            let masked = s.get_by_key(name).ok().flatten().and_then(|c| crate::oracle::gate(&c).ok()).is_some_and(|g| g.masked);
+            if masked {
+                let r = s.set(name, bytes);
+                crate::process::push_console(alloc::format!("rescue: the vault's {name} was masked; the native capsule stored ({})\n", if r.is_ok() { "ok" } else { "failed" }).as_bytes());
+            }
+        }
+    }
     // `home.off` in the vault (any value): no shell this boot, so the panel is the bridge's alone — a measurement session (tools/display-profile.sh) must not have the map redraw because an instrument rests on the glass. Removed with `store rm home.off`.
     if store.as_mut().and_then(|s| s.get_by_key("home.off").ok().flatten()).is_some() {
         crate::process::push_console(b"home: off (vault home.off): no shell this boot\n");

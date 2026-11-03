@@ -60,6 +60,12 @@ fn main() {
         }
         Err(_) => std::fs::write(&out, b"").unwrap(),
     }
+    // FERROS_RESCUE: the vault's usb, pcie1 and bt capsules mended with the native builds the kernel carries when a masked one got stored (service.rs `start_home`).
+    println!("cargo:rustc-check-cfg=cfg(ferros_rescue)");
+    println!("cargo:rerun-if-env-changed=FERROS_RESCUE");
+    if std::env::var("FERROS_RESCUE").is_ok() {
+        println!("cargo:rustc-cfg=ferros_rescue");
+    }
     // FERROS_PRODUCTION: the "Ready?" gate waits for the power key (dev builds auto-press after two seconds).
     if std::env::var("FERROS_PRODUCTION").is_ok() {
         println!("cargo:rustc-cfg=ferros_production");

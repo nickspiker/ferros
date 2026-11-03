@@ -26,11 +26,19 @@ pub fn init(grants: u64) {
     }
 }
 
+/// The AoC's IPC region through its handle (SANDBOX.md, "Handles"): every access `base + (offset & mask)`, the same instructions native and masked. The addresses this file computes are absolute (IPC plus an offset the AoC gave); the handle takes the offset.
+type Ipc = ferros_sys::Handle<{ crate::S_IPC }>;
 fn rd32(a: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(a as *const u32) }
+    Ipc::read32((a - unsafe { IPC }) as u64)
 }
 fn wr32(a: usize, v: u32) {
-    unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+    Ipc::write32((a - unsafe { IPC }) as u64, v)
+}
+fn rd8(a: usize) -> u8 {
+    Ipc::read8((a - unsafe { IPC }) as u64)
+}
+fn wr8(a: usize, v: u8) {
+    Ipc::write8((a - unsafe { IPC }) as u64, v)
 }
 
 // ── The AoC's IPC control block and its queue services (aoc.rs) ──
@@ -59,7 +67,7 @@ fn service(name: &str) -> usize {
         let h = base + i * SVC_HDR;
         let mut k = 0;
         let matched = loop {
-            let c = unsafe { core::ptr::read_volatile((h + k) as *const u8) };
+            let c = rd8(h + k);
             let want = name.as_bytes().get(k).copied().unwrap_or(0);
             if c != want {
                 break false;
@@ -100,7 +108,7 @@ fn ipc_write(h: usize, payload: &[u8]) -> bool {
     wr32(dst, payload.len() as u32 & 0xFFFF);
     wr32(dst + 4, 0);
     for (i, &b) in payload.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((dst + 8 + i) as *mut u8, b) };
+        wr8(dst + 8 + i, b);
     }
     unsafe { core::arch::asm!("dsb sy") };
     wr32(r + 12, tx.wrapping_add(1));
@@ -120,7 +128,7 @@ fn ipc_read(h: usize, buf: &mut [u8]) -> Option<usize> {
     // The length is the AoC's: held to the buffer and the slot.
     let n = ((rd32(src) & 0xFFFF) as usize).min(buf.len()).min(size - 8);
     for i in 0..n {
-        buf[i] = unsafe { core::ptr::read_volatile((src + 8 + i) as *const u8) };
+        buf[i] = rd8(src + 8 + i);
     }
     wr32(r + 16, rx.wrapping_add(1));
     // A ring that was full before this read: the AoC is told there is room again (aoc_service_read), or a stream left full waits for a signal that never comes.
