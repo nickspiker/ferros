@@ -378,9 +378,6 @@ pub fn scrub_memory() {
         return;
     }
     reset_step(2);
-    crate::smp::stop_all();
-    reset_step(3);
-    let t0 = cntpct();
     let regions: [(usize, usize); 12] = [
         (hb, he),
         crate::cachemap::HEAP2,
@@ -395,7 +392,12 @@ pub fn scrub_memory() {
         crate::cachemap::DISPLAY_CANVAS,
         crate::cachemap::SURFACES,
     ];
-    let mut total = 0usize;
+    let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum();
+    // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
+    pstore(alloc::format!("memory scrub before the reset: {} MiB\n", total >> 20).as_bytes());
+    crate::smp::stop_all();
+    reset_step(3);
+    let t0 = cntpct();
     for &(lo, hi) in &regions {
         if hi <= lo {
             continue;
@@ -405,7 +407,6 @@ pub fn scrub_memory() {
             unsafe { core::arch::asm!("dc zva, {a}", "dc cvac, {a}", a = in(reg) a) };
             a += 64;
         }
-        total += hi - lo;
     }
     unsafe { core::arch::asm!("dsb sy") };
     let us = cntpct().wrapping_sub(t0) * 1_000_000 / cntfrq();
@@ -416,7 +417,6 @@ pub fn scrub_memory() {
         // Cleaned to DRAM, as the trail words are: the report page is cacheable under the map, and the reset discards the caches.
         core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) 0xFD60_0250u64);
     }
-    pstore(alloc::format!("memory scrubbed before the reset: {} MiB in {} us\n", total >> 20, us).as_bytes());
 }
 
 /// The reset path's own steps, in the report page at G#FD60_0F00 (a magic word) and G#FD60_0F08 (the step: 1 the hook done, 2 the scrub's checks passed, 3 the workers stopped, 4 the memory zeroed), for reading after the boot that follows.
