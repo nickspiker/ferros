@@ -804,6 +804,8 @@ static mut SMCS: [u64; 16] = [0; 16];
 static mut FIDS: [u64; 32] = [0; 32];
 /// Per core: the last trapped SMC's function ID and the counter value at the last trap; the counter value of the last stats line (core-shared, racy, fine).
 static mut LAST_FID: [u64; 16] = [0; 16];
+/// Per core: the last trapped SMC's x1 and x2 (for PRIV_REG G#8200_0504: the register and the value or option), shown at the jump: a core frozen between Android's PMU write and its CPU_SUSPEND may come to ferros armed to power down at its next WFI (the theory behind the 2026-11-03 jumps that lost the X3 and workers).
+static mut LAST_ARGS: [[u64; 2]; 16] = [[0; 2]; 16];
 static mut LAST_T: [u64; 16] = [0; 16];
 static mut STATS_T: u64 = 0;
 
@@ -1227,6 +1229,7 @@ extern "C" fn hv_sync(frame: &mut [u64; 32]) {
                 let (now, freq): (u64, u64);
                 asm!("mrs {a}, cntpct_el0", "mrs {b}, cntfrq_el0", a = out(reg) now, b = out(reg) freq);
                 write_volatile(&raw mut LAST_FID[core], fid);
+                write_volatile(&raw mut LAST_ARGS[core], [frame[1], frame[2]]);
                 write_volatile(&raw mut LAST_T[core], now);
                 stats_tick(now, freq);
             }
@@ -2451,8 +2454,9 @@ mod hvcore {
         // Measurement for the post-jump TRNG hang (2026-11-03: two jumps in a row froze at ferros's first TRNG_RND64, with or without a suspend before, and the close above answered all ones): each Android core's last trapped SMC, a session opened and closed again here (what the firmware answers to INIT and EXIT), then the hv's own TRNG_RND64 with a line before and after, so a hang here says the firmware is wedged before ferros starts and a return says the hang is ferros's.
         for c in 0..9usize {
             let fid = unsafe { read_volatile(&raw const super::LAST_FID[c]) };
-            let mut hf = [0u8; 16];
-            super::pstore::log(&[b"ferros hv: jump -- core ", &[b'0' + c as u8], b" last SMC ", &super::pstore::hex(fid, &mut hf)[8..16], b"\n"]);
+            let [a1, a2] = unsafe { read_volatile(&raw const super::LAST_ARGS[c]) };
+            let (mut hf, mut h1, mut h2) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+            super::pstore::log(&[b"ferros hv: jump -- core ", &[b'0' + c as u8], b" last SMC ", &super::pstore::hex(fid, &mut hf)[8..16], b" x1 ", super::pstore::hex(a1, &mut h1), b" x2 ", super::pstore::hex(a2, &mut h2), b"\n"]);
         }
         let init = smc(0x8200_1012, 0, 0, 0);
         let exit = smc(0x8200_1012, 1, 0, 0);

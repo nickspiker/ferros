@@ -31,3 +31,5 @@ These are gated off after a jump for now. The panel still shows Android's last f
 **Android OTA warning:** Android thinks it is slot a, so an update writes slot b (ferros's). Keep updates postponed until the UFS firewall refuses writes (not built yet; it only measures).
 
 Related: [[hv-chords-decided]], [[ufs-firewall-decided]], [[android-behind-attestation]], [[feedback-measure-before-fixing]].
+
+2026-11-03: after the deep-sleep fix, jumps are intermittent (5 tries: 3 froze at the first firmware TRNG_RND64 from ferros, 1 lost the X3 + two workers, 1 landed). Suspect Android cores frozen right after a PRIV_REG (G#8200_0504) PMU write, before CPU_SUSPEND, reaching ferros armed to power down at WFI; the jump logs last SMC + x1/x2 per core (HV.md).
