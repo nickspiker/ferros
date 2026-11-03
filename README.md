@@ -94,7 +94,7 @@ Half of MITRE's vulnerability database becomes **irrelevant**, not mitigated.
 - **Microkernel isolation** - Drivers in userspace, can't crash kernel
 - **No cleanup required** - Failed drivers simply restart
 - **Hot-swap support** - Load/unload without system impact
-- **No binary blobs** - Pure Rust, no closed-source components
+- **Rust drivers, vendor firmware behind them** - Every driver is Rust in its own process. The radios (WiFi, cellular, Bluetooth, NFC, GNSS) and the sensor hub run their vendors' closed firmware on their own cores; ferros loads it as data, grants the device its memory window, and trusts nothing it says
 
 ### Cryptographic Stack
 - **Keys in hardware** - Never in RAM, even encrypted

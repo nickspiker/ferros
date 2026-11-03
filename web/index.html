@@ -305,7 +305,7 @@
       <h2>What runs today</h2>
       <p>On a Pixel 8 Pro, from a cold boot, with no Linux underneath:</p>
       <ul>
-         <li>Its own kernel, written in 100% Rust from the first instruction with custom chainlifted Rust to assembly for low level bringup. All drivers run outside the kernel with capabilities.</li>
+         <li>Its own kernel, in Rust from the first instruction after four short hand-written entry stubs (the image headers the bootloader parses and the first jumps, with the MMU off and no stack). All drivers run outside the kernel with capabilities.</li>
          <li>A store of its own on the flash. No file system was ported; every write is a commit.</li>
          <li>The display at full resolution, with its own true 16-bit spectral pipeline, no 1931 CIE anywhere. Gradients look real nice! Oh, and touch. You can touch it and it does things.</li>
          <li>The cameras: the camera takes pitures, so that's fun.</li>
@@ -350,7 +350,7 @@
       </p>
       <h2>How it is built</h2>
       <ul>
-         <li>100% Rust. <code>unsafe</code> only at audited hardware boundaries, and those are chainlifted: the routine is written in safe Rust first, the compiler drafts the assembly, the assembly is read line by line and frozen, and the frozen assembly is what runs. The compiler is the draftsman; the audited listing is the artefact. The keys in CPU registers are built this way.</li>
+         <li>Rust all the way down on the device: the hypervisor, the kernel, the runtime, every driver and the shell, with no C anywhere in them. <code>unsafe</code> only at audited hardware boundaries. The code that touches a secret is chainlifted: written in safe Rust, compiled once to assembly, the listing refused if any register is ever stored to the stack, read line by line and frozen, and the frozen listing is what the kernel links. The compiler is the draftsman; the audited listing is the artefact. The keys in CPU registers are built this way. Two honest exceptions: a std app such as Photon links a few C crates (BLAKE3's NEON kernels, the post-quantum suites) built freestanding, and the radios and the sensor hub run their vendors' firmware on their own cores, loaded by ferros as data it does not trust.</li>
          <li>One format for every file, every wire and every record (VSF). No JSON, no text parsers waiting to be fooled.</li>
          <li>Every secret is a relationship across independent media, never a property of one of them. Seize any one and you hold nothing.</li>
          <li>Inspired by <a href="https://gitlab.redox-os.org/redox-os/redox">Redox OS</a>, which showed what Rust could do; ferros shares no code with it.</li>

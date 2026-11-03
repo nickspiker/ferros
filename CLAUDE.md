@@ -5,7 +5,7 @@ ferros is a mobile OS distilled down to what an OS actually is, in Rust; inspire
 
 ## Conventions
 - All numeric output uses `[base36]#[number]` format (G# for hex, A# for decimal) — NEVER use 0x prefix
-- Pure Rust, no C dependencies. `unsafe` only at audited hardware boundaries
+- Pure Rust in the hypervisor, kernel, seed, runtime and payloads: no C. Four hand-written `global_asm!` entry stubs (hv header/copy, kernel `_entry`, seed start, ferros_rt `_entry`) and one chainlifted listing (keyreg/keys.s: safe Rust lifted to assembly by tools/keyreg-lift.sh, audited, frozen). std processes (tools/std-build.sh) may link C crates (blake3 NEON, PQClean) through the cc crate. `unsafe` only at audited hardware boundaries
 - Binary OCD: powers of 2 for counts, timeouts, loops
 - EWE encoding on disk — no fixed-width integers on persistent storage, ever
 - Write-verify-then-mirror protocol for all persistent writes
