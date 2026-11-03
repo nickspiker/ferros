@@ -2112,7 +2112,8 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                         continue;
                     }
                     let p = px[x];
-                    px[x] = mixl(crow[x], mix(p, line, q(h)), q(c));
+                    // The circle: coverage first (the content over the chrome, in light), the hairline over both sides after (on the codes, as before the plan: a pixel centred on the radius carries the whole line, a straddling pair its profile on each side).
+                    px[x] = mix(mixl(crow[x], p, q(c)), line, q(h));
                 }
                 for x in xa..xb.min(ml) {
                     px[x] = EDGE_MASK;
