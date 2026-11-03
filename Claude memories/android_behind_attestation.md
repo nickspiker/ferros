@@ -1,6 +1,6 @@
 ---
 name: android-behind-attestation
-description: "Planned (owner, 2026-11-01): always boot ferros, Android launchable only after attest and back to ferros; needs a blunt \"not a phone\" disclaimer, OEM-unlock kept reachable; build after the OS swap"
+description: "Android on a ferros Pixel is the owner's choice (2026-11-02, no restrictions): off by default, opt in after attest with the blunt \"not a phone\" disclaimer, the hv cage on whenever Android is installed, ferros scrubs its RAM on every reset (912 MiB, 70 ms), never spoof Google's verdicts, unsupported"
 metadata:
   node_type: memory
   type: project
@@ -32,3 +32,5 @@ Proof scales with the stakes:
 - **Remote wipes** (Find My Device): refused; no one is at the device.
 
 Tested 2026-11-02: a Settings factory reset was refused by the gate (answer 4); `diag recovery` let it through once; the wipe ran; pKVM stayed disabled.
+
+**Decided 2026-11-02 (owner: "no restrictions"):** dual boot stays possible and is the owner's choice. Off by default, opt in after attest with the disclaimer; the cage (hv, UFS firewall, gate) is on whenever Android is installed; ferros zeroes its own memory on every reset path (kernel `scrub_memory`, 912 MiB in 70 ms, verified 2026-11-02; DRAM survives the warm reset, and the hv with its MMU off would take seconds); supervised Android is yellow to Google's hardware verdicts and nothing of ours spoofs root or a device (payments especially: a faked attestation to a card network is a fraud question, RUNWAY.md "Payments"); unsupported = not promised, not broken on purpose. APKs compiled on ferros are the app path; Android is a guest of the fleet like any non-sovereign host (RUNWAY.md "Guests").
