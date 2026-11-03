@@ -48,9 +48,36 @@ fn in_window(a: usize) -> bool {
     WINDOWS.iter().any(|w| a >= w.0 && a < w.1)
 }
 
+/// The shared-memory windows through their handles (SANDBOX.md, "Handles"): every access `base + (offset & mask)`, the same instructions native and masked. modem.rs computes absolute addresses inside a window; the window is found by address and the handle takes the offset. An address in no window is a bug in this driver: fail loud.
+type Pktproc = ferros_sys::Handle<{ S_DMA }>;
+type Ipc = ferros_sys::Handle<{ S_DMA + 1 }>;
+type Msi = ferros_sys::Handle<{ S_DMA + 2 }>;
+fn window(a: usize) -> (usize, u64) {
+    let k = WINDOWS.iter().position(|w| a >= w.0 && a < w.1).unwrap_or_else(|| panic!("no window holds G#{a:X}"));
+    (k, (a - WINDOWS[k].0) as u64)
+}
+pub fn win_rd8(a: usize) -> u8 {
+    match window(a) { (0, o) => Pktproc::read8(o), (1, o) => Ipc::read8(o), (_, o) => Msi::read8(o) }
+}
+pub fn win_wr8(a: usize, v: u8) {
+    match window(a) { (0, o) => Pktproc::write8(o, v), (1, o) => Ipc::write8(o, v), (_, o) => Msi::write8(o, v) }
+}
+pub fn win_rd32(a: usize) -> u32 {
+    match window(a) { (0, o) => Pktproc::read32(o), (1, o) => Ipc::read32(o), (_, o) => Msi::read32(o) }
+}
+pub fn win_wr32(a: usize, v: u32) {
+    match window(a) { (0, o) => Pktproc::write32(o, v), (1, o) => Ipc::write32(o, v), (_, o) => Msi::write32(o, v) }
+}
+pub fn win_rd64(a: usize) -> u64 {
+    match window(a) { (0, o) => Pktproc::read64(o), (1, o) => Ipc::read64(o), (_, o) => Msi::read64(o) }
+}
+pub fn win_wr64(a: usize, v: u64) {
+    match window(a) { (0, o) => Pktproc::write64(o, v), (1, o) => Ipc::write64(o, v), (_, o) => Msi::write64(o, v) }
+}
+
 pub fn rd(a: usize) -> u32 {
     if in_window(a) {
-        return unsafe { core::ptr::read_volatile(a as *const u32) };
+        return win_rd32(a);
     }
     let (slot, off) = block(a);
     ferros_sys::mmio_read(cap(slot), off) as u32
@@ -58,7 +85,7 @@ pub fn rd(a: usize) -> u32 {
 
 pub fn wr(a: usize, v: u32) {
     if in_window(a) {
-        return unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+        return win_wr32(a, v);
     }
     let (slot, off) = block(a);
     ferros_sys::mmio_write(cap(slot), off, v);

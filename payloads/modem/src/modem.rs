@@ -681,10 +681,10 @@ const CH_BOOT: u8 = 0xF1;
 const CHUNK: usize = 0xC000;
 
 fn wr8(a: usize, v: u8) {
-    unsafe { core::ptr::write_volatile(a as *mut u8, v) }
+    crate::hw::win_wr8(a, v)
 }
 fn rd8(a: usize) -> u8 {
-    unsafe { core::ptr::read_volatile(a as *const u8) }
+    crate::hw::win_rd8(a)
 }
 
 /// The ch0 PHY power-down (`exynos_pcie_rc_phy_all_pwrdn`, ch0 branch): what the RC does before PERST drops, so the PHY comes back cleanly on the next `phy()`.
@@ -1200,10 +1200,10 @@ const PP_RINGEND: u64 = 0x08 << 40;
 const PP_DONE: u64 = 0x01 << 48;
 
 fn wr64(a: usize, v: u64) {
-    unsafe { core::ptr::write_volatile(a as *mut u64, v) }
+    crate::hw::win_wr64(a, v)
 }
 fn rd64(a: usize) -> u64 {
-    unsafe { core::ptr::read_volatile(a as *const u64) }
+    crate::hw::win_rd64(a)
 }
 /// `pktproc_q_info` i: 20 bytes from +4 — cp_desc_pbase, num_desc, cp_buff_pbase, fore_ptr, rear_ptr.
 const fn pp_qinfo(q: u32) -> usize {
