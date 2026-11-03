@@ -2127,7 +2127,8 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                         continue;
                     }
                     let p = px[x];
-                    px[x] = mixl(EDGE_MASK, mix(p, edge_line, q(h)), q(c));
+                    // The edge: both mixes in light (owner, 2026-11-02: "as long as the edge renders gamma proper-ish and trims it to black on production"); on a production build the hairline is the mask's black, so the two pixels are one coverage ramp of the content toward black.
+                    px[x] = mixl(EDGE_MASK, mixl(p, edge_line, q(h)), q(c));
                 }
             }
         }
