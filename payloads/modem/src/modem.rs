@@ -2104,8 +2104,8 @@ struct Online {
     cycled: u8,
     allow_set: bool,
     reg_last: [Option<[u8; 4]>; 2],
-    /// The last IND_SIGNAL_STRENGTH's parameters (G#0906, no identity) and their length: logged whole at each change, past the frame cap, to be decoded against Android's readings of the same moment.
-    sig_last: [u8; 64],
+    /// The last IND_SIGNAL_STRENGTH's parameters (G#0906, no identity, up to 256 bytes) and their length: logged whole at each change, past the frame cap, to be decoded against Android's readings of the same moment.
+    sig_last: [u8; 256],
     sig_len: u32,
     camp_seen: [u8; 2],
     call_sent: bool,
@@ -2150,8 +2150,30 @@ fn hexs(at: &dyn Fn(u32) -> u8, n: u32) -> alloc::string::String {
     h
 }
 
+/// The LTE signal in IND_SIGNAL_STRENGTH (G#0906), as read 2026-11-03: two bytes, then 32-bit words, and at word 15 Android's LteSignalStrength in its order (radio HAL: signal strength in ASU, RSRP and RSRQ as positive dB, RS-SNR in tenths of a dB, CQI, timing advance), measured (20, 89, 7, 190, 2, 12) on a registered NSA link, the NR words after it zero. The layout is inferred from those ranges and their moving together, not yet checked against Android's readings of the same moment; each field is taken only inside the HAL's own range for it (outside it, nothing is shown).
+struct LteSignal {
+    rssi: Option<i64>,
+    rsrp: Option<i64>,
+    rsrq: Option<i64>,
+    /// Tenths of a dB.
+    snr: Option<i64>,
+}
+fn lte_signal(p: &[u8]) -> LteSignal {
+    let word = |k: usize| -> Option<i64> {
+        let o = 2 + 4 * k;
+        (o + 4 <= p.len()).then(|| i32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]) as i64)
+    };
+    LteSignal {
+        // ASU 0-31 (99 unknown): RSSI = -113 + 2 ASU dBm.
+        rssi: word(15).filter(|v| (0..=31).contains(v)).map(|v| -113 + 2 * v),
+        rsrp: word(16).filter(|v| (44..=140).contains(v)).map(|v| -v),
+        rsrq: word(17).filter(|v| (3..=20).contains(v)).map(|v| -v),
+        snr: word(18).filter(|v| (-200..=300).contains(v)),
+    }
+}
+
 impl Online {
-    /// The corners' cellular circle (ferros_sys::measure): what the driver knows of the link, each measure in its unit; the radio's signal is not among them until IND_SIGNAL_STRENGTH (G#0906) is decoded against Android's readings of the same moment, so its slots stay empty, never guessed. State: connected with a data call up, on while the data stack is registered (1 home, 5 roaming) or searching; the technology the registration's fourth byte, the RIL radio technology (14 LTE, 20 NR, as ferros_sys's TECH_ codes).
+    /// The corners' cellular circle (ferros_sys::measure): what the driver knows of the link, each measure in its unit, and the LTE signal from IND_SIGNAL_STRENGTH (`lte_signal`). State: connected with a data call up, on while the data stack is registered (1 home, 5 roaming) or searching; the technology the registration's fourth byte, the RIL radio technology (14 LTE, 20 NR, as ferros_sys's TECH_ codes).
     fn publish_status(&self) {
         use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
         let reg = self.reg_last[1];
@@ -2160,6 +2182,11 @@ impl Online {
             Some([1 | 5, _, _, rat]) => w(k::TECH, rat as i64),
             _ => MEASURE_NONE,
         });
+        let s = lte_signal(&self.sig_last[..self.sig_len as usize]);
+        status(2, s.rssi.map_or(MEASURE_NONE, |v| w(k::RSSI, v * 1000)));
+        status(3, s.rsrp.map_or(MEASURE_NONE, |v| w(k::RSRP, v * 1000)));
+        status(4, s.rsrq.map_or(MEASURE_NONE, |v| w(k::RSRQ, v * 1000)));
+        status(5, s.snr.map_or(MEASURE_NONE, |v| w(k::SNR, v * 100)));
     }
     fn new(t0: u64, probe: u8) -> Self {
         Online {
@@ -2178,7 +2205,7 @@ impl Online {
             cycled: 0,
             allow_set: false,
             reg_last: [None, None],
-            sig_last: [0; 64],
+            sig_last: [0; 256],
             sig_len: 0,
             camp_seen: [0; 2],
             call_sent: false,
@@ -2516,10 +2543,10 @@ impl Online {
                     self.publish_status();
                 }
             }
-            // The signal indication, whole (up to 64 bytes) at each change, past the cap too.
+            // The signal indication, whole (up to 256 bytes) at each change, past the cap too.
             if ril && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0906 && flen >= 12 + 8 {
-                let n = (flen - 12 - 8).min(64);
-                let mut s = [0u8; 64];
+                let n = (flen - 12 - 8).min(256);
+                let mut s = [0u8; 256];
                 for i in 0..n {
                     s[i as usize] = at(20 + i);
                 }
@@ -2527,6 +2554,7 @@ impl Online {
                     self.sig_last = s;
                     self.sig_len = n;
                     line(rep, alloc::format!("t={} ms: ch A#{ch} signal now A#{n} bytes: {}\n", since_us(t0) / 1000, hexs(&|i| s[i as usize], n)));
+                    self.publish_status();
                 }
             }
             // A data-call reply, past the cap too: the RCM error, then the call's status (u16), id, active flag and PDP type (params G#0..G#4); the addresses, DNS and gateway after them are the line's and stay hidden. The reply is 304 bytes; one too short for the fields read here is the CP's malformed input and is not taken.
