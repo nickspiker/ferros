@@ -470,8 +470,9 @@ fn words(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-/// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation). The panel itself is taken as on (state A); a panel that is off needs its power-up (state B) after this.
-pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
+/// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation).
+/// The panel: off (`panel_cold`, its VCI off) gets its power-up (state B). On its rails (`awake`: the `panel` switch for its reset pulse, and VDDD) it is asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is, as under Android's hibernation with the screen on; anything else (asleep or dozing with its rails up, or no answer) is reset and powered up as from off. A jump from an Android whose screen had gone off left the panel holding Android's last frame under ferros's running pipe (2026-11-04): the panel was taken as on.
+pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     let t0 = now();
     let r = raster();
@@ -489,6 +490,19 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: O
     m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
     if let Some(vddd) = panel_cold {
         m.panel_on(dsi, &r, vddd);
+    } else if let Some((reset, vddd)) = awake {
+        let mut pm = [0u8; 1];
+        let read = dsi.read(0x0A, &mut pm).is_ok();
+        let showing = read && pm[0] & 0x9C == 0x9C;
+        m.say(alloc::format!("panel: on its rails with the DPU off; power mode {}{}\n", if read { alloc::format!("G#{:02X}", pm[0]) } else { alloc::string::String::from("unread") }, if showing { ", awake: left as it is" } else { ", not showing: reset and powered up" }).as_bytes());
+        if !showing {
+            if reset() {
+                crate::PANEL_ON_DUE.store(1, core::sync::atomic::Ordering::Release);
+                m.panel_on(dsi, &r, vddd);
+            } else {
+                m.say(b"panel: its switch refused the reset\n");
+            }
+        }
     }
     m.after_te();
     let pps = ferros_dsc::pps(&r.cfg);

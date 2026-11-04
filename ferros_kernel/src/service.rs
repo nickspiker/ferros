@@ -971,7 +971,17 @@ pub(crate) fn tcpc_usb_switch(log: bool) {
     use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
     const TCPC: u8 = 0x25;
     let r = |reg: u8| read_byte(HSI2C_11, TCPC, reg).map(|v| v as u32).unwrap_or(0x8000);
-    let (role, cc, pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
+    let (role, mut cc, mut pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
+    // The port as a device needs it (TCPCI): sink on both CC lines (ROLE_CONTROL G#0A, Rd/Rd) with VBUS detection on (POWER_STATUS bit 3). ABL leaves it so on a cold boot (role G#0A, power G#0D). A jump from an Android that had the port in its low-power state (2026-11-04: role G#11, a pull-up as a source, CC_STATUS G#20 looking for a connection, power G#40, detection off) left the host seeing no attach at all, and the USB process never configured. So: detection on (COMMAND G#33, EnableVbusDetect) and the sink role, then the switch below once the host shows on CC with VBUS. A read that failed (G#8000) is left alone.
+    if role & 0x8000 == 0 && pwr & 0x8000 == 0 && (role != 0x0A || pwr & 0x08 == 0) {
+        let _ = write_byte(HSI2C_11, TCPC, 0x23, 0x33);
+        let _ = write_byte(HSI2C_11, TCPC, 0x1A, 0x0A);
+        // A quarter second for the port to see the host on CC and VBUS (tCCDebounce is 100-200 ms), then read again, so this USB process's start closes the switch rather than the next one's.
+        let (f, t0) = (cntfrq(), cntpct());
+        while cntpct().wrapping_sub(t0) < f / 4 {}
+        (cc, pwr) = (r(0x1D), r(0x1E));
+        crate::flashlog::line(&alloc::format!("usb: tcpc role G#{role:X}: to the sink role (G#0A) with VBUS detection on; now cc G#{cc:X} power G#{pwr:X}"));
+    }
     let attached = cc & 0x8000 == 0 && cc & 0xF != 0;
     let vbus = pwr & 0x8000 == 0 && pwr & 0x4 != 0;
     let act = attached && vbus && sw != 0x09;
