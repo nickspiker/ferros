@@ -462,6 +462,8 @@ struct Client {
     /// Where this device stands with the identity (V_*), and when the seed was last asked.
     verdict: u8,
     last_lookup_us: u64,
+    /// When the seed's chain was last read for this device's Add while joining (`join_check`).
+    join_checked_us: u64,
     /// The seed's address, once resolved.
     seed_ip: Option<[u8; 4]>,
     /// A sponsor named at spawn (its address; the key is learnt from its frames), handed the request directly.
@@ -645,6 +647,49 @@ impl Client {
         self.bound = true;
     }
 
+    /// A member with no key recovers it from the published fan-out, into RAM (the default; stored only if unlock-at-boot is on).
+    fn recover_key(&mut self) {
+        let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
+        if !self.bound || self.fleet_key.is_some() {
+            return;
+        }
+        fgtw::set_clock(eagle());
+        let kp = self.keys.keypair();
+        let (recovered, ip) = {
+            let t2 = self.seed();
+            let r = fgtw::client::recover_fleet_key(&t2, &hp, kp, &seed).ok().flatten();
+            (r, t2.ip.get())
+        };
+        self.seed_ip = ip;
+        if let Some(k) = recovered {
+            self.fleet_key = Some(k);
+            self.persist_set(b"fleet_key", &k);
+            self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
+            self.log.line();
+        }
+    }
+
+    /// Joining: fgtw.org's chain for this identity, read quietly; once it holds this device (a sponsor's Add, by the words or the tap), the chain is adopted, the device bound, the tap secret and the beacon stopped, and the fleet key recovered from the published fan-out. The LAN hand-over does the same when the sponsor knows this device's address.
+    fn join_check(&mut self) {
+        let Some(hp) = self.hp else { return };
+        fgtw::set_clock(eagle());
+        let (fetched, ip) = {
+            let s = self.seed();
+            let r = fgtw::client::fetch(&s, &hp);
+            (r, s.ip.get())
+        };
+        self.seed_ip = ip;
+        let Ok(Some(b)) = fetched else { return };
+        let Ok(bytes) = b.to_vsf_bytes() else { return };
+        if !self.hold_chain(&bytes) {
+            return;
+        }
+        self.log.put(b"fgtw: fgtw.org's chain holds this device: THIS DEVICE IS BOUND (a sponsor's Add)");
+        self.log.line();
+        self.radios(None);
+        self.recover_key();
+    }
+
     /// A chain this device should hold: kept, and the device is a member when the fold names it.
     fn hold_chain(&mut self, chain: &[u8]) -> bool {
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return false };
@@ -820,25 +865,7 @@ impl Client {
                         self.hold_chain(&bytes);
                     }
                 }
-                // A member with no key recovers it from the published fan-out, into RAM (the default; stored only if unlock-at-boot is on).
-                if self.bound && self.fleet_key.is_none() {
-                    if let Some(seed) = self.identity_seed {
-                        fgtw::set_clock(eagle());
-                        let kp = self.keys.keypair();
-                        let (recovered, ip) = {
-                            let t2 = self.seed();
-                            let r = fgtw::client::recover_fleet_key(&t2, &hp, kp, &seed).ok().flatten();
-                            (r, t2.ip.get())
-                        };
-                        self.seed_ip = ip;
-                        if let Some(k) = recovered {
-                            self.fleet_key = Some(k);
-                            self.persist_set(b"fleet_key", &k);
-                            self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
-                            self.log.line();
-                        }
-                    }
-                }
+                self.recover_key();
                 V_JOIN
             }
             A::JoinOurs => V_JOIN,
@@ -1237,6 +1264,11 @@ impl Client {
                 }
                 svc(ferros_sys::nr::REPLY, tok.as_ptr() as u64 - self.udp.base, reply.as_ptr() as u64 - self.udp.base, reply.len() as u64, 0, 0);
             }
+            // Joining: the seed's copy of the chain every 16 s, for the sponsor's Add. A sponsor hands the chain and the fan-out to a newcomer at the address its request came from on the LAN; one it knows only from the registry or the tap has no address, and the newcomer has to look (2026-11-04: Brittany's phone bound this device by the tap and the words stayed up). The clock only moves forward, so `t` is never behind the last check.
+            if !self.bound && self.verdict == V_JOIN && t - self.join_checked_us >= 16_000_000 {
+                self.join_checked_us = t;
+                self.join_check();
+            }
             // Leaving: the seed's copy of the chain every 16 s, for the approver's consented Remove (a sibling's push may never reach a device it no longer counts as a sibling). The clock only moves forward, so `t` is never behind the last check.
             if self.depart.as_ref().is_some_and(|d| t - d.checked_us >= 16_000_000) {
                 if let Some(d) = self.depart.as_mut() {
@@ -1353,7 +1385,7 @@ extern "C" fn work(_: u64) -> ! {
     let me = keys.device_pubkey();
     let pt = Pt::new(keys.signing_key());
     let given = unsafe { GIVEN };
-    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, seed_ip: None, given, given_asked_t: 0 };
+    let mut c = Client { log, udp, keys, me, identity_seed: None, hp: None, bound: false, fleet_key: None, pt, sponsors: Vec::new(), request_t: 0, request_frame: Vec::new(), radios_on: false, radios_last: None, radios_missed: false, radios_at: 0, depart: None, net_up: false, offline_looks: 0, last_beacon_us: 0, last_ping_us: 0, last_words_us: 0, persist: false, verdict: V_NONE, last_lookup_us: 0, join_checked_us: 0, seed_ip: None, given, given_asked_t: 0 };
     c.run()
 }
 

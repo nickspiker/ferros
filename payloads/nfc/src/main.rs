@@ -365,13 +365,11 @@ impl Nfc {
                 self.apdu_len = 0;
                 say!(self.grants, "nfc: activated: interface G#{:02X}, protocol G#{:02X}, mode G#{:02X}\n", pl.get(1).copied().unwrap_or(0), pl.get(2).copied().unwrap_or(0), pl.get(3).copied().unwrap_or(0));
             }
-            // RF_DEACTIVATE_NTF: the reader went; back to discovery (type 3) the controller carries on by itself, anything else needs discovery started again.
+            // RF_DEACTIVATE_NTF: only idle (type 0) stops discovery and needs it started again; sleep (1, 2: a reader that put the card to sleep) leaves the controller in listen sleep, back to discovery by itself, and discovery (3) is discovery. Treating sleep as stopped re-sent RF_DISCOVER every pass, answered G#A0 (already started), after the first tap to bind (2026-11-04).
             (3, 1, 6) => {
                 let kind = pl.first().copied().unwrap_or(0);
                 say!(self.grants, "nfc: deactivated, type G#{kind:02X}\n");
-                if kind != 3 {
-                    self.discovering = false;
-                }
+                self.discovering = kind != 0;
             }
             // RF_FIELD_INFO_NTF: a reader's field came or went.
             (3, 1, 7) => {
@@ -430,7 +428,15 @@ impl Nfc {
 
     /// Listening as a card on NFC-A and NFC-B, and between listens polling for tags on NFC-A, NFC-B and NFC-V (each entry a technology and mode, then 1: every discovery period), as Android interleaves them.
     fn discover(&mut self, p: &mut Packet) -> bool {
-        self.discovering = self.ok(&[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01], p).is_some();
+        // G#A0, discovery already started, is discovering too.
+        self.discovering = match self.cmd(&[0x21, 0x03, 0x0B, 0x05, 0x00, 0x01, 0x01, 0x01, 0x06, 0x01, 0x80, 0x01, 0x81, 0x01], p) {
+            Some(n) if n >= 4 && (p[3] == 0 || p[3] == 0xA0) => true,
+            Some(n) => {
+                say!(self.grants, "nfc: discover refused: {}\n", Hex(&p[..n]));
+                false
+            }
+            None => false,
+        };
         self.discovering
     }
 
