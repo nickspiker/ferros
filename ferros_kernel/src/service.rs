@@ -814,6 +814,11 @@ static mut CLOCK_WAIT_MAX_US: u64 = 0;
 
 fn clock_policy(pt_busy: bool, booted_for: u64) {
     let (f, now) = (cntfrq(), cntpct());
+    // After the jump from Android the clocks are whatever Android last asked for, the X3 at 377 MHz on the eleventh jump of 2026-11-03 (the attest mark took 19 s to refine, 3.6 s at the boot's clocks, and the screen looked frozen until the policy's first switch at 16 s): the active profile, the clocks a cold boot runs with, at once. The 16 s wait below is for the cold boot's firmware loads, which a jump does not run.
+    if unsafe { CLOCK_POLICY_ON && CLOCK_STATE == 0 } && platform::jumped() {
+        clock_profile(2);
+        return;
+    }
     // Not while the boot is still loading firmware (the AoC's 29 MB copy, Trusty) at the boot's own clocks.
     if unsafe { !CLOCK_POLICY_ON } || booted_for < 16 * f {
         return;
