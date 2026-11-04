@@ -20,3 +20,5 @@ The display power-up from off (DISPLAY-DESIGN.md §8) layers 1-2 work: `diag dpu
 - Bench test: `diag "kill display"`, `diag "dpu off"`, `diag "restart display"`: the display powers the DPU (grant 101, switch `dpu`) and rebuilds the pipe from the captured cold pipe (oracle/display/husky-hk3/cold-pipe) in 14 ms, frames flowing (2026-11-03).
 
 Related: [[hv_jump_to_ferros]], [[display_driver_design_first]].
+
+**State B (panel off) works since 2026-11-03 night, benched twice:** kernel switches `panel` (VCI L14M G#38 bit 7 + reset pulse gpa6-0, pin 0 bits only: gpa6-2 is the killswitch's vol-up) and `panel-vddd` (L22M G#40), grants 102/103, fact 81 = VCI state. Display server with fact 81 = 1: rails, then in the modeset after the link starts PPS + hk3::POWER_ON_INIT/FEATURES/TAIL (from oracle ON capture), display on after the first frame; get_power_mode answered G#9D. Bench: `ferros-bridge spawn capture.bin 1F --use display` (op 31 panel off) then `diag "restart display"`. Not yet seen by eye (owner asleep), nor tested from a jump with Android's screen timed out.
