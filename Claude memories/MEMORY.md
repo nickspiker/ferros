@@ -123,4 +123,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [DPU power + secure registers](dpu_power_secure_registers.md) — ferros cycles DPU domains (diag dpu); never touch secure zero words; panel-off state B benched
 - [Link measures, no bars](link_measures_no_bars.md) — tagged per-link measures in the corners (SYS_STATUS 27); indicators top, navigation bottom; modem decode unchecked
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) — jumps leave Android uncheckpointed; ferros_f2fs rolls forward read-only; `diag "part f2fs"`
-- [No baked apps](no_baked_apps.md) — one built-in circle (system settings); clock, Photon, Android launcher etc. are installed by the person; attest loads only attest (owner 2026-11-04)
+- [No baked apps](no_baked_apps.md) — one built-in circle (system settings); apps installed by the person; attest loads only attest; no identity = no device, no way past attest (owner 2026-11-04)
