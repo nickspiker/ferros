@@ -17,6 +17,10 @@ const DOMAINS: [(&str, u64, u64, usize, &[u8]); 3] = [
 const DPUB_WORDS: [(usize, usize); 4] = [(0x1800, 0x1800), (0x600, 0x600), (0x610, 0x610), (0x3060, 0x30F0)];
 const DPUF_WORDS: [(usize, usize); 2] = [(0x600, 0x600), (0x3044, 0x30BC)];
 const CONTROLLER_OPTION: usize = 0x800;
+/// The DPUF domains' S2MPUs, and their protection words (s2mpu v9, non-secure): +G#54 clears a VID's protection, +G#58 reads which VIDs have it.
+const DPUF_S2MPUS: [usize; 2] = [0x1987_0000, 0x19C7_0000];
+const S2MPU_PROT_EN_CLR: usize = 0x54;
+const S2MPU_PROT_EN: usize = 0x58;
 /// The DPUF sysregs (G#1982_0000, G#19C2_0000) are never touched: their words read 0 from the non-secure side (D_TZPC secure), and an access poisons EL3.
 /// The DSIM0 DPHY's isolation in the PMU (G#3EB8 bit 0, 1 = PHY usable), set and cleared through the PMU's atomic aliases (exynos-pmu-if.c: +G#C000 sets, +G#8000 clears, the value is the bit index).
 const DPHY_ISO: usize = 0x1546_3EB8;
@@ -188,6 +192,14 @@ pub fn on_with(rep: &mut Vec<u8>, restore: u32) -> bool {
         for d in DOMAINS.iter() {
             wr(d.3 + CONTROLLER_OPTION, word(d.4, CONTROLLER_OPTION));
         }
+    }
+    // The DPUF S2MPUs (zuma-s2mpu.dtsi s2mpu_s0_dpuf0/1, inside their domains): a domain's reset leaves protection on for every VID (+G#58 reads G#FF) over a permission table of power-on noise, and the layer DMA's every read faults (RDMA_IRQ READ_SLAVE_ERR, the S2MPU's fault at the frame buffer's address): the screen black after a jump from a screen-off Android, and after `diag dpu off` (2026-11-04). Left as ABL leaves them: protection off (PROT_EN_PER_VID_CLR, kvm_s2mpu.h), +G#58 reading 0.
+    for s in DPUF_S2MPUS {
+        let was = rd(s + S2MPU_PROT_EN);
+        if was != 0 {
+            wr(s + S2MPU_PROT_EN_CLR, 0xFF);
+        }
+        rep.extend_from_slice(format!("S2MPU G#{s:X}: protection G#{was:X} -> G#{:X}\n", rd(s + S2MPU_PROT_EN)).as_bytes());
     }
     crate::platform::pstore(b"ferros: dpu on: DPHY isolation\n");
     let w = crate::platform::priv_reg(DPHY_ISO_SET, true, 0);

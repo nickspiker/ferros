@@ -325,6 +325,7 @@ impl M<'_> {
     /// DECON init for the raster (decon_reg_init) on top of the restored snapshot: geometry, the DSC encoders, the DSIM interface select, the out-FIFO; the 10 bpc blend with the DQE's display dither onto the 8 bpc link.
     fn decon_init(&mut self, r: &Raster, main: &[u32], sub0: &[u32], sub1: &[u32], win: &[u32], wincon: u32) {
         self.restore(S_DECON, 0, main, &[0x0004, GLOBAL_CON, 0x0038, 0x003C, SHD_REG_UP_REQ, DECON_INT_PEND, DECON_INT_PEND_EXTRA, 0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0114, 0x0118, 0x011C, 0x0120, 0x0124]);
+        self.win_tail();
         self.wr(S_DECON, GLOBAL_CON, 1 << 8 | GLOBAL_CON_TEN_BPC);
         // 10 bpc the way Android runs it (decon_reg_set_bpc_and_dither_path, __exynos_dqe_update): the DQE in the enhance path, sized for the raster, its display dither taking the blend down to the link's 8 bits; no CGC, no ATC. The layer's DPP and HDR-common blocks take the same bit.
         let p = (self.rd(S_DECON, DATA_PATH_CON_0) & !ENHANCE_PATH_MASK) | ENHANCE_DQE_ON | ENHANCE_DITHER_ON;
@@ -394,6 +395,17 @@ impl M<'_> {
         let (n2, f3) = dsi.sequence(ferros_dsi::hk3::POWER_ON_TAIL);
         let ms = now().wrapping_sub(t0) * 1000 / self.f;
         self.say(alloc::format!("panel: powered up from off in {ms} ms: init {n0} packets{}, VDDD {}, features {n1}{}, 53 20{}, tail {n2}{}\n", if f0.is_some() { " (stuck)" } else { "" }, if v { "on" } else { "REFUSED" }, if f1.is_some() { " (stuck)" } else { "" }, if f2.is_some() { " (stuck)" } else { "" }, if f3.is_some() { " (stuck)" } else { "" }).as_bytes());
+    }
+
+    /// Six blocks in DECON0's window grant past the eight windows (+G#8D00 + k·G#1000, k 0-5; not in regs-decon.h, which stops at the windows' G#20 bytes each), as ABL leaves them: word +G#D00 0, words +G#D10, +G#E10 and +G#F10 G#0001_0000. Their reset values (G#44; G#0010_3002 and G#3002) blanked the output with everything else right: after a DPU reset (a jump from a screen-off Android, `diag dpu off`) frames went out at 10 a second, the layer opaque, the panel awake, the screen black, until these were written by hand (2026-11-04).
+    fn win_tail(&mut self) {
+        for k in 0..6u64 {
+            let b = 0x8000 + k * 0x1000;
+            self.wr(S_WIN, b + 0xD00, 0);
+            for o in [0xD10, 0xE10, 0xF10] {
+                self.wr(S_WIN, b + o, 0x0001_0000);
+            }
+        }
     }
 
     /// A panel on its rails after a jump, asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is; anything else (asleep or dozing with its rails up, or no answer) is reset through the `panel` switch and powered up as from off, display on after the first frame. Android's screen off leaves it in either state with the DPU on or off (2026-11-04: off and on, both times black until this).
