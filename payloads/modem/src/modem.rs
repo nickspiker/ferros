@@ -2107,6 +2107,8 @@ struct Online {
     /// The last IND_SIGNAL_STRENGTH's parameters (G#0906, no identity, up to 256 bytes) and their length: logged whole at each change, past the frame cap, to be decoded against Android's readings of the same moment.
     sig_last: [u8; 256],
     sig_len: u32,
+    /// The counter when the indication was last logged (0: never): once a 16 s at most (it changes every second or so and drowned the console).
+    sig_logged: u64,
     camp_seen: [u8; 2],
     call_sent: bool,
     /// Not before this (µs since online): the next setup after a refusal or a lost call.
@@ -2207,6 +2209,7 @@ impl Online {
             reg_last: [None, None],
             sig_last: [0; 256],
             sig_len: 0,
+            sig_logged: 0,
             camp_seen: [0; 2],
             call_sent: false,
             call_retry: 0,
@@ -2543,7 +2546,7 @@ impl Online {
                     self.publish_status();
                 }
             }
-            // The signal indication, whole (up to 256 bytes) at each change, past the cap too.
+            // The signal indication, whole (up to 256 bytes), past the cap too: kept at each change, logged at a change of length or once a 16 s.
             if ril && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0906 && flen >= 12 + 8 {
                 let n = (flen - 12 - 8).min(256);
                 let mut s = [0u8; 256];
@@ -2551,9 +2554,13 @@ impl Online {
                     s[i as usize] = at(20 + i);
                 }
                 if n != self.sig_len || s != self.sig_last {
+                    let log = n != self.sig_len || self.sig_logged == 0 || since_us(self.sig_logged) > 16_000_000;
                     self.sig_last = s;
                     self.sig_len = n;
-                    line(rep, alloc::format!("t={} ms: ch A#{ch} signal now A#{n} bytes: {}\n", since_us(t0) / 1000, hexs(&|i| s[i as usize], n)));
+                    if log {
+                        self.sig_logged = now();
+                        line(rep, alloc::format!("t={} ms: ch A#{ch} signal now A#{n} bytes: {}\n", since_us(t0) / 1000, hexs(&|i| s[i as usize], n)));
+                    }
                     self.publish_status();
                 }
             }
