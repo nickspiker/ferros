@@ -300,6 +300,11 @@ const IDMA_FORMAT_MASK: u32 = 0x3F << 8;
 const IDMA_BGRX8888: u32 = 4 << 8;
 const IDMA_ROT_MASK: u32 = 0x7 << 4;
 const IDMA_COMP_MASK: u32 = 0xF;
+/// RDMA_IN_CTRL_0's frame alpha (bits 24-31), and opaque.
+const IDMA_ALPHA_MASK: u32 = 0xFF << 24;
+const IDMA_ALPHA_OPAQUE: u32 = 0xFF << 24;
+/// DPP_COM_IO_CON bit 7: the DPP takes the DMA's frame alpha.
+const DPP_ALPHA_SEL: u32 = 1 << 7;
 const IDMA_IRQ_CLEAR: u32 = 0xDFB << 16;
 /// The TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
@@ -1061,10 +1066,11 @@ impl Pipe {
         self.wr(S_WINCON, w, 1);
         let ctrl = self.rd(S_DMA0, RDMA_IN_CTRL_0);
         let ten = unsafe { TEN };
-        self.wr(S_DMA0, RDMA_IN_CTRL_0, (ctrl & !(IDMA_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK)) | if ten { 19 << 8 } else { IDMA_BGRX8888 });
+        // The layer's frame alpha opaque (IN_CTRL_0 bits 24-31, IDMA_ALPHA) and the DPP taking it (DPP_COM_IO_CON bit 7, DPP_ALPHA_SEL), as ABL leaves them (G#FF, 1; regs-dpp.h, cal_9865). Kept from whatever was there until 2026-11-04, when a jump from a screen-off Android left both 0 and every frame went out fully transparent: black.
+        self.wr(S_DMA0, RDMA_IN_CTRL_0, (ctrl & !(IDMA_FORMAT_MASK | IDMA_ROT_MASK | IDMA_COMP_MASK | IDMA_ALPHA_MASK)) | IDMA_ALPHA_OPAQUE | if ten { 19 << 8 } else { IDMA_BGRX8888 });
         // A 10-bit layer keeps its two low bits only if the DPP and HDR-common blocks are told the format too (bits [2:0] = 1, ARGB8101010) with their 10 bpc bit (6); measured 2026-10-22.
         let fmt = if ten { 1 | 1 << 6 } else { 0 };
-        self.wr(S_DPP0, 0x0038, (self.rd(S_DPP0, 0x0038) & !(7 | 1 << 6)) | fmt);
+        self.wr(S_DPP0, 0x0038, (self.rd(S_DPP0, 0x0038) & !(7 | 1 << 6)) | fmt | DPP_ALPHA_SEL);
         self.wr(S_HDRCOMM0, 0x000C, (self.rd(S_HDRCOMM0, 0x000C) & !(7 | 1 << 6)) | fmt);
         self.wr(S_DMA0, RDMA_SRC_WIDTH, width);
         self.wr(S_DMA0, 0x0014, height);
@@ -2269,10 +2275,10 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16],
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
     let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
-    // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'.
+    // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'. Bluetooth has more to show than NFC, so it takes the larger place, the next along the top (owner, 2026-11-04).
     let jobs = [
         (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gnss)),
-        (false, true, Corner::Cellular, Corner::Wifi, Corner::Bluetooth, Some(Corner::Nfc)),
+        (false, true, Corner::Cellular, Corner::Wifi, Corner::Nfc, Some(Corner::Bluetooth)),
         (true, false, Corner::Spare, Corner::Spare, Corner::Spare, None),
         (false, false, Corner::Home, Corner::Spare, Corner::Spare, None),
     ];

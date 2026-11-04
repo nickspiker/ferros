@@ -40,6 +40,7 @@ members = [
     "payloads/ramps",
     "payloads/capture",
     "payloads/switchtest",
+    "payloads/tecount",
     "payloads/wintest",
     "payloads/hive",
     "payloads/ahau",
