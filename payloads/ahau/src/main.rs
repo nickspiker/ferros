@@ -11,7 +11,7 @@
 //!
 //! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). There is no switch on this screen (owner, 2026-10-29: the room went to the mark); the layout is set from the identity's settings or `diag pref`, and the keyboard follows it.
 //!
-//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
+//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the screen waits while the client keeps looking. There is no way past the screen but a bind or a mint (owner, 2026-11-04, of the "go on" that let a person in mid-join: "I do not see a point. seems like another security nightmare"); `back` returns to the entry.
 //!
 //! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer).
 #![no_std]
@@ -194,11 +194,11 @@ enum Mode {
     Fresh,
     /// The roots of this seed are in the vault; the identity service (fgtw) is looking the identity up.
     Looking([u8; 32]),
-    /// The identity has a fleet: one of its devices adds this one with the words shown; enter goes on.
+    /// The identity has a fleet: one of its devices adds this one with the words shown (or the tap); the screen closes when the fleet binds it.
     Join([u8; 32]),
     /// No fleet holds the handle: the permanence warning, and the handle again to mint.
     Mint([u8; 32]),
-    /// No fleet device and no fgtw.org answer: nothing decided, the client keeps looking; enter goes on.
+    /// No fleet device and no fgtw.org answer: nothing decided, the client keeps looking.
     Grey([u8; 32]),
     /// fgtw.org's chain for the handle is another identity's: enter starts over.
     Wrong,
@@ -395,10 +395,9 @@ impl Ahau {
     fn button_label(&self) -> Option<&'static str> {
         match self.mode {
             Mode::Fresh => Some(if self.bound { "unlock" } else { "bind" }),
-            Mode::Join(_) | Mode::Grey(_) => Some("go on"),
             Mode::Mint(_) => Some("mint"),
             Mode::Wrong => Some("start over"),
-            Mode::Looking(_) => None,
+            Mode::Looking(_) | Mode::Join(_) | Mode::Grey(_) => None,
         }
     }
 
@@ -934,13 +933,10 @@ impl Ahau {
         ferros_sys::store_set(cap(self.grants, scope), key, value)
     }
 
-    /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a join or grey goes on; a mint confirms; wrong starts over.
+    /// The attest button (or a mint's second enter): a first entry derives the proof and hands the roots to the client; a mint confirms; wrong starts over. A join or no answer has no button: the screen closes only when the fleet binds the device.
     fn attest(&mut self) {
         match self.mode {
-            Mode::Join(_) | Mode::Grey(_) => {
-                // Going on: the client keeps joining (or looking). Nothing on disk.
-                self.attested();
-            }
+            Mode::Join(_) | Mode::Grey(_) => return,
             Mode::Wrong => {
                 self.mode = Mode::Fresh;
                 self.status(self.prompt());

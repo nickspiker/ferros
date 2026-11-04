@@ -79,7 +79,7 @@ The network owns the assignment: a device belongs to the identity whose fleet bo
 | Bound | recognized (its own) | Opens: the screen goes, straight to the home screen | Instant |
 | Bound | not recognized | Denied | Instant |
 | Unbound | recognized (an earlier attempt, join not finished) | Back to finding the identity and the join | Instant (the proof is kept in its space) |
-| Unbound | not recognized | The earlier attempt's space wiped; the proof computed on the X3 and kept; then: an identity exists → join; none → mint, typed twice; no answer → still looking, "go on" offered | The proof once, about 5 s |
+| Unbound | not recognized | The earlier attempt's space wiped; the proof computed on the X3 and kept; then: an identity exists → join; none → mint, typed twice; no answer → still looking, the screen waits | The proof once, about 5 s |
 
 The handle proof is public (beacons and the registry carry it), so keeping it in the identity's sealed space (`ahau.proof`) costs nothing. The identity seed is never kept unless unlock at boot is on.
 
@@ -94,13 +94,15 @@ Owner, 2026-10-31: simple and direct. "Owner" rows are the owner's words (or "cl
 | Denied | Denied. This device is bound to another identity. | | owner ("DENIED"); the second sentence proposed |
 | The proof running | Computing identity keys. | | owner |
 | Looking up | Finding this identity. | | owner |
-| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) | go on | owner |
+| An identity exists | Use an existing device to bind this device to your fleet. (the pairing words below) |  | owner |
 | None exists | This handle is unclaimed. Minting is permanent. Type your handle again to mint your identity. | mint | owner |
 | The two differ | They don't match. Try again. | | proposed |
 | Minting | Minting. | | proposed |
 | Mint failed | Minting failed. Enter to retry. | | proposed |
-| No answer | No answer yet. Still looking. | go on | proposed |
+| No answer | No answer yet. Still looking. |  | proposed |
 | Wrong slot | This handle's record doesn't match. Start over with another. | start over | proposed |
+
+No step after the first entry has a way past the screen (owner, 2026-11-04, removing "go on": "I do not see a point. seems like another security nightmare"): the words screen and "No answer yet" wait, and close only when the fleet binds the device; `back` returns to the entry.
 
 If the glossary's proposals are ruled on (GLOSSARY.md, "Proposed: the auth and fleet words"), "bind" in the first and sixth rows may become "join".
 
