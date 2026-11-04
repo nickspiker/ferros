@@ -94,7 +94,7 @@ pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 32]);
+pub struct Facts(pub [u64; 40]);
 
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 pub fn local_time() -> Option<(i64, u64)> {
@@ -384,7 +384,7 @@ pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    let mut b = [0u8; 256];
+    let mut b = [0u8; 320];
     svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }

@@ -688,7 +688,7 @@ const SYS_SPAWN: u64 = 10;
 const SYS_SET_PREF: u64 = 11;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
-pub const FACT_COUNT: usize = 32;
+pub const FACT_COUNT: usize = 40;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
@@ -2260,6 +2260,16 @@ pub fn alive() -> usize {
 /// The same with the lock already held — from inside a syscall (the facts provider): `alive` there took the lock its own core held and waited on itself forever, which froze the device whenever the device's settings were open (2026-10-23).
 pub fn alive_locked() -> usize {
     k().procs.iter().filter(|p| p.is_some()).count()
+}
+/// Which of `names` have a live process, bit i for names[i] (the facts provider's radios, SYS_FACTS 32); the lock already held, as `alive_locked`.
+pub fn named_alive_locked(names: &[&[u8]]) -> u64 {
+    let mut m = 0;
+    for p in k().procs.iter().flatten() {
+        if let Some(i) = names.iter().position(|n| *n == p.name.as_slice()) {
+            m |= 1 << i;
+        }
+    }
+    m
 }
 
 /// What a spawn left behind.

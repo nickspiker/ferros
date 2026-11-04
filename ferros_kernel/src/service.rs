@@ -594,6 +594,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[31] = crate::ready::GATE_TELEMETRY.load(Relaxed) & 0xFF;
     // 30: whether the DPU's power domains are on (2) or down (1: Android's DECON hibernation at a jump, or ferros's own `dpu off`; never touch DECON or DSIM then, the EL3 poison rule in display.rs, until the `dpu` switch has powered it). Read through EL3, which is safe.
     v[30] = 1 + crate::display::dpu_on() as u64;
+    // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gnss, 5 ip.
+    v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
         use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};

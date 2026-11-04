@@ -2166,33 +2166,179 @@ fn windows_changed(width: usize, height: usize) {
     }
 }
 
-/// The corners' clock into the chrome when the minute changed (or `force`): the time, top left, in the device's base. Returns whether it drew.
+/// The corners' circles (WINDOWS.md, "The corners", owner 2026-11-03: "tangent a few circles from the focused app circle to the window edge"): in each corner, the circle tangent to both screen edges (inset by the margin) and outside the app's circle (its radius grown by the gap), then chains along the edges, each circle tangent to the edge, the app's circle and the one before. All in the corner's own frame: the corner at the origin, its two edges the axes, the app's circle at (ax, ay) with radius `rb`.
+/// The corner circle has a closed form: centre (r, r), |(r, r) − (ax, ay)| = rb + r gives r² − 2(ax + ay + rb) r + (ax² + ay² − rb²) = 0, the smaller root. A chain circle against the edge v = 0 after a circle at (pu, pr) sits at u = pu + 2√(r·pr) (tangent to its neighbour and the edge), and its r is the root of (u − ax)² + (r − ay)² = (rb + r)², found by bisection between 0 and the neighbour's radius (the function is positive at 0, a point outside the app's circle, and negative at the neighbour's size). The edge u = 0 is the same with the axes swapped.
+/// One circle in the corner frame: (u, v, r).
+fn corner_first(ax: f32, ay: f32, rb: f32) -> (f32, f32, f32) {
+    let s = ax + ay + rb;
+    let r = s - libm::sqrtf(s * s - (ax * ax + ay * ay - rb * rb));
+    (r, r, r)
+}
+/// The next circle along the edge v = 0 (`along_v` false) or u = 0 (true), after `prev`.
+fn corner_next(ax: f32, ay: f32, rb: f32, prev: (f32, f32, f32), along_v: bool) -> (f32, f32, f32) {
+    let (pu, pr, ax, ay) = if along_v { (prev.1, prev.2, ay, ax) } else { (prev.0, prev.2, ax, ay) };
+    let place = |r: f32| pu + 2.0 * libm::sqrtf(r * pr);
+    let f = |r: f32| {
+        let u = place(r);
+        (u - ax) * (u - ax) + (r - ay) * (r - ay) - (rb + r) * (rb + r)
+    };
+    let (mut lo, mut hi) = (0.0f32, pr);
+    for _ in 0..32 {
+        let mid = (lo + hi) * 0.5;
+        if f(mid) > 0.0 { lo = mid } else { hi = mid }
+    }
+    let (r, u) = (lo, place(lo));
+    if along_v { (r, u, r) } else { (u, r, r) }
+}
+
+/// What a corner circle shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Corner {
+    Clock,
+    Cellular,
+    Wifi,
+    Bluetooth,
+    Nfc,
+    Gnss,
+    Home,
+}
+
+/// The corners' circles on the screen: (x, y, drawn radius, what). Sized and spaced from the screen's span (2wh/(w+h)): the margin from the edges a sixty-fourth of it, the gap to the app's circle half that, each disc drawn a quarter margin smaller than its tangent circle so neighbours do not touch.
+fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 7], usize) {
+    let (cx, cy, r) = circle(width, height);
+    let (w, h) = (width as f32, height as f32);
+    let span = 2.0 * w * h / (w + h);
+    let (m, g) = (span / 64.0, span / 128.0);
+    let rb = r + g;
+    let shrink = m * 0.25;
+    let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Home); 7];
+    let mut n = 0;
+    let mut put = |u: f32, v: f32, rr: f32, flip_x: bool, flip_y: bool, what: Corner| {
+        let x = if flip_x { w - m - u } else { m + u };
+        let y = if flip_y { h - m - v } else { m + v };
+        out[n] = (x, y, rr - shrink, what);
+        n += 1;
+    };
+    // Top left: the clock.
+    let (ax, ay) = (cx - m, cy - m);
+    let tl = corner_first(ax, ay, rb);
+    put(tl.0, tl.1, tl.2, false, false, Corner::Clock);
+    let gnss = corner_next(ax, ay, rb, tl, true);
+    put(gnss.0, gnss.1, gnss.2, false, false, Corner::Gnss);
+    // Top right: the radios. Cellular in the corner, WiFi along the top, Bluetooth then NFC down the edge.
+    let (ax, ay) = (w - cx - m, cy - m);
+    let tr = corner_first(ax, ay, rb);
+    put(tr.0, tr.1, tr.2, true, false, Corner::Cellular);
+    let wifi = corner_next(ax, ay, rb, tr, false);
+    put(wifi.0, wifi.1, wifi.2, true, false, Corner::Wifi);
+    let bt = corner_next(ax, ay, rb, tr, true);
+    put(bt.0, bt.1, bt.2, true, false, Corner::Bluetooth);
+    let nfc = corner_next(ax, ay, rb, bt, true);
+    put(nfc.0, nfc.1, nfc.2, true, false, Corner::Nfc);
+    // Bottom right: home.
+    let (ax, ay) = (w - cx - m, h - cy - m);
+    let br = corner_first(ax, ay, rb);
+    put(br.0, br.1, br.2, true, true, Corner::Home);
+    (out, n)
+}
+
+/// A disc's coverage at signed distance `d` (pixels inside the edge, negative outside): the algebraic sigmoid x/√(1+x²) over about a pixel, C∞ (no clamp, GUI continuity).
+#[inline]
+fn soft(d: f32) -> f32 {
+    let x = 2.0 * d;
+    0.5 + 0.5 * x / libm::sqrtf(1.0 + x * x)
+}
+
+/// The corners' circles into the chrome when the minute or a radio's state changed (or `force`). Returns whether it drew.
 fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let mut tb = [0u8; 32];
     let (_, _, tn, key, _) = clock_state(&mut tb);
-    let minute = key / 60;
-    if !force && minute == unsafe { CHROME_KEY } {
+    let radios = ferros_sys::facts().0[32];
+    let k = (key / 60) << 8 | (radios & 0xFF) as i64;
+    if !force && k == unsafe { CHROME_KEY } {
         return false;
     }
-    unsafe { CHROME_KEY = minute };
+    unsafe { CHROME_KEY = k };
     let (rows, bot) = unsafe { (CHROME_TOP, CHROME_BOT) };
     let chrome = unsafe { core::slice::from_raw_parts_mut(CHROME as *mut u64, (rows + bot) * width) };
-    chrome[..rows * width].fill(0);
-    // Hours and minutes: the first two places of the time's first line.
+    chrome.fill(0);
+    // A screen pixel's place in the chrome: the top rows, then the bottom rows.
+    let at = |x: i64, y: i64| -> Option<usize> {
+        if x < 0 || x >= width as i64 || y < 0 {
+            return None;
+        }
+        let y = y as usize;
+        if y < rows {
+            Some(y * width + x as usize)
+        } else if y >= height - bot && y < height {
+            Some((rows + y - (height - bot)) * width + x as usize)
+        } else {
+            None
+        }
+    };
+    // Working values (gamma 2, white at Q14): the face, its ring when the thing is live and when it is not, the label.
+    const FACE: f32 = 1800.0;
+    const RING_ON: f32 = 9000.0;
+    const RING_OFF: f32 = 3200.0;
+    const INK: f32 = 11000.0;
     let line = tb[..tn].split(|&c| c == b'\n').next().unwrap_or(&[]);
     let mut colons = 0;
     let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
-    let t = core::str::from_utf8(&line[..end]).unwrap_or("");
-    // Sized and placed from the screen: inside the top-left corner, clear of the circle's edge.
-    let (px, x0, base) = (height as f32 / 64.0, width as f32 / 48.0, height as f32 / 48.0);
-    let v = 9000u64;
-    glyph_engine().cover(t, x0, base, px, (1.0, 0.0), |x, y, a| {
-        if x < 0 || y < 0 || x >= width as i64 || y >= rows as i64 {
-            return;
+    let time = core::str::from_utf8(&line[..end]).unwrap_or("");
+    let (circles, n) = corner_layout(width, height);
+    for &(x, y, r, what) in &circles[..n] {
+        let live = match what {
+            Corner::Clock | Corner::Home => true,
+            Corner::Cellular => radios & 1 != 0,
+            Corner::Wifi => radios & 2 != 0,
+            Corner::Bluetooth => radios & 4 != 0,
+            Corner::Nfc => radios & 8 != 0,
+            Corner::Gnss => radios & 16 != 0,
+        };
+        let ring_w = r / 16.0;
+        let ring = if live { RING_ON } else { RING_OFF };
+        let (x0, x1, y0, y1) = ((x - r - 2.0) as i64, (x + r + 2.0) as i64, (y - r - 2.0) as i64, (y + r + 2.0) as i64);
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let Some(i) = at(px, py) else { continue };
+                let (dx, dy) = (px as f32 + 0.5 - x, py as f32 + 0.5 - y);
+                let d = r - libm::sqrtf(dx * dx + dy * dy);
+                // The disc, then the ring over it: the ring is the band within ring_w of the edge.
+                let disc = soft(d);
+                let band = disc - soft(d - ring_w);
+                let v = (FACE * (disc - band) + ring * band) as u64;
+                chrome[i] = v | v << 16 | v << 32;
+            }
         }
-        let g = v * a as u64 / 255;
-        chrome[y as usize * width + x as usize] = g | g << 16 | g << 32;
-    });
+        let label: &str = match what {
+            Corner::Clock => time,
+            Corner::Cellular => "cell",
+            Corner::Wifi => "wifi",
+            Corner::Bluetooth => "bt",
+            Corner::Nfc => "nfc",
+            Corner::Gnss => "gnss",
+            Corner::Home => "",
+        };
+        if label.is_empty() {
+            continue;
+        }
+        // The label fitted inside the face: as wide as 1.3 radii at most, its height a third of the diameter at most.
+        let eng = glyph_engine();
+        let mut px = r * 0.66;
+        let w1 = eng.width(label, px);
+        if w1 > r * 1.3 {
+            px *= r * 1.3 / w1;
+        }
+        let tw = eng.width(label, px);
+        let ink = if live { INK } else { RING_OFF * 1.4 };
+        eng.cover(label, x - tw * 0.5, y + px * 0.36, px, (1.0, 0.0), |gx, gy, a| {
+            if let Some(i) = at(gx, gy) {
+                let p = chrome[i] & 0xFFFF;
+                let v = (p as f32 + (ink - p as f32) * a as f32 / 255.0) as u64;
+                chrome[i] = v | v << 16 | v << 32;
+            }
+        });
+    }
     ALLOC.reset();
     true
 }
@@ -3459,9 +3605,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                 windows_changed(width, height);
             }
             if { APP }.is_some() && chrome_draw(width, height, false) {
-                let corner = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
+                let top = draw::Rect { x0: 0, y0: 0, x1: width as i32, y1: CHROME_TOP as i32 };
+                let bottom = draw::Rect { x0: 0, y0: (height - CHROME_BOT) as i32, x1: width as i32, y1: height as i32 };
                 for k in 0..PHASES {
-                    publish_app(corner, &tabs, k, width, height);
+                    publish_app(top, &tabs, k, width, height);
+                    publish_app(bottom, &tabs, k, width, height);
                 }
             }
         }
