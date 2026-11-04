@@ -396,6 +396,22 @@ impl M<'_> {
         self.say(alloc::format!("panel: powered up from off in {ms} ms: init {n0} packets{}, VDDD {}, features {n1}{}, 53 20{}, tail {n2}{}\n", if f0.is_some() { " (stuck)" } else { "" }, if v { "on" } else { "REFUSED" }, if f1.is_some() { " (stuck)" } else { "" }, if f2.is_some() { " (stuck)" } else { "" }, if f3.is_some() { " (stuck)" } else { "" }).as_bytes());
     }
 
+    /// A panel on its rails after a jump, asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is; anything else (asleep or dozing with its rails up, or no answer) is reset through the `panel` switch and powered up as from off, display on after the first frame. Android's screen off leaves it in either state with the DPU on or off (2026-11-04: off and on, both times black until this).
+    fn wake_panel(&mut self, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, r: &Raster, reset: &dyn Fn() -> bool, vddd: &dyn Fn() -> bool) {
+        let mut pm = [0u8; 1];
+        let read = dsi.read(0x0A, &mut pm).is_ok();
+        let showing = read && pm[0] & 0x9C == 0x9C;
+        self.say(alloc::format!("panel: on its rails after a jump; power mode {}{}\n", if read { alloc::format!("G#{:02X}", pm[0]) } else { alloc::string::String::from("unread") }, if showing { ", awake: left as it is" } else { ", not showing: reset and powered up" }).as_bytes());
+        if !showing {
+            if reset() {
+                crate::PANEL_ON_DUE.store(1, core::sync::atomic::Ordering::Release);
+                self.panel_on(dsi, r, vddd);
+            } else {
+                self.say(b"panel: its switch refused the reset\n");
+            }
+        }
+    }
+
     fn after_te(&self) {
         let start = now();
         let mut last = self.rd(S_GPP0, GPP0_DAT) >> 3 & 1;
@@ -416,7 +432,7 @@ impl M<'_> {
 /// The modeset when the pipe is still at 8 bpc (ABL's), then the DQE's dither in shift mode either way. Returns what it did and what misbehaved, for the console; empty when the pipe was already at 10 bpc.
 /// `force`: run it even when DECON is already at 10 bpc (after the jump from Android, whose raster and panel mode may not be ferros's).
 /// `panel_cold`: the panel's power-up (state B) goes in after the link's start, with the VDDD switch to call after its init set.
-pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, jumped: bool, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
+pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, jumped: bool, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     m.te_pin();
     if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
@@ -452,6 +468,8 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
         m.decon_init(&r, &c.main, &c.sub0, &c.sub1, &c.win, c.wincon);
         if let Some(vddd) = panel_cold {
             m.panel_on(dsi, &r, vddd);
+        } else if let Some((reset, vddd)) = awake {
+            m.wake_panel(dsi, &r, reset, vddd);
         }
 
         // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
@@ -534,18 +552,7 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: O
     if let Some(vddd) = panel_cold {
         m.panel_on(dsi, &r, vddd);
     } else if let Some((reset, vddd)) = awake {
-        let mut pm = [0u8; 1];
-        let read = dsi.read(0x0A, &mut pm).is_ok();
-        let showing = read && pm[0] & 0x9C == 0x9C;
-        m.say(alloc::format!("panel: on its rails with the DPU off; power mode {}{}\n", if read { alloc::format!("G#{:02X}", pm[0]) } else { alloc::string::String::from("unread") }, if showing { ", awake: left as it is" } else { ", not showing: reset and powered up" }).as_bytes());
-        if !showing {
-            if reset() {
-                crate::PANEL_ON_DUE.store(1, core::sync::atomic::Ordering::Release);
-                m.panel_on(dsi, &r, vddd);
-            } else {
-                m.say(b"panel: its switch refused the reset\n");
-            }
-        }
+        m.wake_panel(dsi, &r, reset, vddd);
     }
     m.after_te();
     let pps = ferros_dsc::pps(&r.cfg);
