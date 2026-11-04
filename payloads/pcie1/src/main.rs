@@ -1440,9 +1440,8 @@ impl Msgbuf {
         }
         let rssi = (dr32u(bi + 76) >> 16) as u16 as i16;
         let five = cs & 0xC000 == 0xC000;
-        // Prefer 5 GHz (a first 2.4 GHz join associated, then lost the link waiting for the first beacon — WLC_E_LINK reason 8; 2.4 GHz shares the antenna with the chip's still-uninitialised Bluetooth), then signal: 5 GHz wins unless more than 15 dB weaker.
-        let score = |five: bool, rssi: i16| rssi as i32 + if five { 15 } else { 0 };
-        if self.target.map(|t| score(t.five, t.rssi) >= score(five, rssi)).unwrap_or(false) {
+        // 5 GHz whenever the network has it, then signal; 2.4 GHz only where there is no 5 GHz. No 2.4 GHz join has held under ferros: each associated, then lost the link waiting for the first beacon (WLC_E_LINK reason 8, NO_FIRST_BCN_RX) — the first on 2026-10-15, three more on 2026-11-04 at −36 dBm, chosen over 5 GHz at −55 by the 15 dB preference this replaces. 2.4 GHz shares the antenna with Bluetooth, which nothing here coordinates with WiFi yet, and which was advertising the pairing beacon each time.
+        if self.target.map(|t| (t.five, t.rssi) >= (five, rssi)).unwrap_or(false) {
             return;
         }
         let bssid: [u8; 6] = core::array::from_fn(|k| dbr(bi + 8 + k as u32));
