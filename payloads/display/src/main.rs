@@ -2952,7 +2952,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         log.s(b"display: the panel was off: rails on, reset, its init set next\n");
         log.flush();
     }
-    let vddd = || ferros_sys::power(cap(grants, S_PANEL_VDDD), true);
+    // VDDD, asked again on a refusal: after three jumps it was refused at the kernel's door while `dpu` and `panel` just before it were taken, and a panel without VDDD stays black and stops its TE (2026-11-04). Each refusal is said; the kernel's flash log says which check refused it.
+    let vddd = || {
+        for _ in 0..4 {
+            if ferros_sys::power(cap(grants, S_PANEL_VDDD), true) {
+                return true;
+            }
+            console(grants, b"display: VDDD refused; asking again in 16 ms\n");
+            ferros_sys::sleep_until(now() + freq() / 64);
+        }
+        false
+    };
     let cold: Option<&dyn Fn() -> bool> = if panel_cold { Some(&vddd) } else { None };
     // On its rails with the DPU off: modeset::from_off asks the panel whether it is showing, and wakes it through this switch if not.
     let reset = || ferros_sys::power(cap(grants, S_PANEL_POWER), true);

@@ -1505,11 +1505,22 @@ fn el0_trap(f: &mut Frame) -> u64 {
         }
         SYS_POWER => {
             let token = p.read(f.x[0], 32);
-            f.x[0] = match p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights)) {
+            let found = p.lookup(&token).map(|i| (p.cspace[i].object, p.cspace[i].rights));
+            f.x[0] = match found {
                 Some((Object::Power(i), r)) if r & RIGHT_SEND != 0 && 1u16 << core() == MASK_BIG => {
                     if (POWERS[i].set)(f.x[1] == 1) { 0 } else { ERR }
                 }
-                _ => ERR,
+                _ => {
+                    // A refusal at the door says which check (2026-11-04: the display's `panel-vddd` was refused after jumps with no word from the switch itself).
+                    let why = match found {
+                        Some((Object::Power(i), r)) if r & RIGHT_SEND == 0 => alloc::format!("{}: no send right", POWERS[i].name),
+                        Some((Object::Power(i), _)) => alloc::format!("{}: called on core {}, not the kernel's", POWERS[i].name, core()),
+                        Some(_) => alloc::string::String::from("the token names no power switch"),
+                        None => alloc::string::String::from("no such token"),
+                    };
+                    crate::flashlog::line(&alloc::format!("SYS_POWER refused: {why}"));
+                    ERR
+                }
             };
             0
         }
