@@ -1,7 +1,7 @@
 the memory for the ferros project is in the ferros project folder. ferros/CLAUDE MEMORY.md
 
 - [opsin recordings on Harbor](opsin_recordings_on_harbor.md) — recordings in /mnt/Harbor/Videos/opsin (fragmented MOV); tools/transcribe + recover-mov-audio; whisper.cpp at ~/whisper.cpp
-- [firmware validate on demand](firmware_validate_on_demand.md) — no per-boot boot-chain hashing/sealing (1 s boot budget, owner flashes); on-demand validate screen for slots A/B + parts vs known-good, with "informational only, EL3 could spoof" disclaimer; never a green "secure" badge
+- [firmware validate on demand](firmware_validate_on_demand.md) — no per-boot chain hashing; an on-demand validate screen vs known-good, "informational only", never a green badge
 - [ferros process model on husky](ferros_process_model_husky.md) — VHE + static cache map, EL0 processes in arcs, capability IPC, signed capsules + oracle ihi, time slices, Ready? gate, boot spawns vault `init` (2026-10-14 night)
 - [husky cold boot on slot b](husky_cold_slot_b.md) — slot b boots ferros straight from ABL (no Linux): husky-cold.sh, link base G#8008_0000, exits→fastboot, delayed watchdog reset, cold display on ABL splash; disk still blocked
 - [husky shim USB service](husky_shim_usb_service.md) — Linux handoff = REGISTER ORACLE ONLY since 2026-10-14 (boot Linux, hand off, dump/diff for new bring-ups), not a boot option; still holds SYSMMU/XferNotReady facts + the EL3 poison rule
@@ -35,13 +35,13 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [PIPE handshake = entropy request](pipe_handshake_is_entropy_request.md) — single bit in, 256 bits of fresh hardware entropy out; no GET_RANDOM command needed because handshake invariably triggers KOHI for wairua and the first response IS the entropy
 - [PIPE mirror-XOR line code](pipe_mirror_xor_line_code.md) — Claim 12: one-XOR single-wire bidirectional line code, DC balance + clock recovery; 12a framing, 12b float-high duplex
 - [PIPE pubkey does five jobs](pipe_pubkey_does_five_jobs.md) — Claim 13: the ephemeral pubkey field = key transport, decryption, auth, DC balance, frame edge
-- [PT unified stack (PIPE is its single-wire embodiment)](pipe_pt_unified_stack.md) — Photon Transport = 5-layer (L0 Medium, L1 Line code, L2 Framing, L3 Message format, L4 Crypto) medium-agnostic stack. PIPE patents the single-wire embodiment; ferros-USB reuses L2-L4. OSI forgot L0.
+- [PT unified stack (PIPE is its single-wire embodiment)](pipe_pt_unified_stack.md) — Photon Transport = 5 layers (L0 medium … L4 crypto); PIPE = single-wire L0-L1; ferros-USB reuses L2-L4
 - [PIPE dev rig has no external 5k pulldown](pipe_dev_rig_no_external_pulldown.md) — only 400Ω series + FPGA weak internal pulldown on the breadboard; the 5kΩ is production spec
 - [PIPE FPGA wire uses two pins (TX + RX bridged)](pipe_fpga_dual_pin_wire.md) — FPGA TX out + RX in shorted externally; silent bitstreams tristate TX; no slot contention
 - [PIPE comms acceptance test](pipe_comms_acceptance_test.md) — "PIPE comms is done" = 1-minute full-duplex PRNG with BLAKE3 match on both ends (~1.3M bits each way, zero corruption). Intermediate metrics are progress, not done signals.
 - [PIPE load_dev is RAM hotload](pipe_load_dev_is_ram_hotload.md) — `bridge load_dev <elf>` streams to SRAM at 0x20000000 via VSF; zero flash wear. The "never got pong" verify failure is a host race; the load succeeded — confirm with `wire_mirror`, don't BOOTSEL.
 - [PIPE session 2026-05-27 findings](pipe_session_5_27_findings.md) — narrow CDR + slot re-anchor shipped; SM1 startup race + slot_phase drift remained
-- [PIPE clean-clock test](pipe_clean_clock_test.md) — `wire_mirror ... 00000000` isolates slot_phase parity drift from all other variables (wire pattern = perfect 50% clock, decode SHOULD be all zeros). Fix path: replace cumulative-arithmetic mid-slot check with per-edge `own_cyc % slot_cyc`.
+- [PIPE clean-clock test](pipe_clean_clock_test.md) — `wire_mirror ... 00000000` isolates slot_phase parity drift; fix: per-edge `own_cyc % slot_cyc`
 - [PIPE Rung 0 + Rung 1 findings](pipe_rung0_rung1_findings.md) — per-edge slot fixes; peak 255/256, slot tracker still drifts; next falling-edge PIO capture
 - [PIPE DC-balance worked trace](pipe_dc_balance_worked_trace.md) — verified 80-slot full-duplex trace; tx streams 15/65 + 25/55 individually unbalanced, wire XOR is exactly 40/40
 - [PIPE 2026-05-28 session](pipe_2026_05_28_session.md) — 256/256 reliable; piezo test proved late drift is the slot tracker; FPGA→bridge listen validated; mirror-XOR sustained still open (PIPE.md)
@@ -54,13 +54,13 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Threat model: harm, not observation](threat_model_harm_not_observation.md) — owner doesn't care about being watched; the line is intent to harm. Local-first = sovereignty + harm-resistance, NOT secrecy. Don't hedge on "keep it private"
 - [Public except keys and handles](public_except_keys_and_handles.md) — everything public except keys + handles (keys/ only); petnames in committed content; handle-guard hook on every repo; a handle is private like a phone number: handed to people, never to a machine that keeps it, never in a repo (2026-11-03)
 - [Feedback: killswitch needs IRQs unmasked](feedback_killswitch_irq_mask.md) — any exception-return path into the kernel must unmask IRQs or Vol Up+Down silently dies; verify DIAG DAIF = G#340
-- [Photon on ferros: no bootstrap](photon_on_ferros_no_bootstrap.md) — peers from physical pairing + LAN broadcast, no seed; Photon side built 2026-10-26 (fleet_req/resp, bind_req, fanout_resp over the LAN); net stack = IPv4/IPv6 + UDP (+ client TCP for fetches)
+- [Photon on ferros: no bootstrap](photon_on_ferros_no_bootstrap.md) — peers from pairing + LAN broadcast, no seed; net stack IPv4/IPv6 + UDP (+ client TCP)
 - [Display driver: design first](display_driver_design_first.md) — before coding the husky display driver, show the owner a knobs inventory + ideal design
 - [toka pipeline + trust model A](toka_pipeline_trust_model_a.md) — device compiles everything (no precompiled trust); toka = WASM fork extended at both pipe ends — real hardware 1:1 first (CPU-FEATURES.md), spirix types later; native capsules dev-only
 - [Photon vocabulary](photon_terminology.md) — message = photon (send a photon), video call = beam (beam someone)
 - [Feedback: single egg rule](feedback_single_egg_rule.md) — never one basket: critical inputs (entropy) from several independent sources; KOHI target = four
 - [Feedback: no attribution](feedback_no_attribution.md) — rule is honesty, not a word filter: no false authorship/ownership claims (Co-Authored-By is a lie), factual tool notes fine; guard in ferros scripts/hooks
-- [Dev box network for phone tests](devbox_network_for_phone_tests.md) — wired NIC is DMX (use WiFi .156), firewall drops unsolicited UDP (receiver pings phone first), router throttles repeated WiFi joins (~10 min), never cut the bridge mid-transfer
+- [Dev box network for phone tests](devbox_network_for_phone_tests.md) — WiFi .156 not the DMX NIC, receiver pings first, router throttles joins, never cut the bridge
 - [Colourspace pinned: VSF gamma2tanh in root space](colourspace_pinned_vsf_gamma2tanh.md) — owner pinned the panel pipeline (tanh²(√(L/H))) as THE profile; Mahere imagery adopts it once ferros settles it (2026-10-17)
 - [Feedback: reservation proof is memblock](feedback_reservation_proof_is_memblock.md) — a reserved-memory node in the DT proves nothing; check /proc/iomem "reserved"/memblock; the hv 64 MiB sat in the page allocator 2026-10-17→19 (two-cell size under a one-cell parent)
 - [TTL 63 everywhere](cellular_ttl_63.md) — TTL/hop limit 63 for all ferros traffic, both families, both links (`HOP` in payloads/ip); Android kernel built the same
@@ -83,14 +83,14 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [MVNO is data-only](mvno_data_only.md) — no POTS/numbers/SMS/MMS/911; EMS via Photon (optional); never plan around telephony; CALEA = just comply (intercepts see Photon ciphertext)
 - [Feedback: hot paths branchless, bit tricks](feedback_hot_paths_branchless_bits.md) — one branchless per-pixel path; clz/exponent/shift tricks over divides and LUTs; a compare forking two maths paths is not a shortcut; owner picks, then build + time
 - [PMU timing: pin to the X3](pmu_timing_pin_x3.md) — unpinned EL0 timings land on the A715s at 1.07 GHz (3-4x off); pin, sleep 1 ms, report cycles/µs as the clock
-- [Hardware night 2026-10-25](husky_hardware_night_2026_10_25.md) — sensors 39/41, haptics, GNSS, modem boot channel, GPU, TPU firmware all alive; where each stands + traps (rails off, flashlog lock, watchdog pets, LPM)
-- [Power profile traps](power_profile_traps.md) — measure with `diag power start` (old display power busy-waits); DVFS only inside zuma-cpu.dtsi floors (CPUCL0 300 MHz hard-reset); X3 2.9→2.0 GHz = 0.66 W; plan in POWER.md
+- [Hardware night 2026-10-25](husky_hardware_night_2026_10_25.md) — sensors, haptics, GNSS, modem boot, GPU, TPU firmware alive; traps per block
+- [Power profile traps](power_profile_traps.md) — measure with `diag power start`; DVFS only inside zuma-cpu.dtsi floors (CPUCL0 300 MHz hard-resets)
 - [GNSS fix via on-chip engine](gnss_onchip_fix.md) — ferros GPS fix = BCM4776's own engine via replayed gpsd on-chip session (IgnoreOnChipRequest off, batchOption 2), time rewritten from RTC; 11 s first fix; ~150 m off Android's host engine indoors
-- [APK support is required to ship](apk_support_required.md) — owner 2026-10-26: no ship without APKs (biggest PITA); APKs compiled on device at install, sealed to the hardware, never runtime-translated, never distributed (2026-10-27); legal decisions logged with dated terms snapshots
+- [APK support is required to ship](apk_support_required.md) — no ship without APKs; compiled on device at install, sealed to the hardware, never translated or distributed
 - [Cellular bring-up authorized](cellular_start_authorized.md) — experimentation may bring up the whole radio (data, voice/SMS stacks, emergency attaches; owner 2026-10-29); ship config decided later; never place a call/text/911 on my own
 - [Input: rhe on glass → honeycomb shape writing](input_rhe_on_glass.md) — honeycomb keyboard built 2026-10-27 (Hive + ahau); shape writing, extent pages, emoji; full design history in the file
 - [ferros attest is OS-level](ferros_attest_os_level.md) — payloads/ahau at boot (2026-10-27): attest/lock is an OS concern; ira unlocks drivers, identity unlocks messages; dev escape diag "kill ahau"
-- [Owner directions 2026-10-27](owner_directions_2026_10_27.md) — windowing manager needed (op-22 frames interfere with the map), multiple/growable arcs later, drivers to userspace, attest screen at boot, HashMap only with proof, AGENT.md rules for every repo via ~/.claude/CLAUDE.md
+- [Owner directions 2026-10-27](owner_directions_2026_10_27.md) — windowing manager, growable arcs, drivers to userspace, attest at boot, HashMap only with proof
 - [std target: Rust std on the phone](std_target_status.md) — target JSON + ferros_rt + forked std (ferros-rust); tools/std-build.sh; build-std fingerprint and PC-relative traps
 - [Photon phone join status](photon_phone_join_status.md) — 2026-10-26 LAN join: owner binds at the desktop; LAN traps (no WiFi multicast, desktop sends first)
 - [Feedback: count from zero](feedback_count_from_zero.md) — every numbered thing in ferros starts at 0: levels, Zil versions, doc IDs (APK-LEGAL D0/O0); never start IDs at 1
@@ -107,19 +107,19 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [tapuwae: NEON then GPU](tapuwae_neon_then_gpu.md) — attest mark renders on NEON now; owner: convert to the Mali GPU once ferros drives it
 - [fluor pixel depth](fluor_pixel_depth.md) — fluor at Argb8 or G2t16 from one source (2026-10-29); display decodes G2t16 natively (op 22 format 1)
 - [Android boot experiments trip rescue](android_boot_experiments_rescue_party.md) — 2026-10-29 the stock RAM boot and an hv capture build on slot a failed and hit "Cannot load Android system"; ask before booting Android under a changed image, never factory reset
-- [Modem: registration, IP, driver process](modem_uecap_registration.md) — Verizon LTE/NR + IP under ferros, userspace payloads/modem; uecap block size + token per block; diff our answers; kprobe capture
+- [Modem: registration, IP, driver process](modem_uecap_registration.md) — Verizon LTE/NR + IP under ferros, payloads/modem; uecap per block; kprobe capture
 - [pKVM resets on wipe](pkvm_resets_on_wipe.md) — fastboot -w puts pKVM back to enabled and breaks Android under the gate; `fastboot oem pkvm disable` after every wipe, check status (2026-10-30)
 - [NFC + BT drivers](husky_radios_nfc_bt.md) — nfc/bt processes since 2026-10-31; WiFi turns BT off before cycling WL_REG_ON (else watchdog reset); BLE address changes per recovery
 - [Auth flow decisions](auth_flow_decisions.md) — 2026-10-31: device vs identity vault classes; WiFi+BT pairings move with identity; key bound to phone; lock only at power loss/OS switch; unlock-key KDF open
 - [Kernel out: moves](kernel_out_moves.md) — USB+PT, touch bring-up, sensors USF are processes since 2026-10-31 (slots 86-96); pattern, traps (kill path skips end hooks, reload 8 s into boot hangs), owner decisions pending
 - [Feedback: device, not phone](feedback_device_not_phone.md) — say "device" for what ferros runs on, never "phone" (owner 2026-11-01): the glyph places no calls
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) — no sRGB/OKLab/Rec.709/XYZ-1931 in ferros or Photon (platform edge only); pick in VSF RGB, match brightness by photopic via LMS (vsf_rgb_to_photopic_f32); the mark + keyboard rainbow were sRGB-authored (2026-11-01)
-- [Android behind attestation](android_behind_attestation.md) — dual boot is the owner's choice (2026-11-02): off by default, opt in after attest + disclaimer, hv cage on, ferros scrubs its RAM on every reset (912 MiB, 70 ms), no spoofing Google, unsupported; APKs on ferros are the app path
+- [Android behind attestation](android_behind_attestation.md) — off by default, opt in after attest + disclaimer; map Android circle + kernel `android` switch built 2026-11-04
 - [hv chords](hv_chords_decided.md) — power+vol up → ferros, vol up+down = kill; hv-owned core 3 takes the key SPIs, proxies to Android (works on slot b 2026-11-01)
-- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros fresh on the hv core; LANDS since 2026-11-02 (jump 35); radios still gated after a jump; the 35-jump bug list
-- [Display: global mask, then layers](display_global_mask_then_layers.md) — owner 2026-11-02: one compressed per-row shape plan (spans + sparse AA) for edge/circle/corners, resolved once per size; then compositing layers by span lists; no per-pixel geometry on the publish path (142 ms vs 20 ms)
-- [Sandbox state 2026-11-03](sandbox_state_2026_11_03.md) — fixed/ring/exact modes + BTI built and verified on husky; masked from the vault: init, touch (fixed), ahau, nfc, ip, sensors, bt, modem, pcie1; vsf signature hole closed in the gate; traps: grep -c, diag quoting, scrub alloc, flash after ABI changes
+- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros on the hv core; lands since 2026-11-02; bug list and tools
+- [Display: global mask, then layers](display_global_mask_then_layers.md) — one per-row shape plan per size (spans + sparse AA), then layers by spans; no per-pixel geometry on publish
+- [Sandbox state 2026-11-03](sandbox_state_2026_11_03.md) — fixed/ring/exact + BTI verified on husky; which processes run masked; vsf signature hole closed; traps
 - [Pages allowed when equivalent](pages_allowed_when_equivalent.md) — owner 2026-11-03: masking is the default, MMU pages where equivalent and faster (Photon: own table + ASID, guard pages, IOMMUs for DMA/GPU); Glyph: ISOMEM bounds on every bus master
-- [DPU power + secure registers](dpu_power_secure_registers.md) — ferros cycles the DPU domains itself (diag dpu); D_TZPC save/restore pairs, muxes first, OPTION last, never touch zero-reading secure words (they poison EL3), DSIM in reset after power-up; panel-off state B benched (op 31 + restart display)
-- [Link measures, no bars](link_measures_no_bars.md) — corner circles show tagged per-link measures (SYS_STATUS 27, facts 33-80), indicators top / navigation bottom, radio flavours; modem 0906 decode inferred (check vs Android)
-- [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) — jumps leave Android's f2fs uncheckpointed; ferros_f2fs rolls forward read-only (modem replay_region read 0 bytes before); `diag "part f2fs <part> <path>"`
+- [DPU power + secure registers](dpu_power_secure_registers.md) — ferros cycles DPU domains (diag dpu); never touch secure zero words; panel-off state B benched
+- [Link measures, no bars](link_measures_no_bars.md) — tagged per-link measures in the corners (SYS_STATUS 27); indicators top, navigation bottom; modem decode unchecked
+- [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) — jumps leave Android uncheckpointed; ferros_f2fs rolls forward read-only; `diag "part f2fs"`
