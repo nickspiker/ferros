@@ -499,9 +499,16 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             rep.push(b'\n');
             continue;
         };
-        // What reads the person's space starts only once a person has attested, as init's `wait_unlocked` holds it (owner, 2026-11-04: "Attest should ONLY load attest"): a restart does not get around that.
-        if matches!(name, b"map" | b"fgtw") && !store.as_mut().is_some_and(|s| s.unlocked()) {
-            rep.extend_from_slice(b"not started, nobody has attested: ");
+        // What reads the person's space starts only when init's `wait_person` would start it (owner, 2026-11-04: "Attest should ONLY load attest", and "if it's not attached to an identity, not usable"): fgtw once a person has attested, the map once the device is also bound to that identity. A restart does not get around either. A vault that cannot say whether it is bound counts as not bound.
+        let person = store.as_mut().is_some_and(|s| s.unlocked());
+        let attached = person && store.as_mut().is_some_and(|s| s.bound().unwrap_or(false));
+        let refused: Option<&[u8]> = match name {
+            b"fgtw" if !person => Some(b"not started, nobody has attested: "),
+            b"map" if !attached => Some(b"not started, this device is not bound to an attested identity: "),
+            _ => None,
+        };
+        if let Some(why) = refused {
+            rep.extend_from_slice(why);
             rep.extend_from_slice(name);
             rep.push(b'\n');
             continue;

@@ -41,9 +41,9 @@ const SHELL: [(&[u8], &[u8], &[u64]); 12] = [
     (b"bt", b"bt", &[81, 82, 76, 83, 41]),
     // The cellular modem's driver (payloads/modem): it powers the CP, registers and serves the data call on rmnet; ip takes it as its second link.
     (b"modem", b"modem", &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]),
-    // What reads the person's space (the identity class), started once an identity is unlocked (`wait_unlocked`): the map (its arrangement: 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`), then fgtw, the identity service (its chain and key; part of attest, not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw).
-    (b"map", b"map", &[17, 18, 19, 20]),
+    // What reads the person's space (the identity class), each when it may (`wait_person`). fgtw, the identity service, once an identity is unlocked: it is part of attest, looking the identity up and joining its fleet (its chain and key; not the Photon app, which a person installs): 1 use udp, 2 the vault scope `fgtw.`, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw). The map only once the device is also bound to that identity (owner, 2026-11-04: "if it's not attached to an identity, not usable"): its arrangement, 1 use display, 2 use touch, 3 settings, 4 the vault scope `map.`.
     (b"fgtw", b"fgtw", &[50, 48, 49, 46, 41, 80, 84, 85]),
+    (b"map", b"map", &[17, 18, 19, 20]),
 ];
 
 #[unsafe(no_mangle)]
@@ -64,14 +64,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             console(grants, b" not started: the jump from Android left its hardware in Android's state\n");
             continue;
         }
-        if *name == b"map" {
+        if *name == b"fgtw" {
             // Every driver the keepers watch is started by now.
             for (k, s) in stacks.0.iter_mut().enumerate() {
                 if !after_jump(KEPT[k].0) {
                     ferros_sys::thread_spawn(keeper, s, (grants << 2) | k as u64);
                 }
             }
-            wait_unlocked(grants);
+            wait_person(grants, false);
+        }
+        if *name == b"map" {
+            wait_person(grants, true);
         }
         if spawn(grants, name, key, slots) != 0 {
             console(grants, b"init: could not start ");
@@ -83,7 +86,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     if failed == 0 {
-        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, sensors, nfc, bt, modem, map, fgtw)\n");
+        console(grants, b"init: shell, network, radios and the person's space started (display, touch, ahau, usb, pcie1, ip, sensors, nfc, bt, modem, fgtw, map)\n");
     }
     // init stays: its keepers run in this process. The main thread only waits.
     let _ = failed;
@@ -133,21 +136,25 @@ extern "C" fn keeper(arg: u64) -> ! {
     }
 }
 
-/// The person's space opens only with them (AUTH.md): the map and fgtw (the identity service) read the identity class, so they start once an identity is unlocked — at once with unlock at boot, else when someone attests. No timeout: without a person there is nothing of theirs to show. A kernel without the Unlock right (an older one) does not hold this up.
-fn wait_unlocked(grants: u64) {
+/// The person's space opens only with them (AUTH.md). fgtw, the identity service, starts once an identity is unlocked (`bound` false): it is the attest's own, looking the identity up and joining its fleet. The map starts only once the device is also bound to that identity (`bound` true): a device not attached to an identity is not usable, nothing to save settings into and no point to it (owner, 2026-11-04). At once with unlock at boot (the kernel unlocked a bound device before init started), else when someone attests and, for the map, the fleet binds the device or a mint makes it the identity's first. No timeout: without a person there is nothing of theirs to show. Fails closed: an answer the kernel cannot give (no Unlock right) waits forever, where it once started everything.
+fn wait_person(grants: u64, bound: bool) {
     let mut said = false;
     loop {
-        match ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) {
-            Some(false) => {}
-            _ => return,
+        let ready = match bound {
+            false => ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true),
+            true => ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true),
+        };
+        if ready {
+            return;
         }
         if !said {
-            console(grants, b"init: waiting for a person (the attest screen) before the map and the identity service\n");
+            console(grants, if bound { b"init: waiting for this device to be bound to the identity before the map\n" } else { b"init: waiting for a person (the attest screen) before the identity service\n" });
             said = true;
         }
         sleep_until(now() + freq() / 64);
     }
 }
+
 
 /// The attest screen before the map: a spawn only queues the process, so without this the map's few calls reached the glass before ahau's keyboard and window, and its circles showed before Attest (2026-10-31). Waits until an app window is in front (the display's op 5, byte 12), at most 4 s, so an attest screen that fails cannot keep the rest of the shell off. A display not serving yet fails the call at once (CALL_LIVE) and is asked again.
 fn wait_front(grants: u64) {

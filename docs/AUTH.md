@@ -37,6 +37,10 @@ The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is ide
   - With the net in place and the bootloader locked, getting to the identity key takes a desoldered UFS and the chip's values as well as the handle.
 - **The identity seed** is BLAKE3 over the typed handle: milliseconds, so the space opens with no visible wait. The memory-hard handle proof is fgtw's (the public registry, squatting) and is made behind the screen.
 
+## No identity, no device
+
+A device not attached to an identity is not usable (owner, 2026-11-04: "if it's not attached to an identity, not usable. No way to save settings or anything, plus it completely defeats the point."). Until the attest screen ends with the device bound to an identity, by the fleet adding it (the words or the tap) or by a mint making it the identity's first device, nothing past the attest screen runs: no home screen, no settings, no apps, and no way past the screen (`go on` was removed the same day). Before that only the device's own drivers and the attest's own processes run (ahau, and fgtw once an identity is unlocked). init enforces it (`wait_person`), and the kernel's `diag restart` refuses the map the same way.
+
 ## One identity per device
 
 The network owns the assignment: a device belongs to the identity whose fleet bound it, and never reassigns itself.
@@ -57,7 +61,8 @@ The network owns the assignment: a device belongs to the identity whose fleet bo
 - **The boot order** (init):
   1. Display, touch, the attest screen.
   2. WiFi (the chip comes up; it joins once `wifi.cred` can be read), IP, NFC, Bluetooth, the modem.
-  3. A wait for a person (op 0), then the map and fgtw (the identity service). They read the identity class.
+  3. A wait for a person (op 0, unlocked), then fgtw, the identity service: part of attest, it looks the identity up and joins its fleet.
+  4. A wait for the device to be bound to that identity (op 0, bound), then the map. Both read the identity class.
 - **Unlock at boot** (`device.unlock_at_boot`, opt-in, warned): while it is on, the kernel keeps the seed in the device class and unlocks at boot, before init starts. Off, the kept seed is deleted at boot.
 - **Locking.** Only when power goes, or when the device switches OS. Every reset the kernel orders drops the key first, its bytes overwritten (`platform::before_reset`), because a warm reset keeps DRAM. There are no timers.
 - **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and fgtw (the identity service) hold:
