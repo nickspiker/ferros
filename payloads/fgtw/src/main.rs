@@ -917,10 +917,14 @@ impl Client {
         self.log.put(b"fgtw: minting the binding request");
         self.log.line();
         // The tap's secret: 32 fresh bytes per request, committed to in the request (`nh`, fgtw::pair::nfc_secret_hash over this device and stamp) so a sponsor that reads S off the tap knows which candidate it touched. Outside the consent bytes: the signature over the frame covers it.
+        // On the X3, as the attest screen makes the handle proof: two SLH-DSA-128s signatures (the request's consent and its envelope, fgtw::protocol) took 15.3 s on the A715 workers (2026-11-04), while the person waited for the words. Pinned for the signing only.
+        ferros_sys::pin(ferros_sys::CORES_BIG);
+        ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
         let mut s = [0u8; 32];
         kernel_entropy(&mut s);
         let req = join::bind_request(&self.keys, &seed, &hp, t, &s);
         let framed = join::bind_req(&req, &hp, &self.keys, t);
+        ferros_sys::pin(0);
         let ms = ferros_sys::us_since(t0) / 1000;
         match framed {
             Ok(f) => {
@@ -1292,8 +1296,12 @@ extern "C" fn work(_: u64) -> ! {
         log.line();
         ferros_sys::exit(1)
     };
+    // On the X3 too (673 ms on the workers, 2026-11-04): the three families' keygen, once per start.
+    ferros_sys::pin(ferros_sys::CORES_BIG);
+    ferros_sys::sleep_until(now() + ferros_sys::freq() / 1000);
     let t0 = now();
     let keys = DeviceKeys::derive(&fingerprint);
+    ferros_sys::pin(0);
     log.put(b"fgtw: device keys derived in ");
     log.dec(ferros_sys::us_since(t0) / 1000);
     log.put(b" ms");

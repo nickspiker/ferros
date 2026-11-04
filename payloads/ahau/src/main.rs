@@ -316,7 +316,7 @@ impl Ahau {
     fn tap_at(&mut self, x: i64, y: i64) {
         // On the entry line: the blinkey to the nearest character boundary.
         let (b, px) = self.entry_at();
-        if ((b - px * 3 / 2) as i64..(b + px / 2) as i64).contains(&y) {
+        if self.typing() && ((b - px * 3 / 2) as i64..(b + px / 2) as i64).contains(&y) {
             self.place_caret(x);
             return;
         }
@@ -348,6 +348,11 @@ impl Ahau {
         self.kb.layout = l;
         self.show_board();
         true
+    }
+
+    /// Whether the screen takes a handle now: the first entry, and the mint's second. Elsewhere (looking, the words, no answer, wrong) there is no text box and keys type nothing.
+    fn typing(&self) -> bool {
+        matches!(self.mode, Mode::Fresh | Mode::Mint(_))
     }
 
     /// Whether a step back to the entry exists: from any step after a first entry (owner, 2026-10-28: "we need a way to go back to the previous screen").
@@ -429,7 +434,8 @@ impl Ahau {
     /// The status: a line, or two split at a newline.
     fn status(&self, t: &str) {
         let (b, px) = self.status_at();
-        self.clear_rows(b - px * 3 / 2, b + px * 2);
+        // Cleared for the longest status, three lines (the mint's: baselines at b, b + 1.3 px, b + 2.6 px, and its descenders): cleared for two, the mint's third line stayed under a one-line status after it (owner, 2026-11-04).
+        self.clear_rows(b - px * 3 / 2, b + 2 * px * 13 / 10 + px / 2);
         for (k, line) in t.split('\n').enumerate() {
             self.centred(b + k * px * 13 / 10, px, QUIET, line);
         }
@@ -499,7 +505,10 @@ impl Ahau {
             }
             console(self.grants, b"ahau: roots handed to fgtw; it looks the identity up\n");
         }
+        // The words as last drawn, to redraw them only when the identity service has new ones (a fresh binding request): redrawn every poll, the words screen flickered four times a second (owner, 2026-11-04).
+        let (len0, words0) = (self.word_len, self.word_buf);
         let Some(state) = self.client_state() else { return false };
+        let same_words = self.word_buf[..self.word_len] == words0[..len0];
         let next = match state {
             1 => Mode::Join(seed),
             2 | 3 => {
@@ -512,13 +521,14 @@ impl Ahau {
             7 => Mode::Grey(seed),
             _ => return false,
         };
-        if next == self.mode && !matches!(next, Mode::Join(_)) {
+        if next == self.mode && (same_words || !matches!(next, Mode::Join(_))) {
             return false;
         }
         let changed = next != self.mode;
         self.mode = next;
         if changed {
             self.status(self.prompt());
+            self.entry_line(false);
             self.button();
         }
         self.words();
@@ -712,6 +722,12 @@ impl Ahau {
     fn entry_line(&self, chase: bool) {
         let (b, px) = self.entry_at();
         let (r0, r1) = ((b - px * 3 / 2) * self.w, (b + px / 2) * self.w);
+        // No entry while nothing is typed: the words screen and the others between entries have no text box (owner, 2026-11-04).
+        if !self.typing() {
+            self.surf()[r0..r1].fill(0);
+            self.present(r0 / self.w, r1 / self.w);
+            return;
+        }
         // Built whole in the back surface's rows and copied in, so a frame the display composes meanwhile never catches them cleared: drawn in place, the line flickered black at the blinkey's ticks (2026-11-01). Without a back surface, in place. The keyboard's boards use the back surface's rows below these.
         let tb = if self.back != 0 { self.back } else { self.base };
         let s = self.surf();
@@ -1066,6 +1082,9 @@ impl Ahau {
 
     /// A finger is down on `key`: the handle as that key would make it goes to the mark's thread now, so its frame is ready by the lift; the text itself changes only at the lift (`tap`). The key's effect is found on a copy of the keyboard (its shift and page are the real one's), so nothing here changes until the tap.
     fn preview(&self, key: Key) {
+        if !self.typing() {
+            return;
+        }
         let mut kb = self.kb.clone();
         // The handle as the key will leave it, at the blinkey, as `tap` will make it.
         let (mut t, mut n, mut ch) = (self.handle, self.len, self.chars);
@@ -1094,7 +1113,9 @@ impl Ahau {
     }
 
     fn tap(&mut self, key: Key) {
+        let typing = self.typing();
         match self.kb.tap(key) {
+            Some(Event::Char(_) | Event::Back | Event::Enter | Event::Leave) if !typing => return,
             Some(Event::Char(c)) => self.type_char(c),
             Some(Event::Back) => {
                 self.caret = delete_before(&mut self.handle, &mut self.len, &mut self.chars, self.caret);
