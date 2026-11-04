@@ -1,4 +1,4 @@
-//! screencap — what ferros's display server has composited, as a VSF visual: its 16-bit canvas (G#C800_0000, the back buffer before the panel's table and dither) read over the bridge and written as one Display plane, VSF RGB, gamma2tanh at 16 bits, so the highlights above white keep their headroom.
+//! screencap — what ferros's display server has composited, as a VSF visual: the finished frame (windows, the corners, the glass, composed for the panel by `display capture` into a free surface; the canvas when no window is up), before the panel's table and dither, read over the bridge and written as one Display plane, VSF RGB, gamma2tanh at 16 bits, so the highlights above white keep their headroom.
 //! The canvas word is R, G, B, A at 16 bits each (payloads/display draw.rs `Px`), a gamma-2 working value with white at Q14: light = (v / 16384)². Each becomes a g2t code through vsf's own encoder, the exact inverse of how a reader turns the plane back into light.
 //! The kernel's memory read hands back up to 4 MiB of DRAM a call (service.rs), so a WQHD canvas is 8 reads; the tool advances by what each read returns, so an older kernel (64 KiB) still works, slowly.
 //! Usage: screencap [out.vsf] [width height]   (default target/screen/<time>.vsf, 1344 2992; a jump from Android's scaled mode runs 1008 2244)
@@ -9,6 +9,21 @@ use vsf::types::BitPackedTensor;
 use vsf::visual::{Encoding, Plane, Primaries, Visual};
 
 const CANVAS: usize = 0xC800_0000;
+
+/// Where the finished frame is: the display server composes it into a free surface on op 30 (the windows, the corners, the glass, in working values) and says where; the `capture` process (payloads/capture, a display client: the kernel has no door to the display server) asks it and prints the answer. With no window up the canvas is the screen.
+fn source(bridge: &std::path::Path) -> usize {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let elf = repo.join("target/el0/aarch64-unknown-none/release/capture");
+    let bin = repo.join("target/el0/aarch64-unknown-none/release/capture.bin");
+    let _ = Command::new("cargo").current_dir(&repo).args(["el0", "-q", "-p", "ferros-payload-capture"]).status();
+    let _ = Command::new("aarch64-linux-gnu-objcopy").args(["-O", "binary"]).arg(&elf).arg(&bin).status();
+    let out = Command::new(bridge).arg("spawn").arg(&bin).args(["--use", "display"]).output().expect("ferros-bridge");
+    let text = String::from_utf8_lossy(&out.stdout);
+    match text.lines().find_map(|l| l.trim().trim_start_matches("proc: ").strip_prefix("G#")) {
+        Some(h) => usize::from_str_radix(h, 16).expect("capture address"),
+        None => CANVAS,
+    }
+}
 const CHUNK: usize = 4 << 20;
 
 fn main() {
@@ -27,11 +42,12 @@ fn main() {
     let bytes = w * h * 8;
     let tmp = std::env::temp_dir().join("screencap.part");
     let t0 = std::time::Instant::now();
+    let base = source(&bridge);
     let mut raw = Vec::with_capacity(bytes);
     let mut reads = 0;
     while raw.len() < bytes {
         let want = (bytes - raw.len()).min(CHUNK);
-        let st = Command::new(&bridge).args(["read", &format!("{:X}", CANVAS + raw.len()), &format!("{want:X}"), tmp.to_str().unwrap()]).output().expect("ferros-bridge");
+        let st = Command::new(&bridge).args(["read", &format!("{:X}", base + raw.len()), &format!("{want:X}"), tmp.to_str().unwrap()]).output().expect("ferros-bridge");
         let got = std::fs::read(&tmp).unwrap_or_default();
         if !st.status.success() || got.is_empty() {
             eprintln!("read failed at +{:#x}: {}", raw.len(), String::from_utf8_lossy(&st.stderr).lines().last().unwrap_or(""));

@@ -38,6 +38,7 @@ members = [
     "payloads/map",
     "payloads/init",
     "payloads/ramps",
+    "payloads/capture",
     "payloads/wintest",
     "payloads/hive",
     "payloads/ahau",

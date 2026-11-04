@@ -2131,6 +2131,12 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
                 }
             }
         }
+        // A screencap (op 30): the finished row, in working values, into the capture surface instead of through the panel's table.
+        if unsafe { CAPTURE } != 0 {
+            let cap = unsafe { core::slice::from_raw_parts_mut(CAPTURE as *mut u64, width * height) };
+            cap[y * width + xa..y * width + xb].copy_from_slice(&px[xa..xb]);
+            continue;
+        }
         let th = neon::thresholds(y, k, &BAYER, &TEMPORAL_RANK);
         unsafe {
             let base = core::arch::aarch64::vld1q_u8(th.as_ptr());
@@ -2150,8 +2156,14 @@ fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: 
         }
         dst[y * width + xa..y * width + xb].copy_from_slice(&row[xa..xb]);
     }
+    if unsafe { CAPTURE } != 0 {
+        return;
+    }
     fps_dot(1 << k, width, height);
 }
+
+/// Where op 30 has the finished frame written instead of a phase (a free surface's pixels), 0 when not capturing.
+static mut CAPTURE: usize = 0;
 
 /// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
 fn windows_changed(width: usize, height: usize) {
@@ -2576,7 +2588,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -3451,6 +3463,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     } else {
                         out[0] = 1;
                     }
+                }
+                // 30 `capture`: the frame as it is composed for the panel (windows, the corners, the glass) but in working values, before the panel's table and dither, into a surface no window holds; replies its physical address as text, `G#…` (tools/screencap reads it; the reply holds 16 bytes). With no window up the canvas is the screen: replies `canvas`.
+                Some(30) => {
+                    let free = (0..SURFACES).find(|&k| unsafe { (*(&raw const WINS))[k] }.is_none());
+                    let text: alloc::string::String = match (unsafe { APP }.is_some(), free) {
+                        (false, _) => "canvas\n".into(),
+                        (true, None) => "no free surface\n".into(),
+                        (true, Some(k)) => {
+                            let s = surface(k, width, height);
+                            unsafe { CAPTURE = s.as_mut_ptr() as usize };
+                            publish_app(draw::Rect::full(width, height), &tabs, 0, width, height);
+                            unsafe { CAPTURE = 0 };
+                            alloc::format!("G#{:X}\n", s.as_ptr() as usize)
+                        }
+                    };
+                    let b = text.as_bytes();
+                    let n = b.len().min(out.len());
+                    out[..n].copy_from_slice(&b[..n]);
+                    len = n;
                 }
                 Some(5) => {
                     out[0..2].copy_from_slice(&(width as u16).to_le_bytes());
