@@ -18,9 +18,11 @@ fn source(bridge: &std::path::Path) -> usize {
     let _ = Command::new("cargo").current_dir(&repo).args(["el0", "-q", "-p", "ferros-payload-capture"]).status();
     let _ = Command::new("aarch64-linux-gnu-objcopy").args(["-O", "binary"]).arg(&elf).arg(&bin).status();
     let out = Command::new(bridge).arg("spawn").arg(&bin).args(["--use", "display"]).output().expect("ferros-bridge");
-    let text = String::from_utf8_lossy(&out.stdout);
-    match text.lines().find_map(|l| l.trim().trim_start_matches("proc: ").strip_prefix("G#")) {
-        Some(h) => usize::from_str_radix(h, 16).expect("capture address"),
+    // The capture's reply, `proc: G#…`, anywhere in a line: other processes' console lines run into it when they have no newline of their own yet (2026-11-03: four captures read the canvas while the modem's log was streaming).
+    let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let hex = text.split("proc: G#").nth(1).map(|s| s.chars().take_while(|c| c.is_ascii_hexdigit()).collect::<String>());
+    match hex.filter(|h| !h.is_empty()) {
+        Some(h) => usize::from_str_radix(&h, 16).expect("capture address"),
         None => CANVAS,
     }
 }

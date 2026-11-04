@@ -233,6 +233,21 @@ impl Bt {
         None
     }
 
+    /// The corners' Bluetooth circle (ferros_sys::measure): up, and while the beacon goes out the power it goes out at (LE Read Advertising Physical Channel Tx Power, G#2007: status, then the power, signed dBm). Published at each change: up, a beacon started, stopped or restored.
+    fn measures(&mut self) {
+        use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+        status(0, w(k::STATE, 1));
+        let mut e = [0u8; 258];
+        let tx = match self.beacon {
+            Some(_) => match self.cmd(0x2007, &[], 256, &mut e) {
+                Some(n) if n >= 2 && e[0] == 0 => w(k::TX_POWER, e[1] as i8 as i64 * 1000),
+                _ => MEASURE_NONE,
+            },
+            None => MEASURE_NONE,
+        };
+        status(1, tx);
+    }
+
     /// A command whose status must be 0.
     fn ok(&mut self, op: u16, params: &[u8], ms: u64) -> bool {
         let mut e = [0u8; 258];
@@ -453,6 +468,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         let ok = bt.advertise(&first);
         say!(grants, "bt: beacon {} {}\n", Hex(&first), if ok { "advertising" } else { "refused" });
     }
+    bt.measures();
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut checked = now();
@@ -485,6 +501,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     let ok = bt.advertise(&b);
                     say!(grants, "bt: beacon {}\n", if ok { "restored" } else { "refused" });
                 }
+                bt.measures();
                 checked = now();
             }
         }
@@ -506,11 +523,13 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     b.copy_from_slice(&msg[1..17]);
                     let ok = bt.advertise(&b);
                     reply(&token, &[!ok as u8]);
+                    bt.measures();
                 }
                 2 => {
                     let ok = bt.ok(0x200A, &[0], 256);
                     bt.beacon = None;
                     reply(&token, &[!ok as u8]);
+                    bt.measures();
                 }
                 _ => {
                     reply(&token, &[]);

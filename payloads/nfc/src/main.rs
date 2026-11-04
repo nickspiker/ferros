@@ -115,6 +115,8 @@ struct Nfc {
     version: [u8; 4],
     config: [u8; 2],
     discovering: bool,
+    /// A reader's field on us now (RF_FIELD_INFO_NTF's last word).
+    field: bool,
 }
 
 impl Nfc {
@@ -376,6 +378,7 @@ impl Nfc {
                 if pl.first() == Some(&1) {
                     self.fields += 1;
                 }
+                self.field = pl.first() == Some(&1);
             }
             // The RF_DEACTIVATE a tag's release sent: its answer.
             (2, 1, 6) => {}
@@ -487,7 +490,7 @@ impl Nfc {
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false };
+    let mut nfc = Nfc { grants, secret: None, credits: 0, apdu: [0; 512], apdu_len: 0, activations: 0, served: 0, fields: 0, tags: 0, version: [0; 4], config: [0; 2], discovering: false, field: false };
     let mut p: Packet = [0; 258];
     if !ferros_sys::power(cap(grants, S_POWER), true) {
         say!(grants, "nfc: power on failed (HSI1 off?)\n");
@@ -500,7 +503,15 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut msg = [0u8; 64];
     let mut token = [0u8; 32];
     let mut retry_at = 0u64;
+    // The corners' NFC circle (ferros_sys::measure), at each change: up; listening, with the carrier it listens on (NFC's 13.56 MHz); a reader's field on us (connected, while it lasts).
+    let mut shown = None;
     loop {
+        if shown != Some((nfc.discovering, nfc.field)) {
+            shown = Some((nfc.discovering, nfc.field));
+            use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+            status(0, w(k::STATE, if nfc.field { 2 } else { 1 }));
+            status(1, if nfc.discovering { w(k::FREQ, 13_560) } else { MEASURE_NONE });
+        }
         if nfc.irq() {
             match nfc.read(&mut p) {
                 Ok(Some(n)) => nfc.packet(&p, n),

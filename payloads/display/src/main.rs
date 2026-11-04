@@ -2443,7 +2443,8 @@ fn measure_text(t: &mut Txt, kind: u16, v: i64) {
         k::VSWR => t.s("VSWR ").num(v, 1000, 2),
         k::TX_POWER => t.s("tx ").num(v, 1000, 0).s(" dBm"),
         k::FREQ if v >= 1_000_000 => t.num(v, 1_000_000, 3).s(" GHz"),
-        k::FREQ => t.num(v, 1000, 0).s(" MHz"),
+        k::FREQ if v >= 100_000 => t.num(v, 1000, 0).s(" MHz"),
+        k::FREQ => t.num(v, 1000, 2).s(" MHz"),
         k::BANDWIDTH => t.num(v, 1000, 0).s(" MHz wide"),
         k::CHANNEL => t.s("ch ").num(v, 1, 0),
         k::RATE_DOWN | k::RATE_UP => {
