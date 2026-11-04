@@ -596,6 +596,12 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[30] = 1 + crate::display::dpu_on() as u64;
     // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gnss, 5 ip.
     v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
+    // 33-80: those drivers' own measures (SYS_STATUS), eight tagged words each, in the same order, then the usb driver's.
+    for i in 0..6 {
+        for w in 0..8 {
+            v[33 + 8 * i + w] = crate::process::STATUS[i][w].load(Relaxed);
+        }
+    }
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
         use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};
@@ -2161,6 +2167,27 @@ pub fn run(mut b: Boot) -> ! {
                     // `diag log [KiB]`: the last 16 KiB of the flash text log (flashlog.rs), or the last KiB asked for (up to 256: a reply's room).
                     let kib = core::str::from_utf8(&cmd.params[3..]).ok().and_then(|t| t.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 256);
                     resp.extend_from_slice(&crate::flashlog::tail(kib * 1024));
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                if let Some(a) = cmd.params.strip_prefix(b"part f2fs ") {
+                    // `diag "part f2fs <part> <path>"`: an f2fs partition's checkpoint and roll-forward chain (ferros_f2fs: what fsync wrote after the checkpoint, Android's newest after a jump), and a file's inode as read, read-only.
+                    let a = alloc::string::String::from_utf8_lossy(a).into_owned();
+                    let mut w = a.split_whitespace();
+                    let s = match (w.next(), w.next()) {
+                        (Some(part), Some(path)) => match crate::partfs::mount_f2fs(part) {
+                            Ok(mut fs) => {
+                                let head = alloc::format!("{part}: checkpoint G#{:X}, roll-forward chain A#{} nodes, A#{} taken\n", fs.checkpoint_ver, fs.chain_len, fs.rolled_forward());
+                                match fs.open(path.as_bytes()) {
+                                    Ok(ino) => alloc::format!("{head}{path}: inode A#{}, size A#{}{}\n", ino.number, ino.size, if fs.rolled(ino.number) { ", from roll-forward" } else { "" }),
+                                    Err(e) => alloc::format!("{head}{path}: {e:?}\n"),
+                                }
+                            }
+                            Err(e) => alloc::format!("{e}\n"),
+                        },
+                        _ => alloc::string::String::from("part f2fs <part> <path>\n"),
+                    };
+                    resp.extend_from_slice(s.as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

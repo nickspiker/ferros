@@ -2189,7 +2189,6 @@ enum Corner {
     Nfc,
     Gnss,
     Usb,
-    Ip,
     Battery,
     Home,
     Spare,
@@ -2222,12 +2221,12 @@ fn glass_dist(rows: &[GlassRow], width: usize, height: usize, x: f32, y: f32, re
     d
 }
 
-/// The screen's corner circles: (x, y, radius, what), up to twelve.
-static mut CORNERS: [(f32, f32, f32, Corner); 12] = [(0.0, 0.0, 0.0, Corner::Spare); 12];
+/// The screen's corner circles: (x, y, radius, what), up to sixteen.
+static mut CORNERS: [(f32, f32, f32, Corner); 16] = [(0.0, 0.0, 0.0, Corner::Spare); 16];
 static mut CORNERS_N: usize = 0;
 static mut CORNERS_FOR: (usize, usize) = (0, 0);
 
-fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12], usize) {
+fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 16], usize) {
     unsafe {
         if CORNERS_FOR == (width, height) {
             return (CORNERS, CORNERS_N);
@@ -2240,16 +2239,16 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
     let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
     let glass = |x: f32, y: f32| glass_dist(rows, width, height, x, y, reach);
     let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
-    let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 12];
+    let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 16];
     let mut n = 0;
-    // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge).
+    // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge, the next along the horizontal edge). The indicators up top, navigation at the bottom (owner, 2026-11-03); IP is no radio, its measures are the links'.
     let jobs = [
-        (true, true, Corner::Clock, Corner::Spare, Corner::Gnss),
-        (false, true, Corner::Cellular, Corner::Wifi, Corner::Bluetooth),
-        (true, false, Corner::Battery, Corner::Usb, Corner::Nfc),
-        (false, false, Corner::Home, Corner::Ip, Corner::Spare),
+        (true, true, Corner::Clock, Corner::Battery, Corner::Usb, Some(Corner::Gnss)),
+        (false, true, Corner::Cellular, Corner::Wifi, Corner::Bluetooth, Some(Corner::Nfc)),
+        (true, false, Corner::Spare, Corner::Spare, Corner::Spare, None),
+        (false, false, Corner::Home, Corner::Spare, Corner::Spare, None),
     ];
-    for &(left, top, mid_what, hor_what, ver_what) in &jobs {
+    for &(left, top, mid_what, hor_what, ver_what, next_what) in &jobs {
         // The corner's quarter of the screen, as far as the app's circle leaves room: the strip above (below) the circle's chord at the screen's edge.
         let strip = if top { cy - libm::sqrtf(rr * rr - cx * cx) } else { h - (cy + libm::sqrtf(rr * rr - cx * cx)) };
         let (xa, xb) = if left { (0.0, w * 0.5) } else { (w * 0.5, w) };
@@ -2277,10 +2276,10 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
         }
         out[n] = (bx, by, br, mid_what);
         n += 1;
-        // A side circle: along `horizontal` (x moves toward the screen's middle) or the vertical edge (y moves toward the app's circle), the centre on the equal-distance line, until its clearance meets the middle circle's edge.
-        for horizontal in [true, false] {
+        // A side circle: along `horizontal` (x moves toward the screen's middle) or the vertical edge (y moves toward the app's circle), the centre on the equal-distance line (so tangent to the glass and the app's circle), from `s0` on until its clearance meets the edge of the circle `prev`, the one it chains from.
+        let side = |horizontal: bool, prev: (f32, f32, f32), s0: f32| -> Option<(f32, f32, f32)> {
             let dir = if horizontal { if left { 1.0 } else { -1.0 } } else if top { 1.0 } else { -1.0 };
-            // The equal-distance point at a coordinate `s` along the edge: bisection across the strip.
+            // The equal-distance point at a coordinate `s` along the edge: bisection across the strip, between the edge and the middle circle's centre line (the strip only narrows away from the middle circle).
             let medial = |s: f32| -> (f32, f32) {
                 let (mut lo, mut hi) = if horizontal { (if top { 0.5 } else { h - 0.5 }, by) } else { (if left { 0.5 } else { w - 0.5 }, bx) };
                 for _ in 0..40 {
@@ -2294,9 +2293,8 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
             let gap = |s: f32| -> f32 {
                 let (x, y) = medial(s);
                 let c = glass(x, y);
-                libm::sqrtf((x - bx) * (x - bx) + (y - by) * (y - by)) - br - c
+                libm::sqrtf((x - prev.0) * (x - prev.0) + (y - prev.1) * (y - prev.1)) - prev.2 - c
             };
-            let s0 = if horizontal { bx } else { by };
             let (mut a, mut found) = (s0, false);
             let mut s = s0 + dir;
             for _ in 0..2048 {
@@ -2308,7 +2306,7 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
                 s += dir;
             }
             if !found {
-                continue;
+                return None;
             }
             let (mut lo, mut hi) = (a, s);
             for _ in 0..30 {
@@ -2316,8 +2314,24 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
                 if gap(mid) >= 0.0 { hi = mid } else { lo = mid }
             }
             let (x, y) = medial(hi);
-            out[n] = (x, y, glass(x, y), if horizontal { hor_what } else { ver_what });
+            Some((x, y, glass(x, y)))
+        };
+        let mid = (bx, by, br);
+        let hor = side(true, mid, bx);
+        if let Some(c) = hor {
+            out[n] = (c.0, c.1, c.2, hor_what);
             n += 1;
+        }
+        if let Some(c) = side(false, mid, by) {
+            out[n] = (c.0, c.1, c.2, ver_what);
+            n += 1;
+        }
+        // The next along the top: tangent to the glass, the app's circle and the side circle before it.
+        if let (Some(what), Some(c)) = (next_what, hor) {
+            if let Some(d) = side(true, c, c.0) {
+                out[n] = (d.0, d.1, d.2, what);
+                n += 1;
+            }
         }
     }
     // The solved circles, once per size, to the console: (x, y, r) in pixels.
@@ -2347,6 +2361,108 @@ fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12],
     (out, n)
 }
 
+/// Each radio's flavour (owner, 2026-11-03: "throw some of that in the design"), picked in VSF RGB and scaled to the light of the grey they replace by VSF's photopic weights (R 0.2584, G 0.6346, B 0.1070, vsf_rgb_to_photopic_f32): the ring at RING_ON's light (0.3017 linear), the name at INK's (0.4507; periwinkle tops out at 0.388, its blue full). As working values, gamma 2 white at Q14. Cellular amber, a warm thing that carries far; WiFi sea teal, the near water; Bluetooth periwinkle; NFC lime, a touch; GNSS dusk magenta, the sky it listens to. The rest grey, equal codes (illuminant E).
+fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
+    const RING_ON: f32 = 9000.0;
+    const INK: f32 = 11000.0;
+    match what {
+        Corner::Cellular => ((12107.0, 8121.0, 3424.0), (14797.0, 9926.0, 4185.0)),
+        Corner::Wifi => ((2706.0, 10480.0, 9373.0), (3307.0, 12809.0, 11456.0)),
+        Corner::Bluetooth => ((8549.0, 7915.0, 14451.0), (9693.0, 8974.0, 16384.0)),
+        Corner::Nfc => ((6893.0, 10276.0, 3980.0), (8425.0, 12560.0, 4864.0)),
+        Corner::Gnss => ((12831.0, 6415.0, 10735.0), (15682.0, 7841.0, 13121.0)),
+        _ => ((RING_ON, RING_ON, RING_ON), (INK, INK, INK)),
+    }
+}
+
+/// A line of a corner's text, on the stack (the chrome draws without the heap's growth).
+#[derive(Clone, Copy)]
+struct Txt {
+    b: [u8; 32],
+    n: usize,
+}
+impl Txt {
+    const fn new() -> Txt {
+        Txt { b: [0; 32], n: 0 }
+    }
+    fn s(&mut self, t: &str) -> &mut Txt {
+        for &c in t.as_bytes() {
+            if self.n < self.b.len() {
+                self.b[self.n] = c;
+                self.n += 1;
+            }
+        }
+        self
+    }
+    /// `v / unit` with `places` digits after the point, rounded half away from zero.
+    fn num(&mut self, v: i64, unit: i64, places: u32) -> &mut Txt {
+        let p = 10i64.pow(places);
+        let scaled = (v.unsigned_abs() as i128 * p as i128 * 2 + unit as i128) / (unit as i128 * 2);
+        if v < 0 && scaled != 0 {
+            self.s("-");
+        }
+        let (whole, frac) = ((scaled / p as i128) as u64, (scaled % p as i128) as u64);
+        let mut d = [0u8; 20];
+        let (mut m, mut i) = (whole, 20);
+        loop {
+            i -= 1;
+            d[i] = b'0' + (m % 10) as u8;
+            m /= 10;
+            if m == 0 {
+                break;
+            }
+        }
+        self.s(core::str::from_utf8(&d[i..]).unwrap_or(""));
+        if places > 0 {
+            self.s(".");
+            let mut f = [0u8; 8];
+            let mut m = frac;
+            for k in (0..places as usize).rev() {
+                f[k] = b'0' + (m % 10) as u8;
+                m /= 10;
+            }
+            self.s(core::str::from_utf8(&f[..places as usize]).unwrap_or(""));
+        }
+        self
+    }
+    fn str(&self) -> &str {
+        core::str::from_utf8(&self.b[..self.n]).unwrap_or("")
+    }
+}
+
+/// One measure as a person reads it: the value in its unit, the kind named where the unit alone does not say it.
+fn measure_text(t: &mut Txt, kind: u16, v: i64) {
+    use ferros_sys::measure as k;
+    let _ = match kind {
+        k::RSSI => t.num(v, 1000, 0).s(" dBm"),
+        k::NOISE => t.s("noise ").num(v, 1000, 0),
+        k::SNR => t.s("SNR ").num(v, 1000, 0).s(" dB"),
+        k::RSRP => t.s("RSRP ").num(v, 1000, 0),
+        k::RSRQ => t.s("RSRQ ").num(v, 1000, 1),
+        k::SINR => t.s("SINR ").num(v, 1000, 0).s(" dB"),
+        k::VSWR => t.s("VSWR ").num(v, 1000, 2),
+        k::TX_POWER => t.s("tx ").num(v, 1000, 0).s(" dBm"),
+        k::FREQ if v >= 1_000_000 => t.num(v, 1_000_000, 3).s(" GHz"),
+        k::FREQ => t.num(v, 1000, 0).s(" MHz"),
+        k::BANDWIDTH => t.num(v, 1000, 0).s(" MHz wide"),
+        k::CHANNEL => t.s("ch ").num(v, 1, 0),
+        k::RATE_DOWN | k::RATE_UP => {
+            if kind == k::RATE_UP {
+                t.s("up ");
+            }
+            if v >= 1_000_000_000 { t.num(v, 1_000_000_000, 2).s(" Gb/s") } else if v >= 1_000_000 { t.num(v, 1_000_000, 0).s(" Mb/s") } else { t.num(v, 1000, 0).s(" kb/s") }
+        }
+        k::LATENCY => t.num(v, 1_000_000, 1).s(" ms"),
+        k::LOSS => t.num(v, 10_000, 2).s(" % loss"),
+        k::MCS => t.s("MCS ").num(v, 1, 0),
+        k::STREAMS => t.num(v, 1, 0).s(" streams"),
+        k::SATS_SEEN => t.num(v, 1, 0).s(" seen"),
+        k::SATS_USED => t.num(v, 1, 0).s(" in fix"),
+        k::CN0 => t.num(v, 1000, 0).s(" dB-Hz"),
+        _ => t.s("kind ").num(kind as i64, 1, 0).s(": ").num(v, 1, 0),
+    };
+}
+
 /// A disc's coverage at signed distance `d` (pixels inside the edge, negative outside): the algebraic sigmoid x/√(1+x²) over about a pixel, C∞ (no clamp, GUI continuity).
 #[inline]
 fn soft(d: f32) -> f32 {
@@ -2358,8 +2474,14 @@ fn soft(d: f32) -> f32 {
 fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let mut tb = [0u8; 32];
     let (_, _, tn, key, _) = clock_state(&mut tb);
-    let radios = ferros_sys::facts().0[32];
-    let k = (key / 60) << 8 | (radios & 0x7F) as i64 | ((ferros_sys::facts().0[5] & 1) as i64) << 7;
+    let facts = ferros_sys::facts().0;
+    let radios = facts[32];
+    // The links' measures (facts 33-80) folded into the key too: the chrome redraws when one changes, at most every two seconds (the drivers' pace).
+    let mut mh = 0u64;
+    for &m in &facts[33..81] {
+        mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let k = ((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64;
     if !force && k == unsafe { CHROME_KEY } {
         return false;
     }
@@ -2390,7 +2512,6 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let mut colons = 0;
     let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
     let time = core::str::from_utf8(&line[..end]).unwrap_or("");
-    let usb = ferros_sys::facts().0[5];
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
         let live = match what {
@@ -2400,12 +2521,30 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Bluetooth => radios & 4 != 0,
             Corner::Nfc => radios & 8 != 0,
             Corner::Gnss => radios & 16 != 0,
-            Corner::Ip => radios & 32 != 0,
-            Corner::Usb => usb == 1,
+            // The usb driver's own word (its measure STATE): connected once the host configured it.
+            Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
             Corner::Battery | Corner::Spare => false,
         };
         let ring_w = r / 16.0;
-        let ring = if live { RING_ON } else { RING_OFF };
+        // The radio's state as its driver says it (measure STATE): connected the flavour's full ring, up and searching one stop darker; a driver that says nothing, its ring by whether it runs.
+        let state = match what {
+            Corner::Cellular => Some(0),
+            Corner::Wifi => Some(1),
+            Corner::Bluetooth => Some(2),
+            Corner::Nfc => Some(3),
+            Corner::Gnss => Some(4),
+            Corner::Usb => Some(5),
+            _ => None,
+        }
+        .and_then(|ri: usize| facts[33 + 8 * ri..41 + 8 * ri].iter().filter_map(|&m| ferros_sys::measure_of(m)).find(|m| m.0 == ferros_sys::measure::STATE).map(|m| m.1));
+        let (ring_c, ink_c) = flavour(what);
+        let ring = if !live {
+            (RING_OFF, RING_OFF, RING_OFF)
+        } else if state == Some(1) {
+            (ring_c.0 * core::f32::consts::FRAC_1_SQRT_2, ring_c.1 * core::f32::consts::FRAC_1_SQRT_2, ring_c.2 * core::f32::consts::FRAC_1_SQRT_2)
+        } else {
+            ring_c
+        };
         let (x0, x1, y0, y1) = ((x - r - 2.0) as i64, (x + r + 2.0) as i64, (y - r - 2.0) as i64, (y + r + 2.0) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -2416,42 +2555,86 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
                 let disc = soft(d);
                 let band = disc - soft(d - ring_w);
                 // Over what is there already, by the disc's own coverage: a neighbour's pixels outside this disc stay as they were.
-                let under = (chrome[i] & 0xFFFF) as f32;
-                let v = (under * (1.0 - disc) + FACE * (disc - band) + ring * band) as u64;
-                chrome[i] = v | v << 16 | v << 32;
+                let ch = |sh: u32, ring: f32| ((((chrome[i] >> sh) & 0xFFFF) as f32 * (1.0 - disc) + FACE * (disc - band) + ring * band) as u64) << sh;
+                chrome[i] = ch(0, ring.0) | ch(16, ring.1) | ch(32, ring.2);
             }
         }
-        let label: &str = match what {
+        // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
+        let radio = match what {
+            Corner::Cellular => Some(0),
+            Corner::Wifi => Some(1),
+            Corner::Bluetooth => Some(2),
+            Corner::Nfc => Some(3),
+            Corner::Gnss => Some(4),
+            Corner::Usb => Some(5),
+            _ => None,
+        };
+        let mut lines = [Txt::new(); 9];
+        let mut nl = 1;
+        let mut tech = None;
+        if let Some(ri) = radio {
+            for &m in &facts[33 + 8 * ri..41 + 8 * ri] {
+                let Some((kind, v)) = ferros_sys::measure_of(m) else { continue };
+                match kind {
+                    ferros_sys::measure::STATE => {}
+                    ferros_sys::measure::TECH => tech = Some(v),
+                    _ => {
+                        measure_text(&mut lines[nl], kind, v);
+                        nl += 1;
+                    }
+                }
+            }
+        }
+        let name: &str = match what {
             Corner::Clock => time,
-            Corner::Cellular => "cell",
+            Corner::Cellular => match tech {
+                Some(14) => "LTE",
+                Some(20) => "NR",
+                _ => "cell",
+            },
             Corner::Wifi => "wifi",
             Corner::Bluetooth => "bt",
             Corner::Nfc => "nfc",
             Corner::Gnss => "gnss",
             Corner::Usb => "usb",
-            Corner::Ip => "ip",
             Corner::Battery => "batt",
             Corner::Home | Corner::Spare => "",
         };
-        if label.is_empty() {
+        if name.is_empty() {
             continue;
         }
-        // The label fitted inside the face: as wide as 1.3 radii at most, its height a third of the diameter at most.
+        lines[0].s(name);
         let eng = glyph_engine();
-        let mut px = r * 0.66;
-        let w1 = eng.width(label, px);
-        if w1 > r * 1.3 {
-            px *= r * 1.3 / w1;
-        }
-        let tw = eng.width(label, px);
-        let ink = if live { INK } else { RING_OFF * 1.4 };
-        eng.cover(label, x - tw * 0.5, y + px * 0.36, px, (1.0, 0.0), |gx, gy, a| {
-            if let Some(i) = at(gx, gy) {
-                let p = chrome[i] & 0xFFFF;
-                let v = (p as f32 + (ink - p as f32) * a as f32 / 255.0) as u64;
-                chrome[i] = v | v << 16 | v << 32;
+        let dim = RING_OFF * 1.4;
+        // The name in the radio's flavour, its measures in plain ink; all dim when it does not run.
+        let ink_of = |j: usize| if !live { (dim, dim, dim) } else if j == 0 { ink_c } else { (INK, INK, INK) };
+        // The lines stacked about the centre, a pitch each; each line as large as fits its own chord (seven tenths of the circle's width at the line's far edge), the name half again as large as a measure.
+        let weight = |j: usize| if j == 0 && nl > 1 { 1.5 } else { 1.0 };
+        let total: f32 = (0..nl).map(weight).sum();
+        let pitch = if nl == 1 { r * 0.66 } else { r * 1.5 / total };
+        let mut top_y = y - pitch * total * 0.5;
+        for j in 0..nl {
+            let text = lines[j].str();
+            let lh = pitch * weight(j);
+            let far = libm::fabsf(top_y - y).max(libm::fabsf(top_y + lh - y));
+            let chord = 2.0 * libm::sqrtf((r * r - far * far).max(0.0)) * 0.7;
+            let mut px = lh * 0.9;
+            let tw0 = eng.width(text, px);
+            if tw0 > chord {
+                px *= chord / tw0;
             }
-        });
+            let tw = eng.width(text, px);
+            let base = top_y + lh * 0.5 + px * 0.36;
+            let ink = ink_of(j);
+            eng.cover(text, x - tw * 0.5, base, px, (1.0, 0.0), |gx, gy, a| {
+                if let Some(i) = at(gx, gy) {
+                    let a = a as f32 / 255.0;
+                    let ch = |sh: u32, ink: f32| { let p = ((chrome[i] >> sh) & 0xFFFF) as f32; ((p + (ink - p) * a) as u64) << sh };
+                    chrome[i] = ch(0, ink.0) | ch(16, ink.1) | ch(32, ink.2);
+                }
+            });
+            top_y += lh;
+        }
     }
     ALLOC.reset();
     true

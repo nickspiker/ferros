@@ -688,7 +688,7 @@ const SYS_SPAWN: u64 = 10;
 const SYS_SET_PREF: u64 = 11;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
-pub const FACT_COUNT: usize = 40;
+pub const FACT_COUNT: usize = 88;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
@@ -720,6 +720,9 @@ const SYS_PT: u64 = 25;
 const DMA_ADDR: u64 = 1 << 63;
 /// sensors(cap, op, offset, len): the sensors process (sensorlink.rs). Op 0 publishes the block of `len` bytes at `offset` in the caller's arc (at least sensorlink `BYTES`) → 0 or ERR. Op 1 → the board's CDT | MLB << 32 from the device tree (usf.rs `read_board`), for the registry scripts.
 const SYS_SENSORS: u64 = 26;
+/// status(slot, word): one of a radio driver's eight measure slots for the corners' circles (WINDOWS.md), SYS_FACTS 33-80, eight words a link: the link is the caller's own, by its name (modem, pcie1, bt, nfc, gnss, usb), so no capability; anyone else, or a slot past 7, gets ERR. A word is a tagged measure (ferros_sys::measure: the kind in bits 48-63, the value in its unit below), all ones empty; the kernel keeps the words and reads none of them.
+const SYS_STATUS: u64 = 27;
+pub static STATUS: [[core::sync::atomic::AtomicU64; 8]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8] }; 6];
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1565,6 +1568,19 @@ fn el0_trap(f: &mut Frame) -> u64 {
                     _ => ERR,
                 },
                 _ => ERR,
+            };
+            0
+        }
+        SYS_STATUS => {
+            let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gnss", b"usb"].iter().position(|n| *n == p.name.as_slice());
+            f.x[0] = match slot {
+                // The slot comes from the process: bounded so a bad one is refused, not a write past the radio's eight.
+                Some(i) if f.x[0] < 8 => {
+                    STATUS[i][f.x[0] as usize].store(f.x[1], core::sync::atomic::Ordering::Relaxed);
+                    0
+                }
+                Some(_) => ERR,
+                None => ERR,
             };
             0
         }

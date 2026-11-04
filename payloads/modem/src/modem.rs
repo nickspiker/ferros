@@ -2104,6 +2104,9 @@ struct Online {
     cycled: u8,
     allow_set: bool,
     reg_last: [Option<[u8; 4]>; 2],
+    /// The last IND_SIGNAL_STRENGTH's parameters (G#0906, no identity) and their length: logged whole at each change, past the frame cap, to be decoded against Android's readings of the same moment.
+    sig_last: [u8; 64],
+    sig_len: u32,
     camp_seen: [u8; 2],
     call_sent: bool,
     /// Not before this (µs since online): the next setup after a refusal or a lost call.
@@ -2148,6 +2151,16 @@ fn hexs(at: &dyn Fn(u32) -> u8, n: u32) -> alloc::string::String {
 }
 
 impl Online {
+    /// The corners' cellular circle (ferros_sys::measure): what the driver knows of the link, each measure in its unit; the radio's signal is not among them until IND_SIGNAL_STRENGTH (G#0906) is decoded against Android's readings of the same moment, so its slots stay empty, never guessed. State: connected with a data call up, on while the data stack is registered (1 home, 5 roaming) or searching; the technology the registration's fourth byte, the RIL radio technology (14 LTE, 20 NR, as ferros_sys's TECH_ codes).
+    fn publish_status(&self) {
+        use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+        let reg = self.reg_last[1];
+        status(0, w(k::STATE, if self.call.is_some() { 2 } else { 1 }));
+        status(1, match reg {
+            Some([1 | 5, _, _, rat]) => w(k::TECH, rat as i64),
+            _ => MEASURE_NONE,
+        });
+    }
     fn new(t0: u64, probe: u8) -> Self {
         Online {
             t0,
@@ -2165,6 +2178,8 @@ impl Online {
             cycled: 0,
             allow_set: false,
             reg_last: [None, None],
+            sig_last: [0; 64],
+            sig_len: 0,
             camp_seen: [0; 2],
             call_sent: false,
             call_retry: 0,
@@ -2498,6 +2513,20 @@ impl Online {
                 if self.reg_last[k] != Some(st) {
                     self.reg_last[k] = Some(st);
                     line(rep, alloc::format!("t={} ms: ch A#{ch} PS registration now {}\n", since_us(t0) / 1000, hexs(&|i| st[i as usize], 4)));
+                    self.publish_status();
+                }
+            }
+            // The signal indication, whole (up to 64 bytes) at each change, past the cap too.
+            if ril && at(12) == 2 && (at(14) as u16 | (at(15) as u16) << 8) == 0x0906 && flen >= 12 + 8 {
+                let n = (flen - 12 - 8).min(64);
+                let mut s = [0u8; 64];
+                for i in 0..n {
+                    s[i as usize] = at(20 + i);
+                }
+                if n != self.sig_len || s != self.sig_last {
+                    self.sig_last = s;
+                    self.sig_len = n;
+                    line(rep, alloc::format!("t={} ms: ch A#{ch} signal now A#{n} bytes: {}\n", since_us(t0) / 1000, hexs(&|i| s[i as usize], n)));
                 }
             }
             // A data-call reply, past the cap too: the RCM error, then the call's status (u16), id, active flag and PDP type (params G#0..G#4); the addresses, DNS and gateway after them are the line's and stay hidden. The reply is 304 bytes; one too short for the fields read here is the CP's malformed input and is not taken.
@@ -2516,6 +2545,7 @@ impl Online {
                     }
                     line(rep, alloc::format!("t={} ms: data call up on rmnet ch A#{}, MTU A#{}\n", since_us(t0) / 1000, CH_PDP_0 + c.cid - 1, c.mtu));
                     self.call = Some(c);
+                    self.publish_status();
                 } else {
                     // Refused: asked again in 16 s, while still registered.
                     self.call_sent = false;

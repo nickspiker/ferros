@@ -45,6 +45,7 @@ pub mod nr {
     pub const UNLOCK: u64 = 24;
     pub const PT: u64 = 25;
     pub const SENSORS: u64 = 26;
+    pub const STATUS: u64 = 27;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -93,8 +94,76 @@ pub fn set_pref(cap: u64, index: u64, value: u8) -> u64 {
     svc(nr::SET_PREF, cap, index, value as u64, 0, 0)
 }
 
+/// A radio's link, as its driver measures it, for the corners' circles (kernel SYS_STATUS, facts 33-80): up to eight measures a link (the five radios, then USB), each a tagged word, the kind in bits 48-63 and its value, signed, in bits 0-47, in the kind's own unit. A link is many measures, never one number and never bars (owner, 2026-11-03: "frequency, bandwidth, speed, latency, flavor, packet loss ... RSSI, VSWR"): a driver publishes what it measures and nothing else, and a new measure is a new kind, not a new layout. `MEASURE_NONE` (all ones) is an empty slot.
+pub mod measure {
+    /// 0 off, 1 on (up, no link), 2 connected.
+    pub const STATE: u16 = 0;
+    /// The technology, `TECH_*`.
+    pub const TECH: u16 = 1;
+    /// Received signal strength, milli-dBm.
+    pub const RSSI: u16 = 2;
+    /// The noise floor, milli-dBm.
+    pub const NOISE: u16 = 3;
+    /// Signal over noise, milli-dB.
+    pub const SNR: u16 = 4;
+    /// Cellular reference-signal received power, milli-dBm.
+    pub const RSRP: u16 = 5;
+    /// Cellular reference-signal received quality, milli-dB.
+    pub const RSRQ: u16 = 6;
+    /// Signal over interference and noise, milli-dB.
+    pub const SINR: u16 = 7;
+    /// The antenna's voltage standing wave ratio, thousandths (1500: 1.5 to 1).
+    pub const VSWR: u16 = 8;
+    /// Transmit power, milli-dBm.
+    pub const TX_POWER: u16 = 9;
+    /// The channel's centre frequency, kHz.
+    pub const FREQ: u16 = 10;
+    /// The channel's bandwidth, kHz.
+    pub const BANDWIDTH: u16 = 11;
+    /// The channel number (WiFi) or the band (cellular), as the standard numbers it.
+    pub const CHANNEL: u16 = 12;
+    /// The link's rate down and up, bit/s.
+    pub const RATE_DOWN: u16 = 13;
+    pub const RATE_UP: u16 = 14;
+    /// Round trip, ns.
+    pub const LATENCY: u16 = 15;
+    /// Loss, parts per million.
+    pub const LOSS: u16 = 16;
+    /// The modulation and coding scheme index, and the spatial streams.
+    pub const MCS: u16 = 17;
+    pub const STREAMS: u16 = 18;
+    /// GNSS: satellites tracked, satellites in the fix, the best carrier to noise (milli-dB-Hz).
+    pub const SATS_SEEN: u16 = 19;
+    pub const SATS_USED: u16 = 20;
+    pub const CN0: u16 = 21;
+}
+pub const MEASURE_NONE: u64 = u64::MAX;
+pub const TECH_NONE: u8 = 0;
+pub const TECH_WIFI4: u8 = 1;
+pub const TECH_WIFI5: u8 = 2;
+pub const TECH_WIFI6: u8 = 3;
+pub const TECH_WIFI7: u8 = 4;
+pub const TECH_LTE: u8 = 14;
+pub const TECH_NR: u8 = 20;
+pub const TECH_BT: u8 = 32;
+pub const TECH_NFC: u8 = 33;
+pub const TECH_GNSS: u8 = 34;
+pub const TECH_USB: u8 = 35;
+/// One measure's word: the kind, and the value in its low 48 bits (two's complement; a driver's measures fit, the widest being a rate in bit/s).
+pub fn measure_word(kind: u16, value: i64) -> u64 {
+    (kind as u64) << 48 | value as u64 & ((1 << 48) - 1)
+}
+/// A word back: its kind and its value sign-extended, `None` for an empty slot.
+pub fn measure_of(w: u64) -> Option<(u16, i64)> {
+    if w == MEASURE_NONE { None } else { Some(((w >> 48) as u16, (w << 16) as i64 >> 16)) }
+}
+/// Set this driver's measure slot `slot` (0-7) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gnss and usb drivers have slots; anyone else gets ERR.
+pub fn status(slot: u64, word: u64) -> u64 {
+    svc(nr::STATUS, slot, word, 0, 0, 0)
+}
+
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 40]);
+pub struct Facts(pub [u64; 88]);
 
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 pub fn local_time() -> Option<(i64, u64)> {
@@ -384,7 +453,7 @@ pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    let mut b = [0u8; 320];
+    let mut b = [0u8; 704];
     svc(nr::FACTS, off(b.as_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))
 }

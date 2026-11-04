@@ -2002,7 +2002,7 @@ impl Dwc3Dev {
     /// The link state (DSTS USBLNKST, bits 18-21): 3 is suspended (U3/L2), where a pulled cable leaves it.
     pub fn link_state(&self) -> u32 { (unsafe { mmio::read32(dwc3_base() + DSTS) } >> 18) & 15 }
 
-    /// Connected speed.
+    /// Connected speed: DSTS.CONNECTSPD at the last connect, 0 high speed, 1 full, 2 low, 4 SuperSpeed, 5 SuperSpeed Plus.
     pub fn connected_speed(&self) -> u32 { self.connected_speed }
 }
 

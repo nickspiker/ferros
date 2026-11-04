@@ -1502,6 +1502,77 @@ impl Msgbuf {
     }
 }
 
+/// The link's measures for the corners' WiFi circle (ferros_sys::measure), from the firmware's own answers (bcm4398 wlioctl_defs.h, bcmwifi_channels.h): RSSI (WLC_GET_RSSI 127, dBm) and the noise floor (WLC_GET_PHY_NOISE 135, dBm) and their difference; the chanspec iovar's centre channel, band and bandwidth as a frequency; the rate (WLC_GET_RATE 12, in 500 kbit/s); loss as the transmit failures over the last two seconds' attempts (WLC_GET_PKTCNTS 137, get_pktcnt_t: rx good, rx bad, tx good, tx bad, cumulative). A slot the firmware did not answer is emptied, never filled with a guess.
+fn publish_measures(m: &mut Msgbuf, d: &mut Drv, pkts: &mut [u32; 4]) {
+    use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};
+    let req = m.dma + 0x1_3000;
+    let ask = |m: &mut Msgbuf, d: &mut Drv, cmd: u32, len: u32| -> Option<u32> {
+        for i in 0..len {
+            db(req + i, 0);
+        }
+        match m.ioctl(d, cmd, req, len, len) {
+            Some((0, b, _)) => Some(m.resp(b)),
+            _ => None,
+        }
+    };
+    status(0, w(k::STATE, if m.keyed { 2 } else { 1 }));
+    if !m.keyed {
+        for s in 1..8 {
+            status(s, MEASURE_NONE);
+        }
+        return;
+    }
+    let rssi = ask(m, d, 127, 12).map(|a| dr32u(a) as i32);
+    let noise = ask(m, d, 135, 4).map(|a| dr32u(a) as i32);
+    status(1, rssi.map_or(MEASURE_NONE, |v| w(k::RSSI, v as i64 * 1000)));
+    status(2, noise.map_or(MEASURE_NONE, |v| w(k::NOISE, v as i64 * 1000)));
+    status(3, match (rssi, noise) {
+        (Some(r), Some(n)) => w(k::SNR, (r - n) as i64 * 1000),
+        _ => MEASURE_NONE,
+    });
+    // The chanspec: the channel (the centre one for a wide channel) in bits 0-7, the bandwidth in 11-13, the band in 14-15; the centre frequency is the band's base plus 5 MHz a channel (2.4 GHz: 2407, channel 14 at 2484; 5 GHz: 5000; 6 GHz: 5950).
+    let cs = match m.get_var(d, b"chanspec", req) {
+        Some((0, b, _)) => Some(dr32u(m.resp(b))),
+        _ => None,
+    };
+    let (freq, bw) = match cs {
+        Some(cs) => {
+            let ch = (cs & 0xFF) as i64;
+            let mhz = match cs & 0xC000 {
+                0x0000 if ch == 14 => Some(2484),
+                0x0000 => Some(2407 + 5 * ch),
+                0xC000 => Some(5000 + 5 * ch),
+                0x4000 => Some(5950 + 5 * ch),
+                _ => None,
+            };
+            let bw = match cs & 0x3800 {
+                0x1000 => Some(20),
+                0x1800 => Some(40),
+                0x2000 => Some(80),
+                0x2800 => Some(160),
+                0x0000 => Some(320),
+                _ => None,
+            };
+            (mhz, bw)
+        }
+        None => (None, None),
+    };
+    status(4, freq.map_or(MEASURE_NONE, |v| w(k::FREQ, v * 1000)));
+    status(5, bw.map_or(MEASURE_NONE, |v: i64| w(k::BANDWIDTH, v * 1000)));
+    status(6, ask(m, d, 12, 4).map_or(MEASURE_NONE, |a| w(k::RATE_DOWN, dr32u(a) as i64 * 500_000)));
+    let now = ask(m, d, 137, 20).map(|a| [dr32u(a), dr32u(a + 4), dr32u(a + 8), dr32u(a + 12)]);
+    status(7, match now {
+        Some(c) => {
+            // Counters wrap at 2^32: the difference wraps with them.
+            let (good, bad) = (c[2].wrapping_sub(pkts[2]) as i64, c[3].wrapping_sub(pkts[3]) as i64);
+            *pkts = c;
+            // No packets sent in the window: loss is undefined there, so no measure (and no divide by zero).
+            if good + bad == 0 { MEASURE_NONE } else { w(k::LOSS, bad * 1_000_000 / (good + bad)) }
+        }
+        None => MEASURE_NONE,
+    });
+}
+
 fn be16(a: u32) -> u32 {
     (dbr(a) as u32) << 8 | dbr(a + 1) as u32
 }
@@ -1589,7 +1660,14 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     let mut msg = [0u8; 2048];
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
+    // The corners' WiFi circle (SYS_STATUS): the link's own measures every two seconds, each in its unit, published only where the firmware answers (owner: many dimensions, never bars). Into the scan's request area: no scan runs while serving.
+    let mut status_at = 0u64;
+    let mut pkts = [0u32; 4];
     loop {
+        if d.now().wrapping_sub(status_at) >= 2 * d.freq {
+            status_at = d.now();
+            publish_measures(m, d, &mut pkts);
+        }
         let _ = m.pump(d);
         m.pump_rx(d);
         m.pump_tx(d);
@@ -1876,6 +1954,8 @@ fn vault_file(d: &Drv, key: &[u8], at: u64) -> Option<&'static mut [u8]> {
 fn wait_cred(d: &mut Drv) -> &'static [u8] {
     d.put(b"no network credential yet (the person's, locked until attest): waiting for it\n");
     d.flush();
+    // The corners' WiFi circle: up, no link, while it waits.
+    ferros_sys::status(0, ferros_sys::measure_word(ferros_sys::measure::STATE, 1));
     loop {
         if let Some(c) = vault_file(d, b"cred", 0x12_0000) {
             d.put(b"network credential readable: joining\n");
