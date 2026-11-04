@@ -1125,7 +1125,7 @@ impl Client {
             }
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
-            // The attest screen: the state, or its roots (op 4, 69 bytes).
+            // The attest screen: the state, or its roots (op 4, 65 bytes).
             let mut req = [0u8; 72];
             let mut tok = [0u8; 32];
             let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
@@ -1148,7 +1148,8 @@ impl Client {
                     }
                 }
                 // Op 4: the attest screen hands the roots in RAM (`[4][seed 32][proof 32]`), the default — nothing of the identity written unless unlock-at-boot is on. Forget the old, take these, persist or wipe per the setting, look up.
-                if n >= 69 && req[0] == 4 {
+                // WHY the length check: another process's message, and the seed and proof are sliced out of it below (req[1..65]); a shorter one would read past what was sent. It said 69 from 2026-10-28 to 2026-11-04 while the attest screen sent 65, so the roots never arrived and the screen stayed on "Finding this identity.".
+                if n >= 65 && req[0] == 4 {
                     let mut seed = [0u8; 32];
                     let mut hp = [0u8; 32];
                     seed.copy_from_slice(&req[1..33]);

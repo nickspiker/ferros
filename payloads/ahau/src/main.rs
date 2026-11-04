@@ -497,6 +497,7 @@ impl Ahau {
             if self.roots_pending {
                 return false;
             }
+            console(self.grants, b"ahau: roots handed to fgtw; it looks the identity up\n");
         }
         let Some(state) = self.client_state() else { return false };
         let next = match state {
@@ -531,7 +532,7 @@ impl Ahau {
         self.roots_pending = !self.hand_roots();
     }
 
-    /// One attempt at the op-4 hand-over of the session's roots: true when the client took them.
+    /// One attempt at the op-4 hand-over of the session's roots: true when fgtw took them, which its reply says (its state byte first, 0 while it holds no identity). Any reply at all is not enough: from 2026-10-28 to 2026-11-04 fgtw ignored the message (it wanted 69 bytes), still replied, and the roots were counted as handed.
     fn hand_roots(&self) -> bool {
         let (Some(seed), Some(proof)) = (self.session_seed, self.session_proof) else { return false };
         let mut m = [0u8; 65];
@@ -539,7 +540,8 @@ impl Ahau {
         m[1..33].copy_from_slice(&seed);
         m[33..65].copy_from_slice(&proof);
         let mut out = [0u8; 16];
-        ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut out) != ferros_sys::ERR
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut out);
+        n != ferros_sys::ERR && n != ferros_sys::NOTHING && n >= 1 && out[0] != 0
     }
 
     /// The entry: the handle as typed, a cursor, and a line under it.
@@ -960,7 +962,7 @@ impl Ahau {
                 let proof = if self.session_seed == Some(seed) { self.session_proof.unwrap() } else { self.proof_for(&seed, true) };
                 // The roots to the client in RAM; it keeps them on disk only if unlock-at-boot is on.
                 self.send_roots(&seed, &proof);
-                console(self.grants, b"ahau: roots handed to fgtw; it looks the identity up\n");
+                console(self.grants, if self.roots_pending { b"ahau: fgtw is not taking the roots yet (it starts once the space is open); handing them on as it answers\n" } else { b"ahau: roots handed to fgtw; it looks the identity up\n" });
                 self.wipe();
                 self.mode = Mode::Looking(seed);
                 self.status(self.prompt());
