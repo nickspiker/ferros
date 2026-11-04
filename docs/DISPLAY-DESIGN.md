@@ -92,3 +92,28 @@ Sixteen black pixels skip all of it.
 - The A715s run the publish bands at 1.07 GHz (measured 2026-10-24): their DVFS point is the next lever on a full-frame publish.
 - The scene is the X3's alone (glow 1.8 ms, blits 1.2 with 207 circles): bands across the workers, as the publish is, when a screen holds more; the glow vectorises now that it has no divide.
 - The kernel's own screens (before the server) are panel-native, not through the ODT.
+
+## 8. Power-up from off (2026-11-03, the owner's decision 4 carried out)
+
+Why now: a jump from Android often finds the DPU powered down (DECON hibernation: Android switches the DPU's domains off between frames whenever the screen is still; the panel keeps its image), and sometimes the panel off too (screen timed out). ferros has only ever adopted a running pipe (ABL's or Android's), so those jumps came up without a picture, and touching the dead DPU poisoned EL3 (the poison rule, display.rs). Both cases are needed for the cold path anyway: ferros turning its own screen fully off and on, and a boot without ABL's splash.
+
+Sources: the stock driver (display-gs `cal_9865`, `exynos_drm_{decon,dsim,hibernation}.c`), the CAL engine (`flexpmu_cal_local_zuma.h`, `pmucal_local.c`, `exynos-pd_el3.c`), the panel (DISPLAY-HK3.md), DISPLAY-MODESET.md, and the oracle (`oracle/display/husky-hk3/ON`: the complete power-on's DSI packets and DPU registers).
+
+The two starting states:
+- **A, hibernation:** DPU domains off, DSIM and its PHY off, the panel on in command mode holding its frame. Android's exit (`exynos_hibernation_exit`): domains on, DECON `decon_reg_init`, DSIM `dsim_reg_init` + ULPS exit + start; the panel is not touched; the next frame's commit configures the DPP and starts DECON.
+- **B, panel off:** as A, then the panel's power-up: rails, reset, the init set, display-on.
+
+The layers, in order, and who owns each:
+1. **Domains (kernel, EL3 only):** DPUB first (DPUF0 and DPUF1 are its children). Each: CONFIGURATION (G#1546_1D00 / 1D80 / 1E00) bit 0 = 1 through SMC_CMD_PRIV_REG; poll STATUS (+4) bit 0, 5 ms; then the D_TZPC restore SMC G#8200_0410 (1, need_smc, 2) once for that power-on (need_smc G#1941_0204 / G#1981_0204 / G#19C1_0204; a second prepare on an already prepared domain never returns, camera.rs); then the CMU restore (CMU_DPUB G#1940_0000: +G#1800 divider, +G#600 / +G#610 user muxes, QCH +G#3060-30F0, +G#800 CONTROLLER_OPTION; CMU_DPUF0/1 G#1980_0000 / G#19C0_0000: +G#600, QCH +G#3044-30BC, +G#800) and the DPUF sysregs (G#1982_0000 / G#19C2_0000 +G#104, +G#108). No source holds these values (Linux saves them at power-off), so they are **measured live on a cold boot**, where ABL leaves the DPU running, and restored from that table.
+2. **DPHY isolation off (kernel, EL3):** PMU G#3EB8 bit 0 through the PMU's atomic alias (PRIV_REG write of bit index 0 to G#1546_FEB8).
+3. **SysMMUs** (G#1984_0000 / G#19C4_0000): translation stays off, as ABL leaves it (ferros's framebuffers are physical); checked after power-on, not assumed.
+4. **DECON from reset (display server):** `decon_reg_init` (DISPLAY-MODESET.md: CLOCK_CON, the output SRAMs, command mode, background size, the urgent/DTA set, TRIG_CON, data path, DSC encoders and PPS), values from the oracle's ON dump.
+5. **DSIM from reset (display server):** `dsim_reg_init` in its order (sysreg PHY reset, OSC clock, SWRST, lanes, escape clocks, the PLL at ABL's 1368 Mbps PMSK, lock, lane enable, PHY reset release, word clock, config), then in A the ULPS exit, then start.
+6. **Panel (B only; kernel for power, display server for commands):** VDDI is always on; VCI (LDO14M) on + 10 ms; reset gpa6-0 high 1 / low 1 / high 5 ms; VDDD (LDO22M) on; `9D 01`, the PPS, the init set (`11` + 10 ms … + 110 ms, `35`, …), `C3`/`F2`, one TE, the display-on set and `29`. Which state the panel is in is read, not guessed: VCI's enable bit through ACPM.
+7. **Start (display server):** the TE pin (gpp0-3) to function G#F, DECON start, the first frame; then the existing 10 bpc modeset and present path as on every boot.
+
+The DPU check everywhere (hv at the jump, kernel fact 30, kernel display.rs) reads CONFIGURATION and STATUS both, because the request alone reads on while a domain is still powering up.
+
+Tested without Android: `diag display cycle hib` and `diag display cycle off` on a cold boot take ferros's own display down into state A or B (DECON stop, DSIM ULPS or stop, panel off and rails off for B, domains off) and back up through this path, repeatable without anyone's hands; then the jump.
+
+Status: designed; the CMU/sysreg capture first.

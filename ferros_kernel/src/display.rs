@@ -315,9 +315,9 @@ const DMA0: usize = 0x1990_0000;
 const DPP0: usize = 0x1993_0000;
 const HDRCOMM0: usize = 0x1996_0000;
 
-/// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`).
+/// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`). G#1546_1D00, 1D80 and 1E00 are the domains' CONFIGURATION registers (the on request; flexpmu_cal_local_zuma.h), STATUS is at +4: both must say on, since the request alone reads on while a domain is still powering up.
 pub fn dpu_on() -> bool {
-    [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) == 1)
+    [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) & 1 == 1 && crate::platform::priv_reg(a + 4, false, 0) & 1 == 1)
 }
 
 /// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear 0x00RRGGBB pixels (BGRX8888), turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.
