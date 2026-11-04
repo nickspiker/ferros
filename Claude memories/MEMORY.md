@@ -73,7 +73,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
 - [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape
 - [sched trace + past-deadline spin](sched_trace_and_past_deadline_spin.md) — diag sched for IPC latency; past-deadline sleep spins its slice; 512 KiB kernel stack, DIAG canary
-- [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) — ~95 % notch is the per-frame off-window under the DDIC; HBM/dimming/60 Hz/G#BD table all tested 2026-10-23, none moves it; 100 % is not on this panel
+- [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) — ~95 % at DBV ≥ ~1490 is the pixel circuit (no knob); below ~1400 the DDIC drops it (<50 % at 983); ferros keeps DBV 3307 and dims in pixels (2026-11-03)
 - [SMP first cut](smp_first_cut.md) — 5 cores since 2026-10-23: X3 kernel+render, 4× A715 workers; one lock, global queue, sev; pin masks; DIAG SMP_UP/SLICES/LOCK_SPINS; TLBI-is + per-core kctx lessons; FERROS_SMP=0
 - [eret race: IRQs masked around eret](eret_race_irqs_masked.md) — the 2026-10-23 freezes: resume path loaded ELR/SPSR with IRQs open, an SGI in the window parked cores on a self-returning eret; diag core <k> SGI dump found it
 - [AoC + USF under ferros](aoc_start_needs_trusty.md) — sensors stream under ferros 2026-10-24: rails on, GSA+Trusty start, registry scripts pushed with board CDT G#26100, gravity in SYS_FACTS; auto at every boot

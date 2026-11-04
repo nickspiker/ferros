@@ -1,6 +1,6 @@
 ---
 name: hk3-emission-duty-is-panel
-description: the HK3's ~95 % emission duty notch is the panel's per-frame off-window, fixed by the DDIC; HBM, dimming bit, 60 Hz NS and the HBM-style G#BD table all tested live 2026-10-23 — none changes it; do not hunt for a 100 % mode again
+description: the HK3 holds ~95 % emission duty at DBV ≥ ~1490 (pixel-circuit compensation window, no host knob); below ~1400 the DDIC lengthens the off window (85 % at 1236, <50 % at 983); ferros keeps DBV 3307 and dims in pixels (owner 2026-11-03)
 metadata:
   type: project
 ---
@@ -10,3 +10,5 @@ The owner (who sees flicker to well above 1 kHz) sees the HK3 at ~94-97 % emissi
 **Why:** the gap is the pixel circuit's per-frame scan/compensation window, not PWM dimming; there is no host-visible register for it. Full write-up in DISPLAY-CALIB.md "Emission duty".
 
 **How to apply:** treat 100 % duty as unavailable on husky's panel; dimming stays in the present stage (table + dither) as designed. If the question comes up again, point at the write-up rather than re-testing. A G#BD table experiment is safe to send whole (the panel took it) and `bd 21 01 83 03 03 … bd 00 00 00 02 00 06 00 16 00 2e 00 ee / f7 0f` restores the normal one.
+
+**2026-11-03:** the "every brightness" claim was wrong below the knee. Sweep in Android (owner by eye, backlight sysfs): 3307/2000/1490 ~95 %, 1236 ~85 %, 983 <50 %; panel idle made no difference. ferros now floors DBV at 3307 and dims every step in pixels (owner: "keep them all max"; payloads/display brightness()). DISPLAY-CALIB.md "Emission duty".

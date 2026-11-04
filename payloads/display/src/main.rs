@@ -1341,7 +1341,9 @@ fn panel_for(nits: f32) -> (bool, u16, f32) {
 fn brightness(step: u8) -> (f32, f32, bool, u16) {
     let top_e = HBM_NITS * E_LIGHT;
     let white = top_e * 0.5 / (1u32 << step.min(8)) as f32;
-    let (hbm, dbv, native) = panel_for((white * 16.0).min(top_e) / E_LIGHT);
+    // The panel never below the normal-mode top (owner, 2026-11-03): below about DBV 1400 the DDIC dims by lengthening each frame's dark window (95 % emission duty at DBV 1490 and above, about 85 % at 1236, under half at 983, measured by eye in Android), so every step under it is the pixel values' (the table and the 12-bit dither), the light's duty staying at the panel's 95 %. High brightness mode only for the steps that need more than DBV 3307 gives.
+    let want = (white * 16.0).min(top_e) / E_LIGHT;
+    let (hbm, dbv, native) = if want > DBV_NITS[6].1 { panel_for(want) } else { (false, DBV_NITS[6].0 as u16, DBV_NITS[6].1) };
     (white, native * E_LIGHT, hbm, dbv)
 }
 
