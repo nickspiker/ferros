@@ -942,6 +942,15 @@ impl Client {
                 self.log.put(b" KiB of ");
                 self.log.dec(STACK_BYTES as u64 / 1024);
                 self.log.line();
+                // The same request to fgtw.org's registry, as the app posts it: a sponsor lists its candidates from the registry and from requests handed to it on the LAN, and matches the typed words and the heard BLE beacon only against those. Handed over the LAN alone, a request never reached a sponsor this device could not hear (a WiFi that passes no multicast between its clients), and the sponsor had nothing to match (2026-11-04, owner: "does not register").
+                match self.post_request(&req, &hp) {
+                    Ok(()) => self.log.put(b"fgtw: binding request posted to fgtw.org"),
+                    Err(e) => {
+                        self.log.put(b"fgtw: binding request not posted to fgtw.org: ");
+                        self.log.put(e.as_bytes());
+                    }
+                }
+                self.log.line();
             }
             Err(e) => {
                 self.log.put(b"fgtw: binding request failed: ");
@@ -949,6 +958,39 @@ impl Client {
                 self.log.line();
             }
         }
+    }
+
+    /// Post an already-built binding request to fgtw.org's registry: the `bindreq_put` body field for field, as the app's `bindreq_post` builds it (photon src/network/fgtw/fleet.rs), so the registry copy and the LAN copy are one request with one stamp (the BLE beacon's too). `device_owned` is the registry's one-owner verdict; any other error is the seed not answering, and the LAN copy still goes.
+    fn post_request(&self, req: &fgtw::fleet::BindRequest, hp: &[u8; 32]) -> Result<(), alloc::string::String> {
+        use alloc::string::ToString;
+        let mut section = vsf::VsfSection::new("bindreq_put");
+        section.add_field("hp", vsf::VsfType::hP(hp.to_vec()));
+        section.add_field("dk", vsf::VsfType::ke(req.device_pubkey.to_vec()));
+        section.add_field("t", vsf::VsfType::e(vsf::types::EtType::e6(req.t)));
+        section.add_field("ds", vsf::VsfType::ge(fgtw::pq::eggs_to_bytes(&req.device_sig)));
+        section.add_field("is", vsf::VsfType::ge(req.identity_sig.clone()));
+        if let Some(b) = &req.bundle {
+            section.add_field("kb", vsf::VsfType::ge(b.to_bytes()));
+        }
+        if let Some(p) = &req.plate {
+            section.add_field("pl", vsf::VsfType::hb(p.to_vec()));
+        }
+        if req.plate_kind != fgtw::fleet::plate::UNSTATED {
+            section.add_field("pk", vsf::VsfType::u(req.plate_kind as usize, false));
+        }
+        section.add_field("nh", vsf::VsfType::hb(req.nfc_hash.to_vec()));
+        let body = vsf::VsfBuilder::new().creation_time_oscillations(eagle()).add_section_direct(section).build().map_err(|e| alloc::format!("bindreq_put build: {e}"))?;
+        let resp = fgtw::client::FgtwTransport::post(&self.seed(), body)?;
+        if fgtw::client::is_error(&resp.body, "device_owned") {
+            return Err("device_owned: this device is still in another identity's fleet".to_string());
+        }
+        if let Some((reason, detail)) = fgtw::client::error_frame(&resp.body) {
+            return Err(alloc::format!("{reason}: {detail}"));
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(alloc::format!("HTTP {}", resp.status));
+        }
+        Ok(())
     }
 
     /// A frame on 4383 after PT: presence first (wire), then the envelope frames (join).
