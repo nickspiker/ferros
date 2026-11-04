@@ -875,7 +875,8 @@ impl Client {
         };
         if v != self.verdict {
             self.log.put(match v {
-                V_JOIN => b"fgtw: this identity has a fleet: waiting to be added from one of its devices".as_slice(),
+                V_JOIN if self.bound => b"fgtw: this device is a member of the identity's fleet".as_slice(),
+                V_JOIN => b"fgtw: this identity has a fleet: waiting to be added from one of its devices",
                 V_FRESH => b"fgtw: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
                 V_WRONG => b"fgtw: fgtw.org's chain for this handle claims another slot",
                 _ => b"fgtw: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
