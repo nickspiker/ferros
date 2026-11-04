@@ -112,6 +112,9 @@ const S_DQE_CGC: u64 = 21;
 const S_DPU_SYSREG: u64 = 22;
 /// Grant slot 23: the `dpu` power switch (init's 101; dpu_power.rs): the DPU powered up from off.
 const S_DPU_POWER: u64 = 23;
+/// The panel's switches (kernel panel_power.rs, grants 102 and 103): VCI and the reset pulse; VDDD after the init set.
+const S_PANEL_POWER: u64 = 24;
+const S_PANEL_VDDD: u64 = 25;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +175,8 @@ static PANEL_SCREEN: AtomicU64 = AtomicU64::new(0);
 /// The panel thread's "screen on again, present the frame the layer holds" to the render thread.
 static PANEL_REPRESENT: AtomicU64 = AtomicU64::new(0);
 static DSI_LOCK: AtomicU64 = AtomicU64::new(0);
+/// The panel powered up from off (state B): display on (`29`) is the panel thread's once a frame has gone out, so the panel never shows the memory it woke with.
+static PANEL_ON_DUE: AtomicU64 = AtomicU64::new(0);
 static mut PANEL_STACK: [u8; 16384] = [0; 16384];
 
 fn dsi_lock() {
@@ -188,6 +193,29 @@ extern "C" fn panel(grants: u64) -> ! {
     let dsi = ferros_dsi::Dsim(DsiGrant { grants });
     let mut screen_off = false;
     let mut seen = 0u64;
+    if PANEL_ON_DUE.load(Ordering::Acquire) == 1 {
+        // The first frame out (the frame-start interrupt's count), or a quarter second: display on, then the brightness with TE2, as after the power key.
+        let t0 = now();
+        while FRAME_STARTS.load(Ordering::Acquire) == 0 && now().wrapping_sub(t0) < freq() / 4 {
+            ferros_sys::sleep_until(now() + freq() / 256);
+        }
+        dsi_lock();
+        let on = dsi.dcs(&[0x29]).is_ok();
+        let (_, _, hbm, dbv) = brightness(ferros_sys::pref(ferros_sys::PREF_BRIGHTNESS));
+        set_panel(&dsi, hbm, dbv);
+        // The panel's own word on it (DCS get_power_mode, G#0A: bit 7 booster, 4 sleep out, 3 normal mode, 2 display on; G#9C when all is well), and the frames seen.
+        let mut pm = [0u8; 1];
+        let read = dsi.read(0x0A, &mut pm).is_ok();
+        dsi_unlock();
+        PANEL_ON_DUE.store(0, Ordering::Release);
+        let mut l = Log { grants, buf: [0; 256], n: 0 };
+        l.s(if on { b"display: panel on after its first frame; power mode " } else { b"display: panel display-on stuck; power mode " });
+        if read { l.hex(pm[0] as u32) } else { l.s(b"unread") }
+        l.s(b", frame starts ");
+        l.dec(FRAME_STARTS.load(Ordering::Acquire));
+        l.s(b"\n");
+        l.flush();
+    }
     loop {
         let seq = PANEL_SEQ.load(Ordering::Acquire);
         if seq == seen {
@@ -2792,7 +2820,7 @@ static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved): the receive thread waits for them.
 fn op_is_sync(op: u8) -> bool {
-    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30)
+    matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31)
 }
 
 extern "C" fn receive(grants: u64) -> ! {
@@ -2910,7 +2938,21 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let jumped = ferros_sys::facts().0[31] == 6;
     // Android switches the panel between 1008x2244 (its default "high resolution") and 1344x2992. A jump from 1008x2244 is drawn at that raster (touch then lands off: the controller reports in 1344x2992). Forcing the WQHD modeset there switched DECON and the DSC encoders but not the panel, which kept decoding in its scaled mode (the picture three-up, garbage below; the thirteenth jump, 2026-11-01): the stock driver changes the panel's resolution inside a full re-initialisation (reset, init set, PPS, C3/F2), not yet ported. Android set to "Full resolution" jumps clean.
     // After the jump the whole modeset runs again (force): with DECON left as Android configured it, ferros's frames never completed (the frame counter stood still, "settle timeout", the panel holding Android's last frame: the thirty-fifth jump). From Android's scaled mode as well: the modeset's PPS and resolution commands take the panel to its full raster (jump 37, 2026-11-02; the thirteenth jump's three-up had other causes, the X3 never launched among them).
-    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants })) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped) };
+    // The panel off (SYS_FACTS 81 = 1: its VCI off, a jump from a screen Android had timed out, or ferros's own `panel off`): its rails and reset pulse through the `panel` switch now, its init set inside the modeset after the link starts, display on after the first frame (DISPLAY-DESIGN.md §8 state B). The modeset is forced then: a running pipe needs the panel's PPS and init all the same.
+    let panel_cold = ferros_sys::facts().0[81] == 1;
+    if panel_cold {
+        if !ferros_sys::power(cap(grants, S_PANEL_POWER), true) {
+            log.s(b"display: the panel is off and its switch did not bring it up\n");
+            log.flush();
+            ferros_sys::exit(3);
+        }
+        PANEL_ON_DUE.store(1, Ordering::Release);
+        log.s(b"display: the panel was off: rails on, reset, its init set next\n");
+        log.flush();
+    }
+    let vddd = || ferros_sys::power(cap(grants, S_PANEL_VDDD), true);
+    let cold: Option<&dyn Fn() -> bool> = if panel_cold { Some(&vddd) } else { None };
+    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), cold) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, cold) };
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
@@ -3686,6 +3728,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let n = b.len().min(out.len());
                     out[..n].copy_from_slice(&b[..n]);
                     len = n;
+                }
+                // 31 `panel off` (development: the bench for state B, DISPLAY-DESIGN.md §8): display off, sleep in, the 100 ms the panel needs, then its rails and reset through the `panel` switch; the screen stays dark until a display server starts and powers it up again (`diag "restart display"`). Replies 0, or 1 if the switch refused.
+                Some(31) if option_env!("FERROS_PRODUCTION").is_none() => {
+                    dsi_lock();
+                    let _ = dsi.dcs(&[0x28]);
+                    let _ = dsi.dcs(&[0x10]);
+                    dsi_unlock();
+                    ferros_sys::sleep_until(now() + freq() / 10);
+                    out[0] = !ferros_sys::power(cap(grants, S_PANEL_POWER), false) as u8;
+                    len = 1;
                 }
                 Some(5) => {
                     out[0..2].copy_from_slice(&(width as u16).to_le_bytes());

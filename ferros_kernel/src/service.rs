@@ -432,6 +432,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Hardware(b"decon0-sub"), Hardware(b"dqe0"), Hardware(b"dqe0-cgc"), Hardware(b"dpu-sysreg"),
         // 101 the `dpu` switch (dpu_power.rs): the display server powers the DPU up from off (DISPLAY-DESIGN.md §8).
         Power(b"dpu"),
+        // 102 the `panel` switch (panel_power.rs: VCI and the reset pulse), 103 `panel-vddd` (VDDD after the init set): the panel from off (§8, state B).
+        Power(b"panel"), Power(b"panel-vddd"),
     ]
 }
 
@@ -439,7 +441,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
 fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'static>>> {
     let slots: &[usize] = match name {
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
-        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101],
+        b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103],
         b"touch" => &[14, 15, 16, 23, 91],
         b"map" => &[17, 18, 19, 20, 22, 47],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
@@ -596,6 +598,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[30] = 1 + crate::display::dpu_on() as u64;
     // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gnss, 5 ip.
     v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
+    // 81: the panel's VCI (panel_power.rs): 2 on, 1 off, unknown until the service loop has read it.
+    v[81] = match crate::panel_power::VCI.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 33-80: those drivers' own measures (SYS_STATUS), eight tagged words each, in the same order, then the usb driver's.
     for i in 0..6 {
         for w in 0..8 {
@@ -1046,6 +1050,8 @@ pub fn run(mut b: Boot) -> ! {
     let keys_settle = cntpct() + cntfrq() / 4;
     let mut keys_settled = false;
     let mut ipc_marked = false;
+    // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
+    crate::panel_power::read_state();
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();

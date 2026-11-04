@@ -369,6 +369,22 @@ impl M<'_> {
     }
 
     /// The next rising edge on the panel's TE pin, then the stock driver's margin (273 × 1.05 µs).
+    /// The panel's power-up from reset (DISPLAY-DESIGN.md §8 state B), its rails and reset pulse already done by the kernel's `panel` switch: DSC on and the PPS (before sleep out, as on a fresh reset), the init set, VDDD, the power-on feature block, `53 20`, the E4 and F4 block, in the ON capture's order (ferros_dsi::hk3 POWER_ON_*). Display on (`29`) waits for the first frame (main.rs), so the panel never shows its memory as it woke.
+    fn panel_on(&mut self, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, r: &Raster, vddd: &dyn Fn() -> bool) {
+        let t0 = now();
+        let pps = ferros_dsc::pps(&r.cfg);
+        if dsi.send(ferros_dsi::DCS_SHORT_WRITE_1, &[0x9D, 0x01]).is_err() || dsi.send(ferros_dsi::PPS_LONG_WRITE, &pps).is_err() {
+            self.say(b"panel: PPS stuck\n");
+        }
+        let (n0, f0) = dsi.sequence(ferros_dsi::hk3::POWER_ON_INIT);
+        let v = vddd();
+        let (n1, f1) = dsi.sequence(ferros_dsi::hk3::POWER_ON_FEATURES);
+        let f2 = dsi.dcs(&[0x53, 0x20]).err();
+        let (n2, f3) = dsi.sequence(ferros_dsi::hk3::POWER_ON_TAIL);
+        let ms = now().wrapping_sub(t0) * 1000 / self.f;
+        self.say(alloc::format!("panel: powered up from off in {ms} ms: init {n0} packets{}, VDDD {}, features {n1}{}, 53 20{}, tail {n2}{}\n", if f0.is_some() { " (stuck)" } else { "" }, if v { "on" } else { "REFUSED" }, if f1.is_some() { " (stuck)" } else { "" }, if f2.is_some() { " (stuck)" } else { "" }, if f3.is_some() { " (stuck)" } else { "" }).as_bytes());
+    }
+
     fn after_te(&self) {
         let start = now();
         let mut last = self.rd(S_GPP0, GPP0_DAT) >> 3 & 1;
@@ -388,7 +404,8 @@ impl M<'_> {
 
 /// The modeset when the pipe is still at 8 bpc (ABL's), then the DQE's dither in shift mode either way. Returns what it did and what misbehaved, for the console; empty when the pipe was already at 10 bpc.
 /// `force`: run it even when DECON is already at 10 bpc (after the jump from Android, whose raster and panel mode may not be ferros's).
-pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -> Vec<u8> {
+/// `panel_cold`: the panel's power-up (state B) goes in after the link's start, with the VDDD switch to call after its init set.
+pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
         if !dsi.alive() {
@@ -411,6 +428,9 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -
         m.dsim_stop();
         m.dsim_init(&r, &link, &bias, &phy, hs, false);
         m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+        if let Some(vddd) = panel_cold {
+            m.panel_on(dsi, &r, vddd);
+        }
 
         // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
         m.after_te();
@@ -451,7 +471,7 @@ fn words(b: &[u8]) -> Vec<u32> {
 }
 
 /// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation). The panel itself is taken as on (state A); a panel that is off needs its power-up (state B) after this.
-pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>) -> Vec<u8> {
+pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     let t0 = now();
     let r = raster();
@@ -467,6 +487,9 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>) -> Vec<u8> {
     m.decon_stop();
     m.dsim_init(&r, &link, &bias, &phy, hs, true);
     m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+    if let Some(vddd) = panel_cold {
+        m.panel_on(dsi, &r, vddd);
+    }
     m.after_te();
     let pps = ferros_dsc::pps(&r.cfg);
     if dsi.send(ferros_dsi::DCS_SHORT_WRITE_1, &[0x9D, 0x01]).is_err() || dsi.send(ferros_dsi::PPS_LONG_WRITE, &pps).is_err() {
