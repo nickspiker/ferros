@@ -114,7 +114,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Kernel out: moves](kernel_out_moves.md) — USB+PT, touch bring-up, sensors USF are processes since 2026-10-31 (slots 86-96); pattern, traps (kill path skips end hooks, reload 8 s into boot hangs), owner decisions pending
 - [Feedback: device, not phone](feedback_device_not_phone.md) — say "device" for what ferros runs on, never "phone" (owner 2026-11-01): the glyph places no calls
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) — no sRGB/OKLab/Rec.709/XYZ-1931 in ferros or Photon (platform edge only); pick in VSF RGB, match brightness by photopic via LMS (vsf_rgb_to_photopic_f32); the mark + keyboard rainbow were sRGB-authored (2026-11-01)
-- [Android behind attestation](android_behind_attestation.md) — off by default, opt in after attest + disclaimer; map Android circle + kernel `android` switch built 2026-11-04
+- [Android behind attestation](android_behind_attestation.md) — off by default, opt in after attest + disclaimer; kernel `android` switch built 2026-11-04, no launcher in the base OS (an installed app holds it later)
 - [hv chords](hv_chords_decided.md) — power+vol up → ferros, vol up+down = kill; hv-owned core 3 takes the key SPIs, proxies to Android (works on slot b 2026-11-01)
 - [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros on the hv core; lands since 2026-11-02; bug list and tools
 - [Display: global mask, then layers](display_global_mask_then_layers.md) — one per-row shape plan per size (spans + sparse AA), then layers by spans; no per-pixel geometry on publish
@@ -123,3 +123,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [DPU power + secure registers](dpu_power_secure_registers.md) — ferros cycles DPU domains (diag dpu); never touch secure zero words; panel-off state B benched
 - [Link measures, no bars](link_measures_no_bars.md) — tagged per-link measures in the corners (SYS_STATUS 27); indicators top, navigation bottom; modem decode unchecked
 - [f2fs roll-forward after a jump](f2fs_rollforward_after_jump.md) — jumps leave Android uncheckpointed; ferros_f2fs rolls forward read-only; `diag "part f2fs"`
+- [No baked apps](no_baked_apps.md) — one built-in circle (system settings); clock, Photon, Android launcher etc. are installed by the person; attest loads only attest (owner 2026-11-04)
