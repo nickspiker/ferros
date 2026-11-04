@@ -51,7 +51,7 @@ fn main() {
             samples[c * w * h + i] = delinearize_gamma2tanh_bits_f32(v * v, 16) as u16;
         }
     }
-    let mut plane = Plane::encoded("screen", "still", w, h, Primaries::Vsf, Encoding::Gamma2Tanh, BitPackedTensor::pack(16, vec![3, h, w], &samples));
+    let mut plane = Plane::encoded("display", "screen", w, h, Primaries::Vsf, Encoding::Gamma2Tanh, BitPackedTensor::pack(16, vec![3, h, w], &samples));
     plane.name = "canvas".into();
     let v = Visual { title: "ferros screen".into(), text: "The display server's 16-bit canvas, before the panel's table and dither.".into(), planes: vec![plane], ..Default::default() };
     let file = v.write().expect("visual");
