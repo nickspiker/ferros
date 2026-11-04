@@ -39,6 +39,7 @@ mod ptlink;
 mod sensorlink;
 #[cfg(feature = "pixel8")]
 mod display;
+mod dpu_power;
 #[cfg(feature = "pixel8")]
 #[cfg(feature = "pixel8")]
 #[cfg(feature = "pixel8")]

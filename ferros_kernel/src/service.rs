@@ -2072,6 +2072,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"dpu" || cmd.params.starts_with(b"dpu ") {
+                    // `diag dpu [on|off]`: the DPU's power domains (dpu_power.rs, DISPLAY-DESIGN.md §8).
+                    crate::dpu_power::diag(core::str::from_utf8(&cmd.params[3..]).unwrap_or(""), &mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"pd" || cmd.params.starts_with(b"pd ") {
                     // `diag pd [off <name>|all]`: the unused SoC power domains (pd.rs).
                     crate::pd::diag(core::str::from_utf8(&cmd.params[2..]).unwrap_or(""), &mut resp);

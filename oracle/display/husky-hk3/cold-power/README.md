@@ -14,3 +14,5 @@ Read with `bridge read` from a cold ferros on slot a, with the three DPU domains
 | cmu_top_2000.bin | G#2604_2000 | G#100 (DPU gates at +G#78-84) |
 
 The words restored: CMU_DPUB +G#1800 = 1, +G#600 = G#10, +G#610 = G#10, QCH +G#3060-30F0, +G#800 = G#F11F_F03F; CMU_DPUF0/1 +G#600 = G#10, QCH +G#3044-30BC, +G#800 = G#F11F_F03F; sysreg DPUF0/1 +G#104 = 0, +G#108 = 0.
+
+**The zeros are not values (2026-11-03).** The DPUF sysregs (both words) and the runs of zeros in the CMU Q-channel ranges read 0 from the non-secure side because they are secure (D_TZPC); a non-secure read or write of one poisons EL3 exactly as a dead domain does: the next EL3 call never returns. ferros touches only the words this capture read as non-zero (dpu_power.rs). The sysreg files here were read before that was known; do not read those addresses again.
