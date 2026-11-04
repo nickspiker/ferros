@@ -2403,7 +2403,7 @@ fn flavour(what: Corner) -> ((f32, f32, f32), (f32, f32, f32)) {
     }
 }
 
-/// A line of a corner's text, on the stack (the chrome draws without the heap's growth).
+/// A line of a corner's text, on the stack (the chrome draws without the heap's growth). 32 bytes hold the longest line `measure_text` makes ("kind 65535: " and a 48-bit value's 15 digits with its sign, 28 bytes), so a write past it is a bug there and panics.
 #[derive(Clone, Copy)]
 struct Txt {
     b: [u8; 32],
@@ -2415,10 +2415,8 @@ impl Txt {
     }
     fn s(&mut self, t: &str) -> &mut Txt {
         for &c in t.as_bytes() {
-            if self.n < self.b.len() {
-                self.b[self.n] = c;
-                self.n += 1;
-            }
+            self.b[self.n] = c;
+            self.n += 1;
         }
         self
     }
@@ -2666,7 +2664,8 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             let text = lines[j].str();
             let lh = pitch * weight(j);
             let far = libm::fabsf(top_y - y).max(libm::fabsf(top_y + lh - y));
-            let chord = 2.0 * libm::sqrtf((r * r - far * far).max(0.0)) * 0.7;
+            // The lines span 1.5 r about the centre, so a line's far edge is at most 0.75 r out and the root's argument stays positive.
+            let chord = 2.0 * libm::sqrtf(r * r - far * far) * 0.7;
             let mut px = lh * 0.9;
             let tw0 = eng.width(text, px);
             if tw0 > chord {
