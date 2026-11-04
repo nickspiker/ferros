@@ -2920,6 +2920,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     ALLOC.init(heap);
 
     // The DPU powered down (SYS_FACTS 30 = 1: Android's DECON hibernation at a jump, or ferros's own `dpu off`): no DECON or DSIM register may be touched before the kernel's `dpu` switch has powered it (the EL3 poison rule, the kernel's display.rs); then the whole pipe from reset (modeset::from_off, DISPLAY-DESIGN.md §8).
+    // On the X3 for the power switches and the modeset: the kernel takes SYS_POWER only from its own core, and a thread nobody pinned runs on the workers. Unpinned, this thread started on the X3 (where init spawned it), took the `dpu` and `panel` switches there, and was on a worker by the modeset's `panel-vddd`, refused without the switch ever running: the panel came up without VDDD after two jumps, ran a few frames and stopped (2026-11-04). Unpinned again before any thread is spawned: they inherit the mask.
+    ferros_sys::pin(ferros_sys::CORES_BIG);
+    ferros_sys::sleep_until(now() + freq() / 1000);
     let from_off = ferros_sys::facts().0[30] == 1;
     if from_off {
         if !ferros_sys::power(cap(grants, S_DPU_POWER), true) || ferros_sys::facts().0[30] != 2 {
@@ -2963,6 +2966,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         log.s(b" ms\n");
         log.flush();
     }
+    ferros_sys::pin(0);
 
     // The raster as the pipe runs it.
     let img = if jumped { pipe.rd(S_DECON, 0x0220) } else { pipe.rd(S_DMA0, RDMA_IMG_SIZE) };
