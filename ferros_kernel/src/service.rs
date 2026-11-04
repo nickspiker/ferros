@@ -260,7 +260,7 @@ pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// The `android` switch (process.rs POWERS, grant 104, the map's): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). The map runs under the attest screen and sees every touch, so this check is the gate, not the map's. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
+/// The `android` switch (process.rs POWERS, grant 104, the map's): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). The home screen (the map) starts only once an identity is unlocked (init's `wait_unlocked`), so only an attested person can tap its Android circle; this check is the second lock, for any other holder of the switch. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
     let present = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked());
     let ok = on && present && ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
