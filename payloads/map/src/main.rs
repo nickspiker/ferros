@@ -1,21 +1,21 @@
 //! The map (SHELL.md): the device is a map of your life. Every person, message, photo and app is a circle on one plane; the view is a camera over it, and the camera is the only thing that moves.
 //!
-//! The circles: the device itself first, at the centre (its front is the dashboard, its back the settings), then the apps — Photon, Mahere, Lumis, Opsin — placed once by a seeded random fit with generous air, so they land in the same place every time.
+//! The circles: one is built in, the system's own (its front is the dashboard, its back the settings). Nothing else is (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"): every other circle is what the person installs, and the map knows nothing about it until then. The placement below (a seeded random fit with generous air) is for when there are more.
 //!
 //! The gestures (owner, 2026-10-22: "two finger scale/move for edits and back to a normal two finger vs one finger for the back"):
 //! - One finger dragged from the air moves the plane; dragged from a circle, it moves that circle.
 //! - Two fingers both inside one circle move and size that circle; otherwise they pinch to zoom and twist to turn the plane, about the point between them.
 //! - Only circles smaller than three quarters of the screen's width can be taken hold of: zoomed in until a circle fills the view, it is a place, and the fingers move the plane again.
-//! - A one-finger tap on a circle arrives at it (or launches it, for an app with a capsule): the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
+//! - A one-finger tap on a circle arrives at it: the next frame has the circle filling the screen, its front shown. A tap in the air around an arrived circle leaves it.
 //! - Whatever was moved is kept in the vault when the fingers lift (owner, 2026-10-22: arranging is always on, no mode).
 //! - Nothing is animated and nothing is timed (owner, 2026-10-22: "no animations ... instant, always, no timers"): a view is simply there on the next frame, and a tap is fingers down and up without moving, however long they rested.
 //! - A two-finger tap turns a circle over: its back, the facts about it and its few choices. Another two-finger tap turns it back.
 //!
 //! All of it integer: the camera centre in world units ×256, the zoom in 16.16, pinches by integer square roots.
 //!
-//! What is still illustrative, and why: area is the share of the owner's time each thing takes, set from the owner's own ordering until time is measured. The rings (importance) and the one lit circle (changed since last seen) are set by hand here; importance becomes the owner's to declare and lit becomes Photon's to report. Positions are deterministic until the owner arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
+//! Positions are deterministic until the person arranges by hand; then each moved circle is kept in the vault (`map.place.<name>`) and wins over the seeded place from then on.
 //!
-//! Started by init (payloads/init). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`, 5 the app surface (handed to the app in front), 6 the Photon client's endpoint (use: its state and pairing words for the Photon circle's front, PHOTON.md).
+//! Started by init (payloads/init), only once a person has attested (it reads their space). Grant slots: 0 console, 1 display (use), 2 touch (use), 3 settings, 4 the vault scope `map.`.
 
 #![no_std]
 #![no_main]
@@ -28,55 +28,19 @@ const S_DISPLAY: u64 = 1;
 const S_TOUCH: u64 = 2;
 const S_SETTINGS: u64 = 3;
 const S_STORE: u64 = 4;
-/// 5: the `surfaces` region (WINDOWS.md); passed to an app it starts, the kernel gives that app one surface of it, its own.
-const S_APPSURF: u64 = 5;
-const S_PHOTON_EP: u64 = 6;
-/// The kernel's `android` switch (grant 104): the Android circle's tap, behind an attest.
-const S_ANDROID: u64 = 7;
 
-/// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
+/// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the map's area in thousandths, and its icon in the display server's bundle (tools/app-icons order).
 struct Spec {
     label: &'static str,
     ring: u8,
     lit: u8,
     share: u32,
     icon: u8,
-    needs: &'static str,
 }
 
-/// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
-const CIRCLES: [Spec; 9] = [
-    Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
-    Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
-    Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
-    Spec { label: "Lumis", ring: 1, lit: 0, share: 200, icon: 3, needs: "the camera as a process" },
-    Spec { label: "Opsin", ring: 1, lit: 0, share: 150, icon: 4, needs: "Lumis's frames" },
-    // The present stage's test screen, as an app: a tap launches its capsule (payloads/ramps).
-    Spec { label: "Ramps", ring: 1, lit: 0, share: 60, icon: 6, needs: "" },
-    // The clock, a widget the display draws itself (icon G#80, display WIDGET_CLOCK): three rings and the time, decimal or dozenal by the device's number base.
-    Spec { label: "Clock", ring: 1, lit: 0, share: 150, icon: 0x80, needs: "" },
-    // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the device. (The spectral bars, G#81, went 2026-10-25: the scope's levels show the same channels.)
-    Spec { label: "Scope", ring: 1, lit: 0, share: 150, icon: 0x82, needs: "" },
-    // Android, a guest (owner, 2026-11-04: launched from the home screen, behind an attest): on a device that allows it (SYS_FACTS 82), a tap asks the kernel's `android` switch, which checks that a person has attested and resets into Android through the gate once. No icon: its name, always shown.
-    Spec { label: "Android", ring: 1, lit: 0, share: 100, icon: 0, needs: "" },
-];
+/// The one built-in circle: the system's own, its front the dashboard and its back the settings. It never lights (lit means a person sent you something).
+const CIRCLES: [Spec; 1] = [Spec { label: "settings", ring: 1, lit: 0, share: 250, icon: 5 }];
 const N: usize = CIRCLES.len();
-const DEVICE: usize = 0;
-/// Photon: arrived at, its front shows the client's state and, until the device is bound, the 23 pairing words for the sponsor's human (payloads/photon op 1).
-const PHOTON: usize = 1;
-const RAMPS: usize = 5;
-const ANDROID: usize = 8;
-
-/// Whether the Android circle is on the map: only on a device that allows Android (SYS_FACTS 82 = 2). Placed either way, so no other circle moves when it comes or goes.
-fn android_shown() -> bool {
-    ferros_sys::facts().0[82] == 2
-}
-/// The light scope: arrived at, it is in focus (`Map::scope_drag`).
-const SCOPE: usize = 7;
-/// The clock: arrived at, it is in focus, and the display shows it to two more places (owner, 2026-10-26).
-const CLOCK: usize = 6;
-/// The scope's channels a vertical swipe steps through, as device preference 7 numbers them (1 + the VD6282's channel: 1 red, 2 visible, 3 blue, 4 green, 5 IR, 6 clear), longest wavelength first and the composites last.
-const SCOPE_STEPS: [u8; 6] = [5, 1, 4, 3, 2, 6];
 
 /// The map's total circle area, as four circles of radius 110 world units: each circle gets its share of it, so area is time.
 const BASE_RADIUS: i64 = 110;
@@ -333,21 +297,8 @@ struct Map {
     rsn: [i64; N],
     /// Circles moved or sized by hand since arranging began, to keep when it ends.
     arranged: [bool; N],
-    /// The one ramps column shown alone, if any (the display-side ramps of op 21, kept for comparison).
-    ramps_only: Option<usize>,
-    /// The app in front has shown itself, and when it was launched.
-    app_seen: bool,
-    app_since: u64,
-    /// The display server's ramps are on the panel (the present stage's test screen); any tap comes back.
-    ramps: bool,
-    /// The time the focused scope shows, µs, and the gesture under way on it: its axis (0 not yet known, 1 across: the time, 2 up and down: the channel) and the vertical travel not yet spent on a step.
-    scope_span_us: u32,
-    scope_axis: u8,
-    scope_acc: i64,
-    /// The focused scope folded on its dominant period (a one-finger tap toggles it).
-    scope_fold: bool,
-    /// The focus, span and mode the display last heard (display op 25).
-    focus_sent: (u8, u32, bool),
+    /// An app is in front (one the map did not start: a bridge spawn), and it has the touches.
+    app_front: bool,
 }
 
 impl Map {
@@ -492,6 +443,10 @@ impl Map {
 
     /// The radius circle `i` may take, given the others: within RADIUS_RATIO of the smallest and the largest of them.
     fn radius_limits(&self, i: usize) -> (i64, i64) {
+        // Alone, a circle has nothing to be within a ratio of (the search below would leave lo at i64::MAX and lo × RADIUS_RATIO would overflow), and sizing the only circle is the same as zooming: it keeps its size.
+        if N == 1 {
+            return (self.rs[i], self.rs[i]);
+        }
         let (mut lo, mut hi) = (i64::MAX, 1i64);
         for j in 0..N {
             if j != i {
@@ -578,6 +533,10 @@ impl Map {
 
     /// Whether, with circle `i` moved by (dx, dy), every circle still has a neighbour within one screen diagonal of it (edge to edge) at the zoom-out limit — distance, not a bounding box, so no orientation and no rectangles (owner, 2026-10-23: "so it never exceeds the screen diagonal; don't want weird rectangles floating around"). Zooming all the way out then always shows a connected set.
     fn fits_when_out(&self, i: usize, dx: i64, dy: i64) -> bool {
+        // Alone, a circle is its own connected set: with no neighbour the nearest distance below stays i64::MAX and every move would be refused.
+        if N == 1 {
+            return true;
+        }
         let (z_out, _) = self.zoom_limits();
         // Positions ×256 and radii in world units: the gap in world units ×256, against the diagonal brought to world ×256 at the zoom-out limit.
         let diag = isqrt(self.w * self.w + self.h * self.h);
@@ -617,11 +576,7 @@ impl Map {
     fn hit(&self, sx: i64, sy: i64) -> Option<usize> {
         let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
         let mut best: Option<usize> = None;
-        let android = android_shown();
         for i in 0..N {
-            if i == ANDROID && !android {
-                continue;
-            }
             let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
             if dx * dx + dy * dy <= self.rs[i] * self.rs[i] && best.is_none_or(|b| self.rs[i] < self.rs[b]) {
                 best = Some(i);
@@ -638,14 +593,11 @@ impl Map {
         let mut m = [0u8; 2 + 30 * N];
         m[0] = 13;
         m[1] = N as u8;
-        let android = android_shown();
         for (i, a) in CIRCLES.iter().enumerate() {
             let at = 2 + i * 30;
             m[at..at + 4].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
             m[at + 4..at + 8].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
-            // A hidden Android circle goes out with no radius: the scene keeps its index, and nothing is drawn.
-            let r = if i == ANDROID && !android { 0 } else { self.rs[i] };
-            m[at + 8..at + 10].copy_from_slice(&(r as u16).to_le_bytes());
+            m[at + 8..at + 10].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
             m[at + 10] = a.ring;
             m[at + 11] = a.lit;
             m[at + 12] = a.icon;
@@ -777,151 +729,18 @@ impl Map {
         self.cam = to;
     }
 
-    /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera.
+    /// Draw the frame: the overlay for the view first (what is sent first is on top), then the scene under it through the camera. The one circle is the system's: its front the dashboard, its back the settings.
     fn draw(&mut self) {
         let mut b = Batch::new();
         b.op(&[1]);
         self.nrows = 0;
         match self.view {
             View::Map => {}
-            View::Front(DEVICE) => self.dashboard(&mut b),
-            View::Back(DEVICE) => self.settings(&mut b),
-            View::Front(SCOPE) => {
-                let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-                b.text(cx, cy + r + 64, 32, grey(), 1, "tap: fold \u{2022} drag across: time \u{2022} swipe up or down: channel \u{2022} two fingers: back");
-            }
-            View::Front(PHOTON) => self.photon_front(&mut b),
-            View::Front(i) => {
-                let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-                b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[i].label);
-                b.text(cx, cy + r + 160, 32, grey(), 1, "not here yet \u{2022} two fingers for its back");
-            }
-            View::Back(i) => self.app_back(&mut b, i),
+            View::Front(_) => self.dashboard(&mut b),
+            View::Back(_) => self.settings(&mut b),
         }
         b.op(&self.cam.op(true));
         b.send(self.display);
-        self.send_focus();
-    }
-
-    /// The Photon circle's front: the client's state line and, while unbound, the 23 pairing words in rows (op 1 of the `photon` endpoint → [state][fleet devices heard][words]). The client not running reads as "not running".
-    fn photon_front(&mut self, b: &mut Batch) {
-        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-        b.text(cx, cy + r + 96, 52, white(), 1, CIRCLES[PHOTON].label);
-        let mut out = [0u8; 512];
-        // CALL_LIVE: a client not answering yet shows as not running, never a frozen map.
-        let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
-        if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
-            b.text(cx, cy + r + 160, 32, grey(), 1, "the Photon client is not running \u{2022} two fingers for its back");
-            return;
-        }
-        let n = (n as usize).min(out.len());
-        let (state, heard) = (out[0], out[1]);
-        let line = match state {
-            0 => "no identity on this device yet: attest at boot",
-            1 => "this identity has a fleet \u{2022} add this device from one of its devices",
-            2 => "bound \u{2022} waiting for the fleet key",
-            3 => "a device of your fleet",
-            4 => "looking the identity up",
-            5 => "no fleet holds this handle \u{2022} it can be minted from the attest screen",
-            6 => "fgtw.org's chain for this handle is another identity's",
-            8 => "leaving the fleet \u{2022} approve on one of its devices",
-            _ => "no fleet device and no fgtw.org answer \u{2022} nothing decided yet",
-        };
-        b.text(cx, cy + r + 160, 32, grey(), 1, line);
-        let mut heard_line = [0u8; 48];
-        let hl = {
-            let s = b"fleet devices heard on this network: ";
-            heard_line[..s.len()].copy_from_slice(s);
-            heard_line[s.len()] = b'0' + heard.min(9);
-            s.len() + 1
-        };
-        if let Ok(t) = core::str::from_utf8(&heard_line[..hl]) {
-            b.text(cx, cy + r + 208, 32, grey(), 1, t);
-        }
-        if state == 1 || state == 8 {
-            if let Ok(words) = core::str::from_utf8(&out[2..n]) {
-                b.text(cx, cy + r + 280, 32, grey(), 1, if state == 1 { "type these on your other device (Settings \u{2022} Fleet \u{2022} Add device):" } else { "type these on the device approving the departure:" });
-                // The words come camelCased in one run; six to a row, split at the capitals.
-                let mut rows: [[u8; 128]; 5] = [[0; 128]; 5];
-                let mut lens = [0usize; 5];
-                let (mut row, mut count) = (0usize, 0usize);
-                for (i, c) in words.bytes().enumerate() {
-                    if c.is_ascii_uppercase() && i > 0 {
-                        count += 1;
-                        if count % 6 == 0 && row + 1 < rows.len() {
-                            row += 1;
-                        } else if lens[row] < 127 {
-                            rows[row][lens[row]] = b' ';
-                            lens[row] += 1;
-                        }
-                    }
-                    if lens[row] < 128 {
-                        rows[row][lens[row]] = c;
-                        lens[row] += 1;
-                    }
-                }
-                for k in 0..=row {
-                    if let Ok(t) = core::str::from_utf8(&rows[k][..lens[k]]) {
-                        b.text(cx, cy + r + 340 + 56 * k as i64, 44, white(), 1, t);
-                    }
-                }
-            }
-        }
-    }
-
-    /// The display told what is in focus (op 25): the scope or the clock when arrived at, so it is redrawn every frame while everything else keeps the 10 Hz flips; the scope's span and whether it is folded. A call of its own, never in a frame's batch: the display replays its last frame between flips, and a replayed focus would undo a drag's span.
-    fn send_focus(&mut self) {
-        let f = (
-            match self.view {
-                View::Front(SCOPE) => CIRCLES[SCOPE].icon,
-                View::Front(CLOCK) => CIRCLES[CLOCK].icon,
-                _ => 0,
-            },
-            self.scope_span_us,
-            self.scope_fold,
-        );
-        if f != self.focus_sent {
-            self.focus_sent = f;
-            let mut m = [0u8; 7];
-            m[0] = 25;
-            m[1] = f.0;
-            m[2..6].copy_from_slice(&f.1.to_le_bytes());
-            m[6] = f.2 as u8;
-            let mut r = [0u8; 4];
-            call(self.display, &m, &mut r);
-        }
-    }
-
-    /// One finger on the focused scope (owner, 2026-10-25), along the plot's own axes however it is turned: across, the time it shows — to the right stretches the trace (a shorter span), to the left compresses it, a factor of two per half the screen's width, from 2^-6 s to 4 s; up or down, the next or the previous channel, a step per eighth of the screen's height. The gesture's axis is whichever its travel (tx, ty) favoured when it passed the slop, and holds until the fingers lift.
-    fn scope_drag(&mut self, dx: i64, dy: i64, tx: i64, ty: i64) {
-        // Into the plot's own axes: its turn on the screen is the camera's and the circle's (as the display draws it), undone.
-        let (cc, cs) = (self.rc[SCOPE], self.rsn[SCOPE]);
-        let (tc, ts) = ((self.cam.c * cc - self.cam.s * cs) >> 14, (self.cam.s * cc + self.cam.c * cs) >> 14);
-        let local = |x: i64, y: i64| ((tc * x + ts * y) >> 14, (tc * y - ts * x) >> 14);
-        let ((dx, dy), (tx, ty)) = (local(dx, dy), local(tx, ty));
-        if self.scope_axis == 0 {
-            self.scope_axis = if tx.abs() >= ty.abs() { 1 } else { 2 };
-        }
-        if self.scope_axis == 1 {
-            let f = libm::exp2f(-(dx as f32) / (self.w as f32 * 0.5));
-            self.scope_span_us = ((self.scope_span_us as f32 * f) as u32).clamp(15_625, 4_000_000);
-            self.send_focus();
-            return;
-        }
-        self.scope_acc += dy;
-        let step = (self.h / 8).max(1);
-        while self.scope_acc.abs() >= step {
-            let up = self.scope_acc < 0;
-            self.scope_acc += if up { step } else { -step };
-            let now_ch = ferros_sys::pref(ferros_sys::PREF_SCOPE);
-            let at = SCOPE_STEPS.iter().position(|&c| c == now_ch);
-            let k = match (at, up) {
-                (None, _) => 0,
-                (Some(i), true) => (i + 1) % SCOPE_STEPS.len(),
-                (Some(i), false) => (i + SCOPE_STEPS.len() - 1) % SCOPE_STEPS.len(),
-            };
-            ferros_sys::set_pref(cap(self.grants, S_SETTINGS), ferros_sys::PREF_SCOPE, SCOPE_STEPS[k]);
-        }
     }
 
     /// Label and value on a row: the label right of centre's left, the value left of centre's right.
@@ -1072,28 +891,6 @@ impl Map {
         }
     }
 
-    /// An app's back: the facts about it, the same for every circle.
-    fn app_back(&self, b: &mut Batch, i: usize) {
-        let (cx, cy, r) = (self.w / 2, self.h / 2, self.arrived_r());
-        let f = ferros_sys::numbers(Style::Glyphs);
-        let a = &CIRCLES[i];
-        let mut y = cy - r / 2;
-        b.text(cx, y, 64, white(), 1, a.label);
-        y += 112;
-        let mut v = Line::new();
-        let _ = tatau::share(&mut v, f, a.share as u64, 1000, 2);
-        Map::row(b, cx, y, "your time", v.as_str());
-        y += 64;
-        let here = a.needs.is_empty();
-        Map::row(b, cx, y, "installed", if here { "yes" } else { "not yet" });
-        y += 64;
-        Map::row(b, cx, y, "waits for", if here { "nothing" } else { a.needs });
-        y += 64;
-        Map::row(b, cx, y, "capabilities", "none");
-        b.text(cx, cy + r * 3 / 4, 28, dim(), 1, "time is set by hand until it is measured");
-        b.disc(cx, cy, r - r / 25 - 1, fill());
-    }
-
     /// A tap: one finger or two, at a panel point. Logged with what it did, so a session can be followed from `diag console`.
     fn tap(&mut self, fingers: usize, sx: i64, sy: i64) {
         let before = self.view;
@@ -1109,75 +906,26 @@ impl Map {
         console(self.grants, l.as_str().as_bytes());
     }
 
-    /// Launch the Ramps app: its capsule from the vault, given the display, touch and the app surface (SYS_SPAWN: a child gets only what its parent holds). While it is in front the map takes no touches; it comes back when the display says no app is in front any more (after it has seen this one arrive).
-    fn show_ramps(&mut self) {
-        if ferros_sys::spawn(self.grants, b"ramps", b"ramps", &[S_DISPLAY, S_TOUCH, S_APPSURF]) == 0 {
-            self.ramps = true;
-            self.app_seen = false;
-            self.app_since = now();
-        } else {
-            console(self.grants, b"map: could not launch ramps\n");
-        }
-    }
-
-    /// While an app is in front: has it handed the screen back (or never arrived)?
+    /// While an app is in front: has it handed the screen back?
     fn app_done(&mut self) -> bool {
         let mut r = [0u8; 16];
         let n = call(self.display, &[5], &mut r);
-        let active = n >= 13 && r[12] == 1;
-        if active {
-            self.app_seen = true;
-        }
-        (self.app_seen && !active) || (!self.app_seen && now().wrapping_sub(self.app_since) > 2 * freq())
+        !(n >= 13 && r[12] == 1)
     }
 
     fn tap_inner(&mut self, fingers: usize, sx: i64, sy: i64) {
-        if self.ramps {
-            // On the ramps: one finger on a column shows it alone, one finger again shows them all; two fingers go back to the map.
-            if fingers == 2 {
-                self.ramps = false;
-                self.ramps_only = None;
-                self.draw();
-                return;
-            }
-            self.ramps_only = match self.ramps_only {
-                Some(_) => None,
-                None => {
-                    // The display server's column layout: nine columns between 4-pixel lines.
-                    let col = (self.w - 4 * 10) / 9;
-                    Some(((sx - 4).max(0) / (col + 4)).clamp(0, 8) as usize)
-                }
-            };
-            let mut r = [0u8; 4];
-            match self.ramps_only {
-                Some(k) => call(self.display, &[21, k as u8], &mut r),
-                None => call(self.display, &[21], &mut r),
-            };
-            return;
-        }
         let inside = {
             let (dx, dy) = (sx - self.w / 2, sy - self.h / 2);
             dx * dx + dy * dy <= self.arrived_r() * self.arrived_r()
         };
         match (fingers, self.view) {
             (1, View::Map) => {
-                if self.hit(sx, sy) == Some(RAMPS) {
-                    self.show_ramps();
-                } else if self.hit(sx, sy) == Some(ANDROID) {
-                    // The kernel decides (an attest, the device's opt-in); accepted, the device resets into Android within a pass of the service loop.
-                    let ok = ferros_sys::power(cap(self.grants, S_ANDROID), true);
-                    console(self.grants, if ok { b"map: Android: launching\n" } else { b"map: Android: refused (no attest, or this device does not allow it)\n" });
-                } else if let Some(i) = self.hit(sx, sy) {
+                if let Some(i) = self.hit(sx, sy) {
                     let to = self.at(i);
                     self.fly(to);
                     self.view = View::Front(i);
                     self.draw();
                 }
-            }
-            (1, View::Front(SCOPE)) if inside => {
-                // The focused scope: a tap folds it on its dominant period, or unfolds it (owner, 2026-10-25).
-                self.scope_fold = !self.scope_fold;
-                self.send_focus();
             }
             (1, View::Front(_)) | (1, View::Back(_)) => {
                 if !inside {
@@ -1185,7 +933,7 @@ impl Map {
                     let to = self.home();
                     self.fly(to);
                     self.draw();
-                } else if self.view == View::Back(DEVICE) {
+                } else if matches!(self.view, View::Back(_)) {
                     let row = self.rows[..self.nrows].iter().find(|r| sy >= r.0 && sy < r.1).map(|r| r.2);
                     match row {
                         Some(Choice::Base(code)) => {
@@ -1225,13 +973,6 @@ impl Map {
                     self.view = View::Back(i);
                     self.draw();
                 }
-            }
-            (2, View::Front(SCOPE)) => {
-                // The focused scope: two fingers leave it (owner, 2026-10-25), back to the map.
-                self.view = View::Map;
-                let to = self.home();
-                self.fly(to);
-                self.draw();
             }
             (2, View::Front(i)) => {
                 self.view = View::Back(i);
@@ -1298,16 +1039,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         rc: [ONE; N],
         rsn: [0; N],
         arranged: [false; N],
-        ramps_only: None,
-        ramps: false,
-        scope_span_us: 1_000_000,
-        scope_axis: 0,
-        scope_acc: 0,
-        scope_fold: false,
-        // Nothing sent yet, whatever the display holds: a display server that outlived a map restarted while the scope was in focus kept flipping at the panel's rate, and the clock policy saw a display animating and held the active clocks (2.9 W at rest, 2026-10-25). The first frame always says.
-        focus_sent: (0xFF, 0, false),
-        app_seen: false,
-        app_since: 0,
+        app_front: false,
     };
     let kept = map.load_places();
     // Whatever the vault held, no two circles start overlapping (places kept before circles pushed each other could).
@@ -1332,9 +1064,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     map.draw();
-    if option_env!("FERROS_MAP_START") == Some("rr") {
-        map.show_ramps();
-    }
+    // Nothing is in focus (display op 25, icon 0): a display that outlived an older map, one with widgets that took focus, would otherwise keep redrawing one at the panel's rate.
+    call(display, &[25, 0, 0, 0, 0, 0, 0], &mut r);
     // A development build can time the frame loop without a finger (FERROS_MAP_START=bench): 32 frames of a pinch with a twist, then 32 of a pan, each the whole round trip to the display server; the averages to the console, then the camera back home.
     // FERROS_MAP_START=ipc: the bare cost of a round trip to each server (64 trivial calls each: display info, touch info).
     if option_env!("FERROS_MAP_START") == Some("ipc") {
@@ -1440,24 +1171,23 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             map.draw();
         }
         // The dashboard is live: once a second while it is showing.
-        if map.view == View::Front(DEVICE) && now().wrapping_sub(last_dashboard) > freq() {
+        if map.view == View::Front(0) && now().wrapping_sub(last_dashboard) > freq() {
             last_dashboard = now();
             map.draw();
         }
 
-        // An app the map did not launch (a bridge spawn: Hive, for one) stands in front the same way: asked of the display eight times a second.
-        if !map.ramps && now().wrapping_sub(last_app_check) > freq() / 8 {
+        // An app in front (a bridge spawn: Hive, for one), asked of the display eight times a second.
+        if !map.app_front && now().wrapping_sub(last_app_check) > freq() / 8 {
             last_app_check = now();
             let mut q = [0u8; 16];
             if call(map.display, &[5], &mut q) >= 13 && q[12] == 1 {
-                map.ramps = true;
-                map.app_seen = true;
+                map.app_front = true;
             }
         }
         // An app in front: it has the touches; the map only watches for it to hand the screen back.
-        if map.ramps {
+        if map.app_front {
             if map.app_done() {
-                map.ramps = false;
+                map.app_front = false;
                 map.draw();
             } else {
                 sleep_until(now() + freq() / 10);
@@ -1538,8 +1268,6 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             start = [(false, 0, 0); 16];
             grab = None;
             grab_n = 0;
-            map.scope_axis = 0;
-            map.scope_acc = 0;
         }
         if down {
             most = most.max(held);
@@ -1601,17 +1329,11 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     if ga == gb { ga } else { None }
                 };
             }
-            // One finger on the focused scope works the scope, not the plane.
-            let on_scope = nb == 1 && map.view == View::Front(SCOPE);
-            if on_scope {
-                let id = both[0];
-                map.scope_drag(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2, cur[id].1 - start[id].1, cur[id].2 - start[id].2);
-            }
-            if !on_scope && nb >= 1 && map.view != View::Map {
+            if nb >= 1 && map.view != View::Map {
                 // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again.
                 map.view = View::Map;
             }
-            if nb == 1 && !on_scope {
+            if nb == 1 {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 if let Some(i) = grab {

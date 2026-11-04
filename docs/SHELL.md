@@ -45,7 +45,7 @@ Each channel carries one meaning:
 
 The device measures what you do; you declare what matters. When a circle lights, the colour goes on its fill, so the ring stays as its steady weight underneath.
 
-**Apps to start:** Photon (people and threads, beam for video and wave for voice), Mahere (maps), Lumis (the camera), Opsin (recording).
+**Built in: one circle, system settings** (owner, 2026-11-04: "For the baked in circles, there should be one. System settings, that's it. You want a clock? INSTALL IT YOURSELF!!!"). Its front is the dashboard, its back the settings. Every other circle is an app the person installs; the base OS knows nothing about it until then. The apps planned below (Photon, Mahere, Lumis, Opsin) are installs, never preloads.
 
 **An app is its icon** (owner, 2026-10-21). An app's circle shows the app's icon and no name: "icons identify just fine." Names under circles are an option in settings, off by default. This reverses the 2026-10-16 design's "No icons", which belonged to a list of rows, where a name was the whole row. Icons come from each app's own codebase — Photon's and Mahere's PNG, Lumis's Android launcher WebP, Opsin's VSF — and `tools/app-icons` brings each into linear VSF RGB, scales and cuts it to one circle there, and bundles VSF RGB gamma 2 codes into the display server at build time, so the phone decodes nothing. The PNG and WebP sources are sRGB and enter through vsf's colorimetric `SRGB2VSF_RGB`, so their white lands slightly off VSF's axis, as vsf intends.
 
@@ -178,7 +178,7 @@ Each frame is now one call (op 15, a batch): the overlay's text and discs, then 
 - **Two fingers** both inside one circle move, size and turn that circle. Otherwise they pinch and twist the plane.
 - **Circles push each other** instead of overlapping, and a push carries on through the neighbours. Every move is kept in the vault when the fingers lift. There is no arranging mode any more.
 - **Circles wider than three quarters of the screen are places, not objects:** the fingers move the plane there, so a zoomed-in view can't trap them.
-- **Tap** arrives (or launches: Ramps). The power key turns the screen off and on.
+- **Tap** arrives. The power key turns the screen off and on.
 
 **Settings on the device's back:** the number base, names under circles, and brightness (nine dots, a stop apart; SETTINGS.md).
 

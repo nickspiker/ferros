@@ -260,7 +260,7 @@ pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// A launch the `android` switch accepted, for the service loop's next pass.
 static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// The `android` switch (process.rs POWERS, grant 104, the map's): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). The home screen (the map) starts only once an identity is unlocked (init's `wait_unlocked`), so only an attested person can tap its Android circle; this check is the second lock, for any other holder of the switch. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
+/// The `android` switch (process.rs POWERS): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). Nothing in the base OS holds it (owner, 2026-11-04: nothing is built in but system settings): it is for an Android launcher a person installs, and this check is the lock whoever holds it. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
 pub fn android_request(on: bool) -> bool {
     let present = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked());
     let ok = on && present && ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
@@ -450,8 +450,7 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"dpu"),
         // 102 the `panel` switch (panel_power.rs: VCI and the reset pulse), 103 `panel-vddd` (VDDD after the init set): the panel from off (§8, state B).
         Power(b"panel"), Power(b"panel-vddd"),
-        // 104 the `android` switch (android_request): the map's Android circle, behind an attest.
-        Power(b"android"),
+        // The `android` switch (android_request) is in no one's list: the base OS has no Android launcher (owner, 2026-11-04: nothing built in but system settings). It goes to a launcher a person installs, once installing exists.
     ]
 }
 
@@ -461,7 +460,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103],
         b"touch" => &[14, 15, 16, 23, 91],
-        b"map" => &[17, 18, 19, 20, 22, 47, 104],
+        b"map" => &[17, 18, 19, 20],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
@@ -500,6 +499,13 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             rep.push(b'\n');
             continue;
         };
+        // What reads the person's space starts only once a person has attested, as init's `wait_unlocked` holds it (owner, 2026-11-04: "Attest should ONLY load attest"): a restart does not get around that.
+        if matches!(name, b"map" | b"photon") && !store.as_mut().is_some_and(|s| s.unlocked()) {
+            rep.extend_from_slice(b"not started, nobody has attested: ");
+            rep.extend_from_slice(name);
+            rep.push(b'\n');
+            continue;
+        }
         // Each step in the flash log and the crumb (G#51 killing, G#52 reading, G#53 spawning, G#54 done — G#70+ are the syscalls; 2026-10-25: a reset followed a display restart with nothing recorded after the vault took the new build).
         let nm = core::str::from_utf8(name).unwrap_or("?");
         crate::flashlog::line(&alloc::format!("restart {nm}: killing"));
