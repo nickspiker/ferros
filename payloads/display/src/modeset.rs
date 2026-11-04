@@ -229,7 +229,7 @@ impl M<'_> {
     }
 
     /// DSIM init + start (dsim_reg_init, dsim_reg_start) for the raster, the DPHY's proven words restored around the PLL re-lock. `hs`: the link's rate, Mbps, unchanged.
-    fn dsim_init(&mut self, r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], hs: u32) {
+    fn dsim_init(&mut self, r: &Raster, link: &[u32], bias: &[u32], phy: &[u32], hs: u32, ulps_exit: bool) {
         // DPHY reset under sysreg control, OSC clock, software reset.
         self.clear(S_DPU_SYSREG, DISP_DPU_MIPI_PHY_CON, SEL_RESET_DPHY0);
         self.clear(S_DSIM, DSIM_CLK_CTRL, CLK_CLOCK_SEL);
@@ -285,6 +285,26 @@ impl M<'_> {
         self.wr(S_DSIM, DSIM_CMD_CONFIG, 0);
         self.wr(S_DSIM, DSIM_CMD_TE_CTRL0, r.w * 2 / 100);
         self.wr(S_DSIM, DSIM_CMD_TE_CTRL1, (hs * 95 * 100 / 120 / 16) << 16 | (hs * 110 * 100 / 120 / 16));
+        // From off after Android's hibernation the panel's link sits in ULPS: the stock exit (dsim_reg_set_smddi_ulps(0)) before the start: enter requested on the clock and data lanes, all four data lanes and the clock in ULPS, exit requested, out of ULPS, the panel's wake-up time, both requests cleared.
+        if ulps_exit {
+            const TX_ULPS_DATA: u32 = 1 << 3;
+            const TX_ULPS_DATA_EXIT: u32 = 1 << 2;
+            const TX_ULPS_CLK: u32 = 1 << 1;
+            const TX_ULPS_CLK_EXIT: u32 = 1 << 0;
+            const ULPS_CLK: u32 = 1 << 9;
+            const ULPS_DATA: u32 = 0xF << 4;
+            self.set(S_DSIM, DSIM_ESCMODE, TX_ULPS_DATA | TX_ULPS_CLK);
+            if !self.poll(S_DSIM, DSIM_DPHY_STATUS, ULPS_DATA | ULPS_CLK, ULPS_DATA | ULPS_CLK, 2_000) {
+                self.say(b"dsim: the lanes never entered ULPS\n");
+            }
+            self.set(S_DSIM, DSIM_ESCMODE, TX_ULPS_DATA_EXIT | TX_ULPS_CLK_EXIT);
+            if !self.poll(S_DSIM, DSIM_DPHY_STATUS, ULPS_DATA | ULPS_CLK, 0, 2_000) {
+                self.say(b"dsim: the lanes never left ULPS\n");
+            }
+            self.wait_us(100);
+            self.clear(S_DSIM, DSIM_ESCMODE, TX_ULPS_DATA | TX_ULPS_CLK);
+            self.clear(S_DSIM, DSIM_ESCMODE, TX_ULPS_DATA_EXIT | TX_ULPS_CLK_EXIT);
+        }
         // Start: request the HS clock, interrupts as they were, status clear.
         self.set(S_DSIM, DSIM_CLK_CTRL, CLK_TX_REQUEST_HSCLK);
         self.wr(S_DSIM, DSIM_INTMSK, link[(DSIM_INTMSK / 4) as usize]);
@@ -389,7 +409,7 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -
 
         m.decon_stop();
         m.dsim_stop();
-        m.dsim_init(&r, &link, &bias, &phy, hs);
+        m.dsim_init(&r, &link, &bias, &phy, hs, false);
         m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
 
         // The panel, just after a TE: DSC on, the PPS, the raster, the full feature block for 120 Hz, control display, FFC on.
@@ -422,6 +442,56 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool) -
     // The DQE's dither in shift mode (EN | MODE = plain truncation of the two low bits): the display server dithers to 8-bit codes itself, from its 14-bit table, with the low two bits of each 10-bit code zero, so the panel gets exactly that pattern (the kernel set it after its modeset until 2026-11-01).
     m.wr(S_DQE, DQE_DISP_DITHER, 3);
     m.set(S_DECON, SHD_REG_UP_REQ, SHD_REG_UP_REQ_DQE);
+    m.rep
+}
+
+/// The captured running pipe (oracle/display/husky-hk3/cold-pipe: ferros's own 10 bpc state on a cold boot), as the words `ten_bpc` snapshots from a live one.
+fn words(b: &[u8]) -> Vec<u32> {
+    b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation). The panel itself is taken as on (state A); a panel that is off needs its power-up (state B) after this.
+pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>) -> Vec<u8> {
+    let mut m = M { p, f: freq(), rep: Vec::new() };
+    let t0 = now();
+    let r = raster();
+    let main = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_main.bin"));
+    let sub0 = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc0.bin"));
+    let sub1 = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc1.bin"));
+    let win = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_win5.bin"));
+    let wincon = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_wincon5.bin"))[0];
+    let link = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dsim0.bin"));
+    let bias = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy_bias.bin"));
+    let phy = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy.bin"));
+    let hs = ferros_dsi::pll_hs_clk(|off| phy[off as usize / 4]);
+    m.decon_stop();
+    m.dsim_init(&r, &link, &bias, &phy, hs, true);
+    m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+    m.after_te();
+    let pps = ferros_dsc::pps(&r.cfg);
+    if dsi.send(ferros_dsi::DCS_SHORT_WRITE_1, &[0x9D, 0x01]).is_err() || dsi.send(ferros_dsi::PPS_LONG_WRITE, &pps).is_err() {
+        m.say(b"panel: PPS stuck\n");
+    }
+    let (_, f1) = dsi.sequence(ferros_dsi::hk3::RES_WQHD);
+    let (_, f2) = dsi.sequence(ferros_dsi::hk3::REFRESH_120);
+    let f3 = dsi.dcs(&[0x53, 0x20]).err();
+    let (_, f4) = dsi.sequence(ferros_dsi::hk3::FFC_ON);
+    if f1.is_some() || f2.is_some() || f3.is_some() || f4.is_some() {
+        m.say(b"panel: a command set stuck\n");
+    }
+    m.set(S_DECON, SHD_REG_UP_REQ, SHD_ALL_WINDOWS);
+    m.set(S_DECON, GLOBAL_CON, GLOBAL_CON_DECON_EN | GLOBAL_CON_DECON_EN_F);
+    m.set(S_DECON, SHD_REG_UP_REQ, SHD_GLOBAL | SHD_CMP | SHD_REG_UP_REQ_DQE);
+    m.wr(S_DECON, DECON_INT_PEND, INT_PEND_FRAME_START);
+    if !m.poll(S_DECON, GLOBAL_CON, GLOBAL_CON_RUN_STATUS, GLOBAL_CON_RUN_STATUS, 2_000) {
+        m.say(b"decon: not running after start\n");
+    }
+    let t = m.rd(S_DECON, TRIG_CON);
+    m.wr(S_DECON, TRIG_CON, (t & !HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+    m.wr(S_DQE, DQE_DISP_DITHER, 3);
+    m.set(S_DECON, SHD_REG_UP_REQ, SHD_REG_UP_REQ_DQE);
+    let ms = now().wrapping_sub(t0) * 1000 / m.f;
+    m.say(alloc::format!("modeset: the pipe from reset in {ms} ms\n").as_bytes());
     m.rep
 }
 

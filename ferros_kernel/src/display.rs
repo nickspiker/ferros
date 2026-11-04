@@ -315,9 +315,9 @@ const DMA0: usize = 0x1990_0000;
 const DPP0: usize = 0x1993_0000;
 const HDRCOMM0: usize = 0x1996_0000;
 
-/// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`). G#1546_1D00, 1D80 and 1E00 are the domains' CONFIGURATION registers (the on request; flexpmu_cal_local_zuma.h), STATUS is at +4: both must say on, since the request alone reads on while a domain is still powering up.
+/// Whether the DPU power domains are on, read through the EL3 monitor (never touch a powered-down DPU: see `adopt`). G#1546_1D00, 1D80 and 1E00 are the domains' CONFIGURATION registers (the on request; flexpmu_cal_local_zuma.h), STATUS is at +4: both must say on, since the request alone reads on while a domain is still powering up. Plain reads: the PMU is readable from the non-secure side, and EL3's PRIV_REG read of a STATUS register does not return it (2026-11-03: it read the DPU down on a cold boot with all three domains on).
 pub fn dpu_on() -> bool {
-    [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| crate::platform::priv_reg(a, false, 0) & 1 == 1 && crate::platform::priv_reg(a + 4, false, 0) & 1 == 1)
+    [0x1546_1D00usize, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| unsafe { core::ptr::read_volatile(a as *const u32) & 1 == 1 && core::ptr::read_volatile((a + 4) as *const u32) & 1 == 1 })
 }
 
 /// Take over the layer ABL (cold) or Linux (--live handoff) left on screen: checks, picks the base window, switches it to linear 0x00RRGGBB pixels (BGRX8888), turns every other window off and clears the whole surface to black. Reports into `rep`; None if there is no panel ferros can drive.

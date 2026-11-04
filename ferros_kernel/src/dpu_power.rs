@@ -195,6 +195,14 @@ pub fn on_with(rep: &mut Vec<u8>, restore: u32) -> bool {
     true
 }
 
+/// The `dpu` power switch (process.rs POWERS): the display server powers the DPU up when it finds it down (SYS_FACTS 30 = 1: Android's hibernation at a jump, or ferros's own `dpu off`), and could take it down.
+pub fn power(on: bool) -> bool {
+    let mut rep = Vec::new();
+    let ok = if on { all_on() || on_with(&mut rep, 0x5) } else { off(&mut rep) };
+    crate::platform::pstore(&rep);
+    ok
+}
+
 /// `diag dpu [on|off]`: the state, or the domains switched (the self-test; the display server must not be running for `off`).
 pub fn diag(args: &str, rep: &mut Vec<u8>) {
     match args.trim() {

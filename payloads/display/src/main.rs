@@ -110,6 +110,8 @@ const S_DECON_SUB: u64 = 19;
 const S_DQE: u64 = 20;
 const S_DQE_CGC: u64 = 21;
 const S_DPU_SYSREG: u64 = 22;
+/// Grant slot 23: the `dpu` power switch (init's 101; dpu_power.rs): the DPU powered up from off.
+const S_DPU_POWER: u64 = 23;
 const INT_EN: u64 = 0x0060;
 const INT_EN_FRAME_START: u32 = 1 << 12;
 static FRAME_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -2424,11 +2426,16 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     ALLOC.init(heap);
 
-    // After the jump with the DPU powered down (Android's DECON hibernation, SYS_FACTS 30 = 1): not one DECON or DSIM register is touched, since such an access poisons EL3 and the next firmware call anywhere hangs forever (the kernel's display.rs). The panel keeps Android's last frame; ferros runs on without a display.
-    if ferros_sys::facts().0[30] == 1 {
-        log.s(b"display: the jump found the DPU powered down (Android's hibernation); its registers are not touched\n");
+    // The DPU powered down (SYS_FACTS 30 = 1: Android's DECON hibernation at a jump, or ferros's own `dpu off`): no DECON or DSIM register may be touched before the kernel's `dpu` switch has powered it (the EL3 poison rule, the kernel's display.rs); then the whole pipe from reset (modeset::from_off, DISPLAY-DESIGN.md §8).
+    let from_off = ferros_sys::facts().0[30] == 1;
+    if from_off {
+        if !ferros_sys::power(cap(grants, S_DPU_POWER), true) || ferros_sys::facts().0[30] != 2 {
+            log.s(b"display: the DPU is powered down and its switch did not bring it up; its registers are not touched\n");
+            log.flush();
+            ferros_sys::exit(3);
+        }
+        log.s(b"display: the DPU was powered down: switched on, the pipe from reset\n");
         log.flush();
-        ferros_sys::exit(3);
     }
 
     // ABL's 8 bpc pipe to the 10 bpc blend, once (modeset.rs; the kernel did this before init until 2026-11-01): before the raster is read and before any frame or panel thread.
@@ -2437,7 +2444,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let jumped = ferros_sys::facts().0[31] == 6;
     // Android switches the panel between 1008x2244 (its default "high resolution") and 1344x2992. A jump from 1008x2244 is drawn at that raster (touch then lands off: the controller reports in 1344x2992). Forcing the WQHD modeset there switched DECON and the DSC encoders but not the panel, which kept decoding in its scaled mode (the picture three-up, garbage below; the thirteenth jump, 2026-11-01): the stock driver changes the panel's resolution inside a full re-initialisation (reset, init set, PPS, C3/F2), not yet ported. Android set to "Full resolution" jumps clean.
     // After the jump the whole modeset runs again (force): with DECON left as Android configured it, ferros's frames never completed (the frame counter stood still, "settle timeout", the panel holding Android's last frame: the thirty-fifth jump). From Android's scaled mode as well: the modeset's PPS and resolution commands take the panel to its full raster (jump 37, 2026-11-02; the thirteenth jump's three-up had other causes, the X3 never launched among them).
-    let rep = modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped);
+    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants })) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped) };
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
