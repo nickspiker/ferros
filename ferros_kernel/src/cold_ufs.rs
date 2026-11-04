@@ -52,7 +52,12 @@ pub fn bring_up() -> bool {
     };
     // A link already up (a RELOAD: the previous generation brought it up) is adopted — our own transfer list on it, proven by the block read — not reset. full_init on a live link came up and served the shell's first reads, then lost a command minutes later, every time (2026-10-23); the Linux handoff always adopted its link this way.
     // Only when the device is powered — gpp0-1 high, which only a previous generation of ferros does; ABL leaves HCE and the link bits set over a hibernated, unpowered device, and adopting that cost four 1 s timeouts on every cold boot (2026-10-23).
-    if rd(GPP0 + 4) & (1 << 1) != 0 && ufs.link_is_up() {
+    // After the jump from Android the live link is Android's, and with a command of Android's still in its doorbell (the camera writing, 2026-11-03) our slot-0 reads never completed: four 4 s timeouts (COLD_UFS_MS 16220) before the full init below brought the disk up. Adopted then only with the doorbell empty (UTRLDBR, G#58); otherwise straight to the full init, which that jump proved.
+    let android_busy = crate::platform::jumped() && rd(UFS_BASE + 0x58) != 0;
+    if android_busy {
+        crate::platform::pstore(b"ferros: UFS: a command of Android's still in the doorbell, full init\n");
+    }
+    if !android_busy && rd(GPP0 + 4) & (1 << 1) != 0 && ufs.link_is_up() {
         ufs.init_transfer_list();
         if answers(&ufs) {
             return true;
