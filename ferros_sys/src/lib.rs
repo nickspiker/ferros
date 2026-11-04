@@ -558,9 +558,14 @@ pub fn spawn_unique(grants: u64, name: &[u8], key: &[u8], slots: &[u64]) -> u64 
     spawn_with(grants, name, key, slots, 1)
 }
 
+/// The most slots a child can be handed in one spawn: the request, at 64 tokens of 32 bytes, stays inside the 4096 bytes the kernel reads of it.
+pub const SPAWN_SLOTS: usize = 64;
+
 fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -> u64 {
-    let mut req = [0u8; 2 + 64 + 64 + 1 + 24 * 32];
-    let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len().min(24));
+    let mut req = [0u8; 2 + 64 + 64 + 1 + SPAWN_SLOTS * 32];
+    // More slots than fit is the caller's bug, so it panics rather than dropping the rest: until 2026-11-04 this took the first 24 without a word, and the display server (25) lost its last, `panel-vddd`, whenever init started it; after a jump from a screen-off Android the panel then came up without VDDD and stayed black.
+    assert!(slots.len() <= SPAWN_SLOTS, "spawn: more slots than a request holds");
+    let (nl, kl, n) = (name.len().min(64), key.len().min(64), slots.len());
     let mut at = 0;
     req[at] = nl as u8;
     req[at + 1..at + 1 + nl].copy_from_slice(&name[..nl]);
