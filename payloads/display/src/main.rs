@@ -2166,32 +2166,8 @@ fn windows_changed(width: usize, height: usize) {
     }
 }
 
-/// The corners' circles (WINDOWS.md, "The corners", owner 2026-11-03: "tangent a few circles from the focused app circle to the window edge"): in each corner, the circle tangent to both screen edges (inset by the margin) and outside the app's circle (its radius grown by the gap), then chains along the edges, each circle tangent to the edge, the app's circle and the one before. All in the corner's own frame: the corner at the origin, its two edges the axes, the app's circle at (ax, ay) with radius `rb`.
-/// The corner circle has a closed form: centre (r, r), |(r, r) − (ax, ay)| = rb + r gives r² − 2(ax + ay + rb) r + (ax² + ay² − rb²) = 0, the smaller root. A chain circle against the edge v = 0 after a circle at (pu, pr) sits at u = pu + 2√(r·pr) (tangent to its neighbour and the edge), and its r is the root of (u − ax)² + (r − ay)² = (rb + r)², found by bisection between 0 and the neighbour's radius (the function is positive at 0, a point outside the app's circle, and negative at the neighbour's size). The edge u = 0 is the same with the axes swapped.
-/// One circle in the corner frame: (u, v, r).
-fn corner_first(ax: f32, ay: f32, rb: f32) -> (f32, f32, f32) {
-    let s = ax + ay + rb;
-    let r = s - libm::sqrtf(s * s - (ax * ax + ay * ay - rb * rb));
-    (r, r, r)
-}
-/// The next circle along the edge v = 0 (`along_v` false) or u = 0 (true), after `prev`.
-fn corner_next(ax: f32, ay: f32, rb: f32, prev: (f32, f32, f32), along_v: bool) -> (f32, f32, f32) {
-    let (pu, pr, ax, ay) = if along_v { (prev.1, prev.2, ay, ax) } else { (prev.0, prev.2, ax, ay) };
-    let place = |r: f32| pu + 2.0 * libm::sqrtf(r * pr);
-    let f = |r: f32| {
-        let u = place(r);
-        (u - ax) * (u - ax) + (r - ay) * (r - ay) - (rb + r) * (rb + r)
-    };
-    let (mut lo, mut hi) = (0.0f32, pr);
-    for _ in 0..32 {
-        let mid = (lo + hi) * 0.5;
-        if f(mid) > 0.0 { lo = mid } else { hi = mid }
-    }
-    let (r, u) = (lo, place(lo));
-    if along_v { (r, u, r) } else { (u, r, r) }
-}
-
-/// What a corner circle shows.
+/// The corners' circles (WINDOWS.md, "The corners", owner 2026-11-03: "tangent on all sides, three for each"): in each corner a middle circle, the largest that fits between the glass's own edge (its fat corner, exactly as `plan_glass` drew it) and the app's circle, so tangent to both; and on each side of it one more, tangent to the glass, the app's circle and the middle one. Planned once per screen size from the glass plan, then cached.
+/// The fit: `clear(p)` is a point's distance to the nearer of the two (the glass boundary, from each row's masked columns and the screen's own edges; the app's circle, |p − C| − R). The middle circle maximises it (a coarse grid, then a fine one around the best). A side circle's centre lies where the two distances are equal (between the glass and the app's circle), found by bisection across the corner's strip at each step along the edge, and is the point there whose clearance also equals its distance to the middle circle's edge: the root of that difference, stepped out from the middle circle and bisected.
 #[derive(Clone, Copy, PartialEq)]
 enum Corner {
     Clock,
@@ -2200,45 +2176,162 @@ enum Corner {
     Bluetooth,
     Nfc,
     Gnss,
+    Usb,
+    Ip,
+    Battery,
     Home,
+    Spare,
 }
 
-/// The corners' circles on the screen: (x, y, drawn radius, what). Sized and spaced from the screen's span (2wh/(w+h)): the margin from the edges a sixty-fourth of it, the gap to the app's circle half that, each disc drawn a quarter margin smaller than its tangent circle so neighbours do not touch.
-fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 7], usize) {
-    let (cx, cy, r) = circle(width, height);
+/// The glass boundary's distance from a point: the masked columns of each row near it (left and right), and the screen's top and bottom edges.
+fn glass_dist(rows: &[GlassRow], width: usize, height: usize, x: f32, y: f32, reach: f32) -> f32 {
+    // Outside the glass on its own row (in a masked corner, or off the screen): no clearance at all. Unsigned, a point beyond the corner's curve read as roomy and the bottom-right circle was solved out in the mask (2026-11-03).
+    if y < 0.0 || y >= height as f32 || x < 0.0 || x >= width as f32 {
+        return -1.0;
+    }
+    let own = &rows[y as usize];
+    if x < own.mask_l as f32 || x > own.mask_r as f32 {
+        return -1.0;
+    }
+    let mut d = y.min(height as f32 - y).min(x).min(width as f32 - x);
+    let y0 = (y - reach).max(0.0) as usize;
+    let y1 = ((y + reach) as usize).min(height - 1);
+    for yy in y0..=y1 {
+        let dy = y - (yy as f32 + 0.5);
+        // The row's glass runs from column mask_l to column mask_r (both from the left; mask_r is the width where the row has no right mask).
+        let (l, r) = (rows[yy].mask_l as f32, rows[yy].mask_r as f32);
+        let dl = x - l;
+        let dr = r - x;
+        let dl2 = libm::sqrtf(dl * dl + dy * dy);
+        let dr2 = libm::sqrtf(dr * dr + dy * dy);
+        if dl2 < d { d = dl2; }
+        if dr2 < d { d = dr2; }
+    }
+    d
+}
+
+/// The screen's corner circles: (x, y, radius, what), up to twelve.
+static mut CORNERS: [(f32, f32, f32, Corner); 12] = [(0.0, 0.0, 0.0, Corner::Spare); 12];
+static mut CORNERS_N: usize = 0;
+static mut CORNERS_FOR: (usize, usize) = (0, 0);
+
+fn corner_layout(width: usize, height: usize) -> ([(f32, f32, f32, Corner); 12], usize) {
+    unsafe {
+        if CORNERS_FOR == (width, height) {
+            return (CORNERS, CORNERS_N);
+        }
+    }
+    let rows = unsafe { core::slice::from_raw_parts(GLASS_ROWS as *const GlassRow, height + 1) };
+    let (cx, cy, rr) = circle(width, height);
     let (w, h) = (width as f32, height as f32);
-    let span = 2.0 * w * h / (w + h);
-    let (m, g) = (span / 64.0, span / 128.0);
-    let rb = r + g;
-    let shrink = m * 0.25;
-    let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Home); 7];
+    let reach = h / 8.0;
+    let app = |x: f32, y: f32| libm::sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) - rr;
+    let glass = |x: f32, y: f32| glass_dist(rows, width, height, x, y, reach);
+    let clear = |x: f32, y: f32| { let (a, g) = (app(x, y), glass(x, y)); if a < g { a } else { g } };
+    let mut out = [(0.0f32, 0.0f32, 0.0f32, Corner::Spare); 12];
     let mut n = 0;
-    let mut put = |u: f32, v: f32, rr: f32, flip_x: bool, flip_y: bool, what: Corner| {
-        let x = if flip_x { w - m - u } else { m + u };
-        let y = if flip_y { h - m - v } else { m + v };
-        out[n] = (x, y, rr - shrink, what);
+    // Each corner: (left?, top?, middle, along the horizontal edge, along the vertical edge).
+    let jobs = [
+        (true, true, Corner::Clock, Corner::Spare, Corner::Gnss),
+        (false, true, Corner::Cellular, Corner::Wifi, Corner::Bluetooth),
+        (true, false, Corner::Battery, Corner::Usb, Corner::Nfc),
+        (false, false, Corner::Home, Corner::Ip, Corner::Spare),
+    ];
+    for &(left, top, mid_what, hor_what, ver_what) in &jobs {
+        // The corner's quarter of the screen, as far as the app's circle leaves room: the strip above (below) the circle's chord at the screen's edge.
+        let strip = if top { cy - libm::sqrtf(rr * rr - cx * cx) } else { h - (cy + libm::sqrtf(rr * rr - cx * cx)) };
+        let (xa, xb) = if left { (0.0, w * 0.5) } else { (w * 0.5, w) };
+        let (ya, yb) = if top { (0.0, strip) } else { (h - strip, h) };
+        // The middle circle: coarse, then fine.
+        let (mut bx, mut by, mut br) = (0.0f32, 0.0f32, -1.0f32);
+        let step = 4.0;
+        let mut y = ya + step * 0.5;
+        while y < yb {
+            let mut x = xa + step * 0.5;
+            while x < xb {
+                let c = clear(x, y);
+                if c > br { (bx, by, br) = (x, y, c); }
+                x += step;
+            }
+            y += step;
+        }
+        let (cx0, cy0) = (bx, by);
+        for j in 0..33 {
+            for i in 0..33 {
+                let (x, y) = (cx0 + (i as f32 - 16.0) * 0.25, cy0 + (j as f32 - 16.0) * 0.25);
+                let c = clear(x, y);
+                if c > br { (bx, by, br) = (x, y, c); }
+            }
+        }
+        out[n] = (bx, by, br, mid_what);
         n += 1;
-    };
-    // Top left: the clock.
-    let (ax, ay) = (cx - m, cy - m);
-    let tl = corner_first(ax, ay, rb);
-    put(tl.0, tl.1, tl.2, false, false, Corner::Clock);
-    let gnss = corner_next(ax, ay, rb, tl, true);
-    put(gnss.0, gnss.1, gnss.2, false, false, Corner::Gnss);
-    // Top right: the radios. Cellular in the corner, WiFi along the top, Bluetooth then NFC down the edge.
-    let (ax, ay) = (w - cx - m, cy - m);
-    let tr = corner_first(ax, ay, rb);
-    put(tr.0, tr.1, tr.2, true, false, Corner::Cellular);
-    let wifi = corner_next(ax, ay, rb, tr, false);
-    put(wifi.0, wifi.1, wifi.2, true, false, Corner::Wifi);
-    let bt = corner_next(ax, ay, rb, tr, true);
-    put(bt.0, bt.1, bt.2, true, false, Corner::Bluetooth);
-    let nfc = corner_next(ax, ay, rb, bt, true);
-    put(nfc.0, nfc.1, nfc.2, true, false, Corner::Nfc);
-    // Bottom right: home.
-    let (ax, ay) = (w - cx - m, h - cy - m);
-    let br = corner_first(ax, ay, rb);
-    put(br.0, br.1, br.2, true, true, Corner::Home);
+        // A side circle: along `horizontal` (x moves toward the screen's middle) or the vertical edge (y moves toward the app's circle), the centre on the equal-distance line, until its clearance meets the middle circle's edge.
+        for horizontal in [true, false] {
+            let dir = if horizontal { if left { 1.0 } else { -1.0 } } else if top { 1.0 } else { -1.0 };
+            // The equal-distance point at a coordinate `s` along the edge: bisection across the strip.
+            let medial = |s: f32| -> (f32, f32) {
+                let (mut lo, mut hi) = if horizontal { (if top { 0.5 } else { h - 0.5 }, by) } else { (if left { 0.5 } else { w - 0.5 }, bx) };
+                for _ in 0..40 {
+                    let mid = (lo + hi) * 0.5;
+                    let (x, y) = if horizontal { (s, mid) } else { (mid, s) };
+                    if glass(x, y) < app(x, y) { lo = mid } else { hi = mid }
+                }
+                let m = (lo + hi) * 0.5;
+                if horizontal { (s, m) } else { (m, s) }
+            };
+            let gap = |s: f32| -> f32 {
+                let (x, y) = medial(s);
+                let c = glass(x, y);
+                libm::sqrtf((x - bx) * (x - bx) + (y - by) * (y - by)) - br - c
+            };
+            let s0 = if horizontal { bx } else { by };
+            let (mut a, mut found) = (s0, false);
+            let mut s = s0 + dir;
+            for _ in 0..2048 {
+                if gap(s) >= 0.0 {
+                    found = true;
+                    break;
+                }
+                a = s;
+                s += dir;
+            }
+            if !found {
+                continue;
+            }
+            let (mut lo, mut hi) = (a, s);
+            for _ in 0..30 {
+                let mid = (lo + hi) * 0.5;
+                if gap(mid) >= 0.0 { hi = mid } else { lo = mid }
+            }
+            let (x, y) = medial(hi);
+            out[n] = (x, y, glass(x, y), if horizontal { hor_what } else { ver_what });
+            n += 1;
+        }
+    }
+    // The solved circles, once per size, to the console: (x, y, r) in pixels.
+    let mut b = [0u8; 512];
+    let mut k = 0;
+    let mut put = |t: &[u8]| { for &c in t { if k < b.len() { b[k] = c; k += 1; } } };
+    put(b"display: corners");
+    for c in &out[..n] {
+        put(b" (");
+        for (j, v) in [c.0, c.1, c.2].iter().enumerate() {
+            let mut d = [0u8; 8];
+            let (mut m, mut i) = (if *v > 0.0 { *v as u32 } else { 0 }, 8);
+            loop { i -= 1; d[i] = b'0' + (m % 10) as u8; m /= 10; if m == 0 { break; } }
+            if *v < 0.0 { put(b"-"); }
+            put(&d[i..]);
+            if j < 2 { put(b","); }
+        }
+        put(b")");
+    }
+    put(b"\n");
+    ferros_sys::console(unsafe { PANIC_GRANTS }, &b[..k]);
+    unsafe {
+        CORNERS = out;
+        CORNERS_N = n;
+        CORNERS_FOR = (width, height);
+    }
     (out, n)
 }
 
@@ -2254,7 +2347,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let mut tb = [0u8; 32];
     let (_, _, tn, key, _) = clock_state(&mut tb);
     let radios = ferros_sys::facts().0[32];
-    let k = (key / 60) << 8 | (radios & 0xFF) as i64;
+    let k = (key / 60) << 8 | (radios & 0x7F) as i64 | ((ferros_sys::facts().0[5] & 1) as i64) << 7;
     if !force && k == unsafe { CHROME_KEY } {
         return false;
     }
@@ -2285,6 +2378,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let mut colons = 0;
     let end = line.iter().position(|&c| { colons += (c == b':') as u32; colons == 2 }).unwrap_or(line.len());
     let time = core::str::from_utf8(&line[..end]).unwrap_or("");
+    let usb = ferros_sys::facts().0[5];
     let (circles, n) = corner_layout(width, height);
     for &(x, y, r, what) in &circles[..n] {
         let live = match what {
@@ -2294,6 +2388,9 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Bluetooth => radios & 4 != 0,
             Corner::Nfc => radios & 8 != 0,
             Corner::Gnss => radios & 16 != 0,
+            Corner::Ip => radios & 32 != 0,
+            Corner::Usb => usb == 1,
+            Corner::Battery | Corner::Spare => false,
         };
         let ring_w = r / 16.0;
         let ring = if live { RING_ON } else { RING_OFF };
@@ -2306,7 +2403,9 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
                 // The disc, then the ring over it: the ring is the band within ring_w of the edge.
                 let disc = soft(d);
                 let band = disc - soft(d - ring_w);
-                let v = (FACE * (disc - band) + ring * band) as u64;
+                // Over what is there already, by the disc's own coverage: a neighbour's pixels outside this disc stay as they were.
+                let under = (chrome[i] & 0xFFFF) as f32;
+                let v = (under * (1.0 - disc) + FACE * (disc - band) + ring * band) as u64;
                 chrome[i] = v | v << 16 | v << 32;
             }
         }
@@ -2317,7 +2416,10 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Bluetooth => "bt",
             Corner::Nfc => "nfc",
             Corner::Gnss => "gnss",
-            Corner::Home => "",
+            Corner::Usb => "usb",
+            Corner::Ip => "ip",
+            Corner::Battery => "batt",
+            Corner::Home | Corner::Spare => "",
         };
         if label.is_empty() {
             continue;
