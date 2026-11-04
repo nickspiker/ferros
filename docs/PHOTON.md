@@ -18,7 +18,7 @@ The device as a device of the owner's Photon fleet (Claude memories/photon_on_fe
 
 | key | what | from |
 |---|---|---|
-| ira-derived `photon device` | the device key's fingerprint | the kernel, every boot |
+| ira-derived `fgtw device` | the device key's fingerprint | the kernel, every boot |
 | `fgtw.identity_seed`, `fgtw.handle_proof` | the identity roots | by default NOT on disk: the attest screen hands them to the client in RAM (op 4). Stored only when `device.unlock_at_boot` is on (opt-in, warned); wiped from disk whenever it is off. Never pushed from another machine. |
 | `fgtw.chain` | the fleet's membership chain as last adopted | a sponsor's `fleet_resp` |
 | `fgtw.fleet_key` | the fleet key | a sponsor's `fanout_resp`, opened with our ira |
