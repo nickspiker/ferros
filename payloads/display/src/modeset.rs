@@ -110,6 +110,9 @@ const LANES: [u64; 5] = [MC_GNR_CON0, md_gnr_con0(0), md_gnr_con0(1), md_gnr_con
 const DISP_DPU_MIPI_PHY_CON: u64 = 0x0008;
 const M_RESETN_M0: u32 = 1 << 0;
 const SEL_RESET_DPHY0: u32 = 1 << 4;
+/// GPP0's configuration word: four bits a pin; pin 3, the panel's TE, is function 2 to reach DECON (read on a cold boot, ABL's: G#0000_2010).
+const GPP0_CON: u64 = 0x0000;
+const TE_FUNCTION: u32 = 2;
 /// The panel's TE pin: GPP0 DAT bit 3.
 const GPP0_DAT: u64 = 0x0004;
 
@@ -146,6 +149,14 @@ impl M<'_> {
     }
     fn wr(&self, s: u64, o: u64, v: u32) {
         self.p.wr(s, o, v)
+    }
+    /// The TE pin routed to DECON (function 2), as ABL leaves it on a cold boot. A jump from an Android whose screen had gone off found it an input (function 0: its pin control's sleep state), and DECON, which starts each frame on TE, started none: frame count 0, every publish a settle timeout (2026-11-04). DISPLAY-DESIGN.md §8 had G#F, which is not the TE function either. Only pin 3's four bits are written; a change is said.
+    fn te_pin(&mut self) {
+        let con = self.rd(S_GPP0, GPP0_CON);
+        if con >> 12 & 0xF != TE_FUNCTION {
+            self.wr(S_GPP0, GPP0_CON, (con & !(0xF << 12)) | TE_FUNCTION << 12);
+            self.say(alloc::format!("TE pin: function {} -> {TE_FUNCTION} (GPP0_CON G#{con:08X})\n", con >> 12 & 0xF).as_bytes());
+        }
     }
     fn set(&self, s: u64, o: u64, bits: u32) {
         self.wr(s, o, self.rd(s, o) | bits)
@@ -407,6 +418,7 @@ impl M<'_> {
 /// `panel_cold`: the panel's power-up (state B) goes in after the link's start, with the VDDD switch to call after its init set.
 pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
+    m.te_pin();
     if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
         if !dsi.alive() {
             m.say(b"modeset: DSIM not running, left at 8 bpc\n");
@@ -474,6 +486,7 @@ fn words(b: &[u8]) -> Vec<u32> {
 /// The panel: off (`panel_cold`, its VCI off) gets its power-up (state B). On its rails (`awake`: the `panel` switch for its reset pulse, and VDDD) it is asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is, as under Android's hibernation with the screen on; anything else (asleep or dozing with its rails up, or no answer) is reset and powered up as from off. A jump from an Android whose screen had gone off left the panel holding Android's last frame under ferros's running pipe (2026-11-04): the panel was taken as on.
 pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
+    m.te_pin();
     let t0 = now();
     let r = raster();
     let main = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_main.bin"));

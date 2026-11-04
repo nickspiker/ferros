@@ -70,7 +70,13 @@ pub fn power(up: bool) -> bool {
 
 /// The `panel-vddd` switch: VDDD after the init set (on, + 1 ms), or off alone.
 pub fn vddd(up: bool) -> bool {
-    let ok = acpm::update(acpm::MAIN, acpm::T_PMIC, L22M_CTRL, if up { EN } else { 0 }, EN).is_ok() && on(L22M_CTRL) == Some(up);
+    let w = acpm::update(acpm::MAIN, acpm::T_PMIC, L22M_CTRL, if up { EN } else { 0 }, EN);
+    let now = acpm::read(acpm::MAIN, acpm::T_PMIC, L22M_CTRL);
+    let ok = w.is_ok() && now.as_ref().is_ok_and(|v| (v & EN != 0) == up);
+    // A refusal says why (2026-11-04: refused once just after a jump, LDO22M left at G#22, then accepted by hand a minute later): the write's answer and the register as read back.
+    if !ok {
+        crate::flashlog::line(&alloc::format!("panel-vddd {}: refused; update {:?}, now {:?}", if up { "on" } else { "off" }, w.map_err(|e| alloc::format!("G#{e:X}")), now.map(|v| alloc::format!("G#{v:02X}")).map_err(|e| alloc::format!("G#{e:X}"))));
+    }
     spin_ms(1);
     ok
 }

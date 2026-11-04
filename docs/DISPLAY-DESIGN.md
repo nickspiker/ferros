@@ -110,7 +110,7 @@ The layers, in order, and who owns each:
 4. **DECON from reset (display server):** `decon_reg_init` (DISPLAY-MODESET.md: CLOCK_CON, the output SRAMs, command mode, background size, the urgent/DTA set, TRIG_CON, data path, DSC encoders and PPS), values from the oracle's ON dump.
 5. **DSIM from reset (display server):** `dsim_reg_init` in its order (sysreg PHY reset, OSC clock, SWRST, lanes, escape clocks, the PLL at ABL's 1368 Mbps PMSK, lock, lane enable, PHY reset release, word clock, config), then in A the ULPS exit, then start.
 6. **Panel (B only; kernel for power, display server for commands):** VDDI is always on; VCI (LDO14M) on + 10 ms; reset gpa6-0 high 1 / low 1 / high 5 ms; VDDD (LDO22M) on; `9D 01`, the PPS, the init set (`11` + 10 ms … + 110 ms, `35`, …), `C3`/`F2`, one TE, the display-on set and `29`. Which state the panel is in is read, not guessed: VCI's enable bit through ACPM.
-7. **Start (display server):** the TE pin (gpp0-3) to function G#F, DECON start, the first frame; then the existing 10 bpc modeset and present path as on every boot.
+7. **Start (display server):** the TE pin (gpp0-3) to function 2 (GPP0_CON bits 12-15; ABL leaves G#0000_2010 on a cold boot, and a jump from a screen-off Android finds it an input: corrected 2026-11-04 from G#F, which is not the TE function), DECON start, the first frame; then the existing 10 bpc modeset and present path as on every boot.
 
 The DPU check everywhere (hv at the jump, kernel fact 30, kernel display.rs) reads CONFIGURATION and STATUS both, because the request alone reads on while a domain is still powering up.
 
