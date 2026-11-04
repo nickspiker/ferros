@@ -836,6 +836,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-capture"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-display"
 version = "0.1.0"
 dependencies = [
