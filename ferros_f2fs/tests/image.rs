@@ -17,7 +17,7 @@ fn image() {
         return;
     };
     let mut fs = Fs::mount(File(std::fs::File::open(path).unwrap())).unwrap();
-    println!("checkpoint version {:x}", fs.checkpoint_ver);
+    println!("checkpoint version {:x}, roll-forward chain {} nodes, {} taken", fs.checkpoint_ver, fs.chain_len, fs.rolled_forward());
     let root = fs.root().unwrap();
     let mut names = Vec::new();
     fs.list(&root, &mut |n, ino| names.push((n.to_vec(), ino))).unwrap();

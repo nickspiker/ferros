@@ -4,7 +4,7 @@
 //! The layout follows the kernel's fs/f2fs (f2fs_fs.h): a superblock at byte 1024, two checkpoint packs (the newer valid one is current), the node address table (NAT) in two copies per block chosen by the checkpoint's bitmap, with recent changes in the checkpoint's NAT journal (compacted or normal summaries), inodes and direct/indirect node blocks, dentry blocks.
 //! Supported: 4 KiB blocks, extra attributes, inline xattrs (fixed or flexible size), inline data, inline dentries, direct, indirect and double-indirect node trees, holes.
 //! Not supported, refused with an error: encrypted or compressed files, large NAT bitmaps, cp_payload blocks.
-//! No roll-forward recovery: what fsync wrote after the last checkpoint is not seen (the files the modem keeps are written whole and checkpointed).
+//! Roll-forward, read only (fs/f2fs/recovery.c): what fsync wrote after the last checkpoint sits in the warm node log's chain from the checkpoint's next free block, each node carrying the checkpoint's version; the nodes of every inode with an fsync mark in the chain, up to its last mark, are taken over the NAT's (as the kernel's recovery would write them back) and nothing is written. Android frozen by the jump to ferros never checkpoints, so after a jump the newest fsync'd state of a file lives only there (2026-11-03: the modem's replay_region.bin read 0 bytes from the checkpoint; cbd had rewritten it).
 //! The caller supplies the storage as a [`Disk`]; every read is one 4 KiB filesystem block.
 #![no_std]
 
@@ -82,7 +82,16 @@ pub struct Fs<D: Disk> {
     journal: [(u32, u32); NAT_JOURNAL_ENTRIES],
     journal_len: usize,
     pub checkpoint_ver: u64,
+    /// Roll-forward's nodes: (nid, block address) taken over the NAT and the journal, and how long the chain was.
+    overlay: [(u32, u32); OVERLAY],
+    overlay_len: usize,
+    pub chain_len: usize,
 }
+/// The most nodes roll-forward takes, and the longest chain it walks: the kernel checkpoints every 60 s by default, so a chain is a minute of fsyncs; a longer one is refused (Unsupported), never cut short.
+const OVERLAY: usize = 256;
+const CHAIN_MAX: usize = 1024;
+const CP_CRC_RECOVERY_FLAG: u32 = 0x40;
+const FSYNC_BIT: u32 = 1 << 1;
 
 /// One inode, as much of it as reading needs: the whole node block (addresses and inline data live in it).
 pub struct Inode {
@@ -144,13 +153,14 @@ impl<D: Disk> Fs<D> {
         let block_count = u64le(sb, 36);
         let cp_blkaddr = u32le(sb, 76) as u64;
         let nat_blkaddr = u32le(sb, 84) as u64;
+        let main_blkaddr = u32le(sb, 92) as u64;
         let root_ino = u32le(sb, 96);
         let cp_payload = u32le(sb, 1664);
         let features = u32le(sb, 2180);
         if cp_payload != 0 || log_blocks_per_seg > 12 {
             return Err(Error::Unsupported);
         }
-        let mut fs = Fs { disk, block_count, root_ino, nat_blkaddr, log_blocks_per_seg, features, nat_bitmap: [0; 1024], nat_bitmap_len: 0, journal: [(0, 0); NAT_JOURNAL_ENTRIES], journal_len: 0, checkpoint_ver: 0 };
+        let mut fs = Fs { disk, block_count, root_ino, nat_blkaddr, log_blocks_per_seg, features, nat_bitmap: [0; 1024], nat_bitmap_len: 0, journal: [(0, 0); NAT_JOURNAL_ENTRIES], journal_len: 0, checkpoint_ver: 0, overlay: [(0, 0); OVERLAY], overlay_len: 0, chain_len: 0 };
         // The two packs: the newer whose first and last blocks carry the same version (a pack interrupted mid-write does not).
         let mut best: Option<(u64, u64)> = None;
         for pack in [cp_blkaddr, cp_blkaddr + (1 << log_blocks_per_seg)] {
@@ -170,6 +180,10 @@ impl<D: Disk> Fs<D> {
         fs.checkpoint_ver = ver;
         fs.read(pack, &mut b)?;
         let flags = u32le(&b, 132);
+        // Roll-forward's start and the version its nodes carry: the warm node log's next free block (cur_node_segno[1] at 40, cur_node_blkoff[1] at 70, in the main area), the checkpoint's version with its CRC above it when the checkpoint says so (is_recoverable_dnode).
+        let chain_start = main_blkaddr + ((u32le(&b, 40) as u64) << log_blocks_per_seg) + u16le(&b, 70) as u64;
+        let crc_off = u32le(&b, 164) as usize;
+        let chain_ver = if flags & CP_CRC_RECOVERY_FLAG != 0 && crc_off + 4 <= BLOCK { ver | (u32le(&b, crc_off) as u64) << 32 } else { ver };
         if flags & CP_LARGE_NAT_BITMAP != 0 {
             return Err(Error::Unsupported);
         }
@@ -191,7 +205,60 @@ impl<D: Disk> Fs<D> {
             fs.journal[k] = (u32le(&b, e), u32le(&b, e + 4 + 5));
         }
         fs.journal_len = n;
+        fs.roll_forward(main_blkaddr, chain_start, chain_ver)?;
         Ok(fs)
+    }
+
+    /// The chain after the checkpoint (find_fsync_dnodes, then recover_data's order): every node whose footer carries the checkpoint's version, linked by its footer's next block address; an inode's nodes count up to its last fsync mark, the rest of its chain was never fsync'd and the kernel drops it too.
+    fn roll_forward(&mut self, main: u64, start: u64, ver: u64) -> Result<(), Error> {
+        let mut chain = [(0u32, 0u32, false, 0u32); CHAIN_MAX];
+        let mut n = 0;
+        let mut a = start;
+        let mut b = [0u8; BLOCK];
+        loop {
+            // Outside the main area: the chain's end (f2fs_is_valid_blkaddr, META_POR).
+            if a < main || a >= self.block_count || self.read(a, &mut b).is_err() {
+                break;
+            }
+            // The footer: nid, ino, flag, cp_ver (u64), next block address, the block's last 24 bytes.
+            let f = BLOCK - 24;
+            if u64le(&b, f + 12) != ver {
+                break;
+            }
+            if n == CHAIN_MAX {
+                return Err(Error::Unsupported);
+            }
+            chain[n] = (u32le(&b, f), u32le(&b, f + 4), u32le(&b, f + 8) & FSYNC_BIT != 0, a as u32);
+            n += 1;
+            a = u32le(&b, f + 20) as u64;
+        }
+        self.chain_len = n;
+        for i in 0..n {
+            let (nid, ino, _, addr) = chain[i];
+            // Taken when a later (or this) node of the same inode carries the fsync mark.
+            if !chain[i..n].iter().any(|c| c.1 == ino && c.2) {
+                continue;
+            }
+            match self.overlay[..self.overlay_len].iter().position(|o| o.0 == nid) {
+                Some(k) => self.overlay[k].1 = addr,
+                None if self.overlay_len < OVERLAY => {
+                    self.overlay[self.overlay_len] = (nid, addr);
+                    self.overlay_len += 1;
+                }
+                None => return Err(Error::Unsupported),
+            }
+        }
+        Ok(())
+    }
+
+    /// How many nodes roll-forward took over the checkpoint's.
+    pub fn rolled_forward(&self) -> usize {
+        self.overlay_len
+    }
+
+    /// Whether `nid` comes from roll-forward.
+    pub fn rolled(&self, nid: u32) -> bool {
+        self.overlay[..self.overlay_len].iter().any(|o| o.0 == nid)
     }
 
     fn read(&mut self, block: u64, buf: &mut [u8; BLOCK]) -> Result<(), Error> {
@@ -203,6 +270,9 @@ impl<D: Disk> Fs<D> {
 
     /// A node's block address: the checkpoint's journal first, then the current NAT copy.
     fn node_addr(&mut self, nid: u32) -> Result<u32, Error> {
+        if let Some(&(_, a)) = self.overlay[..self.overlay_len].iter().find(|e| e.0 == nid) {
+            return Ok(a);
+        }
         if let Some(&(_, a)) = self.journal[..self.journal_len].iter().find(|e| e.0 == nid) {
             return Ok(a);
         }
