@@ -11,7 +11,8 @@ const S_DISPLAY: u64 = 1;
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
-    let mut r = [0u8; 16];
+    // Room for a text reply (the nfc driver's STATE runs to a few hundred bytes), printed in hex.
+    let mut r = [0u8; 512];
     if input_len > 0 {
         let msg = unsafe { core::slice::from_raw_parts((ferros_sys::arc_base() + input) as *const u8, input_len as usize) };
         let n = call(cap(grants, S_DISPLAY), msg, &mut r);
@@ -19,7 +20,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             console(grants, b"capture: the display server did not answer\n");
             exit(1);
         }
-        let mut line = [0u8; 48];
+        let mut line = [0u8; 1025];
         let mut k = 0;
         for &b in r.iter().take((n as usize).min(r.len())) {
             for d in [b >> 4, b & 15] {

@@ -379,6 +379,8 @@ impl Nfc {
                     self.fields += 1;
                 }
                 self.field = pl.first() == Some(&1);
+                // Logged as it comes and goes (rare: a reader held to the device): the first thing to see when a tap does nothing is whether the controller felt the reader at all (2026-11-04, tap to bind: no field counted).
+                say!(self.grants, "nfc: a reader's field {}\n", if self.field { "on" } else { "off" });
             }
             // The RF_DEACTIVATE a tag's release sent: its answer.
             (2, 1, 6) => {}
