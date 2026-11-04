@@ -43,6 +43,7 @@ fn main() {
     let tmp = std::env::temp_dir().join("screencap.part");
     let t0 = std::time::Instant::now();
     let base = source(&bridge);
+    eprintln!("reading G#{base:X}{}", if base == CANVAS { " (the canvas: the capture named no surface)" } else { "" });
     let mut raw = Vec::with_capacity(bytes);
     let mut reads = 0;
     while raw.len() < bytes {

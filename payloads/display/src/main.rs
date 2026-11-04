@@ -2476,9 +2476,9 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
     let (_, _, tn, key, _) = clock_state(&mut tb);
     let facts = ferros_sys::facts().0;
     let radios = facts[32];
-    // The links' measures (facts 33-80) folded into the key too: the chrome redraws when one changes, at most every two seconds (the drivers' pace).
+    // The battery's (facts 1-4) and the links' measures (facts 33-80) folded into the key too: the chrome redraws when one changes, at most every two seconds (the drivers' pace).
     let mut mh = 0u64;
-    for &m in &facts[33..81] {
+    for &m in facts[1..5].iter().chain(&facts[33..81]) {
         mh = (mh.rotate_left(7) ^ m).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
     let k = ((key / 60) << 8 | (radios & 0x7F) as i64) ^ (mh >> 1) as i64;
@@ -2523,7 +2523,9 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Gnss => radios & 16 != 0,
             // The usb driver's own word (its measure STATE): connected once the host configured it.
             Corner::Usb => ferros_sys::measure_of(facts[33 + 8 * 5]) == Some((ferros_sys::measure::STATE, 2)),
-            Corner::Battery | Corner::Spare => false,
+            // The gauge answered (facts 1-4, the kernel's two-second poll of the MAX77759 on hsi2c_11).
+            Corner::Battery => facts[1] != u64::MAX,
+            Corner::Spare => false,
         };
         let ring_w = r / 16.0;
         // The radio's state as its driver says it (measure STATE): connected the flavour's full ring, up and searching one stop darker; a driver that says nothing, its ring by whether it runs.
@@ -2571,6 +2573,23 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
         };
         let mut lines = [Txt::new(); 9];
         let mut nl = 1;
+        // The battery: its charge as the name, then the cell's voltage, the current (+ charging), their product and the temperature, as the gauge measures them (facts 1-4: per cent, hundredths of a degree, µV, µA).
+        let mut charge = Txt::new();
+        if what == Corner::Battery && facts[1] != u64::MAX {
+            charge.num(facts[1] as i64, 1, 0).s(" %");
+            let (cc, uv, ua) = (facts[2] as i64, facts[3] as i64, facts[4] as i64);
+            lines[nl].num(uv, 1_000_000, 3).s(" V");
+            nl += 1;
+            if ua >= 0 {
+                lines[nl].s("+");
+            }
+            lines[nl].num(ua, 1000, 0).s(" mA");
+            nl += 1;
+            lines[nl].num(uv * ua / 1_000_000, 1_000_000, 2).s(" W");
+            nl += 1;
+            lines[nl].num(cc, 100, 1).s(" \u{B0}C");
+            nl += 1;
+        }
         let mut tech = None;
         if let Some(ri) = radio {
             for &m in &facts[33 + 8 * ri..41 + 8 * ri] {
@@ -2597,6 +2616,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
             Corner::Nfc => "nfc",
             Corner::Gnss => "gnss",
             Corner::Usb => "usb",
+            Corner::Battery if charge.n > 0 => charge.str(),
             Corner::Battery => "batt",
             Corner::Home | Corner::Spare => "",
         };
