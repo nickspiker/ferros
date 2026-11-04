@@ -2295,6 +2295,10 @@ mod hvcore {
     }
 
     /// The jump's mailbox (2026-11-02), in the hv's reservation below the report page: one 32-byte slot per core, [entry, context, state]. A parked core sets state 1 and waits; ferros, started by the jump, starts a core by writing its context and then its entry (ferros_kernel platform::start_core) instead of calling PSCI CPU_ON.
+    /// The jump's TRNG pool for ferros (see `jump`): G#A_FFE0_0000, between the jump's bootconfig and the mailbox. [magic "TRNGPOOL", words drawn, words].
+    pub const TRNG_POOL: usize = 0xA_FFE0_0000;
+    pub const TRNG_POOL_MAGIC: u64 = 0x4C4F_4F50_474E_5254;
+    const TRNG_POOL_WORDS: usize = 1278;
     pub const MAILBOX: usize = 0xA_FFFE_0000;
     /// The hand-off's trace in the ramoops page (survives the warm reset a failed jump ends in; the mailbox does not): per core, when ferros asked (+G#80), when the parked core took its entry (+G#0), when it reached ferros's Rust (-G#80, written by ferros). Cleared at each jump.
     pub const TRACE: usize = 0xFD60_0C00;
@@ -2462,18 +2466,31 @@ mod hvcore {
         let exit = smc(0x8200_1012, 1, 0, 0);
         let (mut hi, mut he) = ([0u8; 16], [0u8; 16]);
         super::pstore::log(&[b"ferros hv: jump -- TRNG INIT ", super::pstore::hex(init, &mut hi), b" EXIT ", super::pstore::hex(exit, &mut he), b"\nferros hv: jump -- TRNG_RND64 probe\n"]);
-        // 64 calls (about the self-test's volume), a line every 8: the third jump's single probe answered and so did ferros's first call, then ferros's second never returned; a hang partway here says the firmware's TRNG goes bad after Android whoever asks, all 64 says it is ferros's.
-        let mut rnd = 0u64;
-        for k in 0..64u64 {
-            rnd = smc(0xC400_0053, 192, 0, 0);
-            if k % 8 == 7 || rnd != 0 {
-                let (mut hk, mut hr) = ([0u8; 16], [0u8; 16]);
-                super::pstore::log(&[b"ferros hv: jump -- TRNG_RND64 call ", &super::pstore::hex(k + 1, &mut hk)[14..16], b" answered ", super::pstore::hex(rnd, &mut hr), b"\n"]);
+        // The firmware TRNG's words for ferros, drawn here (HV.md, the jump): ferros's own TRNG_RND64 after a jump hung inside the firmware on about one jump in five (2026-11-03: four of some eighteen, the call never returning, the boot core lost), while the hv's calls on this same core just before ferros never did (hundreds, none hung). So ferros takes none after a jump: these words are its TRNG source until its own boot is done (kohi::trng_words takes them, wiping each word as it goes; the rest is wiped when KOHI's gather is done). A pool: magic, words drawn, then the words in the order ferros's own call returns them (x3, x2, x1). 1278 words: KOHI's 1024 and the key self-test's hundred, with room.
+        let mut drawn = 0usize;
+        let mut status = 0u64;
+        while drawn + 3 <= TRNG_POOL_WORDS {
+            let (st, x1, x2, x3): (u64, u64, u64, u64);
+            unsafe {
+                asm!("smc #0", inout("x0") 0xC400_0053u64 => st, inout("x1") 192u64 => x1, inout("x2") 0u64 => x2, inout("x3") 0u64 => x3,
+                    out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _);
             }
-            if rnd != 0 {
+            if st != 0 {
+                status = st;
                 break;
             }
+            for (k, w) in [x3, x2, x1].iter().enumerate() {
+                unsafe { write_volatile((TRNG_POOL + 16 + (drawn + k) * 8) as *mut u64, *w) };
+            }
+            drawn += 3;
         }
+        unsafe {
+            write_volatile((TRNG_POOL + 8) as *mut u64, drawn as u64);
+            write_volatile(TRNG_POOL as *mut u64, TRNG_POOL_MAGIC);
+            asm!("dsb sy");
+        }
+        let (mut hd, mut hs) = ([0u8; 16], [0u8; 16]);
+        super::pstore::log(&[b"ferros hv: jump -- TRNG pool: ", super::pstore::hex(drawn as u64, &mut hd), b" words, last status ", super::pstore::hex(status, &mut hs), b"\n"]);
         // The cluster watchdogs re-armed at their longest (ferros's own arm_safety setting: prescaler G#FF, divider 128, count G#FFFF): Android's daemon ran them with its own timeout, and between the freeze and ferros's `arm_safety` (the cache clean, the copy, ferros's first steps with the MMU off) that timeout ran out on some jumps: the APC watchdog before ferros had rotated its notes (the eleventh and fourteenth jumps, 2026-11-01). Stopping them instead left a failed jump hung for good, killswitch and all (the sixteenth jump). ferros re-arms them the same way.
         for &w in &WATCHDOGS {
             wr(w, 0);
