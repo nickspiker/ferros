@@ -35,3 +35,5 @@ Related: [[hv-chords-decided]], [[ufs-firewall-decided]], [[android-behind-attes
 2026-11-03: after the deep-sleep fix, jumps are intermittent (5 tries: 3 froze at the first firmware TRNG_RND64 from ferros, 1 lost the X3 + two workers, 1 landed). Suspect Android cores frozen right after a PRIV_REG (G#8200_0504) PMU write, before CPU_SUSPEND, reaching ferros armed to power down at WFI; the jump logs last SMC + x1/x2 per core (HV.md).
 
 2026-11-03 evening, FOUND: parked cores kept Android's PSTATE.PAN; with E2H/TGE it applies at EL2 and the first load from the EL0-accessible hand-over block after MMU-on faulted silently (hv vectors unexecutable). Fix: entries eret to themselves (SPSR G#3C9) first. Also active clocks at once after a jump (Android left the X3 at 377 MHz). Jump 12 landed clean. The PMU-write and DMA theories were tested and ruled out.
+
+2026-11-03: jumps 12-14 clean after PAN + clocks. Camera jumps still fail: UFS doorbell busy (fixed: adopt only when UTRLDBR==0) and DECON reprogrammed under ferros (static) + later watchdog. Android DMA masters keep running after the freeze; proposal: hv fences all non-ferros S2MPUs (deny, fault mode) at the jump.
