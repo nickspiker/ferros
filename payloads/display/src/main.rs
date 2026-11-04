@@ -2424,6 +2424,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     ALLOC.init(heap);
 
+    // After the jump with the DPU powered down (Android's DECON hibernation, SYS_FACTS 30 = 1): not one DECON or DSIM register is touched, since such an access poisons EL3 and the next firmware call anywhere hangs forever (the kernel's display.rs). The panel keeps Android's last frame; ferros runs on without a display.
+    if ferros_sys::facts().0[30] == 1 {
+        log.s(b"display: the jump found the DPU powered down (Android's hibernation); its registers are not touched\n");
+        log.flush();
+        ferros_sys::exit(3);
+    }
+
     // ABL's 8 bpc pipe to the 10 bpc blend, once (modeset.rs; the kernel did this before init until 2026-11-01): before the raster is read and before any frame or panel thread.
     let t_ms = now();
     // After the jump from a running Android (SYS_FACTS 31 = 6) the pipe runs Android's raster and panel mode (already 10 bpc). The raster below is then DECON's own output (the blender's background size), not the layer DMA's, which holds whatever layer Android drew last (1008x2023 on the sixth jump, 2026-11-01). The modeset is not forced: forcing it under Android's panel state was followed by the APM watchdog on jumps seven to nine.

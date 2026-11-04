@@ -2499,9 +2499,14 @@ mod hvcore {
             wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
         set(19, 1);
+        // The EL3 poison rule (ferros_kernel display.rs): a CPU access to DECON with the DPU's power domains down returns 0 and leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever. Android powers the DPU down between frames whenever the screen is still (DECON hibernation), so a jump at such a moment poisoned EL3 here and ferros's first firmware call after it never returned (2026-11-03: the jumps that froze at a TRNG call or lost a core at its first firmware call). The domains read through EL3 first (DPUB, DPUF0, DPUF1 status, 1 = on); DECON and the display SysMMUs are touched only when all three are on.
+        let dpu_on = [0x1546_1D00u64, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| smc(0x8200_0504, a, 0, 0) == 1);
+        super::pstore::log(&[if dpu_on { b"ferros hv: jump -- DPU powered\n" as &[u8] } else { b"ferros hv: jump -- DPU powered DOWN (Android's hibernation): DECON left alone\n" }]);
         // No frame may be in flight when translation goes off: the second jump switched the display SysMMUs off under a running scanout, the engine fetched Android's IOVAs as physical addresses, and the interconnect stalled until the APM watchdog reset the device (ferros left no notes). Trigger masked first, then 1/16 s, longer than a frame at 60 Hz.
-        let t = rd(DECON0_TRIG_CON);
-        wr(DECON0_TRIG_CON, (t & !1) | (1 << 4));
+        if dpu_on {
+            let t = rd(DECON0_TRIG_CON);
+            wr(DECON0_TRIG_CON, (t & !1) | (1 << 4));
+        }
         let (t1, _) = now();
         while now().0.wrapping_sub(t1) < f >> 4 {}
         set(19, 2);
@@ -2515,7 +2520,7 @@ mod hvcore {
         for k in 0..bc {
             unsafe { write_volatile((LOW_BOOTCONFIG + k) as *mut u8, read_volatile((JUMP_BOOTCONFIG + k) as *const u8)) };
         }
-        for &s in &DPU_SYSMMUS {
+        for &s in DPU_SYSMMUS.iter().filter(|_| dpu_on) {
             let n = (rd(s + 0x100) & 0x1F) as usize;
             for vm in 0..n {
                 let c = s + 0x8000 + vm * 0x1000;

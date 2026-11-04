@@ -328,10 +328,6 @@ pub fn gather(context: &str) -> (Option<[u8; 32]>, [Health; 3]) {
             }
         }
     }
-    // The jump's TRNG pool has served its last word (the key self-test before, this gather now): the rest wiped.
-    if crate::platform::jumped() {
-        wipe_jump_pool();
-    }
     if healthy == 0 || healthy * 2 < present {
         return (None, health_of);
     }

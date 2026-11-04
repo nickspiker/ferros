@@ -590,6 +590,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[11] = (THROTTLED_FROM.load(Relaxed) != 0) as u64;
     // How this boot began: the hv gate's answer (ready.rs GATE_TELEMETRY low byte: 1 power, 2 timer, 3 volume down, 4 recovery refused, 5 the chord's reset, 6 the jump from a running Android), 0 when not through the hv. A driver whose hardware Android may have left running reads it (the modem, after a jump).
     v[31] = crate::ready::GATE_TELEMETRY.load(Relaxed) & 0xFF;
+    // 30: after the jump from Android, whether the DPU's power domains are on (2) or down (1, Android's DECON hibernation: never touch DECON or DSIM then, the EL3 poison rule in display.rs); 0 when this boot is not a jump. Read through EL3, which is safe.
+    v[30] = if crate::platform::jumped() { 1 + crate::display::dpu_on() as u64 } else { 0 };
     // The sensors process's block when it publishes one (sensorlink.rs, KERNEL-OUT.md move 4); with none, the sensor words stay unknown (the kernel has no USF of its own since 2026-11-01).
     if crate::sensorlink::live() {
         use crate::sensorlink::{word, GRAVITY_XY, GRAVITY_Z, PAIR, PROX, SPECTRAL};

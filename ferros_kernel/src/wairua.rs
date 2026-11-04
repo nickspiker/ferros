@@ -33,6 +33,10 @@ fn session_state() -> &'static (bool, [crate::kohi::Health; 3]) {
             KOHI_MS.store(((crate::platform::cntpct() - t0) / (crate::platform::cntfrq() / 1000)) as u32, core::sync::atomic::Ordering::Relaxed);
             // Into the registers; `keys::set` wipes this copy.
             let held = w.as_mut().is_some_and(|w| crate::keys::set(crate::keys::WAIRUA, w));
+            // The jump's TRNG pool (kohi::trng_words) has served its last word: the gather took its share and `keys::set` the masks for the wairua's own setting, after which the wairua's stream serves every mask. The rest wiped here, not at the end of the gather (2026-11-03: wiped there, the wairua's set found the pool closed, "keys: TRNG refused", weak masks).
+            if crate::platform::jumped() {
+                crate::kohi::wipe_jump_pool();
+            }
             *s = Some((held, health));
             if held {
                 // Yellow: up, but a stand-in until PIPE (held in CPU registers, not on-die ones). The first two bytes of its one-way fingerprint follow the label.
