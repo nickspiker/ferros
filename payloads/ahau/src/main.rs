@@ -290,8 +290,13 @@ impl Ahau {
 
     /// Text centred across the screen on `baseline`, by the keyboard's estimate of the typeface's advance (0.56 em).
     fn centred(&self, baseline: usize, px: usize, value: u16, t: &str) {
-        let x = self.w as i64 / 2 - t.chars().count() as i64 * px as i64 * 28 / 100;
+        let x = self.centre_x(self.w as i64 / 2, px, t.as_bytes());
         window::text(self.display, self.base, x as i16, baseline as i16, px as u16, value, t.as_bytes());
+    }
+
+    /// Where text starts so it is centred on `cx`: its width as the display's typeface sets it (op 28, `measure`, in quarter pixels). A width guessed from the character count (0.56 em each) put proportional lines off centre (owner, 2026-11-04).
+    fn centre_x(&self, cx: i64, px: usize, t: &[u8]) -> i64 {
+        cx - self.measure(px, t) / 8
     }
 
     fn clear_rows(&self, y0: usize, y1: usize) {
@@ -417,12 +422,12 @@ impl Ahau {
         if self.can_go_back() {
             let (bx0, by0, bx1, by1) = self.back_at();
             let px = self.w / 24;
-            let x = (bx0 + bx1) as i64 / 2 - 4 * px as i64 * 28 / 100;
+            let x = self.centre_x((bx0 + bx1) as i64 / 2, px, b"back");
             window::text(self.display, self.base, x as i16, ((by0 + by1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, b"back");
         }
         if let Some(t) = self.button_label() {
             let px = self.w / 24;
-            let x = (x0 + x1) as i64 / 2 - t.len() as i64 * px as i64 * 28 / 100;
+            let x = self.centre_x((x0 + x1) as i64 / 2, px, t.as_bytes());
             window::text(self.display, self.base, x as i16, ((y0 + y1) / 2 + px * 35 / 100) as i16, px as u16, TEXT, t.as_bytes());
         }
     }

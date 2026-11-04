@@ -729,20 +729,22 @@ impl Client {
     /// The proximity carriers: with a request, its secret served on the NFC tag and its beacon id advertised; without, both stopped. The calls carry CALL_LIVE: a driver that is down, or still bringing its chip up (Bluetooth gives WiFi 16 s at boot), fails the call at once instead of holding this client and, through it, the attest screen. One that missed its handover is tried again every 16 s from the loop (`radios_retry`); the words work meanwhile.
     fn radios(&mut self, on: Option<(&[u8; 32], &[u8; 16])>) {
         let (nfc, bt) = (cap(unsafe { GRANTS }, S_NFC), cap(unsafe { GRANTS }, S_BT));
-        let mut r = [0u8; 4];
+        // Each driver's reply is [0 done, else refused] (payloads/nfc, payloads/bt): read, not just whether it answered. Until 2026-11-04 any answer logged "ok", so a refused advertise looked like a beacon out.
+        let (mut ra, mut rb) = ([0u8; 4], [0u8; 4]);
         let (a, b) = match on {
             Some((s, id)) => {
                 let mut m = [0u8; 33];
                 m[0] = 1;
                 m[1..].copy_from_slice(s);
-                let a = ferros_sys::call_live(nfc, &m, &mut r);
+                let a = ferros_sys::call_live(nfc, &m, &mut ra);
                 let mut m = [0u8; 17];
                 m[0] = 1;
                 m[1..].copy_from_slice(id);
-                (a, ferros_sys::call_live(bt, &m, &mut r))
+                (a, ferros_sys::call_live(bt, &m, &mut rb))
             }
-            None => (ferros_sys::call_live(nfc, &[2], &mut r), ferros_sys::call_live(bt, &[2], &mut r)),
+            None => (ferros_sys::call_live(nfc, &[2], &mut ra), ferros_sys::call_live(bt, &[2], &mut rb)),
         };
+        let said = |n: u64, r: &[u8; 4]| -> &'static [u8] { if n == ERR { b"not running" } else if n >= 1 && r[0] != 0 { b"refused" } else { b"ok" } };
         self.radios_on = on.is_some();
         self.radios_missed = on.is_some() && (a == ERR || b == ERR);
         self.radios_at = now();
@@ -750,9 +752,9 @@ impl Client {
             self.radios_last = Some((*s, *id));
         }
         self.log.put(if on.is_some() { b"fgtw: tap secret and beacon out: nfc " } else { b"fgtw: tap secret and beacon stopped: nfc " });
-        self.log.put(if a == ERR { b"not running" } else { b"ok" });
+        self.log.put(said(a, &ra));
         self.log.put(b", bt ");
-        self.log.put(if b == ERR { b"not running" } else { b"ok" });
+        self.log.put(said(b, &rb));
         self.log.line();
     }
 
