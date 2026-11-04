@@ -1,5 +1,7 @@
 # Photon on ferros
 
+**The Photon app is not part of ferros** (owner, 2026-11-04: "Photon is just an app. on non ferros it just happens to have the FGTW bits in it too. Just like Mahere, or Lumis"). What this page built is the FGTW side, the identity and the fleet, and on ferros that is the OS's own: the process `fgtw` (payloads/fgtw), part of attest, started by init once a person attests, with the vault scope `fgtw.`. Photon the messenger is an app a person installs, and nothing of it is in the base OS. It was the process `photon` until the same day.
+
 The device as a device of the owner's Photon fleet (Claude memories/photon_on_ferros_no_bootstrap.md; photon docs/pairing-v2.md "The ceremony over the mesh", docs/peers-are-fgtw.md Phase A′). Started 2026-10-26, owner: "the priority is allowing the new ferros device bind".
 
 ## What runs
@@ -9,7 +11,7 @@ The device as a device of the owner's Photon fleet (Claude memories/photon_on_fe
   - `pt.rs` — Photon Transport over UDP: a frame up to 1024 bytes as one datagram with its packet ack; larger as a signed `pt_spec`, DATA chunks, chunk acks and a `pt_done`. Interop: a 30 KB frame device → app and 45 KB app → phone through Photon's own `PTManager`, plus packet acks both ways.
   - `join.rs` — the device's keys across the three families (Ed25519, Falcon-512, SLH-DSA-SHA2-128s), derived and signing exactly as fgtw's `SigningBundle`; the LAN beacon; the binding request and its `bind_req` envelope; `fleet_resp` / `fanout_resp` parsing, the chain folded against our roots (fgtw's fold), the fan-out opened with our ira; the 23 pairing words; eagle time from a UTC clock.
   - `fgtw` (the fleet substrate) and `voca` (the wordlist) build `no_std` since 2026-10-26 so the device runs the same fold and codec the desktop and the worker run.
-- **`payloads/photon`** — the client process: beacons as the app does (`pt_disc` to 239.104.199.144 and ff02::68c7:9014, port 4384), hears the fleet's devices beaconing under the same handle, hands the nearest its binding request over PT, takes the chain and the fan-out back, keeps them in the vault, answers pings once bound. 128 KiB thread stack, 160 KiB heap in `.data` (sized to a 1 MiB arc).
+- **`payloads/fgtw`** — the client process: beacons as the app does (`pt_disc` to 239.104.199.144 and ff02::68c7:9014, port 4384), hears the fleet's devices beaconing under the same handle, hands the nearest its binding request over PT, takes the chain and the fan-out back, keeps them in the vault, answers pings once bound. 128 KiB thread stack, 160 KiB heap in `.data` (sized to a 1 MiB arc).
 - **Kernel**: `SYS_IRA` (23) with an Ira capability (spawn kind 9, `ferros-bridge --ira`) hands a process `blake3::derive_key("ferros process ira v1 " ‖ domain, ira)` — the Photon device key's root, the same after a factory reset ([[ira_network_owns_assignment]]); the vault scope `photon`.
 
 ## Identity and the vault
@@ -17,9 +19,9 @@ The device as a device of the owner's Photon fleet (Claude memories/photon_on_fe
 | key | what | from |
 |---|---|---|
 | ira-derived `photon device` | the device key's fingerprint | the kernel, every boot |
-| `photon.identity_seed`, `photon.handle_proof` | the identity roots | by default NOT on disk: the attest screen hands them to the client in RAM (op 4). Stored only when `device.unlock_at_boot` is on (opt-in, warned); wiped from disk whenever it is off. Never pushed from another machine. |
-| `photon.chain` | the fleet's membership chain as last adopted | a sponsor's `fleet_resp` |
-| `photon.fleet_key` | the fleet key | a sponsor's `fanout_resp`, opened with our ira |
+| `fgtw.identity_seed`, `fgtw.handle_proof` | the identity roots | by default NOT on disk: the attest screen hands them to the client in RAM (op 4). Stored only when `device.unlock_at_boot` is on (opt-in, warned); wiped from disk whenever it is off. Never pushed from another machine. |
+| `fgtw.chain` | the fleet's membership chain as last adopted | a sponsor's `fleet_resp` |
+| `fgtw.fleet_key` | the fleet key | a sponsor's `fanout_resp`, opened with our ira |
 
 The handle itself never reaches the device: `ihi::handle_to_hash` runs over vsf's `x` text codec, whose 9 MB tables stay off the device.
 
@@ -40,7 +42,7 @@ Done to step 3 on the first night; steps 4–6 need the device's owner at one of
 
 The owner's rule: no form of the handle on this device. A stored identity seed is the identity's root key and a fast target — on a desktop Ryzen, a stolen seed checks `x`-encode + BLAKE3 at 45 M handle guesses/s across 32 threads (3.1 M on one), so a memorable two-word handle falls in seconds (the handle proof is the memory-hard wall, ~1 s/guess; the seed is not). The vault is sealed under the ira and ferros unseals it itself at boot, so a stored seed on a stolen phone IS the identity.
 
-So by default the device stores nothing of the identity. The handle is typed each boot; the attest screen derives the seed and proof and hands them to the Photon client in RAM (the `photon` endpoint's op 4, `[4][seed 32][proof 32]`); the client looks the identity up, and the fleet key is recovered from the published fan-out into RAM (`recover_fleet_key`). Wiped or stolen, there are no keys anywhere, all derived again from the handle and the ira.
+So by default the device stores nothing of the identity. The handle is typed each boot; the attest screen derives the seed and proof and hands them to fgtw (the identity service) in RAM (the `photon` endpoint's op 4, `[4][seed 32][proof 32]`); the client looks the identity up, and the fleet key is recovered from the published fan-out into RAM (`recover_fleet_key`). Wiped or stolen, there are no keys anywhere, all derived again from the handle and the ira.
 
 Opt-in: `device.unlock_at_boot` (SETTINGS.md) stores the seed, proof, chain and fleet key, so the device unlocks without the handle being typed. The attest screen's entry carries the toggle and, when on, warns "if this device is lost, whoever holds it becomes you." Turning it off (or booting with it off) wipes every identity value from the vault (`Client::forget_disk`).
 

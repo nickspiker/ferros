@@ -20,7 +20,7 @@ The vault holds two classes of entry.
 | What | Vault names |
 |---|---|
 | The home screen | `map.place.*` (where each circle sits), `map.view` (the camera), everything else under `map.` |
-| The Photon client | `photon.*`: the chain and fleet key when kept, its phonebook |
+| fgtw (the identity service) | `photon.*`: the chain and fleet key when kept, its phonebook |
 | The attest screen's own | `ahau.*` |
 | Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
 | Next | the person's installed apps (their capsules), device pairings (car, headphones), every app's data |
@@ -35,14 +35,14 @@ The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is ide
 - **The device-only secret** is 32 bytes from the session's wairua, made at the first unlock and kept in the device class. Google never sees it.
   - Android cannot read it once the gate's hypervisor nets the ferros partition (planned: no Android reads or writes of the ferros partition; the calibration data, chip ID, devinfo and UFS serial stay open because Android needs them).
   - With the net in place and the bootloader locked, getting to the identity key takes a desoldered UFS and the chip's values as well as the handle.
-- **The identity seed** is BLAKE3 over the typed handle: milliseconds, so the space opens with no visible wait. The memory-hard handle proof is the Photon client's (the public registry, squatting) and is made behind the screen.
+- **The identity seed** is BLAKE3 over the typed handle: milliseconds, so the space opens with no visible wait. The memory-hard handle proof is fgtw's (the public registry, squatting) and is made behind the screen.
 
 ## One identity per device
 
 The network owns the assignment: a device belongs to the identity whose fleet bound it, and never reassigns itself.
 
 - **Not bound.** The first handle typed unlocks, and its space is created. The device then joins that identity's fleet (the look-up, the pairing words, a sponsor adds it). A different handle typed later, still unbound, wipes the earlier one's leftovers first.
-- **Bound.** When the fleet's chain names this device, the Photon client binds it (`SYS_UNLOCK` op 3; the attest screen does too when it sees membership). From then on, only that identity's handle opens the device; any other is refused ("This device belongs to another identity").
+- **Bound.** When the fleet's chain names this device, fgtw (the identity service) binds it (`SYS_UNLOCK` op 3; the attest screen does too when it sees membership). From then on, only that identity's handle opens the device; any other is refused ("This device belongs to another identity").
   - The check needs no stored verifier: a seed whose key opens no name list is not the bound identity's.
 - **Released.** A completed departure (the fleet's consented Remove, PHOTON.md "Leaving the fleet") releases the device (op 4):
   - every identity entry is deleted by its address;
@@ -53,14 +53,14 @@ The network owns the assignment: a device belongs to the identity whose fleet bo
 
 ## Unlocking and locking
 
-- **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to the Photon client. On an unbound device the look-up and join run as before.
+- **At attest.** ahau derives the seed and unlocks (op 1). On a bound device the screen closes at once; the proof follows behind it, then the roots go to fgtw (the identity service). On an unbound device the look-up and join run as before.
 - **The boot order** (init):
   1. Display, touch, the attest screen.
   2. WiFi (the chip comes up; it joins once `wifi.cred` can be read), IP, NFC, Bluetooth, the modem.
-  3. A wait for a person (op 0), then the map and the Photon client. They read the identity class.
+  3. A wait for a person (op 0), then the map and fgtw (the identity service). They read the identity class.
 - **Unlock at boot** (`device.unlock_at_boot`, opt-in, warned): while it is on, the kernel keeps the seed in the device class and unlocks at boot, before init starts. Off, the kept seed is deleted at boot.
 - **Locking.** Only when power goes, or when the device switches OS. Every reset the kernel orders drops the key first, its bytes overwritten (`platform::before_reset`), because a warm reset keeps DRAM. There are no timers.
-- **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and the Photon client hold:
+- **The syscall.** `SYS_UNLOCK` (24), with the Unlock right, which only ahau, init and fgtw (the identity service) hold:
 
 | Op | Does | Returns |
 |---|---|---|
@@ -111,7 +111,7 @@ Not built; for the owner to approve before it is.
 **The rule stays one rule.** A name is identity class when it starts with a prefix in `kvault.rs` `IDENTITY`. Moving a thing to the person is adding its prefix there and moving its names under it, never a second mechanism.
 
 **Installed apps.**
-- What the person installs lives under `app.`: the capsule at `app.<name>`, the app's own data under `app.<name>.` (its store scope, one per app, the way `map.` and `photon.` are scoped today).
+- What the person installs lives under `app.`: the capsule at `app.<name>`, the app's own data under `app.<name>.` (its store scope, one per app, the way `map.` and `fgtw.` are scoped today).
 - Drivers and the attest front end stay where they are (`display`, `touch`, `usb`, `pcie1`, `ahau`, …), device class: they run before anyone is present.
 - The map starts an app by its vault name, as it starts `ramps` today, so the change there is the name (`app.ramps`) and the moment: the map already runs only once an identity is unlocked (init's `wait_unlocked`), so an app's capsule is readable exactly when it can be started.
 - The `sealed` list (the seals of installed masked capsules) stays device class: a seal is keyed with the OS-only key, so it says nothing about the person, and the kernel needs it before anyone attests to spawn the device's own masked processes.

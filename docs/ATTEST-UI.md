@@ -5,7 +5,7 @@ Nothing here is built yet beyond "what exists". The decisions are at the end.
 
 ## What exists
 
-- **The attest screen** (ahau): the mark (tapuwae, 900 px), the handle line under it (typed in the clear, the bar's left key clears), the honeycomb keyboard in the device's layout. A first entry is not a claim: the Photon client looks the handle up (the fleet's devices nearby first, then fgtw.org); minting asks for the handle twice, visibly. Optional unlock-at-boot stores the seed.
+- **The attest screen** (ahau): the mark (tapuwae, 900 px), the handle line under it (typed in the clear, the bar's left key clears), the honeycomb keyboard in the device's layout. A first entry is not a claim: fgtw (the identity service) looks the handle up (the fleet's devices nearby first, then fgtw.org); minting asks for the handle twice, visibly. Optional unlock-at-boot stores the seed.
 - **The corners**: the four corners outside the app circle belong to the system (WINDOWS.md). Only the clock is drawn, top left, in the device's base, redrawn once a minute. Signal and navigation are noted as "later".
 - **Facts** a process can read (SYS_FACTS): boot-to-home time, battery (%, temperature, voltage, current and its sign), USB link, processes alive, keys in the vault, the wall clock and zone, the hottest thermal zone and whether throttled, gravity, the spectral and proximity samples, how the boot began. **Not there:** the radios' link state.
 - **WiFi**: the driver joins at boot from the vault's `wifi.cred` (two lines: SSID, passphrase) and serves Ethernet frames on `wlan`. It scans to find the credential's network. It has **no runtime op** for scanning on request, joining a new network, or reporting its state.

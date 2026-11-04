@@ -1,8 +1,8 @@
 //! ahau: the attest screen (Claude memories/ferros_attest_os_level.md; the capsule the owner named, Māori "I, me"). The first thing on the glass at boot: init starts it before the map, at the system level, so it covers everything until the person proves who they are by typing their handle on the honeycomb keyboard. Then its window goes and the map is there.
 //!
-//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the Photon client in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the device unlocks without the handle being typed — a stolen device then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
+//! The derivation is ihi's, computed here without std (ahau_core): the identity seed is BLAKE3 over vsf's `x` encoding of the handle, byte-exact for every character the keyboard can type. Nothing of the identity is written to disk: the seed and proof are handed to the identity service (fgtw) in RAM (op 4), and the device is recognised as its identity's only once the client folds the public chain and finds this device a member (owner, 2026-10-28: "sand on the beach with no keys anywhere and it's all derived from the handle and the ira"). The one exception is opt-in: `device.unlock_at_boot` stores the seed so the device unlocks without the handle being typed — a stolen device then holds the identity. It is not switched here (owner, 2026-10-29: the attest screen carries no toggle); wherever it is switched on must say so.
 //!
-//! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the Photon client in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
+//! - Default: the handle is typed each boot. Its proof (ihi's memory-hard proof, 24.9 MB of scratch, 17 rounds) is derived, the seed and proof go to the identity service (fgtw) in RAM, and the client looks the identity up. A member unlocks; a fleet to join shows the words; a free handle is minted.
 //! - Opt-in (unlock at boot): the seed is stored, the client loads it from the vault at boot, and the screen unlocks as soon as the client reports membership, with no handle typed.
 //!
 //! The handle shows as it is typed: it is a name the person proves, not a password (owner, 2026-10-27: "this is NOT a password"). A wrong one stays on screen to be corrected; the bar's left key clears it. Minting a new identity asks for the handle a second time, shown as typed like the first, the first cleared so a typo is not simply copied (owner, 2026-10-27: "you only do that once"); clear during the second goes back to the first. The buffer is wiped once attest succeeds.
@@ -11,9 +11,9 @@
 //!
 //! The keyboard is the device's layout (`device.layout`, ferros_sys::PREF_LAYOUT: Dvorak unless set), which the last identity to attest leaves on the device (SETTINGS.md). There is no switch on this screen (owner, 2026-10-29: the room went to the mark); the layout is set from the identity's settings or `diag pref`, and the keyboard follows it.
 //!
-//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the Photon client looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
+//! A first entry is not a claim (2026-10-28, after it let a person in under a handle that already had a fleet): the handle's roots go into the vault and the identity service (fgtw) looks the identity up, its fleet's devices nearby first and fgtw.org last (photon docs/pairing-v2.md, peers-are-fgtw.md). A fleet: this device joins it, its pairing words shown for one of the fleet's devices to add it. No fleet anywhere: the permanence warning, the handle again, and the client mints the genesis. Nothing answering: nothing is decided, and the person may go on while the client keeps looking. The screen does not hold the device hostage meanwhile (owner: "Doesn't have to stay locked").
 //!
-//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings, 8 the Photon client (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer).
+//! Grant slots: 0 console, 1 display (use), 2 touch (use), 3 its surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings, 8 the identity service, fgtw (use), 9 the identity unlock right, 10 a second surface (the keyboard's back buffer).
 #![no_std]
 #![no_main]
 
@@ -63,7 +63,8 @@ const S_TOUCH: u64 = 2;
 const S_SURF: u64 = 3;
 /// The vault scope `ahau.` (identity class, AUTH.md): `proof`, the unlocked identity's handle proof once computed here.
 const S_AHAU: u64 = 4;
-const S_PHOTON: u64 = 5;
+/// The vault scope `fgtw.` (identity class): the identity service's, where the roots go when unlock-at-boot keeps them.
+const S_FGTW: u64 = 5;
 const S_SETTINGS: u64 = 7;
 /// The ira key: per-purpose keys derived from the device's ira (here the attest mark's salt).
 const S_IRA: u64 = 6;
@@ -108,8 +109,8 @@ static FRESH_DONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// The generation the last finished frame drew (FRESH_DONE_GEN), and the generation of the handle as typed (SHOW_GEN): the screen puts up only a frame of the typed handle, so a preview drawn while a finger is down waits for the lift, and one the finger slid off never shows.
 static FRESH_DONE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static SHOW_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The Photon client's endpoint (payloads/photon): op 1 its state and, while joining, its pairing words; op 2 mint.
-const S_PHOTON_EP: u64 = 8;
+/// fgtw's endpoint (payloads/fgtw, the identity service): op 1 its state and, while joining, its pairing words; op 2 mint.
+const S_FGTW_EP: u64 = 8;
 /// Grant slot 9: the identity unlock right (SYS_UNLOCK, AUTH.md): the person's space opens from the seed, before the proof.
 const S_UNLOCK: u64 = 9;
 /// Slot 10: a second surface, the keyboard's back buffer: a board that a key's tap will redraw (shift, a page, a layout) is drawn there whole while the finger is down and copied in at the lift (`prepare`), as the mark's frame is rendered ahead by its thread. Without it the lift redrew the board in place, 59 ms (2026-11-01: draw 14, the key map 37, the tint 8), and the shift showed a few frames late.
@@ -191,7 +192,7 @@ static ALLOC: Bump = Bump;
 enum Mode {
     /// No identity in hand: the entry.
     Fresh,
-    /// The roots of this seed are in the vault; the Photon client is looking the identity up.
+    /// The roots of this seed are in the vault; the identity service (fgtw) is looking the identity up.
     Looking([u8; 32]),
     /// The identity has a fleet: one of its devices adds this one with the words shown; enter goes on.
     Join([u8; 32]),
@@ -223,7 +224,7 @@ struct Ahau {
     chars: usize,
     /// The blinkey's place in the handle, a byte offset on a character's boundary: typing inserts there, delete takes the character before it, a tap on the entry line moves it.
     caret: usize,
-    /// The Photon client's pairing words while this device joins its identity's fleet.
+    /// The identity service's pairing words while this device joins its identity's fleet.
     word_buf: [u8; 512],
     word_len: usize,
     /// The back surface's base (0: none granted, the board is drawn in place), where boards are drawn and tinted before they show; which board each slot of BOARDS holds, and the slot on show.
@@ -470,11 +471,11 @@ impl Ahau {
         flush(&row[..n], line);
     }
 
-    /// The Photon client's state (op 1): its state byte, with the pairing words kept while it joins.
+    /// The identity service's state (op 1): its state byte, with the pairing words kept while it joins.
     fn client_state(&mut self) -> Option<u8> {
         let mut out = [0u8; 600];
         // CALL_LIVE: a client that is not answering yet (starting, or between passes of its loop) is a None this poll, never a frozen screen.
-        let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[1], &mut out);
+        let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[1], &mut out);
         if n == ferros_sys::ERR || n == ferros_sys::NOTHING || n < 2 {
             return None;
         }
@@ -523,7 +524,7 @@ impl Ahau {
         true
     }
 
-    /// Hand the roots to the Photon client in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The call does not wait for a client that is not answering yet (CALL_LIVE): the hand-over is then marked pending and made again at the next poll (`follow_client`), so the screen never freezes on it.
+    /// Hand the roots to the identity service (fgtw) in RAM (op 4): it takes them, keeps them on disk only if unlock-at-boot is on, and looks the identity up. Nothing is written here. The call does not wait for a client that is not answering yet (CALL_LIVE): the hand-over is then marked pending and made again at the next poll (`follow_client`), so the screen never freezes on it.
     fn send_roots(&mut self, seed: &[u8; 32], proof: &[u8; 32]) {
         self.session_seed = Some(*seed);
         self.session_proof = Some(*proof);
@@ -538,7 +539,7 @@ impl Ahau {
         m[1..33].copy_from_slice(&seed);
         m[33..65].copy_from_slice(&proof);
         let mut out = [0u8; 16];
-        ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &m, &mut out) != ferros_sys::ERR
+        ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &m, &mut out) != ferros_sys::ERR
     }
 
     /// The entry: the handle as typed, a cursor, and a line under it.
@@ -937,7 +938,7 @@ impl Ahau {
                 return;
             }
         };
-        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the Photon client's business (the public registry), not the unlock's. One identity per device: on a device its fleet has bound, the kernel opens only that identity's space, so an open space there is the device's own person and the screen goes now, the proof made behind it; another handle is refused. On a device not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
+        // The person's space (AUTH.md): unlocked from the seed at once; the memory-hard proof is the identity service's business (the public registry), not the unlock's. One identity per device: on a device its fleet has bound, the kernel opens only that identity's space, so an open space there is the device's own person and the screen goes now, the proof made behind it; another handle is refused. On a device not bound yet the look-up and the join run as before (closing on "the space is not empty" closed Brittany's screen before her join, 2026-10-31).
         if self.mode == Mode::Fresh {
             match ferros_sys::unlock_identity(cap(self.grants, S_UNLOCK), &seed) {
                 // Opened on a bound device: this is the identity the device belongs to.
@@ -959,7 +960,7 @@ impl Ahau {
                 let proof = if self.session_seed == Some(seed) { self.session_proof.unwrap() } else { self.proof_for(&seed, true) };
                 // The roots to the client in RAM; it keeps them on disk only if unlock-at-boot is on.
                 self.send_roots(&seed, &proof);
-                console(self.grants, b"ahau: roots handed to the Photon client; it looks the identity up\n");
+                console(self.grants, b"ahau: roots handed to fgtw; it looks the identity up\n");
                 self.wipe();
                 self.mode = Mode::Looking(seed);
                 self.status(self.prompt());
@@ -973,7 +974,7 @@ impl Ahau {
                 self.entry();
                 self.show();
                 let mut out = [0u8; 600];
-                let n = ferros_sys::call_live(cap(self.grants, S_PHOTON_EP), &[2], &mut out);
+                let n = ferros_sys::call_live(cap(self.grants, S_FGTW_EP), &[2], &mut out);
                 let r = if n == ferros_sys::ERR || n == 0 { 255 } else { out[0] };
                 match r {
                     0 => {
@@ -1039,7 +1040,7 @@ impl Ahau {
         proof
     }
 
-    /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the Photon client (made again until it takes them: it starts once the space is open), then this process ends.
+    /// A person this device knows: the screen closes now, then the handle proof is made behind it and the roots go to the identity service (fgtw) (made again until it takes them: it starts once the space is open), then this process ends.
     fn unlocked_known(&mut self, seed: [u8; 32]) -> ! {
         self.wipe();
         console(self.grants, b"ahau: unlocked (this device knows the identity); the screen goes, the proof follows\n");
@@ -1050,7 +1051,7 @@ impl Ahau {
             sleep_until(now() + freq() / 16);
             self.roots_pending = !self.hand_roots();
         }
-        console(self.grants, b"ahau: roots handed to the Photon client\n");
+        console(self.grants, b"ahau: roots handed to fgtw\n");
         exit(0)
     }
 
@@ -1395,7 +1396,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         console(grants, b"ahau: no surface\n");
         exit(2);
     }
-    // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything): no attest screen; the Photon client loads its own from that space. Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
+    // Unlocked and bound already (unlock at boot, `device.unlock_at_boot`, AUTH.md: the kernel unlocked the device's own identity from the seed it kept, before init started anything): no attest screen; the identity service (fgtw) loads its own from that space. Unlocked but not bound is a join in progress (this screen restarted mid-way): the screen comes back, and the handle typed again is recognized at once.
     if ferros_sys::identity_unlocked(cap(grants, S_UNLOCK)) == Some(true) && ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true) {
         console(grants, b"ahau: the identity was unlocked at boot; no attest screen\n");
         exit(0);
@@ -1494,7 +1495,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         if slid {
             publish_fresh_text(&a.handle[..a.len], true);
         }
-        // Following the Photon client's verdict while the identity is looked up or joined: about four times a second.
+        // Following the identity service's verdict while the identity is looked up or joined: about four times a second.
         polls += 1;
         let followed = polls % 64 == 0 && a.follow_client();
         if a.follow_layout() || no > 0 || followed {

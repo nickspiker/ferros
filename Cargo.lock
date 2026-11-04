@@ -874,6 +874,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferros-payload-fgtw"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "ferros_heap",
+ "ferros_sys",
+ "fgtw",
+ "photon_core",
+ "vsf 0.10.2",
+]
+
+[[package]]
 name = "ferros-payload-focustest"
 version = "0.1.0"
 dependencies = [
@@ -998,18 +1010,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ferros_sys",
-]
-
-[[package]]
-name = "ferros-payload-photon"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "ferros_heap",
- "ferros_sys",
- "fgtw",
- "photon_core",
- "vsf 0.10.2",
 ]
 
 [[package]]

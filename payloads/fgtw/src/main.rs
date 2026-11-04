@@ -1,8 +1,10 @@
-//! Photon on ferros: the client that joins the owner's fleet over the LAN and stands as one of its devices (photon docs/pairing-v2.md "The ceremony over the mesh"; STATUS.md "Enrollment / pairing"). An EL0 process on the `ip` process's UDP: it beacons as the stock app does (`pt_disc` to the app's multicast groups on 4384), hears the owner's other devices beaconing under the same handle, hands the nearest sponsor its binding request as a `bind_req` over Photon Transport, takes the chain (`fleet_resp`) and the fan-out (`fanout_resp`) the sponsor pushes back, folds the chain against its own roots and opens the fan-out with its own ira, and from then on answers pings as a fleet member. Everything it speaks is photon_core (pt, join, wire), pinned byte for byte against the app by tools/photon-interop.
+//! fgtw on ferros: the OS's identity service, part of attest, never an app (owner, 2026-11-04: "Photon is just an app. on non ferros it just happens to have the FGTW bits in it too. Just like Mahere, or Lumis"). Elsewhere these FGTW bits ship inside the Photon app; on ferros they are the system's, and Photon the app is something a person installs like any other. It looks the attesting identity up (its fleet's devices nearby first, fgtw.org last), mints a genesis when there is none, joins this device to the identity's fleet and stands as one of its devices, and leaves the fleet on request. It reads no photons: messages are the Photon app's.
 //!
-//! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`), the same after a factory reset; the identity roots (`photon.identity_seed`, `photon.handle_proof`) are pushed into the vault scope `photon` at pairing by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`photon.chain`) and the fleet key (`photon.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
+//! The fleet over the LAN (photon docs/pairing-v2.md "The ceremony over the mesh"; STATUS.md "Enrollment / pairing"): an EL0 process on the `ip` process's UDP, it beacons as the stock app does (`pt_disc` to the app's multicast groups on 4384), hears the owner's other devices beaconing under the same handle, hands the nearest sponsor its binding request as a `bind_req` over Photon Transport, takes the chain (`fleet_resp`) and the fan-out (`fanout_resp`) the sponsor pushes back, folds the chain against its own roots and opens the fan-out with its own ira, and from then on answers pings as a fleet member. Everything it speaks is photon_core (pt, join, wire), pinned byte for byte against the app by tools/photon-interop.
 //!
-//! Started by init at boot (payloads/init), or from the bridge: ferros-bridge spawn photon.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `photon.sponsor` holds the same 19 bytes for the boot-started client] --name photon --use udp --store photon --ira --serve photon --entropy --use nfc --use bt --unlock. The `photon` endpoint (the map's Photon circle, the attest screen): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store photon, 3 ira, 4 serve photon, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
+//! Identity: the device key is rooted in the kernel's ira (`ira_key("photon device")` → `join::DeviceKeys::derive`; the label stays as it was, since a new one would be a new device key and every fleet that holds this device would lose it), the same after a factory reset; the identity roots (`identity_seed`, `handle_proof`) come from the attest screen (op 4, in RAM) or are pushed into the vault scope `fgtw.` by the dev box (tools/photon-interop `roots` + `ferros-bridge store put`) - the handle itself never reaches the device. Once bound, the chain (`fgtw.chain`) and the fleet key (`fgtw.fleet_key`) live in the same scope. The 23 pairing words are printed on the console for the sponsor's human to type; the sponsor's screen also shows this device as a nearby candidate it can tap.
+//!
+//! Started by init once a person has attested (payloads/init), or from the bridge: ferros-bridge spawn fgtw.bin [hex: fam, address 16, port BE — a sponsor to hand the request to directly, for a network whose access point does not pass multicast between its wireless clients; the vault key `fgtw.sponsor` holds the same 19 bytes for the boot-started service] --name fgtw --use udp --store fgtw --ira --serve fgtw --entropy --use nfc --use bt --unlock. The `fgtw` endpoint (the attest screen's): every op replies [state][fleet devices heard][words], the state as `V_*` below (0 no roots, 1 joining, 2 bound without the key, 3 member, 4 looking, 5 fresh, 6 wrong fleet, 7 grey, 8 leaving) and the words the 23 pairing words while joining or the 3 approval words while leaving; op 1 the state alone, op 2 mint (a result byte first), op 3 roots replaced on disk, op 4 `[4][seed][proof]` roots in RAM, op 5 `[5][intent]` leave the fleet (a result byte first; intent 1 to a new owner, 2 to the desk). Grant slots: 0 console, 1 udp (use), 2 store fgtw, 3 ira, 4 serve fgtw, 5 entropy, 6 nfc (use), 7 bt (use), 8 the identity unlock right (bind when the fleet binds this device, release when a departure completes): while unbound, each binding request's tap secret is served on the NFC tag and its beacon id advertised over BLE (`radios`). Runs on its own 128 KiB thread stack (Falcon's degree-512 signing key is about 60 KiB by value) over a 160 KiB heap in `.data`.
 
 #![no_std]
 #![no_main]
@@ -53,7 +55,7 @@ _entry:
     .quad 0
     .size _entry, . - _entry
 "#,
-    main = sym photon_main
+    main = sym fgtw_main
 );
 
 #[global_allocator]
@@ -357,7 +359,7 @@ struct Depart {
     checked_us: u64,
 }
 
-/// Where this device stands with the identity whose roots it holds (the `photon` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out, its approval words shown).
+/// Where this device stands with the identity whose roots it holds (the `fgtw` endpoint's op 1 state byte; pairing-v2's lamp). 0 no roots, 1 joining (the identity has a fleet, this device is not in it yet: RED, words shown), 2 bound waiting for the fleet key, 3 a member with the key, 4 looking the identity up, 5 fresh (fgtw.org holds no chain and no fleet device is heard: it may be minted), 6 wrong fleet (the seed's chain for this handle has another identity's genesis), 7 unreachable (no peer heard and no seed answer: GREY, never a verdict), 8 leaving (a departure request out, its approval words shown).
 const V_NONE: u8 = 0;
 const V_JOIN: u8 = 1;
 const V_LOOKING: u8 = 4;
@@ -531,7 +533,7 @@ impl Client {
                 if n <= chain.len() {
                     if let Ok((blob, bound)) = join::adopt_chain(&hp, &seed, &self.me, &chain[..n]) {
                         self.bound = bound;
-                        self.log.put(b"photon: chain held, ");
+                        self.log.put(b"fgtw: chain held, ");
                         self.log.dec(blob.ops.len() as u64);
                         self.log.put(if bound { b" op(s), this device is a member" } else { b" op(s), this device is not in it" });
                         self.log.line();
@@ -542,7 +544,7 @@ impl Client {
         if !say && self.hp.is_none() {
             return;
         }
-        self.log.put(b"photon: device key ");
+        self.log.put(b"fgtw: device key ");
         self.log.fp(&self.me);
         self.log.put(match (self.hp.is_some(), self.bound, self.fleet_key.is_some()) {
             (false, _, _) => b" - no identity in hand: waiting for the attest screen to hand the roots over",
@@ -556,7 +558,7 @@ impl Client {
     fn show_words(&mut self) {
         let (Some(seed), false) = (self.identity_seed, self.bound) else { return };
         let words = join::pair_words(&self.me, &seed);
-        self.log.put(b"photon: pairing words - ");
+        self.log.put(b"fgtw: pairing words - ");
         self.log.put(words.as_bytes());
         self.log.line();
     }
@@ -584,7 +586,7 @@ impl Client {
         if let Some(to) = self.given {
             if !self.bound && !self.request_frame.is_empty() && self.given_asked_t != self.request_t {
                 self.given_asked_t = self.request_t;
-                self.log.put(b"photon: handing our binding request to the sponsor named at spawn, ");
+                self.log.put(b"fgtw: handing our binding request to the sponsor named at spawn, ");
                 self.log.addr(&to);
                 self.log.line();
                 let f = self.request_frame.clone();
@@ -609,7 +611,7 @@ impl Client {
                 i
             }
             None => {
-                self.log.put(b"photon: fleet device ");
+                self.log.put(b"fgtw: fleet device ");
                 self.log.fp(&key);
                 self.log.put(b" beaconing at ");
                 self.log.addr(&addr);
@@ -625,7 +627,7 @@ impl Client {
         self.depart_hand(idx);
         if !self.bound && !self.request_frame.is_empty() && self.sponsors[idx].asked_t != self.request_t {
             self.sponsors[idx].asked_t = self.request_t;
-            self.log.put(b"photon: handing our binding request to ");
+            self.log.put(b"fgtw: handing our binding request to ");
             self.log.fp(&key);
             self.log.line();
             let frame = self.request_frame.clone();
@@ -637,7 +639,7 @@ impl Client {
     /// The fleet's chain names this device: bound, and the kernel binds the device to this identity (one identity per device, AUTH.md: from now on only its handle opens the device, until a departure releases it).
     fn became_bound(&mut self) {
         if !self.bound && !ferros_sys::bind_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-            self.log.put(b"photon: the kernel did not bind the device to this identity");
+            self.log.put(b"fgtw: the kernel did not bind the device to this identity");
             self.log.line();
         }
         self.bound = true;
@@ -674,13 +676,13 @@ impl Client {
         let frame = match join::depart_req(&req, &self.keys, t) {
             Ok(f) => f,
             Err(e) => {
-                self.log.put(b"photon: the departure request did not build: ");
+                self.log.put(b"fgtw: the departure request did not build: ");
                 self.log.put(e.as_bytes());
                 self.log.line();
                 return 3;
             }
         };
-        self.log.put(if intent == join::DEPART_NEW_OWNER { b"photon: leaving the fleet (to a new owner); approve on a device of the fleet with the words: ".as_slice() } else { b"photon: leaving the fleet (to the desk); approve on a device of the fleet with the words: " });
+        self.log.put(if intent == join::DEPART_NEW_OWNER { b"fgtw: leaving the fleet (to a new owner); approve on a device of the fleet with the words: ".as_slice() } else { b"fgtw: leaving the fleet (to the desk); approve on a device of the fleet with the words: " });
         self.log.put(words.as_bytes());
         self.log.line();
         self.depart = Some(Depart { t, words, frame, checked_us: 0 });
@@ -698,7 +700,7 @@ impl Client {
         }
         self.sponsors[i].depart_t = d.t;
         let (frame, to, key) = (d.frame.clone(), self.sponsors[i].addr, self.sponsors[i].key);
-        self.log.put(b"photon: handing our departure request to ");
+        self.log.put(b"fgtw: handing our departure request to ");
         self.log.fp(&key);
         self.log.line();
         let out = self.pt.send(to, frame, now_us(), eagle());
@@ -712,13 +714,13 @@ impl Client {
         }
         let (Some(hp), Some(seed)) = (self.hp, self.identity_seed) else { return };
         if let Ok((_, false)) = join::adopt_chain(&hp, &seed, &self.me, chain) {
-            self.log.put(b"photon: the fleet's chain no longer holds this device: departed; the identity is forgotten here");
+            self.log.put(b"fgtw: the fleet's chain no longer holds this device: departed; the identity is forgotten here");
             self.log.line();
             self.depart = None;
             self.forget_disk();
             self.forget_identity();
             if !ferros_sys::release_identity(cap(unsafe { GRANTS }, S_UNLOCK)) {
-                self.log.put(b"photon: the kernel did not release the device's identity space");
+                self.log.put(b"fgtw: the kernel did not release the device's identity space");
                 self.log.line();
             }
         }
@@ -747,7 +749,7 @@ impl Client {
         if let Some((s, id)) = on {
             self.radios_last = Some((*s, *id));
         }
-        self.log.put(if on.is_some() { b"photon: tap secret and beacon out: nfc " } else { b"photon: tap secret and beacon stopped: nfc " });
+        self.log.put(if on.is_some() { b"fgtw: tap secret and beacon out: nfc " } else { b"fgtw: tap secret and beacon stopped: nfc " });
         self.log.put(if a == ERR { b"not running" } else { b"ok" });
         self.log.put(b", bt ");
         self.log.put(if b == ERR { b"not running" } else { b"ok" });
@@ -782,7 +784,7 @@ impl Client {
             return;
         }
         let heard = !self.sponsors.is_empty();
-        self.log.put(b"photon: lookup: asking fgtw.org");
+        self.log.put(b"fgtw: lookup: asking fgtw.org");
         self.log.line();
         let t0 = now();
         fgtw::set_clock(eagle());
@@ -790,7 +792,7 @@ impl Client {
         let fetched = fgtw::client::fetch(&t, &hp);
         let ip = t.ip.get();
         self.seed_ip = ip;
-        self.log.put(b"photon: lookup: fgtw.org answered in ");
+        self.log.put(b"fgtw: lookup: fgtw.org answered in ");
         self.log.dec(ferros_sys::us_since(t0) / 1000);
         self.log.put(match &fetched {
             Ok(Some(_)) => b" ms: a chain".as_slice(),
@@ -830,7 +832,7 @@ impl Client {
                         if let Some(k) = recovered {
                             self.fleet_key = Some(k);
                             self.persist_set(b"fleet_key", &k);
-                            self.log.put(b"photon: the fleet key recovered from the published fan-out");
+                            self.log.put(b"fgtw: the fleet key recovered from the published fan-out");
                             self.log.line();
                         }
                     }
@@ -844,10 +846,10 @@ impl Client {
         };
         if v != self.verdict {
             self.log.put(match v {
-                V_JOIN => b"photon: this identity has a fleet: waiting to be added from one of its devices".as_slice(),
-                V_FRESH => b"photon: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
-                V_WRONG => b"photon: fgtw.org's chain for this handle claims another slot",
-                _ => b"photon: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
+                V_JOIN => b"fgtw: this identity has a fleet: waiting to be added from one of its devices".as_slice(),
+                V_FRESH => b"fgtw: fgtw.org holds no chain for this handle and no fleet device is heard: it may be minted",
+                V_WRONG => b"fgtw: fgtw.org's chain for this handle claims another slot",
+                _ => b"fgtw: neither a fleet device nor fgtw.org answers: no verdict (GREY)",
             });
             self.log.line();
         }
@@ -878,16 +880,16 @@ impl Client {
                 if let Some(c) = chain {
                     self.hold_chain(&c);
                 }
-                self.log.put(b"photon: MINTED: this device is the identity's first member");
+                self.log.put(b"fgtw: MINTED: this device is the identity's first member");
                 self.log.line();
                 match key {
                     Ok((_, k)) => {
                         self.fleet_key = Some(k);
                         self.persist_set(b"fleet_key", &k);
-                        self.log.put(b"photon: the fleet key is founded and ours");
+                        self.log.put(b"fgtw: the fleet key is founded and ours");
                     }
                     Err(e) => {
-                        self.log.put(b"photon: the fleet key was not founded: ");
+                        self.log.put(b"fgtw: the fleet key was not founded: ");
                         self.log.put(e.as_bytes());
                     }
                 }
@@ -899,7 +901,7 @@ impl Client {
                 4
             }
             Err(e) => {
-                self.log.put(b"photon: the genesis did not land: ");
+                self.log.put(b"fgtw: the genesis did not land: ");
                 self.log.put(e.as_bytes());
                 self.log.line();
                 5
@@ -912,7 +914,7 @@ impl Client {
         let (Some(seed), Some(hp)) = (self.identity_seed, self.hp) else { return };
         let t = eagle();
         let t0 = now();
-        self.log.put(b"photon: minting the binding request");
+        self.log.put(b"fgtw: minting the binding request");
         self.log.line();
         // The tap's secret: 32 fresh bytes per request, committed to in the request (`nh`, fgtw::pair::nfc_secret_hash over this device and stamp) so a sponsor that reads S off the tap knows which candidate it touched. Outside the consent bytes: the signature over the frame covers it.
         let mut s = [0u8; 32];
@@ -925,7 +927,7 @@ impl Client {
                 self.request_t = t;
                 self.request_frame = f;
                 self.radios(Some((&s, &fgtw::pair::beacon_id(&hp, &self.me, t))));
-                self.log.put(b"photon: binding request minted (");
+                self.log.put(b"fgtw: binding request minted (");
                 self.log.dec(self.request_frame.len() as u64);
                 self.log.put(b" B) in ");
                 self.log.dec(ms);
@@ -936,7 +938,7 @@ impl Client {
                 self.log.line();
             }
             Err(e) => {
-                self.log.put(b"photon: binding request failed: ");
+                self.log.put(b"fgtw: binding request failed: ");
                 self.log.put(e.as_bytes());
                 self.log.line();
             }
@@ -962,7 +964,7 @@ impl Client {
                     s.heard_us = t;
                     if !s.online {
                         s.online = true;
-                        self.log.put(b"photon: fleet device ");
+                        self.log.put(b"fgtw: fleet device ");
                         self.log.fp(&key);
                         self.log.put(b" answers our pings");
                         self.log.line();
@@ -977,7 +979,7 @@ impl Client {
                 return;
             }
             Some(Frame::Photon { .. }) | Some(Frame::Ack { .. }) => {
-                self.log.put(b"photon: a photon arrived - not read yet (lanes follow the join)");
+                self.log.put(b"fgtw: a photon arrived - not read here (messages are the Photon app's)");
                 self.log.line();
                 return;
             }
@@ -997,7 +999,7 @@ impl Client {
                 }
                 match join::adopt_chain(&hp, &seed, &self.me, &chain) {
                     Ok((blob, bound)) => {
-                        self.log.put(b"photon: our fleet's chain from ");
+                        self.log.put(b"fgtw: our fleet's chain from ");
                         self.log.fp(&signer);
                         self.log.put(b" - ");
                         self.log.dec(blob.ops.len() as u64);
@@ -1010,7 +1012,7 @@ impl Client {
                         self.depart_check(&chain);
                     }
                     Err(e) => {
-                        self.log.put(b"photon: a chain from ");
+                        self.log.put(b"fgtw: a chain from ");
                         self.log.fp(&signer);
                         self.log.put(b" was refused: ");
                         self.log.put(e.as_bytes());
@@ -1025,7 +1027,7 @@ impl Client {
                 }
                 match join::open_fanout(&hp, &blob, &self.keys, &seed) {
                     Ok(Some((revision, key))) => {
-                        self.log.put(b"photon: fan-out revision ");
+                        self.log.put(b"fgtw: fan-out revision ");
                         self.log.dec(revision);
                         self.log.put(b" from ");
                         self.log.fp(&signer);
@@ -1037,20 +1039,20 @@ impl Client {
                         }
                     }
                     Ok(None) => {
-                        self.log.put(b"photon: a fan-out from ");
+                        self.log.put(b"fgtw: a fan-out from ");
                         self.log.fp(&signer);
                         self.log.put(b" holds no wrap for us yet");
                         self.log.line();
                     }
                     Err(e) => {
-                        self.log.put(b"photon: a fan-out was refused: ");
+                        self.log.put(b"fgtw: a fan-out was refused: ");
                         self.log.put(e.as_bytes());
                         self.log.line();
                     }
                 }
             }
             Ok((Inbound::Other(name), signer)) => {
-                self.log.put(b"photon: frame ");
+                self.log.put(b"fgtw: frame ");
                 self.log.put(name.as_bytes());
                 self.log.put(b" from ");
                 self.log.fp(&signer);
@@ -1107,7 +1109,7 @@ impl Client {
                         Event::Frame { from, bytes, signer } => self.on_frame(from, &bytes, signer.is_some()),
                         Event::Sent { to, ok, .. } => {
                             if !ok {
-                                self.log.put(b"photon: a frame to ");
+                                self.log.put(b"fgtw: a frame to ");
                                 self.log.addr(&to);
                                 self.log.put(b" was given up on");
                                 self.log.line();
@@ -1123,7 +1125,7 @@ impl Client {
             }
             let out = self.pt.tick(t, eagle());
             self.send_all(out);
-            // The map asking for the Photon circle's front, or the attest screen setting roots (op 4, 69 bytes).
+            // The attest screen: the state, or its roots (op 4, 69 bytes).
             let mut req = [0u8; 72];
             let mut tok = [0u8; 32];
             let n = ferros_sys::recv(cap(self.log.grants, S_SERVE), &mut req, &mut tok, true);
@@ -1162,7 +1164,7 @@ impl Client {
                     self.hp = Some(hp);
                     self.verdict = V_LOOKING;
                     self.last_lookup_us = 0;
-                    self.log.put(if self.persist { b"photon: roots set in RAM and kept on disk (unlock at boot on)" } else { b"photon: roots set in RAM only (nothing of the identity on disk)" });
+                    self.log.put(if self.persist { b"fgtw: roots set in RAM and kept on disk (unlock at boot on)" } else { b"fgtw: roots set in RAM only (nothing of the identity on disk)" });
                     self.log.line();
                 }
                 // Op 5: leave the fleet, `[5][intent]` (1 to a new owner, 2 to the desk) → [result: 0 started, else why not], then the state (8 leaving, with the approval words).
@@ -1212,7 +1214,7 @@ impl Client {
             if up && !self.net_up {
                 self.net_up = true;
                 self.last_lookup_us = 0;
-                self.log.put(b"photon: the network is up (IPv4)");
+                self.log.put(b"fgtw: the network is up (IPv4)");
                 self.log.line();
             }
             if self.hp.is_some() && !self.bound && matches!(self.verdict, V_LOOKING | V_UNREACHABLE | V_FRESH) && t.saturating_sub(self.last_lookup_us) >= if self.verdict == V_LOOKING { 2_000_000 } else { 30_000_000 } {
@@ -1226,7 +1228,7 @@ impl Client {
                     if self.offline_looks >= 8 {
                         self.offline_looks = 0;
                         self.verdict = V_UNREACHABLE;
-                        self.log.put(b"photon: no network and no fleet device heard: no verdict (GREY)");
+                        self.log.put(b"fgtw: no network and no fleet device heard: no verdict (GREY)");
                         self.log.line();
                     }
                 }
@@ -1282,16 +1284,16 @@ extern "C" fn work(_: u64) -> ! {
     let base = ferros_sys::arc_base();
     let mut log = Log { grants, buf: Vec::new() };
     let udp = Udp { grants, base };
-    // No wait for the network here: the `photon` endpoint is served from the start, so the attest screen and the map always get an answer (until 2026-10-31 this thread waited for an IPv4 lease first, and with no network attest froze on the roots hand-over). The UDP ports and beacon groups are taken now; the IP process keeps the groups and reports them once the link is up; look-ups wait for IPv4 in the loop.
+    // No wait for the network here: the `fgtw` endpoint is served from the start, so the attest screen always gets an answer (until 2026-10-31 this thread waited for an IPv4 lease first, and with no network attest froze on the roots hand-over). The UDP ports and beacon groups are taken now; the IP process keeps the groups and reports them once the link is up; look-ups wait for IPv4 in the loop.
     // The device key, rooted in the ira.
     let Some(fingerprint) = ferros_sys::ira_key(cap(grants, S_IRA), "photon device") else {
-        log.put(b"photon: no ira-derived key (no Ira grant, or the kernel has no ira this boot)");
+        log.put(b"fgtw: no ira-derived key (no Ira grant, or the kernel has no ira this boot)");
         log.line();
         ferros_sys::exit(1)
     };
     let t0 = now();
     let keys = DeviceKeys::derive(&fingerprint);
-    log.put(b"photon: device keys derived in ");
+    log.put(b"fgtw: device keys derived in ");
     log.dec(ferros_sys::us_since(t0) / 1000);
     log.put(b" ms");
     log.line();
@@ -1305,7 +1307,7 @@ extern "C" fn work(_: u64) -> ! {
 static mut GIVEN: Option<Addr> = None;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn photon_main(grants: u64, input: u64, input_len: u64) -> ! {
+pub extern "C" fn fgtw_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     unsafe { ALLOC.init(HEAP.0.get() as usize, HEAP_BYTES) };
     unsafe { GRANTS = grants };
@@ -1341,7 +1343,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
     }
     let mut b = Buf { b: [0; 256], n: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut b, format_args!("photon: PANIC {}", info.message()));
+    let _ = core::fmt::Write::write_fmt(&mut b, format_args!("fgtw: PANIC {}", info.message()));
     if let Some(l) = info.location() {
         let _ = core::fmt::Write::write_fmt(&mut b, format_args!(" at {}:{}", l.file(), l.line()));
     }

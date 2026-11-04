@@ -416,10 +416,10 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Store(b"wifi"),
         Use(b"wlan"),
         Serve(b"udp"),
-        // Photon (PHOTON.md): 46 serve photon (the client's endpoint the map asks for its state and pairing words), 47 use photon (the map's), 48 the vault scope `photon.`, 49 the ira-derived key, 50 use udp (the client's).
-        Serve(b"photon"),
-        Use(b"photon"),
-        Store(b"photon"),
+        // fgtw, the OS's identity service (payloads/fgtw; part of attest, not the Photon app): 46 serve fgtw, 47 use fgtw (the attest screen's: the verdict on an identity, the mint), 48 the vault scope `fgtw.`, 49 the ira-derived key, 50 use udp (the service's).
+        Serve(b"fgtw"),
+        Use(b"fgtw"),
+        Store(b"fgtw"),
         Ira,
         Use(b"udp"),
         // 51 the attest screen's vault scope `ahau.` (payloads/ahau).
@@ -465,13 +465,13 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
         b"modem" => &[53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76],
-        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve photon, 5 entropy (fgtw's fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/photon).
-        b"photon" => &[50, 48, 49, 46, 41, 80, 84, 85],
+        // 1 use udp, 2 the vault scope, 3 the ira key, 4 serve fgtw, 5 entropy (the fleet-key minting), 6 use nfc, 7 use bt, 8 the identity unlock right (payloads/fgtw).
+        b"fgtw" => &[50, 48, 49, 46, 41, 80, 84, 85],
         // 1 serve nfc, 2 hsi2c_0, 3 gpio-alive, 4 its power (payloads/nfc).
         b"nfc" => &[77, 78, 67, 79],
         // 1 serve bt, 2 the APM UART, 3 vendor_a, 4 its power, 5 entropy (payloads/bt).
         b"bt" => &[81, 82, 76, 83, 41],
-        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `photon.`, 6 the ira key, 7 settings (the layout switch), 8 use photon (the client's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer (payloads/ahau).
+        // 1 use display, 2 use touch, 3 a surface, 4 the vault scope `ahau.`, 5 the vault scope `fgtw.`, 6 the ira key, 7 settings (the layout switch), 8 use fgtw (the identity service's verdict and the mint), 9 the identity unlock right, 10 a second surface, the keyboard's back buffer (payloads/ahau).
         b"ahau" => &[17, 18, 22, 51, 48, 49, 19, 47, 85, 22],
         // 1 the controller's registers, 2 its DMA memory, 3 its interrupt, 4 the kernel's PT commands, 5 the `usb` power switch (payloads/usb).
         b"usb" => &[86, 87, 88, 89, 90],
@@ -500,7 +500,7 @@ fn restart(store: &mut Option<ShimStore>, names: &[u8], rep: &mut alloc::vec::Ve
             continue;
         };
         // What reads the person's space starts only once a person has attested, as init's `wait_unlocked` holds it (owner, 2026-11-04: "Attest should ONLY load attest"): a restart does not get around that.
-        if matches!(name, b"map" | b"photon") && !store.as_mut().is_some_and(|s| s.unlocked()) {
+        if matches!(name, b"map" | b"fgtw") && !store.as_mut().is_some_and(|s| s.unlocked()) {
             rep.extend_from_slice(b"not started, nobody has attested: ");
             rep.extend_from_slice(name);
             rep.push(b'\n');

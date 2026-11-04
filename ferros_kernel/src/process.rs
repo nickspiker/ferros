@@ -1034,8 +1034,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "gnss", prefix: "gnss." },
     // The WiFi driver's: its firmware (`wifi.fw`), NVRAM text (`wifi.nvram`), CLM blob (`wifi.clm`) and the network credential (`wifi.cred`; secret, never printed).
     StoreScope { name: "wifi", prefix: "wifi." },
-    // The Photon client's (payloads/photon): the identity roots pushed at pairing (`photon.identity_seed`, `photon.handle_proof`; secret), the fleet chain and key once bound (`photon.chain`, `photon.fleet_key`), the phonebook.
-    StoreScope { name: "photon", prefix: "photon." },
+    // The identity service's (payloads/fgtw, part of attest): the identity roots pushed at pairing (`fgtw.identity_seed`, `fgtw.handle_proof`; secret), the fleet chain and key once bound (`fgtw.chain`, `fgtw.fleet_key`).
+    StoreScope { name: "fgtw", prefix: "fgtw." },
     // The attest screen's (payloads/ahau): the device's verifier for its identity (`ahau.verifier`), the identity seed under the device's ira key.
     StoreScope { name: "ahau", prefix: "ahau." },
     // The sensors process's (payloads/sensors): the AoC's registry scripts (`aoc.reg.0`, … : tools/husky-aoc-reg.sh), which it pushes to the AoC after the firmware starts.

@@ -60,7 +60,7 @@ members = [
     "payloads/rmnetctl",
     "payloads/nettest",
     "payloads/httptest",
-    "payloads/photon",
+    "payloads/fgtw",
     "payloads/pqprobe",
     "payloads/wxtest",
     "payloads/beamtest",
