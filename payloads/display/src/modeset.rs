@@ -416,7 +416,7 @@ impl M<'_> {
 /// The modeset when the pipe is still at 8 bpc (ABL's), then the DQE's dither in shift mode either way. Returns what it did and what misbehaved, for the console; empty when the pipe was already at 10 bpc.
 /// `force`: run it even when DECON is already at 10 bpc (after the jump from Android, whose raster and panel mode may not be ferros's).
 /// `panel_cold`: the panel's power-up (state B) goes in after the link's start, with the VDDD switch to call after its init set.
-pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
+pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, jumped: bool, panel_cold: Option<&dyn Fn() -> bool>) -> Vec<u8> {
     let mut m = M { p, f: freq(), rep: Vec::new() };
     m.te_pin();
     if force || m.rd(S_DECON, GLOBAL_CON) & GLOBAL_CON_TEN_BPC == 0 {
@@ -426,20 +426,30 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, p
         }
         let t0 = now();
         let r = raster();
-        let hs = ferros_dsi::pll_hs_clk(|off| m.rd(S_DPHY, DPHY + off as u64));
-        let main = m.snapshot(S_DECON, 0, 0x0344);
-        let sub0 = m.snapshot(S_DECON_SUB, 0, 0x0100);
-        let sub1 = m.snapshot(S_DECON_SUB, DSC1, 0x0100);
-        let win = m.snapshot(S_WIN, WIN * 0x1000, 0x0020);
-        let wincon = m.rd(S_WINCON, WIN * 0x1000);
-        let link = m.snapshot(S_DSIM, 0, 0x0128);
-        let bias = m.snapshot(S_DPHY, DPHY_BIAS, 0x0014);
-        let phy = m.snapshot(S_DPHY, DPHY, 0x0700);
+        // The pipe to rebuild from: the running one (ABL's on a cold boot), or after a jump the cold boot's tables. Android's pipe with its screen off is no model: the jump of 2026-11-04 found the DPU on and the link's PHY down, the PLL clock read from it came out 0, and with it DSIM's TE protect and timeout (CMD_TE_CTRL1 0, a cold boot's G#1A70_1E9D); DECON started no frame. The link may sit in ULPS then, so it is taken out as from off.
+        let c = if jumped {
+            ColdPipe::new()
+        } else {
+            ColdPipe {
+                main: m.snapshot(S_DECON, 0, 0x0344),
+                sub0: m.snapshot(S_DECON_SUB, 0, 0x0100),
+                sub1: m.snapshot(S_DECON_SUB, DSC1, 0x0100),
+                win: m.snapshot(S_WIN, WIN * 0x1000, 0x0020),
+                wincon: m.rd(S_WINCON, WIN * 0x1000),
+                link: m.snapshot(S_DSIM, 0, 0x0128),
+                bias: m.snapshot(S_DPHY, DPHY_BIAS, 0x0014),
+                phy: m.snapshot(S_DPHY, DPHY, 0x0700),
+            }
+        };
+        let hs = ferros_dsi::pll_hs_clk(|off| c.phy[off as usize / 4]);
+        if jumped {
+            m.say(alloc::format!("modeset: after a jump, from the cold boot's tables (the running PHY's PLL said {} Mbps)\n", ferros_dsi::pll_hs_clk(|off| m.rd(S_DPHY, DPHY + off as u64))).as_bytes());
+        }
 
         m.decon_stop();
         m.dsim_stop();
-        m.dsim_init(&r, &link, &bias, &phy, hs, false);
-        m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+        m.dsim_init(&r, &c.link, &c.bias, &c.phy, hs, jumped);
+        m.decon_init(&r, &c.main, &c.sub0, &c.sub1, &c.win, c.wincon);
         if let Some(vddd) = panel_cold {
             m.panel_on(dsi, &r, vddd);
         }
@@ -482,6 +492,33 @@ fn words(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
+/// A running cold boot's pipe as ABL leaves it (oracle/display/husky-hk3/cold-pipe): DECON's main, DSC 0 and DSC 1 and window 5 blocks, the window's control word, DSIM's link, the D-PHY's bias and the PHY. `from_off` builds from it, and `ten_bpc` after a jump.
+struct ColdPipe {
+    main: Vec<u32>,
+    sub0: Vec<u32>,
+    sub1: Vec<u32>,
+    win: Vec<u32>,
+    wincon: u32,
+    link: Vec<u32>,
+    bias: Vec<u32>,
+    phy: Vec<u32>,
+}
+
+impl ColdPipe {
+    fn new() -> ColdPipe {
+        ColdPipe {
+            main: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_main.bin")),
+            sub0: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc0.bin")),
+            sub1: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc1.bin")),
+            win: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_win5.bin")),
+            wincon: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_wincon5.bin"))[0],
+            link: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dsim0.bin")),
+            bias: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy_bias.bin")),
+            phy: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy.bin")),
+        }
+    }
+}
+
 /// The whole pipe from reset, the DPU just powered up by the kernel's `dpu` switch (DISPLAY-DESIGN.md §8, layers 4, 5 and 7): `ten_bpc`'s sequence with its snapshots from the capture of a running pipe instead of the dead one, no DSIM stop (nothing runs), and the ULPS exit before the link's start (the panel's link left in ULPS by Android's hibernation).
 /// The panel: off (`panel_cold`, its VCI off) gets its power-up (state B). On its rails (`awake`: the `panel` switch for its reset pulse, and VDDD) it is asked its power mode once the link is up: awake and showing (DCS G#0A reads G#9C: booster, sleep out, normal mode, display on) it is left as it is, as under Android's hibernation with the screen on; anything else (asleep or dozing with its rails up, or no answer) is reset and powered up as from off. A jump from an Android whose screen had gone off left the panel holding Android's last frame under ferros's running pipe (2026-11-04): the panel was taken as on.
 pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: Option<&dyn Fn() -> bool>, awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)>) -> Vec<u8> {
@@ -489,18 +526,11 @@ pub fn from_off(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, panel_cold: O
     m.te_pin();
     let t0 = now();
     let r = raster();
-    let main = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_main.bin"));
-    let sub0 = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc0.bin"));
-    let sub1 = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc1.bin"));
-    let win = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_win5.bin"));
-    let wincon = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_wincon5.bin"))[0];
-    let link = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dsim0.bin"));
-    let bias = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy_bias.bin"));
-    let phy = words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy.bin"));
-    let hs = ferros_dsi::pll_hs_clk(|off| phy[off as usize / 4]);
+    let c = ColdPipe::new();
+    let hs = ferros_dsi::pll_hs_clk(|off| c.phy[off as usize / 4]);
     m.decon_stop();
-    m.dsim_init(&r, &link, &bias, &phy, hs, true);
-    m.decon_init(&r, &main, &sub0, &sub1, &win, wincon);
+    m.dsim_init(&r, &c.link, &c.bias, &c.phy, hs, true);
+    m.decon_init(&r, &c.main, &c.sub0, &c.sub1, &c.win, c.wincon);
     if let Some(vddd) = panel_cold {
         m.panel_on(dsi, &r, vddd);
     } else if let Some((reset, vddd)) = awake {

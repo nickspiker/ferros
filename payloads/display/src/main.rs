@@ -2957,7 +2957,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // On its rails with the DPU off: modeset::from_off asks the panel whether it is showing, and wakes it through this switch if not.
     let reset = || ferros_sys::power(cap(grants, S_PANEL_POWER), true);
     let awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)> = if from_off && !panel_cold { Some((&reset, &vddd)) } else { None };
-    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), cold, awake) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, cold) };
+    let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), cold, awake) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, jumped, cold) };
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
