@@ -2610,9 +2610,16 @@ pub fn run(mut b: Boot) -> ! {
                 // Physical memory / MMIO read: params [addr:8 BE][len:4 BE], up to 64 KiB per call. Aligned requests use 32-bit loads so MMIO windows read correctly; anything else is read bytewise. Address bit 63 set = 32-bit reads through the EL3 monitor. MMU is off, so every address is physical (a bad address takes the fault sink: report + reset to Android).
                 let raw = u64::from_be_bytes(cmd.params[0..8].try_into().unwrap());
                 let addr = (raw & !(1 << 63)) as usize;
-                let len = (u32::from_be_bytes(cmd.params[8..12].try_into().unwrap()) as usize).min(64 << 10);
+                // DRAM (G#8000_0000 up), 8-byte aligned: up to 4 MiB in one call with aligned 64-bit loads, valid on every memory type the cache map gives DRAM (a screencap of the 32 MiB canvas in 8 calls, not 512: tools/screencap). Registers below DRAM: 32-bit loads, 64 KiB, as before.
+                let want = u32::from_be_bytes(cmd.params[8..12].try_into().unwrap()) as usize;
+                let dram = raw >> 63 == 0 && addr >= 0x8000_0000 && addr % 8 == 0 && want % 8 == 0;
+                let len = want.min(if dram { 4 << 20 } else { 64 << 10 });
                 let mut out = alloc::vec![0u8; len];
-                if raw >> 63 == 1 {
+                if dram {
+                    for (i, c) in out.chunks_mut(8).enumerate() {
+                        c.copy_from_slice(&unsafe { read_volatile((addr + i * 8) as *const u64) }.to_le_bytes());
+                    }
+                } else if raw >> 63 == 1 {
                     for (i, c) in out.chunks_mut(4).enumerate() {
                         let v = platform::priv_reg((addr + i * 4) as u64, false, 0) as u32;
                         c.copy_from_slice(&v.to_le_bytes()[..c.len()]);
