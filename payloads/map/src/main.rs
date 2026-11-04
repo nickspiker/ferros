@@ -31,6 +31,8 @@ const S_STORE: u64 = 4;
 /// 5: the `surfaces` region (WINDOWS.md); passed to an app it starts, the kernel gives that app one surface of it, its own.
 const S_APPSURF: u64 = 5;
 const S_PHOTON_EP: u64 = 6;
+/// The kernel's `android` switch (grant 104): the Android circle's tap, behind an attest.
+const S_ANDROID: u64 = 7;
 
 /// One circle: its label, its weight of ring (0 none, 1 thin, 2 heavy — importance), whether it is lit (changed since last seen), its share of the owner's time in thousandths (its area is that share of the map), its icon in the display server's bundle (tools/app-icons order), and what it waits for before it can be more than a circle.
 struct Spec {
@@ -43,7 +45,7 @@ struct Spec {
 }
 
 /// The device first: it is placed at the centre and never lights (lit means a person sent you something). The apps' shares are the owner's ordering until time is measured (2026-10-22: "Photon the most, then Mahere, then Lumis").
-const CIRCLES: [Spec; 8] = [
+const CIRCLES: [Spec; 9] = [
     Spec { label: "ferros", ring: 1, lit: 0, share: 120, icon: 5, needs: "" },
     Spec { label: "Photon", ring: 2, lit: 1, share: 400, icon: 1, needs: "WiFi and your enrollment" },
     Spec { label: "Mahere", ring: 1, lit: 0, share: 250, icon: 2, needs: "a position (GNSS)" },
@@ -55,12 +57,20 @@ const CIRCLES: [Spec; 8] = [
     Spec { label: "Clock", ring: 1, lit: 0, share: 150, icon: 0x80, needs: "" },
     // The light scope, a widget the display draws itself (icon G#82, display WIDGET_SCOPE): the last second of light on the back of the device. (The spectral bars, G#81, went 2026-10-25: the scope's levels show the same channels.)
     Spec { label: "Scope", ring: 1, lit: 0, share: 150, icon: 0x82, needs: "" },
+    // Android, a guest (owner, 2026-11-04: launched from the home screen, behind an attest): on a device that allows it (SYS_FACTS 82), a tap asks the kernel's `android` switch, which checks that a person has attested and resets into Android through the gate once. No icon: its name, always shown.
+    Spec { label: "Android", ring: 1, lit: 0, share: 100, icon: 0, needs: "" },
 ];
 const N: usize = CIRCLES.len();
 const DEVICE: usize = 0;
 /// Photon: arrived at, its front shows the client's state and, until the device is bound, the 23 pairing words for the sponsor's human (payloads/photon op 1).
 const PHOTON: usize = 1;
 const RAMPS: usize = 5;
+const ANDROID: usize = 8;
+
+/// Whether the Android circle is on the map: only on a device that allows Android (SYS_FACTS 82 = 2). Placed either way, so no other circle moves when it comes or goes.
+fn android_shown() -> bool {
+    ferros_sys::facts().0[82] == 2
+}
 /// The light scope: arrived at, it is in focus (`Map::scope_drag`).
 const SCOPE: usize = 7;
 /// The clock: arrived at, it is in focus, and the display shows it to two more places (owner, 2026-10-26).
@@ -607,7 +617,11 @@ impl Map {
     fn hit(&self, sx: i64, sy: i64) -> Option<usize> {
         let (wx, wy) = self.cam.world(self.w, self.h, sx, sy);
         let mut best: Option<usize> = None;
+        let android = android_shown();
         for i in 0..N {
+            if i == ANDROID && !android {
+                continue;
+            }
             let (dx, dy) = ((wx - self.xs[i]) >> 8, (wy - self.ys[i]) >> 8);
             if dx * dx + dy * dy <= self.rs[i] * self.rs[i] && best.is_none_or(|b| self.rs[i] < self.rs[b]) {
                 best = Some(i);
@@ -624,16 +638,19 @@ impl Map {
         let mut m = [0u8; 2 + 30 * N];
         m[0] = 13;
         m[1] = N as u8;
+        let android = android_shown();
         for (i, a) in CIRCLES.iter().enumerate() {
             let at = 2 + i * 30;
             m[at..at + 4].copy_from_slice(&((self.xs[i] >> 8) as i32).to_le_bytes());
             m[at + 4..at + 8].copy_from_slice(&((self.ys[i] >> 8) as i32).to_le_bytes());
-            m[at + 8..at + 10].copy_from_slice(&(self.rs[i] as u16).to_le_bytes());
+            // A hidden Android circle goes out with no radius: the scene keeps its index, and nothing is drawn.
+            let r = if i == ANDROID && !android { 0 } else { self.rs[i] };
+            m[at + 8..at + 10].copy_from_slice(&(r as u16).to_le_bytes());
             m[at + 10] = a.ring;
             m[at + 11] = a.lit;
             m[at + 12] = a.icon;
             let label = a.label.as_bytes();
-            let len = if labels { label.len().min(16) } else { 0 };
+            let len = if labels || a.icon == 0 { label.len().min(16) } else { 0 };
             m[at + 13] = len as u8;
             m[at + 14..at + 14 + len].copy_from_slice(&label[..len]);
         }
@@ -1146,6 +1163,10 @@ impl Map {
             (1, View::Map) => {
                 if self.hit(sx, sy) == Some(RAMPS) {
                     self.show_ramps();
+                } else if self.hit(sx, sy) == Some(ANDROID) {
+                    // The kernel decides (an attest, the device's opt-in); accepted, the device resets into Android within a pass of the service loop.
+                    let ok = ferros_sys::power(cap(self.grants, S_ANDROID), true);
+                    console(self.grants, if ok { b"map: Android: launching\n" } else { b"map: Android: refused (no attest, or this device does not allow it)\n" });
                 } else if let Some(i) = self.hit(sx, sy) {
                     let to = self.at(i);
                     self.fly(to);

@@ -378,7 +378,8 @@ pub fn ask(dtb: usize) -> Choice {
         } else if pw {
             gate_telemetry(1, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Ferros;
-        } else if dn {
+        // Volume down: Android, on development builds only. A production gate offers no Android: it opens from within ferros, behind an attest (the map's Android circle, the kernel's `android` switch; owner, 2026-11-01 and 2026-11-04).
+        } else if dn && option_env!("FERROS_PRODUCTION").is_none() {
             gate_telemetry(3, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Android;
         }

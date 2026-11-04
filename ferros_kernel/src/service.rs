@@ -255,6 +255,22 @@ fn status_text(kind: BootKind, generation: u64, probe: Option<&VaultProbe>) -> a
 /// The service loop's vault, lent to `SYS_SPAWN` (process.rs `CAPSULES`) for reading capsules by key: `run` never returns, so the pointer stays good for the rest of the boot.
 static mut SPAWN_STORE: *mut Option<ShimStore> = core::ptr::null_mut();
 
+/// Android from within ferros, behind an attest (owner, 2026-11-01 and 2026-11-04: "launch Android from within ferros so it's gated behind an attest", from the home screen). The device's opt-in, the vault's device-class `android.allowed` (one byte, 1), as the service loop read it at start: 2 allowed, 1 not, 0 not read yet (SYS_FACTS 82, so the map shows the Android circle only on a device that allows it). Written by the opt-in (the disclaimer, next) and for now from the host.
+pub static ANDROID_ALLOWED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A launch the `android` switch accepted, for the service loop's next pass.
+static ANDROID_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The `android` switch (process.rs POWERS, grant 104, the map's): accepted only on a device that allows Android and while a person is present (the vault's identity class unlocked: the kernel's own state, set by an attest through SYS_UNLOCK, never a process's word). The map runs under the attest screen and sees every touch, so this check is the gate, not the map's. The service loop then does the gate's Android path: ANDROID_ONCE, slot a, the reset with its scrub (`diag android`'s sequence).
+pub fn android_request(on: bool) -> bool {
+    let present = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked());
+    let ok = on && present && ANDROID_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) == 2;
+    crate::flashlog::line(if ok { "android: launch accepted (attested, allowed)" } else if !present { "android: launch refused: no one has attested" } else { "android: launch refused: this device does not allow Android" });
+    if ok {
+        ANDROID_REQ.store(true, core::sync::atomic::Ordering::Release);
+    }
+    ok
+}
+
 /// `SYS_SET_PREF`'s persistence: a preference into the device vault under its key (SETTINGS.md).
 fn store_pref(index: usize, value: u8) -> bool {
     if !crate::settings::FIELDS.iter().any(|&(_, i)| i == index) {
@@ -434,6 +450,8 @@ fn home_grants() -> alloc::vec::Vec<crate::process::Grant<'static>> {
         Power(b"dpu"),
         // 102 the `panel` switch (panel_power.rs: VCI and the reset pulse), 103 `panel-vddd` (VDDD after the init set): the panel from off (§8, state B).
         Power(b"panel"), Power(b"panel-vddd"),
+        // 104 the `android` switch (android_request): the map's Android circle, behind an attest.
+        Power(b"android"),
     ]
 }
 
@@ -443,7 +461,7 @@ fn shell_grants(name: &[u8]) -> Option<alloc::vec::Vec<crate::process::Grant<'st
         // The same slots init hands out (payloads/init): a restarted server must see exactly what a booted one does (the display's vsync thread had no interrupt grant after a restart and never started, 2026-10-23).
         b"display" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 21, 22, 25, 26, 27, 97, 98, 99, 100, 101, 102, 103],
         b"touch" => &[14, 15, 16, 23, 91],
-        b"map" => &[17, 18, 19, 20, 22, 47],
+        b"map" => &[17, 18, 19, 20, 22, 47, 104],
         b"pcie1" => &[29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 28, 43, 49, 83],
         b"ip" => &[44, 45, 41, 52],
         // The modem driver: serve rmnet, its hardware, windows and partitions (payloads/modem's slot order).
@@ -598,6 +616,8 @@ fn facts() -> [u64; crate::process::FACT_COUNT] {
     v[30] = 1 + crate::display::dpu_on() as u64;
     // 32: the radios' drivers running, a bit each (the corners' circles, WINDOWS.md): 0 modem (cellular), 1 pcie1 (WiFi), 2 bt, 3 nfc, 4 gnss, 5 ip.
     v[32] = crate::process::named_alive_locked(&[b"modem", b"pcie1", b"bt", b"nfc", b"gnss", b"ip"]);
+    // 82: whether this device allows Android from within ferros (ANDROID_ALLOWED: 2 yes, 1 no).
+    v[82] = match ANDROID_ALLOWED.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 81: the panel's VCI (panel_power.rs): 2 on, 1 off, unknown until the service loop has read it.
     v[81] = match crate::panel_power::VCI.load(Relaxed) { 0 => crate::process::FACT_UNKNOWN, s => s };
     // 33-80: those drivers' own measures (SYS_STATUS), eight tagged words each, in the same order, then the usb driver's.
@@ -1052,9 +1072,29 @@ pub fn run(mut b: Boot) -> ! {
     let mut ipc_marked = false;
     // The panel's VCI as ABL or Android left it (SYS_FACTS 81): the display server reads it to know a panel it must power up (state B).
     crate::panel_power::read_state();
+    // The device's opt-in to Android (ANDROID_ALLOWED), once.
+    if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
+        let yes = matches!(st.get_by_key("android.allowed"), Ok(Some(v)) if v.as_slice() == [1]);
+        ANDROID_ALLOWED.store(if yes { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+    }
     platform::mark(0x3A);
     loop {
         platform::pet_watchdogs();
+        // A launch of Android the `android` switch accepted: the gate's Android path, as `diag android` takes it. The person is checked again here; the reset scrubs ferros's memory on its way (platform::before_reset).
+        #[cfg(not(shim_handoff))]
+        if ANDROID_REQ.swap(false, core::sync::atomic::Ordering::AcqRel) && unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()).is_some_and(|s| s.unlocked()) {
+            let r = crate::slot::set_active(0);
+            unsafe {
+                let p = 0xFD60_0FF8usize as *mut u64;
+                core::ptr::write_volatile(p, 0x414E_4452_4F49_4431);
+                core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) p as u64);
+            }
+            crate::flashlog::line(&alloc::format!("android: launching (slot a {r})"));
+            if r == crate::slot::MARKED {
+                platform::crumb(0xC7);
+                platform::reboot();
+            }
+        }
         // The USB process's command handled last pass: its raw reply to the process, the kernel's own outbound reply back in place.
         if let Some(saved) = proc_restore.take() {
             platform::RAW_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);

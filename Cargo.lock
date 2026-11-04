@@ -1082,6 +1082,13 @@ name = "ferros-payload-spinner"
 version = "0.1.0"
 
 [[package]]
+name = "ferros-payload-switchtest"
+version = "0.1.0"
+dependencies = [
+ "ferros_sys",
+]
+
+[[package]]
 name = "ferros-payload-threads"
 version = "0.1.0"
 dependencies = [
