@@ -20,7 +20,7 @@ Kernel side: `gpu-regs` (G#1F00_0000 16 MiB, EL0), `gpu-mem` (G#B400_0000 32 MiB
 
 **Next:** a resident `gpu` endpoint (each client its own AS and group), then tapuwae as a shader ([[tapuwae-neon-then-gpu]]).
 
-**Compute works** (same night): a 3-instruction Valhall shader runs 16 invocations (G#C0FFEE00 + id). The words with their sources are at Harbor /mnt/Harbor/tmp/mesa-panfrost/ferros-compute-spec.md. Mesa's genxml (v10/v11/v12), cs_builder.h and ISA.xml are fetched there too.
+**Compute works** (same night): a 3-instruction Valhall shader runs 16 and 16384 invocations, and a 26-instruction Mandelbrot kernel (divergent float loop, BRANCHZ.reconverge) is bit-exact against the CPU (ferros-mandel-spec.md on Harbor). The words with their sources are at Harbor /mnt/Harbor/tmp/mesa-panfrost/ferros-compute-spec.md. Mesa's genxml (v10/v11/v12), cs_builder.h and ISA.xml are fetched there too.
 
 **More traps:**
 - Pad every submission to 64 bytes: the CS front end caches the ring's 64-byte line, so a job that starts mid-line runs as stale NOPs.
