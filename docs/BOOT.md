@@ -553,3 +553,14 @@ Measured on slot a (2026-11-05):
 - No step list under the ring any more: the display server takes the panel as soon as home starts, so nobody could read it. Its text cost 180 ms on the boot core (Oxanium blends over the boot surface, Device memory, a bus read and write per glyph pixel). `bridge diag boot` keeps every number.
 - Press to service start: 235 ms, down from 338 ms.
 - **Home no longer waits for a second after the press** (it did from 2026-10-22, the ring's budget made a timer, so no boot could finish in under a second). init starts on the service loop's first pass; its first spawn derives the wairua, which waits for KOHI's words from worker 3 (339 ms). Press to init: 408 ms (was ~1050 ms); press to the first IPC: 481 ms.
+
+**Open, low priority (owner, 2026-11-05: "not irritating me nearly as much as the old 600ms timer on a black screen"):**
+- **What the owner sees:** the ring stops at about two thirds, then about five frames of black, then the keyboard and the attest screen.
+- **The missing third:** the wedges drawn on the service core (wairua, init, the end of KOHI's lane). All 14 are drawn, and DECON sends a frame after each one (`diag boot`'s decon lines), yet the panel does not show them.
+- **The black:** it comes with the display server's start.
+- **Tried with the owner watching, and none of it helped:**
+  - A: skipping the panel's raster and rate commands.
+  - B: keeping the DSI link running instead of restarting it.
+  - C: sending the boot surface's frame right after the modeset's last panel command.
+  - D: no modeset at all (which also showed that the server's 8 bpc path draws nothing any more).
+- **Next to look at:** whether the service core's writes to the boot surface reach the panel. That surface is ABL's splash, mapped Device.
