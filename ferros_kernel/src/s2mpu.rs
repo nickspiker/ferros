@@ -108,6 +108,43 @@ pub fn fence_dpu() -> u32 {
     r
 }
 
+/// The CPUCL0 block's S2MPU (zuma-s2mpu.dtsi s2mpu_s0_cpucl0, always on): in front of the CoreSight system's bus master (CSSYS, STM, the debug port's AXI path: the block's IPs in cmucal-sfr.c), not the cores, whose traffic reaches memory through the cluster. ABL and Android leave it open.
+pub const CPUCL0_S2MPU: usize = 0x29C5_0000;
+
+/// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
+pub fn deny_all(base: usize) -> u32 {
+    if rd(base, VERSION) & 0xFFFF_0000 != 0x9000_0000 {
+        return 0xE1;
+    }
+    let n = (rd(base, NUM_CONTEXT) & 0xF) as usize;
+    let mut ctx = 0u32;
+    for i in 0..n.min(VIDS) {
+        ctx |= ((i as u32) | 8) << (4 * i);
+    }
+    wr(base, CONTEXT_CFG_VALID_VID, ctx);
+    for vid in 0..VIDS {
+        for g in (0..4).chain(34..GBS) {
+            wr(base, l1_attr(vid, g), 0);
+        }
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    wr(base, ALL_INVALIDATION, 1);
+    wr(base, SYNC_CMD, 1);
+    let freq = crate::platform::cntfrq();
+    let t0 = crate::platform::cntpct();
+    while rd(base, SYNC_COMP) & 1 == 0 || rd(base, STATUS) & 3 == 3 {
+        if crate::platform::cntpct().wrapping_sub(t0) > freq / 100 {
+            return 0xE2;
+        }
+    }
+    wr(base, ERR_RESP_PER_VID_SET, 0xFF);
+    wr(base, CTRL0, 0);
+    wr(base, PROT_EN_PER_VID_SET, 0xFF);
+    wr(base, CFG, 0);
+    unsafe { core::arch::asm!("dsb sy") };
+    1
+}
+
 pub fn dpu_result() -> u32 {
     DPU_RESULT.load(core::sync::atomic::Ordering::Relaxed)
 }

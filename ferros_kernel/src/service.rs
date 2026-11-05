@@ -1105,6 +1105,9 @@ pub fn run(mut b: Boot) -> ! {
         let r = crate::s2mpu::fence_dpu();
         crate::flashlog::line(&alloc::format!("dpu: S2MPUs fenced at boot: G#{r:X} (1 = fenced)"));
     }
+    // The CoreSight system's bus master (the debug port's memory access, STM, the trace sinks) cut off from all memory on every boot: ferros uses none of it, and ABL leaves its S2MPU open. Not the cores' path: deny-all on it with ferros running left every core, the display and USB running (2026-11-04). After a jump the hv has already done it.
+    let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
+    crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
         let yes = matches!(st.get_by_key("android.allowed"), Ok(Some(v)) if v.as_slice() == [1]);
@@ -2158,6 +2161,14 @@ pub fn run(mut b: Boot) -> ! {
                         core::arch::asm!("msr cnthctl_el2, {}", "isb", in(reg) v);
                     }
                     resp.extend_from_slice(alloc::format!("event stream on counter bit {n}: every {} us\n", (2u64 << n) * 1_000_000 / cntfrq()).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
+                if cmd.params == b"s2mpu deny cpucl0" {
+                    // The experiment before the CPUCL0 S2MPU joins the jump's deny-all (2026-11-04): if the cores' traffic went through it, this freezes the device on the spot; if not, everything carries on and the debug subsystem is cut off from memory until the next reset.
+                    let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
+                    resp.extend_from_slice(alloc::format!("cpucl0 S2MPU deny-all: G#{r:X} (1 = done); protection now G#{:X}\n", unsafe { core::ptr::read_volatile((crate::s2mpu::CPUCL0_S2MPU + 0x58) as *const u32) }).as_bytes());
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }

@@ -2243,8 +2243,8 @@ mod hvcore {
     const DPU_SYSMMUS: [usize; 2] = [0x1984_0000, 0x19C4_0000];
     /// DECON0's trigger control (gate.rs): the hardware trigger enable (bit 0) and its mask (bit 4). The panel is in command mode, so the engine fetches a frame only when the trigger fires.
     const DECON0_TRIG_CON: usize = 0x1947_0030;
-    /// The always-on S2MPUs set to deny-all at the jump (zuma-s2mpu.dtsi): hsi1, hsi2, misc.
-    const DENY_AT_JUMP: [usize; 3] = [0x1209_0000, 0x131F_0000, 0x101F_0000];
+    /// The always-on S2MPUs set to deny-all at the jump (zuma-s2mpu.dtsi): hsi1, hsi2, misc, and cpucl0 (the CoreSight system's bus master: the debug port's memory access, STM and the trace sinks; not the cores — deny-all on it with ferros running, 2026-11-04, left every core, the display and USB running).
+    const DENY_AT_JUMP: [usize; 4] = [0x1209_0000, 0x131F_0000, 0x101F_0000, 0x29C5_0000];
 
     /// One S2MPU (v9, its non-secure registers; ferros_kernel s2mpu.rs has the same map) set to let no VID reach any memory: every context valid, every L1 entry no-access (GiB 4-33 are no-access in hardware), the caches invalidated and synced, then protection on with error responses. False when it is not a v9 or the sync never completed.
     fn s2mpu_deny_all(s: usize) -> bool {
@@ -2534,7 +2534,7 @@ mod hvcore {
             wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
         set(19, 1);
-        // The jump is a killswitch (owner, 2026-11-04: "if it's mid command, hit it on the fucking head with a crowbar"): every bus master Android left running behind an always-on S2MPU is cut off from all memory before ferros is copied in — hsi1 (PCIe ch0, the modem), hsi2 (UFS and WiFi: ferros's own fence opens UFS's window again as it brings the link up), misc (its DMA engines). Masters behind the S2MPUs inside power domains (the GPU, codecs, the camera chain, the TPU) are stopped by ferros cutting those domains on its first pass (pd.rs), not here: a register access to a domain that is down hangs the bus. cpucl0's is left alone: what sits behind it is not known, and if the CPUs did, deny-all would stop this core.
+        // The jump is a killswitch (owner, 2026-11-04: "if it's mid command, hit it on the fucking head with a crowbar"): every bus master Android left running behind an always-on S2MPU is cut off from all memory before ferros is copied in — hsi1 (PCIe ch0, the modem), hsi2 (UFS and WiFi: ferros's own fence opens UFS's window again as it brings the link up), misc (its DMA engines). Masters behind the S2MPUs inside power domains (the GPU, codecs, the camera chain, the TPU) are stopped by ferros cutting those domains on its first pass (pd.rs), not here: a register access to a domain that is down hangs the bus. cpucl0's too: it guards the CoreSight system's master, not the cores (proven on the running device).
         for &s in &DENY_AT_JUMP {
             let r = s2mpu_deny_all(s);
             super::pstore::log(&[if r { b"ferros hv: jump -- an S2MPU denied all\n" as &[u8] } else { b"ferros hv: jump -- an S2MPU did not take deny-all\n" }]);
