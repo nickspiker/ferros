@@ -974,13 +974,18 @@ pub(crate) fn tcpc_usb_switch(log: bool) {
     let (role, mut cc, mut pwr, sw) = (r(0x1A), r(0x1D), r(0x1E), r(0x93));
     // The port as a device needs it (TCPCI): sink on both CC lines (ROLE_CONTROL G#0A, Rd/Rd) with VBUS detection on (POWER_STATUS bit 3). ABL leaves it so on a cold boot (role G#0A, power G#0D). A jump from an Android that had the port in its low-power state (2026-11-04: role G#11, a pull-up as a source, CC_STATUS G#20 looking for a connection, power G#40, detection off) left the host seeing no attach at all, and the USB process never configured. So: detection on (COMMAND G#33, EnableVbusDetect) and the sink role, then the switch below once the host shows on CC with VBUS. A read that failed (G#8000) is left alone.
     if role & 0x8000 == 0 && pwr & 0x8000 == 0 && (role != 0x0A || pwr & 0x08 == 0) {
-        let _ = write_byte(HSI2C_11, TCPC, 0x23, 0x33);
-        let _ = write_byte(HSI2C_11, TCPC, 0x1A, 0x0A);
+        let w_cmd = write_byte(HSI2C_11, TCPC, 0x23, 0x33).is_ok();
+        let w_role = write_byte(HSI2C_11, TCPC, 0x1A, 0x0A).is_ok();
+        let role_back = r(0x1A);
         // A quarter second for the port to see the host on CC and VBUS (tCCDebounce is 100-200 ms), then read again, so this USB process's start closes the switch rather than the next one's.
         let (f, t0) = (cntfrq(), cntpct());
         while cntpct().wrapping_sub(t0) < f / 4 {}
         (cc, pwr) = (r(0x1D), r(0x1E));
         crate::flashlog::line(&alloc::format!("usb: tcpc role G#{role:X}: to the sink role (G#0A) with VBUS detection on; now cc G#{cc:X} power G#{pwr:X}"));
+        // When it does not take (2026-11-04, a jump: power G#4A — bit 6, the TCPC still initialising, ignores writes — and the role back at G#11 at every start for a minute), the rest of the picture for the next one: whether the writes were taken, the role read straight back, ALERT, and the vendor CC controls (tcpci_max77759_vendor_reg.h: CC_CTRL1-3 at G#8C-G#8E; CC_CTRL2 bits 3-4 the CC low-power mode, Android's auto ultra-low-power G#18).
+        if pwr & 0x40 != 0 || r(0x1A) != 0x0A {
+            crate::flashlog::line(&alloc::format!("usb: tcpc not taking it: writes {w_cmd}/{w_role}, role read back G#{role_back:X}, alert G#{:X}, cc_ctrl1-3 G#{:X} G#{:X} G#{:X}", r(0x10) | r(0x11) << 8, r(0x8C), r(0x8D), r(0x8E)));
+        }
     }
     let attached = cc & 0x8000 == 0 && cc & 0xF != 0;
     let vbus = pwr & 0x8000 == 0 && pwr & 0x4 != 0;
