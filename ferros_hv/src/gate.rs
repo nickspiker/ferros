@@ -239,8 +239,8 @@ fn draw(p: &Panel) {
     unsafe { asm!("dsb sy") };
 }
 
-/// The moment ferros is chosen: the gate's picture off (the rectangles ferros's ready.rs `erase` clears) and the boot ring's first frame, its dark-brick disc (checklist.rs `ring_start`: the same centre, radius and colour), so the press answers on the glass within a frame while ferros boots behind it. ferros then adopts the panel without clearing it (the hv left it black) and draws the same disc again. Owner, 2026-10-27: a third of a second from the press to black was "kind of embarrassing"; it was ferros's whole entry, the cache map and a 16 MB uncached clear, before anything moved.
-fn answered(p: &Panel) {
+/// The gate's two marks off: the rectangles ferros's ready.rs `erase` clears. Holding volume up at the gate takes them off before the press (owner, 2026-11-05: a clean screen to film the whole boot).
+fn erase_marks(p: &Panel) {
     const POWER_Y: usize = 1050;
     const VOL_DOWN_Y: usize = 1700;
     let rect = |xa: usize, ya: usize, xb: usize, yb: usize| {
@@ -253,14 +253,28 @@ fn answered(p: &Panel) {
     let tip = p.width - 28;
     rect(tip - 140, POWER_Y - 91, tip + 1, POWER_Y + 92);
     rect(tip - 80, VOL_DOWN_Y - 49, tip + 1, VOL_DOWN_Y + 50);
-    // The ring's disc: centred, in the top half's middle on a dev build (checklist.rs `centre`), radius 230, dark brick.
-    const R_DISC: i64 = 230;
-    const DISC: u32 = 0x003C_0200;
-    let (cx, cy) = ((p.width / 2) as i64, if option_env!("FERROS_PRODUCTION").is_some() { (p.height / 2) as i64 } else { (p.height / 4) as i64 });
-    for y in -R_DISC..=R_DISC {
-        for x in -R_DISC..=R_DISC {
-            if x * x + y * y <= R_DISC * R_DISC {
-                px(p, (cx + x) as usize, (cy + y) as usize, DISC);
+    unsafe { asm!("dsb sy") };
+}
+
+/// The previous session's report block (platform.rs RAMOOPS_RESULT): its magic survives a reset and not a power-on, and its crumb word says whether it ended in a panic (G#EExx).
+const REPORT: usize = 0xFD60_0000;
+const REPORT_MAGIC: u64 = 0x3153_6655_6F52_6546;
+
+/// The moment ferros is chosen: the gate's marks off and the boot ring's first frame, its centre disc (checklist.rs `ring` and `ring_start`: the attest circle's centre, radius r/2 - r/16 with r = w/3, in the reason's colour), so the press answers on the glass before ferros has started.
+/// The reason as the kernel reads it for a gate answer (main.rs `set_reason`): after a panic, restart, or cold; the jump, the chord's reset and a reload never come through here.
+fn answered(p: &Panel) {
+    erase_marks(p);
+    let (magic, crumb) = unsafe { (read_volatile(REPORT as *const u64), read_volatile((REPORT + 0x18) as *const u64)) };
+    // checklist.rs REASON_RGB: cold, restart, after a panic.
+    let rgb: u32 = if magic != REPORT_MAGIC { 0x003C_0200 } else if crumb >> 8 == 0xEE { 0x009C_0000 } else { 0x003C_2C00 };
+    let w = p.width as i64;
+    let r = w / 3;
+    let (cx, cy) = (w / 2, w * 473 / 5376 + w / 64 + r);
+    let disc = r / 2 - (r >> 4);
+    for y in -disc..=disc {
+        for x in -disc..=disc {
+            if x * x + y * y <= disc * disc {
+                px(p, (cx + x) as usize, (cy + y) as usize, rgb);
             }
         }
     }
@@ -382,6 +396,13 @@ pub fn ask(dtb: usize) -> Choice {
         } else if dn && option_env!("FERROS_PRODUCTION").is_none() {
             gate_telemetry(3, now().wrapping_sub(t0) * 1000 / f, pressed_at_start_ms);
             break Choice::Android;
+        }
+        // Volume up holds (the dev timer cancelled) and takes the marks off, once: the screen goes black and waits for power.
+        if up && !held {
+            if let Some(p) = &panel {
+                erase_marks(p);
+                present(p);
+            }
         }
         held |= up;
         if !held && now().wrapping_sub(t0) > f {

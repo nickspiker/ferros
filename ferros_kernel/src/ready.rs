@@ -91,9 +91,10 @@ pub fn wait() -> (u64, Choice) {
     let freq = crate::platform::cntfrq();
     let mut rep = alloc::vec::Vec::new();
     crate::checklist::at("gate: adopting panel");
-    if let Some(panel) = crate::display::adopt_once(freq, &mut rep) {
+    let panel = crate::display::adopt_once(freq, &mut rep);
+    if let Some(panel) = &panel {
         crate::checklist::at("gate: panel adopted");
-        draw(&panel);
+        draw(panel);
         crate::checklist::at("gate: drawn");
         panel.present(&mut rep);
         crate::checklist::at("gate: on screen");
@@ -106,6 +107,7 @@ pub fn wait() -> (u64, Choice) {
     crate::checklist::at("gate: KOHI done");
     // Dev: a volume key cancels the one-second auto-press for good (the keys' edge interrupts wake the WFI below, so a tap is seen at once).
     let mut held = false;
+    let mut wiped = false;
     let mut choice = Choice::Ferros;
     loop {
         crate::platform::pet_watchdogs();
@@ -116,6 +118,14 @@ pub fn wait() -> (u64, Choice) {
         if crate::killswitch::vol_down_held() && !crate::killswitch::vol_up_held() {
             choice = Choice::Android;
             break;
+        }
+        // Volume up takes the marks off, once (owner, 2026-11-05: a clean screen to film the whole boot); the hv's gate does the same.
+        if !wiped && crate::killswitch::vol_up_held() {
+            wiped = true;
+            if let Some(p) = &panel {
+                erase(p);
+                p.present_nowait();
+            }
         }
         held |= crate::killswitch::volume_key_down();
         if cfg!(not(ferros_production)) && !held && crate::platform::cntpct().wrapping_sub(t0) > freq {
