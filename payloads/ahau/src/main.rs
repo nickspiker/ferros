@@ -95,6 +95,8 @@ fn board_key(kb: &Keyboard) -> BoardKey {
 
 /// The mark thread's work: the grants (for its console line), the radius and the salt, set before it starts; and its stack.
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
+/// The device is bound to an identity: the mark is the attest button (tapuwae `Look::attest()`, `render_disc`) of the handle as typed, not the free device's Mandelbrot (owner, 2026-11-04: the third of tapuwae's marks, designed in tools/attest-mark as "the device bonded to an identity" and never wired here). Drawn from the device's sealed salt and the typed text alone: the owner sees their own picture form as they type their handle, a swapped device or a fake screen cannot draw it, and nothing on the locked device says whose it is.
+static mut BONDED: bool = false;
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// Which pixels of FRESH hold any of a component (tapuwae::render_fresh's mask): what a new handle redraws.
 static mut FRESH_MASK: [u64; (1 << 20) / 64] = [0; (1 << 20) / 64];
@@ -1327,7 +1329,45 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let coarse = unsafe { &mut *(&raw mut FRESH_COARSE) };
     let map = unsafe { &mut *(&raw mut FRESH_MAP) };
     let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
-    let done = tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, core::str::from_utf8(&text[..n]).unwrap_or(""), &tapuwae::Look::fresh(), 4, mask, coarse, map, full, fine, &moved_on);
+    let typed = core::str::from_utf8(&text[..n]).unwrap_or("");
+    // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). One sample a pixel (`Aa::Fixed(1)`), as the fresh mark's first pass takes: `Look::attest()` samples adaptively up to 64 a pixel (tapuwae MAX_SAMPLES, a desktop still's setting), 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04). Free: the Mandelbrot mark, as before.
+    let done = if unsafe { BONDED } {
+        // Two passes, as the fresh mark's: a quick one at half the side (a quarter of the work, each of its pixels drawn 2 × 2) on the glass at once, then the full one in bands of 32 rows, given up the moment a newer handle is typed (the render cannot stop inside a call, and a whole disc is seconds on the workers: unstoppable, it held the cores while keys were pressed, and their highlights never reached the glass, 2026-11-04).
+        let p = tapuwae::Params::new_placed(&salt, typed, true);
+        let look = tapuwae::Look { aa: tapuwae::Aa::Fixed(1), ..tapuwae::Look::attest() };
+        let newer = || FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
+        if !fine {
+            let hs = side / 2;
+            // WHY: the quick pass draws into the mark buffer's tail, past the full mark; sized for husky's panel (a 904-pixel mark leaves 231k words for its 204k), a wider panel's mark would run past the buffer's end, so it goes without the quick pass.
+            let all = unsafe { &mut *(&raw mut FRESH) };
+            if side * side + hs * hs <= all.len() {
+                let (mark, tail) = all.split_at_mut(side * side);
+                let small = &mut tail[..hs * hs];
+                tapuwae::render_disc_pack16(small, hs, hs as f32 * 0.5, hs as f32 * 0.5, r as f32 * 0.5, &p, &look);
+                for y in 0..side {
+                    let src = (y / 2).min(hs - 1) * hs;
+                    for x in 0..side {
+                        mark[y * side + x] = small[src + (x / 2).min(hs - 1)];
+                    }
+                }
+            }
+            true
+        } else {
+            const BAND: usize = 32;
+            let mut y0 = 0;
+            while y0 < side {
+                if newer() {
+                    break;
+                }
+                let y1 = (y0 + BAND).min(side);
+                tapuwae::render_disc_pack16(&mut buf[y0 * side..y1 * side], side, mid, mid - y0 as f32, r as f32, &p, &look);
+                y0 = y1;
+            }
+            y0 >= side
+        }
+    } else {
+        tapuwae::render_fresh(buf, side, mid, mid, r as f32, &salt, typed, &tapuwae::Look::fresh(), 4, mask, coarse, map, full, fine, &moved_on)
+    };
     for b in text.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
@@ -1432,6 +1472,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let l = ferros_sys::pref(ferros_sys::PREF_LAYOUT) as usize;
     kb.layout = if l < honeycomb::LAYOUTS { l } else { 0 };
     let bound = ferros_sys::identity_bound(cap(grants, S_UNLOCK)) == Some(true);
+    unsafe { BONDED = bound };
     // The keyboard's back buffer, when init granted a second surface (an older init does not: the board then redraws in place).
     let back = match ferros_sys::dma(cap(grants, S_BACK)) {
         b if b == 0 || b == u64::MAX || b == base => 0,
@@ -1493,7 +1534,10 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     a.kb.draw_key(a.surf(), key, true, &mut a.label());
                     // The lit key on the glass first: preparing a whole board takes some 50 ms.
                     a.show();
-                    a.preview(key);
+                    // The free device's mark previews the key under the finger (its components redraw in a fraction of a second); the bonded device's whole disc waits for the tap, so a press does not start a render the tap replaces.
+                    if !unsafe { BONDED } {
+                        a.preview(key);
+                    }
                     a.prepare(key);
                 }
                 Touch::Unlight(key) => {
