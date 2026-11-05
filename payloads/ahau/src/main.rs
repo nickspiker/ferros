@@ -97,6 +97,8 @@ fn board_key(kb: &Keyboard) -> BoardKey {
 static mut FRESH_JOB: (u64, usize, [u8; 32]) = (0, 0, [0; 32]);
 /// The device is bound to an identity: the mark is the attest button (tapuwae `Look::attest()`, `render_button_pack16`) of the handle as typed, not the free device's Mandelbrot (owner, 2026-11-04: the third of tapuwae's marks, designed in tools/attest-mark as "the device bonded to an identity" and never wired here). Drawn from the device's sealed salt and the typed text alone: the owner sees their own picture form as they type their handle, a swapped device or a fake screen cannot draw it, and nothing on the locked device says whose it is.
 static mut BONDED: bool = false;
+/// The last lift's stages in microseconds (retint, board, tint pass, present), for its console line while the lift's lag is looked at.
+static mut LIFT_US: [u64; 4] = [0; 4];
 static mut FRESH_STACK: [u8; 1 << 16] = [0; 1 << 16];
 /// The bonded button's helpers: three more threads on the worker cores, each drawing every fourth row of a pass (tapuwae `render_button_pack16`'s row share), the mark's thread the remaining share. The fresh mark redraws only its components, a quarter of the disc (159k of 630k pixels at 900 px), where the ball is 85 % of it (538k) at the same cost a sample, so one core that kept up with the fresh mark is about four short of the ball (1.0 to 1.4 s a pass alone, 2026-11-04).
 const HELPERS: usize = 3;
@@ -893,10 +895,17 @@ impl Ahau {
             self.replay_labels(self.base);
             return;
         }
+        let t0 = now();
         let slot = self.board(&self.kb);
+        let t1 = now();
         self.lay_board(slot, top, bottom);
+        let t2 = now();
         self.present(top, bottom);
+        let t3 = now();
         self.shown_board.set(slot);
+        // The lift's stages, for its console line (`Touch::Tap`): the board (drawn or kept), the tint pass, the present.
+        let us = |a: u64, b: u64| b.wrapping_sub(a) * 1_000_000 / freq();
+        unsafe { LIFT_US[1..4].copy_from_slice(&[us(t0, t1), us(t1, t2), us(t2, t3)]) };
     }
 
     /// Rows y0..y1 (inside the keyboard's) of board `slot` laid into the frame buffer in the handle's tints, the shift key's ▲ on top: what `show_board` presents.
@@ -1172,7 +1181,9 @@ impl Ahau {
             None => return,
         }
         // Every stroke: the keys take the new handle's rainbow, laid on from the board in one pass; a letter that ended a one-letter shift brings the lower-case board, drawn at its press.
+        let t = now();
         self.retint();
+        unsafe { LIFT_US[0] = now().wrapping_sub(t) * 1_000_000 / freq() };
         self.show_board();
     }
 
@@ -1608,7 +1619,7 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     let t0 = now();
                     a.tap(key);
                     let mut l = Line::new();
-                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: lift drawn in {} us\n", ferros_sys::us_since(t0)));
+                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: lift drawn in {} us (retint {}, board {}, tint {}, present {})\n", ferros_sys::us_since(t0), unsafe { LIFT_US[0] }, unsafe { LIFT_US[1] }, unsafe { LIFT_US[2] }, unsafe { LIFT_US[3] }));
                     console(a.grants, l.as_bytes());
                     slid = None;
                 }
