@@ -116,7 +116,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: VSF RGB only](feedback_vsf_rgb_only.md) — no sRGB/OKLab/Rec.709/XYZ-1931 in ferros or Photon (platform edge only); pick in VSF RGB, match brightness by photopic via LMS (vsf_rgb_to_photopic_f32); the mark + keyboard rainbow were sRGB-authored (2026-11-01)
 - [Android behind attestation](android_behind_attestation.md) — off by default, opt in after attest + disclaimer; kernel `android` switch built 2026-11-04, no launcher in the base OS (an installed app holds it later)
 - [hv chords](hv_chords_decided.md) — power+vol up → ferros, vol up+down = kill; hv-owned core 3 takes the key SPIs, proxies to Android (works on slot b 2026-11-01)
-- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros on the hv core; lands since 2026-11-02; bug list and tools
+- [hv jump to ferros](hv_jump_to_ferros.md) — power+vol up freezes Android, boots ferros on the hv core; screen-off jumps fixed 2026-11-04 (TCPC, TE pin fn 2, VDDD slot cap, alpha, DPU S2MPU, window tail); diff black vs cold to hunt
 - [Display: global mask, then layers](display_global_mask_then_layers.md) — one per-row shape plan per size (spans + sparse AA), then layers by spans; no per-pixel geometry on publish
 - [Sandbox state 2026-11-03](sandbox_state_2026_11_03.md) — fixed/ring/exact + BTI verified on husky; which processes run masked; vsf signature hole closed; traps
 - [Pages allowed when equivalent](pages_allowed_when_equivalent.md) — owner 2026-11-03: masking is the default, MMU pages where equivalent and faster (Photon: own table + ASID, guard pages, IOMMUs for DMA/GPU); Glyph: ISOMEM bounds on every bus master
