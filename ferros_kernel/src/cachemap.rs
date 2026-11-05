@@ -92,6 +92,11 @@ pub const GPU_MEM: (usize, usize) = (0xB400_0000, 0xB600_0000);
 pub const GPU_SNOOP: usize = GPU_MEM.1 - (2 << 20);
 #[cfg(shim_handoff)]
 pub const GPU_SNOOP: usize = 0;
+/// The layer arena (cold only; GPU.md "Layers", owner 2026-11-05): 64 MiB of Normal write-back, EL0 read/write, never executable memory where the GPU writes compute-dense layers (the Mandelbrot, glows) and the CPU composes them, or the CPU writes and the GPU reads, with no clean and no copy: the GPU maps it coherent and snoops the CPU's caches (GPU.md "Coherency"). In the GPU's fence beside gpu-mem. Free DRAM: the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000). Granted as `layers`.
+#[cfg(not(shim_handoff))]
+pub const LAYERS: (usize, usize) = (0x9C00_0000, 0xA000_0000);
+#[cfg(shim_handoff)]
+pub const LAYERS: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
 pub const GPU_MEM: (usize, usize) = (0, 0);
 
@@ -262,7 +267,7 @@ pub fn enable() -> bool {
                 dma_pool(vhe, a, BLOCK)
             } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
                 device_el0(vhe, a, BLOCK)
-            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) {
+            } else if (h0 != h1 && a >= h0 && a + MIB2 <= h1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 + USB_DMA_NC && a + MIB2 <= USB_DMA.1) || (GPU_MEM.0 != GPU_MEM.1 && a == GPU_SNOOP) || (LAYERS.0 != LAYERS.1 && a >= LAYERS.0 && a + MIB2 <= LAYERS.1) {
                 pool(vhe, a, BLOCK) | UXN
             } else if b0 != b1 && a >= b0 && a + MIB2 <= b1 {
                 // The big pool at 4 KiB granularity as well: fresh pages are data.

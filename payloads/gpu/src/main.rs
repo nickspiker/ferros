@@ -135,6 +135,9 @@ const TAB_BYTES: usize = 131072 + 5 * 1024;
 const CANV_VA: u64 = 0x7000_0000;
 const WORDS_VA: u64 = 0x7100_0000;
 const TAB_VA: u64 = 0x7200_0000;
+/// The layer arena in the group's address space (kernel cachemap LAYERS, 64 MiB).
+const ARENA_VA: u64 = 0x8000_0000;
+const ARENA_BYTES: usize = 64 << 20;
 
 struct Gpu {
     regs: usize,
@@ -402,6 +405,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     as1.map(&mut m, CANV_VA, canvas, PRESENT_W * PRESENT_H * 8 / PAGE, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, WORDS_VA, words_out, PRESENT_W * PRESENT_H * 4 / PAGE, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, TAB_VA, tab, TAB_BYTES.div_ceil(PAGE), PAGE_RW | NX, TABLE);
+    // The layer arena (input bit 6; grant slot 5, `layers`): all 64 MiB mapped coherent (the shared type, shareable both ways), so whatever the CPU has in its caches the GPU sees, and the other way (GPU.md "Coherency").
+    let arena = ferros_sys::dma(cap(grants, 5)) as usize;
+    let arena_ok = in0 & 0x40 != 0 && arena != 0 && arena != usize::MAX;
+    if arena_ok {
+        as1.map(&mut m, ARENA_VA, arena, ARENA_BYTES / PAGE, PAGE_RW | 6 << 2 | 2 << 8 | NX, TABLE);
+    }
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -793,6 +802,30 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             }
         }
         say!(grants, "gpu: present: the largest channel difference {} (in a word G#{:X})\n", worst.0, worst.1);
+    }
+    // Input bit 6: the layer arena, both ways, at its far end and its start. The CPU writes 16 words through its caches at 60 MiB in and the GPU copies them out; then the GPU renders the 64 x 64 Mandelbrot into the arena's first 16 KiB while the CPU holds those lines stale in its caches, and the CPU checks it against its own arithmetic.
+    if arena_ok {
+        let far = arena + (60 << 20);
+        for i in 0..16 {
+            unsafe { core::ptr::write_volatile((far + 4 * i) as *mut u32, 0xA4E0_0000 + i as u32) };
+            wr32(res + 4 * i, 0);
+        }
+        wr32(out + 0x200, 0);
+        let copy = [0x01A3_C200_2027_3C80u64, 0x0860_8482_1800_0002, 0x01A3_C200_2027_3C82, 0x7861_4402_1800_0002];
+        let n = cx.prepare(&copy, &[ARENA_VA + (60 << 20), RES_VA], 1, done, &mut words);
+        run_for("arena read", &words[..n], &|| rd32(out + 0x200) == 1, 200);
+        let got = (0..16).filter(|&i| rd32(res + 4 * i) == 0xA4E0_0000 + i as u32).count();
+        for i in 0..4096 {
+            unsafe { core::ptr::write_volatile((arena + 4 * i) as *mut u32, 0xFFFF_FFFF) };
+        }
+        let stale: u32 = (0..4096).map(|i| unsafe { core::ptr::read_volatile((arena + 4 * i) as *const u32) } & 1).sum();
+        wr32(out + 0x200, 0);
+        let (shift, max_iter, x0, y0, step) = (6u32, 64u32, -2.0f32, -1.25f32, 0.0390625f32);
+        let u = [ARENA_VA, shift as u64 | (max_iter as u64) << 32, x0.to_bits() as u64 | (y0.to_bits() as u64) << 32, step.to_bits() as u64];
+        let n = cx.prepare(&MANDEL, &u, 4096 / 16, done, &mut words);
+        run_for("arena mandelbrot", &words[..n], &|| rd32(out + 0x200) == 1, 200);
+        let sum: u32 = (0..4096).map(|i| unsafe { core::ptr::read_volatile((arena + 4 * i) as *const u32) }).sum();
+        say!(grants, "gpu: layer arena at G#{arena:X}: CPU wrote, GPU read {got} of 16 at 60 MiB in; GPU rendered the Mandelbrot there, CPU read it from its caches: sum {sum} (expect 83000; {stale} stale lines held before)\n");
     }
     // Input bit 1: the present-stage bench (fluor on the GPU, measured before written): a proxy with the display's present stage's memory shape, a 64-bit pixel in and a 32-bit word out, with 0, 24 or 48 FMAs between, over 1M pixels; and the same at 16 invocations for the fixed cost of a dispatch. The kernel:
     //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:3      (the pixel's address)

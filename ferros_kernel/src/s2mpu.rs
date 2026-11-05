@@ -146,18 +146,18 @@ const PD_G3D_STATUS: usize = 0x1546_1A84;
 static mut GPU_TABLE: Smpt = Smpt([0; 32768]);
 static GPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM) and the layer arena (LAYERS, both in one GiB), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
 pub fn fence_gpu() -> u32 {
-    let m = crate::cachemap::GPU_MEM;
+    let (m, l) = (crate::cachemap::GPU_MEM, crate::cachemap::LAYERS);
     let gb = m.0 >> 30;
     let r = if m.0 == m.1 {
         0xE3
     } else if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
         0xE4
-    } else if (m.1 - 1) >> 30 != gb {
+    } else if [m.1 - 1, l.0, l.1 - 1].iter().any(|&a| a >> 30 != gb) {
         0xE3
     } else {
-        fence_at(GPU_S2MPU, &raw mut GPU_TABLE, gb, 0xC, 0xFF, &|pa| pa >= m.0 && pa < m.1)
+        fence_at(GPU_S2MPU, &raw mut GPU_TABLE, gb, 0xC, 0xFF, &|pa| (pa >= m.0 && pa < m.1) || (pa >= l.0 && pa < l.1))
     };
     GPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
     r

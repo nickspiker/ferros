@@ -196,3 +196,24 @@ The CPU does a full phase in about 1.5 ms of wall time (about 6 ms of CPU across
 So at its top clock the GPU is about 3.5 times slower in wall time; what it buys is the CPU's 6 ms a phase. This kernel is compute-bound: 92 instructions at about a third of the cores' FMA peak, where the proxy with the same memory traffic ran in 0.55 ms per 1M pixels.
 
 The cheapest speed-up the GPU allows and NEON does not: the light (the tanh rational with its divide, about 40 of the 92 instructions per pixel) is a function of one 16-bit value, so it can be a 64 Ki-entry f16 table read like the code table already is. One cached load per channel instead of the arithmetic.
+
+## Layers: the shared arena (2026-11-05)
+
+The owner's direction: the GPU produces compute-dense layers (the Mandelbrot and tapuwae, glows, edge effects). The CPU composes them front to back with `under` and presents them on NEON. Buffers are shared in RAM, never copied. The present stage stays on the CPU, where it measured faster.
+
+**The arena** (cachemap `LAYERS`): 64 MiB at G#9C00_0000.
+- **On the CPU's side:** Normal write-back, EL0 read/write, never executable.
+- **The grant:** `layers` (the GPU driver and the display server; one shared arena for now, with no isolation between its users).
+- **In the GPU's fence:** beside `gpu-mem`, both in one GiB.
+- **Zeroed before every reset.**
+- **Where:** the device tree reserves nothing in G#9800_0000-G#A000_0000 (USB's 4 MiB end at G#9740_0000). It reads and writes as ordinary non-secure DRAM.
+
+The GPU driver maps it coherent (MEMATTR index 6, shareable both ways) at GPU VA G#8000_0000. With input bit 6 and `--dma layers` as grant slot 5, the test runs both ways:
+- The CPU wrote 16 words through its caches 60 MiB in, and the GPU read all 16.
+- The GPU rendered the 64 × 64 Mandelbrot at the arena's start while the CPU held those 4096 words stale in its caches. The CPU then read the exact sum, 83000, from its caches.
+- No clean, no copy, no fence faults.
+
+**Next:**
+- the GPU driver as a resident service, taking jobs that name layers in the arena;
+- a typed Valhall instruction builder in Rust, generated from Mesa's `ISA.xml` and checked against tonight's verified words, which leads to kernels as Rust functions compiled on the device;
+- the attest screen's fresh mark as the first customer.

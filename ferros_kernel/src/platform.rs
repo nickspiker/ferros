@@ -407,7 +407,7 @@ pub fn scrub_memory() {
         return;
     }
     reset_step(2);
-    let regions: [(usize, usize); 13] = [
+    let regions: [(usize, usize); 14] = [
         (hb, he),
         crate::cachemap::HEAP2,
         crate::cachemap::POOL,
@@ -421,6 +421,7 @@ pub fn scrub_memory() {
         crate::cachemap::DISPLAY_CANVAS,
         crate::cachemap::SURFACES,
         crate::cachemap::GPU_MEM,
+        crate::cachemap::LAYERS,
     ];
     let total: usize = regions.iter().map(|&(lo, hi)| if hi > lo { hi - lo } else { 0 }).sum();
     // Said before the zeroing: the allocator's own lists are in the heap, so nothing may allocate after it (the first cut formatted its line after, and the reset path died short of the EL3 reboot-mode stamp: two reboots to fastboot that landed as plain boots, 2026-11-03).
