@@ -64,11 +64,11 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Colourspace pinned: VSF gamma2tanh in root space](colourspace_pinned_vsf_gamma2tanh.md) — owner pinned the panel pipeline (tanh²(√(L/H))) as THE profile; Mahere imagery adopts it once ferros settles it (2026-10-17)
 - [Feedback: reservation proof is memblock](feedback_reservation_proof_is_memblock.md) — a DT reserved-memory node proves nothing; check memblock (hv 64 MiB sat in the page allocator 2026-10-17→19)
 - [TTL 63 everywhere](cellular_ttl_63.md) — TTL/hop limit 63 for all ferros traffic, both families, both links (`HOP` in payloads/ip); Android kernel built the same
-- [husky factory partitions backup](husky_factory_partitions_backup.md) — persist (all factory calibration) + efs/efs_backup (modem per-unit incl. IMEIs) imaged + hash-verified 2026-10-19 to /mnt/Harbor/tmp/husky-backup-2026-10-19; local only
+- [husky factory partitions backup](husky_factory_partitions_backup.md) — persist + efs/efs_backup imaged and hash-verified 2026-10-19 to /mnt/Harbor/tmp; local only
 - [husky camera bring-up](husky_camera_bringup.md) — ferros powers the main camera cold, sensor answers G#08EF (2026-10-19); traps: ACPM, HS-I2C timeout/error IRQs, camera-PMIC chip select high, program voltages before enables
 - [Feedback: oracle capture integrity](feedback_oracle_capture_integrity.md) — pstore captures lose lines (hv + kernel race the ring); quiet console to level 4, stats off, decoder checks each transfer vs AUTO_CONF length before any replay
 - [husky touch bring-up](husky_touch_bringup.md) — FTM5 touch up from cold (2026-10-19): diag touch up/watch/paint; capture = boot probe at loglevel=4, never fts unbind (panics); axes finger test pending
-- [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live under path deps; build breaks inside vsf = wait/retry or message the vsf session, never touch it; no pinning (owner, 2026-10-20); siblings require vsf "0.10"
+- [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live: a build break inside vsf = wait or message that session, never touch it, never pin
 - [Settings flow identity → device only](settings_identity_to_device_only.md) — attesting identity's preference written to the device, never device → identity; device.base (tatau code) is the first; spec in SETTINGS.md
 - [Feedback: NO TIMERS](feedback_no_animations.md) — no waits/holds/delays/animations/time windows; sole exception the dev gate 1 s auto-answer (2026-11-05)
 - [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape
@@ -94,9 +94,9 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [std target: Rust std on the phone](std_target_status.md) — target JSON + ferros_rt + forked std (ferros-rust); tools/std-build.sh; build-std fingerprint and PC-relative traps
 - [Photon phone join status](photon_phone_join_status.md) — 2026-10-26 LAN join: owner binds at the desktop; LAN traps (no WiFi multicast, desktop sends first)
 - [Feedback: count from zero](feedback_count_from_zero.md) — every numbered thing in ferros starts at 0: levels, Zil versions, doc IDs (APK-LEGAL D0/O0); never start IDs at 1
-- [Windows](windows_design_pending.md) — built 2026-10-27: a full-screen surface per app (`--dma surface`), composed frontmost first inside a circle tangent to top/bottom (corners = system clock etc), death = generation byte; ops in WINDOWS.md
+- [Windows](windows_design_pending.md) — a full-screen surface per app composed frontmost first inside a circle; ops in WINDOWS.md
 - [Feedback: a handle is not a password](feedback_handle_not_password.md) — never mask a handle; show as typed; minting (only) asks for it twice, visibly; attest is one entry
-- [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) — never put identity roots on a device without asking whose device and which identity; the 2026-10-26 roots push put the owner's identity on his wife's phone
+- [Feedback: an identity belongs to a person](feedback_identity_belongs_to_a_person.md) — never put identity roots on a device without asking whose device and which identity
 - [fgtw.org serves plain HTTP for ferros](fgtw_plain_http_for_ferros.md) — port 80 works, no redirect (2026-10-28); ferros reaches the seed without TLS via ip's TCP + DNS; never enable Cloudflare Always Use HTTPS on fgtw.org
 - [Identity not on disk by default](identity_not_on_disk_default.md) — handle typed each boot, roots in RAM; opt-in unlock-at-boot with theft warning
 - [Keys in registers](keys_in_registers.md) — ira+wairua only in CPU registers since 2026-10-28; those registers are taken; lift rules
@@ -129,3 +129,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [GPU online](gpu_online.md) — 2026-11-04: Mali-G715 CSF up (payloads/gpu), IRQ-driven queue, hand-encoded Valhall compute shader runs; gpu-mem G#B400_0000; secure carveout at G#B600_0000; traps
 - [GPU role: layers](gpu_role_layers.md) — owner 2026-11-05: GPU produces compute-dense layers (Mandelbrot/tapuwae, glows) into a shared CPU-cacheable/GPU-coherent arena; under + present stay NEON; no wholesale switching
 - [FGTW is a DUNA; buyers are the rūnanga](fgtw_duna_runanga.md) — Wyoming DUNA, nobody owns it; service buyers = assembly members; member unit open (2026-11-05)
+- [Feedback: Photon is the full app](feedback_photon_is_the_full_app.md) — one Photon on every platform (std/photon); no photon_core/stripped copy; FGTW = attest, identity, OS sync (2026-11-05)

@@ -1,5 +1,7 @@
 # BEAM — what a ferros beam has to speak, and the path there
 
+> **Superseded (owner, 2026-11-05):** Photon is one full app on every platform, ferros included: the real photon-messenger crate built as `std/photon` (STD-TARGET.md), running on the device since 2026-10-27. FGTW is attest, identity and the OS's sync. The `photon_core` code below is a reimplementation written before the real app ran here: nothing more is built on it, and it is kept only until the owner decides how to retire it (STATUS.md, "Photon and FGTW on ferros").
+
 A **beam** is Photon's live video, and it is not a call of its own: it is a video track inside a **wave** (a voice call). This is the contract ferros must meet to beam with the stock Photon app, mapped from the Photon source 2026-10-15 (paths under `photon/src/`; the design rationale is `photon/docs/beams.md`). Anything marked UNCONFIRMED is still to be proven against the app.
 
 ## Prerequisites
