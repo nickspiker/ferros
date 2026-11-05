@@ -2244,7 +2244,8 @@ mod hvcore {
     /// DECON0's trigger control (gate.rs): the hardware trigger enable (bit 0) and its mask (bit 4). The panel is in command mode, so the engine fetches a frame only when the trigger fires.
     const DECON0_TRIG_CON: usize = 0x1947_0030;
     /// The always-on S2MPUs set to deny-all at the jump (zuma-s2mpu.dtsi): hsi1, hsi2, misc, and cpucl0 (the CoreSight system's bus master: the debug port's memory access, STM and the trace sinks; not the cores — deny-all on it with ferros running, 2026-11-04, left every core, the display and USB running).
-    const DENY_AT_JUMP: [usize; 4] = [0x1209_0000, 0x131F_0000, 0x101F_0000, 0x29C5_0000];
+    // cpucl0 is not here: closed at a jump (2026-11-04) the jumped ferros froze right after opening its vault, every core silent, the killswitch with them — most likely Android's trace still running on the cores ferros takes over, its sink cut off from memory, the trace backing up into the cores. It needs tracing switched off on every core first (TRFCR); until then ferros closes it on cold boots only.
+    const DENY_AT_JUMP: [usize; 3] = [0x1209_0000, 0x131F_0000, 0x101F_0000];
 
     /// One S2MPU (v9, its non-secure registers; ferros_kernel s2mpu.rs has the same map) set to let no VID reach any memory: every context valid, every L1 entry no-access (GiB 4-33 are no-access in hardware), the caches invalidated and synced, then protection on with error responses. False when it is not a v9 or the sync never completed.
     fn s2mpu_deny_all(s: usize) -> bool {

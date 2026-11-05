@@ -1105,9 +1105,11 @@ pub fn run(mut b: Boot) -> ! {
         let r = crate::s2mpu::fence_dpu();
         crate::flashlog::line(&alloc::format!("dpu: S2MPUs fenced at boot: G#{r:X} (1 = fenced)"));
     }
-    // The CoreSight system's bus master (the debug port's memory access, STM, the trace sinks) cut off from all memory on every boot: ferros uses none of it, and ABL leaves its S2MPU open. Not the cores' path: deny-all on it with ferros running left every core, the display and USB running (2026-11-04). After a jump the hv has already done it.
-    let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
-    crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
+    // The CoreSight system's bus master (the debug port's memory access, STM, the trace sinks) cut off from all memory on a cold boot: ferros uses none of it, and ABL leaves its S2MPU open. Not the cores' path: deny-all on it with ferros running left every core, the display and USB running (2026-11-04). Not after a jump: closed there, the jumped ferros froze right after its vault opened (most likely Android's trace still running on the cores, its sink cut off, backing up into them); that waits for tracing switched off on every core first.
+    if !platform::jumped() {
+        let r = crate::s2mpu::deny_all(crate::s2mpu::CPUCL0_S2MPU);
+        crate::flashlog::line(&alloc::format!("cpucl0: the debug system's S2MPU denied all: G#{r:X} (1 = done)"));
+    }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
         let yes = matches!(st.get_by_key("android.allowed"), Ok(Some(v)) if v.as_slice() == [1]);
