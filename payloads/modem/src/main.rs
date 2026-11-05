@@ -92,6 +92,8 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
     let mut wait_s = 16u64;
     let mut first = true;
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         if !first {
             // The service state cleared with it (`down`), or `up` would find the old one and do nothing.
             modem::down(&mut rep);

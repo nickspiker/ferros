@@ -128,6 +128,8 @@ pub extern "C" fn sensors_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     say("sensors: serving\n");
     let mut scope = 0u8;
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         usf::drain(None);
         usf::publish();
         // The display's state follows the screen (the under-display sensor times its bursts to the panel), and the light scope follows its preference: both the kernel's to watch before the move.

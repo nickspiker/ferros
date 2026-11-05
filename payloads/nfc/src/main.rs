@@ -514,6 +514,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The corners' NFC circle (ferros_sys::measure), at each change: up; listening, with the carrier it listens on (NFC's 13.56 MHz); a reader's field on us (connected, while it lasts).
     let mut shown = None;
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         if shown != Some((nfc.discovering, nfc.field)) {
             shown = Some((nfc.discovering, nfc.field));
             use ferros_sys::{measure as k, measure_word as w, status, MEASURE_NONE};

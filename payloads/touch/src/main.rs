@@ -318,6 +318,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     p.irq_setup();
     let mut screen_off = false;
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         // Screen off, sensing off (owner, 2026-10-25: lean power): the controller stops scanning while the screen is dark and starts again when it comes back, as the vendor driver's mode handler does on screen down/up — scan mode active with every sensing bit clear (`A0 00 00`) or set (`A0 00 FF`), each after the two-byte zero write to G#2000_0000 the controller needs before a mode change.
         let off = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
         if off != screen_off {

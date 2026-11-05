@@ -649,6 +649,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // (HOST_REQ seen, MCU_RESP not answering, bytes read), and when they were last reported.
     let (mut asks, mut silent, mut bytes, mut said) = (0u32, 0u32, 0usize, now());
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         // Asleep until the chip asks or 1/64 s passes (the endpoint is looked at between).
         ferros_sys::irq_wait(cap(grants, S_IRQ), now() + f / 64);
         while chip.get(HOST_REQ) {

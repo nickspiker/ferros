@@ -424,6 +424,12 @@ struct Process {
     line_start: bool,
     /// The spawn input, kept in kernel memory and pulled in by the `input` syscall (so a driver's arc stays small while large one-shot data — firmware — streams through a chunk buffer). Inlined into the arc too only when it is small.
     input: Vec<u8>,
+    /// The process watchdog (KERNEL-OUT.md, owner 2026-11-05), measuring first: when it was spawned, its pets (SYS_PET, once a pass of its main loop), the last one, and the longest stretch between two (from the spawn for the first) with when it ended. Nothing is enforced yet.
+    born: u64,
+    pets: u64,
+    last_pet: u64,
+    gap_max: u64,
+    gap_at: u64,
 }
 
 struct Endpoint {
@@ -723,6 +729,8 @@ const SYS_SENSORS: u64 = 26;
 /// status(slot, word): one of a radio driver's eight measure slots for the corners' circles (WINDOWS.md), SYS_FACTS 33-80, eight words a link: the link is the caller's own, by its name (modem, pcie1, bt, nfc, gnss, usb), so no capability; anyone else, or a slot past 7, gets ERR. A word is a tagged measure (ferros_sys::measure: the kind in bits 48-63, the value in its unit below), all ones empty; the kernel keeps the words and reads none of them.
 const SYS_STATUS: u64 = 27;
 pub static STATUS: [[core::sync::atomic::AtomicU64; 8]; 6] = [const { [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8] }; 6];
+/// pet(): the process is alive and going round its main loop (the process watchdog, measuring: the kernel records the longest stretch between two pets, `diag pets`). → 0.
+const SYS_PET: u64 = 28;
 const SYS_LAST: u64 = 22;
 
 /// A named interrupt line a spawn can grant (`bridge spawn --irq NAME`): the GIC INTID (SPI + 32). Enabled and routed to the kernel's core when granted; `.Lirq` (main.rs) masks a line that fires and marks it pending; the waiting thread handles the device and acks. The kernel's own lines (the keys, the slice timer) are not here.
@@ -1593,6 +1601,18 @@ fn el0_trap(f: &mut Frame) -> u64 {
             };
             0
         }
+        SYS_PET => {
+            let now = crate::platform::cntpct();
+            let from = if p.last_pet != 0 { p.last_pet } else { p.born };
+            if now - from > p.gap_max {
+                p.gap_max = now - from;
+                p.gap_at = now;
+            }
+            p.last_pet = now;
+            p.pets += 1;
+            f.x[0] = 0;
+            0
+        }
         SYS_STATUS => {
             let slot = [b"modem" as &[u8], b"pcie1", b"bt", b"nfc", b"gnss", b"usb"].iter().position(|n| *n == p.name.as_slice());
             f.x[0] = match slot {
@@ -2292,6 +2312,25 @@ pub fn round_trips() -> u32 {
     with_lock(|| k().ipc_round_trips)
 }
 
+/// `diag pets`: the process watchdog's measurements, one line a running process: its pets, the longest stretch between two (from its spawn for the first) and how long ago that stretch ended, and how long since its last pet. A process that never pets is listed with none.
+pub fn pets_report(out: &mut Vec<u8>) {
+    lock();
+    let (now, f) = (crate::platform::cntpct(), crate::platform::cntfrq());
+    let ms = |t: u64| t * 1000 / f;
+    for p in k().procs.iter().flatten() {
+        if p.dying {
+            continue;
+        }
+        let name = core::str::from_utf8(&p.name).unwrap_or("?");
+        if p.pets == 0 {
+            out.extend_from_slice(alloc::format!("{name:<10} no pets, up A#{} ms\n", ms(now - p.born)).as_bytes());
+        } else {
+            out.extend_from_slice(alloc::format!("{name:<10} A#{} pets, longest stretch A#{} ms (ended A#{} ms ago), last pet A#{} ms ago, up A#{} ms\n", p.pets, ms(p.gap_max), ms(now - p.gap_at), ms(now - p.last_pet), ms(now - p.born)).as_bytes());
+        }
+    }
+    unlock();
+}
+
 pub fn alive() -> usize {
     lock();
     let n = alive_locked();
@@ -2572,7 +2611,7 @@ fn build_from(name: &[u8], arc: Arc, code_len: usize, input: &[u8], objects: &[(
         cspace.push(CapEntry { token: mint(object, rights, epoch), object, rights });
     }
     let zero = Frame { x: [0; 31], sp_el0: 0, elr: 0, spsr: 0, esr: 0, far: 0, v: [0; 32], fpcr: 0, fpsr: 0, tpidr: 0, _pad: 0 };
-    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec() };
+    let p = Process { arc, cspace, epoch, dying: false, name: name.to_vec(), line_start: true, input: input.to_vec(), born: crate::platform::cntpct(), pets: 0, last_pet: 0, gap_max: 0, gap_at: 0 };
     // Grants page: the handle table, the count, then the tokens in slot order. Then the code, then the input.
     p.write(TOKENS as u64, &(p.cspace.len() as u32).to_le_bytes());
     for (i, c) in p.cspace.iter().enumerate() {

@@ -474,6 +474,8 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let mut checked = now();
     let mut e = [0u8; 258];
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         // WiFi's driver pulling its REG_ON (a restart) resets this core to its ROM, the patch and the beacon gone, the UART answering nothing at 4 Mbaud: every 8 s Read_Local_Version_Information asks, and silence brings the chip up again with the beacon it had.
         if now() - checked > freq() * 8 {
             checked = now();

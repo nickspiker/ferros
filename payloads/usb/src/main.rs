@@ -203,6 +203,8 @@ fn serve(grants: u64) -> ! {
     let (mut cpu_in, mut cpu_out) = (0u64, 0u64);
 
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         let ev = usb.poll_event();
         let idle = matches!(ev, UsbEvent::None);
         // Packets to take this pass: one from the single-packet buffer, or a whole run.

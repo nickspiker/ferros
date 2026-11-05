@@ -1868,6 +1868,12 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"pets" {
+                    // `diag pets`: the process watchdog's measurements (process.rs pets_report): each process's longest stretch between pets.
+                    crate::process::pets_report(&mut resp);
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"sched" {
                     // `diag sched`: the kernel's scheduler trace (process.rs) — who called whom, who waited, for how long.
                     crate::process::sched_report(&mut resp);

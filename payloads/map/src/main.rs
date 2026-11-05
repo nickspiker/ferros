@@ -1151,6 +1151,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The display's frame-start count, from the last frame wait (op 24).
     let (mut frame_count, mut synth_f0) = (0u32, 0u32);
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         // A preference changed (here or from the bridge): redraw in it.
         let b = ferros_sys::device_base();
         if b != base {

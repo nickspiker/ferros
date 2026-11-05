@@ -46,6 +46,7 @@ pub mod nr {
     pub const PT: u64 = 25;
     pub const SENSORS: u64 = 26;
     pub const STATUS: u64 = 27;
+    pub const PET: u64 = 28;
 }
 /// Core masks for `pin` (bit = core index on husky): the A715 workers, where processes run by default, and the X3, the kernel's core, for one real compute path.
 pub const CORES_WORKERS: u64 = 0x00F0;
@@ -160,6 +161,11 @@ pub fn measure_of(w: u64) -> Option<(u16, i64)> {
 /// Set this driver's measure slot `slot` (0-7) to `word` (`measure_word`, or `MEASURE_NONE` to empty it). Only the modem, pcie1, bt, nfc, gnss and usb drivers have slots; anyone else gets ERR.
 pub fn status(slot: u64, word: u64) -> u64 {
     svc(nr::STATUS, slot, word, 0, 0, 0)
+}
+
+/// The process watchdog: this process is alive and going round its main loop. Call it once a pass, at the top (never only from inside a wait: a wait that never ends is the hang it is there to catch). The kernel records the longest stretch between two pets (`diag pets`); nothing is enforced yet (owner, 2026-11-05).
+pub fn pet() {
+    svc(nr::PET, 0, 0, 0, 0, 0);
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.

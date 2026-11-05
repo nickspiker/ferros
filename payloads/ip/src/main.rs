@@ -1418,6 +1418,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut out = [0u8; 2048];
     let mut tok = [0u8; 32];
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         let mut busy = false;
         // Frames from the driver: [2] → the oldest frame, or nothing.
         for _ in 0..if ip.wifi { 16 } else { 0 } {

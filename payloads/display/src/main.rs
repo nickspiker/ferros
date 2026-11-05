@@ -990,6 +990,8 @@ static mut SETTLE_TIMEOUT: [u32; 4] = [0; 4];
 static mut OP22_US: [u64; 5] = [0; 5];
 /// The counter when the first window's frame was armed (raw, to line up against the kernel's press in `diag boot`).
 static mut OP22_AT: u64 = 0;
+/// Main loop passes, and those that could not sleep: a flip due, or a phase still owed (diagnostic, logged every ten seconds).
+static mut PASSES: [u64; 3] = [0; 3];
 /// The op being handled (G#EE outside the handler), and the first four times the layer was pointed at this server's buffers [counter, op] (2026-11-05: what shows ~80 ms of black before the attest screen).
 static mut CUR_OP: u8 = 0xEE;
 static mut FIRST_SHOWS: [(u64, u8); 4] = [(0, 0); 4];
@@ -3198,6 +3200,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         }
     }
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         // One op, as the endpoint's header lists them: the reply's first byte is the status, the return the reply's length.
         let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
             let mut len = 1usize;
@@ -4185,6 +4189,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             }
             // The frame rate, once a second while frames are coming (presents and flips both count), with the frame starts DECON reported through its interrupt: the two agree when every frame goes out.
             let fs = FRAME_STARTS.load(Ordering::Relaxed);
+            if secs % 10 == 0 {
+                tlog.s(b"display: passes ");
+                tlog.dec(unsafe { PASSES[0] });
+                tlog.s(b", no sleep for a flip ");
+                tlog.dec(unsafe { PASSES[1] });
+                tlog.s(b", for an owed phase ");
+                tlog.dec(unsafe { PASSES[2] });
+                tlog.s(b"\n");
+                tlog.flush();
+                unsafe { PASSES = [0; 3] };
+            }
             // The stats line every ten seconds rather than every one: at one a second it alone filled the kernel's console ring and hid every other process's lines (2026-10-26).
             if frames != frames_last_tick && client_owned && secs % 10 == 0 {
                 tlog.s(b"display: ");
@@ -4324,8 +4339,20 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if flip_possible {
             wake = wake.min(next_flip.max(now()));
         }
-        if unsafe { TEMPORAL } && client_owned && (0..PHASES).any(|k| unsafe { !PHASE_DIRTY[k].is_empty() }) {
+        // Only for what the idle fill above can do this pass: the next phase owed. Woken for any owed phase, the loop never slept while one it does not fill was owed and nothing flipped (~15,700 passes a second at rest, 2026-11-05).
+        if unsafe { TEMPORAL } && client_owned && unsafe { !PHASE_DIRTY[(CUR_PHASE + 1) % PHASES].is_empty() } {
             wake = wake.min((last_interaction + freq() / 8).max(now()));
+        }
+        // Diagnostic (2026-11-05: ~15,700 passes a second at rest): which deadline left nothing to sleep.
+        unsafe {
+            PASSES[0] += 1;
+            if wake <= now() {
+                if flip_possible && next_flip <= now() {
+                    PASSES[1] += 1;
+                } else {
+                    PASSES[2] += 1;
+                }
+            }
         }
         let tail = RING_TAIL.load(Ordering::Acquire);
         if tail == seen_tail {

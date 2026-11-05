@@ -1565,6 +1565,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     // The last frame of the mark put on the glass (FRESH_DONE's count).
     let mut mark_shown = 0u64;
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         let done = FRESH_DONE.load(core::sync::atomic::Ordering::Acquire);
         let typed = FRESH_DONE_GEN.load(core::sync::atomic::Ordering::Acquire) == SHOW_GEN.load(core::sync::atomic::Ordering::Acquire);
         if done != mark_shown && typed {

@@ -1663,6 +1663,8 @@ fn serve(d: &mut Drv, m: &mut Msgbuf, sh: u32) {
     let mut status_at = 0u64;
     let mut pkts = [0u32; 4];
     loop {
+        // The process watchdog's pet, once a pass (ferros_sys::pet; measuring, `diag pets`).
+        ferros_sys::pet();
         if d.now().wrapping_sub(status_at) >= 2 * d.freq {
             status_at = d.now();
             publish_measures(m, d, &mut pkts);
