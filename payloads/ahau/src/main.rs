@@ -222,45 +222,103 @@ fn heap_reset(m: usize) {
     unsafe { HEAP_NEXT = m };
 }
 
-/// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into ahau's region of the layer arena, then into `buf` (side x side pack16 words, as render_button_pack16 writes them). False when there is no GPU service or arena (after a jump), or the job did not finish: the CPU draws it then.
-fn gpu_quick(grants: u64, buf: &mut [u64], side: usize, r: usize, p: &tapuwae::Params) -> bool {
-    let arena = ferros_sys::dma(cap(grants, S_LAYERS)) as usize;
-    if arena == 0 || arena == usize::MAX {
-        return false;
-    }
+/// ahau's region of the layer arena, past the quick pass's pixels (GPU_OUT, 6.5 MB): the circle's staged coordinates and the fine passes' sums.
+const GPU_STAGE: usize = 40 << 20;
+const GPU_SUMS: usize = 43 << 20;
+/// How many pixels the stage holds for the size it was staged at (0: not staged yet), and that size.
+static mut STAGED: (usize, usize) = (0, 0);
+
+/// One kernel through the GPU service: compiled by `make` with the heap held (HEAP_USE) and given back after, its words into ahau's region of the arena, its uniforms `addrs` then the kernel's constants. False when there is no service receiving (after a jump, or still booting the GPU), the proof holds the heap, or the job did not finish.
+fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnOnce() -> tapuwae::gpu::Compiled) -> bool {
     if HEAP_USE.compare_exchange(0, 1, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
         return false;
     }
     let mark = heap_mark();
-    let k = tapuwae::gpu::button_quick_kernel(r as f32, p, &tapuwae::Look::attest());
+    let k = make();
     for (i, &w) in k.words.iter().enumerate() {
         unsafe { core::ptr::write_volatile((arena + GPU_CODE + 8 * i) as *mut u64, w) };
     }
-    // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64]: slot 0 the output, then the kernel's constants.
+    // [1][preload u16, bit 15: 64 registers][code offset u32][words u16][groups x u32][groups y u32][n u8][n × u64].
     let mut msg = [0u8; 18 + 8 * 16];
     msg[0] = 1;
     msg[1..3].copy_from_slice(&(0x1000u16 | if k.regs64 { 0x8000 } else { 0 }).to_le_bytes());
     msg[3..7].copy_from_slice(&(GPU_CODE as u32).to_le_bytes());
     msg[7..9].copy_from_slice(&(k.words.len() as u16).to_le_bytes());
-    msg[9..13].copy_from_slice(&((side * side).div_ceil(16) as u32).to_le_bytes());
+    msg[9..13].copy_from_slice(&groups.to_le_bytes());
     msg[13..17].copy_from_slice(&1u32.to_le_bytes());
-    let nu = 1 + k.consts.len();
+    let nu = addrs.len() + k.consts.len();
     msg[17] = nu as u8;
-    msg[18..26].copy_from_slice(&(ARENA_VA + GPU_OUT as u64).to_le_bytes());
-    for (i, c) in k.consts.iter().enumerate() {
-        msg[26 + 8 * i..34 + 8 * i].copy_from_slice(&c.to_le_bytes());
+    for (i, a) in addrs.iter().chain(k.consts.iter()).enumerate() {
+        msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&a.to_le_bytes());
     }
     drop(k);
     heap_reset(mark);
     HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
-    // `call_live`: no service receiving (after a jump, or still booting the GPU) fails at once, and the CPU draws this pass.
     let mut reply = [1u8, 0, 0, 0, 0];
     let n = ferros_sys::call_live(cap(grants, S_GPU), &msg[..18 + 8 * nu], &mut reply);
-    if n == ferros_sys::ERR || reply[0] != 0 {
+    n != ferros_sys::ERR && reply[0] == 0
+}
+
+/// The layer arena as ahau sees it, if granted.
+fn arena(grants: u64) -> Option<usize> {
+    let a = ferros_sys::dma(cap(grants, S_LAYERS)) as usize;
+    if a == 0 || a == usize::MAX { None } else { Some(a) }
+}
+
+/// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into ahau's region of the layer arena, then into `buf` (side x side pack16 words, as render_button_pack16 writes them). False when the GPU did not draw it: the CPU draws it then.
+fn gpu_quick(grants: u64, buf: &mut [u64], side: usize, r: usize, p: &tapuwae::Params) -> bool {
+    let Some(arena) = arena(grants) else { return false };
+    if !gpu_run(grants, arena, &[ARENA_VA + GPU_OUT as u64], (side * side).div_ceil(16) as u32, || tapuwae::gpu::button_quick_kernel(r as f32, p, &tapuwae::Look::attest())) {
         return false;
     }
     let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
     buf.copy_from_slice(out);
+    true
+}
+
+/// The bonded button's 4 x 4 pass on the GPU as 16 distinct passes over the circle's staged coordinates (owner, 2026-11-05; tapuwae::gpu::button_fine_kernel): each pass one more sample a pixel, its frame published as it stands, so the mark sharpens pass by pass; a newer handle leaves between passes (each ~16 ms). After pass 15 the pixels are the CPU's 4 x 4. False when it stopped for a newer handle or the GPU could not run a pass.
+fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
+    let (grants, r, salt) = unsafe { FRESH_JOB };
+    let side = 2 * r + 4;
+    let Some(arena) = arena(grants) else { return false };
+    // The stage, once for this size: every pixel the passes draw.
+    if unsafe { STAGED.1 } != r {
+        let mut n = 0usize;
+        tapuwae::gpu::button_stage(r as f32, |i| {
+            unsafe { core::ptr::write_volatile((arena + GPU_STAGE + 4 * n) as *mut u32, i) };
+            n += 1;
+        });
+        unsafe { STAGED = (n, r) };
+    }
+    let staged = unsafe { STAGED.0 };
+    let mut text = [0u8; 4 * MAX_CHARS];
+    let n = with_fresh_text(|t, n| {
+        text[..n].copy_from_slice(&t[..n]);
+        n
+    });
+    let p = tapuwae::Params::new_placed(&salt, core::str::from_utf8(&text[..n]).unwrap_or(""), true);
+    for b in text.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    let t0 = now();
+    let buf = unsafe { &mut (&mut *(&raw mut FRESH))[..side * side] };
+    let addrs = [ARENA_VA + GPU_OUT as u64, ARENA_VA + GPU_STAGE as u64, ARENA_VA + GPU_SUMS as u64];
+    for m in 0..16u32 {
+        if FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g {
+            return false;
+        }
+        if !gpu_run(grants, arena, &addrs, staged.div_ceil(16) as u32, || tapuwae::gpu::button_fine_kernel(r as f32, &p, &tapuwae::Look::attest(), m)) {
+            return false;
+        }
+        let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
+        buf.copy_from_slice(out);
+        *frames += 1;
+        FRESH_DONE_GEN.store(g, core::sync::atomic::Ordering::Release);
+        FRESH_DONE.store(*frames, core::sync::atomic::Ordering::Release);
+    }
+    let mut l = Line::new();
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark cleared up ({side} px, 16 passes) in {} ms on the GPU\n", ferros_sys::us_since(t0) / 1000));
+    console(grants, l.as_bytes());
     true
 }
 
@@ -1421,6 +1479,11 @@ extern "C" fn fresh_thread(_: u64) -> ! {
     loop {
         let g = FRESH_GEN.load(core::sync::atomic::Ordering::Acquire);
         for fine in [false, true] {
+            // After a quick pass the GPU drew, the 4 x 4 as 16 GPU passes, each published as it lands; the CPU's pass only when the GPU could not finish them for this handle.
+            if fine && GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) && (gpu_fine_passes(g, &mut frames) || FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g) {
+                full = false;
+                continue;
+            }
             if render_fresh_mark(full, fine, g) {
                 frames += 1;
                 FRESH_DONE_GEN.store(g, core::sync::atomic::Ordering::Release);
@@ -1476,10 +1539,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
     let moved_on = || fine && FRESH_GEN.load(core::sync::atomic::Ordering::Acquire) != g;
     let typed = core::str::from_utf8(&text[..n]).unwrap_or("");
     // Bound: the attest button, the whole disc at every change (it has no components to redraw alone), in the surface's own pixels (`pack16`, as `render_fresh` writes them: the G2t16 encoding first used here came out nearly white). Two passes, as the fresh mark's, through the same machinery (tapuwae `render_button_pack16`: the ball four samples to a lane call, as the fresh mark shades its components): one sample a pixel at once, then a 4 × 4 grid to clear it up, given up for a newer handle. The adaptive `Look::attest()` (up to 64 samples a pixel, one at a time) took 22 s for the first draw and 55 s a keystroke on the workers (2026-11-04).
-    // Experiment (2026-11-05, the owner watching): the CPU's 4 x 4 pass after a GPU quick pass held the workers for seconds and the mark froze behind it; skipped while the GPU draws, to confirm, until the fine passes run on the GPU too.
-    let done = if unsafe { BONDED } && fine && GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) {
-        true
-    } else if unsafe { BONDED } {
+    let done = if unsafe { BONDED } {
         let p = tapuwae::Params::new_placed(&salt, typed, true);
         // The quick pass on the GPU when its service is up (GPU.md), before any helper is woken: when it is drawn there the helpers have nothing to do this pass (and must not write the rows it fills).
         let gpu_drawn = !fine && gpu_quick(grants, buf, side, r, &p);
