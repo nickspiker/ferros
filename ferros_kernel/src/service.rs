@@ -1201,6 +1201,11 @@ pub fn run(mut b: Boot) -> ! {
             let _ = start_home(&mut store);
             crate::checklist::step(crate::checklist::Step::Init);
             crate::checklist::close();
+            // The boot's length to the disk as well, for the next power-on's ring.
+            // Under the kernel lock, as every store access once processes run: the USB and other processes drive the flash from the other cores (unlocked, this write hung the device black on 2026-11-05).
+            if let Some(doc) = crate::checklist::span_document() {
+                let _ = crate::process::with_lock(|| store.as_mut().map(|s| s.set(crate::checklist::SPAN_KEY, &doc).is_ok()));
+            }
         }
 
         if now.wrapping_sub(t_heartbeat) > 64 * freq {

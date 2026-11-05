@@ -35,7 +35,7 @@ fn schema() -> SectionSchema {
 }
 
 /// Eagle time now, in oscillations, from the RTC's base (0 until the RTC has been read: the document then says it was made at the epoch).
-fn eagle_now() -> i64 {
+pub fn eagle_now() -> i64 {
     use core::sync::atomic::Ordering;
     const EPOCH_UNIX: i128 = -14_182_940;
     let base = crate::rtc::BASE.load(Ordering::Relaxed);

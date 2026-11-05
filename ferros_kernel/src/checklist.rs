@@ -274,6 +274,39 @@ pub fn close() {
     }
 }
 
+/// The boot's length on the disk too, for a power-on's scale (the report page does not survive one): a spec VSF document under the vault key `boot`, one section `boot` with `span_us`, written once init has run (service.rs) and read right after the vault opens (main.rs). A power-on draws the wedges so far once it is read, then each as its step ends.
+pub const SPAN_KEY: &str = "boot";
+fn span_schema() -> vsf::schema::SectionSchema {
+    vsf::schema::SectionSchema::new("boot").field("span_us", vsf::schema::TypeConstraint::AnyUnsigned)
+}
+
+/// This boot's length as the document to keep, once the ring is closed.
+pub fn span_document() -> Option<alloc::vec::Vec<u8>> {
+    let us = SPAN_US.load(core::sync::atomic::Ordering::Relaxed);
+    if us == 0 {
+        return None;
+    }
+    let section = span_schema().build().set("span_us", vsf::VsfType::u(us as usize, false)).ok()?.encode().ok()?;
+    vsf::VsfBuilder::new().creation_time_oscillations(crate::settings::eagle_now()).provenance_only().add_unboxed("boot", section).build().ok()
+}
+
+/// The last boot's length from the disk, when the report page had none: the ring is scaled now and draws what it has.
+pub fn span_from_disk(doc: &[u8]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if CIRCLE.load(Relaxed) != 0 {
+        return;
+    }
+    let Ok(section) = vsf::schema::SectionBuilder::parse_document(span_schema(), doc, None) else { return };
+    let Some(us) = section.get_fields("span_us").first().and_then(|f| f.values.first()).and_then(|v| v.as_u64()) else { return };
+    // Read from the disk: a zero would divide by zero.
+    if us == 0 {
+        return;
+    }
+    SCALE_US.store(us, Relaxed);
+    CIRCLE.store(us * crate::platform::cntfrq() / 1_000_000, Relaxed);
+    draw_new();
+}
+
 /// A boot-path step has ended: it began where the last one ended (the ring's zero for the first). Drawn now if the ring is up and scaled; the drawing's time is left out of the next step, so it shows as the black between wedges.
 pub fn step(s: Step) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
@@ -549,7 +582,7 @@ pub fn boot_times() -> alloc::string::String {
     }
     // The ring's steps (lane 0 the boot path, 1 another core): when each began and ended, from the ring's zero, and the ring's own drawing.
     let z = zero();
-    s.push_str(&alloc::format!("ring, from the {} (boot: {})\n", if PRESS.load(Relaxed) != 0 { "press" } else { "entry" }, REASON_NAME[REASON.load(Relaxed) as usize]));
+    s.push_str(&alloc::format!("ring, from the {} at counter A#{} (A#{} a second; processes log the same counter) (boot: {})\n", if PRESS.load(Relaxed) != 0 { "press" } else { "entry" }, z, f, REASON_NAME[REASON.load(Relaxed) as usize]));
     for k in 0..STEPS {
         let (b, en) = (BEGIN[k].load(Relaxed), END[k].load(Relaxed));
         if en != 0 {

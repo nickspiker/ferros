@@ -70,7 +70,7 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [husky touch bring-up](husky_touch_bringup.md) — FTM5 touch up from cold (2026-10-19): diag touch up/watch/paint; capture = boot probe at loglevel=4, never fts unbind (panics); axes finger test pending
 - [Feedback: vsf concurrent edits](feedback_vsf_concurrent_edits.md) — vsf is edited live under path deps; build breaks inside vsf = wait/retry or message the vsf session, never touch it; no pinning (owner, 2026-10-20); siblings require vsf "0.10"
 - [Settings flow identity → device only](settings_identity_to_device_only.md) — attesting identity's preference written to the device, never device → identity; device.base (tatau code) is the first; spec in SETTINGS.md
-- [Feedback: no animations](feedback_no_animations.md) — UI is instant: no animations, no transition timers, no time-windowed gestures (2026-10-22)
+- [Feedback: NO TIMERS](feedback_no_animations.md) — no waits/holds/delays/animations/time windows; sole exception the dev gate 1 s auto-answer (2026-11-05)
 - [Kernel on the X3](kernel_on_x3.md) — since 2026-10-22 the single-core kernel hops from CPU0 to the Cortex-X3 at service start (8× faster shell); copy every per-core EL2 reg (CNTHCTL bit us); FERROS_X3=0 escape
 - [sched trace + past-deadline spin](sched_trace_and_past_deadline_spin.md) — diag sched for IPC latency; past-deadline sleep spins its slice; 512 KiB kernel stack, DIAG canary
 - [HK3 emission duty is the panel's](hk3_emission_duty_is_panel.md) — ~95 % at DBV ≥ ~1490 is the pixel circuit (no knob); below ~1400 the DDIC drops it (<50 % at 983); ferros keeps DBV 3307 and dims in pixels (2026-11-03)

@@ -1933,6 +1933,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     }
     checklist::step(checklist::Step::Log);
     let (probe, mut store) = vault_boot::vault_probe(link_up);
+    // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.
+    if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(checklist::SPAN_KEY).ok().flatten()) {
+        checklist::span_from_disk(&doc);
+    }
     let vault_ms = (platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
     if probe.opened == 1 {
         checklist::mark(checklist::Item::VaultOpen);

@@ -985,7 +985,13 @@ static mut SCENE_N: usize = 0;
 /// Whether the layer is 10-bit (set once at start; `program_layer` reads it).
 static mut TEN: bool = false;
 /// What DECON said when a settle timed out: TRIG_CON, SHD_REG_UP_REQ, the frame-start count, the count it was waiting to move.
-static mut SETTLE_TIMEOUT: [u32; 4] = [1; 4];
+static mut SETTLE_TIMEOUT: [u32; 4] = [0; 4];
+/// The first op 22 (a window shown), µs: [chrome, layout, settle, publish, whole], logged once by the slow-call line (2026-11-05: where the first attest frame's 177 ms goes).
+static mut OP22_US: [u64; 5] = [0; 5];
+/// The counter when the first window's frame was armed (raw, to line up against the kernel's press in `diag boot`).
+static mut OP22_AT: u64 = 0;
+/// The first chrome draw, µs: [the discs, the whole] (the text is the rest), with op 22's line.
+static mut CHROME_US: [u64; 2] = [0; 2];
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
 static mut PHASE_US: [u64; 4] = [1; 4];
 /// Inside the scene: icons, discs, labels (µs, the last camera op).
@@ -1015,9 +1021,11 @@ impl Log {
             }
         }
     }
-    fn hex(&mut self, v: u32) {
+    /// G# hex: eight digits for a 32-bit value, sixteen when it needs them (a counter).
+    fn hex(&mut self, v: impl Into<u64>) {
+        let v: u64 = v.into();
         self.s(b"G#");
-        for i in (0..8).rev() {
+        for i in (0..if v >> 32 == 0 { 8 } else { 16 }).rev() {
             self.s(&[b"0123456789ABCDEF"[((v >> (i * 4)) & 0xF) as usize]]);
         }
     }
@@ -2446,6 +2454,7 @@ fn soft(d: f32) -> f32 {
 
 /// The corners' circles into the chrome when the minute or a radio's state changed (or `force`). Returns whether it drew.
 fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
+    let t_all = now();
     let mut tb = [0u8; 32];
     let (_, _, tn, key, _) = clock_state(&mut tb);
     let facts = ferros_sys::facts().0;
@@ -2521,6 +2530,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
         } else {
             ring_c
         };
+        let t_disc = now();
         let (x0, x1, y0, y1) = ((x - r - 2.0) as i64, (x + r + 2.0) as i64, (y - r - 2.0) as i64, (y + r + 2.0) as i64);
         for py in y0..=y1 {
             for px in x0..=x1 {
@@ -2535,6 +2545,7 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
                 chrome[i] = ch(0, ring.0) | ch(16, ring.1) | ch(32, ring.2);
             }
         }
+        unsafe { CHROME_US[0] += ferros_sys::us_since(t_disc) };
         // The radio's measures, as its driver published them (facts 33 + 8 · radio): every one shown as itself, in its unit, a line each; none folded into a level, no bars (owner, 2026-11-03).
         let radio = match what {
             Corner::Cellular => Some(0),
@@ -2632,6 +2643,11 @@ fn chrome_draw(width: usize, height: usize, force: bool) -> bool {
         }
     }
     ALLOC.reset();
+    unsafe {
+        if CHROME_US[1] == 0 {
+            CHROME_US[1] = ferros_sys::us_since(t_all);
+        }
+    }
     true
 }
 /// The rectangle the last frame drew (cleared before the next one draws), and the one this frame is drawing.
@@ -3554,22 +3570,30 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             let mode = if m.len() > 27 { m[27] } else { 0 };
                             let same = unsafe { WINS[sk] }.is_some_and(|w| w.generation == generation && w.rect == rect && w.level == m[17] && w.mode == mode) && unsafe { APP }.is_some();
                             let changed = if m.len() >= 27 && same { draw::Rect { x0: v(19), y0: v(21), x1: v(19) + v(23), y1: v(21) + v(25) }.intersect(rect) } else { full };
+                            let t22 = now();
+                            let mut t_chrome = t22;
                             unsafe {
                                 if { APP }.is_none() {
                                     chrome_draw(width, height, true);
                                 }
+                                t_chrome = now();
                                 if !same || m.len() < 27 {
                                     RAISES += 1;
                                     WINS[sk] = Some(Win { generation, level: m[17], order: RAISES, rect, format: if m.len() > 18 { m[18] } else { 0 }, mode });
                                     layout_build(width, height);
+                                }
+                                if OP22_US[4] == 0 {
+                                    OP22_US[0] = t_chrome - t22;
                                 }
                                 APP = Some(full);
                                 for k in 0..PHASES {
                                     PHASE_DIRTY[k] = PHASE_DIRTY[k].union(changed);
                                 }
                             }
+                            let t_settle = now();
                             pipe.settle(&mut armed, true);
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
+                            let t_pub = now();
                             // Everything phase k owes, which now holds `changed`: it is about to be shown, and its dirty region is cleared below. Publishing `changed` alone dropped what it still owed from earlier shows, and stale strips of older frames flashed as the phases rotated (2026-11-01).
                             publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height);
                             unsafe {
@@ -3581,6 +3605,17 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                             ferros_sys::dma_barrier();
                             pipe.program_layer(win, layer_fb(fb), width as u32, height as u32);
                             armed = Some(pipe.arm(win));
+                            unsafe {
+                                if OP22_US[4] == 0 {
+                                    let (te, us) = (now(), |t: u64| t * 1_000_000 / freq());
+                                    OP22_US[0] = us(OP22_US[0]);
+                                    OP22_US[1] = us(t_settle - t_chrome);
+                                    OP22_US[2] = us(t_pub - t_settle);
+                                    OP22_US[3] = us(te - t_pub);
+                                    OP22_US[4] = us(te - t22);
+                                    OP22_AT = te;
+                                }
+                            }
                             frames += 1;
                             FRAMES.store(frames, Ordering::Relaxed);
                         }
@@ -4047,14 +4082,33 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                         tlog.s(b" ms");
                     }
                 }
-                tlog.s(b"; settle timeout TRIG ");
-                tlog.hex(unsafe { SETTLE_TIMEOUT[0] });
-                tlog.s(b" SHD ");
-                tlog.hex(unsafe { SETTLE_TIMEOUT[1] });
-                tlog.s(b" FC ");
-                tlog.hex(unsafe { SETTLE_TIMEOUT[2] });
-                tlog.s(b" was ");
-                tlog.hex(unsafe { SETTLE_TIMEOUT[3] });
+                // Only when a settle has timed out (until 2026-11-05 the record started at ones and was printed every time, so every slow call read "settle timeout TRIG G#1 SHD G#1 FC G#1 was G#1" when none had).
+                if unsafe { SETTLE_TIMEOUT[3] } != 0 {
+                    tlog.s(b"; settle timeout TRIG ");
+                    tlog.hex(unsafe { SETTLE_TIMEOUT[0] });
+                    tlog.s(b" SHD ");
+                    tlog.hex(unsafe { SETTLE_TIMEOUT[1] });
+                    tlog.s(b" FC ");
+                    tlog.hex(unsafe { SETTLE_TIMEOUT[2] });
+                    tlog.s(b" was ");
+                    tlog.hex(unsafe { SETTLE_TIMEOUT[3] });
+                }
+                // The first window shown, by part, once.
+                if unsafe { OP22_US[4] } != 0 && unsafe { OP22_US[4] } != u64::MAX {
+                    for (name, &us) in [b"; first op 22: chrome ".as_slice(), b" ms, layout ", b" ms, settle ", b" ms, publish ", b" ms, whole "].iter().zip(unsafe { OP22_US }.iter()) {
+                        tlog.s(name);
+                        tlog.dec(us / 1000);
+                    }
+                    tlog.s(b" ms (chrome discs ");
+                    tlog.dec(unsafe { CHROME_US[0] } / 1000);
+                    tlog.s(b" ms of ");
+                    tlog.dec(unsafe { CHROME_US[1] } / 1000);
+                    tlog.s(b" ms, the rest text");
+                    tlog.s(b", armed at counter ");
+                    tlog.hex(unsafe { OP22_AT });
+                    tlog.s(b")");
+                    unsafe { OP22_US[4] = u64::MAX };
+                }
                 tlog.s(b"; icons ");
                 tlog.dec(unsafe { SCENE_US[0] } / 1000);
                 tlog.s(b" ms (drawn; cached: sprites), discs or blits ");
