@@ -58,8 +58,10 @@ enum Op {
     LoopHead,
     /// The loop's bottom: each phi takes its update, and the loop goes round again while `cont` is set. Its updates are in [`Rec::loops`].
     LoopEnd(u32),
-    /// value â *(uniform slot's address + (gid << shift) + offset).
-    Store { slot: u8, shift: u8, offset: i16, value: u32 },
+    /// value to *(uniform slot's address + (index << shift) + offset).
+    Store { slot: u8, shift: u8, offset: i16, index: u32, value: u32 },
+    /// *(uniform slot's address + (index << shift) + offset), 32 bits.
+    Load { slot: u8, shift: u8, offset: i16, index: u32 },
 }
 
 impl Op {
@@ -77,7 +79,11 @@ impl Op {
                 f(b);
                 f(c)
             }
-            Store { value, .. } => f(value),
+            Store { value, index, .. } => {
+                f(index);
+                f(value)
+            }
+            Load { index, .. } => f(index),
         }
     }
     fn has_value(&self) -> bool {
@@ -93,6 +99,8 @@ struct Loop {
 struct Rec {
     nodes: Vec<Op>,
     loops: Vec<Loop>,
+    /// Uniform slots 0 to reserved - 1 are the caller's (its addresses); the constants go from there.
+    reserved: u8,
 }
 
 /// The recording in progress. Single-threaded by construction: a kernel is recorded on one core, between [`begin`] and [`compile`].
@@ -111,7 +119,7 @@ fn push(op: Op) -> u32 {
 
 /// Start recording a kernel.
 pub fn begin() {
-    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new() }) };
+    unsafe { *(&raw mut REC) = Some(Rec { nodes: Vec::new(), loops: Vec::new(), reserved: 1 }) };
 }
 
 /// The invocation's global id (X), preloaded in r60.
@@ -121,7 +129,23 @@ pub fn gid() -> U {
 
 /// `value` to the address in uniform `slot` (64-bit) plus `gid << shift` plus `offset` bytes.
 pub fn store(slot: u8, shift: u8, offset: i16, value: U) {
-    push(Op::Store { slot, shift, offset, value: value.0 });
+    let g = gid();
+    store_at(slot, g, shift, offset, value);
+}
+
+/// `value` to the address in uniform `slot` plus `index << shift` plus `offset` bytes. The address is worked out in 32 bits (the slot's high word kept): the layer arena lies below 4 GiB.
+pub fn store_at(slot: u8, index: U, shift: u8, offset: i16, value: U) {
+    push(Op::Store { slot, shift, offset, index: index.0, value: value.0 });
+}
+
+/// 32 bits from the address in uniform `slot` plus `index << shift` plus `offset` bytes (the same address as `store_at`).
+pub fn load(slot: u8, index: U, shift: u8, offset: i16) -> U {
+    U(push(Op::Load { slot, shift, offset, index: index.0 }))
+}
+
+/// Uniform slots 0 to n - 1 for the caller (its addresses, set before `begin`'s recording uses any constant): the kernel's constants go from slot n. One by default.
+pub fn reserve(n: u8) {
+    rec().reserved = n;
 }
 
 impl F {
@@ -137,7 +161,7 @@ impl F {
         let e = F::op(Op::FFma(self.neg().0, r.0, F::splat(1.).0));
         F::op(Op::FFma(r.0, e.0, r.0))
     }
-    /// âself from the reciprocal square root, refined once (within an ulp, near or at the correctly rounded value), 0 at 0.
+    /// The square root from the reciprocal square root, refined once (within an ulp, near or at the correctly rounded value), 0 at 0.
     pub fn sqrt(self) -> F {
         let rs = F::op(Op::FRsq(self.0));
         let s = self * rs;
@@ -161,7 +185,7 @@ impl F {
     pub fn floor(self) -> F {
         F::op(Op::FFloor(self.0))
     }
-    /// selfâ¿ by squaring and multiplying, n known when recorded.
+    /// self to the power n by squaring and multiplying, n known when recorded.
     pub fn powi(self, n: i32) -> F {
         let mut e = n.unsigned_abs();
         let (mut base, mut acc) = (self, None::<F>);
@@ -592,11 +616,13 @@ pub fn compile() -> Compiled {
         });
     }
     weight.sort_by(|a, b| b.1.cmp(&a.1));
-    let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(30).enumerate().map(|(k, w)| (w.0, (1 + (k / 2) as u8, (k % 2) as u8))).collect();
+    // The service passes 16 uniform slots: the caller's `reserved` first, then two constants a slot.
+    let reserved = rec.reserved;
+    let ufau: Vec<(u32, (u8, u8))> = weight.iter().take(2 * (16 - reserved as usize)).enumerate().map(|(k, w)| (w.0, (reserved + (k / 2) as u8, (k % 2) as u8))).collect();
     let mut consts = alloc::vec![0u64; ufau.len().div_ceil(2)];
     for &(s, (sl, w)) in &ufau {
         let Op::Const(bits) = nodes[s as usize] else { unreachable!() };
-        consts[(sl - 1) as usize] |= (bits as u64) << (32 * w as u32);
+        consts[(sl - reserved) as usize] |= (bits as u64) << (32 * w as u32);
     }
     let regs64 = high > 15;
     let kept = keep.iter().filter(|&&k| k).count();
@@ -760,8 +786,8 @@ pub fn compile() -> Compiled {
                 loop_words += k.len() - loop_start;
                 loop_no += 1;
             }
-            Op::Store { slot, shift, offset, value } => {
-                k.shaddx_u64(pair(ADDR), u(slot), pair(60), shift);
+            Op::Store { slot, shift, offset, index, value } => {
+                address(&mut k, slot, rr(index), shift);
                 // A store takes its value from a register only: a constant one goes through a constant register.
                 let v = match rr(value) {
                     Src::Reg(x) => x,
@@ -771,6 +797,11 @@ pub fn compile() -> Compiled {
                     }
                 };
                 k.store_i32(v, pair(ADDR), offset, Slot::S0);
+            }
+            Op::Load { slot, shift, offset, index } => {
+                address(&mut k, slot, rr(index), shift);
+                // The wait on the load itself: the flow field acts after the instruction carrying it, so the next one sees the value.
+                k.load_i32(d, pair(ADDR), offset, Slot::S0).wait(Slot::S0);
             }
         }
     }
@@ -782,4 +813,23 @@ pub fn compile() -> Compiled {
 /// Whether an instruction form already reads the LUT's zero itself (a multiply's −0 addend, a negation's, a compare's `or`, the shift group's shift or second operand): it counts against the FAU's two words.
 fn fixed_zero(op: &Op) -> bool {
     matches!(op, Op::FMul(..) | Op::FNeg(_) | Op::FCmp(..) | Op::And(..) | Op::Or(..) | Op::Xor(..) | Op::Shl(..) | Op::Shr(..))
+}
+
+/// r58:r59 = the address in uniform `slot` plus `index << shift`, in 32 bits (the slot's high word kept: the layer arena lies below 4 GiB, so the low word's add never carries). The shift amount is a byte of the LUT's byte-index entries, so it needs no register.
+fn address(k: &mut Kernel<16384>, slot: u8, index: Src, shift: u8) {
+    // WHY: the byte-index entries name shifts 0 to 7; a larger one would silently shift by 7.
+    assert!(shift < 8, "valhall::ssa: an address shift of {shift} (0 to 7 only)");
+    let (lut, byte) = match shift {
+        0 => (Lut::BYTES_0_3, Byte::B0),
+        1 => (Lut::BYTES_0_3, Byte::B1),
+        2 => (Lut::BYTES_0_3, Byte::B2),
+        3 => (Lut::BYTES_0_3, Byte::B3),
+        4 => (Lut::BYTES_4_7, Byte::B0),
+        5 => (Lut::BYTES_4_7, Byte::B1),
+        6 => (Lut::BYTES_4_7, Byte::B2),
+        _ => (Lut::BYTES_4_7, Byte::B3),
+    };
+    k.lshift_or_i32(r(ADDR), index, lut, byte, Lut::ZERO);
+    k.iadd_u32(r(ADDR), r(ADDR), u(slot).w0());
+    k.mov_i32(r(ADDR + 1), u(slot).w1());
 }

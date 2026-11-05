@@ -1007,14 +1007,15 @@ struct Queue {
 impl Queue {
     /// Append `words` to the ring, publish the new insert offset in the user input page, ring the queue's doorbell.
     fn submit(&self, g: &Gpu, words: &[u64]) {
+        // The ring is one page (CS_RING size, set at the queue's start) and the command stream reads it at the insert offset modulo that size: the offset grows for ever and each word goes in at it modulo the page. Until 2026-11-05 the words went in at the raw offset, past the page after about 21 jobs, while the stream read the page's start again: the 16th fine pass of a session wedged the queue (CS_FATAL G#40). One job at a time, each waited for, so a wrap never overwrites words the stream has not read.
         let at = self.insert.get();
         for (k, &w) in words.iter().enumerate() {
-            wr64(self.ring + at + 8 * k, w);
+            wr64(self.ring + (at + 8 * k) % PAGE, w);
         }
         // Padded with NOPs (zero words) to the next 64 bytes: the command-stream front end fetches the ring a 64-byte line at a time and keeps the line, so a job that began inside the line the last one ended in ran as the NOPs it had fetched there (2026-11-04: the second job's words consumed, CS_EXTRACT moved on, nothing done).
         let end = (at + 8 * words.len()).next_multiple_of(64);
         for p in (at + 8 * words.len()..end).step_by(8) {
-            wr64(self.ring + p, 0);
+            wr64(self.ring + p % PAGE, 0);
         }
         unsafe { core::arch::asm!("dmb osh") };
         self.insert.set(end);

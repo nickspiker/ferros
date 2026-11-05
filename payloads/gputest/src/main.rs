@@ -346,6 +346,201 @@ fn ball_test(grants: u64, arena: usize) -> ! {
     say!(grants, "gputest: ball: of {px} pixels {same} identical, {near} within 64 of 16384 a channel, {far} further (worst {worst}, the first further at {})\n", first_far.map_or(-1, |i| i as i64));
     exit(0);
 }
+
+/// tapuwae's button, its 4 x 4 pass as 16 distinct GPU passes over the circle's staged coordinates (tapuwae::gpu::button_fine_kernel), against the CPU's render_button_pack16 with k = 4 at a small size (r = 96, a single-core CPU reference in reasonable time); then the same 16 passes at ahau's size (r = 448), timed only. Arena: the frame from 4 MiB, the stage from 11, the sums from 14, the CPU's frame from 25 (ahau's region begins at 32).
+fn fine_test(grants: u64, arena: usize) -> ! {
+    use tapuwae::{Look, Params};
+    let salt = *b"ferros gputest: the attest ball.";
+    let p = Params::new_placed(&salt, "handle", true);
+    let look = Look::attest();
+    let (frame, stage, sums, cpu_at) = (4usize << 20, 11usize << 20, 14usize << 20, 25usize << 20);
+    for &(r, compare) in &[(96f32, true), (448f32, false)] {
+        let side = 2 * r as usize + 4;
+        let px = side * side;
+        // The quick pass leaves every pixel outside the circle at 0, and the passes never touch them.
+        for i in 0..px {
+            unsafe { core::ptr::write_volatile((arena + frame + 8 * i) as *mut u64, 0) };
+        }
+        let mut n = 0usize;
+        tapuwae::gpu::button_stage(r, |i| {
+            unsafe { core::ptr::write_volatile((arena + stage + 4 * n) as *mut u32, i) };
+            n += 1;
+        });
+        let (mut total_us, mut compile_us, mut bad) = (0u32, 0u64, 0u8);
+        for m in 0..16 {
+            // The heap as it stands, and back to it after the pass: each compile's graph and words are dropped by then (a bump heap; 32 compiles ran its 4 MiB out).
+            let mark = unsafe { HEAP_NEXT };
+            let t0 = ferros_sys::now();
+            let k = tapuwae::gpu::button_fine_kernel(r, &p, &look, m);
+            compile_us += ferros_sys::us_since(t0);
+            for (i, &w) in k.words.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+            }
+            let mut uniforms = alloc::vec![ARENA_VA + frame as u64, ARENA_VA + stage as u64, ARENA_VA + sums as u64];
+            uniforms.extend_from_slice(&k.consts);
+            let preload = 0x1000u16 | if k.regs64 { 0x8000 } else { 0 };
+            let reply = run_with(grants, k.words.len(), n.div_ceil(16) as u32, preload, &uniforms);
+            total_us += reply.1;
+            bad |= reply.0;
+            if reply.0 != 0 {
+                say!(grants, "gputest: fine r = {r}: pass {m} failed (status {}), {} words, {} uniforms\n", reply.0, k.words.len(), uniforms.len());
+                exit(1);
+            }
+            drop(uniforms);
+            drop(k);
+            unsafe { HEAP_NEXT = mark };
+        }
+        say!(grants, "gputest: fine r = {r}: {n} staged pixels, 16 passes {total_us} us on the GPU (status {bad}), compiled in {compile_us} us\n");
+        if compare {
+            let cpu = unsafe { core::slice::from_raw_parts_mut((arena + cpu_at) as *mut u64, px) };
+            cpu.fill(0);
+            let c = side as f32 * 0.5;
+            let t1 = ferros_sys::now();
+            tapuwae::render_button_pack16(cpu, side, c, c, r, &p, &look, 4, (0, 1), &|| false);
+            let cpu_us = ferros_sys::us_since(t1);
+            let (mut same, mut near, mut far, mut worst) = (0u32, 0u32, 0u32, 0u32);
+            for i in 0..px {
+                let g = unsafe { core::ptr::read_volatile((arena + frame + 8 * i) as *const u64) };
+                let w = cpu[i];
+                if g == w {
+                    same += 1;
+                    continue;
+                }
+                let d = (0..4).map(|ch| ((g >> (16 * ch)) as u16 as i32 - (w >> (16 * ch)) as u16 as i32).unsigned_abs()).max().unwrap_or(0);
+                worst = worst.max(d);
+                if d <= 64 {
+                    near += 1;
+                } else {
+                    far += 1;
+                    if far <= 3 {
+                        say!(grants, "gputest: fine far at ({}, {}): GPU G#{g:016X}, CPU G#{w:016X}\n", i % side, i / side);
+                    }
+                }
+            }
+            say!(grants, "gputest: fine r = {r}: of {px} pixels {same} identical, {near} within 64 of 16384 a channel, {far} further (worst {worst}); the CPU's 4 x 4 {cpu_us} us\n");
+        }
+    }
+    exit(0);
+}
+
+/// The SSA's loads and indexed stores alone (2026-11-05: the fine passes wedged the queue): invocation g loads idx = list[g] (shift 2) and four sums (shift 4), writes idx ^ G#5A5A and g + the sums' first word at frame[idx] (shift 3).
+fn ldst_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, U};
+    let (frame, list, sums) = (4usize << 20, 11usize << 20, 14usize << 20);
+    let n = 256usize;
+    for g in 0..n {
+        unsafe {
+            core::ptr::write_volatile((arena + list + 4 * g) as *mut u32, (2 * g + 1) as u32);
+            core::ptr::write_volatile((arena + sums + 16 * g) as *mut u32, 1000 + g as u32);
+        }
+    }
+    for i in 0..2 * n + 2 {
+        unsafe { core::ptr::write_volatile((arena + frame + 8 * i) as *mut u64, 0) };
+    }
+    ssa::begin();
+    ssa::reserve(3);
+    let g = ssa::gid();
+    let idx = ssa::load(1, g, 2, 0);
+    let s0 = ssa::load(2, g, 4, 0);
+    ssa::store_at(0, idx, 3, 0, idx ^ U::splat(0x5A5A));
+    ssa::store_at(0, idx, 3, 4, s0);
+    let k = ssa::compile();
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + frame as u64, ARENA_VA + list as u64, ARENA_VA + sums as u64];
+    uniforms.extend_from_slice(&k.consts);
+    let reply = run_with(grants, k.words.len(), (n / 16) as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+    let mut wrong = 0;
+    for gi in 0..n {
+        let idx = 2 * gi + 1;
+        let lo = unsafe { core::ptr::read_volatile((arena + frame + 8 * idx) as *const u32) };
+        let hi = unsafe { core::ptr::read_volatile((arena + frame + 8 * idx + 4) as *const u32) };
+        if lo != (idx as u32 ^ 0x5A5A) || hi != 1000 + gi as u32 {
+            wrong += 1;
+        }
+    }
+    say!(grants, "gputest: ldst: {} words, status {}, {} us; {wrong} of {n} wrong\n", k.words.len(), reply.0, reply.1);
+    exit(0);
+}
+
+/// tapuwae's jitter hash (its sequence: IMUL, XOR, shifts, u32 to f32) alone through the SSA (2026-11-05: the fine passes, the first kernels with an integer multiply, wedged the queue): invocation g hashes (g, 3g, 5) and writes both offsets' bits.
+fn jitter_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, F, U};
+    let frame = 4usize << 20;
+    let n = 256usize;
+    fn hash_cpu(px: u32, py: u32, m: u32) -> (f32, f32) {
+        let mut h = px.wrapping_mul(0x9E37_79B1) ^ py.wrapping_mul(0x85EB_CA77) ^ m.wrapping_mul(0xC2B2_AE3D);
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB_352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846C_A68B);
+        h ^= h >> 16;
+        let s = 1. / (1u32 << 16) as f32;
+        ((h & 0xFFFF) as f32 * s, (h >> 16) as f32 * s)
+    }
+    ssa::begin();
+    let g = ssa::gid();
+    let k = |c: u32| U::splat(c);
+    let py = g.wrapping_mul(k(3));
+    let mut h = g.wrapping_mul(k(0x9E37_79B1)) ^ py.wrapping_mul(k(0x85EB_CA77)) ^ k(5).wrapping_mul(k(0xC2B2_AE3D));
+    h = h ^ (h >> 16);
+    h = h.wrapping_mul(k(0x7FEB_352D));
+    h = h ^ (h >> 15);
+    h = h.wrapping_mul(k(0x846C_A68B));
+    h = h ^ (h >> 16);
+    let s = 1. / (1u32 << 16) as f32;
+    let (jx, jy) = (F::from_u32(h & k(0xFFFF)) * s, F::from_u32(h >> 16) * s);
+    ssa::store(0, 3, 0, jx.to_bits());
+    ssa::store(0, 3, 4, jy.to_bits());
+    let c = ssa::compile();
+    for (i, &w) in c.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = alloc::vec![ARENA_VA + frame as u64];
+    uniforms.extend_from_slice(&c.consts);
+    let reply = run_with(grants, c.words.len(), (n / 16) as u32, 0x1000 | if c.regs64 { 0x8000 } else { 0 }, &uniforms);
+    let mut wrong = 0;
+    for gi in 0..n {
+        let (x, y) = hash_cpu(gi as u32, 3 * gi as u32, 5);
+        let gx = unsafe { core::ptr::read_volatile((arena + frame + 8 * gi) as *const u32) };
+        let gy = unsafe { core::ptr::read_volatile((arena + frame + 8 * gi + 4) as *const u32) };
+        if gx != x.to_bits() || gy != y.to_bits() {
+            wrong += 1;
+        }
+    }
+    say!(grants, "gputest: jitter: {} words, status {}, {} us; {wrong} of {n} wrong\n", c.words.len(), reply.0, reply.1);
+    exit(0);
+}
+
+/// One kernel, one job, status only (2026-11-05: which of the fine pass's differences wedges the queue): input byte 7 then which (0 the fine pass m = 0 at r = 448, 1 the same at r = 96, 2 the quick pass at r = 96).
+fn one_test(grants: u64, arena: usize, which: u8) -> ! {
+    use tapuwae::{Look, Params};
+    let salt = *b"ferros gputest: the attest ball.";
+    let p = Params::new_placed(&salt, "handle", true);
+    let look = Look::attest();
+    let (frame, stage, sums) = (4usize << 20, 11usize << 20, 14usize << 20);
+    let r = if which == 0 { 448f32 } else { 96f32 };
+    let side = 2 * r as usize + 4;
+    let mut n = 0usize;
+    tapuwae::gpu::button_stage(r, |i| {
+        unsafe { core::ptr::write_volatile((arena + stage + 4 * n) as *mut u32, i) };
+        n += 1;
+    });
+    let (k, groups, u) = if which == 2 {
+        (tapuwae::gpu::button_quick_kernel(r, &p, &look), (side * side).div_ceil(16), alloc::vec![ARENA_VA + frame as u64])
+    } else {
+        (tapuwae::gpu::button_fine_kernel(r, &p, &look, 0), n.div_ceil(16), alloc::vec![ARENA_VA + frame as u64, ARENA_VA + stage as u64, ARENA_VA + sums as u64])
+    };
+    for (i, &w) in k.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let mut uniforms = u;
+    uniforms.extend_from_slice(&k.consts);
+    let reply = run_with(grants, k.words.len(), groups as u32, 0x1000 | if k.regs64 { 0x8000 } else { 0 }, &uniforms);
+    say!(grants, "gputest: one {which}: r = {r}, {} words, {} uniforms, {} groups, peak {}; status {}, {} us\n", k.words.len(), uniforms.len(), groups, k.peak, reply.0, reply.1);
+    exit(0);
+}
 /// One run through the service: the code at arena offset 0, `groups` workgroups of 16, preload r60 (the global id X).
 fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
     run_with(grants, words, groups, 0x1000, uniforms)
@@ -398,6 +593,22 @@ extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 7 then a selector: one kernel, one job, status only.
+    if input_len > 1 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 7 {
+        one_test(grants, arena, unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input + 1) as *const u8) });
+    }
+    // Input byte 6: tapuwae's jitter hash alone.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 6 {
+        jitter_test(grants, arena);
+    }
+    // Input byte 5: the SSA's loads and indexed stores alone.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 5 {
+        ldst_test(grants, arena);
+    }
+    // Input byte 4: the 4 x 4 pass as 16 distinct GPU passes against the CPU.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 4 {
+        fine_test(grants, arena);
     }
     // Input byte 3: tapuwae's attest ball (quick pass) on the GPU against the CPU.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 3 {
