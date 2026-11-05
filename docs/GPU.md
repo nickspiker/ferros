@@ -183,3 +183,16 @@ Repeated three times, the same every time.
 The 92-instruction kernel (hand-encoded from the display's `neon.rs`; the words and their sources are in `ferros-present-spec.md` on Harbor) produces the display's present stage on the GPU. The input is 64 full panel rows (86,016 pixels) of black, white, greys and random channels up to 4× white. The tables are built from the display's real `Odt` (`odt.rs`, shared with the display). In all four temporal phases, **every word is identical to `neon::sixteen_canvas`'s on the device: largest channel difference 0.** Six of its instructions had no Mesa test vector; all were right.
 
 At the GPU's floor clock (150 MHz) a 64-row phase took 845-885 us, about 8 ns a pixel. That's too slow for 2992 rows, and to be measured again at the GPU's own speed and over more rows before the display uses it.
+
+**Speed, over 512 rows** (688,128 pixels; every word still exact in all four phases):
+
+| GPU clock | 512 rows | per pixel | a full phase (2992 rows, scaled) |
+|---|---|---|---|
+| 150 MHz (ABL's floor) | 2.9 ms | 4.2 ns | about 17 ms |
+| 890 MHz | 0.93 ms | 1.35 ns | about 5.4 ms |
+
+The CPU does a full phase in about 1.5 ms of wall time (about 6 ms of CPU across four cores).
+
+So at its top clock the GPU is about 3.5 times slower in wall time; what it buys is the CPU's 6 ms a phase. This kernel is compute-bound: 92 instructions at about a third of the cores' FMA peak, where the proxy with the same memory traffic ran in 0.55 ms per 1M pixels.
+
+The cheapest speed-up the GPU allows and NEON does not: the light (the tanh rational with its divide, about 40 of the 92 instructions per pixel) is a function of one 16-bit value, so it can be a 64 Ki-entry f16 table read like the code table already is. One cached load per channel instead of the arithmetic.

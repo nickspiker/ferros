@@ -128,9 +128,9 @@ const BENCH_VA: u64 = 0x5000_0000;
 const SNOOP_NC_VA: u64 = 0x6000_0000;
 const SNOOP_CO_VA: u64 = 0x6100_0000;
 const RES_VA: u64 = 0x6200_0000;
-/// The present-stage test: 64 rows of the panel's width (1344 = 84 x 16, so whole workgroups), and where its canvas, output words and tables sit in the group's address space.
+/// The present-stage test: 512 rows of the panel's width (1344 = 84 x 16, so whole workgroups), and where its canvas, output words and tables sit in the group's address space.
 const PRESENT_W: usize = 1344;
-const PRESENT_H: usize = 64;
+const PRESENT_H: usize = 512;
 const TAB_BYTES: usize = 131072 + 5 * 1024;
 const CANV_VA: u64 = 0x7000_0000;
 const WORDS_VA: u64 = 0x7100_0000;
@@ -595,7 +595,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
             say!(grants, "gpu: coherency {mode}: GPU wrote through the {name} view, CPU read from its caches: {} of 16 words new (first G#{:X})\n", count(&|i| r(snoop + 4 * i) == base_v + i as u32), r(snoop));
         }
     }
-    // Input bit 5: the present stage on the GPU (GPU.md "The present stage"; the kernel hand-encoded from the display's neon.rs, its words and sources in ferros-present-spec.md on Harbor), checked against the display's own NEON path compiled in here: 64 full rows, the four temporal phases, every word compared (the owner: close is fine, each channel within one code).
+    // Input bit 5: the present stage on the GPU (GPU.md "The present stage"; the kernel hand-encoded from the display's neon.rs, its words and sources in ferros-present-spec.md on Harbor), checked against the display's own NEON path compiled in here: 64 full rows, the four temporal phases, every word compared (the owner: close is fine, each channel within one code). 512 rows, so the dispatch's fixed cost does not hide the per-pixel one.
     if in0 & 0x20 != 0 {
         const PRESENT: [u64; 92] = [
             0x00A0_C000_000A_883D,
