@@ -105,3 +105,7 @@ A hand-encoded 26-instruction Valhall kernel computes the Mandelbrot set's escap
 - The words, decoded field by field with their sources and expected pixel values, are in `/mnt/Harbor/tmp/mesa-panfrost/ferros-mandel-spec.md`. It also holds a branch-free fallback (8 unrolled iterations), unused.
 
 This is the shape of tapuwae's work (an orbit per sample, divergent escape), so the attest mark on the GPU is now a compiler question, not a hardware one.
+
+**On the glass.** `tools/husky-gpu.sh show` renders the Mandelbrot set at 1024 × 2048, up to 256 iterations, in 8.7 ms on the GPU. The CPU turns the counts into grey on a surface (black in the set, gamma 2), and the display shows it at the system level for 60 s.
+
+**Leaving.** The driver ends with a soft reset, which leaves MCU_STATUS 0, L2_READY 0 and SHADER_READY 0, so nothing keeps running or drawing power after it until it becomes a resident service.
