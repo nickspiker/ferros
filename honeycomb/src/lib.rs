@@ -17,6 +17,8 @@ pub const KEY: u64 = 2600;
 pub const LIT: u64 = 7000;
 pub const BAR_KEY: u64 = 1800;
 pub const LABEL: u16 = 13000;
+/// A hex key's bevel (owner, 2026-11-04): a line a pixel thick inside its top-left side, and at half that light inside its left and top-right sides, as if lit from the top left; and its mirror in shadow (owner, the same day): the bottom-right side as much darker than the face as the top-left is lighter, the right and bottom-left sides as the half lines. Added to the key's own light in linear light: the top-left line is √(k² + BEVEL²) for a key of grey k, the half lines √(k² + BEVEL²/2); the shadows k²/that.
+pub const BEVEL: u64 = 1 << 12;
 /// 1/√3 and 2/√3 in Q16: a pointy-topped hex's cap slope, and its circumradius over its half width. √3/2 in Q16: the row pitch over the column pitch.
 const INV_SQRT3: i64 = 37837;
 const TWO_OVER_SQRT3: i64 = 75674;
@@ -294,6 +296,20 @@ impl Keyboard {
         }
     }
 
+    /// The rows `draw_key` draws `key` into, its label included: a hex's height (cy ± r, Q8) or the bar's, with a row either side for the edge's antialiasing.
+    pub fn key_rows(&self, key: Key) -> (usize, usize) {
+        let (y0, y1) = match key {
+            Key::Hex(k) => {
+                let (row, col) = self.place(k);
+                let (_, cy) = self.centre(row, col);
+                (cy - self.r, cy + self.r)
+            }
+            Key::Bar(_) => (self.bar0 + self.gap / 2, self.bar1 - self.gap / 2),
+            Key::None => return (0, 0),
+        };
+        (((y0 >> 8) - 1) as usize, ((y1 >> 8) + 2) as usize)
+    }
+
     /// One key, lit or at rest, with its label.
     pub fn draw_key(&self, s: &mut [u64], key: Key, lit: bool, label: &mut dyn FnMut(i64, i64, u16, u16, &str)) {
         let size = (self.px * 107 >> 16) as u16;
@@ -302,10 +318,11 @@ impl Keyboard {
                 let (row, col) = self.place(k);
                 let (cx, cy) = self.centre(row, col);
                 let (a, r) = (self.a, self.r);
-                shape(s, self.w, cx - a, cx + a, self.colour(key, if lit { LIT } else { KEY }), |fx| {
-                    let t = (fx - cx).abs() * INV_SQRT3 >> 16;
-                    (cy - r + t, cy + r - t)
-                });
+                let g = if lit { LIT } else { KEY };
+                let (tl, half) = ((g * g + BEVEL * BEVEL).isqrt(), (g * g + BEVEL * BEVEL / 2).isqrt());
+                // The shadows are the lights' mirror in ratio: the bottom-right line as much darker than the face as the top-left is lighter (g²/tl), the right and bottom-left as the half lines (g²/half).
+                let lit = [tl, half, g * g / half, g * g / tl].map(|v| self.colour(key, v));
+                hex(s, self.w, cx, cy, a, r, self.colour(key, g), lit);
                 let c = self.cell(k);
                 let mut b = [0u8; 4];
                 let (t, size) = if c == PAGE { ("page", size * 5 / 8) } else { (&*c.encode_utf8(&mut b), size) };
@@ -534,6 +551,36 @@ fn up_triangle(s: &mut [u64], w: usize, cx: i64, cy: i64, h: i64, g: u64) {
             let p = s[i];
             let mix = |c: u64| ((c * c * (16 - n) + g * g * n) >> 4).isqrt();
             s[i] = mix(p & 0xFFFF) | mix(p >> 16 & 0xFFFF) << 16 | mix(p >> 32 & 0xFFFF) << 32;
+        }
+    }
+}
+
+/// A pointy-topped hex key at (`cx`, `cy`), half width `a` and circumradius `r` (Q8), in colour `key`, with its bevel (BEVEL), a line a pixel thick inside each side: `lit` = [top-left, left and top-right, right and bottom-left, bottom-right]. Every pixel is its areas' light added in linear light against black (the way `column` covers an edge): the top side's line, the bottom side's, the left or right line, and the key's face.
+/// The overlaps below are lengths of intervals (a pixel's span against the key's, a line's), the coverage itself, not a bound on anything.
+fn hex(s: &mut [u64], w: usize, cx: i64, cy: i64, a: i64, r: i64, key: [u64; 3], lit: [[u64; 3]; 4]) {
+    let (left, right) = (cx - a, cx + a);
+    // Down a 30° side, a line one pixel thick across it is 2/√3 of a pixel tall.
+    let th = 256 * TWO_OVER_SQRT3 >> 16;
+    let sq = |v: [u64; 3]| v.map(|c| c * c);
+    let (k2, [tl2, h2, d2, br2]) = (sq(key), lit.map(sq));
+    let ov = |a0: i64, a1: i64, b0: i64, b1: i64| (a1.min(b1) - a0.max(b0)).max(0) as u64;
+    for x in (left >> 8)..=((right - 1) >> 8) {
+        let (x0, x1) = (x << 8, (x + 1) << 8);
+        let cov_x = ov(x0, x1, left, right);
+        // The left and right sides' lines: the first pixel's width in from each (inside the key, and the key many pixels wide, so together never more than cov_x).
+        let (lx, rx) = (ov(x0, x1, left, left + 256), ov(x0, x1, right - 256, right));
+        let fx = x0 + 128;
+        let t = (fx - cx).abs() * INV_SQRT3 >> 16;
+        let (top, bot) = (cy - r + t, cy + r - t);
+        let (up, down) = if fx < cx { (tl2, d2) } else { (h2, br2) };
+        for y in (top >> 8)..=((bot - 1) >> 8) {
+            let (y0, y1) = (y << 8, (y + 1) << 8);
+            let face = ov(y0, y1, top, bot);
+            let (above, below) = (ov(y0, y1, top, top + th), ov(y0, y1, bot - th, bot));
+            // The two lines lie a whole side apart (the vertical sides are r long, many pixels), so they never share a pixel's area.
+            let rest = face - above - below;
+            let c = |i: usize| ((cov_x * (above * up[i] + below * down[i]) + rest * (lx * h2[i] + rx * d2[i] + (cov_x - lx - rx) * k2[i])) >> 16).isqrt();
+            s[y as usize * w + x as usize] = c(0) | c(1) << 16 | c(2) << 32;
         }
     }
 }

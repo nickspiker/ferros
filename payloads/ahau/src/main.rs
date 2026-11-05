@@ -807,6 +807,25 @@ impl Ahau {
         (self.kb.top, self.h - honeycomb::corner_rows(self.w, self.h))
     }
 
+    /// One key drawn lit or at rest, onto the glass: into the frame buffer, its label drawn in by the display (on the board's target, then read back, as `board` bakes its labels, so a later present of these rows keeps it), then the keyboard's rows presented and shown.
+    /// Since the sandbox (730cb8a, 2026-11-03) the frame buffer is ahau's own, not the shown surface: a key drawn into it and shown without a present never reached the glass, so a press stopped brightening its key.
+    /// Only the key's own rows: laid first from the board on show, since the frame buffer's keyboard rows are also where a board is drawn ahead (`board`, at start and at a press), so they can hold a board not on show (the upper-case one flashed at the first press, 2026-11-04); the whole keyboard's rows took 20-53 ms a press.
+    fn light(&self, key: Key, lit: bool) {
+        let (y0, y1) = self.kb.key_rows(key);
+        let (top, bottom) = self.kb_rows();
+        if (bottom - top) * self.w <= 1 << 20 {
+            self.lay_board(self.shown_board.get(), y0, y1);
+        }
+        unsafe { NLABELS = 0 };
+        self.kb.draw_key(self.surf(), key, lit, &mut self.label());
+        let (tb, _) = self.target();
+        self.put_rows(tb, y0, y1);
+        self.replay_labels(tb);
+        self.get_rows(tb, y0, y1);
+        self.present(y0, y1);
+        self.show();
+    }
+
     /// Where a board is drawn and painted before it shows: the back surface (its base and pixels), or, without one, the screen itself.
     fn target(&self) -> (u64, &'static mut [u64]) {
         (if self.back != 0 { self.back } else { self.base }, self.surf())
@@ -866,8 +885,7 @@ impl Ahau {
     /// The keyboard on the glass as `self.kb` stands: its board (`board`), the rainbow laid on from the base in one pass (three multiplies a channel), the shift key drawn over it as it stands (off, once or lock; it has no label), then copied in whole, so the display never composes it half done. Its rows: the keyboard's, from its top to the bar's foot.
     fn show_board(&self) {
         let (top, bottom) = self.kb_rows();
-        let w = self.w;
-        let n = (bottom - top) * w;
+        let n = (bottom - top) * self.w;
         // WHY: the board's size follows the panel's; one too big for BOARDS is drawn tinted the slow way (every key and label again) instead of indexing past it.
         if n > 1 << 20 {
             self.kb.draw(self.surf(), &mut self.label());
@@ -876,19 +894,24 @@ impl Ahau {
             return;
         }
         let slot = self.board(&self.kb);
-        let b = unsafe { &(*(&raw const BOARDS))[slot] };
-        let (_, t) = self.target();
-        let one = 1i64 << 14;
-        let tint = self.kb.tint.unwrap_or([[1 << 14; 3]; 64]);
-        let rows = &mut t[top * w..top * w + n];
-        for i in 0..n {
-            let (p, wt, c) = (b.base[i] as i64, b.weight[i] as i64, &tint[b.index[i] as usize]);
-            let ch = |c: u16| (p * (one + (wt * (c as i64 - one) >> 14)) >> 14) as u64;
-            rows[i] = ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32;
-        }
-        self.kb.draw_key(t, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
+        self.lay_board(slot, top, bottom);
         self.present(top, bottom);
         self.shown_board.set(slot);
+    }
+
+    /// Rows y0..y1 (inside the keyboard's) of board `slot` laid into the frame buffer in the handle's tints, the shift key's ▲ on top: what `show_board` presents.
+    fn lay_board(&self, slot: usize, y0: usize, y1: usize) {
+        let (top, w) = (self.kb_rows().0, self.w);
+        let b = unsafe { &(*(&raw const BOARDS))[slot] };
+        let t = self.surf();
+        let one = 1i64 << 14;
+        let tint = self.kb.tint.unwrap_or([[1 << 14; 3]; 64]);
+        for i in (y0 - top) * w..(y1 - top) * w {
+            let (p, wt, c) = (b.base[i] as i64, b.weight[i] as i64, &tint[b.index[i] as usize]);
+            let ch = |c: u16| (p * (one + (wt * (c as i64 - one) >> 14)) >> 14) as u64;
+            t[top * w + i] = ch(c[0]) | ch(c[1]) << 16 | ch(c[2]) << 32;
+        }
+        self.kb.draw_key(t, Key::Bar(honeycomb::B_SHIFT), false, &mut |_, _, _, _, _| {});
     }
 
     /// A finger is down on `key`: if its tap will change the board (a shift, a page, a layout, the letter ending a one-letter shift), that board is drawn now (`prepare_board`), the way the mark's next frame is rendered ahead by its thread, so the lift is a tint and a copy.
@@ -1062,7 +1085,6 @@ impl Ahau {
         let t0 = now();
         let proof = *ihi::handle_proof(&blake3::Hash::from(*seed)).as_bytes();
         let ms = ferros_sys::us_since(t0) / 1000;
-        ferros_sys::pin(0);
         let mut l = Line::new();
         let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: handle proof in {ms} ms on the X3\n"));
         console(self.grants, l.as_bytes());
@@ -1479,6 +1501,8 @@ fn draw_mark(s: &mut [u64], w: usize, cx: usize, cy: usize, r: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
+    // The screen's own thread on the X3, beside the display server: the mark's passes hold all four workers (HELPERS) while a handle is typed, and a press or a lift drawn behind them waited for their slices. The mark's threads pin themselves to the workers.
+    ferros_sys::pin(ferros_sys::CORES_BIG);
     let (display, touch) = (cap(grants, S_DISPLAY), cap(grants, S_TOUCH));
     let mut r = [0u8; 256];
     if call(display, &[5], &mut r) < 4 {
@@ -1557,14 +1581,17 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             outs[no] = t;
             no += 1;
         });
-        // A key let go without its tap (the finger slid off) leaves the typed handle as it was: its preview gives way to the typed handle again, decided after the whole poll, since a lift reports the key's Unlight just before its Tap.
-        let mut slid = false;
+        // A key let go without its tap (the finger slid off) is drawn at rest again (a tap redraws the whole board, so a lift does not) and leaves the typed handle as it was: its preview gives way to the typed handle again, decided after the whole poll, since a lift reports the key's Unlight just before its Tap.
+        let mut slid = None;
         for &t in &outs[..no] {
             match t {
                 Touch::Light(key) => {
-                    a.kb.draw_key(a.surf(), key, true, &mut a.label());
                     // The lit key on the glass first: preparing a whole board takes some 50 ms.
-                    a.show();
+                    let t0 = now();
+                    a.light(key, true);
+                    let mut l = Line::new();
+                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: key lit in {} us\n", ferros_sys::us_since(t0)));
+                    console(a.grants, l.as_bytes());
                     // The free device's mark previews the key under the finger (its components redraw in a fraction of a second); the bonded device's whole disc waits for the tap, so a press does not start a render the tap replaces.
                     if !unsafe { BONDED } {
                         a.preview(key);
@@ -1572,15 +1599,18 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     a.prepare(key);
                 }
                 Touch::Unlight(key) => {
-                    a.kb.draw_key(a.surf(), key, false, &mut a.label());
-                    slid = true;
+                    slid = Some(key);
                 }
                 Touch::Scrolled => {
                     a.show_board();
                 }
                 Touch::Tap(key) => {
+                    let t0 = now();
                     a.tap(key);
-                    slid = false;
+                    let mut l = Line::new();
+                    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: lift drawn in {} us\n", ferros_sys::us_since(t0)));
+                    console(a.grants, l.as_bytes());
+                    slid = None;
                 }
                 Touch::TapAt(x, y) => a.tap_at(x, y),
                 // A drag on the entry line pans it (TEXT.md); elsewhere nothing yet.
@@ -1591,7 +1621,8 @@ pub extern "C" fn ahau_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                 Touch::Trail(..) | Touch::Traced => {}
             }
         }
-        if slid {
+        if let Some(key) = slid {
+            a.light(key, false);
             publish_fresh_text(&a.handle[..a.len], true);
         }
         // Following the identity service's verdict while the identity is looked up or joined: about four times a second.
