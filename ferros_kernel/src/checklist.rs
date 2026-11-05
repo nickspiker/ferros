@@ -152,6 +152,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
     for &d in done {
         c.done |= 1 << d as u8;
     }
+    load_scale();
     ring_start(&c.panel);
     c.panel.present_nowait();
     unsafe { *CHECKLIST.0.get() = Some(c) };
@@ -159,7 +160,7 @@ pub fn start(cntfrq: u64, done: &[Item]) {
 
 // ---------------------------------------------------------------------------
 // The boot ring (owner's design 2026-10-22, redrawn to the owner's direction 2026-11-05): the attest screen's circle (ahau `mark_at`: the same centre and outer radius), a solid disc in its middle for how this boot began, and the boot's work around it.
-// - Angle is time: the full circle is the one-second budget from the press, clockwise from 12 o'clock. Each wedge spans its step from when the step began to when it ended, so its angle is its duration; the black between wedges is the ring's own drawing. Home starts the moment the boot path is done (the display server then takes the panel), so the ring stops where the boot did: what is left of the circle is the budget not spent.
+// - Angle is a share of the boot: the full circle is the whole boot, from the press to init having run, clockwise from 12 o'clock, and each wedge spans its step from when it began to when it ended, so its share of the circle is its share of the boot. The boot's length is known only when it ends, so the wedges are drawn to the previous boot's length (kept in the report page, which survives a reset): this boot closes the circle as far as it matches the last. After a power-on there is no previous length, and the ring is drawn once, exactly, when init has run. No timer anywhere: every wedge is drawn when its step ends. The black between wedges is the ring's own drawing.
 // - Lanes are cores: the boot path in the inner lane, work running beside it on another core (KOHI's TRNG words on worker 3) in the outer lane, at the same angles while they overlap. The two lanes have the same area, so a wedge's area is its duration whichever lane it is in.
 // - Colour is order: dark brick, brick, amber, then a bright lime, along the warm side only (nothing between magenta and green).
 // - The centre disc's colour is the boot's reason (`Reason`).
@@ -188,7 +189,7 @@ pub fn set_reason(r: Reason) {
     REASON.store(r as u8, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The boot's steps on the ring, in the order the boot path runs them; the last runs beside it on worker 3.
+/// The boot's steps on the ring, in the order the boot path runs them (the last two on the service core: the wairua, which waits for KOHI's words, then init), and KOHI beside them on worker 3.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum Step {
@@ -203,12 +204,14 @@ pub enum Step {
     Protect,
     Slot,
     Settings,
+    Wairua,
+    Init,
     Kohi,
 }
-const STEPS: usize = 12;
-const STEP_NAME: [&str; STEPS] = ["eUSB repeater tuned", "panel adopted", "board read", "disk: UFS link", "flash log", "ira", "vault opened", "vault verified", "flash write-protect", "slot marked", "settings + service", "KOHI: TRNG, worker 3"];
+const STEPS: usize = 14;
+const STEP_NAME: [&str; STEPS] = ["eUSB repeater tuned", "panel adopted", "board read", "disk: UFS link", "flash log", "ira", "vault opened", "vault verified", "flash write-protect", "slot marked", "settings + service", "wairua", "init", "KOHI: TRNG, worker 3"];
 /// 0: the boot path (inner lane). 1: beside it on another core (outer lane).
-const STEP_LANE: [u8; STEPS] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const STEP_LANE: [u8; STEPS] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 static BEGIN: [core::sync::atomic::AtomicU64; STEPS] = [const { core::sync::atomic::AtomicU64::new(0) }; STEPS];
 static END: [core::sync::atomic::AtomicU64; STEPS] = [const { core::sync::atomic::AtomicU64::new(0) }; STEPS];
 /// Where the boot path's last step ended (after its wedge was drawn): the next one begins there.
@@ -223,9 +226,60 @@ fn zero() -> u64 {
     if p != 0 { p } else { ENTRY.load(Relaxed) }
 }
 
-/// A boot-path step has ended: it began where the last one ended (the ring's zero for the first). Drawn now if the ring is up; the drawing's time is left out of the next step, so it shows as the black between wedges.
+/// The last boot's length (press to init, µs) in the report page, beside the hand-over stamp: DRAM, so it survives a reset and not a power-on. The top half is a tag, so whatever a power-on left there is not taken for a length.
+const SPAN_AT: usize = crate::platform::RAMOOPS_RESULT + 0x2D0;
+const SPAN_TAG: u64 = 0x5350_414E; // "SPAN"
+/// The full circle in counter ticks: the last boot's length, or 0 while unknown (the wedges wait for `close`).
+static CIRCLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// What the ring was scaled to and this boot's own length (µs), for `diag boot`.
+static SCALE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SPAN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The circle is closed (init has run): later steps (a wairua drawn again, say) are not the boot's.
+static CLOSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Read the last boot's length for the scale (`start`, before the first wedge).
+fn load_scale() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let w = unsafe { core::ptr::read_volatile(SPAN_AT as *const u64) };
+    // The page is DRAM nothing initialises: after a power-on the word is noise, so it counts only under its tag, and a zero length would divide by zero.
+    if w >> 32 == SPAN_TAG && w as u32 != 0 {
+        let us = (w as u32) as u64;
+        SCALE_US.store(us, Relaxed);
+        CIRCLE.store(us * crate::platform::cntfrq() / 1_000_000, Relaxed);
+    }
+}
+
+/// init has run: the boot is over. Keep its length for the next boot's scale, and if this one had none (a power-on), draw the whole ring now, exactly to this boot's length.
+pub fn close() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if CLOSED.swap(true, Relaxed) {
+        return;
+    }
+    let e = END[Step::Init as usize].load(Relaxed);
+    let z = zero();
+    if e <= z {
+        return;
+    }
+    let ticks = e - z;
+    let us = ticks * 1_000_000 / crate::platform::cntfrq();
+    SPAN_US.store(us, Relaxed);
+    unsafe {
+        core::ptr::write_volatile(SPAN_AT as *mut u64, SPAN_TAG << 32 | (us as u32) as u64);
+        core::arch::asm!("dc civac, {a}", "dsb sy", a = in(reg) SPAN_AT as u64);
+    }
+    if CIRCLE.load(Relaxed) == 0 {
+        CIRCLE.store(ticks, Relaxed);
+        SCALE_US.store(us, Relaxed);
+        draw_new();
+    }
+}
+
+/// A boot-path step has ended: it began where the last one ended (the ring's zero for the first). Drawn now if the ring is up and scaled; the drawing's time is left out of the next step, so it shows as the black between wedges.
 pub fn step(s: Step) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
+    if CLOSED.load(Relaxed) {
+        return;
+    }
     let b = PATH_AT.load(Relaxed);
     BEGIN[s as usize].store(if b != 0 { b } else { zero() }, Relaxed);
     END[s as usize].store(crate::platform::cntpct(), Release);
@@ -395,8 +449,13 @@ pub fn draw_new() {
     let Some(c) = (unsafe { (*CHECKLIST.0.get()).as_mut() }) else {
         return;
     };
+    // No scale yet (a power-on): everything waits for `close`.
+    let f = CIRCLE.load(Relaxed);
+    if f == 0 {
+        return;
+    }
     let t_draw = crate::platform::cntpct();
-    let (z, f) = (zero(), crate::platform::cntfrq());
+    let z = zero();
     let g = ring(&c.panel);
     let mut drew = false;
     for s in 0..STEPS {
@@ -414,7 +473,7 @@ pub fn draw_new() {
         let b = if b > z { b } else { z };
         let fine = |t: u64| ((t - z) * FINE as u64 / f) as i64;
         let a0 = fine(b);
-        // The circle is the second to home; a step's time past it is off the ring (`diag boot` still lists it).
+        // A boot longer than the last runs past the circle: that time is off the ring (`diag boot` still lists it).
         let a1 = if fine(e) < FINE as i64 { fine(e) } else { FINE as i64 };
         let n = unsafe { RING_N };
         let rgb = ramp(n, STEPS as u32);
@@ -498,7 +557,7 @@ pub fn boot_times() -> alloc::string::String {
             s.push_str(&alloc::format!("  lane {} {:<22} {} .. {} us, A#{} us\n", STEP_LANE[k], STEP_NAME[k], at(b), at(en), us(en - b)));
         }
     }
-    s.push_str(&alloc::format!("  the ring's drawing A#{} us over A#{} steps\n", us(DRAW_TICKS.load(Relaxed)), unsafe { RING_N }));
+    s.push_str(&alloc::format!("  the ring's drawing A#{} us over A#{} steps; the circle A#{} us (0: none, drawn at the end), this boot A#{} us\n", us(DRAW_TICKS.load(Relaxed)), unsafe { RING_N }, SCALE_US.load(Relaxed), SPAN_US.load(Relaxed)));
     s
 }
 

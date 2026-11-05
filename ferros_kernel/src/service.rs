@@ -1194,10 +1194,13 @@ pub fn run(mut b: Boot) -> ! {
         }
         thermal_poll();
         if !home_started {
-            // Whatever the ring has that ended since the boot path (a step from another core), then home.
-            crate::checklist::draw_new();
+            // The wairua first, as its own step on the ring (init's first spawn needs it, and it waits for KOHI's words from worker 3), then home; the ring closes once init has run.
+            let _ = crate::wairua::draw();
+            crate::checklist::step(crate::checklist::Step::Wairua);
             home_started = true;
             let _ = start_home(&mut store);
+            crate::checklist::step(crate::checklist::Step::Init);
+            crate::checklist::close();
         }
 
         if now.wrapping_sub(t_heartbeat) > 64 * freq {
