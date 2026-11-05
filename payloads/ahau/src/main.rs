@@ -229,12 +229,18 @@ const GPU_SUMS: usize = 43 << 20;
 static mut STAGED: (usize, usize) = (0, 0);
 
 /// One kernel through the GPU service: compiled by `make` with the heap held (HEAP_USE) and given back after, its words into ahau's region of the arena, its uniforms `addrs` then the kernel's constants. False when there is no service receiving (after a jump, or still booting the GPU), the proof holds the heap, or the job did not finish.
+/// The last GPU run's compile and job times (µs), for the mark's console line.
+static GPU_COMPILE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GPU_JOB_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnOnce() -> tapuwae::gpu::Compiled) -> bool {
     if HEAP_USE.compare_exchange(0, 1, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
         return false;
     }
     let mark = heap_mark();
+    let t0 = now();
     let k = make();
+    GPU_COMPILE_US.store(ferros_sys::us_since(t0), core::sync::atomic::Ordering::Relaxed);
     for (i, &w) in k.words.iter().enumerate() {
         unsafe { core::ptr::write_volatile((arena + GPU_CODE + 8 * i) as *mut u64, w) };
     }
@@ -256,7 +262,25 @@ fn gpu_run(grants: u64, arena: usize, addrs: &[u64], groups: u32, make: impl FnO
     HEAP_USE.store(0, core::sync::atomic::Ordering::Release);
     let mut reply = [1u8, 0, 0, 0, 0];
     let n = ferros_sys::call_live(cap(grants, S_GPU), &msg[..18 + 8 * nu], &mut reply);
+    GPU_JOB_US.store(u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]) as u64, core::sync::atomic::Ordering::Relaxed);
     n != ferros_sys::ERR && reply[0] == 0
+}
+
+/// The circle's stage for radius `r` in ahau's region of the arena, made once per size: every pixel the passes draw (tapuwae::gpu::button_stage); the frame zeroed with it, since no pass writes outside the circle. Returns how many pixels it holds.
+fn ensure_stage(arena: usize, r: usize) -> usize {
+    if unsafe { STAGED.1 } != r {
+        let side = 2 * r + 4;
+        for i in 0..side * side {
+            unsafe { core::ptr::write_volatile((arena + GPU_OUT + 8 * i) as *mut u64, 0) };
+        }
+        let mut n = 0usize;
+        tapuwae::gpu::button_stage(r as f32, |i| {
+            unsafe { core::ptr::write_volatile((arena + GPU_STAGE + 4 * n) as *mut u32, i) };
+            n += 1;
+        });
+        unsafe { STAGED = (n, r) };
+    }
+    unsafe { STAGED.0 }
 }
 
 /// The layer arena as ahau sees it, if granted.
@@ -268,7 +292,9 @@ fn arena(grants: u64) -> Option<usize> {
 /// The bonded button's quick pass on the GPU: tapuwae's own shading recorded through valhall (tapuwae::gpu), run by the GPU service into ahau's region of the layer arena, then into `buf` (side x side pack16 words, as render_button_pack16 writes them). False when the GPU did not draw it: the CPU draws it then.
 fn gpu_quick(grants: u64, buf: &mut [u64], side: usize, r: usize, p: &tapuwae::Params) -> bool {
     let Some(arena) = arena(grants) else { return false };
-    if !gpu_run(grants, arena, &[ARENA_VA + GPU_OUT as u64], (side * side).div_ceil(16) as u32, || tapuwae::gpu::button_quick_kernel(r as f32, p, &tapuwae::Look::attest())) {
+    // Over the circle's stage only: nothing outside it is computed (~22 % of the square).
+    let staged = ensure_stage(arena, r);
+    if !gpu_run(grants, arena, &[ARENA_VA + GPU_OUT as u64, ARENA_VA + GPU_STAGE as u64], staged.div_ceil(16) as u32, || tapuwae::gpu::button_quick_staged_kernel(r as f32, p, &tapuwae::Look::attest())) {
         return false;
     }
     let out = unsafe { core::slice::from_raw_parts((arena + GPU_OUT) as *const u64, side * side) };
@@ -281,16 +307,7 @@ fn gpu_fine_passes(g: u64, frames: &mut u64) -> bool {
     let (grants, r, salt) = unsafe { FRESH_JOB };
     let side = 2 * r + 4;
     let Some(arena) = arena(grants) else { return false };
-    // The stage, once for this size: every pixel the passes draw.
-    if unsafe { STAGED.1 } != r {
-        let mut n = 0usize;
-        tapuwae::gpu::button_stage(r as f32, |i| {
-            unsafe { core::ptr::write_volatile((arena + GPU_STAGE + 4 * n) as *mut u32, i) };
-            n += 1;
-        });
-        unsafe { STAGED = (n, r) };
-    }
-    let staged = unsafe { STAGED.0 };
+    let staged = ensure_stage(arena, r);
     let mut text = [0u8; 4 * MAX_CHARS];
     let n = with_fresh_text(|t, n| {
         text[..n].copy_from_slice(&t[..n]);
@@ -1575,7 +1592,7 @@ fn render_fresh_mark(full: bool, fine: bool, g: u64) -> bool {
         (_, true, true) => "cleared up",
         (_, true, false) => "refine stopped for a newer handle",
     };
-    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms {}\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { "on the GPU" } else { "on the workers" }));
+    let _ = core::fmt::Write::write_fmt(&mut l, format_args!("ahau: attest mark {what} ({side} px, {}) in {} ms {}{}\n", if fine { "4x4" } else { "1" }, ferros_sys::us_since(t0) / 1000, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { "on the GPU" } else { "on the workers" }, if GPU_DREW.load(core::sync::atomic::Ordering::Relaxed) { alloc::format!(" (compile {} us, GPU job {} us)", GPU_COMPILE_US.load(core::sync::atomic::Ordering::Relaxed), GPU_JOB_US.load(core::sync::atomic::Ordering::Relaxed)) } else { alloc::string::String::new() }));
     console(grants, l.as_bytes());
     unsafe { FRESH_SIDE = side };
     FRESH_STATE.store(READY, core::sync::atomic::Ordering::Release);
