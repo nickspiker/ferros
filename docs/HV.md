@@ -164,6 +164,8 @@ The kept tree's `/chosen` initrd range is pointed at a copy below 4 GiB (G#8004_
 
 A core that will not stop, or a failed CPU_ON, falls back to the reset path (FERROS_ONCE).
 
+**The jump is a killswitch (2026-11-04).** Android is hostile once killed, and nothing it started runs on into ferros. Before ferros is copied in, the hv sets the always-on S2MPUs in front of Android's bus masters to deny-all: hsi1 (PCIe ch0, the modem), hsi2 (UFS and WiFi; ferros's UFS bring-up opens its own window again) and misc. cpucl0's is left alone, because what sits behind it is unknown. On its first pass ferros cuts the unused power domains (the GPU, codecs, the camera chain, TPU, AUR, BW, EH) through EL3, which stops any master in them dead. The UFS device's VCC is cut for 16 ms before its full init, so Android's last command never completes. Measured on the first jump with all of it: three deny-alls taken, the GPU and EH still on and cut, the DPU down and brought up, UFS up in 222 ms (it was about 16 s when it reset over Android's in-flight command).
+
 **After a jump** (SYS_FACTS 31 = 6), init starts the shell, the screen, touch, the attest screen and USB, but not WiFi, Bluetooth, NFC, sensors or the modem (nor their keepers). The kernel leaves the AoC, GSA and Trusty alone. Every one of those met hardware Android left running and stalled the bus or the service loop:
 - the modem's register read (APM watchdog);
 - the AoC start;

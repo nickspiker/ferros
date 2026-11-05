@@ -16,3 +16,10 @@ On 2026-11-04 I suggested making the jump wait for Android's in-flight UFS comma
 - The same applies to any future "switch away from a hostile OS" path, including the reverse jump.
 
 Related: [[hv-jump-to-ferros]], [[feedback-killswitch-irq-mask]], [[ufs-firewall-decided]].
+
+**Built and verified 2026-11-04 (1ee8369):**
+- The hv sets the hsi1, hsi2 and misc S2MPUs to deny-all before copying ferros in.
+- ferros cuts the unused power domains on its first pass after a jump.
+- The UFS device's VCC is cut for 16 ms, then full init.
+- First jump: all three deny-alls took, the GPU and EH were still on and got cut, UFS came up in 222 ms (it took about 16 s when Android's command was in flight).
+- Not covered: the cpucl0 S2MPU, because what sits behind it is unknown.
