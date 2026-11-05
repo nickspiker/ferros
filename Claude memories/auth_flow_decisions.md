@@ -38,3 +38,10 @@ Owner decisions, 2026-10-31. Built the same day (AUTH.md, commits 9daf32c..c6f8b
 **One identity per phone** (owner, 2026-10-31: "when did we start issuing multiple identities per device?"). The kernel binds the phone when its fleet binds it, and refuses any other handle. Release on a completed departure wipes the identity class. I had shipped per-handle spaces without asking; don't reintroduce them. Spec: ferros AUTH.md.
 
 Related: [[identity-not-on-disk-default]], [[ferros-attest-os-level]], [[radio-addresses-belong-to-identity]], [[bluetooth-pairing-moves-with-identity]].
+
+**NFC tag unlock (owner, 2026-11-05).**
+- **What:** the owner keeps a plain NTAG-type tag (NFC-A Type 2, SAK 00, 7-byte UID, no crypto) in his glasses. Tapping it at attest unlocks without typing the handle, and nothing is remembered without the tag.
+- **How:** the identity seed is kept in the vault, sealed under a KDF of the ira and the tag's number. Device plus tag unlocks.
+- **The owner's threat view:** acceptable, since it needs his device and his glasses. The handle isn't secret anyway (a coworker knows it; a handle is a name, not a password).
+- **Later:** "would be nice to have PIPE on tag".
+- **Order:** build it after the GPU attest mark.
