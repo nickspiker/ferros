@@ -1,0 +1,8 @@
+[package]
+name = "valhall"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Typed instruction builder for the Mali-G715's Valhall ISA (v11): GPU kernels as Rust calls, not hand-encoded words"
+
+[dependencies]
