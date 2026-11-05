@@ -98,6 +98,9 @@ struct Ip {
     cell: Cell,
     /// When the cellular call's info was last asked for.
     cell_t: u64,
+    /// Whether a person is present (SYS_FACTS 83), and when it was last asked (once a second): while nobody is, applications get nothing but the addresses (op 3), AUTH.md "Radios while locked".
+    person: bool,
+    person_t: u64,
     /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
     mode: u8,
 }
@@ -1137,6 +1140,10 @@ impl Ip {
 
     /// One `udp` request; returns the reply length written to `out`.
     fn serve(&mut self, m: &[u8], out: &mut [u8]) -> usize {
+        // While nobody has attested no application sends, receives, connects or joins: nothing may act on what the radios bring until a person is present (the addresses, op 3, stay readable). The locate responder will be the one exception (AUTH.md "Locate").
+        if !self.person && m.first() != Some(&3) {
+            return 0;
+        }
         match m.first() {
             Some(1) if m.len() >= 22 => {
                 let addr: [u8; 16] = m[2..18].try_into().unwrap();
@@ -1381,6 +1388,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         wifi_t: 0,
         cell: CELL_DOWN,
         cell_t: 0,
+        person: false,
+        person_t: 0,
         mode: 0,
     };
     // Randomness: the DHCP transaction id and the IPv6 interface identifier (random per session).
@@ -1456,6 +1465,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         if t.wrapping_sub(ip.cell_t) > if ip.cell.flags & 1 != 0 { 16 } else { 1 } * ip.freq {
             ip.cell_t = t;
             ip.cell_info();
+        }
+        if t.wrapping_sub(ip.person_t) > ip.freq {
+            ip.person_t = t;
+            ip.person = ferros_sys::facts().0[83] == 2;
         }
         // Applications: a polling recv on `udp`.
         let n = svc(RECV, ip.cap(S_UDP), ip.off(msg.as_mut_ptr()), msg.len() as u64, ip.off(tok.as_mut_ptr()), 1);

@@ -541,6 +541,10 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     nfc.state(&mut l);
                     reply(&token, &l.b[..l.n]);
                 }
+                // While nobody has attested no secret is served to a reader (AUTH.md "Radios while locked"; the tap is fgtw's, which only a person starts).
+                1 if n == 33 && ferros_sys::facts().0[83] != 2 => {
+                    reply(&token, &[1]);
+                }
                 1 if n == 33 => {
                     let mut s = [0u8; 32];
                     s.copy_from_slice(&msg[1..33]);

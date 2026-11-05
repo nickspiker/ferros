@@ -78,6 +78,19 @@ The replay carries gpsd's aiding from the capture night: the time (ferros rewrit
 - **Our stance:** published openly, unposted and unauthenticated, exactly as the Pixel fetches it; ferros fetches it the same way for its own chip. If Broadcom or Google ask, it comes down.
 - **Not done yet:** a fresh file into the chip. gpsd's upload is the `1e83`/`1e82` messages; one capture on Android with the exact file it uploads shows the layout, then ferros builds them from a file it fetched (desktop over USB/Photon, or WiFi). Alongside, not instead: the chip's own learned ephemerides kept in the vault, and public broadcast ephemerides (IGS/NASA), so one company's feed is never the only path.
 
+## Location is the person's (owner, 2026-11-04)
+
+- **No GPS while nobody has attested.** The one exception is locate (AUTH.md "Locate", a plan).
+- **The last fix is the person's.** `gnss.last` is identity class (kvault.rs `IDENTITY`): while locked the driver can neither read nor write it.
+  - The old device-class entry was deleted the same night.
+- **The replays keep no place.** They held the capture's position (three `d0 81` messages each, the place they were captured), and they are device class.
+  - The driver's scrub mode (input G#02) zeroes those positions through `patch_aiding`, so the checksum and CRC are redone, and writes the replays back in pieces. It never powers the chip.
+  - Run once on 2026-11-04. Verified on the stored bytes: no latitude or longitude left in either replay.
+  - The messages themselves stay: cut or zeroed, the chip waits 5-8 minutes alike, and zeroed keeps the record sequence the chip acknowledges.
+  - The driver now says "position from none" when there is no last fix of the person's.
+- **Not checked:** the replays' `92 81` and `8e 81` messages are not decoded, so I can't rule out that they also carry a place. The capture's own files stay on Harbor.
+- **A first fix with no last position starts cold** (about 5-8 minutes, measured with a zeroed position). Every fix after it, in that person's session, starts from their own last fix.
+
 ## Next
 
 1. ~~Navigation~~ — done above.

@@ -20,9 +20,10 @@ The vault holds two classes of entry.
 | What | Vault names |
 |---|---|
 | The home screen | `map.place.*` (where each circle sits), `map.view` (the camera), everything else under `map.` |
-| fgtw (the identity service) | `photon.*`: the chain and fleet key when kept, its phonebook |
+| fgtw (the identity service) | `fgtw.*`: the chain and fleet key when kept, its phonebook |
 | The attest screen's own | `ahau.*` |
 | Networks | `wifi.cred` (networks travel with the person; the per-network MAC stays the device's, from the ira) |
+| Where the device has been | `gnss.last`, the GNSS driver's last fix (2026-11-04). No GPS runs while nobody has attested. The replays the chip is aided from (`gnss.replay`, `gnss.replay.sky`) stay device class: Broadcom's firmware, gpsd's configuration and the orbits. Their position messages are zeroed (the gnss driver's scrub, input G#02), so they keep no place. |
 | Next | the person's installed apps (their capsules), device pairings (car, headphones), every app's data |
 
 The rule is in `kvault.rs` `IDENTITY`: a name under one of those prefixes is identity class, and everything else is device class.
@@ -130,6 +131,42 @@ Not built; for the owner to approve before it is.
 - WiFi credentials are already identity class (`wifi.cred`); the per-network MAC stays the device's, from the ira.
 
 **Moving with the person.** Every identity-class entry is what a new device of the fleet should receive: the fleet's chain carries the identity key's derivations, and the entries themselves travel sealed over Photon's fleet channel. That transport is Photon's and is not designed yet; the vault side is only "copy every `IDENTITY` name".
+
+## Radios while locked (owner, 2026-11-04)
+
+Every radio is up at the attest screen: the modem, the WiFi chip, Bluetooth and NFC. Being up while locked is not a larger surface than being up after attest, and a locked device has less to lose (no identity key in memory, the person's half of the vault sealed). Three conditions make it safe:
+
+1. **Every radio's DMA is fenced.**
+   - The kernel owns the fences, and no process may write one (`s2mpu::is_fence`, refused in `SYS_MMIO_WRITE`).
+   - The modem (HSI1) is held to its carve-outs, the WiFi chip (HSI2) to its windows, and BLK_MISC's masters are denied everything (2026-11-04).
+   - The modem's fence matters most: any base station reaches the modem before anyone attests.
+2. **No stable identifier goes on the air while locked.**
+   - Measured 2026-11-04: the WiFi driver neither scans nor joins until `wifi.cred` opens (`wait_cred`), so the chip is up but sends nothing. Bluetooth advertises only when asked, under a fresh non-resolvable random address each time, and refuses to while locked. A locate beacon would rotate its keys.
+   - Radio addresses that last belong to the identity (worn by the person, not the device).
+3. **Nothing acts on radio input while locked unless it carries the fleet's signature.**
+   - No Bluetooth pairing, no NFC action, no listening socket, no clock set from the network.
+   - fgtw, the only thing that acts on what the radios bring, waits for a person. And since 2026-11-04 the drivers refuse it themselves, from SYS_FACTS 83 (a person present): `ip` answers applications nothing but its addresses, `bt` refuses the beacon, `nfc` refuses the tap secret.
+
+Only the cellular link carries data while locked: the WiFi join needs the person's `wifi.cred`. After a jump from Android no radio starts at all, locked or not (their drivers meet Android's hardware state).
+
+## Locate (plan, 2026-11-04)
+
+No GPS runs while nobody has attested, with one exception: locate, for a lost or stolen bound device. The design is write-only. The locked device can produce its location, but it can never read it back.
+
+- **The keys it keeps.** At bind time the device keeps the fleet's public keys in the device class. Public keys are fine there.
+- **The request.** A locate request comes from one of the fleet's other devices, signed with the fleet key and stamped with Eagle time. Without a valid request the GPS stays off, so there is no standing tracking, and no stranger can start one. A stale stamp is refused, so a request cannot be replayed to drain the battery.
+- **The answer.**
+  - The device powers the GPS, takes a fix, and seals it to the fleet's public key (X25519, XChaCha20-Poly1305).
+  - It sends the sealed fix over the cellular link: while locked, `ip` lets only the locate responder open a connection, and only to fgtw.org.
+  - It then drops the fix from memory and powers the GPS off. Nothing readable is ever stored.
+  - With no network, it may keep the sealed fix to send later: the device cannot open it, only the fleet's private key can.
+- **A cold start.** There is no remembered position while locked (`gnss.last` is the person's), so the first fix starts cold (5-8 minutes, GNSS.md). The WiFi access points and cell towers it sees can go in the same sealed answer for a rough place indoors.
+- **Later: a crowd relay over BLE.** The locked device beacons under rotating keys that only its fleet can link. Other ferros and Photon devices that hear it report their own position, sealed to that fleet. This works with no network on the lost device at all.
+- **Only a bound device has locate.** An unbound one has no fleet to answer to.
+
+To check before building:
+- whether the fleet's chain already carries a signing key and an X25519 key that fit;
+- the modem's registration while locked against the carrier's terms (data-only, MVNO.md).
 
 ## Known gaps
 

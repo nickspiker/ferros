@@ -518,6 +518,11 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
                     bt.state(&mut l);
                     reply(&token, &l.b[..l.n]);
                 }
+                // While nobody has attested nothing goes on the air: no beacon (AUTH.md "Radios while locked"; the beacon is fgtw's, which only a person starts).
+                1 if n == 17 && ferros_sys::facts().0[83] != 2 => {
+                    say!(grants, "bt: beacon refused: nobody has attested\n");
+                    reply(&token, &[1]);
+                }
                 1 if n == 17 => {
                     let mut b = [0u8; 16];
                     b.copy_from_slice(&msg[1..17]);

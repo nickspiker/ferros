@@ -14,7 +14,7 @@
 #![no_main]
 
 use core::fmt::Write;
-use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_get_at, store_set, NOTHING};
+use ferros_sys::{cap, console, freq, mmio_read, mmio_write, now, recv, reply, store_get_at, store_set, store_set_at, NOTHING};
 
 const S_GNSS: u64 = 1;
 const S_SPI: u64 = 2;
@@ -507,6 +507,45 @@ fn keep_last(grants: u64, d: &Deframer) {
     store_set(cap(grants, S_STORE), b"last", &v);
 }
 
+/// The capture's place out of a stored replay (owner, 2026-11-04: no place in the device's half, and no GPS while nobody has attested): every `d0 81` position zeroed through `patch_aiding` (its checksum and CRC redone, as at every run; the time fields take the clock's now, which every run rewrites anyway), the replay written back in pieces. The chip is never powered: this takes no fix. The message stays in the replay: cut or zeroed the chip waits 5-8 minutes alike (GNSS.md), and zeroed keeps the record sequence the chip acknowledges; the person's own last fix (`gnss.last`, the identity class) fills it whenever there is one.
+fn scrub(grants: u64, store: u64, key: &[u8]) {
+    let mut head = [0u8; 4];
+    let Some(total) = store_get_at(store, key, 0, &mut head) else {
+        return say!(grants, "gnss: scrub: no {} in the vault\n", core::str::from_utf8(key).unwrap_or("?"));
+    };
+    if &head != b"GNR1" || gps_ms_now().is_none() {
+        return say!(grants, "gnss: scrub: {} is not GNR1, or the clock is not set: left as it was\n", core::str::from_utf8(key).unwrap_or("?"));
+    }
+    let mut ok = store_set_at(store, key, 0, b"GNR1", true);
+    let (mut at, mut out_at, mut places) = (4usize, 4usize, 0u32);
+    let mut rec = [0u8; 4096];
+    let mut patched = [0u8; 8192];
+    while at + 4 <= total {
+        let mut h = [0u8; 4];
+        store_get_at(store, key, at, &mut h);
+        let len = u16::from_le_bytes([h[0], h[1]]) as usize;
+        let mut got = 0;
+        while got < len {
+            let k = (len - got).min(4096);
+            store_get_at(store, key, at + 4 + got, &mut rec[got..got + k]);
+            got += k;
+        }
+        at += 4 + len;
+        let body: &[u8] = match patch_aiding(&rec[..len], Some((0, 0)), &mut patched) {
+            Some(n) => &patched[..n],
+            None => &rec[..len],
+        };
+        if body.windows(4).any(|w| w == [0xC0, 0xC1, 0xD0, 0x81]) {
+            places += 1;
+        }
+        let hdr = [body.len() as u8, (body.len() >> 8) as u8, h[2], h[3]];
+        ok &= store_set_at(store, key, out_at, &hdr, true);
+        ok &= store_set_at(store, key, out_at + 4, body, at + 4 <= total);
+        out_at += 4 + body.len();
+    }
+    say!(grants, "gnss: scrub: {}: {} position messages zeroed, {} B written back ({})\n", core::str::from_utf8(key).unwrap_or("?"), places, out_at, if ok { "stored" } else { "the vault refused a piece" });
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
@@ -516,6 +555,12 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     let sky = input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 1 == 1;
     let key: &[u8] = if sky { b"replay.sky" } else { b"replay" };
     let store = cap(grants, S_STORE);
+    // Input bit 1: scrub both replays of the capture's place and end, the chip never powered (`scrub`).
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } & 2 == 2 {
+        scrub(grants, store, b"replay");
+        scrub(grants, store, b"replay.sky");
+        ferros_sys::exit(0);
+    }
     let mut last = [0u8; 8];
     let pos = (ferros_sys::store_get(store, b"last", &mut last) == Some(8)).then(|| (i32::from_le_bytes([last[0], last[1], last[2], last[3]]), i32::from_le_bytes([last[4], last[5], last[6], last[7]])));
     let mut head = [0u8; 4];
@@ -533,7 +578,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     chip.set(NSTANDBY, true);
     sleep_ms(250);
     let woke = chip.wake(100);
-    say!(grants, "gnss: powered, the chip {} its wake; replaying {} B ({}), position from {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" }, if pos.is_some() { "the last fix" } else { "the capture" });
+    say!(grants, "gnss: powered, the chip {} its wake; replaying {} B ({}), position from {}\n", if woke { "answered" } else { "did not answer" }, total, if sky { "without the LTO" } else { "with the capture's LTO" }, if pos.is_some() { "the last fix" } else { "none (the replay's is zeroed: no place is kept in the device's half)" });
 
     let t_all = now();
     let f = freq();

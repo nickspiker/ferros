@@ -26,8 +26,8 @@ fn reserved(name: &str) -> bool {
     name.starts_with('\0')
 }
 
-/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the identity service's chain and key (payloads/fgtw), the attest screen's own, and the WiFi credential (networks travel with the identity; the per-network MAC stays the device's). They are sealed under a key bound to this device and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not.
-const IDENTITY: [&str; 4] = ["map.", "fgtw.", "ahau.", "wifi.cred"];
+/// The identity class (AUTH.md, owner decisions 2026-10-31): entries under these prefixes are the person's, not the device's — the map's arrangement, the identity service's chain and key (payloads/fgtw), the attest screen's own, the WiFi credential (networks travel with the identity; the per-network MAC stays the device's), and the GNSS driver's last fix (owner, 2026-11-04: where the device has been is the person's, and no GPS runs while nobody has attested; the replays it aids from keep no place, gnss scrub). They are sealed under a key bound to this device and to the person, held only while an identity is unlocked: before attest none of them can be read, their names included. One identity per device: another person's handle is refused once the device is bound, and wipes an earlier attempt's leftovers while it is not.
+const IDENTITY: [&str; 5] = ["map.", "fgtw.", "ahau.", "wifi.cred", "gnss.last"];
 pub fn identity_class(name: &str) -> bool {
     IDENTITY.iter().any(|p| name.starts_with(p))
 }
@@ -37,6 +37,8 @@ const ID_SECRET: &str = "\0id.secret";
 const ID_UNLOCK: &str = "\0id.unlock";
 /// The identity class's own list of names, sealed under the identity key.
 const ID_NAMES: &str = "\0id.names";
+/// Whether an identity is unlocked now (a person is present): the vault's own `id`, mirrored lock-free for SYS_FACTS 83, which any process may ask, so the radios' drivers can refuse while locked without holding the unlock right (AUTH.md "Radios while locked").
+pub static PERSON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// One identity per device (AUTH.md; the network owns the assignment): set when the unlocked identity'"'"'s fleet binds this device, cleared on release (a completed departure). While set, only that identity unlocks.
 const ID_BOUND: &str = "\0id.bound";
 /// Every identity-class entry'"'"'s vault address, 32 bytes each, in the device class: opaque (no names, no contents, nothing but a count), so the identity class can be wiped whole without its key — on release, and when a different handle unlocks a device that is not bound yet.
@@ -377,6 +379,7 @@ impl KVault {
         let addr_key = blake3::derive_key(ID_ADDR_CONTEXT, &k);
         let payload_key = blake3::derive_key(ID_PAYLOAD_CONTEXT, &k);
         self.id = Some(IdKeys { addr_key, payload_key });
+        PERSON.store(true, core::sync::atomic::Ordering::Release);
         for b in [&mut secret, &mut base, &mut k] {
             b.fill(0);
         }
@@ -396,6 +399,7 @@ impl KVault {
 
     /// Lock the identity: its keys dropped, their bytes overwritten first. What it had stored stays sealed on disk.
     pub fn lock(&mut self) {
+        PERSON.store(false, core::sync::atomic::Ordering::Release);
         if let Some(mut k) = self.id.take() {
             k.addr_key.fill(0);
             k.payload_key.fill(0);
