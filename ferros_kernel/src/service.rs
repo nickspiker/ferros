@@ -2172,6 +2172,16 @@ pub fn run(mut b: Boot) -> ! {
                     continue;
                 }
                 #[cfg(not(ferros_production))]
+                if cmd.params == b"wdt rate" {
+                    // `diag wdt rate`: the watchdog's real tick, so the window (platform::WDT_COUNT) is known in seconds, not assumed from the oscillator's rate.
+                    let (ticks, us) = crate::platform::wdt_rate();
+                    // WHY the zero test: the counter's rate is what is being measured, and a watchdog whose clock is stopped counts 0 ticks; dividing by it would panic the kernel inside a diagnostic.
+                    let window_ms = if ticks == 0 { 0 } else { crate::platform::WDT_COUNT as u64 * us / ticks as u64 / 1000 };
+                    resp.extend_from_slice(alloc::format!("watchdog: {ticks} ticks in {us} us, so the window of {} ticks is {window_ms} ms\n", crate::platform::WDT_COUNT).as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
+                #[cfg(not(ferros_production))]
                 if cmd.params == b"cvac canvas" {
                     // What it costs to hand the display's canvas to the GPU (GPU.md, the present stage): the GPU does not snoop the CPU's caches, so whatever the display drew must be cleaned to the point of coherency first, and EL0 cannot (SCTLR_EL2.UCI clear). Times `dc cvac` over the whole 32 MiB canvas twice: once with whatever lines the display left dirty, once with none. A clean writes back, it changes no data.
                     let (lo, hi) = crate::cachemap::DISPLAY_CANVAS;

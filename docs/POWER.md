@@ -160,3 +160,12 @@ Left, roughly by size:
 6. **Screen on: the rest redraws** — the gravity-following clock repaints its whole face on every 10 Hz flip and the scope its plot box; cheaper redraws would let the X3 rest below 2 GHz. A design choice for the owner (the clock's no-dead-zone rule is part of it).
 7. **Focus at 90 frames a second costs ~2.7 W over rest**: whether focus should run at full clocks is the owner's call.
 8. Brightness: the panel's floor alone moves ~0.8 W between 2 and 140 nits; automatic brightness from the front light sensor is the owner's call.
+
+## The watchdog and sleep (2026-11-05)
+
+The cluster watchdogs run a 1 s window (platform.rs `WDT_COUNT`, measured: 150 ticks in 200 ms, 1.333 ms a tick). The longest stretch without a pet: 213 ms on a cold boot, 75-80 ms across a reload's hand-over, about 315 ms in a reloaded kernel's start (DIAG `WDT_GAP_MAX_US`, `WDT_HANDOVER_US`). The hv's re-arm at the jump keeps the longest window until the jump's own stretch is measured.
+
+Today's dark profile keeps the X3 and the service loop running, so the pets go on and nothing changes. When real suspend comes (cores off, DRAM in self-refresh), it does as Linux's watchdog driver does:
+- **Entry:** stop the watchdogs as the very last step before the cores go down, so everything up to that point stays covered.
+- **Resume:** arm them as the very first step, as `arm_safety` does at boot, so a hang while waking resets within 1 s.
+- **Optional, only if the sleep state itself is ever distrusted:** keep them running through the sleep with a long window and a wake timer that pets them.

@@ -71,8 +71,10 @@ pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-/// Cluster watchdogs (s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8). Armed at the longest window (~1-2 min); a pure spin with no pets resets warm instead of hanging forever.
+/// Cluster watchdogs (s3c2410 block: WTCON +0, WTDAT +4, WTCNT +8; RSTEN b0, EN b5, DIV128 3<<3, PRESCALE 0xFF<<8). Armed at WDT_COUNT (1 s; the longest window, ~87 s, until 2026-11-05); a pure spin with no pets resets warm instead of hanging forever.
 const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
+/// The watchdog window (owner, 2026-11-05: "1s?"): 750 ticks of prescaler 256 and divider 128 from the 24.576 MHz oscillator, 1.333 ms a tick, is 1 s; written at the arm and reloaded by every pet. Measured before choosing it: the longest stretch without a pet is 213 ms on a cold boot, 80 ms across a reload's hand-over, 316 ms in a reloaded kernel's start (DIAG WDT_GAP_MAX_US, WDT_HANDOVER_US); the hv's re-arm at the jump keeps the longest window until the jump's stretch is measured. `diag wdt rate` checks the tick against the counter.
+pub const WDT_COUNT: u32 = 750;
 
 /// Make a hang self-reporting and self-recovering (no button reset, which cold-resets and wipes pmsg).
 /// 1. Fault sink: the sync exception handler records the first fault (ELR/FAR/ESR/count) into the result block and warm-resets, so the next Linux boot prints it. The pmsg zone can come up filled with FF (seen on hardware), which would defeat the sink's "already recorded" guard on 0xA0 and pollute every unwritten slot, so the report slots are zeroed first.
@@ -113,8 +115,8 @@ pub fn arm_safety() {
     LAST_PET.store(now, core::sync::atomic::Ordering::Relaxed);
     for &wdt in &WATCHDOGS {
         unsafe {
-            write_volatile((wdt + 0x04) as *mut u32, 0xFFFF);
-            write_volatile((wdt + 0x08) as *mut u32, 0xFFFF);
+            write_volatile((wdt + 0x04) as *mut u32, WDT_COUNT);
+            write_volatile((wdt + 0x08) as *mut u32, WDT_COUNT);
             write_volatile(wdt as *mut u32, WDT_ARM);
         }
     }
@@ -146,8 +148,26 @@ pub fn handover_stamp(kind: u8) {
     }
 }
 
+/// Pets held off for `diag wdt rate`'s measurement (a development tool): the counter must run untouched for it.
+pub static PET_HOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The watchdog's tick measured (`diag wdt rate`, development builds): every pet held off for 200 ms, the first watchdog's counter read before and after; returns (ticks counted, microseconds), so the window in seconds is WDT_COUNT · us / ticks / 10^6. 200 ms is 150 ticks at the assumed 1.333 ms, well inside the 1 s window.
+pub fn wdt_rate() -> (u32, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    pet_watchdogs();
+    PET_HOLD.store(true, Relaxed);
+    let (t0, c0) = (cntpct(), unsafe { read_volatile((WATCHDOGS[0] + 0x08) as *const u32) });
+    while cntpct().wrapping_sub(t0) < cntfrq() / 5 {
+        core::hint::spin_loop();
+    }
+    let (t1, c1) = (cntpct(), unsafe { read_volatile((WATCHDOGS[0] + 0x08) as *const u32) });
+    PET_HOLD.store(false, Relaxed);
+    pet_watchdogs();
+    (c0.wrapping_sub(c1), t1.wrapping_sub(t0) * 1_000_000 / cntfrq())
+}
+
 pub fn pet_watchdogs() {
-    if RESET_ORDERED.load(core::sync::atomic::Ordering::Relaxed) {
+    if RESET_ORDERED.load(core::sync::atomic::Ordering::Relaxed) || PET_HOLD.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
     use core::sync::atomic::Ordering::Relaxed;
@@ -162,7 +182,7 @@ pub fn pet_watchdogs() {
     }
     PETS.fetch_add(1, Relaxed);
     for &wdt in &WATCHDOGS {
-        unsafe { write_volatile((wdt + 0x08) as *mut u32, 0xFFFF) };
+        unsafe { write_volatile((wdt + 0x08) as *mut u32, WDT_COUNT) };
     }
 }
 
