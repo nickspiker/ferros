@@ -1,6 +1,6 @@
 //! The GPU driver (GPU.md): the Mali-G715's CSF microcontroller booted from Arm's firmware, its global interface answering, and a command-stream job run on it — as a process, the kernel holding only the GPU's DMA fence (s2mpu::fence_gpu) and its power.
 //!
-//! Spawn: `ferros-bridge spawn gpu.bin --name gpu --dma gpu-regs --dma gpu-mem --store gpu`. Grant slots: 0 console, 1 the GPU's registers (`gpu-regs`, EL0 Device, mapped at their physical address), 2 the memory the GPU and this process share (`gpu-mem`, Normal non-cacheable), 3 the vault scope `gpu.` (the firmware, `gpu.fw`).
+//! Spawn: `ferros-bridge spawn gpu.bin --name gpu --dma gpu-regs --dma gpu-mem --store gpu --irq gpu-job`. Grant slots: 0 console, 1 the GPU's registers (`gpu-regs`, EL0 Device, mapped at their physical address), 2 the memory the GPU and this process share (`gpu-mem`, Normal non-cacheable), 3 the vault scope `gpu.` (the firmware, `gpu.fw`), 4 the GPU's job line (`gpu-job`).
 //!
 //! The sequence is kbase's (r52p0, Google's tree), condensed in GPU.md "Bring-up": reset, L2, the MCU's address space and the firmware's sections, the MCU started, the global interface's init and a ping, then one command-stream group with one queue running a job of three instructions that writes a word to memory.
 #![no_std]
@@ -16,6 +16,7 @@ use mem::{rd32, wr32, wr64, Mem, Table, PAGE};
 const S_REGS: u64 = 1;
 const S_MEM: u64 = 2;
 const S_STORE: u64 = 3;
+const S_IRQ: u64 = 4;
 
 /// A console line in a fixed buffer.
 pub struct Line([u8; 200], usize);
@@ -395,12 +396,32 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
 
     // The jobs, each appended to the ring after the last and the insert pointer moved on (the ring is 4 KiB: these few jobs never wrap it).
     let q = Queue { ring, uio, insert: core::cell::Cell::new(0), doorbell: doorbell as usize };
+    // A job's completion is waited for on the GPU's job line (`gpu-job`): each interrupt is cleared at the GPU, group 0's events acknowledged as kbase acknowledges them (the IDLE, SYNC_UPDATE and progress-timer bits of CSG_ACK copied into CSG_REQ, CSG_IRQ_ACK = CSG_IRQ_REQ), the line unmasked, and the job's own check asked; 100 ms at most.
+    let irq = cap(grants, S_IRQ);
+    let events = |g: &Gpu| -> u32 {
+        let raw = g.rd(JOB_IRQ_RAWSTAT);
+        g.wr(JOB_IRQ_CLEAR, raw);
+        if raw & 1 != 0 {
+            let mask = 1 << 28 | 1 << 29 | 1 << 31;
+            sh.wr(cin, (sh.rd(cin) & !mask) | (sh.rd(cout) & mask));
+            sh.wr(cin + 0x0C, sh.rd(cout + 0x0C));
+        }
+        ferros_sys::irq_ack(irq);
+        raw
+    };
     let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| -> bool {
         let t0 = now();
         q.submit(&g, words);
-        let ok = g.wait(100, |_| check());
-        say!(grants, "gpu: job {name}: {} in {} us; CS_STATUS_CMD_PTR G#{:X}, blocked reason {}, CS_FAULT G#{:X}, CS_FATAL G#{:X}\n", if ok { "done" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x40) as u64 | (sh.rd(sout + 0x44) as u64) << 32, sh.rd(sout + 0x60), sh.rd(sout + 0x80), sh.rd(sout + 0x84));
-        say!(grants, "gpu:   CSG_REQ G#{:X} CSG_ACK G#{:X} CSG_IRQ_REQ G#{:X} CSG_IRQ_ACK G#{:X} CSG_STATUS_STATE G#{:X}; CS_REQ G#{:X} CS_ACK G#{:X}; CS_EXTRACT {} CS_ACTIVE {}; JOB_IRQ_RAWSTAT G#{:X}\n", sh.rd(cin), sh.rd(cout), sh.rd(cout + 0x0C), sh.rd(cin + 0x0C), sh.rd(cout + 0x18), sh.rd(sin), sh.rd(sout), rd32(uio + PAGE), rd32(uio + PAGE + 8), g.rd(JOB_IRQ_RAWSTAT));
+        let deadline = t0 + g.f / 10;
+        let mut wakes = 0;
+        while !check() && now() < deadline {
+            if ferros_sys::irq_wait(irq, deadline) == 0 {
+                wakes += 1;
+                events(&g);
+            }
+        }
+        let ok = check();
+        say!(grants, "gpu: job {name}: {} in {} us after {wakes} interrupts; CS_FAULT G#{:X}, CS_FATAL G#{:X}; CSG_REQ G#{:X} CSG_ACK G#{:X}\n", if ok { "done" } else { "did not finish" }, ferros_sys::us_since(t0), sh.rd(sout + 0x80), sh.rd(sout + 0x84), sh.rd(cin), sh.rd(cout));
         ok
     };
     let mut ok = true;
