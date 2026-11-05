@@ -1169,8 +1169,8 @@ pub fn run(mut b: Boot) -> ! {
             crate::heap2_join();
         }
         crate::odpm::poll();
-        // The SoC's unused power domains off, once, as the clock policy starts (pd.rs).
-        crate::pd::gate_at_boot(now.wrapping_sub(t_boot), 16 * cntfrq());
+        // The SoC's unused power domains off, once, as the clock policy starts (pd.rs). After a jump at once, on the first pass: the jump is a killswitch, and a domain Android left on may hold a bus master still running Android's work (the GPU, a codec, the camera's chain, the TPU); its power cut stops it dead, through EL3 as every domain switch goes, where its S2MPU could not be touched safely (owner, 2026-11-04: "kill the rails").
+        crate::pd::gate_at_boot(now.wrapping_sub(t_boot), if platform::jumped() { 0 } else { 16 * cntfrq() });
         clock_policy(false, now.wrapping_sub(t_boot));
         // The UFS link into hibernate once it has been idle 16 ms (ferros_hal ufs `h8_enter_if_idle`), under the kernel lock as every command is; every command brings it back.
         if ferros_hal::ufs::H8_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {

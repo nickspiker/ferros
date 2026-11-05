@@ -53,8 +53,17 @@ pub fn bring_up() -> bool {
     // A link already up (a RELOAD: the previous generation brought it up) is adopted — our own transfer list on it, proven by the block read — not reset. full_init on a live link came up and served the shell's first reads, then lost a command minutes later, every time (2026-10-23); the Linux handoff always adopted its link this way.
     // Only when the device is powered — gpp0-1 high, which only a previous generation of ferros does; ABL leaves HCE and the link bits set over a hibernated, unpowered device, and adopting that cost four 1 s timeouts on every cold boot (2026-10-23).
     // After the jump from Android the live link is Android's, and adopting it cost four 4 s timeouts (COLD_UFS_MS ~16200: the screen held Android's last frame that long) twice on 2026-11-03: once with a command of Android's still in the doorbell (the camera writing), once with the doorbell empty (the link most likely in Android's hibernate). The full init below takes 45 ms and brought the disk up both times, so a jump always takes it.
+    // And the device's rail cut first (owner, 2026-11-04: the jump is a killswitch — "if it's mid command, hit it on the fucking head with a crowbar or kill the rails"): Android's last command never completes and nothing it left in the device survives into ferros. VCC off for 16 ms (gpp0-1 low), then the cold path below: VCC on, the host reset, the device's reset pulse, the link from scratch.
     if crate::platform::jumped() {
-        crate::platform::pstore(b"ferros: UFS: the jump from Android, full init (its link is not adopted)\n");
+        crate::platform::pstore(b"ferros: UFS: the jump from Android: the device's VCC cut, then full init (nothing of Android's adopted)\n");
+        let con = rd(GPP0);
+        wr(GPP0, (con & !(0xF << 4)) | (1 << 4)); // gpp0-1 = output
+        wr(GPP0 + 4, rd(GPP0 + 4) & !(1 << 1)); // VCC off
+        unsafe { core::arch::asm!("dsb sy") };
+        let (freq, t0) = (crate::platform::cntfrq(), crate::platform::cntpct());
+        while crate::platform::cntpct().wrapping_sub(t0) < freq / 64 {
+            core::hint::spin_loop();
+        }
     }
     if !crate::platform::jumped() && rd(GPP0 + 4) & (1 << 1) != 0 && ufs.link_is_up() {
         ufs.init_transfer_list();

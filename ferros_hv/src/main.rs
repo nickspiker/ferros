@@ -2243,6 +2243,41 @@ mod hvcore {
     const DPU_SYSMMUS: [usize; 2] = [0x1984_0000, 0x19C4_0000];
     /// DECON0's trigger control (gate.rs): the hardware trigger enable (bit 0) and its mask (bit 4). The panel is in command mode, so the engine fetches a frame only when the trigger fires.
     const DECON0_TRIG_CON: usize = 0x1947_0030;
+    /// The always-on S2MPUs set to deny-all at the jump (zuma-s2mpu.dtsi): hsi1, hsi2, misc.
+    const DENY_AT_JUMP: [usize; 3] = [0x1209_0000, 0x131F_0000, 0x101F_0000];
+
+    /// One S2MPU (v9, its non-secure registers; ferros_kernel s2mpu.rs has the same map) set to let no VID reach any memory: every context valid, every L1 entry no-access (GiB 4-33 are no-access in hardware), the caches invalidated and synced, then protection on with error responses. False when it is not a v9 or the sync never completed.
+    fn s2mpu_deny_all(s: usize) -> bool {
+        if rd(s + 0x060) & 0xFFFF_0000 != 0x9000_0000 {
+            return false;
+        }
+        let n = (rd(s + 0x100) & 0xF) as u32;
+        let mut ctx = 0u32;
+        for i in 0..n.min(8) {
+            ctx |= (i | 8) << (4 * i);
+        }
+        wr(s + 0x104, ctx);
+        for vid in 0..8usize {
+            for g in (0..4usize).chain(34..64) {
+                wr(s + 0x4004 + vid * 0x200 + g * 8, 0);
+            }
+        }
+        unsafe { asm!("dsb sy") };
+        wr(s + 0x1000, 1);
+        wr(s + 0x102C, 1);
+        let (t0, f) = now();
+        while rd(s + 0x1030) & 1 == 0 || rd(s + 0x068) & 3 == 3 {
+            if now().0.wrapping_sub(t0) > f / 100 {
+                return false;
+            }
+        }
+        wr(s + 0x070, 0xFF);
+        wr(s + 0x000, 0);
+        wr(s + 0x050, 0xFF);
+        wr(s + 0x010, 0);
+        unsafe { asm!("dsb sy") };
+        true
+    }
     const WATCHDOGS: [usize; 2] = [0x1006_0000, 0x1007_0000];
     /// Every core but this one (MPIDR Aff1 0-8 without 3).
     const OTHERS: u32 = 0x1F7;
@@ -2499,6 +2534,12 @@ mod hvcore {
             wr(w, 0xFF00 | (3 << 3) | (1 << 5) | 1);
         }
         set(19, 1);
+        // The jump is a killswitch (owner, 2026-11-04: "if it's mid command, hit it on the fucking head with a crowbar"): every bus master Android left running behind an always-on S2MPU is cut off from all memory before ferros is copied in — hsi1 (PCIe ch0, the modem), hsi2 (UFS and WiFi: ferros's own fence opens UFS's window again as it brings the link up), misc (its DMA engines). Masters behind the S2MPUs inside power domains (the GPU, codecs, the camera chain, the TPU) are stopped by ferros cutting those domains on its first pass (pd.rs), not here: a register access to a domain that is down hangs the bus. cpucl0's is left alone: what sits behind it is not known, and if the CPUs did, deny-all would stop this core.
+        for &s in &DENY_AT_JUMP {
+            let r = s2mpu_deny_all(s);
+            super::pstore::log(&[if r { b"ferros hv: jump -- an S2MPU denied all\n" as &[u8] } else { b"ferros hv: jump -- an S2MPU did not take deny-all\n" }]);
+        }
+        set(19, 0x11);
         // The EL3 poison rule (ferros_kernel display.rs): a CPU access to DECON with the DPU's power domains down returns 0 and leaves the next EL3 SMC_CMD_PRIV_REG call hanging forever. Android powers the DPU down between frames whenever the screen is still (DECON hibernation), so a jump at such a moment poisoned EL3 here and ferros's first firmware call after it never returned (2026-11-03: the jumps that froze at a TRNG call or lost a core at its first firmware call). The domains read through EL3 first (DPUB, DPUF0, DPUF1: CONFIGURATION, the on request, and STATUS at +4, both bit 0; the request alone reads on while a domain is still powering up), read plainly (the PMU is readable non-secure; EL3's PRIV_REG read of a STATUS register does not return it); DECON and the display SysMMUs are touched only when all three are on.
         let dpu_on = [0x1546_1D00usize, 0x1546_1D80, 0x1546_1E00].iter().all(|&a| rd(a) & 1 == 1 && rd(a + 4) & 1 == 1);
         super::pstore::log(&[if dpu_on { b"ferros hv: jump -- DPU powered\n" as &[u8] } else { b"ferros hv: jump -- DPU powered DOWN (Android's hibernation): DECON left alone\n" }]);
