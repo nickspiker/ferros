@@ -47,6 +47,7 @@ const GPU_COMMAND: usize = 0x030;
 const GPU_STATUS: usize = 0x034;
 const GPU_FAULTSTATUS: usize = 0x03C;
 const L2_CONFIG: usize = 0x048;
+const THREAD_MAX_THREADS: usize = 0x0A0;
 const SHADER_PRESENT: usize = 0x100;
 const TILER_PRESENT: usize = 0x110;
 const L2_PRESENT: usize = 0x120;
@@ -108,6 +109,7 @@ const DST_VA: u64 = 0x2000_0000;
 const CODE_VA: u64 = 0x3000_0000;
 const DESC_VA: u64 = 0x3100_0000;
 const OUT_VA: u64 = 0x3200_0000;
+const BIG_VA: u64 = 0x3300_0000;
 
 struct Gpu {
     regs: usize,
@@ -349,6 +351,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     as1.map(&mut m, CODE_VA, code, 1, PAGE_RO | NC, TABLE);
     as1.map(&mut m, DESC_VA, desc, 1, PAGE_RW | NC | NX, TABLE);
     as1.map(&mut m, OUT_VA, out, 1, PAGE_RW | NC | NX, TABLE);
+    let big = m.alloc(16);
+    as1.map(&mut m, BIG_VA, big, 16, PAGE_RW | NC | NX, TABLE);
     if !g.install(1, as1.root) {
         g.fail("AS1 never went idle");
     }
@@ -447,51 +451,25 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     //   IADD_IMM.i32 r0, r60, #G#C0FFEE00        (r60: the global id X, preloaded)
     //   SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:2   (u0: the output's address, the first uniform)
     //   STORE.i32.slot0.end @r0, [r2:r3], offset:0
-    for (k, w) in [0x0110_C0C0_FFEE_003Cu64, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002].iter().enumerate() {
-        wr64(code + 8 * k, *w);
-    }
-    // The shader program descriptor (32 bytes): type 8 (shader), stage 1 (compute), 32 registers a thread; preload r60 (bit 12); the binary's address.
-    let (spd, tsd, fau) = (DESC_VA, DESC_VA + 0x40, DESC_VA + 0x80);
-    for (k, w) in [0x8000_0018u32, 0x0000_1000, CODE_VA as u32, (CODE_VA >> 32) as u32].iter().enumerate() {
-        wr32(desc + 4 * k, *w);
-    }
-    // The local storage descriptor: no thread storage, no workgroup memory (its G#8000_0000 packed as log2 31).
-    wr32(desc + 0x40 + 4, 0x1F);
-    // The uniforms: one 64-bit entry, the output's address.
-    wr64(desc + 0x80, OUT_VA);
+    let cx = Compute { code, desc, code_va: CODE_VA, desc_va: DESC_VA, max_threads: g.rd(THREAD_MAX_THREADS) };
+    let done = OUT_VA + 0x200;
     for i in 0..32 {
         wr32(out + 4 * i, 0);
     }
-    let done = OUT_VA + 0x200;
-    let job = [
-        0x2200_0000_0000_0001u64,
-        0x1C00_0000_0000_0003,
-        0x1C00_0001_0000_0000,
-        mv48(0, 0),
-        mv32(8, fau as u32),
-        mv32(9, (fau >> 32) as u32 | 1 << 24),
-        mv48(16, spd),
-        mv48(24, tsd),
-        mv32(32, 0),
-        mv32(33, 0x8000_000F),
-        mv32(34, 0),
-        mv32(35, 0),
-        mv32(36, 0),
-        mv32(37, 1),
-        mv32(38, 1),
-        mv32(39, 1),
-        0x0400_0000_0000_8001,
-        0x0300_0000_0008_0000,
-        mv32(74, 0),
-        0x2400_4A00_0000_0211,
-        0x0300_0000_0001_0000,
-        mv48(70, done),
-        mv32(72, 1),
-        0x2600_4648_0000_0000,
-    ];
+    let mut words = [0u64; 32];
+    let n = cx.prepare(&[0x0110_C0C0_FFEE_003C, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002], &[OUT_VA], 1, done, &mut words);
     let all = || (0..16).all(|i| rd32(out + 4 * i) == 0xC0FF_EE00 + i as u32) && rd32(out + 0x200) == 1;
-    ok &= run("compute", &job, &all);
+    ok &= run("compute", &words[..n], &all);
     say!(grants, "gpu: compute output: G#{:X} G#{:X} G#{:X} … G#{:X}, done flag {}\n", rd32(out), rd32(out + 4), rd32(out + 8), rd32(out + 60), rd32(out + 0x200));
+    // 3: the same shader over 1024 workgroups (16384 invocations, 64 KiB written), the task split along X by the cores' thread limit.
+    for i in 0..16384 {
+        wr32(big + 4 * i, 0);
+    }
+    wr32(out + 0x200, 0);
+    let n = cx.prepare(&[0x0110_C0C0_FFEE_003C, 0x01A3_C200_2027_3C80, 0x7861_4002_1800_0002], &[BIG_VA], 1024, done, &mut words);
+    let all_big = || rd32(out + 0x200) == 1 && (0..16384).all(|i| rd32(big + 4 * i) == 0xC0FF_EE00 + i as u32);
+    ok &= run("compute 16384", &words[..n], &all_big);
+    say!(grants, "gpu: THREAD_MAX_THREADS {}; the last word G#{:X}\n", cx.max_threads, rd32(big + 4 * 16383));
     say!(grants, "gpu: the target reads G#{:X} G#{:X} G#{:X}; {} KiB of gpu-mem used\n", rd32(dst), rd32(dst + 4), rd32(dst + 8), m.used() >> 10);
     exit(if ok { 0 } else { 1 });
 }
@@ -534,5 +512,66 @@ impl Queue {
         self.insert.set(end);
         wr64(self.uio, self.insert.get() as u64);
         g.doorbell(self.doorbell);
+    }
+}
+
+/// A compute dispatch's memory: one page for the shader, one for its descriptors and uniforms (as the CPU sees them and at their VAs in the group's address space), and the cores' thread limit (THREAD_MAX_THREADS), which sizes a task.
+struct Compute {
+    code: usize,
+    desc: usize,
+    code_va: u64,
+    desc_va: u64,
+    max_threads: u32,
+}
+
+impl Compute {
+    /// The shader `code` (Valhall words, at most a page) written and padded, its program descriptor (compute, 32 registers a thread, r60 preloaded with the global id X), no local storage, `uniforms` as 64-bit FAU entries; and into `out` the command stream for `groups` workgroups of 16 invocations in X, then a 32-bit sync object at `done` set to 1. Returns the stream's length in words.
+    fn prepare(&self, code: &[u64], uniforms: &[u64], groups: u32, done: u64, out: &mut [u64; 32]) -> usize {
+        for (k, w) in code.iter().enumerate() {
+            wr64(self.code + 8 * k, *w);
+        }
+        for k in code.len()..PAGE / 8 {
+            wr64(self.code + 8 * k, 0);
+        }
+        let (spd, tsd, fau) = (self.desc_va, self.desc_va + 0x40, self.desc_va + 0x80);
+        for (k, w) in [0x8000_0018u32, 0x0000_1000, self.code_va as u32, (self.code_va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
+            wr32(self.desc + 4 * k, *w);
+        }
+        for k in 0..8 {
+            wr32(self.desc + 0x40 + 4 * k, if k == 1 { 0x1F } else { 0 });
+        }
+        for (k, &u) in uniforms.iter().enumerate() {
+            wr64(self.desc + 0x80 + 8 * k, u);
+        }
+        // The task's axis and size, as Mesa's gallium chooses them (pan_csf.c): along X while the threads fit the core's limit; a task of every workgroup (axis Z, increment 1) when they all fit.
+        let (axis, inc) = if 16 * groups >= self.max_threads { (0u64, (self.max_threads / 16) as u64) } else { (2, 1) };
+        let words = [
+            0x2200_0000_0000_0001u64,
+            0x1C00_0000_0000_0003,
+            0x1C00_0001_0000_0000,
+            mv48(0, 0),
+            mv32(8, fau as u32),
+            mv32(9, (fau >> 32) as u32 | (uniforms.len() as u32) << 24),
+            mv48(16, spd),
+            mv48(24, tsd),
+            mv32(32, 0),
+            mv32(33, 0x8000_000F),
+            mv32(34, 0),
+            mv32(35, 0),
+            mv32(36, 0),
+            mv32(37, groups),
+            mv32(38, 1),
+            mv32(39, 1),
+            0x04 << 56 | axis << 14 | inc,
+            0x0300_0000_0008_0000,
+            mv32(74, 0),
+            0x2400_4A00_0000_0211,
+            0x0300_0000_0001_0000,
+            mv48(70, done),
+            mv32(72, 1),
+            0x2600_4648_0000_0000,
+        ];
+        out[..words.len()].copy_from_slice(&words);
+        words.len()
     }
 }
