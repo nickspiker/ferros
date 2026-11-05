@@ -139,9 +139,33 @@ pub fn fence_modem() -> u32 {
     r
 }
 
+/// The G3D S2MPU (zuma-s2mpu.dtsi s2mpu_s0_g3d, inside pd_g3d): in front of the GPU's bus master. The GPU is the one bus master a process programs directly (its page tables are the GPU driver's), so its fence is what keeps a GPU job inside the memory ferros gave it.
+pub const GPU_S2MPU: usize = 0x1EE7_0000;
+/// pd_g3d's status in the PMU (GPU.md: a plain read, bit 0 on): the S2MPU is reachable only while it is on.
+const PD_G3D_STATUS: usize = 0x1546_1A84;
+static mut GPU_TABLE: Smpt = Smpt([0; 32768]);
+static GPU_RESULT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The GPU's fence: read and write to `gpu-mem` (cachemap GPU_MEM), nothing else, for every VID (only the GPU sits behind it; which VID its traffic arrives as is not measured yet). G#E4: pd_g3d not powered (left alone).
+pub fn fence_gpu() -> u32 {
+    let m = crate::cachemap::GPU_MEM;
+    let gb = m.0 >> 30;
+    let r = if m.0 == m.1 {
+        0xE3
+    } else if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 0 {
+        0xE4
+    } else if (m.1 - 1) >> 30 != gb {
+        0xE3
+    } else {
+        fence_at(GPU_S2MPU, &raw mut GPU_TABLE, gb, 0xC, 0xFF, &|pa| pa >= m.0 && pa < m.1)
+    };
+    GPU_RESULT.store(r, core::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 /// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
 pub fn is_fence(base: usize) -> bool {
-    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
+    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == GPU_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
 }
 
 /// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
@@ -258,6 +282,10 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     }
     append_hex(out, b"S2MPU_MISC_PROT=", rd(MISC_S2MPU, 0x58));
     faults(out, MISC_S2MPU);
+    append_hex(out, b"S2MPU_GPU_FENCE=", GPU_RESULT.load(core::sync::atomic::Ordering::Relaxed));
+    if unsafe { read_volatile(PD_G3D_STATUS as *const u32) } & 1 == 1 {
+        faults(out, GPU_S2MPU);
+    }
     append_hex(out, b"S2MPU_DPU_FENCE=", dpu_result());
     // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).
     if crate::dpu_power::all_on() {

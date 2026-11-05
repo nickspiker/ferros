@@ -133,7 +133,8 @@ pub fn gate_at_boot(booted_for: u64, after: u64) {
     }
     unsafe { GATED = true };
     let mut out = alloc::vec::Vec::new();
-    for &(name, cmu, pmu_off) in DOMAINS.iter() {
+    // The GPU stays as ABL leaves it, powered and clocked, since ferros drives it (GPU.md, 2026-11-04): this file has its off sequence but no on, which needs its PLLs back through ACPM's DVFS. Gating it saved about 50 mW (its rail 66 to 15 mW, 2026-10-25); the GPU driver will gate it itself once it has a power switch with both directions.
+    for &(name, cmu, pmu_off) in DOMAINS.iter().filter(|d| d.0 != "g3d") {
         off(name, cmu, pmu_off, &mut out);
     }
     for l in out.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {

@@ -968,6 +968,9 @@ pub static DMA: &[Dma] = &[
     // The USB driver process (USB.md): the controller's registers, mapped for EL0 (Device), and its non-cacheable DMA memory.
     Dma { name: "usb-regs", base: 0x1121_0000, size: 0x1_0000 },
     Dma { name: "usb-dma", base: crate::cachemap::USB_DMA.0, size: crate::cachemap::USB_DMA.1 - crate::cachemap::USB_DMA.0 },
+    // The GPU driver process (GPU.md): the GPU's registers and doorbells, mapped for EL0 (Device), and the memory it and the GPU share (Normal non-cacheable; the GPU's S2MPU holds it to this).
+    Dma { name: "gpu-regs", base: crate::cachemap::GPU_REGS.0, size: crate::cachemap::GPU_REGS.1 - crate::cachemap::GPU_REGS.0 },
+    Dma { name: "gpu-mem", base: crate::cachemap::GPU_MEM.0, size: crate::cachemap::GPU_MEM.1 - crate::cachemap::GPU_MEM.0 },
     // The AoC's IPC control block and its services' rings (aoc.rs IPC, cachemap.rs AOC_IPC), EL0 Device memory for the sensors process: com.google.usf's rings lie in its first G#85000 bytes.
     Dma { name: "aoc-ipc", base: crate::cachemap::AOC_IPC.0, size: crate::cachemap::AOC_IPC.1 - crate::cachemap::AOC_IPC.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
@@ -1040,6 +1043,8 @@ pub static STORES: &[StoreScope] = &[
     StoreScope { name: "ahau", prefix: "ahau." },
     // The sensors process's (payloads/sensors): the AoC's registry scripts (`aoc.reg.0`, … : tools/husky-aoc-reg.sh), which it pushes to the AoC after the firmware starts.
     StoreScope { name: "aoc", prefix: "aoc." },
+    // The GPU driver's (payloads/gpu): the CSF firmware (`gpu.fw`, mali_csffw-r52p0.bin from the device's own vendor image, Arm's: the vault and Harbor, never the repo).
+    StoreScope { name: "gpu", prefix: "gpu." },
 ];
 /// The vault behind `SYS_STORE`, registered by whoever owns it (service.rs): (full key, None = get / Some(value) = set) -> Ok(the value for a get, None if absent) or Err.
 pub static mut STORE: Option<fn(&str, Option<&[u8]>) -> Result<Option<Vec<u8>>, ()>> = None;

@@ -82,6 +82,14 @@ pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]
 pub const POOL_BIG: (usize, usize) = (0, 0);
 
+/// The GPU's registers (Mali-G715 at G#1F00_0000, 16 MiB: zuma-gpu.dtsi `reg`; its doorbell pages inside, from G#1F08_0000), EL0 Device memory for the GPU driver process (GPU.md), mapped as the USB controller's block is: nothing else lives in G#1F00_0000-G#2000_0000. Granted as `gpu-regs`.
+pub const GPU_REGS: (usize, usize) = (0x1F00_0000, 0x2000_0000);
+/// The GPU's memory (cold only): 32 MiB of Normal non-cacheable, EL0 read/write memory the GPU driver process and the GPU share — the MCU's firmware sections, the GPU's page tables, the shared interface, rings and buffers. Non-cacheable because the GPU does not snoop the CPU's caches (GPU.md). Free DRAM on a cold boot: above the big arc pool (G#B600_0000), below the GiB ABL's modem image starts (G#C000_0000); no reserved-memory node lies there (zuma-rmem.dtsi). The GPU's S2MPU lets it reach this and nothing else (s2mpu::fence_gpu). Granted as `gpu-mem`.
+#[cfg(not(shim_handoff))]
+pub const GPU_MEM: (usize, usize) = (0xB800_0000, 0xBA00_0000);
+#[cfg(shim_handoff)]
+pub const GPU_MEM: (usize, usize) = (0, 0);
+
 /// Device DMA memory for driver processes (see the module doc): cold G#8180_0000, the 2 MiB above the pool, below the reload stub (G#8207_0000). None on the handoff path.
 #[cfg(not(shim_handoff))]
 pub const DMA_POOL: (usize, usize) = (0x8180_0000, 0x81A0_0000);
@@ -237,7 +245,7 @@ pub fn enable() -> bool {
         let l2lo = &mut *(&raw mut L2_LO);
         for (j, e) in l2lo.0.iter_mut().enumerate() {
             let a = j * MIB2;
-            *e = if a >= USB_REGS.0 && a + MIB2 <= USB_REGS.1 { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
+            *e = if (a >= USB_REGS.0 && a + MIB2 <= USB_REGS.1) || (a >= GPU_REGS.0 && a + MIB2 <= GPU_REGS.1) { device_el0(vhe, a, BLOCK) } else { device(vhe, a, BLOCK) };
         }
         l1.0[0] = &raw const L2_LO as u64 | TABLE_OR_PAGE;
         let gib = w0 / GIB * GIB;
@@ -245,7 +253,7 @@ pub fn enable() -> bool {
         let mut next_l3 = 0;
         for (j, e) in l2.0.iter_mut().enumerate() {
             let a = gib + j * MIB2;
-            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) {
+            *e = if (f0 != f1 && a >= f0 && a + MIB2 <= f1) || (t0 != t1 && a >= t0 && a + MIB2 <= t1) || (USB_DMA.0 != USB_DMA.1 && a >= USB_DMA.0 && a + MIB2 <= USB_DMA.0 + USB_DMA_NC) || (GPU_MEM.0 != GPU_MEM.1 && a >= GPU_MEM.0 && a + MIB2 <= GPU_MEM.1) {
                 dma_pool(vhe, a, BLOCK)
             } else if a >= AOC_IPC.0 && a + MIB2 <= AOC_IPC.1 {
                 device_el0(vhe, a, BLOCK)

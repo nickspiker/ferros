@@ -1117,6 +1117,9 @@ pub fn run(mut b: Boot) -> ! {
         // BLK_MISC's bus masters (PDMA1, SPDMA1, DIT), none of them ferros's: denied all, as the hv denies them at the jump.
         let r = crate::s2mpu::deny_all(crate::s2mpu::MISC_S2MPU);
         crate::flashlog::line(&alloc::format!("misc: BLK_MISC's S2MPU denied all: G#{r:X} (1 = done)"));
+        // The GPU held to its own memory (gpu-mem) before any process can program it: its page tables are a process's.
+        let r = crate::s2mpu::fence_gpu();
+        crate::flashlog::line(&alloc::format!("gpu: G3D's S2MPU fenced to gpu-mem: G#{r:X} (1 = fenced)"));
     }
     // The device's opt-in to Android (ANDROID_ALLOWED), once.
     if let Some(st) = unsafe { (*(&raw mut SPAWN_STORE)).as_mut() }.and_then(|s| s.as_mut()) {
