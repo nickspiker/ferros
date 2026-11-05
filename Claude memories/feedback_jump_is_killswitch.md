@@ -1,0 +1,18 @@
+---
+name: feedback-jump-is-killswitch
+description: "The jump from Android is a killswitch: Android is hostile once killed. Never wait for or adopt anything it started (in-flight UFS commands, its links, its DMA). Crowbar it: reset the block or cut its rails, then bring it up fresh"
+metadata:
+  type: feedback
+---
+
+On 2026-11-04 I suggested making the jump wait for Android's in-flight UFS command so ferros could adopt the link. The owner rejected it: "if it's mid command, hit it on the fucking head with a crowbar or kill the rails and reboot it. If I killed it, it's probably because it's being malicious."
+
+**Why:** the person pulls the jump because they no longer trust Android. Anything Android set in motion may be the attack: a storage write, a DMA engine, controller state it configured. Letting it finish, or trusting state it left behind, hands the attacker the last word.
+
+**How to apply:**
+- At a jump, never wait for Android's work to complete, and never adopt a controller, link, queue or descriptor Android configured. Reset the block (or cut its rails) and initialise it fresh, the cold-boot way.
+- Speed comes from making the crowbar fast, never from waiting.
+- Bus masters Android left running must be stopped or fenced (S2MPU deny, rails off) before ferros's memory is at risk.
+- The same applies to any future "switch away from a hostile OS" path, including the reverse jump.
+
+Related: [[hv-jump-to-ferros]], [[feedback-killswitch-irq-mask]], [[ufs-firewall-decided]].
