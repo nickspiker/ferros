@@ -76,3 +76,22 @@ The fence (G3D's S2MPU) saw no access outside `gpu-mem`.
 **Next:**
 1. The driver as a resident service: a `gpu` endpoint taking command streams from processes, each process in its own address space and group, waiting on `gpu-job`.
 2. Compute: a shader (Valhall ISA) and RUN_COMPUTE, which needs Mesa's encodings or a capture of a real job. The attest mark (tapuwae) is the first customer: a pixel's 4 × 4 grid is one 16-lane warp.
+
+## Compute (2026-11-04, the same night)
+
+The shader cores run a hand-encoded Valhall compute shader. Sixteen invocations in one workgroup each store G#C0FF_EE00 + their global id to `out[id]`. The output reads G#C0FFEE00 to G#C0FFEE0F, and the done flag is set, 633 us after the doorbell (the MCU powering the cores included). It worked first try, with no fault, and the fence saw nothing outside `gpu-mem`.
+
+| Piece | Words |
+|---|---|
+| The shader (128-byte aligned, padded with zeros) | `IADD_IMM.i32 r0, r60, #G#C0FFEE00` = G#0110_C0C0_FFEE_003C; `SHADDX.u64 [r2:r3], u0, [r60:r61].w0, shift:2` = G#01A3_C200_2027_3C80; `STORE.i32.slot0.end @r0, [r2:r3]` = G#7861_4002_1800_0002 |
+| Shader program descriptor (32 bytes) | G#8000_0018 (type 8 shader, stage 1 compute, 32 registers a thread), G#0000_1000 (preload r60, the global id X), the binary's address, 0 × 4 |
+| Local storage (64 bytes) | 0, G#1F (no workgroup memory: G#8000_0000 packed as log2), 0 × 6 |
+| Uniforms | one 64-bit entry: the output's address; the FAU register = address \| count << 56 |
+| Command stream | REQ_RESOURCE compute; scoreboard entries set (endpoint 3); SRT 0, FAU, SPD, TSD, workgroup 16x1x1 with merging (r33 G#8000_000F), job offsets 0, sizes 1; RUN_COMPUTE (G#0400_0000_0000_8001); WAIT entry 3; FLUSH_CACHE2 (clean L2 and LSC, invalidate others, flush id register 0) and its WAIT; SYNC_SET32 the done flag |
+
+**Sources.** All the words come from Mesa main's v11 genxml, the Valhall `ISA.xml` and its packer, cross-checked against Mesa's assembler test vectors, with file and line for each. They are written up on Harbor: `/mnt/Harbor/tmp/mesa-panfrost/ferros-compute-spec.md`, beside the CSF spec (`ferros-csf-spec.md`) and the Mesa files themselves.
+
+**What this opens.** tapuwae on the GPU (the owner's 2026-10-29 note: "convert to GPU when we get that shit hot"): a pixel's 4 × 4 grid is one 16-lane warp. It needs:
+- a compiler from tapuwae's shading (or a small kernel language) to Valhall, or Mesa's compiler run on the host to produce binaries checked in as data;
+- resource tables for buffers;
+- the driver as a resident service (a `gpu` endpoint, each client its own address space and group).

@@ -47,6 +47,7 @@ The reusable core of a ferros-native Photon client: `wire.rs` (ping/pong/photon/
 - **The GPU is online (GPU.md "Online").**
   - `payloads/gpu` boots the CSF microcontroller from the device's own firmware (115 us) and answers a ping (15 us).
   - It runs one group and queue, with jobs waited for on the GPU's job interrupt: SYNC_SET32 and STORE_MULTIPLE + WAIT confirmed against Mesa's v11 encodings.
+  - **The shader cores compute:** a hand-encoded Valhall compute shader, 16 invocations each writing G#C0FF_EE00 + its id, first try (GPU.md "Compute").
   - The kernel holds its fence (to `gpu-mem`) and leaves it powered. The secure DRAM carveout at G#B600_0000 is now written down twice.
 - **Kernel out.** The GNSS bring-up tools left. The rest of the list needs owner decisions (KERNEL-OUT.md 3, 5, 7-10).
 - **Attest keys:** the press highlights work again (broken since the sandbox's own frame buffer), plus a bevel.

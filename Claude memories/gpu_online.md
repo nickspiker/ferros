@@ -19,3 +19,9 @@ Kernel side: `gpu-regs` (G#1F00_0000 16 MiB, EL0), `gpu-mem` (G#B400_0000 32 MiB
 **How to apply:** only the CS opcodes kbase decodes are confirmed (MOVE, MOVE32, CALL, SYNC_*). Check STORE_MULTIPLE, WAIT and RUN_COMPUTE against Mesa genxml before use.
 
 **Next:** a resident `gpu` endpoint driven by its IRQs, then compute shaders for tapuwae ([[tapuwae-neon-then-gpu]]).
+
+**Compute works** (same night): a 3-instruction Valhall shader runs 16 invocations (G#C0FFEE00 + id). The words with their sources are at Harbor /mnt/Harbor/tmp/mesa-panfrost/ferros-compute-spec.md. Mesa's genxml (v10/v11/v12), cs_builder.h and ISA.xml are fetched there too.
+
+**More traps:**
+- Pad every submission to 64 bytes: the CS front end caches the ring's 64-byte line, so a job that starts mid-line runs as stale NOPs.
+- A 32-bit sync object is 8 bytes: SYNC_SET32 zeroes the next word.
