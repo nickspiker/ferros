@@ -472,6 +472,31 @@ fn wedge(p: &Panel, g: &Ring, r1: i32, r2: i32, a0: i32, a1: i32, rgb: u32) {
     }
 }
 
+/// Diagnostic (2026-11-05: the owner sees two thirds of the ring, then about 80 ms of black): DECON's frame count and trigger register as the kernel sees them, a line whenever the trigger register changes or frames start again after a stop of more than 16 ms, until 64 lines. `diag boot` prints them.
+static mut FTRACE: [(u64, u32, u32, u64); 64] = [(0, 0, 0, 0); 64];
+static mut FTRACE_N: usize = 0;
+/// The last frame count and trigger seen, and when the frame count last moved.
+static mut FT_LAST: (u32, u32, u64) = (0, 0, 0);
+
+/// One look at DECON (the boot path's draws and the service loop's every pass).
+pub fn frame_trace() {
+    unsafe {
+        if FTRACE_N >= 64 {
+            return;
+        }
+        let now = crate::platform::cntpct();
+        let fc = core::ptr::read_volatile(0x1947_0004usize as *const u32);
+        let trig = core::ptr::read_volatile(0x1947_0030usize as *const u32);
+        let (fc0, trig0, moved) = FT_LAST;
+        let stopped = now - moved > crate::platform::cntfrq() / 64;
+        if trig != trig0 || (fc != fc0 && stopped) || moved == 0 {
+            FTRACE[FTRACE_N] = (now, fc, trig, moved);
+            FTRACE_N += 1;
+        }
+        FT_LAST = (fc, trig, if fc != fc0 || moved == 0 { now } else { moved });
+    }
+}
+
 /// Which steps are on the ring, and how many.
 static mut RING_DRAWN: u32 = 0;
 static mut RING_N: u32 = 0;
@@ -487,6 +512,7 @@ pub fn draw_new() {
     if f == 0 {
         return;
     }
+    frame_trace();
     let t_draw = crate::platform::cntpct();
     let z = zero();
     let g = ring(&c.panel);
@@ -520,6 +546,7 @@ pub fn draw_new() {
     if drew {
         c.panel.present_nowait();
         DRAW_TICKS.fetch_add(crate::platform::cntpct() - t_draw, Relaxed);
+        frame_trace();
     }
 }
 
@@ -583,6 +610,12 @@ pub fn boot_times() -> alloc::string::String {
     // The ring's steps (lane 0 the boot path, 1 another core): when each began and ended, from the ring's zero, and the ring's own drawing.
     let z = zero();
     s.push_str(&alloc::format!("ring, from the {} at counter A#{} (A#{} a second; processes log the same counter) (boot: {})\n", if PRESS.load(Relaxed) != 0 { "press" } else { "entry" }, z, f, REASON_NAME[REASON.load(Relaxed) as usize]));
+    // DECON as the kernel saw it (frame_trace): when, the frame count, the trigger register, and when the count had last moved.
+    for k in 0..unsafe { FTRACE_N } {
+        let (t, fc, trig, moved) = unsafe { FTRACE[k] };
+        let at = |t: u64| if t >= z { alloc::format!("+A#{}", us(t - z)) } else { alloc::format!("-A#{}", us(z - t)) };
+        s.push_str(&alloc::format!("  decon {} us: frames A#{} trigger G#{:X}, frames last moved {} us\n", at(t), fc, trig, at(moved)));
+    }
     for k in 0..STEPS {
         let (b, en) = (BEGIN[k].load(Relaxed), END[k].load(Relaxed));
         if en != 0 {

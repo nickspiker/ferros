@@ -990,6 +990,10 @@ static mut SETTLE_TIMEOUT: [u32; 4] = [0; 4];
 static mut OP22_US: [u64; 5] = [0; 5];
 /// The counter when the first window's frame was armed (raw, to line up against the kernel's press in `diag boot`).
 static mut OP22_AT: u64 = 0;
+/// The op being handled (G#EE outside the handler), and the first four times the layer was pointed at this server's buffers [counter, op] (2026-11-05: what shows ~80 ms of black before the attest screen).
+static mut CUR_OP: u8 = 0xEE;
+static mut FIRST_SHOWS: [(u64, u8); 4] = [(0, 0); 4];
+static mut FIRST_SHOWS_N: usize = 0;
 /// The first chrome draw, µs: [the discs, the whole] (the text is the rest), with op 22's line.
 static mut CHROME_US: [u64; 2] = [0; 2];
 /// The camera op's last phases, microseconds: the scene, the arena reset, the copy to the framebuffer, the present.
@@ -1029,6 +1033,15 @@ impl Log {
             self.s(&[b"0123456789ABCDEF"[((v >> (i * 4)) & 0xF) as usize]]);
         }
     }
+    /// A counter stamp line, to line the server's start up against the kernel's press (diag boot prints its counter).
+    fn at(&mut self, what: &[u8]) {
+        self.s(b"display: at ");
+        self.hex(now());
+        self.s(b" ");
+        self.s(what);
+        self.s(b"\n");
+        self.flush();
+    }
     fn dec(&mut self, mut v: u64) {
         let mut d = [0u8; 20];
         let mut i = d.len();
@@ -1064,6 +1077,12 @@ impl Pipe {
     }
     /// The whole layer, every word, as the kernel's modeset programs it from the oracle (dpu::decon_init) — nothing inherited: window `win` non-secure, ABL's blend function for an opaque base layer (FUNC_CON_0 G#102: function 1, alpha-multiply source 2; proven on this pipe), the full raster from (0,0), no colour map; WINCON enable on channel 0 (DMA0/DPP0); the DMA linear BGRX8888 at `fb` (translation is off, so the DMA address is the physical one), stride = width, no offset, image = raster; DPP0, SRAMC0 and HDRCOMM0 told the same size.
     fn program_layer(&self, win: u32, fb: usize, width: u32, height: u32) {
+        unsafe {
+            if FIRST_SHOWS_N < 4 {
+                FIRST_SHOWS[FIRST_SHOWS_N] = (now(), CUR_OP);
+                FIRST_SHOWS_N += 1;
+            }
+        }
         let w = (win * 0x1000) as u64;
         self.wr(S_WIN, w + 0x00, 1);
         self.wr(S_WIN, w + 0x04, 0x0102);
@@ -2930,7 +2949,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // On its rails with the DPU off, or after any jump: the modeset asks the panel whether it is showing, and wakes it through this switch if not (Android's screen off left it dozing with the DPU on as well as off).
     let reset = || ferros_sys::power(cap(grants, S_PANEL_POWER), true);
     let awake: Option<(&dyn Fn() -> bool, &dyn Fn() -> bool)> = if (from_off || jumped) && !panel_cold { Some((&reset, &vddd)) } else { None };
+    log.at(b"modeset begins");
     let rep = if from_off { modeset::from_off(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), cold, awake) } else { modeset::ten_bpc(&pipe, &ferros_dsi::Dsim(DsiGrant { grants }), jumped || panel_cold, jumped, cold, awake) };
+    log.at(b"modeset done");
     if !rep.is_empty() {
         log.s(b"display: ");
         log.s(&rep);
@@ -3081,6 +3102,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     log.flush();
     // Nothing moves between presents, so the panel may rest: the 10 Hz auto-rate floor (its own engine drops the refresh when frames stop and comes back for the next one; DISPLAY-POWER.md: 150–190 mW under 120 Hz) — with the TE kept fixed at 120 Hz, as Android runs it: DECON triggers on TE, so a changeable TE at the floor would make every present wait for the next 100 ms tick (measured 10 Hz on the pin, 2026-10-16 night). Fixed, the panel inserts the frame at once and the saving stays. A client can change the floor (op 8).
     if dsi.alive() {
+        log.at(b"panel idle + TE commands");
         let (_, f1) = dsi.sequence(ferros_dsi::hk3::IDLE_10);
         let (_, f2) = dsi.sequence(ferros_dsi::hk3::TE_FIXED);
         log.s(if f1.is_none() && f2.is_none() { b"display: panel idle floor 10 Hz, TE fixed 120\n" } else { b"display: idle floor / TE command stuck\n" });
@@ -3090,7 +3112,9 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     // 10 bits when the kernel has put DECON in the 10 bpc blend (GLOBAL_CON bit 20, set by the modeset before the shell starts): the layer becomes 10-bit and every frame goes through the present stage, with the panel at its peak (HBM) so the table's headroom is real. Otherwise the 8-bit copy, as before.
     let ten = pipe.rd(S_DECON, 0x0020) & (1 << 20) != 0;
     if ten && dsi.alive() {
+        log.at(b"panel brightness");
         let r = set_panel(&dsi, hbm0, dbv0);
+        log.at(b"panel brightness done");
         log.s(if r { b"display: 10 bits, panel brightness set for the white and its headroom\n" } else { b"display: 10 bits, but the brightness command stuck\n" });
     } else {
         log.s(b"display: 8 bits (DECON not in the 10 bpc blend)\n");
@@ -3122,7 +3146,8 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
     let mut clock_slow_next = 0u64;
     let mut screen_off = false;
     // A frame armed and not yet seen to start (Pipe::arm / settle).
-    let mut armed: Option<u32> = None;
+    // The modeset re-sent the panel its PPS, raster and rate, and the panel drops what it was showing: black from here to the first client frame (464 to 1033 ms after the press, measured 2026-11-05). The layer is still on the boot ring's surface, so one frame now puts the ring back until the attest screen replaces it. Armed, not waited for (the frame-start count is not running yet; waiting cost a quarter second): the main loop's settle masks the trigger once the frame has started. A cold or jumped panel has shown nothing yet: the same frame is its first.
+    let mut armed: Option<u32> = Some(pipe.arm(win));
 
     let mut frames = 0u64;
     // A client owns the surface from its first `begin` on; until then this process paints its own screen and clock.
@@ -3177,6 +3202,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
         let mut handle = |m: &[u8], out: &mut [u8; 16]| -> usize {
             let mut len = 1usize;
             out[0] = 0;
+            unsafe { CUR_OP = m.first().copied().unwrap_or(0) };
             match m.first() {
                 Some(1) => {
                     client_owned = true;
@@ -4050,6 +4076,7 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
             } else {
                 handle(m, &mut out)
             };
+            unsafe { CUR_OP = 0xEE };
             if m.first() == Some(&14) || (m.first() == Some(&15) && batch_has_camera(m)) {
                 unsafe {
                     let lf = &mut *(&raw mut LAST_FRAME);
@@ -4106,6 +4133,13 @@ pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
                     tlog.s(b" ms, the rest text");
                     tlog.s(b", armed at counter ");
                     tlog.hex(unsafe { OP22_AT });
+                    for k in 0..unsafe { FIRST_SHOWS_N } {
+                        let (t, op) = unsafe { FIRST_SHOWS[k] };
+                        tlog.s(b"; shown at ");
+                        tlog.hex(t);
+                        tlog.s(b" op ");
+                        tlog.hex(op as u32);
+                    }
                     tlog.s(b")");
                     unsafe { OP22_US[4] = u64::MAX };
                 }

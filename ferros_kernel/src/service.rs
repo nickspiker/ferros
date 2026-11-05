@@ -1193,6 +1193,8 @@ pub fn run(mut b: Boot) -> ! {
             crate::process::with_lock(|| ferros_hal::ufs::UfsController::new(0x1320_0000).h8_enter_if_idle(cntfrq() / 64));
         }
         thermal_poll();
+        // Diagnostic: DECON's frames and trigger through the boot (checklist.rs frame_trace, until its 64 lines are full).
+        crate::checklist::frame_trace();
         if !home_started {
             // The wairua first, as its own step on the ring (init's first spawn needs it, and it waits for KOHI's words from worker 3), then home; the ring closes once init has run.
             let _ = crate::wairua::draw();
