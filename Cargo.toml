@@ -41,6 +41,7 @@ members = [
     "payloads/capture",
     "payloads/switchtest",
     "payloads/tecount",
+    "payloads/gpu",
     "payloads/wintest",
     "payloads/hive",
     "payloads/ahau",

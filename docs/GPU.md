@@ -27,3 +27,19 @@ The CSF firmware is `/vendor/firmware/mali_csffw-r52p0.bin` (294912 bytes, Arm's
 5. Global init, one command-stream group and queue, then a buffer fill made of command-stream instructions alone (MOV48, MOV32, STORE_MULTIPLE, SYNC) — no shader.
 
 About 1.2–1.5k lines; a real compute dispatch ~2k. The project's order puts the GPU after toka (KERNEL.md, DISPLAY-DESIGN.md); this is the plan for when it comes.
+
+## The kernel's side (2026-11-04)
+
+The GPU driver is a process (`payloads/gpu`). The kernel holds only what a process must not:
+- **The fence.** G3D's S2MPU (G#1EE7_0000, in pd_g3d) is fenced on a cold boot to `gpu-mem` and nothing else (`s2mpu::fence_gpu`; every VID for now, since only the GPU sits behind it). The GPU is the one bus master a process programs directly (its page tables are the driver's), so the fence is what keeps a GPU job inside the memory ferros gave it. No process may write any S2MPU (`s2mpu::is_fence`).
+- **Power.** `pd::gate_at_boot` no longer gates the GPU: ferros had an off sequence but no on (the PLLs come back through ACPM's DVFS), so the GPU stays as ABL leaves it, powered and clocked (about 50 mW, the rail measured 66 against 15 mW gated). A `gpu` power switch with both directions is the next step, so the driver can gate it when idle.
+
+The grants:
+
+| Slot | Grant | What |
+|---|---|---|
+| 1 | `gpu-regs` (DMA) | the 16 MiB register space at G#1F00_0000, doorbells inside, EL0 Device (cachemap `GPU_REGS`, mapped as the USB controller's block is) |
+| 2 | `gpu-mem` (DMA) | 32 MiB at G#B800_0000, Normal non-cacheable, EL0 (cachemap `GPU_MEM`): free DRAM above the big arc pool, below ABL's modem image's GiB |
+| 3 | the vault scope `gpu.` | `gpu.fw`: `mali_csffw-r52p0.bin`, taken from the device's own vendor image (`/vendor/firmware`, 294912 bytes, sha-256 12ca2252…3ef0; Harbor `/mnt/Harbor/tmp/husky-gpu/`). The vendor image also carries r53p0, r54p0, r54p1 and r54p2. |
+
+First run from EL0 (2026-11-04): GPU_ID G#B8A2_1020, L2_FEATURES G#0814_0306, SHADER_PRESENT G#0111_0055, AS_PRESENT G#FF, MCU_STATUS 0, the firmware's magic G#C3F1_3A6E read from the vault.
