@@ -112,6 +112,9 @@ pub fn fence_dpu() -> u32 {
 /// The CPUCL0 block's S2MPU (zuma-s2mpu.dtsi s2mpu_s0_cpucl0, always on): in front of the CoreSight system's bus master (CSSYS, STM, the debug port's AXI path: the block's IPs in cmucal-sfr.c), not the cores, whose traffic reaches memory through the cluster. ABL and Android leave it open.
 pub const CPUCL0_S2MPU: usize = 0x29C5_0000;
 
+/// The MISC block's S2MPU (zuma-s2mpu.dtsi s2mpu_s0_misc, always on): in front of BLK_MISC's bus masters, PDMA1, the secure SPDMA1 and DIT (the packet engine Linux's modem path offloads to; cmucal-sfr.c), none of which ferros uses. ABL leaves it open (measured 2026-11-04: protection 0). Denied all on a cold boot (`deny_all`), as the hv denies it at the jump, under which ferros already runs.
+pub const MISC_S2MPU: usize = 0x101F_0000;
+
 /// The HSI1 S2MPU (zuma-s2mpu.dtsi s2mpu_s0_hsi1): in front of PCIe ch0, the cellular modem's link, the one radio any base station can reach before anyone attests. ABL leaves it on with protection off (measured 2026-11-04: G#1209_0058 = 0), so the modem could DMA anywhere in DRAM, the kernel included; until then the modem driver also turned its protection off itself before the ROM boot.
 pub const MODEM_S2MPU: usize = 0x1209_0000;
 /// HSI1's power-domain status in the PMU (a plain read; bit 0 on): the S2MPU is reachable only while it is on.
@@ -138,7 +141,7 @@ pub fn fence_modem() -> u32 {
 
 /// Whether `base` is one of the DMA fences: no process writes one (process.rs SYS_MMIO_WRITE refuses it), whatever its grants; the fences are the kernel's (KERNEL-OUT.md "What stays").
 pub fn is_fence(base: usize) -> bool {
-    base == BASE || base == MODEM_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
+    base == BASE || base == MODEM_S2MPU || base == MISC_S2MPU || base == CPUCL0_S2MPU || DPU_S2MPUS.contains(&base)
 }
 
 /// One S2MPU set to let no VID reach any memory (the hv's `s2mpu_deny_all` at the jump, the same steps): every context valid, every L1 entry no-access, invalidated and synced, then protection on with error responses. 1 done, G#E1 not a v9, G#E2 the sync never completed.
@@ -253,6 +256,8 @@ pub fn report(out: &mut alloc::vec::Vec<u8>) {
     if unsafe { read_volatile(PD_HSI1_STATUS as *const u32) } & 1 == 1 {
         faults(out, MODEM_S2MPU);
     }
+    append_hex(out, b"S2MPU_MISC_PROT=", rd(MISC_S2MPU, 0x58));
+    faults(out, MISC_S2MPU);
     append_hex(out, b"S2MPU_DPU_FENCE=", dpu_result());
     // The DPU's only while its domains are on: an access with a domain down poisons EL3 (display.rs).
     if crate::dpu_power::all_on() {
