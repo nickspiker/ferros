@@ -204,11 +204,96 @@ fn ops_test(grants: u64, arena: usize) -> ! {
     exit(0);
 }
 
+
+/// The SSA recorder's working memory (valhall::ssa: the graph and the compiled words): a bump allocator over a zeroed static whose last allocation can be given back, as ahau's.
+#[repr(C, align(64))]
+struct Heap([u8; 4 << 20]);
+static mut HEAP: Heap = Heap([0; 4 << 20]);
+static mut HEAP_NEXT: usize = 0;
+struct Bump;
+unsafe impl core::alloc::GlobalAlloc for Bump {
+    unsafe fn alloc(&self, l: core::alloc::Layout) -> *mut u8 {
+        unsafe {
+            let base = (&raw mut HEAP) as usize;
+            let start = (base + HEAP_NEXT + l.align() - 1) & !(l.align() - 1);
+            if start + l.size() > base + (4 << 20) {
+                return core::ptr::null_mut();
+            }
+            HEAP_NEXT = start + l.size() - base;
+            start as *mut u8
+        }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: core::alloc::Layout) {
+        unsafe {
+            let base = (&raw mut HEAP) as usize;
+            if p as usize + l.size() == base + HEAP_NEXT {
+                HEAP_NEXT = p as usize - base;
+            }
+        }
+    }
+}
+#[global_allocator]
+static ALLOC: Bump = Bump;
+
+/// The Mandelbrot recorded through the SSA layer (valhall::ssa) instead of written register by register: the loop through `iterate`, as tapuwae's orbit will run.
+fn ssa_test(grants: u64, arena: usize) -> ! {
+    use valhall::ssa::{self, F, U};
+    let (x0, y0, step) = (-2.0f32, -1.25f32, 0.0390625f32);
+    ssa::begin();
+    let g = ssa::gid();
+    let py = g >> SIDE_SHIFT;
+    let px = g & U::splat((1 << SIDE_SHIFT) - 1);
+    let cr = F::from_u32(px) * step + x0;
+    let ci = F::from_u32(py) * step + y0;
+    let z = F::splat(0.);
+    let (_, _, kf, _, _) = ssa::iterate(
+        MAX_ITER,
+        (z, z, F::splat(0.), z, z),
+        |_, (zx, zy, kf, _, _)| {
+            let (x2, y2) = (zx * zx, zy * zy);
+            let running = !(x2 + y2).gt(F::splat(4.));
+            ((zx, zy, kf, x2, y2), running)
+        },
+        |_, (zx, zy, kf, x2, y2)| {
+            let nzy = (zx + zx) * zy + ci;
+            let nzx = (x2 - y2) + cr;
+            (nzx, nzy, kf + 1., x2, y2)
+        },
+    );
+    ssa::store(0, 2, 0, kf.to_u32());
+    let compiled = ssa::compile();
+    for (i, &w) in compiled.words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    for i in 0..PIXELS {
+        unsafe { core::ptr::write_volatile((arena + OUT + 4 * i) as *mut u32, u32::MAX) };
+    }
+    let preload = 0x1000u16 | if compiled.regs64 { 0x8000 } else { 0 };
+    let reply = run_with(grants, compiled.words.len(), (PIXELS / 16) as u32, preload, &[ARENA_VA + OUT as u64]);
+    let mut wrong = 0u32;
+    let mut first = None;
+    for gid in 0..PIXELS as u32 {
+        let got = unsafe { core::ptr::read_volatile((arena + OUT + 4 * gid as usize) as *const u32) };
+        let want = reference(gid, x0, y0, step);
+        if got != want {
+            wrong += 1;
+            first.get_or_insert((gid, got, want));
+        }
+    }
+    let (fg, fgot, fwant) = first.unwrap_or((0, 0, 0));
+    say!(grants, "gputest: ssa mandelbrot: {} words, 64 registers {}, status {}, job {} us; {wrong} of {PIXELS} differ (first gid {fg}: {fgot} vs {fwant})\n", compiled.words.len(), compiled.regs64, reply.0, reply.1);
+    exit(0);
+}
 /// One run through the service: the code at arena offset 0, `groups` workgroups of 16, preload r60 (the global id X).
 fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
+    run_with(grants, words, groups, 0x1000, uniforms)
+}
+
+/// As `run` with the preload word given (bit 15: 64 registers a thread).
+fn run_with(grants: u64, words: usize, groups: u32, preload: u16, uniforms: &[u64]) -> (u8, u32) {
     let mut msg = [0u8; 18 + 8 * 16];
     msg[0] = 1;
-    msg[1..3].copy_from_slice(&0x1000u16.to_le_bytes());
+    msg[1..3].copy_from_slice(&preload.to_le_bytes());
     msg[3..7].copy_from_slice(&0u32.to_le_bytes());
     msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
     msg[9..13].copy_from_slice(&groups.to_le_bytes());
@@ -221,9 +306,27 @@ fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
     call(cap(grants, S_GPU), &msg[..18 + 8 * uniforms.len()], &mut reply);
     (reply[0], u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]))
 }
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
+// The entry with the image header (as wintest and ahau carry it): the kernel grows the arc by the .bss the header names, so the zeroed statics below (the recorder's heap) are inside it.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .globl _entry
+    .type _entry, %function
+_entry:
+    b {main}
+    .4byte 0
+    .ascii "ferrosRT"
+    .quad __ferros_tail
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .size _entry, . - _entry
+"#,
+    main = sym gputest_main
+);
+
+extern "C" fn gputest_main(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
     if arena == 0 || arena == usize::MAX {
@@ -233,6 +336,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
     if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
         ops_test(grants, arena);
+    }
+    // Input byte 2: the Mandelbrot recorded through valhall::ssa.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 2 {
+        ssa_test(grants, arena);
     }
     let mut k = Kernel::<32>::new();
     mandelbrot(&mut k);
@@ -276,6 +383,10 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Where and why, on the console: grants are slot 0 at arc offset 0 (the console token), as every payload's.
+    let mut l = Line([0; 160], 0);
+    let _ = core::fmt::write(&mut l, format_args!("gputest: panic: {}\n", info));
+    console(0, &l.0[..l.1]);
     exit(0xDEAD);
 }

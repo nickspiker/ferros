@@ -32,6 +32,10 @@
 //! ```
 
 #![cfg_attr(not(test), no_std)]
+#[cfg(feature = "ssa")]
+extern crate alloc;
+#[cfg(feature = "ssa")]
+pub mod ssa;
 
 // ---------------------------------------------------------------------------
 // Operands
@@ -682,6 +686,12 @@ impl<const N: usize> Kernel<N> {
         let l = self.label();
         self.bind(l);
         l
+    }
+
+    /// The last instruction emitted, for setting its flow field after the fact (the SSA compiler ends a kernel this way). Panics on an empty kernel: there is nothing to end.
+    pub fn last(&mut self) -> Placed<'_> {
+        let at = self.len - 1;
+        Placed { word: &mut self.words[at] }
     }
 
     /// Resolves every branch and returns the words.

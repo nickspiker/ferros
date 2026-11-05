@@ -6,3 +6,7 @@ license.workspace = true
 description = "Typed instruction builder for the Mali-G715's Valhall ISA (v11): GPU kernels as Rust calls, not hand-encoded words"
 
 [dependencies]
+
+[features]
+# The SSA recorder and compiler (ssa.rs): needs an allocator in whatever links it.
+ssa = []

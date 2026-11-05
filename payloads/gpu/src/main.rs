@@ -509,7 +509,7 @@ pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
         ok
     };
     let run = |name: &str, words: &[u64], check: &dyn Fn() -> bool| run_for(name, words, check, 100);
-    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64]; the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md).
+    // The resident service (GPU.md "Layers", owner 2026-11-05): kernels for the clients' layers, one at a time, until the device goes down. A run: [1][preload u16, bit 15 = 64 registers a thread][code at an arena offset u32][code words u16][groups x u32][groups y u32][uniforms n u8][n × u64]; the code is copied from the arena into the service's own executable region, the job runs on the queue, and the reply is [status][µs u32]: 0 done, 1 a request it cannot take, 2 the job never finished (a guard, not a wait: the process watchdog will own hangs, RELEASE.md).
     if serving {
         let big = Compute { code: code_big, desc, code_va: CODE_BIG_VA, desc_va: DESC_VA, max_threads: g.rd(THREAD_MAX_THREADS) };
         let flag = OUT_VA + 0x200;
@@ -1047,7 +1047,9 @@ impl Compute {
             wr64(self.code + 8 * k, 0);
         }
         let (spd, tsd, fau) = (self.desc_va, self.desc_va + 0x40, self.desc_va + 0x80);
-        for (k, w) in [0x8000_0018u32, preload, self.code_va as u32, (self.code_va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
+        // Bit 15 of the preload word, the service's own: 64 registers a thread (register allocation 0 at bits 31:30 of word 0, v11.xml "Shader Register Allocation"; 2 is 32, and in 32-register mode Valhall has only r0-r15 and r48-r63). The SSA compiler asks for it when it uses more.
+        let (spd0, preload) = if preload & 0x8000 != 0 { (0x0000_0018u32, preload & 0x7FFF) } else { (0x8000_0018, preload) };
+        for (k, w) in [spd0, preload, self.code_va as u32, (self.code_va >> 32) as u32, 0, 0, 0, 0].iter().enumerate() {
             wr32(self.desc + 4 * k, *w);
         }
         for k in 0..8 {
