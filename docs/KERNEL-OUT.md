@@ -98,3 +98,8 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
   - Gone: the `touch` tools and `touch.rs`'s bring-up (923 lines to 63: the `touch` power switch alone), the AoC's bring-up tools with the `aoc.rs`, `trusty.rs` and `gsa.rs` code only they used (`diag aoc` keeps a status), `diag gsa|ffa|trusty`, `fp.rs` with the shim's `FERROS_FP_SCAN`, and `tpu.rs` with its Trusty channel.
   - A production build (FERROS_PRODUCTION=1) compiles every development command out (`#[cfg(not(ferros_production))]` on the DIAG subcommands and on each development door's body), where before it only refused them: the production kernel's code is 643 KB against the development build's 1.09 MB. What only the tools used is dead there, allowed by a production-only crate attribute.
   - Verified: a reload; a slot b cold boot (touch ready after 12 ms through its switch, chip G#3640, scan mode set; the display's modeset; sensors serving); the production configuration compiles.
+- 2026-11-04: **the DMA fences are the kernel's alone.**
+  - The modem driver turned HSI1's S2MPU protection off itself before the ROM boot. With ABL leaving it off anyway, the modem could DMA anywhere.
+  - The kernel now fences HSI1 to the modem's carve-outs, denies BLK_MISC's masters, and fences the GPU to `gpu-mem`, all on a cold boot before init starts any driver.
+  - `SYS_MMIO_WRITE` refuses every S2MPU, whatever the grant (`s2mpu::is_fence`). A driver may read its fence, never write it. This is the "Protection" line of "What stays", enforced.
+- 2026-11-04: **the GPU driver starts as a process** (`payloads/gpu`, GPU.md). Nothing GPU-side was ever in the kernel but the power gating (`pd.rs`), which no longer gates the GPU.
