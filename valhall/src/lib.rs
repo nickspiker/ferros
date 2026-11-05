@@ -419,6 +419,32 @@ pub enum CmpResult {
     U1 = 3,
 }
 
+/// What `MUX` tests in its mask (ISA.xml:665-680, in the enum's order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mux {
+    /// The mask's sign bit.
+    Neg = 0,
+    /// The mask is 0x00000000.
+    IntZero = 1,
+    /// The mask is ±0.0.
+    FpZero = 2,
+    /// Each bit: a's where the mask's is set, b's elsewhere.
+    Bit = 3,
+}
+
+/// IEEE 754 rounding (ISA.xml:387-393, in the enum's order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Round {
+    /// To nearest, ties to even.
+    Rte = 0,
+    /// Towards +∞ (ceil).
+    Rtp = 1,
+    /// Towards −∞ (floor).
+    Rtn = 2,
+    /// Towards zero (truncate).
+    Rtz = 3,
+}
+
 /// A branch target, bound to an instruction index by [`Kernel::bind`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Label(u8);
@@ -757,6 +783,22 @@ impl<const N: usize> Kernel<N> {
         self.push(i)
     }
 
+    /// `LSHIFT_XOR.i32 dst, a, shift.bN, b`: (a << byte N of shift) ^ b (ISA.xml:3043-3048, opcode2 G#102).
+    pub fn lshift_xor_i32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, shift: impl Into<Src>, byte: Byte, b: impl Into<Src>) -> Placed<'_> {
+        self.shift(1 << 32 | 2 << 24, dst, a, shift, byte, b)
+    }
+
+    /// `MUX.i32.mode dst, a, b, mask` (ISA.xml:3139-3154): [`Mux::Bit`] takes a's bits where the mask's are set and b's elsewhere, so a compare's all-ones/zero result selects whole words: `select(mask, a, b)`.
+    pub fn mux_i32(&mut self, dst: impl Into<Dst>, mode: Mux, a: impl Into<Src>, b: impl Into<Src>, mask: impl Into<Src>) -> Placed<'_> {
+        let mut i = Ins::new(0x0B8);
+        i.src(a, 0);
+        i.src(b, 8);
+        i.src(mask, 16);
+        i.bits(mode as u64, 32);
+        i.dst(dst);
+        self.push(i)
+    }
+
     /// `ICMP_OR.u32.cond.result dst, a, b, or`: (a cond b) OR the boolean in `or`; tie `or` to [`Lut::ZERO`] for a plain compare (ISA.xml:3288-3293, group 3280-3312).
     pub fn icmp_or_u32(&mut self, dst: impl Into<Dst>, cond: Cond, result: CmpResult, a: impl Into<Src>, b: impl Into<Src>, or: impl Into<Src>) -> Placed<'_> {
         let mut i = Ins::new(0x0F0);
@@ -776,6 +818,39 @@ impl<const N: usize> Kernel<N> {
         let mut i = Ins::new(0x090);
         i.bits(0x19, 16);
         i.src(a, 0);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `S32_TO_F32 dst, a`, round to nearest even (ISA.xml:1823-1828, opcode2 9).
+    pub fn s32_to_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>) -> Placed<'_> {
+        let mut i = Ins::new(0x090);
+        i.bits(0x9, 16);
+        i.src(a, 0);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `F32_TO_S32.round dst, a` (ISA.xml:1888-1893, opcode2 G#C; the round mode at 31:30, ISA.xml:387 and valhall.py `roundmode`).
+    pub fn f32_to_s32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, round: Round) -> Placed<'_> {
+        self.convert(0xC, dst, a, round)
+    }
+
+    /// `F32_TO_U32.round dst, a` (ISA.xml:1894-1899, opcode2 G#1C).
+    pub fn f32_to_u32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, round: Round) -> Placed<'_> {
+        self.convert(0x1C, dst, a, round)
+    }
+
+    /// `FROUND.f32.round dst, a`: a rounded to an integral value, as a float (ISA.xml:2034-2039, opcode2 G#D); [`Round::Rtn`] is floor.
+    pub fn fround_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Src>, round: Round) -> Placed<'_> {
+        self.convert(0xD, dst, a, round)
+    }
+
+    fn convert(&mut self, opcode2: u64, dst: impl Into<Dst>, a: impl Into<Src>, round: Round) -> Placed<'_> {
+        let mut i = Ins::new(0x090);
+        i.bits(opcode2, 16);
+        i.src(a, 0);
+        i.bits(round as u64, 30);
         i.dst(dst);
         self.push(i)
     }
@@ -845,6 +920,35 @@ impl<const N: usize> Kernel<N> {
     /// `FRCP.f32 dst, a`: 1 / a (ISA.xml:2256-2261, source modifiers 2325).
     pub fn frcp_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>) -> Placed<'_> {
         let mut i = Ins::new(0x09C);
+        i.float(a, 0);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FMIN.f32 dst, a, b` (ISA.xml:2382-2398, opcode G#A4 with opcode2 2 at 19:16).
+    pub fn fmin_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>, b: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A4);
+        i.bits(0x2, 16);
+        i.float(a, 0);
+        i.float(b, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FMAX.f32 dst, a, b` (ISA.xml:2401-2417, opcode2 3).
+    pub fn fmax_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>, b: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x0A4);
+        i.bits(0x3, 16);
+        i.float(a, 0);
+        i.float(b, 1);
+        i.dst(dst);
+        self.push(i)
+    }
+
+    /// `FRSQ.f32 dst, a`: 1 / sqrt(a) (ISA.xml:2268-2273, opcode2 2 under SFU G#9C).
+    pub fn frsq_f32(&mut self, dst: impl Into<Dst>, a: impl Into<Float>) -> Placed<'_> {
+        let mut i = Ins::new(0x09C);
+        i.bits(0x2, 16);
         i.float(a, 0);
         i.dst(dst);
         self.push(i)

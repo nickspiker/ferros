@@ -84,14 +84,155 @@ fn reference(gid: u32, x0: f32, y0: f32, step: f32) -> u32 {
     }
 }
 
+
+/// The ops kernel (2026-11-05, the builder's new instructions checked on the device): per invocation, x and y from the input pairs, nine results to nine rows of the output.
+const CASES: usize = 64;
+const OPS: usize = 9;
+fn ops(k: &mut Kernel<32>) {
+    k.shaddx_u64(pair(2), u(0), pair(60), 3);
+    k.load_i32(r(4), pair(2), 0, Slot::S0);
+    k.load_i32(r(5), pair(2), 4, Slot::S0).wait(Slot::S0);
+    k.shaddx_u64(pair(6), u(1), pair(60), 2);
+    k.fmin_f32(r(8), r(4), r(5));
+    k.fmax_f32(r(9), r(4), r(5));
+    k.frsq_f32(r(10), r(4));
+    k.f32_to_s32(r(11), r(4), Round::Rtn);
+    k.f32_to_u32(r(12), r(4), Round::Rtz);
+    k.fround_f32(r(13), r(4), Round::Rtn);
+    k.s32_to_f32(r(14), r(5));
+    k.lshift_xor_i32(r(15), r(4), Lut::ZERO, Byte::B0, r(5));
+    k.fcmp_or_f32(r(16), Cond::Lt, CmpResult::M1, r(4), r(5), Lut::ZERO);
+    k.mux_i32(r(17), Mux::Bit, r(4), r(5), r(16));
+    for (n, reg) in [8u8, 9, 10, 11, 12, 13, 14, 15, 17].iter().enumerate() {
+        let p = k.store_i32(r(*reg), pair(6), (n * CASES * 4) as i16, Slot::S1);
+        if n == OPS - 1 {
+            p.end();
+        }
+    }
+}
+
+/// The inputs: edges (±0, halves, negatives, large, tiny) and a spread, as (x, y) pairs.
+fn case(i: usize) -> (f32, f32) {
+    const X: [f32; 16] = [0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 1e-38, 3.0e9, -7.75, 123456.7, 0.25, 4.0, 1.0e-3, 65536.5];
+    let x = if i < 16 { X[i] } else { (i as f32 - 40.) * 1.37 };
+    let y = if i < 16 { X[15 - i] } else { (i as f32) * -0.61 + 3. };
+    (x, y)
+}
+
+/// The CPU's answer for op `n` (frsq is approximate on the GPU: checked by ulps, not bits).
+fn expect(n: usize, x: f32, y: f32) -> u32 {
+    match n {
+        0 => (if x < y { x } else if y < x { y } else if x.to_bits() >> 31 == 1 { x } else { y }).to_bits(),
+        1 => (if x > y { x } else if y > x { y } else if x.to_bits() >> 31 == 0 { x } else { y }).to_bits(),
+        2 => (1. / libm_sqrt(x)).to_bits(),
+        3 => floor(x) as i32 as u32,
+        4 => if x <= 0. { 0 } else { x as u32 },
+        // floor(-0) is -0 in IEEE; the integer round trip below would make it +0.
+        5 => if x == 0. { x.to_bits() } else { floor(x).to_bits() },
+        6 => (y.to_bits() as i32 as f32).to_bits(),
+        7 => x.to_bits() ^ y.to_bits(),
+        _ => (if x < y { x } else { y }).to_bits(),
+    }
+}
+fn floor(x: f32) -> f32 {
+    let t = x as i64 as f32;
+    if t > x { t - 1. } else { t }
+}
+fn libm_sqrt(x: f32) -> f32 {
+    // Newton on the CPU from a bit guess: exact enough to count the GPU's ulps against.
+    if x <= 0. {
+        return if x == 0. { 0. } else { f32::NAN };
+    }
+    let mut g = f32::from_bits((x.to_bits() >> 1) + 0x1FBD_1DF5);
+    for _ in 0..6 {
+        g = 0.5 * (g + x / g);
+    }
+    g
+}
+
+fn ops_test(grants: u64, arena: usize) -> ! {
+    let mut k = Kernel::<32>::new();
+    ops(&mut k);
+    let words = k.finish();
+    for (i, &w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((arena + 8 * i) as *mut u64, w) };
+    }
+    let (inp, outp) = (2 << 20, 3 << 20);
+    for i in 0..CASES {
+        let (x, y) = case(i);
+        unsafe {
+            core::ptr::write_volatile((arena + inp + 8 * i) as *mut f32, x);
+            core::ptr::write_volatile((arena + inp + 8 * i + 4) as *mut f32, y);
+        }
+    }
+    for i in 0..CASES * OPS {
+        unsafe { core::ptr::write_volatile((arena + outp + 4 * i) as *mut u32, 0xDEAD_BEEF) };
+    }
+    let uniforms = [ARENA_VA + inp as u64, ARENA_VA + outp as u64];
+    let reply = run(grants, words.len(), (CASES / 16) as u32, &uniforms);
+    const NAMES: [&str; OPS] = ["fmin", "fmax", "frsq", "f32_to_s32.rtn", "f32_to_u32.rtz", "fround.rtn", "s32_to_f32", "lshift_xor", "mux.bit"];
+    for n in 0..OPS {
+        let (mut wrong, mut worst_ulp, mut first) = (0u32, 0u32, None);
+        for i in 0..CASES {
+            let (x, y) = case(i);
+            let got = unsafe { core::ptr::read_volatile((arena + outp + 4 * (n * CASES + i)) as *const u32) };
+            let want = expect(n, x, y);
+            if n == 2 {
+                // Normal positive inputs only: the GPU flushes subnormals to zero (1e-38 is one).
+                if x >= f32::MIN_POSITIVE {
+                    let ulp = (got as i64 - want as i64).unsigned_abs() as u32;
+                    if ulp > worst_ulp {
+                        worst_ulp = ulp;
+                        first = Some((i, got, want));
+                    }
+                }
+            } else if got != want {
+                wrong += 1;
+                first.get_or_insert((i, got, want));
+            }
+        }
+        if n == 2 {
+            let (i, g, w) = first.unwrap_or((0, 0, 0));
+            say!(grants, "gputest: {}: worst {worst_ulp} ulp over the normal positive inputs (case {i}: G#{g:08X}, the CPU G#{w:08X})\n", NAMES[n]);
+        } else if let Some((i, g, w)) = first {
+            say!(grants, "gputest: {}: {wrong} of {CASES} wrong, the first case {i}: G#{g:08X}, the CPU G#{w:08X}\n", NAMES[n]);
+        } else {
+            say!(grants, "gputest: {}: all {CASES} as the CPU\n", NAMES[n]);
+        }
+    }
+    say!(grants, "gputest: ops job status {}, {} us\n", reply.0, reply.1);
+    exit(0);
+}
+
+/// One run through the service: the code at arena offset 0, `groups` workgroups of 16, preload r60 (the global id X).
+fn run(grants: u64, words: usize, groups: u32, uniforms: &[u64]) -> (u8, u32) {
+    let mut msg = [0u8; 18 + 8 * 16];
+    msg[0] = 1;
+    msg[1..3].copy_from_slice(&0x1000u16.to_le_bytes());
+    msg[3..7].copy_from_slice(&0u32.to_le_bytes());
+    msg[7..9].copy_from_slice(&(words as u16).to_le_bytes());
+    msg[9..13].copy_from_slice(&groups.to_le_bytes());
+    msg[13..17].copy_from_slice(&1u32.to_le_bytes());
+    msg[17] = uniforms.len() as u8;
+    for (i, u) in uniforms.iter().enumerate() {
+        msg[18 + 8 * i..26 + 8 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let mut reply = [0u8; 5];
+    call(cap(grants, S_GPU), &msg[..18 + 8 * uniforms.len()], &mut reply);
+    (reply[0], u32::from_le_bytes([reply[1], reply[2], reply[3], reply[4]]))
+}
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-pub extern "C" fn _entry(grants: u64, _input: u64, _input_len: u64) -> ! {
+pub extern "C" fn _entry(grants: u64, input: u64, input_len: u64) -> ! {
     unsafe { ferros_sys::relocate() };
     let arena = ferros_sys::dma(cap(grants, S_ARENA)) as usize;
     if arena == 0 || arena == usize::MAX {
         say!(grants, "gputest: no layer arena\n");
         exit(1);
+    }
+    // Input byte 1: the ops test (the builder's new instructions); none: the Mandelbrot.
+    if input_len > 0 && unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + input) as *const u8) } == 1 {
+        ops_test(grants, arena);
     }
     let mut k = Kernel::<32>::new();
     mandelbrot(&mut k);
