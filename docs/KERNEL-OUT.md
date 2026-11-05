@@ -64,6 +64,27 @@ What blocks the rest of the list after the night of 2026-10-31. Each is a choice
    - Proposed: leave it in the kernel until there is a charger process for other reasons (charging policy).
 6. **[decided 2026-11-01] The boot modeset.** It moves into the display server's start, run only while the pipe is still at 8 bpc (so a restart does not redo it); `dpu`/`dsim` then leave the kernel with their `diag` tools. On the attest screen's path, so with the owner present and through a slot b cold boot. The display server's grants for it are in place (slots 97-100: `decon0-sub`, `dqe0`, `dqe0-cgc`, `dpu-sysreg`). Done the same day (see the record).
 
+7. **The speaker amplifiers (`amp.rs`, found 2026-11-04).** The protocol is easy to move: 32-bit SPI reads of the CS35L41's registers. The pins are the problem.
+   - The right amplifier's chip select is a GPIO (gpn1-0), toggled on every transaction. It sits in the bank the touch driver holds (`gpio-gpn0` covers gpn0 and gpn1).
+   - Its reset (gph2-1) sits in HSI1's bank, which the modem driver holds.
+   - A second process writing those banks on every transfer would race their owners' read-modify-writes.
+   - Options:
+     - a GPIO server that owns every shared bank;
+     - a narrow kernel call that drives one granted pin;
+     - leave `amp` in the kernel until audio needs it (nothing plays sound yet).
+   - Proposed: the third, then the second once audio is built (the power switch does the rail and both resets, the process asks the kernel for its chip select).
+8. **Haptics (`haptics.rs`, found 2026-11-04).** The CS40L26 is on hsi2c_0, which the NFC driver owns (`hsi2c0`). Today `diag haptic` in the kernel and the NFC process can drive that bus at the same time. Nothing runs `diag haptic` unasked, but it is a real collision.
+   - Options:
+     - the haptics protocol inside the NFC driver, so the bus has one owner;
+     - an I2C bus server;
+     - the kernel keeps haptics and the NFC driver gives up the bus while `diag haptic` runs.
+   - Proposed: the first, as a "bus owner serves its neighbours" pattern. The same question will come for hsi2c_11 (decision 5).
+9. **The power group (`odpm`, `rtc`, `pd`, the gauge, found 2026-11-04).** Every one of them is ACPM or SPMI underneath, which only the kernel may issue ("Thin brokers").
+   - Moving them means a broker shaped per device (a read-only ODPM sample call, an RTC read and set, the domain switches as power switches) rather than processes doing the protocol.
+   - Proposed: leave them until a power server has a consumer (a battery dashboard, charging policy), then move them together with hsi2c_11's gauge.
+10. **`partfs` (found 2026-11-04).** It reads ext4 and f2fs files on Android's partitions for the modem driver (its image, NV, carrier configs) and the Bluetooth driver (its patch).
+    - Moving it needs a way to give a process read access to one partition's blocks without the vault's LU (an `ufs` block grant, read only, per partition).
+    - Proposed: build the block grant when a second consumer of Android's partitions appears; until then the kernel's reader is one module serving two drivers.
 ## Record
 
 - 2026-10-31: USB steps 1-5 (partial) — USB.md.
