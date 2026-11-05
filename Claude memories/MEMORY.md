@@ -127,3 +127,4 @@ the memory for the ferros project is in the ferros project folder. ferros/CLAUDE
 - [Feedback: the jump is a killswitch](feedback_jump_is_killswitch.md) — Android is hostile once killed: never wait for or adopt what it started (UFS commands, links, DMA); crowbar it (reset/rails), then bring up fresh
 - [Radios at attest, GPS locked](radios_at_attest_gps_locked.md) — 2026-11-04: all radios up at attest (needs DMA fences, no stable IDs, signed-only actions); GPS never unattested except write-only locate; modem S2MPU open on cold boot
 - [GPU online](gpu_online.md) — 2026-11-04: Mali-G715 CSF up (payloads/gpu), IRQ-driven queue, hand-encoded Valhall compute shader runs; gpu-mem G#B400_0000; secure carveout at G#B600_0000; traps
+- [GPU role: layers](gpu_role_layers.md) — owner 2026-11-05: GPU produces compute-dense layers (Mandelbrot/tapuwae, glows) into a shared CPU-cacheable/GPU-coherent arena; under + present stay NEON; no wholesale switching
